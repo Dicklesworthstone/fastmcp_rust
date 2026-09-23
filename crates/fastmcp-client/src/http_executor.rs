@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
@@ -176,19 +177,19 @@ pub const HTTP_03_A_EVALUATOR_MANIFEST_V1: &str = concat!(
     "producer-revision 3a8f4ac54c644f53ac63aedb333c3c8a924545ae\n",
     "producer-tree 9eaea54b5d866441d51de43a3ae062b36cb79e95\n",
     "entrypoint fastmcp_client::http_executor::ModernHttpExecutor::execute\n",
-    "HTTP-03.01 post-route floor=2\n",
-    "HTTP-03.02 request-content-type floor=3\n",
-    "HTTP-03.03 request-accept-two-ranges floor=2\n",
-    "HTTP-03.04 request-accept-encoding-identity floor=2\n",
-    "HTTP-03.05 protocol-version-header floor=2\n",
-    "HTTP-03.06 method-mirror-header floor=2\n",
-    "HTTP-03.07 name-header floor=3\n",
-    "HTTP-03.08 request-body-stamping floor=2\n",
-    "HTTP-03.09 immediate-json-lane floor=3\n",
-    "HTTP-03.10 request-scoped-sse-lane floor=3\n",
-    "HTTP-03.11 response-content-encoding floor=3\n",
-    "HTTP-03.12 bounded-sse-parse floor=3\n",
-    "HTTP-03.13 terminal-outcome-and-stream-close floor=2\n",
+    "HTTP-03.01 public-client-request-construction floor=5\n",
+    "HTTP-03.02 one-post-exact-json-body floor=5\n",
+    "HTTP-03.03 request-content-type-and-two-range-accept floor=7\n",
+    "HTTP-03.04 identity-accept-encoding-no-decompression floor=6\n",
+    "HTTP-03.05 protocol-method-name-routing-headers floor=13\n",
+    "HTTP-03.06 immediate-json-strict-utf8-bom-admission floor=4\n",
+    "HTTP-03.07 response-content-type-selection floor=7\n",
+    "HTTP-03.08 sse-replacement-decoder-leading-bom floor=4\n",
+    "HTTP-03.09 sse-line-ending-data-field-assembly floor=4\n",
+    "HTTP-03.10 sse-comments-empty-data-eof-inert-fields floor=4\n",
+    "HTTP-03.11 line-event-message-memory-bounds floor=8\n",
+    "HTTP-03.12 malformed-invalid-direction-response-isolation floor=3\n",
+    "HTTP-03.13 one-terminal-outcome-request-scoped-progress floor=3\n",
 );
 
 /// Returns the canonical HTTP-03 A evaluator manifest digest.
@@ -596,10 +597,17 @@ impl ModernHttpResponseMetadata {
 
 // Only the full HTTP request flush commits a response wait. Modern requests
 // never use Expect: 100-continue, so there is no earlier header-only flush.
+//
+// `request_bytes_sent` is a different and earlier boundary: the first request
+// byte the transport accepts. From then on the peer may have received enough
+// of the request to act on it, so a failure is an uncertain dispatch rather
+// than one a caller could safely retry. TLS handshake bytes never pass through
+// this wrapper, which only ever sees HTTP request bytes.
 struct ModernHttpIo {
     inner: ClientIo,
     cx: Cx,
     committed_at: Arc<OnceLock<Time>>,
+    request_bytes_sent: Arc<AtomicBool>,
 }
 
 impl AsyncRead for ModernHttpIo {
@@ -620,7 +628,11 @@ impl AsyncWrite for ModernHttpIo {
         bytes: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let _caller = Cx::set_current(Some(self.cx.clone()));
-        Pin::new(&mut self.inner).poll_write(cx, bytes)
+        let written = Pin::new(&mut self.inner).poll_write(cx, bytes);
+        if matches!(written, Poll::Ready(Ok(count)) if count > 0) {
+            self.request_bytes_sent.store(true, Ordering::Release);
+        }
+        written
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -2787,6 +2799,11 @@ pub enum ModernHttpExecutorError {
     InvalidTimeoutPolicy,
     /// The native HTTP client could not complete the single exchange.
     Transport(ClientError),
+    /// The exchange failed after the transport accepted request bytes and
+    /// before any response head was admitted. The peer may have received and
+    /// acted on the request, so it must not be retried or replayed
+    /// automatically.
+    DispatchUncertain(ClientError),
     /// A redirect is terminal for MCP and was not followed.
     Redirect { status: u16 },
     /// A response has no usable singleton content encoding.
@@ -2843,6 +2860,10 @@ impl fmt::Display for ModernHttpExecutorError {
                 formatter.write_str("invalid modern MCP response timeout policy")
             }
             Self::Transport(error) => write!(formatter, "native HTTP exchange failed: {error}"),
+            Self::DispatchUncertain(error) => write!(
+                formatter,
+                "modern MCP request may have reached the peer before the exchange failed: {error}"
+            ),
             Self::Redirect { status } => {
                 write!(
                     formatter,
@@ -2896,6 +2917,46 @@ impl fmt::Display for ModernHttpExecutorError {
 
 impl std::error::Error for ModernHttpExecutorError {}
 
+/// Whether a failed modern POST can be retried without risking a duplicate
+/// side effect at the peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModernHttpRetryClassification {
+    /// The failure precedes the first request byte, so the peer cannot have
+    /// observed the request.
+    NotDispatched,
+    /// Request bytes may have reached the peer. A side-effecting request must
+    /// not be retried or replayed automatically.
+    DispatchUncertain,
+}
+
+impl ModernHttpExecutorError {
+    /// Classifies a transport failure for retry decisions.
+    ///
+    /// `NotDispatched` is reported only for failure kinds that structurally
+    /// precede the request (address, DNS, connect, TLS handshake, proxy and
+    /// pool admission). Other transport failures and every non-transport
+    /// outcome return `None`: the executor cannot prove from the value alone
+    /// that no request byte left, and an unproven `NotDispatched` would license
+    /// exactly the duplicate a caller is trying to avoid.
+    #[must_use]
+    pub const fn retry_classification(&self) -> Option<ModernHttpRetryClassification> {
+        match self {
+            Self::DispatchUncertain(_) => Some(ModernHttpRetryClassification::DispatchUncertain),
+            Self::Transport(
+                ClientError::InvalidUrl(_)
+                | ClientError::DnsError(_)
+                | ClientError::ConnectError(_)
+                | ClientError::TlsError(_)
+                | ClientError::ConnectTunnelRefused { .. }
+                | ClientError::InvalidConnectInput(_)
+                | ClientError::ProxyError(_)
+                | ClientError::PoolExhausted { .. },
+            ) => Some(ModernHttpRetryClassification::NotDispatched),
+            _ => None,
+        }
+    }
+}
+
 /// Executes modern MCP HTTP POSTs through explicit native HTTP primitives.
 #[derive(Clone)]
 pub struct ModernHttpExecutor {
@@ -2931,7 +2992,12 @@ impl ModernHttpExecutor {
         }
     }
 
-    fn with_timeout_policy(mut self, policy: RequestTimeoutPolicy) -> Self {
+    /// Replaces the post-commit response timeout policy for ordinary requests.
+    ///
+    /// Expiry surfaces as [`ModernHttpExecutorError::Timeout`] and closes only
+    /// the owning exchange.
+    #[must_use]
+    pub fn with_timeout_policy(mut self, policy: RequestTimeoutPolicy) -> Self {
         self.request_timeout_policy = policy;
         self
     }
@@ -2992,6 +3058,7 @@ impl ModernHttpExecutor {
         HttpResponseDeadline::add_timeout(cx.now(), policy.idle_timeout())?;
         HttpResponseDeadline::add_timeout(cx.now(), policy.absolute_timeout())?;
         let committed_at = Arc::new(OnceLock::new());
+        let request_bytes_sent = Arc::new(AtomicBool::new(false));
         let progress_marker = serde_json::from_slice::<serde_json::Value>(request.body())
             .ok()
             .and_then(|body| body.pointer("/params/_meta/progressToken").cloned())
@@ -3011,6 +3078,7 @@ impl ModernHttpExecutor {
             request,
             self.bearer_credential.as_deref(),
             committed_at,
+            Arc::clone(&request_bytes_sent),
         ));
         // A native response-head wait may remain pending even after the
         // caller's Cx has been cancelled. Keep the request-owned exchange
@@ -3042,7 +3110,7 @@ impl ModernHttpExecutor {
                     response.map(Ok)
                 })
                 .await?
-                .map_err(map_transport_error)?
+                .map_err(|error| map_modern_exchange_error(error, &request_bytes_sent))?
             }
             None => {
                 let mut ambient_cancelled = std::pin::pin!(ambient_cancellation_signal.recv(cx));
@@ -3061,7 +3129,7 @@ impl ModernHttpExecutor {
                     response.map(Ok)
                 })
                 .await?
-                .map_err(map_transport_error)?
+                .map_err(|error| map_modern_exchange_error(error, &request_bytes_sent))?
             }
         };
         if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
@@ -3096,6 +3164,7 @@ async fn execute_native_modern_request(
     request: &ModernHttpRequest,
     credential: Option<&crate::http_auth::BoundBearerCredential>,
     committed_at: Arc<OnceLock<Time>>,
+    request_bytes_sent: Arc<AtomicBool>,
 ) -> Result<ClientStreamingResponse<ModernHttpIo>, ClientError> {
     let parsed = ParsedUrl::parse(request.target())?;
     cx.checkpoint().map_err(|_| ClientError::Cancelled)?;
@@ -3142,6 +3211,7 @@ async fn execute_native_modern_request(
             inner,
             cx: cx.clone(),
             committed_at,
+            request_bytes_sent,
         },
         native_request,
     )
@@ -4458,6 +4528,7 @@ impl ClientHttpConnection {
                                 reverse_request_handlers,
                                 &server_request,
                             )
+                            .await
                             .ok_or_else(|| {
                                 ClientHttpConnectionError::LegacyUnexpectedMessage {
                                     request_id: request_id.clone(),
@@ -5408,7 +5479,7 @@ fn legacy_cancelled_request_id(notification: &JsonRpcRequest) -> Option<RequestI
 /// The configured callback must match the capability retained for legacy
 /// initialization. Sampling and roots are never serviced merely because a
 /// handler exists; elicitation remains unavailable in exact MCP 2024-11-05.
-fn legacy_http_server_request_response(
+async fn legacy_http_server_request_response(
     cx: &Cx,
     client_capabilities: &ClientCapabilities,
     handlers: &ReverseRequestHandlers,
@@ -5430,28 +5501,38 @@ fn legacy_http_server_request_response(
             let Some(handler) = handlers.sampling_create_message.as_ref() else {
                 return crate::method_not_found_response(request);
             };
-            let result = crate::decode_reverse_request_params(request).and_then(|params| {
-                crate::invoke_shared_reverse_request_handler(
-                    cx,
-                    handler,
-                    ReverseRequestCancellation::new(),
-                    params,
-                )
-            });
+            // This loop already runs on the caller's runtime; awaiting the
+            // handler avoids a nested `block_on` (bd-84om4).
+            let result = match crate::decode_reverse_request_params(request) {
+                Ok(params) => {
+                    crate::invoke_reverse_request_handler_async(
+                        cx,
+                        handler.as_ref(),
+                        ReverseRequestCancellation::new(),
+                        params,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
             Some(crate::reverse_request_response(request_id, result))
         }
         "roots/list" if client_capabilities.roots.is_some() => {
             let Some(handler) = handlers.roots_list.as_ref() else {
                 return crate::method_not_found_response(request);
             };
-            let result = crate::decode_reverse_request_params(request).and_then(|params| {
-                crate::invoke_shared_reverse_request_handler(
-                    cx,
-                    handler,
-                    ReverseRequestCancellation::new(),
-                    params,
-                )
-            });
+            let result = match crate::decode_reverse_request_params(request) {
+                Ok(params) => {
+                    crate::invoke_reverse_request_handler_async(
+                        cx,
+                        handler.as_ref(),
+                        ReverseRequestCancellation::new(),
+                        params,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
             Some(crate::reverse_request_response(request_id, result))
         }
         // Exact 2024-11-05 never admitted elicitation. In particular, do not
@@ -9601,6 +9682,27 @@ fn decode_modern_discovery_response(
 fn map_transport_error(error: ClientError) -> ModernHttpExecutorError {
     if error.is_cancelled() {
         ModernHttpExecutorError::Cancelled
+    } else {
+        ModernHttpExecutorError::Transport(error)
+    }
+}
+
+/// Classifies a modern exchange that failed before any response head was
+/// admitted.
+///
+/// Once the transport has accepted one request byte, the failure is an
+/// uncertain dispatch. Cancellation and the caller's deadline keep their own
+/// typed outcomes rather than being folded into it.
+fn map_modern_exchange_error(
+    error: ClientError,
+    request_bytes_sent: &AtomicBool,
+) -> ModernHttpExecutorError {
+    if error.is_cancelled() {
+        ModernHttpExecutorError::Cancelled
+    } else if !matches!(error, ClientError::DeadlineExceeded)
+        && request_bytes_sent.load(Ordering::Acquire)
+    {
+        ModernHttpExecutorError::DispatchUncertain(error)
     } else {
         ModernHttpExecutorError::Transport(error)
     }

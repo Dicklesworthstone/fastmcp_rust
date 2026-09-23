@@ -44,8 +44,9 @@ use std::time::{Duration, Instant};
 use asupersync::{CancelKind, Cx};
 use asupersync::runtime::RuntimeBuilder;
 use fastmcp_rust::client::http_executor::{
-    HTTP_03_A_EVALUATOR_MANIFEST_V1, HTTP_03_B_EVALUATOR_MANIFEST_V1, ModernHttpFinalCoreEvent,
-    ModernHttpFinalCoreListenError, http_03_a_manifest_digest, http_03_b_manifest_digest,
+    HTTP_03_A_EVALUATOR_MANIFEST_V1, HTTP_03_B_EVALUATOR_MANIFEST_V1,
+    MAX_PENDING_MODERN_HTTP_SSE_EVENTS, ModernHttpFinalCoreEvent, ModernHttpFinalCoreListenError,
+    http_03_a_manifest_digest, http_03_b_manifest_digest,
 };
 use fastmcp_rust::client::{
     BearerBindingError, BoundBearerCredential, ClientBuilder, ClientHttpConnection,
@@ -56,9 +57,9 @@ use fastmcp_rust::client::{
     SseLimits, validate_response_head,
 };
 use fastmcp_rust::{
-    CanonicalHttpUrl, FinalCoreResult, HttpEndpointBundleKey, HttpModernProbe, HttpProbeBody,
-    JsonRpcRequest, ProgressMarker, ProtocolEra, ProtocolPolicy, RequestId, ServerNotification,
-    Sha256Digest, sha256_bounded,
+    CanonicalHttpUrl, ClientCapabilities, ClientInfo, FinalCoreResult, FinalRequestMeta,
+    HttpEndpointBundleKey, HttpModernProbe, HttpProbeBody, JsonRpcRequest, ProgressMarker,
+    ProtocolEra, ProtocolPolicy, RequestId, ServerNotification, Sha256Digest, sha256_bounded,
 };
 
 /// The join's own public entrypoint, recorded in the receipt (PL-3).
@@ -75,7 +76,7 @@ const MINIMUM_POSITIVE_CASES: usize = 26;
 const MINIMUM_NEGATIVE_CASES: usize = 26;
 
 /// The manifest case whose single variable the planted-negative test changes.
-const PLANTED_CASE_ID: &str = "HTTP-03.11";
+const PLANTED_CASE_ID: &str = "HTTP-03.04";
 
 /// The clock regime this join runs under (PL-5 records clocks).
 ///
@@ -112,7 +113,7 @@ const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 /// literals reconstructed from `http_executor.rs` - and agreeing with the same
 /// two values frozen by the A and B producer targets.
 const HTTP_03_A_MANIFEST_DIGEST_HEX: &str =
-    "9f68de2cfb47091ee101006cd67405a8764d6dd79781cf2abffabe1c54658818";
+    "0d5bed420fce1798b7db9cb1ea2dc52ca40496b58cecb5475a95798ea880c2cc";
 const HTTP_03_B_MANIFEST_DIGEST_HEX: &str =
     "23fb2f9a13130aea1c80891371979494a116ac978fd78d987de1152b18af7135";
 
@@ -123,6 +124,9 @@ const BEARER_SECRET: &str = "http-03-integration-bearer-secret";
 /// Placeholder substituted for the ephemeral fixture authority so that case
 /// records are byte-comparable across runs.
 const FIXTURE_AUTHORITY_PLACEHOLDER: &str = "<fixture-authority>";
+
+/// The progress marker the joined `/mcp-a` tools/call carries.
+const JOIN_PROGRESS_MARKER: &str = "http-03-integration-progress";
 
 // ---------------------------------------------------------------------------
 // Producer manifest consumption
@@ -653,8 +657,10 @@ struct WireObservations {
     b_era: ProtocolEra,
     b_json_outcome: String,
     b_lane_refusal: String,
+    b_params_refusal: String,
     method_count: BTreeMap<String, usize>,
     legacy_get_count: usize,
+    response_lanes: ResponseLanes,
     uncertain_dispatch: LaneObservation,
     deadline_race: LaneObservation,
     caller_cancellation: CancellationObservation,
@@ -1359,6 +1365,537 @@ fn observe_extension_notification() -> NotificationObservation {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Response-body lanes (HTTP-03.06, .08-.12)
+// ---------------------------------------------------------------------------
+//
+// Each lane is its own real-socket fixture: one discovery probe, then one
+// request whose response body is exactly the bytes the case supplies. A
+// positive and its planted negative call the same lane with bodies that differ
+// only in the case's one variable, so whatever differs in the recorded outcome
+// is that variable's doing. Lanes never share the A/B fixture above, so no
+// case here can perturb the planted `/mcp-b` coding or any record it compares.
+
+/// The request id every single-stream response lane uses.
+const RESPONSE_LANE_REQUEST_ID: i64 = 2;
+
+/// The sibling request id the isolation lane opens beside the owner.
+const ISOLATION_SIBLING_REQUEST_ID: i64 = 3;
+
+/// Writes `bytes` verbatim as one chunk of an already-begun SSE body.
+///
+/// The size line, payload and terminator go out in ONE write. The pending-event
+/// bound (HTTP-03.11) is charged per native body frame, and a frame is whatever
+/// the client has buffered, so a single small write is what keeps a whole
+/// chunk's events in one frame.
+fn write_raw_sse_chunk(stream: &mut TcpStream, bytes: &[u8]) {
+    assert!(
+        !bytes.is_empty(),
+        "a zero-length chunk would terminate the response body early"
+    );
+    let mut chunk = format!("{:x}\r\n", bytes.len()).into_bytes();
+    chunk.extend_from_slice(bytes);
+    chunk.extend_from_slice(b"\r\n");
+    stream.write_all(&chunk).expect("write fixture chunk");
+    stream.flush().expect("flush fixture chunk");
+}
+
+/// Serves the discovery probe of a response lane on `listener`.
+fn serve_lane_probe(listener: &TcpListener, instance: &str) {
+    let mut probe = accept_bounded(listener);
+    let _probe_request = read_request(&mut probe);
+    write_bounded_response(
+        &mut probe,
+        200,
+        "application/json",
+        Some("identity"),
+        &discovery_body(1, instance),
+    );
+}
+
+/// A `tools/call` terminal result for `request_id` whose text is `text`.
+fn terminal_bytes(request_id: i64, text: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "resultType": "complete",
+            "content": [{"type": "text", "text": text}],
+            "isError": false,
+        },
+    }))
+    .expect("fixture terminal result must serialize")
+}
+
+/// One SSE event carrying `payload` as its single `data` line, LF-framed.
+fn data_event(payload: &[u8]) -> Vec<u8> {
+    let mut event = b"data: ".to_vec();
+    event.extend_from_slice(payload);
+    event.extend_from_slice(b"\n\n");
+    event
+}
+
+/// Renders one listener read as a stable record token.
+fn render_listener_read(
+    read: Result<Option<ModernHttpFinalCoreEvent>, ModernHttpFinalCoreListenError>,
+) -> (String, bool) {
+    match read {
+        Ok(Some(ModernHttpFinalCoreEvent::Progress(progress))) => {
+            (format!("progress:{}", progress.progress.as_str()), false)
+        }
+        Ok(Some(ModernHttpFinalCoreEvent::Terminal(result))) => {
+            (format!("terminal:{result:?}"), false)
+        }
+        Ok(Some(other)) => (format!("event:{other:?}"), false),
+        Ok(None) => ("end".to_owned(), true),
+        Err(error) => (format!("refused:{error:?}"), true),
+    }
+}
+
+/// Opens one SSE `tools/call` through the public listener, serves `sse_body`
+/// as its entire response body, and records every read until the stream ends
+/// or refuses.
+///
+/// The request carries a progress marker, so request-scoped progress in a body
+/// is admissible and is recorded in order.
+fn observe_sse_body(instance: &'static str, sse_body: Vec<u8>, limits: SseLimits) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind an SSE response lane");
+    let address = listener
+        .local_addr()
+        .expect("read the SSE response lane address");
+    let target = format!("http://{address}/mcp-{instance}");
+    let marker = ProgressMarker::from("http-03-integration-lane-progress");
+
+    let server = thread::spawn(move || {
+        serve_lane_probe(&listener, instance);
+        let mut call = accept_bounded(&listener);
+        let _call_request = read_request(&mut call);
+        begin_sse_response(&mut call);
+        write_raw_sse_chunk(&mut call, &sse_body);
+        end_sse_response(&mut call);
+    });
+
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("an SSE response lane owns its caller runtime");
+    let observed = runtime.block_on(async {
+        let cx = Cx::current().expect("the caller runtime must install a current Cx");
+        let connection = integration_builder(&target)
+            .connect_http_with_cx(&cx)
+            .await
+            .expect("an SSE response lane must connect through the public builder");
+        let mut stream = connection
+            .open_final_core_listener(
+                &cx,
+                "tools/call",
+                serde_json::json!({
+                    "name": "http_03_response_lane_tool",
+                    "arguments": {},
+                    "_meta": {"progressToken": marker},
+                }),
+                RequestId::Number(RESPONSE_LANE_REQUEST_ID),
+                limits,
+            )
+            .await
+            .expect("the shipped SSE lane must open a request-owned listener");
+        let mut reads = Vec::new();
+        for _ in 0_u8..8 {
+            let (token, finished) = render_listener_read(stream.next_event(&cx).await);
+            reads.push(token);
+            if finished {
+                break;
+            }
+        }
+        reads.join(" | ")
+    });
+
+    server
+        .join()
+        .expect("the SSE response lane fixture thread must not panic");
+    normalize_lane(address, observed)
+}
+
+/// Sends one `tools/list` through the public immediate-JSON entrypoint with a
+/// `maximum_bytes` response bound and serves `json_body` as its entire
+/// `application/json` response body.
+fn observe_json_body(json_body: Vec<u8>, maximum_bytes: usize) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a JSON response lane");
+    let address = listener
+        .local_addr()
+        .expect("read the JSON response lane address");
+    let target = format!("http://{address}/mcp-json-lane");
+
+    let server = thread::spawn(move || {
+        serve_lane_probe(&listener, "json-lane");
+        let mut call = accept_bounded(&listener);
+        let _call_request = read_request(&mut call);
+        write_bounded_response(
+            &mut call,
+            200,
+            "application/json",
+            Some("identity"),
+            &json_body,
+        );
+    });
+
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("a JSON response lane owns its caller runtime");
+    let observed = runtime.block_on(async {
+        let cx = Cx::current().expect("the caller runtime must install a current Cx");
+        let mut connection = integration_builder(&target)
+            .connect_http_with_cx(&cx)
+            .await
+            .expect("a JSON response lane must connect through the public builder");
+        match connection
+            .request_json(
+                &cx,
+                "tools/list",
+                serde_json::json!({}),
+                RequestId::Number(RESPONSE_LANE_REQUEST_ID),
+                maximum_bytes,
+            )
+            .await
+        {
+            Ok(response) => format!(
+                "admitted id={:?} error={} result={}",
+                response.id,
+                response.error.is_some(),
+                response
+                    .result
+                    .as_ref()
+                    .map_or_else(|| "<none>".to_owned(), serde_json::Value::to_string)
+            ),
+            Err(error) => format!("refused:{}", render_connection_error(&error)),
+        }
+    });
+
+    server
+        .join()
+        .expect("the JSON response lane fixture thread must not panic");
+    normalize_lane(address, observed)
+}
+
+/// Opens an owner and a sibling SSE `tools/call` on ONE connection. The sibling
+/// always receives an admissible terminal. The owner receives `owner_payload`
+/// as its single `data` event, then its body ends.
+///
+/// Records the sibling's terminal, the owner's outcome, and the sibling's read
+/// after its terminal, so a refusal on the owner is observable next to an
+/// unaffected sibling.
+fn observe_isolation(owner_payload: Vec<u8>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind the isolation lane");
+    let address = listener
+        .local_addr()
+        .expect("read the isolation lane address");
+    let target = format!("http://{address}/mcp-isolation");
+
+    let server = thread::spawn(move || {
+        serve_lane_probe(&listener, "isolation");
+        let mut owner = accept_bounded(&listener);
+        let _owner_request = read_request(&mut owner);
+        begin_sse_response(&mut owner);
+
+        let mut sibling = accept_bounded(&listener);
+        let _sibling_request = read_request(&mut sibling);
+        begin_sse_response(&mut sibling);
+        write_raw_sse_chunk(
+            &mut sibling,
+            &data_event(&terminal_bytes(ISOLATION_SIBLING_REQUEST_ID, "sibling-ok")),
+        );
+        end_sse_response(&mut sibling);
+
+        write_raw_sse_chunk(&mut owner, &data_event(&owner_payload));
+        end_sse_response(&mut owner);
+    });
+
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("the isolation lane owns its caller runtime");
+    let observed = runtime.block_on(async {
+        let cx = Cx::current().expect("the caller runtime must install a current Cx");
+        let limits = SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits are nonzero");
+        let connection = integration_builder(&target)
+            .connect_http_with_cx(&cx)
+            .await
+            .expect("the isolation lane must connect through the public builder");
+        let mut owner = connection
+            .open_final_core_listener(
+                &cx,
+                "tools/call",
+                serde_json::json!({"name": "http_03_owner_tool", "arguments": {}}),
+                RequestId::Number(RESPONSE_LANE_REQUEST_ID),
+                limits,
+            )
+            .await
+            .expect("the owner request must reach the fixture");
+        let mut sibling = connection
+            .open_final_core_listener(
+                &cx,
+                "tools/call",
+                serde_json::json!({"name": "http_03_sibling_tool", "arguments": {}}),
+                RequestId::Number(ISOLATION_SIBLING_REQUEST_ID),
+                limits,
+            )
+            .await
+            .expect("the sibling request must reach the fixture");
+
+        let (sibling_first, _) = render_listener_read(sibling.next_event(&cx).await);
+        let (owner_first, _) = render_listener_read(owner.next_event(&cx).await);
+        let (sibling_after, _) = render_listener_read(sibling.next_event(&cx).await);
+        format!("sibling={sibling_first} || owner={owner_first} || sibling-after={sibling_after}")
+    });
+
+    server
+        .join()
+        .expect("the isolation lane fixture thread must not panic");
+    normalize_lane(address, observed)
+}
+
+/// A `tools/call` terminal for the single-stream lanes carrying one raw
+/// malformed octet. Both placements are the SAME bytes with the octet inserted
+/// at a different offset: inside the empty text string, or directly after the
+/// opening brace. Only the octet's position differs.
+fn terminal_with_malformed_octet(inside_json_string: bool) -> Vec<u8> {
+    const TERMINAL: &[u8] = br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":""}],"isError":false}}"#;
+    const TEXT_OPENING: &[u8] = br#""text":""#;
+    let offset = if inside_json_string {
+        TERMINAL
+            .windows(TEXT_OPENING.len())
+            .position(|window| window == TEXT_OPENING)
+            .expect("the terminal carries a text member")
+            + TEXT_OPENING.len()
+    } else {
+        1
+    };
+    let mut payload = TERMINAL.to_vec();
+    payload.insert(offset, 0xFF);
+    payload
+}
+
+/// Prefixes `body` with `boms` UTF-8 byte order marks.
+fn with_leading_boms(boms: usize, body: &[u8]) -> Vec<u8> {
+    let mut prefixed = Vec::new();
+    for _ in 0..boms {
+        prefixed.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+    }
+    prefixed.extend_from_slice(body);
+    prefixed
+}
+
+/// The HTTP-03.09 body: a CR-framed progress event, an LF-framed progress
+/// event, and a CRLF-framed terminal whose JSON is split across two `data`
+/// lines at a structural comma. `field` names the terminal's data field, which
+/// is the planted variable (`data` versus `Data`).
+fn line_ending_body(marker: &ProgressMarker, field: &str) -> Vec<u8> {
+    let progress_one =
+        serde_json::to_vec(&progress_event(marker, 1)).expect("fixture progress serializes");
+    let progress_two =
+        serde_json::to_vec(&progress_event(marker, 2)).expect("fixture progress serializes");
+    let terminal = String::from_utf8(terminal_bytes(RESPONSE_LANE_REQUEST_ID, "line-endings-ok"))
+        .expect("fixture terminal is UTF-8");
+    let (head, tail) = terminal
+        .split_once(",\"result\"")
+        .expect("the fixture terminal carries a result member");
+
+    let mut body = b"data: ".to_vec();
+    body.extend_from_slice(&progress_one);
+    body.extend_from_slice(b"\r\r");
+    body.extend_from_slice(b"data: ");
+    body.extend_from_slice(&progress_two);
+    body.extend_from_slice(b"\n\n");
+    body.extend_from_slice(
+        format!("{field}: {head},\r\n{field}: \"result\"{tail}\r\n\r\n").as_bytes(),
+    );
+    body
+}
+
+/// The HTTP-03.10 body: a comment, a blank line with nothing pending, and a
+/// terminal event carrying inert `event`, `id`, `retry` and unknown fields.
+fn inert_fields_body(terminal_blank_line: bool, empty_data_event: bool) -> Vec<u8> {
+    let mut body = b": http-03 keepalive comment\n\n".to_vec();
+    if empty_data_event {
+        body.extend_from_slice(b"data\n\n");
+    }
+    body.extend_from_slice(b"event: message\nid: 7\nretry: 1000\nunknown: inert\ndata: ");
+    body.extend_from_slice(&terminal_bytes(RESPONSE_LANE_REQUEST_ID, "inert-fields-ok"));
+    body.extend_from_slice(if terminal_blank_line {
+        b"\n\n".as_slice()
+    } else {
+        b"\n".as_slice()
+    });
+    body
+}
+
+/// Everything the response-body lanes observed. Each field is one lane run.
+#[derive(Debug, Clone)]
+struct ResponseLanes {
+    json_utf8: String,
+    json_leading_bom: String,
+    json_invalid_utf8: String,
+    sse_replacement_inside: String,
+    sse_replacement_outside: String,
+    sse_double_bom: String,
+    sse_line_endings: String,
+    sse_uppercase_data: String,
+    sse_inert_fields: String,
+    sse_unterminated_event: String,
+    sse_empty_data: String,
+    line_ceiling_bytes: usize,
+    sse_at_line_ceiling: String,
+    sse_over_line_ceiling: String,
+    event_ceiling_bytes: usize,
+    sse_at_event_ceiling: String,
+    sse_over_event_ceiling: String,
+    message_ceiling_bytes: usize,
+    json_at_message_ceiling: String,
+    json_over_message_ceiling: String,
+    sse_pending_at_bound: String,
+    sse_pending_over_bound: String,
+    isolation_admitted: String,
+    isolation_malformed: String,
+    isolation_server_request: String,
+}
+
+/// One LF-framed event whose terminal JSON is split across two `data` lines at
+/// a structural comma, and the event's raw byte count: the sum of both lines
+/// without their terminators, which is what the event ceiling charges.
+fn two_line_event(text: &str) -> (Vec<u8>, usize) {
+    let terminal = String::from_utf8(terminal_bytes(RESPONSE_LANE_REQUEST_ID, text))
+        .expect("fixture terminal is UTF-8");
+    let (head, tail) = terminal
+        .split_once(",\"result\"")
+        .expect("the fixture terminal carries a result member");
+    let first = format!("data: {head},");
+    let second = format!("data: \"result\"{tail}");
+    let raw_bytes = first.len() + second.len();
+    (format!("{first}\n{second}\n\n").into_bytes(), raw_bytes)
+}
+
+/// The HTTP-03.06 JSON document: a result whose note is non-ASCII UTF-8.
+fn strict_utf8_json(note: &[u8]) -> Vec<u8> {
+    let mut body = br#"{"jsonrpc":"2.0","id":2,"result":{"note":""#.to_vec();
+    body.extend_from_slice(note);
+    body.extend_from_slice(br#""}}"#);
+    body
+}
+
+fn observe_response_lanes() -> ResponseLanes {
+    let limits = SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits are nonzero");
+    let marker = ProgressMarker::from("http-03-integration-lane-progress");
+
+    let utf8_note = "prüfung-✓".as_bytes();
+    let mut invalid_note = utf8_note.to_vec();
+    // The one changed byte: the final byte of `✓` (E2 9C 93) becomes 0xFF, so
+    // the note is no longer well-formed UTF-8 and nothing else moves.
+    let last = invalid_note.len() - 1;
+    invalid_note[last] = 0xFF;
+
+    let at_ceiling = data_event(&terminal_bytes(RESPONSE_LANE_REQUEST_ID, "ceiling"));
+    let over_ceiling = data_event(&terminal_bytes(RESPONSE_LANE_REQUEST_ID, "ceilingx"));
+    // The raw line is `data: <terminal>` without its terminator.
+    let line_ceiling_bytes = at_ceiling.len() - 2;
+    let ceiling_limits =
+        SseLimits::new(line_ceiling_bytes, 65_536, 8).expect("the line ceiling is nonzero");
+
+    // Event bound: two data lines, each far under the line ceiling, whose raw
+    // sum is exactly the event ceiling. The negative's text gains one byte.
+    let (at_event_ceiling, event_ceiling_bytes) = two_line_event("event-ceiling");
+    let (over_event_ceiling, over_event_bytes) = two_line_event("event-ceilingx");
+    assert_eq!(over_event_bytes, event_ceiling_bytes + 1);
+    let event_limits =
+        SseLimits::new(4_096, event_ceiling_bytes, 8).expect("the event ceiling is nonzero");
+
+    // Message bound: the caller's retained-byte bound on the immediate JSON
+    // lane, set to exactly the admitted document's length.
+    let at_message_ceiling = strict_utf8_json(utf8_note);
+    let message_ceiling_bytes = at_message_ceiling.len();
+    let over_message_ceiling = strict_utf8_json("prüfung-✓x".as_bytes());
+    assert_eq!(over_message_ceiling.len(), message_ceiling_bytes + 1);
+
+    // Memory bound: completed events pending from ONE native body frame. Tiny
+    // events keep the whole chunk one small write. At the bound nothing
+    // overflows, so the first event reaches (and fails) JSON admission; one
+    // more event and the pending bound refuses first.
+    let pending_events = |count: usize| b"data: x\n\n".repeat(count);
+
+    ResponseLanes {
+        json_utf8: observe_json_body(strict_utf8_json(utf8_note), 65_536),
+        json_leading_bom: observe_json_body(
+            with_leading_boms(1, &strict_utf8_json(utf8_note)),
+            65_536,
+        ),
+        json_invalid_utf8: observe_json_body(strict_utf8_json(&invalid_note), 65_536),
+        sse_replacement_inside: observe_sse_body(
+            "replacement",
+            with_leading_boms(1, &data_event(&terminal_with_malformed_octet(true))),
+            limits,
+        ),
+        sse_replacement_outside: observe_sse_body(
+            "replacement",
+            with_leading_boms(1, &data_event(&terminal_with_malformed_octet(false))),
+            limits,
+        ),
+        sse_double_bom: observe_sse_body(
+            "replacement",
+            with_leading_boms(2, &data_event(&terminal_with_malformed_octet(true))),
+            limits,
+        ),
+        sse_line_endings: observe_sse_body(
+            "line-endings",
+            line_ending_body(&marker, "data"),
+            limits,
+        ),
+        sse_uppercase_data: observe_sse_body(
+            "line-endings",
+            line_ending_body(&marker, "Data"),
+            limits,
+        ),
+        sse_inert_fields: observe_sse_body("inert-fields", inert_fields_body(true, false), limits),
+        sse_unterminated_event: observe_sse_body(
+            "inert-fields",
+            inert_fields_body(false, false),
+            limits,
+        ),
+        sse_empty_data: observe_sse_body("inert-fields", inert_fields_body(true, true), limits),
+        line_ceiling_bytes,
+        sse_at_line_ceiling: observe_sse_body("bounds", at_ceiling, ceiling_limits),
+        sse_over_line_ceiling: observe_sse_body("bounds", over_ceiling, ceiling_limits),
+        event_ceiling_bytes,
+        sse_at_event_ceiling: observe_sse_body("bounds", at_event_ceiling, event_limits),
+        sse_over_event_ceiling: observe_sse_body("bounds", over_event_ceiling, event_limits),
+        message_ceiling_bytes,
+        json_at_message_ceiling: observe_json_body(at_message_ceiling, message_ceiling_bytes),
+        json_over_message_ceiling: observe_json_body(over_message_ceiling, message_ceiling_bytes),
+        sse_pending_at_bound: observe_sse_body(
+            "bounds",
+            pending_events(MAX_PENDING_MODERN_HTTP_SSE_EVENTS),
+            limits,
+        ),
+        sse_pending_over_bound: observe_sse_body(
+            "bounds",
+            pending_events(MAX_PENDING_MODERN_HTTP_SSE_EVENTS + 1),
+            limits,
+        ),
+        isolation_admitted: observe_isolation(terminal_bytes(RESPONSE_LANE_REQUEST_ID, "owner-ok")),
+        // The positive's own bytes, one byte short: the closing brace is gone.
+        isolation_malformed: observe_isolation({
+            let mut truncated = terminal_bytes(RESPONSE_LANE_REQUEST_ID, "owner-ok");
+            truncated.pop();
+            truncated
+        }),
+        isolation_server_request: observe_isolation(
+            serde_json::to_vec(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 9002,
+                "method": "sampling/createMessage",
+                "params": {},
+            }))
+            .expect("fixture server request serializes"),
+        ),
+    }
+}
+
 fn integration_builder(target: &str) -> ClientBuilder {
     ClientBuilder::new()
         .client_info("http-03-integration-client", "1.0.0")
@@ -1389,6 +1926,7 @@ struct ClientOutcome {
     b_endpoint_key: HttpEndpointBundleKey,
     b_json_outcome: String,
     b_lane_refusal: String,
+    b_params_refusal: String,
 }
 
 fn endpoint_key(connection: &ClientHttpConnection) -> HttpEndpointBundleKey {
@@ -1399,9 +1937,9 @@ fn endpoint_key(connection: &ClientHttpConnection) -> HttpEndpointBundleKey {
         .key()
 }
 
-/// Drives one complete fixture run. `plant_case_11` changes exactly one
+/// Drives one complete fixture run. `plant_case_04` changes exactly one
 /// variable: the `Content-Encoding` of the `/mcp-b` JSON terminal response.
-fn run_fixture(plant_case_11: bool) -> WireObservations {
+fn run_fixture(plant_case_04: bool) -> WireObservations {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind the HTTP-03 integration fixture");
     let address = listener
         .local_addr()
@@ -1409,7 +1947,7 @@ fn run_fixture(plant_case_11: bool) -> WireObservations {
     let authority = address.to_string();
     let a_target = format!("http://{authority}/mcp-a");
     let b_target = format!("http://{authority}/mcp-b");
-    let marker = ProgressMarker::from("http-03-integration-progress");
+    let marker = ProgressMarker::from(JOIN_PROGRESS_MARKER);
     let server_marker = marker.clone();
     let (captures_tx, captures_rx) = mpsc::channel();
 
@@ -1454,7 +1992,7 @@ fn run_fixture(plant_case_11: bool) -> WireObservations {
             &mut b_ping_stream,
             200,
             "application/json",
-            Some(if plant_case_11 { "gzip" } else { "identity" }),
+            Some(if plant_case_04 { "gzip" } else { "identity" }),
             &ping_body(11),
         );
         captures_tx.send(b_ping).expect("record /mcp-b ping");
@@ -1546,6 +2084,23 @@ fn run_fixture(plant_case_11: bool) -> WireObservations {
         let b_versions: Vec<String> = b_discovery_result.supported_versions().to_vec();
         let b_discovery = format!("{b_discovery_result:?}");
         let b_endpoint_key = endpoint_key(&b_connection);
+
+        // HTTP-03.02's one variable: the caller's parameters become an array.
+        // The refusal is typed and local. The fixture still observes exactly
+        // five requests below, which is what proves no POST was sent for it.
+        let b_params_refusal = match b_connection
+            .request_json(
+                &cx,
+                "tools/list",
+                serde_json::json!([]),
+                RequestId::Number(10),
+                65_536,
+            )
+            .await
+        {
+            Ok(_) => panic!("non-object parameters must not become a modern POST"),
+            Err(error) => render_connection_error(&error),
+        };
 
         let b_json_outcome = match b_connection
             .request_json(
@@ -1664,6 +2219,7 @@ fn run_fixture(plant_case_11: bool) -> WireObservations {
             b_endpoint_key,
             b_json_outcome,
             b_lane_refusal,
+            b_params_refusal,
         }
     });
 
@@ -1697,6 +2253,7 @@ fn run_fixture(plant_case_11: bool) -> WireObservations {
         b_endpoint_key,
         b_json_outcome,
         b_lane_refusal,
+        b_params_refusal,
     } = outcome;
 
     let captured = [&a_probe, &a_call, &b_probe, &b_ping, &b_lane_probe];
@@ -1719,6 +2276,7 @@ fn run_fixture(plant_case_11: bool) -> WireObservations {
     let caller_cancellation = observe_caller_cancellation();
     let independent_server_request = observe_independent_server_request();
     let extension_notification = observe_extension_notification();
+    let response_lanes = observe_response_lanes();
 
     WireObservations {
         fixture_authority: authority,
@@ -1742,8 +2300,10 @@ fn run_fixture(plant_case_11: bool) -> WireObservations {
         b_era,
         b_json_outcome,
         b_lane_refusal,
+        b_params_refusal,
         method_count,
         legacy_get_count,
+        response_lanes,
         uncertain_dispatch,
         deadline_race,
         caller_cancellation,
@@ -1893,19 +2453,22 @@ impl JoinReceipt {
 /// So each predicate declares the subject it observes, and the join refuses to
 /// run a predicate under a case name that means something else.
 const PREDICATE_SUBJECTS: &[(&str, &str)] = &[
-    ("HTTP-03.01", "post-route"),
-    ("HTTP-03.02", "request-content-type"),
-    ("HTTP-03.03", "request-accept-two-ranges"),
-    ("HTTP-03.04", "request-accept-encoding-identity"),
-    ("HTTP-03.05", "protocol-version-header"),
-    ("HTTP-03.06", "method-mirror-header"),
-    ("HTTP-03.07", "name-header"),
-    ("HTTP-03.08", "request-body-stamping"),
-    ("HTTP-03.09", "immediate-json-lane"),
-    ("HTTP-03.10", "request-scoped-sse-lane"),
-    ("HTTP-03.11", "response-content-encoding"),
-    ("HTTP-03.12", "bounded-sse-parse"),
-    ("HTTP-03.13", "terminal-outcome-and-stream-close"),
+    ("HTTP-03.01", "public-client-request-construction"),
+    ("HTTP-03.02", "one-post-exact-json-body"),
+    ("HTTP-03.03", "request-content-type-and-two-range-accept"),
+    ("HTTP-03.04", "identity-accept-encoding-no-decompression"),
+    ("HTTP-03.05", "protocol-method-name-routing-headers"),
+    ("HTTP-03.06", "immediate-json-strict-utf8-bom-admission"),
+    ("HTTP-03.07", "response-content-type-selection"),
+    ("HTTP-03.08", "sse-replacement-decoder-leading-bom"),
+    ("HTTP-03.09", "sse-line-ending-data-field-assembly"),
+    ("HTTP-03.10", "sse-comments-empty-data-eof-inert-fields"),
+    ("HTTP-03.11", "line-event-message-memory-bounds"),
+    (
+        "HTTP-03.12",
+        "malformed-invalid-direction-response-isolation",
+    ),
+    ("HTTP-03.13", "one-terminal-outcome-request-scoped-progress"),
     ("HTTP-03.14", "caller-cancellation-response-close"),
     ("HTTP-03.15", "deadline-and-disconnect-races"),
     ("HTTP-03.16", "uncertain-dispatch-no-retry"),
@@ -1941,11 +2504,11 @@ fn assert_predicate_matches_declared_case(case: &ManifestCase) {
     );
 }
 
-/// Evaluates the full ordered join. `plant_case_11` changes exactly one
+/// Evaluates the full ordered join. `plant_case_04` changes exactly one
 /// variable across the whole evaluation.
-fn evaluate_join(plant_case_11: bool) -> JoinReceipt {
+fn evaluate_join(plant_case_04: bool) -> JoinReceipt {
     let manifest = JoinedManifest::consume();
-    let wire = run_fixture(plant_case_11);
+    let wire = run_fixture(plant_case_04);
     let matrix = no_downgrade_matrix();
 
     let mut cases = Vec::with_capacity(manifest.cases.len());
@@ -1953,18 +2516,20 @@ fn evaluate_join(plant_case_11: bool) -> JoinReceipt {
         assert_predicate_matches_declared_case(declared);
         let mut builder = CaseBuilder::new();
         match declared.id.as_str() {
+            // --- A half. Each arm is keyed to the CONTRACT group that ordinal
+            // --- names (rulings #31 (a)), by what its predicate observes.
             "HTTP-03.01" => case_post_route(&mut builder, &wire),
-            "HTTP-03.02" => case_request_content_type(&mut builder, &wire),
-            "HTTP-03.03" => case_request_accept(&mut builder, &wire),
-            "HTTP-03.04" => case_request_accept_encoding(&mut builder, &wire),
-            "HTTP-03.05" => case_protocol_version_header(&mut builder, &wire),
-            "HTTP-03.06" => case_method_mirror_header(&mut builder, &wire),
-            "HTTP-03.07" => case_name_header(&mut builder, &wire),
-            "HTTP-03.08" => case_body_stamping(&mut builder, &wire),
-            "HTTP-03.09" => case_json_lane(&mut builder, &wire),
-            "HTTP-03.10" => case_sse_lane(&mut builder, &wire),
-            "HTTP-03.11" => case_content_encoding(&mut builder, &wire, plant_case_11),
-            "HTTP-03.12" => case_bounded_sse_parse(&mut builder, &wire),
+            "HTTP-03.02" => case_one_post_exact_body(&mut builder, &wire),
+            "HTTP-03.03" => case_request_content_type_and_accept(&mut builder, &wire),
+            "HTTP-03.04" => case_identity_encoding(&mut builder, &wire, plant_case_04),
+            "HTTP-03.05" => case_routing_headers(&mut builder, &wire),
+            "HTTP-03.06" => case_json_strict_utf8(&mut builder, &wire.response_lanes),
+            "HTTP-03.07" => case_response_content_type_selection(&mut builder, &wire),
+            "HTTP-03.08" => case_sse_replacement_and_bom(&mut builder, &wire.response_lanes),
+            "HTTP-03.09" => case_sse_line_endings(&mut builder, &wire.response_lanes),
+            "HTTP-03.10" => case_sse_inert_fields(&mut builder, &wire.response_lanes),
+            "HTTP-03.11" => case_sse_bounds(&mut builder, &wire.response_lanes),
+            "HTTP-03.12" => case_response_isolation(&mut builder, &wire.response_lanes),
             "HTTP-03.13" => case_terminal_and_close(&mut builder, &wire),
             // --- B half. Each arm is keyed to the subject B DECLARES for that
             // --- ordinal, not to the subject this join used to assume.
@@ -2090,14 +2655,130 @@ fn case_post_route(builder: &mut CaseBuilder, wire: &WireObservations) {
     builder.negative("target=\"\"", &format!("{refusal:?}"));
 }
 
-fn case_request_content_type(builder: &mut CaseBuilder, wire: &WireObservations) {
+fn case_one_post_exact_body(builder: &mut CaseBuilder, wire: &WireObservations) {
+    // One POST per call: the fixture accepted exactly five requests for five
+    // client calls, and the single tools/call reached it exactly once.
+    assert_eq!(
+        wire.method_count
+            .get("tools/call")
+            .copied()
+            .unwrap_or_default(),
+        1,
+        "the one tools/call must be POSTed exactly once"
+    );
+    builder.positive("mcp-a-call-post-count", "1");
+
+    // Exact body: the transmitted bytes equal, byte for byte, the expected
+    // serialization of the request the caller asked for. An extra, missing or
+    // duplicated member, a changed value or a different encoding all fail.
+    let expected = expected_join_call_body();
+    assert_eq!(
+        wire.a_call.body,
+        expected,
+        "the tools/call body must be the exact expected serialization; transmitted {:?}, \
+         expected {:?}",
+        String::from_utf8_lossy(&wire.a_call.body),
+        String::from_utf8_lossy(&expected)
+    );
+    builder.positive(
+        "mcp-a-call-exact-body",
+        &format!("{} bytes equal", expected.len()),
+    );
+
+    // Request stamping on the other two client request bodies.
+    for (label, request, method) in [
+        ("mcp-a-probe", &wire.a_probe, "server/discover"),
+        ("mcp-b-ping", &wire.b_ping, "ping"),
+    ] {
+        let body = request.json_body();
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["method"], method);
+        assert_eq!(
+            body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+            "2026-07-28"
+        );
+        assert_eq!(
+            body["params"]["_meta"]["io.modelcontextprotocol/clientInfo"]["name"],
+            "http-03-integration-client"
+        );
+        builder.positive(label, &body["method"].to_string());
+    }
+
+    // One variable: the caller's parameters become an array. The fixture saw
+    // exactly five requests, so the refusal happened before any POST.
+    assert!(
+        wire.b_params_refusal
+            .contains("RequestParametersMustBeObject"),
+        "non-object parameters must be refused as a typed request-shape error, observed {}",
+        wire.b_params_refusal
+    );
+    builder.negative("params=[]", &wire.b_params_refusal);
+
+    // INSTRUMENT CONTROL, deliberately not recorded as an observation (rulings
+    // #35). The expected serialization with the tool name's final byte changed
+    // must not match the transmitted body. That shows the byte comparison above
+    // distinguishes a one-byte change. It runs after that comparison has
+    // passed, so it observes nothing about the product and counts toward no
+    // floor.
+    let mut perturbed = expected;
+    let position = perturbed
+        .windows(b"http_03_join_tool".len())
+        .position(|window| window == b"http_03_join_tool")
+        .expect("the expected body carries the tool name")
+        + b"http_03_join_tool".len()
+        - 1;
+    perturbed[position] = b'X';
+    assert_ne!(
+        wire.a_call.body, perturbed,
+        "instrument control: a body differing in byte {position} must not compare equal"
+    );
+}
+
+/// The exact bytes the joined `/mcp-a` tools/call must carry, built from the
+/// published protocol types rather than read back from the wire.
+///
+/// The caller supplies `name`, `arguments` and a progress marker. The request
+/// stamp is the canonical `FinalRequestMeta` for the configured client: the
+/// builder's default capabilities and `ClientInfo` identity. The shipped
+/// serde_json has no `preserve_order`, so maps serialize in key order, and
+/// `JsonRpcRequest` fixes the envelope's member order.
+fn expected_join_call_body() -> Vec<u8> {
+    let mut stamp = FinalRequestMeta::new(ClientCapabilities::default());
+    stamp.client_info = Some(
+        ClientInfo {
+            name: "http-03-integration-client".to_owned(),
+            version: "1.0.0".to_owned(),
+        }
+        .to_implementation(),
+    );
+    let mut meta = serde_json::to_value(stamp).expect("the request stamp serializes");
+    meta.as_object_mut()
+        .expect("the request stamp is an object")
+        .insert(
+            "progressToken".to_owned(),
+            serde_json::to_value(ProgressMarker::from(JOIN_PROGRESS_MARKER))
+                .expect("the progress marker serializes"),
+        );
+    let request = JsonRpcRequest::new(
+        "tools/call",
+        Some(serde_json::json!({
+            "name": "http_03_join_tool",
+            "arguments": {},
+            "_meta": meta,
+        })),
+        RequestId::Number(2),
+    );
+    serde_json::to_vec(&request).expect("the expected request serializes")
+}
+
+fn case_request_content_type_and_accept(builder: &mut CaseBuilder, wire: &WireObservations) {
     for (label, request) in [("mcp-a-call", &wire.a_call), ("mcp-b-ping", &wire.b_ping)] {
         let observed = request
             .header("Content-Type")
             .expect("every modern JSON-RPC POST carries a content type");
         assert_eq!(observed, MODERN_MCP_CONTENT_TYPE);
         assert_eq!(observed, "application/json");
-        builder.positive(label, &observed);
+        builder.positive(&format!("{label}-content-type"), &observed);
         assert!(
             request.header("Content-Encoding").is_none(),
             "an uncoded request body must not advertise a content coding"
@@ -2105,23 +2786,6 @@ fn case_request_content_type(builder: &mut CaseBuilder, wire: &WireObservations)
         builder.positive(&format!("{label}-request-content-encoding"), "<absent>");
     }
 
-    // One variable: the response media type gains a non-UTF-8 charset.
-    let refusal = validate_response_head(
-        200,
-        &[(
-            "Content-Type".to_owned(),
-            "application/json; charset=us-ascii".to_owned(),
-        )],
-    )
-    .expect_err("only an optional charset=utf-8 parameter is admitted");
-    assert!(matches!(
-        refusal,
-        ModernHttpExecutorError::UnsupportedSuccessContentType
-    ));
-    builder.negative("charset=us-ascii", &format!("{refusal:?}"));
-}
-
-fn case_request_accept(builder: &mut CaseBuilder, wire: &WireObservations) {
     for (label, request) in [("mcp-a-call", &wire.a_call), ("mcp-b-ping", &wire.b_ping)] {
         let observed = request
             .header("Accept")
@@ -2160,7 +2824,7 @@ fn case_request_accept(builder: &mut CaseBuilder, wire: &WireObservations) {
     );
 }
 
-fn case_request_accept_encoding(builder: &mut CaseBuilder, wire: &WireObservations) {
+fn case_identity_encoding(builder: &mut CaseBuilder, wire: &WireObservations, planted: bool) {
     for (label, request) in [("mcp-a-call", &wire.a_call), ("mcp-b-ping", &wire.b_ping)] {
         let observed = request
             .header("Accept-Encoding")
@@ -2193,212 +2857,10 @@ fn case_request_accept_encoding(builder: &mut CaseBuilder, wire: &WireObservatio
         "accept-encoding-gzip-input",
         &format!("builder Accept-Encoding stays {built}"),
     );
-}
 
-fn case_protocol_version_header(builder: &mut CaseBuilder, wire: &WireObservations) {
-    for (label, request) in [
-        ("mcp-a-probe", &wire.a_probe),
-        ("mcp-a-call", &wire.a_call),
-        ("mcp-b-ping", &wire.b_ping),
-    ] {
-        let observed = request
-            .header("MCP-Protocol-Version")
-            .expect("every JSON-RPC request carries the negotiated version");
-        assert_eq!(observed, "2026-07-28");
-        builder.positive(label, &observed);
-    }
-
-    // One variable: the protocol version supplied to the public builder.
-    let refusal = ModernHttpRequest::new(wire.b_target.as_str(), b"{}".to_vec(), "", "ping", None)
-        .expect_err("an empty protocol version must not build a modern POST");
-    assert!(matches!(
-        refusal,
-        ModernHttpExecutorError::InvalidRequestMetadata
-    ));
-    builder.negative("protocol_version=\"\"", &format!("{refusal:?}"));
-}
-
-fn case_method_mirror_header(builder: &mut CaseBuilder, wire: &WireObservations) {
-    for (label, request, expected) in [
-        ("mcp-a-probe", &wire.a_probe, "server/discover"),
-        ("mcp-a-call", &wire.a_call, "tools/call"),
-        ("mcp-b-probe", &wire.b_probe, "server/discover"),
-        ("mcp-b-ping", &wire.b_ping, "ping"),
-    ] {
-        let observed = request
-            .header("Mcp-Method")
-            .expect("every JSON-RPC request mirrors its method");
-        assert_eq!(observed, expected);
-        assert_eq!(request.json_body()["method"], expected);
-        builder.positive(label, &observed);
-    }
-
-    // One variable: the mirrored method name.
-    let refusal = ModernHttpRequest::new(
-        wire.b_target.as_str(),
-        b"{}".to_vec(),
-        "2026-07-28",
-        "",
-        None,
-    )
-    .expect_err("an empty method must not build a modern POST");
-    assert!(matches!(
-        refusal,
-        ModernHttpExecutorError::InvalidRequestMetadata
-    ));
-    builder.negative("method=\"\"", &format!("{refusal:?}"));
-}
-
-fn case_name_header(builder: &mut CaseBuilder, wire: &WireObservations) {
-    let call_name = wire
-        .a_call
-        .header("Mcp-Name")
-        .expect("tools/call mirrors its tool name");
-    assert_eq!(call_name, "http_03_join_tool");
-    assert_eq!(
-        wire.a_call.json_body()["params"]["name"],
-        "http_03_join_tool"
-    );
-    builder.positive("mcp-a-call", &call_name);
-
-    // `ping` is not a name-bearing method, so the header must be absent.
-    assert!(wire.b_ping.header("Mcp-Name").is_none());
-    builder.positive("mcp-b-ping", "<absent>");
-
-    // One variable: the name-bearing parameter is removed from tools/call.
-    let refusal = ModernHttpRequest::new(
-        wire.a_target.as_str(),
-        br#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{}}"#.to_vec(),
-        "2026-07-28",
-        "tools/call",
-        Some("name\r\nInjected: header".to_owned()),
-    )
-    .expect_err("a header-splitting name mirror must not build a modern POST");
-    assert!(matches!(
-        refusal,
-        ModernHttpExecutorError::InvalidRequestMetadata
-    ));
-    builder.negative(
-        "name=\"name\\r\\nInjected: header\"",
-        &format!("{refusal:?}"),
-    );
-}
-
-fn case_body_stamping(builder: &mut CaseBuilder, wire: &WireObservations) {
-    for (label, request, method) in [
-        ("mcp-a-probe", &wire.a_probe, "server/discover"),
-        ("mcp-a-call", &wire.a_call, "tools/call"),
-        ("mcp-b-ping", &wire.b_ping, "ping"),
-    ] {
-        let body = request.json_body();
-        assert_eq!(body["jsonrpc"], "2.0");
-        assert_eq!(body["method"], method);
-        assert_eq!(
-            body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
-            "2026-07-28"
-        );
-        assert_eq!(
-            body["params"]["_meta"]["io.modelcontextprotocol/clientInfo"]["name"],
-            "http-03-integration-client"
-        );
-        builder.positive(label, &body["method"].to_string());
-    }
-
-    // One variable: the POST becomes a reverse-response envelope rather than a
-    // client request. Request-only stamping must disappear with it, so a
-    // reverse response can never be mistaken for a stamped client request.
-    let reverse = ModernHttpRequest::for_jsonrpc_response(
-        wire.b_target.as_str(),
-        "2026-07-28",
-        br#"{"jsonrpc":"2.0","id":7,"result":{}}"#.to_vec(),
-    )
-    .expect("a reverse-response POST builds");
-    let reverse_headers = reverse.headers();
-    assert!(
-        reverse_headers
-            .iter()
-            .all(|(field, _)| field != "Mcp-Method"),
-        "a reverse-response POST must not mirror a client request method"
-    );
-    assert!(
-        reverse_headers.iter().all(|(field, _)| field != "Mcp-Name"),
-        "a reverse-response POST must not mirror a client request name"
-    );
-    builder.negative(
-        "envelope=jsonrpc-response",
-        "Mcp-Method and Mcp-Name absent",
-    );
-}
-
-fn case_json_lane(builder: &mut CaseBuilder, wire: &WireObservations) {
-    let head = validate_response_head(
-        200,
-        &[
-            ("Content-Type".to_owned(), "application/json".to_owned()),
-            ("Content-Encoding".to_owned(), "identity".to_owned()),
-        ],
-    )
-    .expect("an identity-coded JSON head selects the JSON lane");
-    assert_eq!(head.kind(), ModernHttpResponseKind::Json);
-    builder.positive("json-head-kind", &format!("{:?}", head.kind()));
-
-    // The live JSON lane is observed here only through the fixture's second
-    // `/mcp-b` exchange, whose head is never the planted variable. The planted
-    // terminal itself belongs to HTTP-03.11 alone.
-    assert!(
-        wire.b_lane_probe.request_line().starts_with("POST /mcp-b"),
-        "the JSON lane observation must come from the /mcp-b endpoint instance"
-    );
-    builder.positive("json-lane-route", wire.b_lane_probe.request_line());
-
-    let charset = validate_response_head(
-        200,
-        &[(
-            "Content-Type".to_owned(),
-            "APPLICATION/JSON; CHARSET=UTF-8".to_owned(),
-        )],
-    )
-    .expect("the JSON essence and charset parameter are case-insensitive");
-    assert_eq!(charset.kind(), ModernHttpResponseKind::Json);
-    builder.positive(
-        "json-head-case-insensitive",
-        &format!("{:?}", charset.kind()),
-    );
-
-    // One variable: the media type.
-    let refusal =
-        validate_response_head(200, &[("Content-Type".to_owned(), "text/html".to_owned())])
-            .expect_err("an unrelated media type must not select a body lane");
-    assert!(matches!(
-        refusal,
-        ModernHttpExecutorError::UnsupportedSuccessContentType
-    ));
-    builder.negative("content-type=text/html", &format!("{refusal:?}"));
-}
-
-fn case_sse_lane(builder: &mut CaseBuilder, wire: &WireObservations) {
-    let head = validate_response_head(
-        200,
-        &[(
-            "Content-Type".to_owned(),
-            "text/event-stream; charset=utf-8".to_owned(),
-        )],
-    )
-    .expect("a charset-utf-8 event stream selects the SSE lane");
-    assert_eq!(head.kind(), ModernHttpResponseKind::Sse);
-    builder.positive("sse-head-kind", &format!("{:?}", head.kind()));
-    builder.positive("mcp-a-progress-count", &wire.a_progress.len().to_string());
-
-    // One variable: the live response lane the caller asks the stream for.
-    assert!(
-        wire.b_lane_refusal.contains("ExpectedSseResponse"),
-        "a JSON response must refuse SSE conversion, observed {}",
-        wire.b_lane_refusal
-    );
-    builder.negative("json-response-as-sse", &wire.b_lane_refusal);
-}
-
-fn case_content_encoding(builder: &mut CaseBuilder, wire: &WireObservations, planted: bool) {
+    // No decompression: a singleton identity coding is admitted whatever its
+    // case, and a compressed response coding is refused before any body byte is
+    // decoded.
     let accepted = validate_response_head(
         200,
         &[
@@ -2443,24 +2905,498 @@ fn case_content_encoding(builder: &mut CaseBuilder, wire: &WireObservations, pla
     builder.negative("content-encoding=gzip", &format!("{refusal:?}"));
 }
 
-fn case_bounded_sse_parse(builder: &mut CaseBuilder, wire: &WireObservations) {
-    assert_eq!(wire.a_progress, vec!["1".to_owned(), "2".to_owned()]);
-    builder.positive("assembled-progress", &wire.a_progress.join(","));
-    builder.positive("assembled-terminal", &wire.a_terminal);
+fn case_routing_headers(builder: &mut CaseBuilder, wire: &WireObservations) {
+    for (label, request) in [
+        ("mcp-a-probe", &wire.a_probe),
+        ("mcp-a-call", &wire.a_call),
+        ("mcp-b-ping", &wire.b_ping),
+    ] {
+        let observed = request
+            .header("MCP-Protocol-Version")
+            .expect("every JSON-RPC request carries the negotiated version");
+        assert_eq!(observed, "2026-07-28");
+        builder.positive(label, &observed);
+    }
 
-    // One variable: the event ceiling supplied to the public parser bound.
+    // One variable: the protocol version supplied to the public builder.
+    let refusal = ModernHttpRequest::new(wire.b_target.as_str(), b"{}".to_vec(), "", "ping", None)
+        .expect_err("an empty protocol version must not build a modern POST");
+    assert!(matches!(
+        refusal,
+        ModernHttpExecutorError::InvalidRequestMetadata
+    ));
+    builder.negative("protocol_version=\"\"", &format!("{refusal:?}"));
+
+    for (label, request, expected) in [
+        ("mcp-a-probe", &wire.a_probe, "server/discover"),
+        ("mcp-a-call", &wire.a_call, "tools/call"),
+        ("mcp-b-probe", &wire.b_probe, "server/discover"),
+        ("mcp-b-ping", &wire.b_ping, "ping"),
+    ] {
+        let observed = request
+            .header("Mcp-Method")
+            .expect("every JSON-RPC request mirrors its method");
+        assert_eq!(observed, expected);
+        assert_eq!(request.json_body()["method"], expected);
+        builder.positive(label, &observed);
+    }
+
+    // One variable: the mirrored method name.
+    let refusal = ModernHttpRequest::new(
+        wire.b_target.as_str(),
+        b"{}".to_vec(),
+        "2026-07-28",
+        "",
+        None,
+    )
+    .expect_err("an empty method must not build a modern POST");
+    assert!(matches!(
+        refusal,
+        ModernHttpExecutorError::InvalidRequestMetadata
+    ));
+    builder.negative("method=\"\"", &format!("{refusal:?}"));
+
+    let call_name = wire
+        .a_call
+        .header("Mcp-Name")
+        .expect("tools/call mirrors its tool name");
+    assert_eq!(call_name, "http_03_join_tool");
+    assert_eq!(
+        wire.a_call.json_body()["params"]["name"],
+        "http_03_join_tool"
+    );
+    builder.positive("mcp-a-call", &call_name);
+
+    // `ping` is not a name-bearing method, so the header must be absent.
+    assert!(wire.b_ping.header("Mcp-Name").is_none());
+    builder.positive("mcp-b-ping", "<absent>");
+
+    // One variable: the name-bearing parameter is removed from tools/call.
+    let refusal = ModernHttpRequest::new(
+        wire.a_target.as_str(),
+        br#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{}}"#.to_vec(),
+        "2026-07-28",
+        "tools/call",
+        Some("name\r\nInjected: header".to_owned()),
+    )
+    .expect_err("a header-splitting name mirror must not build a modern POST");
+    assert!(matches!(
+        refusal,
+        ModernHttpExecutorError::InvalidRequestMetadata
+    ));
+    builder.negative(
+        "name=\"name\\r\\nInjected: header\"",
+        &format!("{refusal:?}"),
+    );
+
+    // One variable: the POST becomes a reverse-response envelope rather than a
+    // client request. The method and name routing headers must disappear with
+    // it, so a reverse response can never be routed as a client request.
+    let reverse = ModernHttpRequest::for_jsonrpc_response(
+        wire.b_target.as_str(),
+        "2026-07-28",
+        br#"{"jsonrpc":"2.0","id":7,"result":{}}"#.to_vec(),
+    )
+    .expect("a reverse-response POST builds");
+    let reverse_headers = reverse.headers();
     assert!(
-        SseLimits::new(4_096, 65_536, 8).is_some(),
-        "the accepted bounds are constructible"
+        reverse_headers
+            .iter()
+            .all(|(field, _)| field != "Mcp-Method"),
+        "a reverse-response POST must not mirror a client request method"
     );
     assert!(
-        SseLimits::new(4_096, 0, 8).is_none(),
-        "a zero event ceiling must fail closed at configuration time"
+        reverse_headers.iter().all(|(field, _)| field != "Mcp-Name"),
+        "a reverse-response POST must not mirror a client request name"
     );
-    builder.negative("max_event_bytes=0", "SseLimits::new -> None");
+    builder.negative(
+        "envelope=jsonrpc-response",
+        "Mcp-Method and Mcp-Name absent",
+    );
+}
+
+fn case_response_content_type_selection(builder: &mut CaseBuilder, wire: &WireObservations) {
+    let head = validate_response_head(
+        200,
+        &[
+            ("Content-Type".to_owned(), "application/json".to_owned()),
+            ("Content-Encoding".to_owned(), "identity".to_owned()),
+        ],
+    )
+    .expect("an identity-coded JSON head selects the JSON lane");
+    assert_eq!(head.kind(), ModernHttpResponseKind::Json);
+    builder.positive("json-head-kind", &format!("{:?}", head.kind()));
+
+    // The live JSON lane is observed here only through the fixture's second
+    // `/mcp-b` exchange, whose head is never the planted variable. The planted
+    // terminal itself belongs to HTTP-03.04 alone.
+    assert!(
+        wire.b_lane_probe.request_line().starts_with("POST /mcp-b"),
+        "the JSON lane observation must come from the /mcp-b endpoint instance"
+    );
+    builder.positive("json-lane-route", wire.b_lane_probe.request_line());
+
+    let charset = validate_response_head(
+        200,
+        &[(
+            "Content-Type".to_owned(),
+            "APPLICATION/JSON; CHARSET=UTF-8".to_owned(),
+        )],
+    )
+    .expect("the JSON essence and charset parameter are case-insensitive");
+    assert_eq!(charset.kind(), ModernHttpResponseKind::Json);
+    builder.positive(
+        "json-head-case-insensitive",
+        &format!("{:?}", charset.kind()),
+    );
+
+    // One variable: the media type.
+    let refusal =
+        validate_response_head(200, &[("Content-Type".to_owned(), "text/html".to_owned())])
+            .expect_err("an unrelated media type must not select a body lane");
+    assert!(matches!(
+        refusal,
+        ModernHttpExecutorError::UnsupportedSuccessContentType
+    ));
+    builder.negative("content-type=text/html", &format!("{refusal:?}"));
+
+    // One variable: the media type gains a non-UTF-8 charset.
+    let refusal = validate_response_head(
+        200,
+        &[(
+            "Content-Type".to_owned(),
+            "application/json; charset=us-ascii".to_owned(),
+        )],
+    )
+    .expect_err("only an optional charset=utf-8 parameter is admitted");
+    assert!(matches!(
+        refusal,
+        ModernHttpExecutorError::UnsupportedSuccessContentType
+    ));
+    builder.negative("charset=us-ascii", &format!("{refusal:?}"));
+
+    let head = validate_response_head(
+        200,
+        &[(
+            "Content-Type".to_owned(),
+            "text/event-stream; charset=utf-8".to_owned(),
+        )],
+    )
+    .expect("a charset-utf-8 event stream selects the SSE lane");
+    assert_eq!(head.kind(), ModernHttpResponseKind::Sse);
+    builder.positive("sse-head-kind", &format!("{:?}", head.kind()));
+
+    // One variable: the live response lane the caller asks the stream for.
+    assert!(
+        wire.b_lane_refusal.contains("ExpectedSseResponse"),
+        "a JSON response must refuse SSE conversion, observed {}",
+        wire.b_lane_refusal
+    );
+    builder.negative("json-response-as-sse", &wire.b_lane_refusal);
+}
+
+fn case_json_strict_utf8(builder: &mut CaseBuilder, lanes: &ResponseLanes) {
+    assert!(
+        lanes
+            .json_utf8
+            .starts_with("admitted id=Some(Number(2)) error=false"),
+        "well-formed non-ASCII UTF-8 JSON must be admitted without repair, observed {}",
+        lanes.json_utf8
+    );
+    builder.positive("json-utf8-admitted", &lanes.json_utf8);
+    assert!(
+        lanes.json_utf8.contains("prüfung-✓"),
+        "the admitted document must carry its non-ASCII text verbatim, observed {}",
+        lanes.json_utf8
+    );
+    builder.positive("json-utf8-verbatim", "prüfung-✓");
+
+    // One variable: the identical document gains a three-byte leading BOM.
+    assert!(
+        lanes.json_leading_bom.starts_with("refused:")
+            && lanes.json_leading_bom.contains("ByteOrderMark"),
+        "a BOM must be refused, never stripped or repaired, observed {}",
+        lanes.json_leading_bom
+    );
+    builder.negative("leading-bom", &lanes.json_leading_bom);
+
+    // One variable: one byte of the note becomes a malformed octet.
+    assert!(
+        lanes.json_invalid_utf8.starts_with("refused:")
+            && lanes.json_invalid_utf8.contains("InvalidUtf8"),
+        "malformed UTF-8 on the direct JSON lane must be refused, never replaced, observed {}",
+        lanes.json_invalid_utf8
+    );
+    builder.negative("malformed-octet", &lanes.json_invalid_utf8);
+}
+
+fn case_sse_replacement_and_bom(builder: &mut CaseBuilder, lanes: &ResponseLanes) {
+    assert!(
+        lanes.sse_replacement_inside.starts_with("terminal:"),
+        "one leading BOM must be stripped and the malformed octet replaced, leaving an \
+         admissible terminal, observed {}",
+        lanes.sse_replacement_inside
+    );
+    builder.positive("bom-stripped-terminal", &lanes.sse_replacement_inside);
+    assert!(
+        lanes.sse_replacement_inside.contains('\u{FFFD}'),
+        "the malformed octet inside the JSON string must survive as U+FFFD, observed {}",
+        lanes.sse_replacement_inside
+    );
+    builder.positive("replacement-character", "U+FFFD");
+
+    // One variable: the malformed octet moves outside the JSON string.
+    assert!(
+        lanes
+            .sse_replacement_outside
+            .starts_with("refused:JsonRpcAdmission"),
+        "replacement outside a JSON string must be refused by admission, observed {}",
+        lanes.sse_replacement_outside
+    );
+    builder.negative("octet-outside-string", &lanes.sse_replacement_outside);
+
+    // One variable: a second leading BOM. Only one is stripped, so the second
+    // turns the field name into `\u{FEFF}data` and nothing is dispatched.
+    assert!(
+        lanes.sse_double_bom.starts_with("refused:EndOfStream"),
+        "a second BOM is ordinary text and must not be stripped, observed {}",
+        lanes.sse_double_bom
+    );
+    builder.negative("second-leading-bom", &lanes.sse_double_bom);
+}
+
+fn case_sse_line_endings(builder: &mut CaseBuilder, lanes: &ResponseLanes) {
+    let reads: Vec<&str> = lanes.sse_line_endings.split(" | ").collect();
+    assert_eq!(
+        reads.len(),
+        4,
+        "CR-, LF- and CRLF-framed events must each dispatch, then the stream ends, observed {}",
+        lanes.sse_line_endings
+    );
+    assert_eq!(reads[0], "progress:1", "a bare CR terminates each line");
+    builder.positive("cr-framed-progress", reads[0]);
+    assert_eq!(reads[1], "progress:2", "a bare LF terminates each line");
+    builder.positive("lf-framed-progress", reads[1]);
+    assert!(
+        reads[2].starts_with("terminal:") && reads[2].contains("line-endings-ok"),
+        "two CRLF-framed data lines must join into one terminal, observed {}",
+        reads[2]
+    );
+    builder.positive("crlf-multi-data-terminal", reads[2]);
+    assert_eq!(reads[3], "end");
+
+    // One variable: the terminal's field name `data` becomes `Data`, an
+    // unknown field, so its lines contribute nothing and no terminal arrives.
+    assert!(
+        lanes
+            .sse_uppercase_data
+            .starts_with("progress:1 | progress:2 | refused:EndOfStream"),
+        "`Data` is not the data field; the terminal must never dispatch, observed {}",
+        lanes.sse_uppercase_data
+    );
+    builder.negative("field=Data", &lanes.sse_uppercase_data);
+}
+
+fn case_sse_inert_fields(builder: &mut CaseBuilder, lanes: &ResponseLanes) {
+    let reads: Vec<&str> = lanes.sse_inert_fields.split(" | ").collect();
+    assert_eq!(
+        reads.len(),
+        2,
+        "a comment, a blank line with nothing pending and the inert fields must dispatch \
+         nothing of their own, observed {}",
+        lanes.sse_inert_fields
+    );
+    assert!(
+        reads[0].starts_with("terminal:") && reads[0].contains("inert-fields-ok"),
+        "event, id, retry and unknown fields are inert; the terminal must be delivered, \
+         observed {}",
+        reads[0]
+    );
+    builder.positive("inert-fields-terminal", reads[0]);
+    assert_eq!(reads[1], "end");
+    builder.positive("inert-fields-end", reads[1]);
+
+    // One variable: the terminating blank line is removed before EOF.
+    assert!(
+        lanes
+            .sse_unterminated_event
+            .starts_with("refused:EndOfStream")
+            && lanes
+                .sse_unterminated_event
+                .contains("discarded_pending_event: true"),
+        "an unterminated pending event must be discarded, never completed, observed {}",
+        lanes.sse_unterminated_event
+    );
+    builder.negative(
+        "terminating-blank-line-removed",
+        &lanes.sse_unterminated_event,
+    );
+
+    // One variable: an empty-data event is inserted before the terminal. It
+    // dispatches an empty payload, which is not a JSON-RPC message.
+    assert!(
+        lanes.sse_empty_data.starts_with("refused:JsonRpcAdmission"),
+        "an empty data payload must be refused by admission, observed {}",
+        lanes.sse_empty_data
+    );
+    builder.negative("empty-data-event", &lanes.sse_empty_data);
+}
+
+fn case_sse_bounds(builder: &mut CaseBuilder, lanes: &ResponseLanes) {
+    assert!(
+        lanes.sse_at_line_ceiling.starts_with("terminal:"),
+        "a data line of exactly the line ceiling must be admitted, observed {}",
+        lanes.sse_at_line_ceiling
+    );
+    builder.positive(
+        &format!("line-at-ceiling-{}", lanes.line_ceiling_bytes),
+        &lanes.sse_at_line_ceiling,
+    );
+
+    // One variable: the same terminal's text gains one byte, so the line is one
+    // byte over the ceiling.
+    let expected = format!(
+        "LineTooLong {{ limit_bytes: {} }}",
+        lanes.line_ceiling_bytes
+    );
+    assert!(
+        lanes.sse_over_line_ceiling.starts_with("refused:")
+            && lanes.sse_over_line_ceiling.contains(&expected),
+        "one byte over the line ceiling must be refused as {expected}, observed {}",
+        lanes.sse_over_line_ceiling
+    );
+    builder.negative("line-ceiling-plus-one", &lanes.sse_over_line_ceiling);
+
+    // Event bound, live: two data lines whose raw sum is exactly the ceiling.
+    assert!(
+        lanes.sse_at_event_ceiling.starts_with("terminal:"),
+        "an event of exactly the event ceiling must be admitted, observed {}",
+        lanes.sse_at_event_ceiling
+    );
+    builder.positive(
+        &format!("event-at-ceiling-{}", lanes.event_ceiling_bytes),
+        &lanes.sse_at_event_ceiling,
+    );
+    // One variable: the event's text gains one byte.
+    let expected = format!(
+        "EventTooLarge {{ limit_bytes: {} }}",
+        lanes.event_ceiling_bytes
+    );
+    assert!(
+        lanes.sse_over_event_ceiling.starts_with("refused:")
+            && lanes.sse_over_event_ceiling.contains(&expected),
+        "one byte over the event ceiling must be refused as {expected}, observed {}",
+        lanes.sse_over_event_ceiling
+    );
+    builder.negative("event-ceiling-plus-one", &lanes.sse_over_event_ceiling);
+
+    // Message bound, live: the immediate JSON lane's retained-byte bound set to
+    // exactly the document's length.
+    assert!(
+        lanes
+            .json_at_message_ceiling
+            .starts_with("admitted id=Some(Number(2)) error=false"),
+        "a document of exactly the message bound must be admitted, observed {}",
+        lanes.json_at_message_ceiling
+    );
+    builder.positive(
+        &format!("message-at-bound-{}", lanes.message_ceiling_bytes),
+        &lanes.json_at_message_ceiling,
+    );
+    // One variable: the document gains one byte.
+    let expected = format!(
+        "ResponseBodyTooLarge {{ maximum_bytes: {} }}",
+        lanes.message_ceiling_bytes
+    );
+    assert!(
+        lanes.json_over_message_ceiling.starts_with("refused:")
+            && lanes.json_over_message_ceiling.contains(&expected),
+        "one byte over the message bound must be refused as {expected}, observed {}",
+        lanes.json_over_message_ceiling
+    );
+    builder.negative("message-bound-plus-one", &lanes.json_over_message_ceiling);
+
+    // Memory bound, live: completed events pending from one native body frame.
+    // At the bound nothing overflows, so the first event is handed on and
+    // fails JSON admission (it is `x`). That refusal is what shows the bound
+    // admitted every one of them.
+    assert!(
+        lanes
+            .sse_pending_at_bound
+            .starts_with("refused:JsonRpcAdmission")
+            && !lanes.sse_pending_at_bound.contains("PendingSse"),
+        "{MAX_PENDING_MODERN_HTTP_SSE_EVENTS} pending events must be admitted by the memory \
+         bound, observed {}",
+        lanes.sse_pending_at_bound
+    );
+    builder.positive(
+        &format!("pending-events-at-bound-{MAX_PENDING_MODERN_HTTP_SSE_EVENTS}"),
+        &lanes.sse_pending_at_bound,
+    );
+    // One variable: one more event in the same frame.
+    let expected = format!(
+        "PendingSseEventCountExceeded {{ maximum_events: {MAX_PENDING_MODERN_HTTP_SSE_EVENTS} }}"
+    );
+    assert!(
+        lanes.sse_pending_over_bound.starts_with("refused:")
+            && lanes.sse_pending_over_bound.contains(&expected),
+        "one pending event over the memory bound must be refused as {expected}, observed {}",
+        lanes.sse_pending_over_bound
+    );
+    builder.negative("pending-events-plus-one", &lanes.sse_pending_over_bound);
+}
+
+fn case_response_isolation(builder: &mut CaseBuilder, lanes: &ResponseLanes) {
+    let sibling_intact = |observed: &str| {
+        observed.starts_with("sibling=terminal:")
+            && observed.contains("sibling-ok")
+            && observed.ends_with("|| sibling-after=end")
+    };
+
+    assert!(
+        sibling_intact(lanes.isolation_admitted.as_str())
+            && lanes.isolation_admitted.contains("|| owner=terminal:"),
+        "both streams on one connection must reach their own terminals, observed {}",
+        lanes.isolation_admitted
+    );
+    builder.positive("owner-and-sibling-terminals", &lanes.isolation_admitted);
+
+    // One variable: the owner's payload is its own terminal, one byte short.
+    assert!(
+        sibling_intact(lanes.isolation_malformed.as_str())
+            && lanes
+                .isolation_malformed
+                .contains("|| owner=refused:JsonRpcAdmission"),
+        "a malformed owner payload must fail only the owner, observed {}",
+        lanes.isolation_malformed
+    );
+    builder.negative("owner-payload=malformed", &lanes.isolation_malformed);
+
+    // One variable: the owner's payload is a server->client request instead of
+    // its result. It decodes as a JSON-RPC request, so the listener hands it to
+    // final notification admission, which refuses it for carrying an id.
+    assert!(
+        sibling_intact(lanes.isolation_server_request.as_str())
+            && lanes.isolation_server_request.contains(
+                "|| owner=refused:NotificationAdmission(RequestIdPresent { method: \
+                 \"sampling/createMessage\" })"
+            ),
+        "an invalid-direction owner payload must fail only the owner, as the typed \
+         request-id refusal, observed {}",
+        lanes.isolation_server_request
+    );
+    builder.negative(
+        "owner-payload=server-request",
+        &lanes.isolation_server_request,
+    );
 }
 
 fn case_terminal_and_close(builder: &mut CaseBuilder, wire: &WireObservations) {
+    // Request-scoped progress: both records reached the one request that owns
+    // the marker, in order, before its terminal.
+    assert_eq!(wire.a_progress, vec!["1".to_owned(), "2".to_owned()]);
+    builder.positive("request-scoped-progress", &wire.a_progress.join(","));
+
     builder.positive("terminal", &wire.a_terminal);
     assert_eq!(wire.a_terminal, "terminal=tools_call");
 
@@ -3405,7 +4341,7 @@ fn http_03_i_positive() {
 
     // The live terminal outcomes on both lanes.
     assert!(
-        receipt.case("HTTP-03.11").record.contains("terminal=json"),
+        receipt.case("HTTP-03.04").record.contains("terminal=json"),
         "the JSON lane must reach its terminal under the accepted identity coding"
     );
     assert!(
@@ -3466,10 +4402,18 @@ fn http_03_i_planted_negative() {
     }
 
     // The unrelated sibling stream and its waiter completed normally while the
-    // planted POST was refused on the other endpoint instance.
+    // planted POST was refused on the other endpoint instance. Its
+    // request-scoped progress is recorded in HTTP-03.13.
+    assert!(
+        planted
+            .case("HTTP-03.13")
+            .record
+            .contains("request-scoped-progress = 1,2"),
+        "the sibling stream's progress must still reach its owner"
+    );
     assert_eq!(
-        planted.case("HTTP-03.12").record,
-        accepted.case("HTTP-03.12").record
+        planted.case("HTTP-03.13").record,
+        accepted.case("HTTP-03.13").record
     );
     assert!(
         planted

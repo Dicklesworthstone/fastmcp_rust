@@ -1,9 +1,9 @@
 //! Resolve sampling-only MRTR challenges into exact, ordered response maps.
 //!
-//! Every descriptor and initial sampling conversation is admitted before the
-//! first host callback. Mixed roots/elicitation batches are refused in full;
-//! this helper never silently ignores a sibling or invents an answer for it.
-//! The host still owns model disclosure, tool consent and capability admission.
+//! Every descriptor, declared capability and initial sampling conversation is
+//! admitted before the first host callback. Mixed roots/elicitation batches are
+//! refused in full; this helper never silently ignores a sibling or invents an
+//! answer for it. The host still owns model disclosure and tool consent.
 //!
 //! This produces the existing ManagedInputReply for explicit interaction
 //! resumption. It does not send a POST, change the original request, copy or
@@ -18,9 +18,9 @@ use std::fmt;
 use asupersync::Cx;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::{
-    FinalCreateMessageResult, FinalEmbeddedCreateMessageParams, FinalEmbeddedInputRequest,
-    FinalEmbeddedInputResponse, FinalInputResponses, InputRequiredResult, RequestId,
-    exact_json_to_serde,
+    CoreRequest, FINAL_CLIENT_CAPABILITIES_META_KEY, FinalCreateMessageResult,
+    FinalEmbeddedCreateMessageParams, FinalEmbeddedInputRequest, FinalEmbeddedInputResponse,
+    FinalInputResponses, InputRequiredResult, RequestId, exact_json_to_serde,
 };
 
 use super::{
@@ -28,7 +28,9 @@ use super::{
     SamplingRunError, SamplingRunLimits, SamplingToolLoop, check, deadline,
     encoded_size, run_sampling_tool_loop, within,
 };
-use crate::http_auth::rpc::interaction::ManagedInputReply;
+use crate::http_auth::rpc::interaction::{
+    ManagedInputReply, ManagedInteractionError, admit_embedded_input, validate_initial,
+};
 
 const MAX_BATCH_BYTES: usize = 16 * 1024 * 1024;
 
@@ -79,8 +81,10 @@ impl Default for SamplingInputLimits {
 pub enum SamplingInputError {
     InvalidLimits,
     InvalidRequestId,
+    InvalidRequest,
     InvalidInput,
     UnsupportedInput,
+    CapabilityNotAdvertised,
     InputLimit,
     InputByteLimit,
     ReplyByteLimit,
@@ -102,6 +106,18 @@ impl From<SamplingRunError> for SamplingInputError {
 
 /// Resolves all sampling descriptors in one consumed input-required result.
 ///
+/// Supply the SAME interaction's original CoreRequest, including the client
+/// capabilities it actually declared. Base sampling support is required for
+/// every sampling input; tools or toolChoice additionally require sampling.tools.
+/// An unadvertised hard capability or malformed later descriptor refuses the
+/// whole challenge before any model, approval or tool callback.
+///
+/// A peer's non-none includeContext without sampling.context is advisory. Its
+/// effective request omits that hint, and one fixed diagnostic records the
+/// deviation after the complete batch passes preflight. The retained raw input
+/// remains unchanged for response validation; no model content or opaque state
+/// is included in the diagnostic. The host reviews the effective request.
+///
 /// Server-assigned response keys and their order are retained exactly. Absent
 /// inputRequests produces absent inputResponses; a present empty map produces
 /// a present empty map. Neither case invokes the model or tool host. Every
@@ -118,12 +134,19 @@ impl From<SamplingRunError> for SamplingInputError {
 pub async fn resolve_sampling_inputs<H: SamplingHost + ?Sized>(
     cx: &Cx,
     cancellation: &McpRequestCancellation,
+    original: &CoreRequest,
     input: InputRequiredResult,
     request_id: RequestId,
     limits: SamplingInputLimits,
     host: &mut H,
 ) -> Result<ManagedInputReply, SamplingInputError> {
     request_id.validate().map_err(|_| SamplingInputError::InvalidRequestId)?;
+    validate_initial(original).map_err(|_| SamplingInputError::InvalidRequest)?;
+    let original_params = original.encode_params().map_err(|_| SamplingInputError::InvalidRequest)?
+        .ok_or(SamplingInputError::InvalidRequest)?;
+    let capabilities = &original_params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY];
+    let context_advertised = capabilities["sampling"].get("context")
+        .is_some_and(serde_json::Value::is_object);
     let end = deadline(cx, cancellation, limits.run.timeout)?;
     let Some(map) = input.input_requests() else {
         check(cx, cancellation, end)?;
@@ -134,6 +157,7 @@ pub async fn resolve_sampling_inputs<H: SamplingHost + ?Sized>(
     if map.members().len() > limits.model_rounds { return Err(SamplingInputError::ModelRoundLimit); }
     let mut requests = Vec::with_capacity(map.members().len());
     let mut input_bytes = 2_usize; // Braces, including the present-empty case.
+    let mut context_ignored = false;
     for (index, member) in map.members().iter().enumerate() {
         check(cx, cancellation, end)?;
         // ExactJsonObject is the protocol's bounded, duplicate-aware input
@@ -147,11 +171,19 @@ pub async fn resolve_sampling_inputs<H: SamplingHost + ?Sized>(
         input_bytes = input_bytes.checked_add(key_bytes).and_then(|n| n.checked_add(value_bytes))
             .and_then(|n| n.checked_add(1 + usize::from(index != 0)))
             .filter(|n| *n <= limits.input_bytes).ok_or(SamplingInputError::InputByteLimit)?;
-        let descriptor: FinalEmbeddedInputRequest = serde_json::from_value(value)
-            .map_err(|_| SamplingInputError::InvalidInput)?;
-        let FinalEmbeddedInputRequest::Sampling(request) = descriptor else {
+        let ignore_context = !context_advertised
+            && value["params"].get("includeContext").is_some_and(|context| context != "none");
+        let descriptor = admit_embedded_input(capabilities, value).map_err(|error| match error {
+            ManagedInteractionError::CapabilityNotAdvertised => SamplingInputError::CapabilityNotAdvertised,
+            _ => SamplingInputError::InvalidInput,
+        })?;
+        let FinalEmbeddedInputRequest::Sampling(mut request) = descriptor else {
             return Err(SamplingInputError::UnsupportedInput);
         };
+        if ignore_context {
+            request.include_context = None;
+            context_ignored = true;
+        }
         // Fully validate later siblings now, not after an earlier model/tool
         // effect. The executing runner performs the same admission independently.
         SamplingToolLoop::new(request.clone(), limits.run.conversation)
@@ -159,6 +191,9 @@ pub async fn resolve_sampling_inputs<H: SamplingHost + ?Sized>(
         requests.push((member.name.clone(), request));
     }
     check(cx, cancellation, end)?;
+    if context_ignored {
+        log::warn!("Ignoring sampling includeContext because sampling.context was not advertised");
+    }
     let mut budgeted = BatchHost {
         host, models: limits.model_rounds, tools: limits.tool_calls,
         result_bytes: limits.run.tool_result_bytes, refusal: None,

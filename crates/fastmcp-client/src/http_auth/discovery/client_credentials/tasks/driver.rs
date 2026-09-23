@@ -15,10 +15,12 @@ use asupersync::time::Sleep;
 use asupersync::types::Time;
 use fastmcp_core::{McpRequestCancellation, Sha256Digest, sha256_bounded};
 use fastmcp_protocol::tasks_extension::{Task, TaskId, TaskInputLedger, TaskInputRequests, TaskInputResponses};
-use fastmcp_protocol::{CorrelationKey, FinalEmbeddedElicitationParams, FinalEmbeddedInputRequest,
-    RequestId, FINAL_CLIENT_CAPABILITIES_META_KEY};
+use fastmcp_protocol::{CorrelationKey, RequestId, FINAL_CLIENT_CAPABILITIES_META_KEY};
 
 pub use crate::http_auth::managed::tasks::driver::{ManagedTaskInputAction, ManagedTaskRunOutcome};
+use crate::http_auth::rpc::interaction::{
+    ManagedInteractionError, admit_embedded_input, normalize_embedded_input_context,
+};
 use super::{BoundedBody, ClientCredentialsTasksClient, ClientCredentialsTasksError,
     ManagedTaskEvent, ManagedTaskRequest, ManagedTasksError, prepare};
 use super::super::{ClientCredentialsError, OAuthDiscoveryError, active, check_context,
@@ -206,7 +208,9 @@ impl ClientCredentialsTasksClient {
     /// run. A response may be a nonempty subset; unknown keys, wrong response
     /// kinds, and reused keys with changed descriptors fail before a POST.
     /// The immutable advertised roots/sampling/elicitation capabilities gate
-    /// resolver invocation. There is no automatic model, browser, or roots access.
+    /// resolver invocation. Unsupported sampling context hints are omitted from
+    /// resolver copies; snapshots and ledger descriptors retain the peer input.
+    /// There is no automatic model, browser, or roots access.
     #[allow(clippy::too_many_arguments)]
     pub async fn drive_task<I, R, F, O>(
         &self, cx: &Cx, task_id: TaskId, policy: ClientCredentialsTaskDrivePolicy,
@@ -291,9 +295,9 @@ impl ClientCredentialsTasksClient {
                     let (pending, fingerprints) = state.unanswered(input_requests, policy)?;
                     if pending.is_empty() { continue; }
                     if updates >= policy.maximum_updates { return Err(ClientCredentialsTaskWaitError::UpdateLimit); }
-                    admit_capabilities(&self.metadata, &pending)?;
+                    let callback_inputs = admit_capabilities(&self.metadata, &pending)?;
                     check_wait(cx, deadline, owner, cancellation)?;
-                    let resolution = resolve(pending.clone());
+                    let resolution = resolve(callback_inputs);
                     check_wait(cx, deadline, owner, cancellation)?;
                     let action = resolution.await?;
                     check_wait(cx, deadline, owner, cancellation)?;
@@ -482,28 +486,26 @@ fn validate_answers(requests: &TaskInputRequests, responses: &TaskInputResponses
 }
 
 fn admit_capabilities(metadata: &serde_json::Value, requests: &TaskInputRequests)
-    -> Result<(), ClientCredentialsTaskWaitError>
+    -> Result<TaskInputRequests, ClientCredentialsTaskWaitError>
 {
     let capabilities = &metadata[FINAL_CLIENT_CAPABILITIES_META_KEY];
     for request in requests.values() {
-        let advertised = match request {
-            FinalEmbeddedInputRequest::Roots(_) => capabilities.get("roots").is_some_and(serde_json::Value::is_object),
-            FinalEmbeddedInputRequest::Sampling(_) => {
-                let wire = serde_json::to_value(request).map_err(|_| ClientCredentialsTaskWaitError::UnexpectedResponse)?;
-                let sampling = &capabilities["sampling"];
-                sampling.is_object()
-                    && (wire["params"].get("tools").is_none() || sampling.get("tools").is_some_and(serde_json::Value::is_object))
-                    && (wire["params"].get("includeContext").is_none_or(|context| context == "none")
-                        || sampling.get("context").is_some_and(serde_json::Value::is_object))
-            }
-            FinalEmbeddedInputRequest::Elicitation(FinalEmbeddedElicitationParams::Form(_)) =>
-                capabilities["elicitation"].get("form").is_some_and(serde_json::Value::is_object),
-            FinalEmbeddedInputRequest::Elicitation(FinalEmbeddedElicitationParams::Url(_)) =>
-                capabilities["elicitation"].get("url").is_some_and(serde_json::Value::is_object),
-        };
-        if !advertised { return Err(ClientCredentialsTaskWaitError::CapabilityNotAdvertised); }
+        let wire = serde_json::to_value(request)
+            .map_err(|_| ClientCredentialsTaskWaitError::UnexpectedResponse)?;
+        admit_embedded_input(capabilities, wire).map_err(|error| match error {
+            ManagedInteractionError::CapabilityNotAdvertised => ClientCredentialsTaskWaitError::CapabilityNotAdvertised,
+            _ => ClientCredentialsTaskWaitError::UnexpectedResponse,
+        })?;
     }
-    Ok(())
+    let mut callback_inputs = requests.clone();
+    let mut context_ignored = false;
+    for request in callback_inputs.values_mut() {
+        context_ignored |= normalize_embedded_input_context(capabilities, request);
+    }
+    if context_ignored {
+        log::warn!("ignoring unadvertised sampling context hint in Task input");
+    }
+    Ok(callback_inputs)
 }
 
 #[cfg(test)]
@@ -689,9 +691,46 @@ mod tests {
         let sampling: TaskInputRequests = serde_json::from_value(json!({"sample":{"method":"sampling/createMessage",
             "params":{"messages":[],"maxTokens":16,"includeContext":"allServers"}}})).unwrap();
         let ordinary = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"sampling":{}}});
-        assert!(matches!(admit_capabilities(&ordinary, &sampling), Err(ClientCredentialsTaskWaitError::CapabilityNotAdvertised)));
+        let before = serde_json::to_value(&sampling).unwrap();
+        let callback_inputs = admit_capabilities(&ordinary, &sampling).unwrap();
+        assert!(serde_json::to_value(callback_inputs).unwrap()["sample"]["params"].get("includeContext").is_none());
         let context = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"sampling":{"context":{}}}});
-        assert!(admit_capabilities(&context, &sampling).is_ok());
+        assert_eq!(serde_json::to_value(admit_capabilities(&context, &sampling).unwrap()).unwrap(), before);
+        assert_eq!(serde_json::to_value(&sampling).unwrap(), before,
+            "normalizing resolver copies must preserve retained peer descriptors");
+        assert!(matches!(admit_capabilities(&absent, &sampling), Err(ClientCredentialsTaskWaitError::CapabilityNotAdvertised)));
+        let explicit_none: TaskInputRequests = serde_json::from_value(json!({"sample":{"method":"sampling/createMessage",
+            "params":{"messages":[],"maxTokens":16,"includeContext":"none"}}})).unwrap();
+        assert_eq!(serde_json::to_value(admit_capabilities(&ordinary, &explicit_none).unwrap()).unwrap(),
+            serde_json::to_value(&explicit_none).unwrap());
+    }
+
+    #[test]
+    fn input_resolution_requires_tools_for_tool_choice_without_tools() {
+        let sampling: TaskInputRequests = serde_json::from_value(json!({"sample":{"method":"sampling/createMessage",
+            "params":{"messages":[],"maxTokens":16,"toolChoice":{"mode":"auto"}}}})).unwrap();
+        for capability in [json!({}), json!({"context":{}}), json!({"tools":null}), json!({"tools":[]})] {
+            let metadata = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"sampling":capability}});
+            assert!(matches!(admit_capabilities(&metadata, &sampling),
+                Err(ClientCredentialsTaskWaitError::CapabilityNotAdvertised)));
+        }
+        let metadata = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"sampling":{"tools":{}}}});
+        assert!(admit_capabilities(&metadata, &sampling).is_ok());
+    }
+
+    #[test]
+    fn input_resolution_distinguishes_empty_form_grants_from_unknown_children() {
+        let form: TaskInputRequests = serde_json::from_value(json!({"form":{"method":"elicitation/create",
+            "params":{"mode":"form","message":"select","requestedSchema":{"type":"object"}}}})).unwrap();
+        for capability in [json!({}), json!({"form":{}})] {
+            let metadata = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"elicitation":capability}});
+            assert!(admit_capabilities(&metadata, &form).is_ok());
+        }
+        for capability in [json!({"unknown":{}}), json!({"url":{}}), json!({"form":null}), json!({"form":[]})] {
+            let metadata = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"elicitation":capability}});
+            assert!(matches!(admit_capabilities(&metadata, &form),
+                Err(ClientCredentialsTaskWaitError::CapabilityNotAdvertised)));
+        }
     }
 
     #[test]

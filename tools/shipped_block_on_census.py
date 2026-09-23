@@ -33,6 +33,8 @@ Usage:
   tools/shipped_block_on_census.py --validate       # R4: positive + negative
   tools/shipped_block_on_census.py --validate --proxy <file>  # controls on a planted copy
   tools/shipped_block_on_census.py --naive-control <file>
+  tools/shipped_block_on_census.py --workspace     # every crate's module tree, `mod x;` cfg resolved
+  tools/shipped_block_on_census.py --workspace --crates <dir>  # planted fixture crates
 """
 
 import argparse
@@ -417,6 +419,164 @@ def census(path):
     }
 
 
+MOD_DECL = re.compile(r"^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?mod[ \t]+([A-Za-z_]\w*)[ \t]*;", re.M)
+CFG_BODY = re.compile(r"#\s*\[\s*cfg\s*\((.*)\)\s*\]\s*$")
+PATH_ATTR = re.compile(r'#\s*\[\s*path\s*=\s*"([^"]+)"\s*\]')
+
+
+def _preceding_attrs(src, offset):
+    """Raw attribute lines directly above the item at `offset`, nearest last.
+
+    Read from RAW source, not masked text: `#[path = ".."]` keeps its target
+    inside a string literal, which masking blanks.
+    """
+    attrs = []
+    for line in reversed(src[:offset].split("\n")[:-1]):
+        s = line.strip()
+        if s.startswith("#[") or s.startswith("///") or s.startswith("//"):
+            if s.startswith("#["):
+                attrs.append(s)
+            continue
+        break
+    return list(reversed(attrs))
+
+
+def module_tree(root, is_mod_rs=True):
+    """Every file one crate root reaches through out-of-line `mod x;` items.
+
+    Returns (reached, unresolved): reached maps file -> (test_only, reason);
+    unresolved lists declarations whose file does not exist. A file is
+    TEST-ONLY when its own declaration carries a test-only cfg, when the
+    declaration sits inside a test-only region of its parent, or when its
+    parent is itself test-only. The last case is why a per-file census cannot
+    see these: `#[cfg(test)] mod resuming;` makes all of resuming.rs test code,
+    and nothing inside resuming.rs says so.
+    """
+    root = Path(root)
+    reached, unresolved = {}, []
+    queue = [(root, False, "crate root", root.parent if is_mod_rs else root.parent / root.stem)]
+    while queue:
+        path, inherited, reason, mod_dir = queue.pop()
+        key = str(path)
+        # A file declared more than once (for example `#[cfg(feature)] pub
+        # mod x;` beside `#[cfg(all(not(feature), test))] mod x;`) is shipped
+        # if ANY declaration is. Only a shipped reach may revisit a file, and
+        # it re-walks the children so they are upgraded too. Keeping the first
+        # reach instead made the answer depend on traversal order.
+        if key in reached and (inherited or not reached[key][0]):
+            continue
+        reached[key] = (inherited, reason)
+        src = path.read_text(encoding="utf-8", errors="replace")
+        masked = mask(src)
+        regions = test_regions(masked)
+        spans = item_spans(masked)
+        for m in MOD_DECL.finditer(masked):
+            name = m.group(1)
+            attrs = _preceding_attrs(src, m.start())
+            gated = any(
+                (c := CFG_BODY.match(a)) and test_only(c.group(1)) for a in attrs
+            )
+            in_test = in_region(regions, m.start())
+            inline = [lab[4:] for lab in item_path(spans, m.start()).split(" :: ")
+                      if lab.startswith("mod ")]
+            explicit = next((p.group(1) for a in attrs if (p := PATH_ATTR.search(a))), None)
+            if explicit is not None:
+                base = path.parent.joinpath(*inline) if inline else path.parent
+                candidates = [base / explicit]
+            else:
+                base = mod_dir.joinpath(*inline)
+                candidates = [base / f"{name}.rs", base / name / "mod.rs"]
+            child = next((c for c in candidates if c.is_file()), None)
+            line = line_of(line_index(src), m.start())
+            if child is None:
+                unresolved.append(f"{path}:{line} mod {name}")
+                continue
+            test = inherited or gated or in_test
+            why = ("inherited" if inherited else
+                   f"declared at {path.name}:{line} under a test-only cfg" if gated else
+                   f"declared at {path.name}:{line} inside a test-only region" if in_test else
+                   f"declared at {path.name}:{line}")
+            # A `mod.rs` file or a #[path] file is a directory owner, so its
+            # children live beside it; `x.rs` owns the directory `x/`.
+            child_dir = child.parent if (explicit is not None or child.name == "mod.rs") else child.parent / child.stem
+            queue.append((child, test, why, child_dir))
+    return reached, unresolved
+
+
+def crate_roots(crate_dir):
+    """(path, label) for the library and every binary target a manifest builds."""
+    import tomllib
+    crate_dir = Path(crate_dir)
+    manifest = tomllib.loads((crate_dir / "Cargo.toml").read_text(encoding="utf-8"))
+    roots = []
+    lib = manifest.get("lib", {}).get("path", "src/lib.rs")
+    if (crate_dir / lib).is_file():
+        roots.append((crate_dir / lib, "lib"))
+    bins = manifest.get("bin", [])
+    explicit = {b.get("path") for b in bins}
+    if (crate_dir / "src/main.rs").is_file() and "src/main.rs" not in explicit:
+        roots.append((crate_dir / "src/main.rs", "bin (default)"))
+    for b in bins:
+        p = b.get("path") or f"src/bin/{b.get('name')}.rs"
+        feats = b.get("required-features", [])
+        label = f"bin {b.get('name')}" + (f" (required-features {feats})" if feats else "")
+        if (crate_dir / p).is_file():
+            roots.append((crate_dir / p, label))
+    return roots
+
+
+def workspace_census(crates_dir):
+    """Production occurrences per crate, over every file its targets compile.
+
+    A file is counted only if some target reaches it and it is not test-only
+    by its declaration (see module_tree). Occurrences are CALL + IMPORT +
+    OTHER, the population the FND-04 census counts; CALL is listed by site.
+    Files under a crate's src/ that no target reaches are listed, never
+    silently dropped, because an unreached file is not compiled.
+    """
+    crates_dir = Path(crates_dir)
+    grand = {"CALL": 0, "IMPORT": 0, "OTHER": 0}
+    for crate in sorted(p for p in crates_dir.iterdir() if (p / "Cargo.toml").is_file()):
+        seen, test_files, unresolved = {}, {}, []
+        for root, label in crate_roots(crate):
+            reached, missing = module_tree(root)
+            unresolved += missing
+            for path, (test, why) in reached.items():
+                if test:
+                    test_files[path] = why
+                else:
+                    seen.setdefault(path, label)
+        test_files = {p: w for p, w in test_files.items() if p not in seen}
+        counts = {"CALL": 0, "IMPORT": 0, "OTHER": 0}
+        sites = []
+        for path in sorted(seen):
+            shipped = census(path)["shipped"]
+            for kind in counts:
+                counts[kind] += len(shipped[kind])
+            rel = str(Path(path).relative_to(crates_dir))
+            sites += [f"{rel}:{line}" for line in shipped["CALL"]]
+        hidden = sum(sum(len(v) for v in census(p)["shipped"].values()) for p in test_files)
+        src_files = {str(p) for p in (crate / "src").rglob("*.rs")} if (crate / "src").is_dir() else set()
+        orphans = sorted(src_files - set(seen) - set(test_files))
+        for kind in grand:
+            grand[kind] += counts[kind]
+        total = sum(counts.values())
+        print(f"{crate.name}: PRODUCTION {total} (CALL {counts['CALL']}, IMPORT {counts['IMPORT']}, "
+              f"OTHER {counts['OTHER']}) over {len(seen)} files; test-only files {len(test_files)} "
+              f"(per-file census would have counted {hidden} there)")
+        for label in sorted({label for _, label in crate_roots(crate)}):
+            print(f"  target: {label}")
+        for site in sites:
+            print(f"    CALL {site}")
+        for p in orphans:
+            print(f"  UNREACHED (not compiled by any target): {Path(p).relative_to(crates_dir)}")
+        for u in unresolved:
+            print(f"  UNRESOLVED mod declaration: {u}")
+    print(f"\nTOTAL production block_on occurrences: {sum(grand.values())} "
+          f"(CALL {grand['CALL']}, IMPORT {grand['IMPORT']}, OTHER {grand['OTHER']})")
+    return 0
+
+
 def run_controls(report):
     """R4's two controls against a proxy.rs census. Returns (ok, output lines).
 
@@ -511,6 +671,10 @@ def main():
     parser.add_argument("--naive-control", metavar="FILE", help="show the unmasked over-count")
     parser.add_argument("--proxy", metavar="FILE",
                         help="run the controls against this proxy.rs (planted-control demonstrations)")
+    parser.add_argument("--workspace", action="store_true",
+                        help="census every crate's module tree, resolving out-of-line `mod x;` cfg")
+    parser.add_argument("--crates", metavar="DIR",
+                        help="crates directory for --workspace (default: the repo's; planted fixtures)")
     args = parser.parse_args()
 
     if args.naive_control:
@@ -552,6 +716,9 @@ def main():
         return 2
     print(f"control: {len(PROXY_EXPECTED_CALLS)}/{len(PROXY_EXPECTED_CALLS)} frozen proxy.rs "
           f"sites found by symbol; the import and both doc comments excluded\n")
+
+    if args.workspace:
+        return workspace_census(Path(args.crates) if args.crates else REPO / "crates")
 
     targets = args.files or [str(REPO / f) for f in BEAD_FILES]
     total = 0

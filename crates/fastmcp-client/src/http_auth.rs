@@ -40,6 +40,8 @@ pub mod sampling;
 /// Descriptor-relative atomic storage for caller-protected credential blobs.
 #[cfg(target_os = "linux")]
 pub mod secure_file;
+/// Schema-bound tool execution with pre-dispatch and pre-publication validation.
+pub mod tool;
 
 pub use fastmcp_core::CanonicalHttpUrl;
 
@@ -47,7 +49,7 @@ pub use fastmcp_core::CanonicalHttpUrl;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BearerBindingError {
     /// The binding resource is not an `https` URL. Cleartext HTTP —
-    /// including localhost and loopback literals — can never hold a bearer
+    /// including localhost and loopback — can never hold a bearer
     /// credential.
     CleartextResource,
     /// The token is empty.

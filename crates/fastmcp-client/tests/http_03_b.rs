@@ -25,13 +25,15 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use asupersync::Cx;
+use asupersync::http::h1::ClientError;
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener, TcpStream};
 use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
 use fastmcp_client::http_auth::{BearerBindingError, BoundBearerCredential};
 use fastmcp_client::http_executor::{
     HTTP_03_B_EVALUATOR_MANIFEST_V1, ModernHttpExecutor, ModernHttpExecutorError,
-    ModernHttpRequest, ModernHttpResponseKind, ModernHttpResponseStream, http_03_b_manifest_digest,
+    ModernHttpRequest, ModernHttpResponseKind, ModernHttpResponseStream,
+    ModernHttpRetryClassification, http_03_b_manifest_digest,
 };
 use fastmcp_client::{
     CanonicalHttpUrl, ClientBuilder, ClientHttpNegotiation, ClientHttpNegotiationDecision,
@@ -807,6 +809,26 @@ async fn post(
     executor.execute(cx, request).await
 }
 
+/// Sends one POST through the same public executor under an explicit
+/// post-commit response timeout policy.
+async fn post_with_policy(
+    cx: &Cx,
+    request: &ModernHttpRequest,
+    policy: RequestTimeoutPolicy,
+) -> Result<ModernHttpResponseStream, ModernHttpExecutorError> {
+    let executor = ModernHttpExecutor::new().with_timeout_policy(policy);
+    executor.execute(cx, request).await
+}
+
+/// The .15 response deadline. The 1 s idle bound admits a prompt answer and
+/// expires before a 1.5 s stall ends. Both deadlines are counted from the
+/// request flush, which precedes the peer's read of the request, so the idle
+/// deadline is always the earlier of the two regardless of scheduling delay.
+fn response_deadline_policy() -> RequestTimeoutPolicy {
+    RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(5))
+        .expect("the .15 response deadline policy must be valid")
+}
+
 fn ping_body() -> Vec<u8> {
     br#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}"#.to_vec()
 }
@@ -943,7 +965,7 @@ async fn positive_15_response_deadline(cx: &Cx) {
         wire
     };
     let client = async {
-        let stream = post(cx, &request)
+        let stream = post_with_policy(cx, &request, response_deadline_policy())
             .await
             .expect("a prompt in-deadline response must be admitted");
         assert_eq!(
@@ -963,6 +985,12 @@ async fn positive_15_response_deadline(cx: &Cx) {
 
 /// One variable changes: the peer accepts the POST and then stalls without
 /// answering. The executor must surface a typed timeout and must not replay.
+///
+/// Both .15 rows run under [`response_deadline_policy`], whose idle deadline
+/// expires before the peer's 1.5 s stall ends. Under the default 30 s policy
+/// this row could only ever observe the peer's own close, so it would pass
+/// without a deadline firing at all. Only `Timeout(_)` is admitted here, and a
+/// disconnect is a different outcome.
 async fn negative_15_stalled_peer(cx: &Cx) {
     let peer = Peer::bind().await;
     let target = peer.target();
@@ -981,12 +1009,12 @@ async fn negative_15_stalled_peer(cx: &Cx) {
         wire
     };
     let client = async {
-        let outcome = post(cx, &request).await;
+        let outcome = post_with_policy(cx, &request, response_deadline_policy()).await;
         match outcome {
-            Err(ModernHttpExecutorError::Timeout(_)
-            | ModernHttpExecutorError::Transport(_)
-            | ModernHttpExecutorError::ResponseBodyReadFailed) => {}
-            Err(other) => panic!("a stalled peer must be a typed refusal, got {other:?}"),
+            Err(ModernHttpExecutorError::Timeout(_)) => {}
+            Err(other) => {
+                panic!("a stalled peer must be the typed response timeout, got {other:?}")
+            }
             Ok(_) => panic!("a stalled peer must not produce an admitted response"),
         }
     };
@@ -1044,15 +1072,58 @@ async fn negative_16_midexchange_close(cx: &Cx) {
         wire
     };
     let client = async {
-        let outcome = post(cx, &request).await;
+        let error = post(cx, &request)
+            .await
+            .expect_err("an uncertain dispatch must not be reported as success");
         assert!(
-            outcome.is_err(),
-            "an uncertain dispatch must not be reported as success"
+            matches!(error, ModernHttpExecutorError::DispatchUncertain(_)),
+            "a peer that closed after reading the POST must be the typed uncertain dispatch, \
+             got {error:?}"
+        );
+        assert_eq!(
+            error.retry_classification(),
+            Some(ModernHttpRetryClassification::DispatchUncertain),
+            "an uncertain dispatch must carry the no-automatic-retry classification"
         );
     };
 
     let (_wire, ()) = Box::pin(pair(server, client)).await;
     peer.assert_no_further_connection();
+
+    Box::pin(negative_16_never_accepted(cx)).await;
+}
+
+/// Planted row for .16. The fixture is the same, except that the peer never
+/// accepts: its listener is dropped before the POST, so the connection is
+/// refused and no request byte can be written. That is the one changed
+/// variable. The same executor call must then classify the failure as
+/// not dispatched.
+///
+/// A peer that accepts and then closes without reading is deliberately not
+/// used here. A small body lands in the kernel send buffer either way, so the
+/// client cannot observe that difference, and the honest class there is still
+/// an uncertain dispatch.
+async fn negative_16_never_accepted(cx: &Cx) {
+    let peer = Peer::bind().await;
+    let target = peer.target();
+    let request = ping_request(&target);
+    drop(peer);
+
+    let error = post(cx, &request)
+        .await
+        .expect_err("a refused connection must not be reported as success");
+    assert!(
+        matches!(
+            error,
+            ModernHttpExecutorError::Transport(ClientError::ConnectError(_))
+        ),
+        "a peer that never accepted must fail before dispatch, got {error:?}"
+    );
+    assert_eq!(
+        error.retry_classification(),
+        Some(ModernHttpRetryClassification::NotDispatched),
+        "a failure before the first request byte must be classified as not dispatched"
+    );
 }
 
 // ---------------------------------------------------------------------------

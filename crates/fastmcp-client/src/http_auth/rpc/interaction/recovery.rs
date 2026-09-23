@@ -346,7 +346,8 @@ fn recoverable_transport_failure(error: &ManagedCoreError) -> bool {
 }
 pub(crate) fn recovery_http_interruption(error: &ModernHttpExecutorError) -> bool {
     matches!(error, ModernHttpExecutorError::ResponseBodyReadFailed
-        | ModernHttpExecutorError::Transport(ClientError::Io(_) | ClientError::HttpError(HttpError::Io(_))))
+        | ModernHttpExecutorError::Transport(ClientError::Io(_) | ClientError::HttpError(HttpError::Io(_)))
+        | ModernHttpExecutorError::DispatchUncertain(ClientError::Io(_) | ClientError::HttpError(HttpError::Io(_))))
 }
 
 #[cfg(test)]

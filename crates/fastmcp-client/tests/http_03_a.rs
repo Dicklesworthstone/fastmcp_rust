@@ -245,7 +245,7 @@ const NEGATIVE_CASES: [ManifestCase; 13] = [
 /// `env!` and no build-time interpolation: these bytes move only when someone
 /// edits them, which is exactly the event this must catch.
 const HTTP_03_A_MANIFEST_DIGEST_HEX: &str =
-    "9f68de2cfb47091ee101006cd67405a8764d6dd79781cf2abffabe1c54658818";
+    "0d5bed420fce1798b7db9cb1ea2dc52ca40496b58cecb5475a95798ea880c2cc";
 
 /// THE ONE INSTRUMENT both the positive and the planted negative use.
 ///
@@ -284,7 +284,7 @@ fn assert_manifest_digest_refuses_perturbation() {
 
     let perturbations = [
         ("reordering two case rows", reordered.join("\n")),
-        ("raising one declared floor", text.replacen("floor=2", "floor=3", 1)),
+        ("raising one declared floor", text.replacen("floor=3", "floor=4", 1)),
         ("omitting one group row", omitted.join("\n")),
     ];
 

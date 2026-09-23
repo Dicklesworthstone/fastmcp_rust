@@ -55,46 +55,86 @@ record_count = 25
 # that IS globally reachable (anycast services such as PCP, TURN, AS112, AMT)
 # is legitimately admitted by a fetch fence, while one that is NOT globally
 # reachable is precisely what the fence exists to refuse.
-method = "reimplement the classifier match arms exactly, then probe a live address from every global=False prefix"
+method = "drive the FIRST and LAST address of every global=False prefix (by the <global> leading token, 33 prefixes / 66 probes) through the SHIPPED fence via GuardedHttpFetcher::with_resolver, offline, per crates/fastmcp-transport/tests/fnd_05_iana_fence_sweep.rs (bd-fnd-05-implementation-b-ysez bar Y4); the global=True prefixes the fence denies must equal the declared_over_denial set below"
 ipv4_unreachable_prefixes_admitted = 0
-ipv6_unreachable_prefixes_admitted = 4
+ipv6_unreachable_prefixes_admitted = 0
 # Fail-closed over-denials: globally REACHABLE prefixes the classifier refuses
-# anyway, as a side effect of coarser match arms. Harmless for a guarded fetcher.
+# anyway. Harmless for a guarded fetcher. Each is declared below, and the sweep
+# fails if the denied set and the declared set ever differ.
 ipv4_reachable_prefixes_denied = 2  # 192.0.0.9/32 PCP Anycast, 192.0.0.10/32 TURN Anycast
+ipv6_reachable_prefixes_denied = 8  # 64:ff9b::/96 NAT64, and seven 2001::/23 sub-allocations
 
-[[known_uncloseable_gap]]
-# THESE ARE UNMET ACCEPTANCE, NOT APPROVED EXCEPTIONS.
+[[declared_over_denial]]
+# FAIL-CLOSED OVER-DENIALS, DECLARED RATHER THAN HIDDEN.
 #
-# Each entry is a prefix IANA marks globally UNREACHABLE that the shipped
-# classifier does not deny — i.e. the address fence is open on it today. They
-# are enumerated here so the gate can be green about a KNOWN state while
-# failing loudly on any CHANGE, in either direction. Closing them requires an
-# edit to a shipped security classifier, which was referred for authorization
-# rather than taken unilaterally.
+# Each entry is a prefix IANA marks globally REACHABLE (global=True) that the
+# shipped classifier nevertheless denies. They are harmless to a guarded
+# fetcher, but a fence that refuses more than its policy states must say so.
+# fnd_05_iana_fence_sweep.rs requires the denied global=True set to equal this
+# set EXACTLY: an undeclared denial and a declared prefix that is admitted are
+# both red.
 #
-# Do NOT add an entry here to silence a new failure. A new gap is a finding.
-family = "ipv6"
-prefix = "100:0:0:1::/64"
-name = "Dummy IPv6 Prefix"
-cause = "the arm [0x0100, 0, 0, 0, ..] requires the fourth segment to be zero; this prefix has 0x0001 there, so it covers 100::/64 only"
+# Do NOT add an entry here to silence a failing sweep without a ruling. A new
+# over-denial is a behaviour change to a security classifier, and it is
+# reviewed like one.
+family = "ipv4"
+prefix = "192.0.0.9/32"
+name = "Port Control Protocol Anycast"
+reason = "the coarse (192, 0, _) arm of is_public_guarded_ipv4 denies all of 192.0.0.0/24, which contains this global=True anycast address"
 
-[[known_uncloseable_gap]]
-family = "ipv6"
-prefix = "2001:2::/48"
-name = "Benchmarking"
-cause = "the arm [0x2001, 0 | 0x0DB8, ..] covers Teredo 2001:0::/32 and documentation 2001:db8::/32; IANA reserves the whole 2001::/23 and benchmarking sits at 2001:2::"
+[[declared_over_denial]]
+family = "ipv4"
+prefix = "192.0.0.10/32"
+name = "Traversal Using Relays around NAT Anycast"
+reason = "the coarse (192, 0, _) arm of is_public_guarded_ipv4 denies all of 192.0.0.0/24, which contains this global=True anycast address"
 
-[[known_uncloseable_gap]]
+[[declared_over_denial]]
 family = "ipv6"
-prefix = "3fff::/20"
-name = "Documentation"
-cause = "no arm exists; a recent IANA addition postdating the classifier's authoring"
+prefix = "64:ff9b::/96"
+name = "IPv4-IPv6 Translat."
+reason = "the FND-05 package body requires the NAT64 well-known prefix to be DENIED rather than reinterpreted; this pre-existing over-denial was recorded nowhere until bd-fnd-05-implementation-b-ysez"
 
-[[known_uncloseable_gap]]
+[[declared_over_denial]]
 family = "ipv6"
-prefix = "5f00::/16"
-name = "Segment Routing (SRv6) SIDs"
-cause = "no arm exists; a recent IANA addition postdating the classifier's authoring. Reachable inside an SRv6-enabled fabric, so the most plausible genuine SSRF vector of the four"
+prefix = "2001:1::1/128"
+name = "Port Control Protocol Anycast"
+reason = "WAVE16 rulings #23 option (b): 2001::/23 (global=False) is denied whole, fail-closed, which also denies this global=True sub-allocation; reversible by a reviewed narrowing"
+
+[[declared_over_denial]]
+family = "ipv6"
+prefix = "2001:1::2/128"
+name = "Traversal Using Relays around NAT Anycast"
+reason = "WAVE16 rulings #23 option (b): 2001::/23 (global=False) is denied whole, fail-closed, which also denies this global=True sub-allocation; reversible by a reviewed narrowing"
+
+[[declared_over_denial]]
+family = "ipv6"
+prefix = "2001:1::3/128"
+name = "DNS-SD Service Registration Protocol Anycast"
+reason = "WAVE16 rulings #23 option (b): 2001::/23 (global=False) is denied whole, fail-closed, which also denies this global=True sub-allocation; reversible by a reviewed narrowing"
+
+[[declared_over_denial]]
+family = "ipv6"
+prefix = "2001:3::/32"
+name = "AMT"
+reason = "WAVE16 rulings #23 option (b): 2001::/23 (global=False) is denied whole, fail-closed, which also denies this global=True sub-allocation; reversible by a reviewed narrowing"
+
+[[declared_over_denial]]
+family = "ipv6"
+prefix = "2001:4:112::/48"
+name = "AS112-v6"
+reason = "WAVE16 rulings #23 option (b): 2001::/23 (global=False) is denied whole, fail-closed, which also denies this global=True sub-allocation; reversible by a reviewed narrowing"
+
+[[declared_over_denial]]
+family = "ipv6"
+prefix = "2001:20::/28"
+name = "ORCHIDv2"
+reason = "WAVE16 rulings #23 option (b): 2001::/23 (global=False) is denied whole, fail-closed, which also denies this global=True sub-allocation; reversible by a reviewed narrowing"
+
+[[declared_over_denial]]
+family = "ipv6"
+prefix = "2001:30::/28"
+name = "Drone Remote ID Protocol Entity Tags (DETs) Prefix"
+reason = "WAVE16 rulings #23 option (b): 2001::/23 (global=False) is denied whole, fail-closed, which also denies this global=True sub-allocation; reversible by a reviewed narrowing"
 
 [refresh_procedure]
 # MANUAL AND HUMAN-DECIDED, never automated. RCH cannot fetch during a build and

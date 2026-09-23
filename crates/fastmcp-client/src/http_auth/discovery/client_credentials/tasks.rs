@@ -10,6 +10,10 @@
 pub mod subscriptions;
 /// Bounded lifecycle polling with machine-owner and caller cancellation.
 pub mod driver;
+/// Owned Task-capable tool submission, explicit core input, and delivery evidence.
+pub mod submission;
+/// One-shot tool submission with insert-only persistence of accepted Tasks.
+pub mod creation;
 
 use std::fmt;
 use std::io::{self, Write};
@@ -34,6 +38,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub use crate::http_auth::managed::tasks::{ManagedTaskEvent, ManagedTaskRequest, ManagedTasksError};
+use crate::http_auth::managed::tasks::validate_task_input_shapes;
 use crate::http_executor::{
     ModernHttpExecutor, ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind, ModernHttpResponseStream,
     ModernHttpSseResponseStream,
@@ -144,6 +149,18 @@ impl ClientCredentialsTasksClient {
         &self, cx: &Cx, cancellation: &McpRequestCancellation,
         discovery_id: RequestId, request_id: RequestId, request: ManagedTaskRequest,
     ) -> Result<ClientCredentialsTaskCall, ClientCredentialsTasksError> {
+        let round = self.prepare_round(discovery_id, request_id, request)?;
+        let deadline = discovery_deadline(cx, self.limits.timeout.min(self.client.inner.timeout))
+            .map_err(ClientCredentialsError::from)?;
+        self.execute_round(cx, cancellation, round, deadline).await
+    }
+
+    // Shared preflight for immediate requests and caller-owned submissions.
+    // Keep both complete wire documents with their decoder: preparation never
+    // grants authority, sends a Task preference, or acquires a credential.
+    fn prepare_round(
+        &self, discovery_id: RequestId, request_id: RequestId, request: ManagedTaskRequest,
+    ) -> Result<PreparedRound, ClientCredentialsTasksError> {
         discovery_id.validate().map_err(|_| ManagedTasksError::InvalidRequest)?;
         request_id.validate().map_err(|_| ManagedTasksError::InvalidRequest)?;
         if discovery_id.correlates_with(&request_id) { return Err(ManagedTasksError::InvalidRequest.into()); }
@@ -155,8 +172,16 @@ impl ClientCredentialsTasksClient {
         let params = discovery.encode_params().map_err(|_| ManagedTasksError::InvalidRequest)?
             .ok_or(ManagedTasksError::InvalidRequest)?;
         let discovery_wire = encode(self.client.resource().as_str(), "server/discover", &discovery_id, params, None, self.limits.request_bytes)?;
-        let deadline = discovery_deadline(cx, self.limits.timeout.min(self.client.inner.timeout))
-            .map_err(ClientCredentialsError::from)?;
+        Ok(PreparedRound { discovery_id, request_id, prepared, discovery, discovery_wire })
+    }
+
+    // Consume, never clone/retry, the admitted round. All callers establish one
+    // deadline before entry; token expiry can only tighten the existing bound.
+    async fn execute_round(
+        &self, cx: &Cx, cancellation: &McpRequestCancellation,
+        round: PreparedRound, deadline: Time,
+    ) -> Result<ClientCredentialsTaskCall, ClientCredentialsTasksError> {
+        let PreparedRound { discovery_id, request_id, prepared, discovery, discovery_wire } = round;
         let owner = &self.client.inner.closed;
         // The outer bound includes acquisition. Inner bounds retain the opening
         // token's expiry during both network exchanges and all response reads.
@@ -200,6 +225,13 @@ fn require_success(response: &ModernHttpResponseStream) -> Result<(), ManagedTas
 
 enum Decoder { Tool(Box<CoreRequest>), Get(TaskId), Update, Cancel }
 struct Prepared { wire: ModernHttpRequest, decoder: Decoder, progress: Option<ProgressMarker> }
+struct PreparedRound {
+    discovery_id: RequestId,
+    request_id: RequestId,
+    prepared: Prepared,
+    discovery: CoreRequest,
+    discovery_wire: ModernHttpRequest,
+}
 enum Body { Json(ModernHttpResponseStream), Sse(ModernHttpSseResponseStream) }
 
 /// Caller-owned response with typed incremental notifications and one terminal.
@@ -407,6 +439,9 @@ fn decode_result(decoder: &Decoder, bytes: &[u8], id: &RequestId, maximum: usize
     let (response, source) = response_source(bytes, id, maximum)?;
     match decoder {
         Decoder::Tool(request) => {
+            if response.result.as_ref().and_then(|result| result.get("resultType")).and_then(Value::as_str) == Some("task") {
+                validate_task_input_shapes(&response)?;
+            }
             let CoreResult::Final(result) = request.decode_response_result(&response, &source).map_err(|_| ManagedTasksError::InvalidResponse)?
                 else { return Err(ManagedTasksError::InvalidResponse) };
             match result {
@@ -416,6 +451,7 @@ fn decode_result(decoder: &Decoder, bytes: &[u8], id: &RequestId, maximum: usize
             }
         }
         Decoder::Get(expected) => {
+            validate_task_input_shapes(&response)?;
             let result: GetTaskResult = serde_json::from_str(&source).map_err(|_| ManagedTasksError::InvalidResponse)?;
             if &result.task.base().task_id != expected { return Err(ManagedTasksError::TaskIdMismatch); }
             Ok(ManagedTaskEvent::Snapshot(Box::new(result)))
@@ -594,5 +630,175 @@ mod tests {
         }
         assert!(matches!(decode_result(&Decoder::Get(id()), &bytes, &RequestId::Number(3), 65536),
             Err(ManagedTasksError::ResponseIdMismatch)));
+    }
+
+    fn raw_input_task(result_type: &str, input_requests: &str) -> Vec<u8> {
+        let result = format!(
+            r#"{{"resultType":"{result_type}","taskId":"owned-task","status":"input_required","createdAt":"2026-09-17T00:00:00Z","lastUpdatedAt":"2026-09-17T00:00:00Z","ttlMs":60000,"inputRequests":{input_requests}}}"#
+        );
+        format!(r#"{{"jsonrpc":"2.0","id":2,"result":{result}}}"#).into_bytes()
+    }
+
+    fn decoded_task(event: ManagedTaskEvent) -> Task {
+        match event {
+            ManagedTaskEvent::Snapshot(result) => result.task,
+            ManagedTaskEvent::ToolResult(result) => match *result {
+                FinalCoreResult::ToolsCallTask { result } => result.task,
+                _ => panic!("expected a task-producing tool result"),
+            },
+            _ => panic!("expected a task event"),
+        }
+    }
+
+    #[test]
+    fn task_input_descriptors_are_validated_before_get_and_tool_decode() {
+        let get = Decoder::Get(id());
+        let tool = prepared(ManagedTaskRequest::CallTool { name: "compute".to_owned(), arguments: None });
+        let valid = [
+            r#"{"method":"roots/list"}"#,
+            r#"{"method":"roots/list","params":{}}"#,
+            r#"{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":8}}"#,
+            r#"{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":8,"tools":[],"toolChoice":{"mode":"auto"},"includeContext":"allServers"}}"#,
+            r#"{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":8,"toolChoice":{}}}"#,
+            r#"{"method":"elicitation/create","params":{"mode":"form","message":"Approve?","requestedSchema":{"type":"object","properties":{}}}}"#,
+            r#"{"method":"elicitation/create","params":{"mode":"url","message":"Approve?","url":"https://approval.example/confirm"}}"#,
+        ];
+        let invalid = [
+            r#"{"method":"roots/list","params":[]}"#,
+            r#"{"method":"roots/list","params":null}"#,
+            r#"{"method":"sampling/createMessage","params":[[],8]}"#,
+            r#"{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":8,"tools":null}}"#,
+            r#"{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":8,"tools":{}}}"#,
+            r#"{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":8,"toolChoice":null}}"#,
+            r#"{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":8,"toolChoice":[]}}"#,
+            r#"{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":8,"toolChoice":{"mode":null}}}"#,
+            r#"{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":8,"toolChoice":{"mode":{"auto":null}}}}"#,
+            r#"{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":8,"includeContext":null}}"#,
+            r#"{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":8,"includeContext":[]}}"#,
+            r#"{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":8,"includeContext":{"allServers":null}}}"#,
+            r#"{"method":"elicitation/create","params":["form","Approve?",{"type":"object","properties":{}}]}"#,
+        ];
+        for (decoder, result_type) in [(&get, "complete"), (&tool.decoder, "task")] {
+            for descriptor in valid {
+                let requests = format!(r#"{{"input":{descriptor}}}"#);
+                let event = decode_result(decoder, &raw_input_task(result_type, &requests), &RequestId::Number(2), 65536)
+                    .unwrap_or_else(|error| panic!("valid {descriptor}: {error}"));
+                let Task::InputRequired { base, input_requests } = decoded_task(event) else {
+                    panic!("expected an input-required task");
+                };
+                assert_eq!(base.task_id, id());
+                assert_eq!(input_requests.len(), 1);
+                assert!(input_requests.contains_key("input"));
+            }
+            for descriptor in invalid {
+                let requests = format!(r#"{{"input":{descriptor}}}"#);
+                assert!(matches!(
+                    decode_result(decoder, &raw_input_task(result_type, &requests), &RequestId::Number(2), 65536),
+                    Err(ManagedTasksError::InvalidResponse)
+                ), "invalid descriptor was admitted: {descriptor}");
+            }
+        }
+    }
+
+    #[test]
+    fn task_input_admission_preserves_large_integers_and_correlation_precedence() {
+        let get = Decoder::Get(id());
+        let tool = prepared(ManagedTaskRequest::CallTool { name: "compute".to_owned(), arguments: None });
+        for (decoder, result_type) in [(&get, "complete"), (&tool.decoder, "task")] {
+            let bytes = raw_input_task(result_type,
+                r#"{"sample":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":18446744073709551617}}}"#);
+            let event = decode_result(decoder, &bytes, &RequestId::Number(2), 65536).unwrap();
+            let Task::InputRequired { input_requests, .. } = decoded_task(event) else {
+                panic!("expected an input-required task");
+            };
+            let fastmcp_protocol::FinalEmbeddedInputRequest::Sampling(params) = &input_requests["sample"] else {
+                panic!("expected a sampling descriptor");
+            };
+            assert_eq!(params.max_tokens.as_str(), "18446744073709551617");
+
+            let malformed = raw_input_task(result_type,
+                r#"{"sample":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":18446744073709551617,"toolChoice":null}}}"#);
+            assert!(matches!(decode_result(decoder, &malformed, &RequestId::Number(2), 65536),
+                Err(ManagedTasksError::InvalidResponse)));
+            for wrong_id in [RequestId::Number(3), RequestId::String("2".to_owned())] {
+                assert!(matches!(decode_result(decoder, &malformed, &wrong_id, 65536),
+                    Err(ManagedTasksError::ResponseIdMismatch)));
+            }
+        }
+    }
+
+    #[test]
+    fn task_input_admission_keeps_duplicate_rejection_and_all_sibling_checks() {
+        let get = Decoder::Get(id());
+        let tool = prepared(ManagedTaskRequest::CallTool { name: "compute".to_owned(), arguments: None });
+        for (decoder, result_type) in [(&get, "complete"), (&tool.decoder, "task")] {
+            let valid = raw_input_task(result_type,
+                r#"{"a-roots":{"method":"roots/list"},"z-sample":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":8,"metadata":{"nested":{"key":1}}}}}"#);
+            let Task::InputRequired { input_requests, .. } = decoded_task(
+                decode_result(decoder, &valid, &RequestId::Number(2), 65536).unwrap()
+            ) else {
+                panic!("expected an input-required task");
+            };
+            assert_eq!(input_requests.len(), 2);
+            for requests in [
+                r#"{"a-roots":{"method":"roots/list"},"z-sample":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":8,"metadata":{"nested":{"key":1,"key":2}}}}}"#,
+                r#"{"a-roots":{"method":"roots/list"},"z-sample":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":8,"metadata":{"nested":{"key":1}},"tools":null}}}"#,
+                r#"[]"#,
+                r#"null"#,
+            ] {
+                assert!(matches!(
+                    decode_result(decoder, &raw_input_task(result_type, requests), &RequestId::Number(2), 65536),
+                    Err(ManagedTasksError::InvalidResponse)
+                ));
+            }
+            assert!(decode_result(decoder, &valid, &RequestId::Number(2), 65536).is_ok());
+        }
+    }
+
+    #[test]
+    fn task_input_shape_checks_do_not_reinterpret_completed_results_or_acknowledgements() {
+        let get = Decoder::Get(id());
+        let tool = prepared(ManagedTaskRequest::CallTool { name: "compute".to_owned(), arguments: None });
+        let nested = json!({
+            "content": [],
+            "status": "input_required",
+            "inputRequests": {"opaque": {"method": "roots/list", "params": []}}
+        });
+        for (decoder, result_type) in [(&get, "complete"), (&tool.decoder, "task")] {
+            let mut result = serde_json::to_value(task()).unwrap();
+            result.as_object_mut().unwrap().remove("inputRequests");
+            result["resultType"] = json!(result_type);
+            result["status"] = json!("completed");
+            result["result"] = nested.clone();
+            let completed = decoded_task(
+                decode_result(decoder, &envelope(result), &RequestId::Number(2), 65536).unwrap()
+            );
+            assert!(matches!(&completed, Task::Completed { .. }));
+            assert_eq!(serde_json::to_value(completed).unwrap()["result"], nested);
+        }
+        let immediate = envelope(json!({
+            "resultType": "complete",
+            "content": [],
+            "status": "input_required",
+            "inputRequests": []
+        }));
+        assert!(matches!(
+            decode_result(&tool.decoder, &immediate, &RequestId::Number(2), 65536),
+            Ok(ManagedTaskEvent::ToolResult(result))
+                if matches!(result.as_ref(), FinalCoreResult::ToolsCall { .. })
+        ));
+        let acknowledgement = envelope(json!({
+            "resultType": "complete",
+            "status": "input_required",
+            "inputRequests": []
+        }));
+        assert!(matches!(
+            decode_result(&Decoder::Update, &acknowledgement, &RequestId::Number(2), 65536),
+            Ok(ManagedTaskEvent::Updated(_))
+        ));
+        assert!(matches!(
+            decode_result(&Decoder::Cancel, &acknowledgement, &RequestId::Number(2), 65536),
+            Ok(ManagedTaskEvent::Cancelled(_))
+        ));
     }
 }
