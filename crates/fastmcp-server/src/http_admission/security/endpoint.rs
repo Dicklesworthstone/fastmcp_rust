@@ -180,7 +180,7 @@ impl ServerHttpEndpoint {
         let ((response, authorization), mut session) = Box::pin(await_dispatch(cx, async {
             let mut session = self.open_session(cx).map_err(|_| SecuredHttpEndpointError::SessionUnavailable)?;
             let dispatched = match &policy.scope_authorization {
-                Some(scopes) => scope::dispatch(&mut session, cx, scopes, request, policy.sse_revalidation).await,
+                Some(scopes) => Box::pin(scope::dispatch(&mut session, cx, scopes, request, policy.sse_revalidation)).await,
                 None => session.handle_async(cx, request).await
                     .map(|response| (response, None))
                     .map_err(|_| SecuredHttpEndpointError::DispatchFailed),
