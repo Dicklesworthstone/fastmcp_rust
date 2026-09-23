@@ -192,6 +192,10 @@ pub mod __private {
     pub mod protocol {
         #[cfg(feature = "apps")]
         pub use fastmcp_protocol::common_types::{AbsoluteUri, OpenMetadata};
+        // `#[tool]` and `#[derive(JsonSchema)]` expand to
+        // `__private::protocol::schema::…`; the module is already public at the
+        // facade root, so this widens nothing.
+        pub use fastmcp_protocol::schema;
         pub use fastmcp_protocol::{
             CallToolResult, CompleteResult, Content, FinalCallToolResult, FinalGetPromptResult,
             FinalReadResourceResult, Icon, Prompt, PromptArgument, PromptMessage, Resource,

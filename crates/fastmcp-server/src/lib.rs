@@ -7160,9 +7160,9 @@ impl BoundHttpServer {
             #[cfg(test)]
             lib_unit_tests::record_f2ndd_children_at_join(connection_children.tasks.len());
             let _ = modern_session_reaper.join(cx).await;
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
             #[cfg(test)]
             lib_unit_tests::record_f2ndd_serve_stage(33);
+            #[cfg(any(feature = "legacy-2024-11-05", test))]
             close_live_http_sessions(cx, &self.legacy_sessions).await;
             // Phase one closes response-body admission before any uninterruptible
             // connection-child join can begin. Leave the SSE queues alive until
