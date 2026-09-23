@@ -32,6 +32,13 @@ use super::super::ManagedTaskWatchCheckpoint;
 
 /// A fresh remote observation, deliberately neither Clone nor serializable.
 /// A terminal Task may be failed/cancelled or contain a tool-level error.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one value per reconciliation, returned by value and held at most in a restart's \
+              single pending slot (MAX_RESTART_RECORDS = 128 bounds the stream); boxing `record` \
+              would add a heap allocation per Active result and change a public field that \
+              callers destructure"
+)]
 pub enum TaskResumeReconciliation {
     Active {
         /// Current application state; NEVER passed to the checkpoint store.
@@ -91,9 +98,9 @@ impl ManagedTasksClient {
         record: &TaskResumeRecord,
         ids: ManagedTaskRequestIds,
     ) -> Result<TaskResumeReconciliation, TaskResumeReconciliationError> {
-        self.reconcile_task_resume_with_cancellation(
+        Box::pin(self.reconcile_task_resume_with_cancellation(
             cx, &McpRequestCancellation::new(), current, record, ids,
-        ).await
+        )).await
     }
 
     /// Dropping/cancelling the future closes only its owned observation. No
@@ -109,7 +116,7 @@ impl ManagedTasksClient {
         self.session.check(cx, cancellation).map_err(ManagedTasksError::from)?;
         let retention_deadline = resume_read_deadline(cx, current, record, self.session.resource().as_str())?;
         let deadline = retention_deadline.min(deadline_after(cx, self.limits.timeout).map_err(ManagedTasksError::from)?);
-        let observed = self.session.await_active(cx, cancellation, deadline, None, async {
+        let observed = Box::pin(self.session.await_active(cx, cancellation, deadline, None, async {
             Ok(async {
                 let mut call = self.request_with_cancellation(cx, cancellation, ids,
                     ManagedTaskRequest::Get(record.task_id.clone())).await?;
@@ -118,7 +125,7 @@ impl ManagedTasksClient {
                 };
                 Ok::<_, ManagedTasksError>(snapshot.task)
             }.await)
-        }).await;
+        })).await;
         self.session.check(cx, cancellation).map_err(ManagedTasksError::from)?;
         if cx.now() >= retention_deadline { return Err(TaskResumeError::Unavailable.into()); }
         record.admit(cx, current)?;
