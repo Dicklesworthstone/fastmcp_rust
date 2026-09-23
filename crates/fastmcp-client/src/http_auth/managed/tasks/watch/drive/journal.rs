@@ -127,7 +127,7 @@ impl TaskInputJournalRecord {
         }
         if bytes != self.history.bytes { return Err(TaskInputJournalError::InvalidRecord); }
         let unconfirmed = self.state == TaskInputUpdateState::Unconfirmed;
-        let pending = if unconfirmed { 1 } else { 0 };
+        let pending = usize::from(unconfirmed);
         if self.generation != (self.acknowledged as u64) * 2 + pending as u64
             || self.ids.len() != self.acknowledged + pending
             || self.ids.iter().any(|id| id.is_empty() || id.len() > 256)
@@ -146,7 +146,7 @@ impl TaskInputJournalRecord {
             || unconfirmed == self.pending_keys.is_empty()
             || self.history.entries.values().filter(|(_, answered)| *answered).count() < self.acknowledged
             || self.pending_keys.iter().any(|key|
-                !self.history.entries.get(key).is_some_and(|(_, answered)| !answered))
+                self.history.entries.get(key).is_none_or(|(_, answered)| *answered))
         { return Err(TaskInputJournalError::InvalidRecord); }
         Ok(())
     }
