@@ -487,6 +487,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use fastmcp_core::{SamplingRequest, SamplingResponse, SamplingSender};
     use serde_json::json;
+    mod rejection;
 
     struct Echo { calls: Arc<AtomicUsize>, poller: std::thread::ThreadId }
     impl ToolHandler for Echo {
