@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use asupersync::Cx;
 use fastmcp_core::McpRequestCancellation;
+use fastmcp_protocol::http_headers::AdmittedToolHeaderSchema;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{AdmittedSchema, CoreRequest, CoreResult, FinalTool, RequestId, admit_final_schema};
 use serde_json::Value;
@@ -79,7 +80,7 @@ impl From<ManagedCoreError> for ManagedToolError {
 
 struct ToolContract {
     name: String,
-    input: AdmittedSchema,
+    input: AdmittedToolHeaderSchema,
     output: Option<AdmittedSchema>,
     invalidated: AtomicBool,
 }
@@ -100,7 +101,11 @@ impl ToolContract {
         if tool.output_schema.as_ref().is_some_and(|schema| !schema.is_object()) {
             return Err(ManagedToolError::InvalidOutputSchema);
         }
-        let input = admit_final_schema(tool.input_schema)
+        // Standard header annotations are part of the tool definition, not
+        // permission to disclose arguments. Admit their syntax while retaining
+        // the exact source and validating through the ordinary schema engine.
+        // No projection plan is executed by this wrapper or its continuations.
+        let input = AdmittedToolHeaderSchema::admit(tool.input_schema)
             .map_err(|_| ManagedToolError::InvalidInputSchema)?;
         let output = tool.output_schema.map(admit_final_schema).transpose()
             .map_err(|_| ManagedToolError::InvalidOutputSchema)?;
@@ -312,3 +317,6 @@ fn check_tool_call(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod header_schema_tests;
