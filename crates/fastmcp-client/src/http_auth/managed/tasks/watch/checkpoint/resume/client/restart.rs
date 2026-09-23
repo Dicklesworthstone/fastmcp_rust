@@ -35,7 +35,7 @@ pub struct TaskResumeRestartPolicy {
 }
 impl Default for TaskResumeRestartPolicy {
     fn default() -> Self {
-        Self { maximum_records: 128, maximum_bytes: 512 * 1024, timeout: Duration::from_secs(900) }
+        Self { maximum_records: 128, maximum_bytes: 512 * 1024, timeout: Duration::from_mins(15) }
     }
 }
 impl TaskResumeRestartPolicy {
@@ -171,6 +171,12 @@ fn record_bytes(record: &TaskResumeRecord) -> usize {
 /// A fresh response or a nondisclosing unavailable disposition. Unavailable is
 /// shared by local expiry and remote 401/403/404. It does not delete the record
 /// and must not be used as permission to repeat a creating call.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "outcomes are produced one at a time by next_reconciled and held at most in the \
+              single pending_outcome slot; the plan stores records, never outcomes, so boxing \
+              would add a heap allocation per reconciled item for no collection-level saving"
+)]
 pub enum TaskResumeRestartOutcome {
     Reconciled(TaskResumeReconciliation),
     Unavailable,
@@ -374,7 +380,7 @@ impl ManagedTaskRestart {
                 let current = &self.current;
                 let outcome = &mut self.pending_outcome;
                 Box::pin(client.session.await_active(cx, &cancellation, self.deadline, None, async {
-                    let observed = client.reconcile_task_resume_with_cancellation(cx, &cancellation, current, pending, ids).await;
+                    let observed = Box::pin(client.reconcile_task_resume_with_cancellation(cx, &cancellation, current, pending, ids)).await;
                     let observed = match observed {
                         Ok(value) => TaskResumeRestartOutcome::Reconciled(value),
                         Err(TaskResumeReconciliationError::Resume(TaskResumeError::Unavailable)) => TaskResumeRestartOutcome::Unavailable,
