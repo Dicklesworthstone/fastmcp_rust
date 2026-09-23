@@ -245,7 +245,7 @@ const NEGATIVE_CASES: [ManifestCase; 13] = [
 /// `env!` and no build-time interpolation: these bytes move only when someone
 /// edits them, which is exactly the event this must catch.
 const HTTP_03_A_MANIFEST_DIGEST_HEX: &str =
-    "1f8ffc7ba0501ba74350e79b25c3ab997441651bf39ab8404233b8bc0731a6ac";
+    "eb1f9660f31883c6fb17c1618cd84492036fb71f6733f9ee74e55f188100aef8";
 
 /// THE ONE INSTRUMENT both the positive and the planted negative use.
 ///

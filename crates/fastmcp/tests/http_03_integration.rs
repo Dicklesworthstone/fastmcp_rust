@@ -44,8 +44,9 @@ use std::time::{Duration, Instant};
 use asupersync::{CancelKind, Cx};
 use asupersync::runtime::RuntimeBuilder;
 use fastmcp_rust::client::http_executor::{
-    HTTP_03_A_EVALUATOR_MANIFEST_V1, HTTP_03_B_EVALUATOR_MANIFEST_V1, ModernHttpFinalCoreEvent,
-    ModernHttpFinalCoreListenError, http_03_a_manifest_digest, http_03_b_manifest_digest,
+    HTTP_03_A_EVALUATOR_MANIFEST_V1, HTTP_03_B_EVALUATOR_MANIFEST_V1,
+    MAX_PENDING_MODERN_HTTP_SSE_EVENTS, ModernHttpFinalCoreEvent, ModernHttpFinalCoreListenError,
+    http_03_a_manifest_digest, http_03_b_manifest_digest,
 };
 use fastmcp_rust::client::{
     BearerBindingError, BoundBearerCredential, ClientBuilder, ClientHttpConnection,
@@ -56,9 +57,9 @@ use fastmcp_rust::client::{
     SseLimits, validate_response_head,
 };
 use fastmcp_rust::{
-    CanonicalHttpUrl, FinalCoreResult, HttpEndpointBundleKey, HttpModernProbe, HttpProbeBody,
-    JsonRpcRequest, ProgressMarker, ProtocolEra, ProtocolPolicy, RequestId, ServerNotification,
-    Sha256Digest, sha256_bounded,
+    CanonicalHttpUrl, ClientCapabilities, ClientInfo, FinalCoreResult, FinalRequestMeta,
+    HttpEndpointBundleKey, HttpModernProbe, HttpProbeBody, JsonRpcRequest, ProgressMarker,
+    ProtocolEra, ProtocolPolicy, RequestId, ServerNotification, Sha256Digest, sha256_bounded,
 };
 
 /// The join's own public entrypoint, recorded in the receipt (PL-3).
@@ -112,7 +113,7 @@ const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 /// literals reconstructed from `http_executor.rs` - and agreeing with the same
 /// two values frozen by the A and B producer targets.
 const HTTP_03_A_MANIFEST_DIGEST_HEX: &str =
-    "1f8ffc7ba0501ba74350e79b25c3ab997441651bf39ab8404233b8bc0731a6ac";
+    "eb1f9660f31883c6fb17c1618cd84492036fb71f6733f9ee74e55f188100aef8";
 const HTTP_03_B_MANIFEST_DIGEST_HEX: &str =
     "23fb2f9a13130aea1c80891371979494a116ac978fd78d987de1152b18af7135";
 
@@ -123,6 +124,9 @@ const BEARER_SECRET: &str = "http-03-integration-bearer-secret";
 /// Placeholder substituted for the ephemeral fixture authority so that case
 /// records are byte-comparable across runs.
 const FIXTURE_AUTHORITY_PLACEHOLDER: &str = "<fixture-authority>";
+
+/// The progress marker the joined `/mcp-a` tools/call carries.
+const JOIN_PROGRESS_MARKER: &str = "http-03-integration-progress";
 
 // ---------------------------------------------------------------------------
 // Producer manifest consumption
@@ -1379,16 +1383,20 @@ const RESPONSE_LANE_REQUEST_ID: i64 = 2;
 const ISOLATION_SIBLING_REQUEST_ID: i64 = 3;
 
 /// Writes `bytes` verbatim as one chunk of an already-begun SSE body.
+///
+/// The size line, payload and terminator go out in ONE write. The pending-event
+/// bound (HTTP-03.11) is charged per native body frame, and a frame is whatever
+/// the client has buffered, so a single small write is what keeps a whole
+/// chunk's events in one frame.
 fn write_raw_sse_chunk(stream: &mut TcpStream, bytes: &[u8]) {
     assert!(
         !bytes.is_empty(),
         "a zero-length chunk would terminate the response body early"
     );
-    write!(stream, "{:x}\r\n", bytes.len()).expect("write fixture chunk length");
-    stream
-        .write_all(bytes)
-        .expect("write fixture chunk payload");
-    write!(stream, "\r\n").expect("write fixture chunk terminator");
+    let mut chunk = format!("{:x}\r\n", bytes.len()).into_bytes();
+    chunk.extend_from_slice(bytes);
+    chunk.extend_from_slice(b"\r\n");
+    stream.write_all(&chunk).expect("write fixture chunk");
     stream.flush().expect("flush fixture chunk");
 }
 
@@ -1507,9 +1515,10 @@ fn observe_sse_body(instance: &'static str, sse_body: Vec<u8>, limits: SseLimits
     normalize_lane(address, observed)
 }
 
-/// Sends one `tools/list` through the public immediate-JSON entrypoint and
-/// serves `json_body` as its entire `application/json` response body.
-fn observe_json_body(json_body: Vec<u8>) -> String {
+/// Sends one `tools/list` through the public immediate-JSON entrypoint with a
+/// `maximum_bytes` response bound and serves `json_body` as its entire
+/// `application/json` response body.
+fn observe_json_body(json_body: Vec<u8>, maximum_bytes: usize) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind a JSON response lane");
     let address = listener
         .local_addr()
@@ -1544,7 +1553,7 @@ fn observe_json_body(json_body: Vec<u8>) -> String {
                 "tools/list",
                 serde_json::json!({}),
                 RequestId::Number(RESPONSE_LANE_REQUEST_ID),
-                65_536,
+                maximum_bytes,
             )
             .await
         {
@@ -1643,24 +1652,24 @@ fn observe_isolation(owner_payload: Vec<u8>) -> String {
     normalize_lane(address, observed)
 }
 
-/// A `tools/call` terminal for the single-stream lanes whose text value
-/// carries one raw malformed octet, either inside the JSON string or at a
-/// structural position before the first member.
+/// A `tools/call` terminal for the single-stream lanes carrying one raw
+/// malformed octet. Both placements are the SAME bytes with the octet inserted
+/// at a different offset: inside the empty text string, or directly after the
+/// opening brace. Only the octet's position differs.
 fn terminal_with_malformed_octet(inside_json_string: bool) -> Vec<u8> {
-    let mut payload = Vec::new();
-    if inside_json_string {
-        payload.extend_from_slice(
-            br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":""#,
-        );
-        payload.push(0xFF);
-        payload.extend_from_slice(br#""}],"isError":false}}"#);
+    const TERMINAL: &[u8] = br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":""}],"isError":false}}"#;
+    const TEXT_OPENING: &[u8] = br#""text":""#;
+    let offset = if inside_json_string {
+        TERMINAL
+            .windows(TEXT_OPENING.len())
+            .position(|window| window == TEXT_OPENING)
+            .expect("the terminal carries a text member")
+            + TEXT_OPENING.len()
     } else {
-        payload.extend_from_slice(b"{");
-        payload.push(0xFF);
-        payload.extend_from_slice(
-            br#""jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"ok"}],"isError":false}}"#,
-        );
-    }
+        1
+    };
+    let mut payload = TERMINAL.to_vec();
+    payload.insert(offset, 0xFF);
     payload
 }
 
@@ -1735,9 +1744,32 @@ struct ResponseLanes {
     line_ceiling_bytes: usize,
     sse_at_line_ceiling: String,
     sse_over_line_ceiling: String,
+    event_ceiling_bytes: usize,
+    sse_at_event_ceiling: String,
+    sse_over_event_ceiling: String,
+    message_ceiling_bytes: usize,
+    json_at_message_ceiling: String,
+    json_over_message_ceiling: String,
+    sse_pending_at_bound: String,
+    sse_pending_over_bound: String,
     isolation_admitted: String,
     isolation_malformed: String,
     isolation_server_request: String,
+}
+
+/// One LF-framed event whose terminal JSON is split across two `data` lines at
+/// a structural comma, and the event's raw byte count: the sum of both lines
+/// without their terminators, which is what the event ceiling charges.
+fn two_line_event(text: &str) -> (Vec<u8>, usize) {
+    let terminal = String::from_utf8(terminal_bytes(RESPONSE_LANE_REQUEST_ID, text))
+        .expect("fixture terminal is UTF-8");
+    let (head, tail) = terminal
+        .split_once(",\"result\"")
+        .expect("the fixture terminal carries a result member");
+    let first = format!("data: {head},");
+    let second = format!("data: \"result\"{tail}");
+    let raw_bytes = first.len() + second.len();
+    (format!("{first}\n{second}\n\n").into_bytes(), raw_bytes)
 }
 
 /// The HTTP-03.06 JSON document: a result whose note is non-ASCII UTF-8.
@@ -1766,10 +1798,34 @@ fn observe_response_lanes() -> ResponseLanes {
     let ceiling_limits =
         SseLimits::new(line_ceiling_bytes, 65_536, 8).expect("the line ceiling is nonzero");
 
+    // Event bound: two data lines, each far under the line ceiling, whose raw
+    // sum is exactly the event ceiling. The negative's text gains one byte.
+    let (at_event_ceiling, event_ceiling_bytes) = two_line_event("event-ceiling");
+    let (over_event_ceiling, over_event_bytes) = two_line_event("event-ceilingx");
+    assert_eq!(over_event_bytes, event_ceiling_bytes + 1);
+    let event_limits =
+        SseLimits::new(4_096, event_ceiling_bytes, 8).expect("the event ceiling is nonzero");
+
+    // Message bound: the caller's retained-byte bound on the immediate JSON
+    // lane, set to exactly the admitted document's length.
+    let at_message_ceiling = strict_utf8_json(utf8_note);
+    let message_ceiling_bytes = at_message_ceiling.len();
+    let over_message_ceiling = strict_utf8_json("prüfung-✓x".as_bytes());
+    assert_eq!(over_message_ceiling.len(), message_ceiling_bytes + 1);
+
+    // Memory bound: completed events pending from ONE native body frame. Tiny
+    // events keep the whole chunk one small write. At the bound nothing
+    // overflows, so the first event reaches (and fails) JSON admission; one
+    // more event and the pending bound refuses first.
+    let pending_events = |count: usize| b"data: x\n\n".repeat(count);
+
     ResponseLanes {
-        json_utf8: observe_json_body(strict_utf8_json(utf8_note)),
-        json_leading_bom: observe_json_body(with_leading_boms(1, &strict_utf8_json(utf8_note))),
-        json_invalid_utf8: observe_json_body(strict_utf8_json(&invalid_note)),
+        json_utf8: observe_json_body(strict_utf8_json(utf8_note), 65_536),
+        json_leading_bom: observe_json_body(
+            with_leading_boms(1, &strict_utf8_json(utf8_note)),
+            65_536,
+        ),
+        json_invalid_utf8: observe_json_body(strict_utf8_json(&invalid_note), 65_536),
         sse_replacement_inside: observe_sse_body(
             "replacement",
             with_leading_boms(1, &data_event(&terminal_with_malformed_octet(true))),
@@ -1805,8 +1861,29 @@ fn observe_response_lanes() -> ResponseLanes {
         line_ceiling_bytes,
         sse_at_line_ceiling: observe_sse_body("bounds", at_ceiling, ceiling_limits),
         sse_over_line_ceiling: observe_sse_body("bounds", over_ceiling, ceiling_limits),
+        event_ceiling_bytes,
+        sse_at_event_ceiling: observe_sse_body("bounds", at_event_ceiling, event_limits),
+        sse_over_event_ceiling: observe_sse_body("bounds", over_event_ceiling, event_limits),
+        message_ceiling_bytes,
+        json_at_message_ceiling: observe_json_body(at_message_ceiling, message_ceiling_bytes),
+        json_over_message_ceiling: observe_json_body(over_message_ceiling, message_ceiling_bytes),
+        sse_pending_at_bound: observe_sse_body(
+            "bounds",
+            pending_events(MAX_PENDING_MODERN_HTTP_SSE_EVENTS),
+            limits,
+        ),
+        sse_pending_over_bound: observe_sse_body(
+            "bounds",
+            pending_events(MAX_PENDING_MODERN_HTTP_SSE_EVENTS + 1),
+            limits,
+        ),
         isolation_admitted: observe_isolation(terminal_bytes(RESPONSE_LANE_REQUEST_ID, "owner-ok")),
-        isolation_malformed: observe_isolation(br#"{"jsonrpc":"2.0","id":2,"result":"#.to_vec()),
+        // The positive's own bytes, one byte short: the closing brace is gone.
+        isolation_malformed: observe_isolation({
+            let mut truncated = terminal_bytes(RESPONSE_LANE_REQUEST_ID, "owner-ok");
+            truncated.pop();
+            truncated
+        }),
         isolation_server_request: observe_isolation(
             serde_json::to_vec(&serde_json::json!({
                 "jsonrpc": "2.0",
@@ -1870,7 +1947,7 @@ fn run_fixture(plant_case_04: bool) -> WireObservations {
     let authority = address.to_string();
     let a_target = format!("http://{authority}/mcp-a");
     let b_target = format!("http://{authority}/mcp-b");
-    let marker = ProgressMarker::from("http-03-integration-progress");
+    let marker = ProgressMarker::from(JOIN_PROGRESS_MARKER);
     let server_marker = marker.clone();
     let (captures_tx, captures_rx) = mpsc::channel();
 
@@ -2386,7 +2463,7 @@ const PREDICATE_SUBJECTS: &[(&str, &str)] = &[
     ("HTTP-03.08", "sse-replacement-decoder-leading-bom"),
     ("HTTP-03.09", "sse-line-ending-data-field-assembly"),
     ("HTTP-03.10", "sse-comments-empty-data-eof-inert-fields"),
-    ("HTTP-03.11", "sse-line-event-memory-bounds"),
+    ("HTTP-03.11", "line-event-message-memory-bounds"),
     (
         "HTTP-03.12",
         "malformed-invalid-direction-response-isolation",
@@ -2591,31 +2668,26 @@ fn case_one_post_exact_body(builder: &mut CaseBuilder, wire: &WireObservations) 
     );
     builder.positive("mcp-a-call-post-count", "1");
 
-    // Exact body: the advertised length is the transmitted length, and the
-    // caller's own members arrive as the caller supplied them.
-    let advertised = wire
-        .a_call
-        .header("Content-Length")
-        .expect("a modern POST advertises its body length");
-    assert_eq!(advertised, wire.a_call.body.len().to_string());
-    builder.positive("mcp-a-call-content-length", &advertised);
-    let body = wire.a_call.json_body();
-    assert!(body.is_object(), "the POST body is one JSON-RPC object");
-    assert_eq!(body["id"], 2);
-    assert_eq!(body["params"]["name"], "http_03_join_tool");
-    assert_eq!(body["params"]["arguments"], serde_json::json!({}));
+    // Exact body: the transmitted bytes equal, byte for byte, the expected
+    // serialization of the request the caller asked for. An extra, missing or
+    // duplicated member, a changed value or a different encoding all fail.
+    let expected = expected_join_call_body();
+    assert_eq!(
+        wire.a_call.body,
+        expected,
+        "the tools/call body must be the exact expected serialization; transmitted {:?}, \
+         expected {:?}",
+        String::from_utf8_lossy(&wire.a_call.body),
+        String::from_utf8_lossy(&expected)
+    );
     builder.positive(
-        "mcp-a-call-caller-members",
-        &format!(
-            "id={} name={} arguments={}",
-            body["id"], body["params"]["name"], body["params"]["arguments"]
-        ),
+        "mcp-a-call-exact-body",
+        &format!("{} bytes equal", expected.len()),
     );
 
-    // Request stamping carried by every client request body.
+    // Request stamping on the other two client request bodies.
     for (label, request, method) in [
         ("mcp-a-probe", &wire.a_probe, "server/discover"),
-        ("mcp-a-call", &wire.a_call, "tools/call"),
         ("mcp-b-ping", &wire.b_ping, "ping"),
     ] {
         let body = request.json_body();
@@ -2642,30 +2714,62 @@ fn case_one_post_exact_body(builder: &mut CaseBuilder, wire: &WireObservations) 
     );
     builder.negative("params=[]", &wire.b_params_refusal);
 
-    // One variable: the POST becomes a reverse-response envelope rather than a
-    // client request. Request-only stamping must disappear with it, so a
-    // reverse response can never be mistaken for a stamped client request.
-    let reverse = ModernHttpRequest::for_jsonrpc_response(
-        wire.b_target.as_str(),
-        "2026-07-28",
-        br#"{"jsonrpc":"2.0","id":7,"result":{}}"#.to_vec(),
-    )
-    .expect("a reverse-response POST builds");
-    let reverse_headers = reverse.headers();
-    assert!(
-        reverse_headers
-            .iter()
-            .all(|(field, _)| field != "Mcp-Method"),
-        "a reverse-response POST must not mirror a client request method"
-    );
-    assert!(
-        reverse_headers.iter().all(|(field, _)| field != "Mcp-Name"),
-        "a reverse-response POST must not mirror a client request name"
+    // One variable: one body byte. The expected serialization with the tool
+    // name's final byte changed must NOT match what was transmitted, so the
+    // exact comparison above discriminates at a single byte.
+    let mut perturbed = expected;
+    let position = perturbed
+        .windows(b"http_03_join_tool".len())
+        .position(|window| window == b"http_03_join_tool")
+        .expect("the expected body carries the tool name")
+        + b"http_03_join_tool".len()
+        - 1;
+    perturbed[position] = b'X';
+    assert_ne!(
+        wire.a_call.body, perturbed,
+        "a body differing in one byte must not compare equal"
     );
     builder.negative(
-        "envelope=jsonrpc-response",
-        "Mcp-Method and Mcp-Name absent",
+        "one-body-byte",
+        &format!("byte {position} changed -> mismatch"),
     );
+}
+
+/// The exact bytes the joined `/mcp-a` tools/call must carry, built from the
+/// published protocol types rather than read back from the wire.
+///
+/// The caller supplies `name`, `arguments` and a progress marker. The request
+/// stamp is the canonical `FinalRequestMeta` for the configured client: the
+/// builder's default capabilities and `ClientInfo` identity. The shipped
+/// serde_json has no `preserve_order`, so maps serialize in key order, and
+/// `JsonRpcRequest` fixes the envelope's member order.
+fn expected_join_call_body() -> Vec<u8> {
+    let mut stamp = FinalRequestMeta::new(ClientCapabilities::default());
+    stamp.client_info = Some(
+        ClientInfo {
+            name: "http-03-integration-client".to_owned(),
+            version: "1.0.0".to_owned(),
+        }
+        .to_implementation(),
+    );
+    let mut meta = serde_json::to_value(stamp).expect("the request stamp serializes");
+    meta.as_object_mut()
+        .expect("the request stamp is an object")
+        .insert(
+            "progressToken".to_owned(),
+            serde_json::to_value(ProgressMarker::from(JOIN_PROGRESS_MARKER))
+                .expect("the progress marker serializes"),
+        );
+    let request = JsonRpcRequest::new(
+        "tools/call",
+        Some(serde_json::json!({
+            "name": "http_03_join_tool",
+            "arguments": {},
+            "_meta": meta,
+        })),
+        RequestId::Number(2),
+    );
+    serde_json::to_vec(&request).expect("the expected request serializes")
 }
 
 fn case_request_content_type_and_accept(builder: &mut CaseBuilder, wire: &WireObservations) {
@@ -2884,6 +2988,31 @@ fn case_routing_headers(builder: &mut CaseBuilder, wire: &WireObservations) {
     builder.negative(
         "name=\"name\\r\\nInjected: header\"",
         &format!("{refusal:?}"),
+    );
+
+    // One variable: the POST becomes a reverse-response envelope rather than a
+    // client request. The method and name routing headers must disappear with
+    // it, so a reverse response can never be routed as a client request.
+    let reverse = ModernHttpRequest::for_jsonrpc_response(
+        wire.b_target.as_str(),
+        "2026-07-28",
+        br#"{"jsonrpc":"2.0","id":7,"result":{}}"#.to_vec(),
+    )
+    .expect("a reverse-response POST builds");
+    let reverse_headers = reverse.headers();
+    assert!(
+        reverse_headers
+            .iter()
+            .all(|(field, _)| field != "Mcp-Method"),
+        "a reverse-response POST must not mirror a client request method"
+    );
+    assert!(
+        reverse_headers.iter().all(|(field, _)| field != "Mcp-Name"),
+        "a reverse-response POST must not mirror a client request name"
+    );
+    builder.negative(
+        "envelope=jsonrpc-response",
+        "Mcp-Method and Mcp-Name absent",
     );
 }
 
@@ -3124,11 +3253,6 @@ fn case_sse_bounds(builder: &mut CaseBuilder, lanes: &ResponseLanes) {
         &format!("line-at-ceiling-{}", lanes.line_ceiling_bytes),
         &lanes.sse_at_line_ceiling,
     );
-    assert!(
-        SseLimits::new(4_096, 65_536, 8).is_some(),
-        "the accepted bounds are constructible"
-    );
-    builder.positive("limits-constructible", "SseLimits::new -> Some");
 
     // One variable: the same terminal's text gains one byte, so the line is one
     // byte over the ceiling.
@@ -3144,12 +3268,83 @@ fn case_sse_bounds(builder: &mut CaseBuilder, lanes: &ResponseLanes) {
     );
     builder.negative("line-ceiling-plus-one", &lanes.sse_over_line_ceiling);
 
-    // One variable: the event ceiling supplied to the public parser bound.
+    // Event bound, live: two data lines whose raw sum is exactly the ceiling.
     assert!(
-        SseLimits::new(4_096, 0, 8).is_none(),
-        "a zero event ceiling must fail closed at configuration time"
+        lanes.sse_at_event_ceiling.starts_with("terminal:"),
+        "an event of exactly the event ceiling must be admitted, observed {}",
+        lanes.sse_at_event_ceiling
     );
-    builder.negative("max_event_bytes=0", "SseLimits::new -> None");
+    builder.positive(
+        &format!("event-at-ceiling-{}", lanes.event_ceiling_bytes),
+        &lanes.sse_at_event_ceiling,
+    );
+    // One variable: the event's text gains one byte.
+    let expected = format!(
+        "EventTooLarge {{ limit_bytes: {} }}",
+        lanes.event_ceiling_bytes
+    );
+    assert!(
+        lanes.sse_over_event_ceiling.starts_with("refused:")
+            && lanes.sse_over_event_ceiling.contains(&expected),
+        "one byte over the event ceiling must be refused as {expected}, observed {}",
+        lanes.sse_over_event_ceiling
+    );
+    builder.negative("event-ceiling-plus-one", &lanes.sse_over_event_ceiling);
+
+    // Message bound, live: the immediate JSON lane's retained-byte bound set to
+    // exactly the document's length.
+    assert!(
+        lanes
+            .json_at_message_ceiling
+            .starts_with("admitted id=Some(Number(2)) error=false"),
+        "a document of exactly the message bound must be admitted, observed {}",
+        lanes.json_at_message_ceiling
+    );
+    builder.positive(
+        &format!("message-at-bound-{}", lanes.message_ceiling_bytes),
+        &lanes.json_at_message_ceiling,
+    );
+    // One variable: the document gains one byte.
+    let expected = format!(
+        "ResponseBodyTooLarge {{ maximum_bytes: {} }}",
+        lanes.message_ceiling_bytes
+    );
+    assert!(
+        lanes.json_over_message_ceiling.starts_with("refused:")
+            && lanes.json_over_message_ceiling.contains(&expected),
+        "one byte over the message bound must be refused as {expected}, observed {}",
+        lanes.json_over_message_ceiling
+    );
+    builder.negative("message-bound-plus-one", &lanes.json_over_message_ceiling);
+
+    // Memory bound, live: completed events pending from one native body frame.
+    // At the bound nothing overflows, so the first event is handed on and
+    // fails JSON admission (it is `x`). That refusal is what shows the bound
+    // admitted every one of them.
+    assert!(
+        lanes
+            .sse_pending_at_bound
+            .starts_with("refused:JsonRpcAdmission")
+            && !lanes.sse_pending_at_bound.contains("PendingSse"),
+        "{MAX_PENDING_MODERN_HTTP_SSE_EVENTS} pending events must be admitted by the memory \
+         bound, observed {}",
+        lanes.sse_pending_at_bound
+    );
+    builder.positive(
+        &format!("pending-events-at-bound-{MAX_PENDING_MODERN_HTTP_SSE_EVENTS}"),
+        &lanes.sse_pending_at_bound,
+    );
+    // One variable: one more event in the same frame.
+    let expected = format!(
+        "PendingSseEventCountExceeded {{ maximum_events: {MAX_PENDING_MODERN_HTTP_SSE_EVENTS} }}"
+    );
+    assert!(
+        lanes.sse_pending_over_bound.starts_with("refused:")
+            && lanes.sse_pending_over_bound.contains(&expected),
+        "one pending event over the memory bound must be refused as {expected}, observed {}",
+        lanes.sse_pending_over_bound
+    );
+    builder.negative("pending-events-plus-one", &lanes.sse_pending_over_bound);
 }
 
 fn case_response_isolation(builder: &mut CaseBuilder, lanes: &ResponseLanes) {
@@ -3167,7 +3362,7 @@ fn case_response_isolation(builder: &mut CaseBuilder, lanes: &ResponseLanes) {
     );
     builder.positive("owner-and-sibling-terminals", &lanes.isolation_admitted);
 
-    // One variable: the owner's payload is truncated JSON.
+    // One variable: the owner's payload is its own terminal, one byte short.
     assert!(
         sibling_intact(lanes.isolation_malformed.as_str())
             && lanes
@@ -3179,11 +3374,16 @@ fn case_response_isolation(builder: &mut CaseBuilder, lanes: &ResponseLanes) {
     builder.negative("owner-payload=malformed", &lanes.isolation_malformed);
 
     // One variable: the owner's payload is a server->client request instead of
-    // its result.
+    // its result. It decodes as a JSON-RPC request, so the listener hands it to
+    // final notification admission, which refuses it for carrying an id.
     assert!(
         sibling_intact(lanes.isolation_server_request.as_str())
-            && lanes.isolation_server_request.contains("|| owner=refused:"),
-        "an invalid-direction owner payload must fail only the owner, observed {}",
+            && lanes.isolation_server_request.contains(
+                "|| owner=refused:NotificationAdmission(RequestIdPresent { method: \
+                 \"sampling/createMessage\" })"
+            ),
+        "an invalid-direction owner payload must fail only the owner, as the typed \
+         request-id refusal, observed {}",
         lanes.isolation_server_request
     );
     builder.negative(
