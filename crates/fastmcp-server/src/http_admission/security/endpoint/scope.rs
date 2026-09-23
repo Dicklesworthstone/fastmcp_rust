@@ -153,7 +153,7 @@ pub(super) async fn dispatch(
         Ok(authorization) => authorization,
         Err(response) => return Ok((ServerHttpEndpointResponse::Immediate(response), None)),
     };
-    dispatch_with_authorization(session, cx, policy, request, authorization, None, revalidation)
+    Box::pin(dispatch_with_authorization(session, cx, policy, request, authorization, None, revalidation))
         .await.map_err(|_| SecuredHttpEndpointError::DispatchFailed)
 }
 
@@ -177,10 +177,10 @@ async fn dispatch_with_authorization(
         endpoint.handle(cx, prepared.request)?
     };
     let mut lease = prepared.lease;
-    let response = guard_response(cx, &mut lease, session.handle_modern(
+    let response = Box::pin(guard_response(cx, &mut lease, session.handle_modern(
         cx, endpoint_response, authorization, prepared.raw_params,
         Some(prepared.receipt), cancellation,
-    )).await;
+    ))).await;
     match response {
         Ok(response) => Ok((response?, lease)),
         // No response head has been published by this path. Retire the failed
@@ -207,7 +207,7 @@ pub(super) async fn dispatch_socket_json(
         Ok(session) => session,
         Err(_) => return HttpResponse::internal_error(),
     };
-    dispatch_with_authorization(&mut session, cx, policy, request, authorization, Some(cancellation), None)
+    Box::pin(dispatch_with_authorization(&mut session, cx, policy, request, authorization, Some(cancellation), None))
         .await
         .map_err(ServerHttpEndpointError::from_internal)
         .map(|(response, _)| http_endpoint_response_to_static(cx, response))
@@ -250,10 +250,10 @@ pub(super) async fn begin_sse(
     };
     let DualEraHttpEndpointResponse::ModernSse(sse) = endpoint_response else {
         let mut lease = prepared.lease;
-        return match guard_response(cx, &mut lease, session.handle_modern(
+        return match Box::pin(guard_response(cx, &mut lease, session.handle_modern(
             cx, endpoint_response, authorization, prepared.raw_params,
             Some(prepared.receipt), None,
-        )).await {
+        ))).await {
             Ok(response) => response.map(Err),
             Err(_) => Ok(Err(ServerHttpEndpointResponse::Immediate(refusal(503)))),
         };
