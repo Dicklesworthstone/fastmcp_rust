@@ -92,6 +92,9 @@ pub enum ManagedTaskSnapshotCause {
     ChangeNotification,
     /// Fresh state after a new, fully acknowledged recovery subscription.
     Reconnected,
+    /// A fresh read after an explicitly enabled fallback retired a stalled
+    /// subscription. This is neither a notification nor an event-history replay.
+    PollingFallback,
 }
 
 /// One current Task, including input-required, completed, failed or cancelled

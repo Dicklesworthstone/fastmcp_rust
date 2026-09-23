@@ -7,6 +7,11 @@
 //! No creating call, input answer or cancellation can enter this owner.
 //! Input drivers reuse this observation engine with their original credential
 //! pinned: natural expiry then stops the run instead of authorizing renewal.
+//! An opt-in polling fallback also bounds waiting for a new snapshot after
+//! initial reconciliation. It retires the stalled stream, never its authority
+//! checks, and polls only unfinished Tasks with the current pinned credential.
+
+mod polling;
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -35,6 +40,7 @@ pub struct ClientCredentialsTaskRecoveryPolicy {
     maximum_reconnections: usize,
     minimum_delay: Duration,
     maximum_delay: Duration,
+    polling_interval: Option<Duration>,
 }
 
 impl Default for ClientCredentialsTaskRecoveryPolicy {
@@ -43,6 +49,7 @@ impl Default for ClientCredentialsTaskRecoveryPolicy {
             maximum_reconnections: 4,
             minimum_delay: Duration::from_secs(1),
             maximum_delay: Duration::from_secs(30),
+            polling_interval: None,
         }
     }
 }
@@ -60,8 +67,39 @@ impl ClientCredentialsTaskRecoveryPolicy {
         {
             return Err(ClientCredentialsTaskRecoveryError::InvalidPolicy);
         }
-        Ok(Self { maximum_reconnections, minimum_delay, maximum_delay })
+        Ok(Self { maximum_reconnections, minimum_delay, maximum_delay, polling_interval: None })
     }
+
+    /// Opt into polling when an acknowledged subscription stops producing
+    /// snapshots. Each Task is due no sooner than the larger of this interval
+    /// and its last admitted pollIntervalMs. Use one second for the ordinary
+    /// local fallback; the configurable interval is bounded to 1 ms..=60 s.
+    /// Longer peer hints are respected, never clamped down to this local bound.
+    ///
+    /// Initial admission and initial snapshots must succeed first. On a due
+    /// timer the pending read and its socket are dropped, then observation
+    /// permanently switches to fresh discovery/get with the same credential.
+    /// This can abandon an in-flight read-only get, whose snapshot slot remains
+    /// charged. A result/refusal completing an entered read wins its timer
+    /// race. An overdue slot after a caller pause retires the idle stream before
+    /// starting another read, so activity for other Tasks cannot starve it.
+    /// There is no credential renewal,
+    /// resubscription or retry after an error in polling mode.
+    ///
+    /// The original deadline, snapshot budget, IDs and delivered terminals
+    /// survive the switch. Input and persisted watches share this engine, but
+    /// their mutation, persistence and cancellation contracts are unchanged.
+    pub fn with_polling_fallback(mut self, minimum_interval: Duration)
+        -> Result<Self, ClientCredentialsTaskRecoveryError>
+    {
+        if minimum_interval < Duration::from_millis(1)
+            || minimum_interval > Duration::from_secs(60)
+        { return Err(ClientCredentialsTaskRecoveryError::InvalidPolicy); }
+        self.polling_interval = Some(minimum_interval);
+        Ok(self)
+    }
+
+    pub fn polling_fallback_interval(&self) -> Option<Duration> { self.polling_interval }
 
     pub(super) fn connection_policy(
         self,
@@ -180,6 +218,12 @@ pub struct RecoveringClientCredentialsTaskWatch {
 
 impl RecoveringClientCredentialsTaskWatch {
     pub fn reconnection_attempts(&self) -> usize { self.recovery.reconnection_attempts() }
+    /// Remains true after fallback, including after failure or explicit close.
+    pub fn using_polling_fallback(&self) -> bool { self.recovery.polling_active() }
+    /// Fallback discovery/get attempts begun, including failed or abandoned ones.
+    pub fn polling_attempts(&self) -> usize {
+        self.recovery.polling.as_ref().map_or(0, polling::PollFallback::attempts)
+    }
 
     /// Releases local observation only, without changing the machine client,
     /// the caller's cancellation domain or any remote Task.
@@ -213,6 +257,7 @@ pub(super) struct RecoveryState {
     policy: ClientCredentialsTaskRecoveryPolicy,
     intervals: Vec<Duration>,
     reconnections: usize,
+    polling: Option<polling::PollFallback>,
 }
 
 impl RecoveryState {
@@ -225,6 +270,8 @@ impl RecoveryState {
             connection_policy, policy,
             intervals: vec![policy.minimum_delay; watch.state.task_ids.len()],
             reconnections: 0,
+            polling: policy.polling_interval.map(|interval|
+                polling::PollFallback::new(watch.state.task_ids.len(), interval)),
         }
     }
 
@@ -240,6 +287,7 @@ impl RecoveryState {
             .ok_or(ClientCredentialsTaskWatchError::UnexpectedEvent)?;
         if !watch.state.terminal[index] {
             self.intervals[index] = read_interval(task, self.policy.minimum_delay)?;
+            if let Some(polling) = &mut self.polling { polling.record(index, task)?; }
         }
         Ok(())
     }
@@ -250,14 +298,29 @@ impl RecoveryState {
         watch: &mut ClientCredentialsTaskWatch,
         pinned: Option<&ClientCredentialsSnapshot>,
     ) -> Result<Option<ManagedTaskSnapshot>, ClientCredentialsTaskRecoveryError> {
+        if watch.finished { return Ok(None); }
+        if self.polling_active() { return self.polling_snapshot(cx, watch, pinned).await; }
         loop {
-            match watch.next_snapshot(cx).await {
+            let observed = match self.fallback_deadline(cx, watch)? {
+                Some(due) if due <= cx.now() => None,
+                Some(due) => polling::until_due(watch.next_snapshot(cx), due).await,
+                None => Some(watch.next_snapshot(cx).await),
+            };
+            let Some(observed) = observed else {
+                // Drop either the idle stream or the entered read's partial
+                // framing. until_due destroys its future before returning.
+                watch.close();
+                self.polling.as_mut().ok_or(ClientCredentialsTaskWatchError::UnexpectedEvent)?.start();
+                return self.polling_snapshot(cx, watch, pinned).await;
+            };
+            match observed {
                 Ok(mut snapshot) => {
                     if let Some(snapshot) = &mut snapshot {
                         if self.reconnections > 0 && snapshot.cause == ManagedTaskSnapshotCause::Initial {
                             snapshot.cause = ManagedTaskSnapshotCause::Reconnected;
                         }
                         self.record_snapshot(watch, &snapshot.task)?;
+                        self.anchor_poll(cx, watch, &snapshot.task)?;
                     }
                     return Ok(snapshot);
                 }
@@ -273,6 +336,10 @@ impl RecoveryState {
         pinned: Option<&ClientCredentialsSnapshot>,
         error: ClientCredentialsTaskWatchError,
     ) -> Result<(), ClientCredentialsTaskRecoveryError> {
+        // Also applies to an input driver's post-ACK reconciliation failure.
+        // Keep its receipt, but never restore a subscription/retry opportunity
+        // after this owner has switched to explicit, non-retrying polling.
+        if self.polling_active() { return Err(error.into()); }
         let owner = watch.client.client.inner.closed.clone();
         let cancellation = watch.cancellation.clone();
         let deadline = watch.deadline;
