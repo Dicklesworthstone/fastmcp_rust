@@ -1752,7 +1752,14 @@ mod bd_6rfrg_sampling_bridge {
         Errored(String),
         /// Nothing came back inside [`SAMPLING_DEADLINE`]. This is the hazard: no
         /// error, no timeout, no diagnostic, and the evidence destroyed with it.
-        NoOutcomeWithinBound { sampling_requests: usize },
+        NoOutcomeWithinBound {
+            #[allow(
+                dead_code,
+                reason = "read only through the derived Debug in the arms' `{subject:?}` failure \
+                          messages; dead-code analysis ignores derived Debug by design"
+            )]
+            sampling_requests: usize,
+        },
         /// The pump returned but produced no response correlated to the call.
         NoCorrelatedResponse {
             observed: Vec<Option<fastmcp_protocol::RequestId>>,
