@@ -44,15 +44,13 @@ impl JournalCase {
     fn resumes_input(self) -> bool { matches!(self, Self::PartialRestart | Self::LostAck) }
     fn updates(self) -> usize {
         if self.completes() { 2 }
-        else if self.partial() || matches!(self, Self::LostUpdate | Self::FailedAck | Self::LostAck | Self::CancelAck) { 1 }
-        else { 0 }
+        else { usize::from(self.partial() || matches!(self, Self::LostUpdate | Self::FailedAck | Self::LostAck | Self::CancelAck)) }
     }
     fn gets(self) -> usize { if self.completes() { 3 } else if self.partial() { 2 } else { 1 } }
     fn generation(self) -> u64 {
         if self.completes() { 4 }
         else if self.partial() || matches!(self, Self::LostAck) { 2 }
-        else if matches!(self, Self::LostIntent | Self::LostUpdate | Self::FailedAck | Self::CancelAck) { 1 }
-        else { 0 }
+        else { u64::from(matches!(self, Self::LostIntent | Self::LostUpdate | Self::FailedAck | Self::CancelAck)) }
     }
     fn pending_save(self) -> bool {
         !self.completes() && !self.partial() && !matches!(self, Self::LostUpdate)
@@ -149,7 +147,7 @@ impl TaskInputJournalPersistence for Persistence {
             let generation = change.proposed().generation();
             let ack = change.proposed().update_state() == TaskInputUpdateState::Acknowledged;
             assert_eq!(generation, change.expected().generation() + 1);
-            assert_eq!(ack, generation % 2 == 0);
+            assert_eq!(ack, generation.is_multiple_of(2));
             let pause_generation = if matches!(self.case, JournalCase::CancelAck) { 2 } else { 1 };
             if self.case.pauses() && generation == pause_generation {
                 self.entered.cancel();
@@ -272,13 +270,13 @@ async fn scenario(cx: &Cx, case: JournalCase) {
                 assert!(driving.as_mut().poll(task).is_pending());
                 if persistence.entered.is_cancel_requested() { Poll::Ready(()) } else { Poll::Pending }
             }).await;
-            assert_eq!(storage.snapshot().generation(), if matches!(case, JournalCase::CancelAck) { 1 } else { 0 });
+            assert_eq!(storage.snapshot().generation(), u64::from(matches!(case, JournalCase::CancelAck)));
             // The provider was actually entered; an unpolled dummy cannot
             // satisfy this boundary. No update/get may overtake its completion.
             // Do not poll the active listener with a noop waker: that could
             // replace the server future's registration while it awaits a POST.
             assert_eq!(peer.gets.load(Ordering::SeqCst), 1);
-            assert_eq!(peer.updates.load(Ordering::SeqCst), if matches!(case, JournalCase::CancelAck) { 1 } else { 0 });
+            assert_eq!(peer.updates.load(Ordering::SeqCst), usize::from(matches!(case, JournalCase::CancelAck)));
             if matches!(case, JournalCase::ReleasedIntent) { persistence.release.cancel(); }
             if matches!(case, JournalCase::CancelIntent | JournalCase::CancelAck) { cancellation.cancel(); }
         }
@@ -343,7 +341,7 @@ async fn scenario(cx: &Cx, case: JournalCase) {
     }
     assert_eq!(*peer.seen.lock().unwrap(), expected);
     assert_eq!(peer.gets.load(Ordering::SeqCst), case.gets() + if case.restarts() { if case.resumes_input() { 2 } else { 1 } } else { 0 });
-    assert_eq!(peer.updates.load(Ordering::SeqCst), case.updates() + if case.resumes_input() { 1 } else { 0 });
+    assert_eq!(peer.updates.load(Ordering::SeqCst), case.updates() + usize::from(case.resumes_input()));
     let final_generation = if case.resumes_input() { 4 } else { case.generation() };
     assert_eq!(*storage.committed.lock().unwrap(), (1..=final_generation).collect::<Vec<_>>());
     assert_eq!(cancellation.is_cancel_requested(), matches!(case, JournalCase::CancelIntent | JournalCase::CancelAck));
@@ -409,7 +407,7 @@ async fn restart(cx: &Cx, peer: &Peer, client: &ManagedTasksClient, binding: &Ta
         assert_eq!(*storage.bytes.lock().unwrap(), before);
     }
     assert_eq!(persistence.calls.load(Ordering::SeqCst), if case.resumes_input() { 2 } else { 0 });
-    assert_eq!(resolutions.load(Ordering::SeqCst), if case.resumes_input() { 1 } else { 0 });
+    assert_eq!(resolutions.load(Ordering::SeqCst), usize::from(case.resumes_input()));
     assert_eq!(observations.load(Ordering::SeqCst), if matches!(case, JournalCase::ChangedTask) { 0 }
         else if case.resumes_input() { 2 } else { 1 });
     assert_eq!(driver.input_journal().unwrap().record().unwrap(), &storage.snapshot());
