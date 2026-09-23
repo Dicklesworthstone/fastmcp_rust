@@ -10,8 +10,9 @@
 //! Stop, clean subscription completion, failure and dropping the watch future
 //! also retire the current snapshot. Already-dispatched effects and delivered
 //! results cannot be recalled. Invalidation fences subsequent admission and
-//! publication but does not itself wake a pending socket; request cancellation
-//! and the existing transport deadlines retain that responsibility.
+//! publication and wakes pending tool requests, reads and continuations. Their
+//! caller-owned futures release their resources on the next poll or Drop; no
+//! cancellation is sent to the shared login or the caller's context.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -228,7 +229,7 @@ impl ManagedOAuthSession {
                             // fails. Failed refresh must never restore old handles.
                             active.invalidate();
                             let (contracts, invalidated) = admit_contracts(catalog.pages(), limits)?;
-                            active.install(Arc::clone(&invalidated));
+                            active.install_contracts(Arc::clone(&invalidated), &contracts);
                             ManagedToolCatalogEvent::Snapshot(ManagedToolCatalogSnapshot(Arc::new(Snapshot {
                                 session: self.clone(), catalog, contracts, invalidated,
                             })))
@@ -256,17 +257,26 @@ impl ManagedOAuthSession {
 }
 
 #[derive(Default)]
-struct ActiveCatalog(Option<Arc<AtomicBool>>);
+struct ActiveCatalog(Option<Arc<AtomicBool>>, Vec<McpRequestCancellation>);
 
 impl ActiveCatalog {
     fn invalidate(&mut self) {
         if let Some(invalidated) = self.0.take() {
+            // Publish group invalidity before waking any single tool. A waker
+            // may immediately schedule another sibling's next poll.
             invalidated.store(true, Ordering::Release);
         }
+        for signal in self.1.drain(..) { signal.cancel(); }
     }
     fn install(&mut self, invalidated: Arc<AtomicBool>) {
         self.invalidate();
         self.0 = Some(invalidated);
+    }
+    fn install_contracts(&mut self, invalidated: Arc<AtomicBool>, contracts: &Contracts) {
+        self.install(invalidated);
+        // The admitted catalog's hard tool-count bound also bounds this set.
+        // Keep only wake signals, not schemas, pages, tool clients or sessions.
+        self.1.extend(contracts.values().map(|contract| contract.invalidation.clone()));
     }
     fn observe_notification(&mut self, notification: &ServerNotification) {
         if matches!(notification, ServerNotification::ToolsListChanged(_)) { self.invalidate(); }
@@ -317,3 +327,6 @@ impl Write for DefinitionBytes {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod wake_tests;
