@@ -28,6 +28,8 @@ use super::rpc::{ManagedCoreCall, ManagedCoreError, ManagedCoreEvent, ManagedCor
 
 /// Explicit multi-round tool operations retaining this same schema contract.
 pub mod interaction;
+/// Caller-driven catalog watches publishing invalidation-bound tool clients.
+pub mod catalog;
 
 /// Combined encoded-byte ceiling for one retained input/output schema pair.
 pub const MAX_MANAGED_TOOL_SCHEMA_BYTES: usize = 512 * 1024;
@@ -83,6 +85,7 @@ struct ToolContract {
     input: AdmittedToolHeaderSchema,
     output: Option<AdmittedSchema>,
     invalidated: AtomicBool,
+    catalog_invalidated: Option<Arc<AtomicBool>>,
 }
 
 impl ToolContract {
@@ -118,11 +121,16 @@ impl ToolContract {
             serde_json::to_writer(&mut bytes, output.schema())
                 .map_err(|_| ManagedToolError::SchemaTooLarge)?;
         }
-        Ok(Self { name: tool.name, input, output, invalidated: AtomicBool::new(false) })
+        Ok(Self { name: tool.name, input, output, invalidated: AtomicBool::new(false), catalog_invalidated: None })
+    }
+
+    fn is_invalidated(&self) -> bool {
+        self.invalidated.load(Ordering::Acquire)
+            || self.catalog_invalidated.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire))
     }
 
     fn check(&self) -> Result<(), ManagedToolError> {
-        if self.invalidated.load(Ordering::Acquire) {
+        if self.is_invalidated() {
             Err(ManagedToolError::Invalidated)
         } else {
             Ok(())
@@ -229,7 +237,7 @@ impl ManagedToolClient {
     /// handle for prompt abort. A new definition requires a new client.
     pub fn invalidate(&self) { self.contract.invalidated.store(true, Ordering::Release); }
 
-    pub fn is_invalidated(&self) -> bool { self.contract.invalidated.load(Ordering::Acquire) }
+    pub fn is_invalidated(&self) -> bool { self.contract.is_invalidated() }
 
     /// Validates an invocation without acquiring credentials or dispatching it.
     /// The exact name, protocol era and full argument schema must match.
