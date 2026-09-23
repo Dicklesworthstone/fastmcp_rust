@@ -63,9 +63,9 @@ fn isolated_persistence(name: &str, case: PersistenceCase) {
             let test = Box::pin(async {
                 let peer = Peer::new().await;
                 match case {
-                    PersistenceCase::Redelivery => redelivery(&peer, &cx).await,
+                    PersistenceCase::Redelivery => Box::pin(redelivery(&peer, &cx)).await,
                     PersistenceCase::Preflight => preflight(&peer, &cx).await,
-                    _ => lifecycle(&peer, &cx, case).await,
+                    _ => Box::pin(lifecycle(&peer, &cx, case)).await,
                 }
                 peer.no_extra_request();
                 assert!(cx.checkpoint().is_ok());
@@ -638,7 +638,7 @@ mod remote_cancellation {
             } else {
                 assert!(watch.pending().is_none());
                 assert_eq!(memory.borrow().as_ref(), Some(watch.last_published_record()));
-                assert_eq!(calls.get(), if matches!(case, Case::PendingGet) { 0 } else { 1 });
+                assert_eq!(calls.get(), i32::from(!matches!(case, Case::PendingGet)));
             }
             assert!(matches!(watch.acknowledge_terminal(cx).await, Err(PersistedTaskWatchError::NoTerminal)));
             let before = calls.get();
