@@ -21463,6 +21463,7 @@ expect_request notifications/initialized ''
         }
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn proxy_legacy_http_post_commit_cancellation_leaves_the_route_available_to_a_sibling() {
         let listener = TcpListener::bind("127.0.0.1:0")
