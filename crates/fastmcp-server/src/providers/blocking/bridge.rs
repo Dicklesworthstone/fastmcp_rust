@@ -237,10 +237,10 @@ mod tests {
             let lane = BlockingHandlerLane::new(1).unwrap();
             let polls = Arc::new(AtomicUsize::new(0));
             // Even manually declaring a core blocking lane grants no worker.
-            let _declared = fastmcp_core::runtime::enter_blocking_lane();
+            let declared = fastmcp_core::runtime::enter_blocking_lane();
             assert!(lane.wait_for(async { polls.fetch_add(1, Ordering::SeqCst); Ok(1) }).is_err());
             assert_eq!(polls.load(Ordering::SeqCst), 0);
-            drop(_declared);
+            drop(declared);
             let admitted = lane.clone();
             let other = BlockingHandlerLane::new(1).unwrap();
             let observed = Arc::clone(&polls);
@@ -390,7 +390,7 @@ mod tests {
             let probe_lane = lane.clone();
             let mut probe = cx.spawn_blocking(move |_| {
                 probe_lane.wait_for(async { panic!("unadmitted future must not be polled") })
-                    .map(|_: ()| ())
+                    .map(|(): ()| ())
             }).unwrap();
             assert!(probe.join(&cx).await.unwrap().is_err());
             let admitted = lane.clone();
