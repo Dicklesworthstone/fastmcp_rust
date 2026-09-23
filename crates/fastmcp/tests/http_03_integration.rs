@@ -113,7 +113,7 @@ const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 /// literals reconstructed from `http_executor.rs` - and agreeing with the same
 /// two values frozen by the A and B producer targets.
 const HTTP_03_A_MANIFEST_DIGEST_HEX: &str =
-    "eb1f9660f31883c6fb17c1618cd84492036fb71f6733f9ee74e55f188100aef8";
+    "0d5bed420fce1798b7db9cb1ea2dc52ca40496b58cecb5475a95798ea880c2cc";
 const HTTP_03_B_MANIFEST_DIGEST_HEX: &str =
     "23fb2f9a13130aea1c80891371979494a116ac978fd78d987de1152b18af7135";
 
@@ -2714,9 +2714,12 @@ fn case_one_post_exact_body(builder: &mut CaseBuilder, wire: &WireObservations) 
     );
     builder.negative("params=[]", &wire.b_params_refusal);
 
-    // One variable: one body byte. The expected serialization with the tool
-    // name's final byte changed must NOT match what was transmitted, so the
-    // exact comparison above discriminates at a single byte.
+    // INSTRUMENT CONTROL, deliberately not recorded as an observation (rulings
+    // #35). The expected serialization with the tool name's final byte changed
+    // must not match the transmitted body. That shows the byte comparison above
+    // distinguishes a one-byte change. It runs after that comparison has
+    // passed, so it observes nothing about the product and counts toward no
+    // floor.
     let mut perturbed = expected;
     let position = perturbed
         .windows(b"http_03_join_tool".len())
@@ -2727,11 +2730,7 @@ fn case_one_post_exact_body(builder: &mut CaseBuilder, wire: &WireObservations) 
     perturbed[position] = b'X';
     assert_ne!(
         wire.a_call.body, perturbed,
-        "a body differing in one byte must not compare equal"
-    );
-    builder.negative(
-        "one-body-byte",
-        &format!("byte {position} changed -> mismatch"),
+        "instrument control: a body differing in byte {position} must not compare equal"
     );
 }
 

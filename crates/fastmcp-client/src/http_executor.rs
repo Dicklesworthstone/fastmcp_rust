@@ -178,7 +178,7 @@ pub const HTTP_03_A_EVALUATOR_MANIFEST_V1: &str = concat!(
     "producer-tree 9eaea54b5d866441d51de43a3ae062b36cb79e95\n",
     "entrypoint fastmcp_client::http_executor::ModernHttpExecutor::execute\n",
     "HTTP-03.01 public-client-request-construction floor=5\n",
-    "HTTP-03.02 one-post-exact-json-body floor=6\n",
+    "HTTP-03.02 one-post-exact-json-body floor=5\n",
     "HTTP-03.03 request-content-type-and-two-range-accept floor=7\n",
     "HTTP-03.04 identity-accept-encoding-no-decompression floor=6\n",
     "HTTP-03.05 protocol-method-name-routing-headers floor=13\n",
