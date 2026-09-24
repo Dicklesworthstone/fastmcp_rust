@@ -7,7 +7,9 @@
 /// Explicitly reviewed, resource-bound tool parameter headers.
 pub mod parameter_headers;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+#[cfg(feature = "legacy-2024-11-05")]
+use std::collections::HashMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
@@ -23,6 +25,7 @@ use asupersync::http::h1::http_client::{ClientIo, ParsedUrl, Scheme};
 use asupersync::http::h1::{
     ClientError, ClientIncomingBody, ClientStreamingResponse, Http1Client, Method, Request,
 };
+#[cfg(feature = "legacy-2024-11-05")]
 use asupersync::http::h1::{HttpClient, RedirectPolicy, RetryPolicy};
 use asupersync::http::{Body, Frame};
 use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -53,11 +56,13 @@ use fastmcp_protocol::tasks_extension::{
     TaskMethodRequest, TaskRequestMeta, TaskStatusNotification as FinalTaskStatusNotification,
     UpdateTaskParams as FinalUpdateTaskParams, UpdateTaskResult as FinalUpdateTaskResult,
 };
+#[cfg(feature = "legacy-2024-11-05")]
+use fastmcp_protocol::{CancellationSender, CancellationWireMessage, CorrelationKey};
 use fastmcp_protocol::{
-    CancellationSender, CancellationWireMessage, ClientCapabilities, ClientInfo, CompleteResult,
-    CoreDispatchError, CoreRequest, CoreResult, CorrelationKey, FINAL_CLIENT_CAPABILITIES_META_KEY,
-    FINAL_CLIENT_INFO_META_KEY, FINAL_LOG_LEVEL_META_KEY, FINAL_SUBSCRIPTION_ID_META_KEY,
-    FinalCoreResult, FinalNotificationError, FinalProgressNotificationParams, FinalRequestMeta,
+    ClientCapabilities, ClientInfo, CompleteResult, CoreDispatchError, CoreRequest, CoreResult,
+    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY, FINAL_LOG_LEVEL_META_KEY,
+    FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreResult, FinalNotificationError,
+    FinalProgressNotificationParams, FinalRequestMeta,
     FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenResult,
     InputRequiredResult, JsonInteger, JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest,
     JsonRpcResponse, RequestId, SERVER_DISCOVER, ServerDiscoverResult, ServerNotification,
@@ -73,13 +78,15 @@ use crate::{
     ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
     ClientProtocolPlan, MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_INPUT_RESPONSES,
     MAX_MRTR_TOTAL_INPUT_RESPONSES, MrtrInputResponses, RequestTimeoutPolicy, RequestTimeoutSource,
-    ReverseCallbackState, ReverseRequestCancellation, ReverseRequestHandlers,
-    SubscriptionTimeoutPolicy, validate_protocol_plan_feature,
+    ReverseRequestHandlers, SubscriptionTimeoutPolicy, validate_protocol_plan_feature,
 };
+#[cfg(feature = "legacy-2024-11-05")]
+use crate::{ReverseCallbackState, ReverseRequestCancellation};
 #[cfg(feature = "tasks")]
 use crate::{admit_final_tasks_discovery_surface, admit_final_tasks_result_discriminator};
 use fastmcp_core::{McpError, McpRequestCancellation, McpResult, Sha256Digest, sha256_bounded};
 
+#[cfg(feature = "legacy-2024-11-05")]
 const LEGACY_CANCELLATION_CONTROL_SEND_TIMEOUT_NANOS: u64 = 100_000_000;
 
 /// Exact request headers required for a modern MCP JSON-RPC POST.
@@ -282,15 +289,19 @@ const MAX_MODERN_HTTP_INTERLEAVED_CONTROL_FRAMES: usize = 64;
 pub const MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES: usize = 64 * 1024;
 
 /// Maximum retained bytes in one legacy SSE event, including its field names.
+#[cfg(feature = "legacy-2024-11-05")]
 const MAX_LEGACY_SSE_EVENT_BYTES: usize = 64 * 1024;
 
 /// Maximum bytes in one legacy SSE line before the connection is refused.
+#[cfg(feature = "legacy-2024-11-05")]
 const MAX_LEGACY_SSE_LINE_BYTES: usize = 16 * 1024;
 
 /// Maximum ignored legacy SSE comment lines between dispatched events.
+#[cfg(feature = "legacy-2024-11-05")]
 const MAX_LEGACY_SSE_KEEPALIVE_LINES: usize = 64;
 
 /// Maximum JSON-RPC bytes accepted from one legacy `message` SSE event.
+#[cfg(feature = "legacy-2024-11-05")]
 const MAX_LEGACY_SSE_MESSAGE_BYTES: usize = 64 * 1024;
 
 /// Maximum complete legacy SSE events retained after one native body frame.
@@ -298,18 +309,22 @@ const MAX_LEGACY_SSE_MESSAGE_BYTES: usize = 64 * 1024;
 /// The exact legacy lane shares one long-lived response body. Individual event
 /// limits alone do not bound the allocation caused by a native body frame
 /// containing many otherwise-valid events.
+#[cfg(feature = "legacy-2024-11-05")]
 const MAX_PENDING_LEGACY_SSE_EVENTS: usize = 128;
 
 /// Maximum UTF-8 bytes retained by complete legacy SSE events waiting for the
 /// next caller read.
+#[cfg(feature = "legacy-2024-11-05")]
 const MAX_PENDING_LEGACY_SSE_EVENT_BYTES: usize = 64 * 1024;
 
 /// Maximum interleaved notifications and reverse requests accepted while one
 /// legacy request waits for its correlated terminal response.
+#[cfg(feature = "legacy-2024-11-05")]
 const MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES: usize = 64;
 
 /// Maximum server notifications retained while one legacy request waits for
 /// its correlated terminal response.
+#[cfg(feature = "legacy-2024-11-05")]
 const MAX_QUEUED_LEGACY_NOTIFICATIONS: usize = MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES;
 
 /// Maximum terminal response IDs retained after server-authorized cancellation.
@@ -318,20 +333,24 @@ const MAX_QUEUED_LEGACY_NOTIFICATIONS: usize = MAX_LEGACY_INTERLEAVED_CONTROL_FR
 /// after the caller has already received `notifications/cancelled`. Retaining a
 /// bounded tombstone lets the next request discard that late terminal frame
 /// without misaligning the shared SSE stream.
+#[cfg(feature = "legacy-2024-11-05")]
 const MAX_QUEUED_LEGACY_CANCELLED_RESPONSE_IDS: usize = 64;
 
 /// Maximum locally owned legacy response waiters. The persistent reader never
 /// permits an unbounded server stream to create local correlation state.
+#[cfg(feature = "legacy-2024-11-05")]
 const MAX_PERSISTENT_LEGACY_RESPONSE_WAITERS: usize = 64;
 
 /// Maximum live exact-2024 server-to-client callbacks owned by one persistent
 /// legacy SSE connection. This bounds both retained cancellation state and
 /// spawned callback tasks while leaving the shared SSE reader free to accept a
 /// matching cancellation notification.
+#[cfg(feature = "legacy-2024-11-05")]
 const MAX_PERSISTENT_LEGACY_REVERSE_CALLBACKS: usize = 16;
 
 /// Final-only metadata keys that exact 2024-11-05 public requests must reject
 /// before opening their legacy message POST.
+#[cfg(feature = "legacy-2024-11-05")]
 const FINAL_ONLY_LEGACY_REQUEST_METADATA_KEYS: [&str; 5] = [
     "io.modelcontextprotocol/protocolVersion",
     "io.modelcontextprotocol/clientCapabilities",
@@ -2012,6 +2031,7 @@ impl ModernHttpSseResponseStream {
     }
 
     /// A released stream used when a JSON Task body already supplied the terminal.
+    #[cfg(any(test, feature = "tasks"))]
     fn released() -> Self {
         Self {
             response: None,
@@ -3249,6 +3269,7 @@ async fn execute_native_modern_request(
     .map_err(ClientError::from)
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 fn native_http_client() -> HttpClient {
     HttpClient::builder()
         .redirect_policy(RedirectPolicy::None)
@@ -3483,17 +3504,6 @@ pub struct LegacySseConnection {
     client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
 }
 
-#[cfg(not(feature = "legacy-2024-11-05"))]
-struct LegacySseConnection {
-    client: LegacySseHttpClient,
-    negotiated_protocol_version: Option<String>,
-    client_capabilities: ClientCapabilities,
-    reverse_request_handlers: ReverseRequestHandlers,
-    cancelled_response_ids: VecDeque<RequestId>,
-    persistent_receiver: Option<Arc<LegacySsePersistentReceiver>>,
-    client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
-}
-
 /// A connected client HTTP transport selected by its immutable protocol plan.
 ///
 /// Auto performs the modern probe and, only for an authorized refusal, opens
@@ -3545,12 +3555,7 @@ pub struct LegacyHttpRequestCommit {
     request_id: RequestId,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg(not(feature = "legacy-2024-11-05"))]
-struct LegacyHttpRequestCommit {
-    request_id: RequestId,
-}
-
+#[cfg(feature = "legacy-2024-11-05")]
 impl LegacyHttpRequestCommit {
     /// Returns the exact JSON-RPC ID whose POST acknowledgement was observed.
     #[must_use]
@@ -3576,16 +3581,7 @@ pub struct LegacyHttpRequest {
     terminal: bool,
 }
 
-#[cfg(not(feature = "legacy-2024-11-05"))]
-struct LegacyHttpRequest {
-    commit: LegacyHttpRequestCommit,
-    key: CorrelationKey,
-    receiver: oneshot::Receiver<LegacyPersistentResponse>,
-    state: Arc<std::sync::Mutex<LegacySsePersistentState>>,
-    outbound: LegacySseHttpOutbound,
-    terminal: bool,
-}
-
+#[cfg(feature = "legacy-2024-11-05")]
 impl LegacyHttpRequest {
     /// Returns the confirmed POST-commit receipt.
     #[must_use]
@@ -3757,6 +3753,7 @@ impl LegacyHttpRequest {
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl Drop for LegacyHttpRequest {
     fn drop(&mut self) {
         let _ = self.retire();
@@ -5594,6 +5591,7 @@ impl ClientHttpConnection {
 /// correlated response. Counting both notifications and reverse requests
 /// prevents an upstream from bypassing the request-owned stream bound by
 /// alternating frame kinds.
+#[cfg(feature = "legacy-2024-11-05")]
 fn admit_legacy_interleaved_control_frame(
     count: &mut usize,
 ) -> Result<(), ClientHttpConnectionError> {
@@ -5610,6 +5608,7 @@ fn admit_legacy_interleaved_control_frame(
 
 /// Returns whether this exact legacy server cancellation is valid and owns the
 /// application request currently awaiting an SSE response.
+#[cfg(feature = "legacy-2024-11-05")]
 fn matching_legacy_request_cancellation(
     notification: &JsonRpcRequest,
     active_request_id: &RequestId,
@@ -5624,6 +5623,7 @@ fn matching_legacy_request_cancellation(
     params.request_id.correlates_with(active_request_id)
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 fn legacy_cancelled_request_id(notification: &JsonRpcRequest) -> Option<RequestId> {
     let Ok(CancellationWireMessage::Legacy2024 { params, .. }) = CancellationWireMessage::decode(
         ProtocolEra::Legacy2024,
@@ -5641,6 +5641,7 @@ fn legacy_cancelled_request_id(notification: &JsonRpcRequest) -> Option<RequestI
 /// The configured callback must match the capability retained for legacy
 /// initialization. Sampling and roots are never serviced merely because a
 /// handler exists; elicitation remains unavailable in exact MCP 2024-11-05.
+#[cfg(feature = "legacy-2024-11-05")]
 async fn legacy_http_server_request_response(
     cx: &Cx,
     client_capabilities: &ClientCapabilities,
@@ -5739,6 +5740,7 @@ fn admit_modern_json_response_body(
     Ok((response, result_source, receipt))
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 fn reject_final_only_legacy_request_metadata(
     parameters: &serde_json::Value,
 ) -> Result<(), ClientHttpConnectionError> {
@@ -6310,6 +6312,10 @@ impl ModernHttpClient {
         &self.modern_post_target
     }
 
+    #[expect(
+        dead_code,
+        reason = "the modern reverse-request response POST has no caller yet; WildMountain decides wire or delete"
+    )]
     async fn post_jsonrpc_response(
         &self,
         cx: &Cx,
@@ -7699,19 +7705,8 @@ pub struct LegacySseHttpClient {
     notifications: VecDeque<JsonRpcRequest>,
 }
 
-/// Internal exact-2024 connection state retained only so feature-off public
-/// constructors can reject legacy policy before any peer contact.
-#[cfg(not(feature = "legacy-2024-11-05"))]
-pub(crate) struct LegacySseHttpClient {
-    protocol_plan: ClientProtocolPlan,
-    configured_message_post_target: String,
-    advertised_message_post_target: String,
-    post_client: HttpClient,
-    stream: Option<LegacySseResponseStream>,
-    notifications: VecDeque<JsonRpcRequest>,
-}
-
 /// Cloneable POST half of an admitted exact-2024 SSE connection.
+#[cfg(feature = "legacy-2024-11-05")]
 #[derive(Clone)]
 struct LegacySseHttpOutbound {
     advertised_message_post_target: String,
@@ -7720,11 +7715,13 @@ struct LegacySseHttpOutbound {
 
 /// One failed exact-2024 message POST together with whether the peer might
 /// already own the corresponding request and therefore emit its SSE response.
+#[cfg(feature = "legacy-2024-11-05")]
 struct LegacySseOutboundSendError {
     error: LegacySseHttpClientError,
     request_may_have_reached_peer: bool,
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl LegacySseOutboundSendError {
     const fn not_submitted(error: LegacySseHttpClientError) -> Self {
         Self {
@@ -7742,6 +7739,7 @@ impl LegacySseOutboundSendError {
 }
 
 /// One locally registered terminal response waiter.
+#[cfg(feature = "legacy-2024-11-05")]
 struct LegacyPersistentResponseWaiter {
     sender: oneshot::Sender<LegacyPersistentResponse>,
 }
@@ -7749,6 +7747,7 @@ struct LegacyPersistentResponseWaiter {
 /// Owns waiter retirement while POST acknowledgement is still pending. A
 /// dropped send may already have reached the peer, but grants no authority
 /// to send a cancellation control or create a committed request receipt.
+#[cfg(feature = "legacy-2024-11-05")]
 struct LegacyPendingPost<'a> {
     state: &'a std::sync::Mutex<LegacySsePersistentState>,
     key: &'a CorrelationKey,
@@ -7756,6 +7755,7 @@ struct LegacyPendingPost<'a> {
     armed: bool,
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl Drop for LegacyPendingPost<'_> {
     fn drop(&mut self) {
         if self.armed {
@@ -7769,6 +7769,7 @@ impl Drop for LegacyPendingPost<'_> {
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 enum LegacyPersistentResponse {
     Response(JsonRpcResponse),
     IdMismatch { actual: RequestId },
@@ -7779,6 +7780,7 @@ enum LegacyPersistentResponse {
 ///
 /// Only `Cancelled` means this caller removed a live pending waiter and
 /// installed the tombstone that authorizes an outbound cancellation control.
+#[cfg(feature = "legacy-2024-11-05")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LegacyPersistentWaiterRetirement {
     Cancelled,
@@ -7788,6 +7790,7 @@ enum LegacyPersistentWaiterRetirement {
 
 /// A cancellation control frame is valid only after this handle's state-locked
 /// retirement removed the still-live waiter and installed its tombstone.
+#[cfg(feature = "legacy-2024-11-05")]
 const fn cancellation_control_is_authorized(retirement: LegacyPersistentWaiterRetirement) -> bool {
     matches!(retirement, LegacyPersistentWaiterRetirement::Cancelled)
 }
@@ -7795,6 +7798,7 @@ const fn cancellation_control_is_authorized(retirement: LegacyPersistentWaiterRe
 /// Small shared state touched only at message-routing and caller-admission
 /// boundaries. The reader owns all I/O; callers cannot poll or consume its
 /// SSE stream directly.
+#[cfg(feature = "legacy-2024-11-05")]
 struct LegacySsePersistentState {
     pending: HashMap<CorrelationKey, LegacyPersistentResponseWaiter>,
     cancelled_response_ids: VecDeque<RequestId>,
@@ -7802,6 +7806,7 @@ struct LegacySsePersistentState {
     stopped: bool,
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl LegacySsePersistentState {
     fn stop(&mut self) {
         self.stopped = true;
@@ -7814,6 +7819,7 @@ impl LegacySsePersistentState {
 /// Retires a caller that stopped waiting while preserving ownership of its
 /// possible late SSE terminal response. The reader consumes that tombstone
 /// instead of treating the late response as foreign and stopping itself.
+#[cfg(feature = "legacy-2024-11-05")]
 fn retire_abandoned_persistent_waiter(
     state: &mut LegacySsePersistentState,
     key: &CorrelationKey,
@@ -7837,6 +7843,7 @@ fn retire_abandoned_persistent_waiter(
 /// is the cancellation and response-election boundary: a matching
 /// `notifications/cancelled` can be read while a handler runs, and only a
 /// callback that claims its still-open entry may begin a response POST.
+#[cfg(feature = "legacy-2024-11-05")]
 struct LegacySseReverseCallbackDispatcher {
     state: Arc<ReverseCallbackState>,
     tasks: Arc<
@@ -7850,6 +7857,7 @@ struct LegacySseReverseCallbackDispatcher {
     >,
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl LegacySseReverseCallbackDispatcher {
     fn new() -> Self {
         Self {
@@ -8039,6 +8047,7 @@ impl LegacySseReverseCallbackDispatcher {
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 enum LegacySseReverseRequestDispatch {
     Immediate(JsonRpcMessage),
     CallbackAdmitted,
@@ -8050,6 +8059,7 @@ enum LegacySseReverseRequestDispatch {
 /// ready high-level connection must not run a user callback on its sole SSE
 /// receive task, because that task is the only path by which cancellation can
 /// reach the callback registry.
+#[cfg(feature = "legacy-2024-11-05")]
 fn legacy_sse_reverse_request_dispatch(
     cx: &Cx,
     client_capabilities: &ClientCapabilities,
@@ -8147,14 +8157,7 @@ pub struct LegacySsePersistentReceiver {
     reverse_callbacks: LegacySseReverseCallbackDispatcher,
 }
 
-#[cfg(not(feature = "legacy-2024-11-05"))]
-struct LegacySsePersistentReceiver {
-    state: Arc<std::sync::Mutex<LegacySsePersistentState>>,
-    task: asupersync::runtime::TaskHandle<()>,
-    outbound: LegacySseHttpOutbound,
-    reverse_callbacks: LegacySseReverseCallbackDispatcher,
-}
-
+#[cfg(feature = "legacy-2024-11-05")]
 impl LegacySsePersistentReceiver {
     fn start(
         cx: &Cx,
@@ -8485,6 +8488,7 @@ impl LegacySsePersistentReceiver {
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl Drop for LegacySsePersistentReceiver {
     fn drop(&mut self) {
         self.reverse_callbacks.close();
@@ -8506,6 +8510,7 @@ impl Drop for LegacySsePersistentReceiver {
 /// admitted resource, era, authorization, and cache partition stay pinned to
 /// the immutable configured bundle; a configured target that already carries
 /// a query still requires byte equality.
+#[cfg(feature = "legacy-2024-11-05")]
 fn advertised_legacy_target_is_admissible(configured: &str, advertised: &str) -> bool {
     if advertised == configured {
         return true;
@@ -8516,7 +8521,7 @@ fn advertised_legacy_target_is_admissible(configured: &str, advertised: &str) ->
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-2024-11-05"))]
 mod legacy_target_admission_tests {
     use super::advertised_legacy_target_is_admissible;
 
@@ -8570,6 +8575,7 @@ mod legacy_target_admission_tests {
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl LegacySseHttpClient {
     /// Opens the configured exact-2024 SSE GET endpoint and admits its first
     /// `endpoint` event only when it names the immutable configured POST
@@ -8735,6 +8741,7 @@ impl LegacySseHttpClient {
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl LegacySseHttpOutbound {
     async fn send(
         &self,
@@ -8820,6 +8827,7 @@ impl LegacySseHttpOutbound {
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 async fn next_legacy_sse_message(
     stream: &mut LegacySseResponseStream,
     cx: &Cx,
@@ -9000,12 +9008,14 @@ impl std::error::Error for LegacySseHttpClientError {
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 #[derive(Debug)]
 enum LegacySseEvent {
     Endpoint(String),
     Message(String),
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl LegacySseEvent {
     fn len(&self) -> usize {
         match self {
@@ -9014,6 +9024,7 @@ impl LegacySseEvent {
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 struct LegacySseResponseStream {
     response: Option<ClientStreamingResponse<ClientIo>>,
     parser: LegacySseParser,
@@ -9021,6 +9032,7 @@ struct LegacySseResponseStream {
     pending_event_bytes: usize,
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl LegacySseResponseStream {
     fn new(response: ClientStreamingResponse<ClientIo>) -> Self {
         Self {
@@ -9157,6 +9169,7 @@ impl LegacySseResponseStream {
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 #[derive(Default)]
 struct LegacySseParser {
     line: Vec<u8>,
@@ -9168,6 +9181,7 @@ struct LegacySseParser {
     ignored_keepalives: usize,
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 #[derive(Clone, Copy)]
 enum LegacySseEventType {
     Endpoint,
@@ -9175,6 +9189,7 @@ enum LegacySseEventType {
     Ignore,
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl LegacySseParser {
     /// Parses one native body chunk and admits each completed event before
     /// parsing the next. The caller owns the aggregate pending-event budget;
@@ -9292,6 +9307,7 @@ impl LegacySseParser {
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 fn validate_legacy_sse_response_head(
     status: u16,
     headers: &[(String, String)],
@@ -9341,6 +9357,7 @@ fn reject_body_frame_after_cancellation<T, E>(
     Ok(frame)
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 async fn drain_native_response(
     cx: &Cx,
     response: &mut ClientStreamingResponse<ClientIo>,
@@ -9383,25 +9400,6 @@ async fn drain_native_response(
             data.advance(chunk.len());
         }
     }
-}
-
-fn build_modern_request(
-    target: &str,
-    client_info: &ClientInfo,
-    client_capabilities: &ClientCapabilities,
-    method: &str,
-    parameters: serde_json::Value,
-    request_id: Option<RequestId>,
-) -> Result<ModernHttpRequest, ModernHttpClientError> {
-    build_modern_request_with_extensions(
-        target,
-        &client_info.to_implementation(),
-        client_capabilities,
-        method,
-        parameters,
-        request_id,
-        None,
-    )
 }
 
 fn validate_mrtr_request_id(request_id: &RequestId) -> Result<(), ModernHttpMrtrError> {
@@ -9886,6 +9884,7 @@ fn decode_modern_discovery_response(
     Ok(discovery)
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 fn map_transport_error(error: ClientError) -> ModernHttpExecutorError {
     if error.is_cancelled() {
         ModernHttpExecutorError::Cancelled
@@ -10063,7 +10062,9 @@ fn contains_header_control(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap, VecDeque};
+    #[cfg(feature = "legacy-2024-11-05")]
+    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, HashMap};
     use std::fmt::Write as _;
     use std::future::Future as _;
     use std::io::{Read, Write};
@@ -10075,12 +10076,15 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use asupersync::bytes::Bytes;
+    #[cfg(feature = "legacy-2024-11-05")]
     use asupersync::channel::oneshot;
     use asupersync::http::Frame;
     use asupersync::runtime::{Runtime, RuntimeBuilder};
     use asupersync::{CancelKind, Cx};
     #[cfg(feature = "legacy-2024-11-05")]
     use fastmcp_core::McpError;
+    #[cfg(feature = "legacy-2024-11-05")]
+    use fastmcp_protocol::JsonRpcRequest;
     #[cfg(feature = "apps")]
     use fastmcp_protocol::extensions::{
         ClientExtensionDiscovery, ExtensionDescriptorRegistry, McpAppsClientSettings,
@@ -10095,24 +10099,28 @@ mod tests {
     use fastmcp_protocol::protocol_policy::{MODERN_PROTOCOL_VERSION, ProtocolEra};
     use fastmcp_protocol::{
         ClientCapabilities, ClientInfo, CoreResult, FINAL_CLIENT_CAPABILITIES_META_KEY,
-        FinalCoreResult, FinalCreateMessageResult, FinalProgressNotificationParams, JsonRpcRequest,
+        FinalCoreResult, FinalCreateMessageResult, FinalProgressNotificationParams,
         JsonRpcResponse, RequestId, ServerNotification, SubscriptionFilter,
     };
 
     #[cfg(feature = "apps")]
     use super::merge_client_extensions;
     use super::{
-        ClientHttpConnection, ClientHttpConnectionError, LegacyPersistentResponse,
-        LegacyPersistentResponseWaiter, LegacyPersistentWaiterRetirement, LegacySsePersistentState,
+        ClientHttpConnection, ClientHttpConnectionError,
         MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS, MAX_MRTR_CONTINUATION_ROUNDS,
         MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES, MAX_PENDING_MODERN_HTTP_SSE_EVENTS,
-        MAX_QUEUED_FINAL_HTTP_PROGRESS_NOTIFICATIONS, MAX_QUEUED_LEGACY_CANCELLED_RESPONSE_IDS,
-        ModernHttpClient, ModernHttpClientError, ModernHttpExecutor, ModernHttpExecutorError,
-        ModernHttpFinalCoreEvent, ModernHttpFinalCoreListenError, ModernHttpMrtrError,
-        ModernHttpRequest, ModernHttpResponseKind, ModernHttpSubscriptionListenCollector,
-        ModernHttpSubscriptionListenError, cancellation_control_is_authorized,
-        decode_modern_discovery_response, reject_body_frame_after_cancellation,
-        retire_abandoned_persistent_waiter, validate_response_head,
+        MAX_QUEUED_FINAL_HTTP_PROGRESS_NOTIFICATIONS, ModernHttpClient, ModernHttpClientError,
+        ModernHttpExecutor, ModernHttpExecutorError, ModernHttpFinalCoreEvent,
+        ModernHttpFinalCoreListenError, ModernHttpMrtrError, ModernHttpRequest,
+        ModernHttpResponseKind, ModernHttpSubscriptionListenCollector,
+        ModernHttpSubscriptionListenError, decode_modern_discovery_response,
+        reject_body_frame_after_cancellation, validate_response_head,
+    };
+    #[cfg(feature = "legacy-2024-11-05")]
+    use super::{
+        LegacyPersistentResponse, LegacyPersistentResponseWaiter, LegacyPersistentWaiterRetirement,
+        LegacySsePersistentState, MAX_QUEUED_LEGACY_CANCELLED_RESPONSE_IDS,
+        cancellation_control_is_authorized, retire_abandoned_persistent_waiter,
     };
     #[cfg(feature = "legacy-2024-11-05")]
     use super::{
@@ -10148,6 +10156,7 @@ mod tests {
     }
 
     const LEGACY_TEST_PEER_BOUND: Duration = Duration::from_secs(2);
+    #[cfg(feature = "legacy-2024-11-05")]
     const LEGACY_TEST_PEER_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
     #[test]
@@ -10183,6 +10192,7 @@ mod tests {
         assert!(!format!("{stream:?}").contains(token));
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn persistent_state_with_waiter(
         request_id: RequestId,
         cancelled_response_ids: VecDeque<RequestId>,
@@ -10204,6 +10214,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn abandoned_persistent_waiter_retains_one_late_response_tombstone() {
         let request_id = RequestId::Number(41);
@@ -10219,6 +10230,7 @@ mod tests {
         assert!(!state.stopped);
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn reader_wins_request_retirement_emits_no_cancellation_control() {
         let request_id = RequestId::Number(42);
@@ -10238,6 +10250,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn one_extra_abandoned_persistent_waiter_stops_before_losing_response_alignment() {
         let request_id = RequestId::Number(41);
@@ -10255,6 +10268,7 @@ mod tests {
         assert!(state.pending.is_empty());
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn persistent_receiver_shutdown_releases_waiters_and_retained_ingress() {
         let request_id = RequestId::Number(43);
@@ -10302,6 +10316,7 @@ mod tests {
     /// client failure to strand the peer thread. The caller's deadline bounds
     /// every accept in the scripted wire exchange, while the stop signal
     /// closes the no-connection path before its owner joins the thread.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn accept_legacy_test_peer(
         listener: &TcpListener,
         stop: &mpsc::Receiver<()>,
@@ -10333,6 +10348,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn signal_legacy_test_peer_stop(stop: &mpsc::SyncSender<()>) {
         match stop.try_send(()) {
             Ok(()) | Err(mpsc::TrySendError::Full(()) | mpsc::TrySendError::Disconnected(())) => {}
@@ -10761,27 +10777,6 @@ mod tests {
         stream.flush().expect("flush native HTTP response");
     }
 
-    fn write_response_without_content_type(stream: &mut TcpStream, status: u16, body: &[u8]) {
-        let reason = match status {
-            200 => "OK",
-            202 => "Accepted",
-            404 => "Not Found",
-            _ => "Test Response",
-        };
-        write!(
-            stream,
-            "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .expect("write content-type-free native HTTP response head");
-        stream
-            .write_all(body)
-            .expect("write content-type-free native HTTP response body");
-        stream
-            .flush()
-            .expect("flush content-type-free native HTTP response");
-    }
-
     fn begin_chunked_sse(stream: &mut TcpStream) {
         write!(
             stream,
@@ -10819,6 +10814,7 @@ mod tests {
         body
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn legacy_sse_body_with_messages(message_target: &str, message_count: usize) -> String {
         let mut body = format!("event: endpoint\ndata: {message_target}\n\n");
         for index in 0..message_count {
