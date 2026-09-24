@@ -5,6 +5,9 @@
 //! catalog is never sufficient to enable this API: the host supplies a reviewed
 //! plan bound to this resource and tool. Ordinary calls remain header-free.
 
+/// One explicit catalog refresh after a trusted pre-dispatch header rejection.
+pub mod repair;
+
 use std::fmt;
 use std::sync::Arc;
 
