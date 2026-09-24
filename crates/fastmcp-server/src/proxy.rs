@@ -15727,6 +15727,35 @@ IFS= read -r end
         }
     }
 
+    /// Process-wide resources every test in this binary shares. The resource
+    /// hook probe passes alone and stalls only in the full suite, so its
+    /// timeout report names what the other tests may have used up:
+    /// asupersync's pool-less blocking fallback is capped at 256 threads per
+    /// process and yields until one frees, and descriptors are per process.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn shared_process_resources() -> String {
+        let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+            return "no /proc on this host".to_owned();
+        };
+        let (mut threads, mut blocking) = (0_usize, 0_usize);
+        for task in tasks.flatten() {
+            threads += 1;
+            // Linux truncates thread names to 15 bytes, so fallback threads
+            // ("asupersync-blocking") and default-prefix pool workers
+            // ("asupersync-blocking-N") both read "asupersync-bloc". The count
+            // is therefore an upper bound on the fallback threads.
+            if std::fs::read_to_string(task.path().join("comm"))
+                .is_ok_and(|name| name.starts_with("asupersync-bloc"))
+            {
+                blocking += 1;
+            }
+        }
+        let descriptors = std::fs::read_dir("/proc/self/fd").map_or(0, Iterator::count);
+        format!(
+            "{threads} threads, at most {blocking} of them asupersync fallback blocking threads (cap 256), {descriptors} open fds"
+        )
+    }
+
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn proxy_resource_hooks_caller_runtime_probe(http: bool, unsubscribe: bool, interrupt: u8) {
         use fastmcp_protocol::JsonRpcRequest;
@@ -15802,6 +15831,7 @@ IFS= read -r end
                 let mut sse = None;
                 let mut delayed = None;
                 let mut index = 0;
+                let mut connections = 0_usize;
                 while !peer_stop.load(Ordering::Acquire) {
                     if Instant::now() >= deadline {
                         phase("deadline: peer bound expired");
@@ -15832,13 +15862,14 @@ IFS= read -r end
                         .unwrap();
                     post.set_write_timeout(Some(Duration::from_secs(10)))
                         .unwrap();
+                    connections += 1;
                     phase(&format!(
-                        "accepted connection {index}; reading its request at {:?}",
+                        "accepted connection #{connections} (response index {index}); reading its request at {:?}",
                         deadline.saturating_duration_since(Instant::now())
                     ));
                     let incoming = read_http_request(&mut post);
                     phase(&format!(
-                        "read `{}`; {:?} before the peer bound",
+                        "read `{}` on connection #{connections}; {:?} before the peer bound",
                         incoming.head.lines().next().unwrap_or_default(),
                         deadline.saturating_duration_since(Instant::now())
                     ));
@@ -15966,10 +15997,11 @@ IFS= read -r end
                     if control.join("received").exists() { break; }
                     assert!(
                         Instant::now() < deadline,
-                        "request reaches native upstream; http={http}, unsubscribe={unsubscribe}, interrupt={interrupt}, {:?} after probe start, upstream requests so far: {:?}, peer phase: {:?}",
+                        "request reaches native upstream; http={http}, unsubscribe={unsubscribe}, interrupt={interrupt}, {:?} after probe start, upstream requests so far: {:?}, peer phase: {:?}, process: {}",
                         probe_started.elapsed(),
                         std::fs::read_to_string(control.join("requests")).ok(),
-                        std::fs::read_to_string(control.join("peer-phase")).ok()
+                        std::fs::read_to_string(control.join("peer-phase")).ok(),
+                        shared_process_resources()
                     );
                     asupersync::runtime::yield_now().await;
                 }
