@@ -105,7 +105,14 @@ mod tests {
                         }).await
                     }).unwrap();
                     let child_cx = receiver.recv(&cx).await.unwrap();
-                    child_cx.set_cancel_requested(true);
+                    // Cancel with an attributed reason, as the runtime does.
+                    // A reasonless `set_cancel_requested` makes asupersync 0.5
+                    // discard the task's value at `join` ("join channel
+                    // closed"), hiding the refusal this test observes.
+                    child_cx.cancel_with(
+                        asupersync::types::CancelKind::User,
+                        Some("caller cancelled the connection"),
+                    );
                     let result = asupersync::time::timeout(
                         cx.now(), Duration::from_secs(1), child.join(&cx),
                     ).await.expect("cancelled connection must settle").unwrap();

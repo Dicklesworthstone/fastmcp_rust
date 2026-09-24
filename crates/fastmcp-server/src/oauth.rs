@@ -420,15 +420,21 @@ impl OAuthHttpRoutes {
         public_endpoint_base: impl Into<String>,
     ) -> Result<Self, OAuthHttpRouteConfigurationError> {
         let public_endpoint_base = public_endpoint_base.into();
-        let Some(base) = parse_secure_endpoint(&public_endpoint_base, MAX_OAUTH_ISSUER_BYTES)
-        else {
+        let Some(base) = parse_secure_endpoint(
+            &public_endpoint_base,
+            MAX_OAUTH_ISSUER_BYTES,
+            EndpointSpelling::PathlessAuthority,
+        ) else {
             return Err(OAuthHttpRouteConfigurationError::InvalidPublicEndpointBase);
         };
         if base.scheme() != "https" || base.query().is_some() {
             return Err(OAuthHttpRouteConfigurationError::InvalidPublicEndpointBase);
         }
-        let Some(issuer) = parse_secure_endpoint(&server.config().issuer, MAX_OAUTH_ISSUER_BYTES)
-        else {
+        let Some(issuer) = parse_secure_endpoint(
+            &server.config().issuer,
+            MAX_OAUTH_ISSUER_BYTES,
+            EndpointSpelling::PathlessAuthority,
+        ) else {
             return Err(OAuthHttpRouteConfigurationError::IssuerOriginMismatch);
         };
         if base.scheme() != issuer.scheme()
@@ -4792,7 +4798,32 @@ fn is_literal_loopback_host(url: &Url) -> bool {
     }
 }
 
-fn parse_secure_endpoint(value: &str, max_bytes: usize) -> Option<Url> {
+/// How far a secure endpoint's spelling may differ from its `Url`
+/// serialization.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EndpointSpelling {
+    /// Byte-for-byte equal. Redirect URIs are matched exactly, so admitting
+    /// any normalisation of attacker-supplied input is an attack surface.
+    Exact,
+    /// Also admits a path-less authority such as `https://issuer.example`,
+    /// which `Url` serializes with the root path appended. That is the RFC 8414
+    /// issuer form. Issuers and endpoint bases are operator configuration and
+    /// are published and compared verbatim, so no second spelling arises.
+    PathlessAuthority,
+}
+
+impl EndpointSpelling {
+    fn admits(self, value: &str, url: &Url) -> bool {
+        let serialized = url.as_str();
+        serialized == value
+            || (self == Self::PathlessAuthority
+                && url.path() == "/"
+                && url.query().is_none()
+                && serialized.strip_suffix('/') == Some(value))
+    }
+}
+
+fn parse_secure_endpoint(value: &str, max_bytes: usize, spelling: EndpointSpelling) -> Option<Url> {
     if value.is_empty()
         || value.len() > max_bytes
         || value.chars().any(char::is_control)
@@ -4806,7 +4837,7 @@ fn parse_secure_endpoint(value: &str, max_bytes: usize) -> Option<Url> {
         || url.host().is_none()
         || parsed_url_has_credentials(&url)
         || url.fragment().is_some()
-        || url.as_str() != value
+        || !spelling.admits(value, &url)
     {
         return None;
     }
@@ -4826,8 +4857,12 @@ fn parse_secure_endpoint(value: &str, max_bytes: usize) -> Option<Url> {
 }
 
 pub(crate) fn validate_oauth_issuer(issuer: &str) -> Result<(), OAuthError> {
-    let valid = parse_secure_endpoint(issuer, MAX_OAUTH_ISSUER_BYTES)
-        .is_some_and(|url| url.scheme() == "https" && url.query().is_none());
+    let valid = parse_secure_endpoint(
+        issuer,
+        MAX_OAUTH_ISSUER_BYTES,
+        EndpointSpelling::PathlessAuthority,
+    )
+    .is_some_and(|url| url.scheme() == "https" && url.query().is_none());
     if !valid {
         return Err(OAuthError::ServerError(OAUTH_ISSUER_ERROR.to_string()));
     }
@@ -4835,7 +4870,7 @@ pub(crate) fn validate_oauth_issuer(issuer: &str) -> Result<(), OAuthError> {
 }
 
 fn parse_redirect_uri(uri: &str) -> Option<Url> {
-    let url = parse_secure_endpoint(uri, MAX_OAUTH_REDIRECT_URI_BYTES)?;
+    let url = parse_secure_endpoint(uri, MAX_OAUTH_REDIRECT_URI_BYTES, EndpointSpelling::Exact)?;
     let has_reserved_response_parameter = url.query().is_some_and(|query| {
         query.split(['&', ';']).any(|field| {
             let raw_name = field.split_once('=').map_or(field, |(name, _)| name);
@@ -10856,16 +10891,42 @@ mod tests {
             })
             .is_ok()
         );
-        for issuer in ["https://issuer.example/", "https://issuer.example/oauth"] {
+        for issuer in [
+            "https://issuer.example",
+            "https://issuer.example/",
+            "https://issuer.example/oauth",
+        ] {
             assert!(
                 OAuthServer::try_new(OAuthServerConfig {
                     issuer: issuer.to_string(),
                     ..OAuthServerConfig::default()
                 })
                 .is_ok(),
-                "canonical HTTPS issuer should be admitted"
+                "canonical HTTPS issuer should be admitted: {issuer}"
             );
         }
+    }
+
+    #[test]
+    fn pathless_authority_is_an_issuer_spelling_but_never_a_redirect_uri() {
+        // RFC 8414's own issuer form: `Url` serializes it with a root path.
+        let server = Arc::new(
+            OAuthServer::try_new(OAuthServerConfig {
+                issuer: "https://issuer.example".to_string(),
+                ..OAuthServerConfig::default()
+            })
+            .unwrap(),
+        );
+        let routes = OAuthHttpRoutes::new(server, "https://issuer.example").unwrap();
+        assert_eq!(routes.token_path(), "/token");
+        // Only the appended root path is forgiven; any other normalisation of
+        // the same path-less authority is still refused.
+        for issuer in ["https://ISSUER.example", "https://issuer.example:443"] {
+            assert!(validate_oauth_issuer(issuer).is_err(), "{issuer}");
+        }
+        // Redirect URIs stay byte-exact, so the identical spelling is refused.
+        assert!(parse_redirect_uri("https://app.example").is_none());
+        assert!(parse_redirect_uri("https://app.example/").is_some());
     }
 
     #[test]
