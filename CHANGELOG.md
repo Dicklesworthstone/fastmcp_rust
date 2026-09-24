@@ -6,6 +6,71 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ---
 
+## Unreleased
+
+### Schemas
+
+- `#[derive(JsonSchema)]` describes Serde's externally tagged enum payloads,
+  honors Serde renames, `rename_all`, missing-field defaults and
+  `deny_unknown_fields`, emits exact schemas for tuples, fixed arrays, `char`
+  and every integer width, keeps the constraints of `Option<CustomType>`, and
+  gives recursive and repeated derived types shared, bounded `$defs`
+  definitions, including through `Box`, `Rc`, `Arc` and `Cow`. Asymmetric
+  Serde names or skips are refused at compile time with a diagnostic.
+
+### OAuth and OIDC
+
+- Operator-configured issuers and endpoint bases accept the path-less RFC 8414
+  spelling (`https://issuer.example`); redirect URIs remain byte-exact.
+- OIDC discovery for a base with a trailing slash advertises the endpoint paths
+  the server routes, instead of `//authorize` and similar.
+- The built-in authorization server (`builtin-auth-server`) serves the
+  UserInfo endpoint that discovery already advertised. A Bearer token with the
+  `openid` scope receives the claims; a missing, invalid or under-scoped token
+  receives an RFC 6750 challenge. A JWKS path that collides with UserInfo is
+  refused at setup.
+
+### Server
+
+- HTTP listener shutdown no longer waits on a separate session-reaper task;
+  expired modern sessions are reaped in the accept loop.
+- Live HTTP dispatch runs on the caller's runtime handles instead of a nested
+  `block_on`, so a synchronous exact-2024 tool that bridges a reverse request
+  such as `ctx.sample` with `block_on` no longer panics.
+- A synchronous handler that bridges `ctx.sample`, `ctx.elicit_form` or
+  `ctx.list_roots` with `block_on` from the thread driving the runtime receives
+  a named `InvalidRequest` error instead of hanging. Handlers on a blocking
+  lane, including the exact-2024 dispatch worker, still complete these calls.
+- On an unsplit transport, a notification, acknowledgement or response sent
+  while the receive loop waits for input is queued and written when the
+  receive returns, instead of failing the connection.
+- Without the legacy feature, a `subscriptions/listen` on an unsplit transport
+  no longer blocks the receive loop, so client cancellation and EOF still
+  reach the server.
+- Graceful shutdown keeps a subscription's graceful completion that it had
+  already won instead of cancelling it.
+- Live `bind_http` SSE response bodies, including `subscriptions/listen`, no
+  longer drop the connection when a handler commits an event while the writer
+  is polling.
+
+### CLI
+
+- `fastmcp inspect` keeps the operation's error code, such as
+  `RequestCancelled`, when both the operation and its cleanup fail.
+
+### Documentation
+
+- The README's TL;DR, Quick Example, Quick Start and FAQ handler-test code is
+  compiled verbatim and exercised over stdio by `tests/readme_examples.rs`.
+  The FAQ test no longer needs asupersync's `test-internals` feature.
+- Corrected README Troubleshooting and Limitations rows (the unknown-tool
+  error, the request-timeout symptom and unsplit transport output) and the
+  WebSocket claim, which now states that exact-2024 handlers receive sampling
+  and roots replies.
+
+MCP 2026-07-28 support remains under implementation; these changes do not
+claim aggregate conformance.
+
 ## [v0.10.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.10.0) -- 2026-09-13
 
 - Breaking: custom `FinalTaskStore` implementations must provide
