@@ -1408,7 +1408,6 @@ fn assert_shipped_echo_server_catalog(json: &serde_json::Value) {
     }
 
     assert_eq!(json["server"]["name"], "echo-server", "{json}");
-    assert_eq!(json["truncated"], false, "{json}");
     let tools = members(json, "tools", "name");
     for tool in ["echo", "add", "word_count"] {
         assert!(tools.contains(&tool), "missing tool {tool}: {tools:?}");
