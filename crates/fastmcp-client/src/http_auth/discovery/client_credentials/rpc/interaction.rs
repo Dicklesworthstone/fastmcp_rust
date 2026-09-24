@@ -521,7 +521,7 @@ mod tests {
                 token_endpoint: fastmcp_core::CanonicalHttpUrl::parse("https://issuer.example/token").unwrap(),
                 client_id: "machine-test-client".to_owned(), scopes: vec![],
                 authentication: machine::MachineAuthentication::Basic(Arc::new(machine::ClientSecret("test-only".to_owned()))),
-                issuer_roots: vec![], timeout: Duration::from_secs(5),
+                issuer_roots: vec![], resource_tls: None, timeout: Duration::from_secs(5),
                 maximum_lifetime: Duration::from_secs(60), leeway: Duration::from_secs(1),
                 closed, pending: AtomicUsize::new(0),
                 state: Arc::new(asupersync::sync::Mutex::new(machine::TokenState {

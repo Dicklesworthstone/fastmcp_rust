@@ -38,7 +38,7 @@ use super::super::super::{
     authorize, check_context, check_token, discovery_deadline,
 };
 use crate::http_executor::{
-    ModernHttpExecutor, ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind,
+    ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind,
     ModernHttpSubscriptionListenEvent,
 };
 
@@ -280,7 +280,7 @@ async fn request_pinned(
     let owner = &client.client.inner.closed;
     active(cx, deadline, owner, cancellation, Some(binding), async {
         Ok(async {
-            let executor = ModernHttpExecutor::new();
+            let executor = client.client.resource_http_executor();
             let wire = authorize(binding, discovery_wire)?;
             let response = executor.execute_with_cancellation(cx, cancellation, &wire).await.map_err(transport_error)?;
             check_watch(cx, deadline, owner, cancellation, binding)?;

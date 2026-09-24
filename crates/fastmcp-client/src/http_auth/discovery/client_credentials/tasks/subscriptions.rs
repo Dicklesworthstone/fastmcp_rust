@@ -33,7 +33,7 @@ use super::super::{
     authorize, discovery_deadline,
 };
 use crate::http_executor::{
-    ModernHttpExecutor, ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind,
+    ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind,
     ModernHttpSubscriptionListenError, ModernHttpSubscriptionListenEvent,
     ModernHttpSubscriptionListener,
 };
@@ -152,7 +152,7 @@ impl ClientCredentialsTasksClient {
                     },
                     None => self.client.credential_with_cancellation(cx, cancellation).await?,
                 };
-                let executor = ModernHttpExecutor::new();
+                let executor = self.client.resource_http_executor();
                 let discovery_wire = authorize(&snapshot, prepared.discovery_wire)?;
                 let response = active(cx, deadline, owner, cancellation, Some(&snapshot), async {
                     executor.execute_with_cancellation(cx, cancellation, &discovery_wire).await

@@ -36,7 +36,7 @@ pub(super) fn consumer() -> ClientCredentialsTasksClient {
         token_endpoint: CanonicalHttpUrl::parse("https://issuer.example/token").unwrap(),
         client_id: "watch-fixture".to_owned(), scopes: vec![],
         authentication: MachineAuthentication::Basic(Arc::new(ClientSecret("fixture-secret".to_owned()))),
-        issuer_roots: vec![], timeout: Duration::from_secs(5), maximum_lifetime: Duration::from_secs(600),
+        issuer_roots: vec![], resource_tls: None, timeout: Duration::from_secs(5), maximum_lifetime: Duration::from_secs(600),
         leeway: Duration::from_secs(30), closed: McpRequestCancellation::new(),
         pending: AtomicUsize::new(0), state: Arc::new(asupersync::sync::Mutex::new(TokenState::default())),
     }) };
