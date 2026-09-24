@@ -29,6 +29,13 @@ use std::sync::{Arc, Barrier, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+use fastmcp_rust::FinalTaskWatchEvent;
 use fastmcp_rust::server::{BoxFuture, FinalMethodOutcome};
 use fastmcp_rust::{
     AccessToken, AuthContext, AuthRequest, CacheScope, CacheTtl, CanonicalHttpUrl,
@@ -52,8 +59,7 @@ use fastmcp_rust::{
 use fastmcp_rust::{
     ApplicationTaskSupervisor, FinalTask, FinalTaskId, FinalTaskInputRequests,
     FinalTaskInputResponses, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSupervisorFuture,
-    FinalTaskSupervisorHandoff, FinalTaskWatchEvent, FinalTaskWorkDescriptor, FinalToolCallOutcome,
-    RequestId,
+    FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, FinalToolCallOutcome, RequestId,
 };
 #[cfg(feature = "websocket-experimental")]
 use fastmcp_rust::{
@@ -2214,6 +2220,12 @@ impl HttpServerFixture {
             .unwrap_or_else(|error| panic!("public HTTP server teardown failed: {error}"));
     }
 
+    #[cfg(all(
+        unix,
+        feature = "proxy",
+        feature = "tasks",
+        feature = "native-tls-roots"
+    ))]
     fn shutdown_named(mut self, owner: &str) {
         self.settle()
             .unwrap_or_else(|error| panic!("{owner} teardown failed: {error}"));
