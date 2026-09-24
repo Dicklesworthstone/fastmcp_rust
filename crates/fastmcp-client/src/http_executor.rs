@@ -9405,13 +9405,12 @@ impl LegacySseParser {
                 });
             }
             "data" => {
-                if self
-                    .data
-                    .len()
-                    .saturating_add(value.len())
-                    .saturating_add(1)
-                    > MAX_LEGACY_SSE_MESSAGE_BYTES
-                {
+                // The bound applies to the decoded message: the `data:`
+                // values joined by newlines. The retained buffer already ends
+                // each value with the newline that joins it to this one, and
+                // the final newline is stripped at dispatch, so the decoded
+                // length after this line is exactly the buffer plus `value`.
+                if self.data.len().saturating_add(value.len()) > MAX_LEGACY_SSE_MESSAGE_BYTES {
                     return Err(LegacySseHttpClientError::SseEventTooLarge);
                 }
                 self.data.push_str(value);
@@ -14792,13 +14791,13 @@ mod tests {
         format!("event: message\ndata: {}\n\n", "m".repeat(payload_bytes)).into_bytes()
     }
 
-    // LIMIT-01: one decoded SSE JSON message is 8 MiB. The retained data
-    // includes the trailing field newline, so the largest admitted `data:`
-    // value is one byte short of the bound and the next byte is refused.
+    // LIMIT-01: one decoded SSE JSON message is 8 MiB. The decoded message
+    // excludes the newline that ends the last `data:` line, so a value of
+    // exactly 8 MiB is admitted and one more byte is refused.
     #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_sse_parser_admits_the_limit_01_message_and_refuses_one_more_byte() {
-        let admitted_bytes = MAX_LEGACY_SSE_MESSAGE_BYTES - 1;
+        let admitted_bytes = MAX_LEGACY_SSE_MESSAGE_BYTES;
         let events = parse_legacy_sse(&legacy_message_event(admitted_bytes))
             .expect("a message at the LIMIT-01 decoded bound is admitted");
         assert!(
@@ -14811,6 +14810,41 @@ mod tests {
         );
 
         let refused = parse_legacy_sse(&legacy_message_event(admitted_bytes + 1));
+        assert!(
+            matches!(refused, Err(LegacySseHttpClientError::SseEventTooLarge)),
+            "one byte past the decoded bound must be refused: {:?}",
+            refused.map(|events| events.len())
+        );
+    }
+
+    // The newline joining two `data:` lines is part of the decoded message,
+    // so a two-line message is measured the same way as a one-line one.
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_sse_parser_counts_the_joining_newline_in_a_multi_line_message() {
+        let two_lines = |second_bytes: usize| {
+            let first_bytes = MAX_LEGACY_SSE_MESSAGE_BYTES / 2;
+            format!(
+                "data: {}\ndata: {}\n\n",
+                "a".repeat(first_bytes),
+                "b".repeat(second_bytes)
+            )
+            .into_bytes()
+        };
+        // first + joining newline + second == the decoded bound.
+        let admitted_second = MAX_LEGACY_SSE_MESSAGE_BYTES - MAX_LEGACY_SSE_MESSAGE_BYTES / 2 - 1;
+        let events = parse_legacy_sse(&two_lines(admitted_second))
+            .expect("a two-line message at the decoded bound is admitted");
+        assert!(
+            matches!(
+                events.as_slice(),
+                [LegacySseEvent::Message(payload)] if payload.len() == MAX_LEGACY_SSE_MESSAGE_BYTES
+            ),
+            "the two-line message must arrive whole: {} events",
+            events.len()
+        );
+
+        let refused = parse_legacy_sse(&two_lines(admitted_second + 1));
         assert!(
             matches!(refused, Err(LegacySseHttpClientError::SseEventTooLarge)),
             "one byte past the decoded bound must be refused: {:?}",
