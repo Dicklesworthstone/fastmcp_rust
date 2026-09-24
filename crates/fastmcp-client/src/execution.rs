@@ -44,7 +44,8 @@ use fastmcp_transport::{ReceivedTransportFrame, Transport, TransportError};
 use serde_json::Value;
 
 use crate::{
-    RequestTimeoutPolicy, RequestTimeoutSource, request_timeout_error, transport_error_to_mcp,
+    RequestTimeoutPolicy, RequestTimeoutSource, SubscriptionTimeoutPolicy, request_timeout_error,
+    transport_error_to_mcp,
 };
 
 /// Bounded compatibility diagnostic for a peer's final cache TTL.
@@ -857,7 +858,7 @@ impl OpaquePagination {
 struct PendingExecution {
     record: PendingRequestRecord,
     owner_dropped: OwnerDropped,
-    timeout_policy: RequestTimeoutPolicy,
+    timeout_policy: ExecutionTimeoutPolicy,
     /// The exact optional marker the request advertised in `_meta`.
     ///
     /// Progress is never correlated from a JSON-RPC request ID alone: a peer
@@ -865,6 +866,32 @@ struct PendingExecution {
     advertised_progress_marker: Option<ProgressMarker>,
     last_progress: Option<f64>,
     method: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ExecutionTimeoutPolicy {
+    Request(RequestTimeoutPolicy),
+    Subscription(SubscriptionTimeoutPolicy),
+}
+
+impl ExecutionTimeoutPolicy {
+    fn idle_timeout(self) -> Duration {
+        match self {
+            Self::Request(policy) => policy.idle_timeout(),
+            Self::Subscription(policy) => policy.idle_timeout(),
+        }
+    }
+
+    fn absolute_timeout(self) -> Duration {
+        match self {
+            Self::Request(policy) => policy.absolute_timeout(),
+            Self::Subscription(policy) => policy.absolute_timeout(),
+        }
+    }
+
+    fn resets_idle_on_matching_progress(self) -> bool {
+        matches!(self, Self::Request(policy) if policy.resets_idle_on_matching_progress())
+    }
 }
 
 /// Returns the exact progress marker a client request advertised, when valid.
@@ -1492,6 +1519,41 @@ where
         request: Request,
         timeout_policy: RequestTimeoutPolicy,
     ) -> McpResult<RequestExecution<T>> {
+        timeout_policy.validate()?;
+        self.execute_with_deadline_policy(cx, request, ExecutionTimeoutPolicy::Request(timeout_policy))
+    }
+
+    /// Starts a modern listener with its own bounded idle and absolute lifetime.
+    ///
+    /// Valid acknowledgements and accepted subscription events may restart its
+    /// idle timer. Progress and unrelated traffic never extend a subscription.
+    pub(crate) fn execute_subscription_with_timeout_policy(
+        &self,
+        cx: &Cx,
+        request: Request,
+        timeout_policy: SubscriptionTimeoutPolicy,
+    ) -> McpResult<RequestExecution<T>> {
+        timeout_policy.validate()?;
+        if self.protocol_era() != ProtocolEra::Modern2026 || request.method != SUBSCRIPTIONS_LISTEN {
+            return Err(McpError::invalid_params(
+                "Subscription timeout policy requires modern subscriptions/listen",
+            ));
+        }
+        CoreRequest::decode(ProtocolEra::Modern2026, &request.method, request.params.as_ref())
+            .map_err(|_| McpError::invalid_params("Invalid modern subscription request"))?;
+        self.execute_with_deadline_policy(
+            cx,
+            request,
+            ExecutionTimeoutPolicy::Subscription(timeout_policy),
+        )
+    }
+
+    fn execute_with_deadline_policy(
+        &self,
+        cx: &Cx,
+        request: Request,
+        timeout_policy: ExecutionTimeoutPolicy,
+    ) -> McpResult<RequestExecution<T>> {
         if cx.checkpoint().is_err() {
             return Err(McpError::request_cancelled());
         }
@@ -1679,9 +1741,24 @@ where
         cx: &Cx,
         request: Request,
     ) -> McpResult<RequestExecution<T>> {
+        self.execute_tasks_subscription_with_timeout_policy(
+            cx,
+            request,
+            SubscriptionTimeoutPolicy::default(),
+        )
+    }
+
+    /// Starts an official Tasks listener with a bounded subscription lifetime.
+    #[cfg(feature = "tasks")]
+    pub fn execute_tasks_subscription_with_timeout_policy(
+        &self,
+        cx: &Cx,
+        request: Request,
+        timeout_policy: SubscriptionTimeoutPolicy,
+    ) -> McpResult<RequestExecution<T>> {
         self.require_modern_tasks_era()?;
         let requested_filter = self.decode_tasks_subscription_request(&request)?;
-        let mut execution = self.execute(cx, request)?;
+        let mut execution = self.execute_subscription_with_timeout_policy(cx, request, timeout_policy)?;
         execution.task_operation = Some(TaskExecutionOperation::Subscription);
         self.state.borrow_mut().task_subscriptions.insert(
             (execution.request_id.clone(), execution.generation),
@@ -1692,6 +1769,42 @@ where
             },
         );
         Ok(execution)
+    }
+
+    /// Records activity already admitted by the connection-owned catalog
+    /// listener. This seam performs no decoding and is not exposed to callers.
+    pub(crate) fn record_subscription_activity(
+        &self,
+        execution: &RequestExecution<T>,
+    ) -> McpResult<bool> {
+        execution.ensure_owner(&self.state)?;
+        let key = execution.request_id.correlation_key().map_err(|_| {
+            McpError::invalid_params("Subscription request ID is invalid")
+        })?;
+        let mut state = self.state.borrow_mut();
+        if let Some(pending) = state.pending.get_mut(&key)
+            && pending.record.execution_generation == execution.generation
+        {
+            return Self::record_subscription_activity_at(pending, Instant::now());
+        }
+        Ok(false)
+    }
+
+    fn record_subscription_activity_at(
+        pending: &mut PendingExecution,
+        observed_at: Instant,
+    ) -> McpResult<bool> {
+        if !matches!(pending.timeout_policy, ExecutionTimeoutPolicy::Subscription(_))
+            || observed_at >= pending.record.idle_deadline
+            || observed_at >= pending.record.absolute_deadline
+        {
+            return Ok(false);
+        }
+        let next_idle = observed_at
+            .checked_add(pending.timeout_policy.idle_timeout())
+            .ok_or_else(|| McpError::internal_error("Subscription idle deadline exceeds the clock range"))?;
+        pending.record.idle_deadline = next_idle.min(pending.record.absolute_deadline);
+        Ok(true)
     }
 
     /// Drives exactly one peer frame through the correlation registry.
@@ -2929,6 +3042,11 @@ where
             McpError::internal_error("Tasks subscription disappeared during acknowledgement")
         })?;
         subscription.accepted_filter = Some(acknowledgement.notifications);
+        if let Some(pending) = state.pending.get_mut(&subscription_id.correlation_key().map_err(|_| {
+            McpError::invalid_request("Tasks subscription acknowledgement ID is invalid")
+        })?) {
+            Self::record_subscription_activity_at(pending, Instant::now())?;
+        }
         Ok(true)
     }
 
@@ -3009,6 +3127,11 @@ where
             })?
             .notifications
             .push_back(task_notification);
+        if let Some(pending) = state.pending.get_mut(&subscription_id.correlation_key().map_err(|_| {
+            McpError::invalid_request("Tasks subscription event ID is invalid")
+        })?) {
+            Self::record_subscription_activity_at(pending, Instant::now())?;
+        }
         Ok(true)
     }
 
@@ -3361,6 +3484,14 @@ pub struct RequestExecution<T> {
 }
 
 impl<T> RequestExecution<T> {
+    /// A selected failure takes precedence over buffered subscription events.
+    pub(crate) fn terminal_error(&self) -> Option<McpError> {
+        match self.state.borrow().completed.get(&(self.request_id.clone(), self.generation)) {
+            Some(ExecutionOutcome::Failure(error)) => Some(error.clone()),
+            _ => None,
+        }
+    }
+
     /// Returns the exact request ID committed for this execution.
     #[must_use]
     pub fn request_id(&self) -> &RequestId {
@@ -5469,6 +5600,114 @@ mod tests {
         assert_eq!(executor.state.borrow().transport.sent.len(), 2);
         assert_eq!(executor.terminal_records().len(), 0);
         assert_eq!(executor.take_cancellation_events().len(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn stdio_task_subscription_activity_refreshes_only_idle_and_absolute_expiry_is_isolated() {
+        let cx = Cx::for_testing();
+        let task_id = TaskId::parse("task-73").expect("bounded task ID");
+        let executor = RequestExecutor::with_protocol_era(
+            ScriptedTransport::new([
+                Ok(tasks_subscription_acknowledgement(73, &task_id)),
+                Ok(tasks_status_notification(73, &task_id)),
+            ]),
+            ProtocolEra::Modern2026,
+        );
+        let mut subscription = executor
+            .execute_tasks_subscription(&cx, tasks_subscription_request(73, &task_id))
+            .expect("Tasks listener commits with subscription defaults");
+        let initial = executor.pending_records().remove(0);
+        assert_eq!(
+            initial.absolute_deadline.duration_since(initial.idle_deadline),
+            SubscriptionTimeoutPolicy::default().absolute_timeout()
+                - SubscriptionTimeoutPolicy::default().idle_timeout(),
+        );
+        assert!(initial.idle_deadline > Instant::now() + Duration::from_mins(4));
+
+        let mut sibling = executor
+            .execute_with_timeout_policy(
+                &cx,
+                request(74),
+                RequestTimeoutPolicy::from_application_timeout_ms(7_200_000).unwrap(),
+            )
+            .expect("independent ordinary request commits");
+        let key = RequestId::Number(73).correlation_key().unwrap();
+        for _ in 0..2 {
+            let near_idle = Instant::now() + Duration::from_secs(1);
+            executor.state.borrow_mut().pending.get_mut(&key).unwrap().record.idle_deadline = near_idle;
+            executor.drive(&cx).expect("matching acknowledged activity is admitted");
+            let state = executor.state.borrow();
+            let pending = &state.pending[&key];
+            assert!(pending.record.idle_deadline > near_idle);
+            assert_eq!(pending.record.absolute_deadline, initial.absolute_deadline);
+        }
+        assert_eq!(executor.take_tasks_subscription_notifications(&subscription).unwrap().len(), 1);
+        assert!(executor.tasks_subscription_acknowledgement(&subscription).unwrap().is_some());
+
+        executor.poll_timeouts_at(&cx, initial.absolute_deadline).unwrap();
+        executor.poll_timeouts_at(&cx, initial.absolute_deadline).unwrap();
+        let cancellation_events = executor.take_cancellation_events();
+        assert_eq!(cancellation_events.len(), 1);
+        assert_eq!(cancellation_events[0].reason, ExecutionTerminalReason::AbsoluteTimeout);
+        assert_eq!(executor.pending_records().len(), 1);
+        assert_eq!(executor.pending_records()[0].request_id, RequestId::Number(74));
+        assert_eq!(executor.state.borrow().transport.sent.iter().filter(|message| {
+            matches!(message, JsonRpcMessage::Request(request) if request.method == "notifications/cancelled")
+        }).count(), 1);
+        assert!(executor.try_take_response(&mut subscription).is_err());
+
+        executor.route_response_with_raw_result(&cx, JsonRpcResponse::success(
+            RequestId::Number(73), serde_json::json!({"resultType":"complete"}),
+        ), None).unwrap();
+        assert!(executor.take_uncorrelated_responses().is_empty());
+        executor.route_response_with_raw_result(&cx, JsonRpcResponse::success(
+            RequestId::Number(74), serde_json::json!({"resultType":"complete"}),
+        ), None).unwrap();
+        assert!(executor.try_take_response(&mut sibling).unwrap().is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn stdio_task_subscription_foreign_activity_and_progress_do_not_extend_idle() {
+        let cx = Cx::for_testing();
+        let task_id = TaskId::parse("task-73").unwrap();
+        let executor = RequestExecutor::with_protocol_era(
+            ScriptedTransport::new([
+                Ok(tasks_subscription_acknowledgement(73, &task_id)),
+                Ok(tasks_status_notification(74, &task_id)),
+                Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                    "notifications/progress",
+                    Some(serde_json::json!({"progressToken":73,"progress":1})),
+                ))),
+            ]),
+            ProtocolEra::Modern2026,
+        );
+        let mut request = tasks_subscription_request(73, &task_id);
+        request.params.as_mut().unwrap()["_meta"]["progressToken"] = serde_json::json!(73);
+        let mut subscription = executor.execute_tasks_subscription(&cx, request).unwrap();
+        executor.drive(&cx).unwrap();
+        let admitted = executor.pending_records();
+        executor.drive(&cx).unwrap();
+        assert_eq!(executor.pending_records(), admitted);
+        executor.drive(&cx).unwrap();
+        assert_eq!(executor.pending_records(), admitted);
+        executor.poll_timeouts_at(&cx, admitted[0].idle_deadline).unwrap();
+        assert_eq!(executor.take_cancellation_events()[0].reason, ExecutionTerminalReason::IdleTimeout);
+        assert!(executor.try_take_response(&mut subscription).is_err());
+    }
+
+    #[test]
+    fn subscription_policy_rejects_an_ordinary_request_before_sending() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::with_protocol_era(
+            ScriptedTransport::new([]), ProtocolEra::Modern2026,
+        );
+        assert!(executor.execute_subscription_with_timeout_policy(
+            &cx, request(73), SubscriptionTimeoutPolicy::default(),
+        ).is_err());
+        assert!(executor.pending_records().is_empty());
+        assert!(executor.state.borrow().transport.sent.is_empty());
     }
 
     #[test]
