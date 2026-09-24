@@ -3026,6 +3026,104 @@ fn e2e_test_json_report_against_compiled_fastmcp_server() {
     }
 }
 
+/// Runs `fastmcp test --json` against the repository's shipped echo server
+/// (compiled from `crates/fastmcp/examples/echo_server.rs`, see Cargo.toml).
+#[cfg(feature = "e2e-fixture")]
+fn test_report_for_shipped_echo_server(policy: &str, page_size: Option<&str>) -> serde_json::Value {
+    let mut command = Command::new(fastmcp_bin());
+    command.args([
+        "test",
+        "--json",
+        "--protocol-policy",
+        policy,
+        "--idle-timeout",
+        "30",
+        "--absolute-timeout",
+        "120",
+        env!("CARGO_BIN_EXE_fastmcp_cli_echo_server"),
+    ]);
+    command
+        .env("FASTMCP_CHECK_FOR_UPDATES", "0")
+        .env("FASTMCP_NO_BANNER", "1");
+    match page_size {
+        Some(page_size) => command.env("FASTMCP_LIST_PAGE_SIZE", page_size),
+        None => command.env_remove("FASTMCP_LIST_PAGE_SIZE"),
+    };
+    let output = run_with_deadline(command, CLI_DEADLINE).unwrap_or_else(|expired| {
+        panic!(
+            "shipped echo server test exceeded the {:?} harness deadline; cleanup error: {:?}",
+            expired.timeout, expired.cleanup_error
+        )
+    });
+    assert!(
+        output.status.success(),
+        "fastmcp test against the shipped echo server failed: status={:?}, stdout={}, stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout_str(&output)).expect("parse shipped echo server report");
+    assert_eq!(report["success"], true, "{report}");
+    report
+}
+
+/// Returns the details of one executed, successful report entry.
+#[cfg(feature = "e2e-fixture")]
+fn executed_test_details<'a>(report: &'a serde_json::Value, name: &str) -> &'a str {
+    let result = report["tests"]
+        .as_array()
+        .expect("report test array")
+        .iter()
+        .find(|test| test["name"] == name)
+        .unwrap_or_else(|| panic!("report must include {name}: {report}"));
+    assert_eq!(result["success"], true, "{name} must succeed: {result}");
+    assert_ne!(
+        result["skipped"].as_bool(),
+        Some(true),
+        "{name} must execute against a modern server: {result}"
+    );
+    result["details"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{name} must report details: {result}"))
+}
+
+/// A modern `fastmcp test` must list every catalog the shipped server
+/// advertises. RH-5: the paged run is the same command against the same
+/// server, differing only in the server's page size, so each reported count is
+/// the live page rather than a constant or a skipped probe.
+#[cfg(feature = "e2e-fixture")]
+#[test]
+fn e2e_test_modern_only_exercises_every_catalog_of_shipped_echo_server() {
+    let full = test_report_for_shipped_echo_server("modern-only", None);
+    assert_eq!(
+        executed_test_details(&full, "initialize"),
+        "protocol 2026-07-28"
+    );
+    assert_eq!(executed_test_details(&full, "ping"), "server responded");
+
+    let paged = test_report_for_shipped_echo_server("modern-only", Some("1"));
+    for (name, noun) in [
+        ("list_tools", "tools"),
+        ("list_resources", "resources"),
+        ("list_prompts", "prompts"),
+    ] {
+        let details = executed_test_details(&full, name);
+        let count = details
+            .strip_suffix(&format!(" {noun}"))
+            .and_then(|count| count.parse::<usize>().ok())
+            .unwrap_or_else(|| panic!("{name} must report one complete live page: {details}"));
+        assert!(
+            count > 1,
+            "{name}: the shipped server lists several {noun}: {details}"
+        );
+        assert_eq!(
+            executed_test_details(&paged, name),
+            format!("1 {noun} in the bounded first page; more were omitted")
+        );
+    }
+}
+
 #[cfg(feature = "e2e-fixture")]
 #[test]
 fn reality_check_regression_compiled_stdio_server_exits_when_worker_output_fails() {

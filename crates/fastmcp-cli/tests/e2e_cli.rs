@@ -1374,6 +1374,124 @@ fn e2e_cli_inspect_closed_stdout_exits_nonzero() {
     );
 }
 
+/// Runs `fastmcp inspect -f json` against the repository's shipped echo server
+/// (compiled from `crates/fastmcp/examples/echo_server.rs`, see Cargo.toml).
+/// `server_policy` reaches the server through the inherited environment.
+#[cfg(all(unix, feature = "e2e-fixture"))]
+fn inspect_shipped_echo_server(cli_policy: &str, server_policy: &str) -> Output {
+    let mut command = Command::new(get_binary_path());
+    command
+        .args([
+            "inspect",
+            "-f",
+            "json",
+            "--protocol-policy",
+            cli_policy,
+            env!("CARGO_BIN_EXE_fastmcp_cli_echo_server"),
+        ])
+        .env("FASTMCP_CHECK_FOR_UPDATES", "0")
+        .env("FASTMCP_PROTOCOL_POLICY", server_policy)
+        .env("FASTMCP_NO_BANNER", "1")
+        .env_remove("FASTMCP_LIST_PAGE_SIZE");
+    run_command(command)
+}
+
+#[cfg(all(unix, feature = "e2e-fixture"))]
+fn assert_shipped_echo_server_catalog(json: &serde_json::Value) {
+    fn members<'a>(json: &'a serde_json::Value, list: &str, key: &str) -> Vec<&'a str> {
+        json[list]
+            .as_array()
+            .unwrap_or_else(|| panic!("inspect json must carry a {list} array: {json}"))
+            .iter()
+            .map(|item| item[key].as_str().expect("catalog member is a string"))
+            .collect()
+    }
+
+    assert_eq!(json["server"]["name"], "echo-server", "{json}");
+    assert_eq!(json["truncated"], false, "{json}");
+    let tools = members(json, "tools", "name");
+    for tool in ["echo", "add", "word_count"] {
+        assert!(tools.contains(&tool), "missing tool {tool}: {tools:?}");
+    }
+    let resources = members(json, "resources", "uri");
+    for uri in ["info://server", "info://time"] {
+        assert!(
+            resources.contains(&uri),
+            "missing resource {uri}: {resources:?}"
+        );
+    }
+    let templates = members(json, "resource_templates", "uriTemplate");
+    for template in ["note://{name}", "memo://{name}"] {
+        assert!(
+            templates.contains(&template),
+            "missing template {template}: {templates:?}"
+        );
+    }
+    let prompts = members(json, "prompts", "name");
+    assert!(prompts.contains(&"greeting"), "missing prompt: {prompts:?}");
+}
+
+#[cfg(all(unix, feature = "e2e-fixture"))]
+#[test]
+fn e2e_cli_inspect_shipped_echo_server_modern_only_reports_live_catalog() {
+    let output = inspect_shipped_echo_server("modern-only", "auto");
+    assert!(
+        output.status.success(),
+        "modern-only inspect of the shipped echo server failed: status={:?}, stderr={}",
+        output.status.code(),
+        stderr_str(&output)
+    );
+    let json = inspect_json_stdout(&output);
+    assert_eq!(json["protocol"]["policy"], "modern-only", "{json}");
+    assert_eq!(json["protocol"]["version"], "2026-07-28", "{json}");
+    assert_eq!(json["protocol"]["era"], "modern-2026", "{json}");
+    assert_shipped_echo_server_catalog(&json);
+}
+
+#[cfg(all(unix, feature = "e2e-fixture", feature = "legacy-2024-11-05"))]
+#[test]
+fn e2e_cli_inspect_shipped_echo_server_auto_selects_modern() {
+    let output = inspect_shipped_echo_server("auto", "auto");
+    assert!(
+        output.status.success(),
+        "auto inspect of the shipped echo server failed: status={:?}, stderr={}",
+        output.status.code(),
+        stderr_str(&output)
+    );
+    let json = inspect_json_stdout(&output);
+    assert_eq!(json["protocol"]["policy"], "auto", "{json}");
+    assert_eq!(json["protocol"]["era"], "modern-2026", "{json}");
+    assert_shipped_echo_server_catalog(&json);
+}
+
+/// RH-5 pair: the same legacy-only shipped server is inspectable under `auto`,
+/// so the `modern-only` refusal below is the policy, not a harness failure.
+#[cfg(all(unix, feature = "e2e-fixture", feature = "legacy-2024-11-05"))]
+#[test]
+fn e2e_cli_inspect_modern_only_refuses_legacy_only_shipped_echo_server() {
+    let control = inspect_shipped_echo_server("auto", "legacy-only");
+    assert!(
+        control.status.success(),
+        "auto inspect of a legacy-only shipped echo server failed: stderr={}",
+        stderr_str(&control)
+    );
+    let json = inspect_json_stdout(&control);
+    assert_eq!(json["protocol"]["era"], "legacy-2024", "{json}");
+    assert_shipped_echo_server_catalog(&json);
+
+    let refused = inspect_shipped_echo_server("modern-only", "legacy-only");
+    assert!(
+        !refused.status.success(),
+        "modern-only must not downgrade to a legacy-only server: stdout={}",
+        stdout_str(&refused)
+    );
+    assert_eq!(
+        stdout_str(&refused),
+        "",
+        "a refused negotiation reports no catalog"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn e2e_cli_inspect_rejects_schema_misleading_mcp_format_alias() {

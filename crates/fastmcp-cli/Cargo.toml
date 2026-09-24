@@ -25,6 +25,18 @@ test = false
 bench = false
 doc = false
 
+# The repository's shipped `echo_server` example, compiled unchanged from its
+# own source so CLI integration tests drive the real server. Cargo exposes a
+# `CARGO_BIN_EXE_*` path only for binaries of the testing package, and a
+# distinct name avoids an output collision with the facade's `echo_server`.
+[[bin]]
+name = "fastmcp_cli_echo_server"
+path = "../fastmcp/examples/echo_server.rs"
+required-features = ["e2e-fixture"]
+test = false
+bench = false
+doc = false
+
 [features]
 # Ordinary CLI builds retain the exact legacy adapter so their immutable
 # protocol-policy default is Auto. A --no-default-features build is the
@@ -82,10 +94,11 @@ jwt-resource-auth = [
     "fastmcp-server/jwt-resource-auth",
     "fastmcp-console/jwt-resource-auth",
 ]
-# Internal opt-in used only to compile the framework-backed CLI E2E fixture.
+# Internal opt-in used only to compile the framework-backed CLI E2E fixtures.
 # Cargo features are public, so `--all-features` also exposes the deliberately
-# conspicuous fixture binary; default builds and installs include only `fastmcp`.
-e2e-fixture = ["dep:fastmcp-rust"]
+# conspicuous fixture binaries; default builds and installs include only `fastmcp`.
+# The shipped echo server names `fastmcp_server` directly.
+e2e-fixture = ["dep:fastmcp-rust", "dep:fastmcp-server"]
 
 [dependencies]
 # Internal crates
