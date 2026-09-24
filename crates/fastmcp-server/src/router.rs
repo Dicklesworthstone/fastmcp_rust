@@ -933,9 +933,10 @@ fn admit_final_tool_schemas<H: ToolHandler + ?Sized>(
             "tool declares a final input schema without type object",
         ));
     }
-    let input = admit_final_schema(input_schema.clone()).map_err(|_error| {
-        McpError::internal_error("tool declares an invalid final input schema")
-    })?;
+    let input = fastmcp_protocol::http_headers::admit_final_tool_input_schema(input_schema.clone())
+        .map_err(|_error| {
+            McpError::internal_error("tool declares an invalid final input schema")
+        })?;
     let output = output_schema
         .cloned()
         .map(|schema| {

@@ -97,6 +97,18 @@ impl AdmittedToolHeaderSchema {
     pub fn header_plan(&self) -> &ToolParameterHeaderPlan { &self.plan }
     pub fn validate(&self, arguments: &Value) -> ValidationResult { self.validation.validate(arguments) }
 }
+
+/// Admits a tool's final input schema for local registration. A schema within
+/// the Draft 2020-12 vocabulary is admitted unchanged. Otherwise its
+/// `x-mcp-header` annotations are separated from the validation copy, every
+/// annotation rule is enforced, and that copy is returned. Any other
+/// unsupported keyword, or an invalid annotation, still refuses the schema.
+pub fn admit_final_tool_input_schema(source: Value) -> Result<AdmittedSchema, McpHeaderError> {
+    match crate::schema::admit_final_schema(source.clone()) {
+        Ok(schema) => Ok(schema),
+        Err(_) => AdmittedToolHeaderSchema::admit(source).map(|schema| schema.validation),
+    }
+}
 impl fmt::Debug for AdmittedToolHeaderSchema {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AdmittedToolHeaderSchema").field("plan", &self.plan).finish_non_exhaustive()
@@ -716,5 +728,30 @@ mod tests {
         }
         let plan = self::plan(json!({"type":"object","properties":properties})).unwrap();
         assert_eq!(plan.project(Some(&Value::Object(arguments))), Err(McpHeaderError::LimitExceeded));
+    }
+
+    #[test]
+    fn tool_input_schema_admission_keeps_plain_schemas_and_admits_annotations() {
+        let plain = json!({"type":"object","properties":{"region":{"type":"string"}}});
+        assert_eq!(admit_final_tool_input_schema(plain.clone()).unwrap().schema(), &plain);
+        let annotated = json!({"type":"object","properties":{
+            "region":{"type":"string","x-mcp-header":"Region"}
+        }});
+        let admitted = admit_final_tool_input_schema(annotated).unwrap();
+        assert!(!admitted.schema().to_string().contains("x-mcp-header"));
+        assert!(admitted.validate(&json!({"region":"eu-west"})).is_ok());
+        assert!(admitted.validate(&json!({"region":7})).is_err());
+    }
+
+    #[test]
+    fn tool_input_schema_admission_refuses_bad_annotations_and_other_keywords() {
+        let nullable = json!({"type":"object","properties":{
+            "region":{"type":["string","null"],"x-mcp-header":"Region"}
+        }});
+        assert!(admit_final_tool_input_schema(nullable).is_err());
+        let unknown = json!({"type":"object","properties":{
+            "region":{"type":"string","x-mcp-header":"Region","x-other":true}
+        }});
+        assert!(admit_final_tool_input_schema(unknown).is_err());
     }
 }
