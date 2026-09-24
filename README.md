@@ -39,12 +39,17 @@
   retain sequential or blocking boundaries. A non-cooperative handler can
   still exceed the bounded process-exit drain, so end-to-end quiescence and
   reliable `awaitCleanup` semantics remain unverified.
-- **Bidirectional calls are not qualified:** the Unix stdio receive pump can
-  route sampling, elicitation, and roots responses while exact-2024 lifecycle
-  work or modern request children are active. Non-Unix stdio and
-  custom/SSE/WebSocket paths reject or lack that split routing. Public HTTP
-  has its own dual-era request and response routing, but end-to-end
-  bidirectional lifecycle/cancellation evidence is incomplete.
+- **Bidirectional calls are only partly qualified:** the Unix stdio receive
+  pump can route sampling, elicitation, and roots responses while exact-2024
+  lifecycle work or modern request children are active. The WebSocket server
+  and custom split transports share that pump: live `bind_websocket` tests
+  show an exact-2024 handler awaiting `ctx.sample` or `ctx.list_roots`
+  (including a synchronous handler that bridges with `block_on`) receives the
+  client's reply, and a client without the capability gets a typed refusal
+  instead of a hang. Non-Unix stdio, unsplit custom transports, and SSE still
+  reject or lack that split routing. Public HTTP has its own dual-era request
+  and response routing, but end-to-end bidirectional lifecycle/cancellation
+  evidence is incomplete.
 - **Response caching is conservatively partitioned:** eligible production
   requests are keyed by committed authentication facts plus opaque session
   identity and revision. Uncommitted authentication, local-only state views,
@@ -890,7 +895,7 @@ fn commit_revision(
 | **Synchronous HTTP readers** | Low-level HTTP parsing checkpoints before/after reads and retries `EINTR`, but a generic synchronous `Read` already blocked in the kernel cannot be preempted. A bounded host must supply readiness-aware/asynchronous I/O. Public turnkey `run_http*` uses its caller-owned asynchronous listener lifecycle, whose broader qualification boundaries remain documented here |
 | **Returning transport runners** | `run_transport_returning_with_cx` and the split returning variants return fatal receive/send/close errors and preserve simultaneous run-plus-close failures. Clean EOF/cancellation is `Ok(())`. Each exact-2024 handler dispatch now opens and closes a budgeted child region of the caller's runtime, requiring a runtime-backed `Cx`. Blocking transport I/O and complete cancellation/cleanup guarantees remain unresolved |
 | **Request Cancellation Ownership** | Unix modern stdio request work runs in independently owned bounded child contexts, but process-exiting shutdown does not wait unboundedly for a non-cooperative child; cancellation therefore is not yet a complete quiescence or `awaitCleanup` guarantee |
-| **Bidirectional Response Routing** | On Unix, stdio continuously routes inbound responses while exact-2024 lifecycle work or modern request children are active. Non-Unix stdio and custom/SSE/WebSocket paths do not provide the same split routing. Public HTTP has separate dual-era routing, while end-to-end bidirectional lifecycle qualification remains open |
+| **Bidirectional Response Routing** | On Unix, stdio continuously routes inbound responses while exact-2024 lifecycle work or modern request children are active. The WebSocket server and custom split transports use the same routing, proven live for exact-2024 reverse sampling and roots over `bind_websocket`. Non-Unix stdio, unsplit custom transports, and SSE do not provide the same split routing. Public HTTP has separate dual-era routing, while end-to-end bidirectional lifecycle qualification remains open |
 | **Response Cache Partitioning** | Eligible entries are partitioned by committed authentication facts and opaque session identity/revision; ambiguous admission and state mutation fail closed. This does not promote OAuth/OIDC or establish protocol conformance |
 | **Authentication Admission** | Native HTTP requires `Authorization` for protected requests and rejects recognized body/meta and query credential fields before provider invocation. Other adapters retain a stripped legacy fallback. Complete authorization, lease/revocation, and OAuth challenge qualification remain open |
 | **Tasks RPC** | `tasks/list` and `tasks/submit` stay `MethodNotFound`. Official `tasks/get`, `tasks/update`, and `tasks/cancel` run by default on a process-local in-memory store; `ServerBuilder::final_tasks` replaces that store |
