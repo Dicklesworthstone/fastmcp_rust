@@ -3380,7 +3380,8 @@ impl ToolHandler for PublicHttpLargeResultTool {
                 "type": "object",
                 "properties": {
                     "bytes": {"type": "integer", "minimum": 0},
-                    "block": {"type": "integer", "minimum": 1}
+                    "block": {"type": "integer", "minimum": 1},
+                    "image_triplets": {"type": "integer", "minimum": 1}
                 },
                 "required": ["bytes"]
             }),
@@ -3398,6 +3399,18 @@ impl ToolHandler for PublicHttpLargeResultTool {
             .and_then(serde_json::Value::as_u64)
             .and_then(|bytes| usize::try_from(bytes).ok())
             .ok_or_else(|| McpError::invalid_params("bytes must be a non-negative integer"))?;
+        if let Some(triplets) = arguments
+            .get("image_triplets")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|triplets| usize::try_from(triplets).ok())
+        {
+            // Each zero-byte triplet encodes as `AAAA`: valid Base64 without
+            // a codec dependency.
+            return Ok(vec![Content::image_base64(
+                "AAAA".repeat(triplets),
+                "image/png",
+            )]);
+        }
         let block = arguments
             .get("block")
             .and_then(serde_json::Value::as_u64)
@@ -3661,6 +3674,56 @@ fn e2e_public_http_tools_call_carries_one_text_block_over_64_kib() {
             text == expected,
             "the 1 MiB text block must arrive byte-identical (sse_body={sse_body}): received {} bytes",
             text.len()
+        );
+        drop(client);
+    }
+    server.shutdown();
+}
+
+/// LIMIT-01: one decoded binary content block may be 3 MiB. A 2 MiB image
+/// block (699,051 zero-byte triplets, about 2.7 MiB of Base64) must arrive
+/// intact over application/json and over an SSE body.
+#[test]
+fn e2e_public_http_tools_call_carries_one_image_block_over_64_kib() {
+    const IMAGE_TRIPLETS: usize = 699_051;
+    let cx = Cx::for_request();
+    let server = spawn_large_result_http_server(ProtocolPolicy::ModernOnly);
+    let expected = "AAAA".repeat(IMAGE_TRIPLETS);
+    for sse_body in [false, true] {
+        let mut client = runtime_block_on_bounded(
+            &cx,
+            modern::ClientBuilder::new()
+                .client_info("e2e-public-http-one-large-image", "1.0.0")
+                .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+        )
+        .expect("the ModernOnly public facade connects");
+        if sse_body {
+            client
+                .set_log_level(modern::LoggingLevel::Info)
+                .expect("info logLevel is stored as request metadata");
+        }
+        let result = runtime_block_on_bounded(
+            &cx,
+            client.call_tool(
+                &cx,
+                PUBLIC_HTTP_LARGE_RESULT_TOOL_NAME,
+                json!({ "bytes": 0, "image_triplets": IMAGE_TRIPLETS }),
+            ),
+        )
+        .unwrap_or_else(|error| {
+            panic!("a 2 MiB image block must arrive (sse_body={sse_body}): {error:?}")
+        });
+        let tool = serde_json::to_value(result).expect("the modern tool result serializes");
+        let blocks = tool["content"]
+            .as_array()
+            .expect("the modern tool result carries a content array");
+        assert_eq!(blocks.len(), 1, "the image must stay one block");
+        assert_eq!(blocks[0]["type"], "image", "the block must stay an image");
+        let data = blocks[0]["data"].as_str().unwrap_or_default();
+        assert!(
+            data == expected,
+            "the image data must arrive byte-identical (sse_body={sse_body}): received {} bytes",
+            data.len()
         );
         drop(client);
     }
