@@ -69,47 +69,55 @@ fn machine_resume_rejects_wrong_binding_and_invalid_ids_before_acquiring_a_grant
 
 #[test]
 fn machine_restart_stages_exact_duplicates_in_opaque_key_order_without_network_work() {
-    let cx = Cx::for_testing();
-    let client = consumer();
-    let owner = binding(&client, "one");
-    let one = record(&cx, &owner, "é");
-    let two = record(&cx, &owner, "e\u{301}");
-    let mut restart = client.prepare_task_restart(&cx, owner.clone(), [two.clone(), one.clone(), one.clone()],
-        "restore".to_owned(), ClientCredentialsTaskRestartPolicy::default()).unwrap();
-    let mut expected = [one.key(), two.key()];
-    expected.sort();
-    assert_eq!(restart.unvisited().map(TaskResumeRecord::key).collect::<Vec<_>>(), expected);
-    assert_eq!((restart.remaining(), restart.attempted(), restart.delivered()), (2, 0, 0));
-    drop(restart.next_reconciled(&cx));
-    assert!(restart.ready);
-    assert!(restart.pending_record().is_none());
-    restart.close();
-    assert_eq!(restart.remaining(), 2);
-    assert!(!format!("{restart:?}").contains("é"));
-    assert!(client.client.inner.state.try_lock_owned().unwrap().current.is_none());
-    assert!(!client.client.inner.closed.is_cancel_requested());
+    // Staging does no network work, but it binds the restart's deadline, which
+    // fails closed without a runtime timer: stage on a runtime Cx.
+    runtime().block_on(async {
+        let cx = Cx::current().unwrap();
+        let client = consumer();
+        let owner = binding(&client, "one");
+        let one = record(&cx, &owner, "é");
+        let two = record(&cx, &owner, "e\u{301}");
+        let mut restart = client.prepare_task_restart(&cx, owner.clone(), [two.clone(), one.clone(), one.clone()],
+            "restore".to_owned(), ClientCredentialsTaskRestartPolicy::default()).unwrap();
+        let mut expected = [one.key(), two.key()];
+        expected.sort();
+        assert_eq!(restart.unvisited().map(TaskResumeRecord::key).collect::<Vec<_>>(), expected);
+        assert_eq!((restart.remaining(), restart.attempted(), restart.delivered()), (2, 0, 0));
+        drop(restart.next_reconciled(&cx));
+        assert!(restart.ready);
+        assert!(restart.pending_record().is_none());
+        restart.close();
+        assert_eq!(restart.remaining(), 2);
+        assert!(!format!("{restart:?}").contains("é"));
+        assert!(client.client.inner.state.try_lock_owned().unwrap().current.is_none());
+        assert!(!client.client.inner.closed.is_cancel_requested());
+    });
 }
 
 #[test]
 fn machine_restart_shared_staging_limits_charge_duplicates_and_reject_the_whole_conflict() {
-    let cx = Cx::for_testing();
-    let client = consumer();
-    let owner = binding(&client, "one");
-    let saved = record(&cx, &owner, "one");
-    let size = saved.encode().unwrap().len();
-    let pulls = Cell::new(0);
-    let endless = std::iter::repeat_with(|| { pulls.set(pulls.get() + 1); saved.clone() });
-    let policy = ClientCredentialsTaskRestartPolicy::new(2, 4096, Duration::from_secs(1)).unwrap();
-    assert!(matches!(client.prepare_task_restart(&cx, owner.clone(), endless, "restore".to_owned(), policy),
-        Err(ClientCredentialsTaskResumeError::Resume(TaskResumeError::Capacity))));
-    assert_eq!(pulls.get(), 3);
-    let short = ClientCredentialsTaskRestartPolicy::new(2, size * 2 - 1, Duration::from_secs(1)).unwrap();
-    assert!(matches!(client.prepare_task_restart(&cx, owner.clone(), [saved.clone(), saved.clone()], "restore".to_owned(), short),
-        Err(ClientCredentialsTaskResumeError::Resume(TaskResumeError::TooLarge))));
-    let newer = TaskResumeRecord::capture(&cx, &owner, &task("one", "input_required", 2), Duration::from_secs(3600)).unwrap();
-    assert!(matches!(client.prepare_task_restart(&cx, owner, [saved, newer], "restore".to_owned(), policy),
-        Err(ClientCredentialsTaskResumeError::Resume(TaskResumeError::ConflictingSnapshot))));
-    assert!(client.client.inner.state.try_lock_owned().unwrap().current.is_none());
+    // See the test above: the staging limits are reached only after the
+    // restart deadline binds, which needs a runtime timer.
+    runtime().block_on(async {
+        let cx = Cx::current().unwrap();
+        let client = consumer();
+        let owner = binding(&client, "one");
+        let saved = record(&cx, &owner, "one");
+        let size = saved.encode().unwrap().len();
+        let pulls = Cell::new(0);
+        let endless = std::iter::repeat_with(|| { pulls.set(pulls.get() + 1); saved.clone() });
+        let policy = ClientCredentialsTaskRestartPolicy::new(2, 4096, Duration::from_secs(1)).unwrap();
+        assert!(matches!(client.prepare_task_restart(&cx, owner.clone(), endless, "restore".to_owned(), policy),
+            Err(ClientCredentialsTaskResumeError::Resume(TaskResumeError::Capacity))));
+        assert_eq!(pulls.get(), 3);
+        let short = ClientCredentialsTaskRestartPolicy::new(2, size * 2 - 1, Duration::from_secs(1)).unwrap();
+        assert!(matches!(client.prepare_task_restart(&cx, owner.clone(), [saved.clone(), saved.clone()], "restore".to_owned(), short),
+            Err(ClientCredentialsTaskResumeError::Resume(TaskResumeError::TooLarge))));
+        let newer = TaskResumeRecord::capture(&cx, &owner, &task("one", "input_required", 2), Duration::from_secs(3600)).unwrap();
+        assert!(matches!(client.prepare_task_restart(&cx, owner, [saved, newer], "restore".to_owned(), policy),
+            Err(ClientCredentialsTaskResumeError::Resume(TaskResumeError::ConflictingSnapshot))));
+        assert!(client.client.inner.state.try_lock_owned().unwrap().current.is_none());
+    });
 }
 
 #[test]
