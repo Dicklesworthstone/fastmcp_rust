@@ -4261,11 +4261,7 @@ mod tests {
 
     #[test]
     fn builder_resource_template_honors_duplicate_policy() {
-        for behavior in [
-            DuplicateBehavior::Warn,
-            DuplicateBehavior::Ignore,
-            DuplicateBehavior::Error,
-        ] {
+        for behavior in [DuplicateBehavior::Warn, DuplicateBehavior::Ignore] {
             let server = ServerBuilder::new("srv", "1.0")
                 .on_duplicate(behavior)
                 .resource_template(marked_resource_template("original"))
@@ -4282,6 +4278,28 @@ mod tests {
             .build();
         assert_eq!(server.resource_templates().len(), 1);
         assert_eq!(server.resource_templates()[0].name, "incoming");
+    }
+
+    #[test]
+    fn builder_on_duplicate_error_resource_template_refuses_the_build() {
+        let refused = refused_registrations(
+            ServerBuilder::new("srv", "1.0")
+                .on_duplicate(DuplicateBehavior::Error)
+                .resource_template(marked_resource_template("original"))
+                .resource_template(marked_resource_template("incoming")),
+        );
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(
+            (refused[0].kind, refused[0].name.as_str()),
+            (
+                RegistrationKind::ResourceTemplate,
+                "mcp://duplicate-item/{item}"
+            )
+        );
+        assert!(
+            refused[0].reason.contains("already exists"),
+            "the refusal must say why: {refused:?}"
+        );
     }
 
     // ── Lifecycle hooks ──────────────────────────────────────────────
