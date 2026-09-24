@@ -15945,7 +15945,11 @@ IFS= read -r end
                     assert!(polled.is_pending(), "subscription hook must yield until peer response; http={http}, unsubscribe={unsubscribe}, interrupt={interrupt}, event={:?}", stream.try_recv_event(&cx));
                     assert!(proxy.inner.try_lock().is_ok(), "proxy mutex is released while awaiting upstream");
                     if control.join("received").exists() { break; }
-                    assert!(Instant::now() < deadline, "request reaches native upstream");
+                    assert!(
+                        Instant::now() < deadline,
+                        "request reaches native upstream; http={http}, unsubscribe={unsubscribe}, interrupt={interrupt}, upstream requests so far: {:?}",
+                        std::fs::read_to_string(control.join("requests")).ok()
+                    );
                     asupersync::runtime::yield_now().await;
                 }
                 if interrupt == 4 {
