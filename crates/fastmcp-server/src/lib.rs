@@ -161,10 +161,11 @@ pub use router::{
 };
 use router::{RouterPromptCaller, RouterResourceReader, RouterToolCaller, TransportAuthorization};
 pub use session::Session;
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+use session::SessionPrincipalBinding;
 use session::{
-    InitializationSnapshot, MAX_RESOURCE_SUBSCRIPTION_BYTES_PER_SESSION, SessionPrincipalBinding,
-    SubscriptionAdmission, SubscriptionAdmissionError, SubscriptionRemoval,
-    SubscriptionRemovalError,
+    InitializationSnapshot, MAX_RESOURCE_SUBSCRIPTION_BYTES_PER_SESSION, SubscriptionAdmission,
+    SubscriptionAdmissionError, SubscriptionRemoval, SubscriptionRemovalError,
 };
 #[cfg(feature = "tasks")]
 pub use tasks::{
@@ -190,8 +191,6 @@ use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
-#[cfg(test)]
-use std::io::Read;
 use std::io::Write;
 use std::net::SocketAddr;
 #[cfg(feature = "websocket")]
@@ -361,12 +360,6 @@ mod modern_http_only {
                 .map(|message| message.map(frame_message))
                 .map_err(Into::into)
         }
-        pub fn recv_event(&self, cx: &Cx) -> Result<SseEvent, DualEraHttpEndpointError> {
-            self.body
-                .recv_message(cx)
-                .map(frame_message)
-                .map_err(Into::into)
-        }
     }
 
     fn frame_message(
@@ -486,16 +479,6 @@ mod modern_http_only {
                 .send_notification_for_request(cx, cancellation, notification)?;
             Ok(())
         }
-        pub fn send_modern_sse_request(
-            &mut self,
-            cx: &Cx,
-            cancellation: &StreamableHttpRequestCancellation,
-            request: JsonRpcRequest,
-        ) -> Result<(), DualEraHttpEndpointError> {
-            self.transport
-                .send_request_for_request(cx, cancellation, request)?;
-            Ok(())
-        }
         pub fn close(&mut self) {
             self.closed = true;
         }
@@ -522,6 +505,7 @@ use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener as AsyncTcpListener, TcpStream as AsyncTcpStream};
 use asupersync::stream::StreamExt;
 use asupersync::{Budget, CancelKind, Cx, RegionId, channel::oneshot};
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 use fastmcp_console::RequestResponseRenderer;
 use fastmcp_console::banner::StartupBanner;
 use fastmcp_console::console::FastMcpConsole;
@@ -2150,6 +2134,7 @@ fn runtime_stdio_policy(policy: ProtocolPolicy) -> ProtocolPolicy {
 /// Rejects a malformed receive failure as an Auto connection's terminal
 /// opening frame. Later malformed frames retain ordinary JSON-RPC recovery
 /// behavior because their era was already selected.
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn reject_initial_stdio_malformed(classifier: &mut StdioEraClassifier) -> StdioEraDecision {
     classifier.classify_opening(StdioOpeningFrame::Malformed)
 }
@@ -2213,12 +2198,14 @@ fn poll_on_cx<F: Future>(cx: &Cx, future: F) -> F::Output {
 /// even when it races the first request's dispatch. Cancellation itself still
 /// uses `verify_existing`, so a control frame can never claim an unbound
 /// connection.
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn bind_anonymous_connection_principal(
     principal_binding: &SessionPrincipalBinding,
 ) -> McpResult<()> {
     bind_connection_principal(principal_binding, auth::principal_fingerprint(None)?)
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn bind_connection_principal(
     principal_binding: &SessionPrincipalBinding,
     fingerprint: Sha256Digest,
@@ -2371,6 +2358,7 @@ fn legacy_only_modern_refusal(request: &JsonRpcRequest) -> Option<JsonRpcRespons
 /// Selects the refusal shape for a request that failed era admission:
 /// a modern request under `LegacyOnly` is a method-not-found style typed
 /// refusal, every other mismatch is the negotiated-era `-32600` refusal.
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn era_admission_refusal(
     policy: ProtocolPolicy,
     request: &JsonRpcRequest,
@@ -2535,6 +2523,7 @@ impl SessionMutationRollback {
     }
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DispatchPrincipalAdmissionState {
     Pending,
@@ -2542,11 +2531,13 @@ enum DispatchPrincipalAdmissionState {
     Rejected,
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 struct DispatchPrincipalAdmission {
     state: Mutex<DispatchPrincipalAdmissionState>,
     changed: Condvar,
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 impl DispatchPrincipalAdmission {
     fn pending() -> Self {
         Self {
@@ -2649,6 +2640,7 @@ enum DispatchCancellationDisposition {
     AlreadySettled,
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 struct QueuedDispatchRequest {
     request: JsonRpcRequest,
     era: ProtocolEra,
@@ -2656,13 +2648,13 @@ struct QueuedDispatchRequest {
     principal_admission: Arc<DispatchPrincipalAdmission>,
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 enum QueuedDispatchMessage {
     Request(QueuedDispatchRequest),
     /// Exact-2024 client responses are serialized through the same adapter
     /// that allocated their reverse-request IDs. Generic bidirectional
     /// responses never enter this variant: they are consumed directly by the
     /// generic pending-request registry.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
     LegacyResponse(JsonRpcResponse),
 }
 
@@ -2940,6 +2932,7 @@ impl DispatchQueueState {
         }
     }
 
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn is_stopping(&self) -> bool {
         self.inner
             .lock()
@@ -2979,12 +2972,14 @@ impl DispatchQueueState {
 /// returned send failure, disconnected worker queue, or panic therefore closes
 /// admission and makes the pump report failure. Its drop path contains queue
 /// wake-up failures so a worker panic cannot turn into a double-panic abort.
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 struct DispatchWorkerFailureLatch {
     failed: Arc<AtomicBool>,
     queue: Arc<DispatchQueueState>,
     armed: bool,
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 impl DispatchWorkerFailureLatch {
     fn new(failed: Arc<AtomicBool>, queue: Arc<DispatchQueueState>) -> Self {
         Self {
@@ -2999,6 +2994,7 @@ impl DispatchWorkerFailureLatch {
     }
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 impl Drop for DispatchWorkerFailureLatch {
     fn drop(&mut self) {
         if !self.armed {
@@ -3009,8 +3005,10 @@ impl Drop for DispatchWorkerFailureLatch {
     }
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 struct DispatchWorkerCompletionSignal(Option<std::sync::mpsc::Sender<()>>);
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 impl Drop for DispatchWorkerCompletionSignal {
     fn drop(&mut self) {
         if let Some(sender) = self.0.take() {
@@ -3378,6 +3376,7 @@ use fastmcp_transport::{
 use log::Level;
 use log::LevelFilter;
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReceiveErrorDisposition {
     ReplyWithParseError,
@@ -3385,6 +3384,7 @@ enum ReceiveErrorDisposition {
     Terminate,
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn classify_receive_error(error: &TransportError) -> ReceiveErrorDisposition {
     match error {
         // A transport timeout does not prove that the byte stream is still at
@@ -3448,6 +3448,7 @@ fn transport_run_error(stage: &'static str, error: &TransportError) -> McpError 
     )
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn returning_send_result(error: &TransportError) -> McpResult<()> {
     if error.is_cancelled() {
         Ok(())
@@ -3467,6 +3468,7 @@ fn server_run_error(stage: &'static str, kind: &'static str, message: &'static s
     )
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn returning_send_result_with_connection_failure(
     error: &TransportError,
     connection_failure: &Option<Arc<AtomicBool>>,
@@ -3498,6 +3500,7 @@ fn combined_run_and_close_error(run_error: McpError, close_error: McpError) -> M
     )
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn combined_operation_and_cleanup_error(
     operation_error: McpError,
     cleanup: ShutdownCleanupOutcome,
@@ -3517,6 +3520,7 @@ fn combined_operation_and_cleanup_error(
     )
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn send_uncorrelated_parse_error<S>(send: &Arc<Mutex<S>>, cx: &Cx) -> Result<(), TransportError>
 where
     S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError>,
@@ -3524,6 +3528,7 @@ where
     send_jsonrpc_error(send, cx, None, McpErrorCode::ParseError, "Parse error")
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn send_invalid_request<S>(
     send: &Arc<Mutex<S>>,
     cx: &Cx,
@@ -3541,6 +3546,7 @@ where
     )
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn send_jsonrpc_error<S>(
     send: &Arc<Mutex<S>>,
     cx: &Cx,
@@ -4089,15 +4095,6 @@ struct FinalSubscriptionTerminalDelivery {
 }
 
 impl FinalSubscriptionTerminalDelivery {
-    fn mark_enqueued(&self) {
-        let _ = self.state.compare_exchange(
-            FINAL_TERMINAL_OPEN,
-            FINAL_TERMINAL_ENQUEUED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-    }
-
     fn mark_drained(&self) {
         let mut state = self.state.load(Ordering::Acquire);
         while matches!(state, FINAL_TERMINAL_OPEN | FINAL_TERMINAL_ENQUEUED) {
@@ -4181,10 +4178,6 @@ impl FinalSubscriptionTerminalDelivery {
         );
     }
 
-    fn is_enqueued(&self) -> bool {
-        self.state.load(Ordering::Acquire) == FINAL_TERMINAL_ENQUEUED
-    }
-
     fn is_committed(&self) -> bool {
         matches!(
             self.state.load(Ordering::Acquire),
@@ -4204,26 +4197,6 @@ impl FinalSubscriptionTerminalDelivery {
             || completion_state == FINAL_TERMINAL_FAILED
             || terminal_state == FINAL_TERMINAL_DRAINED
                 && completion_state == FINAL_TERMINAL_DRAINED
-    }
-
-    /// True while the dispatcher has not yet selected a terminal response.
-    ///
-    /// A cancelled connection region cannot flush that response. The H1
-    /// writer must fail the receipt instead of waiting out the drain bound.
-    fn completion_is_open(&self) -> bool {
-        self.completion_state.load(Ordering::Acquire) == FINAL_TERMINAL_OPEN
-    }
-
-    /// True once graceful election marked the control half done or the body failed.
-    ///
-    /// A server-owned modern HTTP listen sets this before the dispatch can
-    /// enqueue the complete result. The H1 writer must keep polling that
-    /// result instead of treating request cancellation as a clean close.
-    fn control_is_satisfied(&self) -> bool {
-        matches!(
-            self.state.load(Ordering::Acquire),
-            FINAL_TERMINAL_DRAINED | FINAL_TERMINAL_FAILED
-        )
     }
 }
 
@@ -4499,13 +4472,6 @@ fn final_subscription_terminal_event(event: &SseEvent) -> bool {
         return false;
     };
     final_subscription_terminal_notification(&notification)
-}
-
-fn final_subscription_completion_event(event: &SseEvent) -> bool {
-    let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&event.data) else {
-        return false;
-    };
-    final_subscription_completion_response(&response)
 }
 
 /// Returns whether this request-owned SSE event is its terminal JSON-RPC
@@ -4874,7 +4840,7 @@ fn complete_final_subscription_server_termination(
 }
 
 impl FinalSubscriptionRegistry {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "proxy", feature = "tasks"))]
     fn snapshot_for_test(&self) -> serde_json::Value {
         let state = self
             .inner
@@ -6488,14 +6454,7 @@ impl LiveModernHttpSession {
             <= now
     }
 
-    fn renew(&self, now: Instant) {
-        *self
-            .expires_at
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            now + MODERN_HTTP_RESPONSE_BODY_TTL;
-    }
-
+    #[cfg(test)]
     fn is_closing(&self) -> bool {
         self.closing.load(Ordering::Acquire)
     }
@@ -8240,6 +8199,7 @@ impl AuthAdmissionReceipt {
     ///
     /// Legacy HTTP has no [`InboundRequestContext`]; method and wire-id
     /// equality are the binding between pre-admission and dispatch.
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn commit_legacy(
         &self,
         ctx: &McpContext,
@@ -8333,6 +8293,7 @@ impl AuthDispatchCustody {
         }
     }
 
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn commit_legacy_connection(&self, ctx: &McpContext) -> Result<Sha256Digest, McpError> {
         let (authenticated, fingerprint) = match self {
             Self::Http(receipt) => (receipt.authenticated.clone(), receipt.fingerprint.clone()),
@@ -8354,6 +8315,7 @@ impl AuthDispatchCustody {
         }
     }
 
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn connection_fingerprint(&self) -> Sha256Digest {
         match self {
             Self::Http(receipt) => receipt.fingerprint.clone(),
@@ -11481,28 +11443,6 @@ async fn dispatch_modern_http_request(
     .await
 }
 
-async fn dispatch_modern_http_request_with_cancellation(
-    cx: &Cx,
-    endpoint: &ServerHttpEndpoint,
-    modern_sessions: &LiveModernHttpSessionRegistry,
-    request: HttpRequest,
-    request_cancellation: Option<McpRequestCancellation>,
-) -> HttpResponse {
-    let transport_authorization = match transport_authorization_from_http_request(&request) {
-        Ok(authorization) => authorization,
-        Err(response) => return response,
-    };
-    dispatch_modern_http_request_with_cancellation_and_transport_authorization(
-        cx,
-        endpoint,
-        modern_sessions,
-        request,
-        transport_authorization,
-        request_cancellation,
-    )
-    .await
-}
-
 async fn dispatch_modern_http_request_with_cancellation_and_transport_authorization(
     cx: &Cx,
     endpoint: &ServerHttpEndpoint,
@@ -12480,6 +12420,13 @@ pub struct Server {
     #[cfg(all(test, feature = "tasks"))]
     task_manager: Option<SharedTaskManager>,
     /// Per-connection ceiling for pending server-to-client requests.
+    #[cfg_attr(
+        not(any(feature = "legacy-2024-11-05", test)),
+        expect(
+            dead_code,
+            reason = "only the exact-2024 lane enforces this ceiling; the public setter is kept pending a ruling"
+        )
+    )]
     max_bidirectional_requests_per_connection: usize,
     /// Immutable protocol-era admission policy selected by [`ServerBuilder`].
     protocol_policy: ProtocolPolicy,
@@ -12505,7 +12452,7 @@ pub struct Server {
 impl Server {
     /// Returns the local subscription/notification delivery state for unit
     /// tests that prove a rejected request produced no local side effect.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "proxy", feature = "tasks"))]
     pub(crate) fn final_subscription_snapshot_for_test(&self) -> serde_json::Value {
         self.final_subscriptions.snapshot_for_test()
     }
@@ -12523,6 +12470,7 @@ impl Server {
         &self.info
     }
 
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn new_pending_requests_for_connection(&self) -> Arc<bidirectional::PendingRequests> {
         Arc::new(
             bidirectional::PendingRequests::with_max_in_flight(
@@ -13087,6 +13035,7 @@ impl Server {
         renderer.render_panel(&snapshot, &self.console);
     }
 
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn configured_traffic_renderer(&self) -> Option<RequestResponseRenderer> {
         let show_bodies = match self.console_config.traffic_verbosity {
             TrafficVerbosity::None => return None,
@@ -14269,6 +14218,7 @@ impl Server {
     /// answers `server/discover` and then silently stops responding
     /// (GitHub #65). Callers whose pump and runtime are the same context pass
     /// the same `Cx` twice.
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn dispatch_or_schedule_stdio_modern_request<S>(
         server: Arc<Self>,
         cx: &Cx,
@@ -15474,6 +15424,7 @@ impl Server {
         combine_split_transport_results(run_result, recv_close, send_close)
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     async fn run_split_transport_with_label<R, S>(
         self,
         cx: &Cx,
@@ -15655,28 +15606,6 @@ impl Server {
         }
     }
 
-    /// Performs graceful shutdown: runs hook, closes stats, exits.
-    fn graceful_shutdown(&self, exit_code: i32) -> ! {
-        // Subscription teardown owns the stdio cancellation control and the
-        // matching completion result before generic active-request
-        // cancellation tears down request-local senders. HTTP has only that
-        // complete result.
-        let _ = self.terminate_subscription_streams_for_shutdown();
-        let cleanup = self.cancel_active_requests(CancelKind::Shutdown, true);
-        if matches!(cleanup, ShutdownCleanupOutcome::Quiescent) {
-            self.run_shutdown_hook();
-        } else {
-            error!(
-                target: targets::SESSION,
-                "Skipping shutdown hook because active request cleanup did not quiesce"
-            );
-        }
-        if let Some(ref stats) = self.stats {
-            stats.connection_closed();
-        }
-        std::process::exit(exit_code)
-    }
-
     /// Performs graceful shutdown without exiting the process.
     ///
     /// This is intended for embedding/testing scenarios where the server loop is
@@ -15703,30 +15632,6 @@ impl Server {
     /// Runs a continuous receive pump. Exact-2024 frames retain the one
     /// lifecycle-preserving worker; modern frames use bounded children of the
     /// caller context and may progress independently.
-    fn run_loop<R, S>(
-        self,
-        cx: &Cx,
-        recv: R,
-        send: S,
-        notification_sender: NotificationSender,
-        connection_failure: Arc<AtomicBool>,
-        transport_label: &'static str,
-    ) -> i32
-    where
-        R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
-        S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
-    {
-        self.run_loop_with_dispatch_cx(
-            cx,
-            cx,
-            recv,
-            send,
-            notification_sender,
-            connection_failure,
-            transport_label,
-        )
-    }
-
     fn run_loop_with_dispatch_cx<R, S>(
         self,
         pump_cx: &Cx,
@@ -15759,7 +15664,7 @@ impl Server {
         )
     }
 
-    /// Returning counterpart of [`Self::run_loop`].
+    /// Returning counterpart of [`Self::run_loop_with_dispatch_cx`].
     ///
     /// Clean closure or cancellation returns `Ok(())`; any failing pump status
     /// is preserved as a local server-loop error. A receive implementation
@@ -15770,30 +15675,6 @@ impl Server {
     /// never detaches a non-quiescent handler: after logging the bounded
     /// shutdown deadline it waits without a second deadline for the owned
     /// worker before running lifecycle hooks or returning to the caller.
-    fn run_loop_returning<R, S>(
-        self,
-        cx: &Cx,
-        mut recv: R,
-        send: S,
-        notification_sender: NotificationSender,
-        connection_failure: Option<Arc<AtomicBool>>,
-        transport_label: &'static str,
-    ) -> McpResult<()>
-    where
-        R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
-        S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
-    {
-        self.run_loop_returning_with_dispatch_cx(
-            cx,
-            cx,
-            move |cx, worker_failed| recv(cx, worker_failed),
-            send,
-            notification_sender,
-            connection_failure,
-            transport_label,
-        )
-    }
-
     fn run_loop_returning_with_dispatch_cx<R, S>(
         self,
         pump_cx: &Cx,
@@ -15874,37 +15755,6 @@ impl Server {
                 "Server transport loop failed",
             )),
         }
-    }
-
-    #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
-    fn run_loop_pump<R, S>(
-        self,
-        cx: &Cx,
-        recv: R,
-        send: S,
-        notification_sender: NotificationSender,
-        transport_label: &'static str,
-    ) -> i32
-    where
-        R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
-        S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
-    {
-        Arc::new(self).run_loop_pump_with_policy(
-            cx,
-            cx,
-            recv,
-            send,
-            notification_sender,
-            transport_label,
-            true,
-            None,
-            true,
-            true,
-            None,
-            None,
-            None,
-            PumpIoMode::Unsplit,
-        )
     }
 
     /// Feature-off stdio runner: only final-era envelopes can reach dispatch.
@@ -16340,38 +16190,6 @@ impl Server {
             stats.connection_closed();
         }
         exit_code
-    }
-
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
-    #[allow(clippy::too_many_lines)]
-    fn run_loop_pump<R, S>(
-        self,
-        cx: &Cx,
-        recv: R,
-        send: S,
-        notification_sender: NotificationSender,
-        transport_label: &'static str,
-    ) -> i32
-    where
-        R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
-        S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
-    {
-        Arc::new(self).run_loop_pump_with_policy(
-            cx,
-            cx,
-            recv,
-            send,
-            notification_sender,
-            transport_label,
-            true,
-            None,
-            true,
-            true,
-            None,
-            None,
-            None,
-            PumpIoMode::Split,
-        )
     }
 
     #[cfg(any(feature = "legacy-2024-11-05", test))]
@@ -17737,7 +17555,8 @@ impl Server {
 
     /// Shared server loop for embedding/testing, returning on shutdown instead of exiting.
     ///
-    /// This is intentionally separate from [`run_loop`](Self::run_loop) because the primary server
+    /// This is intentionally separate from
+    /// [`run_loop_with_dispatch_cx`](Self::run_loop_with_dispatch_cx) because the primary server
     /// entrypoints use `std::process::exit` on shutdown for subprocess use-cases. Clean EOF and
     /// cancellation return success; startup, protocol, and fatal transport failures return errors.
     #[allow(clippy::too_many_lines)]
@@ -18225,29 +18044,6 @@ impl Server {
             request_sender,
             None,
             None,
-        )
-        .await
-        .map(|handled| handled.finalize_for_return(session))
-    }
-
-    /// Handles a request with transport-private authorization metadata.
-    async fn handle_request_with_transport_authorization(
-        &self,
-        cx: &Cx,
-        session: &mut Session,
-        request: JsonRpcRequest,
-        transport_authorization: Option<&str>,
-        notification_sender: &NotificationSender,
-        request_sender: &bidirectional::RequestSender,
-    ) -> Option<JsonRpcResponse> {
-        self.handle_request_internal(
-            cx,
-            session,
-            request,
-            notification_sender,
-            request_sender,
-            None,
-            transport_authorization,
         )
         .await
         .map(|handled| handled.finalize_for_return(session))
@@ -19628,6 +19424,7 @@ impl Server {
 
     /// Authenticates and parses an out-of-band cancellation before any queue,
     /// active-request, or bidirectional waiter state is mutated.
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn authenticate_cancelled_control_notification(
         &self,
         cx: &Cx,
@@ -19671,6 +19468,7 @@ impl Server {
         Ok(cancellation)
     }
 
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn request_id_is_active(&self, session_id: u64, request_id: &RequestId) -> bool {
         let Ok(key) = ActiveRequestKey::new(session_id, request_id) else {
             return false;
@@ -19700,6 +19498,7 @@ impl Server {
         }
     }
 
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn handle_cancellation_wire_notification(
         &self,
         session_id: u64,
@@ -20122,6 +19921,7 @@ impl Server {
         self.emit_log_notification_for_level(session.log_level(), sender, level, message);
     }
 
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn maybe_emit_log_notification_for_level(
         &self,
         min_level: Option<LogLevel>,
@@ -20180,6 +19980,7 @@ enum ShutdownCleanupOutcome {
     TimedOut { remaining: usize },
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 impl ShutdownCleanupOutcome {
     fn into_error(self) -> Option<McpError> {
         match self {
@@ -20251,6 +20052,7 @@ impl RequestCompletion {
         }
     }
 
+    #[cfg(test)]
     fn is_done(&self) -> bool {
         let done = self
             .done
@@ -20291,6 +20093,7 @@ impl ActiveRequestKey {
 }
 
 impl ActiveRequest {
+    #[cfg(test)]
     fn new(cx: Cx, completion: Arc<RequestCompletion>) -> Self {
         Self::with_cancellation(cx, completion, McpRequestCancellation::new())
     }
@@ -20313,12 +20116,14 @@ impl ActiveRequest {
 struct ActiveRequestGuard {
     map: Arc<Mutex<HashMap<ActiveRequestKey, ActiveRequest>>>,
     key: ActiveRequestKey,
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     cx: Arc<OnceLock<Cx>>,
     cancellation: McpRequestCancellation,
     completion: Arc<RequestCompletion>,
 }
 
 impl ActiveRequestGuard {
+    #[cfg(test)]
     fn try_new(
         map: Arc<Mutex<HashMap<ActiveRequestKey, ActiveRequest>>>,
         session_id: u64,
@@ -20340,6 +20145,7 @@ impl ActiveRequestGuard {
         Self::try_insert(map, session_id, id, entry)
     }
 
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn try_reserve(
         map: Arc<Mutex<HashMap<ActiveRequestKey, ActiveRequest>>>,
         session_id: u64,
@@ -20367,6 +20173,7 @@ impl ActiveRequestGuard {
         entry: ActiveRequest,
     ) -> Result<Self, RequestId> {
         let key = ActiveRequestKey::new(session_id, &id).map_err(|_| id.clone())?;
+        #[cfg(any(feature = "legacy-2024-11-05", test))]
         let cx = Arc::clone(&entry.cx);
         let completion = Arc::clone(&entry.completion);
         let cancellation = entry.cancellation.clone();
@@ -20386,12 +20193,14 @@ impl ActiveRequestGuard {
         Ok(Self {
             map,
             key,
+            #[cfg(any(feature = "legacy-2024-11-05", test))]
             cx,
             cancellation,
             completion,
         })
     }
 
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn activate(&self, cx: Cx) -> bool {
         // Publish before checking the token. Shutdown cancels the token before
         // reading this same cell, so either it sees the child or activation
@@ -20644,6 +20453,7 @@ impl HandledRequest {
         self.response
     }
 
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn send_with<F>(
         mut self,
         session: &mut Session,
@@ -28613,7 +28423,7 @@ mod lib_unit_tests {
         ];
 
         for (index, (native, params)) in cases.into_iter().enumerate() {
-            let response = block_on(server.handle_request_with_transport_authorization(
+            let response = block_on(server.handle_request_internal(
                 &Cx::for_testing(),
                 &mut session,
                 JsonRpcRequest::new(
@@ -28621,10 +28431,12 @@ mod lib_unit_tests {
                     Some(params),
                     i64::try_from(index + 1).expect("bounded test request ID"),
                 ),
-                native,
                 &notification_sender,
                 &request_sender,
+                None,
+                native,
             ))
+            .map(|handled| handled.finalize_for_return(&mut session))
             .expect("request must receive an authentication error");
             let error = response.error.expect("authentication must fail");
             assert_eq!(
@@ -30148,9 +29960,9 @@ mod lib_unit_tests {
         let send_attempted = Arc::new(AtomicBool::new(false));
         let send_attempted_by_worker = Arc::clone(&send_attempted);
         let cx = Cx::for_testing();
-        let exit_code = Server::new("worker-send-failure-test", "1.0.0")
-            .build()
-            .run_loop_pump(
+        let exit_code = Arc::new(Server::new("worker-send-failure-test", "1.0.0").build())
+            .run_loop_pump_with_policy(
+                &cx,
                 &cx,
                 move |_receive_cx, worker_failed| {
                     if !emitted_for_receive.swap(true, Ordering::AcqRel) {
@@ -30169,6 +29981,14 @@ mod lib_unit_tests {
                 },
                 Arc::new(|_| {}),
                 "test",
+                true,
+                None,
+                true,
+                true,
+                None,
+                None,
+                None,
+                PumpIoMode::Split,
             );
 
         assert_eq!(exit_code, 1);
@@ -30184,10 +30004,11 @@ mod lib_unit_tests {
         let send_entered_for_receive = Arc::clone(&send_entered);
         let send_entered_by_worker = Arc::clone(&send_entered);
 
-        let exit_code = Server::new("worker-send-eof-race-test", "1.0.0")
-            .build()
-            .run_loop_pump(
-                &Cx::for_testing(),
+        let cx = Cx::for_testing();
+        let exit_code = Arc::new(Server::new("worker-send-eof-race-test", "1.0.0").build())
+            .run_loop_pump_with_policy(
+                &cx,
+                &cx,
                 move |_receive_cx, _worker_failed| {
                     if !emitted_for_receive.swap(true, Ordering::AcqRel) {
                         return Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
@@ -30215,6 +30036,14 @@ mod lib_unit_tests {
                 },
                 Arc::new(|_| {}),
                 "test",
+                true,
+                None,
+                true,
+                true,
+                None,
+                None,
+                None,
+                PumpIoMode::Split,
             );
 
         assert!(send_entered.load(Ordering::Acquire));
@@ -30228,9 +30057,9 @@ mod lib_unit_tests {
         let send_entered = Arc::new(AtomicBool::new(false));
         let send_entered_by_worker = Arc::clone(&send_entered);
         let cx = Cx::for_testing();
-        let exit_code = Server::new("worker-panic-latch-test", "1.0.0")
-            .build()
-            .run_loop_pump(
+        let exit_code = Arc::new(Server::new("worker-panic-latch-test", "1.0.0").build())
+            .run_loop_pump_with_policy(
+                &cx,
                 &cx,
                 move |_receive_cx, worker_failed| {
                     if !emitted_for_receive.swap(true, Ordering::AcqRel) {
@@ -30246,6 +30075,14 @@ mod lib_unit_tests {
                 },
                 Arc::new(|_| {}),
                 "test",
+                true,
+                None,
+                true,
+                true,
+                None,
+                None,
+                None,
+                PumpIoMode::Split,
             );
 
         assert_eq!(exit_code, 1);
@@ -30667,9 +30504,9 @@ mod lib_unit_tests {
         let mut transport = StdioTransport::new(server_stream, Vec::<u8>::new());
         let cx = Cx::for_testing();
         let exit_code = cx.masked(|| {
-            Server::new("unix-stdio-worker-failure-test", "1.0.0")
-                .build()
-                .run_loop_pump(
+            Arc::new(Server::new("unix-stdio-worker-failure-test", "1.0.0").build())
+                .run_loop_pump_with_policy(
+                    &cx,
                     &cx,
                     move |receive_cx, worker_failed| {
                         receive_count.fetch_add(1, Ordering::AcqRel);
@@ -30692,6 +30529,14 @@ mod lib_unit_tests {
                     },
                     Arc::new(|_| {}),
                     "stdio-test",
+                    true,
+                    None,
+                    true,
+                    true,
+                    None,
+                    None,
+                    None,
+                    PumpIoMode::Split,
                 )
         });
 
@@ -33043,87 +32888,6 @@ mod lib_unit_tests {
     }
 
     #[derive(Default)]
-    struct LiveModernSlowSseControl {
-        started: AtomicBool,
-        cancelled: AtomicBool,
-    }
-
-    impl LiveModernSlowSseControl {
-        fn has_started(&self) -> bool {
-            self.started.load(Ordering::Acquire)
-        }
-
-        fn was_cancelled(&self) -> bool {
-            self.cancelled.load(Ordering::Acquire)
-        }
-    }
-
-    struct LiveModernSlowSseTool {
-        control: Arc<LiveModernSlowSseControl>,
-    }
-
-    impl ToolHandler for LiveModernSlowSseTool {
-        fn definition(&self) -> Tool {
-            Tool {
-                name: "live_modern_slow_sse_tool".to_owned(),
-                description: Some("Cancellation-only live SSE outcome gate probe".to_owned()),
-                input_schema: serde_json::json!({"type": "object"}),
-                output_schema: None,
-                icon: None,
-                version: None,
-                tags: Vec::new(),
-                annotations: None,
-            }
-        }
-
-        fn call(
-            &self,
-            _ctx: &McpContext,
-            _arguments: serde_json::Value,
-        ) -> McpResult<Vec<Content>> {
-            Err(McpError::internal_error(
-                "live slow SSE probe requires final request dispatch",
-            ))
-        }
-
-        fn call_final_outcome_async_in_request<'a>(
-            &'a self,
-            ctx: &'a McpContext,
-            _request_cx: &'a Cx,
-            _arguments: serde_json::Value,
-        ) -> BoxFuture<'a, fastmcp_core::McpOutcome<FinalToolOutcome>> {
-            Box::pin(async move {
-                self.control.started.store(true, Ordering::Release);
-                ctx.request_cancellation().cancelled().await;
-                self.control.cancelled.store(true, Ordering::Release);
-                fastmcp_core::Outcome::Cancelled(asupersync::CancelReason::user(
-                    "request cancellation observed by slow live SSE tool",
-                ))
-            })
-        }
-    }
-
-    struct LiveModernControlledDiscoveryMiddleware {
-        control: Arc<LiveModernControl>,
-        blocked_request_id: u64,
-    }
-
-    impl Middleware for LiveModernControlledDiscoveryMiddleware {
-        fn on_request(
-            &self,
-            ctx: &McpContext,
-            request: &JsonRpcRequest,
-        ) -> McpResult<MiddlewareDecision> {
-            if request.method == SERVER_DISCOVER_METHOD
-                && ctx.request_id() == self.blocked_request_id
-            {
-                self.control.call(ctx)?;
-            }
-            Ok(MiddlewareDecision::Continue)
-        }
-    }
-
-    #[derive(Default)]
     struct LiveModernNotificationControl {
         started: Mutex<bool>,
         cancelled: AtomicBool,
@@ -33772,6 +33536,7 @@ mod lib_unit_tests {
             .clone()
     }
 
+    #[cfg(feature = "websocket")]
     fn masked_websocket_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
         let mask = [0x41, 0x73, 0x19, 0xC7];
         let mut frame = Vec::with_capacity(payload.len() + 14);
@@ -33797,228 +33562,11 @@ mod lib_unit_tests {
         frame
     }
 
+    #[cfg(feature = "websocket")]
     fn masked_websocket_message(message: JsonRpcMessage) -> Vec<u8> {
         let payload = serde_json::to_vec(&message)
             .expect("live WebSocket request fixture must serialize to JSON-RPC");
         masked_websocket_frame(0x01, &payload)
-    }
-
-    fn websocket_responses(output: &Arc<Mutex<Vec<u8>>>) -> Vec<JsonRpcResponse> {
-        let output = output
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut responses = Vec::new();
-        let mut offset = 0;
-
-        while offset + 2 <= output.len() {
-            let first = output[offset];
-            let second = output[offset + 1];
-            let opcode = first & 0x0F;
-            let masked = second & 0x80 != 0;
-            offset += 2;
-
-            let mut payload_length = usize::from(second & 0x7F);
-            match payload_length {
-                126 => {
-                    if offset + 2 > output.len() {
-                        break;
-                    }
-                    payload_length =
-                        usize::from(u16::from_be_bytes([output[offset], output[offset + 1]]));
-                    offset += 2;
-                }
-                127 => {
-                    if offset + 8 > output.len() {
-                        break;
-                    }
-                    let Ok(length) = usize::try_from(u64::from_be_bytes([
-                        output[offset],
-                        output[offset + 1],
-                        output[offset + 2],
-                        output[offset + 3],
-                        output[offset + 4],
-                        output[offset + 5],
-                        output[offset + 6],
-                        output[offset + 7],
-                    ])) else {
-                        break;
-                    };
-                    payload_length = length;
-                    offset += 8;
-                }
-                _ => {}
-            }
-
-            if masked {
-                if offset + 4 > output.len() {
-                    break;
-                }
-                offset += 4;
-            }
-            let Some(payload_end) = offset.checked_add(payload_length) else {
-                break;
-            };
-            if payload_end > output.len() {
-                break;
-            }
-            if opcode == 0x01 && !masked {
-                if let Ok(JsonRpcMessage::Response(response)) =
-                    serde_json::from_slice(&output[offset..payload_end])
-                {
-                    responses.push(response);
-                }
-            }
-            offset = payload_end;
-        }
-
-        responses
-    }
-
-    fn websocket_response_count(output: &Arc<Mutex<Vec<u8>>>, id: i64) -> usize {
-        websocket_responses(output)
-            .iter()
-            .filter(|response| response.id == Some(id.into()))
-            .count()
-    }
-
-    fn websocket_response(output: &Arc<Mutex<Vec<u8>>>, id: i64) -> Option<JsonRpcResponse> {
-        websocket_responses(output)
-            .into_iter()
-            .find(|response| response.id == Some(id.into()))
-    }
-
-    fn websocket_output_has_exact_response_counts(
-        output: &Arc<Mutex<Vec<u8>>>,
-        ids: &[i64],
-    ) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            if ids
-                .iter()
-                .all(|id| websocket_response_count(output, *id) == 1)
-            {
-                return true;
-            }
-            std::thread::yield_now();
-        }
-        false
-    }
-
-    struct LiveWebSocketWriter {
-        output: Arc<Mutex<Vec<u8>>>,
-    }
-
-    impl Write for LiveWebSocketWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.output
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    struct LiveWebSocketOverlapReader {
-        input: Vec<u8>,
-        offset: usize,
-        control: Arc<LiveModernControl>,
-        output: Arc<Mutex<Vec<u8>>>,
-        close_emitted: bool,
-    }
-
-    impl Read for LiveWebSocketOverlapReader {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            if self.offset == self.input.len() && !self.close_emitted {
-                if !self.control.wait_for_started(2, Duration::from_secs(2)) {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "modern WebSocket requests did not overlap",
-                    ));
-                }
-                self.control.release(1300);
-                self.control.release(1301);
-                if !websocket_output_has_exact_response_counts(&self.output, &[1300, 1301]) {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "modern WebSocket responses did not arrive",
-                    ));
-                }
-                self.input.extend(masked_websocket_frame(0x08, &[]));
-                self.close_emitted = true;
-            }
-            if self.offset == self.input.len() {
-                return Ok(0);
-            }
-            let count = buffer.len().min(self.input.len() - self.offset);
-            buffer[..count].copy_from_slice(&self.input[self.offset..self.offset + count]);
-            self.offset += count;
-            Ok(count)
-        }
-    }
-
-    struct LiveWebSocketCancellationReader {
-        input: Vec<u8>,
-        offset: usize,
-        control: Arc<LiveModernControl>,
-        output: Arc<Mutex<Vec<u8>>>,
-        cancelled_request_id: u64,
-        phase: u8,
-    }
-
-    impl Read for LiveWebSocketCancellationReader {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            if self.offset == self.input.len() {
-                match self.phase {
-                    0 => {
-                        if !self.control.wait_for_started(2, Duration::from_secs(2)) {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                "modern WebSocket requests did not start",
-                            ));
-                        }
-                        self.input
-                            .extend(masked_websocket_message(modern_cancelled_notification(
-                                self.cancelled_request_id,
-                            )));
-                        self.phase = 1;
-                    }
-                    1 => {
-                        if !self.control.wait_for_cancellation(
-                            self.cancelled_request_id,
-                            Duration::from_secs(2),
-                        ) {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                "targeted WebSocket cancellation did not reach its request",
-                            ));
-                        }
-                        self.control.release(if self.cancelled_request_id == 1400 {
-                            1401
-                        } else {
-                            1400
-                        });
-                        if !websocket_output_has_exact_response_counts(&self.output, &[1400, 1401])
-                        {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                "targeted WebSocket cancellation did not preserve both responses",
-                            ));
-                        }
-                        self.input.extend(masked_websocket_frame(0x08, &[]));
-                        self.phase = 2;
-                    }
-                    _ => return Ok(0),
-                }
-            }
-            let count = buffer.len().min(self.input.len() - self.offset);
-            buffer[..count].copy_from_slice(&self.input[self.offset..self.offset + count]);
-            self.offset += count;
-            Ok(count)
-        }
     }
 
     struct ProtocolPolicyScriptTransport {
@@ -48892,10 +48440,12 @@ mod lib_unit_tests {
         let receive_count = Arc::clone(&receive_calls);
         let sent_messages = Arc::clone(&sent);
 
+        let cx = Cx::for_testing();
         Server::new("recoverable-codec-error-test", "1.0.0")
             .build()
-            .run_loop_returning(
-                &Cx::for_testing(),
+            .run_loop_returning_with_dispatch_cx(
+                &cx,
+                &cx,
                 move |_, _worker_failed| {
                     receive_count.fetch_add(1, Ordering::Relaxed);
                     receive_steps
@@ -48970,10 +48520,12 @@ mod lib_unit_tests {
         let receive_steps = Arc::clone(&steps);
         let sent_messages = Arc::clone(&sent);
 
+        let cx = Cx::for_testing();
         Server::new("correlated-invalid-request-test", "1.0.0")
             .build()
-            .run_loop_returning(
-                &Cx::for_testing(),
+            .run_loop_returning_with_dispatch_cx(
+                &cx,
+                &cx,
                 move |_, _worker_failed| {
                     receive_steps
                         .lock()
@@ -49031,10 +48583,12 @@ mod lib_unit_tests {
         let sent = Arc::new(AtomicUsize::new(0));
         let sent_count = Arc::clone(&sent);
 
+        let cx = Cx::for_testing();
         let error = Server::new("fatal-framing-error-test", "1.0.0")
             .build()
-            .run_loop_returning(
-                &Cx::for_testing(),
+            .run_loop_returning_with_dispatch_cx(
+                &cx,
+                &cx,
                 move |_, _worker_failed| {
                     receive_count.fetch_add(1, Ordering::Relaxed);
                     Err(TransportError::Io(std::io::Error::new(
@@ -49102,10 +48656,11 @@ mod lib_unit_tests {
             let sent_count = Arc::clone(&sent);
             let mut next_error = Some(error);
 
-            let exit_code = Server::new("fatal-receive-error-test", "1.0.0")
-                .build()
-                .run_loop_pump(
-                    &Cx::for_testing(),
+            let cx = Cx::for_testing();
+            let exit_code = Arc::new(Server::new("fatal-receive-error-test", "1.0.0").build())
+                .run_loop_pump_with_policy(
+                    &cx,
+                    &cx,
                     move |_, _worker_failed| {
                         receive_count.fetch_add(1, Ordering::Relaxed);
                         Err(next_error.take().unwrap_or(TransportError::Closed))
@@ -49116,6 +48671,14 @@ mod lib_unit_tests {
                     },
                     Arc::new(|_| {}),
                     "test",
+                    true,
+                    None,
+                    true,
+                    true,
+                    None,
+                    None,
+                    None,
+                    PumpIoMode::Split,
                 );
 
             assert_eq!(exit_code, 1, "fatal error must fail: {error_label}");
@@ -49207,7 +48770,7 @@ mod lib_unit_tests {
 
         let mut run_request = |id: i64, token: &str| {
             let authorization = format!("Bearer {token}");
-            block_on(server.handle_request_with_transport_authorization(
+            block_on(server.handle_request_internal(
                 &Cx::for_testing(),
                 &mut session,
                 JsonRpcRequest::new(
@@ -49218,10 +48781,12 @@ mod lib_unit_tests {
                     })),
                     id,
                 ),
-                Some(&authorization),
                 &notification_sender,
                 &request_sender,
+                None,
+                Some(&authorization),
             ))
+            .map(|handled| handled.finalize_for_return(&mut session))
             .expect("tools/call must receive a JSON-RPC response")
         };
 
@@ -53279,12 +52844,7 @@ mod lib_unit_tests {
     fn final_subscription_stdio_shutdown_receipt_waits_for_terminal_consumption() {
         let registry = Arc::new(FinalSubscriptionRegistry::default());
         let terminal_delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
-        let sender_delivery = Arc::clone(&terminal_delivery);
-        let sender: NotificationSender = Arc::new(move |notification| {
-            if notification.method == "notifications/cancelled" {
-                sender_delivery.mark_enqueued();
-            }
-        });
+        let sender: NotificationSender = Arc::new(|_| {});
         let _lease = registry
             .open(
                 RequestId::Number(887),
@@ -53299,7 +52859,6 @@ mod lib_unit_tests {
 
         let receipt = registry.terminate_with_receipt();
         assert_eq!(receipt.terminated, 1);
-        assert!(terminal_delivery.is_enqueued());
         assert!(
             !receipt.is_settled(),
             "queue admission alone must not masquerade as body consumption"
@@ -53320,10 +52879,6 @@ mod lib_unit_tests {
         let delivery = FinalSubscriptionTerminalDelivery::default();
         delivery.mark_control_not_required();
         assert!(
-            delivery.completion_is_open(),
-            "graceful election marks control done before dispatch selects a complete"
-        );
-        assert!(
             !delivery.is_settled(),
             "an unelected complete must keep the drain receipt open"
         );
@@ -53339,16 +52894,8 @@ mod lib_unit_tests {
         let delivery = FinalSubscriptionTerminalDelivery::default();
         delivery.mark_control_not_required();
         assert!(
-            delivery.control_is_satisfied(),
-            "Stream election marks modern HTTP control not-required"
-        );
-        assert!(
             delivery.is_committed(),
             "control-not-required is the committed control half so a cancelled request stays live until complete"
-        );
-        assert!(
-            delivery.completion_is_open(),
-            "peer cancel after acknowledgement still has no complete enqueued"
         );
         assert!(
             !delivery.is_settled(),
@@ -53365,12 +52912,7 @@ mod lib_unit_tests {
     fn final_subscription_stdio_shutdown_receipt_fails_closed_after_backpressure_bound() {
         let registry = Arc::new(FinalSubscriptionRegistry::default());
         let terminal_delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
-        let sender_delivery = Arc::clone(&terminal_delivery);
-        let sender: NotificationSender = Arc::new(move |notification| {
-            if notification.method == "notifications/cancelled" {
-                sender_delivery.mark_enqueued();
-            }
-        });
+        let sender: NotificationSender = Arc::new(|_| {});
         let _lease = registry
             .open(
                 RequestId::Number(888),
@@ -53397,10 +52939,6 @@ mod lib_unit_tests {
     fn modern_http_writer_exit_without_complete_fails_a_graceful_election_receipt() {
         let delivery = FinalSubscriptionTerminalDelivery::default();
         delivery.mark_control_not_required();
-        assert!(
-            delivery.control_is_satisfied(),
-            "graceful modern HTTP election satisfies the control half before complete is queued"
-        );
         assert!(
             delivery.is_committed(),
             "control-not-required is the committed control half; the H1 writer must keep waiting for complete"
