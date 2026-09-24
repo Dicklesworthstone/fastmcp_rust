@@ -44,6 +44,8 @@
 pub mod dynamic;
 /// Opt-in, request-owned host resolution of upstream input-required workflows.
 pub mod interaction;
+/// Explicit schema-derived parameter-header disclosure for upstream tools.
+pub mod headers;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -539,11 +541,27 @@ impl Forwarder {
 trait CoreBackend: Send + Sync {
     fn execute<'a>(&'a self, ctx: &'a McpContext, cx: &'a Cx, request: CoreRequest,
         id: RequestId, limits: ManagedCoreLimits) -> BoxFuture<'a, McpResult<FinalCoreResult>>;
+
+    // A backend must preserve its execution policy when adding disclosure.
+    // Never fall back to a different backend or silently discard the review.
+    fn with_reviewed_headers(
+        &self,
+        _reviewed: Arc<fastmcp_client::http_executor::parameter_headers::ReviewedToolHeaders>,
+    ) -> McpResult<Arc<dyn CoreBackend>> {
+        Err(McpError::invalid_params("Managed OAuth backend does not support reviewed tool headers"))
+    }
 }
 
 struct NativeBackend(ManagedOAuthSession);
 
 impl CoreBackend for NativeBackend {
+    fn with_reviewed_headers(
+        &self,
+        reviewed: Arc<fastmcp_client::http_executor::parameter_headers::ReviewedToolHeaders>,
+    ) -> McpResult<Arc<dyn CoreBackend>> {
+        headers::native_backend(self.0.clone(), reviewed)
+    }
+
     fn execute<'a>(&'a self, ctx: &'a McpContext, cx: &'a Cx, request: CoreRequest,
         id: RequestId, limits: ManagedCoreLimits) -> BoxFuture<'a, McpResult<FinalCoreResult>>
     {
@@ -741,7 +759,7 @@ mod tests {
 
     #[test]
     fn legacy_calls_do_not_start_modern_network_work() {
-        let (tool, backend) = fixture(vec![response(false)], false);
+        let (tool, backend) = fixture(vec![], false);
         let ctx = McpContext::new(Cx::for_testing(), 1);
         assert!(tool.call(&ctx, json!({})).is_err());
         assert!(backend.calls.lock().unwrap().is_empty());
