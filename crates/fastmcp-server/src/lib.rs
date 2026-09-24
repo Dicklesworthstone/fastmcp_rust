@@ -16758,6 +16758,12 @@ impl Server {
         let worker_auth_custody_generation = auth_custody_generation;
         let (worker_completion_sender, worker_completion_receiver) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
+            // This dedicated thread is never the async driver: the receive
+            // pump routes matched reverse responses into `pending_requests` on
+            // its own thread. A handler that bridges sampling, elicitation or
+            // roots here therefore cannot starve its own completion, so declare
+            // the lane or bd-6rfrg's detection rejects a working call.
+            let _lane = fastmcp_core::runtime::enter_blocking_lane();
             let _completion = DispatchWorkerCompletionSignal(Some(worker_completion_sender));
             let mut failure_latch = DispatchWorkerFailureLatch::new(
                 Arc::clone(&worker_failed_flag),
