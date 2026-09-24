@@ -118,6 +118,10 @@ struct DeadlineExceeded {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     cleanup_error: Option<String>,
+    /// The expired command's main-thread `/proc/<pid>/wchan`, read before
+    /// cleanup: it tells a process blocked in a write (`pipe_write`) apart
+    /// from one idling in its own loop.
+    wait_channel: Option<String>,
 }
 
 struct ProcessGroupGuard {
@@ -345,11 +349,15 @@ impl ProcessGroupGuard {
             }
 
             if started.elapsed() >= timeout {
+                let wait_channel = self.child.as_ref().and_then(|child| {
+                    std::fs::read_to_string(format!("/proc/{}/wchan", child.id())).ok()
+                });
                 return Err(DeadlineExceeded {
                     timeout,
                     stdout: Vec::new(),
                     stderr: Vec::new(),
                     cleanup_error: self.kill_and_reap().err(),
+                    wait_channel,
                 });
             }
             std::thread::sleep(PROCESS_POLL_INTERVAL);
@@ -482,6 +490,7 @@ fn run_with_deadline(mut command: Command, timeout: Duration) -> Result<Output, 
                     .collect::<Vec<_>>()
                     .join("; "),
             ),
+            wait_channel: None,
         });
     }
 
@@ -499,6 +508,7 @@ fn run_with_deadline(mut command: Command, timeout: Duration) -> Result<Output, 
                     .collect::<Vec<_>>()
                     .join("; "),
             ),
+            wait_channel: None,
         });
     }
 
@@ -1139,9 +1149,10 @@ fn wait_for_dev_exit(process: &mut DevProcess, timeout: Duration, context: &str)
         .wait_until(timeout)
         .unwrap_or_else(|expired| {
             panic!(
-                "{context} exceeded the {:?} harness deadline; cleanup error: {:?}; captured stdout={} bytes, stderr={} bytes (content redacted)",
+                "{context} exceeded the {:?} harness deadline; cleanup error: {:?}; wait channel: {:?}; captured stdout={} bytes, stderr={} bytes (content redacted)",
                 expired.timeout,
                 expired.cleanup_error,
+                expired.wait_channel,
                 expired.stdout.len(),
                 expired.stderr.len()
             )
@@ -1395,11 +1406,18 @@ done
     // clear fail while that idle child is live.
     write_file(&reload_trigger, "reload\n");
 
-    let status = wait_for_dev_exit(
-        &mut process,
-        Duration::from_secs(15),
-        "fastmcp dev after stdout EPIPE",
-    );
+    // A restart rewrites the marker with a new PID, so on a missed deadline the
+    // marker says whether the reload ran with its output writes succeeding.
+    let status = match process.process.wait_until(Duration::from_secs(15)) {
+        Ok(status) => status,
+        Err(expired) => panic!(
+            "fastmcp dev after stdout EPIPE exceeded the {:?} harness deadline; cleanup error: {:?}; wait channel: {:?}; server marker before=({server_pid}, {managed_group_id}) after={:?}",
+            expired.timeout,
+            expired.cleanup_error,
+            expired.wait_channel,
+            std::fs::read_to_string(&process_marker).ok()
+        ),
+    };
     assert!(
         !status.success(),
         "a development-status EPIPE must surface as a command failure"
