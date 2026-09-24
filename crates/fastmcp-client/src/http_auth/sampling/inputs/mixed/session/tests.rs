@@ -26,8 +26,11 @@ fn challenge(inputs: Value) -> InputRequiredResult {
     }).to_string()).unwrap()).unwrap().clone()
 }
 fn roots() -> InputRequiredResult { challenge(json!({"root":{"method":"roots/list"}})) }
+// A sampling descriptor needs a nonempty conversation: `SamplingToolLoop::new`
+// rejects `messages: []` as InvalidRequest, and admission checks every sibling.
+fn conversation() -> Value { json!([{"role":"user","content":{"type":"text","text":"Summarize the result"}}]) }
 fn sampling() -> InputRequiredResult { challenge(json!({"sample":{"method":"sampling/createMessage","params":{
-    "messages":[],"maxTokens":16,"tools":[{"name":"fixture","inputSchema":{"type":"object"}}]
+    "messages":conversation(),"maxTokens":16,"tools":[{"name":"fixture","inputSchema":{"type":"object"}}]
 }}})) }
 fn limits(models: usize, tools: usize, inputs: usize, reply_bytes: usize) -> CoreInputLimits {
     let run = SamplingRunLimits::new(SamplingToolLoopLimits::default(), Duration::from_secs(5), 4096).unwrap();
@@ -143,7 +146,7 @@ fn session_selection_preserves_omitted_budget_for_later_rounds() {
     run(async |cx| {
         let mut session = CoreInputSession::new(&cx, &McpRequestCancellation::new(), original(), limits(1, 0, 2, 4096), 2).unwrap();
         let mut host = Host::default();
-        let mixed = challenge(json!({"root":{"method":"roots/list"},"sample":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16}}}));
+        let mixed = challenge(json!({"root":{"method":"roots/list"},"sample":{"method":"sampling/createMessage","params":{"messages":conversation(),"maxTokens":16}}}));
         let reply = session.resolve_selected(&cx, mixed, RequestId::Number(1), &["root"], &mut host).await.unwrap();
         assert_eq!(reply.input_responses.unwrap().len(), 1);
         assert_eq!(session.usage().selected_inputs, 1);
@@ -185,7 +188,7 @@ fn session_cumulative_reply_bound_accounts_for_present_empty_maps() {
 fn session_cumulative_descriptor_bytes_include_omitted_siblings() {
     run(async |cx| {
         let mut policy = limits(1, 0, 8, 4096);
-        let batch = challenge(json!({"root":{"method":"roots/list"},"sample":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16}}}));
+        let batch = challenge(json!({"root":{"method":"roots/list"},"sample":{"method":"sampling/createMessage","params":{"messages":conversation(),"maxTokens":16}}}));
         let size = input_size(&batch, 8192).unwrap();
         policy.sampling.input_bytes = size;
         let mut session = CoreInputSession::new(&cx, &McpRequestCancellation::new(), original(), policy, 4).unwrap();
