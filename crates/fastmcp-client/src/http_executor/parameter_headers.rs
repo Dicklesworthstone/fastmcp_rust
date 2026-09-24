@@ -142,8 +142,7 @@ fn project_exact_tool_call(
     if request.parameter_headers.is_some() {
         return Err(ToolHeaderDispatchError::AlreadyProjected);
     }
-    if !request.include_method_header
-        || request.protocol_version != FINAL_PROTOCOL_VERSION
+    if request.protocol_version != FINAL_PROTOCOL_VERSION
         || request.method != "tools/call"
         || request.name.as_deref() != Some(tool_name)
     {
