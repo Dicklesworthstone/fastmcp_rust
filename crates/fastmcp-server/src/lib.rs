@@ -38068,6 +38068,196 @@ mod lib_unit_tests {
         });
     }
 
+    /// Native OAuth routes with OIDC under `base`, plus an access token for a
+    /// client registered and authorized with `scopes`. A Pending signer
+    /// activation is all `with_oidc` needs to fix the OIDC paths.
+    #[cfg(feature = "builtin-auth-server")]
+    fn native_oidc_userinfo_fixture(scopes: &[&str], base: &str) -> (OAuthHttpRoutes, String) {
+        const CLIENT_ID: &str = "native-userinfo-client";
+        const REDIRECT_URI: &str = "http://127.0.0.1/userinfo-callback";
+        // RFC 7636 appendix B.
+        const CODE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        const CODE_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+        let oauth = Arc::new(oauth::OAuthServer::with_defaults());
+        oauth
+            .register_client(
+                oauth::OAuthClient::builder(CLIENT_ID)
+                    .redirect_uri(REDIRECT_URI)
+                    .scopes(scopes.iter().copied())
+                    .build()
+                    .expect("valid userinfo client"),
+            )
+            .expect("register userinfo client");
+        let (code, _) = oauth
+            .authorize(&oauth::AuthorizationRequest {
+                response_type: "code".to_string(),
+                client_id: CLIENT_ID.to_string(),
+                redirect_uri: REDIRECT_URI.to_string(),
+                scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
+                resource: None,
+                state: Some("userinfo-state".to_string()),
+                code_challenge: CODE_CHALLENGE.to_string(),
+                code_challenge_method: oauth::CodeChallengeMethod::S256,
+            })
+            .expect("authorize userinfo client");
+        let access_token = oauth
+            .token(&oauth::TokenRequest {
+                grant_type: "authorization_code".to_string(),
+                code: Some(code),
+                redirect_uri: Some(REDIRECT_URI.to_string()),
+                client_id: CLIENT_ID.to_string(),
+                client_secret: None,
+                code_verifier: Some(CODE_VERIFIER.to_string()),
+                refresh_token: None,
+                scopes: None,
+                resource: None,
+            })
+            .expect("exchange userinfo access token")
+            .access_token;
+
+        let signer = oidc_public_canary_signer();
+        let provider = Arc::new(
+            oidc::OidcProvider::with_defaults(Arc::clone(&oauth)).expect("default OIDC provider"),
+        );
+        provider
+            .set_id_token_signing_activation_dependencies(
+                Arc::new(LiveLoopbackOidcReadBackVerifier {
+                    address: Mutex::new(None),
+                    generation: signer.binding().ring_generation(),
+                }) as Arc<dyn oidc::OidcJwksReadBackVerifier>,
+                Arc::new(LiveOidcActivationStore::default())
+                    as Arc<dyn oidc::OidcSigningActivationStore>,
+            )
+            .expect("OIDC activation dependencies");
+        provider
+            .begin_id_token_signing_activation(signer, "https://fastmcp.invalid/oidc/jwks")
+            .expect("OIDC Pending activation");
+        let routes = OAuthHttpRoutes::new(oauth, base)
+            .expect("OAuth route base")
+            .with_oidc(provider)
+            .expect("OIDC routes");
+        (routes, access_token)
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    fn native_oidc_userinfo_request(
+        routes: &OAuthHttpRoutes,
+        method: Http1Method,
+        authorization: Option<&str>,
+    ) -> HttpResponse {
+        let path = routes
+            .oidc_routes()
+            .expect("OIDC routes configured")
+            .userinfo_path()
+            .to_owned();
+        let request = asupersync::http::h1::Request {
+            method,
+            uri: path.clone(),
+            version: asupersync::http::h1::Version::Http11,
+            headers: authorization
+                .map(|value| vec![("Authorization".to_owned(), value.to_owned())])
+                .unwrap_or_default(),
+            body: Vec::new(),
+            trailers: Vec::new(),
+            peer_addr: None,
+        };
+        dispatch_oauth_h1_request(routes, &request, &path, "")
+    }
+
+    /// bd-vej30: discovery advertises `userinfo_endpoint`, so a native route
+    /// must serve it, under either spelling of the endpoint base.
+    #[cfg(feature = "builtin-auth-server")]
+    #[test]
+    fn native_oidc_userinfo_serves_claims_for_an_openid_token_positive() {
+        for base in [
+            "https://fastmcp.invalid/oauth",
+            "https://fastmcp.invalid/oauth/",
+        ] {
+            let (routes, access_token) = native_oidc_userinfo_fixture(&["openid"], base);
+            let oidc = routes.oidc_routes().expect("OIDC routes configured");
+            let discovery = oidc
+                .provider()
+                .discovery_document(routes.public_endpoint_base());
+            assert_eq!(
+                discovery.userinfo_endpoint,
+                Some(format!("https://fastmcp.invalid{}", oidc.userinfo_path())),
+                "{base}"
+            );
+            assert!(routes.has_path(oidc.userinfo_path()), "{base}");
+
+            for method in [Http1Method::Get, Http1Method::Post] {
+                let response = native_oidc_userinfo_request(
+                    &routes,
+                    method,
+                    Some(&format!("Bearer {access_token}")),
+                );
+                assert_eq!(response.status, HttpStatus::OK, "{base} {response:?}");
+                assert_eq!(
+                    response.headers.get("cache-control").map(String::as_str),
+                    Some("no-store")
+                );
+                let claims: serde_json::Value =
+                    serde_json::from_slice(&response.body).expect("userinfo JSON");
+                assert!(
+                    claims["sub"].as_str().is_some_and(|sub| !sub.is_empty()),
+                    "{claims}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    #[test]
+    fn native_oidc_userinfo_refuses_a_token_without_openid_scope_negative() {
+        let (routes, access_token) =
+            native_oidc_userinfo_fixture(&["mcp"], "https://fastmcp.invalid/oauth");
+        let response = native_oidc_userinfo_request(
+            &routes,
+            Http1Method::Get,
+            Some(&format!("Bearer {access_token}")),
+        );
+        assert_eq!(response.status, HttpStatus::FORBIDDEN, "{response:?}");
+        assert_eq!(
+            response.headers.get("www-authenticate").map(String::as_str),
+            Some("Bearer error=\"insufficient_scope\"")
+        );
+        let body: serde_json::Value = serde_json::from_slice(&response.body).expect("error JSON");
+        assert_eq!(body, serde_json::json!({ "error": "insufficient_scope" }));
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    #[test]
+    fn native_oidc_userinfo_challenges_missing_and_unknown_bearer_tokens() {
+        let (routes, _) =
+            native_oidc_userinfo_fixture(&["openid"], "https://fastmcp.invalid/oauth");
+        for authorization in [None, Some("Basic dXNlcjpwYXNz"), Some("Bearer")] {
+            let response = native_oidc_userinfo_request(&routes, Http1Method::Get, authorization);
+            assert_eq!(
+                response.status,
+                HttpStatus::UNAUTHORIZED,
+                "{authorization:?}"
+            );
+            assert_eq!(
+                response.headers.get("www-authenticate").map(String::as_str),
+                Some("Bearer"),
+                "{authorization:?}"
+            );
+        }
+        let response = native_oidc_userinfo_request(
+            &routes,
+            Http1Method::Get,
+            Some("Bearer forged-opaque-credential"),
+        );
+        assert_eq!(response.status, HttpStatus::UNAUTHORIZED);
+        assert_eq!(
+            response.headers.get("www-authenticate").map(String::as_str),
+            Some("Bearer error=\"invalid_token\"")
+        );
+        let response = native_oidc_userinfo_request(&routes, Http1Method::Put, None);
+        assert_eq!(response.status, HttpStatus::METHOD_NOT_ALLOWED);
+    }
+
     #[cfg(feature = "builtin-auth-server")]
     #[test]
     fn live_http_oidc_jwks_read_back_then_discovery_activate_exact_public_bytes() {
