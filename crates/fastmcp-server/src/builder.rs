@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 use fastmcp_console::stats::ServerStats;
-use fastmcp_core::McpResult;
+use fastmcp_core::{McpError, McpResult};
 use fastmcp_protocol::extensions::ExtensionSettingsCompatibilityResolver;
 #[cfg(feature = "apps")]
 use fastmcp_protocol::extensions::{
@@ -93,6 +93,93 @@ impl fmt::Display for ServerLaunchPolicyError {
 }
 
 impl std::error::Error for ServerLaunchPolicyError {}
+
+/// The kind of catalog item a builder refused to register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationKind {
+    Tool,
+    LegacyTool,
+    Resource,
+    LegacyResource,
+    ResourceTemplate,
+    LegacyResourceTemplate,
+    Prompt,
+    LegacyPrompt,
+    /// A mounted child server, named by its prefix.
+    Mount,
+}
+
+impl fmt::Display for RegistrationKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Tool => "tool",
+            Self::LegacyTool => "exact-2024 tool",
+            Self::Resource => "resource",
+            Self::LegacyResource => "exact-2024 resource",
+            Self::ResourceTemplate => "resource template",
+            Self::LegacyResourceTemplate => "exact-2024 resource template",
+            Self::Prompt => "prompt",
+            Self::LegacyPrompt => "exact-2024 prompt",
+            Self::Mount => "mount",
+        })
+    }
+}
+
+/// One registration the builder refused. It is kept so the build fails with
+/// it instead of starting a server that silently lacks the item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedRegistration {
+    /// What was being registered.
+    pub kind: RegistrationKind,
+    /// The tool or prompt name, resource URI, URI template, or mount prefix.
+    pub name: String,
+    /// Why the registration was refused.
+    pub reason: String,
+}
+
+impl fmt::Display for RefusedRegistration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} {:?}: {}", self.kind, self.name, self.reason)
+    }
+}
+
+/// A builder could not produce a server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerBuildError {
+    /// One or more registrations were refused, listed in registration order.
+    /// No server was built.
+    InvalidConfiguration(Vec<RefusedRegistration>),
+}
+
+impl fmt::Display for ServerBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidConfiguration(refused) => {
+                write!(
+                    formatter,
+                    "invalid server configuration: {} refused registration(s)",
+                    refused.len()
+                )?;
+                for registration in refused {
+                    write!(formatter, "; {registration}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for ServerBuildError {}
+
+#[cfg(feature = "apps")]
+const MOUNT_APPS_REFUSAL: &str = "the child contains MCP Apps components but the destination has no active compatible MCP Apps extension";
+
+/// Reads a registration's name from a host definition hook. A panicking hook
+/// yields a placeholder; the router's own admission reports the panic.
+fn registration_name(name: impl FnOnce() -> String) -> String {
+    crate::catch_extension_unwind(name)
+        .unwrap_or_else(|_payload| "<definition hook panicked>".to_owned())
+}
 
 fn protocol_policy_from_server_launch_value(
     value: Option<&OsStr>,
@@ -198,6 +285,8 @@ pub struct ServerBuilder {
     /// cannot disambiguate two independent upstream task-ID namespaces.
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     final_task_relay: Option<Arc<ProxyFinalTaskRelay>>,
+    /// Registrations refused so far. A nonempty list fails the build.
+    refused_registrations: Vec<RefusedRegistration>,
 }
 
 impl ServerBuilder {
@@ -317,6 +406,7 @@ impl ServerBuilder {
             final_task_runtime: None,
             #[cfg(all(feature = "proxy", feature = "tasks"))]
             final_task_relay: None,
+            refused_registrations: Vec::new(),
         }
     }
 
@@ -326,8 +416,8 @@ impl ServerBuilder {
     /// or mounted component is registered with an identifier that already
     /// exists:
     ///
-    /// - [`DuplicateBehavior::Error`]: Reject the conflicting registration,
-    ///   log the error, and continue constructing the builder
+    /// - [`DuplicateBehavior::Error`]: Refuse the conflicting registration;
+    ///   [`try_build`](Self::try_build) then fails naming it
     /// - [`DuplicateBehavior::Warn`]: Log warning, keep original (default)
     /// - [`DuplicateBehavior::Replace`]: Replace with new component
     /// - [`DuplicateBehavior::Ignore`]: Silently keep original
@@ -338,8 +428,8 @@ impl ServerBuilder {
     /// Server::new("demo", "1.0")
     ///     .on_duplicate(DuplicateBehavior::Error)  // Strict mode
     ///     .tool(handler1)
-    ///     .tool(handler2)  // Rejected and logged if the name conflicts
-    ///     .build();
+    ///     .tool(handler2)  // Refused if the name conflicts
+    ///     .try_build()?;   // Fails, naming the refused tool
     /// ```
     #[must_use]
     pub fn on_duplicate(mut self, behavior: DuplicateBehavior) -> Self {
@@ -857,23 +947,36 @@ impl ServerBuilder {
     /// Registers a tool handler.
     ///
     /// Duplicate handling is controlled by [`on_duplicate`](Self::on_duplicate).
-    /// If [`DuplicateBehavior::Error`] is set and a duplicate is found,
-    /// an error will be logged and the tool will not be registered.
+    /// A refused registration (an inadmissible definition, or a duplicate under
+    /// [`DuplicateBehavior::Error`]) is recorded and fails
+    /// [`try_build`](Self::try_build); the server never starts without it.
     #[must_use]
     pub fn tool<H: ToolHandler + 'static>(mut self, handler: H) -> Self {
-        if let Err(e) = self
+        let name = registration_name(|| handler.definition().name);
+        match self
             .router
             .add_tool_with_behavior(handler, self.on_duplicate)
         {
-            log::error!(
-                target: "fastmcp_rust::builder",
-                "Failed to register tool; code={:?}",
-                e.code
-            );
-        } else {
-            self.advertise_legacy_tools_list_changed();
+            Ok(()) => self.advertise_legacy_tools_list_changed(),
+            Err(error) => self.refuse(RegistrationKind::Tool, name, error),
         }
         self
+    }
+
+    fn refuse(&mut self, kind: RegistrationKind, name: String, error: McpError) {
+        self.refused_registrations.push(RefusedRegistration {
+            kind,
+            name,
+            reason: error.message,
+        });
+    }
+
+    fn refuse_mount(&mut self, prefix: Option<&str>, reason: String) {
+        self.refused_registrations.push(RefusedRegistration {
+            kind: RegistrationKind::Mount,
+            name: prefix.unwrap_or_default().to_owned(),
+            reason,
+        });
     }
 
     /// Registers an intentionally exact MCP 2024-11-05-only tool handler.
@@ -885,17 +988,13 @@ impl ServerBuilder {
     /// when final schema admission fails.
     #[must_use]
     pub fn legacy_tool<H: ToolHandler + 'static>(mut self, handler: H) -> Self {
-        if let Err(error) = self
+        let name = registration_name(|| handler.definition().name);
+        match self
             .router
             .add_legacy_tool_with_behavior(handler, self.on_duplicate)
         {
-            log::error!(
-                target: "fastmcp_rust::builder",
-                "Failed to register exact-2024-only tool; code={:?}",
-                error.code
-            );
-        } else {
-            self.advertise_legacy_tools_list_changed();
+            Ok(()) => self.advertise_legacy_tools_list_changed(),
+            Err(error) => self.refuse(RegistrationKind::LegacyTool, name, error),
         }
         self
     }
@@ -903,21 +1002,17 @@ impl ServerBuilder {
     /// Registers a resource handler.
     ///
     /// Duplicate handling is controlled by [`on_duplicate`](Self::on_duplicate).
-    /// If [`DuplicateBehavior::Error`] is set and a duplicate is found,
-    /// an error will be logged and the resource will not be registered.
+    /// A refused registration is recorded and fails
+    /// [`try_build`](Self::try_build), as for [`Self::tool`].
     #[must_use]
     pub fn resource<H: ResourceHandler + 'static>(mut self, handler: H) -> Self {
-        if let Err(e) = self
+        let name = registration_name(|| handler.definition().uri);
+        match self
             .router
             .add_resource_with_behavior(handler, self.on_duplicate)
         {
-            log::error!(
-                target: "fastmcp_rust::builder",
-                "Failed to register resource; code={:?}",
-                e.code
-            );
-        } else {
-            self.advertise_legacy_resource_subscriptions();
+            Ok(()) => self.advertise_legacy_resource_subscriptions(),
+            Err(error) => self.refuse(RegistrationKind::Resource, name, error),
         }
         self
     }
@@ -965,17 +1060,13 @@ impl ServerBuilder {
     /// Registers an intentionally exact MCP 2024-11-05-only resource.
     #[must_use]
     pub fn legacy_resource<H: ResourceHandler + 'static>(mut self, handler: H) -> Self {
-        if let Err(error) = self
+        let name = registration_name(|| handler.definition().uri);
+        match self
             .router
             .add_legacy_resource_with_behavior(handler, self.on_duplicate)
         {
-            log::error!(
-                target: "fastmcp_rust::builder",
-                "Failed to register exact-2024-only resource; code={:?}",
-                error.code
-            );
-        } else {
-            self.advertise_legacy_resource_subscriptions();
+            Ok(()) => self.advertise_legacy_resource_subscriptions(),
+            Err(error) => self.refuse(RegistrationKind::LegacyResource, name, error),
         }
         self
     }
@@ -983,21 +1074,16 @@ impl ServerBuilder {
     /// Registers a resource template.
     ///
     /// Duplicate handling is controlled by [`on_duplicate`](Self::on_duplicate).
-    /// With [`DuplicateBehavior::Error`], a conflicting template is rejected
-    /// and logged while builder construction continues.
+    /// A refused template is recorded and fails [`try_build`](Self::try_build).
     #[must_use]
     pub fn resource_template(mut self, template: ResourceTemplate) -> Self {
-        if let Err(error) = self
+        let name = template.uri_template.clone();
+        match self
             .router
             .add_resource_template_with_behavior(template, self.on_duplicate)
         {
-            log::error!(
-                target: "fastmcp_rust::builder",
-                "Failed to register resource template; code={:?}",
-                error.code
-            );
-        } else {
-            self.advertise_legacy_resource_subscriptions();
+            Ok(()) => self.advertise_legacy_resource_subscriptions(),
+            Err(error) => self.refuse(RegistrationKind::ResourceTemplate, name, error),
         }
         self
     }
@@ -1005,17 +1091,13 @@ impl ServerBuilder {
     /// Registers an intentionally exact MCP 2024-11-05-only resource template.
     #[must_use]
     pub fn legacy_resource_template(mut self, template: ResourceTemplate) -> Self {
-        if let Err(error) = self
+        let name = template.uri_template.clone();
+        match self
             .router
             .add_legacy_resource_template_with_behavior(template, self.on_duplicate)
         {
-            log::error!(
-                target: "fastmcp_rust::builder",
-                "Failed to register exact-2024-only resource template; code={:?}",
-                error.code
-            );
-        } else {
-            self.advertise_legacy_resource_subscriptions();
+            Ok(()) => self.advertise_legacy_resource_subscriptions(),
+            Err(error) => self.refuse(RegistrationKind::LegacyResourceTemplate, name, error),
         }
         self
     }
@@ -1023,21 +1105,17 @@ impl ServerBuilder {
     /// Registers a prompt handler.
     ///
     /// Duplicate handling is controlled by [`on_duplicate`](Self::on_duplicate).
-    /// If [`DuplicateBehavior::Error`] is set and a duplicate is found,
-    /// an error will be logged and the prompt will not be registered.
+    /// A refused registration is recorded and fails
+    /// [`try_build`](Self::try_build), as for [`Self::tool`].
     #[must_use]
     pub fn prompt<H: PromptHandler + 'static>(mut self, handler: H) -> Self {
-        if let Err(e) = self
+        let name = registration_name(|| handler.definition().name);
+        match self
             .router
             .add_prompt_with_behavior(handler, self.on_duplicate)
         {
-            log::error!(
-                target: "fastmcp_rust::builder",
-                "Failed to register prompt; code={:?}",
-                e.code
-            );
-        } else {
-            self.advertise_legacy_prompts_list_changed();
+            Ok(()) => self.advertise_legacy_prompts_list_changed(),
+            Err(error) => self.refuse(RegistrationKind::Prompt, name, error),
         }
         self
     }
@@ -1045,17 +1123,13 @@ impl ServerBuilder {
     /// Registers an intentionally exact MCP 2024-11-05-only prompt.
     #[must_use]
     pub fn legacy_prompt<H: PromptHandler + 'static>(mut self, handler: H) -> Self {
-        if let Err(error) = self
+        let name = registration_name(|| handler.definition().name);
+        match self
             .router
             .add_legacy_prompt_with_behavior(handler, self.on_duplicate)
         {
-            log::error!(
-                target: "fastmcp_rust::builder",
-                "Failed to register exact-2024-only prompt; code={:?}",
-                error.code
-            );
-        } else {
-            self.advertise_legacy_prompts_list_changed();
+            Ok(()) => self.advertise_legacy_prompts_list_changed(),
+            Err(error) => self.refuse(RegistrationKind::LegacyPrompt, name, error),
         }
         self
     }
@@ -2167,16 +2241,13 @@ impl ServerBuilder {
     /// - Without prefix, names are preserved (may cause conflicts)
     ///
     /// Duplicate handling follows [`on_duplicate`](Self::on_duplicate). With
-    /// [`DuplicateBehavior::Error`], any conflict rejects the complete mount;
-    /// the failure is logged and fluent builder construction continues.
+    /// [`DuplicateBehavior::Error`], any conflict rejects the complete mount.
+    /// A rejected mount is recorded and fails [`try_build`](Self::try_build).
     #[must_use]
     pub fn mount(mut self, server: crate::Server, prefix: Option<&str>) -> Self {
         #[cfg(feature = "apps")]
         if server.router.has_mcp_apps_bound_components() && !self.has_active_official_mcp_apps() {
-            log::error!(
-                target: "fastmcp_rust::mount",
-                "Mount rejected because the child contains MCP Apps components but the destination has no active compatible MCP Apps extension"
-            );
+            self.refuse_mount(prefix, MOUNT_APPS_REFUSAL.to_owned());
             return self;
         }
 
@@ -2194,7 +2265,7 @@ impl ServerBuilder {
             log::warn!(target: "fastmcp_rust::mount", "{}", warning);
         }
         for error in &result.errors {
-            log::error!(target: "fastmcp_rust::mount", "{}", error);
+            self.refuse_mount(prefix, error.clone());
         }
 
         // Update capabilities based on what was mounted
@@ -2227,10 +2298,7 @@ impl ServerBuilder {
     ) -> Self {
         #[cfg(feature = "apps")]
         if server.router.has_mcp_apps_bound_components() && !self.has_active_official_mcp_apps() {
-            log::error!(
-                target: "fastmcp_rust::mount",
-                "Mount rejected because the child contains MCP Apps components but the destination has no active compatible MCP Apps extension"
-            );
+            self.refuse_mount(prefix, MOUNT_APPS_REFUSAL.to_owned());
             return self;
         }
 
@@ -2247,7 +2315,7 @@ impl ServerBuilder {
             log::warn!(target: "fastmcp_rust::mount", "{}", warning);
         }
         for error in &result.errors {
-            log::error!(target: "fastmcp_rust::mount", "{}", error);
+            self.refuse_mount(prefix, error.clone());
         }
 
         if has_tools && result.tools > 0 {
@@ -2290,10 +2358,7 @@ impl ServerBuilder {
     pub fn mount_tools(mut self, server: crate::Server, prefix: Option<&str>) -> Self {
         #[cfg(feature = "apps")]
         if server.router.has_mcp_apps_bound_components() && !self.has_active_official_mcp_apps() {
-            log::error!(
-                target: "fastmcp_rust::mount",
-                "Mount rejected because the child contains MCP Apps components but the destination has no active compatible MCP Apps extension"
-            );
+            self.refuse_mount(prefix, MOUNT_APPS_REFUSAL.to_owned());
             return self;
         }
 
@@ -2307,7 +2372,7 @@ impl ServerBuilder {
             log::warn!(target: "fastmcp_rust::mount", "{}", warning);
         }
         for error in &result.errors {
-            log::error!(target: "fastmcp_rust::mount", "{}", error);
+            self.refuse_mount(prefix, error.clone());
         }
 
         // Update capabilities if tools were mounted
@@ -2343,10 +2408,7 @@ impl ServerBuilder {
     pub fn mount_resources(mut self, server: crate::Server, prefix: Option<&str>) -> Self {
         #[cfg(feature = "apps")]
         if server.router.has_mcp_apps_bound_components() && !self.has_active_official_mcp_apps() {
-            log::error!(
-                target: "fastmcp_rust::mount",
-                "Mount rejected because the child contains MCP Apps components but the destination has no active compatible MCP Apps extension"
-            );
+            self.refuse_mount(prefix, MOUNT_APPS_REFUSAL.to_owned());
             return self;
         }
 
@@ -2360,7 +2422,7 @@ impl ServerBuilder {
             log::warn!(target: "fastmcp_rust::mount", "{}", warning);
         }
         for error in &result.errors {
-            log::error!(target: "fastmcp_rust::mount", "{}", error);
+            self.refuse_mount(prefix, error.clone());
         }
 
         // Update capabilities if resources were mounted
@@ -2406,7 +2468,7 @@ impl ServerBuilder {
             log::warn!(target: "fastmcp_rust::mount", "{}", warning);
         }
         for error in &result.errors {
-            log::error!(target: "fastmcp_rust::mount", "{}", error);
+            self.refuse_mount(prefix, error.clone());
         }
 
         // Update capabilities if prompts were mounted
@@ -2693,8 +2755,37 @@ impl ServerBuilder {
     /// `tasks/cancel` are served. Call [`Self::final_tasks`] to replace that
     /// default with an application-owned store. The historical task-manager
     /// adapter is test-only and does not serve the official methods.
+    ///
+    /// # Panics
+    ///
+    /// Panics with the [`ServerBuildError`] when any registration was refused,
+    /// rather than starting a server that silently lacks it. Use
+    /// [`Self::try_build`] to handle the refusal.
     #[must_use]
-    pub fn build(mut self) -> Server {
+    pub fn build(self) -> Server {
+        match self.try_build() {
+            Ok(server) => server,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// Builds the server, or fails naming every refused registration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerBuildError::InvalidConfiguration`] listing each refused
+    /// tool, resource, resource template, prompt or mount, with its reason.
+    /// No server is built.
+    pub fn try_build(mut self) -> Result<Server, ServerBuildError> {
+        if !self.refused_registrations.is_empty() {
+            return Err(ServerBuildError::InvalidConfiguration(std::mem::take(
+                &mut self.refused_registrations,
+            )));
+        }
+        Ok(self.build_admitted())
+    }
+
+    fn build_admitted(mut self) -> Server {
         // Configure router with strict input validation setting
         self.router
             .set_strict_input_validation(self.strict_input_validation);
@@ -2816,14 +2907,6 @@ impl ServerBuilder {
             final_task_relay,
             final_subscriptions,
         }
-    }
-
-    /// Builds a server through the historical fallible spelling.
-    ///
-    /// Invalid launch configuration is rejected by [`Self::try_new`] before
-    /// the builder exists, so this always returns the result of [`Self::build`].
-    pub fn try_build(self) -> Result<Server, ServerLaunchPolicyError> {
-        Ok(self.build())
     }
 }
 
@@ -4410,16 +4493,95 @@ mod tests {
         }
     }
 
+    /// The refusals a builder must fail with; building must not succeed.
+    fn refused_registrations(builder: ServerBuilder) -> Vec<RefusedRegistration> {
+        match builder.try_build() {
+            Ok(_) => panic!("a refused registration must fail try_build"),
+            Err(ServerBuildError::InvalidConfiguration(refused)) => refused,
+        }
+    }
+
     #[test]
-    fn builder_on_duplicate_error_logs_but_continues() {
-        // With DuplicateBehavior::Error, duplicate registration logs error
-        // but builder doesn't panic
+    fn builder_on_duplicate_error_refuses_the_build() {
+        let refused = refused_registrations(
+            ServerBuilder::new("srv", "1.0")
+                .on_duplicate(DuplicateBehavior::Error)
+                .tool(DupTool("dup"))
+                .tool(DupTool("dup")),
+        );
+        assert_eq!(refused.len(), 1);
+        assert_eq!(
+            (refused[0].kind, refused[0].name.as_str()),
+            (RegistrationKind::Tool, "dup")
+        );
+    }
+
+    struct AnnotatedTool(serde_json::Value);
+    impl crate::ToolHandler for AnnotatedTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "lookup".to_string(),
+                description: None,
+                input_schema: self.0.clone(),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            }
+        }
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text("ok")])
+        }
+    }
+
+    /// A `region` property mirrored as `Mcp-Param-Region`; only its type varies.
+    fn region_schema(region_type: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {
+            "region": {"type": region_type, "x-mcp-header": "Region"}
+        }})
+    }
+
+    #[test]
+    fn builder_admits_a_valid_annotated_tool_into_the_catalog() {
         let server = ServerBuilder::new("srv", "1.0")
-            .on_duplicate(DuplicateBehavior::Error)
-            .tool(DupTool("dup"))
-            .tool(DupTool("dup")) // duplicate - will log error
+            .tool(AnnotatedTool(region_schema(serde_json::json!("string"))))
+            .try_build()
+            .expect("a valid annotated tool must build");
+        let tools = server.tools();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "lookup");
+        assert_eq!(
+            tools[0].input_schema["properties"]["region"]["x-mcp-header"],
+            "Region"
+        );
+    }
+
+    #[test]
+    fn builder_refuses_an_invalid_annotation_naming_the_tool_and_reason() {
+        // Identical to the positive except the annotated type is nullable.
+        let refused = refused_registrations(ServerBuilder::new("srv", "1.0").tool(AnnotatedTool(
+            region_schema(serde_json::json!(["string", "null"])),
+        )));
+        assert_eq!(refused.len(), 1);
+        assert_eq!(
+            (refused[0].kind, refused[0].name.as_str()),
+            (RegistrationKind::Tool, "lookup")
+        );
+        assert_eq!(
+            refused[0].reason,
+            "tool declares an invalid final input schema"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "tool \"lookup\": tool declares an invalid final input schema")]
+    fn builder_build_panics_instead_of_dropping_a_refused_tool() {
+        let _ = ServerBuilder::new("srv", "1.0")
+            .tool(AnnotatedTool(region_schema(serde_json::json!([
+                "string", "null"
+            ]))))
             .build();
-        assert!(server.has_tools());
     }
 
     // ── Mount ──────────────────────────────────────────────────────
@@ -4454,29 +4616,22 @@ mod tests {
 
     #[cfg(feature = "apps")]
     #[test]
-    fn builder_mount_rejects_apps_bound_child_without_apps_opt_in_atomically() {
-        let main = ServerBuilder::new("main", "1.0")
-            .tool(TestTool)
-            .resource(TestResource)
-            .mount(apps_mount_child(), None)
-            .build();
-
-        assert!(main.has_tools());
-        assert!(main.has_resources());
-        assert_eq!(
-            main.extension_registry_receipt()
-                .map(|receipt| receipt.descriptor_count()),
-            cfg!(feature = "tasks").then_some(1),
-            "rejecting a child must retain only the parent's feature-selected runtime"
+    fn builder_mount_refuses_the_build_for_apps_bound_child_without_apps_opt_in() {
+        let refused = refused_registrations(
+            ServerBuilder::new("main", "1.0")
+                .tool(TestTool)
+                .resource(TestResource)
+                .mount(apps_mount_child(), None),
         );
+        assert_single_mount_refusal(&refused, "", "MCP Apps");
+    }
 
-        let router = main.into_router();
-        assert_eq!(router.tools_count(), 1, "the rejected child adds no tools");
-        assert_eq!(
-            router.resources_count(),
-            1,
-            "the rejected child adds no resources"
-        );
+    /// Exactly one refused mount, named by its prefix, for the given cause.
+    fn assert_single_mount_refusal(refused: &[RefusedRegistration], prefix: &str, cause: &str) {
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0].kind, RegistrationKind::Mount);
+        assert_eq!(refused[0].name, prefix);
+        assert!(refused[0].reason.contains(cause), "{refused:?}");
     }
 
     #[cfg(feature = "apps")]
@@ -4505,28 +4660,13 @@ mod tests {
 
     #[cfg(feature = "apps")]
     #[test]
-    fn builder_mount_tools_rejects_apps_bound_child_without_apps_opt_in_atomically() {
-        let main = ServerBuilder::new("main", "1.0")
-            .resource(TestResource)
-            .mount_tools(apps_resource_bound_tool_mount_child(), None)
-            .build();
-
-        assert!(!main.has_tools());
-        assert!(main.has_resources());
-        assert_eq!(
-            main.extension_registry_receipt()
-                .map(|receipt| receipt.descriptor_count()),
-            cfg!(feature = "tasks").then_some(1),
-            "rejecting a child must retain only the parent's feature-selected runtime"
+    fn builder_mount_tools_refuses_the_build_for_apps_bound_child_without_apps_opt_in() {
+        let refused = refused_registrations(
+            ServerBuilder::new("main", "1.0")
+                .resource(TestResource)
+                .mount_tools(apps_resource_bound_tool_mount_child(), None),
         );
-
-        let router = main.into_router();
-        assert_eq!(router.tools_count(), 0, "the rejected child adds no tools");
-        assert_eq!(
-            router.resources_count(),
-            1,
-            "the rejected child leaves existing destination resources unchanged"
-        );
+        assert_single_mount_refusal(&refused, "", "MCP Apps");
     }
 
     #[cfg(feature = "apps")]
@@ -4563,32 +4703,13 @@ mod tests {
 
     #[cfg(feature = "apps")]
     #[test]
-    fn builder_mount_resources_rejects_apps_bound_child_without_apps_opt_in_atomically() {
-        let main = ServerBuilder::new("main", "1.0")
-            .tool(TestTool)
-            .mount_resources(apps_mount_child(), None)
-            .build();
-
-        assert!(main.has_tools());
-        assert!(!main.has_resources());
-        assert_eq!(
-            main.extension_registry_receipt()
-                .map(|receipt| receipt.descriptor_count()),
-            cfg!(feature = "tasks").then_some(1),
-            "rejecting a child must retain only the parent's feature-selected runtime"
+    fn builder_mount_resources_refuses_the_build_for_apps_bound_child_without_apps_opt_in() {
+        let refused = refused_registrations(
+            ServerBuilder::new("main", "1.0")
+                .tool(TestTool)
+                .mount_resources(apps_mount_child(), None),
         );
-
-        let router = main.into_router();
-        assert_eq!(
-            router.tools_count(),
-            1,
-            "the rejected child leaves existing destination tools unchanged"
-        );
-        assert_eq!(
-            router.resources_count(),
-            0,
-            "the rejected child adds no resources"
-        );
+        assert_single_mount_refusal(&refused, "", "MCP Apps");
     }
 
     #[cfg(feature = "apps")]
@@ -4682,11 +4803,15 @@ mod tests {
 
     #[test]
     fn builder_full_mount_honors_duplicate_policy_for_all_component_kinds() {
+        assert_mount_duplicates_refused(refused_registrations(
+            marked_builder("original")
+                .on_duplicate(DuplicateBehavior::Error)
+                .mount(marked_builder("incoming").build(), None),
+        ));
         for behavior in [
             DuplicateBehavior::Warn,
             DuplicateBehavior::Ignore,
             DuplicateBehavior::Replace,
-            DuplicateBehavior::Error,
         ] {
             let server = marked_builder("original")
                 .on_duplicate(behavior)
@@ -4703,13 +4828,34 @@ mod tests {
         }
     }
 
+    /// Under Error a colliding mount is refused, so the build fails.
+    fn assert_mount_duplicates_refused(refused: Vec<RefusedRegistration>) {
+        assert!(!refused.is_empty());
+        assert!(
+            refused
+                .iter()
+                .all(|registration| registration.kind == RegistrationKind::Mount
+                    && registration.reason.contains("already exists")),
+            "{refused:?}"
+        );
+    }
+
     #[test]
     fn builder_partial_mounts_honor_duplicate_policy() {
+        let error = || marked_builder("original").on_duplicate(DuplicateBehavior::Error);
+        assert_mount_duplicates_refused(refused_registrations(
+            error().mount_tools(marked_builder("incoming").build(), None),
+        ));
+        assert_mount_duplicates_refused(refused_registrations(
+            error().mount_resources(marked_builder("incoming").build(), None),
+        ));
+        assert_mount_duplicates_refused(refused_registrations(
+            error().mount_prompts(marked_builder("incoming").build(), None),
+        ));
         for behavior in [
             DuplicateBehavior::Warn,
             DuplicateBehavior::Ignore,
             DuplicateBehavior::Replace,
-            DuplicateBehavior::Error,
         ] {
             let replacement_marker = if behavior == DuplicateBehavior::Replace {
                 "incoming"
@@ -4762,30 +4908,17 @@ mod tests {
     }
 
     #[test]
-    fn builder_full_and_partial_mounts_reject_invalid_prefixes() {
-        let full = marked_builder("original")
-            .on_duplicate(DuplicateBehavior::Replace)
-            .mount(marked_builder("incoming").build(), Some("peer/secret"))
-            .build();
-        assert_marked_server(&full, "original");
-
-        let tools = marked_builder("original")
-            .on_duplicate(DuplicateBehavior::Replace)
-            .mount_tools(marked_builder("incoming").build(), Some("peer/secret"))
-            .build();
-        assert_marked_server(&tools, "original");
-
-        let resources = marked_builder("original")
-            .on_duplicate(DuplicateBehavior::Replace)
-            .mount_resources(marked_builder("incoming").build(), Some("peer/secret"))
-            .build();
-        assert_marked_server(&resources, "original");
-
-        let prompts = marked_builder("original")
-            .on_duplicate(DuplicateBehavior::Replace)
-            .mount_prompts(marked_builder("incoming").build(), Some("peer/secret"))
-            .build();
-        assert_marked_server(&prompts, "original");
+    fn builder_full_and_partial_mounts_refuse_the_build_for_invalid_prefixes() {
+        let replace = || marked_builder("original").on_duplicate(DuplicateBehavior::Replace);
+        let incoming = || marked_builder("incoming").build();
+        for refused in [
+            refused_registrations(replace().mount(incoming(), Some("peer/secret"))),
+            refused_registrations(replace().mount_tools(incoming(), Some("peer/secret"))),
+            refused_registrations(replace().mount_resources(incoming(), Some("peer/secret"))),
+            refused_registrations(replace().mount_prompts(incoming(), Some("peer/secret"))),
+        ] {
+            assert_single_mount_refusal(&refused, "peer/secret", "Invalid mount prefix");
+        }
     }
 
     #[cfg(feature = "proxy")]
@@ -7315,23 +7448,33 @@ mod tests {
     }
 
     #[test]
-    fn builder_on_duplicate_error_resource_logs_but_continues() {
-        let server = ServerBuilder::new("srv", "1.0")
-            .on_duplicate(DuplicateBehavior::Error)
-            .resource(DupResource("dup"))
-            .resource(DupResource("dup"))
-            .build();
-        assert!(server.has_resources());
+    fn builder_on_duplicate_error_resource_refuses_the_build() {
+        let refused = refused_registrations(
+            ServerBuilder::new("srv", "1.0")
+                .on_duplicate(DuplicateBehavior::Error)
+                .resource(DupResource("dup"))
+                .resource(DupResource("dup")),
+        );
+        assert_eq!(refused.len(), 1);
+        assert_eq!(
+            (refused[0].kind, refused[0].name.as_str()),
+            (RegistrationKind::Resource, "file:///dup")
+        );
     }
 
     #[test]
-    fn builder_on_duplicate_error_prompt_logs_but_continues() {
-        let server = ServerBuilder::new("srv", "1.0")
-            .on_duplicate(DuplicateBehavior::Error)
-            .prompt(DupPrompt("dup"))
-            .prompt(DupPrompt("dup"))
-            .build();
-        assert!(server.has_prompts());
+    fn builder_on_duplicate_error_prompt_refuses_the_build() {
+        let refused = refused_registrations(
+            ServerBuilder::new("srv", "1.0")
+                .on_duplicate(DuplicateBehavior::Error)
+                .prompt(DupPrompt("dup"))
+                .prompt(DupPrompt("dup")),
+        );
+        assert_eq!(refused.len(), 1);
+        assert_eq!(
+            (refused[0].kind, refused[0].name.as_str()),
+            (RegistrationKind::Prompt, "dup")
+        );
     }
 
     #[cfg(feature = "proxy")]

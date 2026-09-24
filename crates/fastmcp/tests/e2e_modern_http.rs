@@ -24907,31 +24907,22 @@ fn spawn_modern_duplicate_http_server(behavior: DuplicateBehavior) -> HttpServer
 }
 
 #[test]
-fn e2e_public_http_on_duplicate_error_keeps_first_and_replace_installs_second() {
+fn e2e_public_http_on_duplicate_error_refuses_the_build_and_replace_installs_second() {
     let cx = Cx::for_request();
 
-    let keep_server = spawn_modern_duplicate_http_server(DuplicateBehavior::Error);
-    let mut keep_client = runtime_block_on_bounded(
-        &cx,
-        modern::ClientBuilder::new()
-            .client_info("e2e-public-http-duplicate-error", "1.0.0")
-            .connect_http_with_cx(public_http_target(keep_server.address(), "/mcp"), &cx),
-    )
-    .expect("the ModernOnly public facade connects to the Error-on-duplicate HTTP server");
-    let kept = runtime_block_on_bounded(
-        &cx,
-        keep_client.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({"value": "alpha"})),
-    )
-    .expect("Error must keep the first registration callable");
+    // Error refuses the duplicate, so no server is built at all.
+    let refused = modern::ServerBuilder::new("facade-http-duplicate", "1.0.0")
+        .on_duplicate(DuplicateBehavior::Error)
+        .tool(PublicHttpValue)
+        .tool(ReplacedPublicHttpValue)
+        .try_build();
+    let Err(error) = refused else {
+        panic!("on_duplicate Error must refuse the build instead of dropping the duplicate");
+    };
     assert!(
-        kept.content.iter().any(|content| match content {
-            ContentBlock::Text { text, .. } => text == "tool:alpha",
-            _ => false,
-        }),
-        "on_duplicate Error must keep the first handler: {kept:?}"
+        error.message.contains(PUBLIC_HTTP_TOOL_NAME),
+        "the refusal must name the duplicate tool: {error:?}"
     );
-    drop(keep_client);
-    keep_server.shutdown();
 
     let replace_server = spawn_modern_duplicate_http_server(DuplicateBehavior::Replace);
     let mut replace_client = runtime_block_on_bounded(
@@ -33421,30 +33412,24 @@ fn spawn_legacy_cache_http_server() -> HttpServerFixture {
 }
 
 #[test]
-fn e2e_public_http_legacy_on_duplicate_error_keeps_first_and_replace_installs_second() {
+fn e2e_public_http_legacy_on_duplicate_error_refuses_the_build_and_replace_installs_second() {
     let cx = Cx::for_request();
 
-    let keep_server = spawn_legacy_duplicate_http_server(DuplicateBehavior::Error);
-    let mut keep_client = connect_legacy_http_client(
-        &cx,
-        keep_server.address(),
-        "e2e-public-http-legacy-duplicate-error",
+    // Error refuses the duplicate, so no server is built at all.
+    let refused = ServerBuilder::new("facade-http-legacy-duplicate", "1.0.0")
+        .protocol_policy(ProtocolPolicy::LegacyOnly)
+        .expect("LegacyOnly is available")
+        .on_duplicate(DuplicateBehavior::Error)
+        .tool(PublicHttpValue)
+        .tool(ReplacedPublicHttpValue)
+        .try_build();
+    let Err(error) = refused else {
+        panic!("on_duplicate Error must refuse the build instead of dropping the duplicate");
+    };
+    assert!(
+        error.to_string().contains(PUBLIC_HTTP_TOOL_NAME),
+        "the refusal must name the duplicate tool: {error:?}"
     );
-    let kept = legacy_http_call(
-        &cx,
-        &mut keep_client,
-        PUBLIC_HTTP_TOOL_NAME,
-        json!({"value": "alpha"}),
-        "exact-2024 duplicate-error tools/call",
-    )
-    .expect("Error must keep the first registration callable");
-    assert_eq!(
-        legacy_http_tool_text(&kept).as_deref(),
-        Some("tool:alpha"),
-        "on_duplicate Error must keep the first handler: {kept:?}"
-    );
-    drop(keep_client);
-    keep_server.shutdown();
 
     let replace_server = spawn_legacy_duplicate_http_server(DuplicateBehavior::Replace);
     let mut replace_client = connect_legacy_http_client(
@@ -57514,69 +57499,28 @@ mod live_websocket_bind {
     }
 
     #[test]
-    fn e2e_public_websocket_legacy_bind_on_duplicate_error_keeps_first_and_replace_installs_second()
-    {
+    fn e2e_public_websocket_legacy_bind_on_duplicate_error_refuses_and_replace_installs_second() {
         let runtime = websocket_test_runtime();
         runtime.block_on(async {
             let cx = Cx::current().expect(
                 "owned exact-2024 WebSocket on_duplicate runtime installs an ambient context",
             );
 
-            let keep = legacy_2024::ServerBuilder::new("facade-ws-legacy-dup-error", "1.0.0")
+            // Error refuses the duplicate, so no server is built to bind.
+            let refused = legacy_2024::ServerBuilder::new("facade-ws-legacy-dup-error", "1.0.0")
                 .on_duplicate(DuplicateBehavior::Error)
                 .tool(PublicHttpValue)
                 .tool(ReplacedPublicHttpValue)
-                .build();
-            let keep_bound = keep
-                .bind_websocket(&cx, "127.0.0.1:0")
-                .await
-                .expect("public LegacyOnly bind_websocket duplicate-error must bind");
-            let keep_address = keep_bound
-                .local_addr()
-                .expect("public LegacyOnly bind_websocket duplicate-error publishes its address");
-            let keep_scope = cx.scope();
-            let keep_listener = cx
-                .spawn_in(&keep_scope, move |serve_cx| async move {
-                    keep_bound.serve(&serve_cx).await
-                })
-                .expect("public LegacyOnly bind_websocket duplicate-error serve must be admitted");
-            let keep_transport = websocket_client_bounded(
-                &cx,
-                "live exact-2024 duplicate-error handshake",
-                AsyncWsClientTransport::connect(&cx, &format!("ws://{keep_address}/mcp")),
-            )
-            .await
-            .expect("duplicate-error WebSocket must complete RFC 6455 upgrade");
-            let mut keep_client = websocket_client_bounded(
-                &cx,
-                "live exact-2024 duplicate-error initialize",
-                legacy_2024::ClientBuilder::new()
-                    .client_info("e2e-public-ws-legacy-dup-error", "1.0.0")
-                    .connect_websocket_with_cx(&cx, keep_transport),
-            )
-            .await
-            .expect("duplicate-error WebSocket must negotiate LegacyOnly");
-            let kept = websocket_client_bounded(
-                &cx,
-                "live exact-2024 duplicate-error tools/call",
-                keep_client.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({"value": "alpha"})),
-            )
-            .await
-            .expect("Error must keep the first registration callable");
-            assert_eq!(
-                legacy_http_tool_text(&kept).as_deref(),
-                Some("tool:alpha"),
-                "on_duplicate Error must keep the first handler: {kept:?}"
+                .try_build();
+            let Err(error) = refused else {
+                panic!(
+                    "on_duplicate Error must refuse the build instead of dropping the duplicate"
+                );
+            };
+            assert!(
+                error.message.contains(PUBLIC_HTTP_TOOL_NAME),
+                "the refusal must name the duplicate tool: {error:?}"
             );
-            websocket_client_bounded(
-                &cx,
-                "live exact-2024 duplicate-error close",
-                keep_client.close(&cx),
-            )
-            .await
-            .expect("the duplicate-error WebSocket client closes");
-            drop(keep_client);
-            keep_listener.abort();
 
             let replace = legacy_2024::ServerBuilder::new("facade-ws-legacy-dup-replace", "1.0.0")
                 .on_duplicate(DuplicateBehavior::Replace)
@@ -60086,69 +60030,28 @@ mod live_websocket_bind {
     }
 
     #[test]
-    fn e2e_public_websocket_bind_on_duplicate_error_keeps_first_and_replace_installs_second() {
+    fn e2e_public_websocket_bind_on_duplicate_error_refuses_the_build_and_replace_installs_second()
+    {
         let runtime = websocket_test_runtime();
         runtime.block_on(async {
             let cx = Cx::current()
                 .expect("owned modern WebSocket on_duplicate runtime installs an ambient context");
 
-            let keep = modern::ServerBuilder::new("facade-ws-dup-error", "1.0.0")
+            // Error refuses the duplicate, so no server is built to bind.
+            let refused = modern::ServerBuilder::new("facade-ws-dup-error", "1.0.0")
                 .on_duplicate(DuplicateBehavior::Error)
                 .tool(PublicHttpValue)
                 .tool(ReplacedPublicHttpValue)
-                .build();
-            let keep_bound = keep
-                .bind_websocket(&cx, "127.0.0.1:0")
-                .await
-                .expect("public ModernOnly bind_websocket duplicate-error must bind");
-            let keep_address = keep_bound
-                .local_addr()
-                .expect("public ModernOnly bind_websocket duplicate-error publishes its address");
-            let keep_scope = cx.scope();
-            let keep_listener = cx
-                .spawn_in(&keep_scope, move |serve_cx| async move {
-                    keep_bound.serve(&serve_cx).await
-                })
-                .expect("public ModernOnly bind_websocket duplicate-error serve must be admitted");
-            let keep_transport = websocket_client_bounded(
-                &cx,
-                "live modern duplicate-error handshake",
-                AsyncWsClientTransport::connect(&cx, &format!("ws://{keep_address}/mcp")),
-            )
-            .await
-            .expect("duplicate-error WebSocket must complete RFC 6455 upgrade");
-            let mut keep_client = websocket_client_bounded(
-                &cx,
-                "live modern duplicate-error initialize",
-                modern::ClientBuilder::new()
-                    .client_info("e2e-public-ws-dup-error", "1.0.0")
-                    .connect_websocket_with_cx(&cx, keep_transport),
-            )
-            .await
-            .expect("duplicate-error WebSocket must negotiate ModernOnly");
-            let kept = websocket_client_bounded(
-                &cx,
-                "live modern duplicate-error tools/call",
-                keep_client.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({"value": "alpha"})),
-            )
-            .await
-            .expect("Error must keep the first registration callable");
+                .try_build();
+            let Err(error) = refused else {
+                panic!(
+                    "on_duplicate Error must refuse the build instead of dropping the duplicate"
+                );
+            };
             assert!(
-                kept.content.iter().any(|content| match content {
-                    ContentBlock::Text { text, .. } => text == "tool:alpha",
-                    _ => false,
-                }),
-                "on_duplicate Error must keep the first handler: {kept:?}"
+                error.message.contains(PUBLIC_HTTP_TOOL_NAME),
+                "the refusal must name the duplicate tool: {error:?}"
             );
-            websocket_client_bounded(
-                &cx,
-                "live modern duplicate-error close",
-                keep_client.close(&cx),
-            )
-            .await
-            .expect("the duplicate-error WebSocket client closes");
-            drop(keep_client);
-            keep_listener.abort();
 
             let replace = modern::ServerBuilder::new("facade-ws-dup-replace", "1.0.0")
                 .on_duplicate(DuplicateBehavior::Replace)

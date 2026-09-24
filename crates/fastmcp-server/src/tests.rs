@@ -5380,18 +5380,20 @@ mod duplicate_behavior_tests {
     }
 
     #[test]
-    fn test_server_builder_error_behavior_logs_but_continues() {
-        // Create server with error behavior
-        let server = Server::new("test", "1.0")
-            .on_duplicate(DuplicateBehavior::Error)
-            .tool(DupTool1)
-            .tool(DupTool2) // Should fail silently in builder
-            .build();
-
-        let tools = server.tools();
-        // Only first tool should be registered
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].description, Some("Tool #1".to_string()));
+    fn test_server_builder_error_behavior_refuses_the_build() {
+        // A duplicate refused under Error must fail the build, not vanish.
+        let Err(crate::ServerBuildError::InvalidConfiguration(refused)) =
+            Server::new("test", "1.0")
+                .on_duplicate(DuplicateBehavior::Error)
+                .tool(DupTool1)
+                .tool(DupTool2)
+                .try_build()
+        else {
+            panic!("a duplicate refused under DuplicateBehavior::Error must fail try_build");
+        };
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].kind, crate::RegistrationKind::Tool);
+        assert_eq!(refused[0].name, "dup_tool");
     }
 }
 
@@ -7869,16 +7871,19 @@ mod builder_tests {
     }
 
     #[test]
-    fn builder_on_duplicate_error_logs_and_skips() {
-        // With Error behavior, duplicate registration fails but builder doesn't panic
-        let server = ServerBuilder::new("s", "0.1")
-            .on_duplicate(DuplicateBehavior::Error)
-            .tool(BuilderDupTool)
-            .tool(BuilderDupTool)
-            .build();
-        // Only the first registration succeeds
-        let tools = server.tools();
-        assert_eq!(tools.len(), 1);
+    fn builder_on_duplicate_error_refuses_the_build() {
+        // With Error behavior the duplicate is refused and the build fails.
+        let Err(crate::ServerBuildError::InvalidConfiguration(refused)) =
+            ServerBuilder::new("s", "0.1")
+                .on_duplicate(DuplicateBehavior::Error)
+                .tool(BuilderDupTool)
+                .tool(BuilderDupTool)
+                .try_build()
+        else {
+            panic!("a duplicate refused under DuplicateBehavior::Error must fail try_build");
+        };
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].name, "dup");
     }
 
     #[test]

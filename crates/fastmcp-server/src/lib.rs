@@ -106,7 +106,10 @@ pub use auth::{
     AllowAllAuthProvider, AuthProvider, AuthRequest, StaticTokenVerifier, TokenAuthProvider,
     TokenVerifier,
 };
-pub use builder::{ServerBuilder, ServerLaunchPolicyError};
+pub use builder::{
+    RefusedRegistration, RegistrationKind, ServerBuildError, ServerBuilder,
+    ServerLaunchPolicyError,
+};
 pub use extensions::{
     ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
     ExtensionHandlerLookupError, ExtensionHandlerRegistrationError, ExtensionHandlerRegistry,
