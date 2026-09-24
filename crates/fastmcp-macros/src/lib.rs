@@ -863,7 +863,7 @@ fn generate_schema_bound_content(value: TokenStream2, final_result: bool) -> Tok
         quote! {
             Ok(fastmcp_protocol::CompleteResult::new(
                 fastmcp_protocol::FinalCallToolResult {
-                    content: vec![fastmcp_protocol::ContentBlock::text(result_value.to_string())],
+                    content: vec![fastmcp_protocol::common_types::ContentBlock::text(result_value.to_string())],
                     is_error: false,
                     structured_content: Some(result_value),
                 },
@@ -925,9 +925,7 @@ fn generate_schema_bound_result_conversion(
         _ => false,
     };
 
-    if is_mcp_result
-        || (final_result && final_tool_outcome_result_preserves_mcp_error(output))
-    {
+    if is_mcp_result || (final_result && final_tool_outcome_result_preserves_mcp_error(output)) {
         let content = generate_schema_bound_content(quote! { result_value }, final_result);
         quote! {
             let result_value = result?;
@@ -5183,10 +5181,11 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
             && matches!(analyze_return_type(return_type), ReturnTypeKind::Other));
     let result_conversion = generate_tool_result_conversion(return_type, serialize_legacy_result);
     let final_outcome_conversion = generate_final_tool_outcome_conversion(return_type);
-    let final_result_conversion = generate_final_tool_result_conversion(return_type).or_else(|| {
-        (attrs.output_schema.is_some() && final_outcome_conversion.is_none())
-            .then(|| generate_schema_bound_result_conversion(return_type, true))
-    });
+    let final_result_conversion =
+        generate_final_tool_result_conversion(return_type).or_else(|| {
+            (attrs.output_schema.is_some() && final_outcome_conversion.is_none())
+                .then(|| generate_schema_bound_result_conversion(return_type, true))
+        });
     if mrtr_resume_param.is_some() && final_outcome_conversion.is_none() {
         return syn::Error::new_spanned(
             &input_fn.sig.output,
@@ -6259,7 +6258,6 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// - `#[json_schema(rename = "...")]` - Rename the field in the schema
 /// - `#[json_schema(skip)]` - Skip this field
-/// - `#[json_schema(flatten)]` - Flatten nested object properties
 ///
 /// Symmetric Serde `rename`, `rename_all`, `rename_all_fields`, and `skip`
 /// attributes are also honored. Serde field/container defaults permit omitted
@@ -6268,8 +6266,17 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// `json_schema(rename)` takes precedence over Serde names; the caller owns
 /// wire parity when deliberately overriding them. Direction-specific names
 /// or skips that disagree require an explicit `json_schema()` implementation.
-/// Other Serde representations (including tagging, flattening, and custom
-/// serializers) are not inferred by this derive.
+/// Enum schemas follow Serde's external, internal (`tag`), adjacent (`tag` and
+/// `content`), and `untagged` representations. Internal tagging supports named
+/// and unit variants; internal newtypes require adjacent tagging or an explicit
+/// schema because their arbitrary payload schemas cannot safely be merged with
+/// a discriminator. Adjacent tagging supports every payload form. Untagged
+/// enums and trailing `#[serde(untagged)]` variants use `anyOf` so overlapping
+/// alternatives remain valid. Enum aliases, catch-all variants, flattened
+/// fields, and custom wire conversions require an explicit schema and produce
+/// diagnostics instead of silently advertising the Rust field layout.
+/// Other struct representations, including flattening and custom serializers,
+/// are not inferred by this derive.
 ///
 /// Recursive and repeated derived types share bounded local `$defs` in each
 /// generated document. `Box`, `Rc`, `Arc`, and `Cow` retain their payload's
@@ -6317,9 +6324,8 @@ pub fn derive_json_schema(input: TokenStream) -> TokenStream {
         syn::Data::Struct(data_struct) => {
             generate_struct_schema(data_struct, &type_desc_tokens, &serde_attrs)
         }
-        syn::Data::Enum(data_enum) => {
-            generate_enum_schema(data_enum, &type_desc_tokens, &serde_attrs)
-        }
+        syn::Data::Enum(data_enum) => validate_enum_schema_attributes(&input.attrs)
+            .and_then(|()| generate_enum_schema(data_enum, &type_desc_tokens, &serde_attrs)),
         syn::Data::Union(_) => {
             return syn::Error::new_spanned(input, "JsonSchema cannot be derived for unions")
                 .to_compile_error()
@@ -6499,6 +6505,9 @@ struct SchemaSerdeAttrs {
     skip: bool,
     skip_serializing_if: bool,
     deny_unknown_fields: bool,
+    tag: Option<String>,
+    content: Option<String>,
+    untagged: bool,
 }
 
 impl SchemaSerdeAttrs {
@@ -6535,6 +6544,24 @@ impl SchemaSerdeAttrs {
                     result.skip_serializing_if = true;
                 } else if entry.path().is_ident("deny_unknown_fields") {
                     result.deny_unknown_fields = true;
+                } else if entry.path().is_ident("tag") {
+                    if result.tag.is_some() {
+                        return Err(syn::Error::new_spanned(entry, "duplicate serde tag"));
+                    }
+                    result.tag = Some(schema_serde_string(&entry)?);
+                } else if entry.path().is_ident("content") {
+                    if result.content.is_some() {
+                        return Err(syn::Error::new_spanned(entry, "duplicate serde content"));
+                    }
+                    result.content = Some(schema_serde_string(&entry)?);
+                } else if entry.path().is_ident("untagged") {
+                    if !matches!(entry, Meta::Path(_)) || result.untagged {
+                        return Err(syn::Error::new_spanned(
+                            entry,
+                            "expected one bare serde(untagged) attribute",
+                        ));
+                    }
+                    result.untagged = true;
                 }
             }
         }
@@ -6547,6 +6574,59 @@ impl SchemaSerdeAttrs {
         result.skip |= skip_serializing && skip_deserializing;
         Ok(result)
     }
+}
+
+fn schema_serde_string(meta: &Meta) -> syn::Result<String> {
+    if let Meta::NameValue(value) = meta
+        && let syn::Expr::Lit(value) = &value.value
+        && let Lit::Str(value) = &value.lit
+    {
+        return Ok(value.value());
+    }
+    Err(syn::Error::new_spanned(
+        meta,
+        "expected a serde string literal",
+    ))
+}
+
+/// Enum payloads must not silently keep their Rust shape when Serde replaces
+/// or flattens it. These forms need an explicit schema until their wire
+/// representation can be inferred without weakening validation.
+fn validate_enum_schema_attributes(attrs: &[Attribute]) -> syn::Result<()> {
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
+        let entries =
+            attr.parse_args_with(syn::punctuated::Punctuated::<Meta, Token![,]>::parse_terminated)?;
+        for entry in entries {
+            if [
+                "flatten",
+                "other",
+                "alias",
+                "with",
+                "serialize_with",
+                "deserialize_with",
+                "from",
+                "try_from",
+                "into",
+                "field_identifier",
+                "variant_identifier",
+            ]
+            .iter()
+            .any(|name| entry.path().is_ident(name))
+            {
+                return Err(syn::Error::new_spanned(
+                    entry,
+                    "JsonSchema cannot infer this Serde enum representation; implement json_schema() explicitly",
+                ));
+            }
+        }
+    }
+    if has_json_schema_attr(attrs, "flatten") {
+        return Err(syn::Error::new_spanned(
+            quote! { #(#attrs)* },
+            "JsonSchema cannot infer flattened enum fields; implement json_schema() explicitly",
+        ));
+    }
+    Ok(())
 }
 
 /// One schema is used for both tool inputs and structured outputs. Choosing
@@ -6597,10 +6677,32 @@ fn generate_struct_schema(
     type_desc_tokens: &TokenStream2,
     serde_attrs: &SchemaSerdeAttrs,
 ) -> syn::Result<TokenStream2> {
+    if serde_attrs.tag.is_some() || serde_attrs.content.is_some() || serde_attrs.untagged {
+        return Err(syn::Error::new_spanned(
+            data.struct_token,
+            "JsonSchema supports serde tagging attributes on enums; implement json_schema() explicitly for a tagged struct",
+        ));
+    }
     generate_fields_schema(&data.fields, type_desc_tokens, serde_attrs)
 }
 
-/// Shares field constraints between structs and externally tagged enum payloads.
+fn schema_field_name(
+    field: &syn::Field,
+    attrs: &SchemaSerdeAttrs,
+    parent: &SchemaSerdeAttrs,
+) -> String {
+    let field_name = field.ident.as_ref().expect("named schema field");
+    get_json_schema_rename(&field.attrs).unwrap_or_else(|| {
+        attrs.rename.clone().unwrap_or_else(|| {
+            parent.rename_all.map_or_else(
+                || unraw_schema_name(field_name),
+                |rule| rule.field_name(&unraw_schema_name(field_name)),
+            )
+        })
+    })
+}
+
+/// Shares field constraints between structs and enum payloads.
 fn generate_fields_schema(
     fields: &syn::Fields,
     type_desc_tokens: &TokenStream2,
@@ -6618,17 +6720,8 @@ fn generate_fields_schema(
                     continue;
                 }
 
-                let field_name = field.ident.as_ref().unwrap();
-
                 // Check for rename attribute
-                let schema_name = get_json_schema_rename(&field.attrs).unwrap_or_else(|| {
-                    field_attrs.rename.clone().unwrap_or_else(|| {
-                        serde_attrs.rename_all.map_or_else(
-                            || unraw_schema_name(field_name),
-                            |rule| rule.field_name(&unraw_schema_name(field_name)),
-                        )
-                    })
-                });
+                let schema_name = schema_field_name(field, &field_attrs, serde_attrs);
 
                 // Get field doc comment
                 let field_doc = extract_doc_comments(&field.attrs);
@@ -6759,12 +6852,50 @@ fn generate_fields_schema(
     Ok(schema)
 }
 
-/// Generates JSON Schema for an enum.
+#[derive(Clone, Copy)]
+enum SchemaEnumRepresentation<'a> {
+    External,
+    Internal { tag: &'a str },
+    Adjacent { tag: &'a str, content: &'a str },
+    Untagged,
+}
+
+/// Generates JSON Schema for an enum using its actual Serde representation.
 fn generate_enum_schema(
     data: &syn::DataEnum,
     type_desc_tokens: &TokenStream2,
     serde_attrs: &SchemaSerdeAttrs,
 ) -> syn::Result<TokenStream2> {
+    let representation = match (
+        serde_attrs.tag.as_deref(),
+        serde_attrs.content.as_deref(),
+        serde_attrs.untagged,
+    ) {
+        (None, None, false) => SchemaEnumRepresentation::External,
+        (None, None, true) => SchemaEnumRepresentation::Untagged,
+        (Some(tag), None, false) => SchemaEnumRepresentation::Internal { tag },
+        (Some(tag), Some(content), false) if tag != content => {
+            SchemaEnumRepresentation::Adjacent { tag, content }
+        }
+        (Some(_), Some(_), false) => {
+            return Err(syn::Error::new_spanned(
+                data.enum_token,
+                "serde tag and content keys must differ",
+            ));
+        }
+        (None, Some(_), false) => {
+            return Err(syn::Error::new_spanned(
+                data.enum_token,
+                "serde content requires a tag key",
+            ));
+        }
+        (_, _, true) => {
+            return Err(syn::Error::new_spanned(
+                data.enum_token,
+                "serde untagged cannot be combined with tag or content",
+            ));
+        }
+    };
     let variants = data
         .variants
         .iter()
@@ -6787,12 +6918,57 @@ fn generate_enum_schema(
             })
         })
     };
-    // Check if all variants are unit variants (string enum)
+    let mut untagged_seen = false;
+    let mut tagged_names = std::collections::BTreeSet::new();
+    for (variant, attrs) in &variants {
+        validate_enum_schema_attributes(&variant.attrs)?;
+        if attrs.tag.is_some() || attrs.content.is_some() {
+            return Err(syn::Error::new_spanned(
+                variant,
+                "serde tag and content belong on the enum, not its variants",
+            ));
+        }
+        if !serde_attrs.untagged {
+            if !attrs.untagged && untagged_seen {
+                return Err(syn::Error::new_spanned(
+                    variant,
+                    "serde untagged variants must appear after all tagged variants",
+                ));
+            }
+            untagged_seen |= attrs.untagged;
+            if !attrs.untagged && !tagged_names.insert(variant_name(variant, attrs)) {
+                return Err(syn::Error::new_spanned(
+                    variant,
+                    "JsonSchema requires distinct tagged variant names; implement json_schema() explicitly for ambiguous tags",
+                ));
+            }
+        }
+        for field in &variant.fields {
+            let field_attrs = SchemaSerdeAttrs::parse(&field.attrs)?;
+            if !field_attrs.skip && !has_json_schema_attr(&field.attrs, "skip") {
+                validate_enum_schema_attributes(&field.attrs)?;
+                if field_attrs.tag.is_some()
+                    || field_attrs.content.is_some()
+                    || field_attrs.untagged
+                {
+                    return Err(syn::Error::new_spanned(
+                        field,
+                        "serde enum representation attributes cannot be applied to fields",
+                    ));
+                }
+            }
+        }
+    }
+
+    // Only ordinary external unit variants use Serde's string enum encoding.
     let all_unit = variants
         .iter()
         .all(|(variant, _)| matches!(variant.fields, syn::Fields::Unit));
 
-    let schema = if all_unit {
+    let schema = if all_unit
+        && matches!(representation, SchemaEnumRepresentation::External)
+        && !untagged_seen
+    {
         // Simple string enum
         let variant_names: Vec<String> = variants
             .iter()
@@ -6816,52 +6992,37 @@ fn generate_enum_schema(
             }
         }
     } else {
-        // Serde's default external tagging encodes unit variants as strings and
-        // payload variants as objects containing exactly one variant key.
         let variant_schemas = variants
             .iter()
             .map(|(variant, attrs)| {
                 let variant_name = variant_name(variant, attrs);
-                let schema = match &variant.fields {
-                    syn::Fields::Unit => {
-                        quote! {
-                            serde_json::json!({
-                                "type": "string",
-                                "const": #variant_name
-                            })
-                        }
-                    }
-                    fields => {
-                        let payload_attrs = SchemaSerdeAttrs {
-                            rename_all: attrs.rename_all.or(serde_attrs.rename_all_fields),
-                            deny_unknown_fields: serde_attrs.deny_unknown_fields,
-                            ..SchemaSerdeAttrs::default()
-                        };
-                        let payload_schema = generate_fields_schema(
-                            fields,
-                            &quote! { None::<&str> },
-                            &payload_attrs,
-                        )?;
-                        quote! {
-                            serde_json::json!({
-                                "type": "object",
-                                "properties": {
-                                    #variant_name: (#payload_schema)
-                                },
-                                "required": [#variant_name],
-                                "additionalProperties": false
-                            })
-                        }
-                    }
+                let payload_attrs = SchemaSerdeAttrs {
+                    rename_all: attrs.rename_all.or(serde_attrs.rename_all_fields),
+                    deny_unknown_fields: serde_attrs.deny_unknown_fields,
+                    ..SchemaSerdeAttrs::default()
                 };
-                Ok(schema)
+                let representation = if attrs.untagged {
+                    SchemaEnumRepresentation::Untagged
+                } else {
+                    representation
+                };
+                generate_enum_variant_schema(variant, &variant_name, &payload_attrs, representation)
             })
             .collect::<syn::Result<Vec<_>>>()?;
 
+        // Untagged alternatives may overlap: Serde accepts the first matching
+        // variant, so requiring exactly one matching schema would reject valid
+        // values (including overlapping numeric and unit variants).
+        let combination = if serde_attrs.untagged || untagged_seen {
+            "anyOf"
+        } else {
+            "oneOf"
+        };
         quote! {
             {
+                let variants: Vec<serde_json::Value> = vec![#(#variant_schemas),*];
                 let mut schema = serde_json::json!({
-                    "oneOf": [#(#variant_schemas),*]
+                    #combination: variants
                 });
 
                 if let Some(desc) = #type_desc_tokens {
@@ -6875,6 +7036,109 @@ fn generate_enum_schema(
         }
     };
     Ok(schema)
+}
+
+fn generate_enum_variant_schema(
+    variant: &syn::Variant,
+    name: &str,
+    payload_attrs: &SchemaSerdeAttrs,
+    representation: SchemaEnumRepresentation<'_>,
+) -> syn::Result<TokenStream2> {
+    let fields = &variant.fields;
+    if let SchemaEnumRepresentation::Internal { tag } = representation {
+        return match fields {
+            syn::Fields::Unnamed(_) => Err(syn::Error::new_spanned(
+                variant,
+                "JsonSchema supports internally tagged named and unit variants; use adjacent tagging or implement json_schema() explicitly for a newtype payload",
+            )),
+            syn::Fields::Unit => Ok(quote! {
+                // Serde's internally tagged unit visitor ignores extra members,
+                // including when deny_unknown_fields closes named variants.
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { #tag: { "type": "string", "const": #name } },
+                    "required": [#tag]
+                })
+            }),
+            syn::Fields::Named(named) => {
+                for field in &named.named {
+                    let attrs = SchemaSerdeAttrs::parse(&field.attrs)?;
+                    if !attrs.skip
+                        && !has_json_schema_attr(&field.attrs, "skip")
+                        && schema_field_name(field, &attrs, payload_attrs) == tag
+                    {
+                        return Err(syn::Error::new_spanned(
+                            field,
+                            "an internally tagged field name conflicts with the serde tag key",
+                        ));
+                    }
+                }
+                let payload =
+                    generate_fields_schema(fields, &quote! { None::<&str> }, payload_attrs)?;
+                Ok(quote! {
+                    {
+                        let mut schema = #payload;
+                        schema["properties"][#tag] = serde_json::json!({
+                            "type": "string", "const": #name
+                        });
+                        schema["required"].as_array_mut()
+                            .expect("named variant schema has required fields")
+                            .push(serde_json::json!(#tag));
+                        schema
+                    }
+                })
+            }
+        };
+    }
+
+    let payload = generate_fields_schema(fields, &quote! { None::<&str> }, payload_attrs)?;
+    match representation {
+        SchemaEnumRepresentation::Untagged => Ok(payload),
+        SchemaEnumRepresentation::External => {
+            if matches!(fields, syn::Fields::Unit) {
+                Ok(quote! { serde_json::json!({ "type": "string", "const": #name }) })
+            } else {
+                Ok(quote! {
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": { #name: (#payload) },
+                        "required": [#name],
+                        "additionalProperties": false
+                    })
+                })
+            }
+        }
+        SchemaEnumRepresentation::Adjacent { tag, content } => {
+            let content_optional = matches!(fields, syn::Fields::Unit)
+                || matches!(fields, syn::Fields::Unnamed(fields)
+                    if fields.unnamed.len() == 1 && is_option_type(&fields.unnamed[0].ty));
+            let required = if content_optional {
+                vec![tag]
+            } else {
+                vec![tag, content]
+            };
+            let deny_unknown_fields = payload_attrs.deny_unknown_fields;
+            Ok(quote! {
+                {
+                    let mut schema = serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            #tag: { "type": "string", "const": #name },
+                            #content: (#payload)
+                        },
+                        "required": [#(#required),*]
+                    });
+                    if #deny_unknown_fields {
+                        schema["additionalProperties"] = serde_json::json!(false);
+                    }
+                    schema
+                }
+            })
+        }
+        SchemaEnumRepresentation::Internal { .. } => {
+            unreachable!("handled before payload generation")
+        }
+    }
 }
 
 /// Checks if a field has a specific json_schema attribute.
@@ -6920,7 +7184,86 @@ fn get_json_schema_rename(attrs: &[Attribute]) -> Option<String> {
 
 #[cfg(test)]
 mod serde_schema_tests {
-    use super::{SchemaRenameRule, SchemaSerdeAttrs};
+    use super::{
+        SchemaRenameRule, SchemaSerdeAttrs, generate_enum_schema, validate_enum_schema_attributes,
+    };
+
+    fn enum_representation_error(input: syn::DeriveInput) -> String {
+        let attrs = SchemaSerdeAttrs::parse(&input.attrs).expect("valid attribute syntax");
+        let syn::Data::Enum(data) = &input.data else {
+            panic!("enum fixture required");
+        };
+        validate_enum_schema_attributes(&input.attrs)
+            .and_then(|()| generate_enum_schema(data, &quote::quote! { None::<&str> }, &attrs))
+            .expect_err("unsupported enum representation must produce a diagnostic")
+            .to_string()
+    }
+
+    #[test]
+    fn serde_schema_enum_tag_configuration_has_actionable_diagnostics() {
+        for (input, expected) in [
+            (
+                syn::parse_quote! { #[serde(content = "data")] enum Invalid { Unit } },
+                "serde content requires a tag key",
+            ),
+            (
+                syn::parse_quote! { #[serde(tag = "kind", content = "kind")] enum Invalid { Unit } },
+                "serde tag and content keys must differ",
+            ),
+            (
+                syn::parse_quote! { #[serde(tag = "kind", untagged)] enum Invalid { Unit } },
+                "serde untagged cannot be combined with tag or content",
+            ),
+            (
+                syn::parse_quote! {
+                    enum Invalid { #[serde(untagged)] Fallback(String), Tagged }
+                },
+                "serde untagged variants must appear after all tagged variants",
+            ),
+            (
+                syn::parse_quote! {
+                    #[serde(tag = "kind")]
+                    enum Invalid { Fields { #[serde(rename = "kind")] field: String } }
+                },
+                "an internally tagged field name conflicts with the serde tag key",
+            ),
+        ] {
+            assert_eq!(enum_representation_error(input), expected);
+        }
+        for attribute in [
+            syn::parse_quote! { #[serde(tag = "a", tag = "b")] },
+            syn::parse_quote! { #[serde(content = "a", content = "b")] },
+            syn::parse_quote! { #[serde(untagged = true)] },
+        ] {
+            assert!(SchemaSerdeAttrs::parse(&[attribute]).is_err());
+        }
+    }
+
+    #[test]
+    fn serde_schema_unmodeled_enum_payloads_require_explicit_schemas() {
+        for input in [
+            syn::parse_quote! { #[serde(tag = "kind")] enum Invalid { Newtype(Payload) } },
+            syn::parse_quote! { #[serde(tag = "kind")] enum Invalid { Tuple(String, u32) } },
+            syn::parse_quote! {
+                #[serde(tag = "kind")] enum Invalid { Known, #[serde(other)] Other }
+            },
+            syn::parse_quote! {
+                #[serde(untagged)] enum Invalid { Fields { #[serde(flatten)] extra: Payload } }
+            },
+            syn::parse_quote! {
+                #[serde(tag = "kind", content = "data")]
+                enum Invalid { Value(#[serde(with = "custom")] String) }
+            },
+            syn::parse_quote! { enum Invalid { #[serde(alias = "other")] Value(String) } },
+            syn::parse_quote! {
+                enum Invalid { #[serde(rename = "same")] First, #[serde(rename = "same")] Second }
+            },
+        ] {
+            assert!(
+                enum_representation_error(input).contains("implement json_schema() explicitly")
+            );
+        }
+    }
 
     #[test]
     fn serde_schema_rename_rules_cover_field_and_variant_cases() {

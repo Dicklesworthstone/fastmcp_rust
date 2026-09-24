@@ -181,7 +181,8 @@ pub mod __private {
         pub use fastmcp_server::bidirectional;
         pub use fastmcp_server::{
             BoxFuture, FinalMethodOutcome, FinalResourceReadCacheHintProvenance, FinalToolOutcome,
-            PromptHandler, ResourceHandler, ToolExecutionMode, ToolHandler,
+            PromptHandler, ResourceHandler, ToolErrorKind, ToolExecutionMode, ToolHandler,
+            promote_legacy_tool_content,
         };
     }
 
@@ -199,8 +200,8 @@ pub mod __private {
         pub use fastmcp_protocol::{
             CallToolResult, CompleteResult, Content, FinalCallToolResult, FinalGetPromptResult,
             FinalReadResourceResult, Icon, Prompt, PromptArgument, PromptMessage, Resource,
-            ResourceContent, ResourceTemplate, Tool, ToolAnnotations, UriTemplate, UriTemplatePart,
-            common_types,
+            ResourceContent, ResourceTemplate, ResultMeta, Tool, ToolAnnotations, UriTemplate,
+            UriTemplatePart, common_types,
         };
         #[cfg(feature = "apps")]
         pub use fastmcp_protocol::{

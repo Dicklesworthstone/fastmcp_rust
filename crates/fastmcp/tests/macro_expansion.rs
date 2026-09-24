@@ -1324,8 +1324,7 @@ fn tool_schema_bound_inline_outputs_preserve_all_json_roots_and_result_algebras(
                 "object",
             ] {
                 let result = schema_bound_complete(
-                    schema_bound_wire_call(&server, &connection, name, json!({"mode": mode}))
-                        .await,
+                    schema_bound_wire_call(&server, &connection, name, json!({"mode": mode})).await,
                 );
                 assert_schema_bound_success(&result, &schema_bound_json_root(mode));
             }
@@ -1348,7 +1347,10 @@ fn tool_schema_bound_inline_outputs_preserve_all_json_roots_and_result_algebras(
             );
         }
 
-        for name in ["schema_bound_inline_result", "schema_bound_inline_mcp_result"] {
+        for name in [
+            "schema_bound_inline_result",
+            "schema_bound_inline_mcp_result",
+        ] {
             let result = schema_bound_complete(
                 schema_bound_wire_call(
                     &server,
@@ -1452,9 +1454,8 @@ mod schema_bound_nested_mapper {
 #[test]
 fn tool_schema_bound_error_mapper_paths_resolve_at_the_declaration_site() {
     assert_eq!(
-        schema_bound_nested_mapper::ParentMapping.final_tool_error_structured_content(
-            fastmcp_rust::ToolErrorKind::InputValidation,
-        ),
+        schema_bound_nested_mapper::ParentMapping
+            .final_tool_error_structured_content(fastmcp_rust::ToolErrorKind::InputValidation),
         Some(json!({"value": null, "error": "input-validation"}))
     );
     assert_eq!(
@@ -4608,6 +4609,366 @@ fn json_schema_recursive_arguments_share_definitions_in_registered_modern_tool()
             before + 1,
             "recursive input validation must finish before the handler runs"
         );
+    });
+}
+
+// --- Serde enum representations and their registered input schemas ---
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum InternalTaggedSchema {
+    StandBy,
+    #[serde(rename = "branch-node")]
+    Branch {
+        node_value: i32,
+        #[serde(default)]
+        children: Vec<Self>,
+        #[serde(skip)]
+        transient: bool,
+    },
+    #[serde(skip)]
+    Hidden,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(
+    tag = "kind",
+    content = "data",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum AdjacentTaggedSchema {
+    Idle,
+    #[serde(rename = "count")]
+    Number(i64),
+    Pair(String, bool),
+    Named {
+        display_name: String,
+        #[serde(default)]
+        enabled: bool,
+    },
+    Maybe(Option<String>),
+    Nothing(()),
+    #[serde(skip)]
+    Hidden,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(untagged, deny_unknown_fields)]
+enum UntaggedOverlappingSchema {
+    Small(i32),
+    Wide(i64),
+    Empty,
+    NullValue(()),
+    Pair(String, bool),
+    Named {
+        label: String,
+        #[serde(default)]
+        count: u32,
+    },
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum MixedTaggedSchema {
+    Ready,
+    Named {
+        count: u32,
+    },
+    #[serde(untagged)]
+    TextFallback(String),
+    #[serde(untagged)]
+    IntegerFallback(i64),
+}
+
+fn internal_tagged_schema_fixture() -> InternalTaggedSchema {
+    InternalTaggedSchema::Branch {
+        node_value: 5,
+        children: vec![InternalTaggedSchema::Branch {
+            node_value: 9,
+            children: vec![InternalTaggedSchema::StandBy],
+            transient: false,
+        }],
+        transient: false,
+    }
+}
+
+fn assert_enum_schema_roundtrip<T>(schema: &fastmcp_rust::schema::AdmittedSchema, value: T)
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let encoded = serde_json::to_value(value).expect("Serde serializes the enum fixture");
+    schema
+        .validate(&encoded)
+        .expect("the generated schema accepts the actual Serde representation");
+    let decoded: T = serde_json::from_value(encoded.clone())
+        .expect("the actual representation deserializes through Serde");
+    assert_eq!(
+        serde_json::to_value(decoded).expect("decoded enum serializes"),
+        encoded,
+        "overlapping untagged variants may change Rust variants but preserve their JSON value"
+    );
+}
+
+fn assert_enum_schema_rejects<T: serde::de::DeserializeOwned>(
+    schema: &fastmcp_rust::schema::AdmittedSchema,
+    value: serde_json::Value,
+) {
+    assert!(
+        serde_json::from_value::<T>(value.clone()).is_err(),
+        "Serde must reject the planted representation: {value}"
+    );
+    assert!(
+        schema.validate(&value).is_err(),
+        "the schema must reject the same representation: {value}"
+    );
+}
+
+#[test]
+fn json_schema_internal_tags_preserve_recursive_fields_defaults_and_closed_objects() {
+    let schema = fastmcp_rust::schema::admit_final_schema(InternalTaggedSchema::json_schema())
+        .expect("internally tagged recursive schemas admit");
+    assert!(schema.schema()["$defs"].is_object());
+    assert_enum_schema_roundtrip(&schema, InternalTaggedSchema::StandBy);
+    assert_enum_schema_roundtrip(&schema, internal_tagged_schema_fixture());
+    let unit_with_extra = json!({"kind": "stand_by", "extra": true});
+    schema
+        .validate(&unit_with_extra)
+        .expect("Serde's internal unit visitor permits extra fields");
+    assert_eq!(
+        serde_json::from_value::<InternalTaggedSchema>(unit_with_extra).unwrap(),
+        InternalTaggedSchema::StandBy
+    );
+    let defaulted = json!({"kind": "branch-node", "nodeValue": 7});
+    schema
+        .validate(&defaulted)
+        .expect("defaulted children are optional");
+    assert_eq!(
+        serde_json::from_value::<InternalTaggedSchema>(defaulted).unwrap(),
+        InternalTaggedSchema::Branch {
+            node_value: 7,
+            children: Vec::new(),
+            transient: false,
+        }
+    );
+
+    for invalid in [
+        json!({"kind": "branch", "nodeValue": 7}),
+        json!({"nodeValue": 7}),
+        json!({"kind": "branch-node", "nodeValue": "7"}),
+        json!({"kind": "branch-node", "nodeValue": 7, "extra": true}),
+        json!({"kind": "hidden"}),
+        json!({"kind": "branch-node", "nodeValue": 7, "children": [
+            {"kind": "branch-node", "nodeValue": "9"}
+        ]}),
+    ] {
+        assert_enum_schema_rejects::<InternalTaggedSchema>(&schema, invalid);
+    }
+}
+
+#[test]
+fn json_schema_adjacent_tags_preserve_each_payload_form_and_reject_near_neighbors() {
+    let schema = fastmcp_rust::schema::admit_final_schema(AdjacentTaggedSchema::json_schema())
+        .expect("adjacently tagged schemas admit");
+    for value in [
+        AdjacentTaggedSchema::Idle,
+        AdjacentTaggedSchema::Number(7),
+        AdjacentTaggedSchema::Pair("left".to_owned(), true),
+        AdjacentTaggedSchema::Named {
+            display_name: "ready".to_owned(),
+            enabled: true,
+        },
+        AdjacentTaggedSchema::Maybe(Some("optional".to_owned())),
+        AdjacentTaggedSchema::Maybe(None),
+        AdjacentTaggedSchema::Nothing(()),
+    ] {
+        assert_enum_schema_roundtrip(&schema, value);
+    }
+    let defaulted = json!({"kind": "named", "data": {"displayName": "ready"}});
+    schema
+        .validate(&defaulted)
+        .expect("defaulted named payload field may be omitted");
+    assert_eq!(
+        serde_json::from_value::<AdjacentTaggedSchema>(defaulted).unwrap(),
+        AdjacentTaggedSchema::Named {
+            display_name: "ready".to_owned(),
+            enabled: false,
+        }
+    );
+    for (accepted, expected) in [
+        (
+            json!({"kind": "idle", "data": null}),
+            AdjacentTaggedSchema::Idle,
+        ),
+        (json!({"kind": "maybe"}), AdjacentTaggedSchema::Maybe(None)),
+    ] {
+        assert_eq!(
+            serde_json::from_value::<AdjacentTaggedSchema>(accepted.clone()).unwrap(),
+            expected
+        );
+        schema
+            .validate(&accepted)
+            .expect("explicit unit null and omitted Option content match Serde");
+    }
+    for edge in [
+        json!({"kind": "idle", "data": false}),
+        json!({"kind": "nothing"}),
+    ] {
+        assert_eq!(
+            schema.validate(&edge).is_ok(),
+            serde_json::from_value::<AdjacentTaggedSchema>(edge.clone()).is_ok(),
+            "adjacent content presence must match Serde for {edge}"
+        );
+    }
+    for invalid in [
+        json!({"kind": "number", "data": 7}),
+        json!({"kind": "count"}),
+        json!({"kind": "count", "data": "7"}),
+        json!({"kind": "pair", "data": ["left", "true"]}),
+        json!({"kind": "pair", "data": ["left", true, 3]}),
+        json!({"kind": "named", "data": {"displayName": 7}}),
+        json!({"kind": "named", "data": {"displayName": "ready", "extra": 1}}),
+        json!({"kind": "count", "data": 7, "extra": 1}),
+        json!({"kind": "hidden"}),
+    ] {
+        assert_enum_schema_rejects::<AdjacentTaggedSchema>(&schema, invalid);
+    }
+}
+
+#[test]
+fn json_schema_untagged_overlapping_integer_and_null_branches_follow_serde() {
+    let schema = fastmcp_rust::schema::admit_final_schema(UntaggedOverlappingSchema::json_schema())
+        .expect("overlapping untagged alternatives admit");
+    assert!(schema.schema()["anyOf"].is_array());
+    assert!(schema.schema().get("oneOf").is_none());
+    for value in [
+        UntaggedOverlappingSchema::Small(7),
+        UntaggedOverlappingSchema::Wide(7),
+        UntaggedOverlappingSchema::Wide(i64::MAX),
+        UntaggedOverlappingSchema::Empty,
+        UntaggedOverlappingSchema::NullValue(()),
+        UntaggedOverlappingSchema::Pair("left".to_owned(), false),
+        UntaggedOverlappingSchema::Named {
+            label: "ready".to_owned(),
+            count: 2,
+        },
+    ] {
+        assert_enum_schema_roundtrip(&schema, value);
+    }
+    for invalid in [
+        json!(0.5),
+        json!(true),
+        json!(u64::MAX),
+        json!(["left", "false"]),
+        json!({"label": 7}),
+        json!({"label": "ready", "extra": 1}),
+    ] {
+        assert_enum_schema_rejects::<UntaggedOverlappingSchema>(&schema, invalid);
+    }
+}
+
+#[test]
+fn json_schema_trailing_untagged_fallbacks_overlap_external_tags_without_exclusion() {
+    let schema = fastmcp_rust::schema::admit_final_schema(MixedTaggedSchema::json_schema())
+        .expect("tagged alternatives and untagged fallbacks admit together");
+    assert!(schema.schema()["anyOf"].is_array());
+    for value in [
+        MixedTaggedSchema::Ready,
+        MixedTaggedSchema::Named { count: 2 },
+        MixedTaggedSchema::TextFallback("ready".to_owned()),
+        MixedTaggedSchema::TextFallback("future-value".to_owned()),
+        MixedTaggedSchema::IntegerFallback(7),
+    ] {
+        assert_enum_schema_roundtrip(&schema, value);
+    }
+    for invalid in [
+        json!(true),
+        json!({"unknown": 7}),
+        json!({"named": {"count": "2"}}),
+        json!({"named": {"count": 2, "extra": true}}),
+        json!({"named": {"count": 2}, "extra": true}),
+    ] {
+        assert_enum_schema_rejects::<MixedTaggedSchema>(&schema, invalid);
+    }
+}
+
+static ENUM_REPRESENTATION_TOOL_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[tool]
+fn echo_enum_representations(
+    internal: InternalTaggedSchema,
+    adjacent: AdjacentTaggedSchema,
+) -> String {
+    ENUM_REPRESENTATION_TOOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    serde_json::to_string(&(internal, adjacent)).expect("accepted enum values serialize")
+}
+
+#[test]
+fn json_schema_tagged_enum_inputs_enforce_nested_constraints_before_registered_handler() {
+    on_caller_runtime(async {
+        let connection = ModernConnection::new();
+        let server = Server::new("enum-representation-schema", "1.0.0")
+            .tool(EchoEnumRepresentations)
+            .try_build()
+            .expect("tagged enum input schemas admit through public registration");
+        let internal = serde_json::to_value(internal_tagged_schema_fixture()).unwrap();
+        let adjacent = serde_json::to_value(AdjacentTaggedSchema::Named {
+            display_name: "ready".to_owned(),
+            enabled: true,
+        })
+        .unwrap();
+        let valid = json!({"internal": internal, "adjacent": adjacent});
+        let before = ENUM_REPRESENTATION_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let accepted = schema_bound_complete(
+            schema_bound_wire_call(
+                &server,
+                &connection,
+                "echo_enum_representations",
+                valid.clone(),
+            )
+            .await,
+        );
+        assert_ne!(accepted["isError"], json!(true));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                accepted["content"][0]["text"].as_str().unwrap(),
+            )
+            .unwrap(),
+            json!([valid["internal"], valid["adjacent"]])
+        );
+        assert_eq!(
+            ENUM_REPRESENTATION_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1
+        );
+
+        for (pointer, wrong) in [
+            ("/internal/children/0/nodeValue", json!("nine")),
+            ("/internal/children/0/kind", json!("unknown")),
+            ("/adjacent/data/displayName", json!(false)),
+            ("/adjacent/kind", json!("unknown")),
+        ] {
+            let mut invalid = valid.clone();
+            *invalid
+                .pointer_mut(pointer)
+                .expect("fixture pointer exists") = wrong;
+            let rejected = schema_bound_complete(
+                schema_bound_wire_call(&server, &connection, "echo_enum_representations", invalid)
+                    .await,
+            );
+            assert_eq!(rejected["isError"], json!(true));
+            assert_eq!(
+                ENUM_REPRESENTATION_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                before + 1,
+                "invalid nested enum fields must be rejected before handler invocation"
+            );
+        }
     });
 }
 
