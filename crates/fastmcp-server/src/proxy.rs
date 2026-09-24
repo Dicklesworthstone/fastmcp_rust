@@ -15920,7 +15920,7 @@ IFS= read -r end
     fn runnable_clock_discounts_host_lag_and_keeps_a_wall_backstop() {
         let start = Instant::now();
         let mark = (start, Duration::from_millis(40));
-        let later = |lag_ms| {
+        let later = |lag_ms: u64| {
             (
                 start + Duration::from_secs(1),
                 Duration::from_millis(40 + lag_ms),
