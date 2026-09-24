@@ -160,14 +160,13 @@ mod host_cancelled_pairing {
     /// A third `host_cancelled`-style conversion cannot arrive under
     /// `managed_oauth/` without its test pair.
     ///
-    /// `managed_oauth::interaction::host_cancelled` and
-    /// `managed_oauth::dynamic::machine::interaction::host_cancelled` convert
-    /// the same event into two different error types, and are kept separate
-    /// deliberately: lifting the first through `From` lands it in
-    /// `ClientCredentialsInteractionError::Interaction(..)` while the second
-    /// produces `::Core(Protocol(..))`, so unifying them would change a value.
-    /// Nothing in the type system stops a third from being added the same way,
-    /// and a conversion no test exercises is exactly the gap this guards.
+    /// Both interaction error types implement
+    /// `managed_oauth::interaction::HostDisposition`, which owns the mapping
+    /// from a host failure or a failed checkpoint. Each implementation still
+    /// names its own `host_cancelled` variant, because lifting one type into
+    /// the other through `From` would change a value (`Interaction(..)` versus
+    /// `Core(Protocol(..))`). A new implementation is a new variant that no
+    /// test exercises until its pair exists, which is the gap this guards.
     ///
     /// It is a source-level check because the property is source-level: an
     /// untested conversion is invisible to every runtime assertion. It walks

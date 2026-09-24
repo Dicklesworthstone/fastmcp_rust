@@ -13,11 +13,12 @@ use fastmcp_client::http_auth::discovery::client_credentials::rpc::interaction::
 };
 use fastmcp_client::http_auth::rpc::{ManagedCoreError, ManagedCoreEvent};
 use fastmcp_client::http_auth::rpc::interaction::ManagedInteractionError;
-use fastmcp_core::{McpContext, McpError, McpErrorCode, McpResult};
+use fastmcp_core::{McpContext, McpError, McpResult};
 use fastmcp_protocol::InputRequiredResult;
 
 use crate::providers::managed_oauth::interaction::{
-    ManagedOAuthInputHandler, ManagedOAuthInputPolicy, ManagedOAuthInputResponseMode,
+    HostDisposition, ManagedOAuthInputHandler, ManagedOAuthInputPolicy,
+    ManagedOAuthInputResponseMode,
 };
 use super::{
     BoxFuture, ClientCredentialsCoreError, ClientCredentialsProvider, Forwarder,
@@ -113,12 +114,14 @@ impl MachineResponse for InteractiveMachineResponse {
                 ManagedOAuthInputResponseMode::Complete => operation.drive(
                     cx,
                     |input| resolve_reply(inputs.handler.as_ref(), ctx, cx, &inputs.next_id, input),
-                    |notification| forward_notification(ctx, *notification).map_err(host_error),
+                    |notification| forward_notification(ctx, *notification)
+                        .map_err(ClientCredentialsInteractionError::host_error),
                 ).await,
                 ManagedOAuthInputResponseMode::Partial => operation.drive_partial(
                     cx,
                     |input| resolve_reply(inputs.handler.as_ref(), ctx, cx, &inputs.next_id, input),
-                    |notification| forward_notification(ctx, *notification).map_err(host_error),
+                    |notification| forward_notification(ctx, *notification)
+                        .map_err(ClientCredentialsInteractionError::host_error),
                 ).await,
             }.map_err(interaction_error)?;
             ctx.checkpoint()?;
@@ -137,41 +140,27 @@ async fn resolve_reply(
     ids: &AtomicU64,
     input: Box<InputRequiredResult>,
 ) -> Result<ClientCredentialsInputReply, ClientCredentialsInteractionError> {
+    type E = ClientCredentialsInteractionError;
     // A cancelled request must not even construct an application callback future.
-    ctx.checkpoint().map_err(|_| host_cancelled())?;
-    check_cx(cx).map_err(host_error)?;
-    let input_responses = handler.resolve(ctx, cx, input).await.map_err(host_error)?;
-    ctx.checkpoint().map_err(|_| host_cancelled())?;
-    check_cx(cx).map_err(host_error)?;
-    let (discovery_id, request_id) = next_pair(ids).map_err(host_error)?;
+    E::host_checkpoint(ctx)?;
+    check_cx(cx).map_err(E::host_error)?;
+    let input_responses = handler.resolve(ctx, cx, input).await.map_err(E::host_error)?;
+    E::host_checkpoint(ctx)?;
+    check_cx(cx).map_err(E::host_error)?;
+    let (discovery_id, request_id) = next_pair(ids).map_err(E::host_error)?;
     Ok(ClientCredentialsInputReply { discovery_id, request_id, input_responses })
 }
 
-/// The cancellation disposition, shared by both paths that can reach it.
-///
-/// `McpContext::checkpoint` returns `Result<(), CancelledError>`, so it cannot
-/// route through `host_error`, which consumes an `McpError`. Cancellation is
-/// the only way `checkpoint` fails, which is exactly the branch `host_error`
-/// would have taken, so the two call sites map it here directly.
-///
-/// This mirrors `managed_oauth::interaction::host_cancelled` in shape but not
-/// in type: that one yields `ManagedInteractionError`, this module's error is
-/// `ClientCredentialsInteractionError`, and the cancelled variant is nested one
-/// level deeper. The two cannot share an implementation without a conversion.
-fn host_cancelled() -> ClientCredentialsInteractionError {
-    ClientCredentialsInteractionError::Core(ClientCredentialsCoreError::Protocol(
-        ManagedCoreError::Cancelled,
-    ))
-}
+/// This type's spelling of the shared host dispositions. The cancelled
+/// variant is nested one level deeper than `ManagedInteractionError`'s, which
+/// is why each type names its own variants rather than converting.
+impl HostDisposition for ClientCredentialsInteractionError {
+    fn host_cancelled() -> Self {
+        Self::Core(ClientCredentialsCoreError::Protocol(ManagedCoreError::Cancelled))
+    }
 
-fn host_error(error: McpError) -> ClientCredentialsInteractionError {
-    if error.code == McpErrorCode::RequestCancelled {
-        ClientCredentialsInteractionError::Core(ClientCredentialsCoreError::Protocol(
-            ManagedCoreError::Cancelled,
-        ))
-    } else {
-        // Host diagnostics may include private answers or downstream identity.
-        ClientCredentialsInteractionError::Interaction(ManagedInteractionError::AbortedByHost)
+    fn aborted_by_host() -> Self {
+        Self::Interaction(ManagedInteractionError::AbortedByHost)
     }
 }
 
@@ -191,6 +180,7 @@ pub(super) fn interaction_error(error: ClientCredentialsInteractionError) -> Mcp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fastmcp_core::McpErrorCode;
     use std::future::{Future, pending};
     use std::pin::pin;
     use std::sync::atomic::{AtomicUsize, Ordering};

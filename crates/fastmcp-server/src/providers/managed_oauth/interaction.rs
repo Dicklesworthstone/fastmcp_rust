@@ -254,12 +254,14 @@ impl CoreBackend for InteractiveBackend {
                 ManagedOAuthInputResponseMode::Complete => operation.drive(
                     cx,
                     |input| resolve_reply(self.handler.as_ref(), ctx, cx, &self.next_id, input),
-                    |notification| forward_notification(ctx, *notification).map_err(host_error),
+                    |notification| forward_notification(ctx, *notification)
+                        .map_err(ManagedInteractionError::host_error),
                 ).await,
                 ManagedOAuthInputResponseMode::Partial => operation.drive_partial(
                     cx,
                     |input| resolve_reply(self.handler.as_ref(), ctx, cx, &self.next_id, input),
-                    |notification| forward_notification(ctx, *notification).map_err(host_error),
+                    |notification| forward_notification(ctx, *notification)
+                        .map_err(ManagedInteractionError::host_error),
                 ).await,
             }.map_err(interaction_error)?;
             ctx.checkpoint()?;
@@ -300,34 +302,57 @@ async fn resolve_reply(
     ids: &AtomicU64,
     input: Box<InputRequiredResult>,
 ) -> Result<ManagedInputReply, ManagedInteractionError> {
+    type E = ManagedInteractionError;
     // Check before invoking even the callback's synchronous future constructor.
-    ctx.checkpoint().map_err(|_| host_cancelled())?;
-    check_cx(cx).map_err(host_error)?;
-    let responses = handler.resolve(ctx, cx, input).await.map_err(host_error)?;
-    ctx.checkpoint().map_err(|_| host_cancelled())?;
-    check_cx(cx).map_err(host_error)?;
+    E::host_checkpoint(ctx)?;
+    check_cx(cx).map_err(E::host_error)?;
+    let responses = handler.resolve(ctx, cx, input).await.map_err(E::host_error)?;
+    E::host_checkpoint(ctx)?;
+    check_cx(cx).map_err(E::host_error)?;
     Ok(ManagedInputReply {
-        request_id: allocate_request_id(ids).map_err(host_error)?,
+        request_id: allocate_request_id(ids).map_err(E::host_error)?,
         input_responses: responses,
     })
 }
 
-/// The cancellation disposition, shared by both paths that can reach it.
+/// How a managed-OAuth interaction error spells a host failure. It is the one
+/// conversion for every interaction error type under `managed_oauth`.
 ///
-/// `McpContext::checkpoint` returns `Result<(), CancelledError>`, so it cannot
-/// route through `host_error`, which consumes an `McpError`. Cancellation is
-/// the only way `checkpoint` fails, which is exactly the branch `host_error`
-/// would have taken, so the two call sites map it here directly.
-fn host_cancelled() -> ManagedInteractionError {
-    ManagedInteractionError::Core(fastmcp_client::http_auth::rpc::ManagedCoreError::Cancelled)
+/// Each type names only its own two variants. The cancelled variant sits at a
+/// different depth in each type, so a `From` between them would change a
+/// value. The mapping onto those variants is written once, in the provided
+/// methods, so a new interaction type cannot copy a stale form of it.
+pub(crate) trait HostDisposition: Sized {
+    /// The request was cancelled.
+    fn host_cancelled() -> Self;
+
+    /// Any other host failure. It stays opaque because a host error can
+    /// contain private answers or downstream identity.
+    fn aborted_by_host() -> Self;
+
+    /// Cancellation keeps its meaning; every other host error is opaque.
+    fn host_error(error: McpError) -> Self {
+        if error.code == McpErrorCode::RequestCancelled {
+            Self::host_cancelled()
+        } else {
+            Self::aborted_by_host()
+        }
+    }
+
+    /// `McpContext::checkpoint` fails only by cancellation, and its error is
+    /// not an `McpError`, so it maps straight to the cancelled variant.
+    fn host_checkpoint(ctx: &McpContext) -> Result<(), Self> {
+        ctx.checkpoint().map_err(|_| Self::host_cancelled())
+    }
 }
 
-fn host_error(error: McpError) -> ManagedInteractionError {
-    if error.code == McpErrorCode::RequestCancelled {
-        host_cancelled()
-    } else {
-        // A host error can contain private answers or downstream identity.
-        ManagedInteractionError::AbortedByHost
+impl HostDisposition for ManagedInteractionError {
+    fn host_cancelled() -> Self {
+        Self::Core(fastmcp_client::http_auth::rpc::ManagedCoreError::Cancelled)
+    }
+
+    fn aborted_by_host() -> Self {
+        Self::AbortedByHost
     }
 }
 
