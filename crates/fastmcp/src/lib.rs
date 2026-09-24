@@ -6505,13 +6505,6 @@ pub mod modern {
             }
         }
 
-        /// Sets the bounded number of in-flight server-to-client requests.
-        pub fn max_bidirectional_requests_per_connection(self, maximum: usize) -> McpResult<Self> {
-            self.inner
-                .max_bidirectional_requests_per_connection(maximum)
-                .map(|inner| Self { inner })
-        }
-
         /// Sets the final catalog page size.
         #[must_use]
         pub fn list_page_size(self, page_size: usize) -> Self {

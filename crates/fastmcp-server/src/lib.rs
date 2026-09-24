@@ -12420,13 +12420,7 @@ pub struct Server {
     #[cfg(all(test, feature = "tasks"))]
     task_manager: Option<SharedTaskManager>,
     /// Per-connection ceiling for pending server-to-client requests.
-    #[cfg_attr(
-        not(any(feature = "legacy-2024-11-05", test)),
-        expect(
-            dead_code,
-            reason = "only the exact-2024 lane enforces this ceiling; the public setter is kept pending a ruling"
-        )
-    )]
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     max_bidirectional_requests_per_connection: usize,
     /// Immutable protocol-era admission policy selected by [`ServerBuilder`].
     protocol_policy: ProtocolPolicy,

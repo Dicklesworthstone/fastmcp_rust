@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 use fastmcp_console::stats::ServerStats;
-use fastmcp_core::{McpError, McpResult};
+use fastmcp_core::McpError;
 use fastmcp_protocol::extensions::ExtensionSettingsCompatibilityResolver;
 #[cfg(feature = "apps")]
 use fastmcp_protocol::extensions::{
@@ -263,6 +263,8 @@ pub struct ServerBuilder {
     /// Whether to use strict input validation (reject extra properties).
     strict_input_validation: bool,
     /// Per-connection ceiling for concurrent server-to-client requests.
+    /// Only the exact 2024-11-05 lane enforces it.
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     max_bidirectional_requests_per_connection: usize,
     /// Immutable protocol-era admission policy for live stdio/runtime connections.
     protocol_policy: ProtocolPolicy,
@@ -393,6 +395,7 @@ impl ServerBuilder {
             task_manager: None,
             on_duplicate: DuplicateBehavior::default(),
             strict_input_validation: false,
+            #[cfg(any(feature = "legacy-2024-11-05", test))]
             max_bidirectional_requests_per_connection:
                 crate::bidirectional::DEFAULT_MAX_IN_FLIGHT_REQUESTS,
             protocol_policy,
@@ -470,13 +473,18 @@ impl ServerBuilder {
     }
 
     /// Sets the maximum number of in-flight server-to-client requests for one
-    /// transport connection.
+    /// exact MCP 2024-11-05 transport connection. Modern transports do not
+    /// enforce this ceiling, so the setter exists only with that lane.
     ///
     /// # Errors
     ///
     /// Returns `InvalidParams` when `max` is zero or exceeds the hard safety
     /// limit enforced by the bidirectional request tracker.
-    pub fn max_bidirectional_requests_per_connection(mut self, max: usize) -> McpResult<Self> {
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    pub fn max_bidirectional_requests_per_connection(
+        mut self,
+        max: usize,
+    ) -> fastmcp_core::McpResult<Self> {
         crate::bidirectional::PendingRequests::validate_max_in_flight(max)?;
         self.max_bidirectional_requests_per_connection = max;
         Ok(self)
@@ -761,7 +769,10 @@ impl ServerBuilder {
     /// discovery and reads. Call [`Self::mcp_apps`] first so the server also
     /// advertises the matching modern bilateral extension capability.
     #[cfg(feature = "apps")]
-    pub fn mcp_apps_ui_resource(mut self, resource: McpAppsUiResource) -> McpResult<Self> {
+    pub fn mcp_apps_ui_resource(
+        mut self,
+        resource: McpAppsUiResource,
+    ) -> fastmcp_core::McpResult<Self> {
         if !self.has_active_official_mcp_apps() {
             return Err(fastmcp_core::McpError::invalid_request(
                 "MCP Apps UI resources require ServerBuilder::mcp_apps first",
@@ -781,7 +792,10 @@ impl ServerBuilder {
     /// [`Self::tool`], this Apps-specific entry point returns the registration
     /// failure directly.
     #[cfg(feature = "apps")]
-    pub fn mcp_apps_tool<H: ToolHandler + 'static>(mut self, handler: H) -> McpResult<Self> {
+    pub fn mcp_apps_tool<H: ToolHandler + 'static>(
+        mut self,
+        handler: H,
+    ) -> fastmcp_core::McpResult<Self> {
         if !self.has_active_official_mcp_apps() {
             return Err(fastmcp_core::McpError::invalid_request(
                 "MCP Apps tools require ServerBuilder::mcp_apps first",
@@ -1253,7 +1267,7 @@ impl ServerBuilder {
     fn install_proxy_final_tasks_relay(
         &mut self,
         task_relay: Option<Arc<ProxyFinalTaskRelay>>,
-    ) -> McpResult<()> {
+    ) -> fastmcp_core::McpResult<()> {
         let Some(task_relay) = task_relay else {
             return Ok(());
         };
@@ -1288,7 +1302,11 @@ impl ServerBuilder {
     /// Returns an error when the catalog is malformed, contradicts the route,
     /// or attempts to establish an era without upstream evidence.
     #[cfg(feature = "proxy")]
-    pub fn proxy(mut self, client: ProxyClient, catalog: ProxyCatalog) -> McpResult<Self> {
+    pub fn proxy(
+        mut self,
+        client: ProxyClient,
+        catalog: ProxyCatalog,
+    ) -> fastmcp_core::McpResult<Self> {
         client.admit_catalog(&catalog)?;
         let catalog_era = catalog.era()?;
         let completion_supported = match client.supports_completion() {
@@ -1335,7 +1353,7 @@ impl ServerBuilder {
                 ),
                 None => ProxyToolHandler::from_final(tool, client.clone()),
             })
-            .collect::<McpResult<Vec<_>>>()?;
+            .collect::<fastmcp_core::McpResult<Vec<_>>>()?;
 
         // Legacy catalog entries register exact-2024-only: dual-era proxy
         // composition must not promote a legacy upstream's components into
@@ -2895,6 +2913,7 @@ impl ServerBuilder {
             active_requests: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(all(test, feature = "tasks"))]
             task_manager: self.task_manager,
+            #[cfg(any(feature = "legacy-2024-11-05", test))]
             max_bidirectional_requests_per_connection: self
                 .max_bidirectional_requests_per_connection,
             protocol_policy: self.protocol_policy,
