@@ -9,7 +9,9 @@
 //! or policy requires a new review; retaining a plan does not make it current.
 //! This module does not authorize execution or validate the entire invocation.
 
+use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use fastmcp_core::CanonicalHttpUrl;
 use fastmcp_protocol::http_headers::{
@@ -125,39 +127,95 @@ impl ReviewedToolHeaders {
         if target != self.resource {
             return Err(ToolHeaderDispatchError::TargetMismatch);
         }
-        if !request.include_method_header
-            || request.protocol_version != FINAL_PROTOCOL_VERSION
-            || request.method != "tools/call"
-            || request.name.as_deref() != Some(self.tool_name.as_str())
-        {
-            return Err(ToolHeaderDispatchError::OperationMismatch);
-        }
-        if request.body().len() > MAX_TOOL_HEADER_REQUEST_BYTES {
-            return Err(ToolHeaderDispatchError::RequestTooLarge);
-        }
-        let message = decode_strict_jsonrpc_message(request.body(), MAX_TOOL_HEADER_REQUEST_BYTES)
-            .map_err(|_| ToolHeaderDispatchError::InvalidRequest)?;
-        let JsonRpcMessage::Request(envelope) = message else {
-            return Err(ToolHeaderDispatchError::InvalidRequest);
-        };
-        if envelope.id.is_none() || envelope.method != request.method {
-            return Err(ToolHeaderDispatchError::InvalidRequest);
-        }
-        let params = envelope.params.as_ref().and_then(Value::as_object)
-            .ok_or(ToolHeaderDispatchError::InvalidRequest)?;
-        if params.get("name").and_then(Value::as_str) != Some(self.tool_name.as_str()) {
-            return Err(ToolHeaderDispatchError::OperationMismatch);
-        }
-        if params.get("_meta").and_then(|meta| meta.get(FINAL_PROTOCOL_VERSION_META_KEY))
-            .and_then(Value::as_str) != Some(FINAL_PROTOCOL_VERSION)
-        {
-            return Err(ToolHeaderDispatchError::InvalidRequest);
-        }
-        // Raw duplicate/batch admission precedes typed method/metadata admission.
-        // Neither decoder rewrites the immutable body which the executor sends.
-        let _ = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", envelope.params.as_ref())
-            .map_err(|_| ToolHeaderDispatchError::InvalidRequest)?;
-        Ok(self.schema.header_plan().project(params.get("arguments"))?.into_fields())
+        project_exact_tool_call(request, &self.tool_name, &self.schema)
+    }
+}
+
+/// Projects `schema`'s mirrors from the exact outgoing `tools/call` body of
+/// `request` for `tool_name`. The body is admitted as the executor will send it;
+/// no separate argument map is read, so the fields cannot disagree with it.
+fn project_exact_tool_call(
+    request: &ModernHttpRequest,
+    tool_name: &str,
+    schema: &AdmittedToolHeaderSchema,
+) -> Result<Vec<(String, String)>, ToolHeaderDispatchError> {
+    if request.parameter_headers.is_some() {
+        return Err(ToolHeaderDispatchError::AlreadyProjected);
+    }
+    if !request.include_method_header
+        || request.protocol_version != FINAL_PROTOCOL_VERSION
+        || request.method != "tools/call"
+        || request.name.as_deref() != Some(tool_name)
+    {
+        return Err(ToolHeaderDispatchError::OperationMismatch);
+    }
+    if request.body().len() > MAX_TOOL_HEADER_REQUEST_BYTES {
+        return Err(ToolHeaderDispatchError::RequestTooLarge);
+    }
+    let message = decode_strict_jsonrpc_message(request.body(), MAX_TOOL_HEADER_REQUEST_BYTES)
+        .map_err(|_| ToolHeaderDispatchError::InvalidRequest)?;
+    let JsonRpcMessage::Request(envelope) = message else {
+        return Err(ToolHeaderDispatchError::InvalidRequest);
+    };
+    if envelope.id.is_none() || envelope.method != request.method {
+        return Err(ToolHeaderDispatchError::InvalidRequest);
+    }
+    let params = envelope.params.as_ref().and_then(Value::as_object)
+        .ok_or(ToolHeaderDispatchError::InvalidRequest)?;
+    if params.get("name").and_then(Value::as_str) != Some(tool_name) {
+        return Err(ToolHeaderDispatchError::OperationMismatch);
+    }
+    if params.get("_meta").and_then(|meta| meta.get(FINAL_PROTOCOL_VERSION_META_KEY))
+        .and_then(Value::as_str) != Some(FINAL_PROTOCOL_VERSION)
+    {
+        return Err(ToolHeaderDispatchError::InvalidRequest);
+    }
+    // Raw duplicate/batch admission precedes typed method/metadata admission.
+    // Neither decoder rewrites the immutable body which the executor sends.
+    let _ = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", envelope.params.as_ref())
+        .map_err(|_| ToolHeaderDispatchError::InvalidRequest)?;
+    Ok(schema.header_plan().project(params.get("arguments"))?.into_fields())
+}
+
+/// A gateway's `Mcp-Param-*` recomputation plans for one upstream, keyed by the
+/// exact upstream tool name and built from that upstream's validated
+/// `tools/list` input schemas (PXY-04).
+///
+/// A `tools/call` for a planned tool gets its mirrors projected from the exact
+/// outgoing body, exactly as [`ReviewedToolHeaders`] does, but with no HTTPS or
+/// review gate: the gateway mirrors arguments it already sends in that body to
+/// the same upstream, so the fields disclose nothing the body does not. The
+/// downstream's own fields are never involved. Debug reports a count only.
+#[derive(Default)]
+pub struct GatewayToolHeaders {
+    plans: RwLock<BTreeMap<String, Arc<AdmittedToolHeaderSchema>>>,
+}
+
+impl GatewayToolHeaders {
+    /// Replaces every plan with those of one complete upstream `tools/list`
+    /// catalog of `(name, inputSchema)` pairs, so a tool that left the catalog
+    /// leaves no plan behind. A schema with no admissible annotation recognizes
+    /// nothing, as on the server, so its tool gets no plan rather than a guess.
+    pub fn replace<'a>(&self, catalog: impl IntoIterator<Item = (&'a str, &'a Value)>) {
+        let plans = catalog.into_iter()
+            .filter_map(|(name, schema)| {
+                let admitted = AdmittedToolHeaderSchema::admit(schema.clone()).ok()?;
+                (!admitted.header_plan().bindings().is_empty())
+                    .then(|| (name.to_owned(), Arc::new(admitted)))
+            })
+            .collect();
+        *self.plans.write().unwrap_or_else(PoisonError::into_inner) = plans;
+    }
+
+    fn plan(&self, tool_name: &str) -> Option<Arc<AdmittedToolHeaderSchema>> {
+        self.plans.read().unwrap_or_else(PoisonError::into_inner).get(tool_name).cloned()
+    }
+}
+
+impl fmt::Debug for GatewayToolHeaders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let plans = self.plans.read().unwrap_or_else(PoisonError::into_inner).len();
+        f.debug_struct("GatewayToolHeaders").field("plan_count", &plans).finish()
     }
 }
 
@@ -183,6 +241,23 @@ impl ModernHttpRequest {
         reviewed: &ReviewedToolHeaders,
     ) -> Result<Self, ToolHeaderDispatchError> {
         let headers = reviewed.project_request(&self)?;
+        self.parameter_headers = Some(headers);
+        Ok(self)
+    }
+
+    /// Installs a gateway's recomputed mirrors when this is a `tools/call` for
+    /// a planned upstream tool. Every other request is returned unchanged.
+    pub(crate) fn with_gateway_tool_headers(
+        mut self,
+        gateway: &GatewayToolHeaders,
+    ) -> Result<Self, ToolHeaderDispatchError> {
+        if self.method != "tools/call" {
+            return Ok(self);
+        }
+        let Some(schema) = self.name.as_deref().and_then(|name| gateway.plan(name)) else {
+            return Ok(self);
+        };
+        let headers = project_exact_tool_call(&self, self.name.as_deref().unwrap_or_default(), &schema)?;
         self.parameter_headers = Some(headers);
         Ok(self)
     }

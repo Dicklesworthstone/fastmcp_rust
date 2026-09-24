@@ -22280,6 +22280,169 @@ fn e2e_public_http_as_proxy_refused_roots_yield_no_final_resource_or_prompt() {
     assert_refused_roots_yield_no_final("prompts/get", prompt);
 }
 
+// PXY-04 core: an `as_proxy` gateway recomputes an upstream tool's annotated
+// `Mcp-Param-*` mirrors from that tool's validated schema and the arguments it
+// forwards. It never relays the downstream's own fields (proxy code never sees
+// ingress headers), and since 7a0af503 the upstream refuses a missing mirror.
+const PXY_04_TOOL_NAME: &str = "public-http-pxy04-param-header";
+
+/// Upstream tool whose `region` is annotated. Each call records the
+/// `Mcp-Param-*` fields its request arrived with.
+struct Pxy04ParamHeaderTool {
+    seen: Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>,
+}
+
+impl ToolHandler for Pxy04ParamHeaderTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PXY_04_TOOL_NAME.to_owned(),
+            description: Some("Records the Mcp-Param-* fields a proxied call carries".to_owned()),
+            input_schema: json!({"type": "object", "properties": {
+                "region": {"type": "string", "x-mcp-header": "Region"},
+                "note": {"type": "string"}
+            }}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        self.seen
+            .lock()
+            .expect("the upstream header log is not poisoned")
+            .push(
+                ctx.http_parameter_headers()
+                    .map(<[_]>::to_vec)
+                    .unwrap_or_default(),
+            );
+        let region = arguments["region"].as_str().unwrap_or_default();
+        Ok(vec![Content::text(format!("pxy04:{region}"))])
+    }
+}
+
+/// One downstream `tools/call` through a live `bind_http` `as_proxy` gateway to
+/// a live upstream. The downstream sends its own correct `Mcp-Param-Region`
+/// (the gateway enforces HTTP-05 B as well) plus `extra` fields. Returns the
+/// raw gateway response and the `Mcp-Param-*` fields each upstream call got.
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn pxy_04_call(region: &str, extra: &[(&str, &str)]) -> (Vec<u8>, Vec<Vec<(String, String)>>) {
+    const MAX_RESPONSE_BYTES: usize = 1 << 20;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let upstream_seen = Arc::clone(&seen);
+    let upstream = spawn_legacy_http_server("pxy-04 annotated upstream", move || {
+        ServerBuilder::new("facade-pxy04-upstream", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly is available")
+            .tool(Pxy04ParamHeaderTool {
+                seen: upstream_seen,
+            })
+            .build()
+    });
+    let gateway = spawn_modern_http_identity_proxy_gateway(upstream.address());
+    let name = format!("ext/{PXY_04_TOOL_NAME}");
+    let mut params = json!({"name": name, "arguments": {"region": region, "note": "body-only"}});
+    params["_meta"] = serde_json::to_value(fastmcp_protocol::FinalRequestMeta::new(
+        fastmcp_protocol::ClientCapabilities::default(),
+    ))
+    .expect("final request metadata serializes");
+    let body = serde_json::to_vec(&JsonRpcRequest::new("tools/call", Some(params), 61_i64))
+        .expect("the PXY-04 tools/call body serializes");
+    let mut fields = format!("Mcp-Param-Region: {region}\r\n");
+    for (field, value) in extra {
+        fields.push_str(&format!("{field}: {value}\r\n"));
+    }
+    let address = gateway.address();
+    let mut stream = std::net::TcpStream::connect_timeout(&address, HTTP_OPERATION_BOUND)
+        .expect("native HTTP client connects to the PXY-04 gateway");
+    stream
+        .set_read_timeout(Some(HTTP_OPERATION_BOUND))
+        .expect("native HTTP client read deadline is configured");
+    let head = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {address}\r\nAccept: application/json\r\nContent-Type: application/json\r\nMCP-Protocol-Version: {}\r\nMcp-Method: tools/call\r\nMcp-Name: {name}\r\n{fields}Content-Length: {}\r\n\r\n",
+        modern::PROTOCOL_VERSION,
+        body.len(),
+    );
+    stream
+        .write_all(head.as_bytes())
+        .and_then(|()| stream.write_all(&body))
+        .expect("native HTTP request commits to the PXY-04 gateway");
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = read_native_http_response(&mut stream, &mut buffer);
+        if read == 0 {
+            break;
+        }
+        assert!(response.len() + read <= MAX_RESPONSE_BYTES);
+        response.extend_from_slice(&buffer[..read]);
+    }
+    drop(stream);
+    gateway.shutdown();
+    upstream.shutdown();
+    let seen = seen
+        .lock()
+        .expect("the upstream header log is not poisoned")
+        .clone();
+    (response, seen)
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn assert_pxy_04_forwarded(response: &[u8], seen: &[Vec<(String, String)>], region: &str) {
+    assert!(
+        response.starts_with(b"HTTP/1.1 200"),
+        "the proxied call to an annotated upstream tool must succeed: {}",
+        String::from_utf8_lossy(response)
+    );
+    let body = as_proxy_auth_response_json_body(response);
+    assert!(
+        body.get("error").is_none(),
+        "the proxied call must not error: {body}"
+    );
+    assert!(
+        body.to_string().contains(&format!("pxy04:{region}")),
+        "the upstream answers with the forwarded argument: {body}"
+    );
+    assert_eq!(
+        seen.len(),
+        1,
+        "the upstream handler runs exactly once: {seen:?}"
+    );
+    let fields = &seen[0];
+    assert_eq!(
+        fields.len(),
+        1,
+        "exactly one Mcp-Param-* field reaches the upstream: {fields:?}"
+    );
+    assert!(
+        fields[0].0.eq_ignore_ascii_case("Mcp-Param-Region"),
+        "the upstream field is the annotated mirror: {fields:?}"
+    );
+    assert_eq!(
+        fields[0].1, region,
+        "the upstream mirror is recomputed from the forwarded argument"
+    );
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_recomputes_upstream_parameter_headers() {
+    let (response, seen) = pxy_04_call("eu-west", &[]);
+    assert_pxy_04_forwarded(&response, &seen, "eu-west");
+}
+
+/// Near-identical: only the argument value differs, and a bogus downstream
+/// `Mcp-Param-X` rides along. The upstream mirror follows the argument, and
+/// the downstream's own field never reaches the upstream.
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_recomputes_upstream_parameter_headers_planted_negative() {
+    let (response, seen) = pxy_04_call("us-east", &[("Mcp-Param-X", "smuggled")]);
+    assert_pxy_04_forwarded(&response, &seen, "us-east");
+}
+
 /// The same follow through a live `bind_http` `as_proxy("ext", stdio)` gateway
 /// to the shipped echo's roots-gated `info://mrtr-resource`. The echo has no
 /// roots-gated prompt; its elicitation prompt cannot resume over stateless

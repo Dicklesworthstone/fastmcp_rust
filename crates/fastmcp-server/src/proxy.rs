@@ -24,6 +24,7 @@ use fastmcp_client::FinalToolCallOutcome;
 use fastmcp_client::StdioRequestExecution;
 #[cfg(feature = "tasks")]
 use fastmcp_client::http_executor::ModernHttpFinalCoreEvent;
+use fastmcp_client::http_executor::parameter_headers::GatewayToolHeaders;
 use fastmcp_client::http_executor::{
     ModernHttpClient, ModernHttpResponseKind, ModernHttpResponseStream,
     ModernHttpSubscriptionListenError,
@@ -1116,6 +1117,12 @@ pub trait ProxyBackend: Send {
     fn list_tool_catalog(&mut self) -> McpResult<ProxyToolCatalog> {
         self.list_tools().map(ProxyToolCatalog::Legacy)
     }
+
+    /// Records one complete upstream final `tools/list` catalog so later
+    /// upstream `tools/call` requests recompute their `Mcp-Param-*` mirrors
+    /// from it. Backends that send no such mirrors ignore it.
+    #[doc(hidden)]
+    fn admit_final_tool_catalog(&mut self, _tools: &[fastmcp_protocol::FinalTool]) {}
 
     /// Lists available resources.
     fn list_resources(&mut self) -> McpResult<Vec<Resource>>;
@@ -5086,6 +5093,9 @@ pub struct ProxyHttpClient {
     live_task_listener: Option<ModernHttpSubscriptionListener>,
     #[cfg(feature = "tasks")]
     task_listener_opening: bool,
+    /// Upstream `Mcp-Param-*` plans from the last complete final `tools/list`,
+    /// shared with every clone of the modern client (PXY-04).
+    gateway_tool_headers: Option<Arc<GatewayToolHeaders>>,
 }
 
 fn modern_http_client(connection: &ClientHttpConnection) -> Option<&ModernHttpClient> {
@@ -5123,11 +5133,18 @@ impl ProxyHttpClient {
 
     fn new(
         binding: ProxyUpstreamBinding,
-        connection: ClientHttpConnection,
+        mut connection: ClientHttpConnection,
         cx: Cx,
         client_info: ClientInfo,
         client_capabilities: ClientCapabilities,
     ) -> Self {
+        // A gateway recomputes the upstream's mirrors; it never forwards the
+        // downstream's own `Mcp-Param-*` fields.
+        let gateway_tool_headers = modern_http_client_mut(&mut connection).map(|client| {
+            let gateway = Arc::new(GatewayToolHeaders::default());
+            client.set_gateway_tool_headers(Arc::clone(&gateway));
+            gateway
+        });
         let next_request_id = match connection.selected_protocol_era() {
             ProtocolEra::Modern2026 => 2,
             ProtocolEra::Legacy2024 => 1,
@@ -5169,6 +5186,7 @@ impl ProxyHttpClient {
             live_task_listener: None,
             #[cfg(feature = "tasks")]
             task_listener_opening: false,
+            gateway_tool_headers,
         }
     }
 
@@ -6015,7 +6033,20 @@ impl ProxyBackend for ProxyHttpClient {
                     _ => Err(unexpected_proxy_result("tools/list")),
                 },
             )
-            .map(ProxyToolCatalog::Final),
+            .map(|catalog| {
+                self.admit_final_tool_catalog(&catalog.entries);
+                ProxyToolCatalog::Final(catalog)
+            }),
+        }
+    }
+
+    fn admit_final_tool_catalog(&mut self, tools: &[fastmcp_protocol::FinalTool]) {
+        if let Some(gateway) = &self.gateway_tool_headers {
+            gateway.replace(
+                tools
+                    .iter()
+                    .map(|tool| (tool.name.as_str(), &tool.input_schema)),
+            );
         }
     }
 
@@ -8656,6 +8687,12 @@ impl ProxyClient {
         };
         ctx.ensure_live()?;
         self.admit_observed_era(catalog.era()?, "typed catalog")?;
+        if let ProxyToolCatalog::Final(tools) = &catalog.tools {
+            self.with_backend(|backend| {
+                backend.admit_final_tool_catalog(&tools.entries);
+                Ok(())
+            })?;
+        }
         Ok(catalog)
     }
 

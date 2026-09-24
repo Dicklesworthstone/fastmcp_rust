@@ -266,3 +266,54 @@ fn mcp_name_encoding_preserves_logical_identity_and_keeps_wire_fields_safe() {
         assert_eq!(request.body(), source);
     }
 }
+
+const GATEWAY_UPSTREAM: &str = "http://127.0.0.1:9/mcp";
+
+fn gateway_for(catalog: &[(&str, Value)]) -> GatewayToolHeaders {
+    let gateway = GatewayToolHeaders::default();
+    gateway.replace(catalog.iter().map(|(name, schema)| (*name, schema)));
+    gateway
+}
+
+#[test]
+fn gateway_recomputes_mirrors_from_the_exact_body_without_a_review_or_https() {
+    let gateway = gateway_for(&[("lookup", schema())]);
+    for region in ["eu-west", "us-east"] {
+        let before = body(Some(json!({"region":region, "private":"body-only-canary"})));
+        let request = wire(GATEWAY_UPSTREAM, before.clone()).with_gateway_tool_headers(&gateway).unwrap();
+        assert_eq!(parameters(&request), vec![("Mcp-Param-Region".to_owned(), region.to_owned())]);
+        assert_eq!(request.body(), before);
+        assert!(!format!("{request:?} {gateway:?}").contains(region));
+    }
+    assert_eq!(format!("{gateway:?}"), "GatewayToolHeaders { plan_count: 1 }");
+}
+
+#[test]
+fn gateway_leaves_unplanned_tools_other_methods_and_removed_plans_unprojected() {
+    let arguments = json!({"region":"eu-west"});
+    let unannotated = json!({"type":"object","properties":{"region":{"type":"string"}}});
+    for gateway in [gateway_for(&[]), gateway_for(&[("other", schema())]), gateway_for(&[("lookup", unannotated)])] {
+        let request = wire(GATEWAY_UPSTREAM, body(Some(arguments.clone()))).with_gateway_tool_headers(&gateway).unwrap();
+        assert!(parameters(&request).is_empty());
+        assert!(request.parameter_headers.is_none());
+    }
+    let gateway = gateway_for(&[("lookup", schema())]);
+    let prompt = ModernHttpRequest::new(GATEWAY_UPSTREAM, body(Some(arguments.clone())), FINAL_PROTOCOL_VERSION,
+        "prompts/get", Some("lookup".to_owned())).unwrap().with_gateway_tool_headers(&gateway).unwrap();
+    assert!(parameters(&prompt).is_empty());
+    let planned = wire(GATEWAY_UPSTREAM, body(Some(arguments.clone()))).with_gateway_tool_headers(&gateway).unwrap();
+    assert_eq!(parameters(&planned).len(), 1);
+    gateway.replace([("other", &schema())]);
+    let removed = wire(GATEWAY_UPSTREAM, body(Some(arguments))).with_gateway_tool_headers(&gateway).unwrap();
+    assert!(parameters(&removed).is_empty());
+}
+
+#[test]
+fn gateway_refuses_a_projection_the_body_cannot_support_and_never_merges_a_reviewed_plan() {
+    let gateway = gateway_for(&[("lookup", schema())]);
+    let original = wire(GATEWAY_UPSTREAM, body(Some(json!({"region":"valid","count":"2"}))));
+    assert!(matches!(original.with_gateway_tool_headers(&gateway),
+        Err(ToolHeaderDispatchError::Projection(_))));
+    let reviewed = wire(TARGET, body(Some(json!({"region":"eu"})))).with_reviewed_tool_headers(&plan()).unwrap();
+    assert!(matches!(reviewed.with_gateway_tool_headers(&gateway), Err(ToolHeaderDispatchError::AlreadyProjected)));
+}

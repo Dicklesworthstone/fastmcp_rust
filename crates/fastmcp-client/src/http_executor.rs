@@ -3291,6 +3291,8 @@ pub struct ModernHttpClient {
     discovery_state: Arc<ModernHttpDiscoveryState>,
     executor: ModernHttpExecutor,
     reverse_request_handlers: ReverseRequestHandlers,
+    /// A gateway's upstream `Mcp-Param-*` plans, shared by every clone.
+    gateway_tool_headers: Option<Arc<parameter_headers::GatewayToolHeaders>>,
 }
 
 #[derive(Clone)]
@@ -6274,6 +6276,7 @@ impl ModernHttpClient {
                         .with_timeout_policy(request_timeout_policy)
                         .with_subscription_timeout_policy(subscription_timeout_policy),
                     reverse_request_handlers: ReverseRequestHandlers::new(),
+                    gateway_tool_headers: None,
                 }))
             }
             #[cfg(feature = "legacy-2024-11-05")]
@@ -6367,6 +6370,17 @@ impl ModernHttpClient {
         self.client_capabilities.sampling = inbound.sampling;
         self.client_capabilities.elicitation = inbound.elicitation;
         self.client_capabilities.roots = inbound.roots;
+    }
+
+    /// Makes this handle and every later clone recompute `Mcp-Param-*` for a
+    /// `tools/call` of a tool planned in `gateway`, from the exact outgoing
+    /// body (PXY-04). A reviewed plan for a planned tool is refused as
+    /// already projected rather than merged with the gateway's fields.
+    pub fn set_gateway_tool_headers(
+        &mut self,
+        gateway: Arc<parameter_headers::GatewayToolHeaders>,
+    ) {
+        self.gateway_tool_headers = Some(gateway);
     }
 
     fn stamped_client_identity(&self) -> fastmcp_protocol::common_types::Implementation {
@@ -6489,7 +6503,12 @@ impl ModernHttpClient {
             request_id,
             client_extensions.as_ref(),
         )?;
-        Ok(request)
+        match self.gateway_tool_headers.as_deref() {
+            Some(gateway) => request
+                .with_gateway_tool_headers(gateway)
+                .map_err(ModernHttpClientError::ParameterHeaders),
+            None => Ok(request),
+        }
     }
 
     async fn execute_post_discovery_request(
