@@ -1,7 +1,9 @@
 //! Public notification-driven Tasks watches over real loopback TLS.
 //! The peer is an in-process MCP/authorization-server fixture, not an external
 //! IdP or a conformance oracle. No production transport or watch is mocked.
-#![cfg(feature = "tasks")]
+// The MCP peer is trusted only through SSL_CERT_FILE in the isolated child,
+// which the executor reads only with OS roots enabled (bd-poz5k).
+#![cfg(all(feature = "tasks", feature = "native-tls-roots"))]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::{Future, poll_fn};

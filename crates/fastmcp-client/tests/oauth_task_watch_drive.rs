@@ -1,7 +1,9 @@
 //! Public OAuth watch/input composition over real loopback TLS. The issuer and
 //! MCP peer are fixtures; the production login, HTTP, watch and driver are not
 //! mocked. These tests are not external-IdP or aggregate conformance evidence.
-#![cfg(feature = "tasks")]
+// The MCP peer is trusted only through SSL_CERT_FILE in the isolated child,
+// which the executor reads only with OS roots enabled (bd-poz5k).
+#![cfg(all(feature = "tasks", feature = "native-tls-roots"))]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::{Future, poll_fn};
