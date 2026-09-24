@@ -930,8 +930,11 @@ A: No. The current API and implementation require asupersync; other async runtim
 
 **Q: How do I test my handlers?**
 
-A: Construct `McpContext` from an asupersync testing context and a request ID:
+A: `#[tool]` keeps your function, so call it directly with an `McpContext`
+built from a runtime's context and a request ID. (`Cx::for_testing()` needs
+asupersync's `test-internals` feature; this form needs no extra features.)
 ```rust
+use asupersync::runtime::RuntimeBuilder;
 use fastmcp_rust::{Cx, McpContext, McpResult, tool};
 
 #[tool]
@@ -942,9 +945,14 @@ fn my_tool(ctx: &McpContext, input: String) -> McpResult<String> {
 
 #[test]
 fn test_my_tool() {
-    let ctx = McpContext::new(Cx::for_testing(), 1);
-    let result = my_tool(&ctx, "input".to_string());
-    assert_eq!(result.unwrap(), "input");
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("create test runtime");
+    runtime.block_on(async {
+        let ctx = McpContext::new(Cx::current().expect("test context"), 1);
+        let result = my_tool(&ctx, "input".to_string());
+        assert_eq!(result.unwrap(), "input");
+    });
 }
 ```
 
