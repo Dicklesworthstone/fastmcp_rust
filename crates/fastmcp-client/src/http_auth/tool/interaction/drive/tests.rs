@@ -56,7 +56,9 @@ fn no_callback_construction_after_tool_catalog_or_request_invalidation() {
         match mode {
             0 => contract.invalidate(),
             1 => contract.catalog_invalidated = Some(Arc::new(AtomicBool::new(true))),
-            _ => cancellation.cancel(),
+            _ => {
+                cancellation.cancel();
+            }
         }
         let mut calls = 0;
         let mut resolver = |_| { calls += 1; ready(Ok::<_, ManagedInteractionError>(reply())) };
