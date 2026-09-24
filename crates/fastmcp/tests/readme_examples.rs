@@ -365,36 +365,45 @@ mod troubleshooting_and_limitations {
         );
     }
 
-    /// Troubleshooting: work that outlives `.request_timeout(...)` ends as
-    /// RequestCancelled "Request timeout exceeded"; the same work under a
-    /// longer deadline finishes.
+    /// Troubleshooting: work that outlives `.request_timeout(...)` ends as a
+    /// JSON-RPC RequestCancelled error, whose message depends on where the
+    /// deadline is observed ("Request timeout exceeded" when the server sees
+    /// it, "Request cancelled" when the handler's checkpoint does); the same
+    /// work under a longer deadline finishes. Both runs complete before any
+    /// assertion, so a failure reports the pair and their elapsed times.
     #[test]
     fn request_timeout_bounds_the_same_work_that_a_longer_deadline_completes() {
-        let timed_out = |seconds| {
+        let run_with_timeout = |seconds| {
             let server = modern::ServerBuilder::new("readme-claims", "1.0.0")
                 .tool(Slow)
                 .request_timeout(seconds)
                 .build();
+            let started = Instant::now();
             let (run, responses) = serve(server, &[call(2, "slow", json!({}))]);
             assert!(run.is_ok(), "{run:?}");
-            response(&responses, 2).clone()
+            (response(&responses, 2).clone(), started.elapsed())
         };
 
-        let bounded = timed_out(1);
+        let (bounded, bounded_elapsed) = run_with_timeout(1);
+        let (completed, completed_elapsed) = run_with_timeout(30);
+        let evidence = format!(
+            "1s deadline after {bounded_elapsed:?}: {bounded}; \
+             30s deadline after {completed_elapsed:?}: {completed}"
+        );
         assert_eq!(
             bounded["error"]["code"],
             error_code(McpErrorCode::RequestCancelled),
-            "{bounded}"
+            "{evidence}"
         );
-        assert_eq!(
-            bounded["error"]["message"], "Request timeout exceeded",
-            "{bounded}"
+        assert!(
+            ["Request timeout exceeded", "Request cancelled"]
+                .iter()
+                .any(|message| bounded["error"]["message"] == *message),
+            "{evidence}"
         );
-
-        let completed = timed_out(30);
         assert_eq!(
             completed["result"]["content"][0]["text"], "finished",
-            "{completed}"
+            "{evidence}"
         );
     }
 
