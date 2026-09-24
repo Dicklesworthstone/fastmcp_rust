@@ -327,6 +327,7 @@ pub struct OAuthHttpRoutes {
     metadata_path: String,
     /// The endpoint base's path with one trailing `/`; every fixed route is
     /// this prefix plus its name, matching `DiscoveryDocument`'s spelling.
+    #[cfg(feature = "builtin-auth-server")]
     route_prefix: String,
     authorization_path: String,
     token_path: String,
@@ -509,6 +510,7 @@ impl OAuthHttpRoutes {
             server,
             public_endpoint_base,
             metadata_path,
+            #[cfg(feature = "builtin-auth-server")]
             route_prefix,
             authorization_path,
             token_path,
@@ -3941,6 +3943,10 @@ impl OAuthServer {
         Ok(response)
     }
 
+    /// Direct issuance without an authorization code. No endpoint reaches it
+    /// (the token route serves only `authorization_code` and `refresh_token`);
+    /// tests use it to seed tokens for the live refresh/revoke/verify paths.
+    #[cfg(test)]
     fn issue_tokens(
         &self,
         client_id: &str,
@@ -4045,6 +4051,7 @@ impl OAuthServer {
         })
     }
 
+    #[cfg(test)]
     fn issue_tokens_with_draw<F, E>(
         &self,
         client_id: &str,
@@ -4509,6 +4516,7 @@ fn validate_optional_authorization_value(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_optional_authorization_subject(subject: Option<&str>) -> Result<(), OAuthError> {
     if subject.is_some_and(str::is_empty) {
         return Err(OAuthError::InvalidRequest(

@@ -909,6 +909,7 @@ impl SlidingWindowRateLimitingMiddleware {
         admission
     }
 
+    #[cfg(test)]
     fn is_request_allowed(&self, partition: Sha256Digest) -> bool {
         self.is_request_allowed_with_retry(partition).is_allowed()
     }

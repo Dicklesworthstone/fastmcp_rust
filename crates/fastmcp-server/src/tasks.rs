@@ -952,9 +952,6 @@ pub(crate) enum OfficialTaskInputMethod {
     /// An elicitation input request.
     #[serde(rename = "elicitation/create")]
     ElicitationCreate,
-    /// A sampling input request.
-    #[serde(rename = "sampling/createMessage")]
-    SamplingCreateMessage,
 }
 
 /// Process-local lifecycle configuration.
@@ -6009,6 +6006,7 @@ impl FinalTaskRuntime {
         validate_final_task_transition(expected.task(), task)
     }
 
+    #[cfg(test)]
     fn persist_new_with_work(
         &self,
         task: FinalTask,
@@ -6116,6 +6114,7 @@ impl FinalTaskRuntime {
         Ok(())
     }
 
+    #[cfg(test)]
     fn persist_transition_clearing_input(
         &self,
         expected: &FinalTaskSnapshot,

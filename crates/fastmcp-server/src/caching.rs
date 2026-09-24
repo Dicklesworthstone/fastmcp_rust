@@ -128,6 +128,7 @@ impl std::fmt::Debug for CacheEntry {
 }
 
 impl CacheEntry {
+    #[cfg(test)]
     fn new(value: serde_json::Value, ttl: Duration, max_size_bytes: usize) -> Option<Self> {
         let encoded = encode_json_bounded(&value, max_size_bytes)?;
         Self::new_encoded(encoded, ttl)
@@ -751,6 +752,7 @@ impl LruCache {
             .and_then(|encoded| decode_cached_json(&encoded))
     }
 
+    #[cfg(test)]
     fn insert(&mut self, key: CacheKey, value: serde_json::Value, ttl: Duration) {
         let admission_limit = self.max_item_size.min(
             self.max_size_bytes

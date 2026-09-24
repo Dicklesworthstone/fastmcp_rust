@@ -2777,8 +2777,8 @@ mod signer_activation_tests {
     use std::collections::BTreeMap;
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Mutex, Weak};
 
     use base64::Engine as _;
     use fastmcp_protocol::jose::{
@@ -2898,37 +2898,6 @@ mod signer_activation_tests {
             let calls = Arc::clone(&self.calls);
             Box::pin(async move {
                 calls.fetch_add(1, Ordering::AcqRel);
-                fixed_canary_disposition(request)
-            })
-        }
-    }
-
-    struct StaleReadBackBackend {
-        calls: Arc<AtomicUsize>,
-        provider: Arc<Mutex<Option<Weak<OidcProvider>>>>,
-    }
-
-    impl ExternalRs256SignerBackend for StaleReadBackBackend {
-        fn sign<'a>(
-            &'a self,
-            _: &'a Cx,
-            request: ExternalRs256SigningRequest,
-        ) -> Pin<Box<dyn Future<Output = ExternalRs256SignDisposition> + Send + 'a>> {
-            let calls = Arc::clone(&self.calls);
-            let provider = Arc::clone(&self.provider);
-            Box::pin(async move {
-                calls.fetch_add(1, Ordering::AcqRel);
-                let provider = provider
-                    .lock()
-                    .expect("stale read-back test provider lock")
-                    .as_ref()
-                    .and_then(Weak::upgrade)
-                    .expect("activation retains stale read-back test provider");
-                assert!(
-                    provider
-                        .published_jwks_document("https://fastmcp.invalid/oidc/jwks")
-                        .is_ok()
-                );
                 fixed_canary_disposition(request)
             })
         }

@@ -76,9 +76,6 @@ const MAX_CONFIGURED_ENTRIES: usize = 100_000;
 const MAX_CONFIGURED_DEPTH: usize = 256;
 const MAX_CONFIGURED_LISTING_BYTES: usize = 10 * 1024 * 1024;
 const REDACTED_RESOURCE_PATH: &str = "<resource-path>";
-/// Stable label returned by the public production-promotion gate.
-const FILESYSTEM_PROVIDER_PROMOTION_GATE: &str =
-    "non-unix targets (handle-relative no-follow filesystem I/O is unqualified)";
 const LISTING_ENTRY_PREFIX: &str = "{\"uri\":\"";
 const LISTING_ENTRY_MIME: &str = "\",\"mimeType\":\"";
 const LISTING_ENTRY_SUFFIX: &str = "\"}";
@@ -1813,8 +1810,7 @@ mod tests {
         assert!(matches!(
             error,
             FilesystemProviderError::FeatureUnavailable { platform }
-                if platform == FILESYSTEM_PROVIDER_PROMOTION_GATE
-                || platform == std::env::consts::OS
+                if platform == std::env::consts::OS
         ));
     }
 

@@ -500,7 +500,6 @@ fn block_until_cancelled_logged(ctx: &McpContext, request_id: i64) -> McpResult<
 struct RequestEvent {
     request_id: i64,
     phase: &'static str,
-    elapsed: Duration,
 }
 
 fn record_event(
@@ -511,11 +510,7 @@ fn record_event(
 ) {
     let elapsed = start.elapsed();
     let mut guard = events.lock().expect("events lock poisoned");
-    guard.push(RequestEvent {
-        request_id,
-        phase,
-        elapsed,
-    });
+    guard.push(RequestEvent { request_id, phase });
     info!(
         target: targets::SESSION,
         "e2e event request_id={} phase={} elapsed_ms={}",
@@ -5448,51 +5443,6 @@ mod ctx_read_resource_tests {
         }
     }
 
-    /// A resource that reads another resource.
-    struct NestedResource {
-        inner_uri: String,
-    }
-
-    impl NestedResource {
-        fn new(inner_uri: &str) -> Self {
-            Self {
-                inner_uri: inner_uri.to_string(),
-            }
-        }
-    }
-
-    impl ResourceHandler for NestedResource {
-        fn definition(&self) -> Resource {
-            Resource {
-                uri: "nested://wrapper".to_string(),
-                name: "nested_wrapper".to_string(),
-                description: Some("Wraps another resource".to_string()),
-                mime_type: Some("text/plain".to_string()),
-                icon: None,
-                version: None,
-                tags: vec![],
-            }
-        }
-
-        fn template(&self) -> Option<ResourceTemplate> {
-            None
-        }
-
-        fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-            // Read the inner resource using ctx
-            let inner_uri = self.inner_uri.clone();
-            let inner_result = fastmcp_core::block_on(ctx.read_resource(&inner_uri))?;
-
-            let text = inner_result.first_text().unwrap_or("(no content)");
-            Ok(vec![ResourceContent {
-                uri: "nested://wrapper".to_string(),
-                mime_type: Some("text/plain".to_string()),
-                text: Some(format!("Wrapped: {}", text)),
-                blob: None,
-            }])
-        }
-    }
-
     #[test]
     fn test_resource_content_item_constructors() {
         let text_item = ResourceContentItem::text("file://test", "hello world");
@@ -5671,9 +5621,7 @@ mod ctx_read_resource_tests {
         let ctx = McpContext::new(cx, 1).with_resource_reader(reader);
 
         #[derive(Debug, serde::Deserialize)]
-        struct Config {
-            value: i32,
-        }
+        struct Config {}
 
         let result: McpResult<Config> =
             fastmcp_core::block_on(ctx.read_resource_json("config://app"));
