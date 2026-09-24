@@ -2989,29 +2989,22 @@ fn case_routing_headers(builder: &mut CaseBuilder, wire: &WireObservations) {
         &format!("{refusal:?}"),
     );
 
-    // One variable: the POST becomes a reverse-response envelope rather than a
-    // client request. The method and name routing headers must disappear with
-    // it, so a reverse response can never be routed as a client request.
-    let reverse = ModernHttpRequest::for_jsonrpc_response(
+    // One variable: the mirrored method carries a header-splitting sequence.
+    let refusal = ModernHttpRequest::new(
         wire.b_target.as_str(),
+        b"{}".to_vec(),
         "2026-07-28",
-        br#"{"jsonrpc":"2.0","id":7,"result":{}}"#.to_vec(),
+        "ping\r\nInjected: header",
+        None,
     )
-    .expect("a reverse-response POST builds");
-    let reverse_headers = reverse.headers();
-    assert!(
-        reverse_headers
-            .iter()
-            .all(|(field, _)| field != "Mcp-Method"),
-        "a reverse-response POST must not mirror a client request method"
-    );
-    assert!(
-        reverse_headers.iter().all(|(field, _)| field != "Mcp-Name"),
-        "a reverse-response POST must not mirror a client request name"
-    );
+    .expect_err("a header-splitting method mirror must not build a modern POST");
+    assert!(matches!(
+        refusal,
+        ModernHttpExecutorError::InvalidRequestMetadata
+    ));
     builder.negative(
-        "envelope=jsonrpc-response",
-        "Mcp-Method and Mcp-Name absent",
+        "method=\"ping\\r\\nInjected: header\"",
+        &format!("{refusal:?}"),
     );
 }
 

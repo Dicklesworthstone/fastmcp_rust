@@ -390,7 +390,6 @@ pub struct ModernHttpRequest {
     name_header: Option<String>,
     authorization: Option<String>,
     parameter_headers: Option<Vec<(String, String)>>,
-    include_method_header: bool,
 }
 
 impl fmt::Debug for ModernHttpRequest {
@@ -403,7 +402,6 @@ impl fmt::Debug for ModernHttpRequest {
             .field("name", &self.name)
             .field("body_bytes", &self.body.len())
             .field("parameter_header_count", &self.parameter_headers.as_ref().map_or(0, Vec::len))
-            .field("include_method_header", &self.include_method_header)
             .field(
                 "authorization",
                 &self.authorization.as_ref().map(|_| "<redacted>"),
@@ -460,40 +458,6 @@ impl ModernHttpRequest {
             name_header,
             authorization: None,
             parameter_headers: None,
-            include_method_header: true,
-        })
-    }
-
-    /// POSTs one JSON-RPC response answering a server-initiated reverse request.
-    ///
-    /// Reverse-response POSTs omit `Mcp-Method` because they are not client
-    /// requests. The body is the exact JSON-RPC response envelope.
-    pub fn for_jsonrpc_response(
-        target: impl Into<String>,
-        protocol_version: impl Into<String>,
-        body: Vec<u8>,
-    ) -> Result<Self, ModernHttpExecutorError> {
-        let target = target.into();
-        let protocol_version = protocol_version.into();
-        if target.is_empty() || protocol_version.is_empty() {
-            return Err(ModernHttpExecutorError::InvalidRequestMetadata);
-        }
-        if [target.as_str(), protocol_version.as_str()]
-            .into_iter()
-            .any(contains_header_control)
-        {
-            return Err(ModernHttpExecutorError::InvalidRequestMetadata);
-        }
-        Ok(Self {
-            target,
-            body,
-            protocol_version,
-            method: String::new(),
-            name: None,
-            name_header: None,
-            authorization: None,
-            parameter_headers: None,
-            include_method_header: false,
         })
     }
 
@@ -558,10 +522,8 @@ impl ModernHttpRequest {
                 "MCP-Protocol-Version".to_owned(),
                 self.protocol_version.clone(),
             ),
+            ("Mcp-Method".to_owned(), self.method.clone()),
         ];
-        if self.include_method_header {
-            headers.push(("Mcp-Method".to_owned(), self.method.clone()));
-        }
         if let Some(name) = &self.name_header {
             headers.push(("Mcp-Name".to_owned(), name.clone()));
         }

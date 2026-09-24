@@ -1,4 +1,5 @@
 use super::*;
+use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta};
 use serde_json::Value;
 use std::cell::Cell;
 use std::time::Duration;
@@ -36,6 +37,90 @@ fn limits() -> ToolHeaderRepairLimits {
         ManagedCoreLimits::new(4096, 4096, 65536, 4, Duration::from_secs(10)).unwrap(),
         16384, 4, 16,
     ).unwrap()
+}
+
+fn request_with_capabilities(capabilities: Value) -> CoreRequest {
+    let mut params = request("tools/call", json!({"name":"lookup","arguments":{
+        "region":"eu","verbose":null,"private":"body-only-canary"
+    }})).encode_params().unwrap().unwrap();
+    params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY] = capabilities;
+    params["_meta"]["progressToken"] = json!("progress-only-canary");
+    params["_meta"]["com.example/private-observation"] = json!({"value":"metadata-only-canary"});
+    CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).unwrap()
+}
+
+#[test]
+fn refresh_preserves_each_admitted_core_capability_view() {
+    for capabilities in [
+        json!({"roots":{}}),
+        json!({"roots":{"listChanged":true},"sampling":{},"elicitation":{"form":{},"url":{}}}),
+        json!({"experimental":{"com.example/catalog-view":{"revision":7,"mode":"CaseSensitive"}}}),
+    ] {
+        let original = request_with_capabilities(capabilities.clone());
+        let before = original.encode_params().unwrap().unwrap();
+        assert_eq!(before["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY], capabilities);
+        let catalog = repair_catalog_request(&original).unwrap();
+        assert_eq!(catalog.method(), "tools/list");
+        let params = catalog.encode_params().unwrap().unwrap();
+        assert_eq!(params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY], capabilities);
+        assert_eq!(original.encode_params().unwrap().unwrap(), before);
+        let (wire, _) = prepare_optional(TARGET, catalog, RequestId::Number(11), limits().core, None).unwrap();
+        let sent: Value = serde_json::from_slice(wire.body()).unwrap();
+        assert_eq!(sent["params"], params);
+    }
+}
+
+#[test]
+fn refresh_does_not_copy_private_metadata_arguments_or_progress_identity() {
+    let original = request_with_capabilities(json!({"roots":{}}));
+    let before = original.encode_params().unwrap();
+    let catalog = repair_catalog_request(&original).unwrap();
+    let params = catalog.encode_params().unwrap().unwrap();
+    assert_eq!(params, json!({"_meta":{
+        (FINAL_PROTOCOL_VERSION_META_KEY): FINAL_PROTOCOL_VERSION,
+        (FINAL_CLIENT_CAPABILITIES_META_KEY): {"roots":{}},
+    }}));
+    let (wire, _) = prepare_optional(TARGET, catalog, RequestId::Number(11), limits().core, None).unwrap();
+    let wire = std::str::from_utf8(wire.body()).unwrap();
+    for private in ["progress-only-canary", "metadata-only-canary", "body-only-canary"] {
+        assert!(!wire.contains(private));
+    }
+    assert_eq!(original.encode_params().unwrap(), before);
+}
+
+#[test]
+fn refresh_does_not_invent_capabilities_or_erase_an_explicit_empty_extension_set() {
+    for capabilities in [json!({}), json!({"extensions":{}})] {
+        let original = request_with_capabilities(capabilities.clone());
+        let catalog = repair_catalog_request(&original).unwrap();
+        let params = catalog.encode_params().unwrap().unwrap();
+        assert_eq!(params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY], capabilities);
+        assert!(prepare_optional(TARGET, catalog, RequestId::Number(11), limits().core, None).is_ok());
+    }
+}
+
+#[test]
+fn capability_preservation_cannot_activate_an_unnegotiated_extension() {
+    let original = request_with_capabilities(json!({"extensions":{"io.modelcontextprotocol/tasks":{}}}));
+    let catalog = repair_catalog_request(&original).unwrap();
+    // The same unchanged core preparation refuses the initial request and the
+    // derived catalog; carrying capabilities is not negotiation authority.
+    for request in [original, catalog] {
+        assert!(matches!(prepare_optional(TARGET, request, RequestId::Number(11), limits().core, None),
+            Err(ManagedToolHeaderError::Core(ManagedCoreError::UnsupportedRequest))));
+    }
+}
+
+#[test]
+fn catalog_derivation_never_turns_a_continuation_into_a_repairable_initial_call() {
+    for original in [
+        request("tools/list", json!({})),
+        request("prompts/get", json!({"name":"lookup"})),
+        request("tools/call", json!({"name":"lookup","requestState":""})),
+        request("tools/call", json!({"name":"lookup","inputResponses":{}})),
+    ] {
+        assert!(matches!(repair_catalog_request(&original), Err(ToolHeaderRepairError::InitialToolCallRequired)));
+    }
 }
 
 #[test]

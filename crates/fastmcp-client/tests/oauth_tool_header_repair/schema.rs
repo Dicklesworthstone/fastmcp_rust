@@ -54,6 +54,13 @@ fn schema_definition(fresh: bool) -> FinalTool {
     let mut properties = serde_json::Map::new();
     properties.insert(field.to_owned(), json!({"type":"integer"}));
     tool.output_schema = Some(json!({"type":"object","properties":properties,"required":[field]}));
+    if fresh {
+        // The successful public repair path must retain opaque schema data.
+        // Validation-shaped members here have no assertion or header authority.
+        let annotation = json!({"minimum":"opaque", "$ref":"https://unresolved.example/schema", "x-mcp-header":"Ignored"});
+        tool.input_schema["unknownValidationKeyword"] = annotation.clone();
+        tool.output_schema.as_mut().unwrap()["unknownValidationKeyword"] = annotation;
+    }
     tool
 }
 
@@ -97,7 +104,7 @@ async fn refresh_peer(peer: &Peer, source: &ManagedToolClient, case: SchemaCase)
         assert!(request["params"]["_meta"].get("com.example/private-observation").is_none());
         let mut selected = schema_definition(true);
         if case == SchemaCase::InvalidSchema {
-            selected.output_schema = Some(json!({"type":"object","unknownValidationKeyword":true}));
+            selected.output_schema.as_mut().unwrap()["properties"]["total"]["minimum"] = json!("invalid-schema-private-canary");
         }
         if case == SchemaCase::ChangedInput { selected.input_schema["properties"]["region"]["minLength"] = json!(2); }
         let tools = if index == 0 { vec![selected] } else { vec![definition("other", "Unused")] };
@@ -173,6 +180,7 @@ async fn scenario(cx: &Cx, case: SchemaCase) {
                 },
                 |definition| {
                     assert_eq!(peer.requests.lock().unwrap().len(), 3, "approve only complete catalogs");
+                    assert_eq!(definition.input_schema, schema_definition(true).input_schema);
                     assert_eq!(definition.output_schema, schema_definition(true).output_schema);
                     approvals.fetch_add(1, Ordering::SeqCst);
                     if case == SchemaCase::InvalidDefinitionCallback { source.invalidate(); }

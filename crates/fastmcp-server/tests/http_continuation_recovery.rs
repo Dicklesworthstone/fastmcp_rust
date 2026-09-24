@@ -137,7 +137,10 @@ impl Peer {
         let resource = format!("{origin}/mcp");
         let probe = Probe::new();
         let token = format!("native-recovery-{}", listener.local_addr().unwrap().port());
-        let mut auth = AuthContext::with_subject("alice".to_owned());
+        // Stateless MRTR state needs a verified owner, not a display subject
+        // (auth_00_http_mrtr_subject_without_owner_rejects_without_allocating).
+        let mut auth = AuthContext::with_subject("alice".to_owned())
+            .with_session_owner(fastmcp_core::sha256_bounded(b"alice", 32).unwrap());
         auth.scopes = vec!["tools:call".to_owned()];
         let provider = TokenAuthProvider::new(StaticTokenVerifier::new([(token.clone(), auth)]).unwrap());
         let lifetime = McpRequestCancellation::new();
@@ -149,8 +152,10 @@ impl Peer {
             .auth_provider(provider).tool(probe.clone());
         if journal_enabled { builder = builder.middleware(journal.clone()); }
         builder = builder.middleware(Stamp(probe.transforms.clone()));
+        // The legacy origin only names the exact-2024 SSE lane, which has no
+        // TLS form and which this ModernOnly server never serves.
         #[cfg(feature = "legacy-2024-11-05")]
-        let endpoint = builder.build_http_endpoint(&origin).unwrap();
+        let endpoint = builder.build_http_endpoint(format!("http://{}", listener.local_addr().unwrap())).unwrap();
         #[cfg(not(feature = "legacy-2024-11-05"))]
         let endpoint = builder.build_http_endpoint().unwrap();
         Self { listener, endpoint, probe, token, journal, seen:Mutex::new(vec![]), grants:AtomicUsize::new(0),

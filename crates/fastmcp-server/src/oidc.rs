@@ -1907,6 +1907,8 @@ impl OidcProvider {
     pub fn discovery_document(&self, base_url: impl Into<String>) -> DiscoveryDocument {
         let base_url = base_url.into();
         let mut doc = DiscoveryDocument::new(&self.config.issuer, base_url.as_str());
+        doc.grant_types_supported = self.oauth.supported_grant_types()
+            .into_iter().map(str::to_string).collect();
         doc.scopes_supported = self.config.supported_scopes.clone();
         if self.oauth.config().allow_public_clients {
             let base = base_url.trim_end_matches('/');
@@ -2565,6 +2567,26 @@ mod non_signing_tests {
             if let Some(endpoint) = &doc.registration_endpoint {
                 assert_eq!(endpoint, "https://issuer.example/register");
             }
+        }
+    }
+
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    #[test]
+    fn discovery_client_credentials_tracks_explicit_development_issuer_opt_in() {
+        for enabled in [false, true] {
+            let oauth = Arc::new(OAuthServer::try_new(OAuthServerConfig {
+                issuer: "https://issuer.example".to_string(),
+                allow_development_client_credentials: enabled,
+                ..OAuthServerConfig::default()
+            }).unwrap());
+            let routes = crate::oauth::OAuthHttpRoutes::new(Arc::clone(&oauth), "https://issuer.example/oauth").unwrap();
+            let discovery = OidcProvider::with_defaults(oauth).unwrap()
+                .discovery_document(routes.public_endpoint_base());
+            assert_eq!(discovery.grant_types_supported,
+                routes.authorization_server_metadata().unwrap().grant_types_supported);
+            assert_eq!(discovery.grant_types_supported.iter().any(|grant| grant == "client_credentials"), enabled);
+            assert!(discovery.id_token_signing_alg_values_supported.is_empty());
+            assert!(discovery.jwks_uri.is_none());
         }
     }
 

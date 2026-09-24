@@ -68,6 +68,13 @@ builtin-auth-server = [
     "fastmcp-server/builtin-auth-server",
     "fastmcp-console/builtin-auth-server",
 ]
+# The built-in machine grant also requires builtin-auth-server and an explicit
+# development issuer configuration. External authorization-server clients
+# remain independently available through the ordinary client surface.
+oauth-client-credentials = [
+    "fastmcp-server/oauth-client-credentials",
+    "fastmcp-console/oauth-client-credentials",
+]
 # Full WebSocket support: URI client transport, negotiated MCP client, and
 # server-owned listener/Upgrade bridge. The facade keeps raw framing adapters
 # outside era namespaces while era-pinned builders select their policy first.

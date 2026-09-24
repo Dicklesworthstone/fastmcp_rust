@@ -9,14 +9,17 @@
 //! operation releases its waiter without publishing or consuming a message.
 //! Successful publication is never subsequently reported as cancellation.
 //! Context checkpoints respect cancellation masking and enforce deadline,
-//! poll-quota, and cost-quota exhaustion before admission. Channel polling
-//! repeats these checks while an operation waits for readiness.
+//! poll-quota, and cost-quota exhaustion before admission. Cancellation also
+//! wakes idle operations without requiring the peer to change channel readiness.
+
+mod wait;
 
 use asupersync::{Cx, channel::mpsc};
 use fastmcp_protocol::JsonRpcMessage;
 
 use super::{MemoryQueuedMessage, MemoryRecvHalf, MemorySendHalf, MemoryTransport};
 use crate::{Codec, MAX_CLIENT_TRANSPORT_SOURCE_BYTES, ReceivedTransportFrame, TransportError};
+use wait::await_channel;
 
 /// Encode once, retaining exactly the source that will be committed to the queue.
 pub(super) fn encode_message(
@@ -80,15 +83,16 @@ async fn send_message(
     // Validate before waiting: a full queue must not hide an invalid or
     // oversized message behind an indefinitely pending reservation.
     let queued = encode_message(codec, message)?;
-    let result = match sender
-        .as_ref()
-        .ok_or(TransportError::Closed)?
-        .reserve_checked(cx)
-        .await
-    {
-        Ok(permit) => permit.try_send(queued).map_err(send_error),
-        Err(error) => Err(reservation_error(error)),
-    };
+    let result = await_channel(cx, async {
+        let permit = sender
+            .as_ref()
+            .ok_or(TransportError::Closed)?
+            .reserve_checked(cx)
+            .await
+            .map_err(reservation_error)?;
+        permit.try_send(queued).map_err(send_error)
+    })
+    .await;
     if matches!(result, Err(TransportError::Closed)) {
         *closed = true;
         sender.take();
@@ -105,20 +109,24 @@ async fn recv_source(
         return Err(TransportError::Closed);
     }
     // The channel checkpoints before each dequeue, including after a wake.
-    // Do not override its masking semantics with a raw flag preflight or
-    // discard a received frame through a post-dequeue checkpoint.
-    match receiver.recv(cx).await {
-        Ok(frame) => Ok(frame.source),
-        Err(mpsc::RecvError::Disconnected) => {
-            *closed = true;
-            Err(TransportError::Closed)
+    // The wait observer supplies cancellation wakeups even for a silent peer.
+    // No post-dequeue checkpoint may discard an already committed frame.
+    let result = await_channel(cx, async {
+        match receiver.recv(cx).await {
+            Ok(frame) => Ok(frame.source),
+            Err(mpsc::RecvError::Disconnected) => Err(TransportError::Closed),
+            Err(mpsc::RecvError::Cancelled) => Err(TransportError::Cancelled),
+            Err(mpsc::RecvError::Empty) => Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "memory transport queue is empty",
+            ))),
         }
-        Err(mpsc::RecvError::Cancelled) => Err(TransportError::Cancelled),
-        Err(mpsc::RecvError::Empty) => Err(TransportError::Io(std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            "memory transport queue is empty",
-        ))),
+    })
+    .await;
+    if matches!(result, Err(TransportError::Closed)) {
+        *closed = true;
     }
+    result
 }
 
 /// An actual bounded-channel slot reserved for one memory-transport message.
@@ -178,11 +186,15 @@ async fn reserve_send<'a>(
     }
     // Checked reservation already checkpoints on every poll. Its successful
     // admission is the cancellation boundary; commit must remain unchecked.
-    match sender
-        .as_ref()
-        .ok_or(TransportError::Closed)?
-        .reserve_checked(cx)
-        .await
+    match await_channel(cx, async {
+        sender
+            .as_ref()
+            .ok_or(TransportError::Closed)?
+            .reserve_checked(cx)
+            .await
+            .map_err(reservation_error)
+    })
+    .await
     {
         Ok(permit) => Ok(MemorySendPermit {
             permit,
@@ -190,7 +202,6 @@ async fn reserve_send<'a>(
             closed,
         }),
         Err(error) => {
-            let error = reservation_error(error);
             if matches!(error, TransportError::Closed) {
                 *closed = true;
             }

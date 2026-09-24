@@ -280,6 +280,8 @@ pub mod client {
     /// MCP Apps client APIs are available only with the Apps extension.
     #[cfg(feature = "apps")]
     pub use crate::{
+        McpAppsHostRequestOutcome, McpAppsViewCallToolResult, McpAppsViewTool,
+        McpAppsViewToolsPage, McpAppsWireHostResponse,
         McpAppsBridgeTransport, McpAppsClientWirePolicy, McpAppsHost, McpAppsHostConfiguration,
         McpAppsHostError, McpAppsHostPolicy, McpAppsHttpClientWirePolicy,
         McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport,
@@ -887,6 +889,8 @@ pub use fastmcp_client::{
 
 #[cfg(feature = "apps")]
 pub use fastmcp_client::{
+    McpAppsHostRequestOutcome, McpAppsViewCallToolResult, McpAppsViewTool,
+    McpAppsViewToolsPage, McpAppsWireHostResponse,
     McpAppsBridgeTransport, McpAppsClientWirePolicy, McpAppsHost, McpAppsHostConfiguration,
     McpAppsHostError, McpAppsHostPolicy, McpAppsHttpClientWirePolicy, McpAppsInMemoryHostTransport,
     McpAppsInMemoryViewTransport, McpAppsInMemoryWireHostTransport,
@@ -2844,6 +2848,11 @@ pub mod modern {
         McpAppsWireHostPolicy, mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
     };
     #[cfg(feature = "apps")]
+    pub use fastmcp_client::{
+        McpAppsHostRequestOutcome, McpAppsViewCallToolResult, McpAppsViewTool,
+        McpAppsViewToolsPage, McpAppsWireHostResponse,
+    };
+    #[cfg(feature = "apps")]
     pub use fastmcp_protocol::extensions::{
         MAX_MCP_APPS_MIME_TYPE_BYTES, MAX_MCP_APPS_MIME_TYPES, MCP_APPS_ACTIVATION_PREDICATE_ID,
         MCP_APPS_CLIENT_SETTINGS_SCHEMA_ID, MCP_APPS_DOWNLOAD_FILE_METHOD,
@@ -4260,6 +4269,22 @@ pub mod modern {
             self.inner.mcp_apps_wire_host(transport, configuration)
         }
 
+        /// Starts an activated Apps wire host with the embedding's explicit
+        /// effect and View-tool invocation policy.
+        #[cfg(feature = "apps")]
+        pub fn mcp_apps_wire_host_with_policy<T, P>(
+            &self,
+            transport: T,
+            configuration: McpAppsWireHostConfiguration,
+            policy: P,
+        ) -> Result<McpAppsWireHost<T, P>, McpAppsHostError>
+        where
+            T: McpAppsWireBridgeTransport,
+            P: McpAppsWireHostPolicy,
+        {
+            self.inner.mcp_apps_wire_host_with_policy(transport, configuration, policy)
+        }
+
         /// Lists one exact final page of tools without a legacy projection.
         /// Sends `ping` on this modern stdio session.
         pub fn ping(&mut self) -> McpResult<()> {
@@ -5147,6 +5172,22 @@ pub mod modern {
             T: McpAppsWireBridgeTransport,
         {
             self.inner.mcp_apps_wire_host(transport, configuration)
+        }
+
+        /// Starts an activated Apps wire host with the embedding's explicit
+        /// effect and View-tool invocation policy.
+        #[cfg(feature = "apps")]
+        pub fn mcp_apps_wire_host_with_policy<T, P>(
+            &self,
+            transport: T,
+            configuration: McpAppsWireHostConfiguration,
+            policy: P,
+        ) -> Result<McpAppsWireHost<T, P>, McpAppsHostError>
+        where
+            T: McpAppsWireBridgeTransport,
+            P: McpAppsWireHostPolicy,
+        {
+            self.inner.mcp_apps_wire_host_with_policy(transport, configuration, policy)
         }
 
         /// Attaches a durable final Task and retains its latest admitted snapshot.
@@ -7031,6 +7072,19 @@ pub mod modern {
             addr: impl Into<String>,
         ) -> McpResult<WebSocketServerShutdown> {
             self.inner.serve_websocket(cx, addr).await
+        }
+
+        /// Serves final MCP over caller-owned asynchronous NDJSON I/O.
+        ///
+        /// Request execution, ingress and egress share the supplied runtime.
+        /// This returning lifecycle leaves process ownership with the caller;
+        /// the reader and writer must already be nonblocking async endpoints.
+        pub async fn serve_stdio_io<R, W>(self, cx: &Cx, reader: R, writer: W) -> McpResult<()>
+        where
+            R: asupersync::io::AsyncRead + Unpin + Send + 'static,
+            W: asupersync::io::AsyncWrite + Unpin + Send + 'static,
+        {
+            self.inner.serve_stdio_io(cx, reader, writer).await
         }
 
         /// Runs this final-only server over stdio on the supplied caller-owned context.

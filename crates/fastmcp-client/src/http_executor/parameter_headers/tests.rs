@@ -176,13 +176,12 @@ fn a_plan_cannot_cross_an_endpoint_path_query_authority_or_scheme() {
 }
 
 #[test]
-fn wrong_operation_name_version_and_reverse_response_cannot_project() {
+fn wrong_operation_name_and_version_cannot_project() {
     let review = plan();
     for request in [
         ModernHttpRequest::new(TARGET, body(None), FINAL_PROTOCOL_VERSION, "prompts/get", Some("lookup".to_owned())).unwrap(),
         ModernHttpRequest::new(TARGET, body(None), FINAL_PROTOCOL_VERSION, "tools/call", Some("other".to_owned())).unwrap(),
         ModernHttpRequest::new(TARGET, body(None), "2024-11-05", "tools/call", Some("lookup".to_owned())).unwrap(),
-        ModernHttpRequest::for_jsonrpc_response(TARGET, FINAL_PROTOCOL_VERSION, br#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_vec()).unwrap(),
     ] {
         assert!(matches!(request.with_reviewed_tool_headers(&review), Err(ToolHeaderDispatchError::OperationMismatch)));
     }

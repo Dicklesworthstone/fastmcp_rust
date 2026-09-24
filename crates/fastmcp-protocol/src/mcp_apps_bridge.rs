@@ -1489,12 +1489,11 @@ impl McpAppsBridgeAdmission {
             McpAppsBridgeDirection::HostToView => &mut self.host_progress,
         };
         if bindings.len() >= MAX_MCP_APPS_BRIDGE_IN_FLIGHT
-            || bindings
-                .insert(progress_token, request_id.clone())
-                .is_some()
+            || bindings.contains_key(&progress_token)
         {
             return Err(McpAppsBridgeError::DuplicateLiveRequest);
         }
+        bindings.insert(progress_token, request_id.clone());
         Ok(())
     }
 
@@ -2236,6 +2235,26 @@ mod tests {
             )
             .expect("the initialized notification activates the View");
         admission
+    }
+
+    #[test]
+    fn duplicate_progress_reservation_preserves_the_original_directional_binding() {
+        for direction in [McpAppsBridgeDirection::HostToView, McpAppsBridgeDirection::ViewToHost] {
+            let mut admission = active_admission();
+            let first = McpAppsJsonRpcRequestId::new(10).unwrap();
+            let second = McpAppsJsonRpcRequestId::new(11).unwrap();
+            let token = McpAppsJsonRpcRequestId::string("shared-progress".into()).unwrap();
+            admission.admit_request(direction, first.clone(), McpAppsRoutedMethod::Ping, Some(token.clone())).unwrap();
+            assert_eq!(admission.admit_request(direction, second.clone(), McpAppsRoutedMethod::Ping, Some(token.clone())),
+                Err(McpAppsBridgeError::DuplicateLiveRequest));
+            let progress = json!({"progressToken": token, "progress": 1});
+            assert_eq!(admission.admit_control(opposite_direction(direction), McpAppsRoutedMethod::Progress, Some(&progress)),
+                Ok(McpAppsControlDisposition::Bound(first.clone())));
+            admission.complete_response(direction, &first, &json!({})).unwrap();
+            admission.admit_request(direction, second.clone(), McpAppsRoutedMethod::Ping, Some(token)).unwrap();
+            assert_eq!(admission.admit_control(opposite_direction(direction), McpAppsRoutedMethod::Progress, Some(&progress)),
+                Ok(McpAppsControlDisposition::Bound(second)));
+        }
     }
 
     #[test]

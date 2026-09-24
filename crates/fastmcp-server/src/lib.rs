@@ -72,6 +72,7 @@
 // (including in unit tests).
 extern crate self as fastmcp_server;
 
+mod async_stdio;
 mod auth;
 pub mod bidirectional;
 mod builder;
@@ -3135,7 +3136,6 @@ impl ModernDispatchReservation {
     }
 }
 
-#[cfg(not(any(feature = "legacy-2024-11-05", test)))]
 impl DispatchQueueState {
     fn admit_modern_request(
         self: &Arc<Self>,
@@ -9895,18 +9895,40 @@ fn oauth_token_request(
     client_id: String,
     client_secret: Option<String>,
     client_authentication_method: oauth::TokenEndpointAuthMethod,
+    development_client_credentials_enabled: bool,
 ) -> Result<TokenRequest, OAuthError> {
+    let grant_type = oauth_required_parameter(admission, OAuthParameterName::GrantType)?;
+    let machine_grant = development_client_credentials_enabled && grant_type == "client_credentials";
+    if machine_grant && admission.parameters().iter().any(|parameter| {
+        matches!(parameter.name(),
+            "code" | "redirect_uri" | "code_verifier" | "refresh_token"
+                | "client_assertion" | "client_assertion_type")
+    }) {
+        return Err(OAuthError::InvalidRequest(
+            "machine requests must use only the configured client authentication method".to_string(),
+        ));
+    }
     let scopes = admission
         .take_defined_value(OAuthParameterName::Scope)
         .map(|value| {
-            value
-                .into_string()
+            let value = value.into_string();
+            if machine_grant {
+                // RFC 6749 scope is a nonempty SP-separated sequence. Do not
+                // normalize tabs, repeated spaces or leading/trailing spaces
+                // into an authorized machine request.
+                if value.split(' ').any(|scope| scope.is_empty()
+                    || !scope.bytes().all(|byte| matches!(byte, 0x21 | 0x23..=0x5B | 0x5D..=0x7E)))
+                {
+                    return Err(OAuthError::InvalidScope("invalid machine scope syntax".to_string()));
+                }
+            }
+            Ok(value
                 .split_ascii_whitespace()
                 .map(str::to_owned)
-                .collect()
-        });
+                .collect())
+        }).transpose()?;
     Ok(TokenRequest {
-        grant_type: oauth_required_parameter(admission, OAuthParameterName::GrantType)?,
+        grant_type,
         code: admission
             .take_defined_value(OAuthParameterName::Code)
             .map(|value| value.into_string()),
@@ -10126,6 +10148,7 @@ fn dispatch_oauth_h1_request(
             client_id,
             client_secret,
             client_authentication_method,
+            routes.server().development_client_credentials_enabled(),
         ) {
             Ok(token) => token,
             Err(error) => return oauth_http_error(error),
@@ -13473,7 +13496,7 @@ impl Server {
                     .with_request_cancellation(request_cancellation.clone()),
             ),
         );
-        let budget = self.create_request_budget(request_ctx.cx());
+        let budget = self.create_owned_modern_request_budget(request_ctx.cx(), &method);
         if let Some(error) = Self::request_budget_error(request_ctx.cx(), budget) {
             return response_for_error(error);
         }
@@ -19206,7 +19229,6 @@ impl Server {
         Self::enforce_request_context(ctx)
     }
 
-    #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
     fn admit_modern_pump_authentication(
         &self,
         inbound: &InboundRequestContext,
@@ -37000,6 +37022,132 @@ mod lib_unit_tests {
             body: form.as_bytes().to_vec(),
             trailers: Vec::new(),
             peer_addr: None,
+        }
+    }
+
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    fn native_development_machine_fixture(enabled: bool) -> (OAuthHttpRoutes, String) {
+        let oauth = Arc::new(oauth::OAuthServer::try_new(oauth::OAuthServerConfig {
+            allow_development_client_credentials: enabled,
+            ..oauth::OAuthServerConfig::default()
+        }).unwrap());
+        let endpoint = fastmcp_core::CanonicalHttpUrl::parse("https://resource.example/api").unwrap();
+        let resource = fastmcp_core::CanonicalResourceId::parse_for_endpoint(
+            endpoint.as_str(), &endpoint, fastmcp_core::CanonicalResourceIdPolicy::DEFAULT,
+        ).unwrap();
+        oauth.register_client(oauth::OAuthClient::builder("native-machine")
+            .secret("machine-secret")
+            .scope("browser:admin")
+            .development_client_credentials(oauth::DevelopmentClientCredentialsGrant::new(
+                resource, ["machine:read", "machine:write"],
+            ).unwrap()).build().unwrap()).unwrap();
+        (OAuthHttpRoutes::new(oauth, "https://fastmcp.invalid/oauth").unwrap(),
+            native_oauth_basic_header("native-machine:machine-secret"))
+    }
+
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    #[test]
+    fn native_development_client_credentials_issue_revoke_and_advertise_exact_enabled_grant() {
+        let (routes, basic) = native_development_machine_fixture(true);
+        let form = "grant_type=client_credentials&resource=https%3A%2F%2Fresource.example%2Fapi&scope=machine%3Awrite+machine%3Aread";
+        let request = native_oauth_form_request(routes.token_path(), form, Some(&basic));
+        let response = dispatch_oauth_h1_request(&routes, &request, routes.token_path(), "");
+        assert_eq!(response.status, HttpStatus::OK);
+        assert_eq!(response.headers.get("cache-control").map(String::as_str), Some("no-store"));
+        assert_eq!(response.headers.get("pragma").map(String::as_str), Some("no-cache"));
+        let issued: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(issued["scope"], "machine:read machine:write");
+        assert_eq!(issued["expires_in"], 900);
+        assert!(issued.get("refresh_token").is_none());
+        assert!(issued.get("id_token").is_none());
+        let token = issued["access_token"].as_str().unwrap();
+        let retained = routes.server().validate_access_token(token).unwrap();
+        assert_eq!(retained.client_id, "native-machine");
+        assert!(retained.subject.is_none());
+        assert_eq!(retained.resource.as_deref(), Some("https://resource.example/api"));
+
+        let mut metadata_request = native_oauth_form_request(routes.metadata_path(), "", None);
+        metadata_request.method = Http1Method::Get;
+        metadata_request.headers.clear();
+        let metadata = dispatch_oauth_h1_request(&routes, &metadata_request, routes.metadata_path(), "");
+        assert_eq!(metadata.status, HttpStatus::OK);
+        let metadata: serde_json::Value = serde_json::from_slice(&metadata.body).unwrap();
+        assert_eq!(metadata["grant_types_supported"], serde_json::json!([
+            "authorization_code", "refresh_token", "client_credentials",
+        ]));
+        assert!(metadata["token_endpoint_auth_methods_supported"].as_array().unwrap()
+            .iter().any(|method| method == "client_secret_basic"));
+
+        let revoke = native_oauth_form_request(routes.revocation_path(), &format!("token={token}"), Some(&basic));
+        let response = dispatch_oauth_h1_request(&routes, &revoke, routes.revocation_path(), "");
+        assert_eq!(response.status, HttpStatus::OK);
+        assert!(routes.server().validate_access_token(token).is_none());
+        assert_eq!(routes.server().stats().refresh_tokens, 0);
+    }
+
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    #[test]
+    fn native_development_client_credentials_reject_method_resource_scope_and_mixed_grants() {
+        let (routes, basic) = native_development_machine_fixture(true);
+        let base = "grant_type=client_credentials&resource=https%3A%2F%2Fresource.example%2Fapi&scope=machine%3Aread";
+        let baseline = native_oauth_form_request(routes.token_path(), base, Some(&basic));
+        let response = dispatch_oauth_h1_request(&routes, &baseline, routes.token_path(), "");
+        assert_eq!(response.status, HttpStatus::OK);
+        let issued: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let token = issued["access_token"].as_str().unwrap();
+        for (form, authorization, status, error, challenge) in [
+            (base.to_string(), Some(native_oauth_basic_header("native-machine:wrong-secret")),
+                HttpStatus::UNAUTHORIZED, "invalid_client", Some("Basic realm=\"oauth\"")),
+            (format!("{base}&client_id=native-machine&client_secret=machine-secret"), None,
+                HttpStatus::BAD_REQUEST, "invalid_client", None),
+            (base.replace("resource.example%2Fapi", "resource.example%2Fother"), Some(basic.clone()),
+                HttpStatus::BAD_REQUEST, "invalid_request", None),
+            (base.replace("machine%3Aread", "browser%3Aadmin"), Some(basic.clone()),
+                HttpStatus::BAD_REQUEST, "invalid_scope", None),
+            (base.replace("machine%3Aread", "machine%3Aread%09machine%3Awrite"), Some(basic.clone()),
+                HttpStatus::BAD_REQUEST, "invalid_request", None),
+            (base.replace("machine%3Aread", "+machine%3Aread"), Some(basic.clone()),
+                HttpStatus::BAD_REQUEST, "invalid_scope", None),
+            (base.replace("machine%3Aread", "machine%3Aread++machine%3Awrite"), Some(basic.clone()),
+                HttpStatus::BAD_REQUEST, "invalid_scope", None),
+            (base.replace("&scope=machine%3Aread", ""), Some(basic.clone()),
+                HttpStatus::BAD_REQUEST, "invalid_scope", None),
+            (format!("{base}&scope=machine%3Aread"), Some(basic.clone()),
+                HttpStatus::BAD_REQUEST, "invalid_request", None),
+            (format!("{base}&resource=https%3A%2F%2Fresource.example%2Fapi"), Some(basic.clone()),
+                HttpStatus::BAD_REQUEST, "invalid_request", None),
+            (format!("{base}&code="), Some(basic.clone()),
+                HttpStatus::BAD_REQUEST, "invalid_request", None),
+            (format!("{base}&client_assertion=ignored"), Some(basic.clone()),
+                HttpStatus::BAD_REQUEST, "invalid_request", None),
+            (format!("{base}&client_assertion_type=ignored"), Some(basic.clone()),
+                HttpStatus::BAD_REQUEST, "invalid_request", None),
+        ] {
+            let request = native_oauth_form_request(routes.token_path(), &form, authorization.as_deref());
+            let response = dispatch_oauth_h1_request(&routes, &request, routes.token_path(), "");
+            assert_native_oauth_error(&response, status, error, challenge);
+            assert_eq!(routes.server().stats().access_tokens, 1);
+            assert_eq!(routes.server().stats().refresh_tokens, 0);
+            assert_eq!(routes.server().stats().revoked_tokens, 0);
+            assert!(routes.server().validate_access_token(token).is_some());
+        }
+    }
+
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    #[test]
+    fn native_development_client_credentials_opt_in_does_not_change_disabled_issuer_behavior() {
+        let (routes, basic) = native_development_machine_fixture(false);
+        assert_eq!(routes.authorization_server_metadata().unwrap().grant_types_supported,
+            ["authorization_code", "refresh_token"]);
+        let base = "grant_type=client_credentials&resource=https%3A%2F%2Fresource.example%2Fapi&scope=machine%3Aread";
+        for form in [base.to_string(), format!("{base}&code="), format!("{base}&client_assertion=ignored"),
+            base.replace("machine%3Aread", "machine%3Aread++machine%3Awrite")]
+        {
+            let request = native_oauth_form_request(routes.token_path(), &form, Some(&basic));
+            let response = dispatch_oauth_h1_request(&routes, &request, routes.token_path(), "");
+            assert_native_oauth_error(&response, HttpStatus::BAD_REQUEST, "unsupported_grant_type", None);
+            assert_eq!(routes.server().stats().access_tokens, 0);
+            assert_eq!(routes.server().stats().refresh_tokens, 0);
         }
     }
 
