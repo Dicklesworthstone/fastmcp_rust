@@ -20,6 +20,8 @@ use crate::http_auth::rpc::{ManagedCoreError, interaction::{
 
 /// Explicit journal-backed recovery retaining the tool's original contract.
 pub mod recovery;
+/// Caller-owned input resolution retaining schemas, headers, and invalidation.
+pub mod drive;
 
 /// Errors retain the core interaction's correctable-input distinctions without
 /// retaining the challenge, submitted answer, schema, or tool output.
