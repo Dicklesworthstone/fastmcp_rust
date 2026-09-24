@@ -15829,12 +15829,40 @@ IFS= read -r end
         )
     }
 
+    /// How long the hooked resource request may take to reach the upstream,
+    /// given `setup_control`, the time everything before it took in the same
+    /// run. Setup spans several round trips on the same machinery, so one
+    /// more round trip gets four times that. The unloaded 10 s floor stays, so
+    /// host load scales the bound but never removes it: a request that never
+    /// reaches the upstream still fails.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn resource_hook_reach_bound(setup_control: Duration) -> Duration {
+        Duration::from_secs(10).max(setup_control.saturating_mul(4))
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn resource_hook_reach_bound_scales_with_the_control_and_keeps_its_floor() {
+        for unloaded in [
+            Duration::ZERO,
+            Duration::from_millis(40),
+            Duration::from_millis(2_500),
+        ] {
+            assert_eq!(resource_hook_reach_bound(unloaded), Duration::from_secs(10));
+        }
+        assert_eq!(
+            resource_hook_reach_bound(Duration::from_secs(6)),
+            Duration::from_secs(24)
+        );
+        assert_eq!(resource_hook_reach_bound(Duration::MAX), Duration::MAX);
+    }
+
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn proxy_resource_hooks_caller_runtime_probe(http: bool, unsubscribe: bool, interrupt: u8) {
         use fastmcp_protocol::JsonRpcRequest;
         use fastmcp_transport::http::{HttpMethod, HttpRequest, HttpStatus};
         use std::future::Future;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
         use std::task::Poll;
 
         // Concurrent probes can read the same clock value, so a process-wide
@@ -15888,6 +15916,9 @@ IFS= read -r end
             }
         }).collect();
         let stop = Arc::new(AtomicBool::new(false));
+        // The peer's idle bound. The probe raises it past its own scaled
+        // bound before the hooked request, so the peer never gives up first.
+        let peer_patience_ms = Arc::new(AtomicU64::new(15_000));
         let (peer, plan) = if http {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -15896,10 +15927,15 @@ IFS= read -r end
             let plan = legacy_only_http_proxy_plan(&format!("http://{address}/sse"), &endpoint);
             let peer_control = control.clone();
             let peer_stop = Arc::clone(&stop);
+            let peer_patience_ms = Arc::clone(&peer_patience_ms);
             let peer_responses = responses.clone();
             let peer_initialization = initialization.clone();
             let peer = thread::spawn(move || {
-                let deadline = Instant::now() + Duration::from_secs(15);
+                let mut last_progress = Instant::now();
+                let remaining = |last_progress: Instant| {
+                    Duration::from_millis(peer_patience_ms.load(Ordering::Acquire))
+                        .saturating_sub(last_progress.elapsed())
+                };
                 // The probe's timeout report reads this, so a peer that is
                 // blocked or has already hit its own bound is not mistaken
                 // for a request the proxy never sent.
@@ -15911,11 +15947,12 @@ IFS= read -r end
                 let mut index = 0;
                 let mut connections = 0_usize;
                 while !peer_stop.load(Ordering::Acquire) {
-                    if Instant::now() >= deadline {
-                        phase("deadline: peer bound expired");
+                    let idle_bound_left = remaining(last_progress);
+                    if idle_bound_left.is_zero() {
+                        phase("deadline: peer idle bound expired");
                     }
                     assert!(
-                        Instant::now() < deadline,
+                        !idle_bound_left.is_zero(),
                         "native subscription peer is bounded"
                     );
                     if peer_control.join("permit").exists()
@@ -15941,15 +15978,16 @@ IFS= read -r end
                     post.set_write_timeout(Some(Duration::from_secs(10)))
                         .unwrap();
                     connections += 1;
+                    last_progress = Instant::now();
                     phase(&format!(
                         "accepted connection #{connections} (response index {index}); reading its request at {:?}",
-                        deadline.saturating_duration_since(Instant::now())
+                        remaining(last_progress)
                     ));
                     let incoming = read_http_request(&mut post);
                     phase(&format!(
                         "read `{}` on connection #{connections}; {:?} before the peer bound",
                         incoming.head.lines().next().unwrap_or_default(),
-                        deadline.saturating_duration_since(Instant::now())
+                        remaining(last_progress)
                     ));
                     // Every refusal below names what the proxy actually sent,
                     // in the phase file as well as the panic, because a dead
@@ -16107,9 +16145,19 @@ IFS= read -r end
                 let rewrites = proxy.subscription_rewrites.lock().unwrap().clone();
                 let active_requests = Arc::clone(&session.server.active_requests);
                 let request_id = (target + 2) as i64;
+                // Everything before the hooked request ran on the same
+                // machinery under the same host load, so it is this run's
+                // control for how long one round trip may take here.
+                let setup_control = probe_started.elapsed();
+                let reach_bound = resource_hook_reach_bound(setup_control);
+                let peer_patience = reach_bound + Duration::from_secs(5);
+                peer_patience_ms.fetch_max(
+                    u64::try_from(peer_patience.as_millis()).unwrap_or(u64::MAX),
+                    Ordering::AcqRel,
+                );
                 let request = JsonRpcRequest::new(method, Some(serde_json::json!({"uri":inbound_uri})), request_id);
                 let mut operation = Box::pin(session.handle_async(&cx, post(request)));
-                let deadline = Instant::now() + Duration::from_secs(10);
+                let deadline = Instant::now() + reach_bound;
                 loop {
                     let polled = std::future::poll_fn(|task_cx| Poll::Ready(operation.as_mut().poll(task_cx))).await;
                     assert!(
@@ -16123,7 +16171,7 @@ IFS= read -r end
                     if control.join("received").exists() { break; }
                     assert!(
                         Instant::now() < deadline,
-                        "request reaches native upstream; http={http}, unsubscribe={unsubscribe}, interrupt={interrupt}, {:?} after probe start, upstream requests so far: {:?}, peer phase: {:?}, process: {}",
+                        "request reaches native upstream within {reach_bound:?} (setup control {setup_control:?}); http={http}, unsubscribe={unsubscribe}, interrupt={interrupt}, {:?} after probe start, upstream requests so far: {:?}, peer phase: {:?}, process: {}",
                         probe_started.elapsed(),
                         std::fs::read_to_string(control.join("requests")).ok(),
                         std::fs::read_to_string(control.join("peer-phase")).ok(),
