@@ -637,21 +637,31 @@ fn leg_http_01_b_positive() {
     );
 
     // ---- row 06: size backpressure, MEASURED not declared --------------
-    let observed = measure_sse_line_bound()
-        .expect("the shipped transport refuses some line below the frozen guarded floor");
     let line_floor = limits
         .iter()
         .find(|limit| limit.name() == "sse-line")
         .expect("the manifest declares the sse-line floor");
-    let conflict = LimitConflict::detect(line_floor, observed);
-
-    // This is the recorded disagreement, not a resolved one. It fails loudly
-    // and names both numbers; widening the production bound to make it pass
-    // would buy a green row by moving the thing being measured.
+    // `None` means the doubling probe reached the ceiling without a size
+    // refusal: the shipped transport admits every probed line up to the frozen
+    // floor. A bracketed refusal below the floor is the recorded conflict and
+    // fails loudly, naming both numbers.
+    if let Some(observed) = measure_sse_line_bound() {
+        let conflict = LimitConflict::detect(line_floor, observed);
+        assert!(
+            conflict.is_none(),
+            "{}",
+            conflict.expect("checked above").render()
+        );
+    }
+    // Positive proof at the floor itself, not only the absence of a refusal:
+    // an event whose `data:` line is exactly the frozen guarded floor (the
+    // payload plus `data: ` and CRLF) must be admitted and delivered.
+    let floor_payload = usize::try_from(line_floor.guarded())
+        .expect("the sse-line floor fits usize")
+        - b"data: \r\n".len();
     assert!(
-        conflict.is_none(),
-        "{}",
-        conflict.expect("checked above").render()
+        matches!(probe_line(floor_payload), LineProbe::Admitted),
+        "a {floor_payload}-byte data line (the frozen sse-line floor) must be admitted"
     );
 }
 

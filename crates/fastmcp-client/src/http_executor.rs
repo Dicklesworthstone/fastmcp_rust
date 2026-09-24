@@ -276,8 +276,9 @@ pub const MAX_MODERN_HTTP_PROBE_BODY_BYTES: usize = 64 * 1024;
 /// before a caller receives the next event.
 ///
 /// This is independent of the per-event [`SseLimits`] bound: one valid body
-/// frame can contain many individually valid events.
-pub const MAX_PENDING_MODERN_HTTP_SSE_EVENTS: usize = 128;
+/// frame can contain many individually valid events. LIMIT-01's guarded
+/// default for one stream queue is 256 events or 9 MiB.
+pub const MAX_PENDING_MODERN_HTTP_SSE_EVENTS: usize = 256;
 
 /// Maximum interleaved notifications and reverse requests accepted while one
 /// modern HTTP request waits for its correlated terminal response on SSE.
@@ -286,36 +287,47 @@ const MAX_MODERN_HTTP_INTERLEAVED_CONTROL_FRAMES: usize = 64;
 /// Maximum UTF-8 encoded bytes retained by pending modern HTTP SSE payloads
 /// from one or more native body frames before a caller receives the next
 /// event.
-pub const MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES: usize = 64 * 1024;
+///
+/// Every completed event passes through this budget, so it is also the
+/// largest single modern SSE event: LIMIT-01's 9 MiB stream-queue default,
+/// which admits the 8 MiB decoded message a single event may carry.
+pub const MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES: usize = 9 * 1024 * 1024;
 
-/// Maximum retained bytes in one legacy SSE event, including its field names.
+/// Maximum retained bytes in one legacy SSE event, including its field names
+/// (LIMIT-01 guarded default: 9 MiB).
 #[cfg(feature = "legacy-2024-11-05")]
-const MAX_LEGACY_SSE_EVENT_BYTES: usize = 64 * 1024;
+const MAX_LEGACY_SSE_EVENT_BYTES: usize = 9 * 1024 * 1024;
 
 /// Maximum bytes in one legacy SSE line before the connection is refused.
+///
+/// Each exact-2024 JSON-RPC message is a single `data:` line, so this bounds
+/// the largest message the legacy lane can receive (LIMIT-01 guarded default:
+/// 8 MiB plus the `data: ` prefix and line terminator).
 #[cfg(feature = "legacy-2024-11-05")]
-const MAX_LEGACY_SSE_LINE_BYTES: usize = 16 * 1024;
+const MAX_LEGACY_SSE_LINE_BYTES: usize = 8 * 1024 * 1024 + 8;
 
 /// Maximum ignored legacy SSE comment lines between dispatched events.
 #[cfg(feature = "legacy-2024-11-05")]
 const MAX_LEGACY_SSE_KEEPALIVE_LINES: usize = 64;
 
-/// Maximum JSON-RPC bytes accepted from one legacy `message` SSE event.
+/// Maximum JSON-RPC bytes accepted from one legacy `message` SSE event
+/// (LIMIT-01 guarded default for one decoded SSE JSON message: 8 MiB).
 #[cfg(feature = "legacy-2024-11-05")]
-const MAX_LEGACY_SSE_MESSAGE_BYTES: usize = 64 * 1024;
+const MAX_LEGACY_SSE_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Maximum complete legacy SSE events retained after one native body frame.
 ///
 /// The exact legacy lane shares one long-lived response body. Individual event
 /// limits alone do not bound the allocation caused by a native body frame
-/// containing many otherwise-valid events.
+/// containing many otherwise-valid events; this count and the byte budget
+/// below do (LIMIT-01: one stream queue, 256 events or 9 MiB).
 #[cfg(feature = "legacy-2024-11-05")]
-const MAX_PENDING_LEGACY_SSE_EVENTS: usize = 128;
+const MAX_PENDING_LEGACY_SSE_EVENTS: usize = 256;
 
 /// Maximum UTF-8 bytes retained by complete legacy SSE events waiting for the
-/// next caller read.
+/// next caller read (LIMIT-01 guarded default: 9 MiB).
 #[cfg(feature = "legacy-2024-11-05")]
-const MAX_PENDING_LEGACY_SSE_EVENT_BYTES: usize = 64 * 1024;
+const MAX_PENDING_LEGACY_SSE_EVENT_BYTES: usize = 9 * 1024 * 1024;
 
 /// Maximum interleaved notifications and reverse requests accepted while one
 /// legacy request waits for its correlated terminal response.
@@ -7461,8 +7473,11 @@ impl ModernHttpClient {
         progress_marker: &fastmcp_protocol::ProgressMarker,
         maximum_response_bytes: usize,
     ) -> Result<FinalToolCallOutcome, ModernHttpFinalCoreListenError> {
+        // One JSON-RPC message is one `data:` line, so the line bound must
+        // admit the whole message: LIMIT-01's 8 MiB plus `data: ` and the
+        // terminator, never more than the caller's response budget.
         let limits = SseLimits::new(
-            maximum_response_bytes.clamp(1, 64 * 1024),
+            maximum_response_bytes.clamp(1, 8 * 1024 * 1024 + 8),
             maximum_response_bytes.max(1),
             256,
         )
@@ -10234,7 +10249,9 @@ mod tests {
     };
     #[cfg(feature = "legacy-2024-11-05")]
     use super::{
-        LegacySseConnection, LegacySseHttpClientError, MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES,
+        LegacySseConnection, LegacySseEvent, LegacySseHttpClientError, LegacySseParser,
+        MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES, MAX_LEGACY_SSE_EVENT_BYTES,
+        MAX_LEGACY_SSE_LINE_BYTES, MAX_LEGACY_SSE_MESSAGE_BYTES,
         MAX_PENDING_LEGACY_SSE_EVENT_BYTES, MAX_PENDING_LEGACY_SSE_EVENTS,
     };
     #[cfg(feature = "tasks")]
@@ -14755,6 +14772,103 @@ mod tests {
             ))
         ));
         server.join().expect("overflowing legacy server must join");
+    }
+
+    /// Feeds one body chunk to a fresh legacy parser and collects its events.
+    #[cfg(feature = "legacy-2024-11-05")]
+    fn parse_legacy_sse(bytes: &[u8]) -> Result<Vec<LegacySseEvent>, LegacySseHttpClientError> {
+        let mut parser = LegacySseParser::default();
+        let mut events = Vec::new();
+        parser.push_with(bytes, |event| {
+            events.push(event);
+            Ok(())
+        })?;
+        Ok(events)
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    fn legacy_message_event(payload_bytes: usize) -> Vec<u8> {
+        format!("event: message\ndata: {}\n\n", "m".repeat(payload_bytes)).into_bytes()
+    }
+
+    // LIMIT-01: one decoded SSE JSON message is 8 MiB. The retained data
+    // includes the trailing field newline, so the largest admitted `data:`
+    // value is one byte short of the bound and the next byte is refused.
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_sse_parser_admits_the_limit_01_message_and_refuses_one_more_byte() {
+        let admitted_bytes = MAX_LEGACY_SSE_MESSAGE_BYTES - 1;
+        let events = parse_legacy_sse(&legacy_message_event(admitted_bytes))
+            .expect("a message at the LIMIT-01 decoded bound is admitted");
+        assert!(
+            matches!(
+                events.as_slice(),
+                [LegacySseEvent::Message(payload)] if payload.len() == admitted_bytes
+            ),
+            "the bound-sized message must arrive whole: {} events",
+            events.len()
+        );
+
+        let refused = parse_legacy_sse(&legacy_message_event(admitted_bytes + 1));
+        assert!(
+            matches!(refused, Err(LegacySseHttpClientError::SseEventTooLarge)),
+            "one byte past the decoded bound must be refused: {:?}",
+            refused.map(|events| events.len())
+        );
+    }
+
+    // LIMIT-01: one SSE line is 8 MiB + 8 B. An ignored field isolates the
+    // line bound from the message bound.
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_sse_parser_admits_the_limit_01_line_and_refuses_one_more_byte() {
+        let line = |line_bytes: usize| {
+            let mut line = b"x-pad: ".to_vec();
+            line.resize(line_bytes, b'p');
+            line.extend_from_slice(b"\n\n");
+            line
+        };
+        let events = parse_legacy_sse(&line(MAX_LEGACY_SSE_LINE_BYTES))
+            .expect("a line at the LIMIT-01 line bound is admitted");
+        assert!(events.is_empty(), "an ignored field dispatches no event");
+
+        let refused = parse_legacy_sse(&line(MAX_LEGACY_SSE_LINE_BYTES + 1));
+        assert!(
+            matches!(refused, Err(LegacySseHttpClientError::SseLineTooLong)),
+            "one byte past the line bound must be refused: {:?}",
+            refused.map(|events| events.len())
+        );
+    }
+
+    // LIMIT-01: one SSE event is 9 MiB across all of its lines. Two ignored
+    // fields that each fit the line bound reach the event bound together.
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_sse_parser_admits_the_limit_01_event_and_refuses_one_more_byte() {
+        let event = |event_bytes: usize| {
+            // Each line counts its bytes plus the terminating newline.
+            let first_line_bytes = event_bytes / 2 - 1;
+            let second_line_bytes = event_bytes - event_bytes / 2 - 1;
+            let mut event = Vec::with_capacity(event_bytes + 1);
+            for line_bytes in [first_line_bytes, second_line_bytes] {
+                let mut line = b"x-pad: ".to_vec();
+                line.resize(line_bytes, b'p');
+                event.extend_from_slice(&line);
+                event.push(b'\n');
+            }
+            event.push(b'\n');
+            event
+        };
+        let events = parse_legacy_sse(&event(MAX_LEGACY_SSE_EVENT_BYTES))
+            .expect("an event at the LIMIT-01 event bound is admitted");
+        assert!(events.is_empty(), "ignored fields dispatch no event");
+
+        let refused = parse_legacy_sse(&event(MAX_LEGACY_SSE_EVENT_BYTES + 1));
+        assert!(
+            matches!(refused, Err(LegacySseHttpClientError::SseEventTooLarge)),
+            "one byte past the event bound must be refused: {:?}",
+            refused.map(|events| events.len())
+        );
     }
 
     #[cfg(feature = "legacy-2024-11-05")]

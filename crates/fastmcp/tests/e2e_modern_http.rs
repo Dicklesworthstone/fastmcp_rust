@@ -3336,6 +3336,103 @@ fn e2e_public_sse_constructor_invokes_live_legacy_handlers() {
     server.shutdown();
 }
 
+/// Argument size for the SSE size round trips: eight times the 64 KiB event
+/// bound and 32 times the 16 KiB legacy line bound that SSE once enforced.
+const PUBLIC_HTTP_LARGE_SSE_ARGUMENT_BYTES: usize = 512 * 1024;
+
+/// A non-repeating-per-byte argument, so a truncated or shifted result cannot
+/// compare equal.
+fn public_http_large_sse_argument() -> String {
+    (b'a'..=b'z')
+        .cycle()
+        .take(PUBLIC_HTTP_LARGE_SSE_ARGUMENT_BYTES)
+        .map(char::from)
+        .collect()
+}
+
+fn assert_public_http_large_tool_text(tool: &serde_json::Value, argument: &str, lane: &str) {
+    let text = tool["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the {lane} tool result must carry text content"));
+    assert!(
+        text.strip_prefix("tool:") == Some(argument),
+        "the {lane} tool result must arrive byte-identical: received {} bytes, expected {}",
+        text.len(),
+        argument.len() + "tool:".len()
+    );
+}
+
+/// LIMIT-01: every exact-2024 message is one `data:` line, so the legacy lane
+/// must carry a tool result far above the old 16 KiB line bound.
+#[test]
+fn e2e_public_sse_constructor_carries_a_tool_result_over_64_kib() {
+    let cx = Cx::for_request();
+    let server = HttpServerFixture::spawn_with_policy(ProtocolPolicy::LegacyOnly);
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        fastmcp_rust::Client::sse_with_cx(
+            public_http_target(server.address(), "/sse"),
+            public_http_target(server.address(), "/messages"),
+            &cx,
+        ),
+    )
+    .expect("Client::sse_with_cx connects exact-2024 SSE");
+
+    let argument = public_http_large_sse_argument();
+    let result = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({ "value": argument })),
+    )
+    .expect("the legacy SSE lane must carry a 512 KiB tool result");
+    let CoreResult::Legacy(legacy_2024::LegacyCoreResult::ToolsCall(result)) = result else {
+        panic!("Client::sse_with_cx must stay on the exact-2024 tool result");
+    };
+    let tool = serde_json::to_value(result).expect("the exact-2024 tool result serializes");
+    assert_public_http_large_tool_text(&tool, &argument, "legacy SSE");
+    drop(client);
+    server.shutdown();
+}
+
+/// LIMIT-01: a modern response on a request-scoped SSE body must carry what the
+/// same response carries as application/json. An Info logLevel makes bind_http
+/// answer on SSE, because the final log notification needs a stream; that
+/// notification arriving is the proof the SSE representation was used.
+#[test]
+fn e2e_public_http_sse_body_carries_a_tool_result_over_64_kib() {
+    let cx = Cx::for_request();
+    let server = HttpServerFixture::spawn_with_policy(ProtocolPolicy::ModernOnly);
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-large-sse", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects");
+    client
+        .set_log_level(modern::LoggingLevel::Info)
+        .expect("info logLevel is stored as request metadata");
+
+    let argument = public_http_large_sse_argument();
+    let result = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({ "value": argument })),
+    )
+    .expect("a modern SSE response body must carry a 512 KiB tool result");
+    let notifications = client.take_server_notifications();
+    assert!(
+        notifications.iter().any(|notification| matches!(
+            notification,
+            modern::ServerNotification::Message(message)
+                if message.level == modern::LoggingLevel::Info
+        )),
+        "the response must travel on an SSE body with its final log notification: {notifications:?}"
+    );
+    let tool = serde_json::to_value(result).expect("the modern tool result serializes");
+    assert_public_http_large_tool_text(&tool, &argument, "modern SSE body");
+    drop(client);
+    server.shutdown();
+}
+
 fn spawn_legacy_compose_http_server() -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let tool_calls = Arc::clone(&handler_calls);

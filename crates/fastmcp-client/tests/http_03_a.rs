@@ -3819,9 +3819,10 @@ fn sized_event(payload_bytes: usize, data_lines: usize) -> Vec<u8> {
 ///
 /// Freezing them is legitimate because each one DECLARES A DESIGN LIMIT rather
 /// than MEASURING MUTABLE CONTENT. None of them moves as the crate grows, so
-/// none of them rots.
-const DECLARED_PENDING_SSE_EVENT_CEILING: usize = 128;
-const DECLARED_PENDING_SSE_EVENT_BYTE_CEILING: usize = 64 * 1024;
+/// none of them rots. The two pending-event ceilings transcribe LIMIT-01's
+/// guarded default for one stream queue: 256 events or 9 MiB.
+const DECLARED_PENDING_SSE_EVENT_CEILING: usize = 256;
+const DECLARED_PENDING_SSE_EVENT_BYTE_CEILING: usize = 9 * 1024 * 1024;
 const DECLARED_PROGRESS_QUEUE_CEILING: usize = 64;
 const DECLARED_PROBE_BODY_BYTE_CEILING: usize = 64 * 1024;
 
