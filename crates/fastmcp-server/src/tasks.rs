@@ -1,35 +1,24 @@
-//! Background task manager (Docket/SEP-1686).
+//! Official MCP 2026-07-28 Tasks extension state (`io.modelcontextprotocol/tasks`).
 //!
-//! Provides support for long-running background tasks that outlive individual
-//! request lifecycles. Tasks are managed in a dedicated region that survives
-//! until server shutdown.
+//! [`FinalTaskRuntime`] is the Tasks state machine: a [`FinalTaskStore`] (the
+//! process-local [`InMemoryFinalTaskStore`] or an application store), its
+//! [`FinalTaskRuntimeConfig`] timing policy and notification delivery. It owns
+//! neither a runtime nor a task region.
 //!
-//! # Architecture
+//! - A server built with the `tasks` feature installs an in-memory runtime by
+//!   default, so `tasks/get`, `tasks/update` and `tasks/cancel` are served for
+//!   tasks that exist. [`crate::ServerBuilder::final_tasks`] installs an
+//!   application-owned runtime instead, and [`crate::Server::final_task_runtime`]
+//!   returns whichever runtime is installed.
+//! - Creating a task needs a ready task service, which no server has by
+//!   default. The application calls [`FinalTaskRuntime::install_task_service`]
+//!   with its [`ApplicationTaskSupervisor`], then polls the returned
+//!   [`AuthorizedTaskServiceRunner::run_service`] in its own region; FastMCP
+//!   never spawns it. Until then a task-creating request is refused with
+//!   "Final task creation requires an installed ready task service".
 //!
-//! ```text
-//! Server Region (root)
-//! ├── Session Region (per connection)
-//! │   └── Request Regions (tools/call, etc.)
-//! └── Background Task Region (managed by TaskManager)
-//!     ├── Task 1
-//!     ├── Task 2
-//!     └── ...
-//! ```
-//!
-//! # Usage
-//!
-//! ```ignore
-//! let task_manager = TaskManager::new();
-//!
-//! // Submit a background task
-//! let task_id = task_manager.submit(&cx, "long_analysis", Some(json!({"data": ...})))?;
-//!
-//! // Check status
-//! let info = task_manager.get_info(&task_id);
-//!
-//! // Cancel if needed
-//! task_manager.cancel(&task_id, Some("User requested"))?;
-//! ```
+//! The legacy `TaskManager` (Docket/SEP-1686) in this file is compiled only for
+//! tests and is not part of the shipped API.
 
 #[cfg(test)]
 use std::collections::HashMap;

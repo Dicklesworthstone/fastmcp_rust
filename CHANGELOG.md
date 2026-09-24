@@ -67,6 +67,21 @@ Format: version timeline, organized by landed capabilities. Commit links point t
   error, the request-timeout symptom and unsplit transport output) and the
   WebSocket claim, which now states that exact-2024 handlers receive sampling
   and roots replies.
+- Reconciled README, FEATURE_PARITY and the Tasks module docs with the code:
+  - A default server serves `tasks/get`, `tasks/update` and `tasks/cancel` but
+    cannot create a task until the application installs a task service with
+    `FinalTaskRuntime::install_task_service` and polls its runner.
+  - `Client` is the stdio client; `Client::http_with_cx` and
+    `Client::sse_with_cx` return an `HttpClient`, and `WebSocketClient` needs
+    `websocket-experimental`.
+  - Unix stdio runs modern requests in independent bounded children and
+    exact-2024 requests in one lifecycle worker.
+  - The CLI `tasks` commands, the published version (0.10.0) and the opt-in
+    MCP Apps feature are now described as they ship, and the SSE and
+    WebSocket rows are rated once.
+  - The server's `enterprise-auth`, `jwt-resource-auth` and
+    `oauth-client-credentials` features and the transport's
+    `websocket-experimental` are documented as gating no code.
 
 MCP 2026-07-28 support remains under implementation; these changes do not
 claim aggregate conformance.
