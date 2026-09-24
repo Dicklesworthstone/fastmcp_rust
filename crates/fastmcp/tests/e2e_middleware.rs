@@ -400,7 +400,7 @@ fn middleware_ordering_success_request_in_order_response_in_reverse() {
                 .build()
         });
 
-    let mut client = TestClient::new(transport);
+    let mut client = TestClient::new(transport, Cx::for_testing());
     let init_res = client.initialize();
     trace.log_with_data(
         TraceLevel::Info,
@@ -462,7 +462,7 @@ fn middleware_short_circuit_still_runs_entered_response_stack() {
                 .build()
         });
 
-    let mut client = TestClient::new(transport);
+    let mut client = TestClient::new(transport, Cx::for_testing());
     let init_res = client.initialize();
     assert!(init_res.is_ok());
 
@@ -528,7 +528,7 @@ fn middleware_error_path_calls_on_error_in_reverse_and_can_rewrite() {
             .build()
     });
 
-    let mut client = TestClient::new(transport);
+    let mut client = TestClient::new(transport, Cx::for_testing());
     let init_res = client.initialize();
     assert!(init_res.is_ok());
 
@@ -605,7 +605,7 @@ fn middleware_response_transformation_is_observable_in_client() {
                 .build()
         });
 
-    let mut client = TestClient::new(transport);
+    let mut client = TestClient::new(transport, Cx::for_testing());
     assert!(client.initialize().is_ok());
 
     let res = client.call_tool("echo", json!({"message": "hello"}));
@@ -649,7 +649,7 @@ fn caching_middleware_caches_tools_call_until_ttl_expires() {
             builder.middleware(caching).tool(EchoTool).build()
         });
 
-    let mut client = TestClient::new(transport);
+    let mut client = TestClient::new(transport, Cx::for_testing());
     assert!(client.initialize().is_ok());
 
     let res1 = client.call_tool("echo", json!({"message": "a"}));
@@ -728,7 +728,7 @@ fn rate_limiting_middleware_blocks_second_tool_call_deterministically() {
             builder.middleware(limiter).tool(EchoTool).build()
         });
 
-    let mut client = TestClient::new(transport);
+    let mut client = TestClient::new(transport, Cx::for_testing());
     assert!(client.initialize().is_ok());
 
     let ok = client.call_tool("echo", json!({"message": "x"}));

@@ -52,7 +52,7 @@ pub use trace::*;
 /// Deterministic test helpers, available only with `testing-lab`.
 ///
 /// This is the sole facade path that exposes lab runtime configuration and
-/// helpers that obtain a runtime-installed context on the caller's behalf.
+/// test helpers that run on a context the caller supplies.
 #[cfg(feature = "testing-lab")]
 pub mod lab {
     pub use super::client::*;

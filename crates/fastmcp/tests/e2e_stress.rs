@@ -167,7 +167,7 @@ fn stress_simultaneous_tool_calls_and_reads_reports_percentiles() {
         let name = format!("stress-server-{client_num}");
         let handle = std::thread::spawn(move || -> Result<_, &'static str> {
             let (transport, server_handle) = spawn_stress_server(&name);
-            let mut client = TestClient::new(transport)
+            let mut client = TestClient::new(transport, Cx::for_testing())
                 .with_client_info(format!("stress-client-{client_num}"), "1.0.0");
 
             let mut durations_ms = Vec::with_capacity(OPS_PER_CLIENT * 2);
@@ -289,7 +289,7 @@ fn stress_client_cancellation_under_load_is_non_deadlocking() {
         let cancelled_ops_started = cancelled_ops_started.clone();
         let handle = std::thread::spawn(move || -> Result<_, &'static str> {
             let (transport, server_handle) = spawn_stress_server(&name);
-            let mut client = TestClient::with_cx(transport, cx)
+            let mut client = TestClient::new(transport, cx)
                 .with_client_info(format!("cancel-client-{client_num}"), "1.0.0");
 
             let mut ok = 0usize;
@@ -399,7 +399,8 @@ fn stress_large_payload_reports_rss_delta_best_effort() {
     let rss_start_kb = read_vm_rss_kb();
 
     let (transport, server_handle) = spawn_stress_server("large-payload-server");
-    let mut client = TestClient::new(transport).with_client_info("large-payload-client", "1.0.0");
+    let mut client = TestClient::new(transport, Cx::for_testing())
+        .with_client_info("large-payload-client", "1.0.0");
     assert!(client.initialize().is_ok(), "initialize failed");
 
     let payload = "x".repeat(PAYLOAD_BYTES);

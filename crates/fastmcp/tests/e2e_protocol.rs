@@ -344,7 +344,7 @@ fn setup_test_server_and_client() -> TestHarness {
 
     let handle = spawn_test_server_with_runtime(server, server_transport);
 
-    TestHarness::new(TestClient::new(client_transport), handle)
+    TestHarness::new(TestClient::new(client_transport, Cx::for_testing()), handle)
 }
 
 fn setup_auth_server_and_client<P: fastmcp_rust::AuthProvider + 'static>(
@@ -364,7 +364,7 @@ fn setup_auth_server_and_client<P: fastmcp_rust::AuthProvider + 'static>(
 
     let handle = spawn_test_server_with_runtime(server, server_transport);
 
-    TestHarness::new(TestClient::new(client_transport), handle)
+    TestHarness::new(TestClient::new(client_transport, Cx::for_testing()), handle)
 }
 
 // ============================================================================
@@ -1249,7 +1249,7 @@ fn e2e_server_with_tools_only() {
 
     let handle = spawn_test_server_with_runtime(server, server_transport);
 
-    let mut client = TestHarness::new(TestClient::new(client_transport), handle);
+    let mut client = TestHarness::new(TestClient::new(client_transport, Cx::for_testing()), handle);
     let init = client.initialize().unwrap();
 
     // Should have tools but not resources or prompts
@@ -1272,7 +1272,7 @@ fn e2e_server_with_resources_only() {
 
     let handle = spawn_test_server_with_runtime(server, server_transport);
 
-    let mut client = TestHarness::new(TestClient::new(client_transport), handle);
+    let mut client = TestHarness::new(TestClient::new(client_transport, Cx::for_testing()), handle);
     let init = client.initialize().unwrap();
 
     assert!(init.capabilities.tools.is_none());
@@ -1293,7 +1293,7 @@ fn e2e_server_with_prompts_only() {
 
     let handle = spawn_test_server_with_runtime(server, server_transport);
 
-    let mut client = TestHarness::new(TestClient::new(client_transport), handle);
+    let mut client = TestHarness::new(TestClient::new(client_transport, Cx::for_testing()), handle);
     let init = client.initialize().unwrap();
 
     assert!(init.capabilities.tools.is_none());
@@ -1314,7 +1314,7 @@ fn e2e_empty_server() {
 
     let handle = spawn_test_server_with_runtime(server, server_transport);
 
-    let mut client = TestHarness::new(TestClient::new(client_transport), handle);
+    let mut client = TestHarness::new(TestClient::new(client_transport, Cx::for_testing()), handle);
     let init = client.initialize().unwrap();
 
     // Empty server should not advertise any capabilities
@@ -1336,7 +1336,8 @@ fn e2e_custom_client_info() {
 
     let handle = spawn_test_server_with_runtime(server, server_transport);
 
-    let client = TestClient::new(client_transport).with_client_info("custom-client", "3.0.0");
+    let client = TestClient::new(client_transport, Cx::for_testing())
+        .with_client_info("custom-client", "3.0.0");
     let mut client = TestHarness::new(client, handle);
 
     let init = client.initialize().unwrap();

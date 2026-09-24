@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use asupersync::Cx;
-use fastmcp_core::{McpError, McpResult, block_on};
+use fastmcp_core::{McpError, McpResult};
 use fastmcp_protocol::{
     CallToolParams, CallToolResult, ClientCapabilities, ClientInfo, GetPromptParams,
     GetPromptResult, InitializeParams, InitializeResult, JsonRpcMessage, JsonRpcRequest,
@@ -36,8 +36,8 @@ use fastmcp_transport::memory::MemoryTransport;
 /// // Run server in a background thread (omitted here). Prefer using the
 /// // higher-level E2E harness helpers in this crate which join threads on drop.
 ///
-/// // Create test client
-/// let mut client = TestClient::new(client_transport);
+/// // Create test client on the caller's context
+/// let mut client = TestClient::new(client_transport, cx.clone());
 /// client.initialize().unwrap();
 ///
 /// // Test operations
@@ -66,38 +66,19 @@ pub struct TestClient {
 }
 
 impl TestClient {
-    /// Creates a new test client with the given transport.
+    /// Creates a test client over `transport` that runs on the caller's `cx`.
+    ///
+    /// The caller supplies the context: a library helper that built one would
+    /// have to create or enter a runtime of its own (FND-04).
     ///
     /// # Example
     ///
     /// ```ignore
     /// let (client_transport, server_transport) = create_memory_transport_pair();
-    /// let client = TestClient::new(client_transport);
+    /// let client = TestClient::new(client_transport, cx.clone());
     /// ```
     #[must_use]
-    pub fn new(transport: MemoryTransport) -> Self {
-        let cx =
-            block_on(async { Cx::current().expect("fastmcp runtime should install a current Cx") });
-
-        Self {
-            transport,
-            cx,
-            client_info: ClientInfo {
-                name: "test-client".to_owned(),
-                version: "1.0.0".to_owned(),
-            },
-            capabilities: ClientCapabilities::default(),
-            server_info: None,
-            server_capabilities: None,
-            protocol_version: None,
-            next_id: AtomicU64::new(1),
-            initialized: false,
-        }
-    }
-
-    /// Creates a new test client with custom Cx.
-    #[must_use]
-    pub fn with_cx(transport: MemoryTransport, cx: Cx) -> Self {
+    pub fn new(transport: MemoryTransport, cx: Cx) -> Self {
         Self {
             transport,
             cx,
@@ -538,14 +519,15 @@ mod tests {
     #[test]
     fn test_client_creation() {
         let (client_transport, _server_transport) = create_memory_transport_pair();
-        let client = TestClient::new(client_transport);
+        let client = TestClient::new(client_transport, Cx::for_testing());
         assert!(!client.is_initialized());
     }
 
     #[test]
     fn test_client_with_info() {
         let (client_transport, _server_transport) = create_memory_transport_pair();
-        let client = TestClient::new(client_transport).with_client_info("my-client", "2.0.0");
+        let client = TestClient::new(client_transport, Cx::for_testing())
+            .with_client_info("my-client", "2.0.0");
         assert_eq!(client.client_info.name, "my-client");
         assert_eq!(client.client_info.version, "2.0.0");
     }
@@ -553,22 +535,44 @@ mod tests {
     #[test]
     fn test_not_initialized_error() {
         let (client_transport, _server_transport) = create_memory_transport_pair();
-        let mut client = TestClient::new(client_transport);
+        let mut client = TestClient::new(client_transport, Cx::for_testing());
         let result = client.list_tools();
         assert!(result.is_err());
+    }
+
+    /// Constructing inside a running bridge must not enter a second one. The
+    /// old constructor fetched its context with `block_on`, which panics as a
+    /// nested bridge here.
+    #[test]
+    fn new_inside_an_active_bridge_runs_on_the_callers_cx() {
+        let (ct, _st) = create_memory_transport_pair();
+        let (client, caller) = fastmcp_core::block_on(async move {
+            let caller = Cx::current().expect("the bridge installs a current cx");
+            (TestClient::new(ct, caller.clone()), caller)
+        });
+        assert!(!client.cx.is_cancel_requested());
+        caller.set_cancel_requested(true);
+        assert!(
+            client.cx.is_cancel_requested(),
+            "the client holds the caller's cx itself, so the caller's cancel reaches it"
+        );
+    }
+
+    #[test]
+    fn new_with_an_independent_cx_does_not_share_the_callers_cancel() {
+        let (ct, _st) = create_memory_transport_pair();
+        let caller = Cx::for_testing();
+        let client = TestClient::new(ct, Cx::for_testing());
+        caller.set_cancel_requested(true);
+        assert!(
+            !client.cx.is_cancel_requested(),
+            "CONTROL: a different cx is not cancelled by the caller's"
+        );
     }
 
     // =========================================================================
     // Additional coverage tests (bd-8zle)
     // =========================================================================
-
-    #[test]
-    fn with_cx_sets_custom_cx() {
-        let (ct, _st) = create_memory_transport_pair();
-        let cx = Cx::for_testing();
-        let client = TestClient::with_cx(ct, cx);
-        assert!(!client.is_initialized());
-    }
 
     #[test]
     fn with_capabilities_sets_capabilities() {
@@ -577,14 +581,14 @@ mod tests {
             sampling: Some(fastmcp_protocol::SamplingCapability {}),
             ..Default::default()
         };
-        let client = TestClient::new(ct).with_capabilities(caps);
+        let client = TestClient::new(ct, Cx::for_testing()).with_capabilities(caps);
         assert!(client.capabilities.sampling.is_some());
     }
 
     #[test]
     fn pre_init_getters_return_none() {
         let (ct, _st) = create_memory_transport_pair();
-        let client = TestClient::new(ct);
+        let client = TestClient::new(ct, Cx::for_testing());
         assert!(client.server_info().is_none());
         assert!(client.server_capabilities().is_none());
         assert!(client.protocol_version().is_none());
@@ -593,7 +597,7 @@ mod tests {
     #[test]
     fn debug_output_includes_key_fields() {
         let (ct, _st) = create_memory_transport_pair();
-        let client = TestClient::new(ct);
+        let client = TestClient::new(ct, Cx::for_testing());
         let debug = format!("{client:?}");
         assert!(debug.contains("TestClient"));
         assert!(debug.contains("test-client"));
@@ -603,7 +607,7 @@ mod tests {
     #[test]
     fn transport_accessors() {
         let (ct, _st) = create_memory_transport_pair();
-        let mut client = TestClient::new(ct);
+        let mut client = TestClient::new(ct, Cx::for_testing());
         // Immutable accessor
         let _ = client.transport();
         // Mutable accessor
@@ -613,14 +617,14 @@ mod tests {
     #[test]
     fn close_does_not_panic() {
         let (ct, _st) = create_memory_transport_pair();
-        let mut client = TestClient::new(ct);
+        let mut client = TestClient::new(ct, Cx::for_testing());
         client.close();
     }
 
     #[test]
     fn request_id_auto_increments() {
         let (ct, _st) = create_memory_transport_pair();
-        let client = TestClient::new(ct);
+        let client = TestClient::new(ct, Cx::for_testing());
         let id1 = client.next_request_id();
         let id2 = client.next_request_id();
         let id3 = client.next_request_id();
@@ -632,7 +636,7 @@ mod tests {
     #[test]
     fn ensure_initialized_error_message() {
         let (ct, _st) = create_memory_transport_pair();
-        let mut client = TestClient::new(ct);
+        let mut client = TestClient::new(ct, Cx::for_testing());
         let err = client.list_tools().unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("not initialized"), "error was: {msg}");
@@ -662,7 +666,7 @@ mod tests {
             )
             .expect("queue initialize response");
 
-        let mut client = TestClient::with_cx(client_transport, Cx::for_testing());
+        let mut client = TestClient::new(client_transport, Cx::for_testing());
         client.initialize().expect("initialize test client");
 
         let request = server_transport

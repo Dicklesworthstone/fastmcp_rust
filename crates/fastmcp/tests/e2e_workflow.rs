@@ -602,7 +602,7 @@ fn setup_workflow_server() -> TestHarness {
 
     let handle = spawn_runtime_server(server, server_transport, "workflow server loop");
 
-    TestHarness::new(TestClient::new(client_transport), handle)
+    TestHarness::new(TestClient::new(client_transport, Cx::for_testing()), handle)
 }
 
 const CALLER_OWNED_LIFECYCLE_TOOL: &str = "caller_owned_lifecycle_tool";
@@ -1401,14 +1401,14 @@ fn workflow_two_independent_servers() {
     server_joins.push(handle_b);
 
     // Client A
-    let mut client_a = TestClient::new(client_a_transport);
+    let mut client_a = TestClient::new(client_a_transport, Cx::for_testing());
     let init_a = client_a.initialize().unwrap();
     assert_eq!(init_a.server_info.name, "server-a");
     assert!(init_a.capabilities.tools.is_some());
     assert!(init_a.capabilities.resources.is_none());
 
     // Client B
-    let mut client_b = TestClient::new(client_b_transport);
+    let mut client_b = TestClient::new(client_b_transport, Cx::for_testing());
     let init_b = client_b.initialize().unwrap();
     assert_eq!(init_b.server_info.name, "server-b");
     assert!(init_b.capabilities.tools.is_none());
@@ -1538,7 +1538,7 @@ fn workflow_server_name_and_version() {
     let handle = spawn_runtime_server(server, server_transport, "workflow server loop");
     let _joins = ThreadJoins::new(vec![handle]);
 
-    let mut client = TestClient::new(client_transport);
+    let mut client = TestClient::new(client_transport, Cx::for_testing());
     let init = client.initialize().unwrap();
 
     assert_eq!(init.server_info.name, "custom-name");
@@ -1554,7 +1554,7 @@ fn workflow_capabilities_match_handlers() {
     let handle = spawn_runtime_server(server, server_transport, "workflow server loop");
     let _joins = ThreadJoins::new(vec![handle]);
 
-    let mut client = TestClient::new(client_transport);
+    let mut client = TestClient::new(client_transport, Cx::for_testing());
     let init = client.initialize().unwrap();
 
     // Has tools and resources, but NOT prompts
@@ -1576,8 +1576,8 @@ fn workflow_custom_client_info_accepted() {
     let handle = spawn_runtime_server(server, server_transport, "workflow server loop");
     let _joins = ThreadJoins::new(vec![handle]);
 
-    let mut client =
-        TestClient::new(client_transport).with_client_info("my-custom-client", "5.0.0");
+    let mut client = TestClient::new(client_transport, Cx::for_testing())
+        .with_client_info("my-custom-client", "5.0.0");
 
     // Should initialize successfully with custom client info
     let init = client.initialize().unwrap();
@@ -3938,7 +3938,7 @@ fn workflow_concurrent_clients_isolation() {
         );
         server_joins.push(handle);
 
-        let client = TestClient::new(client_transport)
+        let client = TestClient::new(client_transport, Cx::for_testing())
             .with_client_info(format!("client-{}", client_num), "1.0.0");
 
         clients_and_servers.push((client_num, client));
@@ -4022,7 +4022,7 @@ fn workflow_concurrent_interleaved_operations() {
             );
             server_join.push(server_handle);
 
-            let mut client = TestClient::with_cx(client_transport, Cx::for_testing())
+            let mut client = TestClient::new(client_transport, Cx::for_testing())
                 .with_client_info(format!("client-{}", client_num), "1.0.0");
 
             worker_progress.advance("client initialization");
@@ -4100,7 +4100,7 @@ fn workflow_concurrent_no_crosstalk() {
             );
             server_join.push(server_handle);
 
-            let mut client = TestClient::with_cx(client_transport, Cx::for_testing());
+            let mut client = TestClient::new(client_transport, Cx::for_testing());
             worker_progress.advance("client initialization");
             client.initialize().unwrap();
             worker_progress.advance("RPC");
@@ -4174,7 +4174,7 @@ fn workflow_concurrent_session_state_persistence() {
     );
     let _server_join = ThreadJoins::new(vec![server_handle]);
 
-    let mut client = TestClient::new(client_transport);
+    let mut client = TestClient::new(client_transport, Cx::for_testing());
     client.initialize().unwrap();
 
     // Store multiple values
@@ -4251,7 +4251,7 @@ fn workflow_concurrent_stress_test() {
             );
             server_join.push(server_handle);
 
-            let mut client = TestClient::with_cx(client_transport, Cx::for_testing());
+            let mut client = TestClient::new(client_transport, Cx::for_testing());
             worker_progress.advance("client initialization");
             client
                 .initialize()
@@ -4366,7 +4366,7 @@ fn session_capabilities_reflect_server_handlers() {
     );
     server_joins.push(server_handle3);
 
-    let mut client = TestClient::new(client_transport);
+    let mut client = TestClient::new(client_transport, Cx::for_testing());
     client.initialize().unwrap();
 
     let caps = client.server_capabilities().unwrap();
@@ -4374,7 +4374,7 @@ fn session_capabilities_reflect_server_handlers() {
     assert!(caps.resources.is_none());
     assert!(caps.prompts.is_none());
 
-    let mut client2 = TestClient::new(client_transport2);
+    let mut client2 = TestClient::new(client_transport2, Cx::for_testing());
     client2.initialize().unwrap();
 
     let caps2 = client2.server_capabilities().unwrap();
@@ -4382,7 +4382,7 @@ fn session_capabilities_reflect_server_handlers() {
     assert!(caps2.resources.is_some());
     assert!(caps2.prompts.is_none());
 
-    let mut client3 = TestClient::new(client_transport3);
+    let mut client3 = TestClient::new(client_transport3, Cx::for_testing());
     client3.initialize().unwrap();
 
     let caps3 = client3.server_capabilities().unwrap();
@@ -4417,7 +4417,7 @@ fn session_operations_fail_before_init() {
     );
     let _server_join = ThreadJoins::new(vec![server_handle]);
 
-    let mut client = TestClient::new(client_transport);
+    let mut client = TestClient::new(client_transport, Cx::for_testing());
 
     // All operations should fail before initialization
     assert!(client.list_tools().is_err());
@@ -4444,7 +4444,7 @@ fn session_close_graceful() {
     );
     let _server_join = ThreadJoins::new(vec![server_handle]);
 
-    let mut client = TestClient::new(client_transport);
+    let mut client = TestClient::new(client_transport, Cx::for_testing());
     client.initialize().unwrap();
 
     // Perform some operations
@@ -4493,8 +4493,8 @@ fn session_state_isolated_per_client() {
     );
     server_joins.push(server_b_handle);
 
-    let mut client_a = TestClient::new(client_a_transport);
-    let mut client_b = TestClient::new(client_b_transport);
+    let mut client_a = TestClient::new(client_a_transport, Cx::for_testing());
+    let mut client_b = TestClient::new(client_b_transport, Cx::for_testing());
 
     client_a.initialize().unwrap();
     client_b.initialize().unwrap();
@@ -4576,8 +4576,8 @@ fn session_tracks_client_info() {
     );
     let _server_join = ThreadJoins::new(vec![server_handle]);
 
-    let mut client =
-        TestClient::new(client_transport).with_client_info("custom-client-name", "2.5.0");
+    let mut client = TestClient::new(client_transport, Cx::for_testing())
+        .with_client_info("custom-client-name", "2.5.0");
 
     // Verify client info is set before initialization
     let init = client.initialize().unwrap();
@@ -4608,7 +4608,7 @@ fn session_multiple_clients_independent_lifecycle() {
         let handle = spawn_runtime_server(server, server_transport, "lifecycle server loop");
         server_joins.push(handle);
 
-        let client = TestClient::new(client_transport)
+        let client = TestClient::new(client_transport, Cx::for_testing())
             .with_client_info(format!("lifecycle-client-{}", i), "1.0.0");
         clients.push((i, client));
     }
@@ -4653,7 +4653,7 @@ fn session_state_persists_across_operations() {
     let handle = spawn_runtime_server(server, server_transport, "persistence server loop");
     let _joins = ThreadJoins::new(vec![handle]);
 
-    let mut client = TestClient::new(client_transport);
+    let mut client = TestClient::new(client_transport, Cx::for_testing());
     client.initialize().unwrap();
 
     // Store a value
@@ -4843,7 +4843,7 @@ fn setup_tool_test_server() -> TestHarness {
         "server transport loop settles cleanly",
     );
 
-    TestHarness::new(TestClient::new(client_transport), handle)
+    TestHarness::new(TestClient::new(client_transport, Cx::for_testing()), handle)
 }
 
 #[test]
@@ -5473,7 +5473,7 @@ fn setup_resource_test_server() -> TestHarness {
         "server transport loop settles cleanly",
     );
 
-    TestHarness::new(TestClient::new(client_transport), handle)
+    TestHarness::new(TestClient::new(client_transport, Cx::for_testing()), handle)
 }
 
 #[test]
@@ -5727,7 +5727,7 @@ fn resource_read_before_init_fails() {
     );
     let _server_join = ThreadJoins::new(vec![server_handle]);
 
-    let mut client = TestClient::new(client_transport);
+    let mut client = TestClient::new(client_transport, Cx::for_testing());
 
     // Should fail before initialization
     assert!(client.read_resource("text://plain").is_err());
