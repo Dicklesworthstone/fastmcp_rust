@@ -7198,8 +7198,6 @@ impl BoundHttpServer {
                     Err(error) => break Err(error),
                 }
             };
-            #[cfg(test)]
-            lib_unit_tests::record_f2ndd_serve_stage(31);
             connection_shutdown.request();
             // Closing stateless issuance is a latched registry fence, not merely a
             // purge. A handler racing shutdown therefore cannot mint a new
@@ -7210,8 +7208,6 @@ impl BoundHttpServer {
             // children a bounded scheduling window to flush and close before
             // aborting any unrelated or uncooperative connection.
             let terminal_receipt = server.final_subscriptions.terminate_with_receipt();
-            #[cfg(test)]
-            lib_unit_tests::record_f2ndd_serve_stage(33);
             #[cfg(any(feature = "legacy-2024-11-05", test))]
             close_live_http_sessions(cx, &self.legacy_sessions).await;
             // Phase one closes response-body admission before any uninterruptible
@@ -7219,13 +7215,9 @@ impl BoundHttpServer {
             // the elected terminal response has had its bounded opportunity to
             // flush.
             let closing_modern_sessions = detach_live_modern_http_sessions(&self.modern_sessions);
-            #[cfg(test)]
-            lib_unit_tests::record_f2ndd_serve_stage(34);
             connection_children
                 .drain_terminal_controls(&terminal_receipt)
                 .await;
-            #[cfg(test)]
-            lib_unit_tests::record_f2ndd_serve_stage(35);
             let unsettled_modern_dispatches =
                 finish_live_modern_http_sessions(&self.modern_sessions, closing_modern_sessions)
                     .await;
@@ -7236,8 +7228,6 @@ impl BoundHttpServer {
             connection_children
                 .tasks
                 .extend(unsettled_modern_dispatches);
-            #[cfg(test)]
-            lib_unit_tests::record_f2ndd_serve_stage(36);
             let connection_shutdown = connection_children.drain_cooperative_shutdown().await;
             connection_children
                 .tasks
@@ -7245,8 +7235,6 @@ impl BoundHttpServer {
                     &self.modern_sessions,
                 ));
             connection_children.reap_finished();
-            #[cfg(test)]
-            lib_unit_tests::record_f2ndd_serve_stage(37);
             server.graceful_shutdown_returning();
             match (connection_shutdown, connection_children.tasks.len()) {
                 (_, 0) if connection_children.terminal_failures.is_empty() => {
@@ -23921,14 +23909,6 @@ mod lib_unit_tests {
         http_overlap_control().record_lock_contention(session);
     }
 
-    /// DIAGNOSTIC (bd-f2ndd). Records how far serve's shutdown gets, so a
-    /// probe that times out names the shutdown await it is parked in.
-    pub(super) static F2NDD_SERVE_STAGE: AtomicUsize = AtomicUsize::new(0);
-
-    pub(super) fn record_f2ndd_serve_stage(stage: usize) {
-        F2NDD_SERVE_STAGE.fetch_max(stage, Ordering::SeqCst);
-    }
-
     pub(super) fn record_live_http_listener_wait() {
         LIVE_HTTP_LISTENER_WAITS.fetch_add(1, Ordering::AcqRel);
     }
@@ -31556,13 +31536,6 @@ mod lib_unit_tests {
         }
     }
 
-    /// DIAGNOSTIC (bd-f2ndd). Records how far the SEND side gets, to split
-    /// "the server never sent the reverse request" from "it sent one and the
-    /// waiter never received it". Process-wide rather than per-test, which is
-    /// acceptable only because all five probes stall identically; a single
-    /// probe reaching a later stage would still raise the maximum.
-    static F2NDD_TOOL_STAGE: AtomicUsize = AtomicUsize::new(0);
-
     struct LiveLegacyRuntimeConnectionTool;
 
     impl ToolHandler for LiveLegacyRuntimeConnectionTool {
@@ -31586,7 +31559,6 @@ mod lib_unit_tests {
         }
 
         fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-            F2NDD_TOOL_STAGE.fetch_max(1, Ordering::SeqCst); // handler entered
             let counter = ctx.get_state::<u64>("legacy-runtime-counter").unwrap_or(0) + 1;
             if !ctx.set_state("legacy-runtime-counter", counter) {
                 return Err(McpError::internal_error(
@@ -31600,9 +31572,7 @@ mod lib_unit_tests {
                 .and_then(serde_json::Value::as_bool)
                 .ok_or_else(|| McpError::invalid_params("sample must be a boolean"))?;
             let text = if sample {
-                F2NDD_TOOL_STAGE.fetch_max(2, Ordering::SeqCst); // about to block_on ctx.sample
                 let response = block_on(ctx.sample("legacy runtime sample", 16))?;
-                F2NDD_TOOL_STAGE.fetch_max(3, Ordering::SeqCst); // sampling RETURNED
                 format!("legacy-runtime-{counter}-{}", response.text)
             } else {
                 format!("legacy-runtime-{counter}-without-sampling")
@@ -31614,8 +31584,7 @@ mod lib_unit_tests {
     /// Same tool NAME and schema as `LiveLegacyRuntimeConnectionTool`, but
     /// declares `ToolExecutionMode::Async` and awaits `ctx.sample` directly
     /// instead of bridging it with `block_on`, so legacy HTTP dispatches it on
-    /// the caller-owned path rather than the blocking pool. Stage 21/22/23
-    /// distinguish this hook from the blocking one's 1/2/3 (bd-f2ndd).
+    /// the caller-owned path rather than the blocking pool.
     ///
     /// Note `call_async`'s trait default delegates to `call`, so declaring the
     /// mode without supplying this hook would route straight back into the
@@ -31636,13 +31605,8 @@ mod lib_unit_tests {
             _ctx: &McpContext,
             _arguments: serde_json::Value,
         ) -> McpResult<Vec<Content>> {
-            // Distinct stage: without it, a sync dispatch that this hook
-            // REJECTS would leave the counter at 0 and be reported as
-            // "handler never entered", which is false and would read as
-            // evidence about the server rather than about this probe.
-            F2NDD_TOOL_STAGE.fetch_max(9, Ordering::SeqCst);
             Err(McpError::internal_error(
-                "bd-f2ndd async probe tool requires asynchronous caller-owned dispatch",
+                "the async reverse-response tool requires asynchronous caller-owned dispatch",
             ))
         }
 
@@ -31652,7 +31616,6 @@ mod lib_unit_tests {
             arguments: serde_json::Value,
         ) -> BoxFuture<'a, fastmcp_core::McpOutcome<Vec<Content>>> {
             Box::pin(async move {
-                F2NDD_TOOL_STAGE.fetch_max(21, Ordering::SeqCst);
                 let counter = ctx.get_state::<u64>("legacy-runtime-counter").unwrap_or(0) + 1;
                 if !ctx.set_state("legacy-runtime-counter", counter) {
                     return asupersync::Outcome::Err(McpError::internal_error(
@@ -31667,12 +31630,8 @@ mod lib_unit_tests {
                     ));
                 };
                 let text = if sample {
-                    F2NDD_TOOL_STAGE.fetch_max(22, Ordering::SeqCst);
                     match ctx.sample("legacy runtime sample", 16).await {
-                        Ok(response) => {
-                            F2NDD_TOOL_STAGE.fetch_max(23, Ordering::SeqCst);
-                            format!("legacy-runtime-{counter}-{}", response.text)
-                        }
+                        Ok(response) => format!("legacy-runtime-{counter}-{}", response.text),
                         Err(error) => return asupersync::Outcome::Err(error),
                     }
                 } else {
@@ -43523,13 +43482,6 @@ mod lib_unit_tests {
             .local_addr()
             .map_err(|error| format!("legacy reverse-response address failed: {error}"))?;
         let caller_cx = cx.clone();
-        // DIAGNOSTIC (bd-f2ndd). The outer bound established the stall is in
-        // the client; the client's task-locals are unreachable from outside
-        // it, so record which join it last entered. An atomic store is not
-        // an await and cancels nothing, so no join semantics and no child
-        // authority are affected.
-        let client_stage = Arc::new(AtomicUsize::new(0));
-        let stage = Arc::clone(&client_stage);
         let mut client = cx
             .spawn(move |client_cx| async move {
                 let opener_headers = reverse_response_token
@@ -43587,7 +43539,6 @@ mod lib_unit_tests {
                     &tool_call_body,
                     &opener_headers,
                 );
-                stage.store(5, Ordering::SeqCst);
                 let mut tool_call = client_cx
                     .spawn(move |_tool_call_cx| async move {
                         live_http_exchange(address, tool_call_request).await
@@ -43596,7 +43547,6 @@ mod lib_unit_tests {
                         format!("legacy sampling tool-call POST was not admitted: {error}")
                     })?;
 
-                stage.store(6, Ordering::SeqCst);
                 read_live_http_until(&mut sse, &mut received, b"\"method\":\"sampling/createMessage\"")
                     .await?;
                 let received_text = std::str::from_utf8(&received).map_err(|error| {
@@ -43705,7 +43655,6 @@ mod lib_unit_tests {
                     &reverse_body,
                     &reverse_headers,
                 );
-                stage.store(7, Ordering::SeqCst);
                 let mut reverse_post = client_cx
                     .spawn(move |_reverse_cx| async move { live_http_exchange(address, reverse_post).await })
                     .map_err(|error| {
@@ -43772,7 +43721,6 @@ mod lib_unit_tests {
                             "legacy sampling cancellation was not accepted: {cancellation_response:?}"
                         ));
                     }
-                    stage.store(11, Ordering::SeqCst);
                     let _ = tool_call.join(&client_cx).await.map_err(|error| {
                         caller_cx.cancel_with(
                             CancelKind::User,
@@ -43780,7 +43728,6 @@ mod lib_unit_tests {
                         );
                         format!("legacy sampling cancelled tool-call POST failed: {error:?}")
                     })??;
-                    stage.store(12, Ordering::SeqCst);
                     let _ = reverse_post.join(&client_cx).await.map_err(|error| {
                         caller_cx.cancel_with(
                             CancelKind::User,
@@ -43789,7 +43736,6 @@ mod lib_unit_tests {
                         format!("wrong-ID reverse-response POST failed after settlement: {error:?}")
                     })??;
                 } else {
-                    stage.store(1, Ordering::SeqCst);
                     let reverse_response = reverse_post.join(&client_cx).await.map_err(|error| {
                         format!("legacy sampling reverse-response POST failed: {error:?}")
                     })??;
@@ -43829,7 +43775,6 @@ mod lib_unit_tests {
                             "matching reverse-response POST was not accepted: {reverse_response:?}"
                         ));
                     }
-                    stage.store(2, Ordering::SeqCst);
                     let tool_call_response = tool_call.join(&client_cx).await.map_err(|error| {
                         format!("legacy sampling tool-call POST failed: {error:?}")
                     })??;
@@ -43846,7 +43791,6 @@ mod lib_unit_tests {
                     .await?;
                 }
 
-                stage.store(3, Ordering::SeqCst);
                 caller_cx.cancel_with(
                     CancelKind::User,
                     Some("legacy reverse-response POST probe complete"),
@@ -43855,110 +43799,28 @@ mod lib_unit_tests {
             })
             .map_err(|error| format!("legacy reverse-response client task was not admitted: {error}"))?;
 
-        // DIAGNOSTIC BOUND (bd-f2ndd). THIS DOES NOT FIX THE STALL.
-        //
-        // These two awaits are the outermost in the probe and neither carried
-        // a bound, so a stalled child froze the whole test binary: libtest
-        // never printed a `test result:` line and the output that would name
-        // the cause was destroyed before anyone could read it. Bounding them
-        // converts a freeze into a named failure. The underlying stall is
-        // untouched.
-        //
-        // ONLY the outer awaits are bounded. Every inner join is left exactly
-        // as it was, because a timed join cancels, and cancellation alters the
-        // child task's authority -- which is the property these five tests
-        // exist to verify. Bounding here is safe for that reason: it fires
-        // only after every assertion has already run, and on firing the probe
-        // fails outright, so no later assertion observes the cancelled state.
-        //
-        // A healthy run completes these in well under the bound, so this is
-        // inert on success. If it fires, the stall is still present: raising
-        // the bound hides the defect and does not repair it.
+        // Bound only the two outermost awaits, so a stall fails the test by
+        // name instead of freezing the binary. Inner joins stay unbounded: a
+        // timed join cancels, which would change the authority under test.
         let serve_deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
         let serve = asupersync::time::timeout_at(serve_deadline, bound.serve(cx))
             .await
             .map_err(|_| {
-                // `serve` returns only once the client task cancels `caller_cx`,
-                // so it is DOWNSTREAM of the client and is awaited first purely
-                // to drive the server. "serve pending" therefore does NOT
-                // localise the stall on its own -- it is the expected reading
-                // whichever side is stuck. Interrogate the client here, with
-                // the non-cancelling `try_join` this file already uses, so the
-                // message discriminates instead of implying a server fault.
-                // The client task's output is itself a Result, and the two
-                // `Ok(Some(..))` cases mean opposite things. Eleven `return Err`
-                // sites and twenty-three `?` propagations in that task return
-                // WITHOUT calling `caller_cx.cancel_with`, so a client that
-                // fails early never cancels, `serve` never leaves its accept
-                // loop, and the client's real error is never surfaced because
-                // the outer join is never reached. Collapsing that into "the
-                // server stalled" would be a third wrong localisation, so the
-                // error payload is reported verbatim.
+                // `serve` returns only after the client cancels `caller_cx`, and
+                // a client that fails early returns without cancelling. Report
+                // its outcome so that failure is not misread as a server stall.
                 let client_state = match client.try_join() {
-                    Ok(None) => format!(
-                        "client STILL PENDING -- the stall is upstream, in the client, {}",
-                        match client_stage.load(Ordering::SeqCst) {
-                            0 => "stage 0: never got past opening the SSE session -- connect, write, flush, or the endpoint-prefix read",
-                            5 => "stage 5: session opened and setup POSTs done, spawning the tool call",
-                            6 => match F2NDD_TOOL_STAGE.load(Ordering::SeqCst) {
-                                0 => "stage 6/send 0: parked on the SSE wait AND THE TOOL HANDLER WAS NEVER ENTERED -- the tools/call never reached it, so nothing ever tried to send",
-                                1 => "stage 6/send 1: tool handler entered but it never reached ctx.sample -- it failed or returned before sampling",
-                                2 => "stage 6/send 2: tool handler is INSIDE block_on(ctx.sample(..)) and never came back -- the send side is parked too",
-                                9 => "stage 6/send 9: THE ASYNC PROBE REJECTED A SYNC DISPATCH -- execution_mode(Async) was not honoured on this path, so the counterfactual was NEVER TESTED and a failure here says nothing about a second defect",
-                                21 => "stage 6/send 21: ASYNC hook entered but never reached ctx.sample",
-                                22 => "stage 6/send 22: ASYNC hook is AWAITING ctx.sample and it never resolved -- removing block_on did NOT free it, so there is a second defect",
-                                23 => "stage 6/send 23: ASYNC ctx.sample RESOLVED on the server; the client waiter missed a delivery that happened",
-                                _ => "stage 6/send 3: ctx.sample RETURNED on the server, so a reverse request was sent and answered -- the client waiter missed it",
-                            },
-                            7 => "stage 7: reverse request received and response built, spawning the reverse POST",
-                            1 => "parked on reverse_post.join -- the reverse-response POST never returned",
-                            2 => "parked on tool_call.join -- the reverse POST returned but the tool call never settled",
-                            3 => "past every join: it stalled after its last join and before cancelling",
-                            11 => "wrong-ID arm: parked on tool_call.join",
-                            12 => "wrong-ID arm: parked on reverse_post.join",
-                            _ => "unrecognised client stage",
-                        }
-                    ),
-                    Ok(Some(Ok(()))) => {
-                        "client COMPLETED OK -- it cancelled caller_cx, so the stall is in the \
-                         server"
-                            .to_string()
-                    }
-                    Ok(Some(Err(error))) => format!(
-                        "client FAILED WITHOUT CANCELLING and this is the real error, not a \
-                         stall: {error}"
-                    ),
-                    Err(error) => {
-                        format!("client task could not be joined: {error:?}")
-                    }
+                    Ok(None) => "the client is still pending".to_owned(),
+                    Ok(Some(Ok(()))) => "the client completed and cancelled".to_owned(),
+                    Ok(Some(Err(error))) => format!("the client failed first: {error}"),
+                    Err(error) => format!("the client task could not be joined: {error:?}"),
                 };
-                format!(
-                    "DIAGNOSTIC (bd-f2ndd): `bound.serve(cx)` was still pending at its bound. \
-                     serve completes only when the client cancels caller_cx, so this alone does \
-                     not localise the stall. {client_state}. SERVE SHUTDOWN STAGE {}: {}. \
-                     The stall is NOT fixed; do not raise this bound.",
-                    F2NDD_SERVE_STAGE.load(Ordering::SeqCst),
-                    match F2NDD_SERVE_STAGE.load(Ordering::SeqCst) {
-                        // Each marker is recorded BEFORE its await, so stage N
-                        // means the code reached N and is parked in what follows.
-                        0 => "serve never left its accept loop -- cancellation was not observed",
-                        31 => "left the loop but never reached close_live_http_sessions",
-                        33 => "parked at close_live_http_sessions",
-                        34 => "parked at drain_terminal_controls",
-                        35 => "parked at finish_live_modern_http_sessions",
-                        36 => "parked at drain_cooperative_shutdown",
-                        _ => "past every shutdown await -- the stall is after them",
-                    },
-                )
+                format!("legacy reverse-response serve did not finish; {client_state}")
             })?;
         let join_deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
         asupersync::time::timeout_at(join_deadline, client.join(cx))
             .await
-            .map_err(|_| {
-                "DIAGNOSTIC (bd-f2ndd): `client.join(cx)` was still pending at its bound, so the \
-                 client task never completed. The stall is NOT fixed; do not raise this bound."
-                    .to_string()
-            })?
+            .map_err(|_| "legacy reverse-response client did not finish".to_owned())?
             .map_err(|error| format!("legacy reverse-response client failed: {error:?}"))??;
         let shutdown =
             serve.map_err(|error| format!("legacy reverse-response server failed: {error}"))?;
