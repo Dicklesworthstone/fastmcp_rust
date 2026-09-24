@@ -5874,13 +5874,6 @@ pub enum ModernHttpClientError {
     /// Reviewed parameter headers could not be projected onto this exact
     /// request, so nothing was sent.
     ParameterHeaders(parameter_headers::ToolHeaderDispatchError),
-    /// A modern reverse request could not be dispatched or encoded.
-    ReverseRequestDispatch(McpError),
-    /// The reverse-response POST was not accepted by the peer.
-    ReverseResponsePostRejected {
-        /// HTTP status observed on the reverse-response POST.
-        status: u16,
-    },
     /// The supplied plan has no configured modern HTTP POST target.
     MissingModernPostTarget,
     /// The credential does not bind the exact configured modern HTTPS target.
@@ -6018,11 +6011,6 @@ impl fmt::Display for ModernHttpClientError {
                 .write_str("authenticated modern HTTP cannot fall back to a legacy endpoint"),
             Self::FeatureUnavailable(error) => error.fmt(formatter),
             Self::ParameterHeaders(error) => error.fmt(formatter),
-            Self::ReverseRequestDispatch(error) => error.fmt(formatter),
-            Self::ReverseResponsePostRejected { status } => write!(
-                formatter,
-                "modern HTTP reverse-response POST was rejected with status {status}"
-            ),
             Self::MissingModernPostTarget => {
                 formatter.write_str("the protocol plan has no modern MCP POST target")
             }
@@ -6165,7 +6153,6 @@ impl std::error::Error for ModernHttpClientError {
         match self {
             Self::FeatureUnavailable(error) => Some(error),
             Self::ParameterHeaders(error) => Some(error),
-            Self::ReverseRequestDispatch(error) => Some(error),
             Self::Executor(error) => Some(error),
             Self::Negotiation(error) => Some(error),
             #[cfg(feature = "legacy-2024-11-05")]
@@ -6176,7 +6163,6 @@ impl std::error::Error for ModernHttpClientError {
             Self::MissingModernPostTarget
             | Self::CredentialTargetMismatch
             | Self::AuthenticatedLegacyFallback
-            | Self::ReverseResponsePostRejected { .. }
             | Self::RequestParametersMustBeObject
             | Self::MissingRequestName { .. }
             | Self::UnsupportedFinalMethod { .. }
@@ -6432,42 +6418,6 @@ impl ModernHttpClient {
     #[must_use]
     pub fn modern_post_target(&self) -> &str {
         &self.modern_post_target
-    }
-
-    #[expect(
-        dead_code,
-        reason = "the modern reverse-request response POST has no caller yet; WildMountain decides wire or delete"
-    )]
-    async fn post_jsonrpc_response(
-        &self,
-        cx: &Cx,
-        response: &JsonRpcResponse,
-    ) -> Result<(), ModernHttpClientError> {
-        let body = serde_json::to_vec(response).map_err(|_| {
-            ModernHttpClientError::ReverseRequestDispatch(McpError::internal_error(
-                "modern reverse response could not serialize",
-            ))
-        })?;
-        let request = ModernHttpRequest::for_jsonrpc_response(
-            &self.modern_post_target,
-            MODERN_PROTOCOL_VERSION,
-            body,
-        )
-        .map_err(ModernHttpClientError::Executor)?;
-        let response = self
-            .executor
-            .execute(cx, &request)
-            .await
-            .map_err(ModernHttpClientError::Executor)?;
-        let status = response.metadata().status();
-        let _ = response
-            .read_to_end(cx, 4_096)
-            .await
-            .map_err(ModernHttpClientError::Executor)?;
-        if status != 202 && status != 200 {
-            return Err(ModernHttpClientError::ReverseResponsePostRejected { status });
-        }
-        Ok(())
     }
 
     /// Returns the exact typed discovery result that selected modern HTTP.
