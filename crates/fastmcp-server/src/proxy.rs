@@ -4270,7 +4270,9 @@ impl ProxyCatalog {
     }
 
     /// Creates exact-final proxy handlers without projecting their catalog
-    /// definitions through the legacy [`Tool`] model.
+    /// definitions through the legacy [`Tool`] model. With Tasks the builder
+    /// installs task-aware handlers instead.
+    #[cfg(any(test, not(feature = "tasks")))]
     pub(crate) fn final_tool_handlers(
         &self,
         client: ProxyClient,
@@ -5168,12 +5170,6 @@ impl ProxyHttpClient {
             #[cfg(feature = "tasks")]
             task_listener_opening: false,
         }
-    }
-
-    /// Returns the immutable era binding selected for this backend.
-    #[must_use]
-    pub const fn upstream_binding(&self) -> ProxyUpstreamBinding {
-        self.binding
     }
 
     fn next_request_id(&mut self) -> McpResult<RequestId> {
