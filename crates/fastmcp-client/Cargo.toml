@@ -72,5 +72,13 @@ name = "task_01_b"
 path = "tests/task_01_b.rs"
 required-features = ["tasks"]
 
+[[test]]
+# LEG-HTTP-01 B drives the exact 2024-11-05 GET+SSE client through
+# `into_legacy_sse`, which exists only with this feature. Without the stanza
+# every `--no-default-features --all-targets` build fails on this target.
+name = "leg_http_01_b"
+path = "tests/leg_http_01_b.rs"
+required-features = ["legacy-2024-11-05"]
+
 [lints]
 workspace = true
