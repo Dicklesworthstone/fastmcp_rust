@@ -3021,6 +3021,62 @@ enum PumpIoMode {
     Unsplit,
 }
 
+/// Longest an unsplit pump holds off its next `recv` for a listen that has
+/// neither acknowledged nor finished. Past it the pump reads again, and the
+/// acknowledgement is written when that `recv` returns.
+#[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+const UNSPLIT_LISTEN_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Set once a listen dispatched off an unsplit pump has written its
+/// acknowledgement or finished (bd-4crkf).
+#[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+#[derive(Default)]
+struct UnsplitListenOpened {
+    opened: Mutex<bool>,
+    changed: Condvar,
+}
+
+#[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+impl UnsplitListenOpened {
+    fn fire(&self) {
+        *self
+            .opened
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.changed.notify_all();
+    }
+
+    /// Waits until fired, `timeout` elapses, or the pump is cancelled.
+    fn wait(&self, cx: &Cx, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        let mut opened = self
+            .opened
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*opened && cx.checkpoint().is_ok() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            opened = self
+                .changed
+                .wait_timeout(opened, remaining.min(Duration::from_millis(10)))
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+    }
+}
+
+#[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+struct UnsplitListenOpenedOnDrop(Arc<UnsplitListenOpened>);
+
+#[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+impl Drop for UnsplitListenOpenedOnDrop {
+    fn drop(&mut self) {
+        self.0.fire();
+    }
+}
+
 /// Owns every admission-side resource for one modern stdio request until its
 /// caller-owned child task has finished. The reservation is deliberately held
 /// by the task closure itself: a runtime that rejects or cancels a task before
@@ -16426,7 +16482,13 @@ impl Server {
                     continue;
                 }
             };
-            let blocking_permit = synchronous_dispatch.then(try_reserve_blocking_dispatch);
+            // A listen does not finish until it is terminated, so on an
+            // unsplit transport it cannot run inline: the pump would stop
+            // reading and never see the cancellation that ends it (bd-4crkf).
+            let unsplit_listen =
+                io_mode == PumpIoMode::Unsplit && request.method == SUBSCRIPTIONS_LISTEN;
+            let blocking_permit =
+                (synchronous_dispatch || unsplit_listen).then(try_reserve_blocking_dispatch);
             if matches!(blocking_permit, Some(None)) {
                 if let Some(id) = request.id {
                     let response = JsonRpcResponse::error(
@@ -16490,6 +16552,8 @@ impl Server {
             reservation.begin();
             let request_server = Arc::clone(&server);
             let request_send = Arc::clone(&send);
+            let listen_opened = unsplit_listen.then(|| Arc::new(UnsplitListenOpened::default()));
+            let listen_opened_by_dispatch = listen_opened.clone();
             let dispatch = move |request_cx: Cx| async move {
                 let mut reservation = reservation;
                 let cancellation = reservation.cancellation();
@@ -16499,7 +16563,10 @@ impl Server {
                 let notification_cx = request_cx.clone();
                 let notification_cancellation = cancellation.clone();
                 let notification_failed = Arc::clone(&reservation.failed);
+                let notification_opened = listen_opened_by_dispatch;
                 let committed_notifications: NotificationSender = Arc::new(move |notification| {
+                    let acknowledgement = notification.method
+                        == fastmcp_protocol::methods::NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED;
                     let mut writer = notification_send
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -16508,6 +16575,10 @@ impl Server {
                     {
                         notification_failed.store(true, Ordering::Release);
                         notification_cancellation.cancel();
+                    }
+                    drop(writer);
+                    if acknowledgement && let Some(opened) = &notification_opened {
+                        opened.fire();
                     }
                 });
                 let response = match reservation.queue.begin_modern_dispatch(request.id.as_ref()) {
@@ -16562,7 +16633,7 @@ impl Server {
                 }
                 reservation.disarm_failure();
             };
-            if io_mode == PumpIoMode::Unsplit {
+            if io_mode == PumpIoMode::Unsplit && !unsplit_listen {
                 // An unsplit Transport holds one mutex during recv. Finish
                 // its response before receiving again, otherwise that read
                 // can lock out the response the peer is waiting for.
@@ -16571,14 +16642,25 @@ impl Server {
             }
             if let Some(Some(permit)) = blocking_permit {
                 let request_cx = dispatch_cx.clone();
+                // Fires when the task finishes or is dropped unrun, so the
+                // pump never waits on a listen that ended before it
+                // acknowledged.
+                let listen_finished = listen_opened.clone().map(UnsplitListenOpenedOnDrop);
                 blocking_children.push(BlockingTaskGuard(blocking_dispatch_pool().spawn(
                     move || {
                         let _permit = permit;
+                        let _listen_finished = listen_finished;
                         // A pool thread is never the async driver (bd-6rfrg).
                         let _lane = fastmcp_core::runtime::enter_blocking_lane();
                         poll_on_cx(&request_cx, dispatch(request_cx.clone()));
                     },
                 )));
+                if let Some(opened) = &listen_opened {
+                    // Output written while `recv` blocks waits for that recv
+                    // to return, so let the listen's acknowledgement (or its
+                    // early answer) go out before reading again.
+                    opened.wait(cx, UNSPLIT_LISTEN_OPEN_TIMEOUT);
+                }
                 continue;
             }
             let submitted = dispatch_cx.spawn(dispatch);

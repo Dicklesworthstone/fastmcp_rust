@@ -1127,6 +1127,237 @@ fn srv_65_modern_subscription_drains_before_shutdown() {
     wire.finish();
 }
 
+/// How long the interactive client below waits for a listen's acknowledgement
+/// before it sends its next frame anyway. Longer than the server's own bound
+/// for holding off `recv`, so a server that never writes the acknowledgement
+/// before reading again is observed as such rather than raced.
+#[cfg(not(feature = "legacy-2024-11-05"))]
+const LISTEN_ACKNOWLEDGEMENT_WAIT: Duration = Duration::from_secs(10);
+
+/// bd-4crkf: an UNSPLIT transport driven by an interactive client. After a
+/// `subscriptions/listen` it sends nothing until it has seen the
+/// acknowledgement (bounded), and records whether it did. The unsplit entry
+/// point cannot write while `recv` blocks, so this is the shape that exposes
+/// a server that reads again before acknowledging.
+#[cfg(not(feature = "legacy-2024-11-05"))]
+struct AcknowledgingClient {
+    script: VecDeque<JsonRpcRequest>,
+    outgoing: Arc<Mutex<Vec<JsonRpcMessage>>>,
+    acknowledged_in_time: Arc<Mutex<Option<bool>>>,
+}
+
+#[cfg(not(feature = "legacy-2024-11-05"))]
+fn is_listen_acknowledgement(message: &JsonRpcMessage) -> bool {
+    matches!(message, JsonRpcMessage::Request(request)
+        if request.method == "notifications/subscriptions/acknowledged")
+}
+
+#[cfg(not(feature = "legacy-2024-11-05"))]
+impl Transport for AcknowledgingClient {
+    fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        self.outgoing
+            .lock()
+            .expect("client outgoing log must not be poisoned")
+            .push(message.clone());
+        Ok(())
+    }
+
+    fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        let Some(next) = self.script.pop_front() else {
+            return Err(TransportError::Closed);
+        };
+        if next.method == "notifications/cancelled" {
+            let deadline = std::time::Instant::now() + LISTEN_ACKNOWLEDGEMENT_WAIT;
+            let acknowledged = loop {
+                if self
+                    .outgoing
+                    .lock()
+                    .expect("client outgoing log must not be poisoned")
+                    .iter()
+                    .any(is_listen_acknowledgement)
+                {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            *self
+                .acknowledged_in_time
+                .lock()
+                .expect("client acknowledgement record must not be poisoned") = Some(acknowledged);
+        }
+        Ok(JsonRpcMessage::Request(next))
+    }
+
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "legacy-2024-11-05"))]
+struct UnsplitListenOutcome {
+    run: McpResult<()>,
+    outgoing: Vec<JsonRpcMessage>,
+    acknowledged_in_time: Option<bool>,
+}
+
+/// `discover -> listen(40) -> cancel(cancel_id) -> tools/list(41) -> EOF`
+/// over the unsplit `run_transport_returning_with_cx`, bounded by
+/// [`SCENARIO_DEADLINE`]. Before bd-4crkf the no-legacy pump ran the listen
+/// inline and never read the cancellation, so this deadline is what fails.
+#[cfg(not(feature = "legacy-2024-11-05"))]
+fn run_unsplit_listen_scenario(label: &'static str, cancel_id: i64) -> UnsplitListenOutcome {
+    let mut cancel = modern_request(
+        "notifications/cancelled",
+        0,
+        Some(serde_json::json!({"requestId": cancel_id})),
+    );
+    cancel.id = None;
+    let outgoing = Arc::new(Mutex::new(Vec::new()));
+    let acknowledged_in_time = Arc::new(Mutex::new(None));
+    let transport = AcknowledgingClient {
+        script: VecDeque::from([
+            modern_request("server/discover", 1, None),
+            modern_request(
+                "subscriptions/listen",
+                40,
+                Some(serde_json::json!({"notifications": {"toolsListChanged": true}})),
+            ),
+            cancel,
+            modern_request("tools/list", 41, None),
+        ]),
+        outgoing: Arc::clone(&outgoing),
+        acknowledged_in_time: Arc::clone(&acknowledged_in_time),
+    };
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::Builder::new()
+        .name(format!("srv-65-{label}"))
+        .spawn(move || {
+            let run = block_on(async move {
+                let cx = Cx::current().expect("the asupersync runtime installs a current Cx");
+                let server = Server::new("srv-65-unsplit-listen", "1.0.0")
+                    .tool(Echo)
+                    .build();
+                let mut pump = cx
+                    .spawn_blocking(move |pump_cx| {
+                        server.run_transport_returning_with_cx(&pump_cx, transport)
+                    })
+                    .expect("the caller runtime must admit the transport pump");
+                pump.join(&cx)
+                    .await
+                    .expect("the caller-owned pump must report a final status")
+            });
+            let _ = tx.send(run);
+        })
+        .expect("the scenario worker thread must start");
+
+    match rx.recv_timeout(SCENARIO_DEADLINE) {
+        Ok(run) => {
+            worker.join().expect("the scenario worker must not panic");
+            UnsplitListenOutcome {
+                run,
+                outgoing: outgoing
+                    .lock()
+                    .expect("client outgoing log must not be poisoned")
+                    .clone(),
+                acknowledged_in_time: *acknowledged_in_time
+                    .lock()
+                    .expect("client acknowledgement record must not be poisoned"),
+            }
+        }
+        Err(timeout) => panic!(
+            "[{label}] the pump stopped reading while a subscriptions/listen was open \
+             ({timeout}): the cancellation after it was never received. Written so far: {:?}",
+            outgoing
+                .lock()
+                .expect("client outgoing log must not be poisoned")
+        ),
+    }
+}
+
+/// What both unsplit listen scenarios must show: the pump acknowledged the
+/// listen before reading again, then kept reading and answered the request
+/// after the cancellation, and the connection ended cleanly at EOF.
+#[cfg(not(feature = "legacy-2024-11-05"))]
+fn assert_unsplit_listen_kept_reading(
+    outcome: &UnsplitListenOutcome,
+    label: &str,
+) -> Vec<JsonRpcResponse> {
+    assert!(outcome.run.is_ok(), "{label}: {:?}", outcome.run);
+    assert_eq!(
+        outcome.acknowledged_in_time,
+        Some(true),
+        "{label}: the listen was not acknowledged before the pump read the next frame"
+    );
+    let acknowledgements: Vec<usize> = outcome
+        .outgoing
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| is_listen_acknowledgement(message).then_some(index))
+        .collect();
+    assert_eq!(acknowledgements.len(), 1, "{label}: {:?}", outcome.outgoing);
+    let responses: Vec<JsonRpcResponse> = outcome
+        .outgoing
+        .iter()
+        .filter_map(|message| match message {
+            JsonRpcMessage::Response(response) => Some(response.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_ok_response(response_for(&responses, 1, label), label);
+    assert_ok_response(response_for(&responses, 41, label), label);
+    let catalog_index = outcome
+        .outgoing
+        .iter()
+        .position(|message| {
+            matches!(message, JsonRpcMessage::Response(response)
+                if response.id == JsonRpcRequest::new("probe", None, 41_i64).id)
+        })
+        .expect("tools/list was answered");
+    assert!(
+        acknowledgements[0] < catalog_index,
+        "{label}: {:?}",
+        outcome.outgoing
+    );
+    responses
+}
+
+/// POSITIVE: the matching cancellation is read while the listen is open and
+/// retires it, so the listen gets no terminal response.
+#[test]
+#[cfg(not(feature = "legacy-2024-11-05"))]
+fn srv_65_unsplit_listen_reads_its_cancellation_and_keeps_serving() {
+    let label = "unsplit-listen-matching-cancel";
+    let outcome = run_unsplit_listen_scenario(label, 40);
+    let responses = assert_unsplit_listen_kept_reading(&outcome, label);
+    let listen_id = JsonRpcRequest::new("probe", None, 40_i64).id;
+    assert!(
+        responses.iter().all(|response| response.id != listen_id),
+        "{label}: a peer-cancelled listen must not be answered: {responses:?}"
+    );
+}
+
+/// NEGATIVE: the same script, but the cancellation names another request. The
+/// listen must NOT be retired by it; it stays open until EOF, where shutdown
+/// completes it gracefully.
+#[test]
+#[cfg(not(feature = "legacy-2024-11-05"))]
+fn srv_65_unsplit_listen_ignores_an_unrelated_cancellation_until_eof() {
+    let label = "unsplit-listen-unrelated-cancel";
+    let outcome = run_unsplit_listen_scenario(label, 999);
+    let responses = assert_unsplit_listen_kept_reading(&outcome, label);
+    let completion = response_for(&responses, 40, label);
+    assert_ok_response(completion, label);
+    let result = completion.result.as_ref().expect("completion result");
+    assert_eq!(result["resultType"], "complete", "{label}: {completion:?}");
+    assert_eq!(
+        result["_meta"]["io.modelcontextprotocol/subscriptionId"], 40,
+        "{label}: {completion:?}"
+    );
+}
+
 #[test]
 #[cfg(not(feature = "legacy-2024-11-05"))]
 fn srv_65_modern_child_task_cancellation_preserves_connection_and_quiesces() {
