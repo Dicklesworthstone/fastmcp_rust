@@ -344,6 +344,11 @@ fn recoverable_transport_failure(error: &ManagedCoreError) -> bool {
         || matches!(error, ManagedCoreError::Session(OAuthSessionError::Http(error))
             if recovery_http_interruption(error))
 }
+// Admitting `DispatchUncertain` is not an automatic retry. Continuation custody
+// returns `Interrupted` to the host and sends nothing further; only an explicit
+// `recover` under a configured replay contract re-POSTs, and that journal must
+// answer from its capture rather than re-execute. Task watch recovery reaches
+// this classifier only for listen/`tasks/get` observation, never an update.
 pub(crate) fn recovery_http_interruption(error: &ModernHttpExecutorError) -> bool {
     matches!(error, ModernHttpExecutorError::ResponseBodyReadFailed
         | ModernHttpExecutorError::Transport(ClientError::Io(_) | ClientError::HttpError(HttpError::Io(_)))
