@@ -1,165 +1,35 @@
-diff --git a/crates/fastmcp-client/src/http_auth/rpc/interaction.rs b/crates/fastmcp-client/src/http_auth/rpc/interaction.rs
---- a/crates/fastmcp-client/src/http_auth/rpc/interaction.rs
-+++ b/crates/fastmcp-client/src/http_auth/rpc/interaction.rs
-@@ -15,3 +15,4 @@
- use std::fmt;
- use std::future::Future;
-+use std::sync::Arc;
- 
-@@ -28,5 +29,7 @@
- use super::{
-     ManagedCoreCall, ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits,
--    ManagedOAuthSession, bounded_wait, call_deadline, check_call, prepare,
-+    ManagedOAuthSession, bounded_wait, call_deadline, check_call,
- };
-+use super::tool_headers::ManagedToolHeaderError;
-+use crate::http_executor::parameter_headers::{ReviewedToolHeaders, ToolHeaderDispatchError};
- 
-@@ -95,3 +98,4 @@
-     Closed,
-+    Headers(ToolHeaderDispatchError),
-     Core(ManagedCoreError),
- }
-@@ -112,3 +116,4 @@
-             Self::AbortedByHost => "managed interaction aborted by its host",
-             Self::Closed => "managed interaction is closed",
-+            Self::Headers(error) => return fmt::Display::fmt(error, f),
-             Self::Core(error) => return fmt::Display::fmt(error, f),
-@@ -123,3 +128,12 @@
-     fn from(error: ManagedCoreError) -> Self { Self::Core(error) }
- }
- 
-+impl From<ManagedToolHeaderError> for ManagedInteractionError {
-+    fn from(error: ManagedToolHeaderError) -> Self {
-+        match error {
-+            ManagedToolHeaderError::Headers(error) => Self::Headers(error),
-+            ManagedToolHeaderError::Core(error) => Self::Core(error),
-+        }
-+    }
-+}
-+
-@@ -159,4 +173,5 @@
- pub struct ManagedInteraction {
-     session: ManagedOAuthSession,
-     original: CoreRequest,
-+    header_review: Option<Arc<ReviewedToolHeaders>>,
-     step: Option<Step>,
-@@ -212,19 +227,37 @@
-         limits: ManagedInteractionLimits,
-+    ) -> Result<ManagedInteraction, ManagedInteractionError> {
-+        self.start_core_interaction_configured(
-+            cx, cancellation, request, request_id, limits, None,
-+        ).await
-+    }
-+
-+    // Configuration is immutable before the first POST. Only the explicit
-+    // reviewed API and schema-bound client can install a disclosure plan.
-+    #[allow(clippy::too_many_arguments)]
-+    pub(crate) async fn start_core_interaction_configured(
-+        &self,
-+        cx: &Cx,
-+        cancellation: &McpRequestCancellation,
-+        request: CoreRequest,
-+        request_id: RequestId,
-+        limits: ManagedInteractionLimits,
-+        header_review: Option<Arc<ReviewedToolHeaders>>,
-     ) -> Result<ManagedInteraction, ManagedInteractionError> {
-         let deadline = call_deadline(cx, cancellation, limits.core.timeout)?;
-         validate_initial(&request)?;
--        let (wire, decoder) = prepare(
--            self.resource().as_str(), request.clone(), request_id.clone(), limits.core,
--        )?;
-+        let mut operation = ManagedInteraction {
-+            session: self.clone(), original: request, header_review, step: None,
-+            cancellation: cancellation.clone(), deadline, limits,
-+            used_ids: vec![request_id.clone()], continuations: 0, input_responses: 0,
-+            response_bytes: 0, notifications: 0, generation: 0,
-+        };
-+        let (wire, decoder) = operation.prepare_request(operation.original.clone(), request_id)?;
-         let response = bounded_wait(cx, cancellation, deadline, async {
-             self.execute_with_cancellation(cx, cancellation, &wire).await.map_err(ManagedCoreError::from)
-         }).await?;
-         let call = ManagedCoreCall::from_response(response, decoder, cancellation.clone(), deadline)?;
--        let generation = call.credential_generation();
--        Ok(ManagedInteraction {
--            session: self.clone(), original: request, step: Some(Step::Reading(Box::new(call))),
--            cancellation: cancellation.clone(), deadline, limits, used_ids: vec![request_id],
--            continuations: 0, input_responses: 0, response_bytes: 0, notifications: 0, generation,
--        })
-+        operation.generation = call.credential_generation();
-+        operation.step = Some(Step::Reading(Box::new(call)));
-+        Ok(operation)
-     }
- }
-@@ -450,7 +483,5 @@
-         // All fallible local validation happens before consuming the challenge.
-         let count = responses.as_ref().map_or(0, FinalInputResponses::len);
-         let next = continuation_request_selected(&self.original, input, responses, selection)?;
--        let (wire, mut decoder) = prepare(
--            self.session.resource().as_str(), next, request_id.clone(), self.limits.core,
--        )?;
-+        let (wire, mut decoder) = self.prepare_request(next, request_id.clone())?;
-         decoder.bytes = self.response_bytes;
-@@ -476,2 +507,16 @@
-+    // Initial dispatch, ordinary resume and explicit journal recovery all use
-+    // this same owner-bound preparation. No continuation can drop the review
-+    // or accept a replacement schema, target or argument map from the host.
-+    fn prepare_request(
-+        &self,
-+        request: CoreRequest,
-+        request_id: RequestId,
-+    ) -> Result<(crate::http_executor::ModernHttpRequest, super::CoreDecoder), ManagedInteractionError> {
-+        Ok(super::tool_headers::prepare_optional(
-+            self.session.resource().as_str(), request, request_id, self.limits.core,
-+            self.header_review.as_deref(),
-+        )?)
-+    }
-+
-     fn check(&mut self, cx: &Cx) -> Result<(), ManagedInteractionError> {
-         let deadline = cx.budget().deadline.map_or(self.deadline, |caller| caller.min(self.deadline));
-diff --git a/crates/fastmcp-client/src/http_auth/rpc/interaction/recovery.rs b/crates/fastmcp-client/src/http_auth/rpc/interaction/recovery.rs
---- a/crates/fastmcp-client/src/http_auth/rpc/interaction/recovery.rs
-+++ b/crates/fastmcp-client/src/http_auth/rpc/interaction/recovery.rs
-@@ -15,4 +15,4 @@
-     ManagedInteraction, ManagedInteractionError, ManagedInteractionEvent, Step,
-     admit_challenge, admit_fresh_id, bounded_wait, continuation_request_selected,
--    input_required, prepare,
-+    input_required,
- };
-@@ -168,4 +168,4 @@
-         // Check the complete retained request before handing out the owner.
-         // This ID is used only for encoding admission, never dispatch/history.
--        let _ = prepare(self.session.resource().as_str(), request.clone(), RequestId::Number(0), self.limits.core)?;
-+        let _ = self.prepare_request(request.clone(), RequestId::Number(0))?;
-         self.step = None;
-@@ -265,4 +265,4 @@
-         let reserved = reserve_frame(self.interaction.response_bytes, core.frame_bytes, core.total_bytes)?;
-         let request = self.request.as_ref().ok_or(ContinuationRecoveryError::WrongPhase)?.clone();
--        let (wire, mut decoder) = prepare(self.interaction.session.resource().as_str(), request, request_id.clone(), core)?;
-+        let (wire, mut decoder) = self.interaction.prepare_request(request, request_id.clone())?;
-         decoder.bytes = self.interaction.response_bytes;
 diff --git a/crates/fastmcp-client/src/http_auth/tool.rs b/crates/fastmcp-client/src/http_auth/tool.rs
+index 4557bba9d6b8bf39a58ebe67286408252b7fedd0..9f1a7a63040720672d4a8c35f001de8b921eb2f3 100644
 --- a/crates/fastmcp-client/src/http_auth/tool.rs
 +++ b/crates/fastmcp-client/src/http_auth/tool.rs
-@@ -9,4 +9,4 @@
+@@ -9,7 +9,8 @@
  //! A definition is a contract, not permission to execute a tool. The host must
  //! approve the invocation and invalidate this client when its catalog or policy
  //! changes. Server annotations never grant consent, retry or header-disclosure
 -//! authority. This module does not add parameter-header projection.
-+//! authority. Header projection requires explicit `with_reviewed_headers` opt-in.
-@@ -20,7 +20,10 @@
--use fastmcp_core::McpRequestCancellation;
-+use fastmcp_core::{CanonicalHttpUrl, McpRequestCancellation};
-+use fastmcp_protocol::http_headers::AdmittedToolHeaderSchema;
- use fastmcp_protocol::protocol_policy::ProtocolEra;
- use fastmcp_protocol::{AdmittedSchema, CoreRequest, CoreResult, FinalTool, RequestId, admit_final_schema};
- use serde_json::Value;
++//! authority. Parameter headers require explicit `review_headers` or
++//! `with_reviewed_headers` approval, retained by every continuation.
+ 
+ use std::fmt;
+ use std::io::{self, Write};
+@@ -25,11 +26,15 @@
  
  use super::managed::ManagedOAuthSession;
  use super::rpc::{ManagedCoreCall, ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits};
 +use super::rpc::tool_headers::ManagedToolHeaderError;
 +use crate::http_executor::parameter_headers::{ReviewedToolHeaders, ToolHeaderDispatchError};
-@@ -45,5 +48,7 @@
+ 
+ /// Explicit multi-round tool operations retaining this same schema contract.
+ pub mod interaction;
+ /// Caller-driven catalog watches publishing invalidation-bound tool clients.
+ pub mod catalog;
++/// Disclosure review bound to this client's exact schema and invalidation.
++pub mod headers;
+ 
+ /// Combined encoded-byte ceiling for one retained input/output schema pair.
+ pub const MAX_MANAGED_TOOL_SCHEMA_BYTES: usize = 512 * 1024;
+@@ -48,8 +53,10 @@
+     InvalidResult,
      MissingStructuredOutput,
      InvalidStructuredOutput,
 +    HeaderBindingMismatch,
@@ -167,7 +37,10 @@ diff --git a/crates/fastmcp-client/src/http_auth/tool.rs b/crates/fastmcp-client
      Closed,
 +    Headers(ToolHeaderDispatchError),
      Core(ManagedCoreError),
-@@ -62,5 +67,7 @@
+ }
+ 
+@@ -65,8 +72,10 @@
+             Self::InvalidResult => "managed tool result failed protocol admission",
              Self::MissingStructuredOutput => "successful tool result omitted required structured output",
              Self::InvalidStructuredOutput => "tool structured output does not satisfy its admitted schema",
 +            Self::HeaderBindingMismatch => "header review does not match the bound tool contract",
@@ -175,80 +48,58 @@ diff --git a/crates/fastmcp-client/src/http_auth/tool.rs b/crates/fastmcp-client
              Self::Closed => "managed tool call is closed",
 +            Self::Headers(error) => return fmt::Display::fmt(error, f),
              Self::Core(error) => return fmt::Display::fmt(error, f),
-@@ -78,6 +85,15 @@
+         })
      }
- }
- 
+@@ -77,6 +86,15 @@
+ impl From<ManagedCoreError> for ManagedToolError {
+     fn from(error: ManagedCoreError) -> Self {
+         Self::Core(error)
++    }
++}
++
 +impl From<ManagedToolHeaderError> for ManagedToolError {
 +    fn from(error: ManagedToolHeaderError) -> Self {
 +        match error {
 +            ManagedToolHeaderError::Headers(error) => Self::Headers(error),
 +            ManagedToolHeaderError::Core(error) => Self::Core(error),
 +        }
-+    }
-+}
-+
- struct ToolContract {
-     name: String,
--    input: AdmittedSchema,
-+    input: AdmittedToolHeaderSchema,
-@@ -106,3 +122,6 @@
--        let input = admit_final_schema(tool.input_schema)
-+        // Separate only the standardized projection annotation from the
-+        // validation copy. Unknown validation keywords remain fail-closed,
-+        // and the exact annotated source is retained for review binding.
-+        let input = AdmittedToolHeaderSchema::admit(tool.input_schema)
+     }
+ }
+ 
+@@ -107,7 +125,7 @@
+         // Standard header annotations are part of the tool definition, not
+         // permission to disclose arguments. Admit their syntax while retaining
+         // the exact source and validating through the ordinary schema engine.
+-        // No projection plan is executed by this wrapper or its continuations.
++        // Admission itself never executes this plan or approves disclosure.
+         let input = AdmittedToolHeaderSchema::admit(tool.input_schema)
              .map_err(|_| ManagedToolError::InvalidInputSchema)?;
          let output = tool.output_schema.map(admit_final_schema).transpose()
-@@ -126,2 +145,16 @@
-+    fn admit_headers(
-+        &self,
-+        resource: &CanonicalHttpUrl,
-+        reviewed: &ReviewedToolHeaders,
-+    ) -> Result<(), ManagedToolError> {
-+        self.check()?;
-+        if reviewed.resource() != resource || reviewed.tool_name() != self.name.as_str()
-+            || reviewed.schema() != self.input.schema()
-+        {
-+            return Err(ManagedToolError::HeaderBindingMismatch);
-+        }
-+        self.check()
-+    }
-+
-     fn check(&self) -> Result<(), ManagedToolError> {
-         if self.invalidated.load(Ordering::Acquire) {
-@@ -206,4 +239,5 @@
+@@ -207,12 +225,14 @@
  pub struct ManagedToolClient {
      session: ManagedOAuthSession,
      contract: Arc<ToolContract>,
 +    header_review: Option<Arc<ReviewedToolHeaders>>,
  }
-@@ -215,2 +249,3 @@
+ 
+ impl fmt::Debug for ManagedToolClient {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         f.debug_struct("ManagedToolClient")
              .field("has_output_schema", &self.contract.output.is_some())
 +            .field("parameter_headers", &self.header_review.is_some())
              .field("invalidated", &self.is_invalidated())
-@@ -226,5 +261,19 @@
+             .finish_non_exhaustive()
+     }
+@@ -225,7 +245,7 @@
+     /// server and approving its use with this exact managed login.
+     pub fn new(session: ManagedOAuthSession, tool: FinalTool) -> Result<Self, ManagedToolError> {
          let contract = Arc::new(ToolContract::admit(tool)?);
 -        Ok(Self { session, contract })
 +        Ok(Self { session, contract, header_review: None })
-+    }
-+
-+    /// Explicitly enables one previously approved header plan. It must match
-+    /// this login's exact resource, tool name and complete input-schema source,
-+    /// not merely produce the same field names. Existing clones keep their
-+    /// configuration; subsequent clones share this immutable review. Shared
-+    /// contract invalidation still fences every clone and pending operation.
-+    pub fn with_reviewed_headers(mut self, reviewed: Arc<ReviewedToolHeaders>) -> Result<Self, ManagedToolError> {
-+        self.contract.admit_headers(self.session.resource(), &reviewed)?;
-+        if self.header_review.is_some() {
-+            return Err(ManagedToolError::Headers(ToolHeaderDispatchError::AlreadyProjected));
-+        }
-+        self.header_review = Some(reviewed);
-+        Ok(self)
      }
  
      pub fn tool_name(&self) -> &str { &self.contract.name }
-@@ -257,7 +306,12 @@
+@@ -268,9 +288,14 @@
          check_tool_call(cx, cancellation, &self.contract)?;
          self.contract.validate_request(&request)?;
          check_tool_call(cx, cancellation, &self.contract)?;
@@ -264,10 +115,35 @@ diff --git a/crates/fastmcp-client/src/http_auth/tool.rs b/crates/fastmcp-client
 +            ).await?,
 +        };
          check_tool_call(cx, cancellation, &self.contract)?;
+         Ok(ManagedToolCall {
+             call: Some(call), contract: self.contract.clone(),
+diff --git a/crates/fastmcp-client/src/http_auth/tool/catalog.rs b/crates/fastmcp-client/src/http_auth/tool/catalog.rs
+index 942a18a0099a612010b2117f5b6611fbc17660b6..9711a602ed0e4bffe454709aabd9d90265c77eff 100644
+--- a/crates/fastmcp-client/src/http_auth/tool/catalog.rs
++++ b/crates/fastmcp-client/src/http_auth/tool/catalog.rs
+@@ -154,6 +154,7 @@
+         let client = self.0.contracts.get(name).map(|contract| ManagedToolClient {
+             session: self.0.session.clone(),
+             contract: Arc::clone(contract),
++            header_review: None,
+         });
+         if self.is_invalidated() { return Err(ManagedToolCatalogError::Invalidated); }
+         Ok(client)
 diff --git a/crates/fastmcp-client/src/http_auth/tool/interaction.rs b/crates/fastmcp-client/src/http_auth/tool/interaction.rs
+index 3956ec2b5fb46686e2e0e7e51138c6aa5f9bf82c..192673fd01e1d698e24c90e7772b618adfa212ea 100644
 --- a/crates/fastmcp-client/src/http_auth/tool/interaction.rs
 +++ b/crates/fastmcp-client/src/http_auth/tool/interaction.rs
-@@ -75,7 +75,7 @@
+@@ -49,7 +49,8 @@
+     /// Starts a schema-checked tool operation whose input-required results are
+     /// answered explicitly through `resume` or `resume_partial`. Arguments are
+     /// validated before credential renewal or network I/O. The original schema,
+-    /// tool identity, arguments and login cannot change between rounds.
++    /// tool identity, arguments, login and optional header review cannot change
++    /// between rounds. Every continuation projects the original arguments.
+     pub async fn start_interaction(
+         &self,
+         cx: &Cx,
+@@ -75,8 +76,8 @@
          check_tool_call(cx, cancellation, &self.contract)?;
          self.contract.validate_request(&request)?;
          check_tool_call(cx, cancellation, &self.contract)?;
@@ -277,266 +153,304 @@ diff --git a/crates/fastmcp-client/src/http_auth/tool/interaction.rs b/crates/fa
 +            cx, cancellation, request, request_id, limits, self.header_review.clone(),
          ).await?;
          check_tool_call(cx, cancellation, &self.contract)?;
-diff --git a/crates/fastmcp-client/src/http_auth/rpc/tool_headers.rs b/crates/fastmcp-client/src/http_auth/rpc/tool_headers.rs
---- a/crates/fastmcp-client/src/http_auth/rpc/tool_headers.rs
-+++ b/crates/fastmcp-client/src/http_auth/rpc/tool_headers.rs
-@@ -6,6 +6,7 @@
- //! plan bound to this resource and tool. Ordinary calls remain header-free.
- 
- use std::fmt;
+         Ok(ManagedToolInteraction {
+diff --git a/crates/fastmcp-client/src/http_auth/tool/headers.rs b/crates/fastmcp-client/src/http_auth/tool/headers.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..0e894651bfe5ad1326055cecdcb825c3a37481cc
+--- /dev/null
++++ b/crates/fastmcp-client/src/http_auth/tool/headers.rs
+@@ -0,0 +1,122 @@
++//! Explicit disclosure review for schema-bound and catalog-derived tool clients.
++//!
++//! The client supplies its exact resource, name, and already-admitted schema.
++//! The reviewer sees paths, field names, and primitive types, never invocation
++//! values. A callback is host code and must cooperate; it is not executed by a
++//! worker or treated as authorization to invoke a tool. Approval is immutable
++//! once installed and is retained by the existing multi-round operation owner.
++//!
++//! Review cannot resurrect a retired catalog or tool contract. Invalidation is
++//! checked before and after every callback, before installing the completed
++//! plan, and by the normal call and result-publication boundaries. Already
++//! admitted calls can be dispatching; use their cancellation handles to abort
++//! pending reads. Neither review nor invalidation recalls committed effects.
++
 +use std::sync::Arc;
- 
- use asupersync::Cx;
- use fastmcp_core::McpRequestCancellation;
-@@ -17,6 +18,7 @@
- };
- use crate::http_executor::ModernHttpRequest;
- use crate::http_executor::parameter_headers::{ReviewedToolHeaders, ToolHeaderDispatchError};
-+use super::interaction::{ManagedInteraction, ManagedInteractionError, ManagedInteractionLimits};
- 
- /// Header admission and core transport errors contain no disclosed values.
- #[derive(Debug)]
-@@ -60,6 +62,41 @@
- }
- 
- impl ManagedOAuthSession {
-+    /// Starts an explicitly resumed operation with one immutable header review.
-+    /// Original arguments are projected on the first POST, every continuation,
-+    /// and any separately authorized journal recovery. Input answers and opaque
-+    /// state never become a replacement schema or a source of routing fields.
-+    pub async fn start_tool_interaction_with_headers(
-+        &self,
-+        cx: &Cx,
-+        request: CoreRequest,
-+        request_id: RequestId,
++
++use fastmcp_core::CanonicalHttpUrl;
++use fastmcp_protocol::http_headers::ParameterHeaderBinding;
++
++use super::{ManagedToolClient, ManagedToolError, ToolContract};
++use super::catalog::{ManagedToolCatalogError, ManagedToolCatalogSnapshot};
++use crate::http_executor::parameter_headers::{ReviewedToolHeaders, ToolHeaderDispatchError};
++
++impl ManagedToolClient {
++    /// Reviews the exact schema already bound to this client, not a replacement
++    /// supplied by the host. Refusing any binding refuses the entire approval.
++    /// There is no credential acquisition, invocation, or network schema fetch.
++    ///
++    /// Existing clones remain unconfigured; future clones share this approval
++    /// and the original contract's invalidation state. A catalog change or local
++    /// policy change still requires retiring handles and reviewing again.
++    pub fn review_headers(
++        self,
++        review: impl FnMut(&ParameterHeaderBinding) -> bool,
++    ) -> Result<Self, ManagedToolError> {
++        self.require_unconfigured_headers()?;
++        let reviewed = self.contract.review_headers(self.session.resource(), review)?;
++        self.with_reviewed_headers(reviewed)
++    }
++
++    /// Installs one independently reviewed plan only when its canonical HTTPS
++    /// resource, exact case-sensitive tool name, and complete source schema all
++    /// match this contract. Matching field names alone are insufficient.
++    /// An empty approved projection also seals the configuration.
++    pub fn with_reviewed_headers(
++        mut self,
 +        reviewed: Arc<ReviewedToolHeaders>,
-+        limits: ManagedInteractionLimits,
-+    ) -> Result<ManagedInteraction, ManagedInteractionError> {
-+        self.start_tool_interaction_with_headers_and_cancellation(
-+            cx, &McpRequestCancellation::new(), request, request_id, reviewed, limits,
-+        ).await
++    ) -> Result<Self, ManagedToolError> {
++        self.require_unconfigured_headers()?;
++        self.contract.admit_headers(self.session.resource(), &reviewed)?;
++        self.header_review = Some(reviewed);
++        Ok(self)
 +    }
 +
-+    /// Retains the original cancellation domain, deadline and review across
-+    /// host pauses. A review grants disclosure only; it does not grant replay
-+    /// authority or permission to run an input resolver.
-+    #[allow(clippy::too_many_arguments)]
-+    pub async fn start_tool_interaction_with_headers_and_cancellation(
++    fn require_unconfigured_headers(&self) -> Result<(), ManagedToolError> {
++        self.contract.check()?;
++        if self.header_review.is_some() {
++            return Err(ManagedToolError::Headers(ToolHeaderDispatchError::AlreadyProjected));
++        }
++        Ok(())
++    }
++}
++
++impl ManagedToolCatalogSnapshot {
++    /// Looks up a tool and reviews its own immutable contract. An absent name
++    /// invokes no callback. A retired snapshot cannot yield a newly approved
++    /// handle, including when the callback itself triggers invalidation.
++    /// This does not approve other tools in the catalog or execute this tool.
++    pub fn tool_with_reviewed_headers(
 +        &self,
-+        cx: &Cx,
-+        cancellation: &McpRequestCancellation,
-+        request: CoreRequest,
-+        request_id: RequestId,
-+        reviewed: Arc<ReviewedToolHeaders>,
-+        limits: ManagedInteractionLimits,
-+    ) -> Result<ManagedInteraction, ManagedInteractionError> {
-+        self.start_core_interaction_configured(
-+            cx, cancellation, request, request_id, limits, Some(reviewed),
-+        ).await
++        name: &str,
++        review: impl FnMut(&ParameterHeaderBinding) -> bool,
++    ) -> Result<Option<ManagedToolClient>, ManagedToolCatalogError> {
++        self.tool(name)?
++            .map(|tool| tool.review_headers(review).map_err(ManagedToolCatalogError::Tool))
++            .transpose()
 +    }
++}
 +
-     /// Sends one tools/call with explicitly reviewed schema-derived headers.
-     /// All binding, body, field-type and byte checks run before renewal or I/O.
-     /// This returns the ordinary incremental core call; an input-required result
-@@ -166,4 +203,91 @@
-         assert!(matches!(prepare_optional(TARGET, core, RequestId::Number(17), ManagedCoreLimits::default(), Some(&review())),
-             Err(ManagedToolHeaderError::Core(ManagedCoreError::UnsupportedRequest))));
-     }
--}
-+
-+    fn challenge(original: &CoreRequest, state: Option<&str>) -> fastmcp_protocol::InputRequiredResult {
-+        let mut value = json!({"resultType":"input_required", "inputRequests":{
-+            "one":{"method":"roots/list"}, "two":{"method":"roots/list"}
-+        }});
-+        if let Some(state) = state { value["requestState"] = json!(state); }
-+        let result = original.decode_result(&value.to_string()).unwrap();
-+        super::super::interaction::input_required(&result).unwrap().clone()
-+    }
-+
-+    fn continuation_source() -> CoreRequest {
-+        let original = request("tools/call", json!({"name":"lookup", "arguments":{"region":"eu", "private":"body-only"}}));
-+        let mut params = original.encode_params().unwrap().unwrap();
-+        params["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!({"roots":{}});
-+        CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).unwrap()
-+    }
-+
-+    #[test]
-+    fn full_and_partial_continuations_project_only_immutable_original_arguments() {
-+        use super::super::interaction::{InputSelection, continuation_request_selected};
-+        let original = continuation_source();
-+        let before = original.encode_params().unwrap().unwrap();
-+        let input = challenge(&original, Some("  opaque\0  "));
-+        let review = review();
-+        for (selection, answers) in [
-+            (InputSelection::Complete, json!({"one":{"roots":[]},"two":{"roots":[]}})),
-+            (InputSelection::Partial, json!({"two":{"roots":[]}})),
-+        ] {
-+            let next = continuation_request_selected(&original, &input,
-+                Some(serde_json::from_value(answers.clone()).unwrap()), selection).unwrap();
-+            let (wire, _) = prepare_optional(TARGET, next, RequestId::Number(18), ManagedCoreLimits::default(), Some(&review)).unwrap();
-+            let encoded: Value = serde_json::from_slice(wire.body()).unwrap();
-+            assert_eq!(encoded["params"]["arguments"], before["arguments"]);
-+            assert_eq!(encoded["params"]["_meta"], before["_meta"]);
-+            assert_eq!(encoded["params"]["inputResponses"], answers);
-+            assert_eq!(encoded["params"]["requestState"], "  opaque\0  ");
-+            let fields: Vec<_> = wire.headers().into_iter().filter(|(name, _)| name.starts_with("Mcp-Param-")).collect();
-+            assert_eq!(fields, vec![("Mcp-Param-Region".to_owned(), "eu".to_owned())]);
++impl ToolContract {
++    fn admit_headers(
++        &self,
++        resource: &CanonicalHttpUrl,
++        reviewed: &ReviewedToolHeaders,
++    ) -> Result<(), ManagedToolError> {
++        self.check()?;
++        if reviewed.resource() != resource
++            || reviewed.tool_name() != self.name.as_str()
++            || reviewed.schema() != self.input.schema()
++        {
++            return Err(ManagedToolError::HeaderBindingMismatch);
 +        }
-+        assert_eq!(original.encode_params().unwrap().unwrap(), before);
++        self.check()
 +    }
 +
-+    #[test]
-+    fn invalid_partial_answers_never_become_a_header_bearing_continuation() {
-+        use super::super::interaction::{InputSelection, continuation_request_selected};
-+        let original = continuation_source();
-+        let before = original.encode_params().unwrap().unwrap();
-+        for (input, answers) in [
-+            (challenge(&original, None), json!({"one":{"roots":[]}})),
-+            (challenge(&original, Some("state")), json!({"foreign":{"roots":[]}})),
-+            (challenge(&original, Some("state")), json!({})),
-+        ] {
-+            assert!(continuation_request_selected(&original, &input,
-+                Some(serde_json::from_value(answers).unwrap()), InputSelection::Partial).is_err());
++    fn review_headers(
++        &self,
++        resource: &CanonicalHttpUrl,
++        mut review: impl FnMut(&ParameterHeaderBinding) -> bool,
++    ) -> Result<Arc<ReviewedToolHeaders>, ManagedToolError> {
++        self.check()?;
++        // Source admission already bounded this clone. The reviewed wrapper
++        // repeats syntax admission before any callback and binds the resource.
++        let reviewed = ReviewedToolHeaders::new(
++            resource.clone(), self.name.clone(), self.input.schema().clone(),
++            |binding| {
++                if self.is_invalidated() { return false; }
++                let approved = review(binding);
++                approved && !self.is_invalidated()
++            },
++        );
++        // Preserve invalidation rather than disguising it as a policy refusal.
++        // In particular no later callback runs after the one that invalidates.
++        self.check()?;
++        let reviewed = reviewed.map_err(ManagedToolError::Headers)?;
++        self.admit_headers(resource, &reviewed)?;
++        Ok(Arc::new(reviewed))
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/crates/fastmcp-client/src/http_auth/tool/headers/tests.rs b/crates/fastmcp-client/src/http_auth/tool/headers/tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..592104d25740479d997e0295bb0953f0b498ab49
+--- /dev/null
++++ b/crates/fastmcp-client/src/http_auth/tool/headers/tests.rs
+@@ -0,0 +1,166 @@
++use super::*;
++
++use std::sync::atomic::{AtomicBool, Ordering};
++
++use fastmcp_protocol::{FinalTool, CoreRequest, ClientCapabilities, FinalRequestMeta};
++use fastmcp_protocol::protocol_policy::ProtocolEra;
++use serde_json::{Value, json};
++
++fn resource() -> CanonicalHttpUrl {
++    CanonicalHttpUrl::parse("https://tools.example/mcp?tenant=one").unwrap()
++}
++
++fn definition() -> FinalTool {
++    FinalTool {
++        name: "calculate".to_owned(), title: None, description: None, icons: None,
++        input_schema: json!({"type":"object", "properties": {
++            "count":{"type":"integer","minimum":1,"x-mcp-header":"Count"},
++            "options":{"type":"object","properties":{
++                "a/b~.0":{"type":"string","x-mcp-header":"Region"}
++            }},
++            "private":{"type":"string"}
++        }, "required":["count"], "additionalProperties":false}),
++        output_schema: None, annotations: None, meta: None,
++    }
++}
++
++fn contract() -> ToolContract { ToolContract::admit(definition()).unwrap() }
++
++fn request(arguments: Value) -> CoreRequest {
++    let params = json!({"name":"calculate", "arguments":arguments,
++        "_meta":FinalRequestMeta::new(ClientCapabilities::default())});
++    CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).unwrap()
++}
++
++#[test]
++fn contract_supplies_the_exact_schema_resource_and_literal_paths_to_review() {
++    let contract = contract();
++    let mut visited = Vec::new();
++    let reviewed = contract.review_headers(&resource(), |binding| {
++        visited.push((binding.header_name().to_owned(), binding.property_path().to_vec()));
++        true
++    }).unwrap();
++    assert_eq!(reviewed.resource(), &resource());
++    assert_eq!(reviewed.tool_name(), "calculate");
++    assert_eq!(reviewed.schema(), &definition().input_schema);
++    assert_eq!(visited, vec![
++        ("Mcp-Param-Count".to_owned(), vec!["count".to_owned()]),
++        ("Mcp-Param-Region".to_owned(), vec!["options".to_owned(), "a/b~.0".to_owned()]),
++    ]);
++    contract.admit_headers(&resource(), &reviewed).unwrap();
++}
++
++#[test]
++fn one_refused_binding_refuses_the_plan_without_invalidating_the_contract() {
++    let contract = contract();
++    let mut visits = 0;
++    let outcome = contract.review_headers(&resource(), |binding| {
++        visits += 1;
++        binding.header_name() != "Mcp-Param-Region"
++    });
++    assert!(matches!(outcome, Err(ManagedToolError::Headers(ToolHeaderDispatchError::DisclosureDenied))));
++    assert_eq!(visits, 2);
++    assert!(!contract.is_invalidated());
++    contract.validate_request(&request(json!({"count":2}))).unwrap();
++    assert!(contract.review_headers(&resource(), |_| true).is_ok());
++}
++
++#[test]
++fn previously_invalidated_contracts_do_not_run_review_callbacks() {
++    for catalog in [false, true] {
++        let mut contract = contract();
++        if catalog {
++            contract.catalog_invalidated = Some(Arc::new(AtomicBool::new(true)));
++        } else {
++            contract.invalidated.store(true, Ordering::Release);
 +        }
-+        assert_eq!(original.encode_params().unwrap().unwrap(), before);
-+    }
-+
-+    #[test]
-+    fn reply_recovery_changes_the_rpc_id_but_not_the_projected_headers_or_params() {
-+        use super::super::interaction::continuation_request;
-+        let original = continuation_source();
-+        let input = challenge(&original, Some("journal-state"));
-+        let answers = serde_json::from_value(json!({"one":{"roots":[]},"two":{"roots":[]}})).unwrap();
-+        let request = continuation_request(&original, &input, Some(answers)).unwrap();
-+        let review = review();
-+        let (first, _) = prepare_optional(TARGET, request.clone(), RequestId::Number(18), ManagedCoreLimits::default(), Some(&review)).unwrap();
-+        let (next, _) = prepare_optional(TARGET, request, RequestId::Number(19), ManagedCoreLimits::default(), Some(&review)).unwrap();
-+        let first_body: Value = serde_json::from_slice(first.body()).unwrap();
-+        let next_body: Value = serde_json::from_slice(next.body()).unwrap();
-+        assert_ne!(first_body["id"], next_body["id"]);
-+        assert_eq!(first_body["params"], next_body["params"]);
-+        assert_eq!(first.headers(), next.headers());
-+    }
-+
-+    #[test]
-+    fn state_only_continuation_keeps_absence_and_still_projects_the_original_input() {
-+        use super::super::interaction::{continuation_request, input_required};
-+        let original = continuation_source();
-+        let result = original.decode_result(r#"{"resultType":"input_required","requestState":""}"#).unwrap();
-+        let next = continuation_request(&original, input_required(&result).unwrap(), None).unwrap();
-+        let (wire, _) = prepare_optional(TARGET, next, RequestId::Number(18), ManagedCoreLimits::default(), Some(&review())).unwrap();
-+        let value: Value = serde_json::from_slice(wire.body()).unwrap();
-+        assert_eq!(value["params"]["requestState"], "");
-+        assert!(value["params"].get("inputResponses").is_none());
-+        assert!(wire.headers().iter().any(|(name, value)| name == "Mcp-Param-Region" && value == "eu"));
-+    }
-+}
-diff --git a/crates/fastmcp-client/src/http_auth/tool/tests.rs b/crates/fastmcp-client/src/http_auth/tool/tests.rs
---- a/crates/fastmcp-client/src/http_auth/tool/tests.rs
-+++ b/crates/fastmcp-client/src/http_auth/tool/tests.rs
-@@ -189,3 +189,105 @@
-     let error = contract.validate_result(&invalid).err().unwrap();
-     assert!(!format!("{error:?} {error}").contains("private-canary"));
- }
-+
-+fn annotated_input_schema() -> Value {
-+    json!({"type":"object", "properties":{
-+        "count":{"type":"integer","minimum":1,"x-mcp-header":"Count"},
-+        "payload":{"type":"object","default":{"x-mcp-header":"literal-data"}}
-+    }, "required":["count"], "additionalProperties":false})
-+}
-+
-+fn reviewed_input(target: &str, name: &str, schema: Value) -> ReviewedToolHeaders {
-+    ReviewedToolHeaders::new(CanonicalHttpUrl::parse(target).unwrap(), name, schema, |_| true).unwrap()
-+}
-+
-+#[test]
-+fn standardized_header_annotations_are_admitted_without_skipping_input_validation() {
-+    let source = annotated_input_schema();
-+    let contract = ToolContract::admit(tool(source.clone(), None)).unwrap();
-+    let valid = request("tools/call", json!({"name":"calculate","arguments":{"count":2}}));
-+    let before = valid.encode_params().unwrap().unwrap();
-+    contract.validate_request(&valid).unwrap();
-+    assert_eq!(contract.input.schema(), &source);
-+    assert_eq!(valid.encode_params().unwrap().unwrap(), before);
-+    for arguments in [json!({}), json!({"count":0}), json!({"count":"2"}), json!({"count":2,"extra":true})] {
-+        assert!(matches!(contract.validate_request(&request("tools/call", json!({"name":"calculate","arguments":arguments}))),
-+            Err(ManagedToolError::InvalidArguments)));
++        let mut visits = 0;
++        let outcome = contract.review_headers(&resource(), |_| { visits += 1; true });
++        assert!(matches!(outcome, Err(ManagedToolError::Invalidated)));
++        assert_eq!(visits, 0);
 +    }
 +}
 +
 +#[test]
-+fn annotations_do_not_relax_unknown_schema_or_unreachable_binding_admission() {
-+    let mut unknown = annotated_input_schema();
-+    unknown["madeUpValidationKeyword"] = json!(true);
-+    let mut unreachable = annotated_input_schema();
-+    unreachable["$defs"] = json!({"hidden":{"type":"string","x-mcp-header":"Hidden"}});
-+    for input in [unknown, unreachable] {
-+        assert!(matches!(ToolContract::admit(tool(input, None)), Err(ManagedToolError::InvalidInputSchema)));
++fn individual_invalidation_during_review_stops_callbacks_and_refuses_publication() {
++    let contract = contract();
++    let mut visits = 0;
++    let outcome = contract.review_headers(&resource(), |_| {
++        visits += 1;
++        contract.invalidated.store(true, Ordering::Release);
++        true
++    });
++    assert!(matches!(outcome, Err(ManagedToolError::Invalidated)));
++    assert_eq!(visits, 1);
++    assert!(matches!(contract.validate_request(&request(json!({"count":2}))), Err(ManagedToolError::Invalidated)));
++}
++
++#[test]
++fn catalog_invalidation_during_review_cannot_be_disguised_as_disclosure_denial() {
++    for approve in [false, true] {
++        let flag = Arc::new(AtomicBool::new(false));
++        let mut contract = contract();
++        contract.catalog_invalidated = Some(Arc::clone(&flag));
++        let mut visits = 0;
++        let outcome = contract.review_headers(&resource(), |_| {
++            visits += 1;
++            flag.store(true, Ordering::Release);
++            approve
++        });
++        assert!(matches!(outcome, Err(ManagedToolError::Invalidated)));
++        assert_eq!(visits, 1);
 +    }
 +}
 +
 +#[test]
-+fn review_binding_requires_the_same_resource_tool_and_complete_schema() {
-+    let target = CanonicalHttpUrl::parse("https://tools.example/mcp").unwrap();
-+    let source = annotated_input_schema();
-+    let contract = ToolContract::admit(tool(source.clone(), None)).unwrap();
-+    contract.admit_headers(&target, &reviewed_input(target.as_str(), "calculate", source.clone())).unwrap();
-+    let mut different_schema = source.clone();
-+    different_schema["properties"]["count"]["minimum"] = json!(2);
-+    for review in [
-+        reviewed_input("https://other.example/mcp", "calculate", source.clone()),
-+        reviewed_input("https://tools.example/other", "calculate", source.clone()),
-+        reviewed_input("https://tools.example/mcp?tenant=other", "calculate", source.clone()),
-+        reviewed_input(target.as_str(), "other", source),
-+        reviewed_input(target.as_str(), "calculate", different_schema),
++fn externally_reviewed_plans_must_match_resource_name_and_complete_schema() {
++    let contract = contract();
++    let mut stronger = definition().input_schema;
++    stronger["properties"]["count"]["minimum"] = json!(10);
++    let mut description = definition().input_schema;
++    description["description"] = json!("different-source-canary");
++    for (target, name, schema) in [
++        ("https://tools.example/mcp?tenant=two", "calculate", definition().input_schema),
++        ("https://tools.example/other?tenant=one", "calculate", definition().input_schema),
++        ("https://other.example/mcp?tenant=one", "calculate", definition().input_schema),
++        ("https://tools.example/mcp?tenant=one", "Calculate", definition().input_schema),
++        ("https://tools.example/mcp?tenant=one", "calculate", stronger),
++        ("https://tools.example/mcp?tenant=one", "calculate", description),
 +    ] {
-+        assert!(matches!(contract.admit_headers(&target, &review), Err(ManagedToolError::HeaderBindingMismatch)));
++        let reviewed = ReviewedToolHeaders::new(CanonicalHttpUrl::parse(target).unwrap(), name, schema, |_| true).unwrap();
++        let error = contract.admit_headers(&resource(), &reviewed).err().unwrap();
++        assert!(matches!(error, ManagedToolError::HeaderBindingMismatch));
++        assert!(!format!("{error:?} {error}").contains("different-source-canary"));
 +    }
 +}
 +
 +#[test]
-+fn review_binding_cannot_resurrect_an_invalidated_contract() {
-+    let target = CanonicalHttpUrl::parse("https://tools.example/mcp").unwrap();
-+    let source = annotated_input_schema();
-+    let contract = ToolContract::admit(tool(source.clone(), None)).unwrap();
-+    let review = reviewed_input(target.as_str(), "calculate", source.clone());
-+    contract.admit_headers(&target, &review).unwrap();
-+    contract.invalidated.store(true, Ordering::Release);
-+    assert!(matches!(contract.admit_headers(&target, &review), Err(ManagedToolError::Invalidated)));
-+    ToolContract::admit(tool(source, None)).unwrap().admit_headers(&target, &review).unwrap();
++fn invalid_resource_is_refused_before_any_callback() {
++    let contract = contract();
++    let mut visits = 0;
++    let outcome = contract.review_headers(&CanonicalHttpUrl::parse("http://127.0.0.1/mcp").unwrap(), |_| {
++        visits += 1;
++        true
++    });
++    assert!(matches!(outcome, Err(ManagedToolError::Headers(ToolHeaderDispatchError::InvalidBinding))));
++    assert_eq!(visits, 0);
++    assert!(!contract.is_invalidated());
 +}
 +
 +#[test]
-+fn annotated_input_contract_retains_successful_output_validation() {
-+    let contract = ToolContract::admit(tool(annotated_input_schema(), Some(json!({
-+        "type":"object","properties":{"total":{"type":"integer"}},"required":["total"]
-+    })))).unwrap();
-+    assert!(matches!(contract.validate_result(&result(r#"{"resultType":"complete","content":[]}"#)),
-+        Err(ManagedToolError::MissingStructuredOutput)));
-+    assert!(matches!(contract.validate_result(&result(r#"{"resultType":"complete","content":[],"structuredContent":{"total":"wrong"}}"#)),
-+        Err(ManagedToolError::InvalidStructuredOutput)));
-+    let result = result(r#"{"resultType":"complete","content":[],"structuredContent":{"total":2},"x-exact":1.20e+4}"#);
-+    let before = result.encode().unwrap();
-+    contract.validate_result(&result).unwrap();
-+    assert_eq!(result.encode().unwrap(), before);
-+}
-+
-+#[test]
-+fn valid_large_integers_remain_body_only_until_header_projection_is_requested() {
-+    use crate::http_executor::ModernHttpRequest;
-+    use fastmcp_protocol::FINAL_PROTOCOL_VERSION;
-+    use fastmcp_protocol::http_headers::MAX_PARAMETER_HEADER_INTEGER;
-+
-+    let target = CanonicalHttpUrl::parse("https://tools.example/mcp").unwrap();
-+    let source = annotated_input_schema();
-+    let contract = ToolContract::admit(tool(source.clone(), None)).unwrap();
-+    let request = request("tools/call", json!({"name":"calculate","arguments":{"count":MAX_PARAMETER_HEADER_INTEGER + 1}}));
-+    contract.validate_request(&request).unwrap();
-+    let body = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":request.encode_params().unwrap().unwrap()})).unwrap();
-+    let wire = ModernHttpRequest::new(target.as_str(), body, FINAL_PROTOCOL_VERSION, "tools/call", Some("calculate".to_owned())).unwrap();
-+    assert!(!wire.headers().iter().any(|(name, _)| name.starts_with("Mcp-Param-")));
-+    let review = reviewed_input(target.as_str(), "calculate", source);
-+    contract.admit_headers(&target, &review).unwrap();
-+    assert!(matches!(wire.with_reviewed_tool_headers(&review), Err(ToolHeaderDispatchError::Projection(_))));
++fn approval_does_not_weaken_input_validation_or_reactivate_retired_handles() {
++    let flag = Arc::new(AtomicBool::new(false));
++    let mut contract = contract();
++    contract.catalog_invalidated = Some(Arc::clone(&flag));
++    let reviewed = contract.review_headers(&resource(), |_| true).unwrap();
++    for arguments in [json!({}), json!({"count":0}), json!({"count":"private-value-canary"})] {
++        let error = contract.validate_request(&request(arguments)).err().unwrap();
++        assert!(matches!(error, ManagedToolError::InvalidArguments));
++        assert!(!format!("{error:?} {error}").contains("private-value-canary"));
++    }
++    flag.store(true, Ordering::Release);
++    assert!(matches!(contract.admit_headers(&resource(), &reviewed), Err(ManagedToolError::Invalidated)));
++    let fresh = ToolContract::admit(definition()).unwrap();
++    fresh.validate_request(&request(json!({"count":2}))).unwrap();
++    assert!(contract.is_invalidated());
 +}
