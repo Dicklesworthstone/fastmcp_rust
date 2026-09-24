@@ -46,7 +46,7 @@ fn send_error<T>(error: mpsc::SendError<T>) -> TransportError {
         mpsc::SendError::Full(_) => TransportError::Io(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
             "memory transport queue is full",
-        )),
+        ))),
     }
 }
 
@@ -118,7 +118,99 @@ async fn recv_source(
     }
 }
 
+/// An actual bounded-channel slot reserved for one memory-transport message.
+///
+/// Obtain this through [`MemoryTransport::reserve_send_async`] or
+/// [`MemorySendHalf::reserve_send_async`] before constructing an expensive
+/// response. Reservation awaits channel capacity and checks runtime obligation
+/// admission before returning, without retaining an encoded message.
+///
+/// [`Self::send`] validates and commits synchronously, with no subsequent
+/// cancellation checkpoint. Success means the queue owns the message, not that
+/// the peer has processed it. Encoding or peer closure can still fail. Dropping
+/// or aborting a permit releases its capacity without publishing anything.
+#[must_use = "send or abort the reserved message; dropping releases capacity"]
+pub struct MemorySendPermit<'a> {
+    permit: mpsc::SendPermit<'a, MemoryQueuedMessage>,
+    codec: &'a Codec,
+    closed: &'a mut bool,
+}
+
+impl std::fmt::Debug for MemorySendPermit<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemorySendPermit").finish_non_exhaustive()
+    }
+}
+
+impl MemorySendPermit<'_> {
+    /// Validates, encodes and publishes exactly one message in the reserved slot.
+    ///
+    /// There is no cancellation check after reservation. Even when the context
+    /// is cancelled in the meantime, a successful commit returns success. An
+    /// encoding error releases the slot and leaves the endpoint usable; a peer
+    /// disconnect releases the slot and latches the endpoint closed.
+    pub fn send(self, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        let queued = encode_message(self.codec, message)?;
+        let result = self.permit.try_send(queued).map_err(send_error);
+        if matches!(result, Err(TransportError::Closed)) {
+            *self.closed = true;
+        }
+        result
+    }
+
+    /// Releases the reserved slot and runtime obligation without sending.
+    pub fn abort(self) {
+        self.permit.abort();
+    }
+}
+
+async fn reserve_send<'a>(
+    sender: &'a Option<mpsc::Sender<MemoryQueuedMessage>>,
+    codec: &'a Codec,
+    closed: &'a mut bool,
+    cx: &'a Cx,
+) -> Result<MemorySendPermit<'a>, TransportError> {
+    if *closed || sender.is_none() {
+        return Err(TransportError::Closed);
+    }
+    if cx.is_cancel_requested() {
+        return Err(TransportError::Cancelled);
+    }
+    match sender
+        .as_ref()
+        .ok_or(TransportError::Closed)?
+        .reserve_checked(cx)
+        .await
+    {
+        Ok(permit) => Ok(MemorySendPermit {
+            permit,
+            codec,
+            closed,
+        }),
+        Err(error) => {
+            let error = reservation_error(error);
+            if matches!(error, TransportError::Closed) {
+                *closed = true;
+            }
+            Err(error)
+        }
+    }
+}
+
 impl MemoryTransport {
+    /// Reserves outbound capacity before constructing a message.
+    ///
+    /// This is a real channel reservation, not merely a cancellation preflight.
+    /// Waiting yields to the executor. Dropping the waiting future or an unused
+    /// permit publishes nothing and releases its waiter or slot. Use split
+    /// halves when ingress must continue while an outbound permit is held.
+    pub async fn reserve_send_async<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> Result<MemorySendPermit<'a>, TransportError> {
+        reserve_send(&self.sender, &self.codec, &mut self.closed, cx).await
+    }
+
     /// Sends one bounded message, asynchronously waiting for channel capacity.
     ///
     /// Unlike the synchronous `Transport::send`, a full queue yields to the
@@ -185,6 +277,18 @@ impl MemoryRecvHalf {
 }
 
 impl MemorySendHalf {
+    /// Reserves one outbound slot while the receive half remains independent.
+    ///
+    /// This uses the same checked admission and cancellation contract as
+    /// [`MemoryTransport::reserve_send_async`]. Commit or abort the returned
+    /// permit; dropping it is also an abort and never sends a message.
+    pub async fn reserve_send_async<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> Result<MemorySendPermit<'a>, TransportError> {
+        reserve_send(&self.sender, &self.codec, &mut self.closed, cx).await
+    }
+
     /// Waits for capacity and commits a message independently of ingress.
     ///
     /// This has the same bounds and cancellation contract as
@@ -431,7 +535,10 @@ mod tests {
         recv.close(&cx).unwrap();
         send.close(&cx).unwrap();
         cx.set_cancel_requested(true);
-        assert!(matches!(ready(recv.recv_async(&cx)), Err(TransportError::Closed)));
+        assert!(matches!(
+            ready(recv.recv_async(&cx)),
+            Err(TransportError::Closed)
+        ));
         assert!(matches!(
             ready(send.send_async(&cx, &request(1))),
             Err(TransportError::Closed)
@@ -489,8 +596,7 @@ mod tests {
         let cx = Cx::for_testing();
         let response = JsonRpcResponse::success(
             RequestId::Number(21),
-            serde_json::from_str(r#"{"zeta":1.20e+4,"alpha":{"second":2,"first":1}}"#)
-                .unwrap(),
+            serde_json::from_str(r#"{"zeta":1.20e+4,"alpha":{"second":2,"first":1}}"#).unwrap(),
         );
         let expected = Codec::new().encode_response(&response).unwrap();
         let expected = expected.strip_suffix(b"\n").unwrap();
@@ -513,5 +619,236 @@ mod tests {
         assert_send(send.send_async(&cx, &message));
         assert_send(recv.recv_async(&cx));
         assert_send(recv.recv_with_source_async(&cx));
+    }
+
+    #[test]
+    fn reservation_owns_capacity_without_publishing_a_message() {
+        let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
+        let competing = client.sender.as_ref().unwrap().clone();
+        let cx = Cx::for_testing();
+        let permit = ready(client.reserve_send_async(&cx)).unwrap();
+        assert_eq!(server.receiver.len(), 0);
+        let other = encode_message(&Codec::new(), &request(2)).unwrap();
+        assert!(matches!(
+            competing.try_send(other),
+            Err(mpsc::SendError::Full(_))
+        ));
+        permit.send(&request(1)).unwrap();
+        assert_eq!(request_id(server.recv(&cx).unwrap()), RequestId::Number(1));
+    }
+
+    #[test]
+    fn dropping_or_aborting_permits_releases_capacity_without_sending() {
+        let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
+        let cx = Cx::for_testing();
+        let permit = ready(client.reserve_send_async(&cx)).unwrap();
+        drop(permit);
+        assert_eq!(server.receiver.len(), 0);
+        ready(client.reserve_send_async(&cx)).unwrap().abort();
+        assert_eq!(server.receiver.len(), 0);
+        ready(client.reserve_send_async(&cx))
+            .unwrap()
+            .send(&request(3))
+            .unwrap();
+        assert_eq!(request_id(server.recv(&cx).unwrap()), RequestId::Number(3));
+    }
+
+    #[test]
+    fn reserved_send_commits_even_if_context_is_cancelled_after_reservation() {
+        let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
+        let cx = Cx::for_testing();
+        let permit = ready(client.reserve_send_async(&cx)).unwrap();
+        cx.set_cancel_requested(true);
+        permit.send(&request(4)).unwrap();
+        let live = Cx::for_testing();
+        assert_eq!(request_id(server.recv(&live).unwrap()), RequestId::Number(4));
+        assert!(!client.is_closed());
+    }
+
+    #[test]
+    fn cancelled_reservation_never_claims_capacity() {
+        let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+        assert!(matches!(
+            ready(client.reserve_send_async(&cx)),
+            Err(TransportError::Cancelled)
+        ));
+        assert!(!client.is_closed());
+        let live = Cx::for_testing();
+        ready(client.reserve_send_async(&live))
+            .unwrap()
+            .send(&request(5))
+            .unwrap();
+        assert_eq!(request_id(server.recv(&live).unwrap()), RequestId::Number(5));
+    }
+
+    #[test]
+    fn pending_reservation_cancellation_and_drop_remove_their_waiters() {
+        let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
+        let live = Cx::for_testing();
+        let cancelled = Cx::for_testing();
+        client.send(&live, &request(1)).unwrap();
+        {
+            let mut reservation = pin!(client.reserve_send_async(&cancelled));
+            assert!(poll(reservation.as_mut(), Waker::noop()).is_pending());
+            cancelled.set_cancel_requested(true);
+            assert!(matches!(
+                poll(reservation.as_mut(), Waker::noop()),
+                Poll::Ready(Err(TransportError::Cancelled))
+            ));
+        }
+        {
+            let mut reservation = pin!(client.reserve_send_async(&live));
+            assert!(poll(reservation.as_mut(), Waker::noop()).is_pending());
+        }
+        assert_eq!(request_id(server.recv(&live).unwrap()), RequestId::Number(1));
+        ready(client.reserve_send_async(&live))
+            .unwrap()
+            .send(&request(6))
+            .unwrap();
+        assert_eq!(request_id(server.recv(&live).unwrap()), RequestId::Number(6));
+    }
+
+    #[test]
+    fn split_reservation_waits_for_capacity_without_blocking_ingress() {
+        let (client, mut server) = create_memory_transport_pair_with_capacity(1);
+        let (mut recv, mut send) = client.into_split();
+        let cx = Cx::for_testing();
+        send.send(&cx, &request(1)).unwrap();
+        let counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&counter));
+        let mut reservation = pin!(send.reserve_send_async(&cx));
+        assert!(poll(reservation.as_mut(), &waker).is_pending());
+
+        ready(server.send_async(&cx, &request(7))).unwrap();
+        assert_eq!(
+            request_id(ready(recv.recv_async(&cx)).unwrap()),
+            RequestId::Number(7)
+        );
+        assert_eq!(request_id(server.recv(&cx).unwrap()), RequestId::Number(1));
+        assert!(counter.0.load(Ordering::SeqCst) > 0);
+        let Poll::Ready(Ok(permit)) = poll(reservation.as_mut(), &waker) else {
+            panic!("draining the peer must wake and admit the reservation");
+        };
+        permit.send(&request(8)).unwrap();
+        assert_eq!(request_id(server.recv(&cx).unwrap()), RequestId::Number(8));
+    }
+
+    #[test]
+    fn invalid_reserved_message_releases_slot_and_preserves_endpoint() {
+        let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
+        let cx = Cx::for_testing();
+        let invalid = JsonRpcMessage::Response(JsonRpcResponse {
+            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+            result: None,
+            error: None,
+            id: Some(RequestId::Number(1)),
+        });
+        let permit = ready(client.reserve_send_async(&cx)).unwrap();
+        assert!(matches!(
+            permit.send(&invalid),
+            Err(TransportError::Codec(_))
+        ));
+        assert!(!client.is_closed());
+        assert_eq!(server.receiver.len(), 0);
+        ready(client.send_async(&cx, &request(9))).unwrap();
+        assert_eq!(request_id(server.recv(&cx).unwrap()), RequestId::Number(9));
+    }
+
+    #[test]
+    fn oversized_reserved_message_releases_slot_and_keeps_the_source_limit() {
+        let message = request(1);
+        let size = match &message {
+            JsonRpcMessage::Request(request) => serde_json::to_vec(request).unwrap().len(),
+            JsonRpcMessage::Response(_) => unreachable!(),
+        };
+        let (mut client, mut server) = MemoryTransportBuilder::new()
+            .max_message_size(size)
+            .build();
+        let cx = Cx::for_testing();
+        let large = JsonRpcMessage::Request(JsonRpcRequest::new("x".repeat(size), None, 1_i64));
+        let permit = ready(client.reserve_send_async(&cx)).unwrap();
+        assert!(matches!(
+            permit.send(&large),
+            Err(TransportError::Codec(crate::CodecError::MessageTooLarge(_)))
+        ));
+        assert!(!client.is_closed());
+        assert_eq!(server.receiver.len(), 0);
+        ready(client.reserve_send_async(&cx))
+            .unwrap()
+            .send(&message)
+            .unwrap();
+        assert_eq!(request_id(server.recv(&cx).unwrap()), RequestId::Number(1));
+    }
+
+    #[test]
+    fn peer_closure_after_reservation_refuses_commit_and_latches_closed() {
+        let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
+        let cx = Cx::for_testing();
+        let permit = ready(client.reserve_send_async(&cx)).unwrap();
+        server.close(&cx).unwrap();
+        assert!(matches!(
+            permit.send(&request(10)),
+            Err(TransportError::Closed)
+        ));
+        assert!(client.is_closed());
+        cx.set_cancel_requested(true);
+        assert!(matches!(
+            ready(client.reserve_send_async(&cx)),
+            Err(TransportError::Closed)
+        ));
+    }
+
+    #[test]
+    fn peer_closure_wakes_pending_reservation_and_latches_closed() {
+        let (client, server) = create_memory_transport_pair_with_capacity(1);
+        let (_recv, mut send) = client.into_split();
+        let (mut peer_recv, _peer_send) = server.into_split();
+        let cx = Cx::for_testing();
+        send.send(&cx, &request(1)).unwrap();
+        let counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&counter));
+        {
+            let mut reservation = pin!(send.reserve_send_async(&cx));
+            assert!(poll(reservation.as_mut(), &waker).is_pending());
+            peer_recv.close(&cx).unwrap();
+            assert!(counter.0.load(Ordering::SeqCst) > 0);
+            assert!(matches!(
+                poll(reservation.as_mut(), &waker),
+                Poll::Ready(Err(TransportError::Closed))
+            ));
+        }
+        assert!(send.is_closed());
+    }
+
+    #[test]
+    fn reservation_on_explicitly_closed_endpoint_precedes_cancellation() {
+        let (mut client, server) = create_memory_transport_pair_with_capacity(1);
+        let cx = Cx::for_testing();
+        client.close(&cx).unwrap();
+        cx.set_cancel_requested(true);
+        assert!(matches!(
+            ready(client.reserve_send_async(&cx)),
+            Err(TransportError::Closed)
+        ));
+        let (_recv, mut send) = server.into_split();
+        send.close(&cx).unwrap();
+        assert!(matches!(
+            ready(send.reserve_send_async(&cx)),
+            Err(TransportError::Closed)
+        ));
+    }
+
+    #[test]
+    fn send_permits_and_reservation_futures_are_send() {
+        fn assert_type_send<T: Send>() {}
+        fn assert_future_send<T: Future + Send>(_: T) {}
+        assert_type_send::<MemorySendPermit<'static>>();
+        let (mut client, server) = create_memory_transport_pair_with_capacity(1);
+        let (_recv, mut send) = server.into_split();
+        let cx = Cx::for_testing();
+        assert_future_send(client.reserve_send_async(&cx));
+        assert_future_send(send.reserve_send_async(&cx));
     }
 }
