@@ -3567,7 +3567,7 @@ fn live_server_request_dispatch(
         return invalid_notification_request_response(request)
             .map(LiveServerRequestDispatch::Immediate);
     }
-    if request.method == "ping" && selected_era == Some(ProtocolEra::Legacy2024) {
+    if request.method == "ping" && selected_era != Some(ProtocolEra::Modern2026) {
         return Some(LiveServerRequestDispatch::Immediate(
             JsonRpcMessage::Response(JsonRpcResponse::success(id, serde_json::json!({}))),
         ));
