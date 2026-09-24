@@ -246,26 +246,30 @@ pub(super) async fn scenario(cx: Cx, case: Case) {
     assert_eq!(peer.probe.effects.load(Ordering::SeqCst), usize::from(completes));
     assert_eq!(peer.probe.transforms.load(Ordering::SeqCst), usize::from(completes));
     if case.pending() { assert!(dropped.load(Ordering::SeqCst)); }
-    let observed_states = states.lock().unwrap();
-    assert_eq!(observed_states.len(), polls.load(Ordering::SeqCst));
-    for (index, state) in observed_states.iter().enumerate() {
-        let previous = if index == 0 { &initial } else { &replies[index - 1] };
-        assert_eq!(Some(state.as_str()), previous["result"]["requestState"].as_str());
-        assert_ne!(state, "handler-private-state");
+    // Each std guard lives in its own block: a borrowed guard stays in the
+    // future's state until scope end even after drop(), making it !Send.
+    {
+        let observed_states = states.lock().unwrap();
+        assert_eq!(observed_states.len(), polls.load(Ordering::SeqCst));
+        for (index, state) in observed_states.iter().enumerate() {
+            let previous = if index == 0 { &initial } else { &replies[index - 1] };
+            assert_eq!(Some(state.as_str()), previous["result"]["requestState"].as_str());
+            assert_ne!(state, "handler-private-state");
+        }
     }
-    drop(observed_states);
-    let requests = peer.seen.lock().unwrap();
-    assert_eq!(requests.len(), 1 + case.continuations());
-    for (index, request) in requests.iter().enumerate().skip(1) {
-        let previous = if index == 1 { &initial } else { &replies[index - 2] };
-        assert_eq!(request["params"]["requestState"], previous["result"]["requestState"]);
-        assert_eq!(request["params"]["arguments"], requests[0]["params"]["arguments"]);
-        assert_eq!(request["params"]["_meta"], requests[0]["params"]["_meta"]);
-        assert_eq!(request["id"], 1 + i64::try_from(index).unwrap());
-        let response_keys: Vec<_> = request["params"]["inputResponses"].as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(response_keys, if case.partial() { if index == 1 { vec!["left"] } else { vec!["right"] } } else { vec!["left", "right"] });
+    {
+        let requests = peer.seen.lock().unwrap();
+        assert_eq!(requests.len(), 1 + case.continuations());
+        for (index, request) in requests.iter().enumerate().skip(1) {
+            let previous = if index == 1 { &initial } else { &replies[index - 2] };
+            assert_eq!(request["params"]["requestState"], previous["result"]["requestState"]);
+            assert_eq!(request["params"]["arguments"], requests[0]["params"]["arguments"]);
+            assert_eq!(request["params"]["_meta"], requests[0]["params"]["_meta"]);
+            assert_eq!(request["id"], 1 + i64::try_from(index).unwrap());
+            let response_keys: Vec<_> = request["params"]["inputResponses"].as_object().unwrap().keys().map(String::as_str).collect();
+            assert_eq!(response_keys, if case.partial() { if index == 1 { vec!["left"] } else { vec!["right"] } } else { vec!["left", "right"] });
+        }
     }
-    drop(requests);
     peer.quiet();
     assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
     assert!(cx.checkpoint().is_ok());

@@ -75,8 +75,12 @@ impl ToolHandler for AnnotatedProbe {
 }
 
 fn install_annotated_tool(peer: &mut Peer, case: Case) {
-    let origin = format!("https://{}", peer.listener.local_addr().unwrap());
-    let mut auth = AuthContext::with_subject("alice".to_owned());
+    // Only the exact-2024 SSE lane reads this origin; it has no TLS form and
+    // this ModernOnly upstream never serves it.
+    let origin = format!("http://{}", peer.listener.local_addr().unwrap());
+    // Stateless MRTR state needs a verified owner, not a display subject.
+    let mut auth = AuthContext::with_subject("alice".to_owned())
+        .with_session_owner(fastmcp_core::sha256_bounded(b"alice", 32).unwrap());
     auth.scopes = vec!["tools:call".to_owned()];
     let provider = TokenAuthProvider::new(StaticTokenVerifier::new([(peer.token.clone(), auth)]).unwrap());
     // The fixture explicitly selects these two non-sensitive annotation paths.
