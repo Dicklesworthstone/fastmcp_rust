@@ -15716,16 +15716,24 @@ impl Client {
     }
 
     fn close_transport(&mut self) -> Result<(), TransportError> {
-        let receiver = self
-            .transport
-            .lock()
-            .map_err(|_| TransportError::Closed)?
-            .close(&self.cx);
-        let sender = self
-            .response_sender
-            .lock()
-            .map_err(|_| TransportError::Closed)?
-            .close(&self.cx);
+        // Retiring the owned child's pipes is teardown and must complete when
+        // the stored context is already cancelled or expired. Otherwise the
+        // stdio halves refuse the close and every later close refuses again,
+        // so the connection can never finish closing. Masking is sound here
+        // because both halves wrap unbuffered child pipes: the close performs
+        // no blocking flush that a cancelled owner would be made to wait on.
+        let receiver = self.cx.masked(|| {
+            self.transport
+                .lock()
+                .map_err(|_| TransportError::Closed)?
+                .close(&self.cx)
+        });
+        let sender = self.cx.masked(|| {
+            self.response_sender
+                .lock()
+                .map_err(|_| TransportError::Closed)?
+                .close(&self.cx)
+        });
         receiver.and(sender)
     }
 
