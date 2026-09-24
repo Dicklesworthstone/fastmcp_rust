@@ -37194,6 +37194,31 @@ fn e2e_public_http_custom_token_verifier_refuses_wrong_and_commits_subject() {
     server.shutdown();
 }
 
+/// Exact-2024 reverse sampling over WebSocket from the idiomatic async tool.
+#[cfg(feature = "websocket-experimental")]
+#[tool(name = "public-ws-legacy-sample")]
+async fn public_ws_legacy_sample(ctx: &McpContext) -> McpResult<String> {
+    Ok(ctx.sample("ws legacy sample", 16).await?.text)
+}
+
+/// The same reverse sampling from a synchronous tool that bridges with
+/// `block_on`; the legacy dispatch worker is a blocking lane (bd-6rfrg).
+#[cfg(feature = "websocket-experimental")]
+#[tool(name = "public-ws-legacy-sample-sync")]
+fn public_ws_legacy_sample_sync(ctx: &McpContext) -> McpResult<String> {
+    Ok(fastmcp_core::block_on(ctx.sample("ws legacy sync sample", 16))?.text)
+}
+
+/// Exact-2024 reverse roots over WebSocket from an async tool.
+#[cfg(feature = "websocket-experimental")]
+#[tool(name = "public-ws-legacy-roots")]
+async fn public_ws_legacy_roots(ctx: &McpContext) -> McpResult<String> {
+    let roots = ctx.list_roots().await?;
+    Ok(roots
+        .first()
+        .map_or_else(|| "<no client roots>".to_owned(), |root| root.uri.clone()))
+}
+
 #[cfg(feature = "websocket-experimental")]
 mod live_websocket_bind {
     use super::*;
@@ -39032,6 +39057,163 @@ mod live_websocket_bind {
             drop(client);
             cx.set_cancel_requested(true);
             listener.abort();
+        });
+    }
+
+    /// Answers exact-2024 `sampling/createMessage` and `roots/list`, counting
+    /// every reverse request the server actually sends.
+    fn public_ws_legacy_reverse_handlers(
+        calls: &Arc<AtomicUsize>,
+    ) -> legacy_2024::LegacyReverseRequestHandlers {
+        let sampling_calls = Arc::clone(calls);
+        let roots_calls = Arc::clone(calls);
+        legacy_2024::LegacyReverseRequestHandlers::new()
+            .with_sampling_create_message(move |_cx, _cancellation, _params| {
+                sampling_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Ok(legacy_2024::LegacyCreateMessageResult::text(
+                        "ws-sampled-legacy",
+                        "ws-legacy-model",
+                    ))
+                })
+            })
+            .with_roots_list(move |_cx, _cancellation, _params| {
+                roots_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Ok(legacy_2024::ListRootsResult::new(vec![
+                        legacy_2024::Root::with_name("file:///ws-workspace", "ws-workspace"),
+                    ]))
+                })
+            })
+    }
+
+    /// Serves the three exact-2024 reverse-request tools over `bind_websocket`
+    /// and calls each through a `LegacyOnly` WebSocket client whose only
+    /// variable is `handlers`. Returns each tool's result and the number of
+    /// reverse requests the handlers answered.
+    async fn public_ws_legacy_reverse_round(
+        cx: &Cx,
+        handlers: legacy_2024::LegacyReverseRequestHandlers,
+        calls: &Arc<AtomicUsize>,
+    ) -> (Vec<(&'static str, legacy_2024::CallToolResult)>, usize) {
+        let server = legacy_2024::server_builder("facade-ws-legacy-reverse", "1.0.0")
+            .tool(PublicWsLegacySample)
+            .tool(PublicWsLegacySampleSync)
+            .tool(PublicWsLegacyRoots)
+            .build();
+        let bound = server
+            .bind_websocket(cx, "127.0.0.1:0")
+            .await
+            .expect("legacy bind_websocket must bind a localhost listener");
+        let address = bound
+            .local_addr()
+            .expect("legacy bind_websocket publishes its bound address");
+        let scope = cx.scope();
+        let listener = cx
+            .spawn_in(&scope, move |serve_cx| async move {
+                bound.serve(&serve_cx).await
+            })
+            .expect("legacy bind_websocket serve must be admitted");
+
+        let transport = websocket_client_bounded(
+            cx,
+            "legacy bind_websocket reverse handshake",
+            AsyncWsClientTransport::connect(cx, &format!("ws://{address}/mcp")),
+        )
+        .await
+        .expect("legacy bind_websocket must complete RFC 6455 upgrade");
+        let mut client = websocket_client_bounded(
+            cx,
+            "legacy bind_websocket reverse initialize",
+            legacy_2024::ClientBuilder::new()
+                .client_info("e2e-public-ws-legacy-reverse", "1.0.0")
+                .reverse_request_handlers(handlers)
+                .connect_websocket_with_cx(cx, transport),
+        )
+        .await
+        .expect("the LegacyOnly facade negotiates exact 2024 over bind_websocket");
+
+        let mut results = Vec::new();
+        for tool in [
+            "public-ws-legacy-sample",
+            "public-ws-legacy-sample-sync",
+            "public-ws-legacy-roots",
+        ] {
+            let result = websocket_client_bounded(cx, tool, client.call_tool(cx, tool, json!({})))
+                .await
+                .unwrap_or_else(|error| panic!("{tool} must return a typed result: {error}"));
+            results.push((tool, result));
+        }
+
+        websocket_client_bounded(cx, "legacy bind_websocket reverse close", client.close(cx))
+            .await
+            .expect("the legacy WebSocket client closes after the reverse round");
+        drop(client);
+        listener.abort();
+        (results, calls.load(Ordering::SeqCst))
+    }
+
+    fn legacy_text(result: &legacy_2024::CallToolResult) -> &str {
+        match result.content.first() {
+            Some(legacy_2024::LegacyContent::Text { text, .. }) => text,
+            other => panic!("expected one text item, got {other:?}"),
+        }
+    }
+
+    /// A handler awaiting a reverse request must receive the client's reply
+    /// over WebSocket: the receive side routes it while the handler waits.
+    #[test]
+    fn e2e_public_websocket_legacy_reverse_sampling_and_roots_reach_the_waiting_handler() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect("legacy reverse runtime installs an ambient context");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (results, answered) = public_ws_legacy_reverse_round(
+                &cx,
+                public_ws_legacy_reverse_handlers(&calls),
+                &calls,
+            )
+            .await;
+            for (tool, result) in &results {
+                assert!(!result.is_error, "{tool} must succeed: {result:?}");
+            }
+            assert_eq!(legacy_text(&results[0].1), "ws-sampled-legacy");
+            assert_eq!(legacy_text(&results[1].1), "ws-sampled-legacy");
+            assert_eq!(legacy_text(&results[2].1), "file:///ws-workspace");
+            assert_eq!(answered, 3, "each tool issues exactly one reverse request");
+            cx.set_cancel_requested(true);
+        });
+    }
+
+    /// Differs from the positive only in the client's installed handlers, so
+    /// the client advertises neither capability: each tool gets a typed
+    /// refusal, no reverse request is sent, and nothing waits.
+    #[test]
+    fn e2e_public_websocket_legacy_reverse_without_capabilities_is_refused_not_hung() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect("legacy refusal runtime installs an ambient context");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (results, answered) = public_ws_legacy_reverse_round(
+                &cx,
+                legacy_2024::LegacyReverseRequestHandlers::new(),
+                &calls,
+            )
+            .await;
+            for (tool, result) in &results {
+                assert!(
+                    result.is_error,
+                    "{tool} must refuse without the capability: {result:?}"
+                );
+            }
+            assert!(legacy_text(&results[0].1).contains("does not support sampling capability"));
+            assert!(legacy_text(&results[1].1).contains("does not support sampling capability"));
+            assert_eq!(
+                legacy_text(&results[2].1),
+                "Roots not available: client does not support roots capability"
+            );
+            assert_eq!(answered, 0);
+            cx.set_cancel_requested(true);
         });
     }
 
