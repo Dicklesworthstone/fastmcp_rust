@@ -452,6 +452,13 @@ fn persisted_grant_reopen_renews_over_native_https_with_rotation_and_scope_narro
                 drop(store);
                 (grant, fixture)
             }).join().unwrap();
+            // The token exchange gets its own window, started only now. The
+            // storage work above fsyncs a real directory several times, and on
+            // a loaded build host the time before this point has exceeded two
+            // minutes. A deadline taken before that work then expired before
+            // the server was first polled, so the client's handshake went
+            // unanswered until the client's own token timeout.
+            let deadline = operation_deadline(&cx, Duration::from_secs(20)).unwrap();
             let acceptor = native::test_acceptor();
             let server = within(&cx, deadline, async {
                 let (socket, _) = listener.accept().await.map_err(|_| OAuthError::TransportFailed)?;
