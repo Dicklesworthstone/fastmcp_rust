@@ -3558,6 +3558,7 @@ enum LiveServerRequestDispatch {
 
 fn live_server_request_dispatch(
     selected_era: Option<ProtocolEra>,
+    handshake_era: ProtocolEra,
     handlers: &ReverseRequestHandlers,
     callbacks: &ReverseCallbackPool,
     request: &JsonRpcRequest,
@@ -3567,7 +3568,12 @@ fn live_server_request_dispatch(
         return invalid_notification_request_response(request)
             .map(LiveServerRequestDispatch::Immediate);
     }
-    if request.method == "ping" && selected_era == Some(ProtocolEra::Legacy2024) {
+    // MCP 2024-11-05 lifecycle: "The server SHOULD NOT send requests other
+    // than pings and logging before receiving the initialized notification."
+    // A ping during a legacy `initialize` is therefore answered like one in a
+    // selected legacy session. Sampling and roots still wait for the era.
+    if request.method == "ping" && selected_era.unwrap_or(handshake_era) == ProtocolEra::Legacy2024
+    {
         return Some(LiveServerRequestDispatch::Immediate(
             JsonRpcMessage::Response(JsonRpcResponse::success(id, serde_json::json!({}))),
         ));
@@ -15033,10 +15039,22 @@ impl Client {
         }
     }
 
+    /// The era of the handshake this client sends before an era is selected:
+    /// only a modern-only plan opens with `server/discover`. Auto's modern
+    /// probe runs on a separate modern-only client, so an Auto client itself
+    /// opens with the legacy `initialize`, as `Client::initialize` does.
+    fn handshake_era(&self) -> ProtocolEra {
+        if self.session.protocol_plan().policy() == ProtocolPolicy::ModernOnly {
+            ProtocolEra::Modern2026
+        } else {
+            ProtocolEra::Legacy2024
+        }
+    }
+
     #[cfg(unix)]
     fn start_initialization(&mut self, cx: &Cx) -> McpResult<PendingClientInitialization> {
         self.timeout_policy.validate()?;
-        let modern = self.session.protocol_plan().policy() == ProtocolPolicy::ModernOnly;
+        let modern = self.handshake_era() == ProtocolEra::Modern2026;
         let (method, params) = if modern {
             let params =
                 serde_json::to_value(ServerDiscoverRequest::default()).map_err(|error| {
@@ -15628,6 +15646,7 @@ impl Client {
     fn server_request_response(&mut self, request: &JsonRpcRequest) -> Option<JsonRpcMessage> {
         match live_server_request_dispatch(
             self.session.selected_era(),
+            self.handshake_era(),
             &self.reverse_request_handlers,
             &self.reverse_callback_pool,
             request,
