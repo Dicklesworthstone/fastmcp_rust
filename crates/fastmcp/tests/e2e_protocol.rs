@@ -602,6 +602,8 @@ fn e2e_auth_oauth_token_verifier_revocation_and_refresh() {
             redirect_uri: Some("http://127.0.0.1:3000/callback".to_string()),
             client_id: "test-client".to_string(),
             client_secret: Some(CLIENT_SECRET.to_string()),
+            client_authentication_method:
+                fastmcp_rust::oauth::TokenEndpointAuthMethod::ClientSecretBasic,
             code_verifier: Some(code_verifier.to_string()),
             refresh_token: None,
             scopes: None,
@@ -675,13 +677,23 @@ fn e2e_auth_oauth_token_verifier_revocation_and_refresh() {
     // Near-identical negative: the same call without the secret is refused.
     assert!(
         matches!(
-            oauth.revoke(&access, "test-client", None),
+            oauth.revoke(
+                &access,
+                "test-client",
+                None,
+                fastmcp_rust::oauth::TokenEndpointAuthMethod::ClientSecretBasic,
+            ),
             Err(fastmcp_rust::oauth::OAuthError::InvalidClient { .. })
         ),
         "revocation without the confidential client's secret must be refused"
     );
     oauth
-        .revoke(&access, "test-client", Some(CLIENT_SECRET))
+        .revoke(
+            &access,
+            "test-client",
+            Some(CLIENT_SECRET),
+            fastmcp_rust::oauth::TokenEndpointAuthMethod::ClientSecretBasic,
+        )
         .unwrap();
     let params = json!({ "auth": format!("Bearer {access}") });
     let corr = trace.log_request("tools/list(revoked)", Some(&params));
@@ -705,6 +717,8 @@ fn e2e_auth_oauth_token_verifier_revocation_and_refresh() {
             // RFC 6749 §6: a confidential client authenticates on the
             // refresh_token grant exactly as it did on the code exchange.
             client_secret: Some(CLIENT_SECRET.to_string()),
+            client_authentication_method:
+                fastmcp_rust::oauth::TokenEndpointAuthMethod::ClientSecretBasic,
             code_verifier: None,
             refresh_token: Some(refresh),
             scopes: None,

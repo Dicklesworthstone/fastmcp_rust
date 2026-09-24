@@ -1317,6 +1317,33 @@ pub enum ClientType {
     Public,
 }
 
+/// The single credential method bound to an OAuth client registration.
+///
+/// A confidential registration defaults to HTTP Basic; a public registration
+/// defaults to `none`. Body credentials require an explicit registration with
+/// [`Self::ClientSecretPost`]. A valid secret never authorizes changing methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenEndpointAuthMethod {
+    /// One HTTP Basic Authorization header containing the client credentials.
+    ClientSecretBasic,
+    /// Client credentials in the form body and no Authorization header.
+    ClientSecretPost,
+    /// Public-client identification without a client secret.
+    None,
+}
+
+impl TokenEndpointAuthMethod {
+    /// Returns the exact OAuth registration metadata value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientSecretBasic => "client_secret_basic",
+            Self::ClientSecretPost => "client_secret_post",
+            Self::None => "none",
+        }
+    }
+}
+
 /// A confidential-client credential retained only until registration.
 ///
 /// The bytes are zeroized when the input object is dropped. Registered server
@@ -1401,6 +1428,8 @@ pub struct OAuthClient {
     client_secret: Option<ClientSecret>,
     /// Client type.
     pub client_type: ClientType,
+    /// Exact token and revocation endpoint credential method.
+    pub token_endpoint_auth_method: TokenEndpointAuthMethod,
     /// Allowed redirect URIs.
     pub redirect_uris: Vec<String>,
     /// Allowed scopes.
@@ -1446,8 +1475,14 @@ impl RegisteredOAuthClient {
         self.metadata.validate_scopes(scopes)
     }
 
-    fn authenticate(&self, provided: Option<&str>) -> bool {
-        match (self.secret_verifier.as_ref(), provided) {
+    fn authenticate(
+        &self,
+        provided: Option<&str>,
+        method: TokenEndpointAuthMethod,
+    ) -> bool {
+        // Complete the same verifier work for a wrong method as a wrong
+        // secret. Both failures use the same public invalid_client response.
+        let credentials_match = match (self.secret_verifier.as_ref(), provided) {
             (Some(verifier), Some(secret)) => verifier.verify(secret.as_bytes()),
             (Some(verifier), None) => {
                 std::hint::black_box(verifier.verify(std::hint::black_box(&[])));
@@ -1461,7 +1496,8 @@ impl RegisteredOAuthClient {
                 perform_dummy_client_secret_verification(secret.as_bytes());
                 false
             }
-        }
+        };
+        credentials_match && self.metadata.token_endpoint_auth_method == method
     }
 }
 
@@ -1504,6 +1540,8 @@ pub struct OAuthClientMetadata {
     pub client_id: String,
     /// Client credential classification.
     pub client_type: ClientType,
+    /// Exact token and revocation endpoint credential method.
+    pub token_endpoint_auth_method: TokenEndpointAuthMethod,
     /// Allowed redirect URIs.
     pub redirect_uris: Vec<String>,
     /// Allowed scopes.
@@ -1521,6 +1559,7 @@ impl std::fmt::Debug for OAuthClientMetadata {
         f.debug_struct("OAuthClientMetadata")
             .field("client_id_len", &self.client_id.len())
             .field("client_type", &self.client_type)
+            .field("token_endpoint_auth_method", &self.token_endpoint_auth_method)
             .field("redirect_uri_count", &self.redirect_uris.len())
             .field("allowed_scope_count", &self.allowed_scopes.len())
             .field("name_present", &self.name.is_some())
@@ -1534,6 +1573,7 @@ impl From<&OAuthClient> for OAuthClientMetadata {
         Self {
             client_id: client.client_id.clone(),
             client_type: client.client_type,
+            token_endpoint_auth_method: client.token_endpoint_auth_method,
             redirect_uris: client.redirect_uris.clone(),
             allowed_scopes: client.allowed_scopes.clone(),
             name: client.name.clone(),
@@ -1568,6 +1608,7 @@ impl std::fmt::Debug for OAuthClient {
         f.debug_struct("OAuthClient")
             .field("client_id_len", &self.client_id.len())
             .field("client_secret_present", &self.client_secret.is_some())
+            .field("token_endpoint_auth_method", &self.token_endpoint_auth_method)
             .field("redirect_uri_count", &self.redirect_uris.len())
             .field("allowed_scope_count", &self.allowed_scopes.len())
             .field("name_present", &self.name.is_some())
@@ -1609,6 +1650,19 @@ impl OAuthClient {
         if !credential_class_is_consistent {
             return Err(OAuthError::InvalidRequest(
                 OAUTH_CLIENT_CREDENTIAL_CLASS_ERROR.to_string(),
+            ));
+        }
+        if !matches!(
+            (self.client_type, self.token_endpoint_auth_method),
+            (ClientType::Public, TokenEndpointAuthMethod::None)
+                | (
+                    ClientType::Confidential,
+                    TokenEndpointAuthMethod::ClientSecretBasic
+                        | TokenEndpointAuthMethod::ClientSecretPost
+                )
+        ) {
+            return Err(OAuthError::InvalidRequest(
+                "client authentication method does not match credential class".to_string(),
             ));
         }
 
@@ -1702,6 +1756,7 @@ impl OAuthClient {
 pub struct OAuthClientBuilder {
     client_id: String,
     client_credential: Option<ClientSecret>,
+    token_endpoint_auth_method: Option<TokenEndpointAuthMethod>,
     redirect_uris: Vec<String>,
     allowed_scopes: HashSet<String>,
     name: Option<String>,
@@ -1716,6 +1771,7 @@ impl std::fmt::Debug for OAuthClientBuilder {
                 "client_credential_present",
                 &self.client_credential.is_some(),
             )
+            .field("token_endpoint_auth_method", &self.token_endpoint_auth_method)
             .field("redirect_uri_count", &self.redirect_uris.len())
             .field("allowed_scope_count", &self.allowed_scopes.len())
             .field("name_present", &self.name.is_some())
@@ -1730,6 +1786,7 @@ impl OAuthClientBuilder {
         Self {
             client_id: client_id.into(),
             client_credential: None,
+            token_endpoint_auth_method: None,
             redirect_uris: Vec::new(),
             allowed_scopes: HashSet::new(),
             name: None,
@@ -1741,6 +1798,17 @@ impl OAuthClientBuilder {
     #[must_use]
     pub fn secret(mut self, credential: impl Into<String>) -> Self {
         self.client_credential = Some(ClientSecret::new(credential.into()));
+        self
+    }
+
+    /// Binds the registration to exactly one credential method.
+    ///
+    /// Without an explicit selection, confidential clients use HTTP Basic and
+    /// public clients use `none`. `build` rejects methods inconsistent with the
+    /// credential class, regardless of builder call order.
+    #[must_use]
+    pub fn token_endpoint_auth_method(mut self, method: TokenEndpointAuthMethod) -> Self {
+        self.token_endpoint_auth_method = Some(method);
         self
     }
 
@@ -1808,10 +1876,15 @@ impl OAuthClientBuilder {
             ClientType::Public
         };
 
+        let token_endpoint_auth_method = self.token_endpoint_auth_method.unwrap_or(match client_type {
+            ClientType::Confidential => TokenEndpointAuthMethod::ClientSecretBasic,
+            ClientType::Public => TokenEndpointAuthMethod::None,
+        });
         let client = OAuthClient {
             client_id: self.client_id,
             client_secret: self.client_credential,
             client_type,
+            token_endpoint_auth_method,
             redirect_uris: self.redirect_uris,
             allowed_scopes: self.allowed_scopes,
             name: self.name,
@@ -2395,6 +2468,9 @@ pub struct TokenRequest {
     pub client_id: String,
     /// Client secret (for confidential clients).
     pub client_secret: Option<String>,
+    /// Credential location admitted by the caller before decoding this request.
+    /// It must match the client's registered method exactly.
+    pub client_authentication_method: TokenEndpointAuthMethod,
     /// PKCE code verifier.
     pub code_verifier: Option<String>,
     /// Refresh token (for refresh_token grant).
@@ -2414,6 +2490,10 @@ impl std::fmt::Debug for TokenRequest {
             .field("redirect_uri_present", &self.redirect_uri.is_some())
             .field("client_id_len", &self.client_id.len())
             .field("client_secret_present", &self.client_secret.is_some())
+            .field(
+                "client_authentication_method",
+                &self.client_authentication_method,
+            )
             .field("code_verifier_present", &self.code_verifier.is_some())
             .field("refresh_token_present", &self.refresh_token.is_some())
             .field("scope_count", &self.scopes.as_ref().map_or(0, Vec::len))
@@ -2959,6 +3039,7 @@ impl OAuthServer {
         &self,
         client_id: &str,
         client_secret: Option<&str>,
+        method: TokenEndpointAuthMethod,
     ) -> Result<
         (
             std::sync::RwLockWriteGuard<'_, OAuthServerState>,
@@ -2972,7 +3053,8 @@ impl OAuthServer {
             .state
             .write()
             .map_err(|_| OAuthError::ServerError("failed to acquire write lock".to_string()))?;
-        let registration_epoch = authenticate_client_or_dummy(&state, client_id, client_secret)?;
+        let registration_epoch =
+            authenticate_client_or_dummy(&state, client_id, client_secret, method)?;
         let now = Instant::now();
         state.cleanup_expired_at(now);
         Ok((state, now, registration_epoch))
@@ -2985,6 +3067,7 @@ impl OAuthServer {
         &self,
         client_id: &str,
         client_secret: Option<&str>,
+        method: TokenEndpointAuthMethod,
         resource_matches: F,
     ) -> Result<
         (
@@ -3005,7 +3088,8 @@ impl OAuthServer {
         if !resource_matches(&state) {
             return Err(invalid_grant_error());
         }
-        let registration_epoch = authenticate_client_or_dummy(&state, client_id, client_secret)?;
+        let registration_epoch =
+            authenticate_client_or_dummy(&state, client_id, client_secret, method)?;
         let now = Instant::now();
         state.cleanup_expired_at(now);
         Ok((state, now, registration_epoch))
@@ -3548,6 +3632,7 @@ impl OAuthServer {
             .state_for_authenticated_resource_checked_mutation(
                 &request.client_id,
                 request.client_secret.as_deref(),
+                request.client_authentication_method,
                 |state| {
                     state
                         .authorization_codes
@@ -3678,6 +3763,7 @@ impl OAuthServer {
             .state_for_authenticated_resource_checked_mutation(
                 &request.client_id,
                 request.client_secret.as_deref(),
+                request.client_authentication_method,
                 |state| {
                     state
                         .refresh_tokens
@@ -3944,11 +4030,14 @@ impl OAuthServer {
     /// Revokes a token (access or refresh).
     ///
     /// Per RFC 7009, this always returns success even if the token was not found.
+    /// The caller must supply the credential method admitted at its transport
+    /// boundary; a different registered method is rejected before any mutation.
     pub fn revoke(
         &self,
         token: &str,
         client_id: &str,
         client_secret: Option<&str>,
+        method: TokenEndpointAuthMethod,
     ) -> Result<(), OAuthError> {
         validate_client_authentication_admission(client_id, client_secret)?;
         if token.len() > OAUTH_OPAQUE_CREDENTIAL_BYTES || token.chars().any(char::is_control) {
@@ -3966,7 +4055,7 @@ impl OAuthServer {
             })
             .transpose()?;
         let (mut state, now, _) =
-            self.state_for_authenticated_mutation(client_id, client_secret)?;
+            self.state_for_authenticated_mutation(client_id, client_secret, method)?;
 
         // Perform the ownership check and deletion under the same write lock.
         // In particular, never remove first and discover afterward that the
@@ -4467,6 +4556,7 @@ fn authenticate_client_or_dummy(
     state: &OAuthServerState,
     client_id: &str,
     client_secret: Option<&str>,
+    method: TokenEndpointAuthMethod,
 ) -> Result<OAuthRegistrationEpoch, OAuthError> {
     let client = state.clients.get(client_id);
     let authenticated = client.map_or_else(
@@ -4475,7 +4565,7 @@ fn authenticate_client_or_dummy(
             perform_dummy_client_secret_verification(provided.as_bytes());
             false
         },
-        |client| client.authenticate(client_secret),
+        |client| client.authenticate(client_secret, method),
     );
     if !authenticated {
         return Err(OAuthError::InvalidClient(
@@ -5525,6 +5615,7 @@ mod tests {
                 redirect_uri: Some(redirect_uri.to_string()),
                 client_id: client_id.to_string(),
                 client_secret: None,
+                client_authentication_method: TokenEndpointAuthMethod::None,
                 code_verifier: Some(code_verifier),
                 refresh_token: None,
                 scopes: None,
@@ -6547,6 +6638,7 @@ mod tests {
             redirect_uri: None,
             client_id: client_id.to_string(),
             client_secret: None,
+            client_authentication_method: TokenEndpointAuthMethod::None,
             code_verifier: None,
             refresh_token: Some(refresh_token.to_string()),
             scopes: None,
@@ -6561,6 +6653,7 @@ mod tests {
             redirect_uri: Some("http://127.0.0.1/callback".to_string()),
             client_id: client_id.to_string(),
             client_secret: None,
+            client_authentication_method: TokenEndpointAuthMethod::None,
             code_verifier: Some("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".to_string()),
             refresh_token: None,
             scopes: None,
@@ -7234,6 +7327,7 @@ mod tests {
             .unwrap();
         let mut exchange = bounded_code_exchange_request("public", &code);
         exchange.client_secret = Some("must-not-be-accepted".to_string());
+        exchange.client_authentication_method = TokenEndpointAuthMethod::ClientSecretPost;
 
         let exchange_error = server.token(&exchange).unwrap_err();
         assert_eq!(exchange_error.error_code(), "invalid_client");
@@ -7260,12 +7354,18 @@ mod tests {
         let refresh = issued.refresh_token.as_deref().unwrap();
         let mut refresh_request = bounded_refresh_request("public", refresh);
         refresh_request.client_secret = Some("must-not-be-accepted".to_string());
+        refresh_request.client_authentication_method = TokenEndpointAuthMethod::ClientSecretPost;
         let refresh_error = server.token(&refresh_request).unwrap_err();
         assert_eq!(refresh_error.error_code(), "invalid_client");
         assert_eq!(refresh_error.description(), exchange_error.description());
 
         let revoke_error = server
-            .revoke(&issued.access_token, "public", Some("must-not-be-accepted"))
+            .revoke(
+                &issued.access_token,
+                "public",
+                Some("must-not-be-accepted"),
+                TokenEndpointAuthMethod::ClientSecretPost,
+            )
             .unwrap_err();
         assert_eq!(revoke_error.error_code(), "invalid_client");
         assert_eq!(revoke_error.description(), exchange_error.description());
@@ -7285,6 +7385,7 @@ mod tests {
         let absent_credential = base64url_encode(&[0x77_u8; 32]);
         let mut code_request = bounded_code_exchange_request("confidential", &absent_credential);
         code_request.client_secret = Some("wrong-secret".to_string());
+        code_request.client_authentication_method = TokenEndpointAuthMethod::ClientSecretBasic;
         let wrong_secret = server.token(&code_request).unwrap_err();
 
         code_request.client_id = "unknown-client".to_string();
@@ -7299,9 +7400,163 @@ mod tests {
 
         let mut refresh_request = bounded_refresh_request("confidential", &absent_credential);
         refresh_request.client_secret = Some("wrong-secret".to_string());
+        refresh_request.client_authentication_method = TokenEndpointAuthMethod::ClientSecretBasic;
         let refresh_error = server.token(&refresh_request).unwrap_err();
         assert_eq!(refresh_error.error_code(), "invalid_client");
         assert_eq!(refresh_error.description(), wrong_secret.description());
+    }
+
+    #[test]
+    fn client_authentication_method_defaults_and_registration_class_are_exact() {
+        let public = bounded_test_client("public-method");
+        assert_eq!(
+            public.token_endpoint_auth_method,
+            TokenEndpointAuthMethod::None,
+        );
+        let confidential = OAuthClient::builder("basic-method")
+            .secret("registered-secret")
+            .redirect_uri("http://127.0.0.1/callback")
+            .build()
+            .unwrap();
+        assert_eq!(
+            confidential.token_endpoint_auth_method,
+            TokenEndpointAuthMethod::ClientSecretBasic,
+        );
+        let post = OAuthClient::builder("post-method")
+            .token_endpoint_auth_method(TokenEndpointAuthMethod::ClientSecretPost)
+            .secret("registered-secret")
+            .redirect_uri("http://127.0.0.1/callback")
+            .build()
+            .unwrap();
+        let server = OAuthServer::with_defaults();
+        server.register_client(public).unwrap();
+        server.register_client(confidential).unwrap();
+        server.register_client(post).unwrap();
+        assert_eq!(
+            server.get_client("post-method").unwrap().token_endpoint_auth_method,
+            TokenEndpointAuthMethod::ClientSecretPost,
+        );
+        for method in [
+            TokenEndpointAuthMethod::ClientSecretBasic,
+            TokenEndpointAuthMethod::ClientSecretPost,
+        ] {
+            assert!(
+                OAuthClient::builder("public-rejected")
+                    .token_endpoint_auth_method(method)
+                    .redirect_uri("http://127.0.0.1/callback")
+                    .build()
+                    .is_err(),
+            );
+        }
+        assert!(
+            OAuthClient::builder("confidential-rejected")
+                .secret("registered-secret")
+                .token_endpoint_auth_method(TokenEndpointAuthMethod::None)
+                .redirect_uri("http://127.0.0.1/callback")
+                .build()
+                .is_err(),
+        );
+        assert_registration_rejects_mutation(
+            |client| client.token_endpoint_auth_method = TokenEndpointAuthMethod::ClientSecretPost,
+            "client authentication method does not match credential class",
+        );
+    }
+
+    #[test]
+    fn registered_authentication_method_rejects_substitution_without_grant_mutation() {
+        for (registered, substituted, secret) in [
+            (
+                TokenEndpointAuthMethod::ClientSecretBasic,
+                TokenEndpointAuthMethod::ClientSecretPost,
+                Some("registered-secret"),
+            ),
+            (
+                TokenEndpointAuthMethod::ClientSecretPost,
+                TokenEndpointAuthMethod::ClientSecretBasic,
+                Some("registered-secret"),
+            ),
+            (
+                TokenEndpointAuthMethod::None,
+                TokenEndpointAuthMethod::ClientSecretBasic,
+                None,
+            ),
+        ] {
+            let backend = Arc::new(CountingApprovalBackend::new(ApprovalTestMode::Exact));
+            let server = server_with_counting_approval(backend);
+            let mut client = OAuthClient::builder("method-bound")
+                .token_endpoint_auth_method(registered)
+                .redirect_uri("http://127.0.0.1/callback");
+            if let Some(secret) = secret {
+                client = client.secret(secret);
+            }
+            server.register_client(client.build().unwrap()).unwrap();
+            let (code, _) = server
+                .authorize(&bounded_authorization_request("method-bound"))
+                .unwrap();
+            let cleanup_canary =
+                insert_expired_authorization_code_cleanup_canary(&server, "method-bound");
+            let before = server.stats();
+            let mut request = bounded_code_exchange_request("method-bound", &code);
+            request.client_secret = secret.map(str::to_string);
+            request.client_authentication_method = substituted;
+            let error = server.token(&request).unwrap_err();
+            assert_eq!(error.error_code(), "invalid_client");
+            assert_oauth_stats_unchanged(&before, &server.stats());
+            {
+                let state = server.state.read().unwrap();
+                assert!(
+                    state.authorization_codes.contains_key(&authorization_code_digest(&code)),
+                );
+                assert!(state.authorization_codes.contains_key(&cleanup_canary));
+            }
+
+            // Only the claimed credential method changes; the client, secret,
+            // code, redirect URI and PKCE verifier remain byte-for-byte equal.
+            request.client_authentication_method = registered;
+            let issued = server
+                .token(&request)
+                .expect("registered method redeems the same code");
+            let refresh = issued.refresh_token.as_ref().unwrap();
+            let cleanup_canary =
+                insert_expired_authorization_code_cleanup_canary(&server, "method-bound");
+            let before = server.stats();
+            let refresh_digest = refresh_token_digest(refresh);
+            let retained_refresh =
+                server.state.read().unwrap().refresh_tokens[&refresh_digest].clone();
+            let mut request = bounded_refresh_request("method-bound", refresh);
+            request.client_secret = secret.map(str::to_string);
+            request.client_authentication_method = substituted;
+            assert_eq!(
+                server.token(&request).unwrap_err().error_code(),
+                "invalid_client",
+            );
+            assert_eq!(
+                server
+                    .revoke(refresh, "method-bound", secret, substituted)
+                    .unwrap_err()
+                    .error_code(),
+                "invalid_client",
+            );
+            assert_oauth_stats_unchanged(&before, &server.stats());
+            {
+                let state = server.state.read().unwrap();
+                assert_retained_token_unchanged(
+                    &retained_refresh,
+                    &state.refresh_tokens[&refresh_digest],
+                );
+                assert!(state.authorization_codes.contains_key(&cleanup_canary));
+            }
+            assert!(server.validate_access_token(&issued.access_token).is_some());
+            request.client_authentication_method = registered;
+            let successor = server
+                .token(&request)
+                .expect("registered method rotates the same refresh");
+            let successor_refresh = successor.refresh_token.as_ref().unwrap();
+            server
+                .revoke(successor_refresh, "method-bound", secret, registered)
+                .unwrap();
+            assert!(server.validate_access_token(&successor.access_token).is_none());
+        }
     }
 
     #[test]
@@ -7677,6 +7932,7 @@ mod tests {
             redirect_uri: None,
             client_id: "client".to_string(),
             client_secret: None,
+            client_authentication_method: TokenEndpointAuthMethod::None,
             code_verifier: None,
             refresh_token: Some(refresh_token.clone()),
             scopes: None,
@@ -7811,7 +8067,12 @@ mod tests {
 
         // Revoke the token
         server
-            .revoke(&token_response.access_token, "test-client", None)
+            .revoke(
+                &token_response.access_token,
+                "test-client",
+                None,
+                TokenEndpointAuthMethod::None,
+            )
             .unwrap();
 
         // Token should no longer be valid
@@ -8514,6 +8775,7 @@ mod tests {
             redirect_uri: Some("http://127.0.0.1/cb".to_string()),
             client_id: "c".to_string(),
             client_secret: None,
+            client_authentication_method: TokenEndpointAuthMethod::None,
             code_verifier: Some("verifier".to_string()),
             refresh_token: None,
             scopes: None,
@@ -8594,6 +8856,7 @@ mod tests {
             redirect_uri: Some(format!("https://{CANARY}.example/token")),
             client_id: format!("client-{CANARY}"),
             client_secret: Some(format!("secret-{CANARY}")),
+            client_authentication_method: TokenEndpointAuthMethod::ClientSecretBasic,
             code_verifier: Some(format!("verifier-{CANARY}")),
             refresh_token: Some(format!("refresh-{CANARY}")),
             scopes: Some(vec![format!("scope-{CANARY}")]),
@@ -8842,6 +9105,7 @@ mod tests {
             redirect_uri: None,
             client_id: "c".to_string(),
             client_secret: None,
+            client_authentication_method: TokenEndpointAuthMethod::None,
             code_verifier: None,
             refresh_token: None,
             scopes: None,
@@ -8860,6 +9124,7 @@ mod tests {
             redirect_uri: Some("http://127.0.0.1/cb".to_string()),
             client_id: "c".to_string(),
             client_secret: None,
+            client_authentication_method: TokenEndpointAuthMethod::None,
             code_verifier: Some("v".repeat(43)),
             refresh_token: None,
             scopes: None,
@@ -8878,6 +9143,7 @@ mod tests {
             redirect_uri: None, // missing
             client_id: "c".to_string(),
             client_secret: None,
+            client_authentication_method: TokenEndpointAuthMethod::None,
             code_verifier: Some("v".repeat(43)),
             refresh_token: None,
             scopes: None,
@@ -8896,6 +9162,7 @@ mod tests {
             redirect_uri: Some("http://127.0.0.1/cb".to_string()),
             client_id: "c".to_string(),
             client_secret: None,
+            client_authentication_method: TokenEndpointAuthMethod::None,
             code_verifier: None, // missing
             refresh_token: None,
             scopes: None,
@@ -8944,6 +9211,7 @@ mod tests {
             redirect_uri: Some("http://127.0.0.1/cb".to_string()),
             client_id: "c".to_string(),
             client_secret: None,
+            client_authentication_method: TokenEndpointAuthMethod::None,
             code_verifier: Some(verifier.to_string()),
             refresh_token: None,
             scopes: None,
@@ -8995,6 +9263,7 @@ mod tests {
             redirect_uri: Some("http://127.0.0.1/cb".to_string()),
             client_id: "c".to_string(),
             client_secret: None,
+            client_authentication_method: TokenEndpointAuthMethod::None,
             code_verifier: Some(verifier.to_string()),
             refresh_token: None,
             scopes: None,
@@ -9035,6 +9304,7 @@ mod tests {
             redirect_uri: Some("http://127.0.0.1/cb".to_string()),
             client_id: "c".to_string(),
             client_secret: None,
+            client_authentication_method: TokenEndpointAuthMethod::None,
             code_verifier: Some(verifier.to_string()),
             refresh_token: None,
             scopes: None,
@@ -9234,6 +9504,7 @@ mod tests {
                 redirect_uri: None,
                 client_id: "c1".to_string(),
                 client_secret: None,
+                client_authentication_method: TokenEndpointAuthMethod::None,
                 code_verifier: None,
                 refresh_token: Some(refresh.clone()),
                 scopes: None,
@@ -9282,6 +9553,7 @@ mod tests {
                 redirect_uri: None,
                 client_id: "c1".to_string(),
                 client_secret: None,
+                client_authentication_method: TokenEndpointAuthMethod::None,
                 code_verifier: None,
                 refresh_token: Some(refresh),
                 scopes: Some(vec!["read".to_string()]),
@@ -9319,6 +9591,7 @@ mod tests {
                 redirect_uri: None,
                 client_id: "c1".to_string(),
                 client_secret: None,
+                client_authentication_method: TokenEndpointAuthMethod::None,
                 code_verifier: None,
                 refresh_token: Some(refresh),
                 scopes: Some(vec!["admin".to_string()]),
@@ -9350,7 +9623,9 @@ mod tests {
         let refresh = token_resp.refresh_token.unwrap();
 
         // Revoking a refresh token invalidates the complete grant family.
-        server.revoke(&refresh, "c1", None).unwrap();
+        server
+            .revoke(&refresh, "c1", None, TokenEndpointAuthMethod::None)
+            .unwrap();
         assert!(server.validate_access_token(&access).is_none());
 
         // Refresh should now fail
@@ -9361,6 +9636,7 @@ mod tests {
                 redirect_uri: None,
                 client_id: "c1".to_string(),
                 client_secret: None,
+                client_authentication_method: TokenEndpointAuthMethod::None,
                 code_verifier: None,
                 refresh_token: Some(refresh),
                 scopes: None,
@@ -9405,6 +9681,7 @@ mod tests {
                 redirect_uri: None,
                 client_id: "c2".to_string(),
                 client_secret: None,
+                client_authentication_method: TokenEndpointAuthMethod::None,
                 code_verifier: None,
                 refresh_token: Some(refresh),
                 scopes: None,
@@ -9432,6 +9709,7 @@ mod tests {
                 redirect_uri: None,
                 client_id: "c1".to_string(),
                 client_secret: None,
+                client_authentication_method: TokenEndpointAuthMethod::None,
                 code_verifier: None,
                 refresh_token: None,
                 scopes: None,
@@ -9459,6 +9737,7 @@ mod tests {
                 redirect_uri: None,
                 client_id: "c1".to_string(),
                 client_secret: None,
+                client_authentication_method: TokenEndpointAuthMethod::None,
                 code_verifier: None,
                 refresh_token: Some("nonexistent".to_string()),
                 scopes: None,
@@ -9506,6 +9785,7 @@ mod tests {
                 redirect_uri: Some("http://127.0.0.1/cb2".to_string()),
                 client_id: "c1".to_string(),
                 client_secret: None,
+                client_authentication_method: TokenEndpointAuthMethod::None,
                 code_verifier: Some(verifier.to_string()),
                 refresh_token: None,
                 scopes: None,
@@ -9563,6 +9843,7 @@ mod tests {
                 redirect_uri: Some("http://127.0.0.1/cb".to_string()),
                 client_id: "c2".to_string(),
                 client_secret: None,
+                client_authentication_method: TokenEndpointAuthMethod::None,
                 code_verifier: Some(verifier.to_string()),
                 refresh_token: None,
                 scopes: None,
@@ -9615,6 +9896,7 @@ mod tests {
                 redirect_uri: Some("http://127.0.0.1/cb".to_string()),
                 client_id: "c1".to_string(),
                 client_secret: Some("wrong-secret".to_string()),
+                client_authentication_method: TokenEndpointAuthMethod::ClientSecretBasic,
                 code_verifier: Some(verifier.to_string()),
                 refresh_token: None,
                 scopes: None,
@@ -9662,6 +9944,7 @@ mod tests {
             redirect_uri: Some("http://127.0.0.1/cb".to_string()),
             client_id: "c1".to_string(),
             client_secret: None,
+            client_authentication_method: TokenEndpointAuthMethod::None,
             code_verifier: Some(code_verifier.to_string()),
             refresh_token: None,
             scopes: None,
@@ -9859,7 +10142,9 @@ mod tests {
         server.register_client(client).unwrap();
 
         // Per RFC 7009, revoking an unknown token is not an error
-        server.revoke("no-such-token", "c1", None).unwrap();
+        server
+            .revoke("no-such-token", "c1", None, TokenEndpointAuthMethod::None)
+            .unwrap();
     }
 
     #[test]
@@ -9892,8 +10177,12 @@ mod tests {
 
         // c2 tries to revoke c1's tokens — both calls succeed silently, but
         // neither token may be removed or marked revoked.
-        server.revoke(&token_resp.access_token, "c2", None).unwrap();
-        server.revoke(&refresh_token, "c2", None).unwrap();
+        server
+            .revoke(&token_resp.access_token, "c2", None, TokenEndpointAuthMethod::None)
+            .unwrap();
+        server
+            .revoke(&refresh_token, "c2", None, TokenEndpointAuthMethod::None)
+            .unwrap();
 
         // Token remains active and was not added to the global revocation set.
         assert!(
@@ -9922,7 +10211,9 @@ mod tests {
     #[test]
     fn server_revoke_unknown_client_fails() {
         let server = OAuthServer::with_defaults();
-        let err = server.revoke("some-token", "unknown", None).unwrap_err();
+        let err = server
+            .revoke("some-token", "unknown", None, TokenEndpointAuthMethod::None)
+            .unwrap_err();
         assert_eq!(err.error_code(), "invalid_client");
     }
 
@@ -10015,7 +10306,9 @@ mod tests {
         );
 
         assert!(server.validate_access_token(&resp.access_token).is_some());
-        server.revoke(&resp.access_token, "c1", None).unwrap();
+        server
+            .revoke(&resp.access_token, "c1", None, TokenEndpointAuthMethod::None)
+            .unwrap();
         assert!(server.validate_access_token(&resp.access_token).is_none());
     }
 
@@ -10469,6 +10762,7 @@ mod tests {
                 redirect_uri: Some("http://127.0.0.1/cb".to_string()),
                 client_id: "c1".to_string(),
                 client_secret: Some("correct-secret".to_string()),
+                client_authentication_method: TokenEndpointAuthMethod::ClientSecretBasic,
                 code_verifier: Some(verifier.to_string()),
                 refresh_token: None,
                 scopes: None,
@@ -10486,6 +10780,7 @@ mod tests {
                 redirect_uri: None,
                 client_id: "c1".to_string(),
                 client_secret: Some("wrong-secret".to_string()),
+                client_authentication_method: TokenEndpointAuthMethod::ClientSecretBasic,
                 code_verifier: None,
                 refresh_token: Some(refresh.clone()),
                 scopes: None,
@@ -10505,6 +10800,7 @@ mod tests {
                 redirect_uri: None,
                 client_id: "c1".to_string(),
                 client_secret: Some(one_past_secret.clone()),
+                client_authentication_method: TokenEndpointAuthMethod::ClientSecretBasic,
                 code_verifier: None,
                 refresh_token: Some(refresh),
                 scopes: None,
@@ -10573,7 +10869,9 @@ mod tests {
             .unwrap();
         server.register_client(client).unwrap();
 
-        let err = server.revoke("any-token", "c1", Some("wrong")).unwrap_err();
+        let err = server
+            .revoke("any-token", "c1", Some("wrong"), TokenEndpointAuthMethod::ClientSecretBasic)
+            .unwrap_err();
         assert_eq!(err.error_code(), "invalid_client");
     }
 
@@ -10599,6 +10897,7 @@ mod tests {
 
         let mut request = bounded_refresh_request("c1", &refresh);
         request.client_secret = Some("correct".to_string());
+        request.client_authentication_method = TokenEndpointAuthMethod::ClientSecretBasic;
         let rotated = server
             .token(&request)
             .expect("valid client authentication must rotate the refresh grant");
@@ -10638,6 +10937,7 @@ mod tests {
 
         let mut denied = bounded_refresh_request("c1", &refresh);
         denied.client_secret = Some("wrong".to_string());
+        denied.client_authentication_method = TokenEndpointAuthMethod::ClientSecretBasic;
         let error = server
             .token(&denied)
             .expect_err("wrong client authentication must deny refresh");
@@ -10655,6 +10955,7 @@ mod tests {
 
         let mut valid = bounded_refresh_request("c1", &refresh);
         valid.client_secret = Some("correct".to_string());
+        valid.client_authentication_method = TokenEndpointAuthMethod::ClientSecretBasic;
         let rotated = server
             .token(&valid)
             .expect("the unchanged refresh remains reusable after denial");
@@ -10679,7 +10980,12 @@ mod tests {
         let before = server.stats();
 
         let error = server
-            .revoke(&issued.access_token, "c1", Some("wrong"))
+            .revoke(
+                &issued.access_token,
+                "c1",
+                Some("wrong"),
+                TokenEndpointAuthMethod::ClientSecretBasic,
+            )
             .expect_err("wrong client authentication must deny revocation");
         assert!(matches!(error, OAuthError::InvalidClient(_)));
         assert_oauth_stats_unchanged(&before, &server.stats());
@@ -10694,7 +11000,12 @@ mod tests {
         );
 
         server
-            .revoke(&issued.access_token, "c1", Some("correct"))
+            .revoke(
+                &issued.access_token,
+                "c1",
+                Some("correct"),
+                TokenEndpointAuthMethod::ClientSecretBasic,
+            )
             .expect("valid client authentication must revoke the token");
         assert!(server.validate_access_token(&issued.access_token).is_none());
     }
@@ -10786,6 +11097,7 @@ mod tests {
                 redirect_uri: None,
                 client_id: "c1".to_string(),
                 client_secret: None,
+                client_authentication_method: TokenEndpointAuthMethod::None,
                 code_verifier: None,
                 refresh_token: Some(refresh),
                 scopes: None,
@@ -10835,7 +11147,9 @@ mod tests {
         let refresh = resp.refresh_token.unwrap();
 
         // Revoke the refresh token specifically
-        server.revoke(&refresh, "c1", None).unwrap();
+        server
+            .revoke(&refresh, "c1", None, TokenEndpointAuthMethod::None)
+            .unwrap();
         assert!(server.validate_access_token(&access).is_none());
 
         // Verify it's in revoked set
@@ -10871,7 +11185,9 @@ mod tests {
         assert_ne!(first_grant, second_grant);
         drop(state);
 
-        server.revoke(&first_refresh, "c1", None).unwrap();
+        server
+            .revoke(&first_refresh, "c1", None, TokenEndpointAuthMethod::None)
+            .unwrap();
 
         assert!(server.validate_access_token(&first.access_token).is_none());
         assert!(server.validate_access_token(&second.access_token).is_some());
@@ -11557,7 +11873,9 @@ mod tests {
                 .contains_key(&authorization_code_digest(&code))
         );
 
-        server.revoke(&blocker.access_token, "c1", None).unwrap();
+        server
+            .revoke(&blocker.access_token, "c1", None, TokenEndpointAuthMethod::None)
+            .unwrap();
         server.token(&request).unwrap();
         assert!(
             !server
@@ -11599,7 +11917,9 @@ mod tests {
                 .contains_key(&authorization_code_digest(&code))
         );
 
-        server.revoke(&blocker_refresh, "c1", None).unwrap();
+        server
+            .revoke(&blocker_refresh, "c1", None, TokenEndpointAuthMethod::None)
+            .unwrap();
         server.token(&request).unwrap();
         assert!(
             !server
@@ -11687,7 +12007,9 @@ mod tests {
             assert_eq!(state.refresh_tokens.len(), 1);
         }
 
-        server.revoke(&old_access, "c1", None).unwrap();
+        server
+            .revoke(&old_access, "c1", None, TokenEndpointAuthMethod::None)
+            .unwrap();
         let retried = server.token(&request).unwrap();
         let rotated = retried.refresh_token.expect("rotated refresh token");
         assert_ne!(rotated, old_refresh);
@@ -12021,8 +12343,12 @@ mod tests {
             .expect("stored refresh token")
             .expires_at;
 
-        server.revoke(&first.access_token, "c1", None).unwrap();
-        server.revoke(&first_refresh, "c1", None).unwrap();
+        server
+            .revoke(&first.access_token, "c1", None, TokenEndpointAuthMethod::None)
+            .unwrap();
+        server
+            .revoke(&first_refresh, "c1", None, TokenEndpointAuthMethod::None)
+            .unwrap();
         {
             let state = server.state.read().unwrap();
             assert_eq!(state.revoked_tokens.len(), 1);
@@ -12037,9 +12363,13 @@ mod tests {
             );
         }
 
-        server.revoke(&second.access_token, "c2", None).unwrap();
+        server
+            .revoke(&second.access_token, "c2", None, TokenEndpointAuthMethod::None)
+            .unwrap();
         assert_eq!(server.stats().revoked_tokens, 2);
-        server.revoke(&third.access_token, "c3", None).unwrap();
+        server
+            .revoke(&third.access_token, "c3", None, TokenEndpointAuthMethod::None)
+            .unwrap();
 
         let state = server.state.read().unwrap();
         assert_eq!(state.revoked_tokens.len(), 2);
