@@ -10943,14 +10943,15 @@ mod tests {
     }
 
     #[cfg(feature = "legacy-2024-11-05")]
+    /// The pending-event count bound applies to the events one native body
+    /// frame completes, and the native client reads 8 KiB frames. Each message
+    /// here is 10 bytes, so a whole LIMIT-01 backlog of 256 events fits in one
+    /// frame and the count bound, not the frame size, decides the outcome.
+    /// The retained events are counted, never decoded.
     fn legacy_sse_body_with_messages(message_target: &str, message_count: usize) -> String {
         let mut body = format!("event: endpoint\ndata: {message_target}\n\n");
-        for index in 0..message_count {
-            write!(
-                &mut body,
-                "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":{index},\"result\":{{}}}}\n\n"
-            )
-            .expect("writing a legacy SSE frame into a String cannot fail");
+        for _ in 0..message_count {
+            body.push_str("data: {}\n\n");
         }
         body
     }
