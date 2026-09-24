@@ -8,6 +8,9 @@
 //! send-obligation admission are reserved before publication. Dropping a pending
 //! operation releases its waiter without publishing or consuming a message.
 //! Successful publication is never subsequently reported as cancellation.
+//! Context checkpoints respect cancellation masking and enforce deadline,
+//! poll-quota, and cost-quota exhaustion before admission. Channel polling
+//! repeats these checks while an operation waits for readiness.
 
 use asupersync::{Cx, channel::mpsc};
 use fastmcp_protocol::JsonRpcMessage;
@@ -71,9 +74,9 @@ async fn send_message(
     if *closed || sender.is_none() {
         return Err(TransportError::Closed);
     }
-    if cx.is_cancel_requested() {
-        return Err(TransportError::Cancelled);
-    }
+    // Check before serialization as well as at channel reservation. A raw
+    // cancellation flag would bypass budget enforcement and override masks.
+    cx.checkpoint().map_err(|_| TransportError::Cancelled)?;
     // Validate before waiting: a full queue must not hide an invalid or
     // oversized message behind an indefinitely pending reservation.
     let queued = encode_message(codec, message)?;
@@ -101,9 +104,9 @@ async fn recv_source(
     if *closed {
         return Err(TransportError::Closed);
     }
-    if cx.is_cancel_requested() {
-        return Err(TransportError::Cancelled);
-    }
+    // The channel checkpoints before each dequeue, including after a wake.
+    // Do not override its masking semantics with a raw flag preflight or
+    // discard a received frame through a post-dequeue checkpoint.
     match receiver.recv(cx).await {
         Ok(frame) => Ok(frame.source),
         Err(mpsc::RecvError::Disconnected) => {
@@ -173,9 +176,8 @@ async fn reserve_send<'a>(
     if *closed || sender.is_none() {
         return Err(TransportError::Closed);
     }
-    if cx.is_cancel_requested() {
-        return Err(TransportError::Cancelled);
-    }
+    // Checked reservation already checkpoints on every poll. Its successful
+    // admission is the cancellation boundary; commit must remain unchecked.
     match sender
         .as_ref()
         .ok_or(TransportError::Closed)?
@@ -850,5 +852,172 @@ mod tests {
         let cx = Cx::for_testing();
         assert_future_send(client.reserve_send_async(&cx));
         assert_future_send(send.reserve_send_async(&cx));
+    }
+
+    fn stopped_contexts() -> [Cx; 4] {
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        [
+            cancelled,
+            Cx::for_testing_with_budget(
+                asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+            ),
+            Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(0)),
+            Cx::for_testing_with_budget(asupersync::Budget::new().with_cost_quota(0)),
+        ]
+    }
+
+    #[test]
+    fn async_send_budget_checkpoint_precedes_encoding_without_mutating_queue() {
+        for stopped in stopped_contexts() {
+            let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
+            let live = Cx::for_testing();
+            client.send(&live, &request(81)).unwrap();
+            let invalid = JsonRpcMessage::Response(JsonRpcResponse {
+                jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+                result: None,
+                error: None,
+                id: Some(RequestId::Number(82)),
+            });
+            assert!(matches!(
+                ready(client.send_async(&stopped, &invalid)),
+                Err(TransportError::Cancelled)
+            ));
+            assert_eq!(server.receiver.len(), 1);
+            assert!(!client.is_closed());
+            assert!(matches!(
+                ready(client.send_async(&live, &invalid)),
+                Err(TransportError::Codec(_))
+            ));
+            assert_eq!(server.receiver.len(), 1);
+            assert_eq!(
+                request_id(ready(server.recv_async(&live)).unwrap()),
+                RequestId::Number(81)
+            );
+            ready(client.send_async(&live, &request(83))).unwrap();
+            assert_eq!(
+                request_id(ready(server.recv_async(&live)).unwrap()),
+                RequestId::Number(83)
+            );
+        }
+    }
+
+    #[test]
+    fn async_masked_split_round_trip_preserves_source_and_defers_stops() {
+        for stopped in stopped_contexts() {
+            let (client, server) = create_memory_transport_pair_with_capacity(1);
+            let (_client_recv, mut send) = client.into_split();
+            let (mut recv, _server_send) = server.into_split();
+            let request = JsonRpcRequest::new("masked/async", None, 84_i64);
+            let expected = Codec::new().encode_request(&request).unwrap();
+            let message = JsonRpcMessage::Request(request);
+            assert!(matches!(
+                ready(send.send_async(&stopped, &message)),
+                Err(TransportError::Cancelled)
+            ));
+            assert_eq!(recv.receiver.as_ref().unwrap().len(), 0);
+            stopped.masked(|| ready(send.send_async(&stopped, &message)).unwrap());
+            assert!(matches!(
+                ready(recv.recv_with_source_async(&stopped)),
+                Err(TransportError::Cancelled)
+            ));
+            assert_eq!(recv.receiver.as_ref().unwrap().len(), 1);
+            stopped.masked(|| {
+                let frame = ready(recv.recv_with_source_async(&stopped)).unwrap();
+                assert_eq!(frame.source(), expected.strip_suffix(b"\n").unwrap());
+                assert_eq!(request_id(frame.into_message()), RequestId::Number(84));
+            });
+            assert_eq!(recv.receiver.as_ref().unwrap().len(), 0);
+            assert!(!send.is_closed());
+            assert!(!recv.is_closed());
+            assert!(matches!(
+                ready(recv.recv_async(&stopped)),
+                Err(TransportError::Cancelled)
+            ));
+        }
+    }
+
+    #[test]
+    fn async_masked_reservation_commits_after_mask_exits() {
+        for stopped in stopped_contexts() {
+            let (client, mut server) = create_memory_transport_pair_with_capacity(1);
+            let (_recv, mut send) = client.into_split();
+            assert!(matches!(
+                ready(send.reserve_send_async(&stopped)),
+                Err(TransportError::Cancelled)
+            ));
+            let permit = stopped.masked(|| ready(send.reserve_send_async(&stopped)).unwrap());
+            assert_eq!(server.receiver.len(), 0);
+            assert!(stopped.checkpoint().is_err());
+            // The reservation succeeded under the mask. Ending that mask is
+            // not permission to report an already admitted commit as cancelled.
+            permit.send(&request(85)).unwrap();
+            let live = Cx::for_testing();
+            assert_eq!(
+                request_id(ready(server.recv_async(&live)).unwrap()),
+                RequestId::Number(85)
+            );
+            assert!(matches!(
+                ready(send.reserve_send_async(&stopped)),
+                Err(TransportError::Cancelled)
+            ));
+            assert!(!send.is_closed());
+            ready(send.reserve_send_async(&live))
+                .unwrap()
+                .send(&request(86))
+                .unwrap();
+            assert_eq!(
+                request_id(ready(server.recv_async(&live)).unwrap()),
+                RequestId::Number(86)
+            );
+        }
+    }
+
+    #[test]
+    fn async_masked_pending_send_cancels_after_unmask_without_leaking_capacity() {
+        let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
+        let live = Cx::for_testing();
+        let stopped = Cx::for_testing();
+        stopped.set_cancel_requested(true);
+        client.send(&live, &request(87)).unwrap();
+        let second = request(88);
+        {
+            let mut sending = pin!(client.send_async(&stopped, &second));
+            stopped.masked(|| assert!(poll(sending.as_mut(), Waker::noop()).is_pending()));
+            assert!(matches!(
+                poll(sending.as_mut(), Waker::noop()),
+                Poll::Ready(Err(TransportError::Cancelled))
+            ));
+        }
+        assert_eq!(server.receiver.len(), 1);
+        assert_eq!(request_id(server.recv(&live).unwrap()), RequestId::Number(87));
+        ready(client.send_async(&live, &request(89))).unwrap();
+        assert_eq!(request_id(server.recv(&live).unwrap()), RequestId::Number(89));
+        assert_eq!(server.receiver.len(), 0);
+        assert!(!client.is_closed());
+    }
+
+    #[test]
+    fn async_masked_pending_receive_cancels_after_unmask_without_consuming() {
+        let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
+        let live = Cx::for_testing();
+        let stopped = Cx::for_testing();
+        stopped.set_cancel_requested(true);
+        {
+            let mut receiving = pin!(server.recv_with_source_async(&stopped));
+            stopped.masked(|| assert!(poll(receiving.as_mut(), Waker::noop()).is_pending()));
+            ready(client.send_async(&live, &request(90))).unwrap();
+            assert!(matches!(
+                poll(receiving.as_mut(), Waker::noop()),
+                Poll::Ready(Err(TransportError::Cancelled))
+            ));
+        }
+        assert_eq!(server.receiver.len(), 1);
+        assert_eq!(
+            request_id(ready(server.recv_async(&live)).unwrap()),
+            RequestId::Number(90)
+        );
+        assert_eq!(server.receiver.len(), 0);
+        assert!(!server.is_closed());
     }
 }
