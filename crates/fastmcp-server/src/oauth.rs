@@ -317,13 +317,14 @@ pub enum OAuthParameterName {
 
 /// Immutable public native-HTTP routes for an [`OAuthServer`].
 ///
-/// OAuth authorization, token, and revocation are always available. An OIDC
+/// OAuth metadata, authorization, token, and revocation are always available. An OIDC
 /// provider can add its fixed discovery and JWKS routes only after it has
 /// bound an exact advertised public JWKS URI to an external signer.
 #[derive(Clone)]
 pub struct OAuthHttpRoutes {
     server: Arc<OAuthServer>,
     public_endpoint_base: String,
+    metadata_path: String,
     /// The endpoint base's path with one trailing `/`; every fixed route is
     /// this prefix plus its name, matching `DiscoveryDocument`'s spelling.
     route_prefix: String,
@@ -375,6 +376,7 @@ impl std::fmt::Debug for OAuthHttpRoutes {
         let mut debug = formatter.debug_struct("OAuthHttpRoutes");
         debug
             .field("public_endpoint_base", &self.public_endpoint_base)
+            .field("metadata_path", &self.metadata_path)
             .field("authorization_path", &self.authorization_path)
             .field("token_path", &self.token_path)
             .field("revocation_path", &self.revocation_path)
@@ -421,13 +423,38 @@ impl std::fmt::Display for OAuthHttpRouteConfigurationError {
 
 impl std::error::Error for OAuthHttpRouteConfigurationError {}
 
+/// RFC 8414 discovery for the built-in OAuth authorization-code issuer.
+///
+/// This document is derived from installed routes and server configuration.
+/// It does not advertise OIDC, signing keys, client credentials, CIMD or a
+/// global scope catalog. Client-specific scope and approval policy still apply
+/// at authorization; OIDC retains its separately installed discovery route.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OAuthAuthorizationServerMetadata {
+    pub issuer: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub revocation_endpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration_endpoint: Option<String>,
+    pub response_types_supported: [&'static str; 1],
+    pub response_modes_supported: [&'static str; 1],
+    pub grant_types_supported: [&'static str; 2],
+    pub token_endpoint_auth_methods_supported: Vec<&'static str>,
+    pub revocation_endpoint_auth_methods_supported: Vec<&'static str>,
+    pub code_challenge_methods_supported: [&'static str; 1],
+    pub authorization_response_iss_parameter_supported: bool,
+}
+
 impl OAuthHttpRoutes {
     /// Creates the fixed authorization, token, and revocation routes below an
     /// explicit public HTTPS endpoint base.
     ///
     /// For example, `https://auth.example.test/oauth` exposes
-    /// `/oauth/authorize`, `/oauth/token`, and `/oauth/revoke`. The base is
-    /// never inferred from a request Host or forwarded header.
+    /// `/oauth/authorize`, `/oauth/token`, and `/oauth/revoke`. RFC 8414
+    /// metadata is additionally served at the well-known path derived from
+    /// the exact configured issuer. Neither location is inferred from Host
+    /// or forwarded headers.
     pub fn new(
         server: Arc<OAuthServer>,
         public_endpoint_base: impl Into<String>,
@@ -466,9 +493,22 @@ impl OAuthHttpRoutes {
         let authorization_path = route_path("authorize");
         let token_path = route_path("token");
         let revocation_path = route_path("revoke");
+        // RFC 8414 section 3.1 inserts the suffix before the issuer path,
+        // removing terminating slashes only for this derived location. The
+        // metadata issuer and RFC 9207 response preserve the configured value.
+        let metadata_path = format!(
+            "/.well-known/oauth-authorization-server{}", issuer.path().trim_end_matches('/'),
+        );
+        if [Some(authorization_path.as_str()), Some(token_path.as_str()),
+            Some(revocation_path.as_str()), registration_path.as_deref()]
+            .contains(&Some(metadata_path.as_str()))
+        {
+            return Err(OAuthHttpRouteConfigurationError::InvalidPublicEndpointBase);
+        }
         Ok(Self {
             server,
             public_endpoint_base,
+            metadata_path,
             route_prefix,
             authorization_path,
             token_path,
@@ -515,6 +555,7 @@ impl OAuthHttpRoutes {
             userinfo_path: format!("{}userinfo", self.route_prefix),
         };
         let oauth_paths = [
+            Some(self.metadata_path()),
             Some(self.authorization_path()),
             Some(self.token_path()),
             Some(self.revocation_path()),
@@ -543,6 +584,38 @@ impl OAuthHttpRoutes {
     #[must_use]
     pub fn public_endpoint_base(&self) -> &str {
         &self.public_endpoint_base
+    }
+
+    /// Returns the issuer-derived RFC 8414 discovery path.
+    #[must_use]
+    pub fn metadata_path(&self) -> &str { &self.metadata_path }
+
+    /// Describes exactly the installed OAuth endpoints and supported flows.
+    ///
+    /// A disabled public-client profile omits both DCR and `none` client
+    /// authentication. Scope policy is specific to each registration, so no
+    /// global `scopes_supported` list is inferred from private registrations.
+    /// Invalid issuer configuration returns an error instead of advertising a
+    /// login flow that the server would reject.
+    pub fn authorization_server_metadata(&self) -> Result<OAuthAuthorizationServerMetadata, OAuthError> {
+        self.server.config().validate()?;
+        let base = self.public_endpoint_base.trim_end_matches('/');
+        let mut methods = vec!["client_secret_basic", "client_secret_post"];
+        if self.server.config().allow_public_clients { methods.push("none"); }
+        Ok(OAuthAuthorizationServerMetadata {
+            issuer: self.server.config().issuer.clone(),
+            authorization_endpoint: format!("{base}/authorize"),
+            token_endpoint: format!("{base}/token"),
+            revocation_endpoint: format!("{base}/revoke"),
+            registration_endpoint: self.registration_path.as_ref().map(|_| format!("{base}/register")),
+            response_types_supported: ["code"],
+            response_modes_supported: ["query"],
+            grant_types_supported: ["authorization_code", "refresh_token"],
+            token_endpoint_auth_methods_supported: methods.clone(),
+            revocation_endpoint_auth_methods_supported: methods,
+            code_challenge_methods_supported: ["S256"],
+            authorization_response_iss_parameter_supported: true,
+        })
     }
 
     /// Returns the exact authorization endpoint path.
@@ -574,7 +647,8 @@ impl OAuthHttpRoutes {
     }
 
     pub(crate) fn has_path(&self, path: &str) -> bool {
-        path == self.authorization_path
+        path == self.metadata_path
+            || path == self.authorization_path
             || path == self.token_path
             || path == self.revocation_path
             || self.registration_path.as_deref() == Some(path)
@@ -605,6 +679,7 @@ impl OAuthHttpRoutes {
     ) -> Result<(), OAuthHttpRouteConfigurationError> {
         if occupied_paths.into_iter().any(|occupied| {
             [
+                Some(self.metadata_path()),
                 Some(self.authorization_path()),
                 Some(self.token_path()),
                 Some(self.revocation_path()),
@@ -12632,5 +12707,72 @@ mod tests {
         assert!(disabled.list_clients().is_empty());
     }
 
+    #[test]
+    fn oauth_metadata_preserves_exact_issuer_and_inserts_before_its_path() {
+        for (issuer, expected_path) in [
+            ("https://issuer.example", "/.well-known/oauth-authorization-server"),
+            ("https://issuer.example/", "/.well-known/oauth-authorization-server"),
+            ("https://issuer.example/tenant", "/.well-known/oauth-authorization-server/tenant"),
+            ("https://issuer.example/tenant/", "/.well-known/oauth-authorization-server/tenant"),
+            ("https://issuer.example/tenant%2Fone/", "/.well-known/oauth-authorization-server/tenant%2Fone"),
+        ] {
+            let server = Arc::new(OAuthServer::try_new(OAuthServerConfig {
+                issuer: issuer.to_owned(), ..Default::default()
+            }).unwrap());
+            let routes = OAuthHttpRoutes::new(server, "https://issuer.example/login/").unwrap();
+            let metadata = routes.authorization_server_metadata().unwrap();
+            assert_eq!(routes.metadata_path(), expected_path);
+            assert!(routes.has_path(expected_path));
+            assert!(routes.validate_non_overlapping_paths([expected_path]).is_err());
+            assert_eq!(metadata.issuer, issuer);
+            assert_eq!(metadata.authorization_endpoint, "https://issuer.example/login/authorize");
+            assert_eq!(metadata.token_endpoint, "https://issuer.example/login/token");
+            assert_eq!(metadata.revocation_endpoint, "https://issuer.example/login/revoke");
+            assert_eq!(metadata.registration_endpoint.as_deref(), Some("https://issuer.example/login/register"));
+        }
+    }
+
+    #[test]
+    fn oauth_metadata_advertises_only_enabled_native_issuer_capabilities() {
+        for allow_public_clients in [true, false] {
+            let server = Arc::new(OAuthServer::try_new(OAuthServerConfig {
+                allow_public_clients, ..Default::default()
+            }).unwrap());
+            let routes = OAuthHttpRoutes::new(server, "https://fastmcp.invalid/oauth").unwrap();
+            let metadata = routes.authorization_server_metadata().unwrap();
+            assert_eq!(metadata.response_types_supported, ["code"]);
+            assert_eq!(metadata.response_modes_supported, ["query"]);
+            assert_eq!(metadata.grant_types_supported, ["authorization_code", "refresh_token"]);
+            assert_eq!(metadata.code_challenge_methods_supported, ["S256"]);
+            assert!(metadata.authorization_response_iss_parameter_supported);
+            assert_eq!(metadata.token_endpoint_auth_methods_supported.contains(&"none"), allow_public_clients);
+            assert_eq!(metadata.registration_endpoint.is_some(), allow_public_clients);
+            assert_eq!(metadata.token_endpoint_auth_methods_supported, metadata.revocation_endpoint_auth_methods_supported);
+            assert!(metadata.token_endpoint_auth_methods_supported.contains(&"client_secret_basic"));
+            assert!(metadata.token_endpoint_auth_methods_supported.contains(&"client_secret_post"));
+            let wire = serde_json::to_value(metadata).unwrap();
+            assert_eq!(wire.get("registration_endpoint").is_some(), allow_public_clients);
+            for absent in ["jwks_uri", "id_token_signing_alg_values_supported", "userinfo_endpoint",
+                "scopes_supported", "signed_metadata", "client_id_metadata_document_supported"] {
+                assert!(wire.get(absent).is_none(), "unconfigured capability {absent}");
+            }
+        }
+        let invalid = Arc::new(OAuthServer::new(OAuthServerConfig {
+            max_clients: 0, ..Default::default()
+        }));
+        let routes = OAuthHttpRoutes::new(invalid, "https://fastmcp.invalid/oauth").unwrap();
+        assert!(routes.authorization_server_metadata().is_err());
+    }
+
+    #[test]
+    fn oauth_metadata_route_cannot_shadow_an_installed_token_endpoint() {
+        for (issuer, admissible) in [("https://issuer.example/tenant", true), ("https://issuer.example/token", false)] {
+            let server = Arc::new(OAuthServer::try_new(OAuthServerConfig {
+                issuer: issuer.to_owned(), ..Default::default()
+            }).unwrap());
+            assert_eq!(OAuthHttpRoutes::new(server,
+                "https://issuer.example/.well-known/oauth-authorization-server").is_ok(), admissible);
+        }
+    }
 
 }

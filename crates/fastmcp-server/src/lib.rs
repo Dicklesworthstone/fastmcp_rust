@@ -10029,6 +10029,18 @@ fn dispatch_oauth_h1_request(
         Ok(header) => header,
         Err(response) => return response,
     };
+    if raw_path == routes.metadata_path() {
+        if authorization_header.is_some() || request.uri.contains('?') || !request.body.is_empty() {
+            return oauth_http_invalid_request();
+        }
+        if !matches!(request.method, Http1Method::Get) {
+            return oauth_http_method_not_allowed("GET");
+        }
+        return match routes.authorization_server_metadata() {
+            Ok(metadata) => oauth_http_no_store(HttpResponse::ok().with_json(&metadata)),
+            Err(_) => oauth_http_no_store(HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE)),
+        };
+    }
     #[cfg(feature = "builtin-auth-server")]
     if let Some(oidc) = routes.oidc_routes() {
         if raw_path == oidc.userinfo_path() {
@@ -10205,6 +10217,7 @@ fn dispatch_oauth_h1_request(
 /// listener's MCP-sized body allowance from becoming an OAuth body allowance.
 #[derive(Clone)]
 struct OAuthNativeH1RouteLimits {
+    metadata: String,
     authorization: String,
     token: String,
     revocation: String,
@@ -10220,6 +10233,7 @@ struct OAuthNativeH1RouteLimits {
 impl OAuthNativeH1RouteLimits {
     fn from_routes(routes: &OAuthHttpRoutes) -> Self {
         Self {
+            metadata: routes.metadata_path().to_owned(),
             authorization: routes.authorization_path().to_owned(),
             token: routes.token_path().to_owned(),
             revocation: routes.revocation_path().to_owned(),
@@ -10238,7 +10252,7 @@ impl OAuthNativeH1RouteLimits {
     }
 
     fn body_limit_for_path(&self, path: &str) -> Option<usize> {
-        if path == self.authorization || {
+        if path == self.metadata || path == self.authorization || {
             #[cfg(feature = "builtin-auth-server")]
             {
                 self.oidc_discovery.as_deref() == Some(path)
@@ -10433,6 +10447,14 @@ where
             HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE),
         )
         .await;
+        return true;
+    }
+    // RFC 8414 metadata is derived only from immutable, bounded configuration.
+    // It never invokes consent, authentication, signing, or issuer state, so
+    // discovery remains available without occupying a blocking worker.
+    if raw_path == routes.metadata_path() {
+        let response = dispatch_oauth_h1_request(routes, request, raw_path, raw_query);
+        let _ = send_h1_response(cx, listener_shutdown, framed, response).await;
         return true;
     }
     let routes = routes.clone();

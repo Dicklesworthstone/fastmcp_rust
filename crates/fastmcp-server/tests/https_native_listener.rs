@@ -551,6 +551,14 @@ async fn issuer_exchange(cx: &Cx, running: &Running, request: HttpRequest) -> Ht
     response
 }
 
+fn advertised_issuer_path(metadata: &Value, field: &str) -> String {
+    let endpoint = url::Url::parse(metadata[field].as_str().expect("advertised endpoint")).unwrap();
+    assert_eq!(endpoint.scheme(), "https");
+    assert_eq!(endpoint.host_str(), Some("localhost"));
+    assert!(endpoint.query().is_none());
+    endpoint.path().to_owned()
+}
+
 #[test]
 fn https_native_oauth_registration_pkce_token_refresh_and_revocation() {
     run(|cx| async move {
@@ -560,7 +568,16 @@ fn https_native_oauth_registration_pkce_token_refresh_and_revocation() {
             .protocol_policy(ProtocolPolicy::ModernOnly).unwrap()
             .oauth_http_routes(routes).auth_provider(probe.clone()).tool(probe.clone()).build();
         let running = Running::configured(&cx, server, policy(), Duration::from_secs(10)).await;
-        let registration = issuer_exchange(&cx, &running, registration_request()).await;
+        let discovery = issuer_exchange(&cx, &running, issuer_request(HttpMethod::Get,
+            "/.well-known/oauth-authorization-server", Vec::new())).await;
+        assert_eq!(discovery.status.0, 200);
+        assert_eq!(discovery.headers["content-type"], "application/json");
+        let metadata: Value = serde_json::from_slice(&discovery.body).unwrap();
+        assert_eq!(metadata["issuer"], "https://localhost/");
+        assert_eq!(metadata["grant_types_supported"], json!(["authorization_code", "refresh_token"]));
+        let mut registration = registration_request();
+        registration.path = advertised_issuer_path(&metadata, "registration_endpoint");
+        let registration = issuer_exchange(&cx, &running, registration).await;
         assert_eq!(registration.status.0, 201);
         assert_eq!(registration.headers["access-control-allow-origin"], ORIGIN);
         let registration: Value = serde_json::from_slice(&registration.body).unwrap();
@@ -574,7 +591,7 @@ fn https_native_oauth_registration_pkce_token_refresh_and_revocation() {
             ("code_challenge_method", "S256"),
         ]);
         let response = issuer_exchange(&cx, &running, issuer_request(HttpMethod::Get,
-            &format!("/oauth/authorize?{authorization}"), Vec::new())).await;
+            &format!("{}?{authorization}", advertised_issuer_path(&metadata, "authorization_endpoint")), Vec::new())).await;
         assert_eq!(response.status.0, 303);
         let redirect = url::Url::parse(&response.headers["location"]).unwrap();
         let parameters: std::collections::HashMap<_, _> = redirect.query_pairs().into_owned().collect();
@@ -586,7 +603,8 @@ fn https_native_oauth_registration_pkce_token_refresh_and_revocation() {
             ("redirect_uri", "http://127.0.0.1:32123/callback"), ("resource", "https://localhost/mcp"),
             ("code", &parameters["code"]), ("code_verifier", "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
         ]);
-        let token_request = issuer_request(HttpMethod::Post, "/oauth/token", token_form.into_bytes());
+        let token_path = advertised_issuer_path(&metadata, "token_endpoint");
+        let token_request = issuer_request(HttpMethod::Post, &token_path, token_form.into_bytes());
         let token_response = issuer_exchange(&cx, &running, token_request.clone()).await;
         assert_eq!(token_response.status.0, 200);
         let token: Value = serde_json::from_slice(&token_response.body).unwrap();
@@ -598,19 +616,96 @@ fn https_native_oauth_registration_pkce_token_refresh_and_revocation() {
         let refresh = oauth_form(&[("grant_type", "refresh_token"), ("client_id", client_id),
             ("resource", "https://localhost/mcp"), ("refresh_token", token["refresh_token"].as_str().unwrap())]);
         let refreshed = issuer_exchange(&cx, &running,
-            issuer_request(HttpMethod::Post, "/oauth/token", refresh.into_bytes())).await;
+            issuer_request(HttpMethod::Post, &token_path, refresh.into_bytes())).await;
         assert_eq!(refreshed.status.0, 200);
         let refreshed: Value = serde_json::from_slice(&refreshed.body).unwrap();
         let access = refreshed["access_token"].as_str().unwrap();
         assert!(issuer.validate_access_token(access).is_some());
         let revoke = oauth_form(&[("client_id", client_id), ("token", access)]);
         let revoked = issuer_exchange(&cx, &running,
-            issuer_request(HttpMethod::Post, "/oauth/revoke", revoke.into_bytes())).await;
+            issuer_request(HttpMethod::Post, &advertised_issuer_path(&metadata, "revocation_endpoint"), revoke.into_bytes())).await;
         assert_eq!(revoked.status.0, 200);
         assert!(issuer.validate_access_token(access).is_none());
         assert_eq!(probe.counts(), (0, 0), "issuer routes never invoke MCP authentication or tools");
         success(&decode_wire(&exchange(&cx, running.address, request(false)).await.unwrap()), false);
         running.stop(&cx).await;
+    });
+}
+
+#[test]
+fn https_native_oauth_metadata_respects_exact_tenant_capabilities_and_request_admission() {
+    run(|cx| async move {
+        for public in [true, false] {
+            let probe = Probe::new();
+            let approvals = Arc::new(AtomicUsize::new(0));
+            let issuer = Arc::new(OAuthServer::try_with_approval_backend(
+                OAuthServerConfig {
+                    issuer: "https://localhost/tenant/".to_owned(),
+                    allow_public_clients: public, ..Default::default()
+                }, Arc::new(TestConsent(Arc::clone(&approvals))),
+            ).unwrap());
+            let routes = OAuthHttpRoutes::new(Arc::clone(&issuer), "https://localhost/login/").unwrap();
+            let path = routes.metadata_path().to_owned();
+            assert_eq!(path, "/.well-known/oauth-authorization-server/tenant");
+            let server = Server::new("native-https-issuer-discovery", "1")
+                .protocol_policy(ProtocolPolicy::ModernOnly).unwrap()
+                .oauth_http_routes(routes).auth_provider(probe.clone()).tool(probe.clone()).build();
+            let running = Running::configured(&cx, server, policy(), Duration::from_secs(10)).await;
+            let discovery = || issuer_request(HttpMethod::Get, &path, Vec::new());
+            let response = issuer_exchange(&cx, &running, discovery()).await;
+            assert_eq!(response.status.0, 200);
+            assert_eq!(response.headers["access-control-allow-origin"], ORIGIN);
+            assert!(!response.headers.contains_key("www-authenticate"));
+            let metadata: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(metadata["issuer"], "https://localhost/tenant/");
+            assert_eq!(metadata["authorization_endpoint"], "https://localhost/login/authorize");
+            assert_eq!(metadata["token_endpoint"], "https://localhost/login/token");
+            assert_eq!(metadata["revocation_endpoint"], "https://localhost/login/revoke");
+            assert_eq!(metadata["response_types_supported"], json!(["code"]));
+            assert_eq!(metadata["response_modes_supported"], json!(["query"]));
+            assert_eq!(metadata["code_challenge_methods_supported"], json!(["S256"]));
+            assert_eq!(metadata["authorization_response_iss_parameter_supported"], true);
+            let mut methods = vec!["client_secret_basic", "client_secret_post"];
+            if public { methods.push("none"); }
+            assert_eq!(metadata["token_endpoint_auth_methods_supported"], json!(methods));
+            assert_eq!(metadata["revocation_endpoint_auth_methods_supported"], json!(methods));
+            assert_eq!(metadata.get("registration_endpoint"),
+                public.then(|| json!("https://localhost/login/register")).as_ref());
+            for absent in ["jwks_uri", "userinfo_endpoint", "id_token_signing_alg_values_supported",
+                "scopes_supported", "client_id_metadata_document_supported", "signed_metadata"]
+            {
+                assert!(metadata.get(absent).is_none(), "unconfigured claim: {absent}");
+            }
+            let mut wrong_method = discovery();
+            wrong_method.method = HttpMethod::Post;
+            for (request, expected) in [
+                (discovery().with_header("origin", "https://attacker.example"), 403),
+                (discovery().with_header("host", "attacker.example"), 403),
+                (wrong_method, 405),
+                (discovery().with_header("authorization", "Bearer irrelevant-credential"), 400),
+                (discovery().with_body(vec![b'x']), 400),
+                (issuer_request(HttpMethod::Get, &format!("{path}?"), Vec::new()), 400),
+                (issuer_request(HttpMethod::Get, &format!("{path}?issuer=other"), Vec::new()), 400),
+                (issuer_request(HttpMethod::Get, &format!("{path}/"), Vec::new()), 404),
+                (issuer_request(HttpMethod::Get, "/.well-known/oauth-authorization-server/other", Vec::new()), 404),
+                (issuer_request(HttpMethod::Get, "/tenant/.well-known/oauth-authorization-server", Vec::new()), 404),
+                (issuer_request(HttpMethod::Get, "/.well-known/openid-configuration/tenant", Vec::new()), 404),
+            ] {
+                let response = issuer_exchange(&cx, &running, request).await;
+                assert_eq!(response.status.0, expected);
+                assert!(!response.headers.contains_key("www-authenticate"));
+            }
+            if !public {
+                let mut disabled = registration_request();
+                disabled.path = "/login/register".to_owned();
+                assert_eq!(issuer_exchange(&cx, &running, disabled).await.status.0, 404);
+            }
+            assert!(issuer.list_clients().is_empty());
+            assert_eq!(approvals.load(Ordering::SeqCst), 0);
+            assert_eq!(probe.counts(), (0, 0));
+            assert_eq!(issuer_exchange(&cx, &running, discovery()).await.status.0, 200);
+            running.stop(&cx).await;
+        }
     });
 }
 
@@ -682,6 +777,11 @@ fn https_native_oauth_missing_or_rejected_pool_never_mutates_issuer_state() {
                 .protocol_policy(ProtocolPolicy::ModernOnly).unwrap().oauth_http_routes(routes).build();
             let unpooled = cx.clone().with_blocking_pool_handle(pool);
             let running = Running::configured(&unpooled, server, policy(), Duration::from_secs(10)).await;
+            let metadata = issuer_exchange(&cx, &running, issuer_request(HttpMethod::Get,
+                "/.well-known/oauth-authorization-server", Vec::new())).await;
+            assert_eq!(metadata.status.0, 200, "immutable discovery does not need an issuer worker");
+            let metadata: Value = serde_json::from_slice(&metadata.body).unwrap();
+            assert_eq!(metadata["issuer"], "https://localhost/");
             let response = issuer_exchange(&cx, &running, registration_request()).await;
             assert_eq!(response.status.0, 503);
             assert_eq!(response.headers["access-control-allow-origin"], ORIGIN);
