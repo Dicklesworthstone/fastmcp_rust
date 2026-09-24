@@ -34,7 +34,9 @@ pub use crate::http_auth::managed::tasks::interaction::submission::TaskSubmissio
 
 // At most 130 retained IDs (two for each of 65 rounds). Bound the complete
 // encoded identity before cloning it; JSON escaping cannot evade the ceiling.
-const MAX_ID_WIRE_BYTES: usize = 1024;
+// This is the protocol's own string-id bound: `RequestId::validate` refuses
+// anything longer first, so a larger local ceiling could never be reached.
+const MAX_ID_WIRE_BYTES: usize = fastmcp_protocol::MAX_JSONRPC_STRING_ID_ENCODED_BYTES;
 
 /// Cumulative authority for one initial call and all explicit continuations.
 /// The client's timeout is ONE deadline, including acquisition and host pauses.
