@@ -3378,7 +3378,10 @@ impl ToolHandler for PublicHttpLargeResultTool {
             description: Some("Returns a text result of the requested size".to_owned()),
             input_schema: json!({
                 "type": "object",
-                "properties": {"bytes": {"type": "integer", "minimum": 0}},
+                "properties": {
+                    "bytes": {"type": "integer", "minimum": 0},
+                    "block": {"type": "integer", "minimum": 1}
+                },
                 "required": ["bytes"]
             }),
             output_schema: None,
@@ -3395,10 +3398,16 @@ impl ToolHandler for PublicHttpLargeResultTool {
             .and_then(serde_json::Value::as_u64)
             .and_then(|bytes| usize::try_from(bytes).ok())
             .ok_or_else(|| McpError::invalid_params("bytes must be a non-negative integer"))?;
+        let block = arguments
+            .get("block")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|block| usize::try_from(block).ok())
+            .unwrap_or(PUBLIC_HTTP_LARGE_RESULT_BLOCK_BYTES)
+            .max(1);
         let text = public_http_large_result_text(bytes);
         Ok(text
             .as_bytes()
-            .chunks(PUBLIC_HTTP_LARGE_RESULT_BLOCK_BYTES)
+            .chunks(block)
             .map(|block| {
                 Content::text(std::str::from_utf8(block).expect("the generated text is ASCII"))
             })
@@ -3594,6 +3603,67 @@ fn e2e_public_http_sse_body_carries_a_tool_result_over_64_kib() {
     let tool = serde_json::to_value(result).expect("the modern tool result serializes");
     assert_public_http_large_tool_text(&tool, "modern SSE body");
     drop(client);
+    server.shutdown();
+}
+
+/// LIMIT-01: one result string may carry a 3 MiB decoded binary block as
+/// Base64, so a single 1 MiB text block is well inside it. Checked on both
+/// response representations: application/json, and an SSE body forced by an
+/// Info logLevel.
+#[test]
+fn e2e_public_http_tools_call_carries_one_text_block_over_64_kib() {
+    const ONE_BLOCK_BYTES: usize = 1024 * 1024;
+    let cx = Cx::for_request();
+    let server = spawn_large_result_http_server(ProtocolPolicy::ModernOnly);
+    let expected = public_http_large_result_text(ONE_BLOCK_BYTES);
+    for sse_body in [false, true] {
+        let mut client = runtime_block_on_bounded(
+            &cx,
+            modern::ClientBuilder::new()
+                .client_info("e2e-public-http-one-large-block", "1.0.0")
+                .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+        )
+        .expect("the ModernOnly public facade connects");
+        if sse_body {
+            client
+                .set_log_level(modern::LoggingLevel::Info)
+                .expect("info logLevel is stored as request metadata");
+        }
+        let result = runtime_block_on_bounded(
+            &cx,
+            client.call_tool(
+                &cx,
+                PUBLIC_HTTP_LARGE_RESULT_TOOL_NAME,
+                json!({ "bytes": ONE_BLOCK_BYTES, "block": ONE_BLOCK_BYTES }),
+            ),
+        )
+        .unwrap_or_else(|error| {
+            panic!("a 1 MiB text block must arrive (sse_body={sse_body}): {error:?}")
+        });
+        if sse_body {
+            let notifications = client.take_server_notifications();
+            assert!(
+                notifications.iter().any(|notification| matches!(
+                    notification,
+                    modern::ServerNotification::Message(message)
+                        if message.level == modern::LoggingLevel::Info
+                )),
+                "the SSE-body case must carry its final log notification"
+            );
+        }
+        let tool = serde_json::to_value(result).expect("the modern tool result serializes");
+        let blocks = tool["content"]
+            .as_array()
+            .expect("the modern tool result carries a content array");
+        assert_eq!(blocks.len(), 1, "the 1 MiB text must stay one block");
+        let text = blocks[0]["text"].as_str().unwrap_or_default();
+        assert!(
+            text == expected,
+            "the 1 MiB text block must arrive byte-identical (sse_body={sse_body}): received {} bytes",
+            text.len()
+        );
+        drop(client);
+    }
     server.shutdown();
 }
 
