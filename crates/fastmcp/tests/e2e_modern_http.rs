@@ -22779,6 +22779,412 @@ fn http_05_b_null_annotated_argument_without_header_reaches_schema_validation() 
     assert_eq!(calls, 0, "schema refusal must not reach the handler");
 }
 
+// HTTP-05 B client retry: a live `bind_http` server behind a TLS-terminating
+// relay, because a review binds only to https. The relay forwards each
+// request, or strips every `Mcp-Param-*` field for the planted negative.
+#[cfg(feature = "native-tls-roots")]
+const HTTP_05_B_RETRY_CHILD: &str = "FASTMCP_E2E_HTTP_05_B_RETRY_CASE";
+#[cfg(feature = "native-tls-roots")]
+const HTTP_05_B_RETRY_TOOL: &str = "public-http-e2e-retry-lookup";
+
+#[cfg(feature = "native-tls-roots")]
+#[derive(Clone, Copy)]
+enum Http05BRetryCase {
+    /// The host's review predates the server's annotation.
+    StaleReview,
+    /// Same as `StaleReview`, but the relay drops every mirror, so the retry
+    /// is refused as well.
+    RelayStripsHeaders,
+    /// A current review; the handler returns a tool error.
+    HandlerError,
+}
+
+/// Counts `tools/call` and `tools/list` before routing, so a request refused
+/// at the header stage is counted too.
+#[cfg(feature = "native-tls-roots")]
+struct Http05BRequestCounter {
+    calls: Arc<AtomicUsize>,
+    lists: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "native-tls-roots")]
+impl Middleware for Http05BRequestCounter {
+    fn on_request(
+        &self,
+        _ctx: &McpContext,
+        request: &JsonRpcRequest,
+    ) -> McpResult<MiddlewareDecision> {
+        match request.method.as_str() {
+            "tools/call" => self.calls.fetch_add(1, Ordering::SeqCst),
+            "tools/list" => self.lists.fetch_add(1, Ordering::SeqCst),
+            _ => 0,
+        };
+        Ok(MiddlewareDecision::Continue)
+    }
+}
+
+#[cfg(feature = "native-tls-roots")]
+struct Http05BRetryTool {
+    handled: Arc<AtomicUsize>,
+    fail: bool,
+}
+
+#[cfg(feature = "native-tls-roots")]
+impl ToolHandler for Http05BRetryTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: HTTP_05_B_RETRY_TOOL.to_owned(),
+            description: Some("Proves the HTTP-05 B one-shot client retry".to_owned()),
+            input_schema: json!({"type": "object", "properties": {
+                "region": {"type": "string", "x-mcp-header": "Region"}
+            }}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        self.handled.fetch_add(1, Ordering::SeqCst);
+        if self.fail {
+            return Err(McpError::tool_error("the retry-lookup handler refused"));
+        }
+        let region = arguments["region"].as_str().unwrap_or_default();
+        Ok(vec![Content::text(format!("retry-lookup:{region}"))])
+    }
+}
+
+/// Reads one HTTP/1.1 message head and its body, framed by Content-Length or
+/// chunked encoding. The body is returned verbatim, framing included.
+#[cfg(feature = "native-tls-roots")]
+async fn http_05_b_read_message<S>(stream: &mut S) -> Option<(String, Vec<u8>)>
+where
+    S: asupersync::io::AsyncRead + Unpin,
+{
+    use asupersync::io::AsyncReadExt;
+    const LIMIT: usize = 1 << 20;
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let end = loop {
+        if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+            break index + 4;
+        }
+        let count = stream.read(&mut buffer).await.ok()?;
+        if count == 0 || bytes.len() + count > LIMIT {
+            return None;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    };
+    let head = String::from_utf8(bytes[..end].to_vec()).ok()?;
+    let mut body = bytes[end..].to_vec();
+    let lower = head.to_ascii_lowercase();
+    let length = lower.lines().find_map(|line| {
+        line.strip_prefix("content-length:")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+    });
+    let chunked = lower
+        .lines()
+        .any(|line| line.starts_with("transfer-encoding:") && line.contains("chunked"));
+    loop {
+        let complete = match length {
+            Some(length) => body.len() >= length,
+            None if chunked => body.ends_with(b"0\r\n\r\n"),
+            None => true,
+        };
+        if complete {
+            break;
+        }
+        let count = stream.read(&mut buffer).await.ok()?;
+        if count == 0 || body.len() + count > LIMIT {
+            return None;
+        }
+        body.extend_from_slice(&buffer[..count]);
+    }
+    Some((head, body))
+}
+
+/// Rewrites a message head to close its connection, optionally dropping
+/// every `Mcp-Param-*` field and replacing `Host`.
+#[cfg(feature = "native-tls-roots")]
+fn http_05_b_rewrite_head(head: &str, strip_parameters: bool, host: Option<&str>) -> String {
+    let mut lines = head.trim_end_matches("\r\n").split("\r\n");
+    let mut rewritten = format!("{}\r\n", lines.next().unwrap_or_default());
+    for line in lines {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("connection:")
+            || (strip_parameters && lower.starts_with("mcp-param-"))
+            || (host.is_some() && lower.starts_with("host:"))
+        {
+            continue;
+        }
+        rewritten.push_str(line);
+        rewritten.push_str("\r\n");
+    }
+    if let Some(host) = host {
+        rewritten.push_str("Host: ");
+        rewritten.push_str(host);
+        rewritten.push_str("\r\n");
+    }
+    rewritten.push_str("Connection: close\r\n\r\n");
+    rewritten
+}
+
+/// Terminates TLS for one request per connection and forwards it to the
+/// plain `bind_http` backend.
+#[cfg(feature = "native-tls-roots")]
+async fn http_05_b_relay(
+    listener: asupersync::net::TcpListener,
+    acceptor: asupersync::tls::TlsAcceptor,
+    backend: SocketAddr,
+    strip_parameters: bool,
+) {
+    use asupersync::io::AsyncWriteExt;
+    let backend_host = backend.to_string();
+    loop {
+        let Ok((socket, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(mut client) = acceptor.accept(socket).await else {
+            continue;
+        };
+        let Some((head, body)) = http_05_b_read_message(&mut client).await else {
+            continue;
+        };
+        let Ok(mut upstream) = asupersync::net::TcpStream::connect(backend).await else {
+            continue;
+        };
+        let request = http_05_b_rewrite_head(&head, strip_parameters, Some(&backend_host));
+        if upstream.write_all(request.as_bytes()).await.is_err()
+            || upstream.write_all(&body).await.is_err()
+            || upstream.flush().await.is_err()
+        {
+            continue;
+        }
+        let Some((head, body)) = http_05_b_read_message(&mut upstream).await else {
+            continue;
+        };
+        let response = http_05_b_rewrite_head(&head, false, None);
+        let _ = client.write_all(response.as_bytes()).await;
+        let _ = client.write_all(&body).await;
+        let _ = client.flush().await;
+    }
+}
+
+/// One public `call_tool_with_parameter_headers` through the relay.
+#[cfg(feature = "native-tls-roots")]
+fn http_05_b_retry_run(case: Http05BRetryCase) {
+    use fastmcp_rust::http_executor::parameter_headers::ReviewedToolHeaders;
+    let handled = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let lists = Arc::new(AtomicUsize::new(0));
+    let (tool_handled, counted_calls, counted_lists) =
+        (Arc::clone(&handled), Arc::clone(&calls), Arc::clone(&lists));
+    let fail = matches!(case, Http05BRetryCase::HandlerError);
+    let server = spawn_legacy_http_server("modern parameter-header retry", move || {
+        ServerBuilder::new("facade-http-param-header-retry", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly is available")
+            .middleware(Http05BRequestCounter {
+                calls: counted_calls,
+                lists: counted_lists,
+            })
+            .tool(Http05BRetryTool {
+                handled: tool_handled,
+                fail,
+            })
+            .build()
+    });
+    let backend = server.address();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .with_reactor(
+            asupersync::runtime::reactor::create_reactor().expect("relay reactor initializes"),
+        )
+        .build()
+        .expect("relay runtime builds");
+    let outcome = runtime.block_on(async move {
+        let cx = Cx::current().expect("the runtime installs an ambient context");
+        let listener = asupersync::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the TLS relay");
+        let acceptor = asupersync::tls::TlsAcceptorBuilder::new(
+            asupersync::tls::CertificateChain::from_pem(HTTP_05_A_LEAF).expect("TEST ONLY leaf"),
+            asupersync::tls::PrivateKey::from_pem(HTTP_05_A_KEY).expect("TEST ONLY key"),
+        )
+        .alpn_protocols(vec![b"http/1.1".to_vec()])
+        .build()
+        .expect("relay TLS acceptor builds");
+        let target = format!(
+            "https://{}/mcp",
+            listener.local_addr().expect("relay address")
+        );
+        let strip = matches!(case, Http05BRetryCase::RelayStripsHeaders);
+        let application = async {
+            let endpoint = CanonicalHttpUrl::parse(&target).expect("the relay target is canonical");
+            let mut client = Box::pin(
+                modern::ClientBuilder::new()
+                    .client_info("e2e-http-05-b-retry", "1.0.0")
+                    .connect_http_with_cx(endpoint.clone(), &cx),
+            )
+            .await
+            .expect("the client connects through the TLS relay");
+            let initial_schema = if matches!(case, Http05BRetryCase::HandlerError) {
+                json!({"type": "object", "properties": {
+                    "region": {"type": "string", "x-mcp-header": "Region"}
+                }})
+            } else {
+                json!({"type": "object", "properties": {"region": {"type": "string"}}})
+            };
+            let policy = |binding: &fastmcp_protocol::http_headers::ParameterHeaderBinding| {
+                binding.header_name() == "Mcp-Param-Region"
+            };
+            let reviewed =
+                ReviewedToolHeaders::new(endpoint, HTTP_05_B_RETRY_TOOL, initial_schema, policy)
+                    .expect("the host reviews its current plan");
+            client
+                .call_tool_with_parameter_headers(
+                    &cx,
+                    HTTP_05_B_RETRY_TOOL,
+                    json!({"region": "eu-west"}),
+                    &reviewed,
+                    &policy,
+                )
+                .await
+        };
+        // The relay is polled beside the client, never spawned, so it ends
+        // when the client finishes instead of outliving the runtime.
+        let mut relay = std::pin::pin!(http_05_b_relay(listener, acceptor, backend, strip));
+        let mut application = std::pin::pin!(application);
+        let mut relay_done = false;
+        std::future::poll_fn(|task| {
+            if let std::task::Poll::Ready(outcome) = application.as_mut().poll(task) {
+                return std::task::Poll::Ready(outcome);
+            }
+            if !relay_done {
+                relay_done = relay.as_mut().poll(task).is_ready();
+            }
+            std::task::Poll::Pending
+        })
+        .await
+    });
+    server.shutdown();
+    let (handled, calls, lists) = (
+        handled.load(Ordering::SeqCst),
+        calls.load(Ordering::SeqCst),
+        lists.load(Ordering::SeqCst),
+    );
+    match case {
+        Http05BRetryCase::StaleReview => {
+            let Ok(FinalCoreResult::ToolsCall { result, .. }) = &outcome else {
+                panic!("one refreshed retry must complete the call: {outcome:?}");
+            };
+            assert!(!result.payload.is_error, "{outcome:?}");
+            assert!(format!("{outcome:?}").contains("retry-lookup:eu-west"));
+            assert_eq!(
+                (calls, lists, handled),
+                (2, 1, 1),
+                "one refused POST, one tools/list, one retry, one handler run"
+            );
+        }
+        Http05BRetryCase::RelayStripsHeaders => {
+            assert!(
+                matches!(
+                    outcome,
+                    Err(modern::HttpClientError::Connection(
+                        fastmcp_rust::ClientHttpConnectionError::ParameterHeaderMismatch { .. }
+                    ))
+                ),
+                "a second refusal must be returned, not retried: {outcome:?}"
+            );
+            assert_eq!(
+                (calls, lists, handled),
+                (2, 1, 0),
+                "exactly two POSTs and one tools/list; the handler never runs"
+            );
+        }
+        Http05BRetryCase::HandlerError => {
+            assert!(
+                !matches!(
+                    outcome,
+                    Err(modern::HttpClientError::Connection(
+                        fastmcp_rust::ClientHttpConnectionError::ParameterHeaderMismatch { .. }
+                    ))
+                ),
+                "a handler error is not a header refusal: {outcome:?}"
+            );
+            assert_eq!(
+                (calls, lists, handled),
+                (1, 0, 1),
+                "a response the handler produced is never retried"
+            );
+        }
+    }
+}
+
+/// Re-runs `name` in a child whose only trust root is the TEST ONLY CA.
+#[cfg(feature = "native-tls-roots")]
+fn http_05_b_retry_isolated(name: &str, case: Http05BRetryCase) {
+    if let Ok(selected) = std::env::var(HTTP_05_B_RETRY_CHILD) {
+        assert_eq!(
+            selected, name,
+            "the child must run exactly the selected case"
+        );
+        http_05_b_retry_run(case);
+        return;
+    }
+    let roots = std::env::temp_dir().join(format!("fastmcp-e2e-{name}-ca.pem"));
+    std::fs::write(&roots, HTTP_05_A_ROOT).expect("materialize the TEST ONLY root");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(HTTP_05_B_RETRY_CHILD, name)
+        .env("SSL_CERT_FILE", &roots)
+        .env_remove("SSL_CERT_DIR")
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .expect("launch the isolated HTTP-05 B retry child");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(status) = child.try_wait().expect("poll the HTTP-05 B retry child") {
+            assert!(
+                status.success(),
+                "HTTP-05 B retry case {name} failed in its child"
+            );
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("HTTP-05 B retry case {name} exceeded its child-process bound");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(feature = "native-tls-roots")]
+#[test]
+fn http_05_b_retry_positive() {
+    http_05_b_retry_isolated("http_05_b_retry_positive", Http05BRetryCase::StaleReview);
+}
+
+#[cfg(feature = "native-tls-roots")]
+#[test]
+fn http_05_b_retry_planted_negative() {
+    http_05_b_retry_isolated(
+        "http_05_b_retry_planted_negative",
+        Http05BRetryCase::RelayStripsHeaders,
+    );
+}
+
+#[cfg(feature = "native-tls-roots")]
+#[test]
+fn http_05_b_retry_handler_error_is_not_retried() {
+    http_05_b_retry_isolated(
+        "http_05_b_retry_handler_error_is_not_retried",
+        Http05BRetryCase::HandlerError,
+    );
+}
+
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 #[test]
 fn e2e_public_http_as_proxy_forwards_inbound_progress_marker() {

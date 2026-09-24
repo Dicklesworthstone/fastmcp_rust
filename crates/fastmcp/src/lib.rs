@@ -5298,6 +5298,30 @@ pub mod modern {
             }
         }
 
+        /// Calls one tool with reviewed `Mcp-Param-*` mirrors and at most one
+        /// safe retry after a pre-dispatch header refusal. See
+        /// [`fastmcp_client::HttpClient::call_tool_with_parameter_headers`].
+        pub async fn call_tool_with_parameter_headers(
+            &mut self,
+            cx: &Cx,
+            name: &str,
+            arguments: JsonValue,
+            reviewed: &fastmcp_client::http_executor::parameter_headers::ReviewedToolHeaders,
+            review: &dyn Fn(&fastmcp_protocol::http_headers::ParameterHeaderBinding) -> bool,
+        ) -> Result<fastmcp_protocol::FinalCoreResult, HttpClientError> {
+            match self
+                .inner
+                .call_tool_with_parameter_headers(cx, name, arguments, reviewed, review)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    result @ (fastmcp_protocol::FinalCoreResult::ToolsCall { .. }
+                    | fastmcp_protocol::FinalCoreResult::ToolsCallInputRequired { .. }),
+                ) => Ok(result),
+                _ => Err(unexpected_modern_http_result("tools/call")),
+            }
+        }
+
         /// Calls one tool and admits request-scoped `notifications/progress`
         /// for the supplied progress marker.
         ///

@@ -113,7 +113,7 @@ pub use messages::*;
 pub use methods::SERVER_DISCOVER;
 pub use protocol_version::{
     FINAL_PROTOCOL_VERSION, FinalHttpRequestMetadata, FinalProtocolVersion, FinalRequestAdmission,
-    HEADER_MISMATCH_ERROR_CODE, HeaderMismatchError, HeaderMismatchReason,
+    HEADER_MISMATCH_ERROR_CODE, HEADER_MISMATCH_MESSAGE, HeaderMismatchError, HeaderMismatchReason,
     MAX_REQUIRED_CAPABILITIES_ERROR_DATA_BYTES, MCP_METHOD_HEADER, MCP_NAME_HEADER,
     MCP_PROTOCOL_VERSION_HEADER, MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE,
     MissingRequiredClientCapabilityError, ProtocolVersionError, RequestAdmissionError,

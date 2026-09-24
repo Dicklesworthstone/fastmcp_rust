@@ -12075,8 +12075,14 @@ impl HttpClient {
         method: impl AsRef<str>,
         parameters: serde_json::Value,
     ) -> Result<CoreResult, HttpClientError> {
-        self.request_final_core_with_optional_cancellation(cx, None, method.as_ref(), parameters)
-            .await
+        self.request_final_core_with_optional_cancellation(
+            cx,
+            None,
+            method.as_ref(),
+            parameters,
+            None,
+        )
+        .await
     }
 
     /// Sends one supported core request under a caller-owned cancellation
@@ -12099,6 +12105,7 @@ impl HttpClient {
             Some(cancellation),
             method.as_ref(),
             parameters,
+            None,
         )
         .await
     }
@@ -12109,6 +12116,7 @@ impl HttpClient {
         cancellation: Option<&McpRequestCancellation>,
         method: &str,
         parameters: serde_json::Value,
+        parameter_headers: Option<&http_executor::parameter_headers::ReviewedToolHeaders>,
     ) -> Result<CoreResult, HttpClientError> {
         if cx.checkpoint().is_err()
             || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
@@ -12157,8 +12165,22 @@ impl HttpClient {
                 &mut self.final_server_notifications,
                 &mut self.final_progress_notifications,
             );
-            match cancellation {
-                Some(cancellation) => {
+            match (parameter_headers, cancellation) {
+                (Some(reviewed), cancellation) => {
+                    self.connection
+                        .request_tool_call_json_with_parameter_headers(
+                            cx,
+                            cancellation,
+                            core_parameters,
+                            request_id,
+                            DEFAULT_FINAL_CACHE_MAX_BYTES,
+                            client_extensions.as_ref(),
+                            Some(&mut observer),
+                            reviewed,
+                        )
+                        .await
+                }
+                (None, Some(cancellation)) => {
                     self.connection
                         .request_json_with_result_source_at_with_cancellation(
                             cx,
@@ -12172,7 +12194,7 @@ impl HttpClient {
                         )
                         .await
                 }
-                None => {
+                (None, None) => {
                     self.connection
                         .request_json_with_result_source_at(
                             cx,
@@ -12887,6 +12909,100 @@ impl HttpClient {
             serde_json::json!({ "name": name, "arguments": arguments }),
         )
         .await
+    }
+
+    /// Calls one tool with reviewed `Mcp-Param-*` mirrors (HTTP-05).
+    ///
+    /// `reviewed` is the host's current plan for `name`, bound to this
+    /// client's HTTPS endpoint. If the server refuses this exact request
+    /// before dispatch (HTTP 400, -32020, same id, canonical message), the plan
+    /// is presumed stale: the cached `tools/list` is dropped, a fresh listing
+    /// supplies the tool's schema, `review` re-approves every projected
+    /// binding, and the call is retried exactly once with a new request id.
+    ///
+    /// Nothing else is retried: not a second refusal, not a transport error
+    /// after the send committed, and not any response the handler may have
+    /// produced. If `review` refuses a binding of the refreshed schema, no
+    /// retry is sent. An `input_required` result is returned, not followed.
+    pub async fn call_tool_with_parameter_headers(
+        &mut self,
+        cx: &Cx,
+        name: &str,
+        arguments: serde_json::Value,
+        reviewed: &http_executor::parameter_headers::ReviewedToolHeaders,
+        review: &dyn Fn(&fastmcp_protocol::http_headers::ParameterHeaderBinding) -> bool,
+    ) -> Result<CoreResult, HttpClientError> {
+        let parameters = serde_json::json!({ "name": name, "arguments": arguments });
+        match self
+            .request_final_core_with_optional_cancellation(
+                cx,
+                None,
+                "tools/call",
+                parameters.clone(),
+                Some(reviewed),
+            )
+            .await
+        {
+            Err(HttpClientError::Connection(
+                ClientHttpConnectionError::ParameterHeaderMismatch { .. },
+            )) => {}
+            outcome => return outcome,
+        }
+        let refreshed = self
+            .refreshed_parameter_headers(cx, name, reviewed.resource().clone(), review)
+            .await?;
+        self.request_final_core_with_optional_cancellation(
+            cx,
+            None,
+            "tools/call",
+            parameters,
+            Some(&refreshed),
+        )
+        .await
+    }
+
+    /// Re-reviews `name` from a fresh, uncached `tools/list`.
+    async fn refreshed_parameter_headers(
+        &mut self,
+        cx: &Cx,
+        name: &str,
+        resource: CanonicalHttpUrl,
+        review: &dyn Fn(&fastmcp_protocol::http_headers::ParameterHeaderBinding) -> bool,
+    ) -> Result<http_executor::parameter_headers::ReviewedToolHeaders, HttpClientError> {
+        const MAX_REFRESH_PAGES: usize = 64;
+        self.final_result_cache
+            .invalidate_result_set(&FinalCacheResultSet::Tools);
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_REFRESH_PAGES {
+            let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) =
+                self.list_tools(cx, cursor.as_deref()).await?
+            else {
+                return Err(HttpClientError::CoreResult(McpError::invalid_request(
+                    "Parameter-header refresh requires a final tools/list result",
+                )));
+            };
+            let payload = result.payload;
+            if let Some(tool) = payload.tools.into_iter().find(|tool| tool.name == name) {
+                return http_executor::parameter_headers::ReviewedToolHeaders::new(
+                    resource,
+                    name,
+                    tool.input_schema,
+                    review,
+                )
+                .map_err(|error| {
+                    HttpClientError::Connection(ClientHttpConnectionError::Modern(
+                        ModernHttpClientError::ParameterHeaders(error),
+                    ))
+                });
+            }
+            match payload.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        Err(HttpClientError::CoreResult(McpError::invalid_params(
+            format!("Tool '{name}' is not listed after refreshing tools/list"),
+        )))
     }
 
     /// Calls one tool under a caller-owned cancellation domain.

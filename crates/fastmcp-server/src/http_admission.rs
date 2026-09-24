@@ -495,8 +495,7 @@ pub(crate) fn http_parameter_headers<'a>(
 const MCP_PARAM_HEADER_PREFIX: &str = "mcp-param-";
 
 /// Message shared with the `Mcp-Method`/`Mcp-Name` mirror refusal.
-pub(crate) const HEADER_MISMATCH_MESSAGE: &str =
-    "MCP request headers do not match the JSON-RPC request";
+pub(crate) const HEADER_MISMATCH_MESSAGE: &str = fastmcp_protocol::HEADER_MISMATCH_MESSAGE;
 
 /// Compares a modern HTTP `tools/call`'s `Mcp-Param-*` fields with the
 /// arguments the resolved tool's schema annotates, before argument

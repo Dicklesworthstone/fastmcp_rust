@@ -3524,9 +3524,11 @@ pub enum ClientHttpResponse {
 
 /// The already-proven request construction lane used by the shared bounded
 /// JSON response collector.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 enum ModernRequestAdmission<'a> {
     Core(&'a str),
+    /// A core request carrying reviewed `Mcp-Param-*` mirrors.
+    CoreWithParameterHeaders(&'a str, &'a parameter_headers::ReviewedToolHeaders),
     FinalExtension(&'a str),
 }
 
@@ -3823,6 +3825,11 @@ pub enum ClientHttpConnectionError {
     /// A convenience request expected a finite JSON response but received a
     /// different admitted modern body lane.
     ExpectedJsonResponse { actual: ModernHttpResponseKind },
+    /// The server refused this exact request before dispatch because its MCP
+    /// headers did not match the body: HTTP 400 carrying a JSON-RPC error with
+    /// the same id, code -32020, the canonical message and no data. Nothing
+    /// else, including another 4xx body, is classified this way.
+    ParameterHeaderMismatch { request_id: RequestId },
     /// A convenience request body was not one strictly admitted JSON-RPC
     /// response envelope.
     ResponseAdmission(JsonRpcAdmissionError),
@@ -3935,6 +3942,8 @@ impl fmt::Display for ClientHttpConnectionError {
                 formatter,
                 "HTTP request expected a JSON response but received {actual:?}"
             ),
+            Self::ParameterHeaderMismatch { .. } => formatter
+                .write_str("HTTP server refused the request's MCP headers before dispatch"),
             Self::ResponseAdmission(error) => {
                 write!(
                     formatter,
@@ -4005,6 +4014,7 @@ impl std::error::Error for ClientHttpConnectionError {
             | Self::LegacyPersistentResponseQueueFull
             | Self::LegacyRequestOperationRequiresLegacy
             | Self::ExpectedJsonResponse { .. }
+            | Self::ParameterHeaderMismatch { .. }
             | Self::UnexpectedResponseMessage { .. }
             | Self::ResponseIdMismatch { .. }
             | Self::ModernNotificationUnexpectedStatus { .. }
@@ -4426,10 +4436,15 @@ impl ClientHttpConnection {
         parameters: serde_json::Value,
         request_id: RequestId,
     ) -> Result<ClientHttpResponse, ClientHttpConnectionError> {
-        self.request_with_optional_cancellation(cx, None, method, parameters, request_id, None)
-            .await
+        self.request_with_optional_cancellation(
+            cx, None, method, parameters, request_id, None, None,
+        )
+        .await
     }
 
+    // Parameter headers are a modern-only projection; the legacy transport
+    // refuses a reviewed plan rather than sending the body without it.
+    #[allow(clippy::too_many_arguments)]
     async fn request_with_optional_cancellation(
         &mut self,
         cx: &Cx,
@@ -4438,6 +4453,7 @@ impl ClientHttpConnection {
         parameters: serde_json::Value,
         request_id: RequestId,
         client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
+        parameter_headers: Option<&parameter_headers::ReviewedToolHeaders>,
     ) -> Result<ClientHttpResponse, ClientHttpConnectionError> {
         let method = method.as_ref();
         match self {
@@ -4450,6 +4466,7 @@ impl ClientHttpConnection {
                         parameters,
                         Some(request_id),
                         client_extensions,
+                        parameter_headers,
                     )
                     .await
                     .map(ClientHttpResponse::Modern)
@@ -4461,6 +4478,7 @@ impl ClientHttpConnection {
                         parameters,
                         Some(request_id),
                         client_extensions,
+                        parameter_headers,
                     )
                     .await
                     .map(ClientHttpResponse::Modern)
@@ -4476,6 +4494,9 @@ impl ClientHttpConnection {
                 client_extension_runtime,
                 ..
             }) => {
+                if parameter_headers.is_some() {
+                    return Err(ClientHttpConnectionError::FinalToolCallRequiresModern);
+                }
                 if client_extension_runtime
                     .as_ref()
                     .is_some_and(|runtime| runtime.owns_method(method))
@@ -4713,6 +4734,49 @@ impl ClientHttpConnection {
         .await
     }
 
+    /// Sends one modern `tools/call` whose exact built body receives the
+    /// reviewed `Mcp-Param-*` mirrors, with the same response handling as
+    /// [`Self::request_json_with_result_source_at`]. A projection failure
+    /// sends nothing; a legacy connection refuses the plan.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn request_tool_call_json_with_parameter_headers(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        parameters: serde_json::Value,
+        request_id: RequestId,
+        maximum_response_bytes: usize,
+        client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
+        observer: Option<ModernHttpNotificationObserver<'_>>,
+        reviewed: &parameter_headers::ReviewedToolHeaders,
+    ) -> Result<
+        (
+            JsonRpcResponse,
+            Option<String>,
+            Instant,
+            Vec<ServerNotification>,
+            Vec<FinalProgressNotificationParams>,
+        ),
+        ClientHttpConnectionError,
+    > {
+        if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
+            return Err(ClientHttpConnectionError::Modern(
+                ModernHttpClientError::Executor(ModernHttpExecutorError::Cancelled),
+            ));
+        }
+        self.request_json_with_result_source_at_inner(
+            cx,
+            cancellation,
+            ModernRequestAdmission::CoreWithParameterHeaders("tools/call", reviewed),
+            parameters,
+            request_id,
+            maximum_response_bytes,
+            client_extensions,
+            observer,
+        )
+        .await
+    }
+
     /// Sends one generic final extension request through the exact method
     /// descriptor admitted by both the frozen client registry and retained
     /// `server/discover` result.
@@ -4825,6 +4889,19 @@ impl ClientHttpConnection {
                     parameters,
                     request_id.clone(),
                     client_extensions,
+                    None,
+                )
+                .await?
+            }
+            ModernRequestAdmission::CoreWithParameterHeaders(method, reviewed) => {
+                self.request_with_optional_cancellation(
+                    cx,
+                    cancellation,
+                    method,
+                    parameters,
+                    request_id.clone(),
+                    client_extensions,
+                    Some(reviewed),
                 )
                 .await?
             }
@@ -4902,9 +4979,53 @@ impl ClientHttpConnection {
                         )
                         .await
                     }
+                    ModernHttpResponseKind::HttpFailure if response.metadata().status() == 400 => {
+                        Err(Self::classify_http_bad_request(
+                            cx,
+                            response,
+                            request_id,
+                            maximum_response_bytes,
+                        )
+                        .await)
+                    }
                     actual => Err(ClientHttpConnectionError::ExpectedJsonResponse { actual }),
                 }
             }
+        }
+    }
+
+    /// Classifies a modern HTTP 400 by its bounded JSON-RPC error body. Only
+    /// the exact pre-dispatch header mismatch for this request becomes
+    /// [`ClientHttpConnectionError::ParameterHeaderMismatch`]; any other body,
+    /// or a body that cannot be read, keeps the generic refusal.
+    async fn classify_http_bad_request(
+        cx: &Cx,
+        response: ModernHttpResponseStream,
+        request_id: RequestId,
+        maximum_response_bytes: usize,
+    ) -> ClientHttpConnectionError {
+        let generic = ClientHttpConnectionError::ExpectedJsonResponse {
+            actual: ModernHttpResponseKind::HttpFailure,
+        };
+        let Ok(Some(ModernHttpErrorBody::JsonRpcError(body))) =
+            response.read_error_body(cx, maximum_response_bytes).await
+        else {
+            return generic;
+        };
+        let header_mismatch = body
+            .id
+            .as_ref()
+            .is_some_and(|id| id.correlates_with(&request_id))
+            && body.result.is_none()
+            && body.error.as_ref().is_some_and(|error| {
+                error.code.as_i32() == Some(fastmcp_protocol::HEADER_MISMATCH_ERROR_CODE)
+                    && error.message == fastmcp_protocol::HEADER_MISMATCH_MESSAGE
+                    && error.data.is_none()
+            });
+        if header_mismatch {
+            ClientHttpConnectionError::ParameterHeaderMismatch { request_id }
+        } else {
+            generic
         }
     }
 
@@ -5641,6 +5762,9 @@ fn reject_final_only_legacy_request_metadata(
 pub enum ModernHttpClientError {
     /// A public constructor selected a protocol policy compiled out of this client.
     FeatureUnavailable(McpError),
+    /// Reviewed parameter headers could not be projected onto this exact
+    /// request, so nothing was sent.
+    ParameterHeaders(parameter_headers::ToolHeaderDispatchError),
     /// A modern reverse request could not be dispatched or encoded.
     ReverseRequestDispatch(McpError),
     /// The reverse-response POST was not accepted by the peer.
@@ -5784,6 +5908,7 @@ impl fmt::Display for ModernHttpClientError {
             Self::AuthenticatedLegacyFallback => formatter
                 .write_str("authenticated modern HTTP cannot fall back to a legacy endpoint"),
             Self::FeatureUnavailable(error) => error.fmt(formatter),
+            Self::ParameterHeaders(error) => error.fmt(formatter),
             Self::ReverseRequestDispatch(error) => error.fmt(formatter),
             Self::ReverseResponsePostRejected { status } => write!(
                 formatter,
@@ -5930,6 +6055,7 @@ impl std::error::Error for ModernHttpClientError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::FeatureUnavailable(error) => Some(error),
+            Self::ParameterHeaders(error) => Some(error),
             Self::ReverseRequestDispatch(error) => Some(error),
             Self::Executor(error) => Some(error),
             Self::Negotiation(error) => Some(error),
@@ -6402,7 +6528,7 @@ impl ModernHttpClient {
         parameters: serde_json::Value,
         request_id: Option<RequestId>,
     ) -> Result<ModernHttpResponseStream, ModernHttpClientError> {
-        self.request_with_client_extensions(cx, method.as_ref(), parameters, request_id, None)
+        self.request_with_client_extensions(cx, method.as_ref(), parameters, request_id, None, None)
             .await
     }
 
@@ -6513,6 +6639,7 @@ impl ModernHttpClient {
         parameters: serde_json::Value,
         request_id: Option<RequestId>,
         client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
+        parameter_headers: Option<&parameter_headers::ReviewedToolHeaders>,
     ) -> Result<ModernHttpResponseStream, ModernHttpClientError> {
         validate_final_method(method, request_id.is_some())?;
         if request_id.is_none() {
@@ -6528,6 +6655,7 @@ impl ModernHttpClient {
             client_extensions,
             false,
         )?;
+        let request = with_optional_parameter_headers(request, parameter_headers)?;
         self.execute_post_discovery_request(cx, &request).await
     }
 
@@ -6584,6 +6712,7 @@ impl ModernHttpClient {
         parameters: serde_json::Value,
         request_id: Option<RequestId>,
         client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
+        parameter_headers: Option<&parameter_headers::ReviewedToolHeaders>,
     ) -> Result<ModernHttpResponseStream, ModernHttpClientError> {
         if cancellation.is_cancel_requested() {
             return Err(ModernHttpClientError::Executor(
@@ -6604,6 +6733,7 @@ impl ModernHttpClient {
             client_extensions,
             false,
         )?;
+        let request = with_optional_parameter_headers(request, parameter_headers)?;
         self.execute_post_discovery_request_with_cancellation(cx, cancellation, &request)
             .await
     }
@@ -9631,6 +9761,20 @@ fn request_name_header_value(
         .ok_or_else(|| ModernHttpClientError::MissingRequestName {
             method: method.to_owned(),
         })
+}
+
+/// Installs a reviewed parameter-header plan on the exact built request, or
+/// leaves it unchanged. A projection failure sends nothing.
+fn with_optional_parameter_headers(
+    request: ModernHttpRequest,
+    reviewed: Option<&parameter_headers::ReviewedToolHeaders>,
+) -> Result<ModernHttpRequest, ModernHttpClientError> {
+    match reviewed {
+        Some(reviewed) => request
+            .with_reviewed_tool_headers(reviewed)
+            .map_err(ModernHttpClientError::ParameterHeaders),
+        None => Ok(request),
+    }
 }
 
 fn validate_final_method(method: &str, has_request_id: bool) -> Result<(), ModernHttpClientError> {

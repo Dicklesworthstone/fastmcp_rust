@@ -27,6 +27,12 @@ pub const MCP_NAME_HEADER: &str = "Mcp-Name";
 /// The final MCP JSON-RPC code for malformed, missing, or mismatched headers.
 pub const HEADER_MISMATCH_ERROR_CODE: i32 = -32020;
 
+/// The message FastMCP servers send with a pre-dispatch header mismatch.
+///
+/// A client compares it exactly, together with the code, request id and an
+/// absent `data`, before treating a refusal as safe to retry.
+pub const HEADER_MISMATCH_MESSAGE: &str = "MCP request headers do not match the JSON-RPC request";
+
 /// The final MCP JSON-RPC code for a missing required client capability.
 pub const MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE: i32 = -32021;
 
