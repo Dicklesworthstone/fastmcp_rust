@@ -4681,6 +4681,11 @@ struct FinalSubscriptionEntry {
 struct FinalSubscriptionTerminationReceipt {
     terminated: usize,
     terminal_deliveries: Vec<Arc<FinalSubscriptionTerminalDelivery>>,
+    /// Elections the server won. One won while an acknowledgement or event
+    /// callback was in flight is left `ServerTerminationPending`; that
+    /// callback's owner completes it, and only while its request is not yet
+    /// cancelled.
+    won_elections: Vec<(Arc<FinalSubscriptionElection>, McpRequestCancellation)>,
 }
 
 impl FinalSubscriptionTerminationReceipt {
@@ -4688,6 +4693,36 @@ impl FinalSubscriptionTerminationReceipt {
         self.terminal_deliveries
             .iter()
             .all(|delivery| delivery.is_settled())
+    }
+
+    /// Every path that finishes a won election leaves the pending phase and
+    /// cancels its request last, so both together mean its owner is done.
+    fn elections_settled(&self) -> bool {
+        self.won_elections.iter().all(|(election, cancellation)| {
+            cancellation.is_cancel_requested()
+                && !matches!(
+                    *election
+                        .phase
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    FinalSubscriptionPhase::ServerTerminationPending(_)
+                )
+        })
+    }
+
+    /// Waits, bounded, for the callbacks that own pending elections to finish
+    /// them. Generic shutdown cancellation must not run before this: it is
+    /// indistinguishable from a peer cancel and would defeat the server's
+    /// already-won graceful completion (bd-81cct).
+    fn wait_for_pending_elections(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while !self.elections_settled() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
     }
 
     fn fail_pending(&self) {
@@ -5414,9 +5449,12 @@ impl FinalSubscriptionRegistry {
         };
         let mut receipt = FinalSubscriptionTerminationReceipt::default();
         for entry in entries {
+            let election = Arc::clone(&entry.election);
+            let request_cancellation = entry.request_cancellation.clone();
             let (terminated, terminal_delivery) = Self::terminate_removed_entry(entry);
             if terminated {
                 receipt.terminated += 1;
+                receipt.won_elections.push((election, request_cancellation));
             }
             if let Some(terminal_delivery) = terminal_delivery {
                 receipt.terminal_deliveries.push(terminal_delivery);
@@ -12450,6 +12488,23 @@ impl Server {
         self.final_subscriptions.terminate()
     }
 
+    /// Shutdown's subscription teardown. A listen still inside its
+    /// acknowledgement (or an event) callback when the server wins its election
+    /// is completed by that callback's owner, and only if its request is not
+    /// cancelled yet. So this waits, bounded, for those owners before the
+    /// caller's generic `cancel_active_requests`, which a peer cancel and a
+    /// shutdown cancel look identical to (bd-81cct).
+    fn terminate_subscription_streams_for_shutdown(&self) -> usize {
+        let receipt = self.final_subscriptions.terminate_with_receipt();
+        if !receipt.wait_for_pending_elections(SHUTDOWN_CLEANUP_TIMEOUT) {
+            error!(
+                target: targets::SESSION,
+                "Final subscription callbacks did not finish their graceful completion before shutdown cancellation"
+            );
+        }
+        receipt.terminated
+    }
+
     /// Negotiates currently advertised client extension settings against this server.
     ///
     /// The resulting set is bound to this server's frozen descriptor receipt and
@@ -15868,7 +15923,7 @@ impl Server {
         // matching completion result before generic active-request
         // cancellation tears down request-local senders. HTTP has only that
         // complete result.
-        let _ = self.terminate_subscription_streams();
+        let _ = self.terminate_subscription_streams_for_shutdown();
         let cleanup = self.cancel_active_requests(CancelKind::Shutdown, true);
         if matches!(cleanup, ShutdownCleanupOutcome::Quiescent) {
             self.run_shutdown_hook();
@@ -15891,7 +15946,7 @@ impl Server {
     fn graceful_shutdown_returning(&self) -> ShutdownCleanupOutcome {
         // Preserve the same graceful subscription completion semantics for
         // embedded servers as for the process-exiting lifecycle.
-        let _ = self.terminate_subscription_streams();
+        let _ = self.terminate_subscription_streams_for_shutdown();
         let cleanup = self.cancel_active_requests(CancelKind::Shutdown, true);
         if matches!(cleanup, ShutdownCleanupOutcome::Quiescent) {
             self.run_shutdown_hook();
@@ -16475,7 +16530,7 @@ impl Server {
             }
         }
         if owns_server_lifecycle {
-            let _ = server.terminate_subscription_streams();
+            let _ = server.terminate_subscription_streams_for_shutdown();
         }
         queue.cancel_uncorrelated_modern_children();
         if drain_responses
@@ -17805,7 +17860,7 @@ impl Server {
         // cancellation; cancelling children first would erase that completion
         // before the writer can commit it.
         if owns_server_lifecycle {
-            let _ = server.terminate_subscription_streams();
+            let _ = server.terminate_subscription_streams_for_shutdown();
         }
         // Notification children have no response commit to protect, so they
         // are cancelled before the drain windows instead of being waited out.
@@ -48292,16 +48347,16 @@ mod lib_unit_tests {
     // cannot pass silently. They are deliberately outside the family's
     // `returning_subscription_*` prefix and its denominator.
     //
-    // The pump-first test pins the CURRENT outcome of bd-gl2we finding F1
-    // (stdio shutdown loses a pending graceful election, bd-81cct) as a
-    // mechanism proof, not as a contract; its fix must invert it. The
-    // under-recv-lock test was F2 (an acknowledgement sent during an unsplit
-    // transport's `recv` failed the connection). bd-8bcfq fixed that by
-    // queueing such output, so it now asserts the contract: the
-    // acknowledgement is written as soon as the owning `recv` returns.
+    // Both pairs now assert the contract. The pump-first test was bd-gl2we
+    // finding F1: stdio shutdown lost a pending graceful election. bd-81cct
+    // fixed it by having shutdown wait for the owner of a won election before
+    // generic cancellation. The under-recv-lock test was F2: an
+    // acknowledgement sent during an unsplit transport's `recv` failed the
+    // connection. bd-8bcfq fixed it by queueing such output until `recv`
+    // returns.
 
     #[test]
-    fn forced_subscription_ack_order_pump_first_loses_graceful_completion() {
+    fn forced_subscription_ack_order_pump_first_keeps_graceful_completion() {
         forced_subscription_shutdown_order_case(true);
     }
 
@@ -48366,11 +48421,13 @@ mod lib_unit_tests {
 
     /// EOF shutdown against a listen whose acknowledgement callback has run.
     /// `pump_first` holds the opener inside that callback, before it can
-    /// publish `Active`, until shutdown has cancelled the request: `terminate`
-    /// then records `ServerTerminationPending(0)` and the generic cancellation
-    /// that follows it defeats the opener's deferred election. Otherwise the
-    /// pump holds EOF until the opener has published `Active`, and shutdown
-    /// elects the graceful completion directly.
+    /// publish `Active`, until shutdown's `terminate` has recorded
+    /// `ServerTerminationPending(0)`. It then keeps holding for a grace window
+    /// in which a generic shutdown cancellation, had it been issued, would
+    /// defeat the opener's deferred election. Otherwise the pump holds EOF
+    /// until the opener has published `Active`, and shutdown elects the
+    /// graceful completion directly. Either order must deliver exactly one
+    /// graceful completion.
     fn forced_subscription_shutdown_order_case(pump_first: bool) {
         let runtime = RuntimeBuilder::current_thread()
             .with_reactor(create_reactor().expect("forced shutdown-order reactor"))
@@ -48384,11 +48441,14 @@ mod lib_unit_tests {
         let active = Arc::clone(&server.active_requests);
         let active_for_callback = Arc::clone(&active);
         let registry = Arc::clone(&server.final_subscriptions);
+        let registry_for_callback = Arc::clone(&registry);
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sent_for_send = Arc::clone(&sent);
         let forced = Arc::new(AtomicBool::new(false));
         let forced_by_callback = Arc::clone(&forced);
         let forced_by_recv = Arc::clone(&forced);
+        let cancelled_during_callback = Arc::new(AtomicBool::new(false));
+        let cancelled_by_callback = Arc::clone(&cancelled_during_callback);
         let (acknowledged, acknowledgement) = sync_channel(1);
         runtime
             .block_on(async move {
@@ -48430,6 +48490,18 @@ mod lib_unit_tests {
                                 {
                                     return;
                                 }
+                                // The lease is registered before its
+                                // acknowledgement is sent; keep its election
+                                // so the phase stays observable after
+                                // `terminate` removes the registry entry.
+                                let elections: Vec<_> = registry_for_callback
+                                    .inner
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .entries
+                                    .values()
+                                    .map(|entry| Arc::clone(&entry.election))
+                                    .collect();
                                 acknowledged
                                     .send(())
                                     .expect("receive pump owns acknowledgement channel");
@@ -48437,14 +48509,36 @@ mod lib_unit_tests {
                                     return;
                                 }
                                 let deadline = Instant::now() + Duration::from_secs(2);
-                                while Instant::now() < deadline {
+                                let server_won_during_callback = loop {
+                                    if elections.iter().any(|election| {
+                                        *election
+                                            .phase
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                            == FinalSubscriptionPhase::ServerTerminationPending(0)
+                                    }) {
+                                        break true;
+                                    }
+                                    if Instant::now() >= deadline {
+                                        break false;
+                                    }
+                                    std::thread::sleep(Duration::from_millis(1));
+                                };
+                                if !server_won_during_callback {
+                                    return;
+                                }
+                                forced_by_callback.store(true, Ordering::Release);
+                                // Shutdown must not cancel the request while
+                                // this callback still owns the won election.
+                                let grace = Instant::now() + Duration::from_millis(500);
+                                while Instant::now() < grace {
                                     if active_for_callback
                                         .lock()
                                         .unwrap()
                                         .values()
                                         .any(|owner| owner.cancellation.is_cancel_requested())
                                     {
-                                        forced_by_callback.store(true, Ordering::Release);
+                                        cancelled_by_callback.store(true, Ordering::Release);
                                         return;
                                     }
                                     std::thread::sleep(Duration::from_millis(1));
@@ -48483,15 +48577,12 @@ mod lib_unit_tests {
                 _ => None,
             })
             .collect();
-        if pump_first {
-            assert!(
-                responses.is_empty(),
-                "a cancelled pending election suppresses every response: {responses:?}"
-            );
-        } else {
-            assert_eq!(responses.len(), 1, "{responses:?}");
-            assert!(final_subscription_completion_response(responses[0]));
-        }
+        assert!(
+            !cancelled_during_callback.load(Ordering::Acquire),
+            "shutdown cancelled the request while its won election was still pending"
+        );
+        assert_eq!(responses.len(), 1, "{responses:?}");
+        assert!(final_subscription_completion_response(responses[0]));
     }
 
     /// An invalid response frame after an acknowledged listen, on an unsplit
