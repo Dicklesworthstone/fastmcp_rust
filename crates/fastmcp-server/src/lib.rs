@@ -73,8 +73,8 @@
 // (including in unit tests).
 extern crate self as fastmcp_server;
 
-mod auth;
 mod async_stdio;
+mod auth;
 pub mod bidirectional;
 mod builder;
 pub mod caching;

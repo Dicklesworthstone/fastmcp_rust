@@ -699,6 +699,7 @@ impl Server {
         let mut drain: Option<Pin<Box<Sleep>>> = None;
         let mut stopping = false;
         let mut error = None;
+        let mut request_regions_quiescent = true;
         let mut ingress_first = true;
         loop {
             if !stopping && writing.is_none() && lifetime.output.has_frames() {
@@ -829,6 +830,11 @@ impl Server {
                 Event::Completed(index, result) => {
                     drop(requests.swap_remove(index));
                     if let Err(failure) = result {
+                        // These failures are region-open/cancel/close failures.
+                        // An unavailable runtime cannot provide a quiescence
+                        // receipt; do not run application shutdown over work
+                        // whose closure was merely requested by Drop.
+                        request_regions_quiescent = false;
                         error.get_or_insert(failure);
                         stop = true;
                     }
@@ -884,7 +890,9 @@ impl Server {
                 }
             }
         }
-        server.run_shutdown_hook();
+        if request_regions_quiescent {
+            server.run_shutdown_hook();
+        }
         drop(lifetime);
         error.map_or(Ok(()), Err)
     }
