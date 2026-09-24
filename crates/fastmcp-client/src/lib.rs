@@ -228,8 +228,9 @@ use asupersync::{
     sync::{Mutex as AsyncMutex, OwnedMutexGuard},
 };
 use execution::{MrtrDriver, MrtrDriverLimits};
+use fastmcp_core::runtime::poll_on_cx;
 use fastmcp_core::{
-    McpContext, McpError, McpErrorCode, McpRequestCancellation, McpResult, Sha256Digest, block_on,
+    McpContext, McpError, McpErrorCode, McpRequestCancellation, McpResult, Sha256Digest,
     sha256_bounded,
 };
 use fastmcp_protocol::common_types::{
@@ -3099,7 +3100,9 @@ fn invoke_reverse_request_handler<P, R>(
     params: P,
 ) -> McpResult<R> {
     cancellation.checkpoint()?;
-    catch_client_callback_unwind(|| block_on(handler(cx, cancellation, params)))
+    // Poll under the caller's own Cx: a sync caller running inside a runtime
+    // task must not build or enter a second runtime (FND-04 [7]).
+    catch_client_callback_unwind(|| poll_on_cx(cx, handler(cx, cancellation, params)))
         .map_err(|_| McpError::internal_error("Client reverse request handler failed"))?
 }
 
@@ -22957,6 +22960,7 @@ mod tests {
     use super::*;
     #[cfg(feature = "legacy-2024-11-05")]
     use crate::http_executor::ModernHttpConnectOutcome;
+    use fastmcp_core::block_on;
 
     fn acknowledgement_with_subscription_id(
         id: RequestId,
@@ -39592,6 +39596,82 @@ exec sleep 5
             CoreResult::Final(FinalCoreResult::PromptsGet { .. })
         ));
         client.close().expect("MRTR prompt client cleanup");
+    }
+
+    /// Drives the public sync `call_tool_typed` MRTR path from a task on the
+    /// caller's runtime. The caller's Cx carries a label; the roots handler
+    /// reports the label of the Cx it is ambiently polled under. The two
+    /// cases differ only in whether the handler nests a `block_on`.
+    #[cfg(unix)]
+    fn sync_reverse_handler_under_caller_runtime(
+        nest_block_on: bool,
+    ) -> (McpResult<CoreResult>, Option<String>) {
+        const CALLER_LABEL: &str = "fnd04-sync-reverse-caller";
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let caller = Cx::current().expect("the runtime installs the caller's Cx");
+            caller.set_task_type(CALLER_LABEL);
+            let observed = Arc::new(Mutex::new(None::<String>));
+            let handler_observed = Arc::clone(&observed);
+            let handlers =
+                ReverseRequestHandlers::new().with_modern_roots_list(move |_cx, _, _| {
+                    let observed = Arc::clone(&handler_observed);
+                    Box::pin(async move {
+                        *observed.lock().unwrap() =
+                            Cx::current().and_then(|ambient| ambient.task_type());
+                        if nest_block_on {
+                            block_on(async {});
+                        }
+                        Ok(FinalEmbeddedRootsListResult { roots: Vec::new() })
+                    })
+                });
+            let script = modern_mrtr_retry_client_script(
+                "tools/call",
+                r#"{"resultType":"complete","content":[],"isError":false}"#,
+            );
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .client_info("fnd04-sync-reverse", "1.0.0")
+                .reverse_request_handlers(handlers)
+                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &caller)
+                .await
+                .expect("modern stdio client connects with a roots handler");
+            let result = client.call_tool_typed("retry-tool", serde_json::json!({}));
+            let _ = client.close();
+            let label = observed.lock().unwrap().take();
+            (result, label)
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_reverse_handler_is_polled_under_the_caller_cx_without_a_nested_runtime() {
+        let (result, label) = sync_reverse_handler_under_caller_runtime(false);
+        assert!(
+            matches!(
+                result,
+                Ok(CoreResult::Final(FinalCoreResult::ToolsCall { .. }))
+            ),
+            "the MRTR retry must complete: {result:?}"
+        );
+        assert_eq!(
+            label.as_deref(),
+            Some("fnd04-sync-reverse-caller"),
+            "the handler must run under the caller's Cx, not a nested runtime's"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_reverse_handler_nesting_block_on_is_refused_before_any_retry() {
+        let (result, label) = sync_reverse_handler_under_caller_runtime(true);
+        let error = result.expect_err("a handler that nests block_on must fail the call");
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert_eq!(error.message, "Client reverse request handler failed");
+        assert_eq!(label.as_deref(), Some("fnd04-sync-reverse-caller"));
     }
 
     #[cfg(unix)]
