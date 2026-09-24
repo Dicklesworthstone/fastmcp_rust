@@ -4364,6 +4364,10 @@ impl ProxyCatalog {
 }
 
 /// Shared proxy client wrapper for handler reuse.
+///
+/// Synchronous methods run on the context the proxy was connected with. Over an
+/// exact-2024 HTTP upstream that context must be runtime-backed, because the
+/// upstream's SSE receiver outlives every call and runs on it.
 #[derive(Clone)]
 pub struct ProxyClient {
     inner: Arc<Mutex<dyn ProxyBackend>>,
@@ -8017,6 +8021,9 @@ impl ProxyUpstreamBindingRegistry {
     /// Establishment and exact-2024 initialization run on the caller's runtime.
     /// Cancellation or dropping the opening future leaves the cache unchanged.
     /// Keep that runtime alive while using a cached legacy SSE connection.
+    /// `cx` must be that runtime's own context. A detached one, such as
+    /// `Cx::for_request()`, leaves the legacy SSE receiver nothing to run on,
+    /// so its first request is refused with `LegacyReceiverNeedsRuntimeCx`.
     #[allow(clippy::too_many_arguments)]
     pub async fn connect_http_with_protocol_plan(
         &mut self,
@@ -8967,6 +8974,7 @@ impl ProxyClient {
 
     /// Subscribes the upstream to one resource and remembers the inbound URI
     /// so later `resources/updated` can be republished onto the gateway session.
+    /// Over an exact-2024 HTTP upstream, the proxy must be connected on a runtime-backed caller `Cx`.
     pub fn subscribe_resource(&self, ctx: &McpContext, inbound_uri: &str) -> McpResult<()> {
         ctx.checkpoint()?;
         if self.upstream_binding.map(|binding| binding.era()) == Some(ProtocolEra::Modern2026) {
@@ -8982,6 +8990,7 @@ impl ProxyClient {
     }
 
     /// Ends the matching upstream resource subscription.
+    /// Over an exact-2024 HTTP upstream, the proxy must be connected on a runtime-backed caller `Cx`.
     pub fn unsubscribe_resource(&self, ctx: &McpContext, inbound_uri: &str) -> McpResult<()> {
         ctx.checkpoint()?;
         if self.upstream_binding.map(|binding| binding.era()) == Some(ProtocolEra::Modern2026) {
@@ -9153,6 +9162,7 @@ impl ProxyClient {
     }
 
     /// Completes one argument without erasing the exact selected-era result.
+    /// Over an exact-2024 HTTP upstream, the proxy must be connected on a runtime-backed caller `Cx`.
     pub fn complete_typed(
         &self,
         ctx: &McpContext,
@@ -9243,6 +9253,8 @@ impl ProxyClient {
         self.complete_typed(ctx, params)
     }
 
+    /// Calls a tool on the upstream.
+    /// Over an exact-2024 HTTP upstream, the proxy must be connected on a runtime-backed caller `Cx`.
     pub fn call_tool(
         &self,
         ctx: &McpContext,
@@ -9349,6 +9361,8 @@ impl ProxyClient {
         }
     }
 
+    /// Reads a resource from the upstream.
+    /// Over an exact-2024 HTTP upstream, the proxy must be connected on a runtime-backed caller `Cx`.
     pub fn read_resource(&self, ctx: &McpContext, uri: &str) -> McpResult<Vec<ResourceContent>> {
         match self.read_resource_typed(ctx, uri)? {
             CoreResult::Legacy(LegacyCoreResult::ResourcesRead(result)) => {
@@ -9382,6 +9396,8 @@ impl ProxyClient {
         }
     }
 
+    /// Gets a prompt from the upstream.
+    /// Over an exact-2024 HTTP upstream, the proxy must be connected on a runtime-backed caller `Cx`.
     pub fn get_prompt(
         &self,
         ctx: &McpContext,
@@ -9422,6 +9438,7 @@ impl ProxyClient {
     }
 
     /// Calls a tool without erasing exact legacy fields or final result state.
+    /// Over an exact-2024 HTTP upstream, the proxy must be connected on a runtime-backed caller `Cx`.
     pub fn call_tool_typed(
         &self,
         ctx: &McpContext,
@@ -9439,6 +9456,7 @@ impl ProxyClient {
     /// than IEEE-754 values, preserving the exact JSON-number lexemes admitted
     /// from a modern upstream SSE frame. Exact-2024 backends remain on the
     /// separate [`ProgressCallback`] path and do not invoke this callback.
+    /// Over an exact-2024 HTTP upstream, the proxy must be connected on a runtime-backed caller `Cx`.
     pub fn call_tool_typed_with_final_progress(
         &self,
         ctx: &McpContext,
@@ -10160,6 +10178,7 @@ impl ProxyClient {
     }
 
     /// Reads a resource without erasing exact legacy fields or final result state.
+    /// Over an exact-2024 HTTP upstream, the proxy must be connected on a runtime-backed caller `Cx`.
     pub fn read_resource_typed(&self, ctx: &McpContext, uri: &str) -> McpResult<CoreResult> {
         ctx.checkpoint()?;
         self.forward_inbound_log_level(ctx)?;
@@ -10260,6 +10279,7 @@ impl ProxyClient {
     }
 
     /// Gets a prompt without erasing exact legacy fields or final result state.
+    /// Over an exact-2024 HTTP upstream, the proxy must be connected on a runtime-backed caller `Cx`.
     pub fn get_prompt_typed(
         &self,
         ctx: &McpContext,
