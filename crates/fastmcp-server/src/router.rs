@@ -1809,10 +1809,19 @@ fn compose_handler_budget(
 }
 
 fn budget_error(ctx: &McpContext) -> Option<McpError> {
-    if ctx.ensure_live().is_err() {
-        return Some(McpError::request_cancelled());
+    ctx.ensure_live().is_err().then(|| cancellation_error(ctx))
+}
+
+/// The error for a request that is no longer live. A handler whose own
+/// checkpoint saw the deadline first, or a Cx the runtime cancelled for its
+/// deadline, still ended on that deadline; only an explicit cancellation is
+/// reported as a plain cancellation.
+fn cancellation_error(ctx: &McpContext) -> McpError {
+    if ctx.deadline_expired() {
+        McpError::new(McpErrorCode::RequestCancelled, "Request timeout exceeded")
+    } else {
+        McpError::request_cancelled()
     }
-    None
 }
 
 fn handler_budget_error(ctx: &McpContext, budget: Budget) -> Option<McpError> {
@@ -2006,7 +2015,7 @@ fn run_handler<'a, T>(
             "Request timeout exceeded",
         )),
         Ok(Ok(outcome)) => {
-            if budget_error(ctx).is_some() {
+            if let Some(error) = budget_error(ctx) {
                 // A synchronous handler cannot be preempted by timeout_at, so
                 // a late completion surfaces here; deadline expiry keeps its
                 // distinguishable timeout message.
@@ -2016,7 +2025,7 @@ fn run_handler<'a, T>(
                         "Request timeout exceeded",
                     ))
                 } else {
-                    Err(McpError::request_cancelled())
+                    Err(error)
                 }
             } else {
                 Ok(outcome)
@@ -2040,7 +2049,7 @@ async fn run_handler_in_request<'a, T>(
     make_future: impl FnOnce(&'a Cx) -> BoxFuture<'a, McpOutcome<T>>,
 ) -> McpResult<McpOutcome<T>> {
     if request_cx_cancellation_is_visible(request_cx) {
-        return Err(McpError::request_cancelled());
+        return Err(cancellation_error(ctx));
     }
     if let Some(error) = handler_budget_error(ctx, budget) {
         return Err(error);
@@ -2075,7 +2084,7 @@ async fn run_handler_in_request<'a, T>(
     };
 
     if request_cx_cancellation_is_visible(request_cx) {
-        return Err(McpError::request_cancelled());
+        return Err(cancellation_error(ctx));
     }
     if let Some(error) = handler_budget_error(ctx, budget) {
         return Err(error);
@@ -16881,6 +16890,90 @@ mod router_tests {
         assert_eq!(error.code, McpErrorCode::RequestCancelled);
         assert_eq!(error.message, "Request timeout exceeded");
         assert!(!cx.is_cancel_requested());
+    }
+
+    /// A handler that sees the request deadline first through `checkpoint()`
+    /// still ended on that deadline, so the framework reports the timeout.
+    #[test]
+    fn deadline_first_observed_by_the_handler_reports_request_timeout() {
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let ctx = request_context(&cx, 1, Budget::new().with_deadline(Time::ZERO), &state)
+            .with_request_cancellation(fastmcp_core::McpRequestCancellation::new());
+
+        assert!(
+            ctx.checkpoint().is_err(),
+            "the handler observes the deadline"
+        );
+        let error = budget_error(&ctx).expect("an expired request is not live");
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(error.message, "Request timeout exceeded");
+    }
+
+    /// Near-identical negative: an explicit cancellation first observed by
+    /// the handler stays a plain cancellation.
+    #[test]
+    fn explicit_cancellation_first_observed_by_the_handler_reports_request_cancelled() {
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let cancellation = fastmcp_core::McpRequestCancellation::new();
+        let ctx = request_context(&cx, 1, Budget::INFINITE, &state)
+            .with_request_cancellation(cancellation.clone());
+
+        assert!(cancellation.cancel());
+        assert!(
+            ctx.checkpoint().is_err(),
+            "the handler observes the cancellation"
+        );
+        let error = budget_error(&ctx).expect("a cancelled request is not live");
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(error.message, McpError::request_cancelled().message);
+    }
+
+    fn run_ready_handler(ctx: &McpContext, request_cx: &Cx) -> McpResult<McpOutcome<()>> {
+        fastmcp_core::block_on(run_handler_in_request(
+            ctx,
+            request_cx,
+            Budget::INFINITE,
+            "tool",
+            |_| Box::pin(async { Outcome::Ok(()) }),
+        ))
+    }
+
+    /// A request Cx cancelled once the request's deadline has passed is the
+    /// deadline ending the request, so the handler runner reports the timeout.
+    #[test]
+    fn handler_runner_reports_a_cancelled_request_cx_past_its_deadline_as_timeout() {
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let ctx = request_context(&cx, 1, Budget::new().with_deadline(Time::ZERO), &state)
+            .with_request_cancellation(fastmcp_core::McpRequestCancellation::new());
+        let request_cx = Cx::for_testing();
+        request_cx.set_cancel_requested(true);
+
+        let error = run_ready_handler(&ctx, &request_cx)
+            .expect_err("a cancelled request Cx is refused before the handler runs");
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(error.message, "Request timeout exceeded");
+    }
+
+    /// Near-identical negative: the same cancelled request Cx under an explicit
+    /// cancellation and no deadline stays a plain cancellation.
+    #[test]
+    fn handler_runner_reports_an_explicitly_cancelled_request_cx_as_cancellation() {
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let cancellation = fastmcp_core::McpRequestCancellation::new();
+        let ctx = request_context(&cx, 1, Budget::INFINITE, &state)
+            .with_request_cancellation(cancellation.clone());
+        assert!(cancellation.cancel());
+        let request_cx = Cx::for_testing();
+        request_cx.set_cancel_requested(true);
+
+        let error = run_ready_handler(&ctx, &request_cx)
+            .expect_err("a cancelled request Cx is refused before the handler runs");
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(error.message, McpError::request_cancelled().message);
     }
 
     #[test]

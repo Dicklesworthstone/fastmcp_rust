@@ -365,12 +365,11 @@ mod troubleshooting_and_limitations {
         );
     }
 
-    /// Troubleshooting: work that outlives `.request_timeout(...)` ends as a
-    /// JSON-RPC RequestCancelled error, whose message depends on where the
-    /// deadline is observed ("Request timeout exceeded" when the server sees
-    /// it, "Request cancelled" when the handler's checkpoint does); the same
-    /// work under a longer deadline finishes. Both runs complete before any
-    /// assertion, so a failure reports the pair and their elapsed times.
+    /// Troubleshooting: work that outlives `.request_timeout(...)` ends as
+    /// RequestCancelled "Request timeout exceeded", even though the handler's
+    /// own checkpoint observes the deadline first; the same work under a
+    /// longer deadline finishes. Both runs complete before any assertion, so
+    /// a failure reports the pair and their elapsed times.
     #[test]
     fn request_timeout_bounds_the_same_work_that_a_longer_deadline_completes() {
         let run_with_timeout = |seconds| {
@@ -395,10 +394,8 @@ mod troubleshooting_and_limitations {
             error_code(McpErrorCode::RequestCancelled),
             "{evidence}"
         );
-        assert!(
-            ["Request timeout exceeded", "Request cancelled"]
-                .iter()
-                .any(|message| bounded["error"]["message"] == *message),
+        assert_eq!(
+            bounded["error"]["message"], "Request timeout exceeded",
             "{evidence}"
         );
         assert_eq!(

@@ -19068,15 +19068,18 @@ impl Server {
     }
 
     fn request_budget_error(cx: &Cx, budget: Budget) -> Option<McpError> {
-        if cx.is_cancel_requested() {
-            return Some(McpError::request_cancelled());
-        }
+        // The runtime also cancels a Cx whose deadline passed, so classify the
+        // deadline first; a passed deadline is not reported as a plain
+        // cancellation. Explicit request cancellation is checked by callers.
         let effective_budget = cx.budget().meet(budget);
         if effective_budget.is_past_deadline(cx.now()) {
             return Some(McpError::new(
                 McpErrorCode::RequestCancelled,
                 "Request timeout exceeded",
             ));
+        }
+        if cx.is_cancel_requested() {
+            return Some(McpError::request_cancelled());
         }
         None
     }
@@ -19105,6 +19108,12 @@ impl Server {
 
     fn request_context_error(ctx: &McpContext) -> Option<McpError> {
         if ctx.ensure_live().is_err() {
+            if ctx.deadline_expired() {
+                return Some(McpError::new(
+                    McpErrorCode::RequestCancelled,
+                    "Request timeout exceeded",
+                ));
+            }
             return Some(McpError::request_cancelled());
         }
         None
@@ -30854,6 +30863,32 @@ mod lib_unit_tests {
             0,
             "a response that never reached the transport must not be counted as sent"
         );
+    }
+
+    /// bd-0vcz4: the runtime also cancels a Cx whose deadline passed; that
+    /// cancellation is the timeout, not a plain cancellation.
+    #[test]
+    fn cancelled_cx_past_its_deadline_reports_request_timeout() {
+        let cx = Cx::for_testing_with_budget(Budget::new().with_deadline(asupersync::Time::ZERO));
+        cx.set_cancel_requested(true);
+
+        let error = Server::request_budget_error(&cx, Budget::INFINITE)
+            .expect("an expired, cancelled request is refused");
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(error.message, "Request timeout exceeded");
+    }
+
+    /// Near-identical negative: the same cancelled Cx without a passed deadline
+    /// is a plain cancellation.
+    #[test]
+    fn cancelled_cx_without_a_passed_deadline_reports_request_cancelled() {
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+
+        let error = Server::request_budget_error(&cx, Budget::INFINITE)
+            .expect("a cancelled request is refused");
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(error.message, McpError::request_cancelled().message);
     }
 
     #[test]

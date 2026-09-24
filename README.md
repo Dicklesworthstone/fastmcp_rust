@@ -853,7 +853,7 @@ pub trait PromptHandler: Send + Sync {
 |---------|-------|-----|
 | JSON-RPC `InvalidParams` (`-32602`) `Unknown tool: <name>` for `tools/call` | Tool not registered | Register the generated handler, for example `.tool(MyTool)` |
 | Request cancelled mid-operation | Local request cancellation or budget exhaustion | Add checkpoints and mask only the smallest atomic section that must finish; Unix stdio keeps receiving while bounded modern request children run, but output commits are serialized, non-Unix/custom/SSE/WebSocket loops retain blocking boundaries, and a non-cooperative handler can exceed the process-exit quiescence drain |
-| JSON-RPC `RequestCancelled` (`-32004`) error, `Request timeout exceeded` or `Request cancelled` | The request outlived the server-owned deadline (`.request_timeout(...)`, 30 seconds by default); the message is `Request cancelled` when the handler's own checkpoint observes it first | Add checkpoints so work stops promptly; increase `.request_timeout(...)` only for a deadline that is intentionally too short |
+| JSON-RPC `RequestCancelled` (`-32004`) error `Request timeout exceeded` | The request outlived the server-owned deadline (`.request_timeout(...)`, 30 seconds by default), whether the server or the handler's own checkpoint observed it first | Add checkpoints so work stops promptly; increase `.request_timeout(...)` only for a deadline that is intentionally too short |
 | `#[tool]` macro compilation error | Unsupported return conversion or argument schema | Prefer `String`, `Vec<Content>`, `McpResult<String>`, or `McpResult<Vec<Content>>` and ensure custom argument types implement `JsonSchema` |
 | `TransportError::Io` on startup | stdin unavailable | Ensure nothing else reads stdin |
 

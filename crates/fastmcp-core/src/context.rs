@@ -1652,6 +1652,10 @@ struct FrameworkBudgetState {
     /// dimension. Exact depletion to zero is valid; only an actual overrun
     /// sets this terminal request-local condition.
     deferred_overrun: bool,
+    /// A liveness check refused this request because its own deadline passed,
+    /// not because it was explicitly cancelled. Recorded so the framework can
+    /// report the timeout even when a handler observed it first.
+    deadline_refused: bool,
 }
 
 impl FrameworkBudgetState {
@@ -2462,20 +2466,64 @@ impl McpContext {
 
         let ambient = self.cx.budget();
         let now = self.cx.now();
-        let state = *self
+        let mut state = self
             .budget_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let effective =
             self.apply_operation_deadline(state.effective(ambient, self.budget_debit_origin));
+        let past_deadline = effective.is_past_deadline(now);
         if self.request_cancellation.is_cancel_requested()
             || self.cx.is_cancel_requested()
-            || effective.is_past_deadline(now)
+            || past_deadline
             || state.deferred_overrun
         {
+            state.deadline_refused |= self.refusal_is_deadline(past_deadline);
             return Err(CancelledError);
         }
         Ok(())
+    }
+
+    /// Whether this request's own deadline, not an explicit cancellation,
+    /// has ended it.
+    ///
+    /// True once a checkpoint, liveness check or cost debit refused because
+    /// the request's effective deadline had passed, or while that deadline is
+    /// past now. A server uses this to report a timeout even when a handler
+    /// observed the deadline first and returned [`CancelledError`]. An
+    /// explicit cancellation of the request is never reported as a deadline.
+    #[must_use]
+    pub fn deadline_expired(&self) -> bool {
+        if self.request_cancellation.is_cancel_requested() {
+            return false;
+        }
+        let state = *self
+            .budget_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.deadline_refused
+            || self.cx_cancelled_for_deadline()
+            || self
+                .apply_operation_deadline(
+                    state.effective(self.cx.budget(), self.budget_debit_origin),
+                )
+                .is_past_deadline(self.cx.now())
+    }
+
+    /// Classifies a refusal: the request deadline passed (by this context's
+    /// own budget, or by the runtime cancelling the Cx for its deadline) while
+    /// nothing explicitly cancelled the request.
+    fn refusal_is_deadline(&self, past_deadline: bool) -> bool {
+        !self.request_cancellation.is_cancel_requested()
+            && (past_deadline || self.cx_cancelled_for_deadline())
+    }
+
+    fn cx_cancelled_for_deadline(&self) -> bool {
+        self.cx.is_cancel_requested()
+            && self
+                .cx
+                .cancel_chain()
+                .any(|reason| matches!(reason.kind, asupersync::types::CancelKind::Deadline))
     }
 
     /// Cooperative cancellation checkpoint.
@@ -2537,6 +2585,7 @@ impl McpContext {
         let deferred_overrun = state.deferred_overrun;
 
         if !masked && (cancelled || poll_unavailable || past_deadline || deferred_overrun) {
+            state.deadline_refused |= self.refusal_is_deadline(past_deadline);
             return Err(CancelledError);
         }
 
@@ -2616,6 +2665,7 @@ impl McpContext {
             self.request_cancellation.is_cancel_requested() || self.cx.is_cancel_requested();
 
         if !masked && (cancelled || past_deadline || state.deferred_overrun || !enough_cost) {
+            state.deadline_refused |= self.refusal_is_deadline(past_deadline);
             return Err(CancelledError);
         }
 
@@ -4608,6 +4658,35 @@ mod tests {
 
         // Should fail when budget is exhausted
         assert!(ctx.checkpoint().is_err());
+    }
+
+    /// A checkpoint refused by the request's own deadline is remembered, so a
+    /// server can report the timeout after the handler returned the generic
+    /// cancellation from `checkpoint()?`.
+    #[test]
+    fn checkpoint_refused_by_an_expired_deadline_reports_the_deadline() {
+        let cx = Cx::for_testing_with_budget(Budget::new().with_deadline(asupersync::Time::ZERO));
+        let ctx = McpContext::new(cx, 1).with_request_cancellation(McpRequestCancellation::new());
+
+        assert!(ctx.checkpoint().is_err());
+        assert!(ctx.deadline_expired());
+        assert!(
+            ctx.clone().deadline_expired(),
+            "clones share the recorded reason"
+        );
+    }
+
+    /// Near-identical negative: the same refusal caused by an explicit
+    /// cancellation, with no deadline, is never reported as a deadline.
+    #[test]
+    fn checkpoint_refused_by_an_explicit_cancellation_is_not_a_deadline() {
+        let cancellation = McpRequestCancellation::new();
+        let cx = Cx::for_testing_with_budget(Budget::new());
+        let ctx = McpContext::new(cx, 1).with_request_cancellation(cancellation.clone());
+
+        assert!(cancellation.cancel());
+        assert!(ctx.checkpoint().is_err());
+        assert!(!ctx.deadline_expired());
     }
 
     #[test]
