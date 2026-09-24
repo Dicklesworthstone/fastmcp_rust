@@ -18,6 +18,9 @@ use crate::http_auth::rpc::{ManagedCoreError, interaction::{
     ManagedInteractionLimits,
 }};
 
+/// Explicit journal-backed recovery retaining the tool's original contract.
+pub mod recovery;
+
 /// Errors retain the core interaction's correctable-input distinctions without
 /// retaining the challenge, submitted answer, schema, or tool output.
 #[derive(Debug)]
