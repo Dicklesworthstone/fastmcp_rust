@@ -1227,6 +1227,12 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// JSON-RPC protocol values do not implement `PartialEq`; tests compare
+    /// the JSON each one serializes to.
+    fn json(value: &impl serde::Serialize) -> serde_json::Value {
+        serde_json::to_value(value).expect("JSON-RPC test values serialize")
+    }
+
     fn exhausted_contexts() -> [Cx; 3] {
         [
             Cx::for_testing_with_budget(
@@ -1257,7 +1263,7 @@ mod tests {
             let JsonRpcMessage::Request(received) = server.recv(&live).unwrap() else {
                 panic!("masked publication must retain request direction");
             };
-            assert_eq!(received, request);
+            assert_eq!(json(&received), json(&request));
             assert!(matches!(
                 client.send_request(&stopped, &request),
                 Err(TransportError::Cancelled)
@@ -1287,7 +1293,7 @@ mod tests {
             let JsonRpcMessage::Request(received) = server.recv(&live).unwrap() else {
                 panic!("a refused receive must leave the original message queued");
             };
-            assert_eq!(received, request);
+            assert_eq!(json(&received), json(&request));
             assert_eq!(server.receiver.len(), 0);
         }
     }
@@ -1317,7 +1323,7 @@ mod tests {
         stopped.masked(|| {
             let frame = recv.recv_with_source(&stopped).unwrap();
             assert_eq!(frame.source(), expected.strip_suffix(b"\n").unwrap());
-            assert_eq!(frame.message(), &message);
+            assert_eq!(json(frame.message()), json(&message));
         });
         assert_eq!(recv.receiver.as_ref().unwrap().len(), 0);
         assert!(!send.is_closed());
@@ -1362,7 +1368,7 @@ mod tests {
         let JsonRpcMessage::Request(received) = server.recv(&live).unwrap() else {
             panic!("a deadline must not poison the endpoint");
         };
-        assert_eq!(received, request);
+        assert_eq!(json(&received), json(&request));
     }
 
     struct CancelOnWake(Cx);
@@ -1391,7 +1397,7 @@ mod tests {
         else {
             panic!("publication must succeed even if its wake requests cancellation");
         };
-        assert_eq!(received, request);
+        assert_eq!(json(&received), json(&request));
     }
 
     #[test]
@@ -1413,13 +1419,13 @@ mod tests {
                 panic!("dequeue must succeed even if its wake requests cancellation");
             };
             assert!(receiving_cx.is_cancel_requested());
-            assert_eq!(received, first);
+            assert_eq!(json(&received), json(&first));
         }
         assert_eq!(server.receiver.len(), 0);
         client.send_request(&live, &first).unwrap();
         let JsonRpcMessage::Request(received) = server.recv(&live).unwrap() else {
             panic!("the dropped pending sender must leave the endpoint usable");
         };
-        assert_eq!(received, first);
+        assert_eq!(json(&received), json(&first));
     }
 }
