@@ -438,4 +438,45 @@ mod tests {
         assert!(!cx.is_cancel_requested());
         assert_eq!(ids.load(Ordering::SeqCst), 7);
     }
+
+    /// The shared `HostDisposition::host_error` on this type: a host error
+    /// carrying `RequestCancelled` keeps its meaning as this type's nested
+    /// cancelled variant.
+    #[test]
+    fn host_disposition_maps_a_cancelled_host_error_to_the_nested_cancelled_variant() {
+        let error = ClientCredentialsInteractionError::host_error(McpError::new(
+            McpErrorCode::RequestCancelled,
+            "host failure",
+        ));
+
+        assert!(
+            matches!(
+                error,
+                ClientCredentialsInteractionError::Core(ClientCredentialsCoreError::Protocol(
+                    ManagedCoreError::Cancelled,
+                )),
+            ),
+            "a cancelled host error must yield Core(Protocol(Cancelled)), not {error:?}",
+        );
+    }
+
+    /// Planted negative for the test above: only the host error's code
+    /// differs, and the result must be the opaque abort, not cancellation.
+    #[test]
+    fn host_disposition_maps_any_other_host_error_to_an_opaque_abort() {
+        let error = ClientCredentialsInteractionError::host_error(McpError::new(
+            McpErrorCode::InvalidRequest,
+            "host failure",
+        ));
+
+        assert!(
+            matches!(
+                error,
+                ClientCredentialsInteractionError::Interaction(
+                    ManagedInteractionError::AbortedByHost,
+                ),
+            ),
+            "any other host error must yield Interaction(AbortedByHost), not {error:?}",
+        );
+    }
 }
