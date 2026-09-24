@@ -263,7 +263,8 @@ impl RecoverableMachineContinuation {
             }
         }
         let snapshot = self.snapshot.as_ref().ok_or(ContinuationRecoveryError::WrongPhase)?;
-        let discovery = discover(cx, end, &client.inner.closed, &cancellation, snapshot,
+        let executor = client.resource_http_executor();
+        let discovery = discover(cx, &executor, end, &client.inner.closed, &cancellation, snapshot,
             &discovery_id, prepared.discovery, prepared.discovery_wire, limits.frame_bytes()).await;
         if let Err(error) = discovery { self.close(); return Err(error); }
         self.check(cx)?;
@@ -274,7 +275,7 @@ impl RecoverableMachineContinuation {
         };
         self.phase = Phase::Recoverable;
         let response = guarded(cx, end, &client.inner.closed, &cancellation, snapshot, async {
-            ModernHttpExecutor::new().execute_with_cancellation(cx, &cancellation, &wire)
+            executor.execute_with_cancellation(cx, &cancellation, &wire)
                 .await.map_err(operation_http_error)
         }).await;
         self.check(cx)?;
@@ -325,12 +326,12 @@ fn prepared(resource: &fastmcp_core::CanonicalHttpUrl, request: &CoreRequest,
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn discover(cx: &Cx, end: Time, owner: &McpRequestCancellation, cancellation: &McpRequestCancellation,
+async fn discover(cx: &Cx, executor: &ModernHttpExecutor, end: Time, owner: &McpRequestCancellation, cancellation: &McpRequestCancellation,
     snapshot: &ClientCredentialsSnapshot, id: &RequestId, request: CoreRequest, wire: ModernHttpRequest, frame_bytes: usize,
 ) -> Result<(), MachineContinuationRecoveryError> {
     guarded(cx, end, owner, cancellation, snapshot, async {
         let wire = authorize(snapshot, wire)?;
-        let response = ModernHttpExecutor::new().execute_with_cancellation(cx, cancellation, &wire)
+        let response = executor.execute_with_cancellation(cx, cancellation, &wire)
             .await.map_err(terminal_http_error)?;
         if response.metadata().status() != 200 || response.metadata().kind() != ModernHttpResponseKind::Json {
             return Err(ClientCredentialsError::Negotiation.into());

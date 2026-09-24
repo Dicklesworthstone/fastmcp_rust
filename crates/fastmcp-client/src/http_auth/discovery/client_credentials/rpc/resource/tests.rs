@@ -45,7 +45,7 @@ pub(super) fn consumer(limits: ClientCredentialsResourceLimits) -> ClientCredent
         token_endpoint: CanonicalHttpUrl::parse("https://issuer.example/token").unwrap(),
         client_id: "resource-test-client".to_owned(), scopes: vec![],
         authentication: MachineAuthentication::Basic(Arc::new(ClientSecret("test-secret".to_owned()))),
-        issuer_roots: vec![], timeout: Duration::from_secs(5),
+        issuer_roots: vec![], resource_tls: None, timeout: Duration::from_secs(5),
         maximum_lifetime: Duration::from_secs(600), leeway: Duration::from_secs(30),
         closed, pending: AtomicUsize::new(0),
         state: Arc::new(asupersync::sync::Mutex::new(TokenState { current: Some(token), generation: 1 })),

@@ -61,8 +61,9 @@ fn assert_endpoint_exhaustion(error: Error) {
     ]);
 }
 
-// TEST ONLY CA and localhost certificate, valid 2020-2049. Installed only into
-// each isolated child process through SSL_CERT_FILE, never a persistent store.
+// TEST ONLY CA and localhost certificate, valid 2020-2049. Isolated cases use
+// SSL_CERT_FILE; explicit-resource cases leave ambient trust unchanged and
+// admit this CA only through the caller's resource and issuer policies.
 const ROOT: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBgzCCASmgAwIBAgICA+kwCgYIKoZIzj0EAwIwJzElMCMGA1UEAwwcRmFzdE1D\nUCBPQXV0aCBURVNUIE9OTFkgUm9vdDAeFw0yMDAxMDEwMDAwMDBaFw00OTEyMzEw\nMDAwMDBaMCcxJTAjBgNVBAMMHEZhc3RNQ1AgT0F1dGggVEVTVCBPTkxZIFJvb3Qw\nWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAS5t2O8JZ0hNjgI38E9Ov6i6mKoDRGo\nApMsykFkvgb6Zm9/5gCZ90eIKw7aWgK6iNs7lbtVY9mysZBIqm6pKQO2o0UwQzAS\nBgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQU6QNI\nrmvMiLoV3jIoCyohXARwI8gwCgYIKoZIzj0EAwIDSAAwRQIgCKOrW3vhzUJ2EyuY\nvQUTdqGFhy0zEHj4ITFLvXPz1X8CIQCLKD4EKCvS/zkBSu/6uee1WV9d97UpK3yW\nX/aCEJ5+hA==\n-----END CERTIFICATE-----\n";
 const LEAF: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBjjCCATSgAwIBAgICA+owCgYIKoZIzj0EAwIwJzElMCMGA1UEAwwcRmFzdE1D\nUCBPQXV0aCBURVNUIE9OTFkgUm9vdDAeFw0yMDAxMDEwMDAwMDBaFw00OTEyMzEw\nMDAwMDBaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDBZMBMGByqGSM49AgEGCCqGSM49\nAwEHA0IABPPKylLna9VpWAlpshHBhSsQHNOv3BaEGX4HSBhHiBVel0ce+qfHF15O\n0T63Zlp7TtxlMdEY+rPpgioSFDQVadijYzBhMAwGA1UdEwEB/wQCMAAwLAYDVR0R\nBCUwI4IJbG9jYWxob3N0hwR/AAABhxAAAAAAAAAAAAAAAAAAAAABMBMGA1UdJQQM\nMAoGCCsGAQUFBwMBMA4GA1UdDwEB/wQEAwIHgDAKBggqhkjOPQQDAgNIADBFAiEA\n6qrAr2qp/t6K62T9Et2mUU/zfd4kJb+ekyoAim1yTFcCICb6SdVY2fg15/SXf0vE\nIvYelqtTk8FQInCEcIxvfF3m\n-----END CERTIFICATE-----\n";
 const KEY: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcCe44IBKhbw+D/s7\nBjDHOOV0g+EoxFno7VJGKhJeer2hRANCAATzyspS52vVaVgJabIRwYUrEBzTr9wW\nhBl+B0gYR4gVXpdHHvqnxxdeTtE+t2Zae07cZTHRGPqz6YIqEhQ0FWnY\n-----END PRIVATE KEY-----\n";
@@ -837,4 +838,102 @@ fn invalid_secret_post_token_does_not_advance_the_cached_generation() {
 #[test]
 fn secret_post_cannot_send_credentials_to_an_unapproved_endpoint_origin() {
     isolated_post("secret_post_cannot_send_credentials_to_an_unapproved_endpoint_origin", PostCase::WrongOrigin);
+}
+
+// These cases run directly, without the isolated() / isolated_post() launchers
+// that add ROOT to native trust. The live rejection probe prevents ambient
+// fixture trust from masking a lost resource policy during MCP dispatch.
+fn assert_fixture_requires_explicit_tls_trust() {
+    use fastmcp_client::http_executor::{ModernHttpExecutor, ModernHttpExecutorError, ModernHttpRequest};
+
+    RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(Box::pin(async {
+        let cx = Cx::current().unwrap();
+        let scenario = async {
+            let peer = Peer::new().await;
+            let request = ModernHttpRequest::new(
+                peer.resource(), b"{}".to_vec(), "2026-07-28", "tools/list", None,
+            ).unwrap();
+            let server = async {
+                let (socket, _) = peer.listener.accept().await.unwrap();
+                assert!(peer.acceptor.accept(socket).await.is_err(),
+                    "the default executor must reject the private CA before sending HTTP");
+            };
+            let executor = ModernHttpExecutor::new();
+            let ((), result) = pair(server, executor.execute(&cx, &request)).await;
+            assert!(matches!(result, Err(ModernHttpExecutorError::Transport(
+                asupersync::http::h1::ClientError::TlsError(_),
+            ))), "ambient fixture trust would invalidate explicit resource-CA coverage");
+            assert_eq!(peer.gets.load(Ordering::SeqCst), 0);
+            assert_eq!(peer.grants.load(Ordering::SeqCst), 0);
+            assert_eq!(peer.rpcs.load(Ordering::SeqCst), 0);
+            peer.quiet();
+        };
+        asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), scenario).await
+            .expect("default-trust TLS probe must settle within its bound");
+    }));
+}
+
+#[test]
+fn explicit_resource_ca_survives_basic_machine_discovery_grant_and_core_calls() {
+    assert_fixture_requires_explicit_tls_trust();
+    // Two metadata GETs, one Basic grant, and discovery plus each of tools/list
+    // and tools/call: four exact-bearer MCP POSTs with no further connections.
+    run(Case::Complete);
+}
+
+#[test]
+fn explicit_resource_ca_survives_secret_post_machine_discovery_grant_and_core_call() {
+    assert_fixture_requires_explicit_tls_trust();
+    // Two metadata GETs, one explicitly selected Post grant, and two exact-bearer
+    // MCP POSTs. Advertising Basic alongside Post must not change the selection.
+    run_post(PostCase::BothAdvertised);
+}
+
+#[test]
+fn machine_resource_ca_cannot_authorize_issuer_metadata_tls() {
+    use fastmcp_client::http_auth::discovery::issuer::{IssuerMetadataCause, IssuerMetadataFailureClass, IssuerMetadataLocation};
+
+    RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(Box::pin(async {
+        let cx = Cx::current().unwrap();
+        let scenario = async {
+            let peer = Peer::new().await;
+            let root = Certificate::from_pem(ROOT).unwrap().remove(0);
+            let plan = ClientCredentialsPlan::new(
+                url(&peer.resource()), TrustedOAuthIssuer::new(peer.issuer()).unwrap(),
+                "service-client", "service-secret", vec!["read".to_owned()],
+            ).unwrap().with_resource_root_certificate(root).unwrap()
+                .with_timeout(Duration::from_secs(15)).unwrap();
+            let server = async {
+                let (mut tls, start, headers, body) = peer.request().await;
+                assert_eq!(start, "GET /.well-known/oauth-protected-resource/mcp HTTP/1.1");
+                assert!(!headers.contains_key("authorization") && body.is_empty());
+                peer.gets.fetch_add(1, Ordering::SeqCst);
+                json_reply(&mut tls, &json!({"resource":peer.resource(),
+                    "authorization_servers":[peer.issuer()],"scopes_supported":["read"]}).to_string()).await;
+                drop(tls);
+                for _ in MACHINE_ISSUER_LOCATIONS {
+                    let (socket, _) = peer.listener.accept().await.unwrap();
+                    assert!(peer.acceptor.accept(socket).await.is_err(),
+                        "resource trust must not admit even a same-origin issuer TLS handshake");
+                }
+            };
+            let ((), result) = pair(server, plan.discover(&cx)).await;
+            let Error::Discovery(OAuthDiscoveryError::IssuerMetadataExhausted(failure)) = result.err().unwrap() else {
+                panic!("each issuer candidate must retain its TLS refusal");
+            };
+            assert_eq!(failure.classification(), IssuerMetadataFailureClass::Transport);
+            assert_eq!(failure.attempts().iter().map(|attempt| (attempt.location(), attempt.cause())).collect::<Vec<_>>(), [
+                (IssuerMetadataLocation::OAuthAuthorizationServer, IssuerMetadataCause::TransportFailed),
+                (IssuerMetadataLocation::OpenIdInserted, IssuerMetadataCause::TransportFailed),
+                (IssuerMetadataLocation::OpenIdAppended, IssuerMetadataCause::TransportFailed),
+            ]);
+            assert_eq!(peer.gets.load(Ordering::SeqCst), 1);
+            assert_eq!(peer.grants.load(Ordering::SeqCst), 0);
+            assert_eq!(peer.rpcs.load(Ordering::SeqCst), 0);
+            assert!(cx.checkpoint().is_ok());
+            peer.quiet();
+        };
+        asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), scenario).await
+            .expect("machine issuer TLS refusal must settle within its bound");
+    }));
 }

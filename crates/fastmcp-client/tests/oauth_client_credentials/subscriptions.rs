@@ -364,6 +364,12 @@ fn run_subscription(case: SubCase) {
 }
 
 #[test]
+fn explicit_resource_ca_survives_machine_task_and_resource_subscription() {
+    assert_fixture_requires_explicit_tls_trust();
+    run_subscription(SubCase::Live);
+}
+
+#[test]
 fn machine_subscriptions_deliver_live_task_catalog_and_resource_events() { isolated_subscription("tasks::subscriptions::machine_subscriptions_deliver_live_task_catalog_and_resource_events", SubCase::Live); }
 #[test]
 fn missing_tasks_advertisement_prevents_the_listen_post() { isolated_subscription("tasks::subscriptions::missing_tasks_advertisement_prevents_the_listen_post", SubCase::MissingTasks); }

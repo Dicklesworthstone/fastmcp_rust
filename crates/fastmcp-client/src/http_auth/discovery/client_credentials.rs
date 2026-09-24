@@ -54,7 +54,7 @@ use super::{
 use crate::http_auth::BoundBearerCredential;
 use crate::http_executor::{
     ModernHttpExecutor, ModernHttpRequest, ModernHttpResponseKind, ModernHttpResponseMetadata,
-    ModernHttpResponseStream, ModernHttpSseResponseStream,
+    ModernHttpResponseStream, ModernHttpSseResponseStream, ResourceTlsTrust,
 };
 use crate::sse::SseLimits;
 
@@ -318,9 +318,10 @@ impl ClientCredentialsPlan {
         Ok(self)
     }
 
-    /// Adds private trust for resource-METADATA retrieval only. Protected MCP
-    /// dispatch uses the native executor's bundled roots or explicit build-time
-    /// native-tls-roots policy, just like the managed browser-login client.
+    /// Adds private trust for resource metadata and subsequent MCP POSTs to
+    /// this exact HTTPS resource. Token and issuer endpoints retain their
+    /// separate issuer roots. The immutable policy survives token renewal and
+    /// is shared by core operations, subscriptions, Tasks and continuations.
     pub fn with_resource_root_certificate(mut self, root: Certificate) -> Result<Self, ClientCredentialsError> {
         admit_root(&mut self.discovery.resource_roots, root)?;
         Ok(self)
@@ -330,6 +331,12 @@ impl ClientCredentialsPlan {
     /// signer. A later credential call owns one explicit grant attempt.
     pub async fn discover(&self, cx: &Cx) -> Result<ClientCredentialsClient, ClientCredentialsError> {
         self.authentication.check()?;
+        let mut resource_tls = None;
+        for root in &self.discovery.resource_roots {
+            ResourceTlsTrust::add_root(
+                &mut resource_tls, self.discovery.resource.clone(), root.clone(),
+            ).map_err(|_| ClientCredentialsError::InvalidPolicy)?;
+        }
         let deadline = discovery_deadline(cx, self.discovery.timeout)?;
         let (issuer, body) = self.discovery.discover_issuer_document(cx, deadline).await?;
         let token_endpoint = admit_machine_issuer(&self.discovery, issuer, &body, &self.authentication)?;
@@ -340,7 +347,7 @@ impl ClientCredentialsPlan {
                 resource: self.discovery.resource.clone(), token_endpoint,
                 client_id: self.discovery.client_id.clone().ok_or(ClientCredentialsError::InvalidPolicy)?,
                 scopes: self.discovery.scopes.clone(), authentication: self.authentication.clone(),
-                issuer_roots: issuer.roots.clone(), timeout: self.discovery.timeout,
+                issuer_roots: issuer.roots.clone(), resource_tls, timeout: self.discovery.timeout,
                 maximum_lifetime: self.maximum_lifetime, leeway: self.leeway,
                 closed: McpRequestCancellation::new(), pending: AtomicUsize::new(0),
                 state: Arc::new(Mutex::new(TokenState::default())),
@@ -400,6 +407,7 @@ struct ClientInner {
     scopes: Vec<String>,
     authentication: MachineAuthentication,
     issuer_roots: Vec<Certificate>,
+    resource_tls: Option<ResourceTlsTrust>,
     timeout: Duration,
     maximum_lifetime: Duration,
     leeway: Duration,
@@ -454,6 +462,12 @@ impl fmt::Debug for ClientCredentialsSnapshot {
 
 impl ClientCredentialsClient {
     pub fn resource(&self) -> &CanonicalHttpUrl { &self.inner.resource }
+
+    // Every MCP dispatch path uses the same immutable resource grant. Issuer
+    // transport keeps its own root store and can never consume this policy.
+    fn resource_http_executor(&self) -> ModernHttpExecutor {
+        ModernHttpExecutor::new().with_resource_tls(self.inner.resource_tls.clone())
+    }
 
     /// Irreversible local closure, not an issuer revocation request. Old
     /// snapshots withhold new headers. Already-sent bytes cannot be recalled.
@@ -551,7 +565,7 @@ impl ClientCredentialsClient {
         let deadline = discovery_deadline(cx, self.inner.timeout)?;
         active(cx, deadline, &self.inner.closed, cancellation, None, async {
             let snapshot = self.credential_with_cancellation(cx, cancellation).await?;
-            let executor = ModernHttpExecutor::new();
+            let executor = self.resource_http_executor();
             let discovery_wire = authorize(&snapshot, discovery_wire)?;
             let response = active(cx, deadline, &self.inner.closed, cancellation, Some(&snapshot), async {
                 executor.execute_with_cancellation(cx, cancellation, &discovery_wire).await
@@ -846,7 +860,7 @@ mod tests {
         let plan = plan();
         ClientInner { resource:plan.discovery.resource, token_endpoint:url("https://issuer.example/token"),
             client_id:"service-client".to_owned(), scopes:vec!["read".to_owned(),"write".to_owned()], authentication:plan.authentication,
-            issuer_roots:vec![], timeout:Duration::from_secs(30), maximum_lifetime:Duration::from_secs(60),
+            issuer_roots:vec![], resource_tls:None, timeout:Duration::from_secs(30), maximum_lifetime:Duration::from_secs(60),
             leeway:Duration::from_secs(30), closed:McpRequestCancellation::new(), pending:AtomicUsize::new(0),
             state:Arc::new(Mutex::new(TokenState::default())) }
     }

@@ -36,7 +36,7 @@ fn awaiting(cx: &Cx) -> ClientCredentialsInteraction {
     let client = machine::ClientCredentialsClient { inner: Arc::new(machine::ClientInner {
         resource, token_endpoint: url("https://issuer.example/token"), client_id: "fixture".to_owned(), scopes: vec![],
         authentication: machine::MachineAuthentication::Basic(Arc::new(machine::ClientSecret("test-only".to_owned()))),
-        issuer_roots: vec![], timeout: Duration::from_secs(5), maximum_lifetime: Duration::from_secs(60),
+        issuer_roots: vec![], resource_tls: None, timeout: Duration::from_secs(5), maximum_lifetime: Duration::from_secs(60),
         leeway: Duration::ZERO, closed, pending: AtomicUsize::new(0),
         state: Arc::new(asupersync::sync::Mutex::new(machine::TokenState {
             current: Some(machine::ServiceToken { bearer, scopes: vec![], expires_at, renew_after: expires_at }), generation: 1,

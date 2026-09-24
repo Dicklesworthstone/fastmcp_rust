@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use super::{
     BoundedBody, ClientCredentialsError, ClientCredentialsSnapshot, ClientCredentialsTaskCall,
     ClientCredentialsTasksClient, ClientCredentialsTasksError, Decoder, ManagedTaskEvent,
-    ManagedTaskRequest, ManagedTasksError, ModernHttpExecutor, ModernHttpExecutorError,
+    ManagedTaskRequest, ManagedTasksError, ModernHttpExecutorError,
     ModernHttpRequest, ModernHttpResponseKind, Prepared, active, admit_composition,
     authorize, discovery_deadline, encode, prepare, require_success,
 };
@@ -450,7 +450,7 @@ async fn dispatch(state: &mut TaskSubmissionState, cx: &Cx, client: &ClientCrede
     if remaining_records == 0 { return Err(ClientCredentialsTaskSubmissionCause::RecordLimit); }
     active(cx, deadline, &client.client.inner.closed, cancellation, Some(credential), async {
         Ok(async {
-            let executor = ModernHttpExecutor::new();
+            let executor = client.client.resource_http_executor();
             let wire = authorize(credential, round.discovery_wire)?;
             let response = executor.execute_with_cancellation(cx, cancellation, &wire).await.map_err(transport_error)?;
             check_live(cx, client, cancellation, deadline, credential)?;

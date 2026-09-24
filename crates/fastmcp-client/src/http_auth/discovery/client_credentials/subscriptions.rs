@@ -26,9 +26,11 @@ use super::{
     active, admit_resource, authorize, discovery_deadline, prepare,
 };
 use crate::http_executor::{
-    ModernHttpExecutor, ModernHttpRequest, ModernHttpResponseKind,
+    ModernHttpRequest, ModernHttpResponseKind,
     ModernHttpSubscriptionListenError, ModernHttpSubscriptionListener,
 };
+#[cfg(test)]
+use crate::http_executor::ModernHttpExecutor;
 use crate::sse::SseLimits;
 
 // Re-export the existing event vocabulary rather than inventing a second
@@ -168,7 +170,7 @@ impl ClientCredentialsClient {
         active(cx, deadline, owner, cancellation, None, async {
             Ok(async {
                 let snapshot = self.credential_with_cancellation(cx, cancellation).await?;
-                let executor = ModernHttpExecutor::new();
+                let executor = self.resource_http_executor();
                 let discovery_wire = authorize(&snapshot, prepared.discovery_wire)?;
                 let response = active(cx, deadline, owner, cancellation, Some(&snapshot), async {
                     executor.execute_with_cancellation(cx, cancellation, &discovery_wire).await

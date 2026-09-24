@@ -292,6 +292,12 @@ fn run_tasks(case: TaskCase) {
 }
 
 #[test]
+fn explicit_resource_ca_survives_machine_task_create_input_update_and_cancel() {
+    assert_fixture_requires_explicit_tls_trust();
+    run_tasks(TaskCase::Lifecycle);
+}
+
+#[test]
 fn machine_tasks_complete_the_create_input_update_cancel_lifecycle() { isolated_task("tasks::machine_tasks_complete_the_create_input_update_cancel_lifecycle",TaskCase::Lifecycle); }
 #[test]
 fn missing_tasks_advertisement_prevents_mutation_and_preserves_the_client() { isolated_task("tasks::missing_tasks_advertisement_prevents_mutation_and_preserves_the_client",TaskCase::MissingTasks); }

@@ -40,7 +40,7 @@ use serde_json::{Value, json};
 pub use crate::http_auth::managed::tasks::{ManagedTaskEvent, ManagedTaskRequest, ManagedTasksError};
 use crate::http_auth::managed::tasks::validate_task_input_shapes;
 use crate::http_executor::{
-    ModernHttpExecutor, ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind, ModernHttpResponseStream,
+    ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind, ModernHttpResponseStream,
     ModernHttpSseResponseStream,
 };
 use crate::sse::SseLimits;
@@ -188,7 +188,7 @@ impl ClientCredentialsTasksClient {
         active(cx, deadline, owner, cancellation, None, async {
             Ok(async {
                 let snapshot = self.client.credential_with_cancellation(cx, cancellation).await?;
-                let executor = ModernHttpExecutor::new();
+                let executor = self.client.resource_http_executor();
                 let discovery_wire = authorize(&snapshot, discovery_wire)?;
                 let response = active(cx, deadline, owner, cancellation, Some(&snapshot), async {
                     executor.execute_with_cancellation(cx, cancellation, &discovery_wire).await
