@@ -3336,29 +3336,149 @@ fn e2e_public_sse_constructor_invokes_live_legacy_handlers() {
     server.shutdown();
 }
 
-/// Argument size for the SSE size round trips: eight times the 64 KiB event
-/// bound and 32 times the 16 KiB legacy line bound that SSE once enforced.
-const PUBLIC_HTTP_LARGE_SSE_ARGUMENT_BYTES: usize = 512 * 1024;
+const PUBLIC_HTTP_LARGE_RESULT_TOOL_NAME: &str = "public-http-e2e-large-result";
 
-/// A non-repeating-per-byte argument, so a truncated or shifted result cannot
+/// Result size for the SSE size round trips: eight times the 64 KiB event
+/// bound and 32 times the 16 KiB legacy line bound that SSE once enforced.
+const PUBLIC_HTTP_LARGE_RESULT_BYTES: usize = 512 * 1024;
+
+/// A non-repeating-per-byte text, so a truncated or shifted result cannot
 /// compare equal.
-fn public_http_large_sse_argument() -> String {
-    (b'a'..=b'z')
-        .cycle()
-        .take(PUBLIC_HTTP_LARGE_SSE_ARGUMENT_BYTES)
-        .map(char::from)
-        .collect()
+fn public_http_large_result_text(bytes: usize) -> String {
+    (b'a'..=b'z').cycle().take(bytes).map(char::from).collect()
 }
 
-fn assert_public_http_large_tool_text(tool: &serde_json::Value, argument: &str, lane: &str) {
+/// Returns a text result of the requested size. The request stays tiny, so
+/// the round trip exercises the SSE response path and never the server's
+/// input bounds.
+struct PublicHttpLargeResultTool;
+
+impl ToolHandler for PublicHttpLargeResultTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PUBLIC_HTTP_LARGE_RESULT_TOOL_NAME.to_owned(),
+            description: Some("Returns a text result of the requested size".to_owned()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"bytes": {"type": "integer", "minimum": 0}},
+                "required": ["bytes"]
+            }),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let bytes = arguments
+            .get("bytes")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or_else(|| McpError::invalid_params("bytes must be a non-negative integer"))?;
+        Ok(vec![Content::text(public_http_large_result_text(bytes))])
+    }
+}
+
+/// A bind_http server under `protocol_policy` that serves only the
+/// large-result tool.
+fn spawn_large_result_http_server(protocol_policy: ProtocolPolicy) -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("large-result HTTP server control receiver went away".to_owned());
+            }
+            let server = ServerBuilder::new("facade-http-large-result", "1.0.0")
+                .protocol_policy(protocol_policy)
+                .expect("the fixture selects an available protocol policy")
+                .tool(PublicHttpLargeResultTool)
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("large-result HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message = format!("large-result HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("large-result HTTP server startup receiver went away".to_owned());
+            }
+            bound
+                .serve(&cx)
+                .await
+                .map_err(|error| format!("large-result HTTP server stopped unexpectedly: {error}"))
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("large-result HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("large-result HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("large-result HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+fn assert_public_http_large_tool_text(tool: &serde_json::Value, lane: &str) {
     let text = tool["content"][0]["text"]
         .as_str()
         .unwrap_or_else(|| panic!("the {lane} tool result must carry text content"));
     assert!(
-        text.strip_prefix("tool:") == Some(argument),
+        text == public_http_large_result_text(PUBLIC_HTTP_LARGE_RESULT_BYTES),
         "the {lane} tool result must arrive byte-identical: received {} bytes, expected {}",
         text.len(),
-        argument.len() + "tool:".len()
+        PUBLIC_HTTP_LARGE_RESULT_BYTES
     );
 }
 
@@ -3367,7 +3487,7 @@ fn assert_public_http_large_tool_text(tool: &serde_json::Value, argument: &str, 
 #[test]
 fn e2e_public_sse_constructor_carries_a_tool_result_over_64_kib() {
     let cx = Cx::for_request();
-    let server = HttpServerFixture::spawn_with_policy(ProtocolPolicy::LegacyOnly);
+    let server = spawn_large_result_http_server(ProtocolPolicy::LegacyOnly);
     let mut client = runtime_block_on_bounded(
         &cx,
         fastmcp_rust::Client::sse_with_cx(
@@ -3378,17 +3498,20 @@ fn e2e_public_sse_constructor_carries_a_tool_result_over_64_kib() {
     )
     .expect("Client::sse_with_cx connects exact-2024 SSE");
 
-    let argument = public_http_large_sse_argument();
     let result = runtime_block_on_bounded(
         &cx,
-        client.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({ "value": argument })),
+        client.call_tool(
+            &cx,
+            PUBLIC_HTTP_LARGE_RESULT_TOOL_NAME,
+            json!({ "bytes": PUBLIC_HTTP_LARGE_RESULT_BYTES }),
+        ),
     )
     .expect("the legacy SSE lane must carry a 512 KiB tool result");
     let CoreResult::Legacy(legacy_2024::LegacyCoreResult::ToolsCall(result)) = result else {
         panic!("Client::sse_with_cx must stay on the exact-2024 tool result");
     };
     let tool = serde_json::to_value(result).expect("the exact-2024 tool result serializes");
-    assert_public_http_large_tool_text(&tool, &argument, "legacy SSE");
+    assert_public_http_large_tool_text(&tool, "legacy SSE");
     drop(client);
     server.shutdown();
 }
@@ -3400,7 +3523,7 @@ fn e2e_public_sse_constructor_carries_a_tool_result_over_64_kib() {
 #[test]
 fn e2e_public_http_sse_body_carries_a_tool_result_over_64_kib() {
     let cx = Cx::for_request();
-    let server = HttpServerFixture::spawn_with_policy(ProtocolPolicy::ModernOnly);
+    let server = spawn_large_result_http_server(ProtocolPolicy::ModernOnly);
     let mut client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -3412,10 +3535,13 @@ fn e2e_public_http_sse_body_carries_a_tool_result_over_64_kib() {
         .set_log_level(modern::LoggingLevel::Info)
         .expect("info logLevel is stored as request metadata");
 
-    let argument = public_http_large_sse_argument();
     let result = runtime_block_on_bounded(
         &cx,
-        client.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({ "value": argument })),
+        client.call_tool(
+            &cx,
+            PUBLIC_HTTP_LARGE_RESULT_TOOL_NAME,
+            json!({ "bytes": PUBLIC_HTTP_LARGE_RESULT_BYTES }),
+        ),
     )
     .expect("a modern SSE response body must carry a 512 KiB tool result");
     let notifications = client.take_server_notifications();
@@ -3428,7 +3554,7 @@ fn e2e_public_http_sse_body_carries_a_tool_result_over_64_kib() {
         "the response must travel on an SSE body with its final log notification: {notifications:?}"
     );
     let tool = serde_json::to_value(result).expect("the modern tool result serializes");
-    assert_public_http_large_tool_text(&tool, &argument, "modern SSE body");
+    assert_public_http_large_tool_text(&tool, "modern SSE body");
     drop(client);
     server.shutdown();
 }
