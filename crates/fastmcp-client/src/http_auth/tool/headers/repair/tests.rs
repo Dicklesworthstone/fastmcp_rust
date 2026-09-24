@@ -13,6 +13,19 @@ fn definition(field: &str) -> FinalTool {
         "required":["count"],"additionalProperties":false
     }, "outputSchema":{"type":"object","properties":{"total":{"type":"integer"}},"required":["total"]}})).unwrap()
 }
+fn annotated_definition() -> FinalTool {
+    let mut tool = definition("Fresh");
+    // Unknown keyword values are opaque annotation data under the default
+    // dialect. These members must not become validation or header authority.
+    let annotation = json!({
+        "minimum":"annotation-private-canary",
+        "$ref":"https://unresolved.example/schema",
+        "x-mcp-header":"Ignored"
+    });
+    tool.input_schema["unrecognizedValidationKeyword"] = annotation.clone();
+    tool.output_schema.as_mut().unwrap()["unrecognizedValidationKeyword"] = annotation;
+    tool
+}
 fn source() -> ToolContract { ToolContract::admit(definition("Old")).unwrap() }
 fn request(count: Value) -> CoreRequest {
     CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&json!({
@@ -59,6 +72,40 @@ fn a_new_input_constraint_refuses_the_immutable_invocation_before_host_approval(
         |_| { called = true; true }), Err(ManagedToolError::InvalidArguments)));
     assert!(!called);
     assert!(approve_definition(&cx, &cancel, &source, &request(json!(10)), &fresh, |_| true).unwrap().is_some());
+}
+
+#[test]
+fn opaque_input_and_output_annotations_survive_repair_without_bypassing_constraints() {
+    let cx = Cx::for_testing();
+    let cancel = McpRequestCancellation::new();
+    let source = source();
+    let original = request(json!(2));
+    let before = original.encode_params().unwrap();
+    let fresh = annotated_definition();
+    let mut calls = 0;
+    let replacement = approve_definition(&cx, &cancel, &source, &original, &fresh, |tool| {
+        calls += 1;
+        assert_eq!(tool.input_schema, fresh.input_schema);
+        assert_eq!(tool.output_schema, fresh.output_schema);
+        true
+    }).unwrap().unwrap();
+    assert_eq!(calls, 1);
+    assert_eq!(replacement.input.schema(), &fresh.input_schema);
+    assert_eq!(replacement.output.as_ref().unwrap().schema(), fresh.output_schema.as_ref().unwrap());
+    replacement.validate_request(&original).unwrap();
+    assert!(matches!(replacement.validate_request(&request(json!(0))),
+        Err(ManagedToolError::InvalidArguments)));
+    replacement.validate_result(&result(r#"{"resultType":"complete","content":[],"structuredContent":{"total":2}}"#)).unwrap();
+    assert!(matches!(replacement.validate_result(&result(r#"{"resultType":"complete","content":[],"structuredContent":{"total":"2"}}"#)),
+        Err(ManagedToolError::InvalidStructuredOutput)));
+    let resource = CanonicalHttpUrl::parse("https://tools.example/mcp").unwrap();
+    let mut disclosures = 0;
+    let reviewed = replacement.review_headers(&resource, |_| { disclosures += 1; true }).unwrap();
+    assert_eq!(disclosures, 1);
+    assert_eq!(reviewed.bindings(), review().bindings());
+    assert_eq!(source.input.schema(), &definition("Old").input_schema);
+    assert_eq!(original.encode_params().unwrap(), before);
+    source.check().unwrap();
 }
 
 // SCH-01 admits schemas as Draft 2020-12, where an unknown keyword is an
