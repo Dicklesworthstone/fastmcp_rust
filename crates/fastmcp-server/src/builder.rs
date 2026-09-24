@@ -1247,9 +1247,8 @@ impl ServerBuilder {
         }
     }
 
-    /// Installs one route-bound modern Tasks relay into every server surface
-    /// that owns Tasks discovery and dispatch. Exact-2024 never supplies a
-    /// relay, so callers pass `None` for its selected upstream era.
+    /// Installs modern Tasks discovery and dispatch once, then adds later
+    /// upstream routes to that broker. Exact-2024 supplies no Tasks relay.
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     fn install_proxy_final_tasks_relay(
         &mut self,
@@ -1258,10 +1257,13 @@ impl ServerBuilder {
         let Some(task_relay) = task_relay else {
             return Ok(());
         };
-        if self.final_task_runtime.is_some() || self.final_task_relay.is_some() {
+        if self.final_task_runtime.is_some() {
             return Err(fastmcp_core::McpError::invalid_request(
                 "a server may install only one local or route-bound final Tasks service",
             ));
+        }
+        if let Some(broker) = self.final_task_relay.as_ref() {
+            return broker.attach_route(task_relay);
         }
         if let Some(extension_runtime) = self.extension_runtime.as_mut() {
             extension_runtime
