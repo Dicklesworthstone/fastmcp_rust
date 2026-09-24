@@ -213,7 +213,9 @@ impl AdmittedModernPost {
     }
 
     /// Consumes admission into the typed request and its exact parameter
-    /// source for request-owned modern dispatch.
+    /// source. Test-only: shipped dispatch reads [`Self::raw_params`] and
+    /// clones [`Self::request`] instead.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn into_request_and_raw_params(self) -> (JsonRpcRequest, Option<Arc<str>>) {
         (self.request, self.raw_params)
