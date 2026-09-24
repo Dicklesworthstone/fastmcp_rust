@@ -1683,9 +1683,9 @@ pub trait ToolHandler: Send + Sync {
     /// obvious way to sample from a simple tool is to wrap the await in
     /// `fastmcp_core::block_on`. Do not. On a thread that is driving the
     /// runtime, that bridge blocks the only thread able to deliver the client's
-    /// response, and the request can never complete. Sampling detects this
-    /// position and returns an error naming it rather than parking, but the
-    /// error is a diagnosis, not a way to make the call work.
+    /// response, and the request can never complete. Sampling, elicitation and
+    /// roots detect this position and return an error naming it rather than
+    /// parking, but the error is a diagnosis, not a way to make the call work.
     ///
     /// A tool that needs a context capability which reaches the peer --
     /// sampling, elicitation, roots -- belongs on an async hook

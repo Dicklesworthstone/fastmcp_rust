@@ -522,29 +522,26 @@ impl SamplingStopReason {
     }
 }
 
-/// The disposition for a sampling request made from a position where its own
-/// completion can never be delivered (bd-6rfrg).
+/// The disposition for a reverse request to the peer (sampling, elicitation,
+/// roots) made from a position where its own completion can never be
+/// delivered (bd-6rfrg). `operation` names the capability, e.g. "Sampling".
 ///
 /// `InvalidRequest` and not `InternalError` on purpose: the router redacts
 /// `InternalError` through `sanitized_handler_internal_error`, so an internal
 /// code here would reach the user as "handler returned an opaque internal
 /// failure" and the hazard would stay exactly as unnameable as the hang it
 /// replaces. The whole value of this error is the text.
-///
-/// Elicitation and roots reach the peer through the same reverse-request
-/// mechanism and are therefore exposed to the same bridge, but they are outside
-/// bd-6rfrg's scope and are deliberately NOT guarded here. Extending the
-/// detection to them is one call to
-/// `crate::runtime::bridge_would_starve_its_driver` each.
-fn sampling_bridge_would_deadlock() -> crate::McpError {
+fn peer_request_bridge_would_deadlock(operation: &str) -> crate::McpError {
     crate::McpError::new(
         crate::McpErrorCode::InvalidRequest,
-        "Sampling cannot complete from here: this request is bridged with \
-         fastmcp_core::block_on from inside a task context, so the thread that would \
-         deliver the client's response is blocked by the bridge itself. Implement \
-         ToolHandler's async call hook and declare ToolExecutionMode::Async instead of \
-         calling block_on from the synchronous `call` method, or run the handler on a \
-         dedicated blocking lane.",
+        format!(
+            "{operation} cannot complete from here: this request is bridged with \
+             fastmcp_core::block_on from inside a task context, so the thread that would \
+             deliver the client's response is blocked by the bridge itself. Implement \
+             ToolHandler's async call hook and declare ToolExecutionMode::Async instead of \
+             calling block_on from the synchronous `call` method, or run the handler on a \
+             dedicated blocking lane."
+        ),
     )
 }
 
@@ -3575,6 +3572,10 @@ impl McpContext {
                 "Roots not available: client does not support roots capability",
             )
         })?;
+        // The same reverse-request bridge hazard as sampling (bd-6rfrg).
+        if crate::runtime::bridge_would_starve_its_driver() {
+            return Err(peer_request_bridge_would_deadlock("Listing roots"));
+        }
 
         let roots = provider.list_roots().await?;
         self.ensure_live()
@@ -3683,7 +3684,7 @@ impl McpContext {
         // sampling capability fails immediately and harmlessly, so that error is
         // the true cause and keeps precedence over this one.
         if crate::runtime::bridge_would_starve_its_driver() {
-            return Err(sampling_bridge_would_deadlock());
+            return Err(peer_request_bridge_would_deadlock("Sampling"));
         }
 
         let response = sender.create_message(request).await?;
@@ -3817,6 +3818,10 @@ impl McpContext {
                 "Elicitation not available: client does not support elicitation capability",
             )
         })?;
+        // The same reverse-request bridge hazard as sampling (bd-6rfrg).
+        if crate::runtime::bridge_would_starve_its_driver() {
+            return Err(peer_request_bridge_would_deadlock("Elicitation"));
+        }
 
         let response = sender.elicit(request).await?;
         self.ensure_live()

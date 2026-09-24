@@ -551,3 +551,120 @@ fn bd_6rfrg_the_same_bridge_outside_a_task_position_is_not_diagnosed() {
          nothing: {error:?}"
     );
 }
+
+// bd-6rfrg: elicitation and roots reach the peer through the same reverse
+// request, so the obvious sync-tool bridge hangs the same way. Each pair below
+// differs only in whether a task context is installed before the bridge, and
+// counts peer contacts so the diagnosed arm proves it never sent anything.
+
+struct CountingRoots(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl fastmcp_core::RootsProvider for CountingRoots {
+    fn list_roots(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = fastmcp_core::McpResult<Vec<fastmcp_core::ClientRoot>>>
+                + Send
+                + '_,
+        >,
+    > {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+struct CountingElicitation(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl fastmcp_core::ElicitationSender for CountingElicitation {
+    fn elicit(
+        &self,
+        _request: fastmcp_core::ElicitationRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = fastmcp_core::McpResult<fastmcp_core::ElicitationResponse>,
+                > + Send
+                + '_,
+        >,
+    > {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async {
+            Err(fastmcp_core::McpError::new(
+                fastmcp_core::McpErrorCode::InvalidRequest,
+                "counting elicitation peer",
+            ))
+        })
+    }
+}
+
+fn bd_6rfrg_roots_list(task_position: bool) -> (fastmcp_core::McpResult<usize>, usize) {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ctx = fastmcp_core::McpContext::new(Cx::for_testing(), 6_002).with_roots_provider(
+        std::sync::Arc::new(CountingRoots(std::sync::Arc::clone(&calls))),
+    );
+    let _ambient = task_position.then(|| Cx::set_current(Some(Cx::for_testing())));
+    let result = fastmcp_core::block_on(ctx.list_roots()).map(|roots| roots.len());
+    (result, calls.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+fn bd_6rfrg_elicitation(task_position: bool) -> (fastmcp_core::McpError, usize) {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ctx = fastmcp_core::McpContext::new(Cx::for_testing(), 6_003).with_elicitation(
+        std::sync::Arc::new(CountingElicitation(std::sync::Arc::clone(&calls))),
+    );
+    let _ambient = task_position.then(|| Cx::set_current(Some(Cx::for_testing())));
+    let error = fastmcp_core::block_on(ctx.elicit_form("bd-6rfrg probe", serde_json::json!({})))
+        .expect_err("both arms end in an error");
+    (error, calls.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+#[test]
+fn bd_6rfrg_roots_bridged_from_a_task_position_is_diagnosed() {
+    let (result, calls) = bd_6rfrg_roots_list(true);
+    let error = result.expect_err("roots bridged from a task position must not report success");
+    assert!(
+        error
+            .message
+            .starts_with("Listing roots cannot complete from here"),
+        "{error:?}"
+    );
+    assert!(
+        error.message.contains("ToolExecutionMode::Async"),
+        "{error:?}"
+    );
+    assert_eq!(calls, 0, "the diagnosed bridge must not contact the peer");
+}
+
+#[test]
+fn bd_6rfrg_the_same_roots_bridge_outside_a_task_position_reaches_the_peer() {
+    let (result, calls) = bd_6rfrg_roots_list(false);
+    assert_eq!(
+        result.expect("an undiagnosed bridge lists the peer's roots"),
+        0
+    );
+    assert_eq!(calls, 1);
+}
+
+#[test]
+fn bd_6rfrg_elicitation_bridged_from_a_task_position_is_diagnosed() {
+    let (error, calls) = bd_6rfrg_elicitation(true);
+    assert!(
+        error
+            .message
+            .starts_with("Elicitation cannot complete from here"),
+        "{error:?}"
+    );
+    assert!(
+        error.message.contains("ToolExecutionMode::Async"),
+        "{error:?}"
+    );
+    assert_eq!(calls, 0, "the diagnosed bridge must not contact the peer");
+}
+
+#[test]
+fn bd_6rfrg_the_same_elicitation_bridge_outside_a_task_position_reaches_the_peer() {
+    let (error, calls) = bd_6rfrg_elicitation(false);
+    assert_eq!(error.message, "counting elicitation peer");
+    assert_eq!(calls, 1);
+}
