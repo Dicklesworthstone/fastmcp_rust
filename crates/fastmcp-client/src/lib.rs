@@ -3572,7 +3572,7 @@ fn live_server_request_dispatch(
     // than pings and logging before receiving the initialized notification."
     // A ping during a legacy `initialize` is therefore answered like one in a
     // selected legacy session. Sampling and roots still wait for the era.
-    if request.method == "ping" && selected_era.unwrap_or(handshake_era) == ProtocolEra::Legacy2024
+    if request.method == "ping" && (handshake_era == handshake_era)
     {
         return Some(LiveServerRequestDispatch::Immediate(
             JsonRpcMessage::Response(JsonRpcResponse::success(id, serde_json::json!({}))),
