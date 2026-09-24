@@ -2185,6 +2185,179 @@ exec sleep 5
     }
 
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn legacy_initialize_reply(id: &str, name: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":"2024-11-05","capabilities":{{}},"serverInfo":{{"name":"{name}","version":"1.0.0"}}}}}}"#
+        )
+    }
+
+    /// A legacy peer that answers `initialize` (sent as ID 1) with `foreign`
+    /// first, when present, and then, when `exact_follows`, with ID 1.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn legacy_exact_id_script(foreign: Option<&str>, exact_follows: bool) -> String {
+        let foreign =
+            foreign.map_or_else(String::new, |reply| format!("printf '%s\\n' '{reply}'; "));
+        let exact = if exact_follows {
+            format!(
+                "printf '%s\\n' '{}'; IFS= read -r lifecycle || exit 1; case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; ",
+                legacy_initialize_reply("1", "exact-id-server")
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "IFS= read -r first || exit 1; case \"$first\" in *initialize*2024-11-05*) ;; *) exit 1 ;; esac; \
+             case \"$first\" in *'\"id\":1'*) ;; *) exit 1 ;; esac; {foreign}{exact}exec sleep 5"
+        )
+    }
+
+    /// Connects through the builder's yielding initializer, which polls
+    /// `initialize` under this bounded absolute deadline.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn connect_legacy_yielding(script: &str) -> McpResult<Client> {
+        block_on(
+            ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+                .max_retries(0)
+                .request_timeout_policy(
+                    RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(1))
+                        .expect("bounded legacy initialize timeout is valid"),
+                )
+                .connect_stdio_with_cx("sh", &["-c", script], &Cx::for_request()),
+        )
+    }
+
+    /// Connects through both shipped initializers: the builder's yielding
+    /// poll and the synchronous public constructor's request path.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn connect_legacy_on_both_initializers(script: &str) -> [(&'static str, McpResult<Client>); 2] {
+        let direct = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script],
+            ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            Cx::for_request(),
+        );
+        [
+            ("builder", connect_legacy_yielding(script)),
+            ("constructor", direct),
+        ]
+    }
+
+    /// Both shipped legacy initializers correlate `initialize` by its exact
+    /// request ID. A reply under another number, under the same digits as a
+    /// string, or under a peer-chosen string never completes the handshake;
+    /// the client keeps waiting and takes the exact reply behind it.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn legacy_initialize_waits_past_foreign_ids_for_its_exact_request_id() {
+        for foreign in [
+            None,
+            Some("2"),
+            Some("\"1\""),
+            Some("\"PEER-ID-SECRET-CANARY\""),
+        ] {
+            let foreign_reply = foreign.map(|id| legacy_initialize_reply(id, "foreign-id-server"));
+            let script = legacy_exact_id_script(foreign_reply.as_deref(), true);
+            for (path, result) in connect_legacy_on_both_initializers(&script) {
+                let mut client =
+                    result.unwrap_or_else(|error| panic!("{path} with {foreign:?}: {error}"));
+                assert_eq!(
+                    client.session.server_info().name,
+                    "exact-id-server",
+                    "{path} with {foreign:?}"
+                );
+                assert_eq!(
+                    client.selected_protocol_era(),
+                    Some(fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024)
+                );
+                client.close().expect("legacy exact-id client cleanup");
+            }
+        }
+    }
+
+    /// With nothing behind a peer-chosen ID, `initialize` stays unanswered
+    /// until its own absolute deadline, and the error does not repeat the ID.
+    /// A reply with no ID at all is terminal even when the exact reply
+    /// follows it.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn legacy_initialize_fails_closed_on_foreign_or_missing_ids_without_echoing_them() {
+        let canary = "PEER-ID-SECRET-CANARY";
+        let foreign = legacy_initialize_reply(&format!("\"{canary}\""), "foreign-id-server");
+        for exact_follows in [false, true] {
+            let script = legacy_exact_id_script(Some(&foreign), exact_follows);
+            let yielding = connect_legacy_yielding(&script);
+            if exact_follows {
+                let mut client =
+                    yielding.expect("the exact reply behind the canary ID initializes");
+                assert_eq!(client.session.server_info().name, "exact-id-server");
+                client.close().expect("legacy canary control cleanup");
+                continue;
+            }
+            let Err(error) = yielding else {
+                panic!("an initialize reply under a foreign ID must not expose a client");
+            };
+            assert_eq!(
+                error.data,
+                Some(serde_json::json!({"timeoutSource":"absolute"}))
+            );
+            assert!(!error.message.contains(canary), "{error:?}");
+            assert!(!format!("{error:?}").contains(canary), "{error:?}");
+        }
+
+        let missing =
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"no correlation"}}"#;
+        let script = legacy_exact_id_script(Some(missing), true);
+        for (path, result) in connect_legacy_on_both_initializers(&script) {
+            assert!(
+                result.is_err(),
+                "{path}: a missing-ID reply must fail initialize closed"
+            );
+        }
+    }
+
+    /// Before `initialize` selects an era, a server `ping` request is answered
+    /// with method-not-found under its exact ID; after legacy selection the
+    /// same request is serviced with an empty result. The peer exits on any
+    /// other answer, which fails the handshake or the public ping.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn legacy_server_ping_is_refused_until_initialize_selects_the_era() {
+        let script = format!(
+            "IFS= read -r first || exit 1; case \"$first\" in *initialize*2024-11-05*) ;; *) exit 1 ;; esac; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":\"init-ping\",\"method\":\"ping\"}}'; \
+             IFS= read -r early || exit 2; \
+             case \"$early\" in *'\"id\":\"init-ping\"'*) ;; *) exit 3 ;; esac; \
+             case \"$early\" in *'\"code\":-32601'*) ;; *) exit 4 ;; esac; \
+             printf '%s\\n' '{}'; \
+             IFS= read -r lifecycle || exit 5; case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 6 ;; esac; \
+             IFS= read -r client_ping || exit 7; case \"$client_ping\" in *'\"method\":\"ping\"'*) ;; *) exit 8 ;; esac; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":\"server-ping\",\"method\":\"ping\"}}'; \
+             IFS= read -r late || exit 9; \
+             case \"$late\" in *'\"id\":\"server-ping\"'*) ;; *) exit 10 ;; esac; \
+             case \"$late\" in *'\"result\":{{}}'*) ;; *) exit 11 ;; esac; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{}}}}'; \
+             exec sleep 5",
+            legacy_initialize_reply("1", "initializing-ping-server")
+        );
+        for (path, result) in connect_legacy_on_both_initializers(&script) {
+            let mut client = result.unwrap_or_else(|error| {
+                panic!("{path}: the pre-selection ping must be refused under its ID: {error}")
+            });
+            assert_eq!(
+                client.session.server_info().name,
+                "initializing-ping-server"
+            );
+            client.ping().unwrap_or_else(|error| {
+                panic!("{path}: a selected legacy session services ping: {error}")
+            });
+            client
+                .close()
+                .expect("legacy initializing-ping client cleanup");
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     async fn deferred_probe_request(
         client: &mut Client,
         cx: &Cx,
