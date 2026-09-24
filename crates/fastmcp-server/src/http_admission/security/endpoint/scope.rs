@@ -171,6 +171,7 @@ async fn dispatch_with_authorization(
         Err(response) => return Ok((ServerHttpEndpointResponse::Immediate(response), None)),
     };
     session.selected_era.get_or_insert(ProtocolEra::Modern2026);
+    let http_parameter_headers = crate::http_admission::http_parameter_headers(&prepared.request.headers);
     let endpoint_response = {
         let mut endpoint = session.endpoint_session.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -179,7 +180,7 @@ async fn dispatch_with_authorization(
     let mut lease = prepared.lease;
     let response = Box::pin(guard_response(cx, &mut lease, session.handle_modern(
         cx, endpoint_response, authorization, prepared.raw_params,
-        Some(prepared.receipt), cancellation,
+        Some(http_parameter_headers), Some(prepared.receipt), cancellation,
     ))).await;
     match response {
         Ok(response) => Ok((response?, lease)),
@@ -237,6 +238,7 @@ pub(super) async fn begin_sse(
         Ok(prepared) => prepared,
         Err(response) => return Ok(Err(Box::new(ServerHttpEndpointResponse::Immediate(response)))),
     };
+    let http_parameter_headers = crate::http_admission::http_parameter_headers(&prepared.request.headers);
     let endpoint_response = {
         let mut endpoint = session.endpoint_session.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -254,7 +256,7 @@ pub(super) async fn begin_sse(
         let mut lease = prepared.lease;
         return match Box::pin(guard_response(cx, &mut lease, session.handle_modern(
             cx, endpoint_response, authorization, prepared.raw_params,
-            Some(prepared.receipt), None,
+            Some(http_parameter_headers), Some(prepared.receipt), None,
         ))).await {
             Ok(response) => response.map(|response| Err(Box::new(response))),
             Err(_) => Ok(Err(Box::new(ServerHttpEndpointResponse::Immediate(refusal(503))))),

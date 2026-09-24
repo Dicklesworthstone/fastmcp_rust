@@ -1498,6 +1498,9 @@ pub struct McpContext {
     /// and owns that continuation until consumption, expiry, or listener
     /// shutdown.
     retained_continuation_owner: bool,
+    /// `Mcp-Param-*` fields transport admission received with a modern HTTP
+    /// request. `None` for every transport that has no such header block.
+    http_parameter_headers: Option<Arc<[(String, String)]>>,
     /// Optional progress reporter for long-running operations.
     progress_reporter: Option<ProgressReporter>,
     /// Session state for per-session key-value storage.
@@ -1578,6 +1581,13 @@ impl std::fmt::Debug for McpContext {
             .field(
                 "retained_continuation_owner",
                 &self.retained_continuation_owner,
+            )
+            .field(
+                "http_parameter_header_count",
+                &self
+                    .http_parameter_headers
+                    .as_ref()
+                    .map(|headers| headers.len()),
             )
             .field("progress_reporter", &self.progress_reporter)
             .field("state", &self.state.is_some())
@@ -1738,6 +1748,7 @@ impl McpContext {
             request_id,
             final_request_surface: false,
             retained_continuation_owner: false,
+            http_parameter_headers: None,
             progress_reporter: None,
             state: None,
             cache_admission_partition: Arc::new(Mutex::new(None)),
@@ -1784,6 +1795,7 @@ impl McpContext {
             request_id,
             final_request_surface: false,
             retained_continuation_owner: false,
+            http_parameter_headers: None,
             progress_reporter: None,
             state: Some(state),
             cache_admission_partition: Arc::new(Mutex::new(None)),
@@ -1831,6 +1843,7 @@ impl McpContext {
             request_id,
             final_request_surface: false,
             retained_continuation_owner: false,
+            http_parameter_headers: None,
             progress_reporter: Some(reporter),
             state: None,
             cache_admission_partition: Arc::new(Mutex::new(None)),
@@ -1882,6 +1895,7 @@ impl McpContext {
             request_id,
             final_request_surface: false,
             retained_continuation_owner: false,
+            http_parameter_headers: None,
             progress_reporter: Some(reporter),
             state: Some(state),
             cache_admission_partition: Arc::new(Mutex::new(None)),
@@ -2193,6 +2207,26 @@ impl McpContext {
     pub fn with_retained_continuation_owner(mut self) -> Self {
         self.retained_continuation_owner = true;
         self
+    }
+
+    /// Records the `Mcp-Param-*` fields modern HTTP admission received, so the
+    /// router can compare them with the resolved tool's annotated arguments.
+    ///
+    /// Only transport admission may install them. Values can be disclosed
+    /// arguments; Debug reports only their count.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_http_parameter_headers(mut self, headers: Arc<[(String, String)]>) -> Self {
+        self.http_parameter_headers = Some(headers);
+        self
+    }
+
+    /// Returns the admitted `Mcp-Param-*` fields of a modern HTTP request, or
+    /// `None` when the request arrived over a transport without them.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn http_parameter_headers(&self) -> Option<&[(String, String)]> {
+        self.http_parameter_headers.as_deref()
     }
 
     /// Returns whether transport admission installed retained-continuation
