@@ -262,7 +262,9 @@ impl ClientCredentialsTaskCall {
     ) -> Result<Self, ClientCredentialsTasksError> {
         let body = match response.metadata().kind() {
             ModernHttpResponseKind::Json => Body::Json(response),
-            ModernHttpResponseKind::Sse if matches!(&decoder, Decoder::Tool(_)) => {
+            // Streamable HTTP lets a server answer any request, not only a tool
+            // call, with an SSE stream that ends in the correlated result.
+            ModernHttpResponseKind::Sse => {
                 let framing = SseLimits::new(limits.frame_bytes, limits.frame_bytes, 64)
                     .ok_or(ManagedTasksError::InvalidLimits)?;
                 Body::Sse(response.into_sse_stream(framing).map_err(|_| ManagedTasksError::InvalidResponse)?)
@@ -301,8 +303,8 @@ impl ClientCredentialsTaskCall {
                         Ok((decode_result(&self.decoder, &bytes, &self.request_id, self.limits.frame_bytes)?, None))
                     }
                     Body::Sse(mut stream) => {
-                        let frame = stream.next_event(cx).await.map_err(|_| ManagedTasksError::InvalidResponse)?
-                            .ok_or(ManagedTasksError::MissingTerminal)?;
+                        let frame = stream.next_event(cx).await.map_err(|error| json_body_error(&self.decoder, error))?
+                            .ok_or_else(|| sse_end_without_terminal(&self.decoder))?;
                         let event = decode_record(&self.decoder, frame.as_bytes(), &self.request_id,
                             self.limits.frame_bytes, self.progress.as_ref(), &mut progress)?;
                         Ok((event, Some(Box::new(Body::Sse(stream)))))
@@ -333,6 +335,17 @@ fn json_body_error(decoder: &Decoder, error: ModernHttpExecutorError) -> Managed
         ManagedTasksError::MissingTerminal
     } else {
         ManagedTasksError::InvalidResponse
+    }
+}
+
+/// An SSE body that ends cleanly before the correlated result lost the reply.
+/// A read-only get may reconcile it; an update or cancel must not gain retry
+/// authority from it; a tool call keeps its existing classification.
+fn sse_end_without_terminal(decoder: &Decoder) -> ManagedTasksError {
+    if matches!(decoder, Decoder::Update | Decoder::Cancel) {
+        ManagedTasksError::InvalidResponse
+    } else {
+        ManagedTasksError::MissingTerminal
     }
 }
 
@@ -612,6 +625,16 @@ mod tests {
             ModernHttpExecutorError::Redirect { status: 307 }]
         {
             assert!(matches!(json_body_error(&Decoder::Get(id()), error), ManagedTasksError::InvalidResponse));
+        }
+    }
+
+    #[test]
+    fn only_a_get_or_tool_sse_end_without_terminal_is_a_missing_terminal() {
+        assert!(matches!(sse_end_without_terminal(&Decoder::Get(id())), ManagedTasksError::MissingTerminal));
+        let tool = prepared(ManagedTaskRequest::CallTool { name:"effect".to_owned(), arguments:None });
+        assert!(matches!(sse_end_without_terminal(&tool.decoder), ManagedTasksError::MissingTerminal));
+        for decoder in [&Decoder::Update, &Decoder::Cancel] {
+            assert!(matches!(sse_end_without_terminal(decoder), ManagedTasksError::InvalidResponse));
         }
     }
 
