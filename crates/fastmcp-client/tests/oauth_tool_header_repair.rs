@@ -438,3 +438,6 @@ cases! {
     repair_truncated_error_never_grants_custody => Truncated,
     repair_lost_response_head_never_grants_custody => LostHead,
 }
+
+#[path = "oauth_tool_header_repair/schema.rs"]
+mod schema;

@@ -100,7 +100,13 @@ impl ManagedToolRepairCall {
         )).await;
         match outcome {
             Ok(result) => result,
-            Err(error) => { self.call.close(); Err(error) }
+            Err(error) => {
+                self.call.close();
+                // The inner call may have completed in the same poll that
+                // invalidated the source. Its result was not published here.
+                self.call.finished = false;
+                Err(error)
+            }
         }
     }
 }
