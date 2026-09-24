@@ -113,6 +113,12 @@ fn mask_non_code(source: &str) -> String {
                 }
                 i += 1;
             }
+        } else if b == b'\''
+            && let Some(end) = char_literal_end(bytes, i)
+        {
+            // A char literal can hold a quote or a brace ('"', '{'). Left in,
+            // it opens a phantom string or shifts every later brace match.
+            i = end;
         } else if b == b'"' {
             i += 1;
             while i < bytes.len() {
@@ -152,50 +158,171 @@ fn closing_hashes(bytes: &[u8], from: usize, hashes: usize) -> bool {
     (0..hashes).all(|k| bytes.get(from + k) == Some(&b'#'))
 }
 
-/// Byte ranges covered by a `#[cfg(test)]`-enabled item, by brace matching over
-/// masked source.
+/// `Some(end)` just past a char literal opening at `i`, or `None` for a
+/// lifetime or label (`'a`), which has no closing quote.
+fn char_literal_end(bytes: &[u8], i: usize) -> Option<usize> {
+    let body = *bytes.get(i + 1)?;
+    let close = if body == b'\\' {
+        // '\n', '\'', '\x7f', '\u{10FFFF}': the closing quote is near.
+        (i + 3..(i + 12).min(bytes.len())).find(|&k| bytes[k] == b'\'')?
+    } else {
+        // One UTF-8 scalar, one to four bytes, then the closing quote.
+        let width = match body {
+            0x00..=0x7f => 1,
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            _ => 4,
+        };
+        let k = i + 1 + width;
+        (bytes.get(k) == Some(&b'\'')).then_some(k)?
+    };
+    Some(close + 1)
+}
+
+/// Byte ranges covered by an item only `cargo test` compiles, by brace matching
+/// over masked source.
 ///
-/// Resolved to whichever ITEM follows the attribute — `mod`, `fn`, `impl` — not
+/// Resolved to whichever ITEM follows the attribute (`mod`, `fn`, `impl`), not
 /// only to `mod`, because a `#[cfg(test)]` on a FUNCTION is invisible to a
-/// stripper that only removes `#[cfg(test)] mod X { .. }`. `#[cfg(not(test))]`
-/// is the opposite and is deliberately NOT excluded.
+/// stripper that only removes `#[cfg(test)] mod X { .. }`.
+///
+/// The predicate is EVALUATED, never substring-matched.
+/// `any(feature = "legacy-2024-11-05", test)` mentions `test` but ships whenever
+/// that default feature is on; matching the substring treated about 3,300
+/// shipped lines of `lib.rs` as test code. `#[cfg(not(test))]` is shipped too.
+///
+/// An item without a body (`use x;`, `mod tests;`) ends at its semicolon, so it
+/// can never swallow the item that follows it.
 fn test_regions(masked: &str) -> Vec<(usize, usize)> {
     let bytes = masked.as_bytes();
     let mut regions = Vec::new();
     let mut search = 0usize;
     while let Some(found) = masked[search..].find("#[cfg(") {
         let at = search + found;
-        let head_end = masked[at..]
-            .find(']')
-            .map_or(bytes.len(), |offset| at + offset);
-        let head = &masked[at..head_end];
-        search = head_end.max(at + 1);
-        let enables_test = head.contains("test") && !head.contains("not(test)");
-        if !enables_test {
+        let open = at + "#[cfg".len();
+        let Some(close) = balanced_end(bytes, open) else {
+            break;
+        };
+        search = close + 1;
+        if !cfg_is_test_only(&masked[open + 1..close]) {
             continue;
         }
-        let Some(open) = masked[head_end..].find('{').map(|o| head_end + o) else {
-            continue;
-        };
-        let mut depth = 0usize;
-        let mut k = open;
-        while k < bytes.len() {
-            match bytes[k] {
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        regions.push((at, k));
-                        search = k;
-                        break;
-                    }
-                }
-                _ => {}
+        // Step past this attribute's `]` and any further attributes on the item.
+        let mut item = masked[close..]
+            .find(']')
+            .map_or(bytes.len(), |offset| close + offset + 1);
+        loop {
+            while item < bytes.len() && bytes[item].is_ascii_whitespace() {
+                item += 1;
             }
-            k += 1;
+            let next_attribute = (bytes.get(item) == Some(&b'#'))
+                .then(|| masked[item..].find('['))
+                .flatten()
+                .and_then(|offset| balanced_end(bytes, item + offset));
+            match next_attribute {
+                Some(end) => item = end + 1,
+                None => break,
+            }
+        }
+        if let Some(end) = item_end(bytes, item) {
+            regions.push((at, end));
+            search = search.max(end);
         }
     }
     regions
+}
+
+/// Index of the delimiter that closes the one at `open` (`(`, `[` or `{`).
+fn balanced_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let (opening, closing) = match *bytes.get(open)? {
+        b'(' => (b'(', b')'),
+        b'[' => (b'[', b']'),
+        b'{' => (b'{', b'}'),
+        _ => return None,
+    };
+    let mut depth = 0usize;
+    for (index, &byte) in bytes.iter().enumerate().skip(open) {
+        if byte == opening {
+            depth += 1;
+        } else if byte == closing {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+/// Index of the last byte of the item starting at `start`: its closing `}`, or
+/// its `;`, `,` or enclosing `}` when it has no body of its own.
+fn item_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, &byte) in bytes.iter().enumerate().skip(start) {
+        match byte {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b'{' if depth == 0 => return balanced_end(bytes, index),
+            b';' | b',' | b'}' if depth == 0 => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether an item gated by `cfg(<predicate>)` compiles only under `cargo test`:
+/// with `test` false and every other predicate free, the predicate never holds.
+fn cfg_is_test_only(predicate: &str) -> bool {
+    !cfg_can_be(predicate, true)
+}
+
+/// Whether `predicate` can evaluate to `value` outside `cargo test`, where
+/// `test` is false and every other predicate may take either value.
+fn cfg_can_be(predicate: &str, value: bool) -> bool {
+    let predicate = predicate.trim();
+    for operator in ["all", "any", "not"] {
+        let Some(arguments) = predicate
+            .strip_prefix(operator)
+            .map(str::trim_start)
+            .and_then(|rest| rest.strip_prefix('('))
+            .and_then(|rest| rest.strip_suffix(')'))
+        else {
+            continue;
+        };
+        let arguments = split_cfg_arguments(arguments);
+        return match (operator, value) {
+            ("all", true) | ("any", false) => {
+                arguments.iter().all(|argument| cfg_can_be(argument, value))
+            }
+            ("all", false) | ("any", true) => {
+                arguments.iter().any(|argument| cfg_can_be(argument, value))
+            }
+            _ => arguments
+                .first()
+                .is_some_and(|argument| cfg_can_be(argument, !value)),
+        };
+    }
+    predicate != "test" || !value
+}
+
+/// The comma-separated arguments of a cfg operator, split at paren depth zero.
+fn split_cfg_arguments(arguments: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut depth, mut from) = (0usize, 0usize);
+    for (index, byte) in arguments.bytes().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                parts.push(arguments[from..index].trim());
+                from = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(arguments[from..].trim());
+    parts.retain(|part| !part.is_empty());
+    parts
 }
 
 /// 1-based lines holding a SHIPPED `block_on` CALL site.
@@ -380,5 +507,86 @@ fn fnd_04_b7_shipped_block_on_guard_excludes_non_calls_positive() {
         shipped_block_on_sites(not_test),
         vec![2],
         "cfg(not(test)) is shipped code"
+    );
+}
+
+/// A cfg predicate that MENTIONS `test` is not thereby test-only. Each pair
+/// differs only in whether the predicate can hold outside `cargo test`.
+#[test]
+fn fnd_04_b7_shipped_block_on_guard_evaluates_cfg_predicates() {
+    let body = "fn t() { block_on(async {}); }\n";
+    let cases: [(&str, Vec<usize>); 7] = [
+        // Ships whenever the feature is on: lib.rs gates thousands of lines so.
+        (
+            "#[cfg(any(feature = \"legacy-2024-11-05\", test))]\n",
+            vec![2],
+        ),
+        (
+            "#[cfg(all(test, feature = \"legacy-2024-11-05\"))]\n",
+            vec![],
+        ),
+        // A feature whose NAME contains "test" is not the `test` predicate.
+        ("#[cfg(feature = \"test-internals\")]\n", vec![2]),
+        ("#[cfg(test)]\n", vec![]),
+        // not(feature) ships when the feature is off; not(test) always ships.
+        ("#[cfg(not(feature = \"legacy-2024-11-05\"))]\n", vec![2]),
+        ("#[cfg(all(unix, not(test)))]\n", vec![2]),
+        ("#[cfg(all(unix, any(test, all(test, windows))))]\n", vec![]),
+    ];
+    for (attribute, expected) in cases {
+        assert_eq!(
+            shipped_block_on_sites(&format!("{attribute}{body}")),
+            expected,
+            "{attribute:?}"
+        );
+    }
+}
+
+/// A gated item WITHOUT a body ends at its semicolon. Before this rule the guard
+/// ran on to the next `{` and excluded whatever shipped item came after.
+#[test]
+fn fnd_04_b7_shipped_block_on_guard_bodyless_item_does_not_swallow_the_next() {
+    let declared = "#[cfg(test)]\nmod tests;\nfn shipped() { block_on(async {}); }\n";
+    assert_eq!(
+        shipped_block_on_sites(declared),
+        vec![3],
+        "a shipped fn after `#[cfg(test)] mod tests;` must still be counted"
+    );
+    let inline = "#[cfg(test)]\nmod tests { fn shipped() { block_on(async {}); } }\n";
+    assert_eq!(
+        shipped_block_on_sites(inline),
+        Vec::<usize>::new(),
+        "CONTROL: the same call inside the inline test module is excluded"
+    );
+    let stacked = "#[cfg(test)]\n#[allow(dead_code)]\nfn gated() { block_on(async {}); }\n";
+    assert_eq!(
+        shipped_block_on_sites(stacked),
+        Vec::<usize>::new(),
+        "further attributes between the cfg and its item do not detach the gate"
+    );
+}
+
+/// Char literals holding a quote or a brace must not desynchronise the scan.
+#[test]
+fn fnd_04_b7_shipped_block_on_guard_masks_char_literals() {
+    let quote = "fn s() { let q = '\"'; block_on(async {}); }\n";
+    assert_eq!(
+        shipped_block_on_sites(quote),
+        vec![1],
+        "a '\"' char literal must not open a string that hides the call"
+    );
+    // Unmasked, the '{' leaves this item's braces unbalanced, so the region never
+    // closes and the gated call is counted as shipped.
+    let brace = "#[cfg(test)]\nfn t() { let b = '{'; block_on(async {}); }\n";
+    assert_eq!(
+        shipped_block_on_sites(brace),
+        Vec::<usize>::new(),
+        "a '{{' char literal must not break the cfg(test) item's brace match"
+    );
+    let lifetime = "fn s<'a>(x: &'a str) -> &'a str { block_on(async {}); x }\n";
+    assert_eq!(
+        shipped_block_on_sites(lifetime),
+        vec![1],
+        "lifetimes are code, not char literals"
     );
 }
