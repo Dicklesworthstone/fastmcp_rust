@@ -6,9 +6,10 @@
 //! code with S256 PKCE over HTTPS. It creates no runtime or background task.
 //!
 //! This is the preregistered public-client slice of AUTH-07, not discovery,
-//! dynamic registration, OIDC authentication, or AUTH-05 durable token custody.
-//! Returned secrets stay in process memory. Credential and parsed token-response
-//! types deliberately omit serialization and diagnostic formatting.
+//! dynamic registration or OIDC authentication. The Linux `persistence` adapter
+//! connects refresh grants to caller-supplied durable protection and independently
+//! anchored storage; it does not qualify those deployment providers. Credential
+//! and parsed token-response types omit serialization and diagnostic formatting.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -33,6 +34,9 @@ use serde::{Deserialize, Deserializer};
 
 use super::{BoundBearerCredential, CanonicalHttpUrl};
 
+/// Anchored refresh-grant custody and native renewal after a Linux file reopen.
+#[cfg(target_os = "linux")]
+pub mod persistence;
 /// RFC 7009 remote token revocation for explicitly trusted native clients.
 pub mod revocation;
 
@@ -132,6 +136,10 @@ pub struct OAuthClientConfiguration {
     max_access_token_lifetime: Duration,
     extra_root_certificates: Vec<Vec<u8>>,
     resource_tls: Option<crate::http_executor::ResourceTlsTrust>,
+    // Stable, domain-separated digest of the admitted ordered resource roots.
+    // Updated only after ResourceTlsTrust admission succeeds; persistent OAuth
+    // bindings must not depend on Debug output or duplicate all DER buffers.
+    resource_tls_fingerprint: Option<[u8; 32]>,
 }
 
 impl OAuthClientConfiguration {
@@ -189,6 +197,7 @@ impl OAuthClientConfiguration {
             max_access_token_lifetime: Duration::from_secs(3600),
             extra_root_certificates: Vec::new(),
             resource_tls: None,
+            resource_tls_fingerprint: None,
         })
     }
 
@@ -241,9 +250,20 @@ impl OAuthClientConfiguration {
         mut self,
         certificate: asupersync::tls::Certificate,
     ) -> Result<Self, OAuthError> {
+        let der = certificate.as_der();
+        if der.is_empty() || der.len() > 16 * 1024 {
+            return Err(OAuthError::InvalidConfiguration);
+        }
+        let mut binding = b"fastmcp/oauth-resource-tls/v1\0".to_vec();
+        binding.extend_from_slice(&self.resource_tls_fingerprint.unwrap_or([0; 32]));
+        binding.extend_from_slice(&(der.len() as u32).to_be_bytes());
+        binding.extend_from_slice(der);
+        let fingerprint = sha256_bounded(&binding, 16 * 1024 + 128)
+            .map_err(|_| OAuthError::InvalidConfiguration)?.into_bytes();
         crate::http_executor::ResourceTlsTrust::add_root(
             &mut self.resource_tls, self.resource.clone(), certificate,
         ).map_err(|_| OAuthError::InvalidConfiguration)?;
+        self.resource_tls_fingerprint = Some(fingerprint);
         Ok(self)
     }
 }
@@ -897,7 +917,7 @@ mod tests {
 
     fn url(value: &str) -> CanonicalHttpUrl { CanonicalHttpUrl::parse(value).unwrap() }
 
-    fn config() -> OAuthClientConfiguration {
+    pub(super) fn config() -> OAuthClientConfiguration {
         OAuthClientConfiguration::from_trusted_endpoints(
             "https://issuer.example", url("https://issuer.example/authorize"),
             url("https://issuer.example/token"), url("https://mcp.example/mcp"),
@@ -1277,7 +1297,7 @@ mod tests {
         }
     }
 
-    fn renewable_grant(config: &OAuthClientConfiguration) -> OAuthCredentials {
+    pub(super) fn renewable_grant(config: &OAuthClientConfiguration) -> OAuthCredentials {
         admit_token_response(config, &config.scopes,
             br#"{"access_token":"access-one","token_type":"Bearer","expires_in":3600,"refresh_token":"refresh-one"}"#,
             Instant::now(),
@@ -1373,18 +1393,18 @@ mod tests {
     const TEST_LEAF: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBjjCCATSgAwIBAgICA+owCgYIKoZIzj0EAwIwJzElMCMGA1UEAwwcRmFzdE1D\nUCBPQXV0aCBURVNUIE9OTFkgUm9vdDAeFw0yMDAxMDEwMDAwMDBaFw00OTEyMzEw\nMDAwMDBaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDBZMBMGByqGSM49AgEGCCqGSM49\nAwEHA0IABPPKylLna9VpWAlpshHBhSsQHNOv3BaEGX4HSBhHiBVel0ce+qfHF15O\n0T63Zlp7TtxlMdEY+rPpgioSFDQVadijYzBhMAwGA1UdEwEB/wQCMAAwLAYDVR0R\nBCUwI4IJbG9jYWxob3N0hwR/AAABhxAAAAAAAAAAAAAAAAAAAAABMBMGA1UdJQQM\nMAoGCCsGAQUFBwMBMA4GA1UdDwEB/wQEAwIHgDAKBggqhkjOPQQDAgNIADBFAiEA\n6qrAr2qp/t6K62T9Et2mUU/zfd4kJb+ekyoAim1yTFcCICb6SdVY2fg15/SXf0vE\nIvYelqtTk8FQInCEcIxvfF3m\n-----END CERTIFICATE-----\n";
     const TEST_KEY: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcCe44IBKhbw+D/s7\nBjDHOOV0g+EoxFno7VJGKhJeer2hRANCAATzyspS52vVaVgJabIRwYUrEBzTr9wW\nhBl+B0gYR4gVXpdHHvqnxxdeTtE+t2Zae07cZTHRGPqz6YIqEhQ0FWnY\n-----END PRIVATE KEY-----\n";
 
-    fn test_root() -> asupersync::tls::Certificate {
+    pub(super) fn test_root() -> asupersync::tls::Certificate {
         asupersync::tls::Certificate::from_pem(TEST_ROOT).unwrap().remove(0)
     }
 
-    fn test_acceptor() -> asupersync::tls::TlsAcceptor {
+    pub(super) fn test_acceptor() -> asupersync::tls::TlsAcceptor {
         asupersync::tls::TlsAcceptorBuilder::new(
             asupersync::tls::CertificateChain::from_pem(TEST_LEAF).unwrap(),
             asupersync::tls::PrivateKey::from_pem(TEST_KEY).unwrap(),
         ).alpn_protocols(vec![b"http/1.1".to_vec()]).build().unwrap()
     }
 
-    async fn pair<L: Future, R: Future>(left: L, right: R) -> (L::Output, R::Output) {
+    pub(super) async fn pair<L: Future, R: Future>(left: L, right: R) -> (L::Output, R::Output) {
         let mut left = std::pin::pin!(left);
         let mut right = std::pin::pin!(right);
         let mut left_output = None;
@@ -1402,7 +1422,7 @@ mod tests {
         }).await
     }
 
-    async fn read_token_request<IO: asupersync::io::AsyncRead + Unpin>(
+    pub(super) async fn read_token_request<IO: asupersync::io::AsyncRead + Unpin>(
         stream: &mut IO,
     ) -> Result<(String, BTreeMap<String, String>), OAuthError> {
         let mut wire = Vec::new();
