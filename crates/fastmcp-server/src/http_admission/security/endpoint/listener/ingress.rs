@@ -270,9 +270,8 @@ pub(super) async fn receive<T: AsyncRead + AsyncWrite + Unpin>(
                 if shutdown.is_requested() || cx.checkpoint().is_err() { return Err(()); }
                 // Retain the partially completed write across cancellation
                 // polls. Restarting write_all would duplicate response bytes.
-                match asupersync::time::timeout(cx.now(), HTTP_ACCEPT_CANCEL_POLL, writing.as_mut()).await {
-                    Ok(result) => return result.map_err(|_| ()),
-                    Err(_) => {},
+                if let Ok(result) = asupersync::time::timeout(cx.now(), HTTP_ACCEPT_CANCEL_POLL, writing.as_mut()).await {
+                    return result.map_err(|_| ());
                 }
             }
         };

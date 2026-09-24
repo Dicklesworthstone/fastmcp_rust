@@ -125,7 +125,7 @@ pub(super) async fn serve(
         }
     };
     let opening = match &policy.scope_authorization {
-        Some(scopes) => scope::begin_sse(&mut session, cx, scopes, request.clone(), authorization.clone(), policy.sse_revalidation).await,
+        Some(scopes) => Box::pin(scope::begin_sse(&mut session, cx, scopes, request.clone(), authorization.clone(), policy.sse_revalidation)).await,
         None => session.begin_modern_sse(cx, request.clone(), authorization.clone()).await
             .map(|opening| opening.map(|(request, response, raw, receipt)| (request, response, raw, receipt, None))),
     };
@@ -323,10 +323,10 @@ async fn json(
     let (sender, mut receiver) = asupersync::channel::oneshot::channel::<HttpResponse>();
     let task = cx.spawn(move |request_cx| async move {
         let response = match scopes {
-            Some(scopes) => scope::dispatch_socket_json(
+            Some(scopes) => Box::pin(scope::dispatch_socket_json(
                 &request_cx, &dispatch_endpoint, &dispatch_sessions, &scopes,
                 request, authorization, dispatch_cancellation,
-            ).await,
+            )).await,
             None => dispatch_modern_http_request_with_cancellation_and_transport_authorization(
                 &request_cx, &dispatch_endpoint, &dispatch_sessions, request, authorization, Some(dispatch_cancellation),
             ).await,
