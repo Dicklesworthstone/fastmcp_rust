@@ -1075,6 +1075,393 @@ fn tool_output_schema_in_definition() {
     assert!(def.output_schema.is_some());
     let schema = def.output_schema.unwrap();
     assert_eq!(schema["type"], "object");
+    let content = handler
+        .call(&test_ctx(), json!({"input": "legacy"}))
+        .expect("legacy inline-schema string conversion remains available");
+    assert_eq!(expect_text(&content[0]), "processed: legacy");
+}
+
+// --- Schema-bound ordinary return values on registered modern tools ---
+
+#[derive(serde::Serialize, JsonSchema)]
+struct SchemaBoundResponse {
+    value: Option<String>,
+    error: Option<String>,
+}
+
+static SCHEMA_BOUND_TYPED_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static SCHEMA_BOUND_TYPED_MAPPINGS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn schema_bound_response_error(kind: fastmcp_rust::ToolErrorKind) -> Option<serde_json::Value> {
+    Some(json!({
+        "value": null,
+        "error": match kind {
+            fastmcp_rust::ToolErrorKind::InputValidation => "input-validation",
+            fastmcp_rust::ToolErrorKind::Handler => "handler",
+        }
+    }))
+}
+
+fn schema_bound_counted_error(kind: fastmcp_rust::ToolErrorKind) -> Option<serde_json::Value> {
+    SCHEMA_BOUND_TYPED_MAPPINGS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    schema_bound_response_error(kind)
+}
+
+#[tool(output_schema = SchemaBoundResponse, error_mapper = schema_bound_counted_error)]
+fn schema_bound_typed_response(input: String) -> McpResult<SchemaBoundResponse> {
+    SCHEMA_BOUND_TYPED_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if input == "handler-error" {
+        return Err(McpError::tool_error(
+            "schema-bound handler rejected the request",
+        ));
+    }
+    Ok(SchemaBoundResponse {
+        value: Some(format!("processed: {input}")),
+        error: None,
+    })
+}
+
+fn schema_bound_any_root_schema() -> serde_json::Value {
+    json!({
+        "type": ["null", "boolean", "integer", "string", "array", "object"],
+        "items": {"type": "integer"}
+    })
+}
+
+fn schema_bound_json_root(mode: &str) -> serde_json::Value {
+    match mode {
+        "null" => json!(null),
+        "false" => json!(false),
+        "zero" => json!(0),
+        "empty-string" => json!(""),
+        "array" => json!([0, 2, 7]),
+        "empty-array" => json!([]),
+        "object" => json!({}),
+        "invalid-array" => json!([0, "2", 7]),
+        _ => panic!("the fixture accepts only declared JSON root cases"),
+    }
+}
+
+#[tool(
+    output_schema = schema_bound_any_root_schema(),
+    error_mapper = schema_bound_response_error
+)]
+fn schema_bound_inline_direct(mode: String) -> serde_json::Value {
+    schema_bound_json_root(&mode)
+}
+
+#[tool(
+    output_schema = schema_bound_any_root_schema(),
+    error_mapper = schema_bound_response_error
+)]
+async fn schema_bound_inline_async(mode: String) -> serde_json::Value {
+    schema_bound_json_root(&mode)
+}
+
+#[tool(
+    output_schema = schema_bound_any_root_schema(),
+    error_mapper = schema_bound_response_error
+)]
+fn schema_bound_inline_result(mode: String) -> Result<serde_json::Value, String> {
+    if mode == "handler-error" {
+        return Err("generic application error".to_owned());
+    }
+    Ok(schema_bound_json_root(&mode))
+}
+
+#[tool(
+    output_schema = schema_bound_any_root_schema(),
+    error_mapper = schema_bound_response_error
+)]
+async fn schema_bound_inline_mcp_result(mode: String) -> McpResult<serde_json::Value> {
+    match mode.as_str() {
+        "cancelled" => Err(McpError::request_cancelled()),
+        "internal" => Err(McpError::internal_error("private internal fixture failure")),
+        "handler-error" => Err(McpError::tool_error("application tool failure")),
+        _ => Ok(schema_bound_json_root(&mode)),
+    }
+}
+
+async fn schema_bound_wire_call(
+    server: &Server,
+    connection: &ModernConnection,
+    name: &str,
+    arguments: serde_json::Value,
+) -> fastmcp_rust::JsonRpcResponse {
+    let request = JsonRpcRequest::new(
+        "tools/call",
+        Some(json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+            "name": name,
+            "arguments": arguments,
+        })),
+        64_i64,
+    );
+    server
+        .dispatch_stateless(&facade_final_inbound(connection), &request)
+        .await
+        .expect("a registered modern tool call receives a wire response")
+}
+
+fn schema_bound_complete(response: fastmcp_rust::JsonRpcResponse) -> serde_json::Value {
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let result = response.result.expect("the complete response has a result");
+    assert_eq!(result["resultType"], "complete");
+    result
+}
+
+fn assert_schema_bound_success(result: &serde_json::Value, expected: &serde_json::Value) {
+    assert_eq!(result.get("structuredContent"), Some(expected));
+    assert!(!result["isError"].as_bool().unwrap_or(false));
+    let content = result["content"].as_array().expect("complete text content");
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["type"], "text");
+    let text = content[0]["text"].as_str().expect("JSON text fallback");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(text).expect("fallback is serialized JSON"),
+        *expected
+    );
+}
+
+#[test]
+fn tool_schema_bound_typed_return_and_errors_reach_registered_modern_dispatch() {
+    on_caller_runtime(async {
+        use std::sync::atomic::Ordering;
+
+        SCHEMA_BOUND_TYPED_CALLS.store(0, Ordering::SeqCst);
+        SCHEMA_BOUND_TYPED_MAPPINGS.store(0, Ordering::SeqCst);
+        let connection = ModernConnection::new();
+        let server = Server::new("schema-bound-typed", "1.0.0")
+            .tool(SchemaBoundTypedResponse)
+            .try_build()
+            .expect("the typed output and both mapped errors admit");
+        assert_eq!(SCHEMA_BOUND_TYPED_MAPPINGS.load(Ordering::SeqCst), 2);
+
+        let invalid = schema_bound_complete(
+            schema_bound_wire_call(
+                &server,
+                &connection,
+                "schema_bound_typed_response",
+                json!({"input": 7}),
+            )
+            .await,
+        );
+        assert_eq!(invalid["isError"], true);
+        assert_eq!(
+            invalid["structuredContent"],
+            json!({"value": null, "error": "input-validation"})
+        );
+        assert_eq!(SCHEMA_BOUND_TYPED_CALLS.load(Ordering::SeqCst), 0);
+
+        let success = schema_bound_complete(
+            schema_bound_wire_call(
+                &server,
+                &connection,
+                "schema_bound_typed_response",
+                json!({"input": "seven"}),
+            )
+            .await,
+        );
+        assert_schema_bound_success(
+            &success,
+            &json!({"value": "processed: seven", "error": null}),
+        );
+        assert_eq!(SCHEMA_BOUND_TYPED_CALLS.load(Ordering::SeqCst), 1);
+
+        let failed = schema_bound_complete(
+            schema_bound_wire_call(
+                &server,
+                &connection,
+                "schema_bound_typed_response",
+                json!({"input": "handler-error"}),
+            )
+            .await,
+        );
+        assert_eq!(failed["isError"], true);
+        assert_eq!(
+            failed["structuredContent"],
+            json!({"value": null, "error": "handler"})
+        );
+        assert_eq!(SCHEMA_BOUND_TYPED_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            SCHEMA_BOUND_TYPED_MAPPINGS.load(Ordering::SeqCst),
+            2,
+            "dispatch consumes immutable error mappings admitted at registration"
+        );
+    });
+}
+
+#[test]
+fn tool_schema_bound_inline_outputs_preserve_all_json_roots_and_result_algebras() {
+    on_caller_runtime(async {
+        let connection = ModernConnection::new();
+        let server = Server::new("schema-bound-json", "1.0.0")
+            .tool(SchemaBoundInlineDirect)
+            .tool(SchemaBoundInlineAsync)
+            .tool(SchemaBoundInlineResult)
+            .tool(SchemaBoundInlineMcpResult)
+            .try_build()
+            .expect("sync, async, Result and McpResult schema-bound tools admit");
+
+        for name in [
+            "schema_bound_inline_direct",
+            "schema_bound_inline_async",
+            "schema_bound_inline_result",
+            "schema_bound_inline_mcp_result",
+        ] {
+            for mode in [
+                "null",
+                "false",
+                "zero",
+                "empty-string",
+                "array",
+                "empty-array",
+                "object",
+            ] {
+                let result = schema_bound_complete(
+                    schema_bound_wire_call(&server, &connection, name, json!({"mode": mode}))
+                        .await,
+                );
+                assert_schema_bound_success(&result, &schema_bound_json_root(mode));
+            }
+
+            let invalid = schema_bound_wire_call(
+                &server,
+                &connection,
+                name,
+                json!({"mode": "invalid-array"}),
+            )
+            .await;
+            assert!(invalid.result.is_none());
+            assert_eq!(
+                invalid
+                    .error
+                    .expect("invalid output remains a protocol error")
+                    .code
+                    .as_i32(),
+                Some(-32603)
+            );
+        }
+
+        for name in ["schema_bound_inline_result", "schema_bound_inline_mcp_result"] {
+            let result = schema_bound_complete(
+                schema_bound_wire_call(
+                    &server,
+                    &connection,
+                    name,
+                    json!({"mode": "handler-error"}),
+                )
+                .await,
+            );
+            assert_eq!(result["isError"], true);
+            assert_eq!(
+                result["structuredContent"],
+                json!({"value": null, "error": "handler"})
+            );
+        }
+
+        for (mode, expected_code) in [("cancelled", -32004), ("internal", -32603)] {
+            let response = schema_bound_wire_call(
+                &server,
+                &connection,
+                "schema_bound_inline_mcp_result",
+                json!({"mode": mode}),
+            )
+            .await;
+            assert!(response.result.is_none());
+            assert_eq!(
+                response
+                    .error
+                    .expect("terminal errors bypass tool-error mapping")
+                    .code
+                    .as_i32(),
+                Some(expected_code)
+            );
+        }
+    });
+}
+
+fn schema_bound_incompatible_error(kind: fastmcp_rust::ToolErrorKind) -> Option<serde_json::Value> {
+    match kind {
+        fastmcp_rust::ToolErrorKind::InputValidation => schema_bound_response_error(kind),
+        fastmcp_rust::ToolErrorKind::Handler => Some(json!({"value": null, "error": 7})),
+    }
+}
+
+#[tool(output_schema = SchemaBoundResponse, error_mapper = schema_bound_incompatible_error)]
+fn schema_bound_invalid_mapper(input: String) -> SchemaBoundResponse {
+    SchemaBoundResponse {
+        value: Some(input),
+        error: None,
+    }
+}
+
+#[test]
+fn tool_schema_bound_incompatible_mapper_refuses_registration_before_catalog_mutation() {
+    let mut router = fastmcp_rust::Router::new();
+    router.add_tool(GreetSimple).expect("baseline tool admits");
+    let before = serde_json::to_value(router.tools()).expect("catalog serializes");
+    let error = router
+        .add_tool(SchemaBoundInvalidMapper)
+        .expect_err("one mismatched error branch refuses the complete registration");
+    assert_eq!(error.code, fastmcp_rust::McpErrorCode::InternalError);
+    assert_eq!(
+        error.message,
+        "tool error structured-content mapper does not satisfy outputSchema"
+    );
+    assert_eq!(serde_json::to_value(router.tools()).unwrap(), before);
+    assert!(router.get_tool("greet_simple").is_some());
+    assert!(router.get_tool("schema_bound_invalid_mapper").is_none());
+}
+
+mod schema_bound_nested_mapper {
+    use super::SchemaBoundResponse;
+
+    #[fastmcp_rust::tool(
+        output_schema = SchemaBoundResponse,
+        error_mapper = super::schema_bound_response_error
+    )]
+    fn parent_mapping(input: String) -> SchemaBoundResponse {
+        SchemaBoundResponse {
+            value: Some(input),
+            error: None,
+        }
+    }
+
+    fn sibling_mapping(kind: fastmcp_rust::ToolErrorKind) -> Option<serde_json::Value> {
+        super::schema_bound_response_error(kind)
+    }
+
+    #[fastmcp_rust::tool(
+        output_schema = SchemaBoundResponse,
+        error_mapper = self::sibling_mapping
+    )]
+    fn self_mapping(input: String) -> SchemaBoundResponse {
+        SchemaBoundResponse {
+            value: Some(input),
+            error: None,
+        }
+    }
+}
+
+#[test]
+fn tool_schema_bound_error_mapper_paths_resolve_at_the_declaration_site() {
+    assert_eq!(
+        schema_bound_nested_mapper::ParentMapping.final_tool_error_structured_content(
+            fastmcp_rust::ToolErrorKind::InputValidation,
+        ),
+        Some(json!({"value": null, "error": "input-validation"}))
+    );
+    assert_eq!(
+        schema_bound_nested_mapper::SelfMapping
+            .final_tool_error_structured_content(fastmcp_rust::ToolErrorKind::Handler),
+        Some(json!({"value": null, "error": "handler"}))
+    );
 }
 
 // --- Final complete tool result projection ---
@@ -1160,6 +1547,21 @@ fn tool_final_complete_results_project_exact_legacy_content_and_output_schema() 
         assert_eq!(resource.mime_type.as_deref(), Some("text/plain"));
         assert_eq!(resource.text.as_deref(), Some("embedded"));
         assert!(resource.blob.is_none());
+
+        let complete = handler
+            .call_final(&ctx, json!({}))
+            .expect("explicit final results retain their exact result algebra");
+        assert_eq!(complete.payload.content.len(), 4);
+        assert!(complete.payload.structured_content.is_none());
+        assert_eq!(
+            complete
+                .meta
+                .final_server_info()
+                .expect("final metadata is valid")
+                .expect("explicit metadata retains server identity")
+                .name,
+            "macro-expansion-test"
+        );
     }
 }
 
