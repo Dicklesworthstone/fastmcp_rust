@@ -2170,10 +2170,9 @@ mod bd_6rfrg_sampling_bridge {
     /// WHY NOT THE MODERN `_meta` ENVELOPE, WHICH I TRIED SECOND: on this transport
     /// the sampling sender is installed from `session.supports_sampling()`
     /// (session.rs:537), which reads capabilities stored by the `initialize`
-    /// handshake (session.rs:725 proves that is what stores them). Every
-    /// sender-construction site this loop reaches is session-based -- lib.rs:19287
-    /// `create_bidirectional_senders(session, ..)` and lib.rs:19677
-    /// `create_bidirectional_senders_from_view(session, ..)`. The reader that
+    /// handshake (session.rs:725 proves that is what stores them). The only
+    /// sender-construction site this loop reaches is session-based:
+    /// `create_bidirectional_senders(session, ..)` in lib.rs. The reader that
     /// consumes `_meta` client capabilities, `admitted_final_client_capability_info`
     /// (lib.rs:1865), is called from `serve_modern_http_connection` and NOWHERE
     /// ELSE. So a modern `_meta` frame on this path cannot advertise sampling at

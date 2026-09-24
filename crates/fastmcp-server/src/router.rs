@@ -3804,29 +3804,13 @@ impl Router {
     /// the installed handler. In particular, a final `_meta` object remains a
     /// cross-era error even though the legacy parameter shape is otherwise
     /// intentionally open.
-    pub(crate) fn dispatch_legacy_completion(
+    pub(crate) async fn dispatch_legacy_completion(
         &self,
         request_ctx: &McpContext,
         request: &JsonRpcRequest,
     ) -> McpResult<serde_json::Value> {
-        if request.method != COMPLETION_COMPLETE {
-            return Err(McpError::method_not_found(&request.method));
-        }
-
-        let request = CoreRequest::decode(
-            ProtocolEra::Legacy2024,
-            COMPLETION_COMPLETE,
-            request.params.as_ref(),
-        )
-        .map_err(|error| McpError::invalid_params(error.to_string()))?;
-        let CoreRequest::Legacy(LegacyCoreRequest::Completion(params)) = request else {
-            return Err(McpError::internal_error(
-                "legacy completion dispatch selected another core request",
-            ));
-        };
-
-        serde_json::to_value(self.handle_completion_legacy(request_ctx, params)?)
-            .map_err(McpError::from)
+        self.dispatch_legacy_completion_in_request(request_ctx, request_ctx.cx(), request)
+            .await
     }
 
     pub(crate) async fn dispatch_legacy_completion_in_request(
@@ -3863,12 +3847,13 @@ impl Router {
     /// Completion providers retain the legacy freedom to resolve references
     /// and arguments outside the local catalog. Session-disabled and
     /// final-only targets remain inaccessible through this discovery surface.
-    pub fn handle_completion_legacy(
+    pub async fn handle_completion_legacy(
         &self,
         request_ctx: &McpContext,
         params: LegacyCompletionParams,
     ) -> McpResult<LegacyCompletionResult> {
-        block_on(self.handle_completion_legacy_in_request(request_ctx, request_ctx.cx(), params))
+        self.handle_completion_legacy_in_request(request_ctx, request_ctx.cx(), params)
+            .await
     }
 
     pub(crate) async fn handle_completion_legacy_in_request(
@@ -5132,7 +5117,7 @@ impl Router {
     /// * `session_state` - Session state for per-session storage
     /// * `notification_sender` - Optional callback for sending progress notifications
     /// * `bidirectional_senders` - Optional senders for sampling/elicitation
-    pub fn handle_tools_call(
+    pub async fn handle_tools_call(
         &self,
         request_ctx: &McpContext,
         params: CallToolParams,
@@ -5140,14 +5125,15 @@ impl Router {
         notification_sender: Option<&NotificationSender>,
         bidirectional_senders: Option<&BidirectionalSenders>,
     ) -> McpResult<CallToolResult> {
-        block_on(self.handle_tools_call_in_request(
+        self.handle_tools_call_in_request(
             request_ctx,
             request_ctx.cx(),
             params,
             session_state,
             notification_sender,
             bidirectional_senders,
-        ))
+        )
+        .await
     }
 
     pub(crate) async fn handle_tools_call_in_request(
@@ -5578,7 +5564,7 @@ impl Router {
     /// * `session_state` - Session state for per-session storage
     /// * `notification_sender` - Optional callback for sending progress notifications
     /// * `bidirectional_senders` - Optional senders for sampling/elicitation
-    pub fn handle_resources_read(
+    pub async fn handle_resources_read(
         &self,
         request_ctx: &McpContext,
         params: &ReadResourceParams,
@@ -5586,14 +5572,15 @@ impl Router {
         notification_sender: Option<&NotificationSender>,
         bidirectional_senders: Option<&BidirectionalSenders>,
     ) -> McpResult<ReadResourceResult> {
-        block_on(self.handle_resources_read_in_request(
+        self.handle_resources_read_in_request(
             request_ctx,
             request_ctx.cx(),
             params,
             session_state,
             notification_sender,
             bidirectional_senders,
-        ))
+        )
+        .await
     }
 
     pub(crate) async fn handle_resources_read_in_request(
@@ -5876,7 +5863,7 @@ impl Router {
     /// * `session_state` - Session state for per-session storage
     /// * `notification_sender` - Optional callback for sending progress notifications
     /// * `bidirectional_senders` - Optional senders for sampling/elicitation
-    pub fn handle_prompts_get(
+    pub async fn handle_prompts_get(
         &self,
         request_ctx: &McpContext,
         params: GetPromptParams,
@@ -5884,14 +5871,15 @@ impl Router {
         notification_sender: Option<&NotificationSender>,
         bidirectional_senders: Option<&BidirectionalSenders>,
     ) -> McpResult<GetPromptResult> {
-        block_on(self.handle_prompts_get_in_request(
+        self.handle_prompts_get_in_request(
             request_ctx,
             request_ctx.cx(),
             params,
             session_state,
             notification_sender,
             bidirectional_senders,
-        ))
+        )
+        .await
     }
 
     pub(crate) async fn handle_prompts_get_in_request(
@@ -12924,19 +12912,18 @@ mod router_tests {
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 78, Budget::INFINITE, &state);
-        let legacy = router
-            .handle_tools_call(
-                &request_ctx,
-                CallToolParams {
-                    name: "legacy-only-tool".to_owned(),
-                    arguments: Some(serde_json::json!({})),
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect("exact 2024 dispatch reaches the explicit legacy handler");
+        let legacy = block_on(router.handle_tools_call(
+            &request_ctx,
+            CallToolParams {
+                name: "legacy-only-tool".to_owned(),
+                arguments: Some(serde_json::json!({})),
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect("exact 2024 dispatch reaches the explicit legacy handler");
         assert_eq!(
             serde_json::to_value(legacy).expect("legacy result serializes")["content"][0]["text"],
             "called legacy-only-tool"
@@ -12969,32 +12956,30 @@ mod router_tests {
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 181, Budget::INFINITE, &state);
 
-        let legacy_resource = router
-            .handle_resources_read(
-                &request_ctx,
-                &ReadResourceParams {
-                    uri: "file:///legacy-only".to_owned(),
-                    meta: None,
-                },
-                state.clone(),
-                None,
-                None,
-            )
-            .expect("the exact legacy resource route retains its explicit registration");
+        let legacy_resource = block_on(router.handle_resources_read(
+            &request_ctx,
+            &ReadResourceParams {
+                uri: "file:///legacy-only".to_owned(),
+                meta: None,
+            },
+            state.clone(),
+            None,
+            None,
+        ))
+        .expect("the exact legacy resource route retains its explicit registration");
         assert_eq!(legacy_resource.contents.len(), 1);
-        let legacy_prompt = router
-            .handle_prompts_get(
-                &request_ctx,
-                GetPromptParams {
-                    name: "legacy-only-prompt".to_owned(),
-                    arguments: None,
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect("the exact legacy prompt route retains its explicit registration");
+        let legacy_prompt = block_on(router.handle_prompts_get(
+            &request_ctx,
+            GetPromptParams {
+                name: "legacy-only-prompt".to_owned(),
+                arguments: None,
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect("the exact legacy prompt route retains its explicit registration");
         assert_eq!(legacy_prompt.messages.len(), 0);
 
         let modern_resources = router
@@ -13138,19 +13123,18 @@ mod router_tests {
                 vec!["before", "duplicate-invariant-tool", "after"]
             );
 
-            let legacy = router
-                .handle_tools_call(
-                    &request_ctx,
-                    CallToolParams {
-                        name: "duplicate-invariant-tool".to_owned(),
-                        arguments: Some(serde_json::json!({})),
-                        meta: None,
-                    },
-                    state.clone(),
-                    None,
-                    None,
-                )
-                .expect("legacy dispatch retains the original");
+            let legacy = block_on(router.handle_tools_call(
+                &request_ctx,
+                CallToolParams {
+                    name: "duplicate-invariant-tool".to_owned(),
+                    arguments: Some(serde_json::json!({})),
+                    meta: None,
+                },
+                state.clone(),
+                None,
+                None,
+            ))
+            .expect("legacy dispatch retains the original");
             assert_eq!(
                 serde_json::to_value(legacy).expect("legacy result serializes")["content"][0]["text"],
                 "original"
@@ -13230,19 +13214,18 @@ mod router_tests {
             Some("replacement")
         );
 
-        let legacy = router
-            .handle_tools_call(
-                &request_ctx,
-                CallToolParams {
-                    name: "duplicate-invariant-tool".to_owned(),
-                    arguments: Some(serde_json::json!({})),
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect("legacy dispatch uses replacement");
+        let legacy = block_on(router.handle_tools_call(
+            &request_ctx,
+            CallToolParams {
+                name: "duplicate-invariant-tool".to_owned(),
+                arguments: Some(serde_json::json!({})),
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect("legacy dispatch uses replacement");
         assert_eq!(
             serde_json::to_value(legacy).expect("legacy result serializes")["content"][0]["text"],
             "replacement"
@@ -13849,25 +13832,24 @@ mod router_tests {
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 401, Budget::INFINITE, &state);
-        let legacy = main
-            .dispatch_legacy_completion(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    COMPLETION_COMPLETE,
-                    Some(serde_json::json!({
-                        "ref": {"type": "ref/prompt", "name": "ns/prompt-argument-boundary"},
-                        "argument": {"name": "topic", "value": "sta"},
-                    })),
-                    401_i64,
-                ),
-            )
-            .expect("prefixed legacy completion must reach the mounted provider");
+        let legacy = block_on(main.dispatch_legacy_completion(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                COMPLETION_COMPLETE,
+                Some(serde_json::json!({
+                    "ref": {"type": "ref/prompt", "name": "ns/prompt-argument-boundary"},
+                    "argument": {"name": "topic", "value": "sta"},
+                })),
+                401_i64,
+            ),
+        ))
+        .expect("prefixed legacy completion must reach the mounted provider");
         assert_eq!(
             legacy["completion"]["values"],
             serde_json::json!(["staging"])
         );
 
-        let unprefixed = main.dispatch_legacy_completion(
+        let unprefixed = block_on(main.dispatch_legacy_completion(
             &request_ctx,
             &JsonRpcRequest::new(
                 COMPLETION_COMPLETE,
@@ -13877,7 +13859,7 @@ mod router_tests {
                 })),
                 402_i64,
             ),
-        );
+        ));
         assert!(
             unprefixed.is_err(),
             "the child's original completion name must not remain after a prefixed mount"
@@ -13906,19 +13888,18 @@ mod router_tests {
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 403, Budget::INFINITE, &state);
-        let legacy = main
-            .dispatch_legacy_completion(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    COMPLETION_COMPLETE,
-                    Some(serde_json::json!({
-                        "ref": {"type": "ref/prompt", "name": "prompt-argument-boundary"},
-                        "argument": {"name": "topic", "value": "sta"},
-                    })),
-                    403_i64,
-                ),
-            )
-            .expect("unprefixed mount keeps the original completion key");
+        let legacy = block_on(main.dispatch_legacy_completion(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                COMPLETION_COMPLETE,
+                Some(serde_json::json!({
+                    "ref": {"type": "ref/prompt", "name": "prompt-argument-boundary"},
+                    "argument": {"name": "topic", "value": "sta"},
+                })),
+                403_i64,
+            ),
+        ))
+        .expect("unprefixed mount keeps the original completion key");
         assert_eq!(
             legacy["completion"]["values"],
             serde_json::json!(["staging"])
@@ -13957,25 +13938,24 @@ mod router_tests {
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 411, Budget::INFINITE, &state);
-        let legacy = main
-            .dispatch_legacy_completion(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    COMPLETION_COMPLETE,
-                    Some(serde_json::json!({
-                        "ref": {"type": "ref/resource", "uri": "ns/mcp://books/{id}"},
-                        "argument": {"name": "id", "value": "sta"},
-                    })),
-                    411_i64,
-                ),
-            )
-            .expect("prefixed legacy template completion must reach the mounted provider");
+        let legacy = block_on(main.dispatch_legacy_completion(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                COMPLETION_COMPLETE,
+                Some(serde_json::json!({
+                    "ref": {"type": "ref/resource", "uri": "ns/mcp://books/{id}"},
+                    "argument": {"name": "id", "value": "sta"},
+                })),
+                411_i64,
+            ),
+        ))
+        .expect("prefixed legacy template completion must reach the mounted provider");
         assert_eq!(
             legacy["completion"]["values"],
             serde_json::json!(["staging"])
         );
 
-        let unprefixed = main.dispatch_legacy_completion(
+        let unprefixed = block_on(main.dispatch_legacy_completion(
             &request_ctx,
             &JsonRpcRequest::new(
                 COMPLETION_COMPLETE,
@@ -13985,7 +13965,7 @@ mod router_tests {
                 })),
                 412_i64,
             ),
-        );
+        ));
         assert!(
             unprefixed.is_err(),
             "the child's original template completion URI must not remain after a prefixed mount"
@@ -14019,19 +13999,18 @@ mod router_tests {
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 414, Budget::INFINITE, &state);
-        let legacy = main
-            .dispatch_legacy_completion(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    COMPLETION_COMPLETE,
-                    Some(serde_json::json!({
-                        "ref": {"type": "ref/prompt", "name": "ns/prompt-argument-boundary"},
-                        "argument": {"name": "topic", "value": "sta"},
-                    })),
-                    414_i64,
-                ),
-            )
-            .expect("prefixed fallback completion must reach the child's server-wide handler");
+        let legacy = block_on(main.dispatch_legacy_completion(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                COMPLETION_COMPLETE,
+                Some(serde_json::json!({
+                    "ref": {"type": "ref/prompt", "name": "ns/prompt-argument-boundary"},
+                    "argument": {"name": "topic", "value": "sta"},
+                })),
+                414_i64,
+            ),
+        ))
+        .expect("prefixed fallback completion must reach the child's server-wide handler");
         assert_eq!(
             legacy["completion"]["values"],
             serde_json::json!(["staging"])
@@ -14066,19 +14045,18 @@ mod router_tests {
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 413, Budget::INFINITE, &state);
-        let kept = dest
-            .dispatch_legacy_completion(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    COMPLETION_COMPLETE,
-                    Some(serde_json::json!({
-                        "ref": {"type": "ref/prompt", "name": "kept"},
-                        "argument": {"name": "topic", "value": "sta"},
-                    })),
-                    413_i64,
-                ),
-            )
-            .expect("prompts-only mount must keep the destination fallback completion handler");
+        let kept = block_on(dest.dispatch_legacy_completion(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                COMPLETION_COMPLETE,
+                Some(serde_json::json!({
+                    "ref": {"type": "ref/prompt", "name": "kept"},
+                    "argument": {"name": "topic", "value": "sta"},
+                })),
+                413_i64,
+            ),
+        ))
+        .expect("prompts-only mount must keep the destination fallback completion handler");
         assert_eq!(kept["completion"]["values"], serde_json::json!(["legacy"]));
     }
 
@@ -14094,18 +14072,17 @@ mod router_tests {
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, Budget::INFINITE, &state);
-        let read = main
-            .handle_resources_read(
-                &request_ctx,
-                &ReadResourceParams {
-                    uri: "ns/file:///a".to_string(),
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect("mounted resource is readable through its public URI");
+        let read = block_on(main.handle_resources_read(
+            &request_ctx,
+            &ReadResourceParams {
+                uri: "ns/file:///a".to_string(),
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect("mounted resource is readable through its public URI");
         let [
             LegacyResourceContent::Text {
                 uri,
@@ -14256,18 +14233,17 @@ mod router_tests {
             legacy_templates.resource_templates[0].uri_template,
             "peer/mcp://mounted/{id}"
         );
-        let legacy_read = destination
-            .handle_resources_read(
-                &request_ctx,
-                &ReadResourceParams {
-                    uri: "peer/mcp://mounted/item".to_owned(),
-                    meta: None,
-                },
-                state.clone(),
-                None,
-                None,
-            )
-            .expect("the prefixed template remains readable on the legacy surface");
+        let legacy_read = block_on(destination.handle_resources_read(
+            &request_ctx,
+            &ReadResourceParams {
+                uri: "peer/mcp://mounted/item".to_owned(),
+                meta: None,
+            },
+            state.clone(),
+            None,
+            None,
+        ))
+        .expect("the prefixed template remains readable on the legacy surface");
         assert_eq!(
             serde_json::to_value(legacy_read).expect("legacy result serializes")["contents"][0]["text"],
             "source-template"
@@ -14314,18 +14290,17 @@ mod router_tests {
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, Budget::INFINITE, &state);
-        let read = outer
-            .handle_resources_read(
-                &request_ctx,
-                &ReadResourceParams {
-                    uri: "ns/ns/file:///a".to_string(),
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect("nested mounted resource is readable");
+        let read = block_on(outer.handle_resources_read(
+            &request_ctx,
+            &ReadResourceParams {
+                uri: "ns/ns/file:///a".to_string(),
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect("nested mounted resource is readable");
         let [
             LegacyResourceContent::Text {
                 uri,
@@ -14400,18 +14375,17 @@ mod router_tests {
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, Budget::INFINITE, &state);
-        let read = mounted
-            .handle_resources_read(
-                &request_ctx,
-                &ReadResourceParams {
-                    uri: "peer/peer/db://users".to_string(),
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect("mounted template is readable through its public URI");
+        let read = block_on(mounted.handle_resources_read(
+            &request_ctx,
+            &ReadResourceParams {
+                uri: "peer/peer/db://users".to_string(),
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect("mounted template is readable through its public URI");
         let [
             LegacyResourceContent::Text {
                 uri,
@@ -14519,18 +14493,17 @@ mod router_tests {
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, Budget::INFINITE, &state);
-        let read = mounted
-            .handle_resources_read(
-                &request_ctx,
-                &ReadResourceParams {
-                    uri: "peer/async-db://users".to_string(),
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect("true-async mounted template is readable through its public URI");
+        let read = block_on(mounted.handle_resources_read(
+            &request_ctx,
+            &ReadResourceParams {
+                uri: "peer/async-db://users".to_string(),
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect("true-async mounted template is readable through its public URI");
 
         assert_eq!(read.contents.len(), 1);
         let [
@@ -16102,8 +16075,7 @@ mod router_tests {
             meta: None,
         };
         let request_ctx = request_context(&cx, 1, budget, &state);
-        let err = r
-            .handle_tools_call(&request_ctx, params, state, None, None)
+        let err = block_on(r.handle_tools_call(&request_ctx, params, state, None, None))
             .unwrap_err();
         assert!(err.message.contains("disabled"));
     }
@@ -16124,8 +16096,7 @@ mod router_tests {
         };
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, budget, &state);
-        let result = r
-            .handle_tools_call(&request_ctx, params, state, None, None)
+        let result = block_on(r.handle_tools_call(&request_ctx, params, state, None, None))
             .unwrap();
         assert!(!result.is_error);
         assert_ne!(result.content.len(), 0);
@@ -16145,8 +16116,7 @@ mod router_tests {
         };
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, budget, &state);
-        let err = r
-            .handle_tools_call(&request_ctx, params, state, None, None)
+        let err = block_on(r.handle_tools_call(&request_ctx, params, state, None, None))
             .unwrap_err();
         // The refusal deliberately does not echo the peer-controlled tool
         // name; only the sanitized method-not-found classification surfaces.
@@ -16170,8 +16140,7 @@ mod router_tests {
         };
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, budget, &state);
-        let result = r
-            .handle_tools_call(&request_ctx, params, state, None, None)
+        let result = block_on(r.handle_tools_call(&request_ctx, params, state, None, None))
             .expect("a zero balance is not a retroactive failure");
         assert!(!result.is_error);
     }
@@ -16193,13 +16162,21 @@ mod router_tests {
         };
 
         let masked_result = request_ctx
-            .masked(|| router.handle_tools_call(&request_ctx, params(), state.clone(), None, None))
+            .masked(|| {
+                block_on(router.handle_tools_call(
+                    &request_ctx,
+                    params(),
+                    state.clone(),
+                    None,
+                    None,
+                ))
+            })
             .expect("mask should be admitted");
         assert!(masked_result.is_ok());
 
-        let unmasked_error = router
-            .handle_tools_call(&request_ctx, params(), state, None, None)
-            .expect_err("pending cancellation should surface after mask exit");
+        let unmasked_error =
+            block_on(router.handle_tools_call(&request_ctx, params(), state, None, None))
+                .expect_err("pending cancellation should surface after mask exit");
         assert_eq!(unmasked_error.code, McpErrorCode::RequestCancelled);
     }
 
@@ -16220,8 +16197,7 @@ mod router_tests {
             meta: None,
         };
         let request_ctx = request_context(&cx, 1, budget, &state);
-        let err = r
-            .handle_resources_read(&request_ctx, &params, state, None, None)
+        let err = block_on(r.handle_resources_read(&request_ctx, &params, state, None, None))
             .unwrap_err();
         assert!(err.message.contains("disabled"));
     }
@@ -16240,8 +16216,7 @@ mod router_tests {
         };
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, budget, &state);
-        let result = r
-            .handle_resources_read(&request_ctx, &params, state, None, None)
+        let result = block_on(r.handle_resources_read(&request_ctx, &params, state, None, None))
             .unwrap();
         assert_eq!(result.contents.len(), 1);
         let [
@@ -16273,8 +16248,7 @@ mod router_tests {
         };
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, budget, &state);
-        let err = r
-            .handle_resources_read(&request_ctx, &params, state, None, None)
+        let err = block_on(r.handle_resources_read(&request_ctx, &params, state, None, None))
             .unwrap_err();
         assert!(err.message.contains("nonexistent") || err.message.contains("not found"));
     }
@@ -16293,8 +16267,7 @@ mod router_tests {
         };
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, budget, &state);
-        let result = r
-            .handle_resources_read(&request_ctx, &params, state, None, None)
+        let result = block_on(r.handle_resources_read(&request_ctx, &params, state, None, None))
             .expect("a zero balance is not a retroactive failure");
         assert_eq!(result.contents.len(), 1);
     }
@@ -16317,8 +16290,7 @@ mod router_tests {
             meta: None,
         };
         let request_ctx = request_context(&cx, 1, budget, &state);
-        let err = r
-            .handle_prompts_get(&request_ctx, params, state, None, None)
+        let err = block_on(r.handle_prompts_get(&request_ctx, params, state, None, None))
             .unwrap_err();
         assert!(err.message.contains("disabled"));
     }
@@ -16432,8 +16404,7 @@ mod router_tests {
         };
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, budget, &state);
-        let result = r
-            .handle_prompts_get(&request_ctx, params, state, None, None)
+        let result = block_on(r.handle_prompts_get(&request_ctx, params, state, None, None))
             .unwrap();
         assert!(result.description.is_some());
     }
@@ -16452,8 +16423,7 @@ mod router_tests {
         };
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, budget, &state);
-        let err = r
-            .handle_prompts_get(&request_ctx, params, state, None, None)
+        let err = block_on(r.handle_prompts_get(&request_ctx, params, state, None, None))
             .unwrap_err();
         assert!(err.message.contains("missing") || err.message.contains("not found"));
     }
@@ -16473,8 +16443,7 @@ mod router_tests {
         };
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, budget, &state);
-        let result = r
-            .handle_prompts_get(&request_ctx, params, state, None, None)
+        let result = block_on(r.handle_prompts_get(&request_ctx, params, state, None, None))
             .expect("a zero balance is not a retroactive failure");
         assert_eq!(result.messages.len(), 0);
     }
@@ -16552,19 +16521,18 @@ mod router_tests {
                 state.clone(),
             )));
 
-        let error = router
-            .handle_tools_call(
-                &request_ctx,
-                CallToolParams {
-                    name: "alternating_tool".to_string(),
-                    arguments: None,
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect_err("alternating recursion must stop at the shared depth limit");
+        let error = block_on(router.handle_tools_call(
+            &request_ctx,
+            CallToolParams {
+                name: "alternating_tool".to_string(),
+                arguments: None,
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect_err("alternating recursion must stop at the shared depth limit");
 
         assert_eq!(error.code, McpErrorCode::InternalError);
         // Internal errors crossing the handler boundary are sanitized, so the
@@ -16814,19 +16782,18 @@ mod router_tests {
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, Budget::INFINITE, &state);
-        let error = router
-            .handle_tools_call(
-                &request_ctx,
-                CallToolParams {
-                    name: "budget_probe".to_string(),
-                    arguments: None,
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect_err("the handler deadline must reject a late completion");
+        let error = block_on(router.handle_tools_call(
+            &request_ctx,
+            CallToolParams {
+                name: "budget_probe".to_string(),
+                arguments: None,
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect_err("the handler deadline must reject a late completion");
 
         assert!(timeout_read.load(Ordering::Relaxed));
         assert!(
@@ -16939,19 +16906,18 @@ mod router_tests {
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, Budget::INFINITE, &state);
 
-        router
-            .handle_tools_call(
-                &request_ctx,
-                CallToolParams {
-                    name: "slow_definition".to_string(),
-                    arguments: None,
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect("dispatch uses the admitted snapshot and reaches the handler");
+        block_on(router.handle_tools_call(
+            &request_ctx,
+            CallToolParams {
+                name: "slow_definition".to_string(),
+                arguments: None,
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect("dispatch uses the admitted snapshot and reaches the handler");
 
         assert!(called.load(Ordering::Relaxed));
         assert_eq!(definition_reads.load(Ordering::Relaxed), 1);
@@ -16979,19 +16945,18 @@ mod router_tests {
             Budget::new().with_deadline(request_deadline),
             &state,
         );
-        router
-            .handle_tools_call(
-                &request_ctx,
-                CallToolParams {
-                    name: "budget_probe".to_string(),
-                    arguments: None,
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect("zero adds no ceiling but preserves the request deadline");
+        block_on(router.handle_tools_call(
+            &request_ctx,
+            CallToolParams {
+                name: "budget_probe".to_string(),
+                arguments: None,
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect("zero adds no ceiling but preserves the request deadline");
 
         assert!(timeout_read.load(Ordering::Relaxed));
         assert_eq!(
@@ -17025,19 +16990,18 @@ mod router_tests {
             Budget::new().with_deadline(request_deadline),
             &state,
         );
-        router
-            .handle_tools_call(
-                &request_ctx,
-                CallToolParams {
-                    name: "budget_probe".to_string(),
-                    arguments: None,
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect("looser inner limits must preserve the ambient deadline");
+        block_on(router.handle_tools_call(
+            &request_ctx,
+            CallToolParams {
+                name: "budget_probe".to_string(),
+                arguments: None,
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect("looser inner limits must preserve the ambient deadline");
 
         assert_eq!(
             *observed_deadline
@@ -17055,19 +17019,18 @@ mod router_tests {
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, Budget::INFINITE, &state);
-        let error = router
-            .handle_tools_call(
-                &request_ctx,
-                CallToolParams {
-                    name: name.to_string(),
-                    arguments: None,
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect_err("panic must terminate as a sanitized protocol error");
+        let error = block_on(router.handle_tools_call(
+            &request_ctx,
+            CallToolParams {
+                name: name.to_string(),
+                arguments: None,
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect_err("panic must terminate as a sanitized protocol error");
         let wire = serde_json::to_string(&error).expect("error serializes");
         assert_eq!(error.code, McpErrorCode::InternalError);
         assert_eq!(error.message, SANITIZED_HANDLER_PANIC_MESSAGE);
@@ -17117,54 +17080,51 @@ mod router_tests {
             .expect("tool registration succeeds");
         let tool_state = SessionState::new();
         let tool_ctx = request_context(&cx, 1, Budget::INFINITE, &tool_state);
-        let tool_error = tool_router
-            .handle_tools_call(
-                &tool_ctx,
-                CallToolParams {
-                    name: "opaque_internal_tool".to_string(),
-                    arguments: None,
-                    meta: None,
-                },
-                tool_state,
-                None,
-                None,
-            )
-            .expect_err("opaque internal tool errors must remain protocol failures");
+        let tool_error = block_on(tool_router.handle_tools_call(
+            &tool_ctx,
+            CallToolParams {
+                name: "opaque_internal_tool".to_string(),
+                arguments: None,
+                meta: None,
+            },
+            tool_state,
+            None,
+            None,
+        ))
+        .expect_err("opaque internal tool errors must remain protocol failures");
 
         let mut resource_router = Router::new();
         resource_router.add_resource(OpaqueInternalResource);
         let resource_state = SessionState::new();
         let resource_ctx = request_context(&cx, 2, Budget::INFINITE, &resource_state);
-        let resource_error = resource_router
-            .handle_resources_read(
-                &resource_ctx,
-                &ReadResourceParams {
-                    uri: "opaque://internal".to_string(),
-                    meta: None,
-                },
-                resource_state,
-                None,
-                None,
-            )
-            .expect_err("opaque internal resource errors must be sanitized");
+        let resource_error = block_on(resource_router.handle_resources_read(
+            &resource_ctx,
+            &ReadResourceParams {
+                uri: "opaque://internal".to_string(),
+                meta: None,
+            },
+            resource_state,
+            None,
+            None,
+        ))
+        .expect_err("opaque internal resource errors must be sanitized");
 
         let mut prompt_router = Router::new();
         prompt_router.add_prompt(OpaqueInternalPrompt);
         let prompt_state = SessionState::new();
         let prompt_ctx = request_context(&cx, 3, Budget::INFINITE, &prompt_state);
-        let prompt_error = prompt_router
-            .handle_prompts_get(
-                &prompt_ctx,
-                GetPromptParams {
-                    name: "opaque_internal_prompt".to_string(),
-                    arguments: None,
-                    meta: None,
-                },
-                prompt_state,
-                None,
-                None,
-            )
-            .expect_err("opaque internal prompt errors must be sanitized");
+        let prompt_error = block_on(prompt_router.handle_prompts_get(
+            &prompt_ctx,
+            GetPromptParams {
+                name: "opaque_internal_prompt".to_string(),
+                arguments: None,
+                meta: None,
+            },
+            prompt_state,
+            None,
+            None,
+        ))
+        .expect_err("opaque internal prompt errors must be sanitized");
 
         for error in [tool_error, resource_error, prompt_error] {
             let wire = serde_json::to_string(&error).expect("error serializes");
@@ -17183,18 +17143,17 @@ mod router_tests {
         let resource_cx = Cx::for_testing();
         let resource_state = SessionState::new();
         let resource_ctx = request_context(&resource_cx, 1, Budget::INFINITE, &resource_state);
-        let resource_error = resource_router
-            .handle_resources_read(
-                &resource_ctx,
-                &ReadResourceParams {
-                    uri: "panic://resource".to_string(),
-                    meta: None,
-                },
-                resource_state,
-                None,
-                None,
-            )
-            .expect_err("resource panic must be sanitized");
+        let resource_error = block_on(resource_router.handle_resources_read(
+            &resource_ctx,
+            &ReadResourceParams {
+                uri: "panic://resource".to_string(),
+                meta: None,
+            },
+            resource_state,
+            None,
+            None,
+        ))
+        .expect_err("resource panic must be sanitized");
         assert_eq!(resource_error.message, SANITIZED_HANDLER_PANIC_MESSAGE);
 
         let mut prompt_router = Router::new();
@@ -17202,19 +17161,18 @@ mod router_tests {
         let prompt_cx = Cx::for_testing();
         let prompt_state = SessionState::new();
         let prompt_ctx = request_context(&prompt_cx, 1, Budget::INFINITE, &prompt_state);
-        let prompt_error = prompt_router
-            .handle_prompts_get(
-                &prompt_ctx,
-                GetPromptParams {
-                    name: "panic_prompt".to_string(),
-                    arguments: None,
-                    meta: None,
-                },
-                prompt_state,
-                None,
-                None,
-            )
-            .expect_err("prompt panic must be sanitized");
+        let prompt_error = block_on(prompt_router.handle_prompts_get(
+            &prompt_ctx,
+            GetPromptParams {
+                name: "panic_prompt".to_string(),
+                arguments: None,
+                meta: None,
+            },
+            prompt_state,
+            None,
+            None,
+        ))
+        .expect_err("prompt panic must be sanitized");
         assert_eq!(prompt_error.message, SANITIZED_HANDLER_PANIC_MESSAGE);
 
         for error in [resource_error, prompt_error] {
@@ -17484,8 +17442,7 @@ mod router_tests {
         };
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, budget, &state);
-        let err = r
-            .handle_tools_call(&request_ctx, params, state, None, None)
+        let err = block_on(r.handle_tools_call(&request_ctx, params, state, None, None))
             .unwrap_err();
         assert_eq!(err.code, McpErrorCode::RequestCancelled);
     }
@@ -17503,8 +17460,7 @@ mod router_tests {
         };
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, budget, &state);
-        let err = r
-            .handle_resources_read(&request_ctx, &params, state, None, None)
+        let err = block_on(r.handle_resources_read(&request_ctx, &params, state, None, None))
             .unwrap_err();
         assert_eq!(err.code, McpErrorCode::RequestCancelled);
     }
@@ -17523,8 +17479,7 @@ mod router_tests {
         };
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, budget, &state);
-        let err = r
-            .handle_prompts_get(&request_ctx, params, state, None, None)
+        let err = block_on(r.handle_prompts_get(&request_ctx, params, state, None, None))
             .unwrap_err();
         assert_eq!(err.code, McpErrorCode::RequestCancelled);
     }
@@ -17557,8 +17512,7 @@ mod router_tests {
             })),
             87_i64,
         );
-        let legacy = router
-            .dispatch_legacy_completion(&request_ctx, &legacy_request)
+        let legacy = block_on(router.dispatch_legacy_completion(&request_ctx, &legacy_request))
             .expect("the exact legacy request reaches the registered completion handler");
         assert!(
             legacy.get("resultType").is_none(),
@@ -17643,8 +17597,7 @@ mod router_tests {
                 }))
                 .unwrap();
                 let params_before = serde_json::to_vec(&params).unwrap();
-                let accepted = router
-                    .handle_completion_legacy(&context, params.clone())
+                let accepted = block_on(router.handle_completion_legacy(&context, params.clone()))
                     .expect("visible legacy targets retain provider-owned argument admission");
                 let accepted = serde_json::to_value(accepted).unwrap();
                 assert_eq!(
@@ -17665,8 +17618,7 @@ mod router_tests {
                     fallback_calls.load(Ordering::SeqCst),
                     target_calls.load(Ordering::SeqCst),
                 );
-                let denied = router
-                    .handle_completion_legacy(&context, params.clone())
+                let denied = block_on(router.handle_completion_legacy(&context, params.clone()))
                     .expect_err("session-hidden completion cannot consult any provider");
                 assert_eq!(denied.code, McpErrorCode::InvalidParams);
                 assert_eq!(
@@ -17692,8 +17644,7 @@ mod router_tests {
                 assert_eq!(serde_json::to_vec(&params).unwrap(), params_before);
                 assert_eq!(
                     serde_json::to_value(
-                        router
-                            .handle_completion_legacy(&sibling, params.clone())
+                        block_on(router.handle_completion_legacy(&sibling, params.clone()))
                             .unwrap()
                     )
                     .unwrap(),
@@ -17706,8 +17657,10 @@ mod router_tests {
                     context.enable_resource(target)
                 });
                 assert_eq!(
-                    serde_json::to_value(router.handle_completion_legacy(&context, params).unwrap())
-                        .unwrap(),
+                    serde_json::to_value(
+                        block_on(router.handle_completion_legacy(&context, params)).unwrap()
+                    )
+                    .unwrap(),
                     accepted,
                     "a re-enabled reference must remain usable after refusal"
                 );
@@ -17762,8 +17715,7 @@ mod router_tests {
             .unwrap()
         });
         for request in &params {
-            let result = router
-                .handle_completion_legacy(&context, request.clone())
+            let result = block_on(router.handle_completion_legacy(&context, request.clone()))
                 .expect("legacy-visible registrations can reach the completion provider");
             assert_eq!(result.completion.values.len(), 2);
         }
@@ -17792,8 +17744,7 @@ mod router_tests {
             )
             .unwrap();
         for request in params {
-            let denied = router
-                .handle_completion_legacy(&context, request)
+            let denied = block_on(router.handle_completion_legacy(&context, request))
                 .expect_err("final-only catalog entries cannot leak through legacy completion");
             assert_eq!(denied.code, McpErrorCode::InvalidParams);
         }
@@ -17819,7 +17770,7 @@ mod router_tests {
         .unwrap();
         for count in [99, 100, 101, 100] {
             value_count.store(count, Ordering::SeqCst);
-            let result = router.handle_completion_legacy(&context, params.clone());
+            let result = block_on(router.handle_completion_legacy(&context, params.clone()));
             if count > fastmcp_protocol::MAX_COMPLETION_VALUES {
                 let error = result.expect_err("a public handler result cannot contain 101 values");
                 assert_eq!(error.code, McpErrorCode::InternalError);
@@ -18107,8 +18058,7 @@ mod router_tests {
             184_i64,
         );
         assert!(
-            router
-                .dispatch_legacy_completion(&request_ctx, &request)
+            block_on(router.dispatch_legacy_completion(&request_ctx, &request))
                 .is_ok()
         );
 
@@ -18350,19 +18300,18 @@ mod router_tests {
         assert_eq!(unknown_argument_error.code, McpErrorCode::InvalidParams);
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
 
-        let legacy = router
-            .dispatch_legacy_completion(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    COMPLETION_COMPLETE,
-                    Some(serde_json::json!({
-                        "ref": {"type": "ref/prompt", "name": "legacy-completion-prompt"},
-                        "argument": {"name": "unknown", "value": "sta"},
-                    })),
-                    190_i64,
-                ),
-            )
-            .expect("exact-2024 completion retains its unvalidated target argument behavior");
+        let legacy = block_on(router.dispatch_legacy_completion(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                COMPLETION_COMPLETE,
+                Some(serde_json::json!({
+                    "ref": {"type": "ref/prompt", "name": "legacy-completion-prompt"},
+                    "argument": {"name": "unknown", "value": "sta"},
+                })),
+                190_i64,
+            ),
+        ))
+        .expect("exact-2024 completion retains its unvalidated target argument behavior");
         assert!(legacy.get("resultType").is_none());
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
     }
@@ -18500,18 +18449,17 @@ mod router_tests {
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 189, Budget::INFINITE, &state);
-        let legacy_error = router
-            .handle_resources_read(
-                &request_ctx,
-                &fastmcp_protocol::ReadResourceParams {
-                    uri: "mcp://resource/books/manifest?revision=stable".to_owned(),
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect_err("scalar explode remains unavailable to exact-2024 routing");
+        let legacy_error = block_on(router.handle_resources_read(
+            &request_ctx,
+            &fastmcp_protocol::ReadResourceParams {
+                uri: "mcp://resource/books/manifest?revision=stable".to_owned(),
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect_err("scalar explode remains unavailable to exact-2024 routing");
         assert_eq!(legacy_error.code, McpErrorCode::ResourceNotFound);
         assert_eq!(read_calls.load(Ordering::SeqCst), 0);
 
@@ -18965,18 +18913,17 @@ mod router_tests {
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 190, Budget::INFINITE, &state);
         let uri = "mcp://resource/books/manifest?revision=stable";
-        let legacy_read = router
-            .handle_resources_read(
-                &request_ctx,
-                &ReadResourceParams {
-                    uri: uri.to_owned(),
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect("the exact legacy route retains the registered template");
+        let legacy_read = block_on(router.handle_resources_read(
+            &request_ctx,
+            &ReadResourceParams {
+                uri: uri.to_owned(),
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect("the exact legacy route retains the registered template");
         let legacy_wire =
             serde_json::to_value(legacy_read).expect("legacy resource result serializes");
         assert_eq!(legacy_wire["contents"][0]["text"], "books:stable");
@@ -19203,18 +19150,17 @@ mod router_tests {
                 crate::DuplicateBehavior::Replace,
             )
             .expect("final-only static resource registers");
-        let legacy_read = legacy_router
-            .handle_resources_read(
-                &request_ctx,
-                &ReadResourceParams {
-                    uri: uri.to_owned(),
-                    meta: None,
-                },
-                state.clone(),
-                None,
-                None,
-            )
-            .expect("a final-only static URI cannot hide a listed legacy template");
+        let legacy_read = block_on(legacy_router.handle_resources_read(
+            &request_ctx,
+            &ReadResourceParams {
+                uri: uri.to_owned(),
+                meta: None,
+            },
+            state.clone(),
+            None,
+            None,
+        ))
+        .expect("a final-only static URI cannot hide a listed legacy template");
         assert_eq!(
             serde_json::to_value(legacy_read).expect("legacy result serializes")["contents"][0]["text"],
             "legacy-template"
@@ -19295,11 +19241,9 @@ mod router_tests {
         let catalog_before = router.has_completion_handler();
         let planted_before = serde_json::to_vec(&planted).expect("planted request serializes");
 
-        let baseline_result = router
-            .dispatch_legacy_completion(&request_ctx, &baseline)
+        let baseline_result = block_on(router.dispatch_legacy_completion(&request_ctx, &baseline))
             .expect("the baseline legacy completion request is accepted");
-        let error = router
-            .dispatch_legacy_completion(&request_ctx, &planted)
+        let error = block_on(router.dispatch_legacy_completion(&request_ctx, &planted))
             .expect_err("only final metadata is refused in the exact legacy request");
         assert_eq!(error.code, McpErrorCode::InvalidParams);
         assert_eq!(
@@ -19313,8 +19257,7 @@ mod router_tests {
             "cross-era rejection cannot alter the installed completion handler"
         );
         assert_eq!(
-            router
-                .dispatch_legacy_completion(&request_ctx, &baseline)
+            block_on(router.dispatch_legacy_completion(&request_ctx, &baseline))
                 .expect("the baseline remains accepted after the planted rejection"),
             baseline_result,
             "the one-field rejection cannot alter the accepted legacy completion result"
@@ -19335,19 +19278,18 @@ mod router_tests {
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 91, Budget::INFINITE, &state);
 
-        let legacy = router
-            .handle_tools_call(
-                &request_ctx,
-                CallToolParams {
-                    name: "macro_dual_era_tool".to_string(),
-                    arguments: Some(serde_json::json!({})),
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect("the legacy adapter still invokes the registered handler");
+        let legacy = block_on(router.handle_tools_call(
+            &request_ctx,
+            CallToolParams {
+                name: "macro_dual_era_tool".to_string(),
+                arguments: Some(serde_json::json!({})),
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect("the legacy adapter still invokes the registered handler");
         let legacy_wire = serde_json::to_value(&legacy).expect("legacy result serializes");
         assert!(
             legacy_wire.get("resultType").is_none(),
@@ -19462,19 +19404,18 @@ mod router_tests {
             .expect_err("an unknown final tool is an invalid-params protocol error");
         assert_eq!(modern_error.code, McpErrorCode::InvalidParams);
 
-        let legacy_error = router
-            .handle_tools_call(
-                &request_ctx,
-                CallToolParams {
-                    name: "unknown-tool".to_owned(),
-                    arguments: Some(serde_json::json!({})),
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect_err("the exact legacy unknown-tool result remains method-not-found");
+        let legacy_error = block_on(router.handle_tools_call(
+            &request_ctx,
+            CallToolParams {
+                name: "unknown-tool".to_owned(),
+                arguments: Some(serde_json::json!({})),
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect_err("the exact legacy unknown-tool result remains method-not-found");
         assert_eq!(legacy_error.code, McpErrorCode::MethodNotFound);
     }
 
@@ -19515,19 +19456,18 @@ mod router_tests {
         );
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
 
-        let legacy = router
-            .handle_tools_call(
-                &request_ctx,
-                CallToolParams {
-                    name: "schema-boundary-tool".to_owned(),
-                    arguments: Some(serde_json::json!({"value": "accepted"})),
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect("the legacy tool path does not apply final output-schema validation");
+        let legacy = block_on(router.handle_tools_call(
+            &request_ctx,
+            CallToolParams {
+                name: "schema-boundary-tool".to_owned(),
+                arguments: Some(serde_json::json!({"value": "accepted"})),
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect("the legacy tool path does not apply final output-schema validation");
         assert!(!legacy.is_error);
         let legacy_wire = serde_json::to_value(&legacy).expect("legacy result serializes");
         assert_eq!(
@@ -19778,19 +19718,18 @@ mod router_tests {
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 158, Budget::INFINITE, &state);
-        let legacy = router
-            .handle_tools_call(
-                &request_ctx,
-                CallToolParams {
-                    name: "admitted-schema-replacement-tool".to_owned(),
-                    arguments: Some(serde_json::json!({})),
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect("the replacement is installed for legacy dispatch");
+        let legacy = block_on(router.handle_tools_call(
+            &request_ctx,
+            CallToolParams {
+                name: "admitted-schema-replacement-tool".to_owned(),
+                arguments: Some(serde_json::json!({})),
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect("the replacement is installed for legacy dispatch");
         let legacy_wire = serde_json::to_value(&legacy).expect("legacy result serializes");
         assert_eq!(legacy_wire["content"][0]["text"], "replacement");
         assert_eq!(replacement_legacy_calls.load(Ordering::SeqCst), 1);
@@ -20285,19 +20224,18 @@ mod router_tests {
             "a rejected replacement cannot remove the admitted modern entry"
         );
 
-        let legacy = router
-            .handle_tools_call(
-                &request_ctx,
-                CallToolParams {
-                    name: "admitted-schema-replacement-tool".to_owned(),
-                    arguments: Some(serde_json::json!({})),
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect("the original legacy handler remains installed");
+        let legacy = block_on(router.handle_tools_call(
+            &request_ctx,
+            CallToolParams {
+                name: "admitted-schema-replacement-tool".to_owned(),
+                arguments: Some(serde_json::json!({})),
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect("the original legacy handler remains installed");
         let legacy_wire = serde_json::to_value(&legacy).expect("legacy result serializes");
         assert_eq!(legacy_wire["content"][0]["text"], "original");
         assert_eq!(original_legacy_calls.load(Ordering::SeqCst), 1);
@@ -23384,19 +23322,18 @@ mod router_tests {
         assert_eq!(unknown_error.code, McpErrorCode::InvalidParams);
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
 
-        let legacy = router
-            .handle_prompts_get(
-                &request_ctx,
-                GetPromptParams {
-                    name: "prompt-argument-boundary".to_owned(),
-                    arguments: None,
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect("the exact legacy prompt path retains its existing argument behavior");
+        let legacy = block_on(router.handle_prompts_get(
+            &request_ctx,
+            GetPromptParams {
+                name: "prompt-argument-boundary".to_owned(),
+                arguments: None,
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect("the exact legacy prompt path retains its existing argument behavior");
         let legacy_wire = serde_json::to_value(&legacy).expect("legacy prompt result serializes");
         assert_eq!(
             legacy_wire["messages"][0]["content"]["text"],
@@ -23571,18 +23508,17 @@ mod router_tests {
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 98, Budget::INFINITE, &state);
 
-        let legacy = router
-            .handle_resources_read(
-                &request_ctx,
-                &ReadResourceParams {
-                    uri: "file:///direct-final-resource".to_owned(),
-                    meta: None,
-                },
-                state.clone(),
-                None,
-                None,
-            )
-            .expect("legacy resource requests retain their exact handler path");
+        let legacy = block_on(router.handle_resources_read(
+            &request_ctx,
+            &ReadResourceParams {
+                uri: "file:///direct-final-resource".to_owned(),
+                meta: None,
+            },
+            state.clone(),
+            None,
+            None,
+        ))
+        .expect("legacy resource requests retain their exact handler path");
         let [LegacyResourceContent::Text { text, .. }] = legacy.contents.as_slice() else {
             panic!("legacy resource result retains its exact text variant");
         };
@@ -23740,18 +23676,17 @@ mod router_tests {
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
         assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
 
-        let legacy_error = router
-            .handle_resources_read(
-                &request_ctx,
-                &ReadResourceParams {
-                    uri: "file:///unknown-final-resource".to_owned(),
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect_err("the exact legacy missing-resource error remains unchanged");
+        let legacy_error = block_on(router.handle_resources_read(
+            &request_ctx,
+            &ReadResourceParams {
+                uri: "file:///unknown-final-resource".to_owned(),
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect_err("the exact legacy missing-resource error remains unchanged");
         assert_eq!(legacy_error.code, McpErrorCode::ResourceNotFound);
         assert_eq!(
             legacy_error.message,

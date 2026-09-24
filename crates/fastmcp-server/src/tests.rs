@@ -974,15 +974,14 @@ mod router_tests {
             1,
         );
 
-        let response = server
-            .handle_request(
-                &cx,
-                &mut session,
-                request.clone(),
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("short-circuit response");
+        let response = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            request.clone(),
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("short-circuit response");
         assert_eq!(
             response.result,
             Some(serde_json::json!({"short_circuit": true}))
@@ -1019,26 +1018,24 @@ mod router_tests {
 
         let sender: NotificationSender = Arc::new(|_| {});
 
-        let first = server
-            .handle_request(
-                &cx,
-                &mut session,
-                request.clone(),
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("first response");
+        let first = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            request.clone(),
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("first response");
         assert!(first.error.is_none());
 
-        let second = server
-            .handle_request(
-                &cx,
-                &mut session,
-                request.clone(),
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("second response");
+        let second = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            request.clone(),
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("second response");
         assert!(second.error.is_none());
         assert_eq!(second.result, first.result);
 
@@ -1057,15 +1054,14 @@ mod router_tests {
             ClientCapabilities::default(),
             "2024-11-05".to_string(),
         );
-        let isolated = server
-            .handle_request(
-                &cx,
-                &mut isolated_session,
-                request,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("isolated-session response");
+        let isolated = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut isolated_session,
+            request,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("isolated-session response");
         assert!(isolated.error.is_none());
         assert_eq!(isolated.result, first.result);
 
@@ -1150,15 +1146,14 @@ mod router_tests {
             })),
             6,
         );
-        let response = server
-            .handle_request(
-                &cx,
-                &mut session,
-                request,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("response");
+        let response = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            request,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("response");
         assert!(response.error.is_none(), "expected authorized response");
 
         let request = fastmcp_protocol::JsonRpcRequest::new(
@@ -1170,15 +1165,14 @@ mod router_tests {
             })),
             7,
         );
-        let response = server
-            .handle_request(
-                &cx,
-                &mut session,
-                request,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("response");
+        let response = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            request,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("response");
         assert!(response.is_error(), "expected auth error");
         let error = response.error.expect("error payload");
         assert_eq!(
@@ -1220,15 +1214,14 @@ mod router_tests {
             Some(serde_json::json!({"uri": "resource://secure"})),
             8,
         );
-        let response = server
-            .handle_request(
-                &cx,
-                &mut session,
-                request,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("response");
+        let response = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            request,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("response");
         assert!(response.is_error(), "expected auth error");
 
         let request = fastmcp_protocol::JsonRpcRequest::new(
@@ -1239,15 +1232,14 @@ mod router_tests {
             })),
             9,
         );
-        let response = server
-            .handle_request(
-                &cx,
-                &mut session,
-                request,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("response");
+        let response = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            request,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("response");
         assert!(response.error.is_none(), "expected authorized response");
     }
 
@@ -1280,15 +1272,14 @@ mod router_tests {
             Some(serde_json::json!({ "cursor": null })),
             12,
         );
-        let unauthorized_response = server
-            .handle_request(
-                &cx,
-                &mut session,
-                unauthorized,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("response");
+        let unauthorized_response = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            unauthorized,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("response");
         info!(
             target: targets::SESSION,
             "e2e auth unauthorized ts={} error={:?}",
@@ -1302,15 +1293,14 @@ mod router_tests {
             Some(serde_json::json!({ "cursor": null, "auth": "Bearer good" })),
             13,
         );
-        let authorized_response = server
-            .handle_request(
-                &cx,
-                &mut session,
-                authorized,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("response");
+        let authorized_response = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            authorized,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("response");
         info!(
             target: targets::SESSION,
             "e2e auth authorized ts={} result={:?}",
@@ -1551,15 +1541,14 @@ mod router_tests {
             Some(serde_json::json!({"taskType": "notify_task"})),
             20,
         );
-        let response = server
-            .handle_request(
-                &cx,
-                &mut session,
-                submit,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("submit response");
+        let response = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            submit,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("submit response");
         let error = response
             .error
             .as_ref()
@@ -1609,13 +1598,13 @@ mod router_tests {
             Some(serde_json::to_value(params).unwrap()),
         );
 
-        let response = server.handle_request(
+        let response = fastmcp_core::block_on(server.handle_request(
             &cx,
             &mut session,
             request,
             &sender,
             &create_test_request_sender(),
-        );
+        ));
         assert!(response.is_none());
     }
 
@@ -1894,15 +1883,14 @@ mod router_tests {
                     Some(serde_json::to_value(params).expect("params")),
                     i64::try_from(i + 1).expect("request id fits in i64"),
                 );
-                let response = server
-                    .handle_request(
-                        &cx,
-                        &mut session,
-                        request,
-                        &sender,
-                        &create_test_request_sender(),
-                    )
-                    .expect("response");
+                let response = fastmcp_core::block_on(server.handle_request(
+                    &cx,
+                    &mut session,
+                    request,
+                    &sender,
+                    &create_test_request_sender(),
+                ))
+                .expect("response");
                 tx.send(response).expect("response send failed");
             });
         }
@@ -1982,15 +1970,14 @@ mod router_tests {
                     Some(serde_json::to_value(params).expect("params")),
                     request_id,
                 );
-                let response = server
-                    .handle_request(
-                        &cx,
-                        &mut session,
-                        request,
-                        &sender,
-                        &create_test_request_sender(),
-                    )
-                    .expect("response");
+                let response = fastmcp_core::block_on(server.handle_request(
+                    &cx,
+                    &mut session,
+                    request,
+                    &sender,
+                    &create_test_request_sender(),
+                ))
+                .expect("response");
                 tx.send(response).expect("response send failed");
             });
         }
@@ -2085,15 +2072,14 @@ mod router_tests {
             ),
             1i64,
         );
-        let response = server
-            .handle_request(
-                &cx,
-                &mut session,
-                subscribe,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("response");
+        let response = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            subscribe,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("response");
         assert!(response.error.is_none());
         assert!(session.is_resource_subscribed("resource://test"));
 
@@ -2123,15 +2109,14 @@ mod router_tests {
             ),
             2i64,
         );
-        let response = server
-            .handle_request(
-                &cx,
-                &mut session,
-                unsubscribe,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("response");
+        let response = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            unsubscribe,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("response");
         assert!(response.error.is_none());
         assert!(!session.is_resource_subscribed("resource://test"));
 
@@ -2192,15 +2177,14 @@ mod router_tests {
             ),
             10_i64,
         );
-        let duplicate_response = server
-            .handle_request(
-                &Cx::for_testing(),
-                &mut session,
-                duplicate,
-                &sender,
-                &request_sender,
-            )
-            .expect("duplicate subscribe request should produce a response");
+        let duplicate_response = fastmcp_core::block_on(server.handle_request(
+            &Cx::for_testing(),
+            &mut session,
+            duplicate,
+            &sender,
+            &request_sender,
+        ))
+        .expect("duplicate subscribe request should produce a response");
         assert!(duplicate_response.error.is_none());
         assert!(session.is_resource_subscribed(DUPLICATE_URI));
 
@@ -2214,15 +2198,14 @@ mod router_tests {
             ),
             11_i64,
         );
-        let over_limit_response = server
-            .handle_request(
-                &Cx::for_testing(),
-                &mut session,
-                over_limit,
-                &sender,
-                &request_sender,
-            )
-            .expect("over-limit subscribe request should produce a response");
+        let over_limit_response = fastmcp_core::block_on(server.handle_request(
+            &Cx::for_testing(),
+            &mut session,
+            over_limit,
+            &sender,
+            &request_sender,
+        ))
+        .expect("over-limit subscribe request should produce a response");
         let capacity_error = over_limit_response
             .error
             .expect("over-limit subscription must fail");
@@ -2252,15 +2235,14 @@ mod router_tests {
             ),
             12_i64,
         );
-        let impossible_response = server
-            .handle_request(
-                &Cx::for_testing(),
-                &mut session,
-                impossible,
-                &sender,
-                &request_sender,
-            )
-            .expect("individually over-limit subscribe should produce a response");
+        let impossible_response = fastmcp_core::block_on(server.handle_request(
+            &Cx::for_testing(),
+            &mut session,
+            impossible,
+            &sender,
+            &request_sender,
+        ))
+        .expect("individually over-limit subscribe should produce a response");
         let impossible_error = impossible_response
             .error
             .expect("individually over-limit subscription must fail before lookup");
@@ -2297,15 +2279,14 @@ mod router_tests {
             ),
             13_i64,
         );
-        let cancelled_response = server
-            .handle_request(
-                &cancelled_cx,
-                &mut cancelled_session,
-                cancelled_request,
-                &sender,
-                &request_sender,
-            )
-            .expect("cancelled subscribe request should produce a response");
+        let cancelled_response = fastmcp_core::block_on(server.handle_request(
+            &cancelled_cx,
+            &mut cancelled_session,
+            cancelled_request,
+            &sender,
+            &request_sender,
+        ))
+        .expect("cancelled subscribe request should produce a response");
         let cancellation = cancelled_response
             .error
             .expect("cancelled subscription must fail");
@@ -2325,15 +2306,14 @@ mod router_tests {
             ),
             14_i64,
         );
-        let cancelled_unsubscribe_response = server
-            .handle_request(
-                &cancelled_cx,
-                &mut cancelled_session,
-                cancelled_unsubscribe,
-                &sender,
-                &request_sender,
-            )
-            .expect("cancelled unsubscribe request should produce a response");
+        let cancelled_unsubscribe_response = fastmcp_core::block_on(server.handle_request(
+            &cancelled_cx,
+            &mut cancelled_session,
+            cancelled_unsubscribe,
+            &sender,
+            &request_sender,
+        ))
+        .expect("cancelled unsubscribe request should produce a response");
         let unsubscribe_cancellation = cancelled_unsubscribe_response
             .error
             .expect("cancelled unsubscription must fail");
@@ -2410,15 +2390,14 @@ mod router_tests {
                     .map(str::to_owned)
                     .collect();
                 let sender: NotificationSender = Arc::new(|_| {});
-                let response = server
-                    .handle_request(
-                        &cx,
-                        &mut session,
-                        JsonRpcRequest::new(method, Some(serde_json::json!({"uri":URI})), 91_i64),
-                        &sender,
-                        &create_test_request_sender(),
-                    )
-                    .unwrap();
+                let response = fastmcp_core::block_on(server.handle_request(
+                    &cx,
+                    &mut session,
+                    JsonRpcRequest::new(method, Some(serde_json::json!({"uri":URI})), 91_i64),
+                    &sender,
+                    &create_test_request_sender(),
+                ))
+                .unwrap();
                 if mode == 0 {
                     assert!(
                         response.error.is_none(),
@@ -2500,15 +2479,14 @@ mod router_tests {
             ),
             20_i64,
         );
-        let subscribe_response = server
-            .handle_request(
-                &Cx::for_testing(),
-                &mut session,
-                subscribe,
-                &sender,
-                &request_sender,
-            )
-            .expect("guarded subscribe request should produce a response");
+        let subscribe_response = fastmcp_core::block_on(server.handle_request(
+            &Cx::for_testing(),
+            &mut session,
+            subscribe,
+            &sender,
+            &request_sender,
+        ))
+        .expect("guarded subscribe request should produce a response");
         assert_eq!(
             subscribe_response.error.expect("subscribe must fail").code,
             i32::from(McpErrorCode::InternalError).into()
@@ -2528,15 +2506,14 @@ mod router_tests {
             ),
             21_i64,
         );
-        let unsubscribe_response = server
-            .handle_request(
-                &Cx::for_testing(),
-                &mut session,
-                unsubscribe,
-                &sender,
-                &request_sender,
-            )
-            .expect("guarded unsubscribe request should produce a response");
+        let unsubscribe_response = fastmcp_core::block_on(server.handle_request(
+            &Cx::for_testing(),
+            &mut session,
+            unsubscribe,
+            &sender,
+            &request_sender,
+        ))
+        .expect("guarded unsubscribe request should produce a response");
         assert_eq!(
             unsubscribe_response
                 .error
@@ -2594,15 +2571,14 @@ mod router_tests {
             ),
             22_i64,
         );
-        let response = server
-            .handle_request(
-                &Cx::for_testing(),
-                &mut session,
-                subscribe,
-                &sender,
-                &request_sender,
-            )
-            .expect("subscribe produces response");
+        let response = fastmcp_core::block_on(server.handle_request(
+            &Cx::for_testing(),
+            &mut session,
+            subscribe,
+            &sender,
+            &request_sender,
+        ))
+        .expect("subscribe produces response");
         assert!(response.error.is_some());
         assert!(!session.is_resource_subscribed(URI));
 
@@ -2619,15 +2595,14 @@ mod router_tests {
             ),
             23_i64,
         );
-        let response = server
-            .handle_request(
-                &Cx::for_testing(),
-                &mut session,
-                unsubscribe,
-                &sender,
-                &request_sender,
-            )
-            .expect("unsubscribe produces response");
+        let response = fastmcp_core::block_on(server.handle_request(
+            &Cx::for_testing(),
+            &mut session,
+            unsubscribe,
+            &sender,
+            &request_sender,
+        ))
+        .expect("unsubscribe produces response");
         assert!(response.error.is_some());
         assert!(session.is_resource_subscribed(URI));
     }
@@ -2666,15 +2641,14 @@ mod router_tests {
             ),
             1i64,
         );
-        let _ = server
-            .handle_request(
-                &cx,
-                &mut session,
-                set_level,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("set level response");
+        let _ = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            set_level,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("set level response");
 
         let call = fastmcp_protocol::JsonRpcRequest::new(
             "tools/call",
@@ -2688,15 +2662,14 @@ mod router_tests {
             ),
             2i64,
         );
-        let _ = server
-            .handle_request(
-                &cx,
-                &mut session,
-                call,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("tool call response");
+        let _ = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            call,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("tool call response");
 
         let guard = notifications.lock().expect("notifications lock poisoned");
         let mut logs = guard
@@ -2766,15 +2739,14 @@ mod router_tests {
             )
         };
 
-        let _ = server
-            .handle_request(
-                &cx,
-                &mut session,
-                call(1),
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("handler log without setLevel still responds");
+        let _ = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            call(1),
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("handler log without setLevel still responds");
         let handler_logs = notifications
             .lock()
             .expect("notifications lock poisoned")
@@ -2793,37 +2765,35 @@ mod router_tests {
             "MCP forbids notifications/message before logging/setLevel"
         );
 
-        let _ = server
-            .handle_request(
-                &cx,
-                &mut session,
-                fastmcp_protocol::JsonRpcRequest::new(
-                    "logging/setLevel",
-                    Some(
-                        serde_json::to_value(SetLogLevelParams {
-                            level: LogLevel::Info,
-                        })
-                        .expect("set level params"),
-                    ),
-                    2_i64,
+        let _ = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            fastmcp_protocol::JsonRpcRequest::new(
+                "logging/setLevel",
+                Some(
+                    serde_json::to_value(SetLogLevelParams {
+                        level: LogLevel::Info,
+                    })
+                    .expect("set level params"),
                 ),
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("setLevel must respond");
+                2_i64,
+            ),
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("setLevel must respond");
         notifications
             .lock()
             .expect("notifications lock poisoned")
             .clear();
-        let _ = server
-            .handle_request(
-                &cx,
-                &mut session,
-                call(3),
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("handler log after setLevel must respond");
+        let _ = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            call(3),
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("handler log after setLevel must respond");
         let emitted: Vec<String> = notifications
             .lock()
             .expect("notifications lock poisoned")
@@ -2892,15 +2862,14 @@ mod router_tests {
                 id,
             )
         };
-        let _ = server
-            .handle_request(
-                &cx,
-                &mut session,
-                call(1),
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("first hide must respond");
+        let _ = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            call(1),
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("first hide must respond");
         let first = notifications
             .lock()
             .expect("notifications lock poisoned")
@@ -2913,15 +2882,14 @@ mod router_tests {
             .lock()
             .expect("notifications lock poisoned")
             .clear();
-        let _ = server
-            .handle_request(
-                &cx,
-                &mut session,
-                call(2),
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("repeat hide must respond");
+        let _ = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            call(2),
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("repeat hide must respond");
         let repeat = notifications
             .lock()
             .expect("notifications lock poisoned")
@@ -2974,26 +2942,25 @@ mod router_tests {
             "2024-11-05".to_string(),
         );
         let session_sender: NotificationSender = Arc::new(|_| {});
-        let _ = server
-            .handle_request(
-                &cx,
-                &mut session,
-                fastmcp_protocol::JsonRpcRequest::new(
-                    "tools/call",
-                    Some(
-                        serde_json::to_value(CallToolParams {
-                            name: "hide_greet".to_string(),
-                            arguments: Some(serde_json::json!({})),
-                            meta: None,
-                        })
-                        .expect("tool params"),
-                    ),
-                    1_i64,
+        let _ = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            fastmcp_protocol::JsonRpcRequest::new(
+                "tools/call",
+                Some(
+                    serde_json::to_value(CallToolParams {
+                        name: "hide_greet".to_string(),
+                        arguments: Some(serde_json::json!({})),
+                        meta: None,
+                    })
+                    .expect("tool params"),
                 ),
-                &session_sender,
-                &create_test_request_sender(),
-            )
-            .expect("hide_greet must respond");
+                1_i64,
+            ),
+            &session_sender,
+            &create_test_request_sender(),
+        ))
+        .expect("hide_greet must respond");
         let delivered = sent
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3050,26 +3017,25 @@ mod router_tests {
             "2024-11-05".to_string(),
         );
         let session_sender: NotificationSender = Arc::new(|_| {});
-        let response = server
-            .handle_request(
-                &cx,
-                &mut session,
-                fastmcp_protocol::JsonRpcRequest::new(
-                    "tools/call",
-                    Some(
-                        serde_json::to_value(CallToolParams {
-                            name: "touch_file".to_string(),
-                            arguments: Some(serde_json::json!({ "uri": URI })),
-                            meta: None,
-                        })
-                        .expect("tool params"),
-                    ),
-                    1_i64,
+        let response = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            fastmcp_protocol::JsonRpcRequest::new(
+                "tools/call",
+                Some(
+                    serde_json::to_value(CallToolParams {
+                        name: "touch_file".to_string(),
+                        arguments: Some(serde_json::json!({ "uri": URI })),
+                        meta: None,
+                    })
+                    .expect("tool params"),
                 ),
-                &session_sender,
-                &create_test_request_sender(),
-            )
-            .expect("touch_file must respond");
+                1_i64,
+            ),
+            &session_sender,
+            &create_test_request_sender(),
+        ))
+        .expect("touch_file must respond");
         assert_eq!(
             response
                 .result
@@ -3133,15 +3099,14 @@ mod router_tests {
                 id,
             )
         };
-        let silent = server
-            .handle_request(
-                &cx,
-                &mut session,
-                call(1),
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("unsubscribed touch must respond");
+        let silent = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            call(1),
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("unsubscribed touch must respond");
         assert_eq!(
             silent
                 .result
@@ -3158,32 +3123,30 @@ mod router_tests {
                 .all(|req| req.method != "notifications/resources/updated")
         );
 
-        let _ = server
-            .handle_request(
-                &cx,
-                &mut session,
-                fastmcp_protocol::JsonRpcRequest::new(
-                    "resources/subscribe",
-                    Some(serde_json::json!({ "uri": URI })),
-                    2_i64,
-                ),
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("subscribe must respond");
+        let _ = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            fastmcp_protocol::JsonRpcRequest::new(
+                "resources/subscribe",
+                Some(serde_json::json!({ "uri": URI })),
+                2_i64,
+            ),
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("subscribe must respond");
         notifications
             .lock()
             .expect("notifications lock poisoned")
             .clear();
-        let notified = server
-            .handle_request(
-                &cx,
-                &mut session,
-                call(3),
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("subscribed touch must respond");
+        let notified = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            call(3),
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("subscribed touch must respond");
         assert_eq!(
             notified
                 .result
@@ -3235,15 +3198,14 @@ mod router_tests {
             ),
             1i64,
         );
-        let _ = server
-            .handle_request(
-                &cx,
-                &mut session,
-                set_level,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("set level response");
+        let _ = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            set_level,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("set level response");
 
         let call = fastmcp_protocol::JsonRpcRequest::new(
             "tools/call",
@@ -3257,15 +3219,14 @@ mod router_tests {
             ),
             2i64,
         );
-        let _ = server
-            .handle_request(
-                &cx,
-                &mut session,
-                call,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("tool call response");
+        let _ = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            call,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("tool call response");
 
         let guard = notifications.lock().expect("notifications lock poisoned");
         let log_count = guard
@@ -3322,7 +3283,13 @@ mod router_tests {
 
         let state = SessionState::new();
         let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
-        let result = router.handle_tools_call(&request_ctx, params, state, None, None);
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_ok());
         let call_result = result.unwrap();
@@ -3350,7 +3317,13 @@ mod router_tests {
 
         let state = SessionState::new();
         let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
-        let result = router.handle_tools_call(&request_ctx, params, state, None, None);
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -3374,7 +3347,13 @@ mod router_tests {
 
         let state = SessionState::new();
         let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
-        let result = router.handle_tools_call(&request_ctx, params, state, None, None);
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         // Tool errors are returned as content with is_error=true
         assert!(result.is_ok());
@@ -3398,7 +3377,13 @@ mod router_tests {
 
         let state = SessionState::new();
         let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
-        let result = router.handle_tools_call(&request_ctx, params, state, None, None);
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         // Request should be cancelled before handler runs
         assert!(result.is_err());
@@ -3418,7 +3403,13 @@ mod router_tests {
 
         let state = SessionState::new();
         let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
-        let result = router.handle_tools_call(&request_ctx, params, state, None, None);
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         // The handler explicitly requests a poll checkpoint, so a zero poll
         // balance rejects that next admission rather than retroactively
@@ -3440,7 +3431,13 @@ mod router_tests {
 
         let state = SessionState::new();
         let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
-        let result = router.handle_resources_read(&request_ctx, &params, state, None, None);
+        let result = fastmcp_core::block_on(router.handle_resources_read(
+            &request_ctx,
+            &params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_ok());
         let read_result = result.unwrap();
@@ -3464,7 +3461,13 @@ mod router_tests {
 
         let state = SessionState::new();
         let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
-        let result = router.handle_resources_read(&request_ctx, &params, state, None, None);
+        let result = fastmcp_core::block_on(router.handle_resources_read(
+            &request_ctx,
+            &params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
@@ -3487,7 +3490,13 @@ mod router_tests {
 
         let state = SessionState::new();
         let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
-        let result = router.handle_resources_read(&request_ctx, &params, state, None, None);
+        let result = fastmcp_core::block_on(router.handle_resources_read(
+            &request_ctx,
+            &params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
@@ -3564,7 +3573,13 @@ mod router_tests {
 
         let state = SessionState::new();
         let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
-        let result = router.handle_resources_read(&request_ctx, &params, state, None, None);
+        let result = fastmcp_core::block_on(router.handle_resources_read(
+            &request_ctx,
+            &params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
@@ -3604,7 +3619,13 @@ mod router_tests {
 
         let state = SessionState::new();
         let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
-        let result = router.handle_resources_read(&request_ctx, &params, state, None, None);
+        let result = fastmcp_core::block_on(router.handle_resources_read(
+            &request_ctx,
+            &params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
@@ -3632,7 +3653,13 @@ mod router_tests {
 
         let state = SessionState::new();
         let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
-        let result = router.handle_resources_read(&request_ctx, &params, state, None, None);
+        let result = fastmcp_core::block_on(router.handle_resources_read(
+            &request_ctx,
+            &params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
@@ -3667,7 +3694,13 @@ mod router_tests {
 
         let state = SessionState::new();
         let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
-        let result = router.handle_resources_read(&request_ctx, &params, state, None, None);
+        let result = fastmcp_core::block_on(router.handle_resources_read(
+            &request_ctx,
+            &params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_err());
     }
@@ -3686,7 +3719,13 @@ mod router_tests {
 
         let state = SessionState::new();
         let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
-        let result = router.handle_resources_read(&request_ctx, &params, state, None, None);
+        let result = fastmcp_core::block_on(router.handle_resources_read(
+            &request_ctx,
+            &params,
+            state,
+            None,
+            None,
+        ));
 
         // Should be cancelled
         assert!(result.is_err());
@@ -3710,7 +3749,13 @@ mod router_tests {
 
         let state = SessionState::new();
         let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
-        let result = router.handle_prompts_get(&request_ctx, params, state, None, None);
+        let result = fastmcp_core::block_on(router.handle_prompts_get(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_ok());
         let get_result = result.unwrap();
@@ -3740,7 +3785,13 @@ mod router_tests {
 
         let state = SessionState::new();
         let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
-        let result = router.handle_prompts_get(&request_ctx, params, state, None, None);
+        let result = fastmcp_core::block_on(router.handle_prompts_get(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_err());
     }
@@ -3760,7 +3811,13 @@ mod router_tests {
 
         let state = SessionState::new();
         let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
-        let result = router.handle_tools_call(&request_ctx, params, state, None, None);
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -3782,7 +3839,13 @@ mod router_tests {
 
         let state = SessionState::new();
         let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
-        let result = router.handle_tools_call(&request_ctx, params, state, None, None);
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -3804,7 +3867,13 @@ mod router_tests {
 
         let state = SessionState::new();
         let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
-        let result = router.handle_tools_call(&request_ctx, params, state, None, None);
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_ok());
         let call_result = result.unwrap();
@@ -3827,7 +3896,13 @@ mod router_tests {
 
         let state = SessionState::new();
         let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
-        let result = router.handle_tools_call(&request_ctx, params, state, None, None);
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         // Should pass in lenient mode
         assert!(result.is_ok());
@@ -3852,7 +3927,13 @@ mod router_tests {
 
         let state = SessionState::new();
         let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
-        let result = router.handle_tools_call(&request_ctx, params, state, None, None);
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         // Should fail in strict mode due to extra property
         assert!(result.is_err());
@@ -3877,7 +3958,13 @@ mod router_tests {
 
         let state = SessionState::new();
         let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
-        let result = router.handle_tools_call(&request_ctx, params, state, None, None);
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         // Should pass in strict mode with valid input
         assert!(result.is_ok());
@@ -4276,7 +4363,7 @@ mod multi_handler_tests {
         let state1 = SessionState::new();
         let request_ctx1 =
             McpContext::with_state(cx.clone(), 1, state1.clone()).with_budget_ceiling(budget);
-        let result1 = router.handle_tools_call(
+        let result1 = fastmcp_core::block_on(router.handle_tools_call(
             &request_ctx1,
             CallToolParams {
                 name: "greet".to_string(),
@@ -4286,13 +4373,13 @@ mod multi_handler_tests {
             state1,
             None,
             None,
-        );
+        ));
         assert!(result1.is_ok());
 
         let state2 = SessionState::new();
         let request_ctx2 =
             McpContext::with_state(cx, 2, state2.clone()).with_budget_ceiling(budget);
-        let result2 = router.handle_tools_call(
+        let result2 = fastmcp_core::block_on(router.handle_tools_call(
             &request_ctx2,
             CallToolParams {
                 name: "formal_greet".to_string(),
@@ -4302,7 +4389,7 @@ mod multi_handler_tests {
             state2,
             None,
             None,
-        );
+        ));
         assert!(result2.is_ok());
 
         // Verify different outputs
@@ -4335,7 +4422,7 @@ mod multi_handler_tests {
         let state_a = SessionState::new();
         let request_ctx_a =
             McpContext::with_state(cx.clone(), 1, state_a.clone()).with_budget_ceiling(budget);
-        let result_a = router.handle_resources_read(
+        let result_a = fastmcp_core::block_on(router.handle_resources_read(
             &request_ctx_a,
             &ReadResourceParams {
                 uri: "resource://a".to_string(),
@@ -4344,11 +4431,11 @@ mod multi_handler_tests {
             state_a,
             None,
             None,
-        );
+        ));
         let state_b = SessionState::new();
         let request_ctx_b =
             McpContext::with_state(cx, 2, state_b.clone()).with_budget_ceiling(budget);
-        let result_b = router.handle_resources_read(
+        let result_b = fastmcp_core::block_on(router.handle_resources_read(
             &request_ctx_b,
             &ReadResourceParams {
                 uri: "resource://b".to_string(),
@@ -4357,7 +4444,7 @@ mod multi_handler_tests {
             state_b,
             None,
             None,
-        );
+        ));
 
         assert!(matches!(
             &result_a.unwrap().contents[0],
@@ -4398,8 +4485,13 @@ mod session_state_tests {
         };
         let request_ctx1 =
             McpContext::with_state(cx.clone(), 1, state.clone()).with_budget_ceiling(budget);
-        let result1 =
-            router.handle_tools_call(&request_ctx1, params.clone(), state.clone(), None, None);
+        let result1 = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx1,
+            params.clone(),
+            state.clone(),
+            None,
+            None,
+        ));
         assert!(result1.is_ok());
         if let LegacyContent::Text { text, .. } = &result1.unwrap().content[0] {
             assert_eq!(text, "Counter: 1");
@@ -4408,8 +4500,13 @@ mod session_state_tests {
         // Second call with same state - counter should be 2
         let request_ctx2 =
             McpContext::with_state(cx.clone(), 2, state.clone()).with_budget_ceiling(budget);
-        let result2 =
-            router.handle_tools_call(&request_ctx2, params.clone(), state.clone(), None, None);
+        let result2 = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx2,
+            params.clone(),
+            state.clone(),
+            None,
+            None,
+        ));
         assert!(result2.is_ok());
         if let LegacyContent::Text { text, .. } = &result2.unwrap().content[0] {
             assert_eq!(text, "Counter: 2");
@@ -4417,7 +4514,13 @@ mod session_state_tests {
 
         // Third call - counter should be 3
         let request_ctx3 = McpContext::with_state(cx, 3, state.clone()).with_budget_ceiling(budget);
-        let result3 = router.handle_tools_call(&request_ctx3, params, state.clone(), None, None);
+        let result3 = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx3,
+            params,
+            state.clone(),
+            None,
+            None,
+        ));
         assert!(result3.is_ok());
         if let LegacyContent::Text { text, .. } = &result3.unwrap().content[0] {
             assert_eq!(text, "Counter: 3");
@@ -4447,21 +4550,36 @@ mod session_state_tests {
         // Call with state1 twice
         let request_ctx1 =
             McpContext::with_state(cx.clone(), 1, state1.clone()).with_budget_ceiling(budget);
-        router
-            .handle_tools_call(&request_ctx1, params.clone(), state1.clone(), None, None)
-            .unwrap();
+        fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx1,
+            params.clone(),
+            state1.clone(),
+            None,
+            None,
+        ))
+        .unwrap();
         let request_ctx2 =
             McpContext::with_state(cx.clone(), 2, state1.clone()).with_budget_ceiling(budget);
-        let result1 = router
-            .handle_tools_call(&request_ctx2, params.clone(), state1.clone(), None, None)
-            .unwrap();
+        let result1 = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx2,
+            params.clone(),
+            state1.clone(),
+            None,
+            None,
+        ))
+        .unwrap();
 
         // Call with state2 once
         let request_ctx3 =
             McpContext::with_state(cx, 3, state2.clone()).with_budget_ceiling(budget);
-        let result2 = router
-            .handle_tools_call(&request_ctx3, params, state2.clone(), None, None)
-            .unwrap();
+        let result2 = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx3,
+            params,
+            state2.clone(),
+            None,
+            None,
+        ))
+        .unwrap();
 
         // state1 should have counter=2, state2 should have counter=1
         if let LegacyContent::Text { text, .. } = &result1.content[0] {
@@ -4727,7 +4845,9 @@ mod lab_runtime_tests {
                 let state = SessionState::new();
                 let request_ctx = McpContext::with_state(cx, 1, state.clone())
                     .with_budget_ceiling(Budget::INFINITE);
-                let result = router.handle_tools_call(&request_ctx, params, state, None, None);
+                let result = router
+                    .handle_tools_call(&request_ctx, params, state, None, None)
+                    .await;
 
                 let err = result.as_ref().err().map(|e| e.message.clone());
                 events_for_task
@@ -4771,7 +4891,9 @@ mod lab_runtime_tests {
                 let state = SessionState::new();
                 let request_ctx =
                     McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
-                let result = router.handle_resources_read(&request_ctx, &params, state, None, None);
+                let result = router
+                    .handle_resources_read(&request_ctx, &params, state, None, None)
+                    .await;
 
                 let err = result.as_ref().err().map(|e| e.message.clone());
                 events_for_task

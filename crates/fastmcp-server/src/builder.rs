@@ -3587,10 +3587,12 @@ mod tests {
                 }),
             );
 
-        let baseline_result = server
-            .router
-            .dispatch_legacy_completion(&request_ctx, &baseline)
-            .expect("baseline legacy completion reaches the builder-installed handler");
+        let baseline_result = fastmcp_core::block_on(
+            server
+                .router
+                .dispatch_legacy_completion(&request_ctx, &baseline),
+        )
+        .expect("baseline legacy completion reaches the builder-installed handler");
         assert_eq!(
             invocations.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -3598,10 +3600,12 @@ mod tests {
         );
         let planted_before = serde_json::to_vec(&planted).expect("planted request serializes");
 
-        let error = server
-            .router
-            .dispatch_legacy_completion(&request_ctx, &planted)
-            .expect_err("the sole final metadata field is refused in the exact legacy route");
+        let error = fastmcp_core::block_on(
+            server
+                .router
+                .dispatch_legacy_completion(&request_ctx, &planted),
+        )
+        .expect_err("the sole final metadata field is refused in the exact legacy route");
         assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
         assert_eq!(
             invocations.load(std::sync::atomic::Ordering::SeqCst),
@@ -3614,10 +3618,12 @@ mod tests {
             "the rejected request remains caller-owned and unchanged"
         );
         assert_eq!(
-            server
-                .router
-                .dispatch_legacy_completion(&request_ctx, &baseline)
-                .expect("baseline remains dispatchable after the rejection"),
+            fastmcp_core::block_on(
+                server
+                    .router
+                    .dispatch_legacy_completion(&request_ctx, &baseline),
+            )
+            .expect("baseline remains dispatchable after the rejection"),
             baseline_result,
             "the rejected one-field variant cannot alter the accepted completion result"
         );
@@ -5855,17 +5861,16 @@ mod tests {
                 }),
             );
 
-            let legacy_catalog = server
-                .dispatch_request(
-                    &Cx::for_testing(),
-                    &mut legacy_session,
-                    JsonRpcRequest::new("tools/list", Some(serde_json::json!({})), 801_i64),
-                    &notification_sender,
-                    &request_sender,
-                )
-                .expect("the legacy tools/list request receives a response")
-                .result
-                .expect("the legacy tools/list response has a result payload");
+            let legacy_catalog = fastmcp_core::block_on(server.dispatch_request(
+                &Cx::for_testing(),
+                &mut legacy_session,
+                JsonRpcRequest::new("tools/list", Some(serde_json::json!({})), 801_i64),
+                &notification_sender,
+                &request_sender,
+            ))
+            .expect("the legacy tools/list request receives a response")
+            .result
+            .expect("the legacy tools/list response has a result payload");
             assert_eq!(legacy_catalog["tools"].as_array().map(Vec::len), Some(1));
             assert_eq!(legacy_catalog["tools"][0]["name"], "legacy-weather");
 
@@ -5889,24 +5894,23 @@ mod tests {
                 "the final proxy path retains the full normalized FinalTool model"
             );
 
-            let legacy_call = server
-                .dispatch_request(
-                    &Cx::for_testing(),
-                    &mut legacy_session,
-                    JsonRpcRequest::new(
-                        "tools/call",
-                        Some(serde_json::json!({
-                            "name": "legacy-weather",
-                            "arguments": {"city": "Portland"},
-                        })),
-                        803_i64,
-                    ),
-                    &notification_sender,
-                    &request_sender,
-                )
-                .expect("the legacy tools/call request receives a response")
-                .result
-                .expect("the legacy tools/call response has a result payload");
+            let legacy_call = fastmcp_core::block_on(server.dispatch_request(
+                &Cx::for_testing(),
+                &mut legacy_session,
+                JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "legacy-weather",
+                        "arguments": {"city": "Portland"},
+                    })),
+                    803_i64,
+                ),
+                &notification_sender,
+                &request_sender,
+            ))
+            .expect("the legacy tools/call request receives a response")
+            .result
+            .expect("the legacy tools/call response has a result payload");
             assert_eq!(legacy_call["content"][0]["text"], "bound legacy proxy");
 
             let final_connection = crate::ModernConnection::new();
@@ -5974,22 +5978,21 @@ mod tests {
                 }),
             );
 
-            let legacy_rejected = server
-                .dispatch_request(
-                    &Cx::for_testing(),
-                    &mut legacy_session,
-                    JsonRpcRequest::new(
-                        "tools/call",
-                        Some(serde_json::json!({
-                            "name": "weather",
-                            "arguments": {},
-                        })),
-                        805_i64,
-                    ),
-                    &notification_sender,
-                    &request_sender,
-                )
-                .expect("the legacy cross-era request receives a JSON-RPC error");
+            let legacy_rejected = fastmcp_core::block_on(server.dispatch_request(
+                &Cx::for_testing(),
+                &mut legacy_session,
+                JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "weather",
+                        "arguments": {},
+                    })),
+                    805_i64,
+                ),
+                &notification_sender,
+                &request_sender,
+            ))
+            .expect("the legacy cross-era request receives a JSON-RPC error");
             assert!(legacy_rejected.result.is_none());
             assert_eq!(
                 legacy_rejected.error.and_then(|error| error.code.as_i32()),
@@ -6074,22 +6077,21 @@ mod tests {
                     Err(format!("unexpected outbound message in test: {message:?}"))
                 }),
             );
-            let legacy = server
-                .dispatch_request(
-                    &Cx::for_testing(),
-                    &mut legacy_session,
-                    JsonRpcRequest::new(
-                        "completion/complete",
-                        Some(serde_json::json!({
-                            "ref": {"type": "ref/prompt", "name": "legacy-deploy"},
-                            "argument": {"name": "environment", "value": "sta"},
-                        })),
-                        821_i64,
-                    ),
-                    &notification_sender,
-                    &request_sender,
-                )
-                .expect("the public exact-2024 completion path returns a response")
+            let legacy = fastmcp_core::block_on(server.dispatch_request(
+                &Cx::for_testing(),
+                &mut legacy_session,
+                JsonRpcRequest::new(
+                    "completion/complete",
+                    Some(serde_json::json!({
+                        "ref": {"type": "ref/prompt", "name": "legacy-deploy"},
+                        "argument": {"name": "environment", "value": "sta"},
+                    })),
+                    821_i64,
+                ),
+                &notification_sender,
+                &request_sender,
+            ))
+            .expect("the public exact-2024 completion path returns a response")
                 .result
                 .expect("the exact-2024 completion response has a result payload");
             assert_eq!(
@@ -6651,15 +6653,14 @@ mod tests {
                     serde_json::json!({"type": "ref/resource", "uri": "completion://{environment}"}),
                 ),
             ] {
-                let rejected = evicted
-                    .dispatch_request(
-                        &Cx::for_testing(),
-                        &mut legacy_session,
-                        request,
-                        &notification_sender,
-                        &request_sender,
-                    )
-                    .expect("the public replaced legacy target returns a JSON-RPC error");
+                let rejected = fastmcp_core::block_on(evicted.dispatch_request(
+                    &Cx::for_testing(),
+                    &mut legacy_session,
+                    request,
+                    &notification_sender,
+                    &request_sender,
+                ))
+                .expect("the public replaced legacy target returns a JSON-RPC error");
                 assert_eq!(
                     rejected.error.and_then(|error| error.code.as_i32()),
                     Some(-32601),
@@ -6730,17 +6731,16 @@ mod tests {
                     serde_json::json!({"type": "ref/resource", "uri": "completion://{environment}"}),
                 ),
             ] {
-                let response = restored
-                    .dispatch_request(
-                        &Cx::for_testing(),
-                        &mut legacy_session,
-                        request,
-                        &notification_sender,
-                        &request_sender,
-                    )
-                    .expect("the public local legacy provider returns a response")
-                    .result
-                    .expect("the local legacy provider returns a result payload");
+                let response = fastmcp_core::block_on(restored.dispatch_request(
+                    &Cx::for_testing(),
+                    &mut legacy_session,
+                    request,
+                    &notification_sender,
+                    &request_sender,
+                ))
+                .expect("the public local legacy provider returns a response")
+                .result
+                .expect("the local legacy provider returns a result payload");
                 assert_eq!(
                     response["completion"]["values"],
                     serde_json::json!(["staging"])
@@ -6825,15 +6825,14 @@ mod tests {
                     Err(format!("unexpected outbound message in test: {message:?}"))
                 }),
             );
-            let legacy = server
-                .dispatch_request(
-                    &Cx::for_testing(),
-                    &mut legacy_session,
-                    legacy_ping,
-                    &notification_sender,
-                    &request_sender,
-                )
-                .expect("the exact-2024 public dispatch path responds to ping");
+            let legacy = fastmcp_core::block_on(server.dispatch_request(
+                &Cx::for_testing(),
+                &mut legacy_session,
+                legacy_ping,
+                &notification_sender,
+                &request_sender,
+            ))
+            .expect("the exact-2024 public dispatch path responds to ping");
             assert_eq!(legacy.result, Some(serde_json::json!({})));
             assert!(legacy.error.is_none());
 
@@ -6960,35 +6959,33 @@ mod tests {
             let state = fastmcp_core::SessionState::new();
             let request_ctx =
                 fastmcp_core::McpContext::with_state(Cx::for_testing(), 714, state.clone());
-            let legacy_resource = router
-                .handle_resources_read(
-                    &request_ctx,
-                    &fastmcp_protocol::ReadResourceParams {
-                        uri: "mcp://upstream/resource".to_owned(),
-                        meta: None,
-                    },
-                    state.clone(),
-                    None,
-                    None,
-                )
-                .expect_err("typed-final resource registration is not legacy-visible");
+            let legacy_resource = fastmcp_core::block_on(router.handle_resources_read(
+                &request_ctx,
+                &fastmcp_protocol::ReadResourceParams {
+                    uri: "mcp://upstream/resource".to_owned(),
+                    meta: None,
+                },
+                state.clone(),
+                None,
+                None,
+            ))
+            .expect_err("typed-final resource registration is not legacy-visible");
             assert_eq!(
                 legacy_resource.code,
                 fastmcp_core::McpErrorCode::ResourceNotFound
             );
-            let legacy_prompt = router
-                .handle_prompts_get(
-                    &request_ctx,
-                    fastmcp_protocol::GetPromptParams {
-                        name: "upstream-prompt".to_owned(),
-                        arguments: None,
-                        meta: None,
-                    },
-                    state,
-                    None,
-                    None,
-                )
-                .expect_err("typed-final prompt registration is not legacy-visible");
+            let legacy_prompt = fastmcp_core::block_on(router.handle_prompts_get(
+                &request_ctx,
+                fastmcp_protocol::GetPromptParams {
+                    name: "upstream-prompt".to_owned(),
+                    arguments: None,
+                    meta: None,
+                },
+                state,
+                None,
+                None,
+            ))
+            .expect_err("typed-final prompt registration is not legacy-visible");
             assert_eq!(
                 legacy_prompt.code,
                 fastmcp_core::McpErrorCode::PromptNotFound

@@ -346,18 +346,17 @@ mod tests {
 
         let state = SessionState::new();
         let context = McpContext::with_state(Cx::for_testing(), 2, state.clone());
-        let error = router
-            .handle_resources_read(
-                &context,
-                &ReadResourceParams {
-                    uri: "ui://weather/dashboard".to_owned(),
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect_err("final-only Apps documents are not exact-2024 resources");
+        let error = fastmcp_core::block_on(router.handle_resources_read(
+            &context,
+            &ReadResourceParams {
+                uri: "ui://weather/dashboard".to_owned(),
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect_err("final-only Apps documents are not exact-2024 resources");
 
         assert_eq!(error.code, McpErrorCode::ResourceNotFound);
         assert_eq!(

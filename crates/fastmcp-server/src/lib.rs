@@ -189,8 +189,8 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 #[cfg(test)]
 use std::io::Read;
-use std::io::{BufReader, BufWriter, Write};
-use std::net::{SocketAddr, TcpListener};
+use std::io::Write;
+use std::net::SocketAddr;
 #[cfg(feature = "websocket")]
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -208,7 +208,7 @@ use fastmcp_transport::http::{
 };
 use fastmcp_transport::http::{
     HttpError, HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler, HttpResponse,
-    HttpSessionError, HttpStatus, HttpTransport, StreamableHttpRequestCancellation,
+    HttpSessionError, HttpStatus, StreamableHttpRequestCancellation,
     StreamableHttpRequestResponseSender,
 };
 use fastmcp_transport::sse::SseEvent;
@@ -1754,32 +1754,6 @@ fn require_exact_modern_extension_metadata(request: &JsonRpcRequest) -> McpResul
         Err(McpError::invalid_request(
             "Extension requests require the admitted MCP 2026-07-28 protocol version",
         ))
-    }
-}
-
-fn lock_http_session(session: &Mutex<Session>) -> std::sync::MutexGuard<'_, Session> {
-    #[cfg(test)]
-    if lib_unit_tests::record_http_session_lock_attempt(std::ptr::from_ref(session).addr()) {
-        match session.try_lock() {
-            Ok(guard) => return guard,
-            Err(std::sync::TryLockError::WouldBlock) => {
-                lib_unit_tests::record_http_session_lock_contention(
-                    std::ptr::from_ref(session).addr(),
-                );
-            }
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                error!(target: targets::SERVER, "Session lock poisoned, recovering");
-                return poisoned.into_inner();
-            }
-        }
-    }
-
-    match session.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            error!(target: targets::SERVER, "Session lock poisoned, recovering");
-            poisoned.into_inner()
-        }
     }
 }
 
@@ -3772,41 +3746,6 @@ fn admit_modern_http_post(
     admit_modern_post(&config, method, path, headers, body).map_err(|rejection| {
         modern_post_rejection_response(rejection, body, handler_config.max_body_size)
     })
-}
-
-// Legacy snapshot dispatch support retained privately while the public shared
-// session entry point is fully serialized. A snapshot is an isolated copy;
-// mutations made through a handler context cannot write into the live session.
-#[derive(Debug, Clone)]
-struct SessionView {
-    id: u64,
-    initialized: bool,
-    state: SessionState,
-    supports_sampling: bool,
-    supports_elicitation: bool,
-    supports_roots: bool,
-    log_level: Option<LogLevel>,
-    principal_binding: SessionPrincipalBinding,
-    resource_subscriptions: Vec<String>,
-}
-
-impl SessionView {
-    fn from_session(session: &Session) -> Self {
-        Self {
-            id: session.id(),
-            initialized: session.is_initialized(),
-            state: session.state().snapshot(),
-            supports_sampling: session.supports_sampling(),
-            supports_elicitation: session.supports_elicitation(),
-            supports_roots: session.supports_roots(),
-            log_level: session.log_level(),
-            principal_binding: session.principal_binding(),
-            resource_subscriptions: session
-                .subscribed_resource_uris()
-                .map(str::to_owned)
-                .collect(),
-        }
-    }
 }
 
 impl Default for HttpServerConfig {
@@ -14974,11 +14913,11 @@ impl Server {
     /// let req_sender = RequestSender::noop();
     ///
     /// let request: JsonRpcRequest = /* ... */;
-    /// let response = server.dispatch_request(
-    ///     &cx, &mut session, request, &notify, &req_sender,
-    /// );
+    /// let response = server
+    ///     .dispatch_request(&cx, &mut session, request, &notify, &req_sender)
+    ///     .await;
     /// ```
-    pub fn dispatch_request(
+    pub async fn dispatch_request(
         &self,
         cx: &Cx,
         session: &mut Session,
@@ -14987,83 +14926,7 @@ impl Server {
         request_sender: &bidirectional::RequestSender,
     ) -> Option<JsonRpcResponse> {
         self.handle_request(cx, session, request, notification_sender, request_sender)
-    }
-
-    /// Processes a single JSON-RPC request against a shared session.
-    ///
-    /// This is the concurrent counterpart of [`dispatch_request`](Self::dispatch_request).
-    /// Use it when the session is shared across threads behind an
-    /// `Arc<Mutex<Session>>` (e.g. in HTTP or WebSocket transports where
-    /// multiple requests may arrive simultaneously).
-    ///
-    /// The mutex is held for the full handler duration. MCP tool annotations
-    /// are advisory hints, and every handler context can mutate session state
-    /// or perform nested calls, so treating a hint as an execution-safety
-    /// boundary would permit lost updates.
-    ///
-    /// Mutex poisoning is recovered from automatically (the poisoned inner
-    /// value is used), matching the behaviour of the internal HTTP handler.
-    ///
-    /// # Parameters
-    ///
-    /// - `cx` — The cancellation / budget context for this request.
-    /// - `session` — Shared, mutex-protected session for this connection.
-    /// - `request` — The incoming JSON-RPC request (or notification).
-    /// - `notification_sender` — Callback used to push server-initiated
-    ///   notifications (e.g. progress) back to the client.
-    /// - `request_sender` — Sender for server-to-client requests
-    ///   (sampling, elicitation, roots).
-    ///
-    /// # Returns
-    ///
-    /// `Some(JsonRpcResponse)` for normal requests, or `None` for
-    /// notifications (JSON-RPC messages without an `id`).
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use std::sync::{Arc, Mutex};
-    /// use fastmcp_rust::{
-    ///     Server, Session, JsonRpcRequest, NotificationSender,
-    ///     bidirectional::RequestSender,
-    /// };
-    /// use fastmcp_core::Cx;
-    ///
-    /// let server = Arc::new(
-    ///     Server::new("my-server", "1.0.0").build(),
-    /// );
-    /// let session = Arc::new(Mutex::new(Session::new()));
-    /// let cx = Cx::for_request();
-    /// let notify: NotificationSender = Arc::new(|_| {});
-    /// let req_sender = RequestSender::noop();
-    ///
-    /// let request: JsonRpcRequest = /* ... */;
-    /// let response = server.dispatch_request_concurrent(
-    ///     &cx, &session, request, &notify, &req_sender,
-    /// );
-    /// ```
-    pub fn dispatch_request_concurrent(
-        &self,
-        cx: &Cx,
-        session: &Arc<Mutex<Session>>,
-        request: JsonRpcRequest,
-        notification_sender: &NotificationSender,
-        request_sender: &bidirectional::RequestSender,
-    ) -> Option<JsonRpcResponse> {
-        let mut session_guard = match session.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                error!(target: targets::SERVER, "Session lock poisoned, recovering");
-                poisoned.into_inner()
-            }
-        };
-        self.handle_request(
-            cx,
-            &mut session_guard,
-            request,
-            notification_sender,
-            request_sender,
-        )
+            .await
     }
 
     /// Runs the server on stdio with a provided Cx.
@@ -15650,353 +15513,6 @@ impl Server {
 
     fn configured_http_request_handler(&self) -> HttpRequestHandler {
         HttpRequestHandler::with_config(self.http_config.handler_config.clone())
-    }
-
-    /// Unwired legacy HTTP accept loop retained for extraction into LEG-02.
-    ///
-    /// This sessionful code is deliberately unreachable from every public
-    /// `run_http*` entry point. The only canonical protocol eras are exact
-    /// `2024-11-05` and `2026-07-28`; `2025-11-25` is an unsupported
-    /// near-negative and must never become an adapter target. Any future
-    /// exact-2024 isolation must replace the shared session with the bounded,
-    /// owner-bound legacy registry specified by LEG-02.
-    ///
-    /// Each accepted connection is handled in its own bounded thread, but the
-    /// shared legacy session serializes handler dispatch. This code is retained
-    /// only as source material for the future isolated legacy adapter.
-    #[allow(clippy::too_many_lines)]
-    fn run_unwired_legacy_http_accept_loop(self, cx: &Cx, addr: String, returning: bool) {
-        self.init_rich_logging();
-
-        // Bind the TCP listener.
-        let listener = match TcpListener::bind(&addr) {
-            Ok(l) => l,
-            Err(e) => {
-                error!(target: targets::TRANSPORT, "Failed to bind HTTP listener on {}: {}", addr, e);
-                if returning {
-                    return;
-                }
-                std::process::exit(1);
-            }
-        };
-
-        // Poll accept in nonblocking mode so cancellation/shutdown can be
-        // observed promptly even when no clients are connecting.
-        let _ = listener.set_nonblocking(true);
-
-        info!(target: targets::SERVER, "HTTP server listening on {}", addr);
-
-        // Extract http_config paths before wrapping self in Arc.
-        let mcp_path = self.http_config.handler_config.base_path.clone();
-        let health_path = self.http_config.health_path.clone();
-        let max_connections = self.http_config.max_connections;
-
-        // Set up per-server state shared across connections.
-        let session = Arc::new(Mutex::new(Session::new(
-            self.info.clone(),
-            self.capabilities.clone(),
-        )));
-
-        // Notification sender — for HTTP we log notifications since there is no
-        // persistent outbound channel per connection.
-        let notification_sender: NotificationSender = Arc::new(|request: JsonRpcRequest| {
-            log::debug!(
-                target: targets::SERVER,
-                "HTTP notification (not deliverable to client): {}",
-                request.method
-            );
-        });
-
-        // Track connection opened.
-        if let Some(ref stats) = self.stats {
-            stats.connection_opened();
-        }
-
-        // Render startup banner (with HTTP transport name).
-        if self.console_config.show_banner && !banner_suppressed() {
-            self.render_http_startup_banner(&addr);
-        }
-
-        // Run startup hook.
-        if !self.run_startup_hook() {
-            error!(target: targets::SERVER, "Startup hook failed");
-            if returning {
-                self.graceful_shutdown_returning();
-                return;
-            }
-            self.graceful_shutdown(1);
-        }
-
-        // Preserve the request policy configured on this server. Constructing a
-        // default handler here would silently discard CORS, body-size, and
-        // base-path policy supplied through `HttpServerConfig`.
-        let http_handler = Arc::new(self.configured_http_request_handler());
-
-        // Traffic renderer.
-        let traffic_renderer = Arc::new(self.configured_traffic_renderer());
-
-        // Wrap self in Arc for sharing across connection handler threads.
-        let server = Arc::new(self);
-
-        // Active connection counter for max_connections enforcement.
-        let active_connections = Arc::new(AtomicUsize::new(0));
-
-        // Accept loop — each connection is handled in its own thread.
-        loop {
-            if cx.checkpoint().is_err() {
-                info!(target: targets::SERVER, "Cancellation requested, shutting down HTTP server");
-                if returning {
-                    server.graceful_shutdown_returning();
-                    return;
-                }
-                server.graceful_shutdown(0);
-            }
-
-            let (stream, peer_addr) = match listener.accept() {
-                Ok(pair) => pair,
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Non-blocking timeout — check cancellation and retry.
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-                Err(e) => {
-                    error!(target: targets::TRANSPORT, "Failed to accept connection: {}", e);
-                    continue;
-                }
-            };
-
-            // Enforce max_connections.
-            let current = active_connections.load(Ordering::Relaxed);
-            if current >= max_connections {
-                debug!(
-                    target: targets::TRANSPORT,
-                    "Rejecting connection from {} (max_connections {} reached)",
-                    peer_addr,
-                    max_connections
-                );
-                // Write a 503 Service Unavailable and close.
-                if let Ok(reader_stream) = stream.try_clone() {
-                    let mut http_transport =
-                        HttpTransport::new(BufReader::new(reader_stream), BufWriter::new(stream));
-                    let _ = http_transport.write_response(
-                        &HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE)
-                            .with_json(&serde_json::json!({"error": "too many connections"})),
-                    );
-                }
-                continue;
-            }
-
-            debug!(
-                target: targets::TRANSPORT,
-                "Accepted HTTP connection from {}",
-                peer_addr
-            );
-
-            // The listener is nonblocking so the accepted socket may inherit
-            // that mode on some platforms; force blocking reads for
-            // HttpTransport's request/response flow.
-            let _ = stream.set_nonblocking(false);
-
-            // Clone shared state for the connection handler thread.
-            let server = Arc::clone(&server);
-            let session = Arc::clone(&session);
-            let notification_sender = Arc::clone(&notification_sender);
-            let http_handler = Arc::clone(&http_handler);
-            let traffic_renderer = Arc::clone(&traffic_renderer);
-            let active_connections = Arc::clone(&active_connections);
-            let mcp_path = mcp_path.clone();
-            let health_path = health_path.clone();
-            let conn_cx = cx.clone();
-
-            // Increment active connection count.
-            active_connections.fetch_add(1, Ordering::Relaxed);
-
-            // Spawn a thread to handle this connection concurrently.
-            std::thread::spawn(move || {
-                // Ensure connection count is decremented when this thread exits.
-                struct ConnectionGuard(Arc<AtomicUsize>);
-                impl Drop for ConnectionGuard {
-                    fn drop(&mut self) {
-                        self.0.fetch_sub(1, Ordering::Relaxed);
-                    }
-                }
-                let _guard = ConnectionGuard(active_connections);
-
-                // Read the HTTP request from the connection.
-                let reader = BufReader::new(match stream.try_clone() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!(target: targets::TRANSPORT, "Failed to clone TCP stream: {}", e);
-                        return;
-                    }
-                });
-                let writer = BufWriter::new(stream);
-                let mut http_transport: HttpTransport<
-                    BufReader<std::net::TcpStream>,
-                    BufWriter<std::net::TcpStream>,
-                > = HttpTransport::new(reader, writer);
-                let request_sender = bidirectional::RequestSender::new(
-                    server.new_pending_requests_for_connection(),
-                    Arc::new(|_message| {
-                        Err("HTTP transport does not support server-to-client requests".into())
-                    }),
-                );
-
-                let http_request = match http_transport.read_request() {
-                    Ok(req) => req,
-                    Err(e) => {
-                        debug!(target: targets::TRANSPORT, "Failed to read HTTP request: {}", e);
-                        return;
-                    }
-                };
-
-                // Route by path and method.
-                let response = if http_request.path == health_path
-                    && http_request.method == HttpMethod::Get
-                {
-                    // Health-check endpoint.
-                    HttpResponse::ok().with_json(&serde_json::json!({"status": "ok"}))
-                } else if http_request.path == mcp_path
-                    && http_request.method == HttpMethod::Options
-                {
-                    // CORS preflight.
-                    http_handler.handle_options(&http_request)
-                } else if http_request.path == mcp_path && http_request.method == HttpMethod::Post {
-                    // MCP JSON-RPC handler.
-                    server.handle_http_mcp_request(
-                        &conn_cx,
-                        &session,
-                        &http_handler,
-                        &http_request,
-                        &notification_sender,
-                        &request_sender,
-                        &traffic_renderer,
-                    )
-                } else {
-                    // 404 for anything else.
-                    HttpResponse::new(HttpStatus::NOT_FOUND)
-                        .with_json(&serde_json::json!({"error": "not found"}))
-                };
-
-                // Write the response.
-                if let Err(e) = http_transport.write_response(&response) {
-                    debug!(target: targets::TRANSPORT, "Failed to write HTTP response: {}", e);
-                }
-            });
-        }
-    }
-
-    /// Processes a single MCP JSON-RPC request received over HTTP.
-    fn handle_http_mcp_request(
-        &self,
-        cx: &Cx,
-        session: &Arc<Mutex<Session>>,
-        http_handler: &HttpRequestHandler,
-        http_request: &HttpRequest,
-        notification_sender: &NotificationSender,
-        request_sender: &bidirectional::RequestSender,
-        traffic_renderer: &Option<RequestResponseRenderer>,
-    ) -> HttpResponse {
-        // Parse the JSON-RPC request from the HTTP body.
-        let json_rpc = match http_handler.parse_request(http_request) {
-            Ok(r) => r,
-            Err(e) => {
-                debug!(target: targets::TRANSPORT, "Invalid MCP request: {}", e);
-                let status = match &e {
-                    fastmcp_transport::http::HttpError::InvalidPath(_) => HttpStatus::NOT_FOUND,
-                    fastmcp_transport::http::HttpError::OriginNotAllowed(_) => {
-                        HttpStatus::FORBIDDEN
-                    }
-                    _ => HttpStatus::BAD_REQUEST,
-                };
-                return http_handler.error_response(status, &format!("Invalid request: {e}"));
-            }
-        };
-
-        // Log request traffic.
-        if let Some(renderer) = traffic_renderer {
-            renderer.render_request(&json_rpc, &self.console);
-        }
-
-        // Track bytes received.
-        if let Some(ref stats) = self.stats {
-            if let Ok(json) = serde_json::to_string(&json_rpc) {
-                stats.add_bytes_received(json.len() as u64 + 1);
-            }
-        }
-
-        let start_time = Instant::now();
-
-        // Advisory annotations cannot prove that a handler is free of session
-        // mutations or nested calls. Serialize the full request until a
-        // framework-enforced read-only context exists.
-        let response_opt = {
-            let mut session_guard = lock_http_session(session);
-            self.handle_request_with_transport_authorization(
-                cx,
-                &mut session_guard,
-                json_rpc,
-                http_request.authorization(),
-                notification_sender,
-                request_sender,
-            )
-        };
-
-        let duration = start_time.elapsed();
-
-        match response_opt {
-            Some(json_rpc_response) => {
-                // Log response traffic.
-                if let Some(renderer) = traffic_renderer {
-                    renderer.render_response(&json_rpc_response, Some(duration), &self.console);
-                }
-
-                // Track bytes sent.
-                if let Some(ref stats) = self.stats {
-                    if let Ok(json) = serde_json::to_string(&json_rpc_response) {
-                        stats.add_bytes_sent(json.len() as u64 + 1);
-                    }
-                }
-
-                let origin = http_request.header("origin");
-                http_handler.create_response(&json_rpc_response, origin)
-            }
-            None => {
-                // Notification (no response expected) — return 202 Accepted.
-                HttpResponse::new(HttpStatus::ACCEPTED)
-            }
-        }
-    }
-
-    /// Renders the HTTP-specific startup banner.
-    fn render_http_startup_banner(&self, addr: &str) {
-        let render = || {
-            let transport_label = format!("http://{addr}");
-            let mut banner = StartupBanner::new(&self.info.name, &self.info.version)
-                .tools(self.router.tools_count())
-                .resources(self.router.resources_count())
-                .prompts(self.router.prompts_count())
-                .transport(&transport_label)
-                .show_capabilities(self.console_config.show_capabilities);
-
-            if let Some(desc) = self.instructions.as_deref().filter(|d| !d.is_empty()) {
-                banner = banner.description(desc);
-            }
-
-            match self.console_config.banner_style {
-                BannerStyle::Full => banner.render(&self.console),
-                BannerStyle::Compact => {
-                    banner.no_logo().render(&self.console);
-                }
-                BannerStyle::Minimal => banner.minimal().render(&self.console),
-                BannerStyle::None => {}
-            }
-        };
-
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(render)).is_err() {
-            self.console
-                .print_plain("Warning: startup banner rendering failed");
-        }
     }
 
     /// Runs the startup lifecycle hook, if configured.
@@ -18607,7 +18123,7 @@ impl Server {
     }
 
     /// Handles a single JSON-RPC request.
-    fn handle_request(
+    async fn handle_request(
         &self,
         cx: &Cx,
         session: &mut Session,
@@ -18624,11 +18140,12 @@ impl Server {
             None,
             None,
         )
+        .await
         .map(|handled| handled.finalize_for_return(session))
     }
 
     /// Handles a request with transport-private authorization metadata.
-    fn handle_request_with_transport_authorization(
+    async fn handle_request_with_transport_authorization(
         &self,
         cx: &Cx,
         session: &mut Session,
@@ -18646,30 +18163,11 @@ impl Server {
             None,
             transport_authorization,
         )
+        .await
         .map(|handled| handled.finalize_for_return(session))
     }
 
-    fn handle_request_from_dispatch_queue(
-        &self,
-        cx: &Cx,
-        session: &mut Session,
-        request: JsonRpcRequest,
-        notification_sender: &NotificationSender,
-        request_sender: &bidirectional::RequestSender,
-        queue_state: &DispatchQueueState,
-    ) -> Option<HandledRequest> {
-        self.handle_request_internal(
-            cx,
-            session,
-            request,
-            notification_sender,
-            request_sender,
-            Some(queue_state),
-            None,
-        )
-    }
-
-    fn handle_request_internal(
+    async fn handle_request_internal(
         &self,
         cx: &Cx,
         session: &mut Session,
@@ -18812,18 +18310,20 @@ impl Server {
 
         // Dispatch based on method, passing the budget, notification sender, and request sender
         let mut session_mutation_rollback = None;
-        let mut result = self.dispatch_method(
-            &request_cx,
-            session,
-            request,
-            request_id,
-            &request_cancellation,
-            &budget,
-            notification_sender,
-            request_sender,
-            &mut session_mutation_rollback,
-            transport_authorization,
-        );
+        let mut result = self
+            .dispatch_method(
+                &request_cx,
+                session,
+                request,
+                request_id,
+                &request_cancellation,
+                &budget,
+                notification_sender,
+                request_sender,
+                &mut session_mutation_rollback,
+                transport_authorization,
+            )
+            .await;
         result = Self::enforce_post_dispatch_liveness(
             &request_cancellation,
             &request_cx,
@@ -18908,157 +18408,6 @@ impl Server {
             .suppress_cancelled_response()
             .with_deferred_stats(deferred_stats),
         )
-    }
-
-    fn handle_request_with_view(
-        &self,
-        cx: &Cx,
-        session: &SessionView,
-        request: JsonRpcRequest,
-        notification_sender: &NotificationSender,
-        request_sender: &bidirectional::RequestSender,
-    ) -> Option<JsonRpcResponse> {
-        let id = request.id.clone();
-        let method = request.method.clone();
-        let is_notification = id.is_none();
-
-        let start_time = Instant::now();
-        if !is_notification && is_notification_only_method(&method) {
-            if let Some(ref stats) = self.stats {
-                stats.record_request(&method, start_time.elapsed(), false);
-            }
-            return Some(JsonRpcResponse::error(
-                id,
-                JsonRpcError {
-                    code: McpErrorCode::InvalidRequest.into(),
-                    message: "MCP notification method must not carry a request id".to_string(),
-                    data: None,
-                },
-            ));
-        }
-        if is_notification && is_request_only_method(&method) {
-            if let Some(ref stats) = self.stats {
-                stats.record_request(&method, start_time.elapsed(), false);
-            }
-            return None;
-        }
-        let request_id = request_id_to_u64(id.as_ref());
-        let budget = self.create_request_budget(cx);
-
-        if let Some(error) = Self::request_budget_error(cx, budget) {
-            if let Some(ref stats) = self.stats {
-                stats.record_request(&method, start_time.elapsed(), false);
-            }
-            let response_id = id.clone()?;
-            return Some(JsonRpcResponse::error(
-                Some(response_id),
-                JsonRpcError {
-                    code: error.code.into(),
-                    message: error.message,
-                    data: error.data,
-                },
-            ));
-        }
-
-        let request_cx = cx.clone();
-
-        let active_guard = match id.clone() {
-            Some(request_id) => {
-                match ActiveRequestGuard::try_new(
-                    Arc::clone(&self.active_requests),
-                    session.id,
-                    request_id.clone(),
-                    request_cx.clone(),
-                ) {
-                    Ok(guard) => Some(guard),
-                    Err(_duplicate_id) => {
-                        if let Some(ref stats) = self.stats {
-                            stats.record_request(&method, start_time.elapsed(), false);
-                        }
-                        let message = "Request id is already active; wait for the earlier request to finish before reusing it".to_string();
-                        return Some(JsonRpcResponse::error(
-                            Some(request_id),
-                            JsonRpcError {
-                                code: McpErrorCode::InvalidRequest.into(),
-                                message,
-                                data: None,
-                            },
-                        ));
-                    }
-                }
-            }
-            None => None,
-        };
-        let request_cancellation = active_guard.as_ref().map_or_else(
-            McpRequestCancellation::new,
-            ActiveRequestGuard::cancellation,
-        );
-
-        let mut result = self.dispatch_read_only_http_method(
-            &request_cx,
-            session,
-            request,
-            request_id,
-            &request_cancellation,
-            &budget,
-            notification_sender,
-            request_sender,
-        );
-        result = Self::enforce_post_dispatch_liveness(
-            &request_cancellation,
-            &request_cx,
-            budget,
-            result,
-        );
-
-        let latency = start_time.elapsed();
-        if let Some(ref stats) = self.stats {
-            match &result {
-                Ok(_) => stats.record_request(&method, latency, true),
-                Err(e) if e.code == fastmcp_core::McpErrorCode::RequestCancelled => {
-                    stats.record_cancelled(&method, latency);
-                }
-                Err(_) => stats.record_request(&method, latency, false),
-            }
-        }
-
-        if is_notification {
-            if let Err(e) = result {
-                fastmcp_core::logging::error!(
-                    target: targets::HANDLER,
-                    "Notification method={} failed with code={:?}",
-                    safe_peer_log_key(&method),
-                    e.code
-                );
-            }
-            return None;
-        }
-
-        let response_id = id.clone()?;
-
-        match result {
-            Ok(value) => Some(JsonRpcResponse::success(response_id, value)),
-            Err(e) => {
-                if self.mask_error_details && e.is_internal() {
-                    fastmcp_core::logging::error!(
-                        target: targets::HANDLER,
-                        "Request method={} failed with masked internal code={:?}",
-                        safe_peer_log_key(&method),
-                        e.code
-                    );
-                }
-
-                let masked = mask_peer_error(e, self.mask_error_details);
-                Some(JsonRpcResponse::error(
-                    id,
-                    JsonRpcError {
-                        code: masked.code.into(),
-                        message: masked.message,
-                        data: masked.data,
-                    },
-                ))
-            }
-        }
     }
 
     /// Creates a budget for a new request based on server configuration.
@@ -19286,7 +18635,7 @@ impl Server {
 
     /// Dispatches a request to the appropriate handler.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    fn dispatch_method(
+    async fn dispatch_method(
         &self,
         cx: &Cx,
         session: &mut Session,
@@ -19488,7 +18837,7 @@ impl Server {
         //
         // Without this, `?` would early-return from `dispatch_method` and bypass middleware error
         // rewriting, contradicting the ordering semantics documented in `middleware.rs`.
-        let result: Result<serde_json::Value, McpError> = (|| {
+        let result: Result<serde_json::Value, McpError> = async {
             Self::enforce_request_context(&mw_ctx)?;
             let method = &request.method;
             let params = request.params.clone();
@@ -19542,13 +18891,16 @@ impl Server {
                 }
                 "tools/call" => {
                     let params: CallToolParams = parse_params(params)?;
-                    let result = self.router.handle_tools_call(
-                        &mw_ctx,
-                        params,
-                        session.state().clone(),
-                        Some(notification_sender),
-                        bidirectional_senders.as_ref(),
-                    )?;
+                    let result = self
+                        .router
+                        .handle_tools_call(
+                            &mw_ctx,
+                            params,
+                            session.state().clone(),
+                            Some(notification_sender),
+                            bidirectional_senders.as_ref(),
+                        )
+                        .await?;
                     Ok(serde_json::to_value(result).map_err(McpError::from)?)
                 }
                 "resources/list" => {
@@ -19571,13 +18923,16 @@ impl Server {
                 }
                 "resources/read" => {
                     let params: ReadResourceParams = parse_params(params)?;
-                    let result = self.router.handle_resources_read(
-                        &mw_ctx,
-                        &params,
-                        session.state().clone(),
-                        Some(notification_sender),
-                        bidirectional_senders.as_ref(),
-                    )?;
+                    let result = self
+                        .router
+                        .handle_resources_read(
+                            &mw_ctx,
+                            &params,
+                            session.state().clone(),
+                            Some(notification_sender),
+                            bidirectional_senders.as_ref(),
+                        )
+                        .await?;
                     Ok(serde_json::to_value(result).map_err(McpError::from)?)
                 }
                 "resources/subscribe" => {
@@ -19638,23 +18993,31 @@ impl Server {
                 }
                 "prompts/get" => {
                     let params: GetPromptParams = parse_params(params)?;
-                    let result = self.router.handle_prompts_get(
-                        &mw_ctx,
-                        params,
-                        session.state().clone(),
-                        Some(notification_sender),
-                        bidirectional_senders.as_ref(),
-                    )?;
+                    let result = self
+                        .router
+                        .handle_prompts_get(
+                            &mw_ctx,
+                            params,
+                            session.state().clone(),
+                            Some(notification_sender),
+                            bidirectional_senders.as_ref(),
+                        )
+                        .await?;
                     Ok(serde_json::to_value(result).map_err(McpError::from)?)
                 }
                 "ping" => {
                     // Simple ping-pong for health checks
                     Ok(serde_json::json!({}))
                 }
-                "completion/complete" => self.router.dispatch_legacy_completion(&mw_ctx, &request),
+                "completion/complete" => {
+                    self.router
+                        .dispatch_legacy_completion(&mw_ctx, &request)
+                        .await
+                }
                 _ => Err(McpError::method_not_found(method)),
             }
-        })();
+        }
+        .await;
         let result = self.maybe_dispatch_extension_fallback(&mw_ctx, &request, result);
         let final_result = self.finalize_middleware_result(
             request_cancellation,
@@ -19672,272 +19035,6 @@ impl Server {
 
         self.maybe_emit_log_notification(
             session,
-            notification_sender,
-            &request.method,
-            &final_result,
-        );
-
-        final_result
-    }
-
-    fn dispatch_read_only_http_method(
-        &self,
-        cx: &Cx,
-        session: &SessionView,
-        mut request: JsonRpcRequest,
-        request_id: u64,
-        request_cancellation: &McpRequestCancellation,
-        budget: &Budget,
-        notification_sender: &NotificationSender,
-        request_sender: &bidirectional::RequestSender,
-    ) -> Result<serde_json::Value, McpError> {
-        let (mw_ctx, _request_lease_guard) = self.request_context(
-            cx,
-            request_id,
-            session.state.clone(),
-            request_cancellation.clone(),
-            *budget,
-        )?;
-        let mw_ctx = Self::attach_session_log_floor(mw_ctx, session.log_level);
-        let mut view_caps = ClientCapabilityInfo::new();
-        if session.supports_sampling {
-            view_caps = view_caps.with_sampling();
-        }
-        if session.supports_elicitation {
-            view_caps = view_caps.with_elicitation(true, false);
-        }
-        if session.supports_roots {
-            view_caps = view_caps.with_roots(false);
-        }
-        let mw_ctx = mw_ctx.with_client_capabilities(view_caps);
-        let mw_ctx = Self::attach_session_resource_subscriptions(
-            mw_ctx,
-            session.resource_subscriptions.iter().map(String::as_str),
-        );
-        if let Err(error) = Self::enforce_request_context(&mw_ctx) {
-            let result =
-                Self::enforce_post_dispatch_liveness(request_cancellation, cx, *budget, Err(error));
-            self.maybe_emit_log_notification_for_level(
-                session.log_level,
-                notification_sender,
-                &request.method,
-                &result,
-            );
-            return result;
-        }
-
-        // Preserve the same fail-closed invariant if this private legacy
-        // snapshot path is ever invoked directly.
-        if is_quarantined_task_rpc(&request.method) {
-            let result = Self::enforce_post_dispatch_liveness(
-                request_cancellation,
-                cx,
-                *budget,
-                Err(McpError::method_not_found(&request.method)),
-            );
-            self.maybe_emit_log_notification_for_level(
-                session.log_level,
-                notification_sender,
-                &request.method,
-                &result,
-            );
-            return result;
-        }
-
-        if !session.initialized && request.method != "initialize" && request.method != "ping" {
-            let result = Self::enforce_post_dispatch_liveness(
-                request_cancellation,
-                cx,
-                *budget,
-                Err(McpError::invalid_request(
-                    "Server not initialized. Client must send 'initialize' first.",
-                )),
-            );
-            self.maybe_emit_log_notification_for_level(
-                session.log_level,
-                notification_sender,
-                &request.method,
-                &result,
-            );
-            return result;
-        }
-
-        let auth_result = {
-            let auth_request = AuthRequest {
-                method: &request.method,
-                params: request.params.as_ref(),
-                transport_authorization: None,
-                request_id,
-            };
-            self.authenticate_request(&mw_ctx, auth_request)
-                .and_then(|fingerprint| {
-                    if session.principal_binding.bind_or_verify(fingerprint) {
-                        Self::enforce_request_context(&mw_ctx)
-                    } else {
-                        Err(McpError::new(
-                            McpErrorCode::ResourceForbidden,
-                            "Authenticated principal does not own this session",
-                        ))
-                    }
-                })
-        };
-        auth::strip_recognized_access_credentials(&mut request.params);
-        if let Err(err) = auth_result {
-            let err = Self::request_context_error(&mw_ctx).unwrap_or(err);
-            let err =
-                self.finalize_global_middleware_error(request_cancellation, &mw_ctx, &request, err);
-            let result = Err(err);
-            self.maybe_emit_log_notification_for_level(
-                session.log_level,
-                notification_sender,
-                &request.method,
-                &result,
-            );
-            return result;
-        }
-
-        let mut entered_middleware: Vec<&dyn crate::Middleware> = Vec::new();
-
-        for m in self.middleware.iter() {
-            if let Some(error) = Self::request_context_error(&mw_ctx) {
-                let result = self.finalize_middleware_result(
-                    request_cancellation,
-                    &entered_middleware,
-                    &mw_ctx,
-                    &request,
-                    Err(error),
-                );
-                self.maybe_emit_log_notification_for_level(
-                    session.log_level,
-                    notification_sender,
-                    &request.method,
-                    &result,
-                );
-                return result;
-            }
-            entered_middleware.push(m.as_ref());
-            let decision = match catch_extension_unwind(|| m.on_request(&mw_ctx, &request)) {
-                Ok(decision) => decision,
-                Err(_payload) => Err(extension_panic_error("middleware_on_request")),
-            };
-            if let Some(error) = Self::request_context_error(&mw_ctx) {
-                let result = self.finalize_middleware_result(
-                    request_cancellation,
-                    &entered_middleware,
-                    &mw_ctx,
-                    &request,
-                    Err(error),
-                );
-                self.maybe_emit_log_notification_for_level(
-                    session.log_level,
-                    notification_sender,
-                    &request.method,
-                    &result,
-                );
-                return result;
-            }
-            match decision {
-                Ok(crate::MiddlewareDecision::Continue) => {}
-                Ok(crate::MiddlewareDecision::Respond(v)) => {
-                    let short_circuit_result = if is_session_mutation(&request.method) {
-                        Err(McpError::internal_error(
-                            "Middleware cannot short-circuit session mutations",
-                        ))
-                    } else {
-                        Ok(v)
-                    };
-                    let result = self.finalize_middleware_result(
-                        request_cancellation,
-                        &entered_middleware,
-                        &mw_ctx,
-                        &request,
-                        short_circuit_result,
-                    );
-                    self.maybe_emit_log_notification_for_level(
-                        session.log_level,
-                        notification_sender,
-                        &request.method,
-                        &result,
-                    );
-                    return result;
-                }
-                Err(e) => {
-                    let result = self.finalize_middleware_result(
-                        request_cancellation,
-                        &entered_middleware,
-                        &mw_ctx,
-                        &request,
-                        Err(e),
-                    );
-                    self.maybe_emit_log_notification_for_level(
-                        session.log_level,
-                        notification_sender,
-                        &request.method,
-                        &result,
-                    );
-                    return result;
-                }
-            }
-        }
-
-        let result: Result<serde_json::Value, McpError> = (|| {
-            Self::enforce_request_context(&mw_ctx)?;
-            let method = &request.method;
-            let params = request.params.clone();
-            let bidirectional_senders = self.create_bidirectional_senders_from_view(
-                session,
-                request_sender,
-                request_cancellation,
-                &mw_ctx,
-            );
-
-            match method.as_str() {
-                "tools/call" => {
-                    let params: CallToolParams = parse_params(params)?;
-                    let result = self.router.handle_tools_call(
-                        &mw_ctx,
-                        params,
-                        session.state.clone(),
-                        Some(notification_sender),
-                        bidirectional_senders.as_ref(),
-                    )?;
-                    Ok(serde_json::to_value(result).map_err(McpError::from)?)
-                }
-                "resources/read" => {
-                    let params: ReadResourceParams = parse_params(params)?;
-                    let result = self.router.handle_resources_read(
-                        &mw_ctx,
-                        &params,
-                        session.state.clone(),
-                        Some(notification_sender),
-                        bidirectional_senders.as_ref(),
-                    )?;
-                    Ok(serde_json::to_value(result).map_err(McpError::from)?)
-                }
-                "prompts/get" => {
-                    let params: GetPromptParams = parse_params(params)?;
-                    let result = self.router.handle_prompts_get(
-                        &mw_ctx,
-                        params,
-                        session.state.clone(),
-                        Some(notification_sender),
-                        bidirectional_senders.as_ref(),
-                    )?;
-                    Ok(serde_json::to_value(result).map_err(McpError::from)?)
-                }
-                _ => Err(McpError::method_not_found(method)),
-            }
-        })();
-        let final_result = self.finalize_middleware_result(
-            request_cancellation,
-            &entered_middleware,
-            &mw_ctx,
-            &request,
-            result,
-        );
-
-        self.maybe_emit_log_notification_for_level(
-            session.log_level,
             notification_sender,
             &request.method,
             &final_result,
@@ -20106,23 +19203,6 @@ impl Server {
             session.supports_sampling(),
             session.supports_elicitation(),
             session.supports_roots(),
-            request_sender,
-            request_cancellation,
-            request_context,
-        )
-    }
-
-    fn create_bidirectional_senders_from_view(
-        &self,
-        session: &SessionView,
-        request_sender: &bidirectional::RequestSender,
-        request_cancellation: &McpRequestCancellation,
-        request_context: &McpContext,
-    ) -> Option<handler::BidirectionalSenders> {
-        self.create_bidirectional_senders_from_capabilities(
-            session.supports_sampling,
-            session.supports_elicitation,
-            session.supports_roots,
             request_sender,
             request_cancellation,
             request_context,
@@ -23780,9 +22860,6 @@ mod lib_unit_tests {
     #[derive(Debug, Default)]
     struct HttpOverlapControlState {
         enabled: bool,
-        target_session: Option<usize>,
-        lock_attempts: usize,
-        lock_contentions: usize,
         entries: usize,
         permits: usize,
     }
@@ -23794,33 +22871,12 @@ mod lib_unit_tests {
     }
 
     impl HttpOverlapControl {
-        fn begin(&self, target_session: usize) -> HttpOverlapControlGuard<'_> {
+        fn begin(&self) -> HttpOverlapControlGuard<'_> {
             let mut state = self.state.lock().expect("HTTP overlap control poisoned");
             state.enabled = true;
-            state.target_session = Some(target_session);
-            state.lock_attempts = 0;
-            state.lock_contentions = 0;
             state.entries = 0;
             state.permits = 0;
             HttpOverlapControlGuard { control: self }
-        }
-
-        fn record_lock_attempt(&self, session: usize) -> bool {
-            let mut state = self.state.lock().expect("HTTP overlap control poisoned");
-            if !state.enabled || state.target_session != Some(session) {
-                return false;
-            }
-            state.lock_attempts += 1;
-            self.changed.notify_all();
-            true
-        }
-
-        fn record_lock_contention(&self, session: usize) {
-            let mut state = self.state.lock().expect("HTTP overlap control poisoned");
-            if state.enabled && state.target_session == Some(session) {
-                state.lock_contentions += 1;
-                self.changed.notify_all();
-            }
         }
 
         fn enter_and_wait(&self) {
@@ -23848,24 +22904,6 @@ mod lib_unit_tests {
             state.entries >= target
         }
 
-        fn wait_for_lock_attempts(&self, target: usize, timeout: Duration) -> bool {
-            let state = self.state.lock().expect("HTTP overlap control poisoned");
-            let (state, _) = self
-                .changed
-                .wait_timeout_while(state, timeout, |state| state.lock_attempts < target)
-                .expect("HTTP overlap control poisoned while observing lock attempts");
-            state.lock_attempts >= target
-        }
-
-        fn wait_for_lock_contentions(&self, target: usize, timeout: Duration) -> bool {
-            let state = self.state.lock().expect("HTTP overlap control poisoned");
-            let (state, _) = self
-                .changed
-                .wait_timeout_while(state, timeout, |state| state.lock_contentions < target)
-                .expect("HTTP overlap control poisoned while observing lock contention");
-            state.lock_contentions >= target
-        }
-
         fn release_one(&self) {
             let mut state = self.state.lock().expect("HTTP overlap control poisoned");
             state.permits = state.permits.saturating_add(1);
@@ -23875,7 +22913,6 @@ mod lib_unit_tests {
         fn disable(&self) {
             let mut state = self.state.lock().expect("HTTP overlap control poisoned");
             state.enabled = false;
-            state.target_session = None;
             state.permits = 0;
             self.changed.notify_all();
         }
@@ -23891,44 +22928,6 @@ mod lib_unit_tests {
         }
     }
 
-    type HttpOverlapWorker = thread::JoinHandle<Result<(), String>>;
-    type HttpOverlapWorkerResult = thread::Result<Result<(), String>>;
-
-    struct HttpOverlapWorkers<'a> {
-        control: &'a HttpOverlapControl,
-        handles: Vec<HttpOverlapWorker>,
-    }
-
-    impl<'a> HttpOverlapWorkers<'a> {
-        fn new(control: &'a HttpOverlapControl) -> Self {
-            Self {
-                control,
-                handles: Vec::new(),
-            }
-        }
-
-        fn push(&mut self, handle: HttpOverlapWorker) {
-            self.handles.push(handle);
-        }
-
-        fn join_all(mut self) -> Vec<HttpOverlapWorkerResult> {
-            self.control.disable();
-            self.handles
-                .drain(..)
-                .map(thread::JoinHandle::join)
-                .collect()
-        }
-    }
-
-    impl Drop for HttpOverlapWorkers<'_> {
-        fn drop(&mut self) {
-            self.control.disable();
-            for handle in self.handles.drain(..) {
-                let _ = handle.join();
-            }
-        }
-    }
-
     fn http_overlap_metrics() -> &'static HttpOverlapMetrics {
         HTTP_OVERLAP_METRICS.get_or_init(HttpOverlapMetrics::default)
     }
@@ -23939,14 +22938,6 @@ mod lib_unit_tests {
 
     fn http_overlap_control() -> &'static HttpOverlapControl {
         HTTP_OVERLAP_CONTROL.get_or_init(HttpOverlapControl::default)
-    }
-
-    pub(super) fn record_http_session_lock_attempt(session: usize) -> bool {
-        http_overlap_control().record_lock_attempt(session)
-    }
-
-    pub(super) fn record_http_session_lock_contention(session: usize) {
-        http_overlap_control().record_lock_contention(session);
     }
 
     pub(super) fn record_live_http_listener_wait() {
@@ -24500,13 +23491,6 @@ mod lib_unit_tests {
         RequestSender::new(pending, send_fn)
     }
 
-    fn http_json_request(method: &str, params: serde_json::Value, id: i64) -> HttpRequest {
-        let request = JsonRpcRequest::new(method, Some(params), id);
-        HttpRequest::new(HttpMethod::Post, "/mcp/v1")
-            .with_header("content-type", "application/json")
-            .with_body(serde_json::to_vec(&request).expect("serialize JSON-RPC request"))
-    }
-
     fn fixed_test_subject_for_credential(token: &str) -> McpResult<&'static str> {
         match token {
             "alpha" => Ok("principal-alpha"),
@@ -24579,15 +23563,14 @@ mod lib_unit_tests {
     ) -> JsonRpcResponse {
         let notification_sender: NotificationSender = Arc::new(|_| {});
         let request_sender = test_request_sender();
-        server
-            .dispatch_request(
-                &Cx::for_testing(),
-                session,
-                JsonRpcRequest::new(method, Some(serde_json::json!({})), 1_i64),
-                &notification_sender,
-                &request_sender,
-            )
-            .expect("test request should produce a JSON-RPC response")
+        block_on(server.dispatch_request(
+            &Cx::for_testing(),
+            session,
+            JsonRpcRequest::new(method, Some(serde_json::json!({})), 1_i64),
+            &notification_sender,
+            &request_sender,
+        ))
+        .expect("test request should produce a JSON-RPC response")
     }
 
     #[cfg(feature = "tasks")]
@@ -25138,19 +24121,18 @@ mod lib_unit_tests {
         let notification_sender: NotificationSender = Arc::new(|_| {});
         let request_sender = test_request_sender();
 
-        let response = server
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut session,
-                JsonRpcRequest::new(
-                    "tasks/get",
-                    Some(serde_json::json!({ "value": 41 })),
-                    71_i64,
-                ),
-                &notification_sender,
-                &request_sender,
-            )
-            .expect("legacy request must have a response");
+        let response = block_on(server.dispatch_request(
+            &Cx::for_testing(),
+            &mut session,
+            JsonRpcRequest::new(
+                "tasks/get",
+                Some(serde_json::json!({ "value": 41 })),
+                71_i64,
+            ),
+            &notification_sender,
+            &request_sender,
+        ))
+        .expect("legacy request must have a response");
         let error = response
             .error
             .expect("legacy request must not reach the extension handler");
@@ -27656,19 +26638,18 @@ mod lib_unit_tests {
 
         let mut session = initialized_test_session(&server);
         let notification_sender: NotificationSender = Arc::new(|_| {});
-        let session_get = server
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut session,
-                JsonRpcRequest::new(
-                    fastmcp_protocol::TASK_GET,
-                    Some(final_tasks_get_params(&task_id, serde_json::json!({}))),
-                    72_i64,
-                ),
-                &notification_sender,
-                &test_request_sender(),
-            )
-            .expect("session tasks/get must produce a JSON-RPC response");
+        let session_get = block_on(server.dispatch_request(
+            &Cx::for_testing(),
+            &mut session,
+            JsonRpcRequest::new(
+                fastmcp_protocol::TASK_GET,
+                Some(final_tasks_get_params(&task_id, serde_json::json!({}))),
+                72_i64,
+            ),
+            &notification_sender,
+            &test_request_sender(),
+        ))
+        .expect("session tasks/get must produce a JSON-RPC response");
         assert_eq!(
             session_get.result.as_ref().map(|result| &result["taskId"]),
             Some(&serde_json::json!(task_id.as_str())),
@@ -27676,19 +26657,18 @@ mod lib_unit_tests {
         );
         let missing = fastmcp_protocol::FinalTaskId::parse("missing-task-id-0001")
             .expect("planted missing task id");
-        let session_missing = server
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut session,
-                JsonRpcRequest::new(
-                    fastmcp_protocol::TASK_GET,
-                    Some(final_tasks_get_params(&missing, serde_json::json!({}))),
-                    73_i64,
-                ),
-                &notification_sender,
-                &test_request_sender(),
-            )
-            .expect("session tasks/get of an unknown id must respond");
+        let session_missing = block_on(server.dispatch_request(
+            &Cx::for_testing(),
+            &mut session,
+            JsonRpcRequest::new(
+                fastmcp_protocol::TASK_GET,
+                Some(final_tasks_get_params(&missing, serde_json::json!({}))),
+                73_i64,
+            ),
+            &notification_sender,
+            &test_request_sender(),
+        ))
+        .expect("session tasks/get of an unknown id must respond");
         let missing_error = session_missing
             .error
             .as_ref()
@@ -27780,19 +26760,18 @@ mod lib_unit_tests {
 
         let mut session = initialized_test_session(&server);
         let notification_sender: NotificationSender = Arc::new(|_| {});
-        let session_get = server
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut session,
-                JsonRpcRequest::new(
-                    fastmcp_protocol::TASK_GET,
-                    Some(final_tasks_get_params(&task_id, serde_json::json!({}))),
-                    80_i64,
-                ),
-                &notification_sender,
-                &test_request_sender(),
-            )
-            .expect("default session tasks/get must produce a JSON-RPC response");
+        let session_get = block_on(server.dispatch_request(
+            &Cx::for_testing(),
+            &mut session,
+            JsonRpcRequest::new(
+                fastmcp_protocol::TASK_GET,
+                Some(final_tasks_get_params(&task_id, serde_json::json!({}))),
+                80_i64,
+            ),
+            &notification_sender,
+            &test_request_sender(),
+        ))
+        .expect("default session tasks/get must produce a JSON-RPC response");
         assert_eq!(
             session_get.result.as_ref().map(|result| &result["taskId"]),
             Some(&serde_json::json!(task_id.as_str())),
@@ -27801,19 +26780,18 @@ mod lib_unit_tests {
 
         let missing = fastmcp_protocol::FinalTaskId::parse("missing-default-task-0001")
             .expect("planted missing task id");
-        let session_missing = server
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut session,
-                JsonRpcRequest::new(
-                    fastmcp_protocol::TASK_GET,
-                    Some(final_tasks_get_params(&missing, serde_json::json!({}))),
-                    81_i64,
-                ),
-                &notification_sender,
-                &test_request_sender(),
-            )
-            .expect("unknown default-runtime task id must still be a Tasks response");
+        let session_missing = block_on(server.dispatch_request(
+            &Cx::for_testing(),
+            &mut session,
+            JsonRpcRequest::new(
+                fastmcp_protocol::TASK_GET,
+                Some(final_tasks_get_params(&missing, serde_json::json!({}))),
+                81_i64,
+            ),
+            &notification_sender,
+            &test_request_sender(),
+        ))
+        .expect("unknown default-runtime task id must still be a Tasks response");
         let missing_error = session_missing
             .error
             .as_ref()
@@ -27849,22 +26827,21 @@ mod lib_unit_tests {
             .build();
         let mut session = initialized_test_session(&server);
         let notification_sender: NotificationSender = Arc::new(|_| {});
-        let response = server
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut session,
-                JsonRpcRequest::new(
-                    "completion/complete",
-                    Some(serde_json::json!({
-                        "ref": {"type": "ref/prompt", "name": "deploy"},
-                        "argument": {"name": "environment", "value": "sta"},
-                    })),
-                    90_i64,
-                ),
-                &notification_sender,
-                &test_request_sender(),
-            )
-            .expect("session completion/complete must produce a JSON-RPC response");
+        let response = block_on(server.dispatch_request(
+            &Cx::for_testing(),
+            &mut session,
+            JsonRpcRequest::new(
+                "completion/complete",
+                Some(serde_json::json!({
+                    "ref": {"type": "ref/prompt", "name": "deploy"},
+                    "argument": {"name": "environment", "value": "sta"},
+                })),
+                90_i64,
+            ),
+            &notification_sender,
+            &test_request_sender(),
+        ))
+        .expect("session completion/complete must produce a JSON-RPC response");
         let values = response
             .result
             .as_ref()
@@ -27875,22 +26852,21 @@ mod lib_unit_tests {
 
         let missing_handler = Server::new("session-completion-missing", "1.0.0").build();
         let mut missing_session = initialized_test_session(&missing_handler);
-        let missing = missing_handler
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut missing_session,
-                JsonRpcRequest::new(
-                    "completion/complete",
-                    Some(serde_json::json!({
-                        "ref": {"type": "ref/prompt", "name": "deploy"},
-                        "argument": {"name": "environment", "value": "sta"},
-                    })),
-                    91_i64,
-                ),
-                &notification_sender,
-                &test_request_sender(),
-            )
-            .expect("missing completion handler must still produce a JSON-RPC response");
+        let missing = block_on(missing_handler.dispatch_request(
+            &Cx::for_testing(),
+            &mut missing_session,
+            JsonRpcRequest::new(
+                "completion/complete",
+                Some(serde_json::json!({
+                    "ref": {"type": "ref/prompt", "name": "deploy"},
+                    "argument": {"name": "environment", "value": "sta"},
+                })),
+                91_i64,
+            ),
+            &notification_sender,
+            &test_request_sender(),
+        ))
+        .expect("missing completion handler must still produce a JSON-RPC response");
         let error = missing
             .error
             .as_ref()
@@ -27909,15 +26885,14 @@ mod lib_unit_tests {
             with_handler.capabilities().clone(),
         );
         let notification_sender: NotificationSender = Arc::new(|_| {});
-        let response = with_handler
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut session,
-                initialize_test_request(1, "client", ClientCapabilities::default()),
-                &notification_sender,
-                &test_request_sender(),
-            )
-            .expect("initialize must respond");
+        let response = block_on(with_handler.dispatch_request(
+            &Cx::for_testing(),
+            &mut session,
+            initialize_test_request(1, "client", ClientCapabilities::default()),
+            &notification_sender,
+            &test_request_sender(),
+        ))
+        .expect("initialize must respond");
         assert_eq!(
             response
                 .result
@@ -27939,15 +26914,14 @@ mod lib_unit_tests {
         assert!(server.capabilities().completions.is_some());
         let mut session = Session::new(server.info.clone(), server.capabilities().clone());
         let notification_sender: NotificationSender = Arc::new(|_| {});
-        let response = server
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut session,
-                initialize_test_request(1, "client", ClientCapabilities::default()),
-                &notification_sender,
-                &test_request_sender(),
-            )
-            .expect("initialize must respond");
+        let response = block_on(server.dispatch_request(
+            &Cx::for_testing(),
+            &mut session,
+            initialize_test_request(1, "client", ClientCapabilities::default()),
+            &notification_sender,
+            &test_request_sender(),
+        ))
+        .expect("initialize must respond");
         assert_eq!(
             response
                 .result
@@ -27968,22 +26942,21 @@ mod lib_unit_tests {
         );
 
         let mut session = initialized_test_session(&server);
-        let served = server
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut session,
-                JsonRpcRequest::new(
-                    "completion/complete",
-                    Some(serde_json::json!({
-                        "ref": {"type": "ref/prompt", "name": "deploy"},
-                        "argument": {"name": "environment", "value": "sta"},
-                    })),
-                    92_i64,
-                ),
-                &notification_sender,
-                &test_request_sender(),
-            )
-            .expect("session completion/complete must produce a JSON-RPC response");
+        let served = block_on(server.dispatch_request(
+            &Cx::for_testing(),
+            &mut session,
+            JsonRpcRequest::new(
+                "completion/complete",
+                Some(serde_json::json!({
+                    "ref": {"type": "ref/prompt", "name": "deploy"},
+                    "argument": {"name": "environment", "value": "sta"},
+                })),
+                92_i64,
+            ),
+            &notification_sender,
+            &test_request_sender(),
+        ))
+        .expect("session completion/complete must produce a JSON-RPC response");
         let values = served
             .result
             .as_ref()
@@ -28030,15 +27003,14 @@ mod lib_unit_tests {
         );
         let mut session = Session::new(server.info.clone(), server.capabilities().clone());
         let notification_sender: NotificationSender = Arc::new(|_| {});
-        let response = server
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut session,
-                initialize_test_request(1, "client", ClientCapabilities::default()),
-                &notification_sender,
-                &test_request_sender(),
-            )
-            .expect("initialize must respond");
+        let response = block_on(server.dispatch_request(
+            &Cx::for_testing(),
+            &mut session,
+            initialize_test_request(1, "client", ClientCapabilities::default()),
+            &notification_sender,
+            &test_request_sender(),
+        ))
+        .expect("initialize must respond");
         assert_eq!(
             response
                 .result
@@ -28049,19 +27021,18 @@ mod lib_unit_tests {
         );
 
         let mut session = initialized_test_session(&server);
-        let subscribed = server
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut session,
-                JsonRpcRequest::new(
-                    "resources/subscribe",
-                    Some(serde_json::json!({ "uri": "file:///subscribe.txt" })),
-                    93_i64,
-                ),
-                &notification_sender,
-                &test_request_sender(),
-            )
-            .expect("session resources/subscribe must produce a JSON-RPC response");
+        let subscribed = block_on(server.dispatch_request(
+            &Cx::for_testing(),
+            &mut session,
+            JsonRpcRequest::new(
+                "resources/subscribe",
+                Some(serde_json::json!({ "uri": "file:///subscribe.txt" })),
+                93_i64,
+            ),
+            &notification_sender,
+            &test_request_sender(),
+        ))
+        .expect("session resources/subscribe must produce a JSON-RPC response");
         assert!(
             subscribed.error.is_none(),
             "registered resource must be subscribable without resource_subscriptions(): {subscribed:?}"
@@ -28263,22 +27234,21 @@ mod lib_unit_tests {
 
         let mut legacy_session = initialized_test_session(&server);
         let notification_sender: NotificationSender = Arc::new(|_| {});
-        let legacy = server
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut legacy_session,
-                JsonRpcRequest::new(
-                    "tools/call",
-                    Some(serde_json::json!({
-                        "name": "durable_final_task",
-                        "arguments": {},
-                    })),
-                    81_i64,
-                ),
-                &notification_sender,
-                &test_request_sender(),
-            )
-            .expect("exact legacy tool call must respond through its original handler surface");
+        let legacy = block_on(server.dispatch_request(
+            &Cx::for_testing(),
+            &mut legacy_session,
+            JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "durable_final_task",
+                    "arguments": {},
+                })),
+                81_i64,
+            ),
+            &notification_sender,
+            &test_request_sender(),
+        ))
+        .expect("exact legacy tool call must respond through its original handler surface");
         assert!(legacy.error.is_none());
         assert_eq!(
             legacy
@@ -28473,19 +27443,18 @@ mod lib_unit_tests {
         let notification_sender: NotificationSender = Arc::new(|_| {});
         let request_sender = test_request_sender();
 
-        let response = server
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut session,
-                JsonRpcRequest::new(
-                    fastmcp_protocol::TASK_GET,
-                    Some(serde_json::json!({ "taskId": "legacy-task" })),
-                    71_i64,
-                ),
-                &notification_sender,
-                &request_sender,
-            )
-            .expect("legacy request must respond");
+        let response = block_on(server.dispatch_request(
+            &Cx::for_testing(),
+            &mut session,
+            JsonRpcRequest::new(
+                fastmcp_protocol::TASK_GET,
+                Some(serde_json::json!({ "taskId": "legacy-task" })),
+                71_i64,
+            ),
+            &notification_sender,
+            &request_sender,
+        ))
+        .expect("legacy request must respond");
         assert_eq!(
             response.error.map(|error| error.code),
             Some(i32::from(McpErrorCode::MethodNotFound).into())
@@ -28930,15 +27899,14 @@ mod lib_unit_tests {
                 ),
                 id,
             );
-            let response = server
-                .dispatch_request(
-                    &Cx::for_testing(),
-                    session,
-                    request,
-                    &notification_sender,
-                    &request_sender,
-                )
-                .expect("setLevel request must have a response");
+            let response = block_on(server.dispatch_request(
+                &Cx::for_testing(),
+                session,
+                request,
+                &notification_sender,
+                &request_sender,
+            ))
+            .expect("setLevel request must have a response");
             assert!(
                 response.error.is_none(),
                 "unexpected response: {response:?}"
@@ -28969,15 +27937,14 @@ mod lib_unit_tests {
             3_i64,
         );
 
-        let response = server
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut session,
-                request,
-                &notification_sender,
-                &request_sender,
-            )
-            .expect("setLevel request must have a response");
+        let response = block_on(server.dispatch_request(
+            &Cx::for_testing(),
+            &mut session,
+            request,
+            &notification_sender,
+            &request_sender,
+        ))
+        .expect("setLevel request must have a response");
 
         assert!(
             response.error.is_none(),
@@ -28997,15 +27964,14 @@ mod lib_unit_tests {
             Arc::new(|_| panic!("LOG-SENDER-PANIC-CANARY Bearer secret\r\nforged-line"));
         let request_sender = test_request_sender();
 
-        let response = server
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut session,
-                JsonRpcRequest::new("ping", Some(serde_json::json!({})), 77_i64),
-                &sender,
-                &request_sender,
-            )
-            .expect("ping must retain its response despite sender panic");
+        let response = block_on(server.dispatch_request(
+            &Cx::for_testing(),
+            &mut session,
+            JsonRpcRequest::new("ping", Some(serde_json::json!({})), 77_i64),
+            &sender,
+            &request_sender,
+        ))
+        .expect("ping must retain its response despite sender panic");
 
         assert!(
             response.error.is_none(),
@@ -29025,15 +27991,14 @@ mod lib_unit_tests {
             .build();
         let mut failing_session = initialized_test_session(&failing_server);
         failing_session.set_log_level(LogLevel::Debug);
-        let response = failing_server
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut failing_session,
-                JsonRpcRequest::new("tools/list", Some(serde_json::json!({})), 78_i64),
-                &sender,
-                &request_sender,
-            )
-            .expect("auth failure must retain its response despite sender panic");
+        let response = block_on(failing_server.dispatch_request(
+            &Cx::for_testing(),
+            &mut failing_session,
+            JsonRpcRequest::new("tools/list", Some(serde_json::json!({})), 78_i64),
+            &sender,
+            &request_sender,
+        ))
+        .expect("auth failure must retain its response despite sender panic");
         assert!(response.error.is_some());
         assert!(
             failing_server
@@ -29135,15 +28100,14 @@ mod lib_unit_tests {
         ];
         for (id, params) in cases {
             let request = JsonRpcRequest::new("tools/list", Some(params.clone()), id);
-            let response = server
-                .dispatch_request(
-                    &Cx::for_testing(),
-                    &mut session,
-                    request,
-                    &notification_sender,
-                    &request_sender,
-                )
-                .expect("authenticated tools/list must respond");
+            let response = block_on(server.dispatch_request(
+                &Cx::for_testing(),
+                &mut session,
+                request,
+                &notification_sender,
+                &request_sender,
+            ))
+            .expect("authenticated tools/list must respond");
             assert!(
                 response.error.is_none(),
                 "unexpected response for id {id}: {response:?}"
@@ -29285,64 +28249,60 @@ mod lib_unit_tests {
         let notification_sender: NotificationSender = Arc::new(|_| {});
         let request_sender = test_request_sender();
 
-        let initialize = server
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut session,
-                initialize_test_request(
-                    101,
-                    "authenticated-client",
-                    fastmcp_protocol::ClientCapabilities::default(),
-                ),
-                &notification_sender,
-                &request_sender,
-            )
-            .expect("initialize request must respond");
+        let initialize = block_on(server.dispatch_request(
+            &Cx::for_testing(),
+            &mut session,
+            initialize_test_request(
+                101,
+                "authenticated-client",
+                fastmcp_protocol::ClientCapabilities::default(),
+            ),
+            &notification_sender,
+            &request_sender,
+        ))
+        .expect("initialize request must respond");
         assert!(initialize.error.is_none());
 
         assert!(
-            server
-                .dispatch_request(
-                    &Cx::for_testing(),
-                    &mut session,
-                    JsonRpcRequest::notification("notifications/initialized", None),
-                    &notification_sender,
-                    &request_sender,
-                )
-                .is_none()
-        );
-
-        let ping = server
-            .dispatch_request(
+            block_on(server.dispatch_request(
                 &Cx::for_testing(),
                 &mut session,
-                JsonRpcRequest::new("ping", Some(serde_json::json!({})), 102_i64),
+                JsonRpcRequest::notification("notifications/initialized", None),
                 &notification_sender,
                 &request_sender,
-            )
-            .expect("ping request must respond");
+            ))
+            .is_none()
+        );
+
+        let ping = block_on(server.dispatch_request(
+            &Cx::for_testing(),
+            &mut session,
+            JsonRpcRequest::new("ping", Some(serde_json::json!({})), 102_i64),
+            &notification_sender,
+            &request_sender,
+        ))
+        .expect("ping request must respond");
         assert!(ping.error.is_none());
 
         assert!(
-            server
-                .dispatch_request(
-                    &Cx::for_testing(),
-                    &mut session,
-                    JsonRpcRequest::notification(
-                        "notifications/cancelled",
-                        Some(
-                            serde_json::to_value(CancelledParams {
-                                request_id: RequestId::Number(999),
-                                reason: None,
-                                meta: None,
-                            })
-                            .expect("serialize cancellation"),
-                        ),
+            block_on(server.dispatch_request(
+                &Cx::for_testing(),
+                &mut session,
+                JsonRpcRequest::notification(
+                    "notifications/cancelled",
+                    Some(
+                        serde_json::to_value(CancelledParams {
+                            request_id: RequestId::Number(999),
+                            reason: None,
+                            meta: None,
+                        })
+                        .expect("serialize cancellation"),
                     ),
-                    &notification_sender,
-                    &request_sender,
-                )
-                .is_none()
+                ),
+                &notification_sender,
+                &request_sender,
+            ))
+            .is_none()
         );
 
         assert_eq!(
@@ -29429,20 +28389,19 @@ mod lib_unit_tests {
         ];
 
         for (index, (native, params)) in cases.into_iter().enumerate() {
-            let response = server
-                .handle_request_with_transport_authorization(
-                    &Cx::for_testing(),
-                    &mut session,
-                    JsonRpcRequest::new(
-                        "tools/list",
-                        Some(params),
-                        i64::try_from(index + 1).expect("bounded test request ID"),
-                    ),
-                    native,
-                    &notification_sender,
-                    &request_sender,
-                )
-                .expect("request must receive an authentication error");
+            let response = block_on(server.handle_request_with_transport_authorization(
+                &Cx::for_testing(),
+                &mut session,
+                JsonRpcRequest::new(
+                    "tools/list",
+                    Some(params),
+                    i64::try_from(index + 1).expect("bounded test request ID"),
+                ),
+                native,
+                &notification_sender,
+                &request_sender,
+            ))
+            .expect("request must receive an authentication error");
             let error = response.error.expect("authentication must fail");
             assert_eq!(
                 error.code,
@@ -29533,19 +28492,18 @@ mod lib_unit_tests {
         let notification_sender: NotificationSender = Arc::new(|_| {});
         let request_sender = test_request_sender();
 
-        let response = server
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut session,
-                initialize_test_request(
-                    103,
-                    "unauthenticated-client",
-                    fastmcp_protocol::ClientCapabilities::default(),
-                ),
-                &notification_sender,
-                &request_sender,
-            )
-            .expect("initialize auth failure must respond");
+        let response = block_on(server.dispatch_request(
+            &Cx::for_testing(),
+            &mut session,
+            initialize_test_request(
+                103,
+                "unauthenticated-client",
+                fastmcp_protocol::ClientCapabilities::default(),
+            ),
+            &notification_sender,
+            &request_sender,
+        ))
+        .expect("initialize auth failure must respond");
 
         assert!(response.error.is_some());
         assert!(!session.is_initialized());
@@ -30545,24 +29503,23 @@ mod lib_unit_tests {
             "original-protocol".to_string(),
         );
         let notification_sender: NotificationSender = Arc::new(|_| {});
-        let response = server
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut session,
-                initialize_test_request(
-                    81,
-                    "replacement-client",
-                    fastmcp_protocol::ClientCapabilities {
-                        sampling: None,
-                        elicitation: Some(fastmcp_protocol::ElicitationCapability::form()),
-                        roots: None,
-                        ..Default::default()
-                    },
-                ),
-                &notification_sender,
-                &test_request_sender(),
-            )
-            .expect("initialize middleware failure must produce a response");
+        let response = block_on(server.dispatch_request(
+            &Cx::for_testing(),
+            &mut session,
+            initialize_test_request(
+                81,
+                "replacement-client",
+                fastmcp_protocol::ClientCapabilities {
+                    sampling: None,
+                    elicitation: Some(fastmcp_protocol::ElicitationCapability::form()),
+                    roots: None,
+                    ..Default::default()
+                },
+            ),
+            &notification_sender,
+            &test_request_sender(),
+        ))
+        .expect("initialize middleware failure must produce a response");
 
         assert!(response.error.is_some());
         assert!(session.is_initialized());
@@ -30581,21 +29538,20 @@ mod lib_unit_tests {
         let mut session = Session::new(server.info.clone(), server.capabilities.clone());
         let notification_sender: NotificationSender = Arc::new(|_| {});
         let request_sender = test_request_sender();
-        let handled = server
-            .handle_request_internal(
-                &Cx::for_testing(),
-                &mut session,
-                initialize_test_request(
-                    82,
-                    "cancelled-client",
-                    fastmcp_protocol::ClientCapabilities::default(),
-                ),
-                &notification_sender,
-                &request_sender,
-                None,
-                None,
-            )
-            .expect("initialize must produce a provisional response");
+        let handled = block_on(server.handle_request_internal(
+            &Cx::for_testing(),
+            &mut session,
+            initialize_test_request(
+                82,
+                "cancelled-client",
+                fastmcp_protocol::ClientCapabilities::default(),
+            ),
+            &notification_sender,
+            &request_sender,
+            None,
+            None,
+        ))
+        .expect("initialize must produce a provisional response");
         let cancellation = handled
             .cancellation
             .as_ref()
@@ -30625,21 +29581,20 @@ mod lib_unit_tests {
         let mut session = initialized_test_session(&server);
         let notification_sender: NotificationSender = Arc::new(|_| {});
         let request_sender = test_request_sender();
-        let handled = server
-            .handle_request_internal(
-                &Cx::for_testing(),
-                &mut session,
-                initialize_test_request(
-                    83,
-                    "unsent-replacement-client",
-                    fastmcp_protocol::ClientCapabilities::default(),
-                ),
-                &notification_sender,
-                &request_sender,
-                None,
-                None,
-            )
-            .expect("initialize must produce a provisional response");
+        let handled = block_on(server.handle_request_internal(
+            &Cx::for_testing(),
+            &mut session,
+            initialize_test_request(
+                83,
+                "unsent-replacement-client",
+                fastmcp_protocol::ClientCapabilities::default(),
+            ),
+            &notification_sender,
+            &request_sender,
+            None,
+            None,
+        ))
+        .expect("initialize must produce a provisional response");
 
         assert_eq!(
             session.client_info().map(|info| info.name.as_str()),
@@ -30682,17 +29637,16 @@ mod lib_unit_tests {
             ),
             84_i64,
         );
-        let handled = server
-            .handle_request_internal(
-                &Cx::for_testing(),
-                &mut session,
-                request,
-                &notification_sender,
-                &request_sender,
-                None,
-                None,
-            )
-            .expect("logging/setLevel must produce a provisional response");
+        let handled = block_on(server.handle_request_internal(
+            &Cx::for_testing(),
+            &mut session,
+            request,
+            &notification_sender,
+            &request_sender,
+            None,
+            None,
+        ))
+        .expect("logging/setLevel must produce a provisional response");
 
         assert_eq!(session.log_level(), Some(LogLevel::Debug));
         let error = handled
@@ -43335,7 +42289,7 @@ mod lib_unit_tests {
             .expect("live HTTP overlap test lock poisoned");
         reset_http_overlap_metrics();
         let control = http_overlap_control();
-        let _control_guard = control.begin(usize::MAX);
+        let _control_guard = control.begin();
 
         run_live_http_test(|cx| async move {
             let bound = Server::new("live-http-request-owned-dispatch", "1.0.0")
@@ -49888,128 +48842,7 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn http_advisory_read_only_tools_remain_session_serialized() {
-        let _guard = http_overlap_lock()
-            .lock()
-            .expect("http overlap test lock poisoned");
-        reset_http_overlap_metrics();
-
-        let server = Arc::new(
-            Server::new("http-test-server", "1.0.0")
-                .tool(HttpOverlapTool)
-                .build(),
-        );
-        let session = Arc::new(Mutex::new(Session::new(
-            server.info.clone(),
-            server.capabilities.clone(),
-        )));
-        session.lock().expect("session lock poisoned").initialize(
-            fastmcp_protocol::ClientInfo {
-                name: "http-test-client".to_string(),
-                version: "1.0.0".to_string(),
-            },
-            fastmcp_protocol::ClientCapabilities::default(),
-            "2024-11-05".to_string(),
-        );
-        let control = http_overlap_control();
-        let _control_guard = control.begin(Arc::as_ptr(&session).addr());
-
-        let http_handler = Arc::new(HttpRequestHandler::new());
-        let notification_sender: NotificationSender = Arc::new(|_| {});
-        let request_sender = test_request_sender();
-
-        let run_request = |id| {
-            let server = Arc::clone(&server);
-            let session = Arc::clone(&session);
-            let http_handler = Arc::clone(&http_handler);
-            let notification_sender = Arc::clone(&notification_sender);
-            let request_sender = request_sender.clone();
-            thread::spawn(move || -> Result<(), String> {
-                let cx = Cx::for_testing();
-                let request = http_json_request(
-                    "tools/call",
-                    serde_json::json!({
-                        "name": "http_overlap_tool",
-                        "arguments": {}
-                    }),
-                    id,
-                );
-                let traffic_renderer: Option<RequestResponseRenderer> = None;
-                let response = server.handle_http_mcp_request(
-                    &cx,
-                    &session,
-                    &http_handler,
-                    &request,
-                    &notification_sender,
-                    &request_sender,
-                    &traffic_renderer,
-                );
-                if response.status != HttpStatus::OK {
-                    return Err(format!(
-                        "unexpected HTTP status from overlap request: {:?}",
-                        response.status
-                    ));
-                }
-                let json: JsonRpcResponse = serde_json::from_slice(&response.body)
-                    .map_err(|error| format!("failed to parse HTTP JSON-RPC response: {error}"))?;
-                if let Some(error) = json.error {
-                    return Err(format!("unexpected JSON-RPC error response: {error:?}"));
-                }
-                Ok(())
-            })
-        };
-
-        let mut workers = HttpOverlapWorkers::new(control);
-        workers.push(run_request(1));
-        let first_entered = control.wait_for_entries(1, Duration::from_secs(2));
-
-        workers.push(run_request(2));
-        let both_reached_session_lock = control.wait_for_lock_attempts(2, Duration::from_secs(2));
-        let second_observed_contention =
-            control.wait_for_lock_contentions(1, Duration::from_secs(2));
-
-        control.release_one();
-        let second_entered_after_release = control.wait_for_entries(2, Duration::from_secs(2));
-        control.release_one();
-        // Always unblock the instrumentation and join both workers before any
-        // assertion can panic. This keeps a failing test from leaking request
-        // threads into later tests that share the process-global probe.
-        let mut results = workers.join_all().into_iter();
-        let first_result = results.next().expect("first HTTP worker result missing");
-        let second_result = results.next().expect("second HTTP worker result missing");
-
-        assert!(
-            first_entered,
-            "the first HTTP handler did not enter within the test deadline"
-        );
-        assert!(
-            both_reached_session_lock,
-            "both HTTP requests must reach the target session-lock boundary"
-        );
-        assert!(
-            second_observed_contention,
-            "the second HTTP request did not observe the held session lock"
-        );
-        assert!(
-            second_entered_after_release,
-            "the second HTTP handler did not enter after the first released the session"
-        );
-        first_result
-            .expect("first HTTP request thread panicked")
-            .expect("first HTTP request failed");
-        second_result
-            .expect("second HTTP request thread panicked")
-            .expect("second HTTP request failed");
-
-        let overlap = http_overlap_metrics().max.load(Ordering::SeqCst);
-        assert_eq!(
-            overlap, 1,
-            "advisory read-only metadata must not bypass session serialization"
-        );
-    }
-
-    #[test]
-    fn native_http_auth_binds_session_and_rejects_cross_principal_reuse() {
+    fn transport_auth_binds_session_and_rejects_cross_principal_reuse() {
         #[derive(Debug)]
         struct EchoAuthProvider;
 
@@ -50031,11 +48864,8 @@ mod lib_unit_tests {
             .auth_provider(EchoAuthProvider)
             .tool(HttpAuthEchoToolRuntime)
             .build();
-        let session = Arc::new(Mutex::new(Session::new(
-            server.info.clone(),
-            server.capabilities.clone(),
-        )));
-        session.lock().expect("session lock poisoned").initialize(
+        let mut session = Session::new(server.info.clone(), server.capabilities.clone());
+        session.initialize(
             fastmcp_protocol::ClientInfo {
                 name: "http-auth-test-client".to_string(),
                 version: "1.0.0".to_string(),
@@ -50044,33 +48874,27 @@ mod lib_unit_tests {
             "2024-11-05".to_string(),
         );
 
-        let http_handler = HttpRequestHandler::new();
         let notification_sender: NotificationSender = Arc::new(|_| {});
         let request_sender = test_request_sender();
 
-        let run_request = |id, token: &str| {
-            let request = http_json_request(
-                "tools/call",
-                serde_json::json!({
-                    "name": "http_auth_echo_tool_runtime",
-                    "arguments": {}
-                }),
-                id,
-            )
-            .with_header("Authorization", format!("Bearer {token}"));
-            let traffic_renderer: Option<RequestResponseRenderer> = None;
-            let response = server.handle_http_mcp_request(
+        let mut run_request = |id: i64, token: &str| {
+            let authorization = format!("Bearer {token}");
+            block_on(server.handle_request_with_transport_authorization(
                 &Cx::for_testing(),
-                &session,
-                &http_handler,
-                &request,
+                &mut session,
+                JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "http_auth_echo_tool_runtime",
+                        "arguments": {}
+                    })),
+                    id,
+                ),
+                Some(&authorization),
                 &notification_sender,
                 &request_sender,
-                &traffic_renderer,
-            );
-            assert_eq!(response.status, HttpStatus::OK);
-            serde_json::from_slice::<JsonRpcResponse>(&response.body)
-                .expect("parse HTTP JSON-RPC response")
+            ))
+            .expect("tools/call must receive a JSON-RPC response")
         };
 
         for id in [1, 2] {
@@ -50096,17 +48920,12 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn http_stateful_tool_calls_preserve_session_state_updates() {
-        let server = Arc::new(
-            Server::new("http-state-test-server", "1.0.0")
-                .tool(HttpStatefulIncrementTool)
-                .build(),
-        );
-        let session = Arc::new(Mutex::new(Session::new(
-            server.info.clone(),
-            server.capabilities.clone(),
-        )));
-        session.lock().expect("session lock poisoned").initialize(
+    fn dispatch_stateful_tool_calls_preserve_session_state_updates() {
+        let server = Server::new("http-state-test-server", "1.0.0")
+            .tool(HttpStatefulIncrementTool)
+            .build();
+        let mut session = Session::new(server.info.clone(), server.capabilities.clone());
+        session.initialize(
             fastmcp_protocol::ClientInfo {
                 name: "http-state-test-client".to_string(),
                 version: "1.0.0".to_string(),
@@ -50115,33 +48934,25 @@ mod lib_unit_tests {
             "2024-11-05".to_string(),
         );
 
-        let http_handler = Arc::new(HttpRequestHandler::new());
         let notification_sender: NotificationSender = Arc::new(|_| {});
         let request_sender = test_request_sender();
 
-        let run_request = |id| {
-            let cx = Cx::for_testing();
-            let request = http_json_request(
-                "tools/call",
-                serde_json::json!({
-                    "name": "http_stateful_increment_tool",
-                    "arguments": {}
-                }),
-                id,
-            );
-            let traffic_renderer: Option<RequestResponseRenderer> = None;
-            let response = server.handle_http_mcp_request(
-                &cx,
-                &session,
-                &http_handler,
-                &request,
+        let mut run_request = |id: i64| {
+            let json = block_on(server.dispatch_request(
+                &Cx::for_testing(),
+                &mut session,
+                JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "http_stateful_increment_tool",
+                        "arguments": {}
+                    })),
+                    id,
+                ),
                 &notification_sender,
                 &request_sender,
-                &traffic_renderer,
-            );
-            assert_eq!(response.status, HttpStatus::OK);
-            let json: JsonRpcResponse =
-                serde_json::from_slice(&response.body).expect("parse HTTP JSON-RPC response");
+            ))
+            .expect("tools/call must receive a JSON-RPC response");
             let result = json.result.expect("stateful request should succeed");
             let tool_result: CallToolResult =
                 serde_json::from_value(result).expect("parse tool result payload");
@@ -50157,7 +48968,7 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn http_exclusive_requests_expose_request_auth_to_middleware() {
+    fn dispatch_exclusive_requests_expose_request_auth_to_middleware() {
         #[derive(Debug)]
         struct EchoAuthProvider;
 
@@ -50183,11 +48994,8 @@ mod lib_unit_tests {
             .auth_provider(EchoAuthProvider)
             .middleware(middleware)
             .build();
-        let session = Arc::new(Mutex::new(Session::new(
-            server.info.clone(),
-            server.capabilities.clone(),
-        )));
-        session.lock().expect("session lock poisoned").initialize(
+        let mut session = Session::new(server.info.clone(), server.capabilities.clone());
+        session.initialize(
             fastmcp_protocol::ClientInfo {
                 name: "http-middleware-client".to_string(),
                 version: "1.0.0".to_string(),
@@ -50196,27 +49004,22 @@ mod lib_unit_tests {
             "2024-11-05".to_string(),
         );
 
-        let http_handler = Arc::new(HttpRequestHandler::new());
         let notification_sender: NotificationSender = Arc::new(|_| {});
         let request_sender = test_request_sender();
-        let request = http_json_request(
-            "tools/list",
-            serde_json::json!({
-                "auth": "Bearer alpha"
-            }),
-            1,
-        );
-        let traffic_renderer: Option<RequestResponseRenderer> = None;
-        let response = server.handle_http_mcp_request(
+        block_on(server.dispatch_request(
             &Cx::for_testing(),
-            &session,
-            &http_handler,
-            &request,
+            &mut session,
+            JsonRpcRequest::new(
+                "tools/list",
+                Some(serde_json::json!({
+                    "auth": "Bearer alpha"
+                })),
+                1_i64,
+            ),
             &notification_sender,
             &request_sender,
-            &traffic_renderer,
-        );
-        assert_eq!(response.status, HttpStatus::OK);
+        ))
+        .expect("tools/list must receive a JSON-RPC response");
 
         let observed = seen
             .lock()
@@ -50232,7 +49035,7 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn http_read_only_requests_expose_request_auth_to_middleware() {
+    fn dispatch_read_only_requests_expose_request_auth_to_middleware() {
         #[derive(Debug)]
         struct EchoAuthProvider;
 
@@ -50259,11 +49062,8 @@ mod lib_unit_tests {
             .middleware(middleware)
             .tool(HttpCurrentAuthSubjectTool)
             .build();
-        let session = Arc::new(Mutex::new(Session::new(
-            server.info.clone(),
-            server.capabilities.clone(),
-        )));
-        session.lock().expect("session lock poisoned").initialize(
+        let mut session = Session::new(server.info.clone(), server.capabilities.clone());
+        session.initialize(
             fastmcp_protocol::ClientInfo {
                 name: "http-read-only-middleware-client".to_string(),
                 version: "1.0.0".to_string(),
@@ -50272,32 +49072,24 @@ mod lib_unit_tests {
             "2024-11-05".to_string(),
         );
 
-        let http_handler = Arc::new(HttpRequestHandler::new());
         let notification_sender: NotificationSender = Arc::new(|_| {});
         let request_sender = test_request_sender();
-        let request = http_json_request(
-            "tools/call",
-            serde_json::json!({
-                "name": "http_current_auth_subject_tool",
-                "arguments": {},
-                "auth": "Bearer beta"
-            }),
-            1,
-        );
-        let traffic_renderer: Option<RequestResponseRenderer> = None;
-        let response = server.handle_http_mcp_request(
+        let json = block_on(server.dispatch_request(
             &Cx::for_testing(),
-            &session,
-            &http_handler,
-            &request,
+            &mut session,
+            JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "http_current_auth_subject_tool",
+                    "arguments": {},
+                    "auth": "Bearer beta"
+                })),
+                1_i64,
+            ),
             &notification_sender,
             &request_sender,
-            &traffic_renderer,
-        );
-        assert_eq!(response.status, HttpStatus::OK);
-
-        let json: JsonRpcResponse =
-            serde_json::from_slice(&response.body).expect("parse HTTP JSON-RPC response");
+        ))
+        .expect("tools/call must receive a JSON-RPC response");
         let result = json.result.expect("read-only auth request should succeed");
         let tool_result: CallToolResult =
             serde_json::from_value(result).expect("parse tool result payload");
@@ -50317,18 +49109,15 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn http_exclusive_middleware_cannot_replace_committed_request_auth() {
+    fn dispatch_exclusive_middleware_cannot_replace_committed_request_auth() {
         let server = Server::new("http-exclusive-auth-override-test-server", "1.0.0")
             .middleware(OverridingAuthMiddleware {
                 subject: "exclusive-override",
             })
             .tool(HttpCurrentAuthSubjectExclusiveTool)
             .build();
-        let session = Arc::new(Mutex::new(Session::new(
-            server.info.clone(),
-            server.capabilities.clone(),
-        )));
-        session.lock().expect("session lock poisoned").initialize(
+        let mut session = Session::new(server.info.clone(), server.capabilities.clone());
+        session.initialize(
             fastmcp_protocol::ClientInfo {
                 name: "http-exclusive-auth-override-client".to_string(),
                 version: "1.0.0".to_string(),
@@ -50337,31 +49126,23 @@ mod lib_unit_tests {
             "2024-11-05".to_string(),
         );
 
-        let http_handler = Arc::new(HttpRequestHandler::new());
         let notification_sender: NotificationSender = Arc::new(|_| {});
         let request_sender = test_request_sender();
-        let request = http_json_request(
-            "tools/call",
-            serde_json::json!({
-                "name": "http_current_auth_subject_exclusive_tool",
-                "arguments": {}
-            }),
-            1,
-        );
-        let traffic_renderer: Option<RequestResponseRenderer> = None;
-        let response = server.handle_http_mcp_request(
+        let json = block_on(server.dispatch_request(
             &Cx::for_testing(),
-            &session,
-            &http_handler,
-            &request,
+            &mut session,
+            JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "http_current_auth_subject_exclusive_tool",
+                    "arguments": {}
+                })),
+                1_i64,
+            ),
             &notification_sender,
             &request_sender,
-            &traffic_renderer,
-        );
-        assert_eq!(response.status, HttpStatus::OK);
-
-        let json: JsonRpcResponse =
-            serde_json::from_slice(&response.body).expect("parse HTTP JSON-RPC response");
+        ))
+        .expect("tools/call must receive a JSON-RPC response");
         let result = json
             .result
             .expect("exclusive request should succeed with committed anonymous auth");
@@ -50374,18 +49155,15 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn http_read_only_middleware_cannot_replace_committed_request_auth() {
+    fn dispatch_read_only_middleware_cannot_replace_committed_request_auth() {
         let server = Server::new("http-read-only-auth-override-test-server", "1.0.0")
             .middleware(OverridingAuthMiddleware {
                 subject: "read-only-override",
             })
             .tool(HttpCurrentAuthSubjectTool)
             .build();
-        let session = Arc::new(Mutex::new(Session::new(
-            server.info.clone(),
-            server.capabilities.clone(),
-        )));
-        session.lock().expect("session lock poisoned").initialize(
+        let mut session = Session::new(server.info.clone(), server.capabilities.clone());
+        session.initialize(
             fastmcp_protocol::ClientInfo {
                 name: "http-read-only-auth-override-client".to_string(),
                 version: "1.0.0".to_string(),
@@ -50394,31 +49172,23 @@ mod lib_unit_tests {
             "2024-11-05".to_string(),
         );
 
-        let http_handler = Arc::new(HttpRequestHandler::new());
         let notification_sender: NotificationSender = Arc::new(|_| {});
         let request_sender = test_request_sender();
-        let request = http_json_request(
-            "tools/call",
-            serde_json::json!({
-                "name": "http_current_auth_subject_tool",
-                "arguments": {}
-            }),
-            1,
-        );
-        let traffic_renderer: Option<RequestResponseRenderer> = None;
-        let response = server.handle_http_mcp_request(
+        let json = block_on(server.dispatch_request(
             &Cx::for_testing(),
-            &session,
-            &http_handler,
-            &request,
+            &mut session,
+            JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "http_current_auth_subject_tool",
+                    "arguments": {}
+                })),
+                1_i64,
+            ),
             &notification_sender,
             &request_sender,
-            &traffic_renderer,
-        );
-        assert_eq!(response.status, HttpStatus::OK);
-
-        let json: JsonRpcResponse =
-            serde_json::from_slice(&response.body).expect("parse HTTP JSON-RPC response");
+        ))
+        .expect("tools/call must receive a JSON-RPC response");
         let result = json
             .result
             .expect("read-only request should succeed with committed anonymous auth");
@@ -50431,16 +49201,13 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn http_exclusive_auth_failures_flow_through_middleware_error_rewriting() {
+    fn dispatch_exclusive_auth_failures_flow_through_middleware_error_rewriting() {
         let server = Server::new("http-exclusive-auth-error-test-server", "1.0.0")
             .auth_provider(AlwaysFailAuthProvider)
             .middleware(RewritingErrorMiddleware)
             .build();
-        let session = Arc::new(Mutex::new(Session::new(
-            server.info.clone(),
-            server.capabilities.clone(),
-        )));
-        session.lock().expect("session lock poisoned").initialize(
+        let mut session = Session::new(server.info.clone(), server.capabilities.clone());
+        session.initialize(
             fastmcp_protocol::ClientInfo {
                 name: "http-exclusive-auth-error-client".to_string(),
                 version: "1.0.0".to_string(),
@@ -50449,30 +49216,22 @@ mod lib_unit_tests {
             "2024-11-05".to_string(),
         );
 
-        let http_handler = Arc::new(HttpRequestHandler::new());
         let notification_sender: NotificationSender = Arc::new(|_| {});
         let request_sender = test_request_sender();
-        let request = http_json_request(
-            "tools/list",
-            serde_json::json!({
-                "auth": "Bearer nope"
-            }),
-            1,
-        );
-        let traffic_renderer: Option<RequestResponseRenderer> = None;
-        let response = server.handle_http_mcp_request(
+        let json = block_on(server.dispatch_request(
             &Cx::for_testing(),
-            &session,
-            &http_handler,
-            &request,
+            &mut session,
+            JsonRpcRequest::new(
+                "tools/list",
+                Some(serde_json::json!({
+                    "auth": "Bearer nope"
+                })),
+                1_i64,
+            ),
             &notification_sender,
             &request_sender,
-            &traffic_renderer,
-        );
-        assert_eq!(response.status, HttpStatus::OK);
-
-        let json: JsonRpcResponse =
-            serde_json::from_slice(&response.body).expect("parse HTTP JSON-RPC response");
+        ))
+        .expect("tools/list must receive a JSON-RPC response");
         let error = json
             .error
             .expect("auth failure should return JSON-RPC error");
@@ -50480,17 +49239,14 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn http_read_only_auth_failures_flow_through_middleware_error_rewriting() {
+    fn dispatch_read_only_auth_failures_flow_through_middleware_error_rewriting() {
         let server = Server::new("http-read-only-auth-error-test-server", "1.0.0")
             .auth_provider(AlwaysFailAuthProvider)
             .middleware(RewritingErrorMiddleware)
             .tool(HttpCurrentAuthSubjectTool)
             .build();
-        let session = Arc::new(Mutex::new(Session::new(
-            server.info.clone(),
-            server.capabilities.clone(),
-        )));
-        session.lock().expect("session lock poisoned").initialize(
+        let mut session = Session::new(server.info.clone(), server.capabilities.clone());
+        session.initialize(
             fastmcp_protocol::ClientInfo {
                 name: "http-read-only-auth-error-client".to_string(),
                 version: "1.0.0".to_string(),
@@ -50499,32 +49255,24 @@ mod lib_unit_tests {
             "2024-11-05".to_string(),
         );
 
-        let http_handler = Arc::new(HttpRequestHandler::new());
         let notification_sender: NotificationSender = Arc::new(|_| {});
         let request_sender = test_request_sender();
-        let request = http_json_request(
-            "tools/call",
-            serde_json::json!({
-                "name": "http_current_auth_subject_tool",
-                "arguments": {},
-                "auth": "Bearer nope"
-            }),
-            1,
-        );
-        let traffic_renderer: Option<RequestResponseRenderer> = None;
-        let response = server.handle_http_mcp_request(
+        let json = block_on(server.dispatch_request(
             &Cx::for_testing(),
-            &session,
-            &http_handler,
-            &request,
+            &mut session,
+            JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "http_current_auth_subject_tool",
+                    "arguments": {},
+                    "auth": "Bearer nope"
+                })),
+                1_i64,
+            ),
             &notification_sender,
             &request_sender,
-            &traffic_renderer,
-        );
-        assert_eq!(response.status, HttpStatus::OK);
-
-        let json: JsonRpcResponse =
-            serde_json::from_slice(&response.body).expect("parse HTTP JSON-RPC response");
+        ))
+        .expect("tools/call must receive a JSON-RPC response");
         let error = json
             .error
             .expect("auth failure should return JSON-RPC error");
@@ -50579,11 +49327,8 @@ mod lib_unit_tests {
                 seen: Arc::clone(&seen),
             })
             .build();
-        let session = Arc::new(Mutex::new(Session::new(
-            server.info.clone(),
-            server.capabilities.clone(),
-        )));
-        session.lock().expect("session lock poisoned").initialize(
+        let mut session = Session::new(server.info.clone(), server.capabilities.clone());
+        session.initialize(
             fastmcp_protocol::ClientInfo {
                 name: "auth-error-sanitization-client".to_string(),
                 version: "1.0.0".to_string(),
@@ -50592,23 +49337,21 @@ mod lib_unit_tests {
             "2024-11-05".to_string(),
         );
 
-        let http_handler = HttpRequestHandler::new();
         let notification_sender: NotificationSender = Arc::new(|_| {});
         let request_sender = test_request_sender();
-        let response = server.handle_http_mcp_request(
+        let response = block_on(server.dispatch_request(
             &Cx::for_testing(),
-            &session,
-            &http_handler,
-            &http_json_request(
+            &mut session,
+            JsonRpcRequest::new(
                 "tools/list",
-                serde_json::json!({"authorization": "Bearer peer-token"}),
-                1,
+                Some(serde_json::json!({"authorization": "Bearer peer-token"})),
+                1_i64,
             ),
             &notification_sender,
             &request_sender,
-            &None,
-        );
-        let wire = String::from_utf8(response.body).expect("UTF-8 JSON-RPC response");
+        ))
+        .expect("tools/list must receive a JSON-RPC response");
+        let wire = serde_json::to_string(&response).expect("JSON-RPC response serializes");
         assert!(!wire.contains(CANARY));
         let response: JsonRpcResponse = serde_json::from_str(&wire).expect("JSON-RPC response");
         let error = response.error.expect("authentication must fail");
@@ -50632,20 +49375,18 @@ mod lib_unit_tests {
         let state = SessionState::new();
         let request_ctx = McpContext::with_state(Cx::for_testing(), 41, state.clone())
             .with_auth(AuthContext::with_subject("alpha"));
-        let result = server
-            .router
-            .handle_tools_call(
-                &request_ctx,
-                CallToolParams {
-                    name: "http_current_auth_subject_tool".to_string(),
-                    arguments: Some(serde_json::json!({})),
-                    meta: None,
-                },
-                state,
-                None,
-                None,
-            )
-            .expect("tool call should succeed");
+        let result = block_on(server.router.handle_tools_call(
+            &request_ctx,
+            CallToolParams {
+                name: "http_current_auth_subject_tool".to_string(),
+                arguments: Some(serde_json::json!({})),
+                meta: None,
+            },
+            state,
+            None,
+            None,
+        ))
+        .expect("tool call should succeed");
 
         match result.content.as_slice() {
             [LegacyContent::Text { text, .. }] => assert_eq!(text, "alpha"),
@@ -50751,15 +49492,14 @@ mod lib_unit_tests {
             1,
         );
 
-        let response = server
-            .dispatch_request(
-                &cx,
-                &mut session,
-                request,
-                &notification_sender,
-                &request_sender,
-            )
-            .expect("request should produce a response");
+        let response = block_on(server.dispatch_request(
+            &cx,
+            &mut session,
+            request,
+            &notification_sender,
+            &request_sender,
+        ))
+        .expect("request should produce a response");
         assert!(
             response.error.is_none(),
             "unexpected response: {response:?}"
@@ -50792,22 +49532,21 @@ mod lib_unit_tests {
             .build();
         let mut rejected_session = initialized_test_session(&rejected_server);
         let rejected_cx = Cx::for_testing_with_budget(Budget::new().with_cost_quota(2));
-        let rejected_response = rejected_server
-            .dispatch_request(
-                &rejected_cx,
-                &mut rejected_session,
-                JsonRpcRequest::new(
-                    "tools/call",
-                    Some(serde_json::json!({
-                        "name": "charging_tool",
-                        "arguments": {}
-                    })),
-                    2,
-                ),
-                &notification_sender,
-                &request_sender,
-            )
-            .expect("over-budget tool request should produce a response");
+        let rejected_response = block_on(rejected_server.dispatch_request(
+            &rejected_cx,
+            &mut rejected_session,
+            JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "charging_tool",
+                    "arguments": {}
+                })),
+                2,
+            ),
+            &notification_sender,
+            &request_sender,
+        ))
+        .expect("over-budget tool request should produce a response");
         assert!(rejected_response.result.is_none());
         assert_eq!(
             rejected_response
@@ -50889,22 +49628,21 @@ mod lib_unit_tests {
         let cx = Cx::for_testing_with_budget(Budget::new().with_cost_quota(0));
         let notification_sender: NotificationSender = Arc::new(|_| {});
         let request_sender = test_request_sender();
-        let response = server
-            .dispatch_request(
-                &cx,
-                &mut session,
-                JsonRpcRequest::new(
-                    "tools/call",
-                    Some(serde_json::json!({
-                        "name": "http_current_auth_subject_tool",
-                        "arguments": {}
-                    })),
-                    1,
-                ),
-                &notification_sender,
-                &request_sender,
-            )
-            .expect("zero-cost request should produce a response");
+        let response = block_on(server.dispatch_request(
+            &cx,
+            &mut session,
+            JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "http_current_auth_subject_tool",
+                    "arguments": {}
+                })),
+                1,
+            ),
+            &notification_sender,
+            &request_sender,
+        ))
+        .expect("zero-cost request should produce a response");
 
         assert!(
             response.error.is_none(),
@@ -50984,22 +49722,21 @@ mod lib_unit_tests {
         let mut session = initialized_test_session(&server);
         let notification_sender: NotificationSender = Arc::new(|_| {});
         let request_sender = test_request_sender();
-        let response = server
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut session,
-                JsonRpcRequest::new(
-                    "tools/call",
-                    Some(serde_json::json!({
-                        "name": "outer_tool",
-                        "arguments": {}
-                    })),
-                    1_i64,
-                ),
-                &notification_sender,
-                &request_sender,
-            )
-            .expect("nested tool request should produce a response");
+        let response = block_on(server.dispatch_request(
+            &Cx::for_testing(),
+            &mut session,
+            JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "outer_tool",
+                    "arguments": {}
+                })),
+                1_i64,
+            ),
+            &notification_sender,
+            &request_sender,
+        ))
+        .expect("nested tool request should produce a response");
         let result: CallToolResult = serde_json::from_value(
             response
                 .result
@@ -51054,22 +49791,21 @@ mod lib_unit_tests {
         let mut session = initialized_test_session(&server);
         let notification_sender: NotificationSender = Arc::new(|_| {});
         let request_sender = test_request_sender();
-        let response = server
-            .dispatch_request(
-                &Cx::for_testing(),
-                &mut session,
-                JsonRpcRequest::new(
-                    "tools/call",
-                    Some(serde_json::json!({
-                        "name": "capture_context",
-                        "arguments": {}
-                    })),
-                    1_i64,
-                ),
-                &notification_sender,
-                &request_sender,
-            )
-            .expect("capture request should produce a response");
+        let response = block_on(server.dispatch_request(
+            &Cx::for_testing(),
+            &mut session,
+            JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "capture_context",
+                    "arguments": {}
+                })),
+                1_i64,
+            ),
+            &notification_sender,
+            &request_sender,
+        ))
+        .expect("capture request should produce a response");
         assert!(
             response.error.is_none(),
             "unexpected response: {response:?}"
