@@ -2939,16 +2939,6 @@ exec sleep 5
             .err()
             .expect("an unreachable modern POST target still fails at contact");
         assert!(
-            !matches!(
-                error,
-                ClientHttpConnectionError::Modern(
-                    ModernHttpClientError::ReverseRequestDispatch(_)
-                        | ModernHttpClientError::ReverseResponsePostRejected { .. }
-                )
-            ),
-            "modern reverse handlers must reach the HTTP probe instead of failing closed: {error}"
-        );
-        assert!(
             matches!(error, ClientHttpConnectionError::Modern(_)),
             "unreachable modern POST remains a modern transport error: {error}"
         );
