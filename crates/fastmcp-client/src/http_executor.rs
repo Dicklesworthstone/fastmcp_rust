@@ -3804,6 +3804,11 @@ pub enum ClientHttpConnectionError {
     /// The ready legacy SSE reader was unavailable before it could be owned by
     /// its structured receive task.
     LegacyPersistentReceiverUnavailable,
+    /// The context the exact-2024 SSE receiver would run on has no live
+    /// runtime: it is detached, or its runtime was torn down. The receiver
+    /// outlives every request, so only a caller-owned runtime can drive it.
+    /// Refused before any request is posted.
+    LegacyReceiverNeedsRuntimeCx,
     /// Exact-2024 callback handlers and client capabilities did not describe
     /// the same callable server-to-client surface before SSE ingress started.
     LegacyCallbackConfiguration(McpError),
@@ -3916,6 +3921,9 @@ impl fmt::Display for ClientHttpConnectionError {
             ),
             Self::LegacyPersistentReceiverUnavailable => formatter
                 .write_str("ready legacy SSE receiver is unavailable"),
+            Self::LegacyReceiverNeedsRuntimeCx => formatter.write_str(
+                "the legacy SSE receiver needs a runtime-backed Cx; this context has no runtime to drive it",
+            ),
             Self::LegacyCallbackConfiguration(error) => error.fmt(formatter),
             Self::LegacyPersistentReceiverStopped => formatter
                 .write_str("ready legacy SSE receiver has stopped"),
@@ -3992,6 +4000,7 @@ impl std::error::Error for ClientHttpConnectionError {
             | Self::LegacyNotificationQueueFull
             | Self::LegacyInterleavedControlFrameLimitExceeded { .. }
             | Self::LegacyPersistentReceiverUnavailable
+            | Self::LegacyReceiverNeedsRuntimeCx
             | Self::LegacyPersistentReceiverStopped
             | Self::LegacyPersistentResponseQueueFull
             | Self::LegacyRequestOperationRequiresLegacy
@@ -8175,7 +8184,12 @@ impl LegacySsePersistentReceiver {
                     .stop();
                 task_reverse_callbacks.close();
             })
-            .map_err(|_| ClientHttpConnectionError::LegacyPersistentReceiverUnavailable)?;
+            .map_err(|error| match error {
+                asupersync::runtime::SpawnError::RuntimeUnavailable => {
+                    ClientHttpConnectionError::LegacyReceiverNeedsRuntimeCx
+                }
+                _ => ClientHttpConnectionError::LegacyPersistentReceiverUnavailable,
+            })?;
         Ok(Self {
             state,
             task,

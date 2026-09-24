@@ -11639,6 +11639,7 @@ fn resource_from_template(template: &ResourceTemplate) -> Resource {
 
 #[cfg(test)]
 mod tests {
+    use fastmcp_core::runtime::poll_on_cx;
     #[cfg(feature = "tasks")]
     use std::collections::VecDeque;
     use std::collections::{BTreeMap, HashMap};
@@ -20290,19 +20291,74 @@ exec sleep 2
         .expect("complete legacy-only HTTP plan must be accepted")
     }
 
+    /// A context from a runtime the test process owns and keeps driving on its
+    /// own workers.
+    ///
+    /// FastMCP builds no runtime of its own, so a legacy HTTP proxy, whose SSE
+    /// receiver outlives every call, must be handed a caller runtime's context.
+    /// A detached `Cx::for_request()` is refused
+    /// (`proxy_legacy_http_receiver_needs_a_runtime_backed_cx`). The runtime's
+    /// root waits forever, so every context cloned from it stays spawn-capable
+    /// for the whole process.
+    fn caller_runtime_cx() -> Cx {
+        static CALLER: std::sync::OnceLock<Cx> = std::sync::OnceLock::new();
+        CALLER
+            .get_or_init(|| {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                thread::Builder::new()
+                    .name("proxy-test-caller-runtime".to_owned())
+                    .spawn(move || {
+                        let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
+                            .worker_threads(2)
+                            .with_reactor(
+                                asupersync::runtime::reactor::create_reactor()
+                                    .expect("the caller runtime creates its reactor"),
+                            )
+                            .build()
+                            .expect("the caller runtime builds");
+                        runtime.block_on(async move {
+                            let cx = Cx::current().expect("the caller runtime installs its cx");
+                            sender.send(cx).expect("hand the caller cx to the tests");
+                            std::future::pending::<()>().await;
+                        });
+                    })
+                    .expect("spawn the caller runtime thread");
+                receiver.recv().expect("the caller runtime reports its cx")
+            })
+            .clone()
+    }
+
     fn legacy_http_proxy_client(
         legacy_sse_target: &str,
         legacy_message_target: &str,
         client_capabilities: ClientCapabilities,
     ) -> ProxyHttpClient {
-        let cx = Cx::for_request();
+        legacy_http_proxy_client_on(
+            caller_runtime_cx(),
+            legacy_sse_target,
+            legacy_message_target,
+            client_capabilities,
+        )
+    }
+
+    /// Connects on `cx` itself, so the SSE socket registers with the reactor
+    /// that will drive the proxy's receiver.
+    fn legacy_http_proxy_client_on(
+        cx: Cx,
+        legacy_sse_target: &str,
+        legacy_message_target: &str,
+        client_capabilities: ClientCapabilities,
+    ) -> ProxyHttpClient {
         let client_info = proxy_http_client_info();
-        let connection = block_on(ClientHttpConnection::connect(
+        let connection = poll_on_cx(
             &cx,
-            legacy_only_http_proxy_plan(legacy_sse_target, legacy_message_target),
-            client_info.clone(),
-            client_capabilities.clone(),
-        ))
+            ClientHttpConnection::connect(
+                &cx,
+                legacy_only_http_proxy_plan(legacy_sse_target, legacy_message_target),
+                client_info.clone(),
+                client_capabilities.clone(),
+            ),
+        )
         .expect("legacy-only HTTP plan opens the exact legacy SSE client");
         ProxyHttpClient::new(
             ProxyUpstreamBinding {
@@ -20316,6 +20372,108 @@ exec sleep 2
             client_info,
             client_capabilities,
         )
+    }
+
+    /// A legacy request whose SSE receiver would have no runtime to run on is
+    /// refused before its POST. The same request on a caller runtime's context
+    /// is posted. The two arms differ only in the context the proxy holds.
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn proxy_legacy_http_receiver_needs_a_runtime_backed_cx() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        for runtime_backed in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind native HTTP listener");
+            let address = listener.local_addr().expect("read native HTTP listener address");
+            let legacy_sse_target = format!("http://{address}/legacy-sse");
+            let legacy_message_target =
+                format!("http://{address}/legacy-message?session=runtime-cx");
+            let advertised = legacy_message_target.clone();
+            let stop = Arc::new(AtomicBool::new(false));
+            let peer_stop = Arc::clone(&stop);
+            let server = thread::spawn(move || {
+                let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
+                let _ = read_http_request(&mut sse);
+                write!(
+                    sse,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                )
+                .expect("write streaming SSE response head");
+                let opening = format!(
+                    "event: endpoint\ndata: {advertised}\n\n\
+                     event: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{}},\"serverInfo\":{{\"name\":\"runtime-cx-peer\",\"version\":\"1.0.0\"}}}}}}\n\n"
+                );
+                write_chunked_sse_event(&mut sse, opening.as_bytes());
+                sse.flush().expect("flush initialize SSE event");
+                listener
+                    .set_nonblocking(true)
+                    .expect("poll the listener until the test stops it");
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut methods = Vec::new();
+                while !peer_stop.load(Ordering::Acquire) && Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((mut post, _)) => {
+                            let request = read_http_request(&mut post);
+                            write_http_response(&mut post, 202, "application/json", b"");
+                            let message: serde_json::Value = serde_json::from_slice(&request.body)
+                                .expect("a legacy POST carries JSON");
+                            methods.push(message["method"].as_str().unwrap_or_default().to_owned());
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("accept legacy POST: {error}"),
+                    }
+                }
+                methods
+            });
+
+            let cx = if runtime_backed {
+                caller_runtime_cx()
+            } else {
+                Cx::for_request()
+            };
+            let proxy = ProxyClient::from_backend(legacy_http_proxy_client_on(
+                cx,
+                &legacy_sse_target,
+                &legacy_message_target,
+                ClientCapabilities::default(),
+            ));
+            let context = McpContext::new(Cx::for_request(), 900);
+            let started = proxy.start_legacy_request_with_context(
+                &context,
+                fastmcp_protocol::methods::TOOLS_CALL,
+                serde_json::json!({"name": "runtime", "arguments": {}}),
+            );
+            let committed = match started {
+                Ok(handle) => Some(handle.expect("the exact legacy HTTP route returns a handle")),
+                Err(error) => {
+                    assert!(
+                        !runtime_backed,
+                        "a caller runtime's context must drive the receiver: {}",
+                        error.message
+                    );
+                    assert!(
+                        error.message.contains("needs a runtime-backed Cx"),
+                        "a detached context is refused by name, not as a generic failure: {}",
+                        error.message
+                    );
+                    None
+                }
+            };
+            stop.store(true, Ordering::Release);
+            let methods = server.join().expect("legacy runtime-cx peer must join");
+            let mut expected = vec!["initialize", "notifications/initialized"];
+            if runtime_backed {
+                assert!(committed.is_some(), "the runtime-backed request commits");
+                expected.push("tools/call");
+            }
+            assert_eq!(
+                methods, expected,
+                "runtime_backed={runtime_backed}: the refusal happens before the request is posted"
+            );
+            drop(committed);
+        }
     }
 
     fn legacy_tools_list_names(result: CoreResult) -> Vec<String> {
@@ -20995,15 +21153,21 @@ expect_request notifications/initialized ''
         let plan = http_proxy_plan(&modern_target, &legacy_sse_target, &legacy_message_target);
         let mut bindings = ProxyClient::upstream_binding_registry();
 
-        let proxy = block_on(bindings.connect_http_with_protocol_plan(
-            &Cx::for_request(),
-            "legacy-http-backend",
-            "native-h1:legacy-http-backend",
-            10,
-            plan.clone(),
-            proxy_http_client_info(),
-            ClientCapabilities::default(),
-        ))
+        // The legacy receiver needs a caller runtime to run on, and the SSE
+        // socket must register with that runtime's reactor.
+        let caller = caller_runtime_cx();
+        let proxy = poll_on_cx(
+            &caller,
+            bindings.connect_http_with_protocol_plan(
+                &caller,
+                "legacy-http-backend",
+                "native-h1:legacy-http-backend",
+                10,
+                plan.clone(),
+                proxy_http_client_info(),
+                ClientCapabilities::default(),
+            ),
+        )
         .expect("only the authorized disposable refusal may select legacy SSE");
         let binding = proxy.upstream_binding().expect("live binding is retained");
         assert_eq!(binding.era(), ProtocolEra::Legacy2024);
@@ -22345,15 +22509,21 @@ expect_request notifications/initialized ''
             let mut bindings = ProxyClient::upstream_binding_registry();
             let route = format!("legacy-id-mismatch-{}", path.name());
             let transport = format!("native-h1:{route}");
-            let proxy = block_on(bindings.connect_http_with_protocol_plan(
-                &Cx::for_request(),
-                &route,
-                &transport,
-                15,
-                plan.clone(),
-                proxy_http_client_info(),
-                ClientCapabilities::default(),
-            ))
+            // The legacy receiver needs a caller runtime to run on, and the SSE
+            // socket must register with that runtime's reactor.
+            let caller = caller_runtime_cx();
+            let proxy = poll_on_cx(
+                &caller,
+                bindings.connect_http_with_protocol_plan(
+                    &caller,
+                    &route,
+                    &transport,
+                    15,
+                    plan.clone(),
+                    proxy_http_client_info(),
+                    ClientCapabilities::default(),
+                ),
+            )
             .expect("authorized modern refusal opens the public legacy proxy backend");
             let binding = proxy.upstream_binding().expect("live binding is retained");
 
