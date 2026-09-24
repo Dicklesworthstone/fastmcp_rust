@@ -3360,9 +3360,15 @@ fn public_http_large_result_text(bytes: usize) -> String {
     (b'a'..=b'z').cycle().take(bytes).map(char::from).collect()
 }
 
-/// Returns a text result of the requested size. The request stays tiny, so
-/// the round trip exercises the SSE response path and never the server's
-/// input bounds.
+/// Largest text block the large-result tool emits. The whole result still
+/// travels as one SSE event; splitting keeps each string below the separate
+/// per-string result bound, so this round trip measures the SSE path only.
+const PUBLIC_HTTP_LARGE_RESULT_BLOCK_BYTES: usize = 32 * 1024;
+
+/// Returns a text result of the requested size, in blocks of at most
+/// [`PUBLIC_HTTP_LARGE_RESULT_BLOCK_BYTES`]. The request stays tiny, so the
+/// round trip exercises the SSE response path and never the server's input
+/// bounds.
 struct PublicHttpLargeResultTool;
 
 impl ToolHandler for PublicHttpLargeResultTool {
@@ -3389,7 +3395,14 @@ impl ToolHandler for PublicHttpLargeResultTool {
             .and_then(serde_json::Value::as_u64)
             .and_then(|bytes| usize::try_from(bytes).ok())
             .ok_or_else(|| McpError::invalid_params("bytes must be a non-negative integer"))?;
-        Ok(vec![Content::text(public_http_large_result_text(bytes))])
+        let text = public_http_large_result_text(bytes);
+        Ok(text
+            .as_bytes()
+            .chunks(PUBLIC_HTTP_LARGE_RESULT_BLOCK_BYTES)
+            .map(|block| {
+                Content::text(std::str::from_utf8(block).expect("the generated text is ASCII"))
+            })
+            .collect())
     }
 }
 
@@ -3483,9 +3496,22 @@ fn spawn_large_result_http_server(protocol_policy: ProtocolPolicy) -> HttpServer
 }
 
 fn assert_public_http_large_tool_text(tool: &serde_json::Value, lane: &str) {
-    let text = tool["content"][0]["text"]
-        .as_str()
-        .unwrap_or_else(|| panic!("the {lane} tool result must carry text content"));
+    let blocks = tool["content"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the {lane} tool result must carry a content array"));
+    let text = blocks
+        .iter()
+        .map(|block| {
+            block["text"]
+                .as_str()
+                .unwrap_or_else(|| panic!("every {lane} content block must be text"))
+        })
+        .collect::<String>();
+    assert_eq!(
+        blocks.len(),
+        PUBLIC_HTTP_LARGE_RESULT_BYTES.div_ceil(PUBLIC_HTTP_LARGE_RESULT_BLOCK_BYTES),
+        "the {lane} tool result must keep every block"
+    );
     assert!(
         text == public_http_large_result_text(PUBLIC_HTTP_LARGE_RESULT_BYTES),
         "the {lane} tool result must arrive byte-identical: received {} bytes, expected {}",
