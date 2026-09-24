@@ -1,4 +1,5 @@
 use super::*;
+use crate::http_auth::rpc::interaction::ManagedInteraction;
 use fastmcp_core::block_on;
 use fastmcp_protocol::{ClientCapabilities, CoreRequest, FinalRequestMeta, FinalTool, RequestId};
 use fastmcp_protocol::protocol_policy::ProtocolEra;
@@ -205,4 +206,25 @@ fn dropping_a_polled_resolver_releases_its_owned_input_work() {
     assert!(dropped.load(Ordering::SeqCst));
     assert!(contract.check().is_ok());
     assert!(!cancellation.is_cancel_requested());
+}
+
+// `Cx::spawn` admits only `Send` futures. Given `Send` callbacks, the public
+// drivers must stay `Send`, or a host cannot run one on a spawned task.
+#[test]
+fn public_drive_futures_are_send_for_send_callbacks() {
+    fn assert_send<T: Send>(_: &T) {}
+    fn resolve(_: Box<InputRequiredResult>) -> std::future::Ready<Result<ManagedInputReply, ManagedInteractionError>> {
+        ready(Ok(reply()))
+    }
+    fn notify(_: Box<ServerNotification>) -> Result<(), ManagedInteractionError> { Ok(()) }
+    fn tool_drivers(complete: ManagedToolInteraction, partial: ManagedToolInteraction, cx: &Cx) {
+        assert_send(&complete.drive(cx, resolve, notify));
+        assert_send(&partial.drive_partial(cx, resolve, notify));
+    }
+    fn core_drivers(complete: ManagedInteraction, partial: ManagedInteraction, cx: &Cx) {
+        assert_send(&complete.drive(cx, resolve, notify));
+        assert_send(&partial.drive_partial(cx, resolve, notify));
+    }
+    let _ = tool_drivers as fn(ManagedToolInteraction, ManagedToolInteraction, &Cx);
+    let _ = core_drivers as fn(ManagedInteraction, ManagedInteraction, &Cx);
 }
