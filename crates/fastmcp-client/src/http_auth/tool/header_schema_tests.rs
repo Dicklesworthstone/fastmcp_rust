@@ -95,11 +95,35 @@ fn annotation_admission_does_not_apply_header_representation_limits_to_body_valu
 }
 
 #[test]
-fn malformed_annotations_and_unknown_validation_keywords_still_fail_closed() {
-    let mut unknown = schema();
-    unknown["unknownValidationKeyword"] = json!(true);
+fn unknown_schema_annotations_preserve_contracts_without_header_authority() {
+    let mut source = schema();
+    source["x-ui"] = json!({
+        "$id": "https://annotations.example/data",
+        "$ref": "https://unregistered.example/schema",
+        "type": 42,
+        "properties": {"hidden": {"x-mcp-header": "Invalid\r\nHeader"}}
+    });
+    source["properties"]["count"]["x-unit"] = json!("items");
+    let contract = ToolContract::admit(definition(source.clone(), None)).unwrap();
+    assert_eq!(contract.input.schema(), &source);
+    assert_eq!(contract.input.header_plan().bindings().len(), 2);
+
+    let accepted = request(json!({"name": "calculate", "arguments": {"count": 2}}));
+    let before = accepted.encode_params().unwrap();
+    contract.validate_request(&accepted).unwrap();
+    assert_eq!(accepted.encode_params().unwrap(), before);
+    for arguments in [json!({"count": 0}), json!({"count": "2"}), json!({})] {
+        let rejected = request(json!({"name": "calculate", "arguments": arguments}));
+        assert!(matches!(contract.validate_request(&rejected), Err(ManagedToolError::InvalidArguments)));
+    }
+}
+
+#[test]
+fn malformed_annotations_and_recognized_validation_keywords_still_fail_closed() {
+    let mut malformed = schema();
+    malformed["properties"]["count"]["minimum"] = json!("not-a-number");
     for source in [
-        unknown,
+        malformed,
         json!({"type": "object", "properties": {"x": {"type": "object", "x-mcp-header": "X"}}}),
         json!({"type": "object", "properties": {"x": {"type": "string", "x-mcp-header": "X\r\nBad"}}}),
         json!({"type": "object", "properties": {

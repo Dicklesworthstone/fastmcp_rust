@@ -162,7 +162,11 @@ impl Peer {
         assert_eq!(request["method"], "tools/list");
         assert!(request["params"].get("cursor").is_none());
         let mut input = json!({"type":"object","properties":{"count":{"type":"integer","minimum":minimum,"x-mcp-header":"Count"}},"required":["count"],"additionalProperties":false});
-        if invalid { input["unknownValidationKeyword"] = json!(true); }
+        // Unknown extension data is retained by the real catalog consumer;
+        // schema-shaped values inside it cannot create validators or headers.
+        input["x-ui"] = json!({"type":42,"$ref":"https://unregistered.example/schema",
+            "properties":{"hidden":{"x-mcp-header":"Invalid\r\nHeader"}}});
+        if invalid { input["properties"]["count"]["minimum"] = json!("not-a-number"); }
         let result = json!({"resultType":"complete","tools":[{"name":"calculate","inputSchema":input,
             "outputSchema":{"type":"object","properties":{"total":{"type":"integer"}},"required":["total"]}
         }],"ttlMs":0,"cacheScope":"private"});

@@ -48,6 +48,14 @@ pub const MAX_SCHEMA_VALIDATION_DEPTH: usize = 64;
 /// Maximum schema nodes admitted for one final-dialect schema document.
 pub const MAX_SCHEMA_ADMISSION_NODES: usize = 4_096;
 
+/// Maximum encoded bytes retained by one admitted schema document, including
+/// annotations and literal data. This matches the LIMIT-01 default document bound.
+pub const MAX_SCHEMA_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Maximum JSON values in an admitted document, including opaque annotations.
+/// Schema-valued locations independently retain [`MAX_SCHEMA_ADMISSION_NODES`].
+pub const MAX_SCHEMA_DOCUMENT_NODES: usize = 65_536;
+
 /// Maximum JSON instance nodes traversed by one validation call.
 pub const MAX_SCHEMA_INSTANCE_NODES: usize = 4_096;
 
@@ -848,13 +856,42 @@ impl FinalCoreResultType {
 /// present `$schema` must identify the canonical Draft 2020-12 dialect, and
 /// every structural keyword consumed by this validator is checked before the
 /// schema can be retained. External references are refused rather than being
-/// interpreted as I/O authority.
+/// interpreted as I/O authority. Under the canonical/default dialect, unknown
+/// keywords are retained as bounded annotations, never interpreted as schemas.
+/// Locally selected custom dialects retain their existing closed keyword policy.
 pub fn admit_final_schema(schema: Value) -> Result<AdmittedSchema, SchemaAdmissionError> {
+    bound_schema_document(&schema)?;
     let mut node_count = 0;
-    validate_final_schema_node(&schema, &schema, "$", true, 0, &mut node_count)?;
+    validate_final_schema_node(&schema, &schema, "$", true, true, 0, &mut node_count)?;
     validate_unique_local_anchors(&schema, "$", 0, &mut HashSet::new())?;
     validate_unique_local_resource_ids(&schema, "$", 0, None, &mut HashSet::new())?;
     Ok(AdmittedSchema { schema })
+}
+
+pub(crate) fn bound_schema_document(schema: &Value) -> Result<(), SchemaAdmissionError> {
+    // Bound the complete JSON tree before any recursive semantic walk, clone,
+    // reference search, or numeric comparison. Unknown annotations may contain
+    // arbitrary data and must not escape the document's work/retention limits.
+    measure_generated_schema(
+        schema,
+        SchemaGenerationLimits {
+            max_nodes: MAX_SCHEMA_DOCUMENT_NODES,
+            max_bytes: MAX_SCHEMA_DOCUMENT_BYTES,
+            ..SchemaGenerationLimits::default()
+        },
+    )
+    .map_err(|error| {
+        SchemaAdmissionError::new(
+            "$",
+            match error {
+                SchemaGenerationError::DepthLimit => "schema document nesting limit exceeded",
+                SchemaGenerationError::NodeLimit => "schema document node limit exceeded",
+                SchemaGenerationError::ByteLimit => "schema document byte limit exceeded",
+                _ => "schema document resource limit exceeded",
+            },
+        )
+    })?;
+    Ok(())
 }
 
 /// Admits a final form elicitation schema before a client or server interprets
@@ -1057,6 +1094,7 @@ fn validate_final_schema_node(
     root_schema: &Value,
     path: &str,
     root: bool,
+    unknown_annotations: bool,
     depth: usize,
     node_count: &mut usize,
 ) -> Result<(), SchemaAdmissionError> {
@@ -1080,7 +1118,13 @@ fn validate_final_schema_node(
         .as_object()
         .ok_or_else(|| SchemaAdmissionError::new(path, "schema must be an object or boolean"))?;
 
-    validate_supported_schema_keywords(object, path, root)?;
+    // A selected custom meta-schema may impose a closed keyword contract.
+    // Preserve that existing restriction until custom-dialect admission also
+    // enforces its complete meta-schema; do not infer it from $vocabulary alone.
+    let unknown_annotations = object.get("$schema").map_or(unknown_annotations, |dialect| {
+        dialect.as_str() == Some(FINAL_JSON_SCHEMA_DIALECT)
+    });
+    validate_supported_schema_keywords(object, path, root, unknown_annotations)?;
     validate_schema_id_keyword(object, path)?;
     validate_schema_dialect_keyword(object, root_schema, path)?;
 
@@ -1187,6 +1231,7 @@ fn validate_final_schema_node(
                     root_schema,
                     &format!("{path}.{keyword}.{name}"),
                     false,
+                    unknown_annotations,
                     depth + 1,
                     node_count,
                 )?;
@@ -1213,6 +1258,7 @@ fn validate_final_schema_node(
                 root_schema,
                 &format!("{path}.{keyword}"),
                 false,
+                unknown_annotations,
                 depth + 1,
                 node_count,
             )?;
@@ -1241,6 +1287,7 @@ fn validate_final_schema_node(
                     root_schema,
                     &format!("{path}.{keyword}[{index}]"),
                     false,
+                    unknown_annotations,
                     depth + 1,
                     node_count,
                 )?;
@@ -1255,6 +1302,7 @@ fn validate_supported_schema_keywords(
     object: &serde_json::Map<String, Value>,
     path: &str,
     root: bool,
+    unknown_annotations: bool,
 ) -> Result<(), SchemaAdmissionError> {
     const SUPPORTED: &[&str] = &[
         "$anchor",
@@ -1317,7 +1365,16 @@ fn validate_supported_schema_keywords(
     ];
 
     for keyword in object.keys() {
-        if !SUPPORTED.contains(&keyword.as_str()) {
+        // Draft 2020-12 Core sections 4.3.1 and 6.5 define unknown
+        // keywords as annotations. Their contents were bounded above and
+        // remain opaque to reference, resource, and schema traversal.
+        // The canonical meta-schema reserves these deprecated keywords and
+        // constrains their values. They are not arbitrary extension data;
+        // preserve their existing refusal until that vocabulary is implemented.
+        let unsupported_reserved = matches!(keyword.as_str(),
+            "definitions" | "dependencies" | "$recursiveAnchor" | "$recursiveRef"
+        );
+        if unsupported_reserved || (!unknown_annotations && !SUPPORTED.contains(&keyword.as_str())) {
             return Err(SchemaAdmissionError::new(
                 format!("{path}.{keyword}"),
                 "unsupported Draft 2020-12 vocabulary keyword",
@@ -6224,20 +6281,132 @@ mod tests {
     }
 
     #[test]
-    fn admitted_schema_refuses_unknown_vocabulary_keywords_and_raw_semantics_remain_legacy() {
-        let error = admit_final_schema(json!({
+    fn admitted_schema_retains_opaque_annotations_without_changing_assertions() {
+        let source = json!({
             "$schema": FINAL_JSON_SCHEMA_DIALECT,
-            "unsupportedFinalKeyword": true
-        }))
-        .expect_err("unsupported vocabularies fail before final-schema validation");
-        assert_eq!(error.path(), "$.unsupportedFinalKeyword");
-        assert_eq!(
-            error.reason(),
-            "unsupported Draft 2020-12 vocabulary keyword"
-        );
+            "type": "object",
+            "properties": {"value": {
+                "type": "integer", "minimum": 3,
+                "x-ui": {"type": 17, "$ref": "https://unregistered.example/schema"}
+            }},
+            "required": ["value"],
+            "additionalProperties": false,
+            "customAnnotation": [null, false, {"$schema": 17}]
+        });
+        let admitted = admit_final_schema(source.clone()).expect("custom annotations admit");
+        assert_eq!(admitted.schema(), &source);
+        assert!(admitted.validate(&json!({"value": 3})).is_ok());
+        for invalid in [json!({"value": 2}), json!({"value": "3"}), json!({})] {
+            assert!(admitted.validate(&invalid).is_err());
+        }
+        let mut malformed = source;
+        malformed["properties"]["value"]["type"] = json!(17);
+        assert!(admit_final_schema(malformed).is_err());
 
+        let numeric: Value = serde_json::from_str(
+            r#"{"type":"integer","x-number":1.20e+9000}"#,
+        ).unwrap();
+        let numeric = admit_final_schema(numeric).unwrap();
+        let Value::Number(number) = &numeric.schema()["x-number"] else {
+            panic!("numeric annotation must retain its JSON type");
+        };
+        assert_eq!(number.as_str(), "1.20e+9000");
+        assert!(numeric.validate(&json!(1)).is_ok());
+        assert!(numeric.validate(&json!("1")).is_err());
+    }
+
+    #[test]
+    fn raw_schema_validation_retains_legacy_numeric_and_reference_semantics() {
         assert!(validate(&json!({"type": "integer"}), &json!(1.0)).is_err());
         assert!(validate(&json!({"$ref": "#named"}), &json!(true)).is_err());
+    }
+
+    #[test]
+    fn custom_annotation_objects_never_acquire_reference_or_dialect_authority() {
+        let source = json!({
+            "$id": "https://schemas.example/root",
+            "$defs": {"real": {"type": "integer", "minimum": 3}},
+            "$ref": "#/$defs/real",
+            "x-ui": {
+                "$id": "https://schemas.example/annotation",
+                "$anchor": "annotation",
+                "$dynamicAnchor": "dynamic",
+                "type": 17,
+                "$ref": "https://unregistered.example/schema"
+            }
+        });
+        let admitted = admit_final_schema(source.clone()).unwrap();
+        assert!(admitted.validate(&json!(3)).is_ok());
+        assert!(admitted.validate(&json!(2)).is_err());
+        for target in ["#/x-ui", "#annotation", "#dynamic", "https://schemas.example/annotation"] {
+            let mut invalid = source.clone();
+            invalid["$ref"] = json!(target);
+            assert!(admit_final_schema(invalid).is_err(), "opaque data must not resolve: {target}");
+        }
+        let mut dialect = source;
+        dialect["$schema"] = json!("https://schemas.example/annotation");
+        assert!(admit_final_schema(dialect).is_err());
+    }
+
+    #[test]
+    fn custom_dialect_keyword_policy_is_inherited_until_canonical_resource_reset() {
+        let source = json!({
+            "$id": "https://schemas.example/root",
+            "$schema": "https://schemas.example/meta",
+            "$defs": {"meta": {
+                "$id": "https://schemas.example/meta",
+                "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                "$vocabulary": {CORE_VOCABULARY_URI: true, VALIDATION_VOCABULARY_URI: true}
+            }},
+            "type": "object",
+            "properties": {"value": {
+                "$id": "child",
+                "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                "type": "integer", "x-ui": {"type": 17}
+            }}
+        });
+        let admitted = admit_final_schema(source.clone()).unwrap();
+        assert!(admitted.validate(&json!({"value": 3})).is_ok());
+        assert!(admitted.validate(&json!({"value": "3"})).is_err());
+        let mut inherited = source.clone();
+        inherited["properties"]["value"].as_object_mut().unwrap().remove("$schema");
+        let error = admit_final_schema(inherited).unwrap_err();
+        assert_eq!(error.path(), "$.properties.value.x-ui");
+        let mut root_annotation = source;
+        root_annotation["x-ui"] = json!(true);
+        assert_eq!(admit_final_schema(root_annotation).unwrap_err().path(), "$.x-ui");
+    }
+
+    #[test]
+    fn opaque_annotations_share_document_byte_node_and_depth_bounds() {
+        let overhead = serde_json::to_vec(&json!({"x-note": ""})).unwrap().len();
+        let source = json!({"x-note": "x".repeat(MAX_SCHEMA_DOCUMENT_BYTES - overhead)});
+        assert_eq!(serde_json::to_vec(&source).unwrap().len(), MAX_SCHEMA_DOCUMENT_BYTES);
+        assert!(admit_final_schema(source.clone()).is_ok());
+        let mut oversized = source;
+        oversized["x-note"] = json!("x".repeat(MAX_SCHEMA_DOCUMENT_BYTES - overhead + 1));
+        assert_eq!(admit_final_schema(oversized).unwrap_err().reason(), "schema document byte limit exceeded");
+
+        let mut wide = json!({"x-data": vec![Value::Null; MAX_SCHEMA_DOCUMENT_NODES - 2]});
+        assert!(admit_final_schema(wide.clone()).is_ok());
+        wide["x-data"].as_array_mut().unwrap().push(Value::Null);
+        assert_eq!(admit_final_schema(wide).unwrap_err().reason(), "schema document node limit exceeded");
+
+        let mut nested = Value::Null;
+        for _ in 0..MAX_SCHEMA_VALIDATION_DEPTH - 2 {
+            nested = Value::Array(vec![nested]);
+        }
+        assert!(admit_final_schema(json!({"x-data": nested.clone()})).is_ok());
+        assert_eq!(admit_final_schema(json!({"x-data": [nested]})).unwrap_err().reason(), "schema document nesting limit exceeded");
+    }
+
+    #[test]
+    fn reserved_deprecated_keywords_do_not_become_unchecked_custom_annotations() {
+        for keyword in ["definitions", "dependencies", "$recursiveAnchor", "$recursiveRef"] {
+            let mut source = json!({"type": "integer", "x-ui": {"type": 17}});
+            source[keyword] = json!(17);
+            assert!(admit_final_schema(source).is_err());
+        }
     }
 
     #[test]

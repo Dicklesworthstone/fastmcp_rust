@@ -52,9 +52,35 @@ fn duplicate_names_across_pages_refuse_the_entire_catalog() {
 }
 
 #[test]
+fn unknown_schema_annotations_survive_catalog_admission_and_keep_constraints() {
+    let mut annotated = tool("annotated");
+    annotated.input_schema["x-ui"] = json!({
+        "type": 17,
+        "$ref": "https://unregistered.example/schema",
+        "properties": {"hidden": {"x-mcp-header": "Invalid\r\nHeader"}}
+    });
+    annotated.input_schema["properties"]["count"]["x-unit"] = json!("items");
+    let source = annotated.input_schema.clone();
+    let pages = [page(vec![tool("plain"), annotated])];
+    let before = pages[0].encode().unwrap();
+    let (contracts, invalidated) = admit_contracts(&pages, ManagedToolCatalogLimits::default()).unwrap();
+    assert_eq!(contracts.len(), 2);
+    assert!(!invalidated.load(Ordering::Acquire));
+    let contract = &contracts["annotated"];
+    assert_eq!(contract.input.schema(), &source);
+    assert_eq!(contract.input.header_plan().bindings().len(), 1);
+    contract.validate_request(&request("tools/call", json!({"name":"annotated","arguments":{"count":2}}))).unwrap();
+    for count in [json!(0), json!("2")] {
+        assert!(matches!(contract.validate_request(&request("tools/call", json!({"name":"annotated","arguments":{"count":count}}))),
+            Err(ManagedToolError::InvalidArguments)));
+    }
+    assert_eq!(pages[0].encode().unwrap(), before);
+}
+
+#[test]
 fn one_invalid_definition_does_not_publish_valid_siblings() {
     let mut invalid = tool("bad");
-    invalid.input_schema["unknownValidationKeyword"] = json!(true);
+    invalid.input_schema["properties"]["count"]["minimum"] = json!("not-a-number");
     assert!(matches!(admit_contracts(&[page(vec![tool("good"), invalid])], ManagedToolCatalogLimits::default()),
         Err(ManagedToolCatalogError::Tool(ManagedToolError::InvalidInputSchema))));
 }
