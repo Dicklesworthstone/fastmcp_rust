@@ -362,6 +362,10 @@ pub struct LegacyReceiptBinding {
 impl LegacyReceiptBinding {
     /// Creates a binding only from trusted in-crate adapter installation code.
     #[allow(clippy::too_many_arguments)]
+    #[expect(
+        dead_code,
+        reason = "the sealed LEG-02/LEG-03 receipt installers that call this are not built yet"
+    )]
     pub(crate) fn new(
         policy: ProtocolPolicy,
         transport_binding: String,

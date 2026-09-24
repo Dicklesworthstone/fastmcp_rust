@@ -37,7 +37,6 @@
 //! MCP data models. The modernization disclaimer above still applies.
 
 #![forbid(unsafe_code)]
-#![allow(dead_code)]
 
 pub mod common_types;
 pub mod extensions;

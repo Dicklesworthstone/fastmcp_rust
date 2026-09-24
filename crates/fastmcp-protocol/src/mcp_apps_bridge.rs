@@ -1643,10 +1643,6 @@ impl McpAppsHostIdAllocator {
     }
 }
 
-fn parse_request_id(value: Value) -> Result<McpAppsJsonRpcRequestId, McpAppsBridgeError> {
-    serde_json::from_value(value).map_err(|_| McpAppsBridgeError::InvalidRequestId)
-}
-
 fn parse_raw_request_id(
     raw: Option<&RawValue>,
     value: Value,

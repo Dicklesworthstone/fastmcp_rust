@@ -3892,6 +3892,7 @@ impl CoreRequest {
         }
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn decode_legacy(method: &str, params: Option<&Value>) -> Result<Self, CoreDispatchError> {
         let request =
             match method {
@@ -4603,6 +4604,7 @@ fn encode_params<T: Serialize>(
         .map_err(|_| CoreDispatchError::InvalidParams { era, method })
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 fn require_absent_or_empty_params(
     era: ProtocolEra,
     method: &'static str,
@@ -4615,6 +4617,7 @@ fn require_absent_or_empty_params(
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 fn legacy_params_carry_final_metadata(params: Option<&Value>) -> bool {
     params.is_some_and(has_final_only_metadata)
 }
