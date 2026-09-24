@@ -853,9 +853,9 @@ fn wire_policy_checkpoint(
 
 fn permits_content(
     modalities: &McpAppsContentBlockModalities,
-    content: &[fastmcp_protocol::ContentBlock],
+    content: &[fastmcp_protocol::common_types::ContentBlock],
 ) -> bool {
-    use fastmcp_protocol::ContentBlock;
+    use fastmcp_protocol::common_types::ContentBlock;
     content.iter().all(|block| match block {
         ContentBlock::Text { .. } => modalities.text.is_some(),
         ContentBlock::Image { .. } => modalities.image.is_some(),
