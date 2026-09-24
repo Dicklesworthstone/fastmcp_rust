@@ -15737,6 +15737,7 @@ IFS= read -r end
 
         // Same peer and operation: 0=success, 1=upstream error, 2=cancel,
         // 3=deadline, 4=drop. Every negative retries on the same connection.
+        let probe_started = Instant::now();
         let clock = Arc::new(asupersync::time::VirtualClock::new());
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
@@ -15792,10 +15793,19 @@ IFS= read -r end
             let peer_initialization = initialization.clone();
             let peer = thread::spawn(move || {
                 let deadline = Instant::now() + Duration::from_secs(15);
+                // The probe's timeout report reads this, so a peer that is
+                // blocked or has already hit its own bound is not mistaken
+                // for a request the proxy never sent.
+                let phase = |state: &str| {
+                    let _ = std::fs::write(peer_control.join("peer-phase"), state);
+                };
                 let mut sse = None;
                 let mut delayed = None;
                 let mut index = 0;
                 while !peer_stop.load(Ordering::Acquire) {
+                    if Instant::now() >= deadline {
+                        phase("deadline: peer bound expired");
+                    }
                     assert!(
                         Instant::now() < deadline,
                         "native subscription peer is bounded"
@@ -15822,7 +15832,16 @@ IFS= read -r end
                         .unwrap();
                     post.set_write_timeout(Some(Duration::from_secs(10)))
                         .unwrap();
+                    phase(&format!(
+                        "accepted connection {index}; reading its request at {:?}",
+                        deadline.saturating_duration_since(Instant::now())
+                    ));
                     let incoming = read_http_request(&mut post);
+                    phase(&format!(
+                        "read `{}`; {:?} before the peer bound",
+                        incoming.head.lines().next().unwrap_or_default(),
+                        deadline.saturating_duration_since(Instant::now())
+                    ));
                     if incoming.head.starts_with("GET /sse ") {
                         post.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
                         write_chunked_sse_event(
@@ -15947,8 +15966,10 @@ IFS= read -r end
                     if control.join("received").exists() { break; }
                     assert!(
                         Instant::now() < deadline,
-                        "request reaches native upstream; http={http}, unsubscribe={unsubscribe}, interrupt={interrupt}, upstream requests so far: {:?}",
-                        std::fs::read_to_string(control.join("requests")).ok()
+                        "request reaches native upstream; http={http}, unsubscribe={unsubscribe}, interrupt={interrupt}, {:?} after probe start, upstream requests so far: {:?}, peer phase: {:?}",
+                        probe_started.elapsed(),
+                        std::fs::read_to_string(control.join("requests")).ok(),
+                        std::fs::read_to_string(control.join("peer-phase")).ok()
                     );
                     asupersync::runtime::yield_now().await;
                 }
