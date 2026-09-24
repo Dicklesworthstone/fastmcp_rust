@@ -102,7 +102,7 @@ fn endpoint(probe: &Probe) -> ServerHttpEndpoint {
     #[cfg(not(feature = "legacy-2024-11-05"))]
     let endpoint = server(probe).into_http_endpoint();
     #[cfg(feature = "legacy-2024-11-05")]
-    let endpoint = server(probe).into_http_endpoint("https://lease.example");
+    let endpoint = server(probe).into_http_endpoint("http://lease.example");
     endpoint.unwrap()
 }
 fn policy(checks: usize) -> HttpSecurityPolicy {
@@ -406,7 +406,7 @@ mod resource_watch_tests {
         #[cfg(not(feature = "legacy-2024-11-05"))]
         let endpoint = server.into_http_endpoint();
         #[cfg(feature = "legacy-2024-11-05")]
-        let endpoint = server.into_http_endpoint("https://lease.example");
+        let endpoint = server.into_http_endpoint("http://lease.example");
         endpoint.unwrap()
     }
     fn watch_policy() -> HttpSecurityPolicy {

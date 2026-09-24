@@ -117,7 +117,7 @@ fn endpoint(provider: &RecordingProvider, policy: ScopeImplicationPolicy) -> Ser
     #[cfg(not(feature = "legacy-2024-11-05"))]
     let endpoint = builder.build_http_endpoint();
     #[cfg(feature = "legacy-2024-11-05")]
-    let endpoint = builder.build_http_endpoint("https://service.example");
+    let endpoint = builder.build_http_endpoint("http://service.example");
     endpoint.unwrap()
 }
 

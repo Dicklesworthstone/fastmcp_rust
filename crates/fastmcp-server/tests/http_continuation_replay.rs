@@ -172,7 +172,7 @@ impl Fixture {
         #[cfg(not(feature = "legacy-2024-11-05"))]
         let endpoint = builder.build_http_endpoint();
         #[cfg(feature = "legacy-2024-11-05")]
-        let endpoint = builder.build_http_endpoint("https://service.example");
+        let endpoint = builder.build_http_endpoint("http://service.example");
         let policy = HttpSecurityPolicy::new(
             HttpEndpointConfig::new("/mcp", HttpAdmissionLimits::new(32, 8192, 65536).unwrap()).unwrap(),
             "https://service.example", vec![],

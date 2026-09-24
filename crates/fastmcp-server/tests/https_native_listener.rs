@@ -253,9 +253,12 @@ fn decode_wire(bytes: &[u8]) -> HttpResponse {
     let mut lines = std::str::from_utf8(&bytes[..end]).unwrap().split("\r\n");
     let status = lines.next().unwrap().split_whitespace().nth(1).unwrap().parse::<u16>().unwrap();
     let mut response = HttpResponse::new(HttpStatus(status));
+    // `HttpResponse::new` presets a JSON content-type; decode only what the wire carried.
+    response.headers.clear();
     for line in lines {
         let (name, value) = line.split_once(':').unwrap();
-        assert!(response.headers.insert(name.to_ascii_lowercase(), value.trim().to_owned()).is_none());
+        assert!(response.headers.insert(name.to_ascii_lowercase(), value.trim().to_owned()).is_none(),
+            "duplicate response header {name}");
     }
     let mut body = &bytes[end + 4..];
     if response.headers.get("transfer-encoding").is_some_and(|value| value.eq_ignore_ascii_case("chunked")) {

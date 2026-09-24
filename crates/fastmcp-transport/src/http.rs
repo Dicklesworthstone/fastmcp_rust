@@ -6156,12 +6156,18 @@ fn validate_dual_era_path(label: &str, path: &str) -> Result<(), DualEraHttpEndp
     Ok(())
 }
 
+/// The exact 2024-11-05 lane has no TLS form: [`LegacySseHttpPostSink`] is
+/// plaintext-only, and the native TLS listener serves only MCP 2026-07-28.
+#[cfg(feature = "legacy-2024-11-05")]
+const LEGACY_ORIGIN_REQUIRES_PLAIN_HTTP: &str = "legacy origin must use http://: the exact \
+     2024-11-05 SSE lane has no TLS support (its POST sink is plaintext-only and native TLS \
+     listeners serve only MCP 2026-07-28)";
+
 #[cfg(feature = "legacy-2024-11-05")]
 fn validate_legacy_http_origin(origin: &str) -> Result<(), DualEraHttpEndpointError> {
     let Some(authority) = origin.strip_prefix("http://") else {
         return Err(DualEraHttpEndpointError::InvalidConfiguration(
-            "legacy origin must use the plain HTTP scheme supported by the legacy POST sink"
-                .to_string(),
+            LEGACY_ORIGIN_REQUIRES_PLAIN_HTTP.to_string(),
         ));
     };
     if authority.is_empty()
@@ -12643,6 +12649,25 @@ Content-Length: {}\r\n\
         let config =
             DualEraHttpEndpointConfig::new("/legacy/sse", "/legacy/messages", "http://legacy.test");
         DualEraHttpEndpoint::new(handler, config).expect("dual-era endpoint configuration is valid")
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn dual_era_endpoint_refuses_a_tls_legacy_origin_and_says_why() {
+        let endpoint = |origin: &str| {
+            DualEraHttpEndpoint::new(
+                HttpRequestHandler::new(),
+                DualEraHttpEndpointConfig::new("/legacy/sse", "/legacy/messages", origin),
+            )
+        };
+        assert!(endpoint("http://legacy.test").is_ok());
+        // Near-identical negative: only the scheme differs.
+        match endpoint("https://legacy.test").err() {
+            Some(DualEraHttpEndpointError::InvalidConfiguration(message)) => {
+                assert_eq!(message, LEGACY_ORIGIN_REQUIRES_PLAIN_HTTP);
+            }
+            other => panic!("an https legacy origin must be refused: {other:?}"),
+        }
     }
 
     #[cfg(feature = "legacy-2024-11-05")]

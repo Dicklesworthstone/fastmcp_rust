@@ -137,7 +137,7 @@ fn endpoint(server: Server) -> ServerHttpEndpoint {
     #[cfg(not(feature = "legacy-2024-11-05"))]
     let endpoint = server.into_http_endpoint();
     #[cfg(feature = "legacy-2024-11-05")]
-    let endpoint = server.into_http_endpoint("https://scope.example");
+    let endpoint = server.into_http_endpoint("http://scope.example");
     endpoint.unwrap()
 }
 fn request(probe: &Probe, id: i64, method: &str, mut params: Value) -> HttpRequest {
