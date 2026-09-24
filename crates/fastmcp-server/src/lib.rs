@@ -523,7 +523,7 @@ use fastmcp_console::RequestResponseRenderer;
 use fastmcp_console::banner::StartupBanner;
 use fastmcp_console::console::FastMcpConsole;
 use fastmcp_console::logging::RichLoggerBuilder;
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(test)]
 use fastmcp_core::block_on;
 use fastmcp_core::logging::{debug, error, info, targets};
 use fastmcp_core::{
@@ -1478,6 +1478,18 @@ struct LiveLegacy2024RuntimeHandler<'a> {
     connection_auth: Option<AuthDispatchCustody>,
 }
 
+/// The live exact-2024 runtime handlers are driven only through
+/// `Legacy2024ServerAdapter::receive_async`. Their synchronous hook would have
+/// to block on the request future, so it refuses instead of dispatching.
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+const LIVE_LEGACY_SYNC_DISPATCH_REFUSED: &str =
+    "live exact-2024 runtime handlers dispatch only through receive_async";
+
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+fn live_legacy_sync_dispatch_refused() -> Legacy2024HandlerError {
+    Legacy2024HandlerError::new(LIVE_LEGACY_SYNC_DISPATCH_REFUSED)
+}
+
 #[cfg(any(feature = "legacy-2024-11-05", test))]
 fn combine_legacy_dispatch_and_close<T>(
     dispatch: Result<T, Legacy2024HandlerError>,
@@ -1506,11 +1518,11 @@ impl Legacy2024Handler for LiveLegacy2024RuntimeHandler<'_> {
 
     fn handle_legacy_2024_with_request_id(
         &mut self,
-        request_id: &serde_json::Value,
-        method: &'static str,
-        params: Option<&serde_json::Value>,
+        _request_id: &serde_json::Value,
+        _method: &'static str,
+        _params: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value, Legacy2024HandlerError> {
-        block_on(self.handle_legacy_2024_with_request_id_async(request_id, method, params))
+        Err(live_legacy_sync_dispatch_refused())
     }
 
     fn handle_legacy_2024_with_request_id_async<'a>(
@@ -1618,11 +1630,11 @@ impl Legacy2024Handler for HttpLegacy2024RuntimeHandler {
 
     fn handle_legacy_2024_with_request_id(
         &mut self,
-        request_id: &serde_json::Value,
-        method: &'static str,
-        params: Option<&serde_json::Value>,
+        _request_id: &serde_json::Value,
+        _method: &'static str,
+        _params: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value, Legacy2024HandlerError> {
-        block_on(self.handle_legacy_2024_with_request_id_async(request_id, method, params))
+        Err(live_legacy_sync_dispatch_refused())
     }
 
     fn handle_legacy_2024_with_request_id_async<'a>(
@@ -46464,6 +46476,105 @@ mod lib_unit_tests {
                 .try_recv_event(&cx)
                 .expect("unsubscribed update check must not fail")
                 .is_none()
+        );
+    }
+
+    /// The live exact-2024 HTTP handler serves requests only through its async
+    /// hook; its synchronous hook refuses instead of blocking on the request.
+    #[test]
+    fn legacy_http_runtime_handler_serves_requests_only_through_the_async_hook() {
+        struct ListedResource;
+
+        impl crate::ResourceHandler for ListedResource {
+            fn definition(&self) -> Resource {
+                Resource {
+                    uri: "file:///listed.txt".to_string(),
+                    name: "listed".to_string(),
+                    description: None,
+                    mime_type: Some("text/plain".to_string()),
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                }
+            }
+
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<fastmcp_protocol::ResourceContent>> {
+                Ok(vec![])
+            }
+        }
+
+        let cx = Cx::for_testing();
+        let endpoint = Server::new("legacy-http-async-hook", "1.0.0")
+            .resource(ListedResource)
+            .build_http_endpoint("http://legacy.test")
+            .expect("builder must construct the configured dual-era endpoint");
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("endpoint must open a bounded live session");
+        let ServerHttpEndpointResponse::LegacySse(mut stream) =
+            block_on(session.handle_async(&cx, HttpRequest::new(HttpMethod::Get, "/sse")))
+                .expect("legacy SSE route must open")
+        else {
+            panic!("legacy GET must open an exact SSE stream");
+        };
+        let _endpoint = stream.recv_event(&cx).expect("legacy endpoint event");
+        let session_id = session.legacy_session_id().to_owned();
+        let post = |message: JsonRpcRequest| {
+            HttpRequest::new(HttpMethod::Post, "/messages")
+                .with_header("content-type", "application/json")
+                .with_query("session_id", session_id.clone())
+                .with_body(serde_json::to_vec(&message).expect("message must serialize"))
+        };
+        let list = |id: i64| JsonRpcRequest::new("resources/list", Some(serde_json::json!({})), id);
+        for request in [
+            JsonRpcRequest::new(
+                "initialize",
+                Some(serde_json::json!({
+                    "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "legacy-http-client", "version": "1.0.0"},
+                })),
+                251_i64,
+            ),
+            JsonRpcRequest::notification("notifications/initialized", None),
+            list(252),
+        ] {
+            assert!(matches!(
+                block_on(session.handle_async(&cx, post(request))),
+                Ok(ServerHttpEndpointResponse::Immediate(response)) if response.status == HttpStatus::ACCEPTED
+            ));
+        }
+        let _initialize = stream.recv_event(&cx).expect("initialize response");
+        let listed = stream.recv_event(&cx).expect("resources/list response");
+        let JsonRpcMessage::Response(listed) = Codec::new()
+            .decode_complete_message(listed.data.as_bytes())
+            .expect("the listing must remain JSON-RPC")
+        else {
+            panic!("resources/list must answer with a response");
+        };
+        assert!(listed.error.is_none(), "{listed:?}");
+        assert_eq!(
+            listed.result.as_ref().expect("listing result")["resources"][0]["uri"],
+            "file:///listed.txt"
+        );
+
+        // Near-identical negative: the same request on the same adapter's
+        // synchronous entry point is refused instead of being dispatched.
+        let binding = session.legacy_binding;
+        let wire = serde_json::to_value(list(253)).expect("request must serialize");
+        let refused = session
+            .legacy_adapter
+            .as_mut()
+            .expect("the session installed its exact adapter")
+            .receive(binding, wire)
+            .expect("a handler refusal is answered on the wire");
+        let Legacy2024Outbound::Response(refused) = refused else {
+            panic!("a request must be answered: {refused:?}");
+        };
+        assert_eq!(refused["error"]["code"], -32603, "{refused}");
+        assert_eq!(
+            refused["error"]["message"], LIVE_LEGACY_SYNC_DISPATCH_REFUSED,
+            "{refused}"
         );
     }
 
