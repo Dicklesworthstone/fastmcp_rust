@@ -3927,77 +3927,10 @@ impl ServerHttpEndpointError {
 
 fn http_request_accepts_sse(request: &HttpRequest) -> bool {
     request.header("accept").is_some_and(|value| {
-        const MAX_ACCEPT_ENTRIES: usize = 64;
-        const MAX_ACCEPT_PARAMETERS: usize = 32;
-        const MAX_QVALUE_BYTES: usize = 32;
-
-        let mut entries = value.split(',');
-        for _ in 0..MAX_ACCEPT_ENTRIES {
-            let Some(entry) = entries.next() else {
-                return false;
-            };
-            let mut parameters = entry.split(';');
-            let media_type = parameters.next().unwrap_or("").trim_matches([' ', '\t']);
-            let Some((kind, subtype)) = media_type.split_once('/') else {
-                continue;
-            };
-            if !(kind.eq_ignore_ascii_case("text") || kind == "*")
-                || !(subtype.eq_ignore_ascii_case("event-stream") || subtype == "*")
-            {
-                continue;
-            }
-
-            let mut quality = None;
-            let mut parameter_count = 0;
-            let mut malformed = false;
-            for parameter in parameters {
-                parameter_count += 1;
-                if parameter_count > MAX_ACCEPT_PARAMETERS {
-                    malformed = true;
-                    break;
-                }
-                let Some((name, value)) = parameter.split_once('=') else {
-                    continue;
-                };
-                if !name.trim_matches([' ', '\t']).eq_ignore_ascii_case("q") {
-                    continue;
-                }
-                if quality.is_some() {
-                    malformed = true;
-                    break;
-                }
-                let value = value.trim_matches([' ', '\t']);
-                if value.len() > MAX_QVALUE_BYTES || value.is_empty() {
-                    malformed = true;
-                    break;
-                }
-                quality = Some(match value.split_once('.') {
-                    Some(("0", fraction))
-                        if fraction.len() <= 3
-                            && fraction.bytes().all(|byte| byte.is_ascii_digit()) =>
-                    {
-                        fraction.bytes().any(|byte| byte != b'0')
-                    }
-                    Some(("1", fraction))
-                        if fraction.len() <= 3
-                            && fraction.bytes().all(|byte| byte.is_ascii_digit())
-                            && fraction.bytes().all(|byte| byte == b'0') =>
-                    {
-                        true
-                    }
-                    None if value == "0" => false,
-                    None if value == "1" => true,
-                    _ => {
-                        malformed = true;
-                        false
-                    }
-                });
-            }
-            if !malformed && quality.unwrap_or(true) {
-                return true;
-            }
-        }
-        false
+        fastmcp_transport::http::HttpResponsePreferences::from_headers([("accept", value)])
+            .is_ok_and(|preferences| {
+                preferences.accepts(fastmcp_transport::http::HttpResponseRepresentation::Sse)
+            })
     })
 }
 
@@ -9776,13 +9709,16 @@ fn oauth_http_error(error: OAuthError) -> HttpResponse {
     )
 }
 
-/// Maps OAuth errors emitted while authenticating a token or revocation
-/// request's form client credentials.  These endpoints challenge client-auth
-/// failures without changing authorization-endpoint redirect behavior.
-fn oauth_http_client_authentication_error(error: OAuthError) -> HttpResponse {
+/// RFC 6749 section 5.2 requires a matching challenge only when failed client
+/// authentication used the Authorization header. Form and public-client
+/// failures remain HTTP 400 without inviting a different authentication method.
+fn oauth_http_client_authentication_error(
+    error: OAuthError,
+    used_basic_authorization: bool,
+) -> HttpResponse {
     match &error {
-        OAuthError::InvalidClient(_) | OAuthError::UnauthorizedClient(_) => {
-            oauth_http_client_authentication_rejection(error.error_code())
+        OAuthError::InvalidClient(_) if used_basic_authorization => {
+            oauth_http_client_authentication_rejection()
         }
         _ => oauth_http_error(error),
     }
@@ -9800,30 +9736,91 @@ fn oauth_http_method_not_allowed(allow: &'static str) -> HttpResponse {
     )
 }
 
-fn oauth_http_client_authentication_rejection(error_code: &'static str) -> HttpResponse {
+fn oauth_http_client_authentication_rejection() -> HttpResponse {
     oauth_http_no_store(
         HttpResponse::new(HttpStatus::UNAUTHORIZED)
             .with_header("www-authenticate", "Basic realm=\"oauth\"")
-            .with_json(&serde_json::json!({ "error": error_code })),
+            .with_json(&serde_json::json!({ "error": "invalid_client" })),
     )
 }
 
-/// Rejects an HTTP Authorization header on form-authenticated OAuth routes.
-///
-/// Only an attempted Basic client-authentication exchange is challenged. Other
-/// schemes remain malformed OAuth requests: treating a Bearer credential as a
-/// Basic challenge would both change the established route semantics and
-/// invite a client to resend an unrelated bearer token as client credentials.
-fn oauth_http_client_authorization_header_rejection(authorization: &str) -> HttpResponse {
-    if authorization
-        .split_ascii_whitespace()
-        .next()
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("basic"))
-    {
-        oauth_http_client_authentication_rejection("invalid_client")
-    } else {
-        oauth_http_invalid_request()
+/// Selects one credential location before any OAuth state mutation. Basic
+/// username/password components use OAuth form decoding, not raw HTTP Basic
+/// text (RFC 6749 section 2.3.1). Decoding is bounded before allocation and all
+/// intermediate credential buffers are zeroized on success and rejection.
+fn oauth_http_client_credentials(
+    admission: &mut OAuthParameterAdmission,
+    authorization: Option<&str>,
+) -> Result<(String, Option<String>), HttpResponse> {
+    let Some(authorization) = authorization else {
+        let client_id = oauth_required_parameter(admission, OAuthParameterName::ClientId)
+            .map_err(oauth_http_error)?;
+        let client_secret = admission
+            .take_defined_value(OAuthParameterName::ClientSecret)
+            .map(|value| value.into_string());
+        return Ok((client_id, client_secret));
+    };
+
+    // Keep the raw parameter inventory: empty client_id/client_secret fields
+    // are omitted from the taking surface but still conflict with Basic.
+    if admission.parameters().iter().any(|parameter| {
+        parameter.is_defined() && matches!(parameter.name(), "client_id" | "client_secret")
+    }) {
+        return Err(oauth_http_invalid_request());
     }
+    let authorization = authorization.trim_matches([' ', '\t']);
+    let scheme = authorization.split_ascii_whitespace().next().unwrap_or("");
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return Err(oauth_http_invalid_request());
+    }
+    let (scheme, encoded) = authorization
+        .split_once(' ')
+        .ok_or_else(oauth_http_client_authentication_rejection)?;
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return Err(oauth_http_client_authentication_rejection());
+    }
+    let encoded = encoded.trim_start_matches(' ');
+    // Every UTF-8 byte can expand to three percent-encoded bytes; add the
+    // Basic colon and padded base64 expansion. This also bounds malformed
+    // headers without allocating their decoded representation.
+    const MAX_BASIC_DECODED_BYTES: usize =
+        3 * (oauth::MAX_OAUTH_CLIENT_ID_BYTES + oauth::MAX_OAUTH_CLIENT_CREDENTIAL_BYTES) + 1;
+    const MAX_BASIC_ENCODED_BYTES: usize = 4 * MAX_BASIC_DECODED_BYTES.div_ceil(3);
+    if encoded.is_empty() || encoded.len() > MAX_BASIC_ENCODED_BYTES {
+        return Err(oauth_http_client_authentication_rejection());
+    }
+    use base64::Engine as _;
+    let mut decoded = zeroize::Zeroizing::new(Vec::with_capacity(encoded.len().div_ceil(4) * 3));
+    base64::engine::general_purpose::STANDARD
+        .decode_vec(encoded, &mut decoded)
+        .map_err(|_| oauth_http_client_authentication_rejection())?;
+    if decoded.len() > MAX_BASIC_DECODED_BYTES {
+        return Err(oauth_http_client_authentication_rejection());
+    }
+    let colon = decoded
+        .iter()
+        .position(|byte| *byte == b':')
+        .ok_or_else(oauth_http_client_authentication_rejection)?;
+    let client_id = zeroize::Zeroizing::new(
+        oauth::decode_oauth_form_component(&decoded[..colon], oauth::MAX_OAUTH_CLIENT_ID_BYTES)
+            .map_err(|_| oauth_http_client_authentication_rejection())?,
+    );
+    let client_secret = zeroize::Zeroizing::new(
+        oauth::decode_oauth_form_component(
+            &decoded[colon + 1..],
+            oauth::MAX_OAUTH_CLIENT_CREDENTIAL_BYTES,
+        )
+        .map_err(|_| oauth_http_client_authentication_rejection())?,
+    );
+    if client_id.is_empty()
+        || client_id.chars().any(char::is_control)
+        || client_secret.chars().any(char::is_control)
+    {
+        return Err(oauth_http_client_authentication_rejection());
+    }
+    // An empty Basic password stays Some(""): it cannot downgrade to a
+    // public client's no-secret authentication in the underlying verifier.
+    Ok((client_id.to_string(), Some(client_secret.to_string())))
 }
 
 fn h1_oauth_singleton_header<'a>(
@@ -9916,6 +9913,8 @@ fn oauth_authorization_request(
 
 fn oauth_token_request(
     admission: &mut OAuthParameterAdmission,
+    client_id: String,
+    client_secret: Option<String>,
 ) -> Result<TokenRequest, OAuthError> {
     let scopes = admission
         .take_defined_value(OAuthParameterName::Scope)
@@ -9934,10 +9933,8 @@ fn oauth_token_request(
         redirect_uri: admission
             .take_defined_value(OAuthParameterName::RedirectUri)
             .map(|value| value.into_string()),
-        client_id: oauth_required_parameter(admission, OAuthParameterName::ClientId)?,
-        client_secret: admission
-            .take_defined_value(OAuthParameterName::ClientSecret)
-            .map(|value| value.into_string()),
+        client_id,
+        client_secret,
         code_verifier: admission
             .take_defined_value(OAuthParameterName::CodeVerifier)
             .map(|value| value.into_string()),
@@ -10113,9 +10110,6 @@ fn dispatch_oauth_h1_request(
         return oauth_http_invalid_request();
     }
     if raw_path == routes.token_path() {
-        if let Some(authorization_header) = authorization_header {
-            return oauth_http_client_authorization_header_rejection(authorization_header);
-        }
         if !matches!(request.method, Http1Method::Post) {
             return oauth_http_method_not_allowed("POST");
         }
@@ -10129,19 +10123,23 @@ fn dispatch_oauth_h1_request(
             Ok(admission) => admission,
             Err(_) => return oauth_http_invalid_request(),
         };
-        let token = match oauth_token_request(&mut admission) {
+        let (client_id, client_secret) =
+            match oauth_http_client_credentials(&mut admission, authorization_header) {
+                Ok(credentials) => credentials,
+                Err(response) => return response,
+            };
+        let token = match oauth_token_request(&mut admission, client_id, client_secret) {
             Ok(token) => token,
             Err(error) => return oauth_http_error(error),
         };
         return match routes.server().token(&token) {
             Ok(response) => oauth_http_no_store(HttpResponse::ok().with_json(&response)),
-            Err(error) => oauth_http_client_authentication_error(error),
+            Err(error) => {
+                oauth_http_client_authentication_error(error, authorization_header.is_some())
+            }
         };
     }
 
-    if let Some(authorization_header) = authorization_header {
-        return oauth_http_client_authorization_header_rejection(authorization_header);
-    }
     if !matches!(request.method, Http1Method::Post) {
         return oauth_http_method_not_allowed("POST");
     }
@@ -10158,19 +10156,17 @@ fn dispatch_oauth_h1_request(
         Ok(token) => token,
         Err(error) => return oauth_http_error(error),
     };
-    let client_id = match oauth_required_parameter(&mut admission, OAuthParameterName::ClientId) {
-        Ok(client_id) => client_id,
-        Err(error) => return oauth_http_error(error),
-    };
-    let client_secret = admission
-        .take_defined_value(OAuthParameterName::ClientSecret)
-        .map(|value| value.into_string());
+    let (client_id, client_secret) =
+        match oauth_http_client_credentials(&mut admission, authorization_header) {
+            Ok(credentials) => credentials,
+            Err(response) => return response,
+        };
     match routes
         .server()
         .revoke(&token, &client_id, client_secret.as_deref())
     {
         Ok(()) => oauth_http_no_store(HttpResponse::ok()),
-        Err(error) => oauth_http_client_authentication_error(error),
+        Err(error) => oauth_http_client_authentication_error(error, authorization_header.is_some()),
     }
 }
 
@@ -38125,6 +38121,429 @@ mod lib_unit_tests {
         });
     }
 
+    /// Explicit test consent backend installed through the production API;
+    /// native Basic tests do not depend on the cfg(test) default approval.
+    struct NativeBasicConsent;
+
+    impl oauth::AuthorizationApprovalBackend for NativeBasicConsent {
+        fn generation(&self) -> oauth::AuthorizationApprovalGeneration {
+            oauth::AuthorizationApprovalGeneration::from_bytes([0x42; 32])
+        }
+
+        fn approve(
+            &self,
+            request: &oauth::AuthorizationApprovalRequest,
+        ) -> oauth::AuthorizationApprovalDisposition {
+            oauth::AuthorizationApprovalDisposition::Approved(
+                request
+                    .approve(
+                        "native-basic-owner".to_owned(),
+                        request.scopes().to_vec(),
+                        request.resource().map(str::to_owned),
+                        self.generation(),
+                    )
+                    .expect("approve the exact bounded client request"),
+            )
+        }
+    }
+
+    fn native_oauth_basic_header(encoded_components: &str) -> String {
+        use base64::Engine as _;
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(encoded_components),
+        )
+    }
+
+    fn native_oauth_basic_fixture() -> (OAuthHttpRoutes, String, String) {
+        let oauth = Arc::new(
+            oauth::OAuthServer::try_with_approval_backend(
+                oauth::OAuthServerConfig::default(),
+                Arc::new(NativeBasicConsent),
+            )
+            .expect("valid explicit consent configuration"),
+        );
+        oauth
+            .register_client(
+                oauth::OAuthClient::builder("native:basic+client")
+                    .secret("S3cret:+ &=%")
+                    .redirect_uri("https://client.example.test/callback")
+                    .scope("mcp")
+                    .build()
+                    .expect("bounded confidential client"),
+            )
+            .expect("register confidential client");
+        let (code, _) = oauth
+            .authorize(&oauth::AuthorizationRequest {
+                response_type: "code".to_owned(),
+                client_id: "native:basic+client".to_owned(),
+                redirect_uri: "https://client.example.test/callback".to_owned(),
+                scopes: vec!["mcp".to_owned()],
+                resource: None,
+                state: None,
+                code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_owned(),
+                code_challenge_method: oauth::CodeChallengeMethod::S256,
+            })
+            .expect("issue a code through the explicit consent backend");
+        let form = format!(
+            "grant_type=authorization_code&code={code}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+        );
+        // These literal OAuth components exercise encoded colons, plus signs,
+        // spaces, ampersands, equals signs and percent signs independently of
+        // the production percent decoder.
+        let basic = native_oauth_basic_header("native%3Abasic%2Bclient:S3cret%3A%2B+%26%3D%25");
+        let routes = OAuthHttpRoutes::new(oauth, "https://fastmcp.invalid/oauth")
+            .expect("native OAuth routes");
+        (routes, form, basic)
+    }
+
+    fn native_oauth_form_request(
+        path: &str,
+        form: &str,
+        authorization: Option<&str>,
+    ) -> asupersync::http::h1::Request {
+        let mut headers = vec![(
+            "Content-Type".to_owned(),
+            "application/x-www-form-urlencoded".to_owned(),
+        )];
+        if let Some(authorization) = authorization {
+            headers.push(("Authorization".to_owned(), authorization.to_owned()));
+        }
+        asupersync::http::h1::Request {
+            method: Http1Method::Post,
+            uri: path.to_owned(),
+            version: asupersync::http::h1::Version::Http11,
+            headers,
+            body: form.as_bytes().to_vec(),
+            trailers: Vec::new(),
+            peer_addr: None,
+        }
+    }
+
+    fn assert_native_oauth_error(
+        response: &HttpResponse,
+        status: HttpStatus,
+        error: &str,
+        challenge: Option<&str>,
+    ) {
+        assert_eq!(response.status, status);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response.body).expect("OAuth error JSON"),
+            serde_json::json!({ "error": error }),
+        );
+        assert_eq!(
+            response.headers.get("www-authenticate").map(String::as_str),
+            challenge,
+        );
+        assert_eq!(
+            response.headers.get("cache-control").map(String::as_str),
+            Some("no-store"),
+        );
+        assert_eq!(
+            response.headers.get("pragma").map(String::as_str),
+            Some("no-cache"),
+        );
+    }
+
+    #[test]
+    fn native_oauth_basic_rejections_preserve_code_and_live_grant() {
+        let (routes, form, basic) = native_oauth_basic_fixture();
+        let token_path = routes.token_path();
+        let bad_secret = native_oauth_basic_header("native%3Abasic%2Bclient:wrong-secret");
+        let unknown_client = native_oauth_basic_header("unknown-client:wrong-secret");
+        for authorization in [
+            bad_secret.as_str(),
+            unknown_client.as_str(),
+            "Basic malformed!",
+            "Basic",
+            "Basic \tY2xpZW50OnNlY3JldA==",
+        ] {
+            let request = native_oauth_form_request(token_path, &form, Some(authorization));
+            assert_native_oauth_error(
+                &dispatch_oauth_h1_request(&routes, &request, token_path, ""),
+                HttpStatus::UNAUTHORIZED,
+                "invalid_client",
+                Some("Basic realm=\"oauth\""),
+            );
+        }
+        for extra in [
+            "client_id=native%3Abasic%2Bclient",
+            "client_id=",
+            "client_secret=wrong-secret",
+            "client_secret=",
+            "client%5Fsecret=",
+        ] {
+            let mixed_form = format!("{form}&{extra}");
+            let request = native_oauth_form_request(token_path, &mixed_form, Some(&basic));
+            assert_native_oauth_error(
+                &dispatch_oauth_h1_request(&routes, &request, token_path, ""),
+                HttpStatus::BAD_REQUEST,
+                "invalid_request",
+                None,
+            );
+        }
+        let mut duplicate_header = native_oauth_form_request(token_path, &form, Some(&basic));
+        duplicate_header
+            .headers
+            .push(("authorization".to_owned(), basic.clone()));
+        assert_native_oauth_error(
+            &dispatch_oauth_h1_request(&routes, &duplicate_header, token_path, ""),
+            HttpStatus::BAD_REQUEST,
+            "invalid_request",
+            None,
+        );
+        let request = native_oauth_form_request(token_path, &form, Some(&basic));
+        let issued = dispatch_oauth_h1_request(&routes, &request, token_path, "");
+        assert_eq!(
+            issued.status,
+            HttpStatus::OK,
+            "rejections must preserve the code",
+        );
+        let issued: serde_json::Value = serde_json::from_slice(&issued.body).expect("token JSON");
+        let access = issued["access_token"].as_str().expect("access token");
+        let refresh = issued["refresh_token"].as_str().expect("refresh token");
+        assert!(routes.server().validate_access_token(access).is_some());
+        let refresh_form = format!("grant_type=refresh_token&refresh_token={refresh}");
+        let request = native_oauth_form_request(token_path, &refresh_form, Some(&bad_secret));
+        assert_native_oauth_error(
+            &dispatch_oauth_h1_request(&routes, &request, token_path, ""),
+            HttpStatus::UNAUTHORIZED,
+            "invalid_client",
+            Some("Basic realm=\"oauth\""),
+        );
+        let revoke_path = routes.revocation_path();
+        let revoke_form = format!("token={refresh}");
+        let request = native_oauth_form_request(revoke_path, &revoke_form, Some(&bad_secret));
+        assert_native_oauth_error(
+            &dispatch_oauth_h1_request(&routes, &request, revoke_path, ""),
+            HttpStatus::UNAUTHORIZED,
+            "invalid_client",
+            Some("Basic realm=\"oauth\""),
+        );
+        let request = native_oauth_form_request(
+            revoke_path,
+            &format!("{revoke_form}&client_secret="),
+            Some(&basic),
+        );
+        assert_native_oauth_error(
+            &dispatch_oauth_h1_request(&routes, &request, revoke_path, ""),
+            HttpStatus::BAD_REQUEST,
+            "invalid_request",
+            None,
+        );
+        assert!(routes.server().validate_access_token(access).is_some());
+        let request = native_oauth_form_request(token_path, &refresh_form, Some(&basic));
+        let refreshed = dispatch_oauth_h1_request(&routes, &request, token_path, "");
+        assert_eq!(
+            refreshed.status,
+            HttpStatus::OK,
+            "rejections must preserve refresh",
+        );
+        let refreshed: serde_json::Value =
+            serde_json::from_slice(&refreshed.body).expect("refreshed token JSON");
+        let successor = refreshed["access_token"].as_str().expect("successor token");
+        assert!(routes.server().validate_access_token(successor).is_some());
+        let request =
+            native_oauth_form_request(revoke_path, &format!("token={successor}"), Some(&basic));
+        assert_eq!(
+            dispatch_oauth_h1_request(&routes, &request, revoke_path, "").status,
+            HttpStatus::OK,
+        );
+        assert!(routes.server().validate_access_token(successor).is_none());
+    }
+
+    #[test]
+    fn native_oauth_basic_decoding_is_bounded_and_preserves_empty_password_authentication() {
+        let client_id = "%61".repeat(oauth::MAX_OAUTH_CLIENT_ID_BYTES);
+        let secret = "%62".repeat(oauth::MAX_OAUTH_CLIENT_CREDENTIAL_BYTES);
+        let basic = native_oauth_basic_header(&format!("{client_id}:{secret}"));
+        let mut admission =
+            OAuthParameterAdmission::admit(OAuthParameterEndpoint::TokenForm, b"").unwrap();
+        let (id, password) = oauth_http_client_credentials(&mut admission, Some(&basic))
+            .expect("exact maximum percent-expanded credentials");
+        assert_eq!(id, "a".repeat(oauth::MAX_OAUTH_CLIENT_ID_BYTES));
+        assert_eq!(
+            password,
+            Some("b".repeat(oauth::MAX_OAUTH_CLIENT_CREDENTIAL_BYTES)),
+        );
+        for components in [
+            format!("{client_id}a:{secret}"),
+            format!("{client_id}:{secret}b"),
+            format!("{client_id}a:secret"),
+            format!("client:{secret}b"),
+            "client:%".to_owned(),
+            "client:%GG".to_owned(),
+            "client:%ff".to_owned(),
+            "client:%0a".to_owned(),
+            "client-without-colon".to_owned(),
+            ":secret".to_owned(),
+        ] {
+            let basic = native_oauth_basic_header(&components);
+            let mut admission =
+                OAuthParameterAdmission::admit(OAuthParameterEndpoint::TokenForm, b"").unwrap();
+            let error = oauth_http_client_credentials(&mut admission, Some(&basic))
+                .expect_err("invalid Basic input must fail before authentication");
+            assert_native_oauth_error(
+                &error,
+                HttpStatus::UNAUTHORIZED,
+                "invalid_client",
+                Some("Basic realm=\"oauth\""),
+            );
+        }
+        let oauth = Arc::new(oauth::OAuthServer::with_defaults());
+        oauth
+            .register_client(
+                oauth::OAuthClient::builder("public-client")
+                    .redirect_uri("https://client.example.test/callback")
+                    .build()
+                    .expect("public client"),
+            )
+            .unwrap();
+        let routes = OAuthHttpRoutes::new(oauth, "https://fastmcp.invalid/oauth").unwrap();
+        let empty_password = native_oauth_basic_header("public-client:");
+        let request = native_oauth_form_request(
+            routes.revocation_path(),
+            "token=unknown-token",
+            Some(&empty_password),
+        );
+        assert_native_oauth_error(
+            &dispatch_oauth_h1_request(&routes, &request, routes.revocation_path(), ""),
+            HttpStatus::UNAUTHORIZED,
+            "invalid_client",
+            Some("Basic realm=\"oauth\""),
+        );
+        let request = native_oauth_form_request(
+            routes.revocation_path(),
+            "token=unknown-token&client_id=public-client",
+            None,
+        );
+        assert_eq!(
+            dispatch_oauth_h1_request(&routes, &request, routes.revocation_path(), "").status,
+            HttpStatus::OK,
+            "the same public client remains usable with none authentication",
+        );
+    }
+
+    #[test]
+    fn live_http_oauth_basic_authorization_code_refresh_and_revocation() {
+        run_live_http_test(|cx| async move {
+            let (routes, code_form, basic) = native_oauth_basic_fixture();
+            let oauth = Arc::clone(routes.server());
+            let bound = Server::new("live-oauth-basic", "1.0.0")
+                .oauth_http_routes(routes)
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("Basic OAuth listener failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("Basic OAuth address failed: {error}"))?;
+            let caller_cx = cx.clone();
+            let mut client = cx
+                .spawn(move |_client_cx| async move {
+                    let result = async {
+                        let request = |path: &str, form: &str, authorization: &str| {
+                            format!(
+                                "POST {path} HTTP/1.1\r\nHost: loopback\r\nAuthorization: {authorization}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{form}",
+                                form.len(),
+                            )
+                            .into_bytes()
+                        };
+                        let wrong_basic =
+                            native_oauth_basic_header("native%3Abasic%2Bclient:wrong-secret");
+                        // RH-5: only the Basic password differs from the
+                        // succeeding wire request; its code must survive.
+                        let rejected = live_http_exchange(
+                            address,
+                            request("/oauth/token", &code_form, &wrong_basic),
+                        )
+                        .await?;
+                        if !rejected.starts_with(b"HTTP/1.1 401")
+                            || live_http_response_header(&rejected, "www-authenticate")?
+                                != "Basic realm=\"oauth\""
+                            || serde_json::from_slice::<serde_json::Value>(
+                                live_http_response_body(&rejected)?,
+                            )
+                            .map_err(|_| "Basic rejection was not JSON".to_owned())?
+                                != serde_json::json!({ "error": "invalid_client" })
+                        {
+                            return Err(
+                                "Basic wrong-secret rejection changed its contract".to_owned(),
+                            );
+                        }
+                        let issued = live_http_exchange(
+                            address,
+                            request("/oauth/token", &code_form, &basic),
+                        )
+                        .await?;
+                        if !issued.starts_with(b"HTTP/1.1 200")
+                            || live_http_response_header(&issued, "cache-control")? != "no-store"
+                            || live_http_response_header(&issued, "pragma")? != "no-cache"
+                        {
+                            return Err(
+                                "Basic authorization-code exchange did not succeed".to_owned(),
+                            );
+                        }
+                        let issued: serde_json::Value =
+                            serde_json::from_slice(live_http_response_body(&issued)?)
+                                .map_err(|_| "Basic token response was not JSON".to_owned())?;
+                        let access = issued["access_token"]
+                            .as_str()
+                            .ok_or_else(|| "Basic token response omitted access token".to_owned())?;
+                        if oauth.validate_access_token(access).is_none() {
+                            return Err("Basic access token is not usable".to_owned());
+                        }
+                        let refresh = issued["refresh_token"]
+                            .as_str()
+                            .ok_or_else(|| "Basic token response omitted refresh token".to_owned())?;
+                        let refreshed = live_http_exchange(
+                            address,
+                            request(
+                                "/oauth/token",
+                                &format!("grant_type=refresh_token&refresh_token={refresh}"),
+                                &basic,
+                            ),
+                        )
+                        .await?;
+                        if !refreshed.starts_with(b"HTTP/1.1 200") {
+                            return Err("Basic refresh exchange did not succeed".to_owned());
+                        }
+                        let refreshed: serde_json::Value =
+                            serde_json::from_slice(live_http_response_body(&refreshed)?)
+                                .map_err(|_| "Basic refresh response was not JSON".to_owned())?;
+                        let successor = refreshed["access_token"]
+                            .as_str()
+                            .ok_or_else(|| "Basic refresh omitted access token".to_owned())?;
+                        if successor == access || oauth.validate_access_token(successor).is_none() {
+                            return Err("Basic refresh did not issue a usable successor".to_owned());
+                        }
+                        let revoked = live_http_exchange(
+                            address,
+                            request("/oauth/revoke", &format!("token={successor}"), &basic),
+                        )
+                        .await?;
+                        if !revoked.starts_with(b"HTTP/1.1 200")
+                            || oauth.validate_access_token(successor).is_some()
+                        {
+                            return Err("Basic revocation did not invalidate its token".to_owned());
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    caller_cx.cancel_with(CancelKind::User, Some("Basic OAuth lifecycle complete"));
+                    result
+                })
+                .map_err(|error| format!("Basic OAuth client spawn failed: {error}"))?;
+            let serve = bound.serve(&cx).await;
+            client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("Basic OAuth client failed: {error:?}"))??;
+            let shutdown = serve.map_err(|error| format!("Basic OAuth server failed: {error}"))?;
+            require_quiescent_http_shutdown(shutdown, "Basic OAuth lifecycle").await
+        });
+    }
+
     /// Native OAuth routes with OIDC under `base`, plus an access token for a
     /// client registered and authorized with `scopes`. A Pending signer
     /// activation is all `with_oidc` needs to fix the OIDC paths.
@@ -38675,7 +39094,7 @@ mod lib_unit_tests {
                     )
                     .await?;
                     // RH-5: compared with the eventual successful redemption,
-                    // this request adds only the forbidden Authorization header.
+                    // this adds a second client-credential location.
                     let header_rejected = live_http_exchange(
                         address,
                         request("/oauth/token", &original, Some("Basic ZmFzdG1jcDppbnZhbGlk")),
@@ -38790,9 +39209,8 @@ mod lib_unit_tests {
                 ("token form", &wrong_secret_rejected),
                 ("revocation form", &revoke_wrong_secret),
             ] {
-                if !response.starts_with(b"HTTP/1.1 401")
-                    || live_http_response_header(response, "www-authenticate")?
-                        != "Basic realm=\"oauth\""
+                if !response.starts_with(b"HTTP/1.1 400")
+                    || live_http_response_has_header(response, "www-authenticate")?
                     || serde_json::from_slice::<serde_json::Value>(live_http_response_body(
                         response,
                     )?)
@@ -38802,17 +39220,23 @@ mod lib_unit_tests {
                         != Some("invalid_client")
                 {
                     return Err(format!(
-                        "{endpoint} wrong-secret rejection was not an invalid_client Basic 401: {}",
+                        "{endpoint} wrong-secret rejection was not an unchallenged invalid_client 400: {}",
                         String::from_utf8_lossy(response)
                     ));
                 }
             }
-            if !header_rejected.starts_with(b"HTTP/1.1 401")
-                || live_http_response_header(&header_rejected, "www-authenticate")?
-                    != "Basic realm=\"oauth\""
+            if !header_rejected.starts_with(b"HTTP/1.1 400")
+                || live_http_response_has_header(&header_rejected, "www-authenticate")?
+                || serde_json::from_slice::<serde_json::Value>(live_http_response_body(
+                    &header_rejected,
+                )?)
+                .ok()
+                .and_then(|body| body["error"].as_str().map(str::to_owned))
+                .as_deref()
+                    != Some("invalid_request")
             {
                 return Err(format!(
-                    "token Authorization rejection was not a Basic 401: {}",
+                    "mixed client credentials were not an unchallenged invalid_request 400: {}",
                     String::from_utf8_lossy(&header_rejected)
                 ));
             }
@@ -51932,10 +52356,38 @@ mod lib_unit_tests {
                 &HttpRequest::new(HttpMethod::Post, "/mcp").with_header("accept", value),
             )
         };
-        assert!(accepts("  */* ; unrelated=value ; Q = 1. "));
-        assert!(!accepts("  */* ; unrelated=value ; Q = 0. "));
+        assert!(accepts("  */* ; Q=1. "));
+        assert!(!accepts("  */* ; Q=0. "));
+        assert!(!accepts("*/*; Q = 1."));
+        assert!(!accepts("*/*; unrelated=value; Q=1."));
         assert!(!accepts("text/event-stream; q=1.0000"));
         assert!(!accepts("text/event-stream; q=0.0000"));
+    }
+
+    #[test]
+    fn http_sse_accept_exclusions_override_wildcards_before_stream_allocation() {
+        for value in [
+            "text/event-stream;q=0, */*;q=1",
+            "*/*;q=1, text/event-stream;q=0",
+            "text/*;q=0, */*;q=1",
+            "text/event-stream, text/event-stream;q=0, application/json",
+            "application/json;profile=\"x, text/event-stream\"",
+        ] {
+            assert!(
+                !http_request_accepts_sse(
+                    &HttpRequest::new(HttpMethod::Post, "/mcp").with_header("accept", value),
+                ),
+                "a required SSE body must honor the full admitted preference: {value}",
+            );
+        }
+        assert!(http_request_accepts_sse(
+            &HttpRequest::new(HttpMethod::Post, "/mcp")
+                .with_header("accept", "text/event-stream;q=0.1, */*;q=1"),
+        ));
+        assert!(!http_request_accepts_sse(&HttpRequest::new(
+            HttpMethod::Post,
+            "/mcp",
+        )));
     }
 
     #[test]
@@ -53211,28 +53663,64 @@ mod lib_unit_tests {
             })),
             811_i64,
         );
-        let response = block_on(
-            session.handle_async(
-                &cx,
-                HttpRequest::new(HttpMethod::Post, "/mcp")
-                    .with_header("content-type", "application/json")
-                    .with_header("accept", "application/json, text/event-stream; Q=0.")
-                    .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
-                    .with_header("mcp-method", "tools/call")
-                    .with_header("mcp-name", "http_request_scoped_progress")
-                    .with_body(serde_json::to_vec(&request).expect("final request must encode")),
-            ),
-        )
-        .expect("zero-quality SSE request must be rejected before dispatch");
+        let request = HttpRequest::new(HttpMethod::Post, "/mcp")
+            .with_header("content-type", "application/json")
+            .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+            .with_header("mcp-method", "tools/call")
+            .with_header("mcp-name", "http_request_scoped_progress")
+            .with_body(serde_json::to_vec(&request).expect("final request must encode"));
+        for accept in [
+            "application/json, text/event-stream; Q=0.",
+            "text/event-stream;q=0, */*;q=1",
+            "*/*;q=1, text/event-stream;q=0",
+            "text/*;q=0, */*;q=1",
+            "text/event-stream, text/event-stream;q=0, application/json",
+        ] {
+            let response = block_on(
+                session.handle_async(&cx, request.clone().with_header("accept", accept)),
+            )
+            .expect("zero-quality SSE request must be rejected before dispatch");
+            assert!(matches!(
+                response,
+                ServerHttpEndpointResponse::Immediate(response)
+                    if response.status == HttpStatus::NOT_ACCEPTABLE && response.body.is_empty()
+            ));
+            assert_eq!(
+                calls.load(Ordering::Acquire),
+                0,
+                "an SSE exclusion must prevent handler entry even with a wildcard: {accept}",
+            );
+        }
+
+        // Change only the exact SSE quality. JSON remains preferred by the
+        // wildcard, but a positive SSE weight permits this method's stream.
+        let response = block_on(session.handle_async(
+            &cx,
+            request.with_header("accept", "text/event-stream;q=0.1, */*;q=1"),
+        ))
+        .expect("an accepted required SSE representation must dispatch after refusals");
+        let ServerHttpEndpointResponse::ModernSse(sse) = response else {
+            panic!("the notification-capable method requires its accepted SSE body");
+        };
+        let progress = sse.recv_event(&cx).expect("progress frame must be queued");
+        let log = sse.recv_event(&cx).expect("log frame must be queued");
+        let terminal = sse.recv_event(&cx).expect("terminal response must be queued");
         assert!(matches!(
-            response,
-            ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::NOT_ACCEPTABLE
+            Codec::new().decode_complete_message(progress.data.as_bytes()),
+            Ok(JsonRpcMessage::Request(notification))
+                if notification.method == "notifications/progress"
         ));
-        assert_eq!(
-            calls.load(Ordering::Acquire),
-            0,
-            "changing only the SSE quality from one to zero must prevent handler entry"
-        );
+        assert!(matches!(
+            Codec::new().decode_complete_message(log.data.as_bytes()),
+            Ok(JsonRpcMessage::Request(notification))
+                if notification.method == "notifications/message"
+        ));
+        assert!(matches!(
+            Codec::new().decode_complete_message(terminal.data.as_bytes()),
+            Ok(JsonRpcMessage::Response(response))
+                if response.id == Some(811_i64.into()) && response.error.is_none()
+        ));
+        assert_eq!(calls.load(Ordering::Acquire), 1);
     }
 
     #[test]

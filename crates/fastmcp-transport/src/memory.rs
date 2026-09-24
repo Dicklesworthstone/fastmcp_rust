@@ -54,14 +54,17 @@
 //! assert!(matches!(response, JsonRpcMessage::Response(_)));
 //! ```
 
+/// Awaitable, source-preserving operations on bounded memory endpoints.
+pub mod asynchronous;
+
 use std::time::Duration;
 
 use asupersync::{Cx, channel::mpsc};
 use fastmcp_protocol::JsonRpcMessage;
 
 use crate::{
-    ClientTransportRecvHalf, Codec, MAX_CLIENT_TRANSPORT_SOURCE_BYTES, ReceivedTransportFrame,
-    Transport, TransportError, TransportRecvHalf, TransportSendHalf,
+    ClientTransportRecvHalf, Codec, ReceivedTransportFrame, Transport, TransportError,
+    TransportRecvHalf, TransportSendHalf,
 };
 
 /// Default timeout for recv operations when polling for cancellation.
@@ -70,8 +73,8 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Smallest polling interval admitted by the synchronous transport adapter.
 ///
 /// A zero interval turns an empty receive loop into a hot spin. The transport
-/// remains a compatibility adapter until the async transport boundary lands,
-/// so keep its cancellation polling bounded away from zero in the meantime.
+/// keeps this polling interval for synchronous callers. Async operations use
+/// channel wakers instead and do not sleep or consult this interval.
 const MIN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 fn normalize_poll_interval(interval: Duration) -> Duration {
@@ -94,24 +97,9 @@ fn send_memory_message(
         return Err(TransportError::Cancelled);
     }
 
-    // Count-bounded channels are not byte-bounded. Serialize through the
-    // codec's bounded sink, then enforce the fixed client-ingress ceiling
-    // before cloning so directly constructed typed values cannot retain an
-    // arbitrarily large payload in the queue.
-    let encoded_frame = match message {
-        JsonRpcMessage::Request(request) => codec.encode_request(request)?,
-        JsonRpcMessage::Response(response) => codec.encode_response(response)?,
-    };
-    let source = encoded_frame
-        .strip_suffix(b"\n")
-        .expect("codec encodings always retain their NDJSON delimiter");
-    if source.len() > MAX_CLIENT_TRANSPORT_SOURCE_BYTES {
-        return Err(TransportError::Codec(crate::CodecError::MessageTooLarge(
-            source.len(),
-        )));
-    }
-    let source = source.to_vec().into_boxed_slice();
-    let queued = MemoryQueuedMessage { source };
+    // Share bounded encoding with async sends, without copying the serialized
+    // source into a second allocation before queueing it.
+    let queued = asynchronous::encode_message(codec, message)?;
 
     match sender
         .as_ref()
@@ -222,9 +210,9 @@ struct MemoryQueuedMessage {
 ///
 /// # Cancellation
 ///
-/// Recv operations poll the channel with a timeout, checking for cancellation
-/// between polls. This ensures proper integration with asupersync's
-/// cancellation mechanism.
+/// Synchronous recv operations poll for cancellation between sleeps. The
+/// [`Self::recv_async`] and [`Self::send_async`] methods instead await channel
+/// readiness and cooperate with the executor without blocking its thread.
 pub struct MemoryTransport {
     /// Channel for sending messages to the peer.
     sender: Option<mpsc::Sender<MemoryQueuedMessage>>,
@@ -562,6 +550,7 @@ impl MemoryTransportBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MAX_CLIENT_TRANSPORT_SOURCE_BYTES;
     use fastmcp_protocol::{JsonRpcRequest, JsonRpcResponse, RequestId};
     use std::thread;
 

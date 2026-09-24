@@ -1657,15 +1657,15 @@ impl Default for RequestTimeoutPolicy {
     }
 }
 
-/// Idle and absolute limits for one modern HTTP `subscriptions/listen`
+/// Idle and absolute limits for one modern `subscriptions/listen`
 /// response stream.
 ///
-/// Both timers begin only after the full subscription POST send commits. The
+/// Both timers begin only after the full subscription request send commits. The
 /// idle timer may reset on a valid acknowledgement, an accepted delivered
-/// event, or a bounded complete SSE comment keepalive. The absolute timer
+/// event, or, for HTTP, a bounded complete SSE comment keepalive. The absolute timer
 /// never moves. The earlier caller [`Cx`] deadline and cancellation remain
-/// authoritative; this policy cannot bypass them and applies only to modern
-/// HTTP subscriptions, not ordinary requests or other transports.
+/// authoritative; this policy cannot bypass them. Stdio and HTTP listeners use
+/// these subscription limits independently of ordinary request timeouts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubscriptionTimeoutPolicy {
     idle_timeout: Duration,
@@ -1673,7 +1673,7 @@ pub struct SubscriptionTimeoutPolicy {
 }
 
 impl SubscriptionTimeoutPolicy {
-    /// Creates and validates a modern HTTP subscription timeout policy.
+    /// Creates and validates a modern subscription timeout policy.
     ///
     /// # Errors
     ///
@@ -1757,12 +1757,27 @@ struct RequestDeadlines {
 impl RequestDeadlines {
     fn start_at(policy: RequestTimeoutPolicy, committed_at: Instant) -> McpResult<Self> {
         policy.validate()?;
-        let idle_timeout = policy.idle_timeout;
+        Self::from_durations(policy.idle_timeout, policy.absolute_timeout, committed_at)
+    }
+
+    fn start_subscription_at(
+        policy: SubscriptionTimeoutPolicy,
+        committed_at: Instant,
+    ) -> McpResult<Self> {
+        policy.validate()?;
+        Self::from_durations(policy.idle_timeout, policy.absolute_timeout, committed_at)
+    }
+
+    fn from_durations(
+        idle_timeout: Duration,
+        absolute_timeout: Duration,
+        committed_at: Instant,
+    ) -> McpResult<Self> {
         let idle = committed_at.checked_add(idle_timeout).ok_or_else(|| {
             McpError::internal_error("Request idle timeout exceeds the clock range")
         })?;
         let absolute = committed_at
-            .checked_add(policy.absolute_timeout)
+            .checked_add(absolute_timeout)
             .ok_or_else(|| {
                 McpError::internal_error("Request absolute timeout exceeds the clock range")
             })?;
@@ -13871,6 +13886,28 @@ impl StdioRequestExecutor {
         Ok(StdioRequestExecution { execution })
     }
 
+    /// Commits a modern listener with bounded subscription-specific deadlines.
+    fn execute_subscription_with_timeout_policy(
+        &self,
+        cx: &Cx,
+        parameters: serde_json::Value,
+        timeout_policy: SubscriptionTimeoutPolicy,
+    ) -> McpResult<StdioRequestExecution> {
+        timeout_policy.validate()?;
+        let parameters = self.decorate_modern_request_parameters(Some(parameters))?;
+        let id = next_stdio_request_id(&self.next_id)?;
+        let id = i64::try_from(id).expect("client request ID allocator enforces the i64 bound");
+        let request = JsonRpcRequest::new("subscriptions/listen", parameters, id);
+        let execution = self.executor.execute_subscription_with_timeout_policy(
+            cx, request, timeout_policy,
+        )?;
+        Ok(StdioRequestExecution { execution })
+    }
+
+    fn record_subscription_activity(&self, execution: &StdioRequestExecution) -> McpResult<bool> {
+        self.executor.record_subscription_activity(&execution.execution)
+    }
+
     fn decorate_modern_request_parameters(
         &self,
         params: Option<serde_json::Value>,
@@ -13924,15 +13961,31 @@ impl StdioRequestExecutor {
         cx: &Cx,
         parameters: serde_json::Value,
     ) -> McpResult<StdioRequestExecution> {
+        self.execute_final_tasks_subscription_with_timeout_policy(
+            cx, parameters, SubscriptionTimeoutPolicy::default(),
+        )
+    }
+
+    /// Allocates a Tasks listener with its own bounded subscription lifetime.
+    #[cfg(feature = "tasks")]
+    pub fn execute_final_tasks_subscription_with_timeout_policy(
+        &self,
+        cx: &Cx,
+        parameters: serde_json::Value,
+        timeout_policy: SubscriptionTimeoutPolicy,
+    ) -> McpResult<StdioRequestExecution> {
+        timeout_policy.validate()?;
         if let Some(error) = self.executor.terminal_error() {
             return Err(error);
         }
         let id = next_stdio_request_id(&self.next_id)?;
         let id = i64::try_from(id).expect("client request ID allocator enforces the i64 bound");
-        self.execute_tasks_subscription(
+        let execution = self.executor.execute_tasks_subscription_with_timeout_policy(
             cx,
             JsonRpcRequest::new("subscriptions/listen", Some(parameters), id),
-        )
+            timeout_policy,
+        )?;
+        Ok(StdioRequestExecution { execution })
     }
 
     /// Returns the filter acknowledged for an active Tasks subscription.
@@ -17054,6 +17107,11 @@ impl Client {
                 _ => None,
             };
             self.final_server_notifications.push_back(notification);
+            // Admit subscription activity while the frame is being consumed,
+            // including while a sibling ordinary request owns the reader.
+            // Delaying until the application polls the listener would let an
+            // active stream expire and grant queued stale events a new clock.
+            self.harvest_live_catalog_subscription_notifications()?;
             if let Some(message) = log_message {
                 self.emit_log_message(message);
             }
@@ -18812,7 +18870,7 @@ impl Client {
         mut waiter: ResponseWaiter,
         core_request: &CoreRequest,
         requested: &SubscriptionFilter,
-        deadlines: RequestDeadlines,
+        mut deadlines: RequestDeadlines,
     ) -> McpResult<SubscriptionListenCollector> {
         let cx = self.cx.clone();
         let expected_id = waiter.id.clone();
@@ -18823,6 +18881,11 @@ impl Client {
         let mut server_teardown_requested = false;
 
         loop {
+            if let Some(executor) = &self.multiplexed_executor {
+                executor
+                    .service(&cx)
+                    .map_err(|error| self.terminate_connection(error))?;
+            }
             if let Some(response) = waiter.try_response()? {
                 debug_assert!(
                     response
@@ -19032,6 +19095,7 @@ impl Client {
                         )));
                     }
                     task_notifications.push(notification);
+                    deadlines.reset_idle_at(received_at)?;
                     continue;
                 }
 
@@ -19099,6 +19163,7 @@ impl Client {
                                 return Err(self.terminate_connection(error));
                             }
                             accepted_filter = Some(acknowledgement.notifications);
+                            deadlines.reset_idle_at(received_at)?;
                         }
                         ServerNotification::Cancelled(_) => {
                             return Err(self.terminate_connection(
@@ -19130,6 +19195,7 @@ impl Client {
                                 )));
                             }
                             notifications.push(notification);
+                            deadlines.reset_idle_at(received_at)?;
                         }
                         ServerNotification::Progress(_) | ServerNotification::Message(_) => {
                             if let Err(error) = self.retain_modern_server_notification(&frame) {
@@ -20244,6 +20310,11 @@ impl Client {
         let mut last_final_progress = None;
 
         loop {
+            if let Some(executor) = &self.multiplexed_executor {
+                executor
+                    .service(&cx)
+                    .map_err(|error| self.terminate_connection(error))?;
+            }
             if let Some(response) = waiter.try_response()? {
                 debug_assert_eq!(response.id.as_ref(), Some(&expected_id));
                 return Ok(response);
@@ -21292,14 +21363,23 @@ impl Client {
         &mut self,
         notifications: SubscriptionFilter,
     ) -> McpResult<SubscriptionListenCollector> {
+        self.listen_subscriptions_with_timeout_policy(notifications, SubscriptionTimeoutPolicy::default())
+    }
+
+    /// Collects a final subscription under independently bounded idle and
+    /// absolute lifetimes. Valid matching acknowledgement/events reset only idle.
+    pub fn listen_subscriptions_with_timeout_policy(
+        &mut self,
+        notifications: SubscriptionFilter,
+        timeout_policy: SubscriptionTimeoutPolicy,
+    ) -> McpResult<SubscriptionListenCollector> {
+        timeout_policy.validate()?;
         self.ensure_initialized()?;
         if self.session.selected_era() != Some(ProtocolEra::Modern2026) {
             return Err(McpError::invalid_params(
                 "subscriptions/listen is available only for MCP 2026-07-28",
             ));
         }
-        let timeout_policy = self.timeout_policy;
-        timeout_policy.validate()?;
         let requested = notifications;
         #[cfg(feature = "tasks")]
         let tasks_requested = task_subscription_ids(&requested)
@@ -21357,7 +21437,7 @@ impl Client {
             return Err(self.record_send_failure(Some(&request_id), error));
         }
         let committed_at = Instant::now();
-        let deadlines = match RequestDeadlines::start_at(timeout_policy, committed_at) {
+        let deadlines = match RequestDeadlines::start_subscription_at(timeout_policy, committed_at) {
             Ok(deadlines) => deadlines,
             Err(error) => return Err(self.finish_committed_request_locally(&request_id, error)),
         };
@@ -21376,6 +21456,17 @@ impl Client {
         &mut self,
         notifications: SubscriptionFilter,
     ) -> McpResult<()> {
+        self.open_subscriptions_listener_with_timeout_policy(notifications, SubscriptionTimeoutPolicy::default())
+    }
+
+    /// Opens an incremental stdio catalog listener with a per-listener policy.
+    /// Its absolute lifetime is fixed at send, even under continuous events.
+    pub fn open_subscriptions_listener_with_timeout_policy(
+        &mut self,
+        notifications: SubscriptionFilter,
+        timeout_policy: SubscriptionTimeoutPolicy,
+    ) -> McpResult<()> {
+        timeout_policy.validate()?;
         self.ensure_initialized()?;
         if self.live_catalog_subscription.is_some() {
             return Err(McpError::invalid_request(
@@ -21433,7 +21524,9 @@ impl Client {
             })?;
         let executor = self.multiplexed_stdio_executor()?;
         executor.service(&self.cx)?;
-        let execution = executor.execute(&self.cx, "subscriptions/listen", Some(params_value))?;
+        let execution = executor.execute_subscription_with_timeout_policy(
+            &self.cx, params_value, timeout_policy,
+        )?;
         self.live_catalog_subscription = Some(LiveStdioCatalogSubscription {
             executor,
             execution,
@@ -21543,7 +21636,9 @@ impl Client {
                         harvest_error = Some(error);
                         continue;
                     }
-                    subscription.accepted_filter = Some(acknowledgement.notifications);
+                    if subscription.executor.record_subscription_activity(&subscription.execution)? {
+                        subscription.accepted_filter = Some(acknowledgement.notifications);
+                    }
                 }
                 notification @ (ServerNotification::ResourcesListChanged(_)
                 | ServerNotification::ToolsListChanged(_)
@@ -21569,7 +21664,9 @@ impl Client {
                         ));
                         continue;
                     }
-                    subscription.pending_notifications.push_back(notification);
+                    if subscription.executor.record_subscription_activity(&subscription.execution)? {
+                        subscription.pending_notifications.push_back(notification);
+                    }
                 }
                 other => remainder.push_back(other),
             }
@@ -21643,7 +21740,9 @@ impl Client {
             let subscription = self.live_catalog_subscription.as_mut().ok_or_else(|| {
                 McpError::invalid_request("No live final catalog stdio subscription is active")
             })?;
-            if !subscription.acknowledgement_delivered
+            if let Some(error) = subscription.execution.execution.terminal_error() {
+                ReadyCatalog::Failed(error)
+            } else if !subscription.acknowledgement_delivered
                 && let Some(acknowledged) = subscription.accepted_filter.clone()
             {
                 subscription.acknowledgement_delivered = true;
@@ -21752,6 +21851,9 @@ impl Client {
             self.cancel_live_catalog_subscription(&self.cx.clone())?;
             return Err(McpError::request_cancelled());
         }
+        if let Some(executor) = &self.multiplexed_executor {
+            executor.service(&self.cx).map_err(|error| self.terminate_connection(error))?;
+        }
         self.harvest_live_catalog_subscription_notifications()?;
         if let Some(event) = self.take_ready_catalog_subscription_event()? {
             return Ok(Some(event));
@@ -21805,6 +21907,19 @@ impl Client {
         &mut self,
         notifications: SubscriptionFilter,
     ) -> McpResult<()> {
+        self.open_final_task_subscription_listener_with_timeout_policy(
+            notifications, SubscriptionTimeoutPolicy::default(),
+        )
+    }
+
+    /// Opens an incremental Tasks listener with bounded idle/absolute lifetimes.
+    #[cfg(feature = "tasks")]
+    pub fn open_final_task_subscription_listener_with_timeout_policy(
+        &mut self,
+        notifications: SubscriptionFilter,
+        timeout_policy: SubscriptionTimeoutPolicy,
+    ) -> McpResult<()> {
+        timeout_policy.validate()?;
         self.ensure_initialized()?;
         if self.live_task_subscription.is_some() {
             return Err(McpError::invalid_request(
@@ -21858,7 +21973,9 @@ impl Client {
             })?;
         let executor = self.multiplexed_stdio_executor()?;
         executor.service(&self.cx)?;
-        let execution = executor.execute_final_tasks_subscription(&self.cx, params_value)?;
+        let execution = executor.execute_final_tasks_subscription_with_timeout_policy(
+            &self.cx, params_value, timeout_policy,
+        )?;
         self.live_task_subscription = Some(LiveStdioTaskSubscription {
             executor,
             execution,
@@ -21985,6 +22102,9 @@ impl Client {
             self.cancel_live_final_task_subscription(&self.cx.clone())?;
             return Err(McpError::request_cancelled());
         }
+        if let Some(executor) = &self.multiplexed_executor {
+            executor.service(&self.cx).map_err(|error| self.terminate_connection(error))?;
+        }
         if let Some(event) = self.take_ready_final_task_subscription_event()? {
             return Ok(Some(event));
         }
@@ -22003,6 +22123,12 @@ impl Client {
     fn take_ready_final_task_subscription_event(
         &mut self,
     ) -> McpResult<Option<StdioTaskSubscriptionEvent>> {
+        if let Some(error) = self.live_task_subscription.as_ref()
+            .and_then(|subscription| subscription.execution.execution.terminal_error())
+        {
+            self.live_task_subscription = None;
+            return Err(error);
+        }
         let event = {
             let subscription = self.live_task_subscription.as_mut().ok_or_else(|| {
                 McpError::invalid_request("No live final Tasks stdio subscription is active")
@@ -31175,6 +31301,27 @@ mod tests {
             absolute_deadlines.expired_at(committed_at + Duration::from_millis(250)),
             Some(RequestTimeoutSource::Absolute)
         );
+    }
+
+    #[test]
+    fn subscription_collector_deadlines_preserve_custom_lifetime_under_events() {
+        let committed_at = Instant::now();
+        let policy = SubscriptionTimeoutPolicy::new(
+            Duration::from_mins(10),
+            Duration::from_hours(2),
+        ).unwrap();
+        let mut deadlines = RequestDeadlines::start_subscription_at(policy, committed_at).unwrap();
+        let absolute = deadlines.absolute;
+        for minute in (5..120).step_by(5) {
+            let observed_at = committed_at + Duration::from_secs(minute * 60);
+            assert_eq!(deadlines.expired_at(observed_at), None);
+            deadlines.reset_idle_at(observed_at).unwrap();
+            assert_eq!(deadlines.absolute, absolute);
+        }
+        assert_eq!(deadlines.expired_at(absolute), Some(RequestTimeoutSource::Absolute));
+        let silent = RequestDeadlines::start_subscription_at(policy, committed_at).unwrap();
+        assert_eq!(silent.expired_at(silent.idle), Some(RequestTimeoutSource::Idle));
+        assert!(RequestTimeoutPolicy::new(policy.idle_timeout(), policy.absolute_timeout()).is_err());
     }
 
     #[test]
@@ -40457,6 +40604,14 @@ exec sleep 5
                 ..SubscriptionFilter::default()
             })
             .expect("listen stays live while this client issues another request");
+        let executor = client.multiplexed_stdio_executor().unwrap();
+        let before_ack = executor.executor.pending_records().remove(0);
+        assert_eq!(
+            before_ack.absolute_deadline.duration_since(before_ack.idle_deadline),
+            SubscriptionTimeoutPolicy::default().absolute_timeout()
+                - SubscriptionTimeoutPolicy::default().idle_timeout(),
+            "the public stdio listener must not inherit ordinary request deadlines",
+        );
 
         let cx = Cx::for_request();
         let cancellation = McpRequestCancellation::new();
@@ -40466,6 +40621,9 @@ exec sleep 5
                 .expect("acknowledgement arrives before the interleaved tools/call"),
             StdioSubscriptionEvent::Acknowledged(_)
         ));
+        let after_ack = executor.executor.pending_records().remove(0);
+        assert!(after_ack.idle_deadline > before_ack.idle_deadline);
+        assert_eq!(after_ack.absolute_deadline, before_ack.absolute_deadline);
 
         let result = client
             .call_tool_typed("hide_greet", serde_json::json!({}))
@@ -40474,6 +40632,14 @@ exec sleep 5
             result,
             CoreResult::Final(FinalCoreResult::ToolsCall { .. })
         ));
+        let after_event = executor.executor.pending_records().remove(0);
+        assert!(after_event.idle_deadline > after_ack.idle_deadline);
+        assert_eq!(after_event.absolute_deadline, before_ack.absolute_deadline);
+        assert_eq!(
+            client.live_catalog_subscription.as_ref().unwrap().pending_notifications.len(),
+            1,
+            "a sibling request must admit listener activity before the next listener poll",
+        );
         assert!(matches!(
             client
                 .next_subscription_event(&cx, &cancellation)
@@ -40489,6 +40655,59 @@ exec sleep 5
         client
             .close()
             .expect("interleaved catalog listener cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_catalog_idle_expiry_is_serviced_while_a_sibling_waits_for_progress() {
+        let discovery = modern_discovery_response("idle-listener", &[MODERN_PROTOCOL_VERSION]);
+        let script = r#"
+IFS= read -r first || exit 90
+printf '%s\n' "$1"
+IFS= read -r listen || exit 91
+case "$listen" in *subscriptions/listen*) ;; *) exit 92;; esac
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2},"notifications":{"toolsListChanged":true}}}'
+IFS= read -r call || exit 93
+case "$call" in *tools/call*) ;; *) exit 94;; esac
+IFS= read -r cancel || exit 95
+case "$cancel" in *notifications/cancelled*'"requestId":2'*) ;; *) exit 96;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"type":"text","text":"sibling-completed"}],"isError":false}}'
+IFS= read -r ping || exit 97
+case "$ping" in *ping*) ;; *) exit 98;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete"}}'
+exec sleep 2
+"#;
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script, "--", &discovery],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        ).unwrap();
+        client.set_request_timeout_policy(
+            RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(5)).unwrap(),
+        ).unwrap();
+        client.open_subscriptions_listener_with_timeout_policy(
+            SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            },
+            SubscriptionTimeoutPolicy::new(Duration::from_millis(100), Duration::from_secs(10)).unwrap(),
+        ).unwrap();
+        let cx = Cx::for_request();
+        let cancellation = McpRequestCancellation::new();
+        assert!(matches!(
+            client.next_subscription_event(&cx, &cancellation).unwrap(),
+            StdioSubscriptionEvent::Acknowledged(_)
+        ));
+        let content = client.call_tool_with_progress(
+            "hold", serde_json::json!({}), &mut |_, _, _| {},
+        ).expect("the listener's idle cancellation must unblock the sibling response");
+        assert!(matches!(content.as_slice(), [LegacyContent::Text { text, .. }] if text == "sibling-completed"));
+        let error = client.next_subscription_event(&cx, &cancellation).unwrap_err();
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert!(client.live_catalog_subscription.is_none());
+        client.ping().expect("subscription timeout preserves connection reuse");
+        client.close().unwrap();
     }
 
     #[cfg(unix)]
