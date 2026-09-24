@@ -851,7 +851,12 @@ mod input {
 
                     let result = if case.controlled() {
                         poll_fn(|task| {
-                            assert!(driving.as_mut().poll(task).is_pending());
+                            // A drive that settles here never entered its
+                            // controlled backoff; name how it settled.
+                            if let Poll::Ready(settled) = driving.as_mut().poll(task) {
+                                panic!("the drive settled before its controlled backoff: {}",
+                                    settled.err().map_or_else(|| "Ok(outcome)".to_owned(), |error| format!("{error:?}")));
+                            }
                             if backoff.is_cancel_requested() { Poll::Ready(()) }
                             else { task.waker().wake_by_ref(); Poll::Pending }
                         }).await;
