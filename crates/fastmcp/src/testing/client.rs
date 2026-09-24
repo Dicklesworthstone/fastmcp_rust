@@ -443,24 +443,6 @@ impl TestClient {
             .map_err(|e| McpError::internal_error(format!("Failed to deserialize response: {e}")))
     }
 
-    fn send_notification<P: serde::Serialize>(&mut self, method: &str, params: P) -> McpResult<()> {
-        let params_value = serde_json::to_value(params)
-            .map_err(|e| McpError::internal_error(format!("Failed to serialize params: {e}")))?;
-
-        let request = JsonRpcRequest {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            method: method.to_string(),
-            params: Some(params_value),
-            id: None,
-        };
-
-        self.transport
-            .send(&self.cx, &JsonRpcMessage::Request(request))
-            .map_err(|e| McpError::internal_error(format!("Transport error: {e:?}")))?;
-
-        Ok(())
-    }
-
     fn recv_response(
         &mut self,
         expected_id: &RequestId,

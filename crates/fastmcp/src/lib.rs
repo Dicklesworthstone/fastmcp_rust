@@ -144,7 +144,6 @@
 //! ```
 
 #![forbid(unsafe_code)]
-#![allow(dead_code)]
 
 // `proc-macro-crate` reports `FoundCrate::Itself` for every target belonging
 // to this package, including examples and integration tests. Keep one
@@ -6331,10 +6330,6 @@ pub mod modern {
                 .await
                 .map_err(HttpClientError::Connection)
         }
-    }
-
-    fn final_list_parameters(cursor: Option<&str>) -> JsonValue {
-        final_list_parameters_from(cursor, None, None)
     }
 
     fn final_list_parameters_from(
@@ -12891,7 +12886,13 @@ mod tests {
         let _ = serve_modern_http;
         let _ = list_modern_http_tools;
         let _ = call_modern_http_tool;
+        let _ = call_modern_http_tool_result;
+        let _ = read_modern_http_resource_result;
+        let _ = get_modern_http_prompt_result;
+        let _ = call_modern_http_tool_result_with_cancellation;
         let _ = call_modern_http_tool_with_cancellation;
+        let _ = request_modern_http_core_with_cancellation;
+        let _ = public_http_client_typed_verbs;
         let _ = list_modern_http_prompts;
         let _ = get_modern_http_prompt;
         let _ = get_modern_http_prompt_with_mrtr::<
