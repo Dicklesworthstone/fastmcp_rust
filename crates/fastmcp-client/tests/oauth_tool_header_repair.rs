@@ -41,6 +41,21 @@ enum Case {
     Repair, Fresh, DropRejection, CancelBeforeRefresh, DefinitionDenied, HeaderDenied,
     CancelDefinition, ReusedListId, ReusedRetryId, DuplicateTool, MissingTool,
     WrongProjection, SecondRejection, WrongId, WrongCode, Opaque, Status200, Truncated, LostHead,
+    RootsView, InputView, ExperimentalView,
+}
+
+impl Case {
+    fn capabilities(self) -> Value {
+        match self {
+            Self::RootsView => json!({"roots":{}}),
+            Self::InputView => json!({"roots":{"listChanged":true},"sampling":{},
+                "elicitation":{"form":{},"url":{}}}),
+            Self::ExperimentalView => json!({"experimental":{
+                "com.example/catalog-view":{"revision":7,"mode":"CaseSensitive"}
+            }}),
+            _ => json!({}),
+        }
+    }
 }
 
 fn isolated(name: &str, case: Case) {
@@ -233,7 +248,7 @@ impl Peer {
             let (mut socket, request) = self.rpc("tools/list", 11 + index, None).await;
             assert_eq!(request["params"]["_meta"], json!({
                 "io.modelcontextprotocol/protocolVersion":"2026-07-28",
-                "io.modelcontextprotocol/clientCapabilities":{}
+                "io.modelcontextprotocol/clientCapabilities":case.capabilities()
             }));
             assert!(request["params"].get("arguments").is_none());
             if index == 0 { assert!(request["params"].get("cursor").is_none()); }
@@ -247,7 +262,7 @@ impl Peer {
             if index == 0 { result["nextCursor"] = json!("page-two"); }
             reply(&mut socket, 200, "application/json", &json!({"jsonrpc":"2.0","id":11+index,"result":result}).to_string(), false).await;
         }
-        if matches!(case, Case::Repair | Case::SecondRejection) {
+        if matches!(case, Case::Repair | Case::RootsView | Case::InputView | Case::ExperimentalView | Case::SecondRejection) {
             let (mut socket, _) = self.rpc("tools/call", 13, Some("mcp-param-fresh")).await;
             let (status, body) = if matches!(case, Case::SecondRejection) { (400, error(13, -32020)) }
                 else { (200, complete(13)) };
@@ -297,7 +312,12 @@ async fn scenario(cx: &Cx, case: Case) {
     let session = session.unwrap();
     let cancelled = McpRequestCancellation::new();
     let request = core("tools/call", json!({"name":"lookup","arguments":{"region":"雪","verbose":null,"private":"body-only"}}));
+    let mut original = request.encode_params().unwrap().unwrap();
+    original["_meta"]["io.modelcontextprotocol/clientCapabilities"] = case.capabilities();
+    let request = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&original)).unwrap();
     let original = request.encode_params().unwrap().unwrap();
+    assert_eq!(original["_meta"]["io.modelcontextprotocol/clientCapabilities"], case.capabilities(),
+        "the invocation must actually advertise the capability view under test");
     let reviewed = ReviewedToolHeaders::new(peer.resource(), "lookup", definition("lookup", "Old").input_schema, |_| true).unwrap();
     let limits = ToolHeaderRepairLimits::new(
         ManagedCoreLimits::new(4096, 4096, 65536, 0, Duration::from_secs(10)).unwrap(), 16384, 4, 8,
@@ -352,7 +372,7 @@ async fn scenario(cx: &Cx, case: Case) {
                 let ((), result) = pair(server, retry).await;
                 expected_posts += if no_catalog { 0 } else { 2 };
                 match case {
-                    Case::Repair => {
+                    Case::Repair | Case::RootsView | Case::InputView | Case::ExperimentalView => {
                         expected_posts += 1;
                         let mut call = result.unwrap();
                         let Some(ManagedCoreEvent::Result(result)) = call.next_event(cx).await.unwrap() else { panic!("repaired result"); };
@@ -419,6 +439,9 @@ macro_rules! cases {
 }
 cases! {
     repair_traverses_every_page_and_reprojects_once => Repair,
+    repair_refresh_preserves_roots_capability_on_every_page => RootsView,
+    repair_refresh_preserves_sampling_and_elicitation_view => InputView,
+    repair_refresh_preserves_experimental_catalog_view => ExperimentalView,
     repair_fresh_success_never_lists_or_retries => Fresh,
     repair_dropped_rejection_never_lists_or_retries => DropRejection,
     repair_cancelled_rejection_never_lists => CancelBeforeRefresh,

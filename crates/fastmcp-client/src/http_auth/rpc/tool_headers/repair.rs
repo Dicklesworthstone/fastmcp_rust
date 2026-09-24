@@ -20,9 +20,9 @@ use fastmcp_core::{CanonicalHttpUrl, McpRequestCancellation};
 use fastmcp_protocol::http_headers::ParameterHeaderBinding;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
-    ClientCapabilities, CoreRequest, CoreResult, FinalCoreRequest, FinalCoreResult,
-    FinalRequestMeta, FinalTool, HEADER_MISMATCH_ERROR_CODE, JsonInteger, RequestId,
-    decode_strict_jsonrpc_response,
+    CoreRequest, CoreResult, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION,
+    FINAL_PROTOCOL_VERSION_META_KEY, FinalCoreRequest, FinalCoreResult, FinalTool,
+    HEADER_MISMATCH_ERROR_CODE, JsonInteger, RequestId, decode_strict_jsonrpc_response,
 };
 use serde_json::json;
 
@@ -266,6 +266,9 @@ impl RejectedToolHeaders {
     /// The ID supplier covers every catalog page and the one retry. IDs cannot
     /// alias the rejected request or any earlier page. All invocation parameters
     /// are retained exactly; only its RPC ID and reviewed mirrors change.
+    /// Catalog pages retain the invocation's admitted client capabilities, but
+    /// not its progress token or private observation metadata. A capability-
+    /// dependent catalog must not be refreshed under a different client view.
     /// A second rejection, interrupted retry, callback error, cancellation, or
     /// dropped future is terminal. No further repair owner is returned.
     ///
@@ -287,11 +290,7 @@ impl RejectedToolHeaders {
         check_call(cx, &self.cancellation, self.deadline)?;
         let charged = self.limits.retry_charge(self.rejected_bytes)?;
         let collector = ManagedCatalogClient::new(self.session.clone(), self.limits.catalog()?);
-        // Catalog metadata is local, minimal and never copied from the rejected
-        // invocation's private observation fields or extension advertisements.
-        let list = CoreRequest::decode(ProtocolEra::Modern2026, "tools/list", Some(&json!({
-            "_meta": FinalRequestMeta::new(ClientCapabilities::default()),
-        }))).map_err(|_| ManagedCoreError::InvalidRequest)?;
+        let list = repair_catalog_request(&self.original)?;
         Box::pin(bounded_wait(cx, &self.cancellation, self.deadline, async {
             Ok(async {
                 let catalog = Box::pin(collector.collect_with_cancellation(cx, &self.cancellation, list,
@@ -320,6 +319,27 @@ impl RejectedToolHeaders {
             }.await)
         })).await?
     }
+}
+
+// Preserve the admitted capability view on every page without forwarding the
+// tool call's observation fields. Re-decoding through ClientCapabilities would
+// be a second projection and could discard open capability members; reuse the
+// already-admitted encoded object instead. The core preparation boundary still
+// refuses nonempty extension advertisements before any request is dispatched.
+fn repair_catalog_request(original: &CoreRequest) -> Result<CoreRequest, ToolHeaderRepairError> {
+    admit_initial(original)?;
+    let params = original.encode_params().map_err(|_| ManagedCoreError::InvalidRequest)?
+        .ok_or(ManagedCoreError::InvalidRequest)?;
+    let capabilities = params.get("_meta")
+        .and_then(|meta| meta.get(FINAL_CLIENT_CAPABILITIES_META_KEY))
+        .and_then(serde_json::Value::as_object)
+        .ok_or(ManagedCoreError::InvalidRequest)?;
+    CoreRequest::decode(ProtocolEra::Modern2026, "tools/list", Some(&json!({
+        "_meta": {
+            (FINAL_PROTOCOL_VERSION_META_KEY): FINAL_PROTOCOL_VERSION,
+            (FINAL_CLIENT_CAPABILITIES_META_KEY): capabilities,
+        },
+    }))).map_err(|_| ManagedCoreError::InvalidRequest.into())
 }
 
 fn admit_initial(request: &CoreRequest) -> Result<(), ToolHeaderRepairError> {
