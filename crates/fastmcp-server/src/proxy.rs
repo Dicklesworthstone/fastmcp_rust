@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 #[cfg(feature = "tasks")]
+use base64::Engine as _;
+#[cfg(feature = "tasks")]
 use asupersync::cx::{ChildRegion, ChildRegionSpec};
 #[cfg(feature = "tasks")]
 use fastmcp_client::FinalToolCallOutcome;
@@ -80,7 +82,7 @@ use fastmcp_protocol::{
     ExtensionSettings, FinalCancelTaskParams, FinalCancelTaskResult, FinalGetTaskParams,
     FinalGetTaskResult, FinalTaskId, ServerExtensionDiscovery, Task as FinalTask,
     TaskInputResponses as FinalTaskInputResponses, UpdateTaskParams, UpdateTaskResult,
-    task_subscription_ids,
+    set_task_subscription_ids, task_subscription_ids,
 };
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_protocol::{
@@ -4410,12 +4412,8 @@ impl std::fmt::Debug for ProxyClient {
     }
 }
 
-/// One immutable modern-HTTP upstream Tasks relay.
-///
-/// Task IDs remain byte-for-byte upstream IDs. Consequently this type is
-/// intentionally one-route-only: the official Tasks control methods carry no
-/// route discriminator, so composing two independent upstream ID namespaces
-/// would make a collision ambiguous rather than safely relayable.
+/// One immutable modern upstream Tasks relay with process-local, owner-bound
+/// downstream handles. Upstream IDs never serve as downstream authority.
 #[cfg(feature = "tasks")]
 #[derive(Debug)]
 pub(crate) struct ProxyFinalTaskRelay {
@@ -4428,22 +4426,26 @@ pub(crate) struct ProxyFinalTaskRelay {
 #[derive(Debug, Default)]
 struct ProxyFinalTaskRegistry {
     tasks: HashMap<FinalTaskId, ProxyRelayedFinalTask>,
-    pending_creations: usize,
+    pending_creations: HashSet<FinalTaskId>,
 }
 
-/// A route-bound upstream Task snapshot and its local retention deadline.
+/// An issued handle's exact upstream result, stable owner, and retention clock.
+/// Finite retention is anchored to upstream createdAt + ttlMs, including later
+/// authoritative TTL changes; polling never restarts the lifetime.
 ///
-/// A finite upstream `ttlMs` begins when this proxy first admits the snapshot,
-/// matching the process-local task-store retention rule. A null `ttlMs` is an
-/// explicit unlimited-retention declaration: it remains until a terminal
-/// state is evicted for capacity, never because a local default elapsed.
+/// This increment retains the existing null-TTL policy. A configured positive
+/// TTL contract, renewal during outages, and transactional null-TTL reclamation
+/// are still required before claiming the full transparent Tasks gateway profile.
 #[cfg(feature = "tasks")]
 #[derive(Debug, Clone)]
 struct ProxyRelayedFinalTask {
     task: FinalTask,
+    creation: CreateTaskResult,
     binding: ProxyUpstreamBinding,
+    owner: fastmcp_core::Sha256Digest,
     expires_at: Option<Instant>,
     retained_at: Instant,
+    wall_origin: chrono::DateTime<chrono::Utc>,
 }
 
 /// One bounded upstream Task creation admitted before its non-reversible
@@ -4452,6 +4454,8 @@ struct ProxyRelayedFinalTask {
 #[cfg(feature = "tasks")]
 struct ProxyFinalTaskReservation {
     relay: Arc<ProxyFinalTaskRelay>,
+    handle: FinalTaskId,
+    owner: fastmcp_core::Sha256Digest,
     active: bool,
 }
 
@@ -4472,14 +4476,35 @@ enum ProxyFinalTaskListenerPhase {
 #[cfg(feature = "tasks")]
 struct AdmittedProxyFinalTaskListener {
     inner: Box<dyn ProxyFinalTaskListener>,
+    relay: Arc<ProxyFinalTaskRelay>,
+    owner: fastmcp_core::Sha256Digest,
+    mappings: Vec<(FinalTaskId, FinalTaskId)>,
+    upstream_filter: SubscriptionFilter,
+    downstream_filter: SubscriptionFilter,
+    pending: Option<fastmcp_protocol::TaskStatusNotification>,
+    pending_handles: VecDeque<FinalTaskId>,
     phase: ProxyFinalTaskListenerPhase,
 }
 
 #[cfg(feature = "tasks")]
 impl AdmittedProxyFinalTaskListener {
-    fn new(inner: Box<dyn ProxyFinalTaskListener>) -> Self {
+    fn new(
+        inner: Box<dyn ProxyFinalTaskListener>,
+        relay: Arc<ProxyFinalTaskRelay>,
+        owner: fastmcp_core::Sha256Digest,
+        mappings: Vec<(FinalTaskId, FinalTaskId)>,
+        upstream_filter: SubscriptionFilter,
+        downstream_filter: SubscriptionFilter,
+    ) -> Self {
         Self {
             inner,
+            relay,
+            owner,
+            mappings,
+            upstream_filter,
+            downstream_filter,
+            pending: None,
+            pending_handles: VecDeque::new(),
             phase: ProxyFinalTaskListenerPhase::AwaitingAcknowledgement,
         }
     }
@@ -4487,6 +4512,30 @@ impl AdmittedProxyFinalTaskListener {
     fn reject_sequence(&mut self, message: &'static str) -> McpResult<ProxyFinalTaskListenerEvent> {
         self.phase = ProxyFinalTaskListenerPhase::Terminated;
         Err(McpError::invalid_request(message))
+    }
+
+    fn take_pending_notification(&mut self) -> McpResult<Option<ProxyFinalTaskListenerEvent>> {
+        let Some(handle) = self.pending_handles.pop_front() else {
+            return Ok(None);
+        };
+        // An upstream may return the same Task for several admitted calls.
+        // Retain one incoming payload while emitting its handle aliases; never
+        // queue a full completed result for every subscribed alias at once.
+        let mut notification = if self.pending_handles.is_empty() {
+            self.pending.take().expect("pending handles retain their source notification")
+        } else {
+            self.pending.as_ref().expect("pending handles retain their source notification").clone()
+        };
+        if let Err(error) = self.relay.record_task(
+            self.owner, &handle, notification.params.task.clone(),
+        ) {
+            self.phase = ProxyFinalTaskListenerPhase::Terminated;
+            self.pending = None;
+            self.pending_handles.clear();
+            return Err(error);
+        }
+        set_relayed_task_id(&mut notification.params.task, handle);
+        Ok(Some(ProxyFinalTaskListenerEvent::Notification(notification)))
     }
 
     fn admit_event(
@@ -4498,8 +4547,13 @@ impl AdmittedProxyFinalTaskListener {
                 ProxyFinalTaskListenerPhase::AwaitingAcknowledgement,
                 ProxyFinalTaskListenerEvent::Acknowledged(filter),
             ) => {
+                if !crate::subscription_filter_admission_matches(&self.upstream_filter, &filter)? {
+                    return self.reject_sequence(
+                        "Proxy upstream Tasks acknowledgement does not match its admitted filter",
+                    );
+                }
                 self.phase = ProxyFinalTaskListenerPhase::Streaming;
-                Ok(ProxyFinalTaskListenerEvent::Acknowledged(filter))
+                Ok(ProxyFinalTaskListenerEvent::Acknowledged(self.downstream_filter.clone()))
             }
             (ProxyFinalTaskListenerPhase::AwaitingAcknowledgement, _) => self
                 .reject_sequence("Proxy upstream Tasks listener did not acknowledge before events"),
@@ -4510,7 +4564,23 @@ impl AdmittedProxyFinalTaskListener {
             (
                 ProxyFinalTaskListenerPhase::Streaming,
                 ProxyFinalTaskListenerEvent::Notification(notification),
-            ) => Ok(ProxyFinalTaskListenerEvent::Notification(notification)),
+            ) => {
+                let upstream_id = &notification.params.task.base().task_id;
+                let handles: Vec<_> = self.mappings.iter()
+                    .filter(|(_, expected)| expected == upstream_id)
+                    .map(|(handle, _)| handle.clone())
+                    .collect();
+                if handles.is_empty() {
+                    return self.reject_sequence(
+                        "Proxy upstream Tasks event is outside the admitted subscription",
+                    );
+                }
+                self.pending = Some(notification);
+                self.pending_handles = handles.into();
+                self.take_pending_notification()?.ok_or_else(|| {
+                    McpError::internal_error("Proxy Tasks listener lost its admitted event")
+                })
+            }
             (ProxyFinalTaskListenerPhase::Streaming, ProxyFinalTaskListenerEvent::Terminal) => {
                 self.phase = ProxyFinalTaskListenerPhase::Terminated;
                 Ok(ProxyFinalTaskListenerEvent::Terminal)
@@ -4534,8 +4604,23 @@ impl ProxyFinalTaskListener for AdmittedProxyFinalTaskListener {
                 "Proxy final Tasks listener was polled after terminal completion",
             ));
         }
+        if request_cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            self.phase = ProxyFinalTaskListenerPhase::Terminated;
+            self.pending = None;
+            self.pending_handles.clear();
+            return Err(McpError::request_cancelled());
+        }
+        if let Some(notification) = self.take_pending_notification()? {
+            return Ok(notification);
+        }
 
         let event = self.inner.next(cx, request_cancellation)?;
+        if request_cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            self.phase = ProxyFinalTaskListenerPhase::Terminated;
+            self.pending = None;
+            self.pending_handles.clear();
+            return Err(McpError::request_cancelled());
+        }
         self.admit_event(event)
     }
 
@@ -4550,7 +4635,22 @@ impl ProxyFinalTaskListener for AdmittedProxyFinalTaskListener {
                     "Proxy final Tasks listener was polled after terminal completion",
                 ));
             }
+            if request_cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+                self.phase = ProxyFinalTaskListenerPhase::Terminated;
+                self.pending = None;
+                self.pending_handles.clear();
+                return Err(McpError::request_cancelled());
+            }
+            if let Some(notification) = self.take_pending_notification()? {
+                return Ok(notification);
+            }
             let event = self.inner.next_async(cx, request_cancellation).await?;
+            if request_cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+                self.phase = ProxyFinalTaskListenerPhase::Terminated;
+                self.pending = None;
+                self.pending_handles.clear();
+                return Err(McpError::request_cancelled());
+            }
             self.admit_event(event)
         })
     }
@@ -4560,7 +4660,7 @@ impl ProxyFinalTaskListener for AdmittedProxyFinalTaskListener {
 impl Drop for ProxyFinalTaskReservation {
     fn drop(&mut self) {
         if self.active {
-            self.relay.release_task_reservation();
+            self.relay.release_task_reservation(&self.handle);
         }
     }
 }
@@ -4596,22 +4696,19 @@ impl ProxyFinalTaskRelay {
         result: CreateTaskResult,
     ) -> McpResult<crate::FinalTaskWorkDescriptor> {
         self.ensure_modern_route()?;
-        let encoded = serde_json::to_value(&result).map_err(|error| {
-            McpError::internal_error(format!(
-                "Proxy final Task result could not be retained for router admission: {error}"
-            ))
-        })?;
-        self.commit_task_reservation(&mut reservation, result.task.clone())?;
+        let handle = reservation.handle.clone();
+        self.commit_task_reservation(&mut reservation, result)?;
         crate::FinalTaskWorkDescriptor::new(serde_json::json!({
-            RELAYED_TASK_RESULT_MEMBER: encoded,
+            RELAYED_TASK_RESULT_MEMBER: handle,
         }))
     }
 
-    /// Consumes the proxy-private carrier only when it matches the exact
-    /// upstream snapshot already admitted under this route, then returns it
-    /// for direct final wire encoding.
+    /// Resolves an issued carrier under the current request owner. The carrier
+    /// holds no upstream data: the typed result survives without a JSON Value
+    /// round trip, including nested result sibling order and number lexemes.
     pub(crate) fn admit_carried_task(
         &self,
+        ctx: &McpContext,
         descriptor: &crate::FinalTaskWorkDescriptor,
     ) -> McpResult<Option<CreateTaskResult>> {
         self.ensure_modern_route()?;
@@ -4622,149 +4719,161 @@ impl ProxyFinalTaskRelay {
         else {
             return Ok(None);
         };
-        let result = serde_json::from_value::<CreateTaskResult>(value.clone()).map_err(|_| {
+        let handle = serde_json::from_value::<FinalTaskId>(value.clone()).map_err(|_| {
             McpError::invalid_request("Proxy relayed final Task carrier is invalid")
         })?;
-        let known = self.known_task(&result.task.base().task_id)?;
-        let known = serde_json::to_value(known).map_err(|_| {
-            McpError::internal_error("admitted proxy final Task snapshot could not be serialized")
-        })?;
-        let carried = serde_json::to_value(&result.task).map_err(|_| {
-            McpError::invalid_request("Proxy relayed final Task carrier cannot be serialized")
-        })?;
-        if known != carried {
-            return Err(McpError::invalid_request(
-                "Proxy relayed final Task carrier does not match its admitted upstream handle",
-            ));
-        }
+        let mut result = self.known_mapping(proxy_task_owner(ctx)?, &handle)?.creation;
+        set_relayed_task_id(&mut result.task, handle);
         Ok(Some(result))
     }
 
-    fn reserve_task_creation(self: &Arc<Self>) -> McpResult<ProxyFinalTaskReservation> {
+    fn reserve_task_creation(
+        self: &Arc<Self>,
+        ctx: &McpContext,
+    ) -> McpResult<ProxyFinalTaskReservation> {
+        self.ensure_modern_route()?;
+        let owner = proxy_task_owner(ctx)?;
         let mut registry = self
             .tasks
             .lock()
             .map_err(|_| McpError::internal_error("Proxy final Tasks registry lock poisoned"))?;
         Self::reclaim_expired_tasks(&mut registry, Instant::now());
-        Self::reclaim_terminal_tasks_for_capacity(&mut registry);
-        if registry.tasks.len() + registry.pending_creations >= MAX_RELAYED_FINAL_TASKS {
+        if registry.tasks.len() + registry.pending_creations.len() >= MAX_RELAYED_FINAL_TASKS {
             return Err(McpError::invalid_params(
                 "Proxy final Tasks registry capacity exhausted",
             ));
         }
-        registry.pending_creations += 1;
-        Ok(ProxyFinalTaskReservation {
-            relay: Arc::clone(self),
-            active: true,
-        })
+        let pending_slots = registry.pending_creations.len() + 1;
+        registry.tasks.try_reserve(pending_slots).map_err(|_| {
+            McpError::internal_error("Proxy final Tasks mapping allocation failed")
+        })?;
+        registry.pending_creations.try_reserve(1).map_err(|_| {
+            McpError::internal_error("Proxy final Tasks reservation allocation failed")
+        })?;
+        // Draw and reserve before tools/call can commit upstream work. An
+        // unlikely collision never replaces an existing or in-flight handle.
+        for _ in 0..4 {
+            let identifier = fastmcp_core::draw_security_identifier().map_err(|_| {
+                McpError::internal_error("Proxy final Task handle generation failed")
+            })?;
+            let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(identifier.as_bytes());
+            let handle = FinalTaskId::parse(encoded).map_err(|_| {
+                McpError::internal_error("Proxy final Task handle encoding failed")
+            })?;
+            if !registry.tasks.contains_key(&handle)
+                && registry.pending_creations.insert(handle.clone())
+            {
+                return Ok(ProxyFinalTaskReservation {
+                    relay: Arc::clone(self),
+                    handle,
+                    owner,
+                    active: true,
+                });
+            }
+        }
+        Err(McpError::internal_error("Proxy final Task handle collision limit exceeded"))
     }
 
-    fn release_task_reservation(&self) {
+    fn release_task_reservation(&self, handle: &FinalTaskId) {
         let Ok(mut registry) = self.tasks.lock() else {
             return;
         };
-        registry.pending_creations = registry.pending_creations.saturating_sub(1);
+        registry.pending_creations.remove(handle);
     }
 
     fn commit_task_reservation(
         &self,
         reservation: &mut ProxyFinalTaskReservation,
-        task: FinalTask,
+        result: CreateTaskResult,
     ) -> McpResult<()> {
         if !reservation.active || !std::ptr::eq(self, Arc::as_ptr(&reservation.relay)) {
             return Err(McpError::internal_error(
                 "Proxy final Task creation reservation does not belong to this route",
             ));
         }
-        let task_id = task.base().task_id.clone();
+        let retained_at = Instant::now();
+        let wall_origin = chrono::Utc::now();
+        let retained = ProxyRelayedFinalTask {
+            expires_at: Self::task_expiry(&result.task, retained_at, wall_origin)?,
+            task: result.task.clone(),
+            creation: result,
+            binding: self.binding,
+            owner: reservation.owner,
+            retained_at,
+            wall_origin,
+        };
         let mut registry = self
             .tasks
             .lock()
             .map_err(|_| McpError::internal_error("Proxy final Tasks registry lock poisoned"))?;
-        if registry.pending_creations == 0 {
+        if !registry.pending_creations.contains(&reservation.handle) {
             return Err(McpError::internal_error(
                 "Proxy final Task creation reservation was not retained",
             ));
         }
-        Self::reclaim_terminal_tasks_for_capacity(&mut registry);
-        if !registry.tasks.contains_key(&task_id) && registry.tasks.len() >= MAX_RELAYED_FINAL_TASKS
+        if registry.tasks.contains_key(&reservation.handle)
+            || registry.tasks.len() >= MAX_RELAYED_FINAL_TASKS
         {
             return Err(McpError::internal_error(
                 "Proxy final Tasks registry exceeded its admitted capacity",
             ));
         }
-        registry
-            .tasks
-            .insert(task_id, Self::retained_task(self.binding, task)?);
-        registry.pending_creations -= 1;
+        registry.tasks.insert(reservation.handle.clone(), retained);
+        registry.pending_creations.remove(&reservation.handle);
         reservation.active = false;
         Ok(())
     }
 
-    fn record_task(&self, task: FinalTask) -> McpResult<()> {
-        let task_id = task.base().task_id.clone();
-        let mut tasks = self
+    fn record_task(
+        &self,
+        owner: fastmcp_core::Sha256Digest,
+        handle: &FinalTaskId,
+        task: FinalTask,
+    ) -> McpResult<()> {
+        let mut registry = self
             .tasks
             .lock()
             .map_err(|_| McpError::internal_error("Proxy final Tasks registry lock poisoned"))?;
-        Self::reclaim_expired_tasks(&mut tasks, Instant::now());
-        if !tasks.tasks.contains_key(&task_id) {
-            Self::reclaim_terminal_tasks_for_capacity(&mut tasks);
-        }
-        if !tasks.tasks.contains_key(&task_id)
-            && tasks.tasks.len() + tasks.pending_creations >= MAX_RELAYED_FINAL_TASKS
+        let now = Instant::now();
+        let retained = registry.tasks.get_mut(handle)
+            .filter(|retained| {
+                retained.binding == self.binding && retained.owner == owner
+                    && retained.expires_at.is_none_or(|deadline| deadline > now)
+            })
+            .ok_or_else(unknown_proxy_task)?;
+        if retained.task.base().task_id != task.base().task_id
+            || retained.task.base().created_at != task.base().created_at
         {
-            return Err(McpError::invalid_params(
-                "Proxy final Tasks registry capacity exhausted",
+            return Err(McpError::invalid_request(
+                "Proxy upstream Task snapshot changed its admitted identity",
             ));
         }
-        match tasks.tasks.get_mut(&task_id) {
-            // Upstream snapshots are replacements, not in-place patches. A
-            // replacement must restart finite TTL retention and must turn an
-            // explicit null ttlMs back into unlimited local retention.
-            Some(existing) => *existing = Self::retained_task(self.binding, task)?,
-            None => {
-                tasks
-                    .tasks
-                    .insert(task_id, Self::retained_task(self.binding, task)?);
-            }
-        }
+        retained.expires_at = Self::task_expiry(&task, retained.retained_at, retained.wall_origin)?;
+        retained.task = task;
         Ok(())
     }
 
-    fn retained_task(
-        binding: ProxyUpstreamBinding,
-        task: FinalTask,
-    ) -> McpResult<ProxyRelayedFinalTask> {
-        let retained_at = Instant::now();
-        let expires_at = task
-            .base()
-            .ttl_ms
-            .as_ref()
-            .map(|ttl| {
-                ttl.try_as_millis()
-                    .map_err(|error| {
-                        McpError::invalid_params(format!(
-                            "Proxy final Task ttlMs cannot be represented locally: {error}"
-                        ))
-                    })
-                    .and_then(|milliseconds| {
-                        retained_at
-                            .checked_add(Duration::from_millis(milliseconds))
-                            .ok_or_else(|| {
-                                McpError::internal_error(
-                                    "Proxy final Task ttlMs exceeds the local clock range",
-                                )
-                            })
-                    })
-            })
-            .transpose()?;
-        Ok(ProxyRelayedFinalTask {
-            task,
-            binding,
-            expires_at,
-            retained_at,
-        })
+    fn task_expiry(
+        task: &FinalTask,
+        retained_at: Instant,
+        wall_origin: chrono::DateTime<chrono::Utc>,
+    ) -> McpResult<Option<Instant>> {
+        let Some(ttl) = task.base().ttl_ms.as_ref() else {
+            return Ok(None);
+        };
+        let invalid = || McpError::invalid_request(
+            "Proxy upstream Task retention deadline cannot be represented locally",
+        );
+        let milliseconds = i64::try_from(ttl.try_as_millis().map_err(|_| invalid())?)
+            .map_err(|_| invalid())?;
+        let created_at = chrono::DateTime::parse_from_rfc3339(task.base().created_at.as_str())
+            .map_err(|_| invalid())?;
+        let deadline = created_at.checked_add_signed(
+            chrono::TimeDelta::try_milliseconds(milliseconds).ok_or_else(invalid)?
+        ).ok_or_else(invalid)?;
+        let remaining = deadline.signed_duration_since(wall_origin).to_std().unwrap_or_default();
+        retained_at.checked_add(remaining).map(Some).ok_or_else(invalid)
     }
 
     fn reclaim_expired_tasks(registry: &mut ProxyFinalTaskRegistry, now: Instant) {
@@ -4775,33 +4884,11 @@ impl ProxyFinalTaskRelay {
         });
     }
 
-    /// Reclaims the oldest terminal snapshot when capacity would otherwise
-    /// block a new task. A `ttlMs: null` declaration remains unlimited for a
-    /// live task, but terminal snapshots cannot make the bounded relay
-    /// permanently unavailable.
-    fn reclaim_terminal_tasks_for_capacity(registry: &mut ProxyFinalTaskRegistry) {
-        while registry.tasks.len() + registry.pending_creations >= MAX_RELAYED_FINAL_TASKS {
-            let evicted = registry
-                .tasks
-                .iter()
-                .filter(|(_, retained)| {
-                    matches!(
-                        retained.task.base().status,
-                        fastmcp_protocol::FinalTaskStatus::Completed
-                            | fastmcp_protocol::FinalTaskStatus::Failed
-                            | fastmcp_protocol::FinalTaskStatus::Cancelled
-                    )
-                })
-                .min_by_key(|(_, retained)| retained.retained_at)
-                .map(|(task_id, _)| task_id.clone());
-            let Some(task_id) = evicted else {
-                break;
-            };
-            registry.tasks.remove(&task_id);
-        }
-    }
-
-    fn known_task(&self, task_id: &FinalTaskId) -> McpResult<FinalTask> {
+    fn known_mapping(
+        &self,
+        owner: fastmcp_core::Sha256Digest,
+        handle: &FinalTaskId,
+    ) -> McpResult<ProxyRelayedFinalTask> {
         let mut registry = self
             .tasks
             .lock()
@@ -4809,11 +4896,14 @@ impl ProxyFinalTaskRelay {
         Self::reclaim_expired_tasks(&mut registry, Instant::now());
         registry
             .tasks
-            .get(task_id)
-            .filter(|retained| retained.binding == self.binding)
+            .get(handle)
+            .filter(|retained| retained.binding == self.binding && retained.owner == owner)
             .cloned()
-            .map(|retained| retained.task)
-            .ok_or_else(|| McpError::invalid_params("Unknown proxy-relayed final Task handle"))
+            .ok_or_else(unknown_proxy_task)
+    }
+
+    fn known_task(&self, ctx: &McpContext, handle: &FinalTaskId) -> McpResult<FinalTask> {
+        self.known_mapping(proxy_task_owner(ctx)?, handle).map(|retained| retained.task)
     }
 
     pub(crate) async fn dispatch_get(
@@ -4824,20 +4914,14 @@ impl ProxyFinalTaskRelay {
         self.ensure_modern_route()?;
         let parameters = serde_json::from_value::<FinalGetTaskParams>(parameters)
             .map_err(|_| McpError::invalid_params("Invalid final tasks/get parameters"))?;
-        // A restarted proxy has no local snapshot yet, but this relay still
-        // carries the immutable upstream route receipt. Bootstrap recovery by
-        // querying exactly that bound upstream, then retain the returned
-        // snapshot before any later update or cancellation can use the ID.
-        let result = self
+        let owner = proxy_task_owner(ctx)?;
+        let task = self.known_mapping(owner, &parameters.task_id)?.task;
+        let mut result = self
             .client
-            .get_final_task(ctx, parameters.task_id.clone())
+            .get_final_task(ctx, task.base().task_id.clone())
             .await?;
-        if result.task.base().task_id != parameters.task_id {
-            return Err(McpError::invalid_request(
-                "Proxy upstream tasks/get response taskId does not match its request",
-            ));
-        }
-        self.record_task(result.task.clone())?;
+        self.record_task(owner, &parameters.task_id, result.task.clone())?;
+        set_relayed_task_id(&mut result.task, parameters.task_id);
         serde_json::to_value(result).map_err(|_| {
             McpError::internal_error("Proxy final tasks/get response serialization failed")
         })
@@ -4851,7 +4935,7 @@ impl ProxyFinalTaskRelay {
         self.ensure_modern_route()?;
         let parameters = serde_json::from_value::<UpdateTaskParams>(parameters)
             .map_err(|_| McpError::invalid_params("Invalid final tasks/update parameters"))?;
-        let task = self.known_task(&parameters.task_id)?;
+        let task = self.known_task(ctx, &parameters.task_id)?;
         let result = self
             .client
             .update_final_task(ctx, &task, parameters.input_responses)
@@ -4869,7 +4953,7 @@ impl ProxyFinalTaskRelay {
         self.ensure_modern_route()?;
         let parameters = serde_json::from_value::<FinalCancelTaskParams>(parameters)
             .map_err(|_| McpError::invalid_params("Invalid final tasks/cancel parameters"))?;
-        let task = self.known_task(&parameters.task_id)?;
+        let task = self.known_task(ctx, &parameters.task_id)?;
         let result = self
             .client
             .cancel_final_task(ctx, task.base().task_id.clone())
@@ -4880,7 +4964,7 @@ impl ProxyFinalTaskRelay {
     }
 
     pub(crate) async fn open_listener_async(
-        &self,
+        self: &Arc<Self>,
         ctx: &McpContext,
         notifications: SubscriptionFilter,
     ) -> McpResult<Box<dyn ProxyFinalTaskListener>> {
@@ -4888,14 +4972,27 @@ impl ProxyFinalTaskRelay {
         let task_ids = task_subscription_ids(&notifications)
             .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
             .ok_or_else(|| McpError::invalid_params("Tasks listener requires taskIds"))?;
-        for task_id in &task_ids {
-            self.known_task(task_id)?;
+        let owner = proxy_task_owner(ctx)?;
+        let mut mappings = Vec::new();
+        let mut upstream_ids = Vec::new();
+        for task_id in task_ids {
+            let task = self.known_mapping(owner, &task_id)?.task;
+            let upstream_id = task.base().task_id.clone();
+            if !upstream_ids.contains(&upstream_id) {
+                upstream_ids.push(upstream_id.clone());
+            }
+            if !mappings.iter().any(|(handle, _)| handle == &task_id) {
+                mappings.push((task_id, upstream_id));
+            }
         }
+        let upstream_filter = relayed_task_filter(notifications.clone(), upstream_ids)?;
         self.client
-            .open_final_task_listener_async(ctx, notifications)
+            .open_final_task_listener_async(ctx, upstream_filter.clone())
             .await
             .map(|listener| {
-                Box::new(AdmittedProxyFinalTaskListener::new(listener))
+                Box::new(AdmittedProxyFinalTaskListener::new(
+                    listener, Arc::clone(self), owner, mappings, upstream_filter, notifications,
+                ))
                     as Box<dyn ProxyFinalTaskListener>
             })
     }
@@ -4911,12 +5008,47 @@ impl ProxyFinalTaskRelay {
             .await
     }
 
-    pub(crate) fn record_notification(
-        &self,
-        notification: &fastmcp_protocol::TaskStatusNotification,
-    ) -> McpResult<()> {
-        self.record_task(notification.params.task.clone())
+}
+
+#[cfg(feature = "tasks")]
+fn unknown_proxy_task() -> McpError {
+    McpError::invalid_params("Unknown proxy-relayed final Task handle")
+}
+
+/// The server's current AuthProvider and configured scope policy authorize
+/// each method before dispatch. The relay additionally binds handles to the
+/// stable verified owner, never to a token string or a shared anonymous key.
+#[cfg(feature = "tasks")]
+fn proxy_task_owner(ctx: &McpContext) -> McpResult<fastmcp_core::Sha256Digest> {
+    let auth = ctx.auth().ok_or_else(unknown_proxy_task)?;
+    if auth.session_owner().is_none()
+        && auth.subject.as_ref().is_none_or(|subject| subject.is_empty())
+    {
+        return Err(unknown_proxy_task());
     }
+    crate::auth::principal_fingerprint(Some(&auth))
+}
+
+#[cfg(feature = "tasks")]
+fn set_relayed_task_id(task: &mut FinalTask, handle: FinalTaskId) {
+    let base = match task {
+        FinalTask::Working(base) | FinalTask::Cancelled(base)
+        | FinalTask::InputRequired { base, .. }
+        | FinalTask::Completed { base, .. }
+        | FinalTask::Failed { base, .. } => base,
+    };
+    base.task_id = handle;
+}
+
+#[cfg(feature = "tasks")]
+fn relayed_task_filter(
+    mut filter: SubscriptionFilter,
+    task_ids: Vec<FinalTaskId>,
+) -> McpResult<SubscriptionFilter> {
+    filter.additional.remove(fastmcp_protocol::tasks_extension::TASK_SUBSCRIPTION_IDS_KEY);
+    set_task_subscription_ids(&mut filter, task_ids)
+        .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?;
+    Ok(filter)
 }
 
 /// Immutable adapter selected for one independently configured upstream leg.
@@ -8525,7 +8657,7 @@ impl ProxyClient {
             );
         }
         Ok(serde_json::json!({
-            "pendingCreations": registry.pending_creations,
+            "pendingCreations": registry.pending_creations.len(),
             "tasks": tasks,
         }))
     }
@@ -11046,13 +11178,17 @@ impl ProxyToolHandler {
         Ok(handler)
     }
 
-    fn has_task_relay(&self) -> bool {
+    fn has_task_relay(&self, ctx: &McpContext) -> bool {
         #[cfg(feature = "tasks")]
         {
-            self.task_relay.is_some()
+            self.task_relay.is_some() && ctx.auth().is_some_and(|auth| {
+                auth.session_owner().is_some()
+                    || auth.subject.as_ref().is_some_and(|subject| !subject.is_empty())
+            })
         }
         #[cfg(not(feature = "tasks"))]
         {
+            let _ = ctx;
             false
         }
     }
@@ -11063,10 +11199,10 @@ impl ProxyToolHandler {
         ctx: &McpContext,
     ) -> McpResult<Option<ProxyFinalTaskReservation>> {
         ctx.ensure_live()?;
-        if ctx.client_supports_tasks() {
+        if ctx.client_supports_tasks() && self.has_task_relay(ctx) {
             self.task_relay
                 .as_ref()
-                .map(|relay| relay.reserve_task_creation())
+                .map(|relay| relay.reserve_task_creation(ctx))
                 .transpose()
         } else {
             Ok(None)
@@ -11211,7 +11347,7 @@ impl ToolHandler for ProxyToolHandler {
                 &self.external_name,
                 arguments,
                 None,
-                self.has_task_relay(),
+                self.has_task_relay(ctx),
             ),
         )?;
         self.admit_final_tool_result(
@@ -11253,7 +11389,7 @@ impl ToolHandler for ProxyToolHandler {
                     &self.external_name,
                     arguments,
                     resume_inputs,
-                    self.has_task_relay(),
+                    self.has_task_relay(ctx),
                 )
                 .await
                 .and_then(|result| {
@@ -11771,6 +11907,56 @@ mod tests {
         notifications
     }
 
+    fn relay_test_auth() -> fastmcp_core::AuthContext {
+        fastmcp_core::AuthContext::with_subject("proxy-relay-test-owner")
+    }
+
+    #[cfg(feature = "tasks")]
+    fn relay_test_context(cx: Cx, request_id: u64) -> McpContext {
+        McpContext::new(cx, request_id).with_auth(relay_test_auth())
+    }
+
+    #[cfg(feature = "tasks")]
+    struct RelayTestAuthProvider;
+
+    #[cfg(feature = "tasks")]
+    impl crate::auth::AuthProvider for RelayTestAuthProvider {
+        fn authenticate(
+            &self,
+            _ctx: &McpContext,
+            _request: crate::auth::AuthRequest<'_>,
+        ) -> fastmcp_core::McpResult<fastmcp_core::AuthContext> {
+            Ok(relay_test_auth())
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    fn issue_relay_test_task(
+        relay: &Arc<super::ProxyFinalTaskRelay>,
+        ctx: &McpContext,
+        task: fastmcp_protocol::Task,
+    ) -> CreateTaskResult {
+        let reservation = relay.reserve_task_creation(ctx).expect("reserve an issued handle");
+        let carrier = relay.encode_task_carrier(reservation, CreateTaskResult {
+            task,
+            meta: None,
+            additional: BTreeMap::new(),
+        }).expect("retain the task behind its reserved handle");
+        relay.admit_carried_task(ctx, &carrier).expect("admit the owned carrier")
+            .expect("carrier belongs to the relay")
+    }
+
+    #[cfg(feature = "tasks")]
+    fn assert_relay_task_mapping(mapped: &serde_json::Value, upstream: &serde_json::Value) {
+        let handle = mapped["taskId"].as_str().expect("mapped task handle");
+        assert_eq!(handle.len(), 43, "256-bit canonical base64url handle");
+        assert!(handle.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')));
+        assert_ne!(mapped["taskId"], upstream["taskId"]);
+        let mut expected = upstream.clone();
+        expected["taskId"] = mapped["taskId"].clone();
+        assert_eq!(*mapped, expected, "mapping changes only the typed task identifier");
+    }
+
     /// Real native HTTP I/O against a protocol peer that withholds each reply
     /// until a sibling on the caller's runtime runs. The peer supplies wire
     /// fixtures; this proves dispatch/runtime custody, not an upstream Task
@@ -11916,11 +12102,12 @@ mod tests {
                     .final_tasks_relay()
                     .unwrap()
                     .expect("discovery admits Tasks");
-                if method != "tasks/get" {
-                    relay.record_task(task.clone()).unwrap();
-                }
+                let owner_ctx = relay_test_context(cx.clone(), 882);
+                let issued = issue_relay_test_task(&relay, &owner_ctx, task.clone());
+                let handle = issued.task.base().task_id.clone();
                 let before = proxy.final_task_registry_snapshot_for_test().unwrap();
                 let server = crate::ServerBuilder::new("runtime-control-proxy", "1.0.0")
+                    .auth_provider(RelayTestAuthProvider)
                     .proxy(
                         proxy.clone(),
                         ProxyCatalog {
@@ -11938,7 +12125,7 @@ mod tests {
                             "extensions": {fastmcp_protocol::TASKS_EXTENSION: {}}
                         }
                     },
-                    "taskId": task_id,
+                    "taskId": handle,
                 });
                 if method == "tasks/update" {
                     parameters["inputResponses"] = serde_json::json!({});
@@ -12008,9 +12195,9 @@ mod tests {
                     let result = response.result.expect("async control receives its correlated result");
                     assert_eq!(result["resultType"], "complete");
                     if method == "tasks/get" {
-                        assert_eq!(result["taskId"], task_id);
+                        assert_eq!(result["taskId"], handle.as_str());
                         assert_eq!(
-                            serde_json::to_value(relay.known_task(&task.base().task_id).unwrap())
+                            serde_json::to_value(relay.known_task(&owner_ctx, &handle).unwrap())
                                 .unwrap(),
                             serde_json::to_value(&task).unwrap(),
                         );
@@ -12161,19 +12348,25 @@ IFS= read -r end
                 .unwrap();
             let proxy = ProxyClient::from_client(client).unwrap();
             let relay = proxy.final_tasks_relay().unwrap().unwrap();
-            if method != "tasks/get" {
-                for task in [&first_task, &second_task] {
+            let owner_ctx = relay_test_context(cx.clone(), 894);
+            let mut handles = Vec::new();
+            for task in [&first_task, &second_task] {
+                let task = if method != "tasks/get" {
                     let mut value = serde_json::to_value(task).unwrap();
                     value["inputRequests"] = serde_json::json!({"roots": {"method": "roots/list"}});
-                    relay
-                        .record_task(serde_json::from_value(value).unwrap())
-                        .unwrap();
-                }
+                    serde_json::from_value(value).unwrap()
+                } else {
+                    task.clone()
+                };
+                handles.push(issue_relay_test_task(&relay, &owner_ctx, task).task.base().task_id.clone());
             }
+            let first_handle = handles[0].as_str().to_owned();
+            let second_handle = handles[1].as_str().to_owned();
             let before = proxy.final_task_registry_snapshot_for_test().unwrap();
             let cancellation = McpRequestCancellation::new();
             runtime.block_on(async {
                 let make_ctx = |id| McpContext::new(cx.clone(), id)
+                    .with_auth(relay_test_auth())
                     .with_client_capabilities(fastmcp_core::ClientCapabilityInfo::new().with_tasks().with_roots(false))
                     .with_client_implementation(fastmcp_core::ClientImplementationInfo::new(subject.clone(), "19"));
                 let first_ctx = make_ctx(895).with_request_cancellation(cancellation.clone());
@@ -12195,7 +12388,7 @@ IFS= read -r end
                     }
                 }).unwrap();
                 let first_relay = relay.clone();
-                let first_target = first_id.clone();
+                let first_target = first_handle.clone();
                 let first_worker = Arc::clone(&worker);
                 let first_pending = Arc::clone(&pending);
                 let mut first = cx.spawn(move |first_cx| async move {
@@ -12217,7 +12410,7 @@ IFS= read -r end
                     (result, deadline)
                 }).unwrap();
                 let second_relay = relay.clone();
-                let second_target = second_id.clone();
+                let second_target = second_handle.clone();
                 let second_proxy = proxy.clone();
                 let mut second = cx.spawn(move |second_cx| async move {
                     let deadline = second_cx.now().saturating_add_nanos(3_000_000_000);
@@ -12233,26 +12426,36 @@ IFS= read -r end
                 let (first, deadline) = first.join(&cx).await.unwrap();
                 let second = second.join(&cx).await.unwrap().unwrap();
                 observer.join(&cx).await.unwrap();
-                assert_eq!(second, second_result);
+                if method == "tasks/get" {
+                    let mut expected = second_result.clone();
+                    expected["taskId"] = serde_json::json!(second_handle);
+                    assert_eq!(second, expected);
+                } else {
+                    assert_eq!(second, second_result);
+                }
                 if cancel {
                     assert_eq!(first.unwrap_err().code, McpErrorCode::RequestCancelled);
                     if context_deadline {
                         assert!(!cancellation.is_cancel_requested());
                         assert!(cx.now() >= deadline.unwrap());
                     }
+                } else if method == "tasks/get" {
+                    let mut expected = first_result.clone();
+                    expected["taskId"] = serde_json::json!(first_handle);
+                    assert_eq!(first.unwrap(), expected);
                 } else { assert_eq!(first.unwrap(), first_result); }
                 assert!(!cx.is_cancel_requested());
                 let after = proxy.final_task_registry_snapshot_for_test().unwrap();
                 assert_eq!(after["pendingCreations"], 0);
                 if method == "tasks/get" {
                     if cancel {
-                        assert!(after["tasks"].get(&first_id).is_none());
+                        assert_eq!(after["tasks"].get(&first_handle), before["tasks"].get(&first_handle));
                     } else {
-                        assert_eq!(after["tasks"][&first_id], serde_json::to_value(&first_task).unwrap());
+                        assert_eq!(after["tasks"][&first_handle], serde_json::to_value(&first_task).unwrap());
                     }
-                    assert_eq!(after["tasks"][&second_id], serde_json::to_value(&second_task).unwrap());
+                    assert_eq!(after["tasks"][&second_handle], serde_json::to_value(&second_task).unwrap());
                 } else { assert_eq!(after, before); }
-                let recovery = invoke_stdio_task_control(&relay, &make_ctx(897), "tasks/get", &second_id).await.unwrap();
+                let recovery = invoke_stdio_task_control(&relay, &make_ctx(897), "tasks/get", &second_handle).await.unwrap();
                 let meta = &recovery["_meta"];
                 assert_eq!(meta["wires"].as_array().unwrap().len(), 2);
                 for (index, wire) in meta["wires"].as_array().unwrap().iter().enumerate() {
@@ -12263,16 +12466,16 @@ IFS= read -r end
                     assert_eq!(wire["params"]["_meta"][fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"][fastmcp_protocol::TASKS_EXTENSION], serde_json::json!({}));
                     assert_eq!(wire["params"]["_meta"][fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]["roots"], serde_json::json!({}));
                     if method == "tasks/update" {
-                        assert_eq!(wire["params"]["inputResponses"], serde_json::json!({"roots": {"roots": [{"uri": format!("file:///{}", if index == 0 { &first_id } else { &second_id })}]}}));
+                        assert_eq!(wire["params"]["inputResponses"], serde_json::json!({"roots": {"roots": [{"uri": format!("file:///{}", if index == 0 { &first_handle } else { &second_handle })}]}}));
                     }
                 }
                 if cancel {
                     assert_eq!(meta["control"]["method"], "notifications/cancelled");
                     assert_eq!(meta["control"]["params"]["requestId"], 2);
-                    assert_eq!(proxy.final_task_registry_snapshot_for_test().unwrap()["tasks"].get(&first_id), before["tasks"].get(&first_id));
+                    assert_eq!(proxy.final_task_registry_snapshot_for_test().unwrap()["tasks"].get(&first_handle), before["tasks"].get(&first_handle));
                 } else { assert!(meta["control"].is_null()); }
                 assert_eq!(meta["recovery"]["id"], 4);
-                assert_eq!(recovery["taskId"], second_id);
+                assert_eq!(recovery["taskId"], second_handle);
                 eprintln!("{}", serde_json::json!({"proof": "proxy_stdio_task_controls", "method": method,
                     "cancelled": cancel, "context_deadline": context_deadline, "subject": subject,
                     "before": before, "after": after, "peer": meta}));
@@ -12455,6 +12658,7 @@ IFS= read -r end
                     )
                     .unwrap();
                     let ctx = McpContext::new(cx.clone(), 883)
+                        .with_auth(relay_test_auth())
                         .with_request_cancellation(cancellation.clone())
                         .with_client_capabilities(
                             fastmcp_core::ClientCapabilityInfo::new().with_tasks(),
@@ -12538,16 +12742,17 @@ IFS= read -r end
                             } => {
                                 assert!(task_result);
                                 serde_json::to_value(
-                                    relay.admit_carried_task(&work_descriptor).unwrap().unwrap(),
+                                    relay.admit_carried_task(&ctx, &work_descriptor).unwrap().unwrap(),
                                 )
                                 .unwrap()
                             }
                             FinalToolOutcome::InputRequired(_) => panic!("unexpected MRTR result"),
                         };
-                        assert_eq!(
-                            observed, upstream,
-                            "preserve the exact complete result or upstream Task handle"
-                        );
+                        if task_result {
+                            assert_relay_task_mapping(&observed, &upstream);
+                        } else {
+                            assert_eq!(observed, upstream, "preserve the exact complete result");
+                        }
                     }
                     (proxy, before)
                 });
@@ -12804,6 +13009,7 @@ IFS= read -r end
                         let capabilities = if allow_tasks { capabilities.with_tasks() } else { capabilities };
                         let ctx = McpContext::with_progress(cx.clone(), 891,
                             ProgressReporter::with_marker(serde_json::json!(subject), Arc::clone(&capture) as Arc<dyn NotificationSender>))
+                            .with_auth(relay_test_auth())
                             .with_request_cancellation(cancellation.clone()).with_client_capabilities(capabilities);
                         let exchange_binding = MrtrExchangeBinding::new("tools/call", subject.clone(), [7;32], [9;32], None, [11;32]);
                         let mut resumes = Vec::new();
@@ -12879,8 +13085,8 @@ IFS= read -r end
                                     FinalToolOutcome::CreateTask { work_descriptor, .. } => {
                                         assert!(allow_tasks);
                                         assert_eq!(round, 1);
-                                        let retained = handler.task_relay.as_ref().unwrap().admit_carried_task(&work_descriptor).unwrap().unwrap();
-                                        assert_eq!(serde_json::to_value(retained).unwrap(), upstream);
+                                        let retained = handler.task_relay.as_ref().unwrap().admit_carried_task(&round_ctx, &work_descriptor).unwrap().unwrap();
+                                        assert_relay_task_mapping(&serde_json::to_value(retained).unwrap(), &upstream);
                                     }
                                 }
                             }
@@ -14008,7 +14214,7 @@ IFS= read -r end
                     }) => {
                         let result = relay
                             .expect("Tasks must be explicitly negotiated")
-                            .admit_carried_task(&work_descriptor)
+                            .admit_carried_task(ctx, &work_descriptor)
                             .unwrap()
                             .unwrap();
                         return Ok(serde_json::to_value(result).unwrap());
@@ -14241,6 +14447,7 @@ IFS= read -r end
                             let capabilities = if task_result.is_some() { capabilities.with_tasks() } else { capabilities };
                             McpContext::with_progress(cx.clone(), 893,
                                 ProgressReporter::with_marker(serde_json::json!(marker), Arc::clone(&capture) as Arc<dyn NotificationSender>))
+                                .with_auth(relay_test_auth())
                                 .with_client_capabilities(capabilities)
                                 .with_client_implementation(fastmcp_core::ClientImplementationInfo::new(subject.clone(), "18"))
                         };
@@ -14327,10 +14534,13 @@ IFS= read -r end
                             assert_eq!(second["_meta"]["owner"], 3 + pair*2);
                             for (key, value) in payload.as_object().unwrap() { assert_eq!(&second[key], value); }
                             if task_result == Some(true) {
-                                assert_eq!(second["taskId"], format!("{subject}-{}", 3 + pair*2));
+                                let raw_id = format!("{subject}-{}", 3 + pair*2);
+                                assert_ne!(second["taskId"], raw_id);
+                                assert_eq!(second["taskId"].as_str().unwrap().len(), 43);
                                 let mut task = second.as_object().unwrap().clone();
                                 task.remove("resultType");
                                 task.remove("_meta");
+                                task.insert("taskId".to_owned(), serde_json::json!(raw_id));
                                 expected_tasks.insert(second["taskId"].as_str().unwrap().to_owned(), serde_json::Value::Object(task));
                             }
                         } else {
@@ -14357,10 +14567,13 @@ IFS= read -r end
                                     assert_eq!(result["resultType"], result_type);
                                     for (key, value) in payload.as_object().unwrap() { assert_eq!(&result[key], value); }
                                     if task_result == Some(true) {
-                                        assert_eq!(result["taskId"], format!("{subject}-{}", result["_meta"]["owner"]));
+                                        let raw_id = format!("{subject}-{}", result["_meta"]["owner"]);
+                                        assert_ne!(result["taskId"], raw_id);
+                                        assert_eq!(result["taskId"].as_str().unwrap().len(), 43);
                                         let mut task = result.as_object().unwrap().clone();
                                         task.remove("resultType");
                                         task.remove("_meta");
+                                        task.insert("taskId".to_owned(), serde_json::json!(raw_id));
                                         expected_tasks.insert(result["taskId"].as_str().unwrap().to_owned(), serde_json::Value::Object(task));
                                     }
                                 }
@@ -17468,6 +17681,11 @@ IFS= read -r end
             notifications: SubscriptionFilter,
         ) -> fastmcp_core::McpResult<Box<dyn ProxyFinalTaskListener>> {
             self.record("subscriptions/listen");
+            let ids = fastmcp_protocol::tasks_extension::task_subscription_ids(&notifications)
+                .unwrap().unwrap();
+            for (index, id) in ids.iter().enumerate() {
+                assert!(!ids[..index].contains(id), "the relay deduplicates upstream task IDs");
+            }
             Ok(Box::new(FinalTaskRelayListener {
                 events: self.listener_events.take().unwrap_or_else(|| {
                     VecDeque::from([
@@ -17486,12 +17704,17 @@ IFS= read -r end
 
     #[cfg(feature = "tasks")]
     fn final_task_relay_result_with_ttl(task_id: &str, ttl_ms: Option<u64>) -> CreateTaskResult {
+        let timestamp = if ttl_ms.is_some() {
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        } else {
+            "2026-07-28T12:00:00Z".to_owned()
+        };
         serde_json::from_value(serde_json::json!({
             "resultType": "task",
             "taskId": task_id,
             "status": "input_required",
-            "createdAt": "2026-07-28T12:00:00Z",
-            "lastUpdatedAt": "2026-07-28T12:00:00Z",
+            "createdAt": timestamp,
+            "lastUpdatedAt": timestamp,
             "ttlMs": ttl_ms,
             "inputRequests": {},
         }))
@@ -17527,6 +17750,191 @@ IFS= read -r end
     }
 
     #[cfg(feature = "tasks")]
+    fn relay_test_filter(ids: Vec<fastmcp_protocol::FinalTaskId>) -> SubscriptionFilter {
+        let mut filter = SubscriptionFilter::default();
+        set_task_subscription_ids(&mut filter, ids).unwrap();
+        filter
+    }
+
+    #[cfg(feature = "tasks")]
+    fn relay_test_notification(task: fastmcp_protocol::Task) -> fastmcp_protocol::TaskStatusNotification {
+        fastmcp_protocol::TaskStatusNotification::new(
+            fastmcp_protocol::FinalTaskStatusNotificationParams {
+                task,
+                meta: None,
+                additional: BTreeMap::from([(
+                    "com.example/retained".to_owned(), serde_json::json!({"value": false}),
+                )]),
+            },
+        )
+    }
+
+    #[cfg(feature = "tasks")]
+    fn relay_listener_fixture(
+        initial: CreateTaskResult,
+        update: fastmcp_protocol::Task,
+    ) -> (ProxyClient, Arc<super::ProxyFinalTaskRelay>, McpContext, fastmcp_protocol::FinalTaskId) {
+        let upstream_filter = relay_test_filter(vec![initial.task.base().task_id.clone()]);
+        let proxy = ProxyClient::from_backend_with_upstream_binding(
+            FinalTaskRelayBackend {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                task: initial.clone(),
+                listener_events: Some(VecDeque::from([
+                    ProxyFinalTaskListenerEvent::Acknowledged(upstream_filter),
+                    ProxyFinalTaskListenerEvent::Notification(relay_test_notification(update)),
+                    ProxyFinalTaskListenerEvent::Terminal,
+                ])),
+                cancel_after_task_commit: None,
+                final_progress: None,
+            },
+            final_task_relay_binding(ProtocolEra::Modern2026), "2026-07-28",
+        ).unwrap();
+        let relay = proxy.final_tasks_relay().unwrap().unwrap();
+        let owner = relay_test_context(Cx::for_testing(), 753);
+        let issued = issue_relay_test_task(&relay, &owner, initial.task);
+        let handle = issued.task.base().task_id.clone();
+        (proxy, relay, owner, handle)
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_listener_ready_cancellation_prevents_emission_and_mutation() {
+        struct CancelReadyListener(VecDeque<ProxyFinalTaskListenerEvent>);
+        impl ProxyFinalTaskListener for CancelReadyListener {
+            fn next(
+                &mut self,
+                _cx: &Cx,
+                cancellation: &McpRequestCancellation,
+            ) -> fastmcp_core::McpResult<ProxyFinalTaskListenerEvent> {
+                let event = self.0.pop_front().expect("only admitted events are polled");
+                if matches!(&event, ProxyFinalTaskListenerEvent::Notification(_)) {
+                    assert!(cancellation.cancel());
+                }
+                Ok(event)
+            }
+        }
+        for asynchronous in [false, true] {
+            let initial = final_task_relay_result();
+            let mut update = serde_json::to_value(&initial.task).unwrap();
+            update["statusMessage"] = serde_json::json!("must remain unobserved");
+            let update: fastmcp_protocol::Task = serde_json::from_value(update).unwrap();
+            let (proxy, relay, owner, handle) = relay_listener_fixture(initial.clone(), update.clone());
+            let upstream_filter = relay_test_filter(vec![initial.task.base().task_id.clone()]);
+            let downstream_filter = relay_test_filter(vec![handle.clone()]);
+            let mut listener = super::AdmittedProxyFinalTaskListener::new(
+                Box::new(CancelReadyListener(VecDeque::from([
+                    ProxyFinalTaskListenerEvent::Acknowledged(upstream_filter.clone()),
+                    ProxyFinalTaskListenerEvent::Notification(relay_test_notification(update)),
+                ]))),
+                relay.clone(), super::proxy_task_owner(&owner).unwrap(),
+                vec![(handle, initial.task.base().task_id.clone())],
+                upstream_filter, downstream_filter,
+            );
+            let cancellation = McpRequestCancellation::new();
+            let before = proxy.final_task_registry_snapshot_for_test().unwrap();
+            let acknowledgement = if asynchronous {
+                block_on(listener.next_async(owner.cx(), &cancellation))
+            } else {
+                listener.next(owner.cx(), &cancellation)
+            }.unwrap();
+            assert!(matches!(acknowledgement, ProxyFinalTaskListenerEvent::Acknowledged(_)));
+            let error = if asynchronous {
+                block_on(listener.next_async(owner.cx(), &cancellation))
+            } else {
+                listener.next(owner.cx(), &cancellation)
+            }.unwrap_err();
+            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            assert_eq!(proxy.final_task_registry_snapshot_for_test().unwrap(), before,
+                "a ready upstream event cannot mutate the registry after cancellation");
+            assert_eq!(listener.next(owner.cx(), &cancellation).unwrap_err().code,
+                McpErrorCode::InvalidRequest, "the cancelled listener stays terminated");
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_listener_deduplicates_upstream_and_emits_each_owned_alias() {
+        let initial = final_task_relay_result();
+        let mut update = serde_json::to_value(&initial.task).unwrap();
+        update["statusMessage"] = serde_json::json!("shared upstream progress");
+        let update: fastmcp_protocol::Task = serde_json::from_value(update).unwrap();
+        let (proxy, relay, owner, first) = relay_listener_fixture(initial.clone(), update.clone());
+        let second = issue_relay_test_task(&relay, &owner, initial.task).task.base().task_id.clone();
+        assert_ne!(first, second, "each admitted call issues a distinct opaque handle");
+        let filter = relay_test_filter(vec![first.clone(), second.clone(), first.clone()]);
+        let mut listener = block_on(relay.open_listener_async(&owner, filter.clone())).unwrap();
+        let cancellation = McpRequestCancellation::new();
+        let ProxyFinalTaskListenerEvent::Acknowledged(accepted) =
+            listener.next(owner.cx(), &cancellation).unwrap() else { panic!("acknowledgement first") };
+        assert_eq!(serde_json::to_value(accepted).unwrap(), serde_json::to_value(filter).unwrap());
+        for handle in [&first, &second] {
+            let ProxyFinalTaskListenerEvent::Notification(notification) =
+                block_on(listener.next_async(owner.cx(), &cancellation)).unwrap()
+                else { panic!("one notification per distinct downstream alias") };
+            let mut expected = serde_json::to_value(relay_test_notification(update.clone())).unwrap();
+            expected["params"]["taskId"] = serde_json::json!(handle);
+            assert_eq!(serde_json::to_value(notification).unwrap(), expected,
+                "mapping changes only the task ID and preserves open notification siblings");
+            assert_eq!(serde_json::to_value(relay.known_task(&owner, handle).unwrap()).unwrap(),
+                serde_json::to_value(&update).unwrap());
+        }
+        assert!(matches!(listener.next(owner.cx(), &cancellation).unwrap(),
+            ProxyFinalTaskListenerEvent::Terminal), "a duplicate requested handle emits no extra event");
+        assert_eq!(proxy.final_task_registry_snapshot_for_test().unwrap()["tasks"].as_object().unwrap().len(), 2);
+    }
+
+    #[cfg(feature = "tasks")]
+    fn proxy_final_task_listener_retention_probe(expired: bool) {
+        let initial = final_task_relay_result_with_ttl("listener-retention", Some(60_000));
+        let mut update = serde_json::to_value(&initial.task).unwrap();
+        update["ttlMs"] = serde_json::json!(120_000);
+        update["statusMessage"] = serde_json::json!("retention extended");
+        let update: fastmcp_protocol::Task = serde_json::from_value(update).unwrap();
+        let (proxy, relay, owner, handle) = relay_listener_fixture(initial, update.clone());
+        let mut listener = block_on(relay.open_listener_async(&owner,
+            relay_test_filter(vec![handle.clone()]))).unwrap();
+        let cancellation = McpRequestCancellation::new();
+        assert!(matches!(listener.next(owner.cx(), &cancellation).unwrap(),
+            ProxyFinalTaskListenerEvent::Acknowledged(_)));
+        let deadline = relay.tasks.lock().unwrap().tasks[&handle].expires_at.unwrap();
+        if expired {
+            relay.tasks.lock().unwrap().tasks.get_mut(&handle).unwrap().expires_at =
+                Some(Instant::now() - Duration::from_millis(1));
+        }
+        let before = proxy.final_task_registry_snapshot_for_test().unwrap();
+        let event = listener.next(owner.cx(), &cancellation);
+        if expired {
+            let error = event.expect_err("an expired handle cannot be revived by a late notification");
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert_eq!(error.message, "Unknown proxy-relayed final Task handle");
+            assert_eq!(proxy.final_task_registry_snapshot_for_test().unwrap(), before);
+            assert!(relay.tasks.lock().unwrap().tasks[&handle].expires_at.unwrap() < Instant::now());
+            assert_eq!(listener.next(owner.cx(), &cancellation).unwrap_err().code,
+                McpErrorCode::InvalidRequest);
+        } else {
+            let ProxyFinalTaskListenerEvent::Notification(notification) = event.unwrap()
+                else { panic!("a live upstream extension is delivered") };
+            assert_eq!(notification.params.task.base().task_id, handle);
+            assert_eq!(relay.tasks.lock().unwrap().tasks[&handle].expires_at.unwrap(),
+                deadline + Duration::from_secs(60), "TTL changes use the original clock anchor");
+            assert_eq!(serde_json::to_value(relay.known_task(&owner, &handle).unwrap()).unwrap(),
+                serde_json::to_value(update).unwrap());
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_listener_refuses_expired_handle_without_emission() {
+        proxy_final_task_listener_retention_probe(true);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_listener_accepts_extension_before_expiry() {
+        proxy_final_task_listener_retention_probe(false);
+    }
+
+    #[cfg(feature = "tasks")]
     fn proxy_final_task_capacity_admission_probe(available: bool) {
         use fastmcp_core::Outcome;
         for asynchronous in [false, true] {
@@ -17547,13 +17955,10 @@ IFS= read -r end
                 )
                 .unwrap();
                 let relay = proxy.final_tasks_relay().unwrap().unwrap();
+                let owner_ctx = relay_test_context(Cx::for_testing(), 498);
                 for index in 0..(super::MAX_RELAYED_FINAL_TASKS - usize::from(available)) {
-                    relay
-                        .record_task(
-                            final_task_relay_result_with_ttl(&format!("occupied-{index}"), None)
-                                .task,
-                        )
-                        .unwrap();
+                    issue_relay_test_task(&relay, &owner_ctx,
+                        final_task_relay_result_with_ttl(&format!("occupied-{index}"), None).task);
                 }
                 let before = proxy.final_task_registry_snapshot_for_test().unwrap();
                 let handler = ProxyToolHandler::from_final_with_task_relay(
@@ -17562,7 +17967,7 @@ IFS= read -r end
                     Arc::clone(&relay),
                 )
                 .unwrap();
-                let context = McpContext::new(Cx::for_testing(), 499)
+                let context = relay_test_context(Cx::for_testing(), 499)
                     .with_request_cancellation(cancellation.clone())
                     .with_client_capabilities(
                         fastmcp_core::ClientCapabilityInfo::new().with_tasks(),
@@ -17585,13 +17990,9 @@ IFS= read -r end
                     else {
                         panic!("one reserved slot must retain the upstream Task");
                     };
-                    assert_eq!(
-                        serde_json::to_value(
-                            relay.admit_carried_task(&work_descriptor).unwrap().unwrap()
-                        )
-                        .unwrap(),
-                        serde_json::to_value(&task).unwrap()
-                    );
+                    assert_relay_task_mapping(
+                        &serde_json::to_value(relay.admit_carried_task(&owner_ctx, &work_descriptor).unwrap().unwrap()).unwrap(),
+                        &serde_json::to_value(&task).unwrap());
                     assert_eq!(calls.lock().unwrap().as_slice(), ["tools/call"]);
                     assert_eq!(cancellation.is_cancel_requested(), cancel_after_commit);
                     let retained = proxy.final_task_registry_snapshot_for_test().unwrap();
@@ -17637,7 +18038,7 @@ IFS= read -r end
 
     #[cfg(feature = "tasks")]
     #[test]
-    fn proxy_final_tasks_relay_preserves_one_upstream_handle_controls_and_listener() {
+    fn proxy_final_tasks_relay_maps_owned_handle_controls_and_listener() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let upstream = final_task_relay_result();
         let proxy = ProxyClient::from_backend_with_upstream_binding(
@@ -17657,8 +18058,11 @@ IFS= read -r end
             .expect("relay discovery is available")
             .expect("the modern HTTP route installs the relay");
 
+        let owner_ctx = relay_test_context(Cx::for_testing(), 733);
+        let reservation = relay.reserve_task_creation(&owner_ctx)
+            .expect("reserve a handle before upstream task creation");
         let outcome = block_on(proxy.call_tool_final_outcome(
-            &McpContext::new(Cx::for_testing(), 733),
+            &owner_ctx,
             "task-tool",
             serde_json::json!({"city": "Boston"}),
         ))
@@ -17668,38 +18072,33 @@ IFS= read -r end
         };
         let carrier = relay
             .encode_task_carrier(
-                relay
-                    .reserve_task_creation()
-                    .expect("the bounded Task slot is available before upstream creation"),
+                reservation,
                 created,
             )
             .expect("the private router carrier retains the Task result");
         let admitted = relay
-            .admit_carried_task(&carrier)
+            .admit_carried_task(&owner_ctx, &carrier)
             .expect("the exact carrier is admitted")
             .expect("the carrier belongs to this relay");
-        assert_eq!(
-            serde_json::to_value(admitted).expect("admitted task serializes"),
-            serde_json::to_value(upstream).expect("upstream task serializes"),
-            "the router receives the original upstream task handle, not a local replacement"
-        );
-
-        let task_id = final_task_relay_result().task.base().task_id.clone();
+        let task_id = admitted.task.base().task_id.clone();
+        assert_relay_task_mapping(
+            &serde_json::to_value(admitted).expect("admitted task serializes"),
+            &serde_json::to_value(upstream).expect("upstream task serializes"));
         let meta = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default()))
             .expect("exact final Task metadata serializes");
-        let task_context = McpContext::new(Cx::for_testing(), 732);
+        let task_context = relay_test_context(Cx::for_testing(), 732);
         let get = block_on(relay.dispatch_get(
             &task_context,
             serde_json::json!({"_meta": meta.clone(), "taskId": task_id}),
         ))
         .expect("the retained upstream handle permits tasks/get");
-        assert_eq!(get["taskId"], "proxy-task-73");
+        assert_eq!(get["taskId"], task_id.as_str());
         assert_eq!(get["resultType"], "complete");
         let update = block_on(relay.dispatch_update(
             &task_context,
             serde_json::json!({
                 "_meta": meta.clone(),
-                "taskId": "proxy-task-73",
+                "taskId": task_id,
                 "inputResponses": {},
             }),
         ))
@@ -17707,7 +18106,7 @@ IFS= read -r end
         assert_eq!(update["resultType"], "complete");
         let cancel = block_on(relay.dispatch_cancel(
             &task_context,
-            serde_json::json!({"_meta": meta, "taskId": "proxy-task-73"}),
+            serde_json::json!({"_meta": meta, "taskId": task_id}),
         ))
         .expect("the retained upstream handle permits tasks/cancel");
         assert_eq!(cancel["resultType"], "complete");
@@ -17715,7 +18114,7 @@ IFS= read -r end
         let mut notifications = SubscriptionFilter::default();
         set_task_subscription_ids(&mut notifications, vec![task_id])
             .expect("the task filter is exact");
-        let listener_context = McpContext::new(Cx::for_testing(), 734);
+        let listener_context = relay_test_context(Cx::for_testing(), 734);
         let listener_cancellation = fastmcp_core::McpRequestCancellation::new();
         let mut listener =
             block_on(relay.open_listener_async(&listener_context, notifications.clone()))
@@ -17759,6 +18158,152 @@ IFS= read -r end
 
     #[cfg(feature = "tasks")]
     #[test]
+    fn proxy_final_tasks_handles_reject_foreign_and_anonymous_owners_before_io() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let upstream = final_task_relay_result();
+        let proxy = ProxyClient::from_backend_with_upstream_binding(
+            FinalTaskRelayBackend {
+                calls: Arc::clone(&calls), task: upstream.clone(), listener_events: None,
+                cancel_after_task_commit: None, final_progress: None,
+            },
+            final_task_relay_binding(ProtocolEra::Modern2026), "2026-07-28",
+        ).unwrap();
+        let relay = proxy.final_tasks_relay().unwrap().unwrap();
+        let owner = relay_test_context(Cx::for_testing(), 747);
+        let issued = issue_relay_test_task(&relay, &owner, upstream.task.clone());
+        let handle = issued.task.base().task_id.clone();
+        let unknown = fastmcp_protocol::FinalTaskId::parse("unknown-handle").unwrap();
+        let foreign = McpContext::new(Cx::for_testing(), 748)
+            .with_auth(fastmcp_core::AuthContext::with_subject("other-proxy-owner"));
+        let anonymous = McpContext::new(Cx::for_testing(), 749);
+        let empty_auth = McpContext::new(Cx::for_testing(), 750)
+            .with_auth(fastmcp_core::AuthContext::anonymous());
+        let before = proxy.final_task_registry_snapshot_for_test().unwrap();
+        let metadata = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
+        for ctx in [&foreign, &anonymous, &empty_auth] {
+            for id in [&handle, &unknown, &upstream.task.base().task_id] {
+                let params = serde_json::json!({"_meta": metadata, "taskId": id});
+                let get = block_on(relay.dispatch_get(ctx, params.clone())).unwrap_err();
+                let cancel = block_on(relay.dispatch_cancel(ctx, params.clone())).unwrap_err();
+                let mut update_params = params;
+                update_params["inputResponses"] = serde_json::json!({});
+                let update = block_on(relay.dispatch_update(ctx, update_params)).unwrap_err();
+                for error in [get, cancel, update] {
+                    assert_eq!(error.code, McpErrorCode::InvalidParams);
+                    assert_eq!(error.message, "Unknown proxy-relayed final Task handle");
+                    assert!(error.data.is_none());
+                }
+                let mut filter = SubscriptionFilter::default();
+                set_task_subscription_ids(&mut filter, vec![id.clone()]).unwrap();
+                let error = match block_on(relay.open_listener_async(ctx, filter)) {
+                    Ok(_) => panic!("foreign listener must never open upstream"),
+                    Err(error) => error,
+                };
+                assert_eq!(error.code, McpErrorCode::InvalidParams);
+                assert_eq!(error.message, "Unknown proxy-relayed final Task handle");
+            }
+        }
+        for ctx in [&anonymous, &empty_auth] {
+            assert!(relay.reserve_task_creation(ctx).is_err(), "anonymous identity cannot own a handle");
+        }
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(proxy.final_task_registry_snapshot_for_test().unwrap(), before);
+
+        let mut refreshed_auth = relay_test_auth();
+        refreshed_auth.scopes = vec!["changed-verified-scope".to_owned()];
+        let refreshed = McpContext::new(Cx::for_testing(), 751).with_auth(refreshed_auth);
+        let get = block_on(relay.dispatch_get(&refreshed,
+            serde_json::json!({"_meta": metadata, "taskId": handle}))).unwrap();
+        assert_eq!(get["taskId"], handle.as_str());
+        assert_eq!(calls.lock().unwrap().as_slice(), ["tasks/get"],
+            "stable ownership survives changed scope facts; request policy decides permission");
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_tasks_recheck_current_scope_before_using_an_owned_handle() {
+        use crate::http_admission::security::scope_policy::{RequiredScopes, ScopeImplicationPolicy};
+        use crate::http_admission::security::scope_policy::request::ScopeRequestPolicy;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct RefreshingAuth(Arc<AtomicBool>);
+        impl crate::auth::AuthProvider for RefreshingAuth {
+            fn authenticate(
+                &self,
+                _ctx: &McpContext,
+                _request: crate::auth::AuthRequest<'_>,
+            ) -> fastmcp_core::McpResult<fastmcp_core::AuthContext> {
+                let mut auth = relay_test_auth();
+                if !self.0.load(Ordering::Acquire) {
+                    auth.scopes.push("task:cancel".to_owned());
+                }
+                Ok(auth)
+            }
+        }
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build().unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let reduced = Arc::new(AtomicBool::new(false));
+        runtime.block_on(async {
+            let upstream = final_task_relay_result();
+            let proxy = ProxyClient::from_backend_with_upstream_binding(
+                FinalTaskRelayBackend {
+                    calls: Arc::clone(&calls), task: upstream.clone(), listener_events: None,
+                    cancel_after_task_commit: None, final_progress: None,
+                },
+                final_task_relay_binding(ProtocolEra::Modern2026), "2026-07-28",
+            ).unwrap();
+            let relay = proxy.final_tasks_relay().unwrap().unwrap();
+            let owner = relay_test_context(cx.clone(), 753);
+            let issued = issue_relay_test_task(&relay, &owner, upstream.task);
+            let handle = issued.task.base().task_id.clone();
+            let policy = ScopeRequestPolicy::new(
+                1, ScopeImplicationPolicy::new(1, Vec::new()).unwrap(),
+                vec![("tasks/cancel".to_owned(), RequiredScopes::new(vec!["task:cancel".to_owned()]).unwrap())],
+            ).unwrap();
+            let server = Arc::new(crate::ServerBuilder::new("owned-task-scope", "1.0.0")
+                .auth_provider(RefreshingAuth(Arc::clone(&reduced)))
+                .proxy(proxy.clone(), ProxyCatalog {
+                    tool_catalog_era: Some(ProtocolEra::Modern2026), ..ProxyCatalog::default()
+                }).unwrap().build().with_scope_authorization(policy).unwrap());
+            for denied in [false, true] {
+                reduced.store(denied, Ordering::Release);
+                let request = fastmcp_protocol::JsonRpcRequest::new("tasks/cancel", Some(serde_json::json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {
+                            "extensions": {fastmcp_protocol::TASKS_EXTENSION: {}}
+                        }
+                    },
+                    "taskId": handle,
+                })), 754_i64);
+                let inbound = crate::InboundRequestContext::new(
+                    cx.clone(), 754, crate::InboundRequestTransport::Stdio,
+                );
+                let response = Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                    ProtocolPolicy::ModernOnly, &inbound, request, None, None, None, None,
+                    McpRequestCancellation::new(), None, Arc::new(|_| {}),
+                ).await.expect("correlated task control response");
+                if denied {
+                    assert!(response.result.is_none());
+                    assert_eq!(response.error.unwrap().code,
+                        i32::from(McpErrorCode::ResourceForbidden).into());
+                } else {
+                    assert!(response.error.is_none(), "{:?}", response.error);
+                    assert_eq!(response.result.unwrap()["resultType"], "complete");
+                }
+                assert_eq!(calls.lock().unwrap().as_slice(), ["tasks/cancel"],
+                    "refresh keeps the owner but reduced grants cannot reach upstream");
+            }
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
     fn proxy_final_tasks_relay_rejects_terminal_before_acknowledgement() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let upstream = final_task_relay_result();
@@ -17778,17 +18323,15 @@ IFS= read -r end
             .final_tasks_relay()
             .expect("relay discovery is available")
             .expect("the modern HTTP route installs the relay");
-        relay
-            .record_task(upstream.task.clone())
-            .expect("the test retains the upstream Task handle");
+        let listener_context = relay_test_context(Cx::for_testing(), 735);
+        let mapped = issue_relay_test_task(&relay, &listener_context, upstream.task.clone());
 
         let mut notifications = SubscriptionFilter::default();
         set_task_subscription_ids(
             &mut notifications,
-            vec![upstream.task.base().task_id.clone()],
+            vec![mapped.task.base().task_id.clone()],
         )
         .expect("the task filter is exact");
-        let listener_context = McpContext::new(Cx::for_testing(), 735);
         let listener_cancellation = fastmcp_core::McpRequestCancellation::new();
         let mut listener = block_on(relay.open_listener_async(&listener_context, notifications))
             .expect("the relay opens the upstream listener before it observes its events");
@@ -17846,14 +18389,14 @@ IFS= read -r end
 
     #[cfg(feature = "tasks")]
     #[test]
-    fn proxy_final_tasks_relay_recovers_a_route_bound_snapshot_after_restart() {
+    fn proxy_final_tasks_relay_rejects_previous_instance_and_raw_upstream_handles() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let upstream = final_task_relay_result();
         let task_id = upstream.task.base().task_id.clone();
-        let proxy = ProxyClient::from_backend_with_upstream_binding(
+        let make_proxy = || ProxyClient::from_backend_with_upstream_binding(
             FinalTaskRelayBackend {
                 calls: Arc::clone(&calls),
-                task: upstream,
+                task: upstream.clone(),
                 listener_events: None,
                 cancel_after_task_commit: None,
                 final_progress: None,
@@ -17862,30 +18405,28 @@ IFS= read -r end
             "2026-07-28",
         )
         .expect("the modern route binding is exact");
+        let context = relay_test_context(Cx::for_testing(), 736);
+        let previous = make_proxy();
+        let previous_relay = previous.final_tasks_relay().unwrap().unwrap();
+        let issued = issue_relay_test_task(&previous_relay, &context, upstream.task.clone());
+        let old_handle = issued.task.base().task_id.clone();
+        let proxy = make_proxy();
         let relay = proxy
             .final_tasks_relay()
             .expect("relay discovery is available")
             .expect("the selected modern route installs a relay");
         let metadata = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default()))
             .expect("exact task metadata serializes");
-        let context = McpContext::new(Cx::for_testing(), 736);
-
-        let recovered = block_on(relay.dispatch_get(
-            &context,
-            serde_json::json!({"_meta": metadata.clone(), "taskId": task_id}),
-        ))
-        .expect("a fresh relay recovers an upstream task through its bound route");
-        assert_eq!(recovered["taskId"], "proxy-task-73");
-        block_on(relay.dispatch_cancel(
-            &context,
-            serde_json::json!({"_meta": metadata, "taskId": "proxy-task-73"}),
-        ))
-        .expect("the recovered snapshot enables a later route-bound control");
-        assert_eq!(
-            calls.lock().expect("calls are not poisoned").as_slice(),
-            &["tasks/get", "tasks/cancel"],
-            "recovery and follow-up control stay on the same immutable upstream route"
-        );
+        for unknown in [old_handle, task_id] {
+            let parameters = serde_json::json!({"_meta": metadata, "taskId": unknown});
+            let get = block_on(relay.dispatch_get(&context, parameters.clone())).unwrap_err();
+            let cancel = block_on(relay.dispatch_cancel(&context, parameters)).unwrap_err();
+            assert_eq!(get.code, McpErrorCode::InvalidParams);
+            assert_eq!(cancel.code, get.code);
+            assert_eq!(cancel.message, get.message);
+            assert_eq!(get.message, "Unknown proxy-relayed final Task handle");
+        }
+        assert!(calls.lock().unwrap().is_empty(), "unknown handles never bootstrap upstream I/O");
     }
 
     #[cfg(feature = "tasks")]
@@ -17893,7 +18434,6 @@ IFS= read -r end
     fn proxy_final_tasks_relay_accepts_the_same_route_bound_contract_over_modern_stdio() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let upstream = final_task_relay_result();
-        let task_id = upstream.task.base().task_id.clone();
         let binding = ProxyUpstreamBinding {
             era: ProtocolEra::Modern2026,
             adapter: ProxyUpstreamAdapter::ModernStdio,
@@ -17903,7 +18443,7 @@ IFS= read -r end
         let proxy = ProxyClient::from_backend_with_upstream_binding(
             FinalTaskRelayBackend {
                 calls: Arc::clone(&calls),
-                task: upstream,
+                task: upstream.clone(),
                 listener_events: None,
                 cancel_after_task_commit: None,
                 final_progress: None,
@@ -17918,11 +18458,15 @@ IFS= read -r end
             .expect("modern stdio installs the same final Tasks relay");
         let metadata = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default()))
             .expect("exact task metadata serializes");
-        block_on(relay.dispatch_get(
-            &McpContext::new(Cx::for_testing(), 738),
-            serde_json::json!({"_meta": metadata, "taskId": task_id}),
+        let context = relay_test_context(Cx::for_testing(), 738);
+        let issued = issue_relay_test_task(&relay, &context, upstream.task);
+        let handle = issued.task.base().task_id.clone();
+        let result = block_on(relay.dispatch_get(
+            &context,
+            serde_json::json!({"_meta": metadata, "taskId": handle}),
         ))
-        .expect("modern stdio recovery remains route-bound");
+        .expect("modern stdio resolves the issued handle through its bound route");
+        assert_eq!(result["taskId"], handle.as_str());
         assert_eq!(
             calls.lock().expect("calls are not poisoned").as_slice(),
             &["tasks/get"],
@@ -17932,7 +18476,7 @@ IFS= read -r end
 
     #[cfg(feature = "tasks")]
     #[test]
-    fn proxy_final_tasks_relay_evicts_terminal_snapshots_before_rejecting_new_work() {
+    fn proxy_final_tasks_relay_never_evicts_terminal_handles_before_retention_deadline() {
         let proxy = ProxyClient::from_backend_with_upstream_binding(
             FinalTaskRelayBackend {
                 calls: Arc::new(Mutex::new(Vec::new())),
@@ -17949,39 +18493,18 @@ IFS= read -r end
             .final_tasks_relay()
             .expect("relay discovery is available")
             .expect("the selected modern route installs a relay");
+        let context = relay_test_context(Cx::for_testing(), 743);
         for index in 0..super::MAX_RELAYED_FINAL_TASKS {
-            relay
-                .record_task(terminal_task(&format!("terminal-{index}")))
-                .expect("terminal snapshots fit exactly to the bounded capacity");
+            issue_relay_test_task(&relay, &context, terminal_task(&format!("terminal-{index}")));
         }
-
-        let reservation = relay
-            .reserve_task_creation()
-            .expect("one terminal snapshot is reclaimed for newly committed work");
-        assert_eq!(
-            relay
-                .tasks
-                .lock()
-                .expect("registry is not poisoned")
-                .tasks
-                .len(),
-            super::MAX_RELAYED_FINAL_TASKS - 1,
-            "the reclaimed slot is removed before the upstream side effect starts"
-        );
-        drop(reservation);
-        let active = final_task_relay_result_with_ttl("replacement-working", None).task;
-        relay
-            .record_task(active.clone())
-            .expect("the reclaimed capacity accepts a nonterminal snapshot");
-        assert_eq!(
-            serde_json::to_value(
-                relay
-                    .known_task(&active.base().task_id)
-                    .expect("replacement remains route-bound"),
-            )
-            .expect("replacement serializes"),
-            serde_json::to_value(active).expect("expected replacement serializes")
-        );
+        let before = proxy.final_task_registry_snapshot_for_test().unwrap();
+        let error = match relay.reserve_task_creation(&context) {
+            Ok(_) => panic!("terminal handles retain their advertised lifetime at capacity"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert!(error.message.contains("capacity exhausted"));
+        assert_eq!(proxy.final_task_registry_snapshot_for_test().unwrap(), before);
     }
 
     #[cfg(feature = "tasks")]
@@ -18002,15 +18525,13 @@ IFS= read -r end
         let relay = proxy
             .final_tasks_relay()
             .expect("relay discovery is available")
-            .expect("the selected modern route installs a relay");
+        .expect("the selected modern route installs a relay");
+        let context = relay_test_context(Cx::for_testing(), 744);
         for index in 0..super::MAX_RELAYED_FINAL_TASKS {
-            relay
-                .record_task(
-                    final_task_relay_result_with_ttl(&format!("live-null-{index}"), None).task,
-                )
-                .expect("null-TTL live snapshots are retained explicitly");
+            issue_relay_test_task(&relay, &context,
+                final_task_relay_result_with_ttl(&format!("live-null-{index}"), None).task);
         }
-        let error = match relay.reserve_task_creation() {
+        let error = match relay.reserve_task_creation(&context) {
             Ok(_) => panic!("capacity with no terminal or finite-TTL snapshot must fail closed"),
             Err(error) => error,
         };
@@ -18037,14 +18558,11 @@ IFS= read -r end
             .final_tasks_relay()
             .expect("relay discovery is available")
             .expect("the selected modern route installs a relay");
-        let finite = final_task_relay_result_with_ttl("finite-ttl", Some(1)).task;
+        let context = relay_test_context(Cx::for_testing(), 745);
+        let finite = final_task_relay_result_with_ttl("finite-ttl", Some(60_000)).task;
         let unlimited = final_task_relay_result_with_ttl("null-ttl", None).task;
-        relay
-            .record_task(finite.clone())
-            .expect("finite TTL admits");
-        relay
-            .record_task(unlimited.clone())
-            .expect("null TTL admits with explicit unlimited policy");
+        let finite = issue_relay_test_task(&relay, &context, finite).task;
+        let unlimited = issue_relay_test_task(&relay, &context, unlimited).task;
         let mut registry = relay.tasks.lock().expect("registry is not poisoned");
         let finite_entry = registry
             .tasks
@@ -18067,10 +18585,41 @@ IFS= read -r end
 
     #[cfg(feature = "tasks")]
     #[test]
+    fn proxy_final_tasks_finite_retention_does_not_restart_when_polled() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let upstream = final_task_relay_result_with_ttl("finite-poll", Some(60_000));
+        let proxy = ProxyClient::from_backend_with_upstream_binding(
+            FinalTaskRelayBackend {
+                calls: Arc::clone(&calls), task: upstream.clone(), listener_events: None,
+                cancel_after_task_commit: None, final_progress: None,
+            },
+            final_task_relay_binding(ProtocolEra::Modern2026), "2026-07-28",
+        ).unwrap();
+        let relay = proxy.final_tasks_relay().unwrap().unwrap();
+        let owner = relay_test_context(Cx::for_testing(), 752);
+        let issued = issue_relay_test_task(&relay, &owner, upstream.task);
+        let handle = issued.task.base().task_id.clone();
+        let expires_at = relay.tasks.lock().unwrap().tasks[&handle].expires_at;
+        let metadata = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
+        let parameters = serde_json::json!({"_meta": metadata, "taskId": handle});
+        block_on(relay.dispatch_get(&owner, parameters.clone())).unwrap();
+        assert_eq!(relay.tasks.lock().unwrap().tasks[&handle].expires_at, expires_at,
+            "a fresh read of the same task must preserve its authoritative deadline");
+        relay.tasks.lock().unwrap().tasks.get_mut(&handle).unwrap().expires_at =
+            Some(Instant::now() - Duration::from_millis(1));
+        let error = block_on(relay.dispatch_get(&owner, parameters)).unwrap_err();
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(error.message, "Unknown proxy-relayed final Task handle");
+        assert_eq!(calls.lock().unwrap().as_slice(), ["tasks/get"],
+            "an expired mapping never dispatches upstream recovery");
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
     fn proxy_final_tasks_relay_retains_task_when_cancellation_follows_upstream_commit() {
         let cancellation = McpRequestCancellation::new();
         let context =
-            McpContext::new(Cx::for_testing(), 737).with_request_cancellation(cancellation.clone());
+            relay_test_context(Cx::for_testing(), 737).with_request_cancellation(cancellation.clone());
         let upstream = final_task_relay_result();
         let proxy = ProxyClient::from_backend_with_upstream_binding(
             FinalTaskRelayBackend {
@@ -18089,7 +18638,7 @@ IFS= read -r end
             .expect("relay discovery is available")
             .expect("the selected modern route installs a relay");
         let reservation = relay
-            .reserve_task_creation()
+            .reserve_task_creation(&context)
             .expect("the route reserves a task slot before the upstream side effect");
         let FinalToolCallOutcome::Task(created) =
             block_on(proxy.call_tool_final_outcome(&context, "task-tool", serde_json::json!({})))
@@ -18097,14 +18646,16 @@ IFS= read -r end
         else {
             panic!("fixture always commits a Task branch");
         };
-        relay
+        let carrier = relay
             .encode_task_carrier(reservation, created)
             .expect("the committed upstream Task is retained before cancellation is surfaced");
         assert!(context.request_cancellation().is_cancel_requested());
+        let control_context = relay_test_context(Cx::for_testing(), 746);
+        let admitted = relay.admit_carried_task(&control_context, &carrier).unwrap().unwrap();
         assert_eq!(
             serde_json::to_value(
                 relay
-                    .known_task(&upstream.task.base().task_id)
+                    .known_task(&control_context, &admitted.task.base().task_id)
                     .expect("committed task remains controllable instead of orphaned"),
             )
             .expect("retained task serializes"),
@@ -18215,6 +18766,7 @@ IFS= read -r end
                 Arc::clone(&capture) as Arc<dyn NotificationSender>,
             ),
         )
+        .with_auth(relay_test_auth())
         .with_client_capabilities(fastmcp_core::ClientCapabilityInfo::new().with_tasks());
         let proxy = ProxyClient::from_backend_with_upstream_binding(
             FinalTaskRelayBackend {
@@ -18270,6 +18822,7 @@ IFS= read -r end
                 Arc::clone(&capture) as Arc<dyn NotificationSender>,
             ),
         )
+        .with_auth(relay_test_auth())
         .with_client_capabilities(fastmcp_core::ClientCapabilityInfo::new().with_tasks());
         let proxy = ProxyClient::from_backend_with_upstream_binding(
             FinalTaskRelayBackend {
@@ -18310,7 +18863,7 @@ IFS= read -r end
 
     #[cfg(feature = "tasks")]
     #[test]
-    fn proxy_final_task_handler_uses_ordinary_call_without_downstream_tasks_capability() {
+    fn proxy_final_task_handler_uses_ordinary_call_without_an_owning_identity() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let proxy = ProxyClient::from_backend_with_upstream_binding(
             FinalTaskRelayBackend {
@@ -18331,20 +18884,24 @@ IFS= read -r end
         let handler =
             ProxyToolHandler::from_final_with_task_relay(final_catalog_tool(), proxy, relay)
                 .expect("exact final task handler is constructed");
-        let context = McpContext::new(Cx::for_testing(), 743);
-
-        let outcome = handler
-            .call_final_outcome(&context, serde_json::json!({}))
-            .expect("ordinary Complete remains available without downstream Tasks");
-
-        assert!(matches!(outcome, FinalToolOutcome::Complete(_)));
+        for downstream_tasks in [false, true] {
+            let context = McpContext::new(Cx::for_testing(), 743);
+            let context = if downstream_tasks {
+                context.with_client_capabilities(fastmcp_core::ClientCapabilityInfo::new().with_tasks())
+            } else { context };
+            let outcome = handler.call_final_outcome(&context, serde_json::json!({}))
+                .expect("anonymous callers retain ordinary Complete behavior");
+            assert!(matches!(outcome, FinalToolOutcome::Complete(_)));
+            assert!(matches!(block_on(handler.call_final_outcome_async(&context, serde_json::json!({}))),
+                fastmcp_core::Outcome::Ok(FinalToolOutcome::Complete(_))));
+        }
         assert_eq!(
             calls
                 .lock()
                 .expect("call capture is not poisoned")
                 .as_slice(),
-            &["ordinary-tools/call"],
-            "the proxy must not advertise Tasks upstream for an ordinary downstream call"
+            &["ordinary-tools/call"; 4],
+            "the proxy strips Tasks upstream when no stable downstream owner can hold a handle"
         );
     }
 

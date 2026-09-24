@@ -698,6 +698,20 @@ enum AsProxyGatewayAuth {
     Custom,
 }
 
+/// Fixed owner supplied through the real server authentication boundary for
+/// loopback relay tests. These fixtures prove Task ownership and transport
+/// behavior; they do not claim to verify an HTTP credential. Separate bearer
+/// admission tests exercise the actual token verifiers.
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+struct ProxyTaskFixtureOwner;
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+impl fastmcp_rust::AuthProvider for ProxyTaskFixtureOwner {
+    fn authenticate(&self, _ctx: &McpContext, _request: AuthRequest<'_>) -> McpResult<AuthContext> {
+        Ok(AuthContext::with_subject("facade-proxy-task-fixture-owner"))
+    }
+}
+
 /// Sends one bounded native HTTP POST with optional Authorization plus the
 /// routed Mcp-Method/Mcp-Name headers and returns the raw response bytes for
 /// as_proxy gateway admission proofs.
@@ -4649,6 +4663,7 @@ fn spawn_modern_http_task_proxy_gateway(upstream: SocketAddr) -> HttpServerFixtu
                 ));
             }
             let server = modern::ServerBuilder::new("e2e-http-task-gateway", "1.0.0")
+                .auth_provider(ProxyTaskFixtureOwner)
                 .as_proxy_typed("ext", proxy, catalog)
                 .map_err(|error| format!("as_proxy_typed task install failed: {error}"))?
                 .build();
@@ -4728,36 +4743,37 @@ fn spawn_modern_http_task_proxy_gateway(upstream: SocketAddr) -> HttpServerFixtu
 
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 #[test]
-fn e2e_public_http_prefixed_as_proxy_gets_upstream_created_task() {
+fn e2e_public_http_prefixed_as_proxy_controls_its_issued_task_handle() {
     let cx = Cx::for_request();
     let upstream = spawn_modern_task_http_server();
     let gateway = spawn_modern_http_task_proxy_gateway(upstream.address());
 
-    let mut upstream_client = runtime_block_on_bounded(
+    let mut creator = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
-            .client_info("e2e-public-http-task-upstream-client", "1.0.0")
-            .connect_http_with_cx(public_http_target(upstream.address(), "/mcp"), &cx),
+            .client_info("e2e-public-http-task-gateway-creator", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
     )
-    .expect("the public facade connects to the live task upstream HTTP server");
+    .expect("the public facade connects to the Task-issuing HTTP gateway");
     let created = runtime_block_on_bounded(
         &cx,
-        upstream_client.call_tool_outcome(
+        creator.call_tool_outcome(
             &cx,
             RequestId::Number(2),
-            PUBLIC_HTTP_TASK_TOOL_NAME,
+            &format!("ext/{PUBLIC_HTTP_TASK_TOOL_NAME}"),
             json!({}),
             1 << 20,
         ),
     )
-    .expect("the live upstream must create one official Task");
+    .expect("the gateway must create the upstream Task and issue its own owner-bound handle");
     let FinalToolCallOutcome::Task(created) = created else {
         panic!(
             "the task-capable live tool must return the official Task result branch: {created:?}"
         );
     };
     let task_id = created.task.base().task_id.clone();
-    drop(upstream_client);
+    assert_eq!(task_id.as_str().len(), 43, "the relay issues an opaque downstream handle");
+    drop(creator);
 
     let mut gateway_client = runtime_block_on_bounded(
         &cx,
@@ -4796,7 +4812,7 @@ fn e2e_public_http_prefixed_as_proxy_gets_upstream_created_task() {
     assert_eq!(
         observed.task.base().task_id,
         task_id,
-        "as_proxy_typed must return the upstream-created Task rather than a disconnected local store: {observed:?}"
+        "as_proxy_typed must retain its issued handle while returning the upstream Task state: {observed:?}"
     );
 
     let missing = FinalTaskId::parse("missing-upstream-task")
@@ -4891,7 +4907,7 @@ fn e2e_public_http_prefixed_as_proxy_gets_upstream_created_task() {
     assert_eq!(
         working.task.base().task_id,
         task_id,
-        "as_proxy_typed must resume the same upstream-created Task: {working:?}"
+        "as_proxy_typed must resume the same owner-bound relayed Task: {working:?}"
     );
 
     let missing_cancel = runtime_block_on_bounded(
@@ -4942,10 +4958,62 @@ fn e2e_public_http_prefixed_as_proxy_gets_upstream_created_task() {
     assert_eq!(
         cancelled.task.base().task_id,
         task_id,
-        "as_proxy_typed must cancel the same upstream-created Task: {cancelled:?}"
+        "as_proxy_typed must cancel the same owner-bound relayed Task: {cancelled:?}"
     );
 
     drop(gateway_client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_refuses_unissued_upstream_task_ids() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_task_http_server();
+    let gateway = spawn_modern_http_task_proxy_gateway(upstream.address());
+    let mut creator = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-http-raw-task-creator", "1.0.0")
+            .connect_http_with_cx(public_http_target(upstream.address(), "/mcp"), &cx),
+    ).expect("the direct client connects to the real Task upstream");
+    let created = runtime_block_on_bounded(
+        &cx,
+        creator.call_tool_outcome(&cx, RequestId::Number(2), PUBLIC_HTTP_TASK_TOOL_NAME, json!({}), 1 << 20),
+    ).expect("the direct upstream call creates a Task outside the gateway registry");
+    let FinalToolCallOutcome::Task(created) = created else {
+        panic!("the real upstream returns its Task result: {created:?}");
+    };
+    let raw_id = created.task.base().task_id.clone();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-http-unissued-task-client", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    ).expect("the fixed-owner client connects to the gateway");
+    let get_error = runtime_block_on_bounded(
+        &cx, client.get_task(&cx, RequestId::Number(2), raw_id.clone(), 1 << 20),
+    ).expect_err("a valid raw upstream ID is not an issued downstream handle");
+    assert!(matches!(get_error,
+        modern::HttpClientError::Connection(ClientHttpConnectionError::Modern(
+            modern::ModernHttpClientError::TasksRemoteError { code, .. }
+        )) if code.as_i32() == Some(-32602)), "raw-ID lookup must be InvalidParams");
+    let cancel_error = runtime_block_on_bounded(
+        &cx, client.cancel_task(&cx, RequestId::Number(3), raw_id.clone(), 1 << 20),
+    ).expect_err("the gateway cannot cancel a Task for which it issued no handle");
+    assert!(matches!(cancel_error,
+        modern::HttpClientError::Connection(ClientHttpConnectionError::Modern(
+            modern::ModernHttpClientError::TasksRemoteError { code, .. }
+        )) if code.as_i32() == Some(-32602)), "raw-ID cancellation must be InvalidParams");
+    let retained = runtime_block_on_bounded(
+        &cx, creator.get_task(&cx, RequestId::Number(3), raw_id.clone(), 1 << 20),
+    ).expect("the direct creator still owns the real upstream Task");
+    assert_eq!(retained.task.base().task_id, raw_id);
+    assert!(!matches!(retained.task, FinalTask::Cancelled(_)),
+        "the refused downstream cancel must not mutate the upstream Task");
+    drop(client);
+    drop(creator);
     gateway.shutdown();
     upstream.shutdown();
 }
@@ -5067,10 +5135,6 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_auth(
                     .await
                 {
                     Ok(mut client) => {
-                        if precreate_task {
-                            stdio = Some(client);
-                            break;
-                        }
                         // as_proxy catalog listing is the first stdio request
                         // on this path. A live tools/list first proves the
                         // echo process is answering. An idle-deadline miss
@@ -5097,28 +5161,13 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_auth(
                     }
                 }
             }
-            let mut stdio = stdio.ok_or_else(|| {
+            let stdio = stdio.ok_or_else(|| {
                 format!(
                     "live stdio as_proxy upstream connect failed: {}",
                     last_connect_error
                         .expect("a failed stdio connect records its last transport error")
                 )
             })?;
-            let task_id = if precreate_task {
-                let created = stdio
-                    .call_tool_outcome("durable_task", json!({}))
-                    .map_err(|error| {
-                        format!("live stdio as_proxy upstream must create one official Task: {error}")
-                    })?;
-                let FinalToolCallOutcome::Task(created) = created else {
-                    return Err(format!(
-                        "the shipped durable_task tool must return the official Task result branch: {created:?}"
-                    ));
-                };
-                Some(created.task.base().task_id.clone())
-            } else {
-                None
-            };
             let mut builder = modern::ServerBuilder::new("e2e-http-stdio-as-proxy", "1.0.0")
                 .mask_error_details(mask_error_details);
             if let Some(request_timeout_secs) = request_timeout_secs {
@@ -5140,7 +5189,9 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_auth(
                 );
             }
             match gateway_auth {
-                AsProxyGatewayAuth::None => {}
+                AsProxyGatewayAuth::None => {
+                    builder = builder.auth_provider(ProxyTaskFixtureOwner);
+                }
                 AsProxyGatewayAuth::Static => {
                     let verifier = StaticTokenVerifier::new([(
                         "alpha",
@@ -5192,7 +5243,7 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_auth(
                     return Err(message);
                 }
             };
-            if ready_tx.send(Ok((address, task_id))).is_err() {
+            if ready_tx.send(Ok((address, None))).is_err() {
                 cx.set_cancel_requested(true);
                 return Err("stdio as_proxy gateway HTTP server startup receiver went away".to_owned());
             }
@@ -5213,7 +5264,7 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_auth(
         join,
     };
     let startup_deadline = Instant::now() + PROXY_GATEWAY_STARTUP_BOUND;
-    let (address, task_id) = loop {
+    let (address, _) = loop {
         startup.capture_server_cx();
         let remaining = startup_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -5232,18 +5283,39 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_auth(
     startup.capture_server_cx();
     let (server_cx, finished, join) = startup.into_parts();
 
-    (
-        HttpServerFixture {
-            address,
-            server_cx,
-            finished,
-            shutdown_completion: None,
-            join,
-            nonquiescent: None,
-            handler_calls,
-        },
-        task_id,
-    )
+    let gateway = HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    };
+    let task_id = if precreate_task {
+        assert!(matches!(gateway_auth, AsProxyGatewayAuth::None),
+            "bootstrap Task creation uses the fixed-owner relay fixture");
+        let cx = Cx::for_request();
+        let mut creator = runtime_block_on_bounded(
+            &cx,
+            modern::ClientBuilder::new()
+                .client_info("e2e-http-stdio-as-proxy-bootstrap", "1.0.0")
+                .connect_http_with_cx(public_http_target(address, "/mcp"), &cx),
+        ).expect("the Task bootstrap client connects after the relay starts serving");
+        let created = runtime_block_on_bounded(
+            &cx,
+            creator.call_tool_outcome(&cx, RequestId::Number(2), "ext/durable_task", json!({}), 1 << 20),
+        ).expect("bootstrap creation must cross the gateway and issue a downstream Task handle");
+        let FinalToolCallOutcome::Task(created) = created else {
+            panic!("the shipped durable_task must return the official Task branch: {created:?}");
+        };
+        let task_id = created.task.base().task_id.clone();
+        assert_eq!(task_id.as_str().len(), 43, "the stdio relay issues an opaque downstream handle");
+        Some(task_id)
+    } else {
+        None
+    };
+    (gateway, task_id)
 }
 #[cfg(all(unix, feature = "proxy", feature = "tasks"))]
 fn spawn_modern_http_stdio_as_proxy_gateway_with_duplicate(
@@ -11336,20 +11408,20 @@ fn e2e_public_http_as_proxy_tasks_listen_retains_status_through_the_gateway() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-http-as-proxy-tasks-listen-creator", "1.0.0")
-            .connect_http_with_cx(public_http_target(upstream.address(), "/mcp"), &cx),
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
     )
-    .expect("the public facade connects to the live Tasks upstream");
+    .expect("the public facade connects to the Task-issuing gateway");
     let created = runtime_block_on_bounded(
         &cx,
         creator.call_tool_outcome(
             &cx,
             RequestId::Number(2),
-            PUBLIC_HTTP_TASK_TOOL_NAME,
+            &format!("ext/{PUBLIC_HTTP_TASK_TOOL_NAME}"),
             json!({}),
             1 << 20,
         ),
     )
-    .expect("the live upstream must create one official Task");
+    .expect("the gateway must create the upstream Task and issue an owner-bound handle");
     let FinalToolCallOutcome::Task(created) = created else {
         panic!(
             "the task-capable live tool must return the official Task result branch: {created:?}"
@@ -11374,7 +11446,7 @@ fn e2e_public_http_as_proxy_tasks_listen_retains_status_through_the_gateway() {
     )
     .expect("the public facade connects a second as_proxy Tasks watch client");
     let mut handle = runtime_block_on_bounded(&cx, watcher.attach_final_task(&cx, task_id.clone()))
-        .expect("as_proxy must attach the upstream-created Task for watch");
+        .expect("as_proxy must attach its issued Task handle for the same fixture owner");
     let mut watch = runtime_block_on_bounded(
         &cx,
         watcher.watch_final_task(
@@ -12288,7 +12360,7 @@ fn e2e_public_http_as_proxy_stdio_tasks_listen_retains_status_through_the_gatewa
     )
     .expect("the public facade connects a second stdio as_proxy Tasks watch client");
     let mut handle = runtime_block_on_bounded(&cx, watcher.attach_final_task(&cx, task_id.clone()))
-        .expect("stdio as_proxy must attach the upstream-created Task for watch");
+        .expect("stdio as_proxy must attach its issued Task handle for the same fixture owner");
     let mut watch = runtime_block_on_bounded(
         &cx,
         watcher.watch_final_task(
@@ -41244,7 +41316,32 @@ mod live_websocket_bind {
                     "the task-capable live tool must return the official Task result branch: {created:?}"
                 );
             };
-            let task_id = created.task.base().task_id.clone();
+            let upstream_task_id = created.task.base().task_id.clone();
+            let initial_handoff_deadline = Instant::now() + HTTP_OPERATION_BOUND;
+            let mut upstream_request_id = 3;
+            loop {
+                let observed = websocket_client_bounded(
+                    &cx,
+                    "live modern WebSocket as_proxy Tasks listen upstream initial handoff",
+                    creator.get_task(
+                        &cx,
+                        RequestId::Number(upstream_request_id),
+                        upstream_task_id.clone(),
+                        1 << 20,
+                    ),
+                )
+                .await
+                .expect("the raw upstream Task remains directly readable before gateway admission");
+                if matches!(observed.task, FinalTask::InputRequired { .. }) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < initial_handoff_deadline,
+                    "the initial upstream handoff must settle before the gateway creates another Task"
+                );
+                upstream_request_id += 1;
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
             drop(creator);
 
             let plan = ClientProtocolPlan::http(
@@ -41281,6 +41378,15 @@ mod live_websocket_bind {
                 .await
                 .expect("live modern HTTP Tasks proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-tasks-gateway", "1.0.0")
+                .auth_provider(TokenAuthProvider::new(
+                    StaticTokenVerifier::new([(
+                        "alpha",
+                        AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
+                    )])
+                    .expect("the WebSocket Tasks relay owner verifier is valid")
+                    .with_allowed_schemes(["Bearer"])
+                    .expect("the WebSocket Tasks relay bearer scheme is valid"),
+                ))
                 .as_proxy_typed("ext", proxy, catalog)
                 .expect("modern as_proxy_typed Tasks install must succeed")
                 .build();
@@ -41296,13 +41402,14 @@ mod live_websocket_bind {
                 .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
                 .expect("public ModernOnly bind_websocket as_proxy Tasks serve must be admitted");
 
-            let transport = websocket_client_bounded(
-                &cx,
-                "live modern WebSocket as_proxy Tasks listen handshake",
-                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
-            )
-            .await
-            .expect("public ModernOnly bind_websocket as_proxy Tasks must complete RFC 6455 upgrade");
+            let (accepted, stream) =
+                websocket_upgrade_status(&cx, address, Some("Bearer alpha")).await;
+            assert!(
+                accepted.starts_with(b"HTTP/1.1 101"),
+                "the Tasks relay owner must complete the WebSocket upgrade: {}",
+                String::from_utf8_lossy(&accepted)
+            );
+            let transport = AsyncWsClientTransport::from_upgraded(stream);
             let mut client = websocket_client_bounded(
                 &cx,
                 "live modern WebSocket as_proxy Tasks listen initialize",
@@ -41313,17 +41420,50 @@ mod live_websocket_bind {
             .await
             .expect("the ModernOnly public facade negotiates as_proxy official Tasks over bind_websocket");
 
+            let raw_id_rejected = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy Tasks listen raw upstream id refusal",
+                client.get_task(&cx, upstream_task_id.clone()),
+            )
+            .await
+            .expect_err("an upstream Task id must not attach through the WebSocket gateway");
+            assert_eq!(
+                raw_id_rejected.code,
+                McpErrorCode::InvalidParams,
+                "the authenticated gateway must refuse an unissued upstream Task id: {raw_id_rejected:?}"
+            );
+
+            let created = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy Tasks listen gateway tools/call",
+                client.call_tool_outcome(
+                    &cx,
+                    &format!("ext/{PUBLIC_HTTP_TASK_TOOL_NAME}"),
+                    json!({}),
+                ),
+            )
+            .await
+            .expect("the authenticated WebSocket gateway must issue a Task handle from tools/call");
+            let FinalToolCallOutcome::Task(created) = created else {
+                panic!("the gateway must return the official Task result branch: {created:?}");
+            };
+            let task_id = created.task.base().task_id.clone();
+            assert_ne!(
+                task_id, upstream_task_id,
+                "the gateway-issued Task handle must not reuse the rejected upstream id"
+            );
+
             let attached = websocket_client_bounded(
                 &cx,
                 "live modern WebSocket as_proxy Tasks listen get",
                 client.get_task(&cx, task_id.clone()),
             )
             .await
-            .expect("as_proxy must attach the upstream-created Task through the WebSocket gateway");
+            .expect("as_proxy must resolve the Task created by this authenticated WebSocket caller");
             assert_eq!(
                 attached.task.base().task_id,
                 task_id,
-                "as_proxy must return the upstream-created Task: {attached:?}"
+                "as_proxy must retain the gateway-issued Task handle: {attached:?}"
             );
 
             let mut filter = modern::SubscriptionFilter::default();
@@ -41643,6 +41783,15 @@ mod live_websocket_bind {
                 .await
                 .expect("live modern HTTP dual-listen proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-dual-listen-gateway", "1.0.0")
+                .auth_provider(TokenAuthProvider::new(
+                    StaticTokenVerifier::new([(
+                        "alpha",
+                        AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
+                    )])
+                    .expect("the WebSocket dual-listen Task owner verifier is valid")
+                    .with_allowed_schemes(["Bearer"])
+                    .expect("the WebSocket dual-listen bearer scheme is valid"),
+                ))
                 .as_proxy_typed("ext", proxy, catalog)
                 .expect("modern as_proxy_typed dual-listen install must succeed")
                 .build();
@@ -41658,13 +41807,14 @@ mod live_websocket_bind {
                 .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
                 .expect("public ModernOnly bind_websocket as_proxy dual listen serve must be admitted");
 
-            let transport = websocket_client_bounded(
-                &cx,
-                "live modern WebSocket as_proxy dual listen handshake",
-                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
-            )
-            .await
-            .expect("public ModernOnly bind_websocket as_proxy dual listen must complete RFC 6455 upgrade");
+            let (accepted, stream) =
+                websocket_upgrade_status(&cx, address, Some("Bearer alpha")).await;
+            assert!(
+                accepted.starts_with(b"HTTP/1.1 101"),
+                "the dual-listen Task owner must complete the WebSocket upgrade: {}",
+                String::from_utf8_lossy(&accepted)
+            );
+            let transport = AsyncWsClientTransport::from_upgraded(stream);
             let mut client = websocket_client_bounded(
                 &cx,
                 "live modern WebSocket as_proxy dual listen initialize",
@@ -41895,6 +42045,15 @@ mod live_websocket_bind {
                 .await
                 .expect("live modern HTTP Tasks proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-tasks-create-gateway", "1.0.0")
+                .auth_provider(TokenAuthProvider::new(
+                    StaticTokenVerifier::new([(
+                        "alpha",
+                        AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
+                    )])
+                    .expect("the WebSocket Task creation owner verifier is valid")
+                    .with_allowed_schemes(["Bearer"])
+                    .expect("the WebSocket Task creation bearer scheme is valid"),
+                ))
                 .as_proxy_typed("ext", proxy, catalog)
                 .expect("modern as_proxy_typed Tasks install must succeed")
                 .build();
@@ -41910,13 +42069,14 @@ mod live_websocket_bind {
                 .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
                 .expect("public ModernOnly bind_websocket as_proxy Tasks create serve must be admitted");
 
-            let transport = websocket_client_bounded(
-                &cx,
-                "live modern WebSocket as_proxy Tasks create handshake",
-                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
-            )
-            .await
-            .expect("public ModernOnly bind_websocket as_proxy Tasks create must complete RFC 6455 upgrade");
+            let (accepted, stream) =
+                websocket_upgrade_status(&cx, address, Some("Bearer alpha")).await;
+            assert!(
+                accepted.starts_with(b"HTTP/1.1 101"),
+                "the Task creation owner must complete the WebSocket upgrade: {}",
+                String::from_utf8_lossy(&accepted)
+            );
+            let transport = AsyncWsClientTransport::from_upgraded(stream);
             let mut client = websocket_client_bounded(
                 &cx,
                 "live modern WebSocket as_proxy Tasks create initialize",
@@ -41992,7 +42152,11 @@ mod live_websocket_bind {
             )
             .await
             .expect_err("changing only the task id must not invent a Task on the as_proxy WebSocket gateway");
-            let _ = missing_get;
+            assert_eq!(
+                missing_get.code,
+                McpErrorCode::InvalidParams,
+                "an unissued Task handle must remain InvalidParams: {missing_get:?}"
+            );
 
             websocket_client_bounded(
                 &cx,
@@ -47740,6 +47904,15 @@ mod live_websocket_bind {
                 .expect("live modern HTTP Tasks proxy catalog is typed");
             let server =
                 modern::ServerBuilder::new("e2e-ws-as-proxy-tasks-progress-gateway", "1.0.0")
+                    .auth_provider(TokenAuthProvider::new(
+                        StaticTokenVerifier::new([(
+                            "alpha",
+                            AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
+                        )])
+                        .expect("the WebSocket Task progress owner verifier is valid")
+                        .with_allowed_schemes(["Bearer"])
+                        .expect("the WebSocket Task progress bearer scheme is valid"),
+                    ))
                     .as_proxy_typed("ext", proxy, catalog)
                     .expect("modern as_proxy_typed Tasks install must succeed")
                     .build();
@@ -47755,13 +47928,14 @@ mod live_websocket_bind {
                 .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
                 .expect("public ModernOnly bind_websocket as_proxy Tasks progress-create serve must be admitted");
 
-            let transport = websocket_client_bounded(
-                &cx,
-                "live modern WebSocket as_proxy Tasks progress-create handshake",
-                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
-            )
-            .await
-            .expect("public ModernOnly bind_websocket as_proxy Tasks progress-create must complete RFC 6455 upgrade");
+            let (accepted, stream) =
+                websocket_upgrade_status(&cx, address, Some("Bearer alpha")).await;
+            assert!(
+                accepted.starts_with(b"HTTP/1.1 101"),
+                "the Task progress owner must complete the WebSocket upgrade: {}",
+                String::from_utf8_lossy(&accepted)
+            );
+            let transport = AsyncWsClientTransport::from_upgraded(stream);
             let mut client = websocket_client_bounded(
                 &cx,
                 "live modern WebSocket as_proxy Tasks progress-create initialize",

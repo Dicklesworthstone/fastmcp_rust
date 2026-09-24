@@ -14076,9 +14076,6 @@ impl Server {
                     .await
                 {
                     Ok(ProxyFinalTaskListenerEvent::Notification(notification)) => {
-                        if let Some(relay) = self.final_task_relay.as_ref() {
-                            relay.record_notification(&notification)?;
-                        }
                         self.final_subscriptions.publish_task(notification)?;
                     }
                     Ok(ProxyFinalTaskListenerEvent::Terminal) => {
