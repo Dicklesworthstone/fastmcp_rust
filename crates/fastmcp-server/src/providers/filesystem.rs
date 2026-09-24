@@ -1214,6 +1214,7 @@ where
     F: FnOnce(&McpContext) -> McpResult<T> + Send + 'static,
 {
     let worker_ctx = ctx.clone();
+    // Awaited blocking-pool offload for synchronous std::fs I/O, not runtime re-entry.
     match asupersync::runtime::spawn_blocking(move || work(&worker_ctx)).await {
         Ok(value) => Outcome::Ok(value),
         Err(error) => Outcome::Err(error),
