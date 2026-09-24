@@ -22317,6 +22317,262 @@ fn e2e_public_http_as_proxy_stdio_refused_roots_yield_no_final_resource() {
     assert_refused_roots_yield_no_final("resources/read", as_proxy_http_stdio_follow_roots(true));
 }
 
+// HTTP-05 A: through the public `http_executor` surface, a reviewed,
+// resource-bound parameter header reaches the server's request headers.
+// Review binds only to `https`, and the executor trusts only native roots
+// there, so each case runs in a child of this binary with an isolated
+// SSL_CERT_FILE; this process's environment is never mutated.
+#[cfg(feature = "native-tls-roots")]
+const HTTP_05_A_CHILD: &str = "FASTMCP_E2E_HTTP_05_A_CASE";
+// TEST ONLY root, leaf (localhost, 127.0.0.1, ::1) and key, byte-identical to
+// the fastmcp-client oauth_core_rpc target's. Inlined because remote build
+// workers never receive `*.pem` files.
+#[cfg(feature = "native-tls-roots")]
+const HTTP_05_A_ROOT: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBgzCCASmgAwIBAgICA+kwCgYIKoZIzj0EAwIwJzElMCMGA1UEAwwcRmFzdE1D\nUCBPQXV0aCBURVNUIE9OTFkgUm9vdDAeFw0yMDAxMDEwMDAwMDBaFw00OTEyMzEw\nMDAwMDBaMCcxJTAjBgNVBAMMHEZhc3RNQ1AgT0F1dGggVEVTVCBPTkxZIFJvb3Qw\nWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAS5t2O8JZ0hNjgI38E9Ov6i6mKoDRGo\nApMsykFkvgb6Zm9/5gCZ90eIKw7aWgK6iNs7lbtVY9mysZBIqm6pKQO2o0UwQzAS\nBgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQU6QNI\nrmvMiLoV3jIoCyohXARwI8gwCgYIKoZIzj0EAwIDSAAwRQIgCKOrW3vhzUJ2EyuY\nvQUTdqGFhy0zEHj4ITFLvXPz1X8CIQCLKD4EKCvS/zkBSu/6uee1WV9d97UpK3yW\nX/aCEJ5+hA==\n-----END CERTIFICATE-----\n";
+#[cfg(feature = "native-tls-roots")]
+const HTTP_05_A_LEAF: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBjjCCATSgAwIBAgICA+owCgYIKoZIzj0EAwIwJzElMCMGA1UEAwwcRmFzdE1D\nUCBPQXV0aCBURVNUIE9OTFkgUm9vdDAeFw0yMDAxMDEwMDAwMDBaFw00OTEyMzEw\nMDAwMDBaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDBZMBMGByqGSM49AgEGCCqGSM49\nAwEHA0IABPPKylLna9VpWAlpshHBhSsQHNOv3BaEGX4HSBhHiBVel0ce+qfHF15O\n0T63Zlp7TtxlMdEY+rPpgioSFDQVadijYzBhMAwGA1UdEwEB/wQCMAAwLAYDVR0R\nBCUwI4IJbG9jYWxob3N0hwR/AAABhxAAAAAAAAAAAAAAAAAAAAABMBMGA1UdJQQM\nMAoGCCsGAQUFBwMBMA4GA1UdDwEB/wQEAwIHgDAKBggqhkjOPQQDAgNIADBFAiEA\n6qrAr2qp/t6K62T9Et2mUU/zfd4kJb+ekyoAim1yTFcCICb6SdVY2fg15/SXf0vE\nIvYelqtTk8FQInCEcIxvfF3m\n-----END CERTIFICATE-----\n";
+#[cfg(feature = "native-tls-roots")]
+const HTTP_05_A_KEY: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcCe44IBKhbw+D/s7\nBjDHOOV0g+EoxFno7VJGKhJeer2hRANCAATzyspS52vVaVgJabIRwYUrEBzTr9wW\nhBl+B0gYR4gVXpdHHvqnxxdeTtE+t2Zae07cZTHRGPqz6YIqEhQ0FWnY\n-----END PRIVATE KEY-----\n";
+
+/// `region` carries an `x-mcp-header` annotation; `note` is body-only.
+#[cfg(feature = "native-tls-roots")]
+fn http_05_a_schema() -> serde_json::Value {
+    json!({"type": "object", "properties": {
+        "region": {"type": "string", "x-mcp-header": "Region"},
+        "note": {"type": "string"}
+    }})
+}
+
+#[cfg(feature = "native-tls-roots")]
+fn http_05_a_body() -> Vec<u8> {
+    let mut params = json!({
+        "name": "lookup",
+        "arguments": {"region": "eu-west", "note": "body-only"}
+    });
+    params["_meta"] = serde_json::to_value(fastmcp_protocol::FinalRequestMeta::new(
+        fastmcp_protocol::ClientCapabilities::default(),
+    ))
+    .expect("final request metadata serializes");
+    serde_json::to_vec(
+        &json!({"jsonrpc": "2.0", "id": 51, "method": "tools/call", "params": params}),
+    )
+    .expect("the HTTP-05 A tools/call body serializes")
+}
+
+/// Accepts one TLS POST and records its header block (names lowercased) and
+/// body, then answers with a complete tools/call result.
+#[cfg(feature = "native-tls-roots")]
+async fn http_05_a_serve_one(
+    listener: &asupersync::net::TcpListener,
+    acceptor: &asupersync::tls::TlsAcceptor,
+) -> (BTreeMap<String, String>, Vec<u8>) {
+    use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+    let (socket, _) = listener.accept().await.expect("accept the HTTP-05 A POST");
+    let mut tls = acceptor
+        .accept(socket)
+        .await
+        .expect("TLS handshake with the executor");
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 2048];
+    let end = loop {
+        let count = tls.read(&mut buffer).await.expect("read the request head");
+        assert!(count > 0 && bytes.len() + count <= 16 * 1024);
+        bytes.extend_from_slice(&buffer[..count]);
+        if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+            break index + 4;
+        }
+    };
+    let head = std::str::from_utf8(&bytes[..end])
+        .expect("request head is UTF-8")
+        .to_owned();
+    assert!(head.starts_with("POST /mcp HTTP/1.1\r\n"), "{head}");
+    let headers: BTreeMap<String, String> = head
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            line.split_once(':')
+                .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+        })
+        .collect();
+    let length: usize = headers["content-length"]
+        .parse()
+        .expect("numeric Content-Length");
+    while bytes.len() < end + length {
+        let count = tls.read(&mut buffer).await.expect("read the request body");
+        assert!(count > 0 && bytes.len() + count <= 16 * 1024);
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    let body = bytes[end..end + length].to_vec();
+    let reply = r#"{"jsonrpc":"2.0","id":51,"result":{"resultType":"complete","content":[{"type":"text","text":"http-05-a-complete"}]}}"#;
+    let wire = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+        reply.len()
+    );
+    tls.write_all(wire.as_bytes())
+        .await
+        .expect("write the tools/call result");
+    tls.flush().await.expect("flush the tools/call result");
+    (headers, body)
+}
+
+/// One public executor POST; `reviewed` is the only difference between cases.
+#[cfg(feature = "native-tls-roots")]
+fn http_05_a_run(reviewed: bool) {
+    use fastmcp_rust::http_executor::parameter_headers::ReviewedToolHeaders;
+    use fastmcp_rust::http_executor::{ModernHttpExecutor, ModernHttpRequest};
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .with_reactor(
+            asupersync::runtime::reactor::create_reactor().expect("HTTP-05 A reactor initializes"),
+        )
+        .build()
+        .expect("HTTP-05 A runtime builds");
+    runtime.block_on(async move {
+        let cx = Cx::current().expect("the runtime installs an ambient context");
+        let listener = asupersync::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the HTTP-05 A TLS peer");
+        let acceptor = asupersync::tls::TlsAcceptorBuilder::new(
+            asupersync::tls::CertificateChain::from_pem(HTTP_05_A_LEAF).expect("TEST ONLY leaf"),
+            asupersync::tls::PrivateKey::from_pem(HTTP_05_A_KEY).expect("TEST ONLY key"),
+        )
+        .alpn_protocols(vec![b"http/1.1".to_vec()])
+        .build()
+        .expect("HTTP-05 A TLS acceptor builds");
+        let target = format!(
+            "https://{}/mcp",
+            listener.local_addr().expect("peer address")
+        );
+        let application = async {
+            let mut request = ModernHttpRequest::new(
+                target.clone(),
+                http_05_a_body(),
+                "2026-07-28",
+                "tools/call",
+                Some("lookup".to_owned()),
+            )
+            .expect("the tools/call request is admissible");
+            if reviewed {
+                let review = ReviewedToolHeaders::new(
+                    CanonicalHttpUrl::parse(&target).expect("the peer target is canonical"),
+                    "lookup",
+                    http_05_a_schema(),
+                    |binding| binding.header_name() == "Mcp-Param-Region",
+                )
+                .expect("the host approves the single annotated binding");
+                request = request
+                    .with_reviewed_tool_headers(&review)
+                    .expect("the review matches this exact request");
+            }
+            let response = ModernHttpExecutor::new()
+                .execute(&cx, &request)
+                .await
+                .expect("the executor completes one HTTPS POST");
+            let body = response
+                .read_to_end(&cx, 64 * 1024)
+                .await
+                .expect("the tools/call result body is read");
+            assert!(String::from_utf8_lossy(&body).contains("http-05-a-complete"));
+        };
+        let mut server = std::pin::pin!(http_05_a_serve_one(&listener, &acceptor));
+        let mut application = std::pin::pin!(application);
+        let mut observed = None;
+        let mut completed = false;
+        std::future::poll_fn(|task| {
+            if observed.is_none() {
+                if let std::task::Poll::Ready(value) = server.as_mut().poll(task) {
+                    observed = Some(value);
+                }
+            }
+            if !completed && application.as_mut().poll(task).is_ready() {
+                completed = true;
+            }
+            if observed.is_some() && completed {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+        let (headers, body) = observed.expect("the peer observed one request");
+
+        assert_eq!(body, http_05_a_body(), "review must never rewrite the body");
+        assert_eq!(headers.get("mcp-name").map(String::as_str), Some("lookup"));
+        assert!(
+            !headers.values().any(|value| value.contains("body-only")),
+            "an unannotated argument must never reach a header: {headers:?}"
+        );
+        let parameter_headers: Vec<&str> = headers
+            .keys()
+            .map(String::as_str)
+            .filter(|name| name.starts_with("mcp-param-"))
+            .collect();
+        if reviewed {
+            assert_eq!(parameter_headers, vec!["mcp-param-region"]);
+            assert_eq!(headers["mcp-param-region"], "eu-west");
+        } else {
+            assert!(
+                parameter_headers.is_empty(),
+                "unreviewed call disclosed {headers:?}"
+            );
+            assert!(
+                !headers.values().any(|value| value.contains("eu-west")),
+                "an annotation alone must not disclose: {headers:?}"
+            );
+        }
+    });
+}
+
+/// Re-runs `name` in a child whose only trust root is the TEST ONLY CA.
+#[cfg(feature = "native-tls-roots")]
+fn http_05_a_isolated(name: &str, reviewed: bool) {
+    if let Ok(selected) = std::env::var(HTTP_05_A_CHILD) {
+        assert_eq!(
+            selected, name,
+            "the child must run exactly the selected case"
+        );
+        http_05_a_run(reviewed);
+        return;
+    }
+    let roots = std::env::temp_dir().join(format!("fastmcp-e2e-{name}-ca.pem"));
+    std::fs::write(&roots, HTTP_05_A_ROOT).expect("materialize the TEST ONLY root");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(HTTP_05_A_CHILD, name)
+        .env("SSL_CERT_FILE", &roots)
+        .env_remove("SSL_CERT_DIR")
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .expect("launch the isolated HTTP-05 A child");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.try_wait().expect("poll the HTTP-05 A child") {
+            assert!(
+                status.success(),
+                "HTTP-05 A case {name} failed in its child"
+            );
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("HTTP-05 A case {name} exceeded its child-process bound");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(feature = "native-tls-roots")]
+#[test]
+fn http_05_a_positive() {
+    http_05_a_isolated("http_05_a_positive", true);
+}
+
+#[cfg(feature = "native-tls-roots")]
+#[test]
+fn http_05_a_planted_negative() {
+    http_05_a_isolated("http_05_a_planted_negative", false);
+}
+
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 #[test]
 fn e2e_public_http_as_proxy_forwards_inbound_progress_marker() {
