@@ -607,6 +607,54 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     })
 }
 
+/// Drives `future` to completion on the calling thread under the caller's own
+/// `cx`, without creating or entering a runtime.
+///
+/// This is the synchronous bridge for code that already owns a request or
+/// connection `Cx` but must return synchronously. Unlike [`block_on`] it builds
+/// no private runtime: I/O registers on `cx`'s driver, timers read `cx`'s
+/// clock, and children spawned through `cx` join `cx`'s region. The caller's
+/// runtime is not driven while this thread waits, so the loop re-polls at least
+/// every millisecond and readiness that no driver delivers is still observed.
+///
+/// The entry is recorded exactly as [`block_on`] records its own, so
+/// [`bridge_would_starve_its_driver`] still names a reverse request that could
+/// only complete through the thread this bridge occupies.
+///
+/// # Panics
+///
+/// Panics on a nested bridge on the same thread, like [`block_on`].
+pub fn poll_on_cx<F: Future>(cx: &asupersync::Cx, future: F) -> F::Output {
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct ThreadWake(std::thread::Thread);
+
+    impl Wake for ThreadWake {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    // Record the position before installing `cx`, which would otherwise make
+    // a bridge entered from a bare thread look like one entered from a task.
+    let _entry = BridgeEntry::enter();
+    let _current = asupersync::Cx::set_current(Some(cx.clone()));
+    let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+    let mut task_cx = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut task_cx) {
+            return output;
+        }
+        std::thread::park_timeout(std::time::Duration::from_millis(1));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ProcessGenerationGuard, block_on};
@@ -670,6 +718,59 @@ mod tests {
             }
         });
         assert_eq!(block_on(async { 7 }), 7);
+    }
+
+    #[test]
+    fn poll_on_cx_drives_under_the_callers_cx_and_restores_the_thread() {
+        use asupersync::Cx;
+
+        let cx = Cx::for_testing();
+        assert!(Cx::current().is_none());
+        let driven = super::poll_on_cx(&cx, async {
+            asupersync::runtime::yield_now().await;
+            Cx::current().is_some()
+        });
+        assert!(
+            driven,
+            "the future is polled with the caller's cx installed"
+        );
+        assert!(
+            Cx::current().is_none(),
+            "the thread's previous cx is restored"
+        );
+        assert_eq!(super::poll_on_cx(&cx, async { 5 }), 5);
+    }
+
+    #[test]
+    fn poll_on_cx_entered_from_a_task_names_the_starved_driver() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let starved = runtime.block_on(async {
+            let cx = asupersync::Cx::current().expect("a runtime task has a cx");
+            super::poll_on_cx(&cx, async { super::bridge_would_starve_its_driver() })
+        });
+        assert!(starved, "a bridge that occupies its task's driver says so");
+    }
+
+    #[test]
+    fn poll_on_cx_entered_from_a_bare_thread_starves_no_driver() {
+        let cx = asupersync::Cx::for_testing();
+        let starved = super::poll_on_cx(&cx, async { super::bridge_would_starve_its_driver() });
+        assert!(!starved, "a bare thread occupies no task's driver");
+    }
+
+    #[test]
+    fn poll_on_cx_nested_in_a_bridge_is_rejected() {
+        block_on(async {
+            let cx = asupersync::Cx::for_testing();
+            let nested = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::poll_on_cx(&cx, async { 1 })
+            }));
+            assert!(nested.is_err(), "a second bridge on the thread is rejected");
+        });
+        let cx = asupersync::Cx::for_testing();
+        assert_eq!(super::poll_on_cx(&cx, async { 3 }), 3);
     }
 
     #[test]

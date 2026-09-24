@@ -41,9 +41,10 @@ use fastmcp_client::{
 };
 #[cfg(feature = "tasks")]
 use fastmcp_client::{StdioFinalTaskExecution, StdioTaskSubscriptionEvent};
+use fastmcp_core::runtime::poll_on_cx;
 use fastmcp_core::{
     CanonicalHttpUrl, McpContext, McpError, McpErrorCode, McpLogLevel, McpOutcome, McpResult,
-    Outcome, SamplingRequest, SamplingRequestMessage, SamplingRole, block_on,
+    Outcome, SamplingRequest, SamplingRequestMessage, SamplingRole,
 };
 use fastmcp_protocol::common_types::{AbsoluteUri, Implementation, LoggingLevel, RawIcon};
 #[cfg(feature = "tasks")]
@@ -4865,14 +4866,6 @@ impl ProxyFinalTaskRelay {
         })
     }
 
-    pub(crate) fn open_listener(
-        &self,
-        ctx: &McpContext,
-        notifications: SubscriptionFilter,
-    ) -> McpResult<Box<dyn ProxyFinalTaskListener>> {
-        block_on(self.open_listener_async(ctx, notifications))
-    }
-
     pub(crate) async fn open_listener_async(
         &self,
         ctx: &McpContext,
@@ -5315,11 +5308,14 @@ impl ProxyHttpClient {
         )?;
         self.admit_legacy_initialize_response(response)?;
 
-        block_on(self.connection.notify(
+        poll_on_cx(
             &self.cx,
-            fastmcp_protocol::methods::NOTIFICATIONS_INITIALIZED,
-            None,
-        ))
+            self.connection.notify(
+                &self.cx,
+                fastmcp_protocol::methods::NOTIFICATIONS_INITIALIZED,
+                None,
+            ),
+        )
         .map_err(proxy_http_connection_error)?;
         self.legacy_initialized = true;
         Ok(())
@@ -5611,15 +5607,18 @@ impl ProxyHttpClient {
                 "Modern HTTP proxy connection entered a legacy request path",
             ));
         }
-        let response = block_on(await_proxy_request_or_cancellation(
-            ctx,
-            Box::pin(async {
-                self.connection
-                    .request(ctx.cx(), method, parameters, request_id.clone())
-                    .await
-                    .map_err(proxy_http_connection_error)
-            }),
-        ))?;
+        let response = poll_on_cx(
+            ctx.cx(),
+            await_proxy_request_or_cancellation(
+                ctx,
+                Box::pin(async {
+                    self.connection
+                        .request(ctx.cx(), method, parameters, request_id.clone())
+                        .await
+                        .map_err(proxy_http_connection_error)
+                }),
+            ),
+        )?;
         match response {
             ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) => Ok(response),
             ClientHttpResponse::Legacy(JsonRpcMessage::Request(_)) => {
@@ -5703,14 +5702,17 @@ impl ProxyHttpClient {
                     ));
                 };
                 match ctx {
-                    Some(ctx) => block_on(receive_modern_response_with_cancellation(
-                        client,
-                        ctx,
-                        method,
-                        parameters,
-                        &request_id,
-                        on_progress,
-                    )),
+                    Some(ctx) => poll_on_cx(
+                        ctx.cx(),
+                        receive_modern_response_with_cancellation(
+                            client,
+                            ctx,
+                            method,
+                            parameters,
+                            &request_id,
+                            on_progress,
+                        ),
+                    ),
                     None => receive_modern_response(
                         client,
                         &self.cx,
@@ -5778,7 +5780,8 @@ impl ProxyHttpClient {
                 "Modern HTTP proxy connection entered a legacy request path",
             ));
         }
-        let response = block_on(
+        let response = poll_on_cx(
+            &self.cx,
             self.connection
                 .request(&self.cx, method, parameters, request_id),
         )
@@ -5824,11 +5827,14 @@ impl ProxyHttpClient {
     }
 
     fn cancel_legacy_request(&mut self, ctx: &McpContext, request_id: &RequestId) -> McpResult<()> {
-        block_on(self.connection.notify(
+        poll_on_cx(
             ctx.cx(),
-            "notifications/cancelled",
-            Some(serde_json::json!({"requestId": request_id})),
-        ))
+            self.connection.notify(
+                ctx.cx(),
+                "notifications/cancelled",
+                Some(serde_json::json!({"requestId": request_id})),
+            ),
+        )
         .map_err(proxy_http_connection_error)
     }
 }
@@ -5937,7 +5943,8 @@ impl ProxyBackend for ProxyHttpClient {
                 ))
             })?;
         let request_id = self.next_request_id()?;
-        let handle = block_on(
+        let handle = poll_on_cx(
+            &self.cx,
             self.connection
                 .start_legacy_request(&self.cx, method, parameters, request_id),
         )
@@ -6529,13 +6536,16 @@ impl ProxyBackend for ProxyHttpClient {
             ));
         }
         let request_id = self.next_request_id()?;
-        block_on(self.connection.call_tool_final_outcome(
+        poll_on_cx(
             &self.cx,
-            request_id,
-            name,
-            arguments,
-            Self::MAX_RESPONSE_BYTES,
-        ))
+            self.connection.call_tool_final_outcome(
+                &self.cx,
+                request_id,
+                name,
+                arguments,
+                Self::MAX_RESPONSE_BYTES,
+            ),
+        )
         .map_err(|error| {
             McpError::invalid_request(format!("Proxy HTTP final tools/call failed: {error}"))
         })
@@ -6549,12 +6559,11 @@ impl ProxyBackend for ProxyHttpClient {
             ));
         }
         let request_id = self.next_request_id()?;
-        block_on(self.connection.get_task_final(
+        poll_on_cx(
             &self.cx,
-            request_id,
-            task_id,
-            Self::MAX_RESPONSE_BYTES,
-        ))
+            self.connection
+                .get_task_final(&self.cx, request_id, task_id, Self::MAX_RESPONSE_BYTES),
+        )
         .map_err(|error| {
             McpError::invalid_request(format!("Proxy HTTP final tasks/get failed: {error}"))
         })
@@ -6572,13 +6581,16 @@ impl ProxyBackend for ProxyHttpClient {
             ));
         }
         let request_id = self.next_request_id()?;
-        block_on(self.connection.update_task_final(
+        poll_on_cx(
             &self.cx,
-            request_id,
-            task,
-            input_responses,
-            Self::MAX_RESPONSE_BYTES,
-        ))
+            self.connection.update_task_final(
+                &self.cx,
+                request_id,
+                task,
+                input_responses,
+                Self::MAX_RESPONSE_BYTES,
+            ),
+        )
         .map_err(|error| {
             McpError::invalid_request(format!("Proxy HTTP final tasks/update failed: {error}"))
         })
@@ -6592,12 +6604,15 @@ impl ProxyBackend for ProxyHttpClient {
             ));
         }
         let request_id = self.next_request_id()?;
-        block_on(self.connection.cancel_task_final(
+        poll_on_cx(
             &self.cx,
-            request_id,
-            task_id,
-            Self::MAX_RESPONSE_BYTES,
-        ))
+            self.connection.cancel_task_final(
+                &self.cx,
+                request_id,
+                task_id,
+                Self::MAX_RESPONSE_BYTES,
+            ),
+        )
         .map_err(|error| {
             McpError::invalid_request(format!("Proxy HTTP final tasks/cancel failed: {error}"))
         })
@@ -6672,12 +6687,15 @@ impl ProxyBackend for ProxyHttpClient {
             ));
         }
         let request_id = self.next_request_id()?;
-        let listener = block_on(self.connection.open_subscriptions_listener(
+        let listener = poll_on_cx(
             &self.cx,
-            request_id,
-            notifications,
-            Self::sse_limits(),
-        ))
+            self.connection.open_subscriptions_listener(
+                &self.cx,
+                request_id,
+                notifications,
+                Self::sse_limits(),
+            ),
+        )
         .map_err(|error| {
             McpError::invalid_request(format!(
                 "Proxy HTTP final subscriptions/listen failed: {error}"
@@ -6767,10 +6785,9 @@ impl ProxyBackend for ProxyHttpClient {
                 self.live_catalog_listener = None;
                 return Err(McpError::request_cancelled());
             }
-            block_on(asupersync::time::sleep(
-                cx.now(),
-                std::time::Duration::from_millis(20),
-            ));
+            // A synchronous poll loop waits wall time between attempts. A timer
+            // bridged on `cx` would never fire under a frozen virtual clock.
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
 
@@ -6906,7 +6923,7 @@ impl ProxyBackend for ProxyHttpClient {
             let listener = self.live_task_listener.as_mut().ok_or_else(|| {
                 McpError::invalid_request("No live HTTP official Tasks subscription is active")
             })?;
-            block_on(listener.next_event(cx))
+            poll_on_cx(cx, listener.next_event(cx))
         };
         let event = match event {
             Ok(event) => event,
@@ -7043,11 +7060,10 @@ impl ProxyFinalTaskListener for ProxyHttpFinalTaskListener {
     ) -> McpResult<ProxyFinalTaskListenerEvent> {
         let listen = self.listener.next_event(cx);
         let listen = async move { listen.await.map_err(Self::map_listen_error) };
-        let event = block_on(await_proxy_operation_or_cancellation(
+        let event = poll_on_cx(
             cx,
-            request_cancellation,
-            Box::pin(listen),
-        ))
+            await_proxy_operation_or_cancellation(cx, request_cancellation, Box::pin(listen)),
+        )
         .map_err(|error| {
             if error.code == fastmcp_core::McpErrorCode::RequestCancelled {
                 return error;
@@ -7282,18 +7298,24 @@ fn receive_modern_response(
     request_id: &RequestId,
     on_progress: FinalProgressCallback<'_>,
 ) -> McpResult<ProxyHttpResponse> {
-    let response = block_on(client.request(cx, method, parameters, Some(request_id.clone())))
-        .map_err(|error| {
-            McpError::internal_error(format!("Proxy HTTP modern request failed: {error}"))
-        })?;
+    let response = poll_on_cx(
+        cx,
+        client.request(cx, method, parameters, Some(request_id.clone())),
+    )
+    .map_err(|error| {
+        McpError::internal_error(format!("Proxy HTTP modern request failed: {error}"))
+    })?;
     match response.metadata().kind() {
         ModernHttpResponseKind::Json => {
-            let body = block_on(response.read_to_end(cx, ProxyHttpClient::MAX_RESPONSE_BYTES))
-                .map_err(|error| {
-                    McpError::internal_error(format!(
-                        "Proxy HTTP modern JSON response could not be read: {error}"
-                    ))
-                })?;
+            let body = poll_on_cx(
+                cx,
+                response.read_to_end(cx, ProxyHttpClient::MAX_RESPONSE_BYTES),
+            )
+            .map_err(|error| {
+                McpError::internal_error(format!(
+                    "Proxy HTTP modern JSON response could not be read: {error}"
+                ))
+            })?;
             response_for_request(&body, request_id)
         }
         ModernHttpResponseKind::Sse => {
@@ -7305,7 +7327,7 @@ fn receive_modern_response(
                     ))
                 })?;
             loop {
-                let event = block_on(stream.next_event(cx)).map_err(|error| {
+                let event = poll_on_cx(cx, stream.next_event(cx)).map_err(|error| {
                     McpError::internal_error(format!(
                         "Proxy HTTP modern SSE response could not be read: {error}"
                     ))
@@ -8842,7 +8864,10 @@ impl ProxyClient {
         request: ProxyLegacyHttpRequest,
         method: &str,
     ) -> McpResult<CoreResult> {
-        block_on(self.await_legacy_request_with_context_async(ctx, request, method))
+        poll_on_cx(
+            ctx.cx(),
+            self.await_legacy_request_with_context_async(ctx, request, method),
+        )
     }
 
     /// Yielding counterpart of [`Self::await_legacy_request_with_context`].
@@ -9937,15 +9962,6 @@ impl ProxyClient {
                     .with_backend(|backend| backend.cancel_final_task_with_context(ctx, task_id)),
             },
         }
-    }
-
-    #[cfg(feature = "tasks")]
-    fn open_final_task_listener(
-        &self,
-        ctx: &McpContext,
-        notifications: SubscriptionFilter,
-    ) -> McpResult<Box<dyn ProxyFinalTaskListener>> {
-        block_on(self.open_final_task_listener_async(ctx, notifications))
     }
 
     #[cfg(feature = "tasks")]
@@ -11135,13 +11151,16 @@ impl ToolHandler for ProxyToolHandler {
     ) -> McpResult<FinalToolOutcome> {
         #[cfg(feature = "tasks")]
         let reservation = self.reserve_final_task_creation(ctx)?;
-        let result = block_on(self.client.call_tool_final_outcome_with_resume(
-            ctx,
-            &self.external_name,
-            arguments,
-            None,
-            self.has_task_relay(),
-        ))?;
+        let result = poll_on_cx(
+            ctx.cx(),
+            self.client.call_tool_final_outcome_with_resume(
+                ctx,
+                &self.external_name,
+                arguments,
+                None,
+                self.has_task_relay(),
+            ),
+        )?;
         self.admit_final_tool_result(
             result,
             #[cfg(feature = "tasks")]
@@ -17570,9 +17589,9 @@ IFS= read -r end
             .expect("the task filter is exact");
         let listener_context = McpContext::new(Cx::for_testing(), 734);
         let listener_cancellation = fastmcp_core::McpRequestCancellation::new();
-        let mut listener = relay
-            .open_listener(&listener_context, notifications.clone())
-            .expect("the relay opens one live route-bound listener");
+        let mut listener =
+            block_on(relay.open_listener_async(&listener_context, notifications.clone()))
+                .expect("the relay opens one live route-bound listener");
         match listener
             .next(listener_context.cx(), &listener_cancellation)
             .expect("the upstream listener acknowledges first")
@@ -17643,8 +17662,7 @@ IFS= read -r end
         .expect("the task filter is exact");
         let listener_context = McpContext::new(Cx::for_testing(), 735);
         let listener_cancellation = fastmcp_core::McpRequestCancellation::new();
-        let mut listener = relay
-            .open_listener(&listener_context, notifications)
+        let mut listener = block_on(relay.open_listener_async(&listener_context, notifications))
             .expect("the relay opens the upstream listener before it observes its events");
 
         let error = listener
