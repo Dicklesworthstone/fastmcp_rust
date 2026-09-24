@@ -39,8 +39,6 @@
 //! - **Deterministic test support**: The lab runtime is available to tests
 
 #![forbid(unsafe_code)]
-// Allow dead code during Phase 0 development
-#![allow(dead_code)]
 
 mod auth;
 pub mod combinator;
