@@ -61,6 +61,27 @@ fn public_partial_reply_loss_recovers_and_completes_without_repeating_answers() 
 }
 
 #[test]
+fn public_recovered_successor_state_is_still_validated_by_the_router() {
+    run(|cx| async move {
+        let f = fixture(&cx, true, ContinuationReplayLimits::default());
+        let first = answer(f.begin(&cx, 1).await, "left");
+        drop(partial(&f, &cx, &first, 2).await);
+        let recovered = partial(&f, &cx, &first, 3).await;
+        // Replaying the reply grants no authority over its requestState: one
+        // changed byte is refused by the router on the next retry.
+        let mut state = recovered["requestState"].as_str().unwrap().to_owned();
+        let last = state.pop().unwrap();
+        state.push(if last == 'A' { 'B' } else { 'A' });
+        let mut tampered = recovered.clone();
+        tampered["requestState"] = json!(state);
+        assert!(rejected(&f.post(&cx, 4, &f.probe.alice, successor(&first, &tampered)).await));
+        assert_eq!(f.probe.effects(), 0);
+        let terminal = f.finish(&cx, &successor(&first, &recovered), 5).await;
+        assert_terminal(&f, &terminal);
+    });
+}
+
+#[test]
 fn public_terminal_only_control_does_not_claim_partial_reply_recovery() {
     run(|cx| async move {
         let f = fixture(&cx, false, ContinuationReplayLimits::default());

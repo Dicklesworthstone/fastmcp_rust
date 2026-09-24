@@ -1966,13 +1966,28 @@ fn retained_raw_params<'a>(
 /// Re-admits a middleware-produced final core response through the request's
 /// exact result algebra and returns its canonical wire representation.
 /// A response-cache hit may complete a final core method. Arbitrary
-/// middleware still cannot invent a typed final result.
+/// middleware still cannot invent a typed final result. Only the sealed
+/// continuation replay journal may also answer with the router-minted
+/// `input_required` reply it captured, and only with a nonempty requestState.
 fn middleware_may_complete_final_core_from_cache(
     ctx: &McpContext,
+    middleware: &dyn crate::Middleware,
     value: &serde_json::Value,
 ) -> bool {
-    ctx.response_was_served_from_cache()
-        && value.get("resultType").and_then(serde_json::Value::as_str) == Some("complete")
+    if !ctx.response_was_served_from_cache() {
+        return false;
+    }
+    match value.get("resultType").and_then(serde_json::Value::as_str) {
+        Some("complete") => true,
+        Some("input_required") => {
+            middleware.replays_router_minted_continuation(crate::middleware::seal::Sealed)
+                && value
+                    .get("requestState")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|state| !state.is_empty())
+        }
+        _ => false,
+    }
 }
 
 fn validate_final_core_middleware_response(
@@ -13268,7 +13283,11 @@ impl Server {
                     Ok(Ok(MiddlewareDecision::Continue)) => {}
                     Ok(Ok(MiddlewareDecision::Respond(value))) => {
                         if final_core_request.is_some()
-                            && !middleware_may_complete_final_core_from_cache(&request_ctx, &value)
+                            && !middleware_may_complete_final_core_from_cache(
+                                &request_ctx,
+                                middleware.as_ref(),
+                                &value,
+                            )
                         {
                             return Err(McpError::internal_error(
                                 "middleware cannot short-circuit a final core response",
@@ -13562,7 +13581,11 @@ impl Server {
                 Ok(MiddlewareDecision::Respond(value)) => {
                     middleware_result = Some(
                         if final_core_request.is_some()
-                            && !middleware_may_complete_final_core_from_cache(&request_ctx, &value)
+                            && !middleware_may_complete_final_core_from_cache(
+                                &request_ctx,
+                                middleware.as_ref(),
+                                &value,
+                            )
                         {
                             Err(McpError::internal_error(
                                 "middleware cannot short-circuit a final core response",

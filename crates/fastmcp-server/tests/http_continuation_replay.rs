@@ -19,7 +19,7 @@ use fastmcp_protocol::{CompleteResult, Content, CoreResultDiscriminatorPolicy, D
 use fastmcp_server::{AuthProvider, AuthRequest, Server, ServerHttpEndpoint, StaticTokenVerifier, TokenAuthProvider, ToolHandler};
 use fastmcp_server::bidirectional::MrtrCompletedInputs;
 use fastmcp_server::{BoxFuture, FinalToolOutcome, ToolExecutionMode};
-use fastmcp_server::Middleware;
+use fastmcp_server::{Middleware, MiddlewareDecision};
 use fastmcp_server::{ContinuationReplayAuthority, ContinuationReplayLimits, ContinuationReplayMiddleware};
 use fastmcp_server::http_admission::{HttpAdmissionLimits, HttpEndpointConfig};
 use fastmcp_server::http_admission::security::HttpSecurityPolicy;
@@ -153,12 +153,32 @@ impl Middleware for Stamp {
         Ok(value)
     }
 }
+/// A generic response cache: it records a hit exactly as the shipped cache
+/// does, then answers with a stored value of the configured result type.
+struct GenericCache(&'static str);
+impl Middleware for GenericCache {
+    fn on_request(&self, ctx: &McpContext, _: &fastmcp_protocol::JsonRpcRequest) -> McpResult<MiddlewareDecision> {
+        assert!(ctx.mark_response_cache_hit(u64::MAX), "the request scope must admit a cache hit");
+        Ok(MiddlewareDecision::Respond(match self.0 {
+            "input_required" => json!({"resultType":"input_required","requestState":"cache-held-state"}),
+            _ => json!({"resultType":"complete","content":[{"type":"text","text":"cached"}],"isError":false}),
+        }))
+    }
+}
 struct Fixture { endpoint: ServerHttpEndpoint, probe: Probe, journal: Arc<ContinuationReplayMiddleware>, policy: HttpSecurityPolicy }
 impl Fixture {
     fn new(cx: &Cx, enabled: bool, limits: ContinuationReplayLimits) -> Self {
         Self::with_probe(cx, enabled, limits, Probe::new(), false)
     }
     fn with_probe(cx: &Cx, enabled: bool, limits: ContinuationReplayLimits, probe: Probe, recover_successors: bool) -> Self {
+        Self::build(cx, enabled, limits, probe, recover_successors, None)
+    }
+    /// No journal: the given middleware is the only one that can short-circuit.
+    fn with_generic_cache(cx: &Cx, cache: Arc<dyn Middleware>) -> Self {
+        Self::build(cx, false, ContinuationReplayLimits::default(), Probe::new(), false, Some(cache))
+    }
+    fn build(cx: &Cx, enabled: bool, limits: ContinuationReplayLimits, probe: Probe, recover_successors: bool,
+        cache: Option<Arc<dyn Middleware>>) -> Self {
         let authorizer = probe.clone();
         let authorize = move |ctx: &McpContext, _: &fastmcp_protocol::JsonRpcRequest| authorizer.authority(ctx);
         let guard = ProcessGenerationGuard::install().unwrap();
@@ -171,6 +191,7 @@ impl Fixture {
         }.unwrap());
         let mut builder = Server::new("continuation-replay", "1")
             .protocol_policy(ProtocolPolicy::ModernOnly).unwrap().auth_provider(probe.clone()).tool(probe.clone());
+        if let Some(cache) = cache { builder = builder.middleware(cache); }
         if enabled { builder = builder.middleware(journal.clone()); }
         builder = builder.middleware(Stamp(probe.transforms.clone()));
         #[cfg(not(feature = "legacy-2024-11-05"))]
@@ -356,6 +377,32 @@ fn public_mrtr_rotation_preserves_replies_and_close_does_not_reexecute() {
         f.journal.close().unwrap();
         assert!(rejected(&f.post(&cx, 4, &f.probe.alice, params).await));
         assert_eq!(f.probe.effects(), 1);
+    });
+}
+
+#[test]
+fn public_generic_cache_may_complete_but_never_replay_an_input_required_reply() {
+    run(|cx| async move {
+        // Near-identical pair: only the cached result type differs. A recorded
+        // hit completes a final request, but only the continuation journal may
+        // answer with a router-minted input_required reply.
+        for (result_type, admitted) in [("complete", true), ("input_required", false)] {
+            let f = Fixture::with_generic_cache(&cx, Arc::new(GenericCache(result_type)));
+            let params = json!({"name":"checkout","arguments":{"quantity":1},"_meta":{
+                "io.modelcontextprotocol/protocolVersion":FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities":{}}});
+            let (status, body) = f.post(&cx, 1, &f.probe.alice, params).await;
+            assert_eq!(status, 200);
+            if admitted {
+                assert!(body.get("error").is_none(), "{body}");
+                assert_eq!(body["result"]["content"][0]["text"], "cached");
+            } else {
+                assert_eq!(body["error"]["code"], -32603, "{body}");
+                assert_eq!(body["error"]["message"], "middleware cannot short-circuit a final core response");
+            }
+            assert_eq!(f.probe.starts.load(Ordering::SeqCst), 0, "the handler never runs");
+            assert_eq!(f.probe.effects(), 0);
+        }
     });
 }
 

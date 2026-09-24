@@ -299,6 +299,13 @@ impl Middleware for ContinuationReplayMiddleware {
     }
     // Deliberately retain fences on errors. on_error can be called for a
     // rejected duplicate or even before on_request (authentication failures).
+
+    /// Successor recovery replays the exact router-minted `input_required`
+    /// reply it captured; the router still validates that requestState when
+    /// the client retries with it. Terminal-only journals never replay one.
+    fn replays_router_minted_continuation(&self, _: super::seal::Sealed) -> bool {
+        self.recover_successors
+    }
 }
 impl fmt::Debug for ContinuationReplayMiddleware {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

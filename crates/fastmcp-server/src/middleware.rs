@@ -19,6 +19,13 @@
 /// Encrypted terminal-result recovery for exact modern continuation retries.
 pub mod continuation_replay;
 
+pub(crate) mod seal {
+    /// Cannot be named outside this crate, so only in-crate middleware can
+    /// override or call [`super::Middleware::replays_router_minted_continuation`].
+    #[derive(Debug, Clone, Copy)]
+    pub struct Sealed;
+}
+
 use fastmcp_core::{McpContext, McpError, McpResult};
 use fastmcp_protocol::JsonRpcRequest;
 
@@ -68,6 +75,15 @@ pub trait Middleware: Send + Sync {
     fn on_error(&self, _ctx: &McpContext, _request: &JsonRpcRequest, error: McpError) -> McpError {
         error
     }
+
+    /// Whether a `Respond` from this middleware may replay a router-minted
+    /// `input_required` reply. Generic middleware, caches included, may only
+    /// complete a final request; only the successor-recovering
+    /// [`continuation_replay::ContinuationReplayMiddleware`] answers `true`.
+    #[doc(hidden)]
+    fn replays_router_minted_continuation(&self, _: seal::Sealed) -> bool {
+        false
+    }
 }
 
 impl<T> Middleware for Arc<T>
@@ -93,6 +109,10 @@ where
 
     fn on_error(&self, ctx: &McpContext, request: &JsonRpcRequest, error: McpError) -> McpError {
         (**self).on_error(ctx, request, error)
+    }
+
+    fn replays_router_minted_continuation(&self, seal: seal::Sealed) -> bool {
+        (**self).replays_router_minted_continuation(seal)
     }
 }
 
