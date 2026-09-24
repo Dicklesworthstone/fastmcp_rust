@@ -459,3 +459,67 @@ fn next_generation(current: Option<SlotRevision>) -> Result<u64, CredentialSlotE
     current.map_or(0, |current| current.generation).checked_add(1)
         .ok_or(CredentialSlotError::GenerationExhausted)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::tests::{PrivateDirectory, failing_directory_sync};
+    use fastmcp_core::partition::{DurableOwnerKey, PartitionDescriptor};
+
+    fn identity() -> (CredentialStoreKey, PartitionAuthorization) {
+        let descriptor = PartitionDescriptor::from_verified_facts(
+            "fixture-provider", 1, "https://issuer.example", "https://resource.example/mcp",
+            "fixture-tenant", "fixture-subject", "native-client", 1, 1, &[b"fixture-audience"],
+        ).unwrap();
+        let owner = DurableOwnerKey::derive(&descriptor, 1).unwrap();
+        (
+            CredentialStoreKey::derive(&descriptor, "fixture-store", "refresh-family", "stable-lineage")
+                .unwrap(),
+            PartitionAuthorization::current(&descriptor, &owner),
+        )
+    }
+
+    #[test]
+    fn an_uncertain_file_commit_is_the_slots_commit_uncertain() {
+        let cx = Cx::for_testing();
+        let directory = PrivateDirectory::new();
+        let (key, authorization) = identity();
+        let mut slot =
+            DurableCredentialSlot::open(&cx, directory.open(&cx), &key, &authorization, None).unwrap();
+        let mutation = slot.prepare_replace(&cx, &authorization, None, b"protected").unwrap();
+        let intent = mutation.intent();
+        slot.file.directory_sync = failing_directory_sync;
+
+        assert_eq!(
+            slot.commit(&cx, &authorization, mutation).err(),
+            Some(CredentialSlotError::CommitUncertain {
+                previous: intent.previous(),
+                proposed: intent.proposed(),
+            }),
+        );
+        assert_eq!(slot.revision(), None, "an uncertain commit must not advance the trusted revision");
+
+        // Recovery takes a fresh handle and the independently retained intent.
+        drop(slot);
+        let (_, outcome) =
+            DurableCredentialSlot::recover(&cx, directory.open(&cx), &key, &authorization, intent).unwrap();
+        assert_eq!(outcome, SlotRecoveryOutcome::Committed(intent.proposed()));
+    }
+
+    /// Planted negative: identical except the post-rename directory sync
+    /// succeeds, so the commit is certain and the revision advances.
+    #[test]
+    fn a_certain_file_commit_is_the_slots_commit() {
+        let cx = Cx::for_testing();
+        let directory = PrivateDirectory::new();
+        let (key, authorization) = identity();
+        let mut slot =
+            DurableCredentialSlot::open(&cx, directory.open(&cx), &key, &authorization, None).unwrap();
+        let mutation = slot.prepare_replace(&cx, &authorization, None, b"protected").unwrap();
+        let intent = mutation.intent();
+
+        let commit = slot.commit(&cx, &authorization, mutation).unwrap();
+        assert_eq!(commit.revision(), intent.proposed());
+        assert_eq!(slot.revision(), Some(intent.proposed()));
+    }
+}

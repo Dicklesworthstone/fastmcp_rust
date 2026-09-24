@@ -137,6 +137,12 @@ pub struct SecureAtomicFile {
     lock_leaf: String,
     maximum_bytes: usize,
     recovery_required: bool,
+    /// The directory durability step, `File::sync_all` in every handle `open`
+    /// returns. It is a field so crate tests can make it fail after `open`:
+    /// `CommitUncertain` needs a directory that synced at open and fails later
+    /// (ENOSPC, EIO, a filesystem going read-only), which no unprivileged
+    /// fixture can produce.
+    directory_sync: fn(&File) -> std::io::Result<()>,
 }
 
 impl SecureAtomicFile {
@@ -195,6 +201,7 @@ impl SecureAtomicFile {
             lock_leaf,
             maximum_bytes,
             recovery_required: false,
+            directory_sync: File::sync_all,
         };
         store.validate_authority()?;
         // Persist creation of the stable lock inode before a payload can commit.
@@ -202,7 +209,7 @@ impl SecureAtomicFile {
         checkpoint(cx)?;
         store.lock.sync_all().map_err(|_| AtomicFileError::Io)?;
         checkpoint(cx)?;
-        store.directory.sync_all().map_err(|_| AtomicFileError::Io)?;
+        store.sync_directory().map_err(|_| AtomicFileError::Io)?;
         store.read_current(cx)?;
         Ok(store)
     }
@@ -256,11 +263,15 @@ impl SecureAtomicFile {
         drop(temporary);
         // No cancellation checkpoint is legal between rename and this durability
         // result: the visible mutation has already happened.
-        if self.directory.sync_all().is_err() {
+        if self.sync_directory().is_err() {
             self.recovery_required = true;
             return Err(AtomicFileError::CommitUncertain { attempted: version });
         }
         Ok(version)
+    }
+
+    fn sync_directory(&self) -> std::io::Result<()> {
+        (self.directory_sync)(&self.directory)
     }
 
     /// Resolves an uncertain commit by rereading the actual target and syncing
@@ -272,7 +283,7 @@ impl SecureAtomicFile {
         self.validate_authority()?;
         let current = self.read_current(cx)?;
         checkpoint(cx)?;
-        self.directory.sync_all().map_err(|_| AtomicFileError::RecoveryRequired)?;
+        self.sync_directory().map_err(|_| AtomicFileError::RecoveryRequired)?;
         self.recovery_required = false;
         Ok(current)
     }
@@ -472,4 +483,86 @@ fn checkpoint(cx: &Cx) -> Result<(), AtomicFileError> {
             },
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    /// An owner-private 0700 directory, removed on drop. Only the directory this
+    /// fixture created is removed.
+    pub(super) struct PrivateDirectory(std::path::PathBuf);
+
+    impl PrivateDirectory {
+        pub(super) fn new() -> Self {
+            let id = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("fastmcp-commit-uncertain-{}-{id}", std::process::id()));
+            std::fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            Self(path)
+        }
+
+        pub(super) fn open(&self, cx: &Cx) -> SecureAtomicFile {
+            SecureAtomicFile::open(cx, File::open(&self.0).unwrap(), "credential", 4096).unwrap()
+        }
+    }
+
+    impl Drop for PrivateDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A directory fsync that fails after the store has validated the directory.
+    pub(super) fn failing_directory_sync(_: &File) -> std::io::Result<()> {
+        Err(std::io::Error::other("injected directory fsync failure"))
+    }
+
+    #[test]
+    fn a_failed_post_rename_directory_sync_is_commit_uncertain() {
+        let cx = Cx::for_testing();
+        let directory = PrivateDirectory::new();
+        let mut store = directory.open(&cx);
+        let previous = store.replace(&cx, None, b"previous").unwrap();
+        store.directory_sync = failing_directory_sync;
+        let attempted = version(b"attempted").unwrap();
+
+        assert_eq!(
+            store.replace(&cx, Some(previous), b"attempted"),
+            Err(AtomicFileError::CommitUncertain { attempted }),
+        );
+        // The post-state, not only the error: load and replace stay refused
+        // until reconciliation establishes which value is durable.
+        assert!(store.recovery_required);
+        assert!(matches!(store.load(&cx), Err(AtomicFileError::RecoveryRequired)));
+        assert_eq!(
+            store.replace(&cx, Some(attempted), b"again"),
+            Err(AtomicFileError::RecoveryRequired),
+        );
+
+        store.directory_sync = File::sync_all;
+        let reconciled = store.reconcile(&cx).unwrap().expect("the rename happened");
+        assert_eq!(reconciled.version(), attempted);
+        assert!(!store.recovery_required);
+        assert_eq!(store.load(&cx).unwrap().unwrap().bytes(), b"attempted");
+    }
+
+    /// Planted negative: identical except the post-rename directory sync
+    /// succeeds, so neither the error nor the recovery state may appear.
+    #[test]
+    fn a_successful_post_rename_directory_sync_commits() {
+        let cx = Cx::for_testing();
+        let directory = PrivateDirectory::new();
+        let mut store = directory.open(&cx);
+        let previous = store.replace(&cx, None, b"previous").unwrap();
+        let attempted = version(b"attempted").unwrap();
+
+        assert_eq!(store.replace(&cx, Some(previous), b"attempted"), Ok(attempted));
+        assert!(!store.recovery_required);
+        assert_eq!(store.load(&cx).unwrap().unwrap().version(), attempted);
+    }
 }
