@@ -256,6 +256,19 @@ fn stateless_public_catalog_snapshot(server: &Server) -> Vec<u8> {
     .expect("public stateless catalog must serialize")
 }
 
+/// Runs dispatch on a caller-owned runtime, so it awaits on that runtime's Cx.
+/// Sync transport runs stay outside it.
+fn on_caller_runtime(body: impl Future<Output = ()>) {
+    asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("the caller runtime builds")
+        .block_on(body);
+}
+
+fn caller_cx() -> Cx {
+    Cx::current().expect("the caller runtime installs its Cx")
+}
+
 /// An actual buffered stdout transport: only close commits the queued reply.
 /// This integration crate links the shipped server, including its feature-off
 /// pump, rather than selecting the server's `cfg(test)` dispatcher.
@@ -513,107 +526,113 @@ fn srv_01_a_positive() {
     // must produce byte-identical responses that both start from empty state.
     // A dispatcher that carried request state forward would answer
     // `observed=1` the second time.
-    let immutable_server = Server::new("stateless-immutable-dispatch", "1.0.0")
-        .tool(Greet)
-        .tool(LeakProbe)
-        .build();
-    let catalog_before = stateless_public_catalog_snapshot(&immutable_server);
-    let probe_inbound =
-        InboundRequestContext::new(Cx::for_testing(), 81, InboundRequestTransport::Memory);
-    let probe_request = stateless_tool_call("leak_probe", 81_i64);
+    on_caller_runtime(async {
+        let immutable_server = Server::new("stateless-immutable-dispatch", "1.0.0")
+            .tool(Greet)
+            .tool(LeakProbe)
+            .build();
+        let catalog_before = stateless_public_catalog_snapshot(&immutable_server);
+        let probe_inbound =
+            InboundRequestContext::new(caller_cx(), 81, InboundRequestTransport::Memory);
+        let probe_request = stateless_tool_call("leak_probe", 81_i64);
 
-    let first = immutable_server
-        .dispatch_stateless(&probe_inbound, &probe_request)
-        .expect("the first stateless dispatch returns a response");
-    let second = immutable_server
-        .dispatch_stateless(&probe_inbound, &probe_request)
-        .expect("the second stateless dispatch returns a response");
+        let first = immutable_server
+            .dispatch_stateless(&probe_inbound, &probe_request)
+            .await
+            .expect("the first stateless dispatch returns a response");
+        let second = immutable_server
+            .dispatch_stateless(&probe_inbound, &probe_request)
+            .await
+            .expect("the second stateless dispatch returns a response");
 
-    const FRESH_DISPATCH: &str = "observed=0 recorded=1 stored=true disabled=true";
-    assert_eq!(
-        stateless_tool_text(&first).as_deref(),
-        Some(FRESH_DISPATCH),
-        "the first stateless dispatch must start from empty request state \
+        const FRESH_DISPATCH: &str = "observed=0 recorded=1 stored=true disabled=true";
+        assert_eq!(
+            stateless_tool_text(&first).as_deref(),
+            Some(FRESH_DISPATCH),
+            "the first stateless dispatch must start from empty request state \
          and both mutation attempts must really be applied to it"
-    );
-    assert_eq!(
-        stateless_tool_text(&second).as_deref(),
-        Some(FRESH_DISPATCH),
-        "the second dispatch of the same request observed state left by the first"
-    );
-    assert_eq!(
-        serde_json::to_vec(&first).expect("first response must serialize"),
-        serde_json::to_vec(&second).expect("second response must serialize"),
-        "repeating one immutable dispatch is not byte-identical"
-    );
+        );
+        assert_eq!(
+            stateless_tool_text(&second).as_deref(),
+            Some(FRESH_DISPATCH),
+            "the second dispatch of the same request observed state left by the first"
+        );
+        assert_eq!(
+            serde_json::to_vec(&first).expect("first response must serialize"),
+            serde_json::to_vec(&second).expect("second response must serialize"),
+            "repeating one immutable dispatch is not byte-identical"
+        );
 
-    // `leak_probe` called `disable_tool("greet")` on both dispatches and both
-    // writes succeeded. Neither the published catalog nor a later list result
-    // may observe them: a handler cannot reach shared router state through its
-    // context.
-    assert_eq!(
-        stateless_public_catalog_snapshot(&immutable_server),
-        catalog_before,
-        "a handler mutated the published router catalog through its context"
-    );
-    // The invocation path is what actually consults the disabled set
-    // (`session_state.is_tool_enabled` in the final tools/call dispatch), so
-    // this is the observation that would change if the disable survived: a
-    // later `greet` call would come back MethodNotFound / "disabled for this
-    // session" instead of a result.
-    let greet_inbound =
-        InboundRequestContext::new(Cx::for_testing(), 82, InboundRequestTransport::Memory);
-    let greet_request = JsonRpcRequest::new(
-        "tools/call",
-        Some(serde_json::json!({
-            "name": "greet",
-            "arguments": {"name": "after leak probe"},
-            "_meta": {
-                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                "io.modelcontextprotocol/clientCapabilities": {},
-            },
-        })),
-        82_i64,
-    );
-    let greeted = immutable_server
-        .dispatch_stateless(&greet_inbound, &greet_request)
-        .expect("a later greet dispatch returns a response");
-    assert!(
-        greeted.error.is_none(),
-        "an earlier handler's disable_tool leaked into a later dispatch: {:?}",
-        greeted.error
-    );
-    assert_eq!(
-        stateless_tool_text(&greeted).as_deref(),
-        Some("Hello, after leak probe!"),
-        "the later dispatch must really reach the tool the earlier handler disabled"
-    );
+        // `leak_probe` called `disable_tool("greet")` on both dispatches and both
+        // writes succeeded. Neither the published catalog nor a later list result
+        // may observe them: a handler cannot reach shared router state through its
+        // context.
+        assert_eq!(
+            stateless_public_catalog_snapshot(&immutable_server),
+            catalog_before,
+            "a handler mutated the published router catalog through its context"
+        );
+        // The invocation path is what actually consults the disabled set
+        // (`session_state.is_tool_enabled` in the final tools/call dispatch), so
+        // this is the observation that would change if the disable survived: a
+        // later `greet` call would come back MethodNotFound / "disabled for this
+        // session" instead of a result.
+        let greet_inbound =
+            InboundRequestContext::new(caller_cx(), 82, InboundRequestTransport::Memory);
+        let greet_request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "greet",
+                "arguments": {"name": "after leak probe"},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            })),
+            82_i64,
+        );
+        let greeted = immutable_server
+            .dispatch_stateless(&greet_inbound, &greet_request)
+            .await
+            .expect("a later greet dispatch returns a response");
+        assert!(
+            greeted.error.is_none(),
+            "an earlier handler's disable_tool leaked into a later dispatch: {:?}",
+            greeted.error
+        );
+        assert_eq!(
+            stateless_tool_text(&greeted).as_deref(),
+            Some("Hello, after leak probe!"),
+            "the later dispatch must really reach the tool the earlier handler disabled"
+        );
 
-    // The published catalog is catalog-derived rather than session-filtered on
-    // the modern list path, so this is a shape check, not the immutability
-    // proof above.
-    let list_inbound =
-        InboundRequestContext::new(Cx::for_testing(), 86, InboundRequestTransport::Memory);
-    let list_request = JsonRpcRequest::new(
-        "tools/list",
-        Some(serde_json::json!({
-            "_meta": {
-                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                "io.modelcontextprotocol/clientCapabilities": {},
-            },
-        })),
-        86_i64,
-    );
-    let listed = immutable_server
-        .dispatch_stateless(&list_inbound, &list_request)
-        .expect("a stateless tools/list returns a response");
-    assert!(listed.error.is_none(), "tools/list is dispatchable");
-    let listed_names = stateless_listed_tool_names(&listed);
-    assert!(
-        listed_names.iter().any(|name| name == "greet")
-            && listed_names.iter().any(|name| name == "leak_probe"),
-        "the list result must be the real published catalog: {listed_names:?}"
-    );
+        // The published catalog is catalog-derived rather than session-filtered on
+        // the modern list path, so this is a shape check, not the immutability
+        // proof above.
+        let list_inbound =
+            InboundRequestContext::new(caller_cx(), 86, InboundRequestTransport::Memory);
+        let list_request = JsonRpcRequest::new(
+            "tools/list",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            })),
+            86_i64,
+        );
+        let listed = immutable_server
+            .dispatch_stateless(&list_inbound, &list_request)
+            .await
+            .expect("a stateless tools/list returns a response");
+        assert!(listed.error.is_none(), "tools/list is dispatchable");
+        let listed_names = stateless_listed_tool_names(&listed);
+        assert!(
+            listed_names.iter().any(|name| name == "greet")
+                && listed_names.iter().any(|name| name == "leak_probe"),
+            "the list result must be the real published catalog: {listed_names:?}"
+        );
+    });
 
     #[cfg(feature = "legacy-2024-11-05")]
     {
@@ -705,473 +724,492 @@ fn srv_01_a_planted_negative() {
     // immutable-ingress boundary of the retained `&Server` surface — the
     // JSON-RPC request id no longer matches the sanitized ingress identity —
     // so every named mutable state field can be read back after the refusal.
-    let identity_server = Server::new("stateless-ingress-identity-refusal", "1.0.0")
-        .tool(Greet)
-        .tool(LeakProbe)
-        .build();
-    let identity_catalog_before = stateless_public_catalog_snapshot(&identity_server);
-    let identity_inbound =
-        InboundRequestContext::new(Cx::for_testing(), 83, InboundRequestTransport::Memory);
-    let identity_baseline = stateless_tool_call("leak_probe", 83_i64);
-    let identity_planted = stateless_tool_call("leak_probe", 84_i64);
+    on_caller_runtime(async {
+        let identity_server = Server::new("stateless-ingress-identity-refusal", "1.0.0")
+            .tool(Greet)
+            .tool(LeakProbe)
+            .build();
+        let identity_catalog_before = stateless_public_catalog_snapshot(&identity_server);
+        let identity_inbound =
+            InboundRequestContext::new(caller_cx(), 83, InboundRequestTransport::Memory);
+        let identity_baseline = stateless_tool_call("leak_probe", 83_i64);
+        let identity_planted = stateless_tool_call("leak_probe", 84_i64);
 
-    // The request id is the sole planted dimension.
-    assert_eq!(identity_baseline.jsonrpc, identity_planted.jsonrpc);
-    assert_eq!(identity_baseline.method, identity_planted.method);
-    assert_eq!(identity_baseline.params, identity_planted.params);
-    assert_ne!(identity_baseline.id, identity_planted.id);
-    let identity_planted_before =
-        serde_json::to_vec(&identity_planted).expect("planted request must serialize");
+        // The request id is the sole planted dimension.
+        assert_eq!(identity_baseline.jsonrpc, identity_planted.jsonrpc);
+        assert_eq!(identity_baseline.method, identity_planted.method);
+        assert_eq!(identity_baseline.params, identity_planted.params);
+        assert_ne!(identity_baseline.id, identity_planted.id);
+        let identity_planted_before =
+            serde_json::to_vec(&identity_planted).expect("planted request must serialize");
 
-    let accepted = identity_server
-        .dispatch_stateless(&identity_inbound, &identity_baseline)
-        .expect("the matching-identity baseline receives a response");
-    assert!(accepted.error.is_none(), "the baseline is admitted");
-    assert_eq!(
-        stateless_tool_text(&accepted).as_deref(),
-        Some("observed=0 recorded=1 stored=true disabled=true"),
-        "the accepted baseline must really reach the handler and mutate its \
+        let accepted = identity_server
+            .dispatch_stateless(&identity_inbound, &identity_baseline)
+            .await
+            .expect("the matching-identity baseline receives a response");
+        assert!(accepted.error.is_none(), "the baseline is admitted");
+        assert_eq!(
+            stateless_tool_text(&accepted).as_deref(),
+            Some("observed=0 recorded=1 stored=true disabled=true"),
+            "the accepted baseline must really reach the handler and mutate its \
          own request state, or the refusal below proves nothing"
-    );
+        );
 
-    let refused = identity_server
-        .dispatch_stateless(&identity_inbound, &identity_planted)
-        .expect("a request carrying an id must receive a response");
-    assert_eq!(
-        refused.error.as_ref().map(|error| error.code.clone()),
-        Some(McpErrorCode::InvalidRequest.into()),
-        "a mismatched ingress identity must reach the typed refusal boundary"
-    );
-    assert!(
-        refused.result.is_none(),
-        "a refused dispatch must not carry a result"
-    );
+        let refused = identity_server
+            .dispatch_stateless(&identity_inbound, &identity_planted)
+            .await
+            .expect("a request carrying an id must receive a response");
+        assert_eq!(
+            refused.error.as_ref().map(|error| error.code.clone()),
+            Some(McpErrorCode::InvalidRequest.into()),
+            "a mismatched ingress identity must reach the typed refusal boundary"
+        );
+        assert!(
+            refused.result.is_none(),
+            "a refused dispatch must not carry a result"
+        );
 
-    // Every named mutable state field, byte for byte, after the refusal:
-    // the published catalog, the caller's own request, and the request state
-    // a following accepted dispatch can observe.
-    assert_eq!(
-        stateless_public_catalog_snapshot(&identity_server),
-        identity_catalog_before,
-        "the typed identity refusal changed the published catalog"
-    );
-    assert_eq!(
-        serde_json::to_vec(&identity_planted).expect("planted request remains serializable"),
-        identity_planted_before,
-        "the typed identity refusal changed caller input"
-    );
-    let after_inbound =
-        InboundRequestContext::new(Cx::for_testing(), 85, InboundRequestTransport::Memory);
-    let after = identity_server
-        .dispatch_stateless(&after_inbound, &stateless_tool_call("leak_probe", 85_i64))
-        .expect("a later accepted dispatch receives a response");
-    assert_eq!(
-        stateless_tool_text(&after).as_deref(),
-        Some("observed=0 recorded=1 stored=true disabled=true"),
-        "the refused dispatch left observable request state behind"
-    );
+        // Every named mutable state field, byte for byte, after the refusal:
+        // the published catalog, the caller's own request, and the request state
+        // a following accepted dispatch can observe.
+        assert_eq!(
+            stateless_public_catalog_snapshot(&identity_server),
+            identity_catalog_before,
+            "the typed identity refusal changed the published catalog"
+        );
+        assert_eq!(
+            serde_json::to_vec(&identity_planted).expect("planted request remains serializable"),
+            identity_planted_before,
+            "the typed identity refusal changed caller input"
+        );
+        let after_inbound =
+            InboundRequestContext::new(caller_cx(), 85, InboundRequestTransport::Memory);
+        let after = identity_server
+            .dispatch_stateless(&after_inbound, &stateless_tool_call("leak_probe", 85_i64))
+            .await
+            .expect("a later accepted dispatch receives a response");
+        assert_eq!(
+            stateless_tool_text(&after).as_deref(),
+            Some("observed=0 recorded=1 stored=true disabled=true"),
+            "the refused dispatch left observable request state behind"
+        );
+    });
 }
 
 #[test]
 fn srv_01_b_positive() {
-    let server = Server::new("stateless-handler-result", "1.0.0")
-        .tool(DeclinedTool)
-        .tool(Greet)
-        .build();
-    let inbound =
-        InboundRequestContext::new(Cx::for_testing(), 73, InboundRequestTransport::Memory);
-    let request = JsonRpcRequest::new(
-        "tools/call",
-        Some(serde_json::json!({
-            "name": "declined",
-            "arguments": {},
-            "_meta": {
-                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                "io.modelcontextprotocol/clientCapabilities": {},
-            },
-        })),
-        73_i64,
-    );
-
-    let response = server
-        .dispatch_stateless(&inbound, &request)
-        .expect("handler request with an id must receive a response");
-
-    assert!(response.error.is_none());
-    assert_eq!(
-        response
-            .result
-            .as_ref()
-            .and_then(|result| result.get("isError"))
-            .and_then(serde_json::Value::as_bool),
-        Some(true),
-        "a handler error must convert to CallToolResult rather than a JSON-RPC failure"
-    );
-    assert_eq!(
-        response
-            .result
-            .as_ref()
-            .and_then(|result| result.pointer("/content/0/text"))
-            .and_then(serde_json::Value::as_str),
-        Some("caller input was declined")
-    );
-    assert_eq!(
-        response.id, request.id,
-        "the converted handler error still echoes the request id"
-    );
-
-    // The other handler outcome must convert to a visibly different public
-    // shape on the same immutable server: a success carries content and no
-    // `isError` flag at all. Without this arm the isError assertion above
-    // would also pass against an implementation that flagged every result.
-    let success_inbound =
-        InboundRequestContext::new(Cx::for_testing(), 77, InboundRequestTransport::Memory);
-    let success_request = JsonRpcRequest::new(
-        "tools/call",
-        Some(serde_json::json!({
-            "name": "greet",
-            "arguments": {"name": "stateless client"},
-            "_meta": {
-                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                "io.modelcontextprotocol/clientCapabilities": {},
-            },
-        })),
-        77_i64,
-    );
-    let success = server
-        .dispatch_stateless(&success_inbound, &success_request)
-        .expect("a successful handler request with an id must receive a response");
-    assert!(
-        success.error.is_none(),
-        "a successful handler is not a JSON-RPC failure"
-    );
-    assert_eq!(
-        stateless_tool_text(&success).as_deref(),
-        Some("Hello, stateless client!")
-    );
-    assert_eq!(
-        success
-            .result
-            .as_ref()
-            .and_then(|result| result.get("isError")),
-        None,
-        "a successful handler result must not carry an isError flag"
-    );
-    assert_eq!(success.id, success_request.id);
-
-    // The four-valued Outcome has two arms left, and they must NOT convert the
-    // way Outcome::Err did above. A handler-returned McpError became an isError
-    // *result*; cancellation and panic are framework-terminal and have to
-    // become typed JSON-RPC *errors* instead. Without these the B slice only
-    // ever proved one of four arms.
-    let arms_server = Server::new("stateless-handler-outcome-arms", "1.0.0")
-        .tool(Greet)
-        .tool(OutcomeArmTool {
-            name: "returns_cancelled",
-            arm: OutcomeArm::ReturnsCancelled,
-        })
-        .tool(OutcomeArmTool {
-            name: "returns_panicked",
-            arm: OutcomeArm::ReturnsPanicked,
-        })
-        .tool(OutcomeArmTool {
-            name: "unwinds",
-            arm: OutcomeArm::Unwinds,
-        })
-        .build();
-
-    // ServerBuilder::tool only logs a registration failure, so confirm the
-    // three handlers are really published. Otherwise a rejected schema would
-    // silently turn every assertion below into MethodNotFound.
-    let arm_names: Vec<String> = arms_server
-        .tools()
-        .into_iter()
-        .map(|tool| tool.name)
-        .collect();
-    for required in ["returns_cancelled", "returns_panicked", "unwinds"] {
-        assert!(
-            arm_names.iter().any(|name| name == required),
-            "outcome-arm handler {required} was not registered: {arm_names:?}"
+    on_caller_runtime(async {
+        let server = Server::new("stateless-handler-result", "1.0.0")
+            .tool(DeclinedTool)
+            .tool(Greet)
+            .build();
+        let inbound = InboundRequestContext::new(caller_cx(), 73, InboundRequestTransport::Memory);
+        let request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "declined",
+                "arguments": {},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            })),
+            73_i64,
         );
-    }
-    let arms_catalog_before = stateless_public_catalog_snapshot(&arms_server);
 
-    // Outcome::Cancelled -> typed RequestCancelled JSON-RPC error.
-    let cancelled_inbound =
-        InboundRequestContext::new(Cx::for_testing(), 91, InboundRequestTransport::Memory);
-    let cancelled = arms_server
-        .dispatch_stateless(
-            &cancelled_inbound,
-            &stateless_tool_call("returns_cancelled", 91_i64),
-        )
-        .expect("a cancelled handler outcome still answers a request carrying an id");
-    assert_eq!(
-        cancelled.error.as_ref().map(|error| error.code.clone()),
-        Some(McpErrorCode::RequestCancelled.into()),
-        "Outcome::Cancelled must convert to a typed RequestCancelled error"
-    );
-    assert!(
-        cancelled.result.is_none(),
-        "a cancelled handler must not also produce a result payload"
-    );
+        let response = server
+            .dispatch_stateless(&inbound, &request)
+            .await
+            .expect("handler request with an id must receive a response");
 
-    // Outcome::Panicked -> sanitized InternalError with the payload withheld.
-    let panicked_inbound =
-        InboundRequestContext::new(Cx::for_testing(), 92, InboundRequestTransport::Memory);
-    let panicked = arms_server
-        .dispatch_stateless(
-            &panicked_inbound,
-            &stateless_tool_call("returns_panicked", 92_i64),
-        )
-        .expect("a panicked handler outcome still answers a request carrying an id");
-    assert_eq!(
-        panicked.error.as_ref().map(|error| error.code.clone()),
-        Some(McpErrorCode::InternalError.into()),
-        "Outcome::Panicked must convert to a typed InternalError"
-    );
-    assert_eq!(
-        panicked.error.as_ref().map(|error| error.message.as_str()),
-        Some(SANITIZED_PANIC_MESSAGE),
-        "the panic conversion must substitute the sanitized message"
-    );
-    let panicked_wire = serde_json::to_string(&panicked).expect("response must serialize");
-    assert!(
-        !panicked_wire.contains(OUTCOME_PANIC_SECRET),
-        "the panic payload reached the peer: {panicked_wire}"
-    );
+        assert!(response.error.is_none());
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "a handler error must convert to CallToolResult rather than a JSON-RPC failure"
+        );
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/content/0/text"))
+                .and_then(serde_json::Value::as_str),
+            Some("caller input was declined")
+        );
+        assert_eq!(
+            response.id, request.id,
+            "the converted handler error still echoes the request id"
+        );
 
-    // A handler that actually unwinds takes a different production path --
-    // catch_extension_unwind around the poll in run_handler_in_request -- and
-    // must land on the same sanitized error without killing the process.
-    let unwind_inbound =
-        InboundRequestContext::new(Cx::for_testing(), 93, InboundRequestTransport::Memory);
-    let unwound = arms_server
-        .dispatch_stateless(&unwind_inbound, &stateless_tool_call("unwinds", 93_i64))
-        .expect("a real handler unwind still answers a request carrying an id");
-    assert_eq!(
-        unwound.error.as_ref().map(|error| error.code.clone()),
-        Some(McpErrorCode::InternalError.into()),
-        "a real handler unwind must be caught and converted, not propagated"
-    );
-    let unwound_wire = serde_json::to_string(&unwound).expect("response must serialize");
-    assert!(
-        !unwound_wire.contains(OUTCOME_PANIC_SECRET),
-        "the panic message reached the peer: {unwound_wire}"
-    );
+        // The other handler outcome must convert to a visibly different public
+        // shape on the same immutable server: a success carries content and no
+        // `isError` flag at all. Without this arm the isError assertion above
+        // would also pass against an implementation that flagged every result.
+        let success_inbound =
+            InboundRequestContext::new(caller_cx(), 77, InboundRequestTransport::Memory);
+        let success_request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "greet",
+                "arguments": {"name": "stateless client"},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            })),
+            77_i64,
+        );
+        let success = server
+            .dispatch_stateless(&success_inbound, &success_request)
+            .await
+            .expect("a successful handler request with an id must receive a response");
+        assert!(
+            success.error.is_none(),
+            "a successful handler is not a JSON-RPC failure"
+        );
+        assert_eq!(
+            stateless_tool_text(&success).as_deref(),
+            Some("Hello, stateless client!")
+        );
+        assert_eq!(
+            success
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError")),
+            None,
+            "a successful handler result must not carry an isError flag"
+        );
+        assert_eq!(success.id, success_request.id);
 
-    // REAL cancellation, as opposed to a handler that returns the Cancelled
-    // variant. `run_handler_in_request` tests
-    // `request_cx_cancellation_is_visible(request_cx)` before the handler
-    // future is ever polled (crates/fastmcp-server/src/router.rs:2037) and
-    // again after it resolves (:2072), so a genuinely cancelled request context
-    // is intercepted UPSTREAM of the outcome match.
-    //
-    // This is a one-variable contrast against the panic arm immediately above:
-    // same server, same tool, same request shape, and the only difference is
-    // that this request's context is already cancelled. If cancellation were
-    // not intercepted upstream, the handler would run and this would come back
-    // InternalError exactly as `returns_panicked` just did. Getting
-    // RequestCancelled instead is what proves the precedence.
-    let cancelled_cx = Cx::for_testing();
-    cancelled_cx.cancel_with(CancelKind::User, None);
-    let precancelled_inbound =
-        InboundRequestContext::new(cancelled_cx, 95, InboundRequestTransport::Memory);
-    let precancelled = arms_server
-        .dispatch_stateless(
-            &precancelled_inbound,
-            &stateless_tool_call("returns_panicked", 95_i64),
-        )
-        .expect("a cancelled request carrying an id still receives a response");
-    assert_eq!(
-        precancelled.error.as_ref().map(|error| error.code.clone()),
-        Some(McpErrorCode::RequestCancelled.into()),
-        "real cancellation must be intercepted upstream of the handler rather than \
+        // The four-valued Outcome has two arms left, and they must NOT convert the
+        // way Outcome::Err did above. A handler-returned McpError became an isError
+        // *result*; cancellation and panic are framework-terminal and have to
+        // become typed JSON-RPC *errors* instead. Without these the B slice only
+        // ever proved one of four arms.
+        let arms_server = Server::new("stateless-handler-outcome-arms", "1.0.0")
+            .tool(Greet)
+            .tool(OutcomeArmTool {
+                name: "returns_cancelled",
+                arm: OutcomeArm::ReturnsCancelled,
+            })
+            .tool(OutcomeArmTool {
+                name: "returns_panicked",
+                arm: OutcomeArm::ReturnsPanicked,
+            })
+            .tool(OutcomeArmTool {
+                name: "unwinds",
+                arm: OutcomeArm::Unwinds,
+            })
+            .build();
+
+        // ServerBuilder::tool only logs a registration failure, so confirm the
+        // three handlers are really published. Otherwise a rejected schema would
+        // silently turn every assertion below into MethodNotFound.
+        let arm_names: Vec<String> = arms_server
+            .tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        for required in ["returns_cancelled", "returns_panicked", "unwinds"] {
+            assert!(
+                arm_names.iter().any(|name| name == required),
+                "outcome-arm handler {required} was not registered: {arm_names:?}"
+            );
+        }
+        let arms_catalog_before = stateless_public_catalog_snapshot(&arms_server);
+
+        // Outcome::Cancelled -> typed RequestCancelled JSON-RPC error.
+        let cancelled_inbound =
+            InboundRequestContext::new(caller_cx(), 91, InboundRequestTransport::Memory);
+        let cancelled = arms_server
+            .dispatch_stateless(
+                &cancelled_inbound,
+                &stateless_tool_call("returns_cancelled", 91_i64),
+            )
+            .await
+            .expect("a cancelled handler outcome still answers a request carrying an id");
+        assert_eq!(
+            cancelled.error.as_ref().map(|error| error.code.clone()),
+            Some(McpErrorCode::RequestCancelled.into()),
+            "Outcome::Cancelled must convert to a typed RequestCancelled error"
+        );
+        assert!(
+            cancelled.result.is_none(),
+            "a cancelled handler must not also produce a result payload"
+        );
+
+        // Outcome::Panicked -> sanitized InternalError with the payload withheld.
+        let panicked_inbound =
+            InboundRequestContext::new(caller_cx(), 92, InboundRequestTransport::Memory);
+        let panicked = arms_server
+            .dispatch_stateless(
+                &panicked_inbound,
+                &stateless_tool_call("returns_panicked", 92_i64),
+            )
+            .await
+            .expect("a panicked handler outcome still answers a request carrying an id");
+        assert_eq!(
+            panicked.error.as_ref().map(|error| error.code.clone()),
+            Some(McpErrorCode::InternalError.into()),
+            "Outcome::Panicked must convert to a typed InternalError"
+        );
+        assert_eq!(
+            panicked.error.as_ref().map(|error| error.message.as_str()),
+            Some(SANITIZED_PANIC_MESSAGE),
+            "the panic conversion must substitute the sanitized message"
+        );
+        let panicked_wire = serde_json::to_string(&panicked).expect("response must serialize");
+        assert!(
+            !panicked_wire.contains(OUTCOME_PANIC_SECRET),
+            "the panic payload reached the peer: {panicked_wire}"
+        );
+
+        // A handler that actually unwinds takes a different production path --
+        // catch_extension_unwind around the poll in run_handler_in_request -- and
+        // must land on the same sanitized error without killing the process.
+        let unwind_inbound =
+            InboundRequestContext::new(caller_cx(), 93, InboundRequestTransport::Memory);
+        let unwound = arms_server
+            .dispatch_stateless(&unwind_inbound, &stateless_tool_call("unwinds", 93_i64))
+            .await
+            .expect("a real handler unwind still answers a request carrying an id");
+        assert_eq!(
+            unwound.error.as_ref().map(|error| error.code.clone()),
+            Some(McpErrorCode::InternalError.into()),
+            "a real handler unwind must be caught and converted, not propagated"
+        );
+        let unwound_wire = serde_json::to_string(&unwound).expect("response must serialize");
+        assert!(
+            !unwound_wire.contains(OUTCOME_PANIC_SECRET),
+            "the panic message reached the peer: {unwound_wire}"
+        );
+
+        // REAL cancellation, as opposed to a handler that returns the Cancelled
+        // variant. `run_handler_in_request` tests
+        // `request_cx_cancellation_is_visible(request_cx)` before the handler
+        // future is ever polled (crates/fastmcp-server/src/router.rs:2037) and
+        // again after it resolves (:2072), so a genuinely cancelled request context
+        // is intercepted UPSTREAM of the outcome match.
+        //
+        // This is a one-variable contrast against the panic arm immediately above:
+        // same server, same tool, same request shape, and the only difference is
+        // that this request's context is already cancelled. If cancellation were
+        // not intercepted upstream, the handler would run and this would come back
+        // InternalError exactly as `returns_panicked` just did. Getting
+        // RequestCancelled instead is what proves the precedence.
+        let cancelled_cx = Cx::for_testing();
+        cancelled_cx.cancel_with(CancelKind::User, None);
+        let precancelled_inbound =
+            InboundRequestContext::new(cancelled_cx, 95, InboundRequestTransport::Memory);
+        let precancelled = arms_server
+            .dispatch_stateless(
+                &precancelled_inbound,
+                &stateless_tool_call("returns_panicked", 95_i64),
+            )
+            .await
+            .expect("a cancelled request carrying an id still receives a response");
+        assert_eq!(
+            precancelled.error.as_ref().map(|error| error.code.clone()),
+            Some(McpErrorCode::RequestCancelled.into()),
+            "real cancellation must be intercepted upstream of the handler rather than \
          converted from whatever outcome the handler would have produced"
-    );
-    assert!(
-        precancelled.result.is_none(),
-        "a cancelled request must not also carry a result payload"
-    );
+        );
+        assert!(
+            precancelled.result.is_none(),
+            "a cancelled request must not also carry a result payload"
+        );
 
-    // None of the three framework-terminal arms may disturb the catalog, and
-    // the server must still serve a normal request afterwards -- a caught
-    // unwind that poisoned the router would show up here.
-    assert_eq!(
-        stateless_public_catalog_snapshot(&arms_server),
-        arms_catalog_before,
-        "a framework-terminal handler outcome changed the published catalog"
-    );
-    let survivor_inbound =
-        InboundRequestContext::new(Cx::for_testing(), 94, InboundRequestTransport::Memory);
-    let survivor_request = JsonRpcRequest::new(
-        "tools/call",
-        Some(serde_json::json!({
-            "name": "greet",
-            "arguments": {"name": "after the panic"},
-            "_meta": {
-                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                "io.modelcontextprotocol/clientCapabilities": {},
-            },
-        })),
-        94_i64,
-    );
-    let survivor = arms_server
-        .dispatch_stateless(&survivor_inbound, &survivor_request)
-        .expect("the server still answers after a caught handler unwind");
-    assert!(survivor.error.is_none());
-    assert_eq!(
-        stateless_tool_text(&survivor).as_deref(),
-        Some("Hello, after the panic!"),
-        "a caught handler unwind left the server unable to serve"
-    );
+        // None of the three framework-terminal arms may disturb the catalog, and
+        // the server must still serve a normal request afterwards -- a caught
+        // unwind that poisoned the router would show up here.
+        assert_eq!(
+            stateless_public_catalog_snapshot(&arms_server),
+            arms_catalog_before,
+            "a framework-terminal handler outcome changed the published catalog"
+        );
+        let survivor_inbound =
+            InboundRequestContext::new(caller_cx(), 94, InboundRequestTransport::Memory);
+        let survivor_request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "greet",
+                "arguments": {"name": "after the panic"},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            })),
+            94_i64,
+        );
+        let survivor = arms_server
+            .dispatch_stateless(&survivor_inbound, &survivor_request)
+            .await
+            .expect("the server still answers after a caught handler unwind");
+        assert!(survivor.error.is_none());
+        assert_eq!(
+            stateless_tool_text(&survivor).as_deref(),
+            Some("Hello, after the panic!"),
+            "a caught handler unwind left the server unable to serve"
+        );
+    });
 }
 
 #[test]
 fn srv_01_b_planted_negative() {
-    let server = Server::new("stateless-handler-refusal", "1.0.0")
-        .tool(DeclinedTool)
-        .tool(LeakProbe)
-        .build();
-    let inbound =
-        InboundRequestContext::new(Cx::for_testing(), 74, InboundRequestTransport::Memory);
-    let baseline = JsonRpcRequest::new(
-        "tools/call",
-        Some(serde_json::json!({
-            "name": "declined",
-            "arguments": {},
-            "_meta": {
-                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                "io.modelcontextprotocol/clientCapabilities": {},
-            },
-        })),
-        74_i64,
-    );
-    let mut planted = baseline.clone();
-    planted
-        .params
-        .as_mut()
-        .and_then(|params| params.as_object_mut())
-        .expect("tools/call test parameters must be an object")
-        .insert("name".to_string(), serde_json::json!("missing-handler"));
-
-    // The handler name is the sole planted dimension. The method, request
-    // identity, and argument object remain the accepted baseline values.
-    assert_eq!(baseline.method, planted.method);
-    assert_eq!(baseline.jsonrpc, planted.jsonrpc);
-    assert_eq!(baseline.id, planted.id);
-    assert_eq!(
-        baseline
-            .params
-            .as_ref()
-            .and_then(|params| params.get("name"))
-            .and_then(serde_json::Value::as_str),
-        Some("declined")
-    );
-    assert_eq!(
+    on_caller_runtime(async {
+        let server = Server::new("stateless-handler-refusal", "1.0.0")
+            .tool(DeclinedTool)
+            .tool(LeakProbe)
+            .build();
+        let inbound = InboundRequestContext::new(caller_cx(), 74, InboundRequestTransport::Memory);
+        let baseline = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "declined",
+                "arguments": {},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            })),
+            74_i64,
+        );
+        let mut planted = baseline.clone();
         planted
             .params
-            .as_ref()
-            .and_then(|params| params.get("name"))
-            .and_then(serde_json::Value::as_str),
-        Some("missing-handler")
-    );
-    assert_eq!(
-        baseline
-            .params
-            .as_ref()
-            .and_then(|params| params.get("arguments")),
-        planted
-            .params
-            .as_ref()
-            .and_then(|params| params.get("arguments"))
-    );
-    let planted_input_before =
-        serde_json::to_vec(&planted).expect("planted request must serialize");
-    let catalog_before = stateless_public_catalog_snapshot(&server);
+            .as_mut()
+            .and_then(|params| params.as_object_mut())
+            .expect("tools/call test parameters must be an object")
+            .insert("name".to_string(), serde_json::json!("missing-handler"));
 
-    let baseline_response = server
-        .dispatch_stateless(&inbound, &baseline)
-        .expect("accepted handler baseline must receive a response");
-    assert!(baseline_response.error.is_none());
-    assert_eq!(
-        baseline_response
-            .result
-            .as_ref()
-            .and_then(|result| result.get("isError"))
-            .and_then(serde_json::Value::as_bool),
-        Some(true)
-    );
+        // The handler name is the sole planted dimension. The method, request
+        // identity, and argument object remain the accepted baseline values.
+        assert_eq!(baseline.method, planted.method);
+        assert_eq!(baseline.jsonrpc, planted.jsonrpc);
+        assert_eq!(baseline.id, planted.id);
+        assert_eq!(
+            baseline
+                .params
+                .as_ref()
+                .and_then(|params| params.get("name"))
+                .and_then(serde_json::Value::as_str),
+            Some("declined")
+        );
+        assert_eq!(
+            planted
+                .params
+                .as_ref()
+                .and_then(|params| params.get("name"))
+                .and_then(serde_json::Value::as_str),
+            Some("missing-handler")
+        );
+        assert_eq!(
+            baseline
+                .params
+                .as_ref()
+                .and_then(|params| params.get("arguments")),
+            planted
+                .params
+                .as_ref()
+                .and_then(|params| params.get("arguments"))
+        );
+        let planted_input_before =
+            serde_json::to_vec(&planted).expect("planted request must serialize");
+        let catalog_before = stateless_public_catalog_snapshot(&server);
 
-    let planted_response = server
-        .dispatch_stateless(&inbound, &planted)
-        .expect("planted handler request with an id must receive a response");
-    assert_eq!(
-        planted_response
-            .error
-            .as_ref()
-            .map(|error| error.code.clone()),
-        Some(McpErrorCode::InvalidParams.into())
-    );
-    assert_eq!(
-        serde_json::to_vec(&planted).expect("planted request remains serializable"),
-        planted_input_before,
-        "typed handler refusal changed caller input"
-    );
-    assert_eq!(
-        stateless_public_catalog_snapshot(&server),
-        catalog_before,
-        "typed handler refusal changed the public catalog"
-    );
+        let baseline_response = server
+            .dispatch_stateless(&inbound, &baseline)
+            .await
+            .expect("accepted handler baseline must receive a response");
+        assert!(baseline_response.error.is_none());
+        assert_eq!(
+            baseline_response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
 
-    // Third named mutable state field: the request state a handler can reach.
-    // A following accepted dispatch must still start from empty state, so the
-    // refused invocation left nothing behind for the next handler.
-    let after_inbound =
-        InboundRequestContext::new(Cx::for_testing(), 78, InboundRequestTransport::Memory);
-    let after = server
-        .dispatch_stateless(&after_inbound, &stateless_tool_call("leak_probe", 78_i64))
-        .expect("a later accepted dispatch receives a response");
-    assert_eq!(
-        stateless_tool_text(&after).as_deref(),
-        Some("observed=0 recorded=1 stored=true disabled=true"),
-        "the typed handler refusal left observable request state behind"
-    );
+        let planted_response = server
+            .dispatch_stateless(&inbound, &planted)
+            .await
+            .expect("planted handler request with an id must receive a response");
+        assert_eq!(
+            planted_response
+                .error
+                .as_ref()
+                .map(|error| error.code.clone()),
+            Some(McpErrorCode::InvalidParams.into())
+        );
+        assert_eq!(
+            serde_json::to_vec(&planted).expect("planted request remains serializable"),
+            planted_input_before,
+            "typed handler refusal changed caller input"
+        );
+        assert_eq!(
+            stateless_public_catalog_snapshot(&server),
+            catalog_before,
+            "typed handler refusal changed the public catalog"
+        );
+
+        // Third named mutable state field: the request state a handler can reach.
+        // A following accepted dispatch must still start from empty state, so the
+        // refused invocation left nothing behind for the next handler.
+        let after_inbound =
+            InboundRequestContext::new(caller_cx(), 78, InboundRequestTransport::Memory);
+        let after = server
+            .dispatch_stateless(&after_inbound, &stateless_tool_call("leak_probe", 78_i64))
+            .await
+            .expect("a later accepted dispatch receives a response");
+        assert_eq!(
+            stateless_tool_text(&after).as_deref(),
+            Some("observed=0 recorded=1 stored=true disabled=true"),
+            "the typed handler refusal left observable request state behind"
+        );
+    });
 }
 
 #[test]
 fn srv_01_i_positive() {
-    let server = Server::new("stateless-integration-runtime", "1.0.0")
-        .tool(Greet)
-        .build();
-    let inbound =
-        InboundRequestContext::new(Cx::for_testing(), 75, InboundRequestTransport::Memory);
-    let request = JsonRpcRequest::new(
-        "tools/call",
-        Some(serde_json::json!({
-            "name": "greet",
-            "arguments": {"name": "FastMCP"},
-            "_meta": {
-                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                "io.modelcontextprotocol/clientCapabilities": {},
-            },
-        })),
-        75_i64,
-    );
+    on_caller_runtime(async {
+        let server = Server::new("stateless-integration-runtime", "1.0.0")
+            .tool(Greet)
+            .build();
+        let inbound = InboundRequestContext::new(caller_cx(), 75, InboundRequestTransport::Memory);
+        let request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "greet",
+                "arguments": {"name": "FastMCP"},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            })),
+            75_i64,
+        );
 
-    let response = server
-        .dispatch_stateless(&inbound, &request)
-        .expect("stateless integration dispatch with id must receive response");
+        let response = server
+            .dispatch_stateless(&inbound, &request)
+            .await
+            .expect("stateless integration dispatch with id must receive response");
 
-    assert!(response.error.is_none());
-    assert_eq!(
-        response
-            .result
-            .as_ref()
-            .and_then(|result| result.pointer("/content/0/text"))
-            .and_then(serde_json::Value::as_str),
-        Some("Hello, FastMCP!")
-    );
-    assert_eq!(response.id, request.id);
+        assert!(response.error.is_none());
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/content/0/text"))
+                .and_then(serde_json::Value::as_str),
+            Some("Hello, FastMCP!")
+        );
+        assert_eq!(response.id, request.id);
+    });
 
     // The integration claim is the join itself: a server composed through the
     // public builder and driven by the shipped runtime transport (the A
@@ -1218,8 +1256,6 @@ fn srv_01_i_planted_negative() {
         .tool(Greet)
         .tool(LeakProbe)
         .build();
-    let inbound =
-        InboundRequestContext::new(Cx::for_testing(), 76, InboundRequestTransport::Memory);
     let baseline = JsonRpcRequest::new(
         "tools/call",
         Some(serde_json::json!({
@@ -1247,10 +1283,14 @@ fn srv_01_i_planted_negative() {
         serde_json::to_vec(&planted).expect("planted request must serialize");
     let catalog_before = stateless_public_catalog_snapshot(&server);
 
-    let baseline_response = server
-        .dispatch_stateless(&inbound, &baseline)
-        .expect("baseline request receives response");
-    assert!(baseline_response.error.is_none());
+    on_caller_runtime(async {
+        let inbound = InboundRequestContext::new(caller_cx(), 76, InboundRequestTransport::Memory);
+        let baseline_response = server
+            .dispatch_stateless(&inbound, &baseline)
+            .await
+            .expect("baseline request receives response");
+        assert!(baseline_response.error.is_none());
+    });
 
     let (transport, probe) = RuntimeTransport::single_request(planted.clone());
     let error = Server::new("stateless-integration-refusal-rt", "1.0.0")
@@ -1282,16 +1322,19 @@ fn srv_01_i_planted_negative() {
     // Third named mutable state field: the request state reachable from a
     // handler. After the refused run, a later accepted dispatch on the
     // retained server must still start from empty state.
-    let after_inbound =
-        InboundRequestContext::new(Cx::for_testing(), 80, InboundRequestTransport::Memory);
-    let after = server
-        .dispatch_stateless(&after_inbound, &stateless_tool_call("leak_probe", 80_i64))
-        .expect("a later accepted dispatch receives a response");
-    assert_eq!(
-        stateless_tool_text(&after).as_deref(),
-        Some("observed=0 recorded=1 stored=true disabled=true"),
-        "the typed refusal left observable request state behind"
-    );
+    on_caller_runtime(async {
+        let after_inbound =
+            InboundRequestContext::new(caller_cx(), 80, InboundRequestTransport::Memory);
+        let after = server
+            .dispatch_stateless(&after_inbound, &stateless_tool_call("leak_probe", 80_i64))
+            .await
+            .expect("a later accepted dispatch receives a response");
+        assert_eq!(
+            stateless_tool_text(&after).as_deref(),
+            Some("observed=0 recorded=1 stored=true disabled=true"),
+            "the typed refusal left observable request state behind"
+        );
+    });
 }
 
 #[cfg(feature = "tasks")]

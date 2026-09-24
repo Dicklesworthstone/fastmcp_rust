@@ -285,545 +285,581 @@ fn public_catalog_snapshot(server: &Server) -> Vec<u8> {
     .expect("public catalog snapshot must serialize")
 }
 
+/// Runs a test body on a caller-owned runtime, so dispatch awaits on its Cx.
+fn on_caller_runtime(body: impl Future<Output = ()>) {
+    asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("the caller runtime builds")
+        .block_on(body);
+}
+
+fn caller_cx() -> Cx {
+    Cx::current().expect("the caller runtime installs its Cx")
+}
+
 #[test]
 fn srv_02_b_positive() {
-    let server = Server::new("discoverable-server", "1.0.0")
-        .instructions("")
-        .tool(Discoverable)
-        .build();
-    let stdio = InboundRequestContext::new(Cx::for_testing(), 401, InboundRequestTransport::Stdio);
-    let discover = JsonRpcRequest::new(
-        SERVER_DISCOVER_METHOD,
-        Some(json!({
-            "_meta": {
-                FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
-                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
-            },
-        })),
-        401_i64,
-    );
-
-    let first_response = server
-        .dispatch_with_protocol_policy(ProtocolPolicy::ModernOnly, &stdio, &discover)
-        .expect("first discovery request has an id");
-    let first_result = first_response
-        .result
-        .as_ref()
-        .expect("first discovery request succeeds");
-
-    assert_eq!(
-        first_result["supportedVersions"],
-        json!([MODERN_PROTOCOL_VERSION])
-    );
-    assert_eq!(
-        first_result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
-        json!("discoverable-server")
-    );
-    assert_eq!(first_result["instructions"], json!(""));
-    assert_eq!(first_result["ttlMs"], json!(60_000));
-    assert_eq!(first_result["cacheScope"], json!("private"));
-    assert!(first_result["capabilities"].get("tools").is_some());
-    assert!(first_result["capabilities"].get("logging").is_none());
-    assert!(first_result["capabilities"].get("completions").is_none());
-    assert!(first_result["capabilities"].get("resources").is_none());
-    assert!(first_result["capabilities"].get("prompts").is_none());
-    assert!(first_result["capabilities"].get("subscriptions").is_none());
-    assert!(first_result.get("extensions").is_none());
-
-    // "Capabilities exactly match enabled behavior" and "discovery reflects
-    // runtime policy, not compile-time possibility" are claims about AGREEMENT
-    // between two independent derivations from registration: the behavior
-    // registry that builds `capabilities` (router.rs server_discovery_behavior_registry,
-    // consulted in exactly one production place to author the advertisement)
-    // and the dispatch table, which never reads that registry. Asserting the
-    // advertisement alone, as the checks above do, cannot fail interestingly —
-    // it restates the derivation instead of testing it.
-    //
-    // This is the load-bearing proof: two servers from the same binary with
-    // the same name and the same instructions, differing ONLY in whether a
-    // tool was registered. A hard-coded or compile-time-derived capability set
-    // advertises identically for both and fails here.
-    let toolless = Server::new("discoverable-server", "1.0.0")
-        .instructions("")
-        .build();
-    let toolless_inbound =
-        InboundRequestContext::new(Cx::for_testing(), 407, InboundRequestTransport::Stdio);
-    let toolless_discover = JsonRpcRequest::new(
-        SERVER_DISCOVER_METHOD,
-        Some(json!({
-            "_meta": {
-                FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
-                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
-            },
-        })),
-        407_i64,
-    );
-    let toolless_result = toolless
-        .dispatch_with_protocol_policy(
-            ProtocolPolicy::ModernOnly,
-            &toolless_inbound,
-            &toolless_discover,
-        )
-        .expect("tool-less discovery request has an id")
-        .result
-        .expect("tool-less discovery succeeds");
-    assert!(
-        toolless_result["capabilities"].get("tools").is_none(),
-        "an unregistered behavior must be absent from the advertisement, not \
-         encoded as a placeholder: {}",
-        toolless_result["capabilities"]
-    );
-    assert_ne!(
-        toolless_result["capabilities"], first_result["capabilities"],
-        "the advertised capabilities did not follow runtime registration"
-    );
-
-    // Corroborating direction: advertised => dispatchable. The registry admits
-    // a tool only when it carries a final registration, while dispatch reads
-    // the catalog, so the two can disagree. The server that advertised `tools`
-    // must actually serve tools/list with that exact tool, and the one that did
-    // not advertise it must not serve it either.
-    // `u32` so the one request identity converts losslessly to both the
-    // sanitized ingress `u64` and the JSON-RPC `i64` without a fallible cast.
-    let listed_tool_names = |server: &Server, id: u32| -> Vec<String> {
-        let inbound = InboundRequestContext::new(
-            Cx::for_testing(),
-            u64::from(id),
-            InboundRequestTransport::Stdio,
-        );
-        let request = JsonRpcRequest::new(
-            "tools/list",
+    on_caller_runtime(async {
+        let server = Server::new("discoverable-server", "1.0.0")
+            .instructions("")
+            .tool(Discoverable)
+            .build();
+        let stdio = InboundRequestContext::new(caller_cx(), 401, InboundRequestTransport::Stdio);
+        let discover = JsonRpcRequest::new(
+            SERVER_DISCOVER_METHOD,
             Some(json!({
                 "_meta": {
                     FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
                     FINAL_CLIENT_CAPABILITIES_META_KEY: {},
                 },
             })),
-            i64::from(id),
+            401_i64,
         );
-        let response = server
-            .dispatch_with_protocol_policy(ProtocolPolicy::ModernOnly, &inbound, &request)
-            .expect("tools/list request has an id");
-        assert!(
-            response.error.is_none(),
-            "discovery advertised tools but tools/list refused: {:?}",
-            response.error
-        );
-        response
+
+        let first_response = server
+            .dispatch_with_protocol_policy(ProtocolPolicy::ModernOnly, &stdio, &discover)
+            .await
+            .expect("first discovery request has an id");
+        let first_result = first_response
             .result
             .as_ref()
-            .and_then(|result| result.get("tools"))
+            .expect("first discovery request succeeds");
+
+        assert_eq!(
+            first_result["supportedVersions"],
+            json!([MODERN_PROTOCOL_VERSION])
+        );
+        assert_eq!(
+            first_result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            json!("discoverable-server")
+        );
+        assert_eq!(first_result["instructions"], json!(""));
+        assert_eq!(first_result["ttlMs"], json!(60_000));
+        assert_eq!(first_result["cacheScope"], json!("private"));
+        assert!(first_result["capabilities"].get("tools").is_some());
+        assert!(first_result["capabilities"].get("logging").is_none());
+        assert!(first_result["capabilities"].get("completions").is_none());
+        assert!(first_result["capabilities"].get("resources").is_none());
+        assert!(first_result["capabilities"].get("prompts").is_none());
+        assert!(first_result["capabilities"].get("subscriptions").is_none());
+        assert!(first_result.get("extensions").is_none());
+
+        // "Capabilities exactly match enabled behavior" and "discovery reflects
+        // runtime policy, not compile-time possibility" are claims about AGREEMENT
+        // between two independent derivations from registration: the behavior
+        // registry that builds `capabilities` (router.rs server_discovery_behavior_registry,
+        // consulted in exactly one production place to author the advertisement)
+        // and the dispatch table, which never reads that registry. Asserting the
+        // advertisement alone, as the checks above do, cannot fail interestingly —
+        // it restates the derivation instead of testing it.
+        //
+        // This is the load-bearing proof: two servers from the same binary with
+        // the same name and the same instructions, differing ONLY in whether a
+        // tool was registered. A hard-coded or compile-time-derived capability set
+        // advertises identically for both and fails here.
+        let toolless = Server::new("discoverable-server", "1.0.0")
+            .instructions("")
+            .build();
+        let toolless_inbound =
+            InboundRequestContext::new(caller_cx(), 407, InboundRequestTransport::Stdio);
+        let toolless_discover = JsonRpcRequest::new(
+            SERVER_DISCOVER_METHOD,
+            Some(json!({
+                "_meta": {
+                    FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                },
+            })),
+            407_i64,
+        );
+        let toolless_result = toolless
+            .dispatch_with_protocol_policy(
+                ProtocolPolicy::ModernOnly,
+                &toolless_inbound,
+                &toolless_discover,
+            )
+            .await
+            .expect("tool-less discovery request has an id")
+            .result
+            .expect("tool-less discovery succeeds");
+        assert!(
+            toolless_result["capabilities"].get("tools").is_none(),
+            "an unregistered behavior must be absent from the advertisement, not \
+         encoded as a placeholder: {}",
+            toolless_result["capabilities"]
+        );
+        assert_ne!(
+            toolless_result["capabilities"], first_result["capabilities"],
+            "the advertised capabilities did not follow runtime registration"
+        );
+
+        // Corroborating direction: advertised => dispatchable. The registry admits
+        // a tool only when it carries a final registration, while dispatch reads
+        // the catalog, so the two can disagree. The server that advertised `tools`
+        // must actually serve tools/list with that exact tool, and the one that did
+        // not advertise it must not serve it either.
+        // `u32` so the one request identity converts losslessly to both the
+        // sanitized ingress `u64` and the JSON-RPC `i64` without a fallible cast.
+        let listed_tool_names = async |server: &Server, id: u32| -> Vec<String> {
+            let inbound = InboundRequestContext::new(
+                caller_cx(),
+                u64::from(id),
+                InboundRequestTransport::Stdio,
+            );
+            let request = JsonRpcRequest::new(
+                "tools/list",
+                Some(json!({
+                    "_meta": {
+                        FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
+                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                    },
+                })),
+                i64::from(id),
+            );
+            let response = server
+                .dispatch_with_protocol_policy(ProtocolPolicy::ModernOnly, &inbound, &request)
+                .await
+                .expect("tools/list request has an id");
+            assert!(
+                response.error.is_none(),
+                "discovery advertised tools but tools/list refused: {:?}",
+                response.error
+            );
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("tools"))
+                .and_then(serde_json::Value::as_array)
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .filter_map(|tool| tool.get("name"))
+                        .filter_map(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let advertised_names = listed_tool_names(&server, 408).await;
+        assert!(
+            advertised_names.iter().any(|name| name == "discoverable"),
+            "discovery advertised tools but tools/list omitted the registered tool: \
+         {advertised_names:?}"
+        );
+        let unadvertised_names = listed_tool_names(&toolless, 409).await;
+        assert!(
+            !unadvertised_names.iter().any(|name| name == "discoverable"),
+            "a server that never advertised tools dispatched one anyway: \
+         {unadvertised_names:?}"
+        );
+
+        // FULL CAPABILITY-TO-BEHAVIOR MATRIX. The tools axis above established the
+        // principle; the plan's acceptance names completions and prompts
+        // explicitly, and each is a SEPARATE independent derivation inside
+        // server_discovery_behavior_registry, so proving one says nothing about the
+        // others.
+        //
+        // This belongs at the PUBLIC surface specifically. The router's own
+        // cfg(test) suite already asserts "discovery advertises completion only
+        // after the handler is installed" (crates/fastmcp-server/src/router.rs:17437,
+        // inside the cfg(test) region that begins at :9153). Under PL-3 a cfg(test)
+        // assertion cannot prove shipped behavior, which is exactly why the same
+        // property is re-established here through the public builder and the public
+        // discovery surface.
+        //
+        // `first_result` above is the baseline: the SAME name, the SAME instructions
+        // and the SAME registered tool. Only the prompt and completion handler are
+        // added, so each axis below varies alone against it.
+        let matrixed = Server::new("discoverable-server", "1.0.0")
+            .instructions("")
+            .tool(Discoverable)
+            .prompt(MatrixPrompt)
+            .completion_handler(MatrixCompletions)
+            .build();
+
+        // ServerBuilder only logs a rejected handler, so confirm registration
+        // really happened. Otherwise every assertion below passes vacuously.
+        let registered_prompts: Vec<String> = matrixed
+            .prompts()
+            .into_iter()
+            .map(|prompt| prompt.name)
+            .collect();
+        assert!(
+            registered_prompts
+                .iter()
+                .any(|name| name == "matrix_prompt"),
+            "the matrix prompt was not registered: {registered_prompts:?}"
+        );
+
+        let matrix_inbound =
+            InboundRequestContext::new(caller_cx(), 410, InboundRequestTransport::Stdio);
+        let matrix_discover = JsonRpcRequest::new(
+            SERVER_DISCOVER_METHOD,
+            Some(json!({
+                "_meta": {
+                    FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                },
+            })),
+            410_i64,
+        );
+        let matrix_result = matrixed
+            .dispatch_with_protocol_policy(
+                ProtocolPolicy::ModernOnly,
+                &matrix_inbound,
+                &matrix_discover,
+            )
+            .await
+            .expect("matrix discovery request has an id")
+            .result
+            .expect("matrix discovery succeeds");
+        let matrix_capabilities = &matrix_result["capabilities"];
+
+        // Prompts axis. Registering a prompt must both add the parent capability
+        // and its exact listChanged sub-capability, and the tool-only baseline must
+        // still omit it entirely rather than carry a false placeholder.
+        assert_eq!(
+            matrix_capabilities["prompts"]["listChanged"],
+            json!(true),
+            "a registered prompt must advertise its exact listChanged sub-capability"
+        );
+        assert!(
+            first_result["capabilities"].get("prompts").is_none(),
+            "the tool-only baseline must omit prompts entirely: {}",
+            first_result["capabilities"]
+        );
+
+        // Completions axis, same contrast against the same baseline.
+        assert!(
+            matrix_capabilities.get("completions").is_some(),
+            "installing a completion handler must advertise completions: {matrix_capabilities}"
+        );
+        assert!(
+            first_result["capabilities"].get("completions").is_none(),
+            "the baseline without a completion handler must omit completions"
+        );
+
+        // Advertised implies dispatchable, prompts edge: the advertisement above
+        // claimed prompts, so prompts/list must actually serve that exact prompt.
+        let prompts_inbound =
+            InboundRequestContext::new(caller_cx(), 411, InboundRequestTransport::Stdio);
+        let prompts_request = JsonRpcRequest::new(
+            "prompts/list",
+            Some(json!({
+                "_meta": {
+                    FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                },
+            })),
+            411_i64,
+        );
+        let prompts_response = matrixed
+            .dispatch_with_protocol_policy(
+                ProtocolPolicy::ModernOnly,
+                &prompts_inbound,
+                &prompts_request,
+            )
+            .await
+            .expect("prompts/list request has an id");
+        assert!(
+            prompts_response.error.is_none(),
+            "discovery advertised prompts but prompts/list refused: {:?}",
+            prompts_response.error
+        );
+        let listed_prompts: Vec<String> = prompts_response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("prompts"))
             .and_then(serde_json::Value::as_array)
-            .map(|tools| {
-                tools
+            .map(|prompts| {
+                prompts
                     .iter()
-                    .filter_map(|tool| tool.get("name"))
+                    .filter_map(|prompt| prompt.get("name"))
                     .filter_map(serde_json::Value::as_str)
                     .map(ToOwned::to_owned)
                     .collect()
             })
-            .unwrap_or_default()
-    };
-    let advertised_names = listed_tool_names(&server, 408);
-    assert!(
-        advertised_names.iter().any(|name| name == "discoverable"),
-        "discovery advertised tools but tools/list omitted the registered tool: \
-         {advertised_names:?}"
-    );
-    let unadvertised_names = listed_tool_names(&toolless, 409);
-    assert!(
-        !unadvertised_names.iter().any(|name| name == "discoverable"),
-        "a server that never advertised tools dispatched one anyway: \
-         {unadvertised_names:?}"
-    );
-
-    // FULL CAPABILITY-TO-BEHAVIOR MATRIX. The tools axis above established the
-    // principle; the plan's acceptance names completions and prompts
-    // explicitly, and each is a SEPARATE independent derivation inside
-    // server_discovery_behavior_registry, so proving one says nothing about the
-    // others.
-    //
-    // This belongs at the PUBLIC surface specifically. The router's own
-    // cfg(test) suite already asserts "discovery advertises completion only
-    // after the handler is installed" (crates/fastmcp-server/src/router.rs:17437,
-    // inside the cfg(test) region that begins at :9153). Under PL-3 a cfg(test)
-    // assertion cannot prove shipped behavior, which is exactly why the same
-    // property is re-established here through the public builder and the public
-    // discovery surface.
-    //
-    // `first_result` above is the baseline: the SAME name, the SAME instructions
-    // and the SAME registered tool. Only the prompt and completion handler are
-    // added, so each axis below varies alone against it.
-    let matrixed = Server::new("discoverable-server", "1.0.0")
-        .instructions("")
-        .tool(Discoverable)
-        .prompt(MatrixPrompt)
-        .completion_handler(MatrixCompletions)
-        .build();
-
-    // ServerBuilder only logs a rejected handler, so confirm registration
-    // really happened. Otherwise every assertion below passes vacuously.
-    let registered_prompts: Vec<String> = matrixed
-        .prompts()
-        .into_iter()
-        .map(|prompt| prompt.name)
-        .collect();
-    assert!(
-        registered_prompts
-            .iter()
-            .any(|name| name == "matrix_prompt"),
-        "the matrix prompt was not registered: {registered_prompts:?}"
-    );
-
-    let matrix_inbound =
-        InboundRequestContext::new(Cx::for_testing(), 410, InboundRequestTransport::Stdio);
-    let matrix_discover = JsonRpcRequest::new(
-        SERVER_DISCOVER_METHOD,
-        Some(json!({
-            "_meta": {
-                FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
-                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
-            },
-        })),
-        410_i64,
-    );
-    let matrix_result = matrixed
-        .dispatch_with_protocol_policy(
-            ProtocolPolicy::ModernOnly,
-            &matrix_inbound,
-            &matrix_discover,
-        )
-        .expect("matrix discovery request has an id")
-        .result
-        .expect("matrix discovery succeeds");
-    let matrix_capabilities = &matrix_result["capabilities"];
-
-    // Prompts axis. Registering a prompt must both add the parent capability
-    // and its exact listChanged sub-capability, and the tool-only baseline must
-    // still omit it entirely rather than carry a false placeholder.
-    assert_eq!(
-        matrix_capabilities["prompts"]["listChanged"],
-        json!(true),
-        "a registered prompt must advertise its exact listChanged sub-capability"
-    );
-    assert!(
-        first_result["capabilities"].get("prompts").is_none(),
-        "the tool-only baseline must omit prompts entirely: {}",
-        first_result["capabilities"]
-    );
-
-    // Completions axis, same contrast against the same baseline.
-    assert!(
-        matrix_capabilities.get("completions").is_some(),
-        "installing a completion handler must advertise completions: {matrix_capabilities}"
-    );
-    assert!(
-        first_result["capabilities"].get("completions").is_none(),
-        "the baseline without a completion handler must omit completions"
-    );
-
-    // Advertised implies dispatchable, prompts edge: the advertisement above
-    // claimed prompts, so prompts/list must actually serve that exact prompt.
-    let prompts_inbound =
-        InboundRequestContext::new(Cx::for_testing(), 411, InboundRequestTransport::Stdio);
-    let prompts_request = JsonRpcRequest::new(
-        "prompts/list",
-        Some(json!({
-            "_meta": {
-                FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
-                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
-            },
-        })),
-        411_i64,
-    );
-    let prompts_response = matrixed
-        .dispatch_with_protocol_policy(
-            ProtocolPolicy::ModernOnly,
-            &prompts_inbound,
-            &prompts_request,
-        )
-        .expect("prompts/list request has an id");
-    assert!(
-        prompts_response.error.is_none(),
-        "discovery advertised prompts but prompts/list refused: {:?}",
-        prompts_response.error
-    );
-    let listed_prompts: Vec<String> = prompts_response
-        .result
-        .as_ref()
-        .and_then(|result| result.get("prompts"))
-        .and_then(serde_json::Value::as_array)
-        .map(|prompts| {
-            prompts
-                .iter()
-                .filter_map(|prompt| prompt.get("name"))
-                .filter_map(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
-    assert!(
-        listed_prompts.iter().any(|name| name == "matrix_prompt"),
-        "discovery advertised prompts but prompts/list omitted the registered \
+            .unwrap_or_default();
+        assert!(
+            listed_prompts.iter().any(|name| name == "matrix_prompt"),
+            "discovery advertised prompts but prompts/list omitted the registered \
          prompt: {listed_prompts:?}"
-    );
+        );
 
-    // Completions is deliberately advertisement-variance only, with no dispatch
-    // cross-check. A valid completion/complete request needs a populated `ref`
-    // naming a prompt or resource template, and building one would make this
-    // assertion about completion argument shapes rather than about the
-    // capability matrix. Recording the limit rather than implying coverage.
+        // Completions is deliberately advertisement-variance only, with no dispatch
+        // cross-check. A valid completion/complete request needs a populated `ref`
+        // naming a prompt or resource template, and building one would make this
+        // assertion about completion argument shapes rather than about the
+        // capability matrix. Recording the limit rather than implying coverage.
 
-    let instructionless = Server::new("discoverable-server", "1.0.0")
-        .tool(Discoverable)
-        .build();
-    let instructionless_wire = serde_json::to_value(
-        instructionless
-            .server_discovery()
-            .expect("instructionless discovery result is constructed"),
-    )
-    .expect("instructionless discovery result serializes");
-    assert!(instructionless_wire.get("instructions").is_none());
-    assert_eq!(
-        instructionless_wire["capabilities"], first_result["capabilities"],
-        "instructions cannot alter the advertised behavior registry"
-    );
+        let instructionless = Server::new("discoverable-server", "1.0.0")
+            .tool(Discoverable)
+            .build();
+        let instructionless_wire = serde_json::to_value(
+            instructionless
+                .server_discovery()
+                .expect("instructionless discovery result is constructed"),
+        )
+        .expect("instructionless discovery result serializes");
+        assert!(instructionless_wire.get("instructions").is_none());
+        assert_eq!(
+            instructionless_wire["capabilities"], first_result["capabilities"],
+            "instructions cannot alter the advertised behavior registry"
+        );
 
-    let oversized = Server::new("bounded-instructions", "1.0.0")
-        .instructions("x".repeat(MAX_SERVER_INSTRUCTIONS_BYTES + 1))
-        .build();
-    assert!(
-        oversized.server_discovery().is_err(),
-        "oversized local instructions are refused before discovery copies them"
-    );
+        let oversized = Server::new("bounded-instructions", "1.0.0")
+            .instructions("x".repeat(MAX_SERVER_INSTRUCTIONS_BYTES + 1))
+            .build();
+        assert!(
+            oversized.server_discovery().is_err(),
+            "oversized local instructions are refused before discovery copies them"
+        );
 
-    let auto = InboundRequestContext::new(Cx::for_testing(), 402, InboundRequestTransport::Http);
-    let auto_discover = JsonRpcRequest::new(
-        SERVER_DISCOVER_METHOD,
-        Some(json!({
-            "_meta": {
-                FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
-                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
-            },
-        })),
-        402_i64,
-    );
-    let auto_response = server
-        .dispatch_with_protocol_policy(ProtocolPolicy::Auto, &auto, &auto_discover)
-        .expect("Auto-composed discovery request has an id");
-    assert_eq!(
-        auto_response
-            .result
-            .as_ref()
-            .and_then(|result| result.get("supportedVersions")),
-        Some(&json!([MODERN_PROTOCOL_VERSION]))
-    );
+        let auto = InboundRequestContext::new(caller_cx(), 402, InboundRequestTransport::Http);
+        let auto_discover = JsonRpcRequest::new(
+            SERVER_DISCOVER_METHOD,
+            Some(json!({
+                "_meta": {
+                    FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                },
+            })),
+            402_i64,
+        );
+        let auto_response = server
+            .dispatch_with_protocol_policy(ProtocolPolicy::Auto, &auto, &auto_discover)
+            .await
+            .expect("Auto-composed discovery request has an id");
+        assert_eq!(
+            auto_response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("supportedVersions")),
+            Some(&json!([MODERN_PROTOCOL_VERSION]))
+        );
 
-    let initialize = JsonRpcRequest::new("initialize", None, 403_i64);
-    let stdio_initialize =
-        InboundRequestContext::new(Cx::for_testing(), 403, InboundRequestTransport::Stdio);
-    let http_initialize =
-        InboundRequestContext::new(Cx::for_testing(), 403, InboundRequestTransport::Http);
-    let stdio_error = server
-        .dispatch_with_protocol_policy(ProtocolPolicy::ModernOnly, &stdio_initialize, &initialize)
-        .and_then(|response| response.error)
-        .expect("ModernOnly stdio initialize is rejected");
-    let http_response = server.dispatch_http_with_protocol_policy(
-        ProtocolPolicy::ModernOnly,
-        &http_initialize,
-        &initialize,
-    );
-    assert_eq!(http_response.status, HttpStatus::BAD_REQUEST);
-    let http_error =
-        serde_json::from_slice::<fastmcp_protocol::JsonRpcResponse>(&http_response.body)
-            .expect("ModernOnly HTTP response is JSON-RPC")
-            .error
-            .expect("ModernOnly HTTP initialize is rejected");
-    assert_eq!(stdio_error.code.as_i32(), Some(-32601));
-    assert_eq!(
-        stdio_error.message,
-        "Initialization-based MCP is not enabled"
-    );
-    assert_eq!(stdio_error.data, Some(json!({"supported": ["2026-07-28"]})));
-    assert_eq!(http_error.code, stdio_error.code);
-    assert_eq!(http_error.message, stdio_error.message);
-    assert_eq!(http_error.data, stdio_error.data);
+        let initialize = JsonRpcRequest::new("initialize", None, 403_i64);
+        let stdio_initialize =
+            InboundRequestContext::new(caller_cx(), 403, InboundRequestTransport::Stdio);
+        let http_initialize =
+            InboundRequestContext::new(caller_cx(), 403, InboundRequestTransport::Http);
+        let stdio_error = server
+            .dispatch_with_protocol_policy(
+                ProtocolPolicy::ModernOnly,
+                &stdio_initialize,
+                &initialize,
+            )
+            .await
+            .and_then(|response| response.error)
+            .expect("ModernOnly stdio initialize is rejected");
+        let http_response = server
+            .dispatch_http_with_protocol_policy(
+                ProtocolPolicy::ModernOnly,
+                &http_initialize,
+                &initialize,
+            )
+            .await;
+        assert_eq!(http_response.status, HttpStatus::BAD_REQUEST);
+        let http_error =
+            serde_json::from_slice::<fastmcp_protocol::JsonRpcResponse>(&http_response.body)
+                .expect("ModernOnly HTTP response is JSON-RPC")
+                .error
+                .expect("ModernOnly HTTP initialize is rejected");
+        assert_eq!(stdio_error.code.as_i32(), Some(-32601));
+        assert_eq!(
+            stdio_error.message,
+            "Initialization-based MCP is not enabled"
+        );
+        assert_eq!(stdio_error.data, Some(json!({"supported": ["2026-07-28"]})));
+        assert_eq!(http_error.code, stdio_error.code);
+        assert_eq!(http_error.message, stdio_error.message);
+        assert_eq!(http_error.data, stdio_error.data);
+    });
 }
 
 #[test]
 fn srv_02_b_planted_negative() {
-    let server = Server::new("discover-negative", "1.0.0").build();
-    let inbound =
-        InboundRequestContext::new(Cx::for_testing(), 404, InboundRequestTransport::Memory);
-    let baseline = JsonRpcRequest::new(
-        SERVER_DISCOVER_METHOD,
-        Some(json!({
-            "_meta": {
-                FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
-                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
-            },
-        })),
-        404_i64,
-    );
-    let mut planted = baseline.clone();
-    planted.method = "initialize".to_owned();
+    on_caller_runtime(async {
+        let server = Server::new("discover-negative", "1.0.0").build();
+        let inbound = InboundRequestContext::new(caller_cx(), 404, InboundRequestTransport::Memory);
+        let baseline = JsonRpcRequest::new(
+            SERVER_DISCOVER_METHOD,
+            Some(json!({
+                "_meta": {
+                    FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                },
+            })),
+            404_i64,
+        );
+        let mut planted = baseline.clone();
+        planted.method = "initialize".to_owned();
 
-    assert_eq!(baseline.jsonrpc, planted.jsonrpc);
-    assert_eq!(baseline.id, planted.id);
-    assert_eq!(baseline.params, planted.params);
-    let input_before = serde_json::to_vec(&planted).expect("planted request must serialize");
-    let catalog_before = public_catalog_snapshot(&server);
+        assert_eq!(baseline.jsonrpc, planted.jsonrpc);
+        assert_eq!(baseline.id, planted.id);
+        assert_eq!(baseline.params, planted.params);
+        let input_before = serde_json::to_vec(&planted).expect("planted request must serialize");
+        let catalog_before = public_catalog_snapshot(&server);
 
-    let baseline_response = server
-        .dispatch_with_protocol_policy(ProtocolPolicy::ModernOnly, &inbound, &baseline)
-        .expect("baseline discovery request responds");
-    assert!(baseline_response.error.is_none());
+        let baseline_response = server
+            .dispatch_with_protocol_policy(ProtocolPolicy::ModernOnly, &inbound, &baseline)
+            .await
+            .expect("baseline discovery request responds");
+        assert!(baseline_response.error.is_none());
 
-    let planted_response = server
-        .dispatch_with_protocol_policy(ProtocolPolicy::ModernOnly, &inbound, &planted)
-        .expect("planted initialize request responds");
-    let planted_error = planted_response
-        .error
-        .expect("modern-marked initialize reaches the final method refusal boundary");
-    assert_eq!(planted_error.code.as_i32(), Some(-32601));
-    assert_eq!(planted_error.message, "Method not found");
-    assert_eq!(planted_error.data, None);
-    assert_eq!(
-        serde_json::to_vec(&planted).expect("planted request remains serializable"),
-        input_before,
-        "typed ModernOnly refusal changed caller input"
-    );
-    assert_eq!(
-        public_catalog_snapshot(&server),
-        catalog_before,
-        "typed ModernOnly refusal changed public server state"
-    );
+        let planted_response = server
+            .dispatch_with_protocol_policy(ProtocolPolicy::ModernOnly, &inbound, &planted)
+            .await
+            .expect("planted initialize request responds");
+        let planted_error = planted_response
+            .error
+            .expect("modern-marked initialize reaches the final method refusal boundary");
+        assert_eq!(planted_error.code.as_i32(), Some(-32601));
+        assert_eq!(planted_error.message, "Method not found");
+        assert_eq!(planted_error.data, None);
+        assert_eq!(
+            serde_json::to_vec(&planted).expect("planted request remains serializable"),
+            input_before,
+            "typed ModernOnly refusal changed caller input"
+        );
+        assert_eq!(
+            public_catalog_snapshot(&server),
+            catalog_before,
+            "typed ModernOnly refusal changed public server state"
+        );
+    });
 }
 
 #[test]
 fn srv_02_i_positive() {
-    let server = Server::new("discoverable-integration", "1.0.0")
-        .instructions("Integration instructions")
-        .tool(Discoverable)
-        .build();
-    let inbound =
-        InboundRequestContext::new(Cx::for_testing(), 405, InboundRequestTransport::Memory);
-    let discover = JsonRpcRequest::new(
-        SERVER_DISCOVER_METHOD,
-        Some(json!({
-            "_meta": {
-                FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
-                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
-            },
-        })),
-        405_i64,
-    );
+    on_caller_runtime(async {
+        let server = Server::new("discoverable-integration", "1.0.0")
+            .instructions("Integration instructions")
+            .tool(Discoverable)
+            .build();
+        let inbound = InboundRequestContext::new(caller_cx(), 405, InboundRequestTransport::Memory);
+        let discover = JsonRpcRequest::new(
+            SERVER_DISCOVER_METHOD,
+            Some(json!({
+                "_meta": {
+                    FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                },
+            })),
+            405_i64,
+        );
 
-    let response = server
-        .dispatch_with_protocol_policy(ProtocolPolicy::ModernOnly, &inbound, &discover)
-        .expect("modern discovery request receives response");
-    assert!(response.error.is_none());
-    let result = response.result.expect("discovery result is present");
-    assert_eq!(
-        result["supportedVersions"],
-        json!([MODERN_PROTOCOL_VERSION])
-    );
-    assert_eq!(result["instructions"], json!("Integration instructions"));
-    assert_eq!(
-        result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
-        json!("discoverable-integration")
-    );
-    assert!(result["capabilities"].get("tools").is_some());
+        let response = server
+            .dispatch_with_protocol_policy(ProtocolPolicy::ModernOnly, &inbound, &discover)
+            .await
+            .expect("modern discovery request receives response");
+        assert!(response.error.is_none());
+        let result = response.result.expect("discovery result is present");
+        assert_eq!(
+            result["supportedVersions"],
+            json!([MODERN_PROTOCOL_VERSION])
+        );
+        assert_eq!(result["instructions"], json!("Integration instructions"));
+        assert_eq!(
+            result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            json!("discoverable-integration")
+        );
+        assert!(result["capabilities"].get("tools").is_some());
 
-    // The integration claim is the join: B's server composition must emit
-    // exactly the typed contract A defines. Every assertion above stays inside
-    // serde_json and so cannot show the two slices agree — a server emitting a
-    // field A's type does not model, or omitting one A requires, would satisfy
-    // all of them. Decoding the live wire result with A's public type, and
-    // requiring the re-encode to reproduce the server's bytes exactly, is what
-    // actually binds the A contract to the B runtime.
-    let typed: ServerDiscoverResult = serde_json::from_value(result.clone())
-        .expect("the server's live discovery result must decode as the typed SRV-02 A contract");
-    assert_eq!(typed.result_type(), "complete");
-    assert_eq!(
-        typed
-            .supported_versions()
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        [MODERN_PROTOCOL_VERSION],
-        "the typed contract must carry the same final-only version list as the wire"
-    );
-    assert_eq!(
-        typed.peer_diagnostic(),
-        None,
-        "a locally authored discovery result must need no peer-compatibility diagnostic"
-    );
-    assert_eq!(
-        serde_json::to_value(&typed).expect("typed discovery result re-encodes"),
-        result,
-        "the typed SRV-02 A contract did not round-trip the server's own discovery bytes"
-    );
+        // The integration claim is the join: B's server composition must emit
+        // exactly the typed contract A defines. Every assertion above stays inside
+        // serde_json and so cannot show the two slices agree — a server emitting a
+        // field A's type does not model, or omitting one A requires, would satisfy
+        // all of them. Decoding the live wire result with A's public type, and
+        // requiring the re-encode to reproduce the server's bytes exactly, is what
+        // actually binds the A contract to the B runtime.
+        let typed: ServerDiscoverResult = serde_json::from_value(result.clone()).expect(
+            "the server's live discovery result must decode as the typed SRV-02 A contract",
+        );
+        assert_eq!(typed.result_type(), "complete");
+        assert_eq!(
+            typed
+                .supported_versions()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [MODERN_PROTOCOL_VERSION],
+            "the typed contract must carry the same final-only version list as the wire"
+        );
+        assert_eq!(
+            typed.peer_diagnostic(),
+            None,
+            "a locally authored discovery result must need no peer-compatibility diagnostic"
+        );
+        assert_eq!(
+            serde_json::to_value(&typed).expect("typed discovery result re-encodes"),
+            result,
+            "the typed SRV-02 A contract did not round-trip the server's own discovery bytes"
+        );
+    });
 }
 
 #[test]
 fn srv_02_i_planted_negative() {
-    let server = Server::new("discoverable-integration-refusal", "1.0.0")
-        .tool(Discoverable)
-        .build();
-    let inbound =
-        InboundRequestContext::new(Cx::for_testing(), 406, InboundRequestTransport::Memory);
-    let baseline = JsonRpcRequest::new(
-        SERVER_DISCOVER_METHOD,
-        Some(json!({
-            "_meta": {
-                FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
-                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
-            },
-        })),
-        406_i64,
-    );
-    let mut planted = baseline.clone();
-    planted
-        .params
-        .as_mut()
-        .and_then(|params| params.as_object_mut())
-        .and_then(|obj| obj.get_mut("_meta"))
-        .and_then(|meta| meta.as_object_mut())
-        .expect("modern metadata object")
-        .insert(
-            FINAL_PROTOCOL_VERSION_META_KEY.to_owned(),
-            json!("2025-11-25"),
+    on_caller_runtime(async {
+        let server = Server::new("discoverable-integration-refusal", "1.0.0")
+            .tool(Discoverable)
+            .build();
+        let inbound = InboundRequestContext::new(caller_cx(), 406, InboundRequestTransport::Memory);
+        let baseline = JsonRpcRequest::new(
+            SERVER_DISCOVER_METHOD,
+            Some(json!({
+                "_meta": {
+                    FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                },
+            })),
+            406_i64,
         );
+        let mut planted = baseline.clone();
+        planted
+            .params
+            .as_mut()
+            .and_then(|params| params.as_object_mut())
+            .and_then(|obj| obj.get_mut("_meta"))
+            .and_then(|meta| meta.as_object_mut())
+            .expect("modern metadata object")
+            .insert(
+                FINAL_PROTOCOL_VERSION_META_KEY.to_owned(),
+                json!("2025-11-25"),
+            );
 
-    assert_eq!(baseline.method, planted.method);
-    assert_eq!(baseline.jsonrpc, planted.jsonrpc);
-    assert_eq!(baseline.id, planted.id);
-    let input_before = serde_json::to_vec(&planted).expect("planted request must serialize");
-    let catalog_before = public_catalog_snapshot(&server);
+        assert_eq!(baseline.method, planted.method);
+        assert_eq!(baseline.jsonrpc, planted.jsonrpc);
+        assert_eq!(baseline.id, planted.id);
+        let input_before = serde_json::to_vec(&planted).expect("planted request must serialize");
+        let catalog_before = public_catalog_snapshot(&server);
 
-    let baseline_response = server
-        .dispatch_with_protocol_policy(ProtocolPolicy::ModernOnly, &inbound, &baseline)
-        .expect("baseline discovery request responds");
-    assert!(baseline_response.error.is_none());
+        let baseline_response = server
+            .dispatch_with_protocol_policy(ProtocolPolicy::ModernOnly, &inbound, &baseline)
+            .await
+            .expect("baseline discovery request responds");
+        assert!(baseline_response.error.is_none());
 
-    let planted_response = server
-        .dispatch_with_protocol_policy(ProtocolPolicy::ModernOnly, &inbound, &planted)
-        .expect("planted request receives response");
-    let planted_error = planted_response
-        .error
-        .expect("unsupported version 2025-11-25 must be refused at version boundary");
-    assert_eq!(planted_error.code.as_i32(), Some(-32600));
-    assert_eq!(
-        serde_json::to_vec(&planted).expect("planted request remains serializable"),
-        input_before,
-        "typed refusal changed caller input"
-    );
-    assert_eq!(
-        public_catalog_snapshot(&server),
-        catalog_before,
-        "typed refusal changed server state"
-    );
+        let planted_response = server
+            .dispatch_with_protocol_policy(ProtocolPolicy::ModernOnly, &inbound, &planted)
+            .await
+            .expect("planted request receives response");
+        let planted_error = planted_response
+            .error
+            .expect("unsupported version 2025-11-25 must be refused at version boundary");
+        assert_eq!(planted_error.code.as_i32(), Some(-32600));
+        assert_eq!(
+            serde_json::to_vec(&planted).expect("planted request remains serializable"),
+            input_before,
+            "typed refusal changed caller input"
+        );
+        assert_eq!(
+            public_catalog_snapshot(&server),
+            catalog_before,
+            "typed refusal changed server state"
+        );
+    });
 }
 
 // This integration target compiles `fastmcp-server` as an ordinary dependency.

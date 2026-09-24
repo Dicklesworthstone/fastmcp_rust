@@ -1238,9 +1238,17 @@ fn facade_final_tool_outcome_request(
     )
 }
 
+/// Runs a test body on a caller-owned runtime, so dispatch awaits on its Cx.
+fn on_caller_runtime(body: impl Future<Output = ()>) {
+    asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("the caller runtime builds")
+        .block_on(body);
+}
+
 fn facade_final_inbound(connection: &ModernConnection) -> InboundRequestContext {
     InboundRequestContext::with_modern_connection(
-        Cx::for_testing(),
+        Cx::current().expect("the caller runtime installs its Cx"),
         64,
         InboundRequestTransport::Memory,
         connection,
@@ -1356,193 +1364,210 @@ fn tool_final_outcome_variants_reach_the_final_outcome_hook() {
 
 #[test]
 fn facade_final_tool_outcome_encodes_input_required_through_modern_wire() {
-    let connection = ModernConnection::new();
-    let server = Server::new("facade-final-outcome", "1.0.0")
-        .tool(FinalToolOutcomeResult)
-        .build();
-    let response = server
-        .dispatch_stateless(
-            &facade_final_inbound(&connection),
-            &facade_final_tool_outcome_request(
-                "final_tool_outcome_result",
-                "input-required",
-                false,
-            ),
-        )
-        .expect("facade final tools/call returns an input-required wire response");
-    let result = response
-        .result
-        .expect("input-required final tools/call has a result");
+    on_caller_runtime(async {
+        let connection = ModernConnection::new();
+        let server = Server::new("facade-final-outcome", "1.0.0")
+            .tool(FinalToolOutcomeResult)
+            .build();
+        let response = server
+            .dispatch_stateless(
+                &facade_final_inbound(&connection),
+                &facade_final_tool_outcome_request(
+                    "final_tool_outcome_result",
+                    "input-required",
+                    false,
+                ),
+            )
+            .await
+            .expect("facade final tools/call returns an input-required wire response");
+        let result = response
+            .result
+            .expect("input-required final tools/call has a result");
 
-    assert!(response.error.is_none());
-    assert_eq!(result["resultType"], "input_required");
-    let request_state = result["requestState"]
-        .as_str()
-        .expect("the framework emits an opaque MRTR continuation state");
-    assert!(!request_state.is_empty());
-    assert_ne!(
-        request_state, "retry-state",
-        "handler-controlled state must not cross the framework MRTR boundary"
-    );
+        assert!(response.error.is_none());
+        assert_eq!(result["resultType"], "input_required");
+        let request_state = result["requestState"]
+            .as_str()
+            .expect("the framework emits an opaque MRTR continuation state");
+        assert!(!request_state.is_empty());
+        assert_ne!(
+            request_state, "retry-state",
+            "handler-controlled state must not cross the framework MRTR boundary"
+        );
+    });
 }
 
 #[cfg(feature = "tasks")]
 #[test]
 fn facade_final_tool_outcome_creates_task_through_modern_wire() {
-    let connection = ModernConnection::new();
-    let notifications = std::sync::Arc::new(AtomicUsize::new(0));
-    let emitted_notifications = std::sync::Arc::clone(&notifications);
-    let runtime = FinalTaskRuntime::in_memory(
-        FinalTaskRuntimeConfig::new(60_000, None).expect("valid final task policy"),
-        std::sync::Arc::new(move |_| {
-            emitted_notifications.fetch_add(1, Ordering::SeqCst);
-        }),
-    );
-    let service_runner = runtime
-        .install_task_service(1, std::sync::Arc::new(NoopFinalTaskSupervisor))
-        .expect("the facade installs an application-owned task service");
-    let service_cx = Cx::for_testing();
-    let mut running_service = Box::pin(service_runner.run(&service_cx));
-    let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
-    assert!(matches!(
-        Future::poll(running_service.as_mut(), &mut task_cx),
-        Poll::Pending
-    ));
-    let server = Server::new("facade-final-task", "1.0.0")
-        .tool(FinalToolOutcomeDirect)
-        .final_tasks(runtime.clone())
-        .expect("final Tasks install through the facade builder")
-        .build();
-    let response = server
-        .dispatch_stateless(
-            &facade_final_inbound(&connection),
-            &facade_final_tool_outcome_request("final_tool_outcome_direct", "create-task", true),
+    on_caller_runtime(async {
+        let connection = ModernConnection::new();
+        let notifications = std::sync::Arc::new(AtomicUsize::new(0));
+        let emitted_notifications = std::sync::Arc::clone(&notifications);
+        let runtime = FinalTaskRuntime::in_memory(
+            FinalTaskRuntimeConfig::new(60_000, None).expect("valid final task policy"),
+            std::sync::Arc::new(move |_| {
+                emitted_notifications.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let service_runner = runtime
+            .install_task_service(1, std::sync::Arc::new(NoopFinalTaskSupervisor))
+            .expect("the facade installs an application-owned task service");
+        let service_cx = Cx::for_testing();
+        let mut running_service = Box::pin(service_runner.run(&service_cx));
+        let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            Future::poll(running_service.as_mut(), &mut task_cx),
+            Poll::Pending
+        ));
+        let server = Server::new("facade-final-task", "1.0.0")
+            .tool(FinalToolOutcomeDirect)
+            .final_tasks(runtime.clone())
+            .expect("final Tasks install through the facade builder")
+            .build();
+        let response = server
+            .dispatch_stateless(
+                &facade_final_inbound(&connection),
+                &facade_final_tool_outcome_request(
+                    "final_tool_outcome_direct",
+                    "create-task",
+                    true,
+                ),
+            )
+            .await
+            .expect("task-capable facade final tools/call returns a wire response");
+        assert!(response.error.is_none());
+        let result = response.result.expect("task final tools/call has a result");
+        assert_eq!(result["resultType"], "task");
+        assert_eq!(result["status"], "working");
+        assert_eq!(result["statusMessage"], "queued");
+        let task_id = fastmcp_rust::FinalTaskId::parse(
+            result["taskId"]
+                .as_str()
+                .expect("task creation wire result includes its public task identifier"),
         )
-        .expect("task-capable facade final tools/call returns a wire response");
-    assert!(response.error.is_none());
-    let result = response.result.expect("task final tools/call has a result");
-    assert_eq!(result["resultType"], "task");
-    assert_eq!(result["status"], "working");
-    assert_eq!(result["statusMessage"], "queued");
-    let task_id = fastmcp_rust::FinalTaskId::parse(
-        result["taskId"]
-            .as_str()
-            .expect("task creation wire result includes its public task identifier"),
-    )
-    .expect("task creation wire result has a valid public task identifier");
-    let retained = runtime
-        .get_task(&task_id)
-        .expect("the created task remains readable from the caller-owned runtime");
-    let mut durable_task = result.clone();
-    durable_task
-        .as_object_mut()
-        .expect("task result is an object")
-        .remove("resultType");
-    assert_eq!(
-        serde_json::to_value(retained.task).expect("created task serializes"),
-        durable_task,
-        "the public task result is the exact durable caller-owned task state"
-    );
-    assert_eq!(
-        notifications.load(Ordering::SeqCst),
-        1,
-        "creation advertises one durable task state transition"
-    );
+        .expect("task creation wire result has a valid public task identifier");
+        let retained = runtime
+            .get_task(&task_id)
+            .expect("the created task remains readable from the caller-owned runtime");
+        let mut durable_task = result.clone();
+        durable_task
+            .as_object_mut()
+            .expect("task result is an object")
+            .remove("resultType");
+        assert_eq!(
+            serde_json::to_value(retained.task).expect("created task serializes"),
+            durable_task,
+            "the public task result is the exact durable caller-owned task state"
+        );
+        assert_eq!(
+            notifications.load(Ordering::SeqCst),
+            1,
+            "creation advertises one durable task state transition"
+        );
+    });
 }
 
 #[cfg(feature = "tasks")]
 #[test]
 fn facade_final_tool_outcome_rejects_declared_task_without_client_capability() {
-    let connection = ModernConnection::new();
-    let notifications = std::sync::Arc::new(AtomicUsize::new(0));
-    let emitted_notifications = std::sync::Arc::clone(&notifications);
-    let task_store = std::sync::Arc::new(InMemoryFinalTaskStore::default());
-    let runtime = FinalTaskRuntime::new(
-        task_store.clone(),
-        FinalTaskRuntimeConfig::new(60_000, None).expect("valid final task policy"),
-        std::sync::Arc::new(move |_| {
-            emitted_notifications.fetch_add(1, Ordering::SeqCst);
-        }),
-    );
-    let service_runner = runtime
-        .install_task_service(1, std::sync::Arc::new(NoopFinalTaskSupervisor))
-        .expect("the facade installs an application-owned task service");
-    let service_cx = Cx::for_testing();
-    let mut running_service = Box::pin(service_runner.run(&service_cx));
-    let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
-    assert!(matches!(
-        Future::poll(running_service.as_mut(), &mut task_cx),
-        Poll::Pending
-    ));
-    let retained_task = runtime
-        .create_task_with_work(
-            FinalTaskWorkDescriptor::new(json!({
-                "operation": "retained-state-for-capability-rejection"
-            }))
-            .expect("non-null retained task work descriptor"),
-            Some("retained before capability rejection".to_owned()),
-        )
-        .expect("the ready caller-owned runtime creates retained work")
-        .task;
-    let retained_task_id = retained_task.base().task_id.clone();
-    let state_before = serde_json::to_value(
-        runtime
-            .get_task(&retained_task_id)
-            .expect("read retained task before the capability rejection")
-            .task,
-    )
-    .expect("retained task serializes before the capability rejection");
-    let task_count_before = task_store.task_count();
-    let notifications_before = notifications.load(Ordering::SeqCst);
-    let server = Server::new("facade-final-task", "1.0.0")
-        .tool(FinalToolOutcomeDirect)
-        .final_tasks(runtime.clone())
-        .expect("final Tasks install through the facade builder")
-        .build();
-    let response = server
-        .dispatch_stateless(
-            &facade_final_inbound(&connection),
-            &facade_final_tool_outcome_request("final_tool_outcome_direct", "create-task", false),
-        )
-        .expect("missing task capability returns a JSON-RPC error response");
-
-    assert!(response.result.is_none());
-    let error = response
-        .error
-        .expect("missing task capability returns the final capability error");
-    assert_eq!(
-        error.code,
-        MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE.into()
-    );
-    assert_eq!(
-        error.data,
-        Some(json!({
-            "requiredCapabilities": {
-                "extensions": { "io.modelcontextprotocol/tasks": {} },
-            },
-        }))
-    );
-    assert_eq!(
-        serde_json::to_value(
+    on_caller_runtime(async {
+        let connection = ModernConnection::new();
+        let notifications = std::sync::Arc::new(AtomicUsize::new(0));
+        let emitted_notifications = std::sync::Arc::clone(&notifications);
+        let task_store = std::sync::Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = FinalTaskRuntime::new(
+            task_store.clone(),
+            FinalTaskRuntimeConfig::new(60_000, None).expect("valid final task policy"),
+            std::sync::Arc::new(move |_| {
+                emitted_notifications.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let service_runner = runtime
+            .install_task_service(1, std::sync::Arc::new(NoopFinalTaskSupervisor))
+            .expect("the facade installs an application-owned task service");
+        let service_cx = Cx::for_testing();
+        let mut running_service = Box::pin(service_runner.run(&service_cx));
+        let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            Future::poll(running_service.as_mut(), &mut task_cx),
+            Poll::Pending
+        ));
+        let retained_task = runtime
+            .create_task_with_work(
+                FinalTaskWorkDescriptor::new(json!({
+                    "operation": "retained-state-for-capability-rejection"
+                }))
+                .expect("non-null retained task work descriptor"),
+                Some("retained before capability rejection".to_owned()),
+            )
+            .expect("the ready caller-owned runtime creates retained work")
+            .task;
+        let retained_task_id = retained_task.base().task_id.clone();
+        let state_before = serde_json::to_value(
             runtime
                 .get_task(&retained_task_id)
-                .expect("read retained task after the capability rejection")
+                .expect("read retained task before the capability rejection")
                 .task,
         )
-        .expect("retained task serializes after the capability rejection"),
-        state_before,
-        "removing only the client Tasks capability leaves durable task state unchanged"
-    );
-    assert_eq!(
-        task_store.task_count(),
-        task_count_before,
-        "removing only the client Tasks capability cannot add another durable task"
-    );
-    assert_eq!(
-        notifications.load(Ordering::SeqCst),
-        notifications_before,
-        "removing only the client Tasks capability emits no task transition"
-    );
+        .expect("retained task serializes before the capability rejection");
+        let task_count_before = task_store.task_count();
+        let notifications_before = notifications.load(Ordering::SeqCst);
+        let server = Server::new("facade-final-task", "1.0.0")
+            .tool(FinalToolOutcomeDirect)
+            .final_tasks(runtime.clone())
+            .expect("final Tasks install through the facade builder")
+            .build();
+        let response = server
+            .dispatch_stateless(
+                &facade_final_inbound(&connection),
+                &facade_final_tool_outcome_request(
+                    "final_tool_outcome_direct",
+                    "create-task",
+                    false,
+                ),
+            )
+            .await
+            .expect("missing task capability returns a JSON-RPC error response");
+
+        assert!(response.result.is_none());
+        let error = response
+            .error
+            .expect("missing task capability returns the final capability error");
+        assert_eq!(
+            error.code,
+            MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE.into()
+        );
+        assert_eq!(
+            error.data,
+            Some(json!({
+                "requiredCapabilities": {
+                    "extensions": { "io.modelcontextprotocol/tasks": {} },
+                },
+            }))
+        );
+        assert_eq!(
+            serde_json::to_value(
+                runtime
+                    .get_task(&retained_task_id)
+                    .expect("read retained task after the capability rejection")
+                    .task,
+            )
+            .expect("retained task serializes after the capability rejection"),
+            state_before,
+            "removing only the client Tasks capability leaves durable task state unchanged"
+        );
+        assert_eq!(
+            task_store.task_count(),
+            task_count_before,
+            "removing only the client Tasks capability cannot add another durable task"
+        );
+        assert_eq!(
+            notifications.load(Ordering::SeqCst),
+            notifications_before,
+            "removing only the client Tasks capability emits no task transition"
+        );
+    });
 }
 
 #[cfg(not(feature = "tasks"))]
@@ -2293,34 +2318,37 @@ fn resource_final_complete_results_keep_final_payloads() {
 
 #[test]
 fn async_macro_final_resource_outcome_reaches_public_final_resources_read() {
-    let connection = ModernConnection::new();
-    let server = Server::new("facade-final-resource-outcome", "1.0.0")
-        .resource(AsyncFinalResourceOutcomeResource)
-        .build();
-    let request = JsonRpcRequest::new(
-        "resources/read",
-        Some(json!({
-            "_meta": {
-                "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
-                "io.modelcontextprotocol/clientCapabilities": {},
-            },
-            "uri": "final://resource/async-outcome",
-        })),
-        64_i64,
-    );
-    let response = server
-        .dispatch_stateless(&facade_final_inbound(&connection), &request)
-        .expect("the public final resources/read route invokes the async macro outcome hook");
-    assert!(
-        response.error.is_none(),
-        "final resources/read returned an unexpected error: {:?}",
-        response.error
-    );
-    let result = response
-        .result
-        .expect("final resources/read returns its outcome as a result");
-    assert_eq!(result["resultType"], "complete");
-    assert_eq!(result["contents"][0]["text"], "async-outcome");
+    on_caller_runtime(async {
+        let connection = ModernConnection::new();
+        let server = Server::new("facade-final-resource-outcome", "1.0.0")
+            .resource(AsyncFinalResourceOutcomeResource)
+            .build();
+        let request = JsonRpcRequest::new(
+            "resources/read",
+            Some(json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "uri": "final://resource/async-outcome",
+            })),
+            64_i64,
+        );
+        let response = server
+            .dispatch_stateless(&facade_final_inbound(&connection), &request)
+            .await
+            .expect("the public final resources/read route invokes the async macro outcome hook");
+        assert!(
+            response.error.is_none(),
+            "final resources/read returned an unexpected error: {:?}",
+            response.error
+        );
+        let result = response
+            .result
+            .expect("final resources/read returns its outcome as a result");
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["contents"][0]["text"], "async-outcome");
+    });
 }
 
 // --- Resource default trait methods ---
@@ -3849,39 +3877,42 @@ fn describe_wire_enum(value: WireEnum) -> String {
 
 #[test]
 fn json_schema_external_enum_reaches_registered_modern_tool() {
-    let server = Server::new("enum-schema", "1.0.0")
-        .tool(DescribeWireEnum)
-        .build();
-    let connection = ModernConnection::new();
-    for value in [
-        json!("Idle"),
-        json!({"Pair": ["work", 3]}),
-        json!({"Record": {"count": 3}}),
-    ] {
-        let request = JsonRpcRequest::new(
-            "tools/call",
-            Some(json!({
-                "_meta": {
-                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
-                    "io.modelcontextprotocol/clientCapabilities": {},
-                },
-                "name": "describe_wire_enum",
-                "arguments": {"value": value},
-            })),
-            64_i64,
-        );
-        let response = server
-            .dispatch_stateless(&facade_final_inbound(&connection), &request)
-            .expect("registered enum tool produces a response");
-        assert!(response.error.is_none(), "{:?}", response.error);
-        let result = response.result.expect("enum tool produced a result");
-        assert_eq!(result["resultType"], "complete");
-        assert!(
-            result["content"][0]["text"]
-                .as_str()
-                .is_some_and(|text| !text.is_empty())
-        );
-    }
+    on_caller_runtime(async {
+        let server = Server::new("enum-schema", "1.0.0")
+            .tool(DescribeWireEnum)
+            .build();
+        let connection = ModernConnection::new();
+        for value in [
+            json!("Idle"),
+            json!({"Pair": ["work", 3]}),
+            json!({"Record": {"count": 3}}),
+        ] {
+            let request = JsonRpcRequest::new(
+                "tools/call",
+                Some(json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                    "name": "describe_wire_enum",
+                    "arguments": {"value": value},
+                })),
+                64_i64,
+            );
+            let response = server
+                .dispatch_stateless(&facade_final_inbound(&connection), &request)
+                .await
+                .expect("registered enum tool produces a response");
+            assert!(response.error.is_none(), "{:?}", response.error);
+            let result = response.result.expect("enum tool produced a result");
+            assert_eq!(result["resultType"], "complete");
+            assert!(
+                result["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty())
+            );
+        }
+    });
 }
 
 #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
@@ -4123,55 +4154,59 @@ fn json_schema_recursive_arguments_share_definitions_in_registered_modern_tool()
     );
     fastmcp_rust::schema::admit_final_schema(definition.input_schema)
         .expect("multiple recursive arguments form one standalone input schema");
-    let server = Server::new("recursive-schema", "1.0.0")
-        .tool(CompareRecursiveSchemaTrees)
-        .build();
-    let connection = ModernConnection::new();
-    let request = |arguments| {
-        JsonRpcRequest::new(
-            "tools/call",
-            Some(json!({
-                "_meta": {
-                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
-                    "io.modelcontextprotocol/clientCapabilities": {},
-                },
-                "name": "compare_recursive_schema_trees",
-                "arguments": arguments,
-            })),
-            64_i64,
-        )
-    };
-    let valid = json!({
-        "left": {"value": 1, "children": [{"value": 2, "children": []}]},
-        "right": {"value": 3, "children": [{"value": 4, "children": []}]}
+    on_caller_runtime(async {
+        let server = Server::new("recursive-schema", "1.0.0")
+            .tool(CompareRecursiveSchemaTrees)
+            .build();
+        let connection = ModernConnection::new();
+        let request = |arguments| {
+            JsonRpcRequest::new(
+                "tools/call",
+                Some(json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                    "name": "compare_recursive_schema_trees",
+                    "arguments": arguments,
+                })),
+                64_i64,
+            )
+        };
+        let valid = json!({
+            "left": {"value": 1, "children": [{"value": 2, "children": []}]},
+            "right": {"value": 3, "children": [{"value": 4, "children": []}]}
+        });
+        let before = RECURSIVE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let response = server
+            .dispatch_stateless(&facade_final_inbound(&connection), &request(valid.clone()))
+            .await
+            .expect("registered recursive input tool produces a response");
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.unwrap();
+        assert_eq!(result["resultType"], "complete");
+        assert_ne!(result["isError"], json!(true));
+        assert_eq!(result["content"][0]["text"], "1:3");
+        assert_eq!(
+            RECURSIVE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1
+        );
+        let mut invalid = valid;
+        invalid["right"]["children"][0]["value"] = json!("four");
+        let response = server
+            .dispatch_stateless(&facade_final_inbound(&connection), &request(invalid))
+            .await
+            .expect("nested invalid input produces a tool execution error");
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.unwrap();
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["isError"], json!(true));
+        assert_eq!(
+            RECURSIVE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1,
+            "recursive input validation must finish before the handler runs"
+        );
     });
-    let before = RECURSIVE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
-    let response = server
-        .dispatch_stateless(&facade_final_inbound(&connection), &request(valid.clone()))
-        .expect("registered recursive input tool produces a response");
-    assert!(response.error.is_none(), "{:?}", response.error);
-    let result = response.result.unwrap();
-    assert_eq!(result["resultType"], "complete");
-    assert_ne!(result["isError"], json!(true));
-    assert_eq!(result["content"][0]["text"], "1:3");
-    assert_eq!(
-        RECURSIVE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
-        before + 1
-    );
-    let mut invalid = valid;
-    invalid["right"]["children"][0]["value"] = json!("four");
-    let response = server
-        .dispatch_stateless(&facade_final_inbound(&connection), &request(invalid))
-        .expect("nested invalid input produces a tool execution error");
-    assert!(response.error.is_none(), "{:?}", response.error);
-    let result = response.result.unwrap();
-    assert_eq!(result["resultType"], "complete");
-    assert_eq!(result["isError"], json!(true));
-    assert_eq!(
-        RECURSIVE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
-        before + 1,
-        "recursive input validation must finish before the handler runs"
-    );
 }
 
 #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
@@ -4463,81 +4498,87 @@ fn describe_optional_schema(
 
 #[test]
 fn json_schema_optional_custom_types_reach_registered_modern_tool() {
-    let server = Server::new("optional-schema", "1.0.0")
-        .tool(DescribeOptionalSchema)
-        .build();
-    let connection = ModernConnection::new();
-    let request = |arguments| {
-        JsonRpcRequest::new(
-            "tools/call",
-            Some(json!({
-                "_meta": {
-                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
-                    "io.modelcontextprotocol/clientCapabilities": {},
-                },
-                "name": "describe_optional_schema",
-                "arguments": arguments,
-            })),
-            64_i64,
-        )
-    };
-    for arguments in [
-        json!({}),
-        json!({"unit": null, "mixed": null, "constant": null, "conjunction": null,
+    on_caller_runtime(async {
+        let server = Server::new("optional-schema", "1.0.0")
+            .tool(DescribeOptionalSchema)
+            .build();
+        let connection = ModernConnection::new();
+        let request = |arguments| {
+            JsonRpcRequest::new(
+                "tools/call",
+                Some(json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                    "name": "describe_optional_schema",
+                    "arguments": arguments,
+                })),
+                64_i64,
+            )
+        };
+        for arguments in [
+            json!({}),
+            json!({"unit": null, "mixed": null, "constant": null, "conjunction": null,
             "already_nullable": null}),
-        json!({"unit": "First", "mixed": {"Pair": ["work", 3]}, "constant": "Allowed",
+            json!({"unit": "First", "mixed": {"Pair": ["work", 3]}, "constant": "Allowed",
             "conjunction": "Allowed", "already_nullable": "Allowed"}),
-    ] {
-        let expected: OptionalSchemaArguments = serde_json::from_value(arguments.clone()).unwrap();
-        let before = OPTIONAL_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
-        let response = server
-            .dispatch_stateless(&facade_final_inbound(&connection), &request(arguments))
-            .expect("the registered optional tool returns a response");
-        assert!(response.error.is_none(), "{:?}", response.error);
-        let result = response
-            .result
-            .expect("tool returned its actual decoded arguments");
-        assert_eq!(result["resultType"], "complete");
-        assert_ne!(result["isError"], json!(true));
-        let actual: OptionalSchemaArguments = serde_json::from_str(
-            result["content"][0]["text"]
-                .as_str()
-                .expect("serialized handler arguments"),
-        )
-        .unwrap();
-        assert_eq!(actual, expected);
-        assert_eq!(
-            OPTIONAL_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
-            before + 1
-        );
-    }
-    for (valid, invalid) in optional_schema_argument_pairs() {
-        let positive = server
-            .dispatch_stateless(&facade_final_inbound(&connection), &request(valid))
-            .expect("the matched optional argument reaches the tool");
-        assert!(positive.error.is_none());
-        let result = positive
-            .result
-            .expect("the matched positive returns application content");
-        assert_eq!(result["resultType"], "complete");
-        assert_ne!(result["isError"], json!(true));
-        let before = OPTIONAL_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
-        let response = server
-            .dispatch_stateless(&facade_final_inbound(&connection), &request(invalid))
-            .expect("invalid optional values receive a protocol response");
-        assert!(
-            response.error.is_some()
-                || response
-                    .result
-                    .as_ref()
-                    .is_some_and(|result| result["isError"] == json!(true))
-        );
-        assert_eq!(
-            OPTIONAL_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
-            before,
-            "invalid non-null values must not reach application code"
-        );
-    }
+        ] {
+            let expected: OptionalSchemaArguments =
+                serde_json::from_value(arguments.clone()).unwrap();
+            let before = OPTIONAL_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+            let response = server
+                .dispatch_stateless(&facade_final_inbound(&connection), &request(arguments))
+                .await
+                .expect("the registered optional tool returns a response");
+            assert!(response.error.is_none(), "{:?}", response.error);
+            let result = response
+                .result
+                .expect("tool returned its actual decoded arguments");
+            assert_eq!(result["resultType"], "complete");
+            assert_ne!(result["isError"], json!(true));
+            let actual: OptionalSchemaArguments = serde_json::from_str(
+                result["content"][0]["text"]
+                    .as_str()
+                    .expect("serialized handler arguments"),
+            )
+            .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                OPTIONAL_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                before + 1
+            );
+        }
+        for (valid, invalid) in optional_schema_argument_pairs() {
+            let positive = server
+                .dispatch_stateless(&facade_final_inbound(&connection), &request(valid))
+                .await
+                .expect("the matched optional argument reaches the tool");
+            assert!(positive.error.is_none());
+            let result = positive
+                .result
+                .expect("the matched positive returns application content");
+            assert_eq!(result["resultType"], "complete");
+            assert_ne!(result["isError"], json!(true));
+            let before = OPTIONAL_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+            let response = server
+                .dispatch_stateless(&facade_final_inbound(&connection), &request(invalid))
+                .await
+                .expect("invalid optional values receive a protocol response");
+            assert!(
+                response.error.is_some()
+                    || response
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result["isError"] == json!(true))
+            );
+            assert_eq!(
+                OPTIONAL_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                before,
+                "invalid non-null values must not reach application code"
+            );
+        }
+    });
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -4838,57 +4879,61 @@ fn describe_serde_schema(value: SerdeWireArguments) -> McpResult<String> {
 
 #[test]
 fn json_schema_serde_names_and_defaults_reach_registered_modern_tool() {
-    let server = Server::new("serde-schema", "1.0.0")
-        .tool(DescribeSerdeSchema)
-        .build();
-    let connection = ModernConnection::new();
-    let request = |value| {
-        JsonRpcRequest::new(
-            "tools/call",
-            Some(json!({
-                "_meta": {
-                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
-                    "io.modelcontextprotocol/clientCapabilities": {},
-                },
-                "name": "describe_serde_schema",
-                "arguments": {"value": value},
-            })),
-            64_i64,
-        )
-    };
-    for (valid, invalid) in serde_schema_argument_pairs() {
-        let expected: SerdeWireArguments = serde_json::from_value(valid.clone()).unwrap();
-        let before = SERDE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
-        let response = server
-            .dispatch_stateless(&facade_final_inbound(&connection), &request(valid))
-            .unwrap();
-        assert!(response.error.is_none(), "{:?}", response.error);
-        let result = response.result.unwrap();
-        assert_eq!(result["resultType"], "complete");
-        assert_ne!(result["isError"], json!(true));
-        let actual: SerdeWireArguments =
-            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(actual, expected);
-        assert_eq!(
-            SERDE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
-            before + 1
-        );
-        let response = server
-            .dispatch_stateless(&facade_final_inbound(&connection), &request(invalid))
-            .unwrap();
-        assert!(
-            response.error.is_some()
-                || response
-                    .result
-                    .as_ref()
-                    .is_some_and(|result| result["isError"] == json!(true))
-        );
-        assert_eq!(
-            SERDE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
-            before + 1,
-            "invalid neighboring arguments do not invoke the handler"
-        );
-    }
+    on_caller_runtime(async {
+        let server = Server::new("serde-schema", "1.0.0")
+            .tool(DescribeSerdeSchema)
+            .build();
+        let connection = ModernConnection::new();
+        let request = |value| {
+            JsonRpcRequest::new(
+                "tools/call",
+                Some(json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                    "name": "describe_serde_schema",
+                    "arguments": {"value": value},
+                })),
+                64_i64,
+            )
+        };
+        for (valid, invalid) in serde_schema_argument_pairs() {
+            let expected: SerdeWireArguments = serde_json::from_value(valid.clone()).unwrap();
+            let before = SERDE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+            let response = server
+                .dispatch_stateless(&facade_final_inbound(&connection), &request(valid))
+                .await
+                .unwrap();
+            assert!(response.error.is_none(), "{:?}", response.error);
+            let result = response.result.unwrap();
+            assert_eq!(result["resultType"], "complete");
+            assert_ne!(result["isError"], json!(true));
+            let actual: SerdeWireArguments =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                SERDE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                before + 1
+            );
+            let response = server
+                .dispatch_stateless(&facade_final_inbound(&connection), &request(invalid))
+                .await
+                .unwrap();
+            assert!(
+                response.error.is_some()
+                    || response
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result["isError"] == json!(true))
+            );
+            assert_eq!(
+                SERDE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                before + 1,
+                "invalid neighboring arguments do not invoke the handler"
+            );
+        }
+    });
 }
 
 const SHAPED_SCHEMA_ARRAY_WIDTH: usize = 2;
@@ -5168,57 +5213,61 @@ fn describe_shaped_schema(value: ShapedSchemaArguments) -> McpResult<String> {
 
 #[test]
 fn json_schema_shaped_arguments_reach_registered_modern_tool() {
-    let server = Server::new("shaped-schema", "1.0.0")
-        .tool(DescribeShapedSchema)
-        .build();
-    let connection = ModernConnection::new();
-    let request = |value| {
-        JsonRpcRequest::new(
-            "tools/call",
-            Some(json!({
-                "_meta": {
-                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
-                    "io.modelcontextprotocol/clientCapabilities": {},
-                },
-                "name": "describe_shaped_schema",
-                "arguments": {"value": value},
-            })),
-            64_i64,
-        )
-    };
-    for (valid, invalid) in shaped_schema_argument_pairs() {
-        let expected: ShapedSchemaArguments = serde_json::from_value(valid.clone()).unwrap();
-        let before = SHAPED_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
-        let response = server
-            .dispatch_stateless(&facade_final_inbound(&connection), &request(valid))
-            .unwrap();
-        assert!(response.error.is_none(), "{:?}", response.error);
-        let result = response.result.unwrap();
-        assert_eq!(result["resultType"], "complete");
-        assert_ne!(result["isError"], json!(true));
-        let actual: ShapedSchemaArguments =
-            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(actual, expected);
-        assert_eq!(
-            SHAPED_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
-            before + 1
-        );
-        let response = server
-            .dispatch_stateless(&facade_final_inbound(&connection), &request(invalid))
-            .unwrap();
-        assert!(
-            response.error.is_some()
-                || response
-                    .result
-                    .as_ref()
-                    .is_some_and(|result| result["isError"] == json!(true))
-        );
-        assert_eq!(
-            SHAPED_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
-            before + 1,
-            "invalid shape or out-of-range integer must not reach the handler"
-        );
-    }
+    on_caller_runtime(async {
+        let server = Server::new("shaped-schema", "1.0.0")
+            .tool(DescribeShapedSchema)
+            .build();
+        let connection = ModernConnection::new();
+        let request = |value| {
+            JsonRpcRequest::new(
+                "tools/call",
+                Some(json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                    "name": "describe_shaped_schema",
+                    "arguments": {"value": value},
+                })),
+                64_i64,
+            )
+        };
+        for (valid, invalid) in shaped_schema_argument_pairs() {
+            let expected: ShapedSchemaArguments = serde_json::from_value(valid.clone()).unwrap();
+            let before = SHAPED_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+            let response = server
+                .dispatch_stateless(&facade_final_inbound(&connection), &request(valid))
+                .await
+                .unwrap();
+            assert!(response.error.is_none(), "{:?}", response.error);
+            let result = response.result.unwrap();
+            assert_eq!(result["resultType"], "complete");
+            assert_ne!(result["isError"], json!(true));
+            let actual: ShapedSchemaArguments =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                SHAPED_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                before + 1
+            );
+            let response = server
+                .dispatch_stateless(&facade_final_inbound(&connection), &request(invalid))
+                .await
+                .unwrap();
+            assert!(
+                response.error.is_some()
+                    || response
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result["isError"] == json!(true))
+            );
+            assert_eq!(
+                SHAPED_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                before + 1,
+                "invalid shape or out-of-range integer must not reach the handler"
+            );
+        }
+    });
 }
 
 // --- Struct with only description, no fields ---

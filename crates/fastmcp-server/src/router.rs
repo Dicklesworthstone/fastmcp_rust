@@ -34,10 +34,12 @@ use asupersync::types::Time;
 use asupersync::{Budget, Cx, Outcome};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+#[cfg(test)]
+use fastmcp_core::block_on;
 use fastmcp_core::logging::{debug, targets, trace};
 use fastmcp_core::{
     McpContext, McpError, McpErrorCode, McpOutcome, McpResult, PromptCaller, PromptGetResult,
-    PromptMessageItem, PromptMessageRole, SessionState, block_on, sha256_bounded,
+    PromptMessageItem, PromptMessageRole, SessionState, sha256_bounded,
 };
 use fastmcp_protocol::common_types::{
     AbsoluteUri, Annotations, ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
@@ -4098,21 +4100,18 @@ impl Router {
     /// complete-result contract. State-bearing lifecycle methods and exact
     /// 2024-11-05 wire results stay on the legacy adapter rather than
     /// acquiring accidental modern semantics.
-    pub(crate) fn dispatch_stateless(
+    pub(crate) async fn dispatch_stateless(
         &self,
         request_ctx: &McpContext,
         request: &JsonRpcRequest,
     ) -> McpResult<serde_json::Value> {
-        // The connection-oriented server adapter remains synchronous today.
-        // Keep its ordered compatibility semantics here; modern runtime entry
-        // points must use `dispatch_stateless_owned` below instead of sharing
-        // this blocking bridge.
         let continuation_cancellation = fastmcp_core::McpRequestCancellation::new();
         self.dispatch_stateless_with_continuation_cancellation(
             request_ctx,
             request,
             &continuation_cancellation,
         )
+        .await
     }
 
     /// Dispatches a modern request with the exact admitted `params` source.
@@ -4120,7 +4119,7 @@ impl Router {
     /// Callers that received an ingress raw-parameter sidecar must use this
     /// entry point so final MRTR retries retain ordered response entries and
     /// reject duplicate keys before registry admission.
-    pub(crate) fn dispatch_stateless_with_raw_params(
+    pub(crate) async fn dispatch_stateless_with_raw_params(
         &self,
         request_ctx: &McpContext,
         request: &JsonRpcRequest,
@@ -4133,9 +4132,10 @@ impl Router {
             raw_params,
             &continuation_cancellation,
         )
+        .await
     }
 
-    pub(crate) fn dispatch_stateless_with_continuation_cancellation(
+    pub(crate) async fn dispatch_stateless_with_continuation_cancellation(
         &self,
         request_ctx: &McpContext,
         request: &JsonRpcRequest,
@@ -4147,24 +4147,26 @@ impl Router {
             None,
             continuation_cancellation,
         )
+        .await
     }
 
     /// Dispatches with connection-owned continuation cancellation and the
     /// exact admitted parameter source retained by transport ingress.
-    pub(crate) fn dispatch_stateless_with_continuation_cancellation_and_raw_params(
+    pub(crate) async fn dispatch_stateless_with_continuation_cancellation_and_raw_params(
         &self,
         request_ctx: &McpContext,
         request: &JsonRpcRequest,
         raw_params: Option<&str>,
         continuation_cancellation: &fastmcp_core::McpRequestCancellation,
     ) -> McpResult<serde_json::Value> {
-        block_on(self.dispatch_stateless_in_request(
+        self.dispatch_stateless_in_request(
             request_ctx,
             request_ctx.cx(),
             request,
             raw_params,
             continuation_cancellation,
-        ))
+        )
+        .await
     }
 
     /// Dispatches one modern request in a request-owned structured child task.
@@ -12929,19 +12931,17 @@ mod router_tests {
             "called legacy-only-tool"
         );
 
-        let modern_catalog = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_list_request(None, None, None, 79_i64),
-            )
-            .expect("modern tools/list remains a valid empty catalog");
+        let modern_catalog = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_list_request(None, None, None, 79_i64),
+        ))
+        .expect("modern tools/list remains a valid empty catalog");
         assert_eq!(modern_catalog["tools"], serde_json::json!([]));
-        let modern_error = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request("legacy-only-tool", serde_json::json!({}), 80_i64),
-            )
-            .expect_err("modern dispatch cannot resolve an explicit legacy-only tool");
+        let modern_error = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request("legacy-only-tool", serde_json::json!({}), 80_i64),
+        ))
+        .expect_err("modern dispatch cannot resolve an explicit legacy-only tool");
         assert_eq!(modern_error.code, McpErrorCode::InvalidParams);
         assert_eq!(router.tools_count(), 1);
     }
@@ -12982,55 +12982,52 @@ mod router_tests {
         .expect("the exact legacy prompt route retains its explicit registration");
         assert_eq!(legacy_prompt.messages.len(), 0);
 
-        let modern_resources = router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    "resources/list",
-                    Some(serde_json::json!({
-                        "_meta": {
-                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                            "io.modelcontextprotocol/clientCapabilities": {},
-                        },
-                    })),
-                    182_i64,
-                ),
-            )
-            .expect("final discovery remains valid with only legacy resources");
+        let modern_resources = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                "resources/list",
+                Some(serde_json::json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                })),
+                182_i64,
+            ),
+        ))
+        .expect("final discovery remains valid with only legacy resources");
         assert_eq!(modern_resources["resources"], serde_json::json!([]));
-        let modern_templates = router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    "resources/templates/list",
-                    Some(serde_json::json!({
-                        "_meta": {
-                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                            "io.modelcontextprotocol/clientCapabilities": {},
-                        },
-                    })),
-                    183_i64,
-                ),
-            )
-            .expect("final template discovery remains valid with only legacy templates");
+        let modern_templates = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                "resources/templates/list",
+                Some(serde_json::json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                })),
+                183_i64,
+            ),
+        ))
+        .expect("final template discovery remains valid with only legacy templates");
         assert_eq!(modern_templates["resourceTemplates"], serde_json::json!([]));
 
-        let modern_prompt = router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    "prompts/get",
-                    Some(serde_json::json!({
-                        "_meta": {
-                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                            "io.modelcontextprotocol/clientCapabilities": {},
-                        },
-                        "name": "legacy-only-prompt",
-                    })),
-                    184_i64,
-                ),
-            )
-            .expect_err("changing only the dispatch era refuses the legacy-only prompt");
+        let modern_prompt = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                "prompts/get",
+                Some(serde_json::json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                    "name": "legacy-only-prompt",
+                })),
+                184_i64,
+            ),
+        ))
+        .expect_err("changing only the dispatch era refuses the legacy-only prompt");
         assert_eq!(modern_prompt.code, McpErrorCode::InvalidParams);
         assert!(
             !router
@@ -13078,12 +13075,11 @@ mod router_tests {
             let request_ctx = request_context(&cx, 81, Budget::INFINITE, &state);
             let legacy_before =
                 serde_json::to_value(router.tools()).expect("legacy catalog serializes");
-            let modern_before = router
-                .dispatch_stateless(
-                    &request_ctx,
-                    &final_tools_list_request(None, None, None, 81_i64),
-                )
-                .expect("modern catalog is available");
+            let modern_before = block_on(router.dispatch_stateless(
+                &request_ctx,
+                &final_tools_list_request(None, None, None, 81_i64),
+            ))
+            .expect("modern catalog is available");
 
             let registration = router.add_tool_with_behavior(
                 DuplicateInvariantTool {
@@ -13106,12 +13102,11 @@ mod router_tests {
                 legacy_before
             );
             assert_eq!(
-                router
-                    .dispatch_stateless(
-                        &request_ctx,
-                        &final_tools_list_request(None, None, None, 82_i64),
-                    )
-                    .expect("modern catalog remains available"),
+                block_on(router.dispatch_stateless(
+                    &request_ctx,
+                    &final_tools_list_request(None, None, None, 82_i64),
+                ))
+                .expect("modern catalog remains available"),
                 modern_before
             );
             assert_eq!(
@@ -13139,16 +13134,15 @@ mod router_tests {
                 serde_json::to_value(legacy).expect("legacy result serializes")["content"][0]["text"],
                 "original"
             );
-            let modern = router
-                .dispatch_stateless(
-                    &request_ctx,
-                    &final_tools_call_request(
-                        "duplicate-invariant-tool",
-                        serde_json::json!({}),
-                        83_i64,
-                    ),
-                )
-                .expect("modern dispatch retains the original");
+            let modern = block_on(router.dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "duplicate-invariant-tool",
+                    serde_json::json!({}),
+                    83_i64,
+                ),
+            ))
+            .expect("modern dispatch retains the original");
             assert_eq!(modern["content"][0]["text"], "original");
             assert_eq!(original_legacy_calls.load(Ordering::SeqCst), 1);
             assert_eq!(original_final_calls.load(Ordering::SeqCst), 1);
@@ -13199,12 +13193,11 @@ mod router_tests {
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 84, Budget::INFINITE, &state);
-        let modern_catalog = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_list_request(None, None, None, 84_i64),
-            )
-            .expect("modern replacement catalog is available");
+        let modern_catalog = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_list_request(None, None, None, 84_i64),
+        ))
+        .expect("modern replacement catalog is available");
         assert_eq!(
             modern_catalog["tools"][1]["inputSchema"]["properties"],
             serde_json::json!({"replacement_property": {"type": "boolean"}})
@@ -13230,16 +13223,15 @@ mod router_tests {
             serde_json::to_value(legacy).expect("legacy result serializes")["content"][0]["text"],
             "replacement"
         );
-        let modern = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request(
-                    "duplicate-invariant-tool",
-                    serde_json::json!({}),
-                    85_i64,
-                ),
-            )
-            .expect("modern dispatch uses replacement");
+        let modern = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request(
+                "duplicate-invariant-tool",
+                serde_json::json!({}),
+                85_i64,
+            ),
+        ))
+        .expect("modern dispatch uses replacement");
         assert_eq!(modern["content"][0]["text"], "replacement");
         assert_eq!(replacement_legacy_calls.load(Ordering::SeqCst), 1);
         assert_eq!(replacement_final_calls.load(Ordering::SeqCst), 1);
@@ -14202,19 +14194,18 @@ mod router_tests {
         let mut source = Router::new();
         source.add_resource(FinalTemplateResource);
 
-        let source_final_read = source
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    "resources/read",
-                    Some(serde_json::json!({
-                        "_meta": final_metadata.clone(),
-                        "uri": "mcp://mounted/item",
-                    })),
-                    191_i64,
-                ),
-            )
-            .expect("the unprefixed final template dispatches");
+        let source_final_read = block_on(source.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                "resources/read",
+                Some(serde_json::json!({
+                    "_meta": final_metadata.clone(),
+                    "uri": "mcp://mounted/item",
+                })),
+                191_i64,
+            ),
+        ))
+        .expect("the unprefixed final template dispatches");
         assert_eq!(source_final_read["contents"][0]["text"], "source-template");
 
         let mut destination = Router::new();
@@ -14249,31 +14240,29 @@ mod router_tests {
             "source-template"
         );
 
-        let final_templates = destination
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    "resources/templates/list",
-                    Some(serde_json::json!({"_meta": final_metadata.clone()})),
-                    192_i64,
-                ),
-            )
-            .expect("prefixed legacy-only templates do not break final discovery");
+        let final_templates = block_on(destination.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                "resources/templates/list",
+                Some(serde_json::json!({"_meta": final_metadata.clone()})),
+                192_i64,
+            ),
+        ))
+        .expect("prefixed legacy-only templates do not break final discovery");
         assert_eq!(final_templates["resourceTemplates"], serde_json::json!([]));
 
-        let final_error = destination
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    "resources/read",
-                    Some(serde_json::json!({
-                        "_meta": final_metadata,
-                        "uri": "peer/mcp://mounted/item",
-                    })),
-                    193_i64,
-                ),
-            )
-            .expect_err("the relative mounted namespace is not exposed to final dispatch");
+        let final_error = block_on(destination.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                "resources/read",
+                Some(serde_json::json!({
+                    "_meta": final_metadata,
+                    "uri": "peer/mcp://mounted/item",
+                })),
+                193_i64,
+            ),
+        ))
+        .expect_err("the relative mounted namespace is not exposed to final dispatch");
         assert_eq!(final_error.code, McpErrorCode::InvalidParams);
     }
 
@@ -15631,17 +15620,16 @@ mod router_tests {
         );
 
         router.set_list_page_size(Some(1));
-        let first_page = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_list_request(
-                    None,
-                    Some(vec!["visible"]),
-                    Some(vec!["excluded"]),
-                    164_i64,
-                ),
-            )
-            .expect("the first final page contains the first admitted entry");
+        let first_page = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_list_request(
+                None,
+                Some(vec!["visible"]),
+                Some(vec!["excluded"]),
+                164_i64,
+            ),
+        ))
+        .expect("the first final page contains the first admitted entry");
         assert_eq!(first_page["tools"][0]["name"], "peer/first");
         assert_eq!(first_page["tools"].as_array().map(Vec::len), Some(1));
         let cursor = first_page["nextCursor"]
@@ -15664,31 +15652,29 @@ mod router_tests {
             "the cursor advances across admitted entries"
         );
 
-        let query_mismatch = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_list_request(
-                    Some(cursor),
-                    Some(vec!["other"]),
-                    Some(vec!["excluded"]),
-                    165_i64,
-                ),
-            )
-            .expect_err("changing only the final list filter rejects the continuation");
+        let query_mismatch = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_list_request(
+                Some(cursor),
+                Some(vec!["other"]),
+                Some(vec!["excluded"]),
+                165_i64,
+            ),
+        ))
+        .expect_err("changing only the final list filter rejects the continuation");
         assert_eq!(query_mismatch.code, McpErrorCode::InvalidParams);
         assert!(query_mismatch.message.contains("query filters"));
 
-        let second_page = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_list_request(
-                    Some(cursor),
-                    Some(vec!["visible"]),
-                    Some(vec!["excluded"]),
-                    166_i64,
-                ),
-            )
-            .expect("the continuation page keeps admitted source order");
+        let second_page = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_list_request(
+                Some(cursor),
+                Some(vec!["visible"]),
+                Some(vec!["excluded"]),
+                166_i64,
+            ),
+        ))
+        .expect("the continuation page keeps admitted source order");
         assert_eq!(second_page["tools"][0]["name"], "peer/second");
         assert_eq!(second_page["tools"].as_array().map(Vec::len), Some(1));
         assert!(
@@ -15714,12 +15700,11 @@ mod router_tests {
         let cx = Cx::for_testing();
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 167, Budget::INFINITE, &state);
-        let full = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_list_request(None, None, None, 167_i64),
-            )
-            .expect("a cursor-free default final list returns the full catalog");
+        let full = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_list_request(None, None, None, 167_i64),
+        ))
+        .expect("a cursor-free default final list returns the full catalog");
         assert_eq!(full["tools"].as_array().map(Vec::len), Some(2));
         assert!(full.get("nextCursor").is_none());
 
@@ -15731,14 +15716,11 @@ mod router_tests {
             0,
             None,
         );
-        let validated_full = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_list_request(Some(&valid_cursor), None, None, 168_i64),
-            )
-            .expect(
-                "a valid cursor remains admitted while default listing returns the full catalog",
-            );
+        let validated_full = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_list_request(Some(&valid_cursor), None, None, 168_i64),
+        ))
+        .expect("a valid cursor remains admitted while default listing returns the full catalog");
         assert_eq!(validated_full["tools"].as_array().map(Vec::len), Some(2));
         assert!(validated_full.get("nextCursor").is_none());
 
@@ -15748,12 +15730,11 @@ mod router_tests {
             .expect("registered tools advance the final catalog revision");
         let stale_cursor =
             encode_final_catalog_cursor(FinalCatalogKind::Tools, stale_revision, &query, 0, None);
-        let stale = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_list_request(Some(&stale_cursor), None, None, 169_i64),
-            )
-            .expect_err("changing only the revision rejects a default-list cursor");
+        let stale = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_list_request(Some(&stale_cursor), None, None, 169_i64),
+        ))
+        .expect_err("changing only the revision rejects a default-list cursor");
         assert_eq!(stale.code, McpErrorCode::InvalidParams);
         assert!(stale.message.contains("stale catalog revision"));
 
@@ -15764,12 +15745,11 @@ mod router_tests {
             0,
             None,
         );
-        let wrong_kind = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_list_request(Some(&wrong_kind_cursor), None, None, 170_i64),
-            )
-            .expect_err("changing only the kind rejects a default-list cursor");
+        let wrong_kind = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_list_request(Some(&wrong_kind_cursor), None, None, 170_i64),
+        ))
+        .expect_err("changing only the kind rejects a default-list cursor");
         assert_eq!(wrong_kind.code, McpErrorCode::InvalidParams);
         assert!(wrong_kind.message.contains("another list method"));
 
@@ -15782,12 +15762,11 @@ mod router_tests {
             0,
             None,
         );
-        let wrong_query = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_list_request(Some(&wrong_query_cursor), None, None, 171_i64),
-            )
-            .expect_err("changing only the filters rejects a default-list cursor");
+        let wrong_query = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_list_request(Some(&wrong_query_cursor), None, None, 171_i64),
+        ))
+        .expect_err("changing only the filters rejects a default-list cursor");
         assert_eq!(wrong_query.code, McpErrorCode::InvalidParams);
         assert!(wrong_query.message.contains("query filters"));
 
@@ -15798,12 +15777,11 @@ mod router_tests {
             2,
             None,
         );
-        let out_of_range = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_list_request(Some(&out_of_range_cursor), None, None, 172_i64),
-            )
-            .expect_err("changing only the offset rejects a default-list cursor");
+        let out_of_range = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_list_request(Some(&out_of_range_cursor), None, None, 172_i64),
+        ))
+        .expect_err("changing only the offset rejects a default-list cursor");
         assert_eq!(out_of_range.code, McpErrorCode::InvalidParams);
         assert!(
             out_of_range
@@ -15838,62 +15816,56 @@ mod router_tests {
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 166, Budget::INFINITE, &state);
 
-        let resource_first = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_list_request("resources/list", None, 166_i64),
-            )
-            .expect("the first final resource page is emitted");
+        let resource_first = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_list_request("resources/list", None, 166_i64),
+        ))
+        .expect("the first final resource page is emitted");
         let resource_cursor = resource_first["nextCursor"]
             .as_str()
             .expect("the first resource page has a continuation")
             .to_owned();
-        let resource_second = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_list_request("resources/list", Some(&resource_cursor), 167_i64),
-            )
-            .expect("an unchanged final resource catalog accepts its cursor");
+        let resource_second = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_list_request("resources/list", Some(&resource_cursor), 167_i64),
+        ))
+        .expect("an unchanged final resource catalog accepts its cursor");
         assert_eq!(
             resource_second["resources"][0]["uri"],
             "file:///cursor-resource-b"
         );
 
         router.add_resource(NamedResource::new("file:///cursor-resource-c"));
-        let resource_stale = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_list_request("resources/list", Some(&resource_cursor), 168_i64),
-            )
-            .expect_err("adding only one catalog resource invalidates the old continuation");
+        let resource_stale = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_list_request("resources/list", Some(&resource_cursor), 168_i64),
+        ))
+        .expect_err("adding only one catalog resource invalidates the old continuation");
         assert_eq!(resource_stale.code, McpErrorCode::InvalidParams);
         assert!(resource_stale.message.contains("stale catalog revision"));
 
-        let prompt_first = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_list_request("prompts/list", None, 169_i64),
-            )
-            .expect("the first final prompt page is emitted");
+        let prompt_first = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_list_request("prompts/list", None, 169_i64),
+        ))
+        .expect("the first final prompt page is emitted");
         let prompt_cursor = prompt_first["nextCursor"]
             .as_str()
             .expect("the first prompt page has a continuation")
             .to_owned();
-        let prompt_second = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_list_request("prompts/list", Some(&prompt_cursor), 170_i64),
-            )
-            .expect("an unchanged final prompt catalog accepts its cursor");
+        let prompt_second = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_list_request("prompts/list", Some(&prompt_cursor), 170_i64),
+        ))
+        .expect("an unchanged final prompt catalog accepts its cursor");
         assert_eq!(prompt_second["prompts"][0]["name"], "cursor-prompt-b");
 
         router.add_prompt(NamedPrompt::new("cursor-prompt-c"));
-        let prompt_stale = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_list_request("prompts/list", Some(&prompt_cursor), 171_i64),
-            )
-            .expect_err("adding only one catalog prompt invalidates the old continuation");
+        let prompt_stale = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_list_request("prompts/list", Some(&prompt_cursor), 171_i64),
+        ))
+        .expect_err("adding only one catalog prompt invalidates the old continuation");
         assert_eq!(prompt_stale.code, McpErrorCode::InvalidParams);
         assert!(prompt_stale.message.contains("stale catalog revision"));
     }
@@ -15905,12 +15877,11 @@ mod router_tests {
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 166, Budget::INFINITE, &state);
 
-        let visible = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_list_request(None, Some(vec!["visible"]), None, 166_i64),
-            )
-            .expect("the final include filter projects only admitted visible entries");
+        let visible = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_list_request(None, Some(vec!["visible"]), None, 166_i64),
+        ))
+        .expect("the final include filter projects only admitted visible entries");
         assert_eq!(
             visible["tools"]
                 .as_array()
@@ -15922,12 +15893,11 @@ mod router_tests {
             "tag filtering preserves admitted insertion order"
         );
 
-        let other = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_list_request(None, Some(vec!["other"]), None, 167_i64),
-            )
-            .expect("the include filter is evaluated after final admission");
+        let other = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_list_request(None, Some(vec!["other"]), None, 167_i64),
+        ))
+        .expect("the include filter is evaluated after final admission");
         assert_eq!(other["tools"][0]["name"], "peer/other");
         assert_eq!(other["tools"].as_array().map(Vec::len), Some(1));
     }
@@ -17523,23 +17493,22 @@ mod router_tests {
             serde_json::json!(["staging"])
         );
 
-        let modern = router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    COMPLETION_COMPLETE,
-                    Some(serde_json::json!({
-                        "_meta": {
-                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                            "io.modelcontextprotocol/clientCapabilities": {},
-                        },
-                        "ref": {"type": "ref/prompt", "name": "prompt-argument-boundary"},
-                        "argument": {"name": "topic", "value": "sta"},
-                    })),
-                    88_i64,
-                ),
-            )
-            .expect("the final request reaches the same registered completion handler");
+        let modern = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                COMPLETION_COMPLETE,
+                Some(serde_json::json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                    "ref": {"type": "ref/prompt", "name": "prompt-argument-boundary"},
+                    "argument": {"name": "topic", "value": "sta"},
+                })),
+                88_i64,
+            ),
+        ))
+        .expect("the final request reaches the same registered completion handler");
         assert_eq!(
             modern.get("resultType"),
             Some(&serde_json::json!("complete"))
@@ -17856,11 +17825,9 @@ mod router_tests {
             188_i64,
         );
 
-        let prompt = router
-            .dispatch_stateless(&request_ctx, &prompt_request)
+        let prompt = block_on(router.dispatch_stateless(&request_ctx, &prompt_request))
             .expect("the registered prompt provider handles its exact target");
-        let resource = router
-            .dispatch_stateless(&request_ctx, &resource_request)
+        let resource = block_on(router.dispatch_stateless(&request_ctx, &resource_request))
             .expect("the registered resource provider handles its exact target");
         assert_eq!(
             prompt["completion"]["values"],
@@ -17903,8 +17870,7 @@ mod router_tests {
                 .and_then(|params| params.get("argument")),
             "the referenced resource template is the sole planted dimension"
         );
-        let fallback = router
-            .dispatch_stateless(&request_ctx, &unregistered_provider)
+        let fallback = block_on(router.dispatch_stateless(&request_ctx, &unregistered_provider))
             .expect("an admitted target without a provider-specific handler reaches the fallback");
         assert_eq!(
             fallback["completion"]["values"],
@@ -17972,8 +17938,7 @@ mod router_tests {
         );
         let allowed_context = allowed_inbound.request_context();
         for request in [&prompt_request, &resource_request] {
-            let result = router
-                .dispatch_stateless(&allowed_context, request)
+            let result = block_on(router.dispatch_stateless(&allowed_context, request))
                 .expect("a visible completion target reaches the fallback provider");
             assert_eq!(
                 result["completion"]["values"],
@@ -17999,8 +17964,7 @@ mod router_tests {
             prompt_request_bytes,
             "connection visibility is the sole planted prompt-completion dimension"
         );
-        let hidden_prompt = router
-            .dispatch_stateless(&denied_context, &prompt_request)
+        let hidden_prompt = block_on(router.dispatch_stateless(&denied_context, &prompt_request))
             .expect_err("a hidden prompt cannot be used as a completion reference");
         assert_eq!(hidden_prompt.code, McpErrorCode::InvalidParams);
         assert_eq!(
@@ -18014,9 +17978,9 @@ mod router_tests {
             resource_request_bytes,
             "connection visibility is the sole planted resource-template-completion dimension"
         );
-        let hidden_resource = router
-            .dispatch_stateless(&denied_context, &resource_request)
-            .expect_err("a hidden resource template cannot reach the fallback provider");
+        let hidden_resource =
+            block_on(router.dispatch_stateless(&denied_context, &resource_request))
+                .expect_err("a hidden resource template cannot reach the fallback provider");
         assert_eq!(hidden_resource.code, McpErrorCode::InvalidParams);
         assert_eq!(
             hidden_resource.message,
@@ -18075,8 +18039,7 @@ mod router_tests {
                     "io.modelcontextprotocol/clientCapabilities": {},
                 }),
             );
-        let error = router
-            .dispatch_stateless(&request_ctx, &final_request)
+        let error = block_on(router.dispatch_stateless(&request_ctx, &final_request))
             .expect_err("only the selected protocol era changes completion availability");
         assert_eq!(error.code, McpErrorCode::MethodNotFound);
         assert!(
@@ -18114,8 +18077,7 @@ mod router_tests {
         );
         let templates_before = serde_json::to_vec(&router.resource_templates())
             .expect("resource-template catalog serializes");
-        let template_accepted = router
-            .dispatch_stateless(&request_ctx, &baseline)
+        let template_accepted = block_on(router.dispatch_stateless(&request_ctx, &baseline))
             .expect("a registered final resource-template reference is accepted");
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
 
@@ -18128,8 +18090,7 @@ mod router_tests {
             .and_then(serde_json::Value::as_object_mut)
             .expect("completion reference is an object")
             .insert("uri".to_owned(), serde_json::json!("resource://static"));
-        let static_error = router
-            .dispatch_stateless(&request_ctx, &static_reference)
+        let static_error = block_on(router.dispatch_stateless(&request_ctx, &static_reference))
             .expect_err("a static resource is not a final completion-template target");
         assert_eq!(static_error.code, McpErrorCode::InvalidParams);
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
@@ -18159,9 +18120,9 @@ mod router_tests {
                 .and_then(|params| params.get("argument")),
             "the target URI is the sole planted visibility dimension"
         );
-        let legacy_template_error = router
-            .dispatch_stateless(&request_ctx, &legacy_template)
-            .expect_err("an exact-2024-only template is not final-visible");
+        let legacy_template_error =
+            block_on(router.dispatch_stateless(&request_ctx, &legacy_template))
+                .expect_err("an exact-2024-only template is not final-visible");
         assert_eq!(legacy_template_error.code, McpErrorCode::InvalidParams);
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
 
@@ -18187,9 +18148,9 @@ mod router_tests {
                 .and_then(|params| params.get("ref")),
             "the argument name is the sole planted validation dimension"
         );
-        let unknown_argument_error = router
-            .dispatch_stateless(&request_ctx, &unknown_argument)
-            .expect_err("an undeclared template argument is rejected before the handler");
+        let unknown_argument_error =
+            block_on(router.dispatch_stateless(&request_ctx, &unknown_argument))
+                .expect_err("an undeclared template argument is rejected before the handler");
         assert_eq!(unknown_argument_error.code, McpErrorCode::InvalidParams);
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
@@ -18199,8 +18160,7 @@ mod router_tests {
             "completion reference refusal cannot mutate the registered catalog"
         );
         assert_eq!(
-            router
-                .dispatch_stateless(&request_ctx, &baseline)
+            block_on(router.dispatch_stateless(&request_ctx, &baseline))
                 .expect("the registered reference remains accepted after refusal"),
             template_accepted,
             "rejected target or argument changes cannot alter the accepted completion"
@@ -18235,8 +18195,7 @@ mod router_tests {
             })),
             189_i64,
         );
-        let accepted = router
-            .dispatch_stateless(&request_ctx, &baseline)
+        let accepted = block_on(router.dispatch_stateless(&request_ctx, &baseline))
             .expect("a final-visible prompt and its declared argument are accepted");
         assert_eq!(accepted["resultType"], "complete");
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
@@ -18266,8 +18225,7 @@ mod router_tests {
                 .and_then(|params| params.get("argument")),
             "the prompt name is the sole planted visibility dimension"
         );
-        let legacy_prompt_error = router
-            .dispatch_stateless(&request_ctx, &legacy_prompt)
+        let legacy_prompt_error = block_on(router.dispatch_stateless(&request_ctx, &legacy_prompt))
             .expect_err("an exact-2024-only prompt is not final-visible");
         assert_eq!(legacy_prompt_error.code, McpErrorCode::InvalidParams);
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
@@ -18294,9 +18252,9 @@ mod router_tests {
                 .and_then(|params| params.get("ref")),
             "the argument name is the sole planted validation dimension"
         );
-        let unknown_argument_error = router
-            .dispatch_stateless(&request_ctx, &unknown_argument)
-            .expect_err("an undeclared prompt argument is rejected before the handler");
+        let unknown_argument_error =
+            block_on(router.dispatch_stateless(&request_ctx, &unknown_argument))
+                .expect_err("an undeclared prompt argument is rejected before the handler");
         assert_eq!(unknown_argument_error.code, McpErrorCode::InvalidParams);
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
 
@@ -18342,8 +18300,7 @@ mod router_tests {
             })),
             191_i64,
         );
-        let accepted = router
-            .dispatch_stateless(&request_ctx, &baseline)
+        let accepted = block_on(router.dispatch_stateless(&request_ctx, &baseline))
             .expect("a local handler result at the 100-value limit is accepted");
         assert_eq!(
             accepted["completion"]["values"].as_array().map(Vec::len),
@@ -18373,8 +18330,7 @@ mod router_tests {
                 .and_then(|params| params.get("ref")),
             "the handler result boundary is the sole planted dimension"
         );
-        let error = router
-            .dispatch_stateless(&request_ctx, &one_over)
+        let error = block_on(router.dispatch_stateless(&request_ctx, &one_over))
             .expect_err("a local handler cannot return a 101st completion value");
         assert_eq!(error.code, McpErrorCode::InternalError);
         assert_eq!(
@@ -18392,8 +18348,7 @@ mod router_tests {
             .and_then(serde_json::Value::as_object_mut)
             .expect("completion argument is an object")
             .insert("value".to_owned(), serde_json::json!("negative-total"));
-        let error = router
-            .dispatch_stateless(&request_ctx, &negative_total)
+        let error = block_on(router.dispatch_stateless(&request_ctx, &negative_total))
             .expect_err("a local handler cannot return a negative final completion total");
         assert_eq!(error.code, McpErrorCode::InternalError);
         assert_eq!(
@@ -18467,35 +18422,33 @@ mod router_tests {
             "io.modelcontextprotocol/protocolVersion": "2026-07-28",
             "io.modelcontextprotocol/clientCapabilities": {},
         });
-        let templates = router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    "resources/templates/list",
-                    Some(serde_json::json!({"_meta": final_metadata.clone()})),
-                    189_i64,
-                ),
-            )
-            .expect("the admitted template is final-visible");
+        let templates = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                "resources/templates/list",
+                Some(serde_json::json!({"_meta": final_metadata.clone()})),
+                189_i64,
+            ),
+        ))
+        .expect("the admitted template is final-visible");
         assert_eq!(templates["resultType"], "complete");
         assert_eq!(
             templates["resourceTemplates"][0]["uriTemplate"],
             "mcp://resource{/collection*}/manifest{?revision*}"
         );
 
-        let final_read = router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    "resources/read",
-                    Some(serde_json::json!({
-                        "_meta": final_metadata.clone(),
-                        "uri": "mcp://resource/books%2Ffiction/manifest?revision=stable",
-                    })),
-                    189_i64,
-                ),
-            )
-            .expect("the final route uses the same reversible matcher");
+        let final_read = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                "resources/read",
+                Some(serde_json::json!({
+                    "_meta": final_metadata.clone(),
+                    "uri": "mcp://resource/books%2Ffiction/manifest?revision=stable",
+                })),
+                189_i64,
+            ),
+        ))
+        .expect("the final route uses the same reversible matcher");
         assert_eq!(final_read["resultType"], "complete");
         assert_eq!(
             final_read["contents"][0]["text"], "books/fiction:stable",
@@ -18503,23 +18456,22 @@ mod router_tests {
         );
         assert_eq!(read_calls.load(Ordering::SeqCst), 1);
 
-        let completion = router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    COMPLETION_COMPLETE,
-                    Some(serde_json::json!({
-                        "_meta": final_metadata,
-                        "ref": {
-                            "type": "ref/resource",
-                            "uri": "mcp://resource{/collection*}/manifest{?revision*}",
-                        },
-                        "argument": {"name": "revision", "value": "sta"},
-                    })),
-                    189_i64,
-                ),
-            )
-            .expect("the final completion target exposes protocol-derived variables");
+        let completion = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                COMPLETION_COMPLETE,
+                Some(serde_json::json!({
+                    "_meta": final_metadata,
+                    "ref": {
+                        "type": "ref/resource",
+                        "uri": "mcp://resource{/collection*}/manifest{?revision*}",
+                    },
+                    "argument": {"name": "revision", "value": "sta"},
+                })),
+                189_i64,
+            ),
+        ))
+        .expect("the final completion target exposes protocol-derived variables");
         assert_eq!(completion["resultType"], "complete");
         assert_eq!(
             completion["completion"]["values"],
@@ -18934,52 +18886,49 @@ mod router_tests {
             "io.modelcontextprotocol/protocolVersion": "2026-07-28",
             "io.modelcontextprotocol/clientCapabilities": {},
         });
-        let templates = router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    "resources/templates/list",
-                    Some(serde_json::json!({"_meta": final_metadata.clone()})),
-                    190_i64,
-                ),
-            )
-            .expect("final template discovery remains valid with only exact-2024 templates");
+        let templates = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                "resources/templates/list",
+                Some(serde_json::json!({"_meta": final_metadata.clone()})),
+                190_i64,
+            ),
+        ))
+        .expect("final template discovery remains valid with only exact-2024 templates");
         assert_eq!(templates["resultType"], "complete");
         assert_eq!(templates["resourceTemplates"], serde_json::json!([]));
 
-        let final_read = router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    "resources/read",
-                    Some(serde_json::json!({
-                        "_meta": final_metadata.clone(),
-                        "uri": uri,
-                    })),
-                    190_i64,
-                ),
-            )
-            .expect_err("changing only the dispatch era cannot invoke a legacy-only template");
+        let final_read = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                "resources/read",
+                Some(serde_json::json!({
+                    "_meta": final_metadata.clone(),
+                    "uri": uri,
+                })),
+                190_i64,
+            ),
+        ))
+        .expect_err("changing only the dispatch era cannot invoke a legacy-only template");
         assert_eq!(final_read.code, McpErrorCode::InvalidParams);
         assert_eq!(read_calls.load(Ordering::SeqCst), 1);
 
-        let completion = router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    COMPLETION_COMPLETE,
-                    Some(serde_json::json!({
-                        "_meta": final_metadata,
-                        "ref": {
-                            "type": "ref/resource",
-                            "uri": "mcp://resource/{collection}/manifest?revision={revision}",
-                        },
-                        "argument": {"name": "revision", "value": "sta"},
-                    })),
-                    190_i64,
-                ),
-            )
-            .expect_err("a legacy-only template is not a final completion target");
+        let completion = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                COMPLETION_COMPLETE,
+                Some(serde_json::json!({
+                    "_meta": final_metadata,
+                    "ref": {
+                        "type": "ref/resource",
+                        "uri": "mcp://resource/{collection}/manifest?revision={revision}",
+                    },
+                    "argument": {"name": "revision", "value": "sta"},
+                })),
+                190_i64,
+            ),
+        ))
+        .expect_err("a legacy-only template is not a final completion target");
         assert_eq!(completion.code, McpErrorCode::InvalidParams);
         assert_eq!(completion_calls.load(Ordering::SeqCst), 0);
     }
@@ -19181,22 +19130,21 @@ mod router_tests {
                 crate::DuplicateBehavior::Replace,
             )
             .expect("legacy-only static resource registers");
-        let final_read = final_router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    "resources/read",
-                    Some(serde_json::json!({
-                        "_meta": {
-                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                            "io.modelcontextprotocol/clientCapabilities": {},
-                        },
-                        "uri": uri,
-                    })),
-                    190_i64,
-                ),
-            )
-            .expect("a legacy-only static URI cannot hide a listed final template");
+        let final_read = block_on(final_router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                "resources/read",
+                Some(serde_json::json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                    "uri": uri,
+                })),
+                190_i64,
+            ),
+        ))
+        .expect("a legacy-only static URI cannot hide a listed final template");
         assert_eq!(final_read["contents"][0]["text"], "final-template");
     }
 
@@ -19297,23 +19245,22 @@ mod router_tests {
         );
         assert_eq!(legacy_wire["content"][0]["text"], "macro final tool result");
 
-        let modern = router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    "tools/call",
-                    Some(serde_json::json!({
-                        "_meta": {
-                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                            "io.modelcontextprotocol/clientCapabilities": {},
-                        },
-                        "name": "macro_dual_era_tool",
-                        "arguments": {},
-                    })),
-                    91_i64,
-                ),
-            )
-            .expect("the modern router invokes the same installed handler");
+        let modern = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                    "name": "macro_dual_era_tool",
+                    "arguments": {},
+                })),
+                91_i64,
+            ),
+        ))
+        .expect("the modern router invokes the same installed handler");
 
         assert_eq!(
             modern.get("resultType"),
@@ -19350,16 +19297,15 @@ mod router_tests {
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 150, Budget::INFINITE, &state);
 
-        let rejected = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request(
-                    "schema-boundary-tool",
-                    serde_json::json!({"value": 7}),
-                    150_i64,
-                ),
-            )
-            .expect("registered final tool input failures are tool results");
+        let rejected = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request(
+                "schema-boundary-tool",
+                serde_json::json!({"value": 7}),
+                150_i64,
+            ),
+        ))
+        .expect("registered final tool input failures are tool results");
         assert_eq!(rejected["resultType"], "complete");
         assert_eq!(rejected["isError"], true);
         assert_eq!(
@@ -19369,16 +19315,15 @@ mod router_tests {
         assert_eq!(final_calls.load(Ordering::SeqCst), 0);
         assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
 
-        let accepted = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request(
-                    "schema-boundary-tool",
-                    serde_json::json!({"value": "accepted"}),
-                    151_i64,
-                ),
-            )
-            .expect("changing only the input value to match the schema is accepted");
+        let accepted = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request(
+                "schema-boundary-tool",
+                serde_json::json!({"value": "accepted"}),
+                151_i64,
+            ),
+        ))
+        .expect("changing only the input value to match the schema is accepted");
         assert_eq!(accepted["resultType"], "complete");
         assert!(accepted.get("isError").is_none());
         assert_eq!(
@@ -19396,12 +19341,11 @@ mod router_tests {
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 152, Budget::INFINITE, &state);
 
-        let modern_error = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request("unknown-tool", serde_json::json!({}), 152_i64),
-            )
-            .expect_err("an unknown final tool is an invalid-params protocol error");
+        let modern_error = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request("unknown-tool", serde_json::json!({}), 152_i64),
+        ))
+        .expect_err("an unknown final tool is an invalid-params protocol error");
         assert_eq!(modern_error.code, McpErrorCode::InvalidParams);
 
         let legacy_error = block_on(router.handle_tools_call(
@@ -19440,16 +19384,15 @@ mod router_tests {
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 153, Budget::INFINITE, &state);
 
-        let accepted = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request(
-                    "schema-boundary-tool",
-                    serde_json::json!({"value": "accepted"}),
-                    153_i64,
-                ),
-            )
-            .expect("a complete result matching the declared output schema is emitted");
+        let accepted = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request(
+                "schema-boundary-tool",
+                serde_json::json!({"value": "accepted"}),
+                153_i64,
+            ),
+        ))
+        .expect("a complete result matching the declared output schema is emitted");
         assert_eq!(
             accepted["structuredContent"],
             serde_json::json!({"accepted": true})
@@ -19491,16 +19434,15 @@ mod router_tests {
                 invalid_final_output_schema: false,
             })
             .expect("schema-boundary tool registration succeeds");
-        let rejected = rejected_router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request(
-                    "schema-boundary-tool",
-                    serde_json::json!({"value": "accepted"}),
-                    154_i64,
-                ),
-            )
-            .expect_err("a complete result failing the declared output schema is not emitted");
+        let rejected = block_on(rejected_router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request(
+                "schema-boundary-tool",
+                serde_json::json!({"value": "accepted"}),
+                154_i64,
+            ),
+        ))
+        .expect_err("a complete result failing the declared output schema is not emitted");
         assert_eq!(rejected.code, McpErrorCode::InternalError);
         assert_eq!(
             rejected.message,
@@ -19530,16 +19472,15 @@ mod router_tests {
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 154, Budget::INFINITE, &state);
 
-        let accepted = accepted_router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request(
-                    "schema-boundary-tool",
-                    serde_json::json!({"value": "accepted"}),
-                    154_i64,
-                ),
-            )
-            .expect("a schema-conforming complete error payload is emitted");
+        let accepted = block_on(accepted_router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request(
+                "schema-boundary-tool",
+                serde_json::json!({"value": "accepted"}),
+                154_i64,
+            ),
+        ))
+        .expect("a schema-conforming complete error payload is emitted");
         assert_eq!(accepted["resultType"], "complete");
         assert_eq!(accepted["isError"], true);
         assert_eq!(
@@ -19563,16 +19504,15 @@ mod router_tests {
             })
             .expect("schema-boundary tool registration succeeds");
 
-        let rejected = rejected_router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request(
-                    "schema-boundary-tool",
-                    serde_json::json!({"value": "accepted"}),
-                    155_i64,
-                ),
-            )
-            .expect_err("a nonconforming complete error payload is not emitted");
+        let rejected = block_on(rejected_router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request(
+                "schema-boundary-tool",
+                serde_json::json!({"value": "accepted"}),
+                155_i64,
+            ),
+        ))
+        .expect_err("a nonconforming complete error payload is not emitted");
         assert_eq!(rejected.code, McpErrorCode::InternalError);
         assert_eq!(
             rejected.message,
@@ -19602,31 +19542,29 @@ mod router_tests {
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 155, Budget::INFINITE, &state);
 
-        let rejected_input = input_router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request(
-                    "schema-boundary-tool",
-                    serde_json::json!({"value": "accepted", "unexpected": true}),
-                    155_i64,
-                ),
-            )
-            .expect("unevaluated final input properties return the bounded tool error result");
+        let rejected_input = block_on(input_router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request(
+                "schema-boundary-tool",
+                serde_json::json!({"value": "accepted", "unexpected": true}),
+                155_i64,
+            ),
+        ))
+        .expect("unevaluated final input properties return the bounded tool error result");
         assert_eq!(rejected_input["resultType"], "complete");
         assert_eq!(rejected_input["isError"], true);
         assert_eq!(input_final_calls.load(Ordering::SeqCst), 0);
         assert_eq!(input_legacy_calls.load(Ordering::SeqCst), 0);
 
-        let accepted_input = input_router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request(
-                    "schema-boundary-tool",
-                    serde_json::json!({"value": "accepted"}),
-                    156_i64,
-                ),
-            )
-            .expect("removing only the unevaluated input property reaches the handler");
+        let accepted_input = block_on(input_router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request(
+                "schema-boundary-tool",
+                serde_json::json!({"value": "accepted"}),
+                156_i64,
+            ),
+        ))
+        .expect("removing only the unevaluated input property reaches the handler");
         assert_eq!(accepted_input["resultType"], "complete");
         assert_eq!(input_final_calls.load(Ordering::SeqCst), 1);
 
@@ -19646,16 +19584,15 @@ mod router_tests {
             })
             .expect("schema-boundary tool registration succeeds");
 
-        let rejected_output = output_router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request(
-                    "schema-boundary-tool",
-                    serde_json::json!({"value": "accepted"}),
-                    157_i64,
-                ),
-            )
-            .expect_err("an unevaluated final output property is not emitted as success");
+        let rejected_output = block_on(output_router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request(
+                "schema-boundary-tool",
+                serde_json::json!({"value": "accepted"}),
+                157_i64,
+            ),
+        ))
+        .expect_err("an unevaluated final output property is not emitted as success");
         assert_eq!(rejected_output.code, McpErrorCode::InternalError);
         assert_eq!(
             rejected_output.message,
@@ -19735,26 +19672,24 @@ mod router_tests {
         assert_eq!(replacement_legacy_calls.load(Ordering::SeqCst), 1);
         assert_eq!(original_legacy_calls.load(Ordering::SeqCst), 0);
 
-        let modern = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request(
-                    "admitted-schema-replacement-tool",
-                    serde_json::json!({}),
-                    159_i64,
-                ),
-            )
-            .expect("the replacement is installed for modern dispatch");
+        let modern = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request(
+                "admitted-schema-replacement-tool",
+                serde_json::json!({}),
+                159_i64,
+            ),
+        ))
+        .expect("the replacement is installed for modern dispatch");
         assert_eq!(modern["structuredContent"], serde_json::json!(true));
         assert_eq!(replacement_final_calls.load(Ordering::SeqCst), 1);
         assert_eq!(original_final_calls.load(Ordering::SeqCst), 0);
 
-        let modern_catalog = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_list_request(None, None, None, 160_i64),
-            )
-            .expect("the admitted replacement remains visible to the modern catalog");
+        let modern_catalog = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_list_request(None, None, None, 160_i64),
+        ))
+        .expect("the admitted replacement remains visible to the modern catalog");
         assert_eq!(
             modern_catalog["tools"]
                 .as_array()
@@ -19781,12 +19716,11 @@ mod router_tests {
         let request_ctx = request_context(&cx, 161, Budget::INFINITE, &state);
         let legacy_before =
             serde_json::to_value(router.tools()).expect("legacy catalog serializes");
-        let modern_before = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_list_request(None, None, None, 161_i64),
-            )
-            .expect("baseline modern catalog is available");
+        let modern_before = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_list_request(None, None, None, 161_i64),
+        ))
+        .expect("baseline modern catalog is available");
 
         let error = router
             .add_tool_with_behavior(
@@ -19801,12 +19735,11 @@ mod router_tests {
             "failed admission cannot add a legacy-only entry"
         );
         assert_eq!(
-            router
-                .dispatch_stateless(
-                    &request_ctx,
-                    &final_tools_list_request(None, None, None, 162_i64),
-                )
-                .expect("modern catalog remains available"),
+            block_on(router.dispatch_stateless(
+                &request_ctx,
+                &final_tools_list_request(None, None, None, 162_i64),
+            ))
+            .expect("modern catalog remains available"),
             modern_before,
             "failed admission cannot alter the modern catalog"
         );
@@ -19825,16 +19758,15 @@ mod router_tests {
             })
             .expect("an upstream-owned scalar schema is retained without local admission");
 
-        let response = registered_proxy_router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request(
-                    "upstream-scalar-schema-tool",
-                    serde_json::json!({}),
-                    1601_i64,
-                ),
-            )
-            .expect("upstream-owned structured content is not locally revalidated");
+        let response = block_on(registered_proxy_router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request(
+                "upstream-scalar-schema-tool",
+                serde_json::json!({}),
+                1601_i64,
+            ),
+        ))
+        .expect("upstream-owned structured content is not locally revalidated");
         assert_eq!(
             response["structuredContent"],
             serde_json::json!({"upstream": true})
@@ -19867,16 +19799,15 @@ mod router_tests {
             .expect("an upstream-owned object schema is retained without local admission");
         router.set_strict_input_validation(true);
 
-        let refused = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request(
-                    "upstream-scalar-schema-tool",
-                    serde_json::json!({"extra": 1}),
-                    1602_i64,
-                ),
-            )
-            .expect("gateway strict mode returns a complete tools/call result");
+        let refused = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request(
+                "upstream-scalar-schema-tool",
+                serde_json::json!({"extra": 1}),
+                1602_i64,
+            ),
+        ))
+        .expect("gateway strict mode returns a complete tools/call result");
         assert_eq!(refused["resultType"], "complete");
         assert_eq!(refused["isError"], true);
         assert_eq!(
@@ -19884,32 +19815,30 @@ mod router_tests {
             "Tool arguments do not match the declared input schema."
         );
 
-        let admitted = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request(
-                    "upstream-scalar-schema-tool",
-                    serde_json::json!({}),
-                    1603_i64,
-                ),
-            )
-            .expect("declared empty object arguments still reach the proxy handler");
+        let admitted = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request(
+                "upstream-scalar-schema-tool",
+                serde_json::json!({}),
+                1603_i64,
+            ),
+        ))
+        .expect("declared empty object arguments still reach the proxy handler");
         assert_eq!(
             admitted["structuredContent"],
             serde_json::json!({"upstream": true})
         );
 
         router.set_strict_input_validation(false);
-        let extra = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request(
-                    "upstream-scalar-schema-tool",
-                    serde_json::json!({"extra": 1}),
-                    1604_i64,
-                ),
-            )
-            .expect("changing only the strict flag must admit the extra property");
+        let extra = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request(
+                "upstream-scalar-schema-tool",
+                serde_json::json!({"extra": 1}),
+                1604_i64,
+            ),
+        ))
+        .expect("changing only the strict flag must admit the extra property");
         assert_eq!(
             extra["structuredContent"],
             serde_json::json!({"upstream": true})
@@ -19964,16 +19893,15 @@ mod router_tests {
                 structured_content: Some(serde_json::json!("")),
             })
             .expect("scalar-output tool registration succeeds");
-        let scalar = scalar_router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request(
-                    "admitted-schema-replacement-tool",
-                    serde_json::json!({}),
-                    163_i64,
-                ),
-            )
-            .expect("an object-valued schema document may describe a scalar result");
+        let scalar = block_on(scalar_router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request(
+                "admitted-schema-replacement-tool",
+                serde_json::json!({}),
+                163_i64,
+            ),
+        ))
+        .expect("an object-valued schema document may describe a scalar result");
         assert_eq!(
             scalar.get("structuredContent"),
             Some(&serde_json::json!("")),
@@ -19990,16 +19918,15 @@ mod router_tests {
                 structured_content: Some(serde_json::Value::Null),
             })
             .expect("null-output tool registration succeeds");
-        let null = null_router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request(
-                    "admitted-schema-replacement-tool",
-                    serde_json::json!({}),
-                    164_i64,
-                ),
-            )
-            .expect("present JSON null is validated against a null output schema");
+        let null = block_on(null_router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request(
+                "admitted-schema-replacement-tool",
+                serde_json::json!({}),
+                164_i64,
+            ),
+        ))
+        .expect("present JSON null is validated against a null output schema");
         assert_eq!(
             null.get("structuredContent"),
             Some(&serde_json::Value::Null),
@@ -20023,16 +19950,15 @@ mod router_tests {
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 165, Budget::INFINITE, &state);
 
-        let error = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request(
-                    "admitted-schema-replacement-tool",
-                    serde_json::json!({}),
-                    165_i64,
-                ),
-            )
-            .expect_err("a declared output schema requires structured content on complete output");
+        let error = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request(
+                "admitted-schema-replacement-tool",
+                serde_json::json!({}),
+                165_i64,
+            ),
+        ))
+        .expect_err("a declared output schema requires structured content on complete output");
         assert_eq!(error.code, McpErrorCode::InternalError);
         assert_eq!(
             error.message,
@@ -20054,16 +19980,15 @@ mod router_tests {
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 169, Budget::INFINITE, &state);
 
-        let input_error = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request(
-                    "error-mapped-tool",
-                    serde_json::json!({"value": 7}),
-                    169_i64,
-                ),
-            )
-            .expect("input rejection is a schema-valid complete tool error");
+        let input_error = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request(
+                "error-mapped-tool",
+                serde_json::json!({"value": 7}),
+                169_i64,
+            ),
+        ))
+        .expect("input rejection is a schema-valid complete tool error");
         assert_eq!(input_error["isError"], true);
         assert_eq!(
             input_error["structuredContent"],
@@ -20071,16 +19996,15 @@ mod router_tests {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-        let handler_error = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request(
-                    "error-mapped-tool",
-                    serde_json::json!({"value": "accepted"}),
-                    170_i64,
-                ),
-            )
-            .expect("handler rejection is a schema-valid complete tool error");
+        let handler_error = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request(
+                "error-mapped-tool",
+                serde_json::json!({"value": "accepted"}),
+                170_i64,
+            ),
+        ))
+        .expect("handler rejection is a schema-valid complete tool error");
         assert_eq!(handler_error["isError"], true);
         assert_eq!(
             handler_error["structuredContent"],
@@ -20115,12 +20039,11 @@ mod router_tests {
             let request_ctx = request_context(&cx, 171, Budget::INFINITE, &state);
             let legacy_before =
                 serde_json::to_value(router.tools()).expect("legacy catalog serializes");
-            let modern_before = router
-                .dispatch_stateless(
-                    &request_ctx,
-                    &final_tools_list_request(None, None, None, 171_i64),
-                )
-                .expect("modern catalog is available");
+            let modern_before = block_on(router.dispatch_stateless(
+                &request_ctx,
+                &final_tools_list_request(None, None, None, 171_i64),
+            ))
+            .expect("modern catalog is available");
 
             let error = router
                 .add_tool(ErrorMappedTool {
@@ -20135,12 +20058,11 @@ mod router_tests {
                 legacy_before
             );
             assert_eq!(
-                router
-                    .dispatch_stateless(
-                        &request_ctx,
-                        &final_tools_list_request(None, None, None, 172_i64),
-                    )
-                    .expect("modern catalog remains available"),
+                block_on(router.dispatch_stateless(
+                    &request_ctx,
+                    &final_tools_list_request(None, None, None, 172_i64),
+                ))
+                .expect("modern catalog remains available"),
                 modern_before
             );
             assert!(router.get_tool("error-mapped-tool").is_none());
@@ -20191,12 +20113,11 @@ mod router_tests {
         let request_ctx = request_context(&cx, 166, Budget::INFINITE, &state);
         let legacy_before =
             serde_json::to_value(router.tools()).expect("legacy catalog serializes");
-        let modern_before = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_list_request(None, None, None, 166_i64),
-            )
-            .expect("baseline modern catalog is available");
+        let modern_before = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_list_request(None, None, None, 166_i64),
+        ))
+        .expect("baseline modern catalog is available");
 
         let error = router
             .add_tool_with_behavior(
@@ -20214,12 +20135,11 @@ mod router_tests {
             "a rejected replacement cannot replace the legacy handler"
         );
         assert_eq!(
-            router
-                .dispatch_stateless(
-                    &request_ctx,
-                    &final_tools_list_request(None, None, None, 167_i64),
-                )
-                .expect("modern catalog remains available"),
+            block_on(router.dispatch_stateless(
+                &request_ctx,
+                &final_tools_list_request(None, None, None, 167_i64),
+            ))
+            .expect("modern catalog remains available"),
             modern_before,
             "a rejected replacement cannot remove the admitted modern entry"
         );
@@ -20240,16 +20160,15 @@ mod router_tests {
         assert_eq!(legacy_wire["content"][0]["text"], "original");
         assert_eq!(original_legacy_calls.load(Ordering::SeqCst), 1);
 
-        let modern = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request(
-                    "admitted-schema-replacement-tool",
-                    serde_json::json!({}),
-                    168_i64,
-                ),
-            )
-            .expect("the original modern handler remains installed");
+        let modern = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request(
+                "admitted-schema-replacement-tool",
+                serde_json::json!({}),
+                168_i64,
+            ),
+        ))
+        .expect("the original modern handler remains installed");
         assert_eq!(modern["structuredContent"], serde_json::json!("original"));
         assert_eq!(original_final_calls.load(Ordering::SeqCst), 1);
     }
@@ -20321,14 +20240,14 @@ mod router_tests {
             "explicit-null final tool arguments are rejected at decode"
         );
 
-        let absent_tool_result = router
-            .dispatch_stateless(&request_ctx, &absent_tool_arguments)
-            .expect("absent final tool arguments default to an empty object");
+        let absent_tool_result =
+            block_on(router.dispatch_stateless(&request_ctx, &absent_tool_arguments))
+                .expect("absent final tool arguments default to an empty object");
         assert_eq!(absent_tool_result["resultType"], "input_required");
         assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
-        let null_tool_error = router
-            .dispatch_stateless(&request_ctx, &null_tool_arguments)
-            .expect_err("explicit-null final tool arguments are rejected");
+        let null_tool_error =
+            block_on(router.dispatch_stateless(&request_ctx, &null_tool_arguments))
+                .expect_err("explicit-null final tool arguments are rejected");
         assert_eq!(null_tool_error.code, McpErrorCode::InvalidParams);
         assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
 
@@ -20363,14 +20282,14 @@ mod router_tests {
             "explicit-null final prompt arguments are rejected at decode"
         );
 
-        let absent_prompt_result = router
-            .dispatch_stateless(&request_ctx, &absent_prompt_arguments)
-            .expect("absent final prompt arguments default to an empty map");
+        let absent_prompt_result =
+            block_on(router.dispatch_stateless(&request_ctx, &absent_prompt_arguments))
+                .expect("absent final prompt arguments default to an empty map");
         assert_eq!(absent_prompt_result["resultType"], "complete");
         assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 1);
-        let null_prompt_error = router
-            .dispatch_stateless(&request_ctx, &null_prompt_arguments)
-            .expect_err("explicit-null final prompt arguments are rejected");
+        let null_prompt_error =
+            block_on(router.dispatch_stateless(&request_ctx, &null_prompt_arguments))
+                .expect_err("explicit-null final prompt arguments are rejected");
         assert_eq!(null_prompt_error.code, McpErrorCode::InvalidParams);
         assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 1);
     }
@@ -20419,16 +20338,15 @@ mod router_tests {
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 159, Budget::INFINITE, &state);
 
-        let observed = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request(
-                    "canonical-capability-error",
-                    serde_json::json!({}),
-                    159_i64,
-                ),
-            )
-            .expect_err("the exact framework-owned refusal remains a JSON-RPC error");
+        let observed = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request(
+                "canonical-capability-error",
+                serde_json::json!({}),
+                159_i64,
+            ),
+        ))
+        .expect_err("the exact framework-owned refusal remains a JSON-RPC error");
         assert_eq!(observed.code, canonical.code);
         assert_eq!(observed.message, canonical.message);
         assert_eq!(observed.data, canonical.data);
@@ -20438,12 +20356,11 @@ mod router_tests {
             ("data-lookalike", 161_i64),
             ("non-object-required-capabilities", 162_i64),
         ] {
-            let result = router
-                .dispatch_stateless(
-                    &request_ctx,
-                    &final_tools_call_request(name, serde_json::json!({}), request_id),
-                )
-                .expect("a handler-controlled lookalike remains a tool-level error result");
+            let result = block_on(router.dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(name, serde_json::json!({}), request_id),
+            ))
+            .expect("a handler-controlled lookalike remains a tool-level error result");
             assert_eq!(result["isError"], true);
         }
     }
@@ -20475,9 +20392,11 @@ mod router_tests {
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 160, Budget::INFINITE, &state);
 
-        let result = router
-            .dispatch_stateless(&request_ctx, &final_task_capable_tool_request(160_i64))
-            .expect("the admitted task-capable outcome creates a work-bound task");
+        let result = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_task_capable_tool_request(160_i64),
+        ))
+        .expect("the admitted task-capable outcome creates a work-bound task");
         assert_eq!(result["resultType"], "task");
         assert_eq!(result["status"], "working");
         assert_eq!(result["statusMessage"], "router task created");
@@ -20524,15 +20443,13 @@ mod router_tests {
             "Tasks negotiation is unchanged between the paired requests"
         );
 
-        let result = router
-            .dispatch_stateless(&request_ctx, &complete)
+        let result = block_on(router.dispatch_stateless(&request_ctx, &complete))
             .expect("a declared task-capable handler may complete without Tasks negotiation");
         assert_eq!(result["resultType"], "complete");
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
         assert_eq!(store.task_count(), 0);
 
-        let error = router
-            .dispatch_stateless(&request_ctx, &task)
+        let error = block_on(router.dispatch_stateless(&request_ctx, &task))
             .expect_err("only the CreateTask outcome requires Tasks negotiation");
         assert!(matches!(error.code, McpErrorCode::Custom(_)));
         assert_eq!(final_calls.load(Ordering::SeqCst), 2);
@@ -20558,9 +20475,11 @@ mod router_tests {
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 161, Budget::INFINITE, &state);
 
-        let error = router
-            .dispatch_stateless(&request_ctx, &final_task_capable_tool_request(161_i64))
-            .expect_err("a CreateTask outcome cannot persist without a final Tasks runtime");
+        let error = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_task_capable_tool_request(161_i64),
+        ))
+        .expect_err("a CreateTask outcome cannot persist without a final Tasks runtime");
         assert_eq!(error.code, McpErrorCode::InternalError);
         assert_eq!(
             error.message,
@@ -20594,9 +20513,11 @@ mod router_tests {
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 162, Budget::INFINITE, &state);
 
-        let error = router
-            .dispatch_stateless(&request_ctx, &final_task_capable_tool_request(162_i64))
-            .expect_err("an installed but unready task service is refused before task creation");
+        let error = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_task_capable_tool_request(162_i64),
+        ))
+        .expect_err("an installed but unready task service is refused before task creation");
         assert_eq!(error.code, McpErrorCode::InvalidParams);
         assert_eq!(
             error.message,
@@ -20637,16 +20558,15 @@ mod router_tests {
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 162, Budget::INFINITE, &state);
 
-        let error = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request(
-                    "task-capable-router-tool",
-                    serde_json::json!({}),
-                    162_i64,
-                ),
-            )
-            .expect_err("a missing peer Tasks capability is refused before task-store mutation");
+        let error = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request(
+                "task-capable-router-tool",
+                serde_json::json!({}),
+                162_i64,
+            ),
+        ))
+        .expect_err("a missing peer Tasks capability is refused before task-store mutation");
         assert!(matches!(error.code, McpErrorCode::Custom(_)));
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
@@ -20686,8 +20606,7 @@ mod router_tests {
             163_i64,
         );
 
-        let error = router
-            .dispatch_stateless(&request_ctx, &request)
+        let error = block_on(router.dispatch_stateless(&request_ctx, &request))
             .expect_err("the router refuses a task outcome without a preflight declaration");
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
         assert_eq!(
@@ -20746,8 +20665,7 @@ mod router_tests {
         let catalog_before = serde_json::to_vec(&router.tools()).expect("catalog serializes");
         let planted_before = serde_json::to_vec(&planted).expect("request serializes");
 
-        let baseline_result = router
-            .dispatch_stateless(&request_ctx, &baseline)
+        let baseline_result = block_on(router.dispatch_stateless(&request_ctx, &baseline))
             .expect("the baseline invokes the registered handler");
         assert_eq!(
             baseline_result.get("resultType"),
@@ -20755,8 +20673,7 @@ mod router_tests {
         );
         assert_eq!(MACRO_DUAL_ERA_TOOL_CALLS.load(Ordering::SeqCst), 1);
 
-        let error = router
-            .dispatch_stateless(&request_ctx, &planted)
+        let error = block_on(router.dispatch_stateless(&request_ctx, &planted))
             .expect_err("only final metadata is refused");
         assert_eq!(error.code, McpErrorCode::InvalidParams);
         assert_eq!(
@@ -20775,8 +20692,7 @@ mod router_tests {
             "metadata refusal cannot invoke the macro-generated tool"
         );
         assert_eq!(
-            router
-                .dispatch_stateless(&request_ctx, &baseline)
+            block_on(router.dispatch_stateless(&request_ctx, &baseline))
                 .expect("the unchanged baseline remains accepted after the rejection"),
             baseline_result,
             "the one-field rejection cannot alter the accepted final result"
@@ -20837,8 +20753,7 @@ mod router_tests {
             tool_request.params.as_ref(),
         )
         .expect("final tools/call request decodes");
-        let tool_response = router
-            .dispatch_stateless(&request_ctx, &tool_request)
+        let tool_response = block_on(router.dispatch_stateless(&request_ctx, &tool_request))
             .expect("public final tools/call dispatch encodes input_required");
         assert_eq!(tool_response["resultType"], "input_required");
         assert_ne!(tool_response["requestState"], "tool-retry-state");
@@ -20867,8 +20782,7 @@ mod router_tests {
             resource_request.params.as_ref(),
         )
         .expect("final resources/read request decodes");
-        let resource_response = router
-            .dispatch_stateless(&request_ctx, &resource_request)
+        let resource_response = block_on(router.dispatch_stateless(&request_ctx, &resource_request))
             .expect("public final resources/read dispatch encodes input_required");
         assert_eq!(resource_response["resultType"], "input_required");
         assert_ne!(resource_response["requestState"], "resource-retry-state");
@@ -20898,8 +20812,7 @@ mod router_tests {
             prompt_request.params.as_ref(),
         )
         .expect("final prompts/get request decodes");
-        let prompt_response = router
-            .dispatch_stateless(&request_ctx, &prompt_request)
+        let prompt_response = block_on(router.dispatch_stateless(&request_ctx, &prompt_request))
             .expect("public final prompts/get dispatch encodes input_required");
         assert_eq!(prompt_response["resultType"], "input_required");
         assert_ne!(prompt_response["requestState"], "prompt-retry-state");
@@ -20954,8 +20867,7 @@ mod router_tests {
         .request_context()
         .with_client_capabilities(ClientCapabilityInfo::new().with_elicitation(true, false));
 
-        let initial = router
-            .dispatch_stateless(&initial_context, &initial_request)
+        let initial = block_on(router.dispatch_stateless(&initial_context, &initial_request))
             .expect("an elicitation-capable final client receives MRTR input_required");
         assert_eq!(initial["resultType"], "input_required");
         assert_eq!(
@@ -21000,8 +20912,7 @@ mod router_tests {
         .request_context()
         .with_client_capabilities(ClientCapabilityInfo::new().with_elicitation(true, false));
 
-        let completed = router
-            .dispatch_stateless(&retry_context, &retry_request)
+        let completed = block_on(router.dispatch_stateless(&retry_context, &retry_request))
             .expect("the accepted final elicitation resumes the original tools/call");
         assert_eq!(completed["resultType"], "complete");
         assert_eq!(completed["content"][0]["text"], "approved");
@@ -21038,8 +20949,7 @@ mod router_tests {
             ["io.modelcontextprotocol/clientCapabilities"] = serde_json::json!({
             "elicitation": {"form": {}},
         });
-        let initial = router
-            .dispatch_stateless(&context_for(950), &initial_request)
+        let initial = block_on(router.dispatch_stateless(&context_for(950), &initial_request))
             .expect("initial form request issues continuation state");
         let state = initial["requestState"]
             .as_str()
@@ -21066,9 +20976,12 @@ mod router_tests {
             params["requestState"] = serde_json::json!(state);
             params["inputResponses"] = serde_json::json!({"approval": answer});
             let raw = serde_json::to_string(params).expect("retry params encode");
-            let error = router
-                .dispatch_stateless_with_raw_params(&context_for(id), &retry, Some(&raw))
-                .expect_err("invalid answers fail before a handler continuation can consume state");
+            let error = block_on(router.dispatch_stateless_with_raw_params(
+                &context_for(id),
+                &retry,
+                Some(&raw),
+            ))
+            .expect_err("invalid answers fail before a handler continuation can consume state");
             assert_eq!(error.code, McpErrorCode::InvalidParams);
             assert!(!error.message.contains("private-invalid-answer"));
             assert_eq!(initial_calls.load(Ordering::SeqCst), 1);
@@ -21088,9 +21001,12 @@ mod router_tests {
             "approval": {"action": "accept", "content": {"approved": true}},
         });
         let raw = serde_json::to_string(params).expect("valid retry params encode");
-        let completed = router
-            .dispatch_stateless_with_raw_params(&context_for(955), &valid, Some(&raw))
-            .expect("the original continuation state remains usable for a corrected answer");
+        let completed = block_on(router.dispatch_stateless_with_raw_params(
+            &context_for(955),
+            &valid,
+            Some(&raw),
+        ))
+        .expect("the original continuation state remains usable for a corrected answer");
         assert_eq!(completed["resultType"], "complete");
         assert_eq!(completed["content"][0]["text"], "approved");
         assert_eq!(initial_calls.load(Ordering::SeqCst), 1);
@@ -21122,8 +21038,7 @@ mod router_tests {
         )
         .request_context();
 
-        let refusal = router
-            .dispatch_stateless(&context, &request)
+        let refusal = block_on(router.dispatch_stateless(&context, &request))
             .expect("changing only client elicitation capability returns a final tool result");
         assert_eq!(refusal["resultType"], "complete");
         assert_eq!(refusal["isError"], true);
@@ -21158,8 +21073,7 @@ mod router_tests {
         )
         .request_context()
         .with_client_capabilities(ClientCapabilityInfo::new().with_sampling());
-        let admitted = router
-            .dispatch_stateless(&admitted_context, &request)
+        let admitted = block_on(router.dispatch_stateless(&admitted_context, &request))
             .expect("sampling capability admits final MRTR sampling");
         assert_eq!(admitted["resultType"], "input_required");
         assert_eq!(
@@ -21179,8 +21093,7 @@ mod router_tests {
             &connection,
         )
         .request_context();
-        let rejection = router
-            .dispatch_stateless(&removed_capability_context, &request)
+        let rejection = block_on(router.dispatch_stateless(&removed_capability_context, &request))
             .expect_err("removing only sampling capability rejects the descriptor");
         assert_eq!(rejection.code, McpErrorCode::InvalidRequest);
         assert_eq!(
@@ -21238,14 +21151,15 @@ mod router_tests {
         .expect("tool body serializes");
         let (tool_initial, tool_initial_raw) =
             admit_http_wire("tools/call", "input-required-tool", &tool_initial_body);
-        let tool_issued = router
-            .dispatch_stateless_with_continuation_cancellation_and_raw_params(
+        let tool_issued = block_on(
+            router.dispatch_stateless_with_continuation_cancellation_and_raw_params(
                 &request_ctx,
                 &tool_initial,
                 tool_initial_raw.as_deref(),
                 &cancellation,
-            )
-            .expect("HTTP-admitted tool issues state");
+            ),
+        )
+        .expect("HTTP-admitted tool issues state");
         let tool_retry_body = format!(
             r#"{{"jsonrpc":"2.0","id":1439,"method":"tools/call","params":{{"_meta":{},"name":"input-required-tool","arguments":{{}},"inputResponses":{{"inert":{},"roots":{}}},"requestState":{}}}}}"#,
             serde_json::to_string(&metadata).expect("metadata serializes"),
@@ -21258,14 +21172,13 @@ mod router_tests {
             "input-required-tool",
             tool_retry_body.as_bytes(),
         );
-        router
-            .dispatch_stateless_with_continuation_cancellation_and_raw_params(
-                &request_ctx,
-                &tool_retry,
-                tool_retry_raw.as_deref(),
-                &cancellation,
-            )
-            .expect("HTTP-admitted ordered tool retry reaches the handler");
+        block_on(router.dispatch_stateless_with_continuation_cancellation_and_raw_params(
+            &request_ctx,
+            &tool_retry,
+            tool_retry_raw.as_deref(),
+            &cancellation,
+        ))
+        .expect("HTTP-admitted ordered tool retry reaches the handler");
 
         let resource_initial_body = serde_json::to_vec(&serde_json::json!({
             "jsonrpc": "2.0", "id": 1440, "method": "resources/read",
@@ -21277,14 +21190,15 @@ mod router_tests {
             "file:///input-required-resource",
             &resource_initial_body,
         );
-        let resource_issued = router
-            .dispatch_stateless_with_continuation_cancellation_and_raw_params(
+        let resource_issued = block_on(
+            router.dispatch_stateless_with_continuation_cancellation_and_raw_params(
                 &request_ctx,
                 &resource_initial,
                 resource_initial_raw.as_deref(),
                 &cancellation,
-            )
-            .expect("HTTP-admitted resource issues state");
+            ),
+        )
+        .expect("HTTP-admitted resource issues state");
         let resource_retry_body = format!(
             r#"{{"jsonrpc":"2.0","id":1441,"method":"resources/read","params":{{"_meta":{},"uri":"file:///input-required-resource","inputResponses":{{"inert":{},"roots":{}}},"requestState":{}}}}}"#,
             serde_json::to_string(&metadata).expect("metadata serializes"),
@@ -21308,16 +21222,15 @@ mod router_tests {
                 "uri".to_owned(),
                 serde_json::json!("file:///sanitized-resource"),
             );
-        let resource_sidecar_error = router
-            .dispatch_stateless_with_continuation_cancellation_and_raw_params(
+        let resource_sidecar_error = block_on(
+            router.dispatch_stateless_with_continuation_cancellation_and_raw_params(
                 &request_ctx,
                 &sanitized_resource_retry,
                 resource_retry_raw.as_deref(),
                 &cancellation,
-            )
-            .expect_err(
-                "a resource raw sidecar cannot survive a one-field sanitized typed mismatch",
-            );
+            ),
+        )
+        .expect_err("a resource raw sidecar cannot survive a one-field sanitized typed mismatch");
         assert_eq!(resource_sidecar_error.code, McpErrorCode::InvalidParams);
         assert_eq!(
             resource_calls.load(Ordering::SeqCst),
@@ -21329,14 +21242,13 @@ mod router_tests {
             2,
             "the rejected resource sidecar leaves its continuation available"
         );
-        router
-            .dispatch_stateless_with_continuation_cancellation_and_raw_params(
-                &request_ctx,
-                &resource_retry,
-                resource_retry_raw.as_deref(),
-                &cancellation,
-            )
-            .expect("HTTP-admitted ordered resource retry reaches the handler");
+        block_on(router.dispatch_stateless_with_continuation_cancellation_and_raw_params(
+            &request_ctx,
+            &resource_retry,
+            resource_retry_raw.as_deref(),
+            &cancellation,
+        ))
+        .expect("HTTP-admitted ordered resource retry reaches the handler");
 
         let prompt_initial_body = serde_json::to_vec(&serde_json::json!({
             "jsonrpc": "2.0", "id": 1442, "method": "prompts/get",
@@ -21345,14 +21257,15 @@ mod router_tests {
         .expect("prompt body serializes");
         let (prompt_initial, prompt_initial_raw) =
             admit_http_wire("prompts/get", "input-required-prompt", &prompt_initial_body);
-        let prompt_issued = router
-            .dispatch_stateless_with_continuation_cancellation_and_raw_params(
+        let prompt_issued = block_on(
+            router.dispatch_stateless_with_continuation_cancellation_and_raw_params(
                 &request_ctx,
                 &prompt_initial,
                 prompt_initial_raw.as_deref(),
                 &cancellation,
-            )
-            .expect("HTTP-admitted prompt issues state");
+            ),
+        )
+        .expect("HTTP-admitted prompt issues state");
         let prompt_retry_body = format!(
             r#"{{"jsonrpc":"2.0","id":1443,"method":"prompts/get","params":{{"_meta":{},"name":"input-required-prompt","inputResponses":{{"inert":{},"roots":{}}},"requestState":{}}}}}"#,
             serde_json::to_string(&metadata).expect("metadata serializes"),
@@ -21372,14 +21285,15 @@ mod router_tests {
             .and_then(serde_json::Value::as_object_mut)
             .expect("HTTP-admitted prompt parameters are an object")
             .insert("name".to_owned(), serde_json::json!("sanitized-prompt"));
-        let prompt_sidecar_error = router
-            .dispatch_stateless_with_continuation_cancellation_and_raw_params(
+        let prompt_sidecar_error = block_on(
+            router.dispatch_stateless_with_continuation_cancellation_and_raw_params(
                 &request_ctx,
                 &sanitized_prompt_retry,
                 prompt_retry_raw.as_deref(),
                 &cancellation,
-            )
-            .expect_err("a prompt raw sidecar cannot survive a one-field sanitized typed mismatch");
+            ),
+        )
+        .expect_err("a prompt raw sidecar cannot survive a one-field sanitized typed mismatch");
         assert_eq!(prompt_sidecar_error.code, McpErrorCode::InvalidParams);
         assert_eq!(
             prompt_calls.load(Ordering::SeqCst),
@@ -21391,14 +21305,13 @@ mod router_tests {
             3,
             "the rejected prompt sidecar leaves its continuation available"
         );
-        router
-            .dispatch_stateless_with_continuation_cancellation_and_raw_params(
-                &request_ctx,
-                &prompt_retry,
-                prompt_retry_raw.as_deref(),
-                &cancellation,
-            )
-            .expect("HTTP-admitted ordered prompt retry reaches the handler");
+        block_on(router.dispatch_stateless_with_continuation_cancellation_and_raw_params(
+            &request_ctx,
+            &prompt_retry,
+            prompt_retry_raw.as_deref(),
+            &cancellation,
+        ))
+        .expect("HTTP-admitted ordered prompt retry reaches the handler");
 
         assert_eq!(tool_calls.load(Ordering::SeqCst), 2);
         assert_eq!(resource_calls.load(Ordering::SeqCst), 2);
@@ -21422,42 +21335,39 @@ mod router_tests {
             "io.modelcontextprotocol/clientCapabilities": {},
         });
 
-        let tool = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request("complete-only-tool", serde_json::json!({}), 1430_i64),
-            )
-            .expect("a complete-only tool remains available without a session partition");
+        let tool = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request("complete-only-tool", serde_json::json!({}), 1430_i64),
+        ))
+        .expect("a complete-only tool remains available without a session partition");
         assert_eq!(tool["resultType"], "complete");
 
-        let resource = router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    "resources/read",
-                    Some(serde_json::json!({
-                        "_meta": metadata.clone(),
-                        "uri": "file:///complete-only-resource",
-                    })),
-                    1431_i64,
-                ),
-            )
-            .expect("a complete-only resource remains available without a session partition");
+        let resource = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                "resources/read",
+                Some(serde_json::json!({
+                    "_meta": metadata.clone(),
+                    "uri": "file:///complete-only-resource",
+                })),
+                1431_i64,
+            ),
+        ))
+        .expect("a complete-only resource remains available without a session partition");
         assert_eq!(resource["resultType"], "complete");
 
-        let prompt = router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    "prompts/get",
-                    Some(serde_json::json!({
-                        "_meta": metadata,
-                        "name": "complete-only-prompt",
-                    })),
-                    1432_i64,
-                ),
-            )
-            .expect("a complete-only prompt remains available without a session partition");
+        let prompt = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                "prompts/get",
+                Some(serde_json::json!({
+                    "_meta": metadata,
+                    "name": "complete-only-prompt",
+                })),
+                1432_i64,
+            ),
+        ))
+        .expect("a complete-only prompt remains available without a session partition");
         assert_eq!(prompt["resultType"], "complete");
     }
 
@@ -21490,42 +21400,39 @@ mod router_tests {
             "io.modelcontextprotocol/clientCapabilities": {},
         });
 
-        let tool_error = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_call_request("input-required-tool", serde_json::json!({}), 1433_i64),
-            )
-            .expect_err("a stateless MRTR tool is rejected before its handler runs");
+        let tool_error = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_call_request("input-required-tool", serde_json::json!({}), 1433_i64),
+        ))
+        .expect_err("a stateless MRTR tool is rejected before its handler runs");
         assert_eq!(tool_error.code, McpErrorCode::InvalidParams);
 
-        let resource_error = router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    "resources/read",
-                    Some(serde_json::json!({
-                        "_meta": metadata.clone(),
-                        "uri": "file:///input-required-resource",
-                    })),
-                    1434_i64,
-                ),
-            )
-            .expect_err("a stateless MRTR resource is rejected before its handler runs");
+        let resource_error = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                "resources/read",
+                Some(serde_json::json!({
+                    "_meta": metadata.clone(),
+                    "uri": "file:///input-required-resource",
+                })),
+                1434_i64,
+            ),
+        ))
+        .expect_err("a stateless MRTR resource is rejected before its handler runs");
         assert_eq!(resource_error.code, McpErrorCode::InvalidParams);
 
-        let prompt_error = router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    "prompts/get",
-                    Some(serde_json::json!({
-                        "_meta": metadata,
-                        "name": "input-required-prompt",
-                    })),
-                    1435_i64,
-                ),
-            )
-            .expect_err("a stateless MRTR prompt is rejected before its handler runs");
+        let prompt_error = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                "prompts/get",
+                Some(serde_json::json!({
+                    "_meta": metadata,
+                    "name": "input-required-prompt",
+                })),
+                1435_i64,
+            ),
+        ))
+        .expect_err("a stateless MRTR prompt is rejected before its handler runs");
         assert_eq!(prompt_error.code, McpErrorCode::InvalidParams);
         assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
         assert_eq!(resource_calls.load(Ordering::SeqCst), 0);
@@ -21699,8 +21606,7 @@ mod router_tests {
             })),
             144_i64,
         );
-        let input_required = router
-            .dispatch_stateless(&request_ctx, &initial)
+        let input_required = block_on(router.dispatch_stateless(&request_ctx, &initial))
             .expect("state-only handler outcome is framework-bound");
         assert_eq!(input_required["resultType"], "input_required");
         assert!(
@@ -21744,13 +21650,12 @@ mod router_tests {
                 .expect("explicit-empty retry has parameters"),
         )
         .expect("explicit-empty retry parameters serialize");
-        let empty_error = router
-            .dispatch_stateless_with_raw_params(
-                &request_ctx,
-                &explicit_empty,
-                Some(&explicit_empty_raw_params),
-            )
-            .expect_err("an explicit empty inputResponses map cannot impersonate an absent member");
+        let empty_error = block_on(router.dispatch_stateless_with_raw_params(
+            &request_ctx,
+            &explicit_empty,
+            Some(&explicit_empty_raw_params),
+        ))
+        .expect_err("an explicit empty inputResponses map cannot impersonate an absent member");
         assert_eq!(empty_error.code, McpErrorCode::InvalidParams);
         assert_eq!(initial_calls.load(Ordering::SeqCst), 1);
         assert_eq!(resumed_calls.load(Ordering::SeqCst), 0);
@@ -21762,9 +21667,12 @@ mod router_tests {
                 .expect("absent-member retry has parameters"),
         )
         .expect("absent-member retry parameters serialize");
-        let completed = router
-            .dispatch_stateless_with_raw_params(&request_ctx, &retry, Some(&retry_raw_params))
-            .expect("the unchanged absent-member retry resumes exactly once");
+        let completed = block_on(router.dispatch_stateless_with_raw_params(
+            &request_ctx,
+            &retry,
+            Some(&retry_raw_params),
+        ))
+        .expect("the unchanged absent-member retry resumes exactly once");
         assert_eq!(completed["resultType"], "complete");
         assert_eq!(completed["content"][0]["text"], "state-only resumed");
         assert_eq!(initial_calls.load(Ordering::SeqCst), 1);
@@ -21815,8 +21723,7 @@ mod router_tests {
             })),
             145_i64,
         );
-        let tool_initial_result = router
-            .dispatch_stateless(&request_ctx, &tool_initial)
+        let tool_initial_result = block_on(router.dispatch_stateless(&request_ctx, &tool_initial))
             .expect("normal final dispatch mints the tool request state");
         let tool_state = tool_initial_result["requestState"]
             .as_str()
@@ -21861,13 +21768,12 @@ mod router_tests {
                 .expect("sampling response converts to a wire value"),
             );
         let kind_mismatch_raw_params = raw_params_for(&kind_mismatch);
-        let kind_error = router
-            .dispatch_stateless_with_raw_params(
-                &request_ctx,
-                &kind_mismatch,
-                Some(&kind_mismatch_raw_params),
-            )
-            .expect_err("changing only the response kind is refused before handler invocation");
+        let kind_error = block_on(router.dispatch_stateless_with_raw_params(
+            &request_ctx,
+            &kind_mismatch,
+            Some(&kind_mismatch_raw_params),
+        ))
+        .expect_err("changing only the response kind is refused before handler invocation");
         assert_eq!(kind_error.code, McpErrorCode::InvalidParams);
         assert_eq!(
             tool_final_calls.load(Ordering::SeqCst),
@@ -21887,13 +21793,12 @@ mod router_tests {
             145_i64,
         );
         let missing_raw_params = raw_params_for(&missing_responses);
-        let missing_error = router
-            .dispatch_stateless_with_raw_params(
-                &request_ctx,
-                &missing_responses,
-                Some(&missing_raw_params),
-            )
-            .expect_err("a missing roots response cannot consume a tool continuation");
+        let missing_error = block_on(router.dispatch_stateless_with_raw_params(
+            &request_ctx,
+            &missing_responses,
+            Some(&missing_raw_params),
+        ))
+        .expect_err("a missing roots response cannot consume a tool continuation");
         assert_eq!(missing_error.code, McpErrorCode::InvalidParams);
         assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
 
@@ -21912,13 +21817,12 @@ mod router_tests {
             ),
             145_i64,
         );
-        let duplicate_error = router
-            .dispatch_stateless_with_raw_params(
-                &request_ctx,
-                &duplicate_retry,
-                Some(&duplicate_raw_params),
-            )
-            .expect_err("duplicate raw response keys cannot collapse before MRTR admission");
+        let duplicate_error = block_on(router.dispatch_stateless_with_raw_params(
+            &request_ctx,
+            &duplicate_retry,
+            Some(&duplicate_raw_params),
+        ))
+        .expect_err("duplicate raw response keys cannot collapse before MRTR admission");
         assert_eq!(duplicate_error.code, McpErrorCode::InvalidParams);
         assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
 
@@ -21930,13 +21834,12 @@ mod router_tests {
             .and_then(|params| params.get_mut("inputResponses"))
             .expect("tool retry contains inputResponses") = serde_json::json!({"inert": null});
         let unknown_only_raw_params = raw_params_for(&unknown_only);
-        let unknown_error = router
-            .dispatch_stateless_with_raw_params(
-                &request_ctx,
-                &unknown_only,
-                Some(&unknown_only_raw_params),
-            )
-            .expect_err("unknown-only inputResponses cannot consume a tool continuation");
+        let unknown_error = block_on(router.dispatch_stateless_with_raw_params(
+            &request_ctx,
+            &unknown_only,
+            Some(&unknown_only_raw_params),
+        ))
+        .expect_err("unknown-only inputResponses cannot consume a tool continuation");
         assert_eq!(unknown_error.code, McpErrorCode::InvalidParams);
         assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
 
@@ -21951,8 +21854,7 @@ mod router_tests {
         for index in 0..crate::bidirectional::DEFAULT_MAX_MRTR_INPUT_REQUESTS_PER_ROUND {
             responses.insert(format!("inert-{index}"), serde_json::Value::Null);
         }
-        let oversized_error = router
-            .dispatch_stateless(&request_ctx, &oversized_map)
+        let oversized_error = block_on(router.dispatch_stateless(&request_ctx, &oversized_map))
             .expect_err("an oversized raw response map is refused before retry decoding");
         assert_eq!(oversized_error.code, McpErrorCode::InvalidParams);
         assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
@@ -21969,9 +21871,11 @@ mod router_tests {
                 "roots".to_owned(),
                 serde_json::Value::String("x".repeat(MAX_MRTR_RAW_INPUT_RESPONSES_BYTES + 1)),
             );
-        let tool_bytes_error = router
-            .dispatch_stateless(&request_ctx, &tool_oversized_bytes)
-            .expect_err("only an oversized tool response value is refused before retry decoding");
+        let tool_bytes_error =
+            block_on(router.dispatch_stateless(&request_ctx, &tool_oversized_bytes))
+                .expect_err(
+                    "only an oversized tool response value is refused before retry decoding",
+                );
         assert_eq!(tool_bytes_error.code, McpErrorCode::InvalidParams);
         assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
 
@@ -21982,8 +21886,7 @@ mod router_tests {
             .and_then(serde_json::Value::as_object_mut)
             .expect("tool retry parameters are an object")
             .insert("name".to_owned(), serde_json::json!("other-tool"));
-        let target_error = router
-            .dispatch_stateless(&request_ctx, &target_mismatch)
+        let target_error = block_on(router.dispatch_stateless(&request_ctx, &target_mismatch))
             .expect_err("changing only the target cannot consume a tool state");
         assert_eq!(target_error.code, McpErrorCode::InvalidParams);
         assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
@@ -21996,28 +21899,25 @@ mod router_tests {
             &other_connection,
         );
         let other_session_ctx = other_inbound.request_context();
-        let session_error = router
-            .dispatch_stateless(&other_session_ctx, &tool_retry)
+        let session_error = block_on(router.dispatch_stateless(&other_session_ctx, &tool_retry))
             .expect_err("changing only the session cannot consume a tool state");
         assert_eq!(session_error.code, McpErrorCode::InvalidParams);
         assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
 
         let principal_ctx = inbound.request_context();
         assert!(principal_ctx.set_auth(fastmcp_core::AuthContext::with_subject("other-user")));
-        let principal_error = router
-            .dispatch_stateless(&principal_ctx, &tool_retry)
+        let principal_error = block_on(router.dispatch_stateless(&principal_ctx, &tool_retry))
             .expect_err("changing only the principal cannot consume a tool state");
         assert_eq!(principal_error.code, McpErrorCode::InvalidParams);
         assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
 
         let tool_retry_raw_params = raw_params_for(&tool_retry);
-        let tool_response = router
-            .dispatch_stateless_with_raw_params(
-                &request_ctx,
-                &tool_retry,
-                Some(&tool_retry_raw_params),
-            )
-            .expect("a framework-minted tool state resumes through the final handler");
+        let tool_response = block_on(router.dispatch_stateless_with_raw_params(
+            &request_ctx,
+            &tool_retry,
+            Some(&tool_retry_raw_params),
+        ))
+        .expect("a framework-minted tool state resumes through the final handler");
         assert_eq!(tool_response["resultType"], "input_required");
         assert_eq!(tool_final_calls.load(Ordering::SeqCst), 2);
 
@@ -22029,9 +21929,9 @@ mod router_tests {
             })),
             146_i64,
         );
-        let resource_initial_result = router
-            .dispatch_stateless(&request_ctx, &resource_initial)
-            .expect("normal final dispatch mints the resource request state");
+        let resource_initial_result =
+            block_on(router.dispatch_stateless(&request_ctx, &resource_initial))
+                .expect("normal final dispatch mints the resource request state");
         let resource_state = resource_initial_result["requestState"]
             .as_str()
             .expect("framework result carries opaque resource state")
@@ -22053,9 +21953,9 @@ mod router_tests {
             .and_then(serde_json::Value::as_object_mut)
             .and_then(|params| params.get_mut("inputResponses"))
             .expect("resource retry contains inputResponses") = serde_json::json!({"inert": null});
-        let resource_unknown_error = router
-            .dispatch_stateless(&request_ctx, &resource_unknown_only)
-            .expect_err("unknown-only inputResponses cannot consume a resource continuation");
+        let resource_unknown_error =
+            block_on(router.dispatch_stateless(&request_ctx, &resource_unknown_only))
+                .expect_err("unknown-only inputResponses cannot consume a resource continuation");
         assert_eq!(resource_unknown_error.code, McpErrorCode::InvalidParams);
         assert_eq!(resource_final_calls.load(Ordering::SeqCst), 1);
 
@@ -22072,20 +21972,19 @@ mod router_tests {
             .and_then(serde_json::Value::as_object_mut)
             .expect("resource retry contains an inputResponses object")
             .insert("roots".to_owned(), resource_nested_value);
-        let resource_depth_error = router
-            .dispatch_stateless(&request_ctx, &resource_oversized_depth)
-            .expect_err("only excessive response nesting is refused before retry decoding");
+        let resource_depth_error =
+            block_on(router.dispatch_stateless(&request_ctx, &resource_oversized_depth))
+                .expect_err("only excessive response nesting is refused before retry decoding");
         assert_eq!(resource_depth_error.code, McpErrorCode::InvalidParams);
         assert_eq!(resource_final_calls.load(Ordering::SeqCst), 1);
 
         let resource_retry_raw_params = raw_params_for(&resource_retry);
-        let resource_response = router
-            .dispatch_stateless_with_raw_params(
-                &request_ctx,
-                &resource_retry,
-                Some(&resource_retry_raw_params),
-            )
-            .expect("a framework-minted resource state resumes through the final handler");
+        let resource_response = block_on(router.dispatch_stateless_with_raw_params(
+            &request_ctx,
+            &resource_retry,
+            Some(&resource_retry_raw_params),
+        ))
+        .expect("a framework-minted resource state resumes through the final handler");
         assert_eq!(resource_response["resultType"], "input_required");
         assert_eq!(resource_final_calls.load(Ordering::SeqCst), 2);
 
@@ -22097,9 +21996,9 @@ mod router_tests {
             })),
             147_i64,
         );
-        let prompt_initial_result = router
-            .dispatch_stateless(&request_ctx, &prompt_initial)
-            .expect("normal final dispatch mints the prompt request state");
+        let prompt_initial_result =
+            block_on(router.dispatch_stateless(&request_ctx, &prompt_initial))
+                .expect("normal final dispatch mints the prompt request state");
         let prompt_state = prompt_initial_result["requestState"]
             .as_str()
             .expect("framework result carries opaque prompt state")
@@ -22121,9 +22020,9 @@ mod router_tests {
             .and_then(serde_json::Value::as_object_mut)
             .and_then(|params| params.get_mut("inputResponses"))
             .expect("prompt retry contains inputResponses") = serde_json::json!({"inert": null});
-        let prompt_unknown_error = router
-            .dispatch_stateless(&request_ctx, &prompt_unknown_only)
-            .expect_err("unknown-only inputResponses cannot consume a prompt continuation");
+        let prompt_unknown_error =
+            block_on(router.dispatch_stateless(&request_ctx, &prompt_unknown_only))
+                .expect_err("unknown-only inputResponses cannot consume a prompt continuation");
         assert_eq!(prompt_unknown_error.code, McpErrorCode::InvalidParams);
         assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 1);
 
@@ -22139,22 +22038,21 @@ mod router_tests {
                 "roots".to_owned(),
                 serde_json::Value::Array(vec![serde_json::Value::Null; MAX_MRTR_RAW_JSON_VALUES]),
             );
-        let prompt_values_error = router
-            .dispatch_stateless(&request_ctx, &prompt_oversized_values)
-            .expect_err(
-                "only an oversized prompt response value set is refused before retry decoding",
-            );
+        let prompt_values_error =
+            block_on(router.dispatch_stateless(&request_ctx, &prompt_oversized_values))
+                .expect_err(
+                    "only an oversized prompt response value set is refused before retry decoding",
+                );
         assert_eq!(prompt_values_error.code, McpErrorCode::InvalidParams);
         assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 1);
 
         let prompt_retry_raw_params = raw_params_for(&prompt_retry);
-        let prompt_response = router
-            .dispatch_stateless_with_raw_params(
-                &request_ctx,
-                &prompt_retry,
-                Some(&prompt_retry_raw_params),
-            )
-            .expect("a framework-minted prompt state resumes through the final handler");
+        let prompt_response = block_on(router.dispatch_stateless_with_raw_params(
+            &request_ctx,
+            &prompt_retry,
+            Some(&prompt_retry_raw_params),
+        ))
+        .expect("a framework-minted prompt state resumes through the final handler");
         assert_eq!(prompt_response["resultType"], "input_required");
         assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 2);
 
@@ -22172,9 +22070,9 @@ mod router_tests {
                 "requestState".to_owned(),
                 tool_response["requestState"].clone(),
             );
-        let tool_second_response = router
-            .dispatch_stateless(&request_ctx, &tool_second_retry)
-            .expect("a second public tools/call round reaches the resumed handler");
+        let tool_second_response =
+            block_on(router.dispatch_stateless(&request_ctx, &tool_second_retry))
+                .expect("a second public tools/call round reaches the resumed handler");
         assert_eq!(tool_second_response["resultType"], "input_required");
 
         let mut resource_second_retry = resource_retry.clone();
@@ -22187,9 +22085,9 @@ mod router_tests {
                 "requestState".to_owned(),
                 resource_response["requestState"].clone(),
             );
-        let resource_second_response = router
-            .dispatch_stateless(&request_ctx, &resource_second_retry)
-            .expect("a second public resources/read round reaches the resumed handler");
+        let resource_second_response =
+            block_on(router.dispatch_stateless(&request_ctx, &resource_second_retry))
+                .expect("a second public resources/read round reaches the resumed handler");
         assert_eq!(resource_second_response["resultType"], "input_required");
 
         let mut prompt_second_retry = prompt_retry.clone();
@@ -22202,16 +22100,15 @@ mod router_tests {
                 "requestState".to_owned(),
                 prompt_response["requestState"].clone(),
             );
-        let prompt_second_response = router
-            .dispatch_stateless(&request_ctx, &prompt_second_retry)
-            .expect("a second public prompts/get round reaches the resumed handler");
+        let prompt_second_response =
+            block_on(router.dispatch_stateless(&request_ctx, &prompt_second_retry))
+                .expect("a second public prompts/get round reaches the resumed handler");
         assert_eq!(prompt_second_response["resultType"], "input_required");
         assert_eq!(tool_final_calls.load(Ordering::SeqCst), 3);
         assert_eq!(resource_final_calls.load(Ordering::SeqCst), 3);
         assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 3);
 
-        let replay = router
-            .dispatch_stateless(&request_ctx, &tool_retry)
+        let replay = block_on(router.dispatch_stateless(&request_ctx, &tool_retry))
             .expect_err("replaying only the already consumed tool state is refused");
         assert_eq!(replay.code, McpErrorCode::InvalidParams);
         assert_eq!(
@@ -22291,13 +22188,12 @@ mod router_tests {
             .expect("modern connection supplies continuation ownership");
 
         for request in [&tool_request, &resource_request, &prompt_request] {
-            let result = router
-                .dispatch_stateless_with_continuation_cancellation(
-                    &allowed_ctx,
-                    request,
-                    &allowed_cancellation,
-                )
-                .expect("enabled final component reaches its handler");
+            let result = block_on(router.dispatch_stateless_with_continuation_cancellation(
+                &allowed_ctx,
+                request,
+                &allowed_cancellation,
+            ))
+            .expect("enabled final component reaches its handler");
             assert_eq!(result["resultType"], "input_required");
             assert!(
                 result["requestState"].is_string(),
@@ -22328,13 +22224,12 @@ mod router_tests {
             request_bytes[0],
             "connection state is the sole tool-request admission difference"
         );
-        let tool_error = router
-            .dispatch_stateless_with_continuation_cancellation(
-                &denied_ctx,
-                &tool_request,
-                &denied_cancellation,
-            )
-            .expect_err("a disabled tool cannot mint final MRTR state");
+        let tool_error = block_on(router.dispatch_stateless_with_continuation_cancellation(
+            &denied_ctx,
+            &tool_request,
+            &denied_cancellation,
+        ))
+        .expect_err("a disabled tool cannot mint final MRTR state");
         assert_eq!(tool_error.code, McpErrorCode::MethodNotFound);
 
         assert_eq!(
@@ -22342,13 +22237,12 @@ mod router_tests {
             request_bytes[1],
             "connection state is the sole resource-request admission difference"
         );
-        let resource_error = router
-            .dispatch_stateless_with_continuation_cancellation(
-                &denied_ctx,
-                &resource_request,
-                &denied_cancellation,
-            )
-            .expect_err("a disabled resource cannot mint final MRTR state");
+        let resource_error = block_on(router.dispatch_stateless_with_continuation_cancellation(
+            &denied_ctx,
+            &resource_request,
+            &denied_cancellation,
+        ))
+        .expect_err("a disabled resource cannot mint final MRTR state");
         assert_eq!(resource_error.code, McpErrorCode::ResourceNotFound);
 
         assert_eq!(
@@ -22356,13 +22250,12 @@ mod router_tests {
             request_bytes[2],
             "connection state is the sole prompt-request admission difference"
         );
-        let prompt_error = router
-            .dispatch_stateless_with_continuation_cancellation(
-                &denied_ctx,
-                &prompt_request,
-                &denied_cancellation,
-            )
-            .expect_err("a disabled prompt cannot mint final MRTR state");
+        let prompt_error = block_on(router.dispatch_stateless_with_continuation_cancellation(
+            &denied_ctx,
+            &prompt_request,
+            &denied_cancellation,
+        ))
+        .expect_err("a disabled prompt cannot mint final MRTR state");
         assert_eq!(prompt_error.code, McpErrorCode::PromptNotFound);
 
         assert_eq!(
@@ -22428,21 +22321,24 @@ mod router_tests {
             )
         };
 
-        let tools = router
-            .dispatch_stateless(&request_ctx, &list_request("tools/list", 614_i64))
-            .expect("enabled tool is discovered");
-        let resources = router
-            .dispatch_stateless(&request_ctx, &list_request("resources/list", 615_i64))
-            .expect("enabled resource is discovered");
-        let templates = router
-            .dispatch_stateless(
-                &request_ctx,
-                &list_request("resources/templates/list", 616_i64),
-            )
-            .expect("enabled resource template is discovered");
-        let prompts = router
-            .dispatch_stateless(&request_ctx, &list_request("prompts/list", 617_i64))
-            .expect("enabled prompt is discovered");
+        let tools =
+            block_on(router.dispatch_stateless(&request_ctx, &list_request("tools/list", 614_i64)))
+                .expect("enabled tool is discovered");
+        let resources = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &list_request("resources/list", 615_i64),
+        ))
+        .expect("enabled resource is discovered");
+        let templates = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &list_request("resources/templates/list", 616_i64),
+        ))
+        .expect("enabled resource template is discovered");
+        let prompts = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &list_request("prompts/list", 617_i64),
+        ))
+        .expect("enabled prompt is discovered");
         assert_eq!(tools["tools"][0]["name"], "connection-scoped-tool");
         assert_eq!(
             resources["resources"][0]["uri"],
@@ -22459,21 +22355,24 @@ mod router_tests {
         assert!(request_ctx.disable_resource(template_uri));
         assert!(request_ctx.disable_prompt("connection-scoped-prompt"));
 
-        let discovered_tools = router
-            .dispatch_stateless(&request_ctx, &list_request("tools/list", 618_i64))
-            .expect("disabled tool remains in the immutable final catalog");
-        let discovered_resources = router
-            .dispatch_stateless(&request_ctx, &list_request("resources/list", 619_i64))
-            .expect("disabled resource remains in the immutable final catalog");
-        let discovered_templates = router
-            .dispatch_stateless(
-                &request_ctx,
-                &list_request("resources/templates/list", 620_i64),
-            )
-            .expect("disabled template remains in the immutable final catalog");
-        let discovered_prompts = router
-            .dispatch_stateless(&request_ctx, &list_request("prompts/list", 621_i64))
-            .expect("disabled prompt remains in the immutable final catalog");
+        let discovered_tools =
+            block_on(router.dispatch_stateless(&request_ctx, &list_request("tools/list", 618_i64)))
+                .expect("disabled tool remains in the immutable final catalog");
+        let discovered_resources = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &list_request("resources/list", 619_i64),
+        ))
+        .expect("disabled resource remains in the immutable final catalog");
+        let discovered_templates = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &list_request("resources/templates/list", 620_i64),
+        ))
+        .expect("disabled template remains in the immutable final catalog");
+        let discovered_prompts = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &list_request("prompts/list", 621_i64),
+        ))
+        .expect("disabled prompt remains in the immutable final catalog");
         assert_eq!(
             discovered_tools["tools"][0]["name"],
             "connection-scoped-tool"
@@ -22555,62 +22454,57 @@ mod router_tests {
             &connection,
         );
         let later_ctx = later_inbound.request_context();
-        let read_error = router
-            .dispatch_stateless(
-                &later_ctx,
-                &JsonRpcRequest::new(
-                    "resources/read",
-                    Some(serde_json::json!({
-                        "_meta": metadata,
-                        "uri": "file:///connection-scoped-resource",
-                    })),
-                    631_i64,
-                ),
-            )
-            .expect_err(
-                "a later inbound on the same modern connection must refuse the disabled resource",
-            );
+        let read_error = block_on(router.dispatch_stateless(
+            &later_ctx,
+            &JsonRpcRequest::new(
+                "resources/read",
+                Some(serde_json::json!({
+                    "_meta": metadata,
+                    "uri": "file:///connection-scoped-resource",
+                })),
+                631_i64,
+            ),
+        ))
+        .expect_err(
+            "a later inbound on the same modern connection must refuse the disabled resource",
+        );
         assert_eq!(read_error.code, McpErrorCode::ResourceNotFound);
         assert!(
             read_error.message.contains("disabled"),
             "the refused resource read must keep the session-disabled message: {read_error:?}"
         );
-        let prompt_error = router
-            .dispatch_stateless(
-                &later_ctx,
-                &JsonRpcRequest::new(
-                    "prompts/get",
-                    Some(serde_json::json!({
-                        "_meta": metadata,
-                        "name": "connection-scoped-prompt",
-                    })),
-                    632_i64,
-                ),
-            )
-            .expect_err(
-                "a later inbound on the same modern connection must refuse the disabled prompt",
-            );
+        let prompt_error = block_on(router.dispatch_stateless(
+            &later_ctx,
+            &JsonRpcRequest::new(
+                "prompts/get",
+                Some(serde_json::json!({
+                    "_meta": metadata,
+                    "name": "connection-scoped-prompt",
+                })),
+                632_i64,
+            ),
+        ))
+        .expect_err(
+            "a later inbound on the same modern connection must refuse the disabled prompt",
+        );
         assert_eq!(prompt_error.code, McpErrorCode::PromptNotFound);
         assert!(
             prompt_error.message.contains("disabled"),
             "the refused prompt get must keep the session-disabled message: {prompt_error:?}"
         );
-        let tool_error = router
-            .dispatch_stateless(
-                &later_ctx,
-                &JsonRpcRequest::new(
-                    "tools/call",
-                    Some(serde_json::json!({
-                        "_meta": metadata,
-                        "name": "connection-scoped-tool",
-                        "arguments": {},
-                    })),
-                    633_i64,
-                ),
-            )
-            .expect_err(
-                "a later inbound on the same modern connection must refuse the disabled tool",
-            );
+        let tool_error = block_on(router.dispatch_stateless(
+            &later_ctx,
+            &JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "_meta": metadata,
+                    "name": "connection-scoped-tool",
+                    "arguments": {},
+                })),
+                633_i64,
+            ),
+        ))
+        .expect_err("a later inbound on the same modern connection must refuse the disabled tool");
         assert_eq!(tool_error.code, McpErrorCode::MethodNotFound);
         assert!(
             tool_error.message.contains("disabled"),
@@ -22634,8 +22528,7 @@ mod router_tests {
         let request_ctx = request_context(&cx, 622, Budget::INFINITE, &state);
         let initial = final_tools_list_request(None, None, None, 622_i64);
         let initial_bytes = serde_json::to_vec(&initial).expect("initial request serializes");
-        let first_page = router
-            .dispatch_stateless(&request_ctx, &initial)
+        let first_page = block_on(router.dispatch_stateless(&request_ctx, &initial))
             .expect("the initial final catalog page is admitted");
         let cursor = first_page["nextCursor"]
             .as_str()
@@ -22648,24 +22541,22 @@ mod router_tests {
             initial_bytes,
             "connection state cannot alter the request or its catalog continuation"
         );
-        let continued = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_list_request(Some(&cursor), None, None, 623_i64),
-            )
-            .expect("a disabled-component change cannot invalidate an immutable final cursor");
+        let continued = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_list_request(Some(&cursor), None, None, 623_i64),
+        ))
+        .expect("a disabled-component change cannot invalidate an immutable final cursor");
         assert_eq!(
             continued["tools"][0]["name"],
             "second-connection-cursor-tool"
         );
         assert!(continued.get("nextCursor").is_none());
 
-        let refreshed = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_tools_list_request(None, None, None, 624_i64),
-            )
-            .expect("a cursor-free request keeps the immutable final catalog");
+        let refreshed = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_list_request(None, None, None, 624_i64),
+        ))
+        .expect("a cursor-free request keeps the immutable final catalog");
         assert_eq!(
             refreshed["tools"][0]["name"],
             "first-connection-cursor-tool"
@@ -22713,23 +22604,21 @@ mod router_tests {
             "distinct modern connections have distinct durable partitions"
         );
 
-        let first_page = router
-            .dispatch_stateless(
-                &origin_context,
-                &final_tools_list_request(None, None, None, 625_i64),
-            )
-            .expect("the origin connection receives the first final catalog page");
+        let first_page = block_on(router.dispatch_stateless(
+            &origin_context,
+            &final_tools_list_request(None, None, None, 625_i64),
+        ))
+        .expect("the origin connection receives the first final catalog page");
         let cursor = first_page["nextCursor"]
             .as_str()
             .expect("the first page has a continuation")
             .to_owned();
 
-        let continued = router
-            .dispatch_stateless(
-                &continuation_context,
-                &final_tools_list_request(Some(&cursor), None, None, 626_i64),
-            )
-            .expect("a final catalog cursor is not bound to its origin connection partition");
+        let continued = block_on(router.dispatch_stateless(
+            &continuation_context,
+            &final_tools_list_request(Some(&cursor), None, None, 626_i64),
+        ))
+        .expect("a final catalog cursor is not bound to its origin connection partition");
         assert_eq!(
             continued["tools"][0]["name"],
             "second-cross-connection-cursor-tool"
@@ -22773,13 +22662,12 @@ mod router_tests {
             })),
             301_i64,
         );
-        let initial_result = router
-            .dispatch_stateless_with_continuation_cancellation(
-                &request_ctx,
-                &initial,
-                &continuation_cancellation,
-            )
-            .expect("the connected request mints a continuation");
+        let initial_result = block_on(router.dispatch_stateless_with_continuation_cancellation(
+            &request_ctx,
+            &initial,
+            &continuation_cancellation,
+        ))
+        .expect("the connected request mints a continuation");
         let retry = JsonRpcRequest::new(
             "tools/call",
             Some(serde_json::json!({
@@ -22796,13 +22684,12 @@ mod router_tests {
         // The request, opaque state, durable partition, and response map all
         // remain unchanged. Peer disconnect is the sole changed dimension.
         connection.disconnect();
-        let error = router
-            .dispatch_stateless_with_continuation_cancellation(
-                &request_ctx,
-                &retry,
-                &continuation_cancellation,
-            )
-            .expect_err("disconnect must cancel the retained continuation");
+        let error = block_on(router.dispatch_stateless_with_continuation_cancellation(
+            &request_ctx,
+            &retry,
+            &continuation_cancellation,
+        ))
+        .expect_err("disconnect must cancel the retained continuation");
         assert_eq!(error.code, McpErrorCode::RequestCancelled);
         assert_eq!(
             serde_json::to_vec(&retry).expect("retry serializes"),
@@ -22849,8 +22736,7 @@ mod router_tests {
             })),
             148_i64,
         );
-        let initial_result = router
-            .dispatch_stateless(&request_ctx, &initial)
+        let initial_result = block_on(router.dispatch_stateless(&request_ctx, &initial))
             .expect("a task-capable tool may return input_required without Tasks negotiation");
         let request_state = initial_result["requestState"]
             .as_str()
@@ -22869,8 +22755,7 @@ mod router_tests {
             })),
             149_i64,
         );
-        let resumed = router
-            .dispatch_stateless(&request_ctx, &retry)
+        let resumed = block_on(router.dispatch_stateless(&request_ctx, &retry))
             .expect("a task-capable input-required retry remains an ordinary MRTR operation");
         assert_eq!(resumed["resultType"], "input_required");
         assert_eq!(final_calls.load(Ordering::SeqCst), 2);
@@ -22932,15 +22817,13 @@ mod router_tests {
         let catalog_before = serde_json::to_vec(&router.tools()).expect("catalog serializes");
         let planted_before = serde_json::to_vec(&planted).expect("request serializes");
 
-        let accepted = router
-            .dispatch_stateless(&request_ctx, &baseline)
+        let accepted = block_on(router.dispatch_stateless(&request_ctx, &baseline))
             .expect("negotiated final request is accepted");
         assert_eq!(accepted["resultType"], "input_required");
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
         assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
 
-        let error = router
-            .dispatch_stateless(&request_ctx, &planted)
+        let error = block_on(router.dispatch_stateless(&request_ctx, &planted))
             .expect_err("one-field no-negotiation request is rejected instead of falling back");
         assert_eq!(error.code, McpErrorCode::InvalidParams);
         assert_eq!(
@@ -22955,8 +22838,7 @@ mod router_tests {
         );
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
         assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
-        let retried = router
-            .dispatch_stateless(&request_ctx, &baseline)
+        let retried = block_on(router.dispatch_stateless(&request_ctx, &baseline))
             .expect("the negotiated baseline remains accepted after rejection");
         assert_eq!(retried["resultType"], "input_required");
         assert_ne!(
@@ -22985,8 +22867,7 @@ mod router_tests {
         )
         .expect("final prompts/get request decodes through the public core surface");
 
-        let response = router
-            .dispatch_stateless(&request_ctx, &request)
+        let response = block_on(router.dispatch_stateless(&request_ctx, &request))
             .expect("final prompts/get reaches the direct final handler");
 
         assert_eq!(
@@ -23055,33 +22936,31 @@ mod router_tests {
         accepted_router
             .add_resource_with_behavior(client_direct, crate::DuplicateBehavior::Replace)
             .expect("an explicitly client-direct HTTPS catalog resource is admitted");
-        let accepted = accepted_router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    "resources/list",
-                    Some(serde_json::json!({"_meta": final_metadata.clone()})),
-                    971_i64,
-                ),
-            )
-            .expect("public final resource listing succeeds");
+        let accepted = block_on(accepted_router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                "resources/list",
+                Some(serde_json::json!({"_meta": final_metadata.clone()})),
+                971_i64,
+            ),
+        ))
+        .expect("public final resource listing succeeds");
         assert_eq!(
             accepted["resources"][0]["uri"],
             "https://client.example.test/catalog.txt"
         );
-        let direct_read = accepted_router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    "resources/read",
-                    Some(serde_json::json!({
-                        "_meta": final_metadata.clone(),
-                        "uri": "https://client.example.test/catalog.txt",
-                    })),
-                    972_i64,
-                ),
-            )
-            .expect_err("client-direct HTTPS catalog entries are not MCP-read identities");
+        let direct_read = block_on(accepted_router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                "resources/read",
+                Some(serde_json::json!({
+                    "_meta": final_metadata.clone(),
+                    "uri": "https://client.example.test/catalog.txt",
+                })),
+                972_i64,
+            ),
+        ))
+        .expect_err("client-direct HTTPS catalog entries are not MCP-read identities");
         assert_eq!(direct_read.code, McpErrorCode::InvalidParams);
 
         let mut rejected_router = Router::new();
@@ -23103,16 +22982,15 @@ mod router_tests {
             catalog_before,
             "rejected URI-use admission leaves the prior catalog unchanged"
         );
-        let unchanged = rejected_router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    "resources/list",
-                    Some(serde_json::json!({"_meta": final_metadata})),
-                    972_i64,
-                ),
-            )
-            .expect("rejection leaves public final dispatch usable");
+        let unchanged = block_on(rejected_router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                "resources/list",
+                Some(serde_json::json!({"_meta": final_metadata})),
+                972_i64,
+            ),
+        ))
+        .expect("rejection leaves public final dispatch usable");
         assert_eq!(unchanged["resources"].as_array().map(Vec::len), Some(1));
         assert_eq!(
             unchanged["resources"][0]["uri"],
@@ -23162,49 +23040,47 @@ mod router_tests {
             "io.modelcontextprotocol/clientCapabilities": {},
         });
 
-        let prompt = router
-            .dispatch_stateless(
-                &InboundRequestContext::with_modern_connection(
-                    cx.clone(),
-                    973,
-                    InboundRequestTransport::Memory,
-                    &connection,
-                )
-                .request_context(),
-                &JsonRpcRequest::new(
-                    "prompts/get",
-                    Some(serde_json::json!({
-                        "_meta": metadata.clone(),
-                        "name": "client-direct-https-prompt",
-                    })),
-                    973_i64,
-                ),
+        let prompt = block_on(router.dispatch_stateless(
+            &InboundRequestContext::with_modern_connection(
+                cx.clone(),
+                973,
+                InboundRequestTransport::Memory,
+                &connection,
             )
-            .expect("a client-direct HTTPS resource link is emitted from the public prompt path");
+            .request_context(),
+            &JsonRpcRequest::new(
+                "prompts/get",
+                Some(serde_json::json!({
+                    "_meta": metadata.clone(),
+                    "name": "client-direct-https-prompt",
+                })),
+                973_i64,
+            ),
+        ))
+        .expect("a client-direct HTTPS resource link is emitted from the public prompt path");
         assert_eq!(
             prompt["messages"][0]["content"]["uri"],
             "https://client.example.test/prompt-link"
         );
 
-        let initial = router
-            .dispatch_stateless(
-                &InboundRequestContext::with_modern_connection(
-                    cx.clone(),
-                    974,
-                    InboundRequestTransport::Memory,
-                    &connection,
-                )
-                .request_context(),
-                &JsonRpcRequest::new(
-                    "resources/read",
-                    Some(serde_json::json!({
-                        "_meta": metadata.clone(),
-                        "uri": "mcp://uri-policy/mrtr",
-                    })),
-                    974_i64,
-                ),
+        let initial = block_on(router.dispatch_stateless(
+            &InboundRequestContext::with_modern_connection(
+                cx.clone(),
+                974,
+                InboundRequestTransport::Memory,
+                &connection,
             )
-            .expect("initial public resource request mints MRTR state");
+            .request_context(),
+            &JsonRpcRequest::new(
+                "resources/read",
+                Some(serde_json::json!({
+                    "_meta": metadata.clone(),
+                    "uri": "mcp://uri-policy/mrtr",
+                })),
+                974_i64,
+            ),
+        ))
+        .expect("initial public resource request mints MRTR state");
         assert_eq!(initial["resultType"], "input_required");
         let request_state = initial["requestState"]
             .as_str()
@@ -23222,20 +23098,19 @@ mod router_tests {
             })),
             975_i64,
         );
-        let error = router
-            .dispatch_stateless(
-                &InboundRequestContext::with_modern_connection(
-                    cx,
-                    975,
-                    InboundRequestTransport::Memory,
-                    &connection,
-                )
-                .request_context(),
-                &retry,
+        let error = block_on(router.dispatch_stateless(
+            &InboundRequestContext::with_modern_connection(
+                cx,
+                975,
+                InboundRequestTransport::Memory,
+                &connection,
             )
-            .expect_err(
-                "an MRTR-resumed HTTPS embedded resource remains server-mediated and is refused",
-            );
+            .request_context(),
+            &retry,
+        ))
+        .expect_err(
+            "an MRTR-resumed HTTPS embedded resource remains server-mediated and is refused",
+        );
         assert_eq!(error.code, McpErrorCode::InternalError);
         assert_eq!(initial_calls.load(Ordering::SeqCst), 1);
         assert_eq!(resumed_calls.load(Ordering::SeqCst), 1);
@@ -23299,26 +23174,23 @@ mod router_tests {
             "the required argument is the sole planted dimension"
         );
 
-        let accepted = router
-            .dispatch_stateless(&request_ctx, &baseline)
+        let accepted = block_on(router.dispatch_stateless(&request_ctx, &baseline))
             .expect("the complete required-argument request is accepted");
         assert_eq!(accepted["resultType"], "complete");
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
         assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
 
-        let missing_error = router
-            .dispatch_stateless(&request_ctx, &missing_required)
+        let missing_error = block_on(router.dispatch_stateless(&request_ctx, &missing_required))
             .expect_err("removing only a required prompt argument is rejected");
         assert_eq!(missing_error.code, McpErrorCode::InvalidParams);
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
         assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
 
-        let unknown_error = router
-            .dispatch_stateless(
-                &request_ctx,
-                &final_prompt_get_request("unknown-prompt", serde_json::json!({}), 156_i64),
-            )
-            .expect_err("an unknown final prompt is an invalid-params protocol error");
+        let unknown_error = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_prompt_get_request("unknown-prompt", serde_json::json!({}), 156_i64),
+        ))
+        .expect_err("an unknown final prompt is an invalid-params protocol error");
         assert_eq!(unknown_error.code, McpErrorCode::InvalidParams);
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
 
@@ -23396,32 +23268,29 @@ mod router_tests {
             "the required argument is the sole planted dimension"
         );
 
-        let catalog = router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    "prompts/list",
-                    Some(serde_json::json!({
-                        "_meta": {
-                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                            "io.modelcontextprotocol/clientCapabilities": {},
-                        },
-                    })),
-                    157_i64,
-                ),
-            )
-            .expect("the final prompt catalog retains its admitted argument metadata");
+        let catalog = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                "prompts/list",
+                Some(serde_json::json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                })),
+                157_i64,
+            ),
+        ))
+        .expect("the final prompt catalog retains its admitted argument metadata");
         assert_eq!(catalog["prompts"][0]["arguments"][0]["name"], "topic");
         assert_eq!(catalog["prompts"][0]["arguments"][0]["required"], true);
 
-        let response = router
-            .dispatch_stateless(&request_ctx, &accepted)
+        let response = block_on(router.dispatch_stateless(&request_ctx, &accepted))
             .expect("the admitted final argument remains accepted after the legacy hook changes");
         assert_eq!(response["resultType"], "complete");
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
 
-        let error = router
-            .dispatch_stateless(&request_ctx, &missing_required)
+        let error = block_on(router.dispatch_stateless(&request_ctx, &missing_required))
             .expect_err("removing only the admitted required argument is rejected");
         assert_eq!(error.code, McpErrorCode::InvalidParams);
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
@@ -23444,8 +23313,7 @@ mod router_tests {
             request.params.as_ref(),
         )
         .expect("final prompts/get request decodes through the public core surface");
-        let accepted = router
-            .dispatch_stateless(&request_ctx, &request)
+        let accepted = block_on(router.dispatch_stateless(&request_ctx, &request))
             .expect("the direct final prompt response is accepted");
         let accepted_wire = serde_json::to_string(&accepted).expect("accepted result serializes");
         let mut incompatible = accepted.clone();
@@ -23533,8 +23401,7 @@ mod router_tests {
             request.params.as_ref(),
         )
         .expect("final resources/read request decodes through the public core surface");
-        let response = router
-            .dispatch_stateless(&request_ctx, &request)
+        let response = block_on(router.dispatch_stateless(&request_ctx, &request))
             .expect("final resources/read reaches the direct final handler");
 
         assert_eq!(response["resultType"], "complete");
@@ -23607,8 +23474,7 @@ mod router_tests {
             );
             router.add_resource(SentinelHintResource { provenance });
 
-            let response = router
-                .dispatch_stateless(&request_ctx, &request)
+            let response = block_on(router.dispatch_stateless(&request_ctx, &request))
                 .expect("final resource result dispatches");
             assert_eq!(response["ttlMs"], expected_ttl);
             assert_eq!(response["cacheScope"], expected_scope);
@@ -23657,15 +23523,13 @@ mod router_tests {
             "the resource URI is the sole planted dimension"
         );
 
-        let accepted = router
-            .dispatch_stateless(&request_ctx, &baseline)
+        let accepted = block_on(router.dispatch_stateless(&request_ctx, &baseline))
             .expect("the registered final resource is accepted");
         assert_eq!(accepted["resultType"], "complete");
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
         assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
 
-        let error = router
-            .dispatch_stateless(&request_ctx, &unknown)
+        let error = block_on(router.dispatch_stateless(&request_ctx, &unknown))
             .expect_err("changing only the URI to an unknown resource is rejected");
         assert_eq!(error.code, McpErrorCode::InvalidParams);
         assert_eq!(error.message, "Resource not found");
@@ -23713,8 +23577,7 @@ mod router_tests {
             request.params.as_ref(),
         )
         .expect("final resources/read request decodes through the public core surface");
-        let accepted = router
-            .dispatch_stateless(&request_ctx, &request)
+        let accepted = block_on(router.dispatch_stateless(&request_ctx, &request))
             .expect("the direct final resource response is accepted");
         let accepted_wire = serde_json::to_string(&accepted).expect("accepted result serializes");
         let mut incompatible = accepted.clone();
@@ -23839,16 +23702,15 @@ mod router_tests {
             "io.modelcontextprotocol/clientCapabilities": {},
         });
 
-        let resources = router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    "resources/list",
-                    Some(serde_json::json!({"_meta": final_metadata.clone()})),
-                    96_i64,
-                ),
-            )
-            .expect("final resource catalog is encoded");
+        let resources = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                "resources/list",
+                Some(serde_json::json!({"_meta": final_metadata.clone()})),
+                96_i64,
+            ),
+        ))
+        .expect("final resource catalog is encoded");
         assert_eq!(resources["resources"][0]["title"], "Final Catalog Resource");
         assert_eq!(
             resources["resources"][0]["icons"][0]["src"],
@@ -23860,16 +23722,15 @@ mod router_tests {
             "resource-handler"
         );
 
-        let templates = router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    "resources/templates/list",
-                    Some(serde_json::json!({"_meta": final_metadata.clone()})),
-                    97_i64,
-                ),
-            )
-            .expect("final resource-template catalog is encoded");
+        let templates = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                "resources/templates/list",
+                Some(serde_json::json!({"_meta": final_metadata.clone()})),
+                97_i64,
+            ),
+        ))
+        .expect("final resource-template catalog is encoded");
         assert_eq!(
             templates["resourceTemplates"][0]["title"],
             "Final Catalog Template"
@@ -23887,16 +23748,15 @@ mod router_tests {
             "template-handler"
         );
 
-        let prompts = router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new(
-                    "prompts/list",
-                    Some(serde_json::json!({"_meta": final_metadata})),
-                    98_i64,
-                ),
-            )
-            .expect("final prompt catalog is encoded");
+        let prompts = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                "prompts/list",
+                Some(serde_json::json!({"_meta": final_metadata})),
+                98_i64,
+            ),
+        ))
+        .expect("final prompt catalog is encoded");
         assert_eq!(prompts["prompts"][0]["title"], "Final Catalog Prompt");
         assert_eq!(
             prompts["prompts"][0]["icons"][0]["src"],
@@ -23972,16 +23832,14 @@ mod router_tests {
         );
         let catalog_before = serde_json::to_vec(&router.resources()).expect("catalog serializes");
         let planted_before = serde_json::to_vec(&planted).expect("request serializes");
-        let baseline_result = router
-            .dispatch_stateless(&request_ctx, &baseline)
+        let baseline_result = block_on(router.dispatch_stateless(&request_ctx, &baseline))
             .expect("final baseline is accepted");
         assert_eq!(
             baseline_result["resources"][0]["title"],
             "Final Catalog Resource"
         );
 
-        let error = router
-            .dispatch_stateless(&request_ctx, &planted)
+        let error = block_on(router.dispatch_stateless(&request_ctx, &planted))
             .expect_err("only final request metadata is refused");
         assert_eq!(error.code, McpErrorCode::InvalidParams);
         assert_eq!(
@@ -23995,8 +23853,7 @@ mod router_tests {
             "the one-field rejection cannot mutate the resource catalog"
         );
         assert_eq!(
-            router
-                .dispatch_stateless(&request_ctx, &baseline)
+            block_on(router.dispatch_stateless(&request_ctx, &baseline))
                 .expect("the baseline remains accepted after rejection"),
             baseline_result,
             "the one-field rejection cannot alter final field preservation"
@@ -24068,12 +23925,11 @@ mod router_tests {
             Some(&final_list_params),
         )
         .expect("final catalog request decodes through the public core surface");
-        let modern_list = router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new("tools/list", Some(final_list_params), 93_i64),
-            )
-            .expect("final catalog is projected through the exact model");
+        let modern_list = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new("tools/list", Some(final_list_params), 93_i64),
+        ))
+        .expect("final catalog is projected through the exact model");
         assert_eq!(modern_list["resultType"], "complete");
         assert_eq!(modern_list["ttlMs"].to_string(), list_ttl.as_str());
         assert_eq!(modern_list["cacheScope"], "private");
@@ -24164,12 +24020,11 @@ mod router_tests {
             Some(&final_read_params),
         )
         .expect("final resource-read request decodes through the public core surface");
-        let modern_read = router
-            .dispatch_stateless(
-                &request_ctx,
-                &JsonRpcRequest::new("resources/read", Some(final_read_params), 94_i64),
-            )
-            .expect("final resource content is projected through the final model");
+        let modern_read = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &JsonRpcRequest::new("resources/read", Some(final_read_params), 94_i64),
+        ))
+        .expect("final resource content is projected through the final model");
         assert_eq!(modern_read["ttlMs"].to_string(), resource_read_ttl.as_str());
         assert_eq!(modern_read["cacheScope"], "private");
         assert_eq!(
@@ -24224,11 +24079,9 @@ mod router_tests {
         let catalog_before = serde_json::to_vec(&router.tools()).expect("catalog serializes");
         let planted_before = serde_json::to_vec(&planted).expect("request serializes");
 
-        let baseline_result = router
-            .dispatch_stateless(&request_ctx, &baseline)
+        let baseline_result = block_on(router.dispatch_stateless(&request_ctx, &baseline))
             .expect("the final baseline is accepted");
-        let error = router
-            .dispatch_stateless(&request_ctx, &planted)
+        let error = block_on(router.dispatch_stateless(&request_ctx, &planted))
             .expect_err("only missing final metadata is refused");
         assert_eq!(error.code, McpErrorCode::InvalidParams);
         assert_eq!(
@@ -24242,8 +24095,7 @@ mod router_tests {
             "the rejected one-field request cannot mutate the catalog"
         );
         assert_eq!(
-            router
-                .dispatch_stateless(&request_ctx, &baseline)
+            block_on(router.dispatch_stateless(&request_ctx, &baseline))
                 .expect("the unchanged final baseline remains accepted"),
             baseline_result,
             "the rejection cannot alter final cache hints or catalog projection"

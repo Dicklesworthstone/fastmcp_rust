@@ -8760,8 +8760,7 @@ mod helper_function_tests {
         );
         let catalog_before = stateless_public_catalog_snapshot(&server);
 
-        let response = server
-            .dispatch_stateless(&inbound, &request)
+        let response = fastmcp_core::block_on(server.dispatch_stateless(&inbound, &request))
             .expect("request with an id must receive a response");
 
         assert!(response.error.is_none());
@@ -8807,14 +8806,14 @@ mod helper_function_tests {
             serde_json::to_vec(&planted).expect("planted request must serialize");
         let catalog_before = stateless_public_catalog_snapshot(&server);
 
-        let baseline_response = server
-            .dispatch_stateless(&inbound, &baseline)
-            .expect("stateless tools/list baseline must respond");
+        let baseline_response =
+            fastmcp_core::block_on(server.dispatch_stateless(&inbound, &baseline))
+                .expect("stateless tools/list baseline must respond");
         assert!(baseline_response.error.is_none());
 
-        let planted_response = server
-            .dispatch_stateless(&inbound, &planted)
-            .expect("planted request with an id must receive a response");
+        let planted_response =
+            fastmcp_core::block_on(server.dispatch_stateless(&inbound, &planted))
+                .expect("planted request with an id must receive a response");
         assert_eq!(
             planted_response
                 .error
@@ -8856,8 +8855,7 @@ mod helper_function_tests {
             73_i64,
         );
 
-        let response = server
-            .dispatch_stateless(&inbound, &request)
+        let response = fastmcp_core::block_on(server.dispatch_stateless(&inbound, &request))
             .expect("handler request with an id must receive a response");
 
         assert!(response.error.is_none());
@@ -8942,9 +8940,9 @@ mod helper_function_tests {
             serde_json::to_vec(&planted).expect("planted request must serialize");
         let catalog_before = stateless_public_catalog_snapshot(&server);
 
-        let baseline_response = server
-            .dispatch_stateless(&inbound, &baseline)
-            .expect("accepted handler baseline must receive a response");
+        let baseline_response =
+            fastmcp_core::block_on(server.dispatch_stateless(&inbound, &baseline))
+                .expect("accepted handler baseline must receive a response");
         assert!(baseline_response.error.is_none());
         assert_eq!(
             baseline_response
@@ -8955,9 +8953,9 @@ mod helper_function_tests {
             Some(true)
         );
 
-        let planted_response = server
-            .dispatch_stateless(&inbound, &planted)
-            .expect("planted handler request with an id must receive a response");
+        let planted_response =
+            fastmcp_core::block_on(server.dispatch_stateless(&inbound, &planted))
+                .expect("planted handler request with an id must receive a response");
         // An unknown tool name is an invalid `name` parameter (-32602) per the
         // MCP unknown-tool mapping; the method itself exists.
         assert_eq!(

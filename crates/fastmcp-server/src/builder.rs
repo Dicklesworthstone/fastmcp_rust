@@ -5536,9 +5536,10 @@ mod tests {
                 701,
                 crate::InboundRequestTransport::Memory,
             );
-            let response = server
-                .dispatch_stateless(&inbound, &final_tools_list_request(701))
-                .expect("the public server path responds to the modern tools/list request");
+            let response = fastmcp_core::block_on(
+                server.dispatch_stateless(&inbound, &final_tools_list_request(701)),
+            )
+            .expect("the public server path responds to the modern tools/list request");
             assert!(response.error.is_none());
             let catalog = response
                 .result
@@ -5575,9 +5576,10 @@ mod tests {
                 702,
                 crate::InboundRequestTransport::Memory,
             );
-            let response = server
-                .dispatch_stateless(&inbound, &final_tools_list_request(702))
-                .expect("the public final tools/list path responds for an empty catalog");
+            let response = fastmcp_core::block_on(
+                server.dispatch_stateless(&inbound, &final_tools_list_request(702)),
+            )
+            .expect("the public final tools/list path responds for an empty catalog");
             assert_eq!(
                 response.result,
                 Some(serde_json::json!({
@@ -5879,11 +5881,12 @@ mod tests {
                 802,
                 crate::InboundRequestTransport::Memory,
             );
-            let final_catalog = server
-                .dispatch_stateless(&final_inbound, &final_tools_list_request(802_i64))
-                .expect("the final tools/list request receives a response")
-                .result
-                .expect("the final tools/list response has a result payload");
+            let final_catalog = fastmcp_core::block_on(
+                server.dispatch_stateless(&final_inbound, &final_tools_list_request(802_i64)),
+            )
+            .expect("the final tools/list request receives a response")
+            .result
+            .expect("the final tools/list response has a result payload");
             assert_eq!(final_catalog["tools"].as_array().map(Vec::len), Some(1));
             assert_eq!(final_catalog["tools"][0]["name"], "weather");
             assert_eq!(
@@ -5920,16 +5923,11 @@ mod tests {
                 crate::InboundRequestTransport::Memory,
                 &final_connection,
             );
-            let final_call_response = server
-                .dispatch_stateless(
-                    &final_call_inbound,
-                    &final_tools_call_request(
-                        "weather",
-                        serde_json::json!({"city": "Boston"}),
-                        804,
-                    ),
-                )
-                .expect("the final tools/call request receives a response");
+            let final_call_response = fastmcp_core::block_on(server.dispatch_stateless(
+                &final_call_inbound,
+                &final_tools_call_request("weather", serde_json::json!({"city": "Boston"}), 804),
+            ))
+            .expect("the final tools/call request receives a response");
             assert!(
                 final_call_response.error.is_none(),
                 "the bound final proxy call must succeed: {:?}",
@@ -6005,12 +6003,11 @@ mod tests {
                 806,
                 crate::InboundRequestTransport::Memory,
             );
-            let final_rejected = server
-                .dispatch_stateless(
-                    &final_inbound,
-                    &final_tools_call_request("legacy-weather", serde_json::json!({}), 806),
-                )
-                .expect("the final cross-era request receives a JSON-RPC error");
+            let final_rejected = fastmcp_core::block_on(server.dispatch_stateless(
+                &final_inbound,
+                &final_tools_call_request("legacy-weather", serde_json::json!({}), 806),
+            ))
+            .expect("the final cross-era request receives a JSON-RPC error");
             assert!(final_rejected.result.is_none());
             assert_eq!(
                 final_rejected.error.and_then(|error| error.code.as_i32()),
@@ -6104,11 +6101,12 @@ mod tests {
                 822,
                 crate::InboundRequestTransport::Memory,
             );
-            let final_response = server
-                .dispatch_stateless(&final_inbound, &final_completion_request(822))
-                .expect("the public final completion path returns a response")
-                .result
-                .expect("the final completion response has a result payload");
+            let final_response = fastmcp_core::block_on(
+                server.dispatch_stateless(&final_inbound, &final_completion_request(822)),
+            )
+            .expect("the public final completion path returns a response")
+            .result
+            .expect("the final completion response has a result payload");
             assert_eq!(final_response["resultType"], "complete");
             assert_eq!(
                 final_response["completion"]["values"],
@@ -6186,31 +6184,31 @@ mod tests {
                 823,
                 crate::InboundRequestTransport::Memory,
             );
-            let before = server
-                .dispatch_stateless(
-                    &before_inbound,
-                    &JsonRpcRequest::new(
-                        "prompts/list",
-                        Some(serde_json::json!({
-                            "_meta": {
-                                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                                "io.modelcontextprotocol/clientCapabilities": {},
-                            },
-                        })),
-                        823_i64,
-                    ),
-                )
-                .expect("the proxied final prompt catalog is public before rejection")
-                .result
-                .expect("the proxied final prompt catalog has a result payload");
+            let before = fastmcp_core::block_on(server.dispatch_stateless(
+                &before_inbound,
+                &JsonRpcRequest::new(
+                    "prompts/list",
+                    Some(serde_json::json!({
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                    })),
+                    823_i64,
+                ),
+            ))
+            .expect("the proxied final prompt catalog is public before rejection")
+            .result
+            .expect("the proxied final prompt catalog has a result payload");
             let rejected_inbound = crate::InboundRequestContext::new(
                 Cx::for_testing(),
                 824,
                 crate::InboundRequestTransport::Memory,
             );
-            let rejected = server
-                .dispatch_stateless(&rejected_inbound, &final_completion_request(824))
-                .expect("the unsupported completion request receives a JSON-RPC error");
+            let rejected = fastmcp_core::block_on(
+                server.dispatch_stateless(&rejected_inbound, &final_completion_request(824)),
+            )
+            .expect("the unsupported completion request receives a JSON-RPC error");
             assert_eq!(
                 rejected.error.and_then(|error| error.code.as_i32()),
                 Some(-32601),
@@ -6222,23 +6220,22 @@ mod tests {
                 825,
                 crate::InboundRequestTransport::Memory,
             );
-            let after = server
-                .dispatch_stateless(
-                    &after_inbound,
-                    &JsonRpcRequest::new(
-                        "prompts/list",
-                        Some(serde_json::json!({
-                            "_meta": {
-                                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                                "io.modelcontextprotocol/clientCapabilities": {},
-                            },
-                        })),
-                        825_i64,
-                    ),
-                )
-                .expect("the proxied final prompt catalog remains public after rejection")
-                .result
-                .expect("the proxied final prompt catalog still has a result payload");
+            let after = fastmcp_core::block_on(server.dispatch_stateless(
+                &after_inbound,
+                &JsonRpcRequest::new(
+                    "prompts/list",
+                    Some(serde_json::json!({
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                    })),
+                    825_i64,
+                ),
+            ))
+            .expect("the proxied final prompt catalog remains public after rejection")
+            .result
+            .expect("the proxied final prompt catalog still has a result payload");
             assert_eq!(
                 before, after,
                 "the rejected request cannot mutate downstream catalog state"
@@ -6289,23 +6286,22 @@ mod tests {
                     826,
                     crate::InboundRequestTransport::Memory,
                 );
-                let before = server
-                    .dispatch_stateless(
-                        &before_inbound,
-                        &JsonRpcRequest::new(
-                            "prompts/list",
-                            Some(serde_json::json!({
-                                "_meta": {
-                                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                                    "io.modelcontextprotocol/clientCapabilities": {},
-                                },
-                            })),
-                            826_i64,
-                        ),
-                    )
-                    .expect("the retained local prompt is visible through the public final list")
-                    .result
-                    .expect("the retained local prompt list has a result payload");
+                let before = fastmcp_core::block_on(server.dispatch_stateless(
+                    &before_inbound,
+                    &JsonRpcRequest::new(
+                        "prompts/list",
+                        Some(serde_json::json!({
+                            "_meta": {
+                                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                                "io.modelcontextprotocol/clientCapabilities": {},
+                            },
+                        })),
+                        826_i64,
+                    ),
+                ))
+                .expect("the retained local prompt is visible through the public final list")
+                .result
+                .expect("the retained local prompt list has a result payload");
                 assert_eq!(
                     before["prompts"][0]["title"], "Local Final Deploy",
                     "{duplicate_behavior:?} retains the pre-existing local prompt target"
@@ -6316,9 +6312,10 @@ mod tests {
                     827,
                     crate::InboundRequestTransport::Memory,
                 );
-                let rejected = server
-                    .dispatch_stateless(&rejected_inbound, &final_completion_request(827))
-                    .expect("the absent completion mapping returns a JSON-RPC error");
+                let rejected = fastmcp_core::block_on(
+                    server.dispatch_stateless(&rejected_inbound, &final_completion_request(827)),
+                )
+                .expect("the absent completion mapping returns a JSON-RPC error");
                 assert_eq!(
                     rejected.error.and_then(|error| error.code.as_i32()),
                     Some(-32601),
@@ -6331,23 +6328,22 @@ mod tests {
                     828,
                     crate::InboundRequestTransport::Memory,
                 );
-                let after = server
-                    .dispatch_stateless(
-                        &after_inbound,
-                        &JsonRpcRequest::new(
-                            "prompts/list",
-                            Some(serde_json::json!({
-                                "_meta": {
-                                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                                    "io.modelcontextprotocol/clientCapabilities": {},
-                                },
-                            })),
-                            828_i64,
-                        ),
-                    )
-                    .expect("the rejected request leaves the retained local target public")
-                    .result
-                    .expect("the retained local prompt list still has a result payload");
+                let after = fastmcp_core::block_on(server.dispatch_stateless(
+                    &after_inbound,
+                    &JsonRpcRequest::new(
+                        "prompts/list",
+                        Some(serde_json::json!({
+                            "_meta": {
+                                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                                "io.modelcontextprotocol/clientCapabilities": {},
+                            },
+                        })),
+                        828_i64,
+                    ),
+                ))
+                .expect("the rejected request leaves the retained local target public")
+                .result
+                .expect("the retained local prompt list still has a result payload");
                 assert_eq!(
                     before, after,
                     "{duplicate_behavior:?} completion rejection cannot mutate the retained local target"
@@ -6399,23 +6395,22 @@ mod tests {
                 829,
                 crate::InboundRequestTransport::Memory,
             );
-            let prompts = server
-                .dispatch_stateless(
-                    &list_inbound,
-                    &JsonRpcRequest::new(
-                        "prompts/list",
-                        Some(serde_json::json!({
-                            "_meta": {
-                                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                                "io.modelcontextprotocol/clientCapabilities": {},
-                            },
-                        })),
-                        829_i64,
-                    ),
-                )
-                .expect("the replaced prompt is public through the final list")
-                .result
-                .expect("the replaced prompt list has a result payload");
+            let prompts = fastmcp_core::block_on(server.dispatch_stateless(
+                &list_inbound,
+                &JsonRpcRequest::new(
+                    "prompts/list",
+                    Some(serde_json::json!({
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                    })),
+                    829_i64,
+                ),
+            ))
+            .expect("the replaced prompt is public through the final list")
+            .result
+            .expect("the replaced prompt list has a result payload");
             assert_eq!(
                 prompts["prompts"][0]["title"], "Upstream Final Deploy",
                 "Replace exposes the admitted upstream prompt instead of the local target"
@@ -6426,11 +6421,12 @@ mod tests {
                 830,
                 crate::InboundRequestTransport::Memory,
             );
-            let completion = server
-                .dispatch_stateless(&completion_inbound, &final_completion_request(830))
-                .expect("the replaced target forwards through the public final completion route")
-                .result
-                .expect("the replaced target completion has a result payload");
+            let completion = fastmcp_core::block_on(
+                server.dispatch_stateless(&completion_inbound, &final_completion_request(830)),
+            )
+            .expect("the replaced target forwards through the public final completion route")
+            .result
+            .expect("the replaced target completion has a result payload");
             assert_eq!(
                 completion["completion"]["values"],
                 serde_json::json!(["final-staging"])
@@ -6499,9 +6495,9 @@ mod tests {
                     id,
                     crate::InboundRequestTransport::Memory,
                 );
-                let rejected = evicted
-                    .dispatch_stateless(&inbound, &request)
-                    .expect("the evicted completion mapping returns a JSON-RPC error");
+                let rejected =
+                    fastmcp_core::block_on(evicted.dispatch_stateless(&inbound, &request))
+                        .expect("the evicted completion mapping returns a JSON-RPC error");
                 assert_eq!(
                     rejected.error.and_then(|error| error.code.as_i32()),
                     Some(-32601),
@@ -6575,11 +6571,11 @@ mod tests {
                     id,
                     crate::InboundRequestTransport::Memory,
                 );
-                let response = restored
-                    .dispatch_stateless(&inbound, &request)
-                    .expect("the local replacement provider handles the public final request")
-                    .result
-                    .expect("the local replacement provider returns a result payload");
+                let response =
+                    fastmcp_core::block_on(restored.dispatch_stateless(&inbound, &request))
+                        .expect("the local replacement provider handles the public final request")
+                        .result
+                        .expect("the local replacement provider returns a result payload");
                 assert_eq!(
                     response["completion"]["values"],
                     serde_json::json!(["staging"])
@@ -6841,8 +6837,7 @@ mod tests {
                 714,
                 crate::InboundRequestTransport::Memory,
             );
-            let answered = server
-                .dispatch_stateless(&inbound, &final_ping)
+            let answered = fastmcp_core::block_on(server.dispatch_stateless(&inbound, &final_ping))
                 .expect("stateless modern ping is a connection health-check");
             assert_eq!(answered.result, Some(serde_json::json!({})));
             assert!(answered.error.is_none());
@@ -6930,21 +6925,20 @@ mod tests {
                     u64::try_from(id).expect("test request IDs are non-negative"),
                     crate::InboundRequestTransport::Memory,
                 );
-                let response = server
-                    .dispatch_stateless(
-                        &inbound,
-                        &JsonRpcRequest::new(
-                            method,
-                            Some(serde_json::json!({
-                                "_meta": {
-                                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                                    "io.modelcontextprotocol/clientCapabilities": {},
-                                },
-                            })),
-                            id,
-                        ),
-                    )
-                    .expect("final discovery dispatch succeeds");
+                let response = fastmcp_core::block_on(server.dispatch_stateless(
+                    &inbound,
+                    &JsonRpcRequest::new(
+                        method,
+                        Some(serde_json::json!({
+                            "_meta": {
+                                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                                "io.modelcontextprotocol/clientCapabilities": {},
+                            },
+                        })),
+                        id,
+                    ),
+                ))
+                .expect("final discovery dispatch succeeds");
                 assert_eq!(
                     response.result.expect("final discovery has a result")[member][0],
                     expected,

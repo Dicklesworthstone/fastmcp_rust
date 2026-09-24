@@ -13085,15 +13085,16 @@ impl Server {
     /// from the immutable router catalog and never depend on previous request
     /// data.
     #[must_use]
-    pub fn dispatch_stateless(
+    pub async fn dispatch_stateless(
         &self,
         inbound: &InboundRequestContext,
         request: &JsonRpcRequest,
     ) -> Option<JsonRpcResponse> {
         self.dispatch_stateless_with_cancellation(inbound, request, None, None, None, None)
+            .await
     }
 
-    fn dispatch_stateless_with_cancellation(
+    async fn dispatch_stateless_with_cancellation(
         &self,
         inbound: &InboundRequestContext,
         request: &JsonRpcRequest,
@@ -13232,7 +13233,7 @@ impl Server {
         remove_modern_protocol_metadata(&mut request);
 
         let mut entered_middleware: Vec<&dyn crate::Middleware> = Vec::new();
-        let result: McpResult<serde_json::Value> = (|| {
+        let result: McpResult<serde_json::Value> = async {
             for middleware in self.middleware.iter() {
                 Self::enforce_request_context(&request_ctx)?;
                 entered_middleware.push(middleware.as_ref());
@@ -13274,14 +13275,17 @@ impl Server {
                         &admission_request,
                         retained_raw_params(raw_params, &admission_request),
                         &continuation_cancellation,
-                    ) {
+                    )
+                    .await
+                {
                     Err(error) if error.code == McpErrorCode::MethodNotFound => {
                         self.dispatch_extension_fallback(&request_ctx, &admission_request)
                     }
                     result => result,
                 }
             }
-        })();
+        }
+        .await;
         let result = match result {
             Ok(value) => {
                 let metadata_seal = final_core_middleware_metadata_seal(
@@ -14757,7 +14761,7 @@ impl Server {
     /// `server/discover` remains a valid first request when it carries that
     /// marker.
     #[must_use]
-    pub fn dispatch_with_protocol_policy(
+    pub async fn dispatch_with_protocol_policy(
         &self,
         policy: ProtocolPolicy,
         inbound: &InboundRequestContext,
@@ -14766,31 +14770,10 @@ impl Server {
         self.dispatch_with_protocol_policy_and_cancellation(
             policy, inbound, request, None, None, None, None,
         )
+        .await
     }
 
-    /// Processes a modern request and delivers its request-scoped final log
-    /// notification through the same connection-owned output sender.
-    fn dispatch_with_protocol_policy_and_final_logging(
-        &self,
-        policy: ProtocolPolicy,
-        inbound: &InboundRequestContext,
-        request: &JsonRpcRequest,
-        notification_sender: &NotificationSender,
-    ) -> Option<JsonRpcResponse> {
-        let response = self.dispatch_with_protocol_policy(policy, inbound, request);
-        if let Some(response) = &response
-            && inbound.request_context().ensure_live().is_ok()
-        {
-            self.maybe_emit_final_log_notification(
-                request,
-                notification_sender,
-                response.error.is_none(),
-            );
-        }
-        response
-    }
-
-    fn dispatch_with_protocol_policy_and_cancellation(
+    async fn dispatch_with_protocol_policy_and_cancellation(
         &self,
         policy: ProtocolPolicy,
         inbound: &InboundRequestContext,
@@ -14833,6 +14816,7 @@ impl Server {
             auth_receipt,
             websocket_connection_generation,
         )
+        .await
     }
 
     /// Maps an explicit-policy modern dispatch result onto the HTTP response
@@ -14843,7 +14827,7 @@ impl Server {
     /// helper owns only the transport-neutral JSON-RPC result and its final
     /// HTTP status mapping.
     #[must_use]
-    pub fn dispatch_http_with_protocol_policy(
+    pub async fn dispatch_http_with_protocol_policy(
         &self,
         policy: ProtocolPolicy,
         inbound: &InboundRequestContext,
@@ -14855,7 +14839,10 @@ impl Server {
             && modern_protocol_version(request).is_some())
             || (matches!(policy, ProtocolPolicy::ModernOnly)
                 && modern_protocol_version(request) != Some(MODERN_PROTOCOL_VERSION));
-        match self.dispatch_with_protocol_policy(policy, inbound, request) {
+        match self
+            .dispatch_with_protocol_policy(policy, inbound, request)
+            .await
+        {
             Some(response)
                 if is_cross_era_request
                     || is_modern_http_request
@@ -22760,21 +22747,20 @@ mod lib_unit_tests {
 
         let inbound =
             InboundRequestContext::new(Cx::for_testing(), 901, InboundRequestTransport::Memory);
-        let response = server
-            .dispatch_stateless(
-                &inbound,
-                &JsonRpcRequest::new(
-                    "resources/list",
-                    Some(serde_json::json!({
-                        "_meta": {
-                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                            "io.modelcontextprotocol/clientCapabilities": {},
-                        },
-                    })),
-                    901_i64,
-                ),
-            )
-            .expect("modern resource catalog dispatch succeeds");
+        let response = block_on(server.dispatch_stateless(
+            &inbound,
+            &JsonRpcRequest::new(
+                "resources/list",
+                Some(serde_json::json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                })),
+                901_i64,
+            ),
+        ))
+        .expect("modern resource catalog dispatch succeeds");
         let resources = response.result.expect("modern resource list has a result");
         assert_eq!(resources["resources"][0]["uri"], "ui://weather/dashboard");
         assert_eq!(
@@ -22794,8 +22780,7 @@ mod lib_unit_tests {
             })),
             902_i64,
         );
-        let read = server
-            .dispatch_stateless(&read_inbound, &read_request)
+        let read = block_on(server.dispatch_stateless(&read_inbound, &read_request))
             .expect("modern Apps UI read reaches its final-only resource");
         assert!(
             read.error.is_none(),
@@ -23698,12 +23683,11 @@ mod lib_unit_tests {
         let inbound =
             InboundRequestContext::new(Cx::for_testing(), 71, InboundRequestTransport::Memory);
 
-        let admitted = server
-            .dispatch_stateless(
-                &inbound,
-                &extension_tasks_get_request(serde_json::json!({})),
-            )
-            .expect("modern extension request must have a response");
+        let admitted = block_on(server.dispatch_stateless(
+            &inbound,
+            &extension_tasks_get_request(serde_json::json!({})),
+        ))
+        .expect("modern extension request must have a response");
         assert_eq!(admitted.result, Some(serde_json::json!({ "next": 42 })));
         assert!(admitted.error.is_none());
 
@@ -23737,8 +23721,7 @@ mod lib_unit_tests {
             })
             .expect("test request must contain its extension settings") =
             serde_json::json!({ "unexpected": true });
-        let rejected = server
-            .dispatch_stateless(&inbound, &rejected)
+        let rejected = block_on(server.dispatch_stateless(&inbound, &rejected))
             .expect("rejected extension request must have an error response");
         let error = rejected
             .error
@@ -23755,12 +23738,11 @@ mod lib_unit_tests {
         let inbound =
             InboundRequestContext::new(Cx::for_testing(), 71, InboundRequestTransport::Memory);
 
-        let admitted = server
-            .dispatch_stateless(
-                &inbound,
-                &extension_tasks_get_request(serde_json::json!({})),
-            )
-            .expect("modern extension request must have a response");
+        let admitted = block_on(server.dispatch_stateless(
+            &inbound,
+            &extension_tasks_get_request(serde_json::json!({})),
+        ))
+        .expect("modern extension request must have a response");
         assert!(admitted.error.is_none());
 
         let negotiated = server
@@ -23779,8 +23761,7 @@ mod lib_unit_tests {
             .and_then(|value| value.pointer_mut("/_meta/io.modelcontextprotocol~1protocolVersion"))
             .expect("test request must contain its protocol version") =
             serde_json::json!(LEGACY_PROTOCOL_VERSION);
-        let rejected = server
-            .dispatch_stateless(&inbound, &rejected)
+        let rejected = block_on(server.dispatch_stateless(&inbound, &rejected))
             .expect("wrong-era extension request must have an error response");
         assert_eq!(
             rejected.error.map(|error| error.code),
@@ -23829,8 +23810,7 @@ mod lib_unit_tests {
             InboundRequestContext::new(Cx::for_testing(), 72, InboundRequestTransport::Memory);
         let request = JsonRpcRequest::new("tools/list", Some(serde_json::json!({})), 72_i64);
 
-        let response = server
-            .dispatch_stateless(&inbound, &request)
+        let response = block_on(server.dispatch_stateless(&inbound, &request))
             .expect("a malformed final request with an id receives an error response");
         assert_eq!(
             response.error.map(|error| error.code),
@@ -23881,8 +23861,7 @@ mod lib_unit_tests {
             721_i64,
         );
 
-        let response = server
-            .dispatch_stateless(&inbound, &request)
+        let response = block_on(server.dispatch_stateless(&inbound, &request))
             .expect("short-circuited final request receives an error response");
         assert_eq!(
             response.error.map(|error| error.code),
@@ -23925,8 +23904,7 @@ mod lib_unit_tests {
             73_i64,
         );
 
-        let response = server
-            .dispatch_stateless(&inbound, &request)
+        let response = block_on(server.dispatch_stateless(&inbound, &request))
             .expect("a malformed middleware result with an id receives an error response");
         assert_eq!(
             response.error.map(|error| error.code),
@@ -23968,8 +23946,7 @@ mod lib_unit_tests {
             74_i64,
         );
 
-        let response = server
-            .dispatch_stateless(&inbound, &request)
+        let response = block_on(server.dispatch_stateless(&inbound, &request))
             .expect("final request has a response");
         assert!(response.error.is_none());
         assert_eq!(
@@ -24018,8 +23995,7 @@ mod lib_unit_tests {
             75_i64,
         );
 
-        let response = server
-            .dispatch_stateless(&inbound, &request)
+        let response = block_on(server.dispatch_stateless(&inbound, &request))
             .expect("sealed metadata mutation receives an error response");
         assert_eq!(
             response.error.map(|error| error.code),
@@ -24062,8 +24038,7 @@ mod lib_unit_tests {
             76_i64,
         );
 
-        let response = server
-            .dispatch_stateless(&inbound, &request)
+        let response = block_on(server.dispatch_stateless(&inbound, &request))
             .expect("sealed discovery mutation receives an error response");
         assert_eq!(
             response.error.map(|error| error.code),
@@ -26441,8 +26416,10 @@ mod lib_unit_tests {
         );
         let inbound =
             InboundRequestContext::new(Cx::for_testing(), 82, InboundRequestTransport::Http);
-        let response = public_http_capability_error_test_server(malformed_data.clone())
-            .dispatch_http_with_protocol_policy(ProtocolPolicy::ModernOnly, &inbound, &request);
+        let response = block_on(
+            public_http_capability_error_test_server(malformed_data.clone())
+                .dispatch_http_with_protocol_policy(ProtocolPolicy::ModernOnly, &inbound, &request),
+        );
 
         assert_eq!(response.status, HttpStatus::OK);
         let response: JsonRpcResponse =
@@ -26475,8 +26452,10 @@ mod lib_unit_tests {
         );
         let inbound =
             InboundRequestContext::new(Cx::for_testing(), 83, InboundRequestTransport::Http);
-        let response = public_http_capability_error_test_server(canonical_data.clone())
-            .dispatch_http_with_protocol_policy(ProtocolPolicy::LegacyOnly, &inbound, &request);
+        let response = block_on(
+            public_http_capability_error_test_server(canonical_data.clone())
+                .dispatch_http_with_protocol_policy(ProtocolPolicy::LegacyOnly, &inbound, &request),
+        );
 
         assert_eq!(response.status, HttpStatus::OK);
         let response: JsonRpcResponse =
@@ -26617,16 +26596,15 @@ mod lib_unit_tests {
 
         let inbound =
             InboundRequestContext::new(Cx::for_testing(), 71, InboundRequestTransport::Memory);
-        let get = server
-            .dispatch_stateless(
-                &inbound,
-                &JsonRpcRequest::new(
-                    fastmcp_protocol::TASK_GET,
-                    Some(final_tasks_get_params(&task_id, serde_json::json!({}))),
-                    71_i64,
-                ),
-            )
-            .expect("tasks/get must respond");
+        let get = block_on(server.dispatch_stateless(
+            &inbound,
+            &JsonRpcRequest::new(
+                fastmcp_protocol::TASK_GET,
+                Some(final_tasks_get_params(&task_id, serde_json::json!({}))),
+                71_i64,
+            ),
+        ))
+        .expect("tasks/get must respond");
         assert_eq!(
             get.result.as_ref().map(|result| &result["resultType"]),
             Some(&serde_json::json!("complete"))
@@ -26696,31 +26674,29 @@ mod lib_unit_tests {
                 "inputResponses".to_owned(),
                 serde_json::json!({ "roots": { "roots": [] } }),
             );
-        let update = server
-            .dispatch_stateless(
-                &inbound,
-                &JsonRpcRequest::new(
-                    fastmcp_protocol::tasks_extension::TASK_UPDATE,
-                    Some(update_params),
-                    71_i64,
-                ),
-            )
-            .expect("tasks/update must respond");
+        let update = block_on(server.dispatch_stateless(
+            &inbound,
+            &JsonRpcRequest::new(
+                fastmcp_protocol::tasks_extension::TASK_UPDATE,
+                Some(update_params),
+                71_i64,
+            ),
+        ))
+        .expect("tasks/update must respond");
         assert_eq!(
             update.result,
             Some(serde_json::json!({ "resultType": "complete" }))
         );
 
-        let cancel = server
-            .dispatch_stateless(
-                &inbound,
-                &JsonRpcRequest::new(
-                    fastmcp_protocol::TASK_CANCEL,
-                    Some(final_tasks_get_params(&task_id, serde_json::json!({}))),
-                    71_i64,
-                ),
-            )
-            .expect("tasks/cancel must respond");
+        let cancel = block_on(server.dispatch_stateless(
+            &inbound,
+            &JsonRpcRequest::new(
+                fastmcp_protocol::TASK_CANCEL,
+                Some(final_tasks_get_params(&task_id, serde_json::json!({}))),
+                71_i64,
+            ),
+        ))
+        .expect("tasks/cancel must respond");
         assert_eq!(
             cancel.result,
             Some(serde_json::json!({ "resultType": "complete" }))
@@ -27091,10 +27067,10 @@ mod lib_unit_tests {
             fastmcp_protocol::tasks_extension::TASK_UPDATE,
             Some(parameters.clone()),
         );
-        let no_response = server.dispatch_stateless(
+        let no_response = block_on(server.dispatch_stateless(
             &InboundRequestContext::new(Cx::for_testing(), 0, InboundRequestTransport::Memory),
             &notification,
-        );
+        ));
         assert!(
             no_response.is_none(),
             "an id-less extension request cannot produce a JSON-RPC response"
@@ -27120,16 +27096,15 @@ mod lib_unit_tests {
             "the id-less rejected update cannot append, replace, or alter notifications"
         );
 
-        let update = server
-            .dispatch_stateless(
-                &InboundRequestContext::new(Cx::for_testing(), 72, InboundRequestTransport::Memory),
-                &JsonRpcRequest::new(
-                    fastmcp_protocol::tasks_extension::TASK_UPDATE,
-                    Some(parameters),
-                    72_i64,
-                ),
-            )
-            .expect("adding only a request id admits the same Tasks update");
+        let update = block_on(server.dispatch_stateless(
+            &InboundRequestContext::new(Cx::for_testing(), 72, InboundRequestTransport::Memory),
+            &JsonRpcRequest::new(
+                fastmcp_protocol::tasks_extension::TASK_UPDATE,
+                Some(parameters),
+                72_i64,
+            ),
+        ))
+        .expect("adding only a request id admits the same Tasks update");
         assert_eq!(
             update.result,
             Some(serde_json::json!({ "resultType": "complete" }))
@@ -27168,9 +27143,11 @@ mod lib_unit_tests {
         let inbound =
             InboundRequestContext::new(Cx::for_testing(), 81, InboundRequestTransport::Memory);
 
-        let admitted = server
-            .dispatch_stateless(&inbound, &final_task_creating_tool_request(true))
-            .expect("declared final Tasks tool request must respond");
+        let admitted = block_on(server.dispatch_stateless(
+            &inbound,
+            &final_task_creating_tool_request(true),
+        ))
+        .expect("declared final Tasks tool request must respond");
         assert!(admitted.error.is_none());
         assert_eq!(
             admitted.result.as_ref().map(|result| &result["resultType"]),
@@ -27205,9 +27182,11 @@ mod lib_unit_tests {
             "the admitted request publishes exactly one durable task transition"
         );
 
-        let rejected = server
-            .dispatch_stateless(&inbound, &final_task_creating_tool_request(false))
-            .expect("missing-capability final tool request must respond");
+        let rejected = block_on(server.dispatch_stateless(
+            &inbound,
+            &final_task_creating_tool_request(false),
+        ))
+        .expect("missing-capability final tool request must respond");
         let error = rejected
             .error
             .expect("removing only the Tasks declaration must reject task creation");
@@ -27332,12 +27311,11 @@ mod lib_unit_tests {
             .and_then(serde_json::Value::as_object_mut)
             .expect("baseline request declares client extensions")
             .insert("com.example/echo".to_owned(), serde_json::json!({}));
-        let response = server
-            .dispatch_stateless(
-                &InboundRequestContext::new(Cx::for_testing(), 71, InboundRequestTransport::Memory),
-                &JsonRpcRequest::new(fastmcp_protocol::TASK_GET, Some(get_params), 71_i64),
-            )
-            .expect("merged final Tasks handler must route requests");
+        let response = block_on(server.dispatch_stateless(
+            &InboundRequestContext::new(Cx::for_testing(), 71, InboundRequestTransport::Memory),
+            &JsonRpcRequest::new(fastmcp_protocol::TASK_GET, Some(get_params), 71_i64),
+        ))
+        .expect("merged final Tasks handler must route requests");
         assert!(response.error.is_none());
     }
 
@@ -27392,16 +27370,15 @@ mod lib_unit_tests {
         let inbound =
             InboundRequestContext::new(Cx::for_testing(), 71, InboundRequestTransport::Memory);
 
-        let admitted = server
-            .dispatch_stateless(
-                &inbound,
-                &JsonRpcRequest::new(
-                    fastmcp_protocol::TASK_GET,
-                    Some(final_tasks_get_params(&task_id, serde_json::json!({}))),
-                    71_i64,
-                ),
-            )
-            .expect("baseline final Tasks request must respond");
+        let admitted = block_on(server.dispatch_stateless(
+            &inbound,
+            &JsonRpcRequest::new(
+                fastmcp_protocol::TASK_GET,
+                Some(final_tasks_get_params(&task_id, serde_json::json!({}))),
+                71_i64,
+            ),
+        ))
+        .expect("baseline final Tasks request must respond");
         assert!(admitted.error.is_none());
         let notification_count = delivered
             .lock()
@@ -27415,12 +27392,11 @@ mod lib_unit_tests {
             )
             .expect("baseline request must contain Tasks settings") =
             serde_json::json!({ "unexpected": true });
-        let rejected = server
-            .dispatch_stateless(
-                &inbound,
-                &JsonRpcRequest::new(fastmcp_protocol::TASK_GET, Some(rejected_params), 71_i64),
-            )
-            .expect("rejected final Tasks request must respond");
+        let rejected = block_on(server.dispatch_stateless(
+            &inbound,
+            &JsonRpcRequest::new(fastmcp_protocol::TASK_GET, Some(rejected_params), 71_i64),
+        ))
+        .expect("rejected final Tasks request must respond");
         let error = rejected
             .error
             .expect("changing only Tasks settings must reject the request");
@@ -34199,8 +34175,7 @@ mod lib_unit_tests {
         let JsonRpcMessage::Request(request) = modern_subscriptions_listen_request(926) else {
             panic!("listen fixture must be a request");
         };
-        let response = server
-            .dispatch_stateless(&inbound, &request)
+        let response = block_on(server.dispatch_stateless(&inbound, &request))
             .expect("listen with an id must produce a JSON-RPC response");
         let error = response
             .error
@@ -34257,8 +34232,7 @@ mod lib_unit_tests {
         let JsonRpcMessage::Request(request) = modern_catalog_mutating_tool_request(927) else {
             panic!("catalog mutation fixture must be a request");
         };
-        let response = server
-            .dispatch_stateless(&inbound, &request)
+        let response = block_on(server.dispatch_stateless(&inbound, &request))
             .expect("stateless tools/call must respond");
         assert!(
             response.error.is_none(),
@@ -34311,8 +34285,7 @@ mod lib_unit_tests {
         let JsonRpcMessage::Request(request) = modern_catalog_mutating_tool_request(928) else {
             panic!("catalog mutation fixture must be a request");
         };
-        let _ = server
-            .dispatch_stateless(&inbound, &request)
+        let _ = block_on(server.dispatch_stateless(&inbound, &request))
             .expect("stateless tools/call must respond");
         assert!(
             sent.lock()
@@ -36949,11 +36922,11 @@ mod lib_unit_tests {
             .protocol_policy(ProtocolPolicy::LegacyOnly)
             .expect("LegacyOnly must be available to this test build")
             .build();
-        let modern_response = legacy_only.dispatch_http_with_protocol_policy(
+        let modern_response = block_on(legacy_only.dispatch_http_with_protocol_policy(
             ProtocolPolicy::LegacyOnly,
             &modern_inbound,
             &modern_request,
-        );
+        ));
         assert_eq!(modern_response.status, HttpStatus::BAD_REQUEST);
 
         let legacy_request = JsonRpcRequest::new(
@@ -36971,11 +36944,11 @@ mod lib_unit_tests {
             .protocol_policy(ProtocolPolicy::ModernOnly)
             .expect("ModernOnly must be available to this test build")
             .build();
-        let legacy_response = modern_only.dispatch_http_with_protocol_policy(
+        let legacy_response = block_on(modern_only.dispatch_http_with_protocol_policy(
             ProtocolPolicy::ModernOnly,
             &legacy_inbound,
             &legacy_request,
-        );
+        ));
         assert_eq!(legacy_response.status, HttpStatus::BAD_REQUEST);
     }
 
@@ -36998,11 +36971,11 @@ mod lib_unit_tests {
             .expect("ModernOnly must be available to this test build")
             .build();
 
-        let response = server.dispatch_http_with_protocol_policy(
+        let response = block_on(server.dispatch_http_with_protocol_policy(
             ProtocolPolicy::ModernOnly,
             &inbound,
             &request,
-        );
+        ));
 
         assert_eq!(response.status, HttpStatus::OK);
         let response: JsonRpcResponse =
@@ -37025,11 +36998,11 @@ mod lib_unit_tests {
             .expect("ModernOnly must be available to this test build")
             .build();
 
-        let response = server.dispatch_http_with_protocol_policy(
+        let response = block_on(server.dispatch_http_with_protocol_policy(
             ProtocolPolicy::ModernOnly,
             &inbound,
             &request,
-        );
+        ));
 
         assert_eq!(response.status, HttpStatus::BAD_REQUEST);
         let response: JsonRpcResponse =
@@ -51642,17 +51615,16 @@ mod lib_unit_tests {
                 FINAL_CLIENT_CAPABILITIES_META_KEY: {"elicitation": {"form": {}}},
             },
         });
-        let admitted = server
-            .dispatch_stateless(
-                &InboundRequestContext::with_modern_connection(
-                    cx.clone(),
-                    950,
-                    InboundRequestTransport::Memory,
-                    &connection,
-                ),
-                &JsonRpcRequest::new("tools/call", Some(admitted_params.clone()), 950_i64),
-            )
-            .expect("public final form elicitation must respond");
+        let admitted = block_on(server.dispatch_stateless(
+            &InboundRequestContext::with_modern_connection(
+                cx.clone(),
+                950,
+                InboundRequestTransport::Memory,
+                &connection,
+            ),
+            &JsonRpcRequest::new("tools/call", Some(admitted_params.clone()), 950_i64),
+        ))
+        .expect("public final form elicitation must respond");
         assert!(admitted.error.is_none());
         assert_eq!(
             admitted
@@ -51683,17 +51655,16 @@ mod lib_unit_tests {
             "the planted negative removes only the elicitation capability"
         );
         assert_eq!(capabilities.len() + 1, admitted_capability_count);
-        let capability_rejected = server
-            .dispatch_stateless(
-                &InboundRequestContext::with_modern_connection(
-                    cx.clone(),
-                    951,
-                    InboundRequestTransport::Memory,
-                    &connection,
-                ),
-                &JsonRpcRequest::new("tools/call", Some(capability_removed), 951_i64),
-            )
-            .expect("the capability-negative final request must respond");
+        let capability_rejected = block_on(server.dispatch_stateless(
+            &InboundRequestContext::with_modern_connection(
+                cx.clone(),
+                951,
+                InboundRequestTransport::Memory,
+                &connection,
+            ),
+            &JsonRpcRequest::new("tools/call", Some(capability_removed), 951_i64),
+        ))
+        .expect("the capability-negative final request must respond");
         assert!(capability_rejected.error.is_none());
         let capability_rejected = capability_rejected
             .result
@@ -51713,17 +51684,16 @@ mod lib_unit_tests {
 
         let mut url_mismatch = admitted_params;
         url_mismatch["name"] = serde_json::json!("public-final-url-elicitation");
-        let url_rejected = server
-            .dispatch_stateless(
-                &InboundRequestContext::with_modern_connection(
-                    cx,
-                    952,
-                    InboundRequestTransport::Memory,
-                    &connection,
-                ),
-                &JsonRpcRequest::new("tools/call", Some(url_mismatch), 952_i64),
-            )
-            .expect("the form-only URL negative must respond");
+        let url_rejected = block_on(server.dispatch_stateless(
+            &InboundRequestContext::with_modern_connection(
+                cx,
+                952,
+                InboundRequestTransport::Memory,
+                &connection,
+            ),
+            &JsonRpcRequest::new("tools/call", Some(url_mismatch), 952_i64),
+        ))
+        .expect("the form-only URL negative must respond");
         assert!(url_rejected.error.is_none());
         let url_rejected = url_rejected
             .result
@@ -51762,17 +51732,16 @@ mod lib_unit_tests {
                 FINAL_CLIENT_CAPABILITIES_META_KEY: {"sampling": {}},
             },
         });
-        let initial = server
-            .dispatch_stateless(
-                &InboundRequestContext::with_modern_connection(
-                    cx.clone(),
-                    960,
-                    InboundRequestTransport::Memory,
-                    &connection,
-                ),
-                &JsonRpcRequest::new("tools/call", Some(admitted_params.clone()), 960_i64),
-            )
-            .expect("public final sampling request must respond");
+        let initial = block_on(server.dispatch_stateless(
+            &InboundRequestContext::with_modern_connection(
+                cx.clone(),
+                960,
+                InboundRequestTransport::Memory,
+                &connection,
+            ),
+            &JsonRpcRequest::new("tools/call", Some(admitted_params.clone()), 960_i64),
+        ))
+        .expect("public final sampling request must respond");
         assert!(initial.error.is_none());
         assert_eq!(
             initial
@@ -51830,17 +51799,16 @@ mod lib_unit_tests {
             "the planted RH-5 negative removes only sampling capability"
         );
         assert_eq!(capabilities.len() + 1, admitted_capability_count);
-        let rejected = server
-            .dispatch_stateless(
-                &InboundRequestContext::with_modern_connection(
-                    cx.clone(),
-                    961,
-                    InboundRequestTransport::Memory,
-                    &connection,
-                ),
-                &JsonRpcRequest::new("tools/call", Some(capability_removed), 961_i64),
-            )
-            .expect("the capability-negative final sampling request must respond");
+        let rejected = block_on(server.dispatch_stateless(
+            &InboundRequestContext::with_modern_connection(
+                cx.clone(),
+                961,
+                InboundRequestTransport::Memory,
+                &connection,
+            ),
+            &JsonRpcRequest::new("tools/call", Some(capability_removed), 961_i64),
+        ))
+        .expect("the capability-negative final sampling request must respond");
         assert!(rejected.error.is_none());
         let rejected = rejected
             .result
@@ -51872,17 +51840,16 @@ mod lib_unit_tests {
             },
         });
         retry_params["requestState"] = serde_json::json!(request_state);
-        let resumed = server
-            .dispatch_stateless(
-                &InboundRequestContext::with_modern_connection(
-                    cx,
-                    962,
-                    InboundRequestTransport::Memory,
-                    &connection,
-                ),
-                &JsonRpcRequest::new("tools/call", Some(retry_params), 962_i64),
-            )
-            .expect("an admitted final sampling retry must respond");
+        let resumed = block_on(server.dispatch_stateless(
+            &InboundRequestContext::with_modern_connection(
+                cx,
+                962,
+                InboundRequestTransport::Memory,
+                &connection,
+            ),
+            &JsonRpcRequest::new("tools/call", Some(retry_params), 962_i64),
+        ))
+        .expect("an admitted final sampling retry must respond");
         assert!(resumed.error.is_none());
         assert_eq!(
             resumed
