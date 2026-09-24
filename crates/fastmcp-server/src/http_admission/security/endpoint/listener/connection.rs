@@ -124,6 +124,7 @@ pub(super) async fn serve(
             return;
         }
     };
+    let http_parameter_headers = crate::http_admission::http_parameter_headers(&request.headers);
     let opening = match &policy.scope_authorization {
         Some(scopes) => Box::pin(scope::begin_sse(&mut session, cx, scopes, request.clone(), authorization.clone(), policy.sse_revalidation)).await,
         None => session.begin_modern_sse(cx, request.clone(), authorization.clone()).await
@@ -134,7 +135,7 @@ pub(super) async fn serve(
             InboundRequestContext::with_modern_connection_and_transport_authorization(
                 cx.clone(), request_id_to_u64(request.id.as_ref()), InboundRequestTransport::Http,
                 &session.modern_connection, authorization,
-            ), request, raw_params, receipt, response, lease,
+            ).with_http_parameter_headers(http_parameter_headers), request, raw_params, receipt, response, lease,
         ))),
         Ok(Err(response)) => Ok(Err(response)),
         Err(error) => Err(ServerHttpEndpointError::from_internal(error)),

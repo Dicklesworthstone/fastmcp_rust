@@ -22573,6 +22573,212 @@ fn http_05_a_planted_negative() {
     http_05_a_isolated("http_05_a_planted_negative", false);
 }
 
+// HTTP-05 B: a live `bind_http` server compares each recognized
+// `Mcp-Param-*` mirror with the resolved tool's annotated argument before the
+// handler runs. Every case sends the same body to the same tool; only the
+// parameter-header fields differ.
+const HTTP_05_B_TOOL_NAME: &str = "public-http-e2e-param-header";
+
+/// `region` carries an `x-mcp-header` annotation; `note` is body-only. Each
+/// handler run increments `calls`, the only state a refusal must not change.
+struct Http05BParamHeaderTool {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ToolHandler for Http05BParamHeaderTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: HTTP_05_B_TOOL_NAME.to_owned(),
+            description: Some("Proves server-side HTTP-05 parameter header validation".to_owned()),
+            input_schema: json!({"type": "object", "properties": {
+                "region": {"type": "string", "x-mcp-header": "Region"},
+                "note": {"type": "string"}
+            }}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let region = arguments["region"].as_str().unwrap_or_default();
+        Ok(vec![Content::text(format!("param-header:{region}"))])
+    }
+}
+
+fn http_05_b_arguments() -> serde_json::Value {
+    json!({"region": "eu-west", "note": "body-only"})
+}
+
+/// Posts one modern `tools/call` with `arguments` and the given
+/// `Mcp-Param-*` fields and returns the raw HTTP response and handler count.
+fn http_05_b_call(
+    arguments: serde_json::Value,
+    parameter_headers: &[(&str, &str)],
+) -> (Vec<u8>, usize) {
+    const MAX_RESPONSE_BYTES: usize = 1 << 20;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = Arc::clone(&calls);
+    let server = spawn_legacy_http_server("modern parameter headers", move || {
+        ServerBuilder::new("facade-http-param-headers", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly is available")
+            .tool(Http05BParamHeaderTool {
+                calls: handler_calls,
+            })
+            .build()
+    });
+    let mut params = json!({"name": HTTP_05_B_TOOL_NAME, "arguments": arguments});
+    params["_meta"] = serde_json::to_value(fastmcp_protocol::FinalRequestMeta::new(
+        fastmcp_protocol::ClientCapabilities::default(),
+    ))
+    .expect("final request metadata serializes");
+    let body = serde_json::to_vec(&JsonRpcRequest::new("tools/call", Some(params), 51_i64))
+        .expect("the HTTP-05 B tools/call body serializes");
+    let mut extra = String::new();
+    for (name, value) in parameter_headers {
+        extra.push_str(name);
+        extra.push_str(": ");
+        extra.push_str(value);
+        extra.push_str("\r\n");
+    }
+    let address = server.address();
+    let mut stream = std::net::TcpStream::connect_timeout(&address, HTTP_OPERATION_BOUND)
+        .expect("native HTTP client connects to the parameter-header server");
+    stream
+        .set_read_timeout(Some(HTTP_OPERATION_BOUND))
+        .expect("native HTTP client read deadline is configured");
+    let head = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {address}\r\nAccept: application/json\r\nContent-Type: application/json\r\nMCP-Protocol-Version: {}\r\nMcp-Method: tools/call\r\nMcp-Name: {HTTP_05_B_TOOL_NAME}\r\n{extra}Content-Length: {}\r\n\r\n",
+        modern::PROTOCOL_VERSION,
+        body.len(),
+    );
+    stream
+        .write_all(head.as_bytes())
+        .and_then(|()| stream.write_all(&body))
+        .expect("native HTTP request commits to the parameter-header server");
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = read_native_http_response(&mut stream, &mut buffer);
+        if read == 0 {
+            break;
+        }
+        assert!(response.len() + read <= MAX_RESPONSE_BYTES);
+        response.extend_from_slice(&buffer[..read]);
+    }
+    drop(stream);
+    server.shutdown();
+    (response, calls.load(Ordering::SeqCst))
+}
+
+fn assert_http_05_b_admitted(response: &[u8], calls: usize) {
+    assert!(
+        response.starts_with(b"HTTP/1.1 200"),
+        "a matching or unrecognized mirror must be admitted: {}",
+        String::from_utf8_lossy(response)
+    );
+    let body = as_proxy_auth_response_json_body(response);
+    assert!(
+        body.get("error").is_none(),
+        "admitted call must not error: {body}"
+    );
+    assert!(
+        body.to_string().contains("param-header:eu-west"),
+        "the handler must answer with the body argument: {body}"
+    );
+    assert_eq!(calls, 1, "the handler must run exactly once");
+}
+
+#[test]
+fn http_05_b_positive() {
+    let (response, calls) =
+        http_05_b_call(http_05_b_arguments(), &[("Mcp-Param-Region", "eu-west")]);
+    assert_http_05_b_admitted(&response, calls);
+}
+
+#[test]
+fn http_05_b_planted_negative() {
+    // Identical to the positive except for the one recognized header value.
+    let (response, calls) =
+        http_05_b_call(http_05_b_arguments(), &[("Mcp-Param-Region", "us-east")]);
+    assert!(
+        response.starts_with(b"HTTP/1.1 400"),
+        "a mismatched mirror must be refused with HTTP 400: {}",
+        String::from_utf8_lossy(&response)
+    );
+    let body = as_proxy_auth_response_json_body(&response);
+    assert_eq!(body["id"], 51, "the refusal answers the request id: {body}");
+    assert_eq!(
+        body["error"]["code"],
+        fastmcp_protocol::HEADER_MISMATCH_ERROR_CODE,
+        "the refusal is the -32020 header mismatch: {body}"
+    );
+    assert_eq!(
+        body["error"]["message"],
+        "MCP request headers do not match the JSON-RPC request"
+    );
+    assert!(
+        body.get("result").is_none(),
+        "no result may accompany the refusal: {body}"
+    );
+    assert_eq!(calls, 0, "a refused mirror must not reach the handler");
+}
+
+#[test]
+fn http_05_b_missing_recognized_parameter_header_is_refused() {
+    let (response, calls) = http_05_b_call(http_05_b_arguments(), &[]);
+    assert!(
+        response.starts_with(b"HTTP/1.1 400"),
+        "an annotated argument without its mirror must be refused: {}",
+        String::from_utf8_lossy(&response)
+    );
+    let body = as_proxy_auth_response_json_body(&response);
+    assert_eq!(
+        body["error"]["code"],
+        fastmcp_protocol::HEADER_MISMATCH_ERROR_CODE
+    );
+    assert_eq!(calls, 0, "a missing mirror must not reach the handler");
+}
+
+#[test]
+fn http_05_b_unannotated_parameter_header_is_ignored() {
+    let (response, calls) = http_05_b_call(
+        http_05_b_arguments(),
+        &[
+            ("Mcp-Param-Region", "eu-west"),
+            ("Mcp-Param-Note", "not-an-annotation"),
+        ],
+    );
+    assert_http_05_b_admitted(&response, calls);
+}
+
+#[test]
+fn http_05_b_null_annotated_argument_without_header_reaches_schema_validation() {
+    // sep-2243-client-omit-null: a present-but-null annotated argument has no
+    // mirror, so the header stage admits it and ordinary validation refuses
+    // the null as a bounded tool error without running the handler.
+    let (response, calls) = http_05_b_call(json!({"region": null, "note": "body-only"}), &[]);
+    assert!(
+        response.starts_with(b"HTTP/1.1 200"),
+        "a null annotated argument must not be a header refusal: {}",
+        String::from_utf8_lossy(&response)
+    );
+    let body = as_proxy_auth_response_json_body(&response);
+    assert!(
+        body.get("error").is_none(),
+        "no -32020 or other JSON-RPC error: {body}"
+    );
+    assert_eq!(
+        body["result"]["isError"], true,
+        "schema validation must refuse the null: {body}"
+    );
+    assert_eq!(calls, 0, "schema refusal must not reach the handler");
+}
+
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 #[test]
 fn e2e_public_http_as_proxy_forwards_inbound_progress_marker() {

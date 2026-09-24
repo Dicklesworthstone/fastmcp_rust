@@ -3305,6 +3305,9 @@ fn mask_peer_error(error: McpError, mask_error_details: bool) -> McpError {
         || error.code == McpErrorCode::Custom(RESOURCE_EXHAUSTED_ERROR_CODE)
             && error.message == RESOURCE_SUBSCRIPTION_CAPACITY_MESSAGE
             && error.data.is_none()
+        || error.code == McpErrorCode::Custom(fastmcp_protocol::HEADER_MISMATCH_ERROR_CODE)
+            && error.message == http_admission::HEADER_MISMATCH_MESSAGE
+            && error.data.is_none()
     {
         error
     } else {
@@ -3329,11 +3332,23 @@ fn is_canonical_missing_required_client_capability_response(response: &JsonRpcRe
     })
 }
 
-fn canonical_missing_required_client_capability_http_response(
-    response: &JsonRpcResponse,
-) -> Option<HttpResponse> {
-    is_canonical_missing_required_client_capability_response(response)
-        .then(|| HttpResponse::new(HttpStatus::BAD_REQUEST).with_json(response))
+/// Whether a recognized `Mcp-Param-*` mirror refused a modern HTTP
+/// `tools/call` after its tool was resolved (HTTP-05).
+fn is_parameter_header_mismatch_response(response: &JsonRpcResponse) -> bool {
+    response.error.as_ref().is_some_and(|error| {
+        error.code.as_i32() == Some(fastmcp_protocol::HEADER_MISMATCH_ERROR_CODE)
+            && error.message == http_admission::HEADER_MISMATCH_MESSAGE
+            && error.data.is_none()
+    })
+}
+
+/// Final outcomes whose canonical modern HTTP status is 400: a missing
+/// required client capability (-32021) or a parameter-header mismatch
+/// (-32020), each carried as the JSON-RPC error body.
+fn canonical_http_bad_request_response(response: &JsonRpcResponse) -> Option<HttpResponse> {
+    (is_canonical_missing_required_client_capability_response(response)
+        || is_parameter_header_mismatch_response(response))
+    .then(|| HttpResponse::new(HttpStatus::BAD_REQUEST).with_json(response))
 }
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_transport::sse::SseServerTransport;
@@ -8431,6 +8446,7 @@ impl ServerHttpSession {
         let is_modern = request.method == HttpMethod::Post
             && request.path == self.server.http_config.handler_config.base_path;
         let mut raw_params = None;
+        let mut http_parameter_headers = None;
         let mut auth_receipt = None;
         #[cfg(any(feature = "legacy-2024-11-05", test))]
         let is_legacy = (request.method == HttpMethod::Get
@@ -8482,6 +8498,7 @@ impl ServerHttpSession {
                 };
             request = prepared_request;
             raw_params = admitted_raw_params;
+            http_parameter_headers = Some(http_admission::http_parameter_headers(&request.headers));
             auth_receipt = match self.preauthenticate_modern_http_request(
                 cx,
                 &admitted_request,
@@ -8630,6 +8647,7 @@ impl ServerHttpSession {
                     endpoint_response,
                     transport_authorization,
                     raw_params,
+                    http_parameter_headers,
                     auth_receipt,
                     modern_request_cancellation,
                 )
@@ -8932,6 +8950,7 @@ impl ServerHttpSession {
         endpoint_response: DualEraHttpEndpointResponse,
         transport_authorization: TransportAuthorization,
         raw_params: Option<Arc<str>>,
+        http_parameter_headers: Option<Arc<[(String, String)]>>,
         auth_receipt: Option<AuthDispatchCustody>,
         modern_request_cancellation: Option<McpRequestCancellation>,
     ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
@@ -8999,6 +9018,10 @@ impl ServerHttpSession {
             &self.modern_connection,
             transport_authorization,
         );
+        let inbound = match http_parameter_headers {
+            Some(headers) => inbound.with_http_parameter_headers(headers),
+            None => inbound,
+        };
 
         match endpoint_response {
             DualEraHttpEndpointResponse::ModernJson(pending) => {
@@ -9026,9 +9049,7 @@ impl ServerHttpSession {
                     )
                     .await;
                 if let Some(response) = response {
-                    if let Some(rejection) =
-                        canonical_missing_required_client_capability_http_response(&response)
-                    {
+                    if let Some(rejection) = canonical_http_bad_request_response(&response) {
                         return Ok(ServerHttpEndpointResponse::Immediate(rejection));
                     }
                     self.endpoint_session
@@ -9137,7 +9158,7 @@ impl ServerHttpSession {
                     .await;
                 if let Some(rejection) = response
                     .as_ref()
-                    .and_then(canonical_missing_required_client_capability_http_response)
+                    .and_then(canonical_http_bad_request_response)
                 {
                     return Ok(ServerHttpEndpointResponse::Immediate(rejection));
                 }
@@ -9243,6 +9264,7 @@ impl ServerHttpSession {
                 ))));
             }
         };
+        let http_parameter_headers = http_admission::http_parameter_headers(&request.headers);
         let endpoint_response = match self
             .endpoint_session
             .lock()
@@ -9271,6 +9293,7 @@ impl ServerHttpSession {
                     endpoint_response,
                     transport_authorization,
                     raw_params,
+                    Some(http_parameter_headers),
                     Some(auth_receipt),
                     None,
                 )
@@ -10851,7 +10874,7 @@ fn spawn_modern_sse_dispatch(
             outcome_gate.as_ref(),
             response
                 .as_ref()
-                .and_then(canonical_missing_required_client_capability_http_response),
+                .and_then(canonical_http_bad_request_response),
         ) {
             if outcome_gate.elect(ModernSseDispatchElection::Immediate(rejection)) {
                 return;
@@ -11340,7 +11363,7 @@ fn protocol_admission_error_response(
         });
     let (message, data) = match &admission {
         fastmcp_protocol::RequestAdmissionError::HeaderMismatch(error) => (
-            "MCP request headers do not match the JSON-RPC request",
+            http_admission::HEADER_MISMATCH_MESSAGE,
             error.canonical_error_data(),
         ),
         fastmcp_protocol::RequestAdmissionError::UnsupportedProtocolVersion(error) => (
@@ -11831,6 +11854,7 @@ async fn serve_http_connection(
                 return;
             }
         };
+        let http_parameter_headers = http_admission::http_parameter_headers(&request.headers);
         let response = {
             match session
                 .begin_modern_sse(cx, request.clone(), transport_authorization.clone())
@@ -11843,7 +11867,8 @@ async fn serve_http_connection(
                         InboundRequestTransport::Http,
                         &session.modern_connection,
                         transport_authorization.clone(),
-                    ),
+                    )
+                    .with_http_parameter_headers(http_parameter_headers),
                     request,
                     raw_params,
                     auth_receipt,
@@ -12215,6 +12240,7 @@ async fn serve_modern_http_connection(
                 return;
             }
         };
+        let http_parameter_headers = http_admission::http_parameter_headers(&request.headers);
         let response = {
             match session
                 .begin_modern_sse(cx, request.clone(), transport_authorization.clone())
@@ -12227,7 +12253,8 @@ async fn serve_modern_http_connection(
                         InboundRequestTransport::Http,
                         &session.modern_connection,
                         transport_authorization.clone(),
-                    ),
+                    )
+                    .with_http_parameter_headers(http_parameter_headers),
                     request,
                     raw_params,
                     auth_receipt,
@@ -14846,7 +14873,9 @@ impl Server {
             Some(response)
                 if is_cross_era_request
                     || is_modern_http_request
-                        && is_canonical_missing_required_client_capability_response(&response) =>
+                        && (is_canonical_missing_required_client_capability_response(
+                            &response,
+                        ) || is_parameter_header_mismatch_response(&response)) =>
             {
                 HttpResponse::new(HttpStatus::BAD_REQUEST).with_json(&response)
             }

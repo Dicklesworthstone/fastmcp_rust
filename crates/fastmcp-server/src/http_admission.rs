@@ -41,10 +41,11 @@ pub mod security;
 use core::fmt;
 use std::sync::Arc;
 
+use fastmcp_protocol::http_headers::AdmittedToolHeaderSchema;
 use fastmcp_protocol::{
     FINAL_PROTOCOL_VERSION_META_KEY, FinalHttpRequestMetadata, FinalProtocolVersion,
-    JsonRpcAdmissionError, JsonRpcRequest, MCP_METHOD_HEADER, MCP_NAME_HEADER,
-    MCP_PROTOCOL_VERSION_HEADER, RawJsonAdmissionError, RequestAdmissionError,
+    HEADER_MISMATCH_ERROR_CODE, JsonRpcAdmissionError, JsonRpcRequest, MCP_METHOD_HEADER,
+    MCP_NAME_HEADER, MCP_PROTOCOL_VERSION_HEADER, RawJsonAdmissionError, RequestAdmissionError,
     RequestVersionMetadata, admit_final_http_request,
 };
 use serde_json::Value;
@@ -473,6 +474,56 @@ fn body_protocol_version(request: &JsonRpcRequest) -> Option<&str> {
         .and_then(|params| params.get("_meta"))
         .and_then(|meta| meta.get(FINAL_PROTOCOL_VERSION_META_KEY))
         .and_then(Value::as_str)
+}
+
+/// Collects a transport request's `Mcp-Param-*` fields for the router's
+/// comparison with the resolved tool. Every such field is kept, since which
+/// ones are recognized depends on the tool; the rest are ignored there.
+pub(crate) fn http_parameter_headers<'a>(
+    headers: impl IntoIterator<Item = (&'a String, &'a String)>,
+) -> Arc<[(String, String)]> {
+    headers
+        .into_iter()
+        .filter(|(name, _)| {
+            name.get(..MCP_PARAM_HEADER_PREFIX.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(MCP_PARAM_HEADER_PREFIX))
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
+const MCP_PARAM_HEADER_PREFIX: &str = "mcp-param-";
+
+/// Message shared with the `Mcp-Method`/`Mcp-Name` mirror refusal.
+pub(crate) const HEADER_MISMATCH_MESSAGE: &str =
+    "MCP request headers do not match the JSON-RPC request";
+
+/// Compares a modern HTTP `tools/call`'s `Mcp-Param-*` fields with the
+/// arguments the resolved tool's schema annotates, before argument
+/// validation or dispatch.
+///
+/// Only annotated arguments are recognized: an unannotated `Mcp-Param-*`
+/// field is ignored. A recognized field that is missing for a present
+/// argument, present for an absent one, duplicated or unequal refuses with
+/// the -32020 header mismatch. A schema whose annotations cannot be admitted
+/// yields no recognized fields, so such a tool keeps its existing behavior.
+pub(crate) fn validate_tool_parameter_headers(
+    input_schema: &Value,
+    arguments: &Value,
+    headers: &[(String, String)],
+) -> fastmcp_core::McpResult<()> {
+    let Ok(schema) = AdmittedToolHeaderSchema::admit(input_schema.clone()) else {
+        return Ok(());
+    };
+    schema
+        .header_plan()
+        .validate(Some(arguments), headers)
+        .map_err(|_| {
+            fastmcp_core::McpError::new(
+                fastmcp_core::McpErrorCode::Custom(HEADER_MISMATCH_ERROR_CODE),
+                HEADER_MISMATCH_MESSAGE,
+            )
+        })
 }
 
 /// Returns the body value mirrored by `Mcp-Name` for the methods that
@@ -938,5 +989,96 @@ mod tests {
         assert!(HttpEndpointConfig::new("mcp", limits).is_none());
         assert!(HttpEndpointConfig::new("/m cp", limits).is_none());
         assert!(HttpEndpointConfig::new("/mcp\r", limits).is_none());
+    }
+
+    fn annotated_schema() -> serde_json::Value {
+        json!({"type": "object", "properties": {
+            "region": {"type": "string", "x-mcp-header": "Region"},
+            "note": {"type": "string"}
+        }})
+    }
+
+    fn fields(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    fn assert_header_mismatch(result: fastmcp_core::McpResult<()>) {
+        let error = result.expect_err("a recognized mirror mismatch must refuse");
+        assert_eq!(
+            i32::from(error.code),
+            fastmcp_protocol::HEADER_MISMATCH_ERROR_CODE
+        );
+        assert_eq!(error.message, super::HEADER_MISMATCH_MESSAGE);
+    }
+
+    #[test]
+    fn parameter_header_matching_the_annotated_argument_is_admitted() {
+        let arguments = json!({"region": "eu-west", "note": "body-only"});
+        super::validate_tool_parameter_headers(
+            &annotated_schema(),
+            &arguments,
+            &fields(&[("mcp-param-region", "eu-west")]),
+        )
+        .expect("the mirrored value matches");
+    }
+
+    #[test]
+    fn parameter_header_differing_only_in_value_is_refused() {
+        let arguments = json!({"region": "eu-west", "note": "body-only"});
+        assert_header_mismatch(super::validate_tool_parameter_headers(
+            &annotated_schema(),
+            &arguments,
+            &fields(&[("mcp-param-region", "us-east")]),
+        ));
+    }
+
+    #[test]
+    fn missing_or_orphan_recognized_parameter_header_is_refused() {
+        let schema = annotated_schema();
+        assert_header_mismatch(super::validate_tool_parameter_headers(
+            &schema,
+            &json!({"region": "eu-west"}),
+            &[],
+        ));
+        assert_header_mismatch(super::validate_tool_parameter_headers(
+            &schema,
+            &json!({"note": "body-only"}),
+            &fields(&[("mcp-param-region", "eu-west")]),
+        ));
+    }
+
+    #[test]
+    fn present_null_annotated_argument_without_header_is_not_a_mismatch() {
+        // sep-2243-client-omit-null: the client omits the mirror for a null,
+        // and ordinary schema validation owns the value afterwards.
+        super::validate_tool_parameter_headers(
+            &annotated_schema(),
+            &json!({"region": null, "note": "body-only"}),
+            &[],
+        )
+        .expect("a null annotated argument expects no mirror");
+    }
+
+    #[test]
+    fn unannotated_parameter_header_is_ignored() {
+        super::validate_tool_parameter_headers(
+            &annotated_schema(),
+            &json!({"note": "body-only"}),
+            &fields(&[("mcp-param-note", "anything")]),
+        )
+        .expect("a field no annotation names is not recognized");
+    }
+
+    #[test]
+    fn unadmittable_schema_recognizes_no_parameter_headers() {
+        super::validate_tool_parameter_headers(
+            &json!({"type": "string"}),
+            &json!({"region": "eu-west"}),
+            &fields(&[("mcp-param-region", "us-east")]),
+        )
+        .expect("no plan can be derived, so nothing is recognized");
     }
 }

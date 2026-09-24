@@ -134,11 +134,14 @@ impl TransportAuthorization {
 /// Sanitized, immutable ingress facts for one server dispatch.
 ///
 /// The type intentionally has no `Clone`, `Serialize`, or `Debug`
-/// implementation. In particular, it offers no channel for raw headers or
-/// credentials. A native transport may retain its singleton authorization
-/// field in crate-private custody for server admission, but it never exposes
-/// that field through this public context. The server creates a fresh
-/// request-scoped [`McpContext`] from these facts for every dispatch.
+/// implementation. In particular, it offers no channel for credentials or
+/// arbitrary raw headers. A native transport may retain its singleton
+/// authorization field in crate-private custody for server admission, but it
+/// never exposes that field through this public context. The only header
+/// fields it carries are a modern HTTP request's admitted `Mcp-Param-*`
+/// mirrors, which the router compares with the resolved tool's annotated
+/// arguments. The server creates a fresh request-scoped [`McpContext`] from
+/// these facts for every dispatch.
 pub struct InboundRequestContext {
     cx: Cx,
     request_id: u64,
@@ -147,6 +150,7 @@ pub struct InboundRequestContext {
     mrtr_continuation_cancellation: Option<fastmcp_core::McpRequestCancellation>,
     transport_authorization: TransportAuthorization,
     principal_binding: Option<SessionPrincipalBinding>,
+    http_parameter_headers: Option<Arc<[(String, String)]>>,
 }
 
 impl InboundRequestContext {
@@ -162,6 +166,7 @@ impl InboundRequestContext {
             mrtr_continuation_cancellation: None,
             transport_authorization: TransportAuthorization::default(),
             principal_binding: None,
+            http_parameter_headers: None,
         }
     }
 
@@ -223,7 +228,17 @@ impl InboundRequestContext {
             mrtr_continuation_cancellation: Some(connection.continuation_cancellation.clone()),
             transport_authorization,
             principal_binding: Some(connection.principal_binding.clone()),
+            http_parameter_headers: None,
         }
+    }
+
+    /// Installs the `Mcp-Param-*` fields modern HTTP admission received.
+    /// Only the HTTP transport calls this; every other transport leaves them
+    /// absent, so no parameter-header comparison is made for it.
+    #[must_use]
+    pub(crate) fn with_http_parameter_headers(mut self, headers: Arc<[(String, String)]>) -> Self {
+        self.http_parameter_headers = Some(headers);
+        self
     }
 
     /// Returns the transport's allowlisted provenance fact.
@@ -247,6 +262,10 @@ impl InboundRequestContext {
             || McpContext::with_state(self.cx.clone(), self.request_id, SessionState::new()),
             |state| McpContext::with_state(self.cx.clone(), self.request_id, state),
         );
+        let context = match &self.http_parameter_headers {
+            Some(headers) => context.with_http_parameter_headers(Arc::clone(headers)),
+            None => context,
+        };
         if self.mrtr_continuation_cancellation.is_some() {
             context.with_retained_continuation_owner()
         } else {
@@ -5337,6 +5356,16 @@ impl Router {
             .arguments
             .into_value()
             .unwrap_or_else(|| serde_json::json!({}));
+        // HTTP-05: recognized `Mcp-Param-*` mirrors are compared after the
+        // tool is resolved, so unknown and disabled tools keep their own
+        // errors, and before argument validation or any handler effect.
+        if let Some(headers) = request_ctx.http_parameter_headers() {
+            crate::http_admission::validate_tool_parameter_headers(
+                &final_registration.final_definition.input_schema,
+                &arguments,
+                headers,
+            )?;
+        }
         let input_validation_failed = match input_schema {
             Some(schema) => {
                 let validation = if self.strict_input_validation {
