@@ -324,6 +324,9 @@ pub enum OAuthParameterName {
 pub struct OAuthHttpRoutes {
     server: Arc<OAuthServer>,
     public_endpoint_base: String,
+    /// The endpoint base's path with one trailing `/`; every fixed route is
+    /// this prefix plus its name, matching `DiscoveryDocument`'s spelling.
+    route_prefix: String,
     authorization_path: String,
     token_path: String,
     revocation_path: String,
@@ -340,6 +343,7 @@ pub(crate) struct OidcHttpRoutes {
     discovery_path: String,
     jwks_path: String,
     jwks_uri: String,
+    userinfo_path: String,
 }
 
 #[cfg(feature = "builtin-auth-server")]
@@ -354,6 +358,11 @@ impl OidcHttpRoutes {
 
     pub(crate) fn jwks_path(&self) -> &str {
         &self.jwks_path
+    }
+
+    /// The route serving the discovery document's `userinfo_endpoint`.
+    pub(crate) fn userinfo_path(&self) -> &str {
+        &self.userinfo_path
     }
 
     pub(crate) fn jwks_uri(&self) -> &str {
@@ -379,6 +388,10 @@ impl std::fmt::Debug for OAuthHttpRoutes {
             .field(
                 "oidc_jwks_path",
                 &self.oidc.as_ref().map(|oidc| oidc.jwks_path.as_str()),
+            )
+            .field(
+                "oidc_userinfo_path",
+                &self.oidc.as_ref().map(|oidc| oidc.userinfo_path.as_str()),
             );
         debug.finish_non_exhaustive()
     }
@@ -444,31 +457,29 @@ impl OAuthHttpRoutes {
             return Err(OAuthHttpRouteConfigurationError::IssuerOriginMismatch);
         }
 
-        let base_path = base.path().trim_end_matches('/');
-        let route_path = |suffix: &str| {
-            if base_path.is_empty() {
-                format!("/{suffix}")
-            } else {
-                format!("{base_path}/{suffix}")
-            }
-        };
+        let route_prefix = format!("{}/", base.path().trim_end_matches('/'));
+        let route_path = |suffix: &str| format!("{route_prefix}{suffix}");
         let registration_path = server
             .config()
             .allow_public_clients
             .then(|| route_path("register"));
+        let authorization_path = route_path("authorize");
+        let token_path = route_path("token");
+        let revocation_path = route_path("revoke");
         Ok(Self {
             server,
             public_endpoint_base,
-            authorization_path: route_path("authorize"),
-            token_path: route_path("token"),
-            revocation_path: route_path("revoke"),
+            route_prefix,
+            authorization_path,
+            token_path,
+            revocation_path,
             registration_path,
             #[cfg(feature = "builtin-auth-server")]
             oidc: None,
         })
     }
 
-    /// Adds fixed OIDC discovery and JWKS routes for a provider that has
+    /// Adds fixed OIDC discovery, JWKS and UserInfo routes for a provider that has
     /// already entered signer activation. The provider must be layered over
     /// this exact OAuth server; neither issuer nor endpoint paths are inferred
     /// from requests.
@@ -501,22 +512,26 @@ impl OAuthHttpRoutes {
             discovery_path,
             jwks_path: jwks.path().to_string(),
             jwks_uri,
+            userinfo_path: format!("{}userinfo", self.route_prefix),
         };
-        if [
+        let oauth_paths = [
             Some(self.authorization_path()),
             Some(self.token_path()),
             Some(self.revocation_path()),
             self.registration_path(),
-        ]
-        .contains(&Some(candidate.discovery_path.as_str()))
-            || [
-                Some(self.authorization_path()),
-                Some(self.token_path()),
-                Some(self.revocation_path()),
-                self.registration_path(),
-            ]
-            .contains(&Some(candidate.jwks_path.as_str()))
-            || candidate.discovery_path == candidate.jwks_path
+        ];
+        let oidc_paths = [
+            candidate.discovery_path.as_str(),
+            candidate.jwks_path.as_str(),
+            candidate.userinfo_path.as_str(),
+        ];
+        if oidc_paths
+            .iter()
+            .any(|path| oauth_paths.contains(&Some(*path)))
+            || oidc_paths
+                .iter()
+                .enumerate()
+                .any(|(index, path)| oidc_paths[index + 1..].contains(path))
         {
             return Err(OAuthHttpRouteConfigurationError::InvalidPublicEndpointBase);
         }
@@ -566,9 +581,11 @@ impl OAuthHttpRoutes {
             || {
                 #[cfg(feature = "builtin-auth-server")]
                 {
-                    self.oidc
-                        .as_ref()
-                        .is_some_and(|oidc| path == oidc.discovery_path || path == oidc.jwks_path)
+                    self.oidc.as_ref().is_some_and(|oidc| {
+                        path == oidc.discovery_path
+                            || path == oidc.jwks_path
+                            || path == oidc.userinfo_path
+                    })
                 }
                 #[cfg(not(feature = "builtin-auth-server"))]
                 {
@@ -598,7 +615,9 @@ impl OAuthHttpRoutes {
                     #[cfg(feature = "builtin-auth-server")]
                     {
                         self.oidc.as_ref().is_some_and(|oidc| {
-                            occupied == oidc.discovery_path || occupied == oidc.jwks_path
+                            occupied == oidc.discovery_path
+                                || occupied == oidc.jwks_path
+                                || occupied == oidc.userinfo_path
                         })
                     }
                     #[cfg(not(feature = "builtin-auth-server"))]

@@ -9897,6 +9897,57 @@ fn oauth_token_request(
     })
 }
 
+/// OIDC Core 5.3 UserInfo: the discovery document's `userinfo_endpoint`
+/// (bd-vej30). The access token is accepted only as an RFC 6750 Bearer
+/// `Authorization` header; failures carry the RFC 6750 challenge and never
+/// reflect the credential.
+#[cfg(feature = "builtin-auth-server")]
+fn oidc_userinfo_response(
+    oidc: &crate::oauth::OidcHttpRoutes,
+    request: &asupersync::http::h1::Request,
+    authorization_header: Option<&str>,
+    raw_query: &str,
+) -> HttpResponse {
+    if !matches!(request.method, Http1Method::Get | Http1Method::Post) {
+        return oauth_http_method_not_allowed("GET, POST");
+    }
+    if !raw_query.is_empty() || !request.body.is_empty() {
+        return oauth_http_invalid_request();
+    }
+    let bearer = authorization_header.and_then(|header| {
+        let (scheme, token) = header.trim().split_once(' ')?;
+        let token = token.trim_start();
+        (scheme.eq_ignore_ascii_case("bearer")
+            && !token.is_empty()
+            && !token.contains(char::is_whitespace))
+        .then_some(token)
+    });
+    let Some(token) = bearer else {
+        return oidc_userinfo_challenge(HttpStatus::UNAUTHORIZED, None);
+    };
+    match oidc.provider().userinfo(token) {
+        Ok(claims) => oauth_http_no_store(HttpResponse::ok().with_json(&claims)),
+        Err(oidc::OidcError::MissingOpenIdScope) => {
+            oidc_userinfo_challenge(HttpStatus::FORBIDDEN, Some("insufficient_scope"))
+        }
+        Err(_) => oidc_userinfo_challenge(HttpStatus::UNAUTHORIZED, Some("invalid_token")),
+    }
+}
+
+#[cfg(feature = "builtin-auth-server")]
+fn oidc_userinfo_challenge(status: HttpStatus, error: Option<&'static str>) -> HttpResponse {
+    let Some(error) = error else {
+        return oauth_http_no_store(
+            HttpResponse::new(status).with_header("www-authenticate", "Bearer"),
+        );
+    };
+    oauth_http_no_store(
+        HttpResponse::new(status)
+            .with_header("www-authenticate", format!("Bearer error=\"{error}\""))
+            .with_json(&serde_json::json!({ "error": error })),
+    )
+}
+
 fn dispatch_oauth_h1_request(
     routes: &OAuthHttpRoutes,
     request: &asupersync::http::h1::Request,
@@ -9909,6 +9960,9 @@ fn dispatch_oauth_h1_request(
     };
     #[cfg(feature = "builtin-auth-server")]
     if let Some(oidc) = routes.oidc_routes() {
+        if raw_path == oidc.userinfo_path() {
+            return oidc_userinfo_response(oidc, request, authorization_header, raw_query);
+        }
         if raw_path == oidc.discovery_path() || raw_path == oidc.jwks_path() {
             if authorization_header.is_some() || !raw_query.is_empty() || !request.body.is_empty() {
                 return oauth_http_invalid_request();
@@ -10079,6 +10133,8 @@ struct OAuthNativeH1RouteLimits {
     oidc_discovery: Option<String>,
     #[cfg(feature = "builtin-auth-server")]
     oidc_jwks: Option<String>,
+    #[cfg(feature = "builtin-auth-server")]
+    oidc_userinfo: Option<String>,
 }
 
 impl OAuthNativeH1RouteLimits {
@@ -10094,6 +10150,10 @@ impl OAuthNativeH1RouteLimits {
                 .map(|oidc| oidc.discovery_path().to_owned()),
             #[cfg(feature = "builtin-auth-server")]
             oidc_jwks: routes.oidc_routes().map(|oidc| oidc.jwks_path().to_owned()),
+            #[cfg(feature = "builtin-auth-server")]
+            oidc_userinfo: routes
+                .oidc_routes()
+                .map(|oidc| oidc.userinfo_path().to_owned()),
         }
     }
 
@@ -10103,6 +10163,7 @@ impl OAuthNativeH1RouteLimits {
             {
                 self.oidc_discovery.as_deref() == Some(path)
                     || self.oidc_jwks.as_deref() == Some(path)
+                    || self.oidc_userinfo.as_deref() == Some(path)
             }
             #[cfg(not(feature = "builtin-auth-server"))]
             {
