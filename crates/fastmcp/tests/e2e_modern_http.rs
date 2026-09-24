@@ -8513,6 +8513,81 @@ impl PromptHandler for PublicHttpElicitationPrompt {
     }
 }
 
+const PUBLIC_HTTP_ROOTS_PROMPT_NAME: &str = "public_http_roots_greeting";
+
+fn public_http_roots_input_required(
+    ctx: &McpContext,
+) -> McpResult<fastmcp_rust::InputRequiredResult> {
+    ctx.final_roots("roots", FinalEmbeddedRootsListParams::default())?
+        .into_input_required()
+}
+
+fn public_http_completed_roots(
+    completed_inputs: &fastmcp_rust::MrtrCompletedInputs,
+) -> McpResult<String> {
+    let roots = completed_inputs
+        .roots("roots")?
+        .ok_or_else(|| McpError::internal_error("roots input was not preserved"))?;
+    Ok(roots
+        .roots
+        .iter()
+        .map(|root| root.uri.as_str())
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
+/// Resource template whose read needs one roots answer, then completes with it.
+#[resource(uri = "test://public-http-e2e/roots/{subject}")]
+fn public_http_roots_gate(
+    ctx: &McpContext,
+    subject: String,
+    completed_inputs: Option<&fastmcp_rust::MrtrCompletedInputs>,
+) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+    let Some(completed_inputs) = completed_inputs else {
+        return public_http_roots_input_required(ctx).map(FinalMethodOutcome::InputRequired);
+    };
+    let roots = public_http_completed_roots(completed_inputs)?;
+    let uri =
+        fastmcp_rust::FinalAbsoluteUri::parse(&format!("test://public-http-e2e/roots/{subject}"))
+            .map_err(|error| McpError::internal_error(error.to_string()))?;
+    Ok(FinalMethodOutcome::Complete(CompleteResult::new(
+        FinalReadResourceResult {
+            contents: vec![EmbeddedResourceContents::Text {
+                uri,
+                text: format!("roots-resource:{subject}:{roots}"),
+                mime_type: Some("text/plain".to_owned()),
+                meta: None,
+                additional: BTreeMap::new(),
+            }],
+            ttl_ms: CacheTtl::milliseconds(7),
+            cache_scope: CacheScope::Private,
+        },
+        ResultMeta::empty(),
+    )))
+}
+
+/// Prompt that needs one roots answer, then completes with it.
+#[prompt]
+fn public_http_roots_greeting(
+    ctx: &McpContext,
+    completed_inputs: Option<&fastmcp_rust::MrtrCompletedInputs>,
+) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
+    let Some(completed_inputs) = completed_inputs else {
+        return public_http_roots_input_required(ctx).map(FinalMethodOutcome::InputRequired);
+    };
+    let roots = public_http_completed_roots(completed_inputs)?;
+    Ok(FinalMethodOutcome::Complete(CompleteResult::new(
+        FinalGetPromptResult {
+            description: Some("typed roots prompt result".to_owned()),
+            messages: vec![FinalPromptMessage {
+                role: Role::Assistant,
+                content: ContentBlock::text(format!("roots-prompt:{roots}")),
+            }],
+        },
+        ResultMeta::empty(),
+    )))
+}
+
 /// Starts one ModernOnly facade whose only tool is live final sampling.
 fn spawn_modern_sampling_http_server() -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
@@ -8534,6 +8609,8 @@ fn spawn_modern_sampling_http_server() -> HttpServerFixture {
                 .tool(PublicHttpUrlElicitationTool)
                 .resource(PublicHttpElicitationResource)
                 .prompt(PublicHttpElicitationPrompt)
+                .resource(PublicHttpRootsGateResource)
+                .prompt(PublicHttpRootsGreetingPrompt)
                 .build();
             let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
                 Ok(bound) => bound,
@@ -22078,6 +22155,166 @@ fn e2e_public_http_as_proxy_stdio_forwards_inbound_sampling_capability() {
     drop(no_url);
     drop(bare);
     gateway.shutdown();
+}
+
+const AS_PROXY_DOWNSTREAM_ROOT: &str = "file:///e2e-as-proxy-downstream-root";
+const AS_PROXY_DOWNSTREAM_ROOTS_REFUSAL: &str = "e2e-as-proxy-downstream-refused-roots";
+
+/// The downstream answer to a proxied roots `input_required`. The positive and
+/// the planted negative differ only in `refuse`.
+fn as_proxy_downstream_roots_handlers(refuse: bool) -> modern::ReverseRequestHandlers {
+    modern::ReverseRequestHandlers::new().with_modern_roots_list(
+        move |_cx, _cancellation, _params| {
+            Box::pin(async move {
+                if refuse {
+                    return Err(McpError::invalid_request(AS_PROXY_DOWNSTREAM_ROOTS_REFUSAL));
+                }
+                Ok(modern::FinalEmbeddedRootsListResult {
+                    roots: vec![fastmcp_protocol::Root::new(AS_PROXY_DOWNSTREAM_ROOT)],
+                })
+            })
+        },
+    )
+}
+
+/// A roots-capable downstream client of one live `bind_http` gateway.
+fn as_proxy_roots_follow_client(cx: &Cx, gateway: SocketAddr, refuse: bool) -> modern::HttpClient {
+    let mut capabilities = ClientCapabilities::default();
+    capabilities.roots = serde_json::from_value(json!({})).expect("roots capability is valid");
+    runtime_block_on_bounded(
+        cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-roots-follow", "1.0.0")
+            .capabilities(capabilities)
+            .modern_reverse_request_handlers(as_proxy_downstream_roots_handlers(refuse))
+            .connect_http_with_cx(public_http_target(gateway, "/mcp"), cx),
+    )
+    .expect("the roots-follow facade connects to the live as_proxy gateway")
+}
+
+fn assert_refused_roots_yield_no_final<T: std::fmt::Debug>(
+    verb: &str,
+    outcome: Result<T, modern::HttpClientError>,
+) {
+    match outcome {
+        Ok(result) => {
+            panic!("a refused downstream roots answer must not yield a final {verb}: {result:?}")
+        }
+        Err(modern::HttpClientError::CoreResult(error)) => {
+            assert_eq!(
+                error.code,
+                McpErrorCode::InvalidRequest,
+                "{verb}: {error:?}"
+            );
+            assert_eq!(
+                error.message, AS_PROXY_DOWNSTREAM_ROOTS_REFUSAL,
+                "{verb} must surface the downstream refusal unchanged"
+            );
+        }
+        Err(other) => panic!("{verb} must fail with the typed refusal, got {other:?}"),
+    }
+}
+
+/// Follows roots `input_required` on a resource template and a prefixed prompt
+/// through a live `bind_http` `as_proxy_typed("ext")` gateway to a live HTTP
+/// upstream. The resumed upstream echoes the downstream's root URI.
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn as_proxy_http_follow_roots(
+    refuse: bool,
+) -> (
+    Result<FinalReadResourceResult, modern::HttpClientError>,
+    Result<FinalGetPromptResult, modern::HttpClientError>,
+) {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_sampling_http_server();
+    let gateway = spawn_modern_http_identity_proxy_gateway(upstream.address());
+    let mut client = as_proxy_roots_follow_client(&cx, gateway.address(), refuse);
+    let resource = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, "test://public-http-e2e/roots/alpha"),
+    );
+    let prompt = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            &format!("ext/{PUBLIC_HTTP_ROOTS_PROMPT_NAME}"),
+            HashMap::new(),
+        ),
+    );
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+    (resource, prompt)
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_resumes_roots_on_resource_template_and_prompt() {
+    let (resource, prompt) = as_proxy_http_follow_roots(false);
+    let resource =
+        resource.expect("as_proxy must resume the upstream roots input on resources/read");
+    let expected = format!("roots-resource:alpha:{AS_PROXY_DOWNSTREAM_ROOT}");
+    assert!(
+        resource.contents.iter().any(|content| matches!(
+            content,
+            EmbeddedResourceContents::Text { text, .. } if *text == expected
+        )),
+        "the resumed template read must carry the downstream root: {resource:?}"
+    );
+    let prompt = prompt.expect("as_proxy must resume the upstream roots input on prompts/get");
+    let expected = format!("roots-prompt:{AS_PROXY_DOWNSTREAM_ROOT}");
+    assert!(
+        prompt.messages.iter().any(|message| matches!(
+            &message.content,
+            ContentBlock::Text { text, .. } if *text == expected
+        )),
+        "the resumed prompt must carry the downstream root: {prompt:?}"
+    );
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_refused_roots_yield_no_final_resource_or_prompt() {
+    let (resource, prompt) = as_proxy_http_follow_roots(true);
+    assert_refused_roots_yield_no_final("resources/read", resource);
+    assert_refused_roots_yield_no_final("prompts/get", prompt);
+}
+
+/// The same follow through a live `bind_http` `as_proxy("ext", stdio)` gateway
+/// to the shipped echo's roots-gated `info://mrtr-resource`. The echo has no
+/// roots-gated prompt; its elicitation prompt cannot resume over stateless
+/// HTTP by design, so prompts/get is proven on the HTTP upstream above.
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+fn as_proxy_http_stdio_follow_roots(
+    refuse: bool,
+) -> Result<FinalReadResourceResult, modern::HttpClientError> {
+    let cx = Cx::for_request();
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_without_precreated_task();
+    let mut client = as_proxy_roots_follow_client(&cx, gateway.address(), refuse);
+    let resource = runtime_block_on_bounded(&cx, client.read_resource(&cx, "info://mrtr-resource"));
+    drop(client);
+    gateway.shutdown();
+    resource
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_resumes_roots_on_resource() {
+    let resource = as_proxy_http_stdio_follow_roots(false)
+        .expect("stdio as_proxy must resume the echo's roots input on resources/read");
+    assert!(
+        resource.contents.iter().any(|content| matches!(
+            content,
+            EmbeddedResourceContents::Text { text, .. } if text == "typed resource roots=1"
+        )),
+        "the resumed stdio read must count the one downstream root: {resource:?}"
+    );
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_refused_roots_yield_no_final_resource() {
+    assert_refused_roots_yield_no_final("resources/read", as_proxy_http_stdio_follow_roots(true));
 }
 
 #[cfg(all(feature = "proxy", feature = "tasks"))]
