@@ -9314,19 +9314,25 @@ impl ServerHttpSession {
                 Option<Arc<str>>,
                 AuthDispatchCustody,
             ),
-            ServerHttpEndpointResponse,
+            // Boxed so this Result stays small (bd-cmvwm): the response enum
+            // is hundreds of bytes and only the refusal path pays the box.
+            Box<ServerHttpEndpointResponse>,
         >,
         DualEraHttpEndpointError,
     > {
         if matches!(self.server.protocol_policy, ProtocolPolicy::LegacyOnly) {
-            return Ok(Err(ServerHttpEndpointResponse::Immediate(
+            return Ok(Err(Box::new(ServerHttpEndpointResponse::Immediate(
                 HttpResponse::new(HttpStatus::BAD_REQUEST),
-            )));
+            ))));
         }
         let (request, admitted_request, raw_params) =
             match self.prepare_modern_http_request(request) {
                 Ok(request) => request,
-                Err(response) => return Ok(Err(ServerHttpEndpointResponse::Immediate(response))),
+                Err(response) => {
+                    return Ok(Err(Box::new(ServerHttpEndpointResponse::Immediate(
+                        response,
+                    ))));
+                }
             };
         let auth_receipt = match self.preauthenticate_modern_http_request(
             cx,
@@ -9334,7 +9340,11 @@ impl ServerHttpSession {
             &transport_authorization,
         ) {
             Ok(receipt) => AuthDispatchCustody::Http(receipt),
-            Err(response) => return Ok(Err(ServerHttpEndpointResponse::Immediate(response))),
+            Err(response) => {
+                return Ok(Err(Box::new(ServerHttpEndpointResponse::Immediate(
+                    response,
+                ))));
+            }
         };
         let endpoint_response = match self
             .endpoint_session
@@ -9351,9 +9361,9 @@ impl ServerHttpSession {
             Err(DualEraHttpEndpointError::Transport(TransportError::Io(error)))
                 if error.kind() == std::io::ErrorKind::InvalidInput =>
             {
-                return Ok(Err(ServerHttpEndpointResponse::Immediate(
+                return Ok(Err(Box::new(ServerHttpEndpointResponse::Immediate(
                     HttpResponse::bad_request(),
-                )));
+                ))));
             }
             Err(error) => return Err(error),
         };
@@ -9368,7 +9378,7 @@ impl ServerHttpSession {
                     None,
                 )
                 .await
-                .map(Err);
+                .map(|response| Err(Box::new(response)));
         };
         let request = self
             .endpoint_session
@@ -9376,9 +9386,9 @@ impl ServerHttpSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .recv_modern_request(cx)?;
         if request.method == "notifications/cancelled" {
-            return Ok(Err(ServerHttpEndpointResponse::Immediate(
+            return Ok(Err(Box::new(ServerHttpEndpointResponse::Immediate(
                 HttpResponse::bad_request(),
-            )));
+            ))));
         }
         Ok(Ok((request, sse, raw_params, auth_receipt)))
     }
@@ -11931,7 +11941,7 @@ async fn serve_http_connection(
                     cx,
                     &listener_shutdown,
                     &mut framed,
-                    http_endpoint_response_to_static(cx, response),
+                    http_endpoint_response_to_static(cx, *response),
                 )
                 .await;
                 return;
@@ -12315,7 +12325,7 @@ async fn serve_modern_http_connection(
                     cx,
                     &listener_shutdown,
                     &mut framed,
-                    http_endpoint_response_to_static(cx, response),
+                    http_endpoint_response_to_static(cx, *response),
                 )
                 .await;
                 return;
@@ -54090,7 +54100,8 @@ mod lib_unit_tests {
                     TransportAuthorization::default(),
                 )
                 .await
-                .map_err(|error| format!("streaming cancellation rejection failed: {error}"))?;
+                .map_err(|error| format!("streaming cancellation rejection failed: {error}"))?
+                .map_err(|response| *response);
             let Err(ServerHttpEndpointResponse::Immediate(streaming_rejected)) = streaming_rejected
             else {
                 return Err("live SSE cancellation POST was not rejected immediately".to_owned());

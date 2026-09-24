@@ -156,7 +156,7 @@ pub(super) async fn serve(
                 Some(receipt), response, &cors, lease, io).await;
         }
         Ok(Err(response)) => {
-            buffered(cx, &shutdown, &mut framed, http_endpoint_response_to_static(cx, response), Some(&cors), io).await;
+            buffered(cx, &shutdown, &mut framed, http_endpoint_response_to_static(cx, *response), Some(&cors), io).await;
             close_detached_modern_http_session(&sessions, live);
         }
         Err(error) => {

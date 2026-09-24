@@ -216,9 +216,11 @@ pub(super) async fn dispatch_socket_json(
         ))
 }
 
+/// The refusal is boxed so this Result stays small (bd-cmvwm): the response
+/// enum is hundreds of bytes and only the refusal path pays the allocation.
 type ScopedSseOpening = Result<
     (JsonRpcRequest, DualEraHttpSseResponse, Option<Arc<str>>, AuthDispatchCustody, Option<SseAuthorizationLease>),
-    ServerHttpEndpointResponse,
+    Box<ServerHttpEndpointResponse>,
 >;
 
 /// The socket retains its peer monitor, registry, outcome election and terminal
@@ -233,7 +235,7 @@ pub(super) async fn begin_sse(
 ) -> Result<ScopedSseOpening, DualEraHttpEndpointError> {
     let prepared = match prepare(session, cx, policy, request, &authorization, None, revalidation) {
         Ok(prepared) => prepared,
-        Err(response) => return Ok(Err(ServerHttpEndpointResponse::Immediate(response))),
+        Err(response) => return Ok(Err(Box::new(ServerHttpEndpointResponse::Immediate(response)))),
     };
     let endpoint_response = {
         let mut endpoint = session.endpoint_session.lock()
@@ -243,7 +245,7 @@ pub(super) async fn begin_sse(
             Err(DualEraHttpEndpointError::Transport(TransportError::Io(error)))
                 if error.kind() == std::io::ErrorKind::InvalidInput =>
             {
-                return Ok(Err(ServerHttpEndpointResponse::Immediate(HttpResponse::bad_request())));
+                return Ok(Err(Box::new(ServerHttpEndpointResponse::Immediate(HttpResponse::bad_request()))));
             }
             Err(error) => return Err(error),
         }
@@ -254,14 +256,14 @@ pub(super) async fn begin_sse(
             cx, endpoint_response, authorization, prepared.raw_params,
             Some(prepared.receipt), None,
         ))).await {
-            Ok(response) => response.map(Err),
-            Err(_) => Ok(Err(ServerHttpEndpointResponse::Immediate(refusal(503)))),
+            Ok(response) => response.map(|response| Err(Box::new(response))),
+            Err(_) => Ok(Err(Box::new(ServerHttpEndpointResponse::Immediate(refusal(503))))),
         };
     };
     let request = session.endpoint_session.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner).recv_modern_request(cx)?;
     if request.method == "notifications/cancelled" {
-        return Ok(Err(ServerHttpEndpointResponse::Immediate(HttpResponse::bad_request())));
+        return Ok(Err(Box::new(ServerHttpEndpointResponse::Immediate(HttpResponse::bad_request()))));
     }
     Ok(Ok((request, sse, prepared.raw_params, prepared.receipt, prepared.lease)))
 }
