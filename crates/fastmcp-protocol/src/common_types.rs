@@ -59,8 +59,10 @@ pub const MAX_CURSOR_BYTES: usize = 4 * 1024;
 pub const MAX_ICON_SIZE_ENTRIES: usize = 32;
 /// Maximum UTF-8 bytes in an individual peer icon size string.
 pub const MAX_ICON_SIZE_BYTES: usize = 128;
-/// Maximum encoded bytes in one common binary content payload.
-pub const MAX_CONTENT_ENCODED_BYTES: usize = 1024 * 1024;
+/// Maximum encoded bytes in one common binary content payload: the Base64
+/// size of one LIMIT-01 decoded binary content block (3 MiB),
+/// `4 * ceil(3 MiB / 3)`.
+pub const MAX_CONTENT_ENCODED_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum UTF-8 bytes in each W3C trace field.
 pub const MAX_TRACE_FIELD_BYTES: usize = 4 * 1024;
 /// Maximum bytes retained for one exact finite final progress number lexeme.
