@@ -1276,7 +1276,10 @@ mod tests {
             let live = Cx::for_testing();
             let request = JsonRpcRequest::new("budget/receive", None, 72_i64);
             client.send_request(&live, &request).unwrap();
-            assert!(matches!(server.recv(&stopped), Err(TransportError::Cancelled)));
+            assert!(matches!(
+                server.recv(&stopped),
+                Err(TransportError::Cancelled)
+            ));
             assert!(stopped.cancel_reason().is_some());
             assert_eq!(server.receiver.len(), 1);
             assert!(!server.is_closed());
@@ -1300,7 +1303,10 @@ mod tests {
         let expected = Codec::new().encode_request(&request).unwrap();
         let message = JsonRpcMessage::Request(request);
 
-        assert!(matches!(send.send(&stopped, &message), Err(TransportError::Cancelled)));
+        assert!(matches!(
+            send.send(&stopped, &message),
+            Err(TransportError::Cancelled)
+        ));
         assert_eq!(recv.receiver.as_ref().unwrap().len(), 0);
         stopped.masked(|| send.send(&stopped, &message).unwrap());
         assert!(matches!(
@@ -1320,26 +1326,100 @@ mod tests {
     }
 
     #[test]
-    fn memory_idle_receive_exhausts_poll_budget_without_peer_traffic() {
+    fn memory_idle_receive_observes_deadline_and_remains_reusable() {
         let (client, mut server) = MemoryTransportBuilder::new()
             .poll_interval(Duration::from_millis(1))
             .build();
+        let mut client = Some(client);
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
         let handle = thread::spawn(move || {
-            let cx = Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(3));
+            // Checkpoints observe quotas; the runtime, not checkpoint(),
+            // debits them. A real deadline advances even while sync I/O waits.
+            let clock = Cx::for_testing();
+            let cx = Cx::for_testing_with_budget(
+                clock.budget_for_timeout(Duration::from_millis(20)),
+            );
             let cancelled = matches!(server.recv(&cx), Err(TransportError::Cancelled));
             let reason = cx.cancel_reason().map(|reason| reason.kind);
             done_tx.send((cancelled, reason, server.is_closed())).unwrap();
+            server
         });
 
         // This is a deadlock watchdog, not a latency assertion. Even a broken
         // receive is released by dropping the peer before joining the worker.
         let completed = done_rx.recv_timeout(Duration::from_secs(5));
-        drop(client);
-        handle.join().unwrap();
+        if completed.is_err() {
+            drop(client.take());
+        }
+        let mut server = handle.join().unwrap();
         assert!(matches!(
             completed,
-            Ok((true, Some(asupersync::CancelKind::PollQuota), false))
+            Ok((true, Some(asupersync::CancelKind::Deadline), false))
         ));
+        let live = Cx::for_testing();
+        let request = JsonRpcRequest::new("after-deadline", None, 94_i64);
+        client.as_mut().unwrap().send_request(&live, &request).unwrap();
+        let JsonRpcMessage::Request(received) = server.recv(&live).unwrap() else {
+            panic!("a deadline must not poison the endpoint");
+        };
+        assert_eq!(received, request);
+    }
+
+    struct CancelOnWake(Cx);
+
+    impl std::task::Wake for CancelOnWake {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.set_cancel_requested(true);
+        }
+    }
+
+    #[test]
+    fn memory_send_reports_success_when_publication_wakes_a_cancelling_peer() {
+        let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
+        let live = Cx::for_testing();
+        let sending_cx = Cx::for_testing();
+        let waker = std::task::Waker::from(std::sync::Arc::new(CancelOnWake(sending_cx.clone())));
+        let mut task_cx = std::task::Context::from_waker(&waker);
+        let mut receiving = std::pin::pin!(server.recv_async(&live));
+        assert!(std::future::Future::poll(receiving.as_mut(), &mut task_cx).is_pending());
+
+        let request = JsonRpcRequest::new("commit/send", None, 95_i64);
+        client.send_request(&sending_cx, &request).unwrap();
+        assert!(sending_cx.is_cancel_requested());
+        let std::task::Poll::Ready(Ok(JsonRpcMessage::Request(received))) =
+            std::future::Future::poll(receiving.as_mut(), &mut task_cx)
+        else {
+            panic!("publication must succeed even if its wake requests cancellation");
+        };
+        assert_eq!(received, request);
+    }
+
+    #[test]
+    fn memory_receive_reports_success_when_dequeue_wakes_a_cancelling_sender() {
+        let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
+        let live = Cx::for_testing();
+        let receiving_cx = Cx::for_testing();
+        let first = JsonRpcRequest::new("commit/receive", None, 96_i64);
+        client.send_request(&live, &first).unwrap();
+        let second = JsonRpcMessage::Request(JsonRpcRequest::new("not-committed", None, 97_i64));
+        {
+            let waker =
+                std::task::Waker::from(std::sync::Arc::new(CancelOnWake(receiving_cx.clone())));
+            let mut task_cx = std::task::Context::from_waker(&waker);
+            let mut sending = std::pin::pin!(client.send_async(&live, &second));
+            assert!(std::future::Future::poll(sending.as_mut(), &mut task_cx).is_pending());
+
+            let JsonRpcMessage::Request(received) = server.recv(&receiving_cx).unwrap() else {
+                panic!("dequeue must succeed even if its wake requests cancellation");
+            };
+            assert!(receiving_cx.is_cancel_requested());
+            assert_eq!(received, first);
+        }
+        assert_eq!(server.receiver.len(), 0);
+        client.send_request(&live, &first).unwrap();
+        let JsonRpcMessage::Request(received) = server.recv(&live).unwrap() else {
+            panic!("the dropped pending sender must leave the endpoint usable");
+        };
+        assert_eq!(received, first);
     }
 }
