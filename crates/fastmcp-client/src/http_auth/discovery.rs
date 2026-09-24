@@ -26,11 +26,11 @@ use asupersync::http::h1::{HttpClient, Method, RedirectPolicy, RetryPolicy};
 use asupersync::time::Sleep;
 use asupersync::tls::{Certificate, RootCertStore};
 use asupersync::types::Time;
-use fastmcp_core::{CanonicalHttpUrl, CanonicalResourceId, CanonicalResourceIdPolicy};
+use fastmcp_core::{CanonicalHttpUrl, CanonicalResourceId};
 use serde::{Deserialize, Deserializer};
 
 use super::managed::{ManagedOAuthSession, OAuthSessionError, OAuthSessionPolicy};
-use super::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError};
+use super::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError, endpoint_resource_policy};
 
 /// Explicit RFC 7591 native-public-client registration after trusted discovery.
 pub mod registration;
@@ -303,7 +303,7 @@ impl OAuthDiscoveryPlan {
     ) -> Result<Self, OAuthDiscoveryError> {
         validate_https(&resource).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
         CanonicalResourceId::parse_for_endpoint(
-            resource.as_str(), &resource, CanonicalResourceIdPolicy::DEFAULT,
+            resource.as_str(), &resource, endpoint_resource_policy(&resource),
         ).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
         if issuers.is_empty() || issuers.len() > MAX_ISSUERS {
             return Err(OAuthDiscoveryError::InvalidPolicy);
@@ -1108,6 +1108,26 @@ mod tests {
             vec![issuer.clone(), issuer], "client", vec![]).is_err());
         assert!(plan().with_timeout(Duration::ZERO).is_err());
         assert!(plan().with_timeout(Duration::from_secs(121)).is_err());
+    }
+
+    /// MCP lists an origin-root server URI (`https://mcp.example.com`) as a
+    /// valid canonical resource, and discovery has a root-resource path.
+    #[test]
+    fn a_resource_at_the_origin_root_is_a_valid_discovery_plan() {
+        let issuer = TrustedOAuthIssuer::new("https://issuer.example/tenant").unwrap();
+        assert!(OAuthDiscoveryPlan::new(url("https://resource.example"), vec![issuer], "client", vec![])
+            .is_ok());
+    }
+
+    /// Planted negative: identical except the resource is a non-root path with
+    /// a trailing slash, which the default endpoint policy still refuses.
+    #[test]
+    fn a_non_root_resource_with_a_trailing_slash_is_still_refused() {
+        let issuer = TrustedOAuthIssuer::new("https://issuer.example/tenant").unwrap();
+        assert!(matches!(
+            OAuthDiscoveryPlan::new(url("https://resource.example/mcp/"), vec![issuer], "client", vec![]),
+            Err(OAuthDiscoveryError::InvalidPolicy)
+        ));
     }
 
     #[test]

@@ -100,6 +100,18 @@ impl fmt::Display for OAuthError {
 
 impl std::error::Error for OAuthError {}
 
+/// The resource-identifier policy for a configured MCP endpoint. An endpoint
+/// at the origin root (`https://mcp.example.com`, a canonical server URI MCP
+/// lists as valid) needs the root policy; every other endpoint keeps the safe
+/// non-root, no-trailing-slash default.
+pub(crate) fn endpoint_resource_policy(resource: &CanonicalHttpUrl) -> CanonicalResourceIdPolicy {
+    if resource.path() == "/" {
+        CanonicalResourceIdPolicy::root_endpoint()
+    } else {
+        CanonicalResourceIdPolicy::DEFAULT
+    }
+}
+
 /// Immutable, administrator-supplied configuration for an RFC 8252 native
 /// public client. The registration must allow the `/oauth/callback` path on
 /// an IP-literal loopback URI with an ephemeral port. The authorization server
@@ -153,7 +165,7 @@ impl OAuthClientConfiguration {
         CanonicalResourceId::parse_for_endpoint(
             resource.as_str(),
             &resource,
-            CanonicalResourceIdPolicy::DEFAULT,
+            endpoint_resource_policy(&resource),
         )
         .map_err(|_| OAuthError::InvalidConfiguration)?;
         let client_id = client_id.into();
