@@ -50,8 +50,22 @@ fn run(future: impl Future<Output = ()>) {
     RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap())
         .build().unwrap().block_on(async {
             let cx = Cx::current().unwrap();
-            asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), future)
-                .await.expect("complete discovery fixture must settle within its bound");
+            // The bound is the harness's, not the test's. Several tests cancel
+            // this very Cx, and an unmasked Sleep completes early under ambient
+            // cancellation, so a fixture still settling one turn after its
+            // cancel would be reported as Elapsed. Mask only the bound's poll.
+            let mut future = std::pin::pin!(future);
+            let mut bound = std::pin::pin!(asupersync::time::sleep(cx.now(), Duration::from_secs(20)));
+            poll_fn(|task| {
+                if future.as_mut().poll(task).is_ready() {
+                    return Poll::Ready(());
+                }
+                assert!(
+                    cx.masked(|| bound.as_mut().poll(task)).is_pending(),
+                    "complete discovery fixture must settle within its bound"
+                );
+                Poll::Pending
+            }).await;
         });
 }
 
