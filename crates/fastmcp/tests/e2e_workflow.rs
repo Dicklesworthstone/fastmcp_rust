@@ -191,13 +191,18 @@ const MEMORY_SERVER_TEARDOWN_BOUND: Duration = Duration::from_secs(2);
 /// Caps a runtime-backed fixture's whole lifetime without changing the
 /// existing two-second teardown and cancellation settlement checks.
 const MEMORY_SERVER_LIFETIME_CAP: Duration = Duration::from_secs(30);
+/// How long an overrunning worker is watched before its failure is reported,
+/// only to say whether it finished late or was stuck. It widens no bound.
+const WORKER_OVERRUN_CLASSIFICATION_GRACE: Duration = Duration::from_secs(10);
 
 /// Owns memory-transport server threads until their paired clients close.
 ///
 /// Declare this before the client owners so normal and unwinding drops close
 /// the client transports before this bounded settlement runs. A server that
-/// does not stop within the bound aborts the test process rather than silently
-/// detaching a live server thread.
+/// does not stop within the bound fails its own test with a diagnostic; it
+/// never aborts the process, which would destroy every other test's result.
+/// The late thread is detached, not joined, because joining it could block
+/// forever, and a stuck memory-transport server affects only its own pair.
 struct ThreadJoins(Vec<JoinHandle<()>>, Option<WorkerProgress>);
 
 impl ThreadJoins {
@@ -223,29 +228,42 @@ impl Drop for ThreadJoins {
         let deadline = started + MEMORY_SERVER_TEARDOWN_BOUND;
         while self.0.iter().any(|handle| !handle.is_finished()) {
             if Instant::now() >= deadline {
-                // Bypass libtest capture: abort cannot flush a test's captured diagnostics.
-                let _ = writeln!(
-                    std::io::stderr().lock(),
+                self.0.clear();
+                fail_fixture(&format!(
                     "memory-transport server teardown exceeded its bounded settlement window in {:?}",
                     thread::current().name()
-                );
-                std::process::abort();
+                ));
+                return;
             }
             thread::sleep(Duration::from_millis(1));
         }
-        for handle in self.0.drain(..) {
-            if handle.join().is_err() {
-                let _ = writeln!(
-                    std::io::stderr().lock(),
-                    "memory-transport server thread panicked during settlement in {:?}",
-                    thread::current().name()
-                );
-                std::process::abort();
-            }
+        let panicked = self
+            .0
+            .drain(..)
+            .fold(false, |panicked, handle| handle.join().is_err() || panicked);
+        if panicked {
+            fail_fixture(&format!(
+                "memory-transport server thread panicked during settlement in {:?}",
+                thread::current().name()
+            ));
+            return;
         }
         if let Some(progress) = &self.1 {
             progress.advance("worker return");
         }
+    }
+}
+
+/// Fails the current test with `diagnostic`, or only reports it when the test
+/// is already unwinding, since a second panic would abort the whole process.
+fn fail_fixture(diagnostic: &str) {
+    if std::thread::panicking() {
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "{diagnostic} (while already panicking)"
+        );
+    } else {
+        panic!("{diagnostic}");
     }
 }
 
@@ -321,7 +339,10 @@ impl WorkerStage {
     fn new(started: Instant) -> Self {
         Self {
             started,
-            name: "client initialization",
+            // The clock starts before the worker thread exists, so this first
+            // stage covers thread spawn and server runtime startup. Workers
+            // advance to "client initialization" when the RPC itself begins.
+            name: "worker startup",
             expired: None,
         }
     }
@@ -389,33 +410,59 @@ impl<T> WorkerJoins<T> {
         self.0.push((handle, progress));
     }
 
-    fn wait(&self, owner: &str) {
+    /// Waits for every worker. A stage overrun is returned as a diagnostic,
+    /// never an abort, so one stalled worker cannot hide the rest of the
+    /// target's results. The overrunning worker gets a grace period only to
+    /// classify the overrun as late or stuck; a late finish still fails,
+    /// because the stage bound is the assertion.
+    fn wait(&self, owner: &str) -> Result<(), String> {
         loop {
             let mut all_finished = true;
-            for (handle, progress) in &self.0 {
+            for (index, (handle, progress)) in self.0.iter().enumerate() {
                 // Sample time before completion, so descheduling after the
                 // completion read cannot expire a worker that has since exited.
                 let observed_at = Instant::now();
                 let finished = handle.is_finished();
                 if let Some(stage) = progress.expired(finished, observed_at) {
-                    let _ = writeln!(
-                        std::io::stderr().lock(),
-                        "{owner} exceeded its bounded {stage} stage in {:?}",
+                    let grace_end = observed_at + WORKER_OVERRUN_CLASSIFICATION_GRACE;
+                    while !handle.is_finished() && Instant::now() < grace_end {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    let outcome = if handle.is_finished() {
+                        format!(
+                            "it finished {:?} after the overrun was observed",
+                            observed_at.elapsed()
+                        )
+                    } else {
+                        format!(
+                            "it was still running {WORKER_OVERRUN_CLASSIFICATION_GRACE:?} later (stuck)"
+                        )
+                    };
+                    return Err(format!(
+                        "{owner} {index} exceeded its bounded {stage} stage in {:?}; {outcome}",
                         thread::current().name()
-                    );
-                    std::process::abort();
+                    ));
                 }
                 all_finished &= finished;
             }
             if all_finished {
-                return;
+                return Ok(());
             }
             thread::sleep(Duration::from_millis(1));
         }
     }
 
+    /// Fails the test for an overrun after detaching every worker, since a
+    /// stuck worker cannot be joined without blocking forever.
+    fn fail_detached(&mut self, diagnostic: &str) {
+        self.0.clear();
+        fail_fixture(diagnostic);
+    }
+
     fn join_all(mut self, owner: &str) -> Vec<T> {
-        self.wait(owner);
+        if let Err(diagnostic) = self.wait(owner) {
+            self.fail_detached(&diagnostic);
+        }
         let mut values = Vec::with_capacity(self.0.len());
         let mut first_panic = None;
         for (handle, _) in self.0.drain(..) {
@@ -434,7 +481,10 @@ impl<T> WorkerJoins<T> {
 
 impl<T> Drop for WorkerJoins<T> {
     fn drop(&mut self) {
-        self.wait("concurrent E2E worker");
+        if let Err(diagnostic) = self.wait("concurrent E2E worker") {
+            self.fail_detached(&diagnostic);
+            return;
+        }
         let mut first_panic = None;
         for (handle, _) in self.0.drain(..) {
             match handle.join() {
@@ -1714,11 +1764,12 @@ impl Drop for FinalTasksHttpStartupGuard {
         };
         let settlement = settle_final_tasks_http_server(shutdown, finished, &mut self.join);
         if settlement.is_err() && self.join.is_some() {
-            let _ = writeln!(
-                std::io::stderr().lock(),
-                "final Tasks HTTP server startup left a live unjoinable thread after bounded settlement"
+            // Fail this test and detach the thread, as FinalTasksHttpFixture's
+            // drop does; aborting would destroy every other test's result.
+            self.join = None;
+            fail_fixture(
+                "final Tasks HTTP server startup left a live unjoinable thread after bounded settlement",
             );
-            std::process::abort();
         }
     }
 }
@@ -3974,6 +4025,7 @@ fn workflow_concurrent_interleaved_operations() {
             let mut client = TestClient::with_cx(client_transport, Cx::for_testing())
                 .with_client_info(format!("client-{}", client_num), "1.0.0");
 
+            worker_progress.advance("client initialization");
             client.initialize().unwrap();
             worker_progress.advance("RPC");
 
@@ -4049,6 +4101,7 @@ fn workflow_concurrent_no_crosstalk() {
             server_join.push(server_handle);
 
             let mut client = TestClient::with_cx(client_transport, Cx::for_testing());
+            worker_progress.advance("client initialization");
             client.initialize().unwrap();
             worker_progress.advance("RPC");
 
@@ -4199,6 +4252,7 @@ fn workflow_concurrent_stress_test() {
             server_join.push(server_handle);
 
             let mut client = TestClient::with_cx(client_transport, Cx::for_testing());
+            worker_progress.advance("client initialization");
             client
                 .initialize()
                 .expect("stress client worker must initialize successfully");
