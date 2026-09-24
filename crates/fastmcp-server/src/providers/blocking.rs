@@ -178,7 +178,7 @@ impl BlockingHandlerLane {
                 }
             }
         }).map_err(|_| unavailable("blocking handler admission to caller runtime failed"))?;
-        let mut owner = WorkerOwner { worker: Some(worker), _charge: charge };
+        let mut owner = WorkerOwner { worker: Some(worker), charge };
         let result = wait(&context, async {
             // Keep the handle inside its RAII owner while join is suspended.
             // An abandoned join therefore aborts this worker and no sibling.
@@ -213,11 +213,11 @@ impl Drop for Charge {
 
 struct WorkerOwner<T: Send + 'static> {
     worker: Option<TaskHandle<McpResult<T>>>,
-    _charge: Arc<Charge>,
+    charge: Arc<Charge>,
 }
 impl<T: Send + 'static> Drop for WorkerOwner<T> {
     fn drop(&mut self) {
-        if self._charge.0.process.verify().is_ok() {
+        if self.charge.0.process.verify().is_ok() {
             if let Some(worker) = &self.worker { worker.abort(); }
         }
     }
