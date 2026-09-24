@@ -1027,6 +1027,7 @@ mod tests {
     fn server(gate: &Arc<Gate>) -> Server {
         Server::new("async-stdio", "1.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly is available in every build")
             .tool(ProbeTool(Arc::clone(gate)))
             .build()
     }

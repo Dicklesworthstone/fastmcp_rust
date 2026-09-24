@@ -3375,7 +3375,6 @@ use fastmcp_transport::{
 use log::Level;
 use log::LevelFilter;
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReceiveErrorDisposition {
     ReplyWithParseError,
@@ -3383,7 +3382,6 @@ enum ReceiveErrorDisposition {
     Terminate,
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn classify_receive_error(error: &TransportError) -> ReceiveErrorDisposition {
     match error {
         // A transport timeout does not prove that the byte stream is still at
