@@ -171,6 +171,39 @@ path = "examples/echo_server.rs"
 # the README in the same commit.
 required-features = ["legacy-2024-11-05", "tasks"]
 
+# The README's server snippets, compiled from their exact text so
+# tests/readme_examples.rs can drive them over stdio. The `testing` gate keeps
+# them out of default builds and `cargo install`.
+[[bin]]
+name = "readme_tldr"
+path = "tests/readme/tldr.rs"
+required-features = ["testing"]
+test = false
+bench = false
+doc = false
+
+[[bin]]
+name = "readme_quick_example"
+path = "tests/readme/quick_example.rs"
+required-features = ["testing"]
+test = false
+bench = false
+doc = false
+
+[[bin]]
+name = "readme_quick_start"
+path = "tests/readme/quick_start.rs"
+required-features = ["testing"]
+test = false
+bench = false
+doc = false
+
+[[test]]
+name = "readme_examples"
+path = "tests/readme_examples.rs"
+# Uses the three README binaries above.
+required-features = ["testing"]
+
 [[example]]
 name = "bench"
 path = "examples/bench.rs"
