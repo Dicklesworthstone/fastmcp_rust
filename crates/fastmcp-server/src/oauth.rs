@@ -92,6 +92,8 @@ const ACCESS_TOKEN_DIGEST_DOMAIN: &[u8] = b"fastmcp:oauth:access-token:v1\0";
 const REFRESH_TOKEN_DIGEST_DOMAIN: &[u8] = b"fastmcp:oauth:refresh-token:v1\0";
 const AUTHORIZATION_GRANT_ID_DOMAIN: &[u8] = b"fastmcp:oauth:authorization-grant-id:v1\0";
 const DIRECT_GRANT_ID_DOMAIN: &[u8] = b"fastmcp:oauth:direct-grant-id:v1\0";
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+const CLIENT_CREDENTIALS_GRANT_ID_DOMAIN: &[u8] = b"fastmcp:oauth:machine-grant-id:v1\0";
 const OAUTH_SESSION_OWNER_DOMAIN: &[u8] = b"fastmcp:oauth:session-owner:v1\0";
 const OAUTH_REGISTRATION_EPOCH_BYTES: usize = 32;
 const CLIENT_SECRET_SALT_BYTES: usize = 32;
@@ -439,7 +441,7 @@ pub struct OAuthAuthorizationServerMetadata {
     pub registration_endpoint: Option<String>,
     pub response_types_supported: [&'static str; 1],
     pub response_modes_supported: [&'static str; 1],
-    pub grant_types_supported: [&'static str; 2],
+    pub grant_types_supported: Vec<&'static str>,
     pub token_endpoint_auth_methods_supported: Vec<&'static str>,
     pub revocation_endpoint_auth_methods_supported: Vec<&'static str>,
     pub code_challenge_methods_supported: [&'static str; 1],
@@ -610,7 +612,7 @@ impl OAuthHttpRoutes {
             registration_endpoint: self.registration_path.as_ref().map(|_| format!("{base}/register")),
             response_types_supported: ["code"],
             response_modes_supported: ["query"],
-            grant_types_supported: ["authorization_code", "refresh_token"],
+            grant_types_supported: self.server.supported_grant_types(),
             token_endpoint_auth_methods_supported: methods.clone(),
             revocation_endpoint_auth_methods_supported: methods,
             code_challenge_methods_supported: ["S256"],
@@ -1147,6 +1149,15 @@ pub struct OAuthServerConfig {
     pub authorization_code_lifetime: Duration,
     /// Whether to allow public clients (clients without a secret).
     pub allow_public_clients: bool,
+    /// Enables the bounded, single-process development client-credentials
+    /// issuer. Each confidential client must also have its own explicit
+    /// [`DevelopmentClientCredentialsGrant`]; browser scopes confer no rights.
+    ///
+    /// This opt-in uses the existing in-memory opaque-token store and secret
+    /// verifier. It does not activate a production issuer, private-key JWT
+    /// authentication, or an official-draft MCP extension advertisement.
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    pub allow_development_client_credentials: bool,
     /// Minimum PKCE code verifier length (default: 43, min: 43, max: 128).
     pub min_code_verifier_length: usize,
     /// Maximum PKCE code verifier length.
@@ -1191,6 +1202,8 @@ impl Default for OAuthServerConfig {
             refresh_token_lifetime: Duration::from_hours(720),
             authorization_code_lifetime: Duration::from_mins(5),
             allow_public_clients: true,
+            #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+            allow_development_client_credentials: false,
             min_code_verifier_length: PKCE_CODE_VERIFIER_MIN_BYTES,
             max_code_verifier_length: PKCE_CODE_VERIFIER_MAX_BYTES,
             max_clients: DEFAULT_MAX_OAUTH_CLIENTS,
@@ -1419,6 +1432,68 @@ impl TokenEndpointAuthMethod {
     }
 }
 
+/// Administrative authorization for one machine client at one exact resource.
+///
+/// This is deliberately separate from browser redirect and consent scopes.
+/// Only an explicit confidential, HTTP Basic registration may carry it. It
+/// belongs to the single-process development issuer, whose opaque tokens and
+/// in-memory revocation state are not the production AUTH-06 issuer profile.
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+#[derive(Clone, PartialEq, Eq)]
+pub struct DevelopmentClientCredentialsGrant {
+    resource: CanonicalResourceId,
+    scopes: Vec<String>,
+}
+
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+impl DevelopmentClientCredentialsGrant {
+    /// Admits one exact resource and a nonempty bounded machine scope set.
+    ///
+    /// No default scopes are inferred. `openid` and `offline_access` are not
+    /// machine permissions: this grant never creates an owner identity, ID
+    /// token, or refresh token.
+    pub fn new<I, S>(resource: CanonicalResourceId, scopes: I) -> Result<Self, OAuthError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        validate_optional_authorization_resource(Some(resource.as_str()))?;
+        let scopes: Vec<String> = scopes
+            .into_iter()
+            .take(MAX_OAUTH_SCOPES_PER_CLIENT + 1)
+            .map(Into::into)
+            .collect();
+        let mut scopes = canonicalize_request_scopes(&scopes)?;
+        if scopes.is_empty()
+            || scopes.iter().any(|scope| matches!(scope.as_str(), "openid" | "offline_access"))
+        {
+            return Err(OAuthError::InvalidScope(
+                "machine authorization requires nonempty resource scopes".to_string(),
+            ));
+        }
+        scopes.sort_unstable();
+        Ok(Self { resource, scopes })
+    }
+
+    /// Returns the exact protected resource authorized by the administrator.
+    #[must_use]
+    pub fn resource(&self) -> &CanonicalResourceId { &self.resource }
+
+    /// Returns the admitted machine scopes in deterministic order.
+    #[must_use]
+    pub fn scopes(&self) -> &[String] { &self.scopes }
+}
+
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+impl std::fmt::Debug for DevelopmentClientCredentialsGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DevelopmentClientCredentialsGrant")
+            .field("resource_len", &self.resource.as_str().len())
+            .field("scope_count", &self.scopes.len())
+            .finish()
+    }
+}
+
 /// A confidential-client credential retained only until registration.
 ///
 /// The bytes are zeroized when the input object is dropped. Registered server
@@ -1509,6 +1584,8 @@ pub struct OAuthClient {
     pub redirect_uris: Vec<String>,
     /// Allowed scopes.
     pub allowed_scopes: HashSet<String>,
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    development_client_credentials: Option<DevelopmentClientCredentialsGrant>,
     /// Client name (for display).
     pub name: Option<String>,
     /// Client description.
@@ -1621,6 +1698,9 @@ pub struct OAuthClientMetadata {
     pub redirect_uris: Vec<String>,
     /// Allowed scopes.
     pub allowed_scopes: HashSet<String>,
+    /// Explicit machine authorization, independent of browser scopes.
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    pub development_client_credentials: Option<DevelopmentClientCredentialsGrant>,
     /// Client name (for display).
     pub name: Option<String>,
     /// Client description.
@@ -1651,6 +1731,8 @@ impl From<&OAuthClient> for OAuthClientMetadata {
             token_endpoint_auth_method: client.token_endpoint_auth_method,
             redirect_uris: client.redirect_uris.clone(),
             allowed_scopes: client.allowed_scopes.clone(),
+            #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+            development_client_credentials: client.development_client_credentials.clone(),
             name: client.name.clone(),
             description: client.description.clone(),
             registered_at: client.registered_at,
@@ -1741,7 +1823,20 @@ impl OAuthClient {
             ));
         }
 
-        if self.redirect_uris.is_empty() {
+        #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+        let requires_redirect = self.development_client_credentials.is_none();
+        #[cfg(not(all(feature = "builtin-auth-server", feature = "oauth-client-credentials")))]
+        let requires_redirect = true;
+        #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+        if self.development_client_credentials.is_some()
+            && (self.client_type != ClientType::Confidential
+                || self.token_endpoint_auth_method != TokenEndpointAuthMethod::ClientSecretBasic)
+        {
+            return Err(OAuthError::InvalidRequest(
+                "development machine clients require confidential HTTP Basic registration".to_string(),
+            ));
+        }
+        if requires_redirect && self.redirect_uris.is_empty() {
             return Err(OAuthError::InvalidRequest(
                 OAUTH_CLIENT_REDIRECT_REQUIRED_ERROR.to_string(),
             ));
@@ -1834,6 +1929,8 @@ pub struct OAuthClientBuilder {
     token_endpoint_auth_method: Option<TokenEndpointAuthMethod>,
     redirect_uris: Vec<String>,
     allowed_scopes: HashSet<String>,
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    development_client_credentials: Option<DevelopmentClientCredentialsGrant>,
     name: Option<String>,
     description: Option<String>,
 }
@@ -1864,6 +1961,8 @@ impl OAuthClientBuilder {
             token_endpoint_auth_method: None,
             redirect_uris: Vec::new(),
             allowed_scopes: HashSet::new(),
+            #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+            development_client_credentials: None,
             name: None,
             description: None,
         }
@@ -1884,6 +1983,18 @@ impl OAuthClientBuilder {
     #[must_use]
     pub fn token_endpoint_auth_method(mut self, method: TokenEndpointAuthMethod) -> Self {
         self.token_endpoint_auth_method = Some(method);
+        self
+    }
+
+    /// Grants explicit machine authorization in the development issuer.
+    ///
+    /// A machine-only client may omit redirect URIs. Adding this grant never
+    /// changes its browser scopes, and the issuer must separately opt in via
+    /// [`OAuthServerConfig::allow_development_client_credentials`].
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    #[must_use]
+    pub fn development_client_credentials(mut self, grant: DevelopmentClientCredentialsGrant) -> Self {
+        self.development_client_credentials = Some(grant);
         self
     }
 
@@ -1962,6 +2073,8 @@ impl OAuthClientBuilder {
             token_endpoint_auth_method,
             redirect_uris: self.redirect_uris,
             allowed_scopes: self.allowed_scopes,
+            #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+            development_client_credentials: self.development_client_credentials,
             name: self.name,
             description: self.description,
             registered_at: SystemTime::now(),
@@ -3617,15 +3730,167 @@ impl OAuthServer {
     // Token Endpoint
     // -------------------------------------------------------------------------
 
-    /// Exchanges an authorization code or refresh token for tokens.
+    pub(crate) fn development_client_credentials_enabled(&self) -> bool {
+        #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+        { self.config.allow_development_client_credentials }
+        #[cfg(not(all(feature = "builtin-auth-server", feature = "oauth-client-credentials")))]
+        { false }
+    }
+
+    pub(crate) fn supported_grant_types(&self) -> Vec<&'static str> {
+        if self.development_client_credentials_enabled() {
+            return vec!["authorization_code", "refresh_token", "client_credentials"];
+        }
+        vec!["authorization_code", "refresh_token"]
+    }
+
+    /// Exchanges an admitted grant for tokens.
+    ///
+    /// The optional development machine grant requires both Cargo features,
+    /// explicit issuer opt-in, and a separate resource/scope authorization on
+    /// the exact confidential client registration. It returns no refresh token.
     pub fn token(&self, request: &TokenRequest) -> Result<TokenResponse, OAuthError> {
         match request.grant_type.as_str() {
             "authorization_code" => self.token_authorization_code(request),
             "refresh_token" => self.token_refresh_token(request),
+            #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+            "client_credentials" if self.config.allow_development_client_credentials => {
+                self.token_client_credentials_with_draw(request, draw_security_identifier)
+            }
             _ => Err(OAuthError::UnsupportedGrantType(
                 OAUTH_GRANT_TYPE_UNSUPPORTED_ERROR.to_string(),
             )),
         }
+    }
+
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    fn token_client_credentials_with_draw<F, E>(
+        &self,
+        request: &TokenRequest,
+        mut draw: F,
+    ) -> Result<TokenResponse, OAuthError>
+    where
+        F: FnMut() -> Result<SecurityIdentifier, E>,
+        E: std::fmt::Display,
+    {
+        if !self.config.allow_development_client_credentials {
+            return Err(OAuthError::UnsupportedGrantType(
+                OAUTH_GRANT_TYPE_UNSUPPORTED_ERROR.to_string(),
+            ));
+        }
+        self.config.validate()?;
+        validate_client_authentication_admission(
+            &request.client_id,
+            request.client_secret.as_deref(),
+        )?;
+        if request.code.is_some() || request.redirect_uri.is_some()
+            || request.code_verifier.is_some() || request.refresh_token.is_some()
+        {
+            return Err(OAuthError::InvalidRequest(
+                "machine requests cannot contain authorization-code or refresh credentials".to_string(),
+            ));
+        }
+        let resource = request.resource.as_deref().ok_or_else(|| {
+            OAuthError::InvalidRequest("machine requests require an explicit resource".to_string())
+        })?;
+        validate_optional_authorization_resource(Some(resource))?;
+        let mut scopes = canonicalize_request_scopes(request.scopes.as_deref().ok_or_else(|| {
+            OAuthError::InvalidScope("machine requests require explicit nonempty scopes".to_string())
+        })?)?;
+        if scopes.is_empty() {
+            return Err(OAuthError::InvalidScope(
+                "machine requests require explicit nonempty scopes".to_string(),
+            ));
+        }
+        scopes.sort_unstable();
+
+        // Authentication, registration identity, machine policy and commit
+        // share one lock. In particular, a denied resource/scope/method request
+        // may not even clean up unrelated expired state. Generate the candidate
+        // only after every authorization and capacity decision succeeds.
+        let mut state = self.state.write().map_err(|_| {
+            OAuthError::ServerError("failed to acquire write lock".to_string())
+        })?;
+        let registration_epoch = authenticate_client_or_dummy(
+            &state,
+            &request.client_id,
+            request.client_secret.as_deref(),
+            request.client_authentication_method,
+        )?;
+        let client = state.clients.get(&request.client_id).ok_or_else(|| {
+            OAuthError::InvalidClient(OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string())
+        })?;
+        let grant = client.metadata.development_client_credentials.as_ref().ok_or_else(|| {
+            OAuthError::UnauthorizedClient("client is not authorized for machine grants".to_string())
+        })?;
+        if client.metadata.client_type != ClientType::Confidential
+            || request.client_authentication_method != TokenEndpointAuthMethod::ClientSecretBasic
+        {
+            return Err(OAuthError::InvalidClient(OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string()));
+        }
+        if resource != grant.resource.as_str() {
+            return Err(OAuthError::InvalidRequest("machine resource is not authorized".to_string()));
+        }
+        if !scopes.iter().all(|scope| grant.scopes.binary_search(scope).is_ok()) {
+            return Err(OAuthError::InvalidScope("machine scopes are not authorized".to_string()));
+        }
+        let now = Instant::now();
+        ensure_capacity(
+            state.access_tokens.values().filter(|token| token.expires_at > now).count(),
+            state.access_tokens.values().filter(|token| {
+                token.expires_at > now && token.client_id == request.client_id
+            }).count(),
+            self.config.max_access_tokens,
+            self.config.max_access_tokens_per_client,
+            "access tokens",
+        )?;
+
+        // At most four independent CSPRNG candidates. A collision, RNG error,
+        // or deadline failure cannot overwrite a token or change any state.
+        for _ in 0..4 {
+            let mut access_value = Zeroizing::new(generate_token_with_draw(&mut draw)?);
+            if state.credential_value_in_use(&access_value) {
+                continue;
+            }
+            let access_digest = digest_credential(CredentialKind::AccessToken, &access_value)?;
+            let grant_id = derive_grant_id(CLIENT_CREDENTIALS_GRANT_ID_DOMAIN, &[access_digest])?;
+            let issued_at = Instant::now();
+            let expires_at = checked_deadline(
+                issued_at,
+                self.config.access_token_lifetime,
+                "access_token_lifetime",
+            )?;
+            let metadata = StoredOAuthToken {
+                metadata: OAuthToken {
+                    token: String::new(),
+                    token_type: TokenType::Bearer,
+                    client_id: request.client_id.clone(),
+                    scopes: scopes.clone(),
+                    resource: Some(resource.to_string()),
+                    issued_at,
+                    expires_at,
+                    // The machine client is the principal. Never impersonate
+                    // a resource owner, including an equal-looking subject ID.
+                    subject: None,
+                    is_refresh_token: false,
+                },
+                grant_id,
+                registration_epoch,
+                family_expires_at: expires_at,
+            };
+            state.cleanup_expired_at(issued_at);
+            state.access_tokens.insert(access_digest, metadata);
+            return Ok(TokenResponse {
+                access_token: std::mem::take(&mut *access_value),
+                token_type: TokenType::Bearer.as_str().to_string(),
+                expires_in: self.config.access_token_lifetime.as_secs(),
+                refresh_token: None,
+                scope: Some(scopes.join(" ")),
+            });
+        }
+        Err(OAuthError::ServerError(
+            "OAuth machine credential collision retry limit exhausted".to_string(),
+        ))
     }
 
     fn token_authorization_code(
@@ -5115,6 +5380,323 @@ mod tests {
             fastmcp_core::CanonicalResourceIdPolicy::DEFAULT,
         )
         .expect("trusted test resource")
+    }
+
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    fn development_machine_client(client_id: &str, secret: &str) -> OAuthClient {
+        OAuthClient::builder(client_id)
+            .secret(secret)
+            .development_client_credentials(DevelopmentClientCredentialsGrant::new(
+                configured_resource(TEST_MCP_RESOURCE), ["machine:read", "machine:write"],
+            ).unwrap())
+            .build().unwrap()
+    }
+
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    fn development_machine_request() -> TokenRequest {
+        TokenRequest {
+            grant_type: "client_credentials".to_string(),
+            client_id: "machine-client".to_string(),
+            client_secret: Some("machine-secret".to_string()),
+            client_authentication_method: TokenEndpointAuthMethod::ClientSecretBasic,
+            scopes: Some(vec!["machine:read".to_string()]),
+            resource: Some(TEST_MCP_RESOURCE.to_string()),
+            code: None,
+            redirect_uri: None,
+            code_verifier: None,
+            refresh_token: None,
+        }
+    }
+
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    fn development_machine_server() -> Arc<OAuthServer> {
+        let server = Arc::new(OAuthServer::try_new(OAuthServerConfig {
+            allow_development_client_credentials: true,
+            ..OAuthServerConfig::default()
+        }).unwrap());
+        server.register_client(development_machine_client("machine-client", "machine-secret")).unwrap();
+        server
+    }
+
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    #[test]
+    fn development_client_credentials_issue_machine_identity_without_refresh_or_consent() {
+        let server = development_machine_server();
+        let client = server.get_client("machine-client").unwrap();
+        assert!(client.redirect_uris.is_empty());
+        assert!(client.allowed_scopes.is_empty());
+        assert_eq!(client.development_client_credentials.unwrap().scopes(),
+            ["machine:read", "machine:write"]);
+        // OAuthServer::try_new installs the deny-all user approval backend.
+        // Successful issuance therefore has no invented resource-owner consent.
+        let response = server.token(&development_machine_request()).unwrap();
+        assert_eq!(response.scope.as_deref(), Some("machine:read"));
+        assert_eq!(response.expires_in, 900);
+        assert!(response.refresh_token.is_none());
+        let wire = serde_json::to_value(&response).unwrap();
+        assert!(wire.get("refresh_token").is_none());
+        assert!(wire.get("id_token").is_none());
+        let info = server.validate_access_token(&response.access_token).unwrap();
+        assert_eq!(info.resource.as_deref(), Some(TEST_MCP_RESOURCE));
+        assert_eq!(info.client_id, "machine-client");
+        assert!(info.subject.is_none());
+        assert!(info.token.is_empty());
+        assert!(!info.is_refresh_token);
+        assert_eq!(server.stats().access_tokens, 1);
+        assert_eq!(server.stats().refresh_tokens, 0);
+        assert_eq!(server.stats().authorization_codes, 0);
+
+        let context = McpContext::new(asupersync::Cx::for_testing(), 1);
+        let request = AuthRequest {
+            method: "tools/call", params: None, transport_authorization: None, request_id: 1,
+        };
+        let access = AccessToken { scheme: "Bearer".to_string(), token: response.access_token };
+        let verifier = server.token_verifier(configured_resource(TEST_MCP_RESOURCE));
+        let auth = verifier.verify(&context, request, &access).unwrap();
+        assert_eq!(auth.subject.as_deref(), Some("machine-client"));
+        assert_eq!(auth.scopes, ["machine:read"]);
+        assert_eq!(auth.claims.as_ref().unwrap()["grant_subject"], serde_json::Value::Null);
+        let registration_epoch = server.state.read().unwrap().clients["machine-client"].registration_epoch;
+        let owner_with_same_display_name = oauth_session_owner(
+            &server.config.issuer, "machine-client", registration_epoch,
+            Some("machine-client"), Some(TEST_MCP_RESOURCE),
+        ).unwrap();
+        assert_ne!(auth.session_owner(), Some(owner_with_same_display_name));
+        let other_resource = server.token_verifier(configured_resource("https://resource.example/other"));
+        assert!(other_resource.verify(&context, request, &access).is_err());
+        let other_issuer = development_machine_server();
+        assert!(other_issuer.validate_access_token(&access.token).is_none());
+        // No access credential can be repurposed into a refresh grant.
+        let refresh = TokenRequest {
+            grant_type: "refresh_token".to_string(),
+            refresh_token: Some(access.token.clone()),
+            ..development_machine_request()
+        };
+        assert!(matches!(server.token(&refresh), Err(OAuthError::InvalidGrant(_))));
+        assert!(server.validate_access_token(&access.token).is_some());
+        server.revoke(&access.token, "machine-client", Some("machine-secret"),
+            TokenEndpointAuthMethod::ClientSecretBasic).unwrap();
+        assert!(verifier.verify(&context, request, &access).is_err());
+        assert_eq!(server.stats().refresh_tokens, 0);
+    }
+
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    #[test]
+    fn development_client_credentials_rejections_preserve_tokens_and_expired_state() {
+        let server = development_machine_server();
+        server.register_client(OAuthClient::builder("browser-client")
+            .secret("machine-secret")
+            .redirect_uri("https://client.example/callback")
+            .scope("machine:read").build().unwrap()).unwrap();
+        server.register_client(OAuthClient::builder("public-client")
+            .redirect_uri("https://client.example/callback")
+            .scope("machine:read").build().unwrap()).unwrap();
+        let response = server.token(&development_machine_request()).unwrap();
+        let token_digest = digest_credential(CredentialKind::AccessToken, &response.access_token).unwrap();
+        let retained = server.state.read().unwrap().access_tokens[&token_digest].clone();
+        let clients = server.list_clients();
+        let expired = insert_expired_authorization_code_cleanup_canary(&server, "machine-client");
+        let expired_deadline = server.state.read().unwrap().authorization_codes[&expired].expires_at;
+
+        for case in 0..16 {
+            let mut request = development_machine_request();
+            let expected = match case {
+                0 => { request.client_secret = Some("wrong-secret".to_string()); "invalid_client" }
+                1 => { request.client_authentication_method = TokenEndpointAuthMethod::ClientSecretPost; "invalid_client" }
+                2 => { request.client_secret = None; request.client_authentication_method = TokenEndpointAuthMethod::None; "invalid_client" }
+                3 => { request.client_id = "unknown-client".to_string(); "invalid_client" }
+                4 => { request.resource = Some("https://resource.example/other".to_string()); "invalid_request" }
+                5 => { request.resource = None; "invalid_request" }
+                6 => { request.scopes = None; "invalid_scope" }
+                7 => { request.scopes = Some(Vec::new()); "invalid_scope" }
+                8 => { request.scopes = Some(vec!["machine:admin".to_string()]); "invalid_scope" }
+                9 => { request.scopes = Some(vec!["openid".to_string()]); "invalid_scope" }
+                10 => { request.code = Some(String::new()); "invalid_request" }
+                11 => { request.redirect_uri = Some("https://client.example/callback".to_string()); "invalid_request" }
+                12 => { request.code_verifier = Some("x".repeat(43)); "invalid_request" }
+                13 => { request.refresh_token = Some(response.access_token.clone()); "invalid_request" }
+                14 => { request.client_id = "browser-client".to_string(); "unauthorized_client" }
+                _ => { request.client_id = "public-client".to_string(); request.client_secret = None;
+                    request.client_authentication_method = TokenEndpointAuthMethod::None; "unauthorized_client" }
+            };
+            let draws = std::cell::Cell::new(0);
+            let error = server.token_client_credentials_with_draw(&request, || {
+                draws.set(draws.get() + 1);
+                draw_security_identifier()
+            }).unwrap_err();
+            assert_eq!(error.error_code(), expected, "case {case}");
+            assert_eq!(draws.get(), 0, "case {case}");
+            assert_eq!(server.list_clients(), clients, "case {case}");
+            let state = server.state.read().unwrap();
+            assert_eq!(state.access_tokens.len(), 1, "case {case}");
+            assert_eq!(state.authorization_codes.len(), 1, "case {case}");
+            assert_eq!(state.authorization_codes[&expired].expires_at, expired_deadline);
+            assert!(state.refresh_tokens.is_empty());
+            assert!(state.revoked_tokens.is_empty());
+            assert_retained_token_unchanged(&retained, &state.access_tokens[&token_digest]);
+        }
+        // The exact same request succeeds after changing only the denied field
+        // back to its authorized value, and performs normal bounded cleanup.
+        assert!(server.token(&development_machine_request()).is_ok());
+        assert_eq!(server.stats().access_tokens, 2);
+        assert_eq!(server.stats().authorization_codes, 0);
+    }
+
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    #[test]
+    fn development_client_credentials_require_explicit_confidential_machine_registration() {
+        let grant = || DevelopmentClientCredentialsGrant::new(
+            configured_resource(TEST_MCP_RESOURCE), ["machine:read"],
+        ).unwrap();
+        assert!(OAuthClient::builder("public").development_client_credentials(grant()).build().is_err());
+        assert!(OAuthClient::builder("post").secret("secret")
+            .token_endpoint_auth_method(TokenEndpointAuthMethod::ClientSecretPost)
+            .development_client_credentials(grant()).build().is_err());
+        assert!(OAuthClient::builder("browser").secret("secret").build().is_err());
+        let machine = development_machine_client("machine", "secret");
+        assert!(!machine.validate_redirect_uri("https://client.example/callback"));
+        assert!(!machine.validate_scopes(&["machine:read".to_string()]));
+        for scopes in [Vec::<String>::new(), vec!["openid".to_string()],
+            vec!["offline_access".to_string()], vec!["a b".to_string()],
+            vec!["x".repeat(MAX_OAUTH_SCOPE_BYTES + 1)],
+            (0..=MAX_OAUTH_SCOPES_PER_CLIENT).map(|i| format!("scope{i}")).collect()]
+        {
+            assert!(DevelopmentClientCredentialsGrant::new(configured_resource(TEST_MCP_RESOURCE), scopes).is_err());
+        }
+        let exact = DevelopmentClientCredentialsGrant::new(configured_resource(TEST_MCP_RESOURCE),
+            (0..MAX_OAUTH_SCOPES_PER_CLIENT).map(|i| format!("scope{i}"))).unwrap();
+        assert_eq!(exact.scopes().len(), MAX_OAUTH_SCOPES_PER_CLIENT);
+
+        let disabled = OAuthServer::try_new(OAuthServerConfig::default()).unwrap();
+        disabled.register_client(development_machine_client("machine-client", "machine-secret")).unwrap();
+        assert!(matches!(disabled.token(&development_machine_request()), Err(OAuthError::UnsupportedGrantType(_))));
+        assert_eq!(disabled.stats().access_tokens, 0);
+        assert!(!disabled.supported_grant_types().contains(&"client_credentials"));
+
+        // Revalidate public fields at retention after builder admission.
+        let mut changed = development_machine_client("changed", "secret");
+        changed.token_endpoint_auth_method = TokenEndpointAuthMethod::ClientSecretPost;
+        assert!(disabled.register_client(changed).is_err());
+        assert!(disabled.get_client("changed").is_none());
+    }
+
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    #[test]
+    fn development_client_credentials_rotation_revocation_and_expiry_remain_client_bound() {
+        let server = development_machine_server();
+        server.register_client(development_machine_client("other-client", "other-secret")).unwrap();
+        let first = server.token(&development_machine_request()).unwrap();
+        server.revoke(&first.access_token, "other-client", Some("other-secret"),
+            TokenEndpointAuthMethod::ClientSecretBasic).unwrap();
+        assert!(server.validate_access_token(&first.access_token).is_some());
+        assert!(server.revoke(&first.access_token, "machine-client", Some("machine-secret"),
+            TokenEndpointAuthMethod::ClientSecretPost).is_err());
+        assert!(server.validate_access_token(&first.access_token).is_some());
+        assert!(server.register_client(development_machine_client("machine-client", "new-secret")).is_err());
+        assert!(server.validate_access_token(&first.access_token).is_some());
+        server.unregister_client("machine-client").unwrap();
+        server.register_client(development_machine_client("machine-client", "new-secret")).unwrap();
+        assert!(server.validate_access_token(&first.access_token).is_none());
+        assert!(matches!(server.token(&development_machine_request()), Err(OAuthError::InvalidClient(_))));
+        let mut request = development_machine_request();
+        request.client_secret = Some("new-secret".to_string());
+        let second = server.token(&request).unwrap();
+        assert_ne!(first.access_token, second.access_token);
+        let digest = digest_credential(CredentialKind::AccessToken, &second.access_token).unwrap();
+        server.state.write().unwrap().access_tokens.get_mut(&digest).unwrap().metadata.expires_at = Instant::now();
+        assert!(server.validate_access_token(&second.access_token).is_none());
+        assert_eq!(server.stats().refresh_tokens, 0);
+    }
+
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    #[test]
+    fn development_client_credentials_capacity_and_rng_failures_do_not_mutate_state() {
+        let server = OAuthServer::try_new(OAuthServerConfig {
+            allow_development_client_credentials: true,
+            max_access_tokens: 1,
+            max_access_tokens_per_client: 1,
+            ..OAuthServerConfig::default()
+        }).unwrap();
+        server.register_client(development_machine_client("machine-client", "machine-secret")).unwrap();
+        let first = server.token(&development_machine_request()).unwrap();
+        let digest = digest_credential(CredentialKind::AccessToken, &first.access_token).unwrap();
+        let expired = insert_expired_authorization_code_cleanup_canary(&server, "machine-client");
+        let draws = std::cell::Cell::new(0);
+        let denied = server.token_client_credentials_with_draw(&development_machine_request(), || {
+            draws.set(draws.get() + 1); draw_security_identifier()
+        });
+        assert!(denied.is_err());
+        assert_eq!(draws.get(), 0);
+        assert!(server.state.read().unwrap().authorization_codes.contains_key(&expired));
+        assert!(server.validate_access_token(&first.access_token).is_some());
+        server.state.write().unwrap().access_tokens.get_mut(&digest).unwrap().metadata.expires_at = Instant::now();
+        let denied = server.token_client_credentials_with_draw(&development_machine_request(), || {
+            Err::<SecurityIdentifier, _>("forced RNG failure")
+        });
+        assert!(matches!(denied, Err(OAuthError::ServerError(_))));
+        assert_eq!(server.stats().access_tokens, 1);
+        assert!(server.state.read().unwrap().authorization_codes.contains_key(&expired));
+        let second = server.token(&development_machine_request()).unwrap();
+        assert_eq!(server.stats().access_tokens, 1);
+        assert_eq!(server.stats().authorization_codes, 0);
+        assert!(server.validate_access_token(&second.access_token).is_some());
+        assert!(server.validate_access_token(&first.access_token).is_none());
+    }
+
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    #[test]
+    fn development_client_credentials_collision_budget_is_atomic_and_retry_is_bounded() {
+        let server = development_machine_server();
+        let first = server.token(&development_machine_request()).unwrap();
+        let first_digest = digest_credential(CredentialKind::AccessToken, &first.access_token).unwrap();
+        let retained = server.state.read().unwrap().access_tokens[&first_digest].clone();
+        let candidates: Vec<_> = (0..4).map(|_| draw_security_identifier().unwrap()).collect();
+        // Pre-existing entries match four future candidate draws. This changes
+        // only the collision dimension of otherwise valid machine issuance.
+        for candidate in &candidates {
+            let value = base64url_encode(candidate.as_bytes());
+            let digest = digest_credential(CredentialKind::AccessToken, &value).unwrap();
+            assert!(server.state.write().unwrap().access_tokens.insert(digest, retained.clone()).is_none());
+        }
+        let expired = insert_expired_authorization_code_cleanup_canary(&server, "machine-client");
+        let before = server.state.read().unwrap().access_tokens.clone();
+        let mut candidates = candidates.into_iter();
+        let draws = std::cell::Cell::new(0);
+        let rejected = server.token_client_credentials_with_draw(&development_machine_request(), || {
+            draws.set(draws.get() + 1);
+            Ok::<_, &'static str>(candidates.next().expect("at most four candidate draws"))
+        });
+        assert!(matches!(rejected, Err(OAuthError::ServerError(_))));
+        assert_eq!(draws.get(), 4);
+        {
+            let state = server.state.read().unwrap();
+            assert_eq!(state.access_tokens.len(), before.len());
+            assert!(state.authorization_codes.contains_key(&expired));
+            assert!(state.refresh_tokens.is_empty());
+            assert!(state.revoked_tokens.is_empty());
+            for (digest, metadata) in &before {
+                assert_retained_token_unchanged(metadata, &state.access_tokens[digest]);
+            }
+        }
+
+        let collision = draw_security_identifier().unwrap();
+        let digest = digest_credential(CredentialKind::AccessToken,
+            &base64url_encode(collision.as_bytes())).unwrap();
+        server.state.write().unwrap().access_tokens.insert(digest, retained.clone());
+        let fresh = draw_security_identifier().unwrap();
+        let expected_value = base64url_encode(fresh.as_bytes());
+        let mut candidates = vec![collision, fresh].into_iter();
+        draws.set(0);
+        let response = server.token_client_credentials_with_draw(&development_machine_request(), || {
+            draws.set(draws.get() + 1);
+            Ok::<_, &'static str>(candidates.next().expect("collision followed by one fresh candidate"))
+        }).unwrap();
+        assert_eq!(draws.get(), 2);
+        assert_eq!(response.access_token, expected_value);
+        assert!(response.refresh_token.is_none());
+        assert_eq!(server.stats().authorization_codes, 0);
+        assert_eq!(server.stats().refresh_tokens, 0);
+        assert_retained_token_unchanged(&retained, &server.state.read().unwrap().access_tokens[&first_digest]);
     }
 
     #[derive(Clone, Copy)]
