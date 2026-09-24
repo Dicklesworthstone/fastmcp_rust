@@ -7040,6 +7040,19 @@ pub mod modern {
             self.inner.serve_websocket(cx, addr).await
         }
 
+        /// Serves final MCP over caller-owned asynchronous NDJSON I/O.
+        ///
+        /// Request execution, ingress and egress share the supplied runtime.
+        /// This returning lifecycle leaves process ownership with the caller;
+        /// the reader and writer must already be nonblocking async endpoints.
+        pub async fn serve_stdio_io<R, W>(self, cx: &Cx, reader: R, writer: W) -> McpResult<()>
+        where
+            R: asupersync::io::AsyncRead + Unpin + Send + 'static,
+            W: asupersync::io::AsyncWrite + Unpin + Send + 'static,
+        {
+            self.inner.serve_stdio_io(cx, reader, writer).await
+        }
+
         /// Runs this final-only server over stdio on the supplied caller-owned context.
         ///
         /// The facade does not create a runtime or detach the stdio pump; the

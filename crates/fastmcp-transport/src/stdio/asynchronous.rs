@@ -146,6 +146,7 @@ async fn receive<R: AsyncRead + Unpin>(
     state: &mut ReadState,
     codec: &Codec,
     terminal: &Terminal,
+    server_ingress: bool,
 ) -> Result<ReceivedTransportFrame, TransportError> {
     let mut chunks = 0;
     loop {
@@ -186,9 +187,21 @@ async fn receive<R: AsyncRead + Unpin>(
                 match ReceivedTransportFrame::admit(source) {
                     Ok(frame) => return Ok(frame),
                     Err(error) => {
-                        // A shared byte-stream decode failure has no trusted
-                        // request owner. It cannot be skipped to serve a sibling.
-                        fail_read(reader, state, terminal);
+                        // A server may answer a bounded, isolated request-like
+                        // line without losing framing. Client ingress has no
+                        // trusted response owner and remains terminal.
+                        let recoverable_request = server_ingress
+                            && matches!(
+                                &error,
+                                TransportError::Codec(CodecError::Json(_))
+                                    | TransportError::Codec(CodecError::InvalidMessage {
+                                        kind: crate::InvalidMessageKind::Request,
+                                        ..
+                                    })
+                            );
+                        if !recoverable_request {
+                            fail_read(reader, state, terminal);
+                        }
                         return Err(error);
                     }
                 }
@@ -446,6 +459,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> AsyncStdioTransport<R, W> {
             &mut self.asynchronous,
             &self.codec,
             &self.terminal,
+            false,
         )
         .await
     }
@@ -533,6 +547,29 @@ impl<R: AsyncRead + Unpin> AsyncStdioRecvHalf<R> {
             &mut self.state,
             &self.codec,
             &self.terminal,
+            false,
+        )
+        .await
+    }
+
+    /// Receives one client line at a server's already-selected protocol binding.
+    ///
+    /// An isolated syntax error or invalid request retains the following line
+    /// so the server can send its bounded parse/invalid-request response.
+    /// Oversized, response-like invalid, and I/O failures remain terminal.
+    /// Client consumers must use [`Self::recv_with_source_async`], whose shared
+    /// response-channel failures always terminate instead of guessing an owner.
+    pub async fn recv_server_with_source_async(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<ReceivedTransportFrame, TransportError> {
+        receive(
+            cx,
+            &mut self.reader,
+            &mut self.state,
+            &self.codec,
+            &self.terminal,
+            true,
         )
         .await
     }
@@ -884,6 +921,65 @@ mod tests {
         }
         assert!(output.bytes.lock().unwrap().is_empty());
         assert!(output.dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn async_stdio_server_request_error_retains_next_line_but_client_error_is_terminal() {
+        let wire = b"{bad\n{\"jsonrpc\":\"2.0\",\"method\":\"test/next\",\"id\":91}\n";
+        let cx = Cx::for_testing();
+        for server_ingress in [true, false] {
+            let (mut reader, mut writer) =
+                AsyncStdioTransport::from_io(wire.as_slice(), Vec::<u8>::new()).into_split();
+            let error = if server_ingress {
+                ready(reader.recv_server_with_source_async(&cx)).unwrap_err()
+            } else {
+                ready(reader.recv_with_source_async(&cx)).unwrap_err()
+            };
+            assert!(matches!(error, TransportError::Codec(CodecError::Json(_))));
+            if server_ingress {
+                ready(writer.send_async(
+                    &cx,
+                    &JsonRpcMessage::Response(JsonRpcResponse::error(
+                        None,
+                        fastmcp_protocol::JsonRpcError {
+                            code: (-32700).into(),
+                            message: "Parse error".to_owned(),
+                            data: None,
+                        },
+                    )),
+                ))
+                .unwrap();
+                assert!(
+                    matches!(ready(reader.recv_server_with_source_async(&cx)).unwrap().message(), JsonRpcMessage::Request(request) if request.id == Some(91_i64.into()))
+                );
+            } else {
+                assert!(reader.is_closed());
+                assert!(matches!(
+                    ready(writer.send_async(&cx, &request(92))),
+                    Err(TransportError::Closed)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn async_stdio_server_invalid_response_remains_terminal() {
+        let wire = b"{\"jsonrpc\":\"2.0\",\"id\":91,\"result\":{},\"error\":{\"code\":-32603,\"message\":\"bad\"}}\n";
+        let cx = Cx::for_testing();
+        let (mut reader, mut writer) =
+            AsyncStdioTransport::from_io(wire.as_slice(), Vec::<u8>::new()).into_split();
+        assert!(matches!(
+            ready(reader.recv_server_with_source_async(&cx)),
+            Err(TransportError::Codec(CodecError::InvalidMessage {
+                kind: crate::InvalidMessageKind::Response,
+                ..
+            }))
+        ));
+        assert!(reader.is_closed());
+        assert!(matches!(
+            ready(writer.send_async(&cx, &request(92))),
+            Err(TransportError::Closed)
+        ));
     }
 
     #[test]

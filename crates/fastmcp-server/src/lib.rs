@@ -74,6 +74,7 @@
 extern crate self as fastmcp_server;
 
 mod auth;
+mod async_stdio;
 pub mod bidirectional;
 mod builder;
 pub mod caching;
@@ -3138,7 +3139,6 @@ impl ModernDispatchReservation {
     }
 }
 
-#[cfg(not(any(feature = "legacy-2024-11-05", test)))]
 impl DispatchQueueState {
     fn admit_modern_request(
         self: &Arc<Self>,
@@ -13554,7 +13554,7 @@ impl Server {
                     .with_request_cancellation(request_cancellation.clone()),
             ),
         );
-        let budget = self.create_request_budget(request_ctx.cx());
+        let budget = self.create_owned_modern_request_budget(request_ctx.cx(), &method);
         if let Some(error) = Self::request_budget_error(request_ctx.cx(), budget) {
             return response_for_error(error);
         }
@@ -19440,7 +19440,6 @@ impl Server {
         Self::enforce_request_context(ctx)
     }
 
-    #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
     fn admit_modern_pump_authentication(
         &self,
         inbound: &InboundRequestContext,
