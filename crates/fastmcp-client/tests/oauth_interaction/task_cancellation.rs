@@ -395,6 +395,7 @@ fn remote_cancel_cannot_extend_the_original_watch_deadline() {
 mod input_driver {
     use super::*;
     use std::cell::Cell;
+    use fastmcp_client::http_auth::managed::tasks::watch::ManagedTaskWatchError;
     use fastmcp_client::http_auth::managed::tasks::watch::drive::{
         ManagedTaskInputAction, ManagedTaskRunOutcome, ManagedTaskWatchDriveError,
         ManagedTaskWatchDrivePolicy, TaskInputUpdateState,

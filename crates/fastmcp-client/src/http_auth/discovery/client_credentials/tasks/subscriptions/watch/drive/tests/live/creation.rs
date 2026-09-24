@@ -206,8 +206,8 @@ fn run_creation(case: Case) {
                             controlled = true;
                             match case {
                                 Case::GatedSave => release.store(true, Ordering::SeqCst),
-                                Case::CancelSave => cancellation.cancel(),
-                                Case::CloseSave => client.client.inner.closed.cancel(),
+                                Case::CancelSave => { cancellation.cancel(); }
+                                Case::CloseSave => { client.client.inner.closed.cancel(); }
                                 Case::AbandonSave => return Poll::Ready(None),
                                 _ => {},
                             }

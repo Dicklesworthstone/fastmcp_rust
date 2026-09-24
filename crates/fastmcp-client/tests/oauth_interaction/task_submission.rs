@@ -9,7 +9,7 @@ use fastmcp_client::http_auth::managed::tasks::interaction::{
 use fastmcp_client::http_auth::managed::tasks::interaction::submission::{
     ManagedTaskSubmission, ManagedTaskSubmissionError, TaskSubmissionState,
 };
-use fastmcp_protocol::{ClientCapabilities, FinalCoreResult, FinalRequestMeta};
+use fastmcp_protocol::{ClientCapabilities, CoreResult, FinalCoreResult, FinalRequestMeta};
 
 const SUBMISSION_CASE: &str = "FASTMCP_TEST_TASK_SUBMISSION_CASE";
 const DISCOVER: &str = r#"{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{"listChanged":true},"extensions":{"io.modelcontextprotocol/tasks":{}}},"ttlMs":0,"cacheScope":"private"}"#;
@@ -258,11 +258,11 @@ fn run(case: Case) {
                     match case {
                         Case::Task => {
                             assert!(matches!(*result, FinalCoreResult::ToolsCallTask { .. }));
-                            assert!(result.encode().unwrap().contains("actual-peer-task"));
+                            assert!(CoreResult::Final(*result).encode().unwrap().contains("actual-peer-task"));
                         }
                         Case::Complete => {
                             assert!(matches!(*result, FinalCoreResult::ToolsCall { .. }));
-                            let encoded = result.encode().unwrap();
+                            let encoded = CoreResult::Final(*result).encode().unwrap();
                             assert!(encoded.contains("1.20e+4"));
                             assert_eq!(serde_json::from_str::<Value>(&encoded).unwrap()["isError"], true);
                         }
