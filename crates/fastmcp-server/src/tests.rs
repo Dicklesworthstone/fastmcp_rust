@@ -318,9 +318,9 @@ fn get_state_from_ctx(ctx: &McpContext) -> String {
     name = "nested_state",
     description = "Sets state then calls another tool"
 )]
-fn nested_state_call(ctx: &McpContext) -> McpResult<String> {
+async fn nested_state_call(ctx: &McpContext) -> McpResult<String> {
     ctx.set_state("tool_test_key", "tool_propagated_value");
-    let inner_result = fastmcp_core::block_on(ctx.call_tool("get_state", serde_json::json!({})))?;
+    let inner_result = ctx.call_tool("get_state", serde_json::json!({})).await?;
     let text = inner_result.first_text().unwrap_or("(no content)");
     Ok(format!("Inner tool saw: {}", text))
 }
@@ -5623,20 +5623,34 @@ mod ctx_read_resource_tests {
             None
         }
 
-        fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-            // Set a value in session state
-            ctx.set_state("test_key", "propagated_value");
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            // A nested read is async; bridging it with block_on from this
+            // synchronous hook is the rejected pattern (bd-6rfrg).
+            Err(McpError::internal_error("nested reads use read_async"))
+        }
 
-            // Read another resource - it should see our session state
-            let inner_result = fastmcp_core::block_on(ctx.read_resource("session://state"))?;
-            let text = inner_result.first_text().unwrap_or("(no content)");
+        fn read_async<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+        ) -> crate::handler::BoxFuture<'a, fastmcp_core::McpOutcome<Vec<ResourceContent>>> {
+            Box::pin(async move {
+                // Set a value in session state
+                ctx.set_state("test_key", "propagated_value");
 
-            Ok(vec![ResourceContent {
-                uri: "nested://session".to_string(),
-                mime_type: Some("text/plain".to_string()),
-                text: Some(format!("Inner saw: {}", text)),
-                blob: None,
-            }])
+                // Read another resource - it should see our session state
+                let inner_result = match ctx.read_resource("session://state").await {
+                    Ok(result) => result,
+                    Err(error) => return fastmcp_core::Outcome::Err(error),
+                };
+                let text = inner_result.first_text().unwrap_or("(no content)");
+
+                fastmcp_core::Outcome::Ok(vec![ResourceContent {
+                    uri: "nested://session".to_string(),
+                    mime_type: Some("text/plain".to_string()),
+                    text: Some(format!("Inner saw: {}", text)),
+                    blob: None,
+                }])
+            })
         }
     }
 
@@ -5722,14 +5736,28 @@ mod ctx_read_resource_tests {
             None
         }
 
-        fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-            let inner = fastmcp_core::block_on(ctx.read_resource("auth://subject"))?;
-            Ok(vec![ResourceContent {
-                uri: "nested://auth".to_string(),
-                mime_type: Some("text/plain".to_string()),
-                text: Some(inner.first_text().unwrap_or("missing").to_string()),
-                blob: None,
-            }])
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            // A nested read is async; bridging it with block_on from this
+            // synchronous hook is the rejected pattern (bd-6rfrg).
+            Err(McpError::internal_error("nested reads use read_async"))
+        }
+
+        fn read_async<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+        ) -> crate::handler::BoxFuture<'a, fastmcp_core::McpOutcome<Vec<ResourceContent>>> {
+            Box::pin(async move {
+                let inner = match ctx.read_resource("auth://subject").await {
+                    Ok(result) => result,
+                    Err(error) => return fastmcp_core::Outcome::Err(error),
+                };
+                fastmcp_core::Outcome::Ok(vec![ResourceContent {
+                    uri: "nested://auth".to_string(),
+                    mime_type: Some("text/plain".to_string()),
+                    text: Some(inner.first_text().unwrap_or("missing").to_string()),
+                    blob: None,
+                }])
+            })
         }
     }
 
@@ -6249,12 +6277,33 @@ mod ctx_call_tool_tests {
             }
         }
 
-        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-            let inner =
-                fastmcp_core::block_on(ctx.call_tool("current_auth", serde_json::json!({})))?;
-            Ok(vec![Content::Text {
-                text: inner.first_text().unwrap_or("missing").to_string(),
-            }])
+        fn execution_mode(&self) -> crate::handler::ToolExecutionMode {
+            crate::handler::ToolExecutionMode::Async
+        }
+
+        fn call(
+            &self,
+            _ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<Vec<Content>> {
+            // A nested call is async; bridging it with block_on from this
+            // synchronous hook is the rejected pattern (bd-6rfrg).
+            Err(McpError::internal_error("nested calls use call_async"))
+        }
+
+        fn call_async<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+            _arguments: serde_json::Value,
+        ) -> crate::handler::BoxFuture<'a, fastmcp_core::McpOutcome<Vec<Content>>> {
+            Box::pin(async move {
+                match ctx.call_tool("current_auth", serde_json::json!({})).await {
+                    Ok(inner) => fastmcp_core::Outcome::Ok(vec![Content::Text {
+                        text: inner.first_text().unwrap_or("missing").to_string(),
+                    }]),
+                    Err(error) => fastmcp_core::Outcome::Err(error),
+                }
+            })
         }
     }
 
