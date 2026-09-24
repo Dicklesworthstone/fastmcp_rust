@@ -4725,21 +4725,26 @@ impl MultiplexedProxyFinalTaskListener {
         let event = await_proxy_operation_or_cancellation(
             cx,
             cancellation,
-            std::future::poll_fn(|task_cx| {
+            Box::pin(std::future::poll_fn(|task_cx| {
                 let route_count = self.listeners.len();
                 for offset in 0..route_count {
                     let index = (self.next_route + offset) % route_count;
                     if self.turns[index].is_none() {
-                        let mut listener = self.listeners[index].take()
+                        let mut listener = self.listeners[index]
+                            .take()
                             .expect("each route is retained by its listener or its read turn");
                         let owned_cx = cx.clone();
                         let owned_cancellation = cancellation.clone();
                         self.turns[index] = Some(Box::pin(async move {
-                            let event = listener.next_async(&owned_cx, &owned_cancellation).await;
+                            let event = listener
+                                .next_async(&owned_cx, &owned_cancellation)
+                                .await;
                             (listener, event)
                         }));
                     }
-                    let turn = self.turns[index].as_mut().expect("route read was installed");
+                    let turn = self.turns[index]
+                        .as_mut()
+                        .expect("route read was installed");
                     if let Poll::Ready((listener, event)) = turn.as_mut().poll(task_cx) {
                         self.turns[index] = None;
                         self.listeners[index] = Some(listener);
@@ -4748,8 +4753,9 @@ impl MultiplexedProxyFinalTaskListener {
                     }
                 }
                 Poll::Pending
-            }),
-        ).await;
+            })),
+        )
+        .await;
         match event {
             Ok(ProxyFinalTaskListenerEvent::Notification(notification)) => {
                 Ok(ProxyFinalTaskListenerEvent::Notification(notification))
@@ -5191,7 +5197,8 @@ impl ProxyFinalTaskRelay {
                 ctx.cx(),
                 &cancellation,
                 listener.next_async(ctx.cx(), &cancellation),
-            ).await?;
+            )
+            .await?;
             ctx.ensure_live()?;
             match acknowledgement {
                 ProxyFinalTaskListenerEvent::Acknowledged(accepted)
