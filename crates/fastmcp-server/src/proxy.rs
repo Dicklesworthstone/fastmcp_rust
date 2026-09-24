@@ -15829,32 +15829,132 @@ IFS= read -r end
         )
     }
 
-    /// How long the hooked resource request may take to reach the upstream,
-    /// given `setup_control`, the time everything before it took in the same
-    /// run. Setup spans several round trips on the same machinery, so one
-    /// more round trip gets four times that. The unloaded 10 s floor stays, so
-    /// host load scales the bound but never removes it: a request that never
-    /// reaches the upstream still fails.
+    /// A same-run control for host load. A heartbeat thread asks to sleep
+    /// [`Self::TICK`] at a time, and whatever it oversleeps is time a runnable
+    /// thread of this process waited for a CPU. A bound measured in runnable
+    /// time (wall time less that lag) stretches under host load but still
+    /// expires on a hang, where the process could run and made no progress.
+    /// Ten times the bound in wall time expires it regardless, so no amount of
+    /// lag removes a bound. Reports state the lag, which tells the two apart.
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
-    fn resource_hook_reach_bound(setup_control: Duration) -> Duration {
-        Duration::from_secs(10).max(setup_control.saturating_mul(4))
+    #[derive(Clone)]
+    struct RunnableClock {
+        lag_micros: Arc<std::sync::atomic::AtomicU64>,
     }
 
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
-    #[test]
-    fn resource_hook_reach_bound_scales_with_the_control_and_keeps_its_floor() {
-        for unloaded in [
-            Duration::ZERO,
-            Duration::from_millis(40),
-            Duration::from_millis(2_500),
-        ] {
-            assert_eq!(resource_hook_reach_bound(unloaded), Duration::from_secs(10));
+    impl RunnableClock {
+        const TICK: Duration = Duration::from_millis(5);
+
+        /// Starts the heartbeat; it stops once every clone is dropped.
+        fn start() -> Self {
+            let lag_micros = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let heartbeat = Arc::downgrade(&lag_micros);
+            thread::spawn(move || {
+                loop {
+                    let asked = Instant::now();
+                    thread::sleep(Self::TICK);
+                    let late = asked.elapsed().saturating_sub(Self::TICK);
+                    let Some(lag) = heartbeat.upgrade() else {
+                        break;
+                    };
+                    lag.fetch_add(
+                        u64::try_from(late.as_micros()).unwrap_or(u64::MAX),
+                        std::sync::atomic::Ordering::AcqRel,
+                    );
+                }
+            });
+            Self { lag_micros }
         }
+
+        fn lag(&self) -> Duration {
+            Duration::from_micros(self.lag_micros.load(std::sync::atomic::Ordering::Acquire))
+        }
+
+        /// A point to measure from: the wall instant and the lag so far.
+        fn mark(&self) -> (Instant, Duration) {
+            (Instant::now(), self.lag())
+        }
+
+        /// Wall time from `mark` to `now`, less the lag accrued between them.
+        fn runnable_between(mark: (Instant, Duration), now: (Instant, Duration)) -> Duration {
+            now.0
+                .saturating_duration_since(mark.0)
+                .saturating_sub(now.1.saturating_sub(mark.1))
+        }
+
+        /// Whether `bound` of runnable time, or ten times it of wall time,
+        /// passed from `mark` to `now`.
+        fn expired_between(
+            mark: (Instant, Duration),
+            now: (Instant, Duration),
+            bound: Duration,
+        ) -> bool {
+            Self::runnable_between(mark, now) >= bound
+                || now.0.saturating_duration_since(mark.0) >= bound.saturating_mul(10)
+        }
+
+        fn expired(&self, mark: (Instant, Duration), bound: Duration) -> bool {
+            Self::expired_between(mark, self.mark(), bound)
+        }
+
+        fn remaining(&self, mark: (Instant, Duration), bound: Duration) -> Duration {
+            bound.saturating_sub(Self::runnable_between(mark, self.mark()))
+        }
+
+        fn describe(&self, mark: (Instant, Duration)) -> String {
+            let now = self.mark();
+            format!(
+                "{:?} runnable ({:?} wall, {:?} host lag)",
+                Self::runnable_between(mark, now),
+                now.0.saturating_duration_since(mark.0),
+                now.1.saturating_sub(mark.1)
+            )
+        }
+    }
+
+    /// One second of wall time between two marks; only the lag accrued in
+    /// it differs between the arms.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn runnable_clock_discounts_host_lag_and_keeps_a_wall_backstop() {
+        let start = Instant::now();
+        let mark = (start, Duration::from_millis(40));
+        let later = |lag_ms| {
+            (
+                start + Duration::from_secs(1),
+                Duration::from_millis(40 + lag_ms),
+            )
+        };
+        let bound = Duration::from_millis(500);
+        // Unloaded: the whole second was runnable, so the bound expired.
         assert_eq!(
-            resource_hook_reach_bound(Duration::from_secs(6)),
-            Duration::from_secs(24)
+            RunnableClock::runnable_between(mark, later(0)),
+            Duration::from_secs(1)
         );
-        assert_eq!(resource_hook_reach_bound(Duration::MAX), Duration::MAX);
+        assert!(RunnableClock::expired_between(mark, later(0), bound));
+        // Loaded: 900 ms of it was host lag, so the same bound has not.
+        assert_eq!(
+            RunnableClock::runnable_between(mark, later(900)),
+            Duration::from_millis(100)
+        );
+        assert!(!RunnableClock::expired_between(mark, later(900), bound));
+        // Nearly all lag: 10 ms runnable is under a 90 ms bound, but the
+        // second of wall time is past ten times it, so the backstop expires.
+        assert_eq!(
+            RunnableClock::runnable_between(mark, later(990)),
+            Duration::from_millis(10)
+        );
+        assert!(RunnableClock::expired_between(
+            mark,
+            later(990),
+            Duration::from_millis(90)
+        ));
+        assert!(!RunnableClock::expired_between(
+            mark,
+            later(990),
+            Duration::from_millis(101)
+        ));
     }
 
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
@@ -15862,7 +15962,7 @@ IFS= read -r end
         use fastmcp_protocol::JsonRpcRequest;
         use fastmcp_transport::http::{HttpMethod, HttpRequest, HttpStatus};
         use std::future::Future;
-        use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::task::Poll;
 
         // Concurrent probes can read the same clock value, so a process-wide
@@ -15871,7 +15971,9 @@ IFS= read -r end
 
         // Same peer and operation: 0=success, 1=upstream error, 2=cancel,
         // 3=deadline, 4=drop. Every negative retries on the same connection.
-        let probe_started = Instant::now();
+        // The probe's wall-clock bounds count runnable time only.
+        let host = RunnableClock::start();
+        let probe_started = host.mark();
         let clock = Arc::new(asupersync::time::VirtualClock::new());
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
@@ -15916,9 +16018,6 @@ IFS= read -r end
             }
         }).collect();
         let stop = Arc::new(AtomicBool::new(false));
-        // The peer's idle bound. The probe raises it past its own scaled
-        // bound before the hooked request, so the peer never gives up first.
-        let peer_patience_ms = Arc::new(AtomicU64::new(15_000));
         let (peer, plan) = if http {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -15927,15 +16026,13 @@ IFS= read -r end
             let plan = legacy_only_http_proxy_plan(&format!("http://{address}/sse"), &endpoint);
             let peer_control = control.clone();
             let peer_stop = Arc::clone(&stop);
-            let peer_patience_ms = Arc::clone(&peer_patience_ms);
+            let peer_host = host.clone();
             let peer_responses = responses.clone();
             let peer_initialization = initialization.clone();
             let peer = thread::spawn(move || {
-                let mut last_progress = Instant::now();
-                let remaining = |last_progress: Instant| {
-                    Duration::from_millis(peer_patience_ms.load(Ordering::Acquire))
-                        .saturating_sub(last_progress.elapsed())
-                };
+                // Runnable time the peer waits between accepted connections.
+                const IDLE: Duration = Duration::from_secs(15);
+                let mut last_progress = peer_host.mark();
                 // The probe's timeout report reads this, so a peer that is
                 // blocked or has already hit its own bound is not mistaken
                 // for a request the proxy never sent.
@@ -15947,14 +16044,14 @@ IFS= read -r end
                 let mut index = 0;
                 let mut connections = 0_usize;
                 while !peer_stop.load(Ordering::Acquire) {
-                    let idle_bound_left = remaining(last_progress);
-                    if idle_bound_left.is_zero() {
-                        phase("deadline: peer idle bound expired");
+                    if peer_host.expired(last_progress, IDLE) {
+                        let report = format!(
+                            "deadline: peer idle for {} after {connections} connections",
+                            peer_host.describe(last_progress)
+                        );
+                        phase(&report);
+                        panic!("native subscription peer is bounded: {report}");
                     }
-                    assert!(
-                        !idle_bound_left.is_zero(),
-                        "native subscription peer is bounded"
-                    );
                     if peer_control.join("permit").exists()
                         && let Some(response) = delayed.take()
                     {
@@ -15978,16 +16075,16 @@ IFS= read -r end
                     post.set_write_timeout(Some(Duration::from_secs(10)))
                         .unwrap();
                     connections += 1;
-                    last_progress = Instant::now();
+                    last_progress = peer_host.mark();
                     phase(&format!(
                         "accepted connection #{connections} (response index {index}); reading its request at {:?}",
-                        remaining(last_progress)
+                        peer_host.remaining(last_progress, IDLE)
                     ));
                     let incoming = read_http_request(&mut post);
                     phase(&format!(
                         "read `{}` on connection #{connections}; {:?} before the peer bound",
                         incoming.head.lines().next().unwrap_or_default(),
-                        remaining(last_progress)
+                        peer_host.remaining(last_progress, IDLE)
                     ));
                     // Every refusal below names what the proxy actually sent,
                     // in the phase file as well as the panic, because a dead
@@ -16099,11 +16196,17 @@ IFS= read -r end
             let mut work = root.spawn(move |cx| async move {
                 let worker = thread::current().id();
                 let mut registry = ProxyClient::upstream_binding_registry();
-                let proxy = if http {
-                    registry.connect_http_with_protocol_plan(&cx, &subject, "native", 1, plan, proxy_http_client_info(), ClientCapabilities::default()).await.unwrap()
+                let connected = if http {
+                    registry.connect_http_with_protocol_plan(&cx, &subject, "native", 1, plan, proxy_http_client_info(), ClientCapabilities::default()).await
                 } else {
-                    registry.connect_stdio_with_protocol_plan(&cx, &subject, "native", 1, "sh", &["-c", &script, "subscription-peer", control.to_str().unwrap()], plan).await.unwrap()
+                    registry.connect_stdio_with_protocol_plan(&cx, &subject, "native", 1, "sh", &["-c", &script, "subscription-peer", control.to_str().unwrap()], plan).await
                 };
+                let proxy = connected.unwrap_or_else(|error| panic!(
+                    "upstream connects; http={http}, unsubscribe={unsubscribe}, interrupt={interrupt}: {error}; {} since probe start, peer phase: {:?}, process: {}",
+                    host.describe(probe_started),
+                    std::fs::read_to_string(control.join("peer-phase")).ok(),
+                    shared_process_resources()
+                ));
                 let handler = super::ProxyResourceHandler::with_prefix(Resource {
                     uri: uri.clone(), name: subject.clone(), description: None, mime_type: None,
                     icon: None, version: None, tags: Vec::new(),
@@ -16145,19 +16248,9 @@ IFS= read -r end
                 let rewrites = proxy.subscription_rewrites.lock().unwrap().clone();
                 let active_requests = Arc::clone(&session.server.active_requests);
                 let request_id = (target + 2) as i64;
-                // Everything before the hooked request ran on the same
-                // machinery under the same host load, so it is this run's
-                // control for how long one round trip may take here.
-                let setup_control = probe_started.elapsed();
-                let reach_bound = resource_hook_reach_bound(setup_control);
-                let peer_patience = reach_bound + Duration::from_secs(5);
-                peer_patience_ms.fetch_max(
-                    u64::try_from(peer_patience.as_millis()).unwrap_or(u64::MAX),
-                    Ordering::AcqRel,
-                );
                 let request = JsonRpcRequest::new(method, Some(serde_json::json!({"uri":inbound_uri})), request_id);
                 let mut operation = Box::pin(session.handle_async(&cx, post(request)));
-                let deadline = Instant::now() + reach_bound;
+                let sent = host.mark();
                 loop {
                     let polled = std::future::poll_fn(|task_cx| Poll::Ready(operation.as_mut().poll(task_cx))).await;
                     assert!(
@@ -16170,9 +16263,10 @@ IFS= read -r end
                     assert!(proxy.inner.try_lock().is_ok(), "proxy mutex is released while awaiting upstream");
                     if control.join("received").exists() { break; }
                     assert!(
-                        Instant::now() < deadline,
-                        "request reaches native upstream within {reach_bound:?} (setup control {setup_control:?}); http={http}, unsubscribe={unsubscribe}, interrupt={interrupt}, {:?} after probe start, upstream requests so far: {:?}, peer phase: {:?}, process: {}",
-                        probe_started.elapsed(),
+                        !host.expired(sent, Duration::from_secs(10)),
+                        "request reaches native upstream within 10 s runnable; http={http}, unsubscribe={unsubscribe}, interrupt={interrupt}, {} since sending it, {} since probe start, upstream requests so far: {:?}, peer phase: {:?}, process: {}",
+                        host.describe(sent),
+                        host.describe(probe_started),
                         std::fs::read_to_string(control.join("requests")).ok(),
                         std::fs::read_to_string(control.join("peer-phase")).ok(),
                         shared_process_resources()
