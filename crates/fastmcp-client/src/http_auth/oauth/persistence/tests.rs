@@ -450,6 +450,7 @@ fn persisted_grant_reopen_renews_over_native_https_with_rotation_and_scope_narro
                 let grant = store.take_refresh(&storage_cx, &fixture.authorization).unwrap().unwrap();
                 assert!(store.take_refresh(&storage_cx, &fixture.authorization).unwrap().is_none());
                 drop(store);
+                std::thread::sleep(Duration::from_secs(21)); // PLANT: slow storage host
                 (grant, fixture)
             }).join().unwrap();
             let acceptor = native::test_acceptor();
