@@ -1897,7 +1897,7 @@ mod tests {
             .expect("reverse callback test runtime must build")
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "apps", feature = "legacy-2024-11-05"))]
     fn auto_legacy_lifecycle_script(discovery_error_code: i32) -> String {
         format!(
             "IFS= read -r first || exit 1; \\
@@ -1915,7 +1915,7 @@ mod tests {
         )
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "apps"))]
     fn modern_apps_lifecycle_script(server_advertises_apps: bool) -> String {
         let discovery_result = if server_advertises_apps {
             r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"extensions":{"io.modelcontextprotocol/ui":{}}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"builder-modern-apps","version":"1.0.0"}}}}"#

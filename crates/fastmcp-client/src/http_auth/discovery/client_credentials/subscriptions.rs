@@ -537,11 +537,6 @@ mod tests {
         )
     }
 
-    const ACK: &str = concat!(
-        "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",",
-        "\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":7},",
-        "\"notifications\":{\"resourceSubscriptions\":[\"file:///tmp/watched\"]}}}\n\n"
-    );
     const UPDATE: &str = concat!(
         "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\",",
         "\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":7},",

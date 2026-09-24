@@ -253,6 +253,7 @@ impl ClientExtensionRuntime {
             .contains_key(&official_mcp_apps_extension_id())
     }
 
+    #[cfg(not(feature = "tasks"))]
     pub(crate) fn configures_extension(&self, extension_id: &str) -> bool {
         self.client_discovery
             .extensions
@@ -672,6 +673,7 @@ impl ClientSession {
 
     /// Returns the immutable current Apps activation receipt, if modern
     /// discovery negotiated the official extension bilaterally.
+    #[cfg(feature = "apps")]
     #[must_use]
     pub(crate) fn mcp_apps_activation_receipt(&self) -> Option<&McpAppsActivationReceipt> {
         self.mcp_apps_activation_receipt.as_ref()
@@ -839,16 +841,6 @@ pub(crate) fn mcp_apps_activation_receipt(
         .mcp_apps_activation_receipt(&registry)
 }
 
-/// Compatibility predicate for callers that only need to advertise Apps over
-/// an already-negotiated HTTP connection. Session-bearing clients retain the
-/// opaque receipt through [`mcp_apps_activation_receipt`] instead.
-pub(crate) fn resolve_mcp_apps_activation(
-    client_settings: Option<&McpAppsClientSettings>,
-    discovery: &ServerDiscoverResult,
-) -> bool {
-    mcp_apps_activation_receipt(client_settings, discovery).is_some()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -881,9 +873,9 @@ mod tests {
         let inactive = McpAppsClientSettings::new(vec!["text/html".to_owned()])
             .expect("valid non-Apps MIME settings");
 
-        assert!(resolve_mcp_apps_activation(Some(&active), &discovery));
+        assert!(mcp_apps_activation_receipt(Some(&active), &discovery).is_some());
         assert!(
-            !resolve_mcp_apps_activation(Some(&inactive), &discovery),
+            mcp_apps_activation_receipt(Some(&inactive), &discovery).is_none(),
             "only the advertised Apps HTML MIME differs"
         );
     }

@@ -970,6 +970,8 @@ impl ConfigLoader {
 
 #[derive(Debug, Clone)]
 struct ConfigLocations {
+    // Other Unix targets derive their paths from `unix_config` instead.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     home: Option<PathBuf>,
     #[cfg(all(unix, not(target_os = "macos")))]
     unix_config: Option<PathBuf>,
@@ -987,6 +989,7 @@ impl ConfigLocations {
         );
 
         Self {
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             home,
             #[cfg(all(unix, not(target_os = "macos")))]
             unix_config,
@@ -1481,7 +1484,6 @@ mod tests {
         let home = Path::new("/isolated/home");
         let xdg = std::ffi::OsStr::new("/isolated/xdg");
         let locations = ConfigLocations {
-            home: Some(home.to_path_buf()),
             unix_config: unix_config_home(Some(home), Some(xdg)),
         };
         let expected = PathBuf::from("/isolated/xdg/Claude/claude_desktop_config.json");

@@ -59,16 +59,10 @@ pub enum FinalCacheTtlDiagnostic {
 
 /// Default maximum number of active request owners.
 pub const DEFAULT_MAX_IN_FLIGHT_EXECUTIONS: usize = 1_024;
-/// Absolute ceiling for active request owners.
-pub const MAX_IN_FLIGHT_EXECUTIONS: usize = 16_384;
 /// Default maximum number of retained response correlations.
 pub const DEFAULT_MAX_RESPONSE_CORRELATIONS: usize = 4_096;
-/// Absolute ceiling for retained response correlations.
-pub const MAX_RESPONSE_CORRELATIONS: usize = 65_536;
 /// Default period for retaining a retired execution's exact response ID.
 pub const DEFAULT_TOMBSTONE_RETENTION: Duration = Duration::from_mins(10);
-/// Longest admitted period for retaining a retired response ID.
-pub const MAX_TOMBSTONE_RETENTION: Duration = Duration::from_hours(1);
 
 const MAX_RETAINED_PEER_ACTIVITY: usize = 1_024;
 /// Minimum automatic-pagination page bound admitted by CLT-01 B.
@@ -273,10 +267,6 @@ pub fn clt_01_b_manifest_digest() -> Sha256Digest {
 /// final `tools/call` response with a legacy result or with another core
 /// method's complete payload. The caller owns connection policy after a peer
 /// violates this contract.
-pub(crate) fn decode_core_result(request: &CoreRequest, result: &Value) -> McpResult<CoreResult> {
-    decode_core_result_from_source(request, result, None)
-}
-
 pub(crate) fn decode_core_result_from_source(
     request: &CoreRequest,
     result: &Value,
@@ -310,13 +300,6 @@ pub(crate) fn decode_core_result_from_source(
 /// normalized to zero freshness and reported through a bounded local
 /// diagnostic. All other malformed shapes continue through strict protocol
 /// decoding unchanged.
-pub(crate) fn decode_core_result_with_cache_ttl(
-    request: &CoreRequest,
-    result: &Value,
-) -> McpResult<(CoreResult, Option<FinalCacheTtlDiagnostic>)> {
-    decode_core_result_with_cache_ttl_from_source(request, result, None)
-}
-
 pub(crate) fn decode_core_result_with_cache_ttl_from_source(
     request: &CoreRequest,
     result: &Value,
@@ -981,8 +964,8 @@ impl<T> SharedExecutorState<T> {
 enum TaskExecutionOperation {
     ToolCall,
     Get(TaskId),
-    Update(TaskId),
-    Cancel(TaskId),
+    Update,
+    Cancel,
     Subscription,
 }
 
@@ -1655,7 +1638,9 @@ where
             generation,
             owner_dropped,
             state: self.state.clone(),
+            #[cfg(feature = "tasks")]
             method: request.method,
+            #[cfg(feature = "tasks")]
             params: request.params,
             #[cfg(feature = "tasks")]
             task_operation: None,
@@ -1718,7 +1703,7 @@ where
             ));
         }
         let mut execution = self.execute(cx, request)?;
-        execution.task_operation = Some(TaskExecutionOperation::Update(update.task_id));
+        execution.task_operation = Some(TaskExecutionOperation::Update);
         Ok(execution)
     }
 
@@ -1729,9 +1714,9 @@ where
         request: Request,
     ) -> McpResult<RequestExecution<T>> {
         self.require_modern_tasks_era()?;
-        let task = self.decode_tasks_cancel_request(&request)?;
+        self.decode_tasks_cancel_request(&request)?;
         let mut execution = self.execute(cx, request)?;
-        execution.task_operation = Some(TaskExecutionOperation::Cancel(task.task_id));
+        execution.task_operation = Some(TaskExecutionOperation::Cancel);
         Ok(execution)
     }
 
@@ -2164,8 +2149,8 @@ where
         let expected = execution.task_id_for(|operation| match operation {
             TaskExecutionOperation::Get(task_id) => Some(task_id),
             TaskExecutionOperation::ToolCall
-            | TaskExecutionOperation::Update(_)
-            | TaskExecutionOperation::Cancel(_)
+            | TaskExecutionOperation::Update
+            | TaskExecutionOperation::Cancel
             | TaskExecutionOperation::Subscription => None,
         })?;
         let response = self.wait(cx, execution)?;
@@ -2186,7 +2171,7 @@ where
     ) -> McpResult<UpdateTaskResult> {
         self.require_modern_tasks_era()?;
         execution.ensure_task_operation(|operation| {
-            matches!(operation, TaskExecutionOperation::Update(_))
+            matches!(operation, TaskExecutionOperation::Update)
         })?;
         let response = self.wait(cx, execution)?;
         decode_task_response(&response, "tasks/update")
@@ -2200,7 +2185,7 @@ where
     ) -> McpResult<CancelTaskResult> {
         self.require_modern_tasks_era()?;
         execution.ensure_task_operation(|operation| {
-            matches!(operation, TaskExecutionOperation::Cancel(_))
+            matches!(operation, TaskExecutionOperation::Cancel)
         })?;
         let response = self.wait(cx, execution)?;
         decode_task_response(&response, "tasks/cancel")
@@ -3475,7 +3460,10 @@ pub struct RequestExecution<T> {
     generation: u64,
     owner_dropped: OwnerDropped,
     state: SharedExecutorState<T>,
+    // Only the Tasks decoders re-read the request that opened an execution.
+    #[cfg(feature = "tasks")]
     method: String,
+    #[cfg(feature = "tasks")]
     params: Option<Value>,
     #[cfg(feature = "tasks")]
     task_operation: Option<TaskExecutionOperation>,
@@ -3789,6 +3777,7 @@ mod tests {
         JsonRpcMessage::Response(JsonRpcResponse::success(RequestId::Number(id), result))
     }
 
+    #[cfg(feature = "tasks")]
     fn source_frame(message: JsonRpcMessage) -> ReceivedTransportFrame {
         let source = serde_json::to_vec(&message).expect("scripted message serializes");
         ReceivedTransportFrame::admit(source.into_boxed_slice())
@@ -5777,13 +5766,14 @@ mod tests {
             },
         ));
 
-        let (missing, missing_diagnostic) = decode_core_result_with_cache_ttl(
+        let (missing, missing_diagnostic) = decode_core_result_with_cache_ttl_from_source(
             &request,
             &serde_json::json!({
                 "resultType": "complete",
                 "tools": [],
                 "cacheScope": "private",
             }),
+            None,
         )
         .expect("a missing peer TTL is normalized to zero freshness");
         assert_eq!(missing_diagnostic, Some(FinalCacheTtlDiagnostic::Missing));
@@ -5794,7 +5784,7 @@ mod tests {
                     && result.payload.ttl_ms.as_str() == "0"
         ));
 
-        let (negative, negative_diagnostic) = decode_core_result_with_cache_ttl(
+        let (negative, negative_diagnostic) = decode_core_result_with_cache_ttl_from_source(
             &request,
             &serde_json::json!({
                 "resultType": "complete",
@@ -5802,6 +5792,7 @@ mod tests {
                 "ttlMs": -1.5,
                 "cacheScope": "private",
             }),
+            None,
         )
         .expect("a negative peer TTL is normalized to zero freshness");
         assert_eq!(negative_diagnostic, Some(FinalCacheTtlDiagnostic::Negative));
@@ -5848,7 +5839,7 @@ mod tests {
         );
 
         assert!(
-            decode_core_result_with_cache_ttl(
+            decode_core_result_with_cache_ttl_from_source(
                 &request,
                 &serde_json::json!({
                     "resultType": "complete",
@@ -5856,6 +5847,7 @@ mod tests {
                     "ttlMs": 1.5,
                     "cacheScope": "private",
                 }),
+                None,
             )
             .is_err()
         );
