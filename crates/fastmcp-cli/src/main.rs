@@ -12556,10 +12556,10 @@ mod tests {
                     );
                     let response =
                         serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": discovery});
-                    format!("IFS= read -r init || exit 90\nprintf '%s\\n' '{response}'")
+                    format!("IFS= read -r init || fail 90 init-eof\nprintf '%s\\n' '{response}'")
                 } else {
                     format!(
-                        "IFS= read -r init || exit 90\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{\"tools\":{{}},\"resources\":{{}},\"prompts\":{{}}}},\"serverInfo\":{{\"name\":\"{subject}\",\"version\":\"1\"}}}}}}'\nIFS= read -r initialized || exit 91"
+                        "IFS= read -r init || fail 90 init-eof\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{\"tools\":{{}},\"resources\":{{}},\"prompts\":{{}}}},\"serverInfo\":{{\"name\":\"{subject}\",\"version\":\"1\"}}}}}}'\nIFS= read -r initialized || fail 91 initialized-eof"
                     )
                 };
                 let methods = if inspect {
@@ -12572,7 +12572,12 @@ mod tests {
                 } else {
                     ["ping", "tools/list", "resources/list", "prompts/list"]
                 };
-                let mut script = handshake;
+                // Every early exit names itself and what it read on the
+                // inherited stderr, so a failed run shows which step broke.
+                let mut script = String::from(
+                    "fail() { printf 'CLI_CORE_SCRIPT exit %s: %s\\n' \"$1\" \"$2\" >&2; exit \"$1\"; }\n",
+                );
+                script.push_str(&handshake);
                 for (index, method) in methods.into_iter().enumerate() {
                     let id = index + 2;
                     let mut result = match method {
@@ -12598,17 +12603,17 @@ mod tests {
                     }
                     script.push_str(&format!(
                         r#"
-IFS= read -r request || exit 92
+IFS= read -r request || fail 92 request-eof
 case "$request" in
     *'"method":"notifications/cancelled"'*) exit 0 ;;
     *'"method":"{method}"'*'"id":{id}'*) ;;
-    *) exit 93 ;;
+    *) fail 93 "$request" ;;
 esac
-printf '%s' '{id}' > {ready}
+printf '%s' '{id}' > {ready} || fail 95 ready-write
 remaining=1000
 while [ "$(cat {release})" != '{id}' ]; do
     remaining=$((remaining - 1))
-    [ "$remaining" -gt 0 ] || exit 94
+    [ "$remaining" -gt 0 ] || fail 94 release-timeout
     sleep 0.01
 done
 printf '%s\n' '{{"jsonrpc":"2.0","id":{id},"result":{result}}}'
@@ -12662,28 +12667,12 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":{id},"result":{result}}}'
                         if cancel {
                             let error = outcome.unwrap_err();
                             assert!(cx.checkpoint().is_err());
-                            // INVERTED DELIBERATELY on 2026-09-17. This read
-                            // `assert!(!is_cleanup_unverified(&error))` and
-                            // encoded a contract the system no longer offers.
-                            //
-                            // FND-04 landed `Transport::close(&Cx)` in 53584e04
-                            // and cf8126cb, making stdio close CONSUME the
-                            // caller's budget. See the reasoning at
-                            // crates/fastmcp-transport/src/stdio.rs:921-931: a
-                            // cancelled caller is not made to wait on real
-                            // blocking pipe I/O, and the transport is left
-                            // untouched so the caller may retry or escalate.
-                            // `flush()` therefore never runs under cancellation,
-                            // so cleanup genuinely IS unverified and the flag is
-                            // reporting a true fact. The old assertion was
-                            // written 2026-09-07, ten days before that change.
-                            //
-                            // This was not tuned until it passed. The assertion
-                            // is inverted because the guarantee inverted.
+                            // Since ff469df6 the client finishes retiring its
+                            // unbuffered child pipes under a cancelled Cx, so a
+                            // cancelled command reports only its cancellation.
                             assert!(
-                                fastmcp_client::is_cleanup_unverified(&error),
-                                "a cancelled teardown must REPORT cleanup as unverified \
-                                 rather than claim a flush it never performed: {error}"
+                                !fastmcp_client::is_cleanup_unverified(&error),
+                                "a cancelled teardown still retires the stdio pipes: {error}"
                             );
                             if inspect {
                                 assert_eq!(error.code, fastmcp_core::McpErrorCode::RequestCancelled, "{error}");
@@ -12691,26 +12680,9 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":{id},"result":{result}}}'
                                 assert!(error.message.contains("Some tests failed"), "{error}");
                             }
                         } else {
-                            // PAIRED NEGATIVE for the assertion above, and it is
-                            // load-bearing rather than decorative.
-                            //
-                            // The worthless implementation this excludes: one
-                            // that marks EVERY error cleanup-unverified,
-                            // unconditionally. Such an implementation satisfies
-                            // the cancelled branch perfectly while proving
-                            // nothing, because the flag would no longer
-                            // distinguish anything.
-                            //
-                            // It cannot survive this line. With no cancellation
-                            // the operation and the cleanup both succeed, so
-                            // `combine_operation_and_cleanup(Ok, Ok)` must yield
-                            // `Ok` (crates/fastmcp-client/src/lib.rs:2735). An
-                            // always-marking implementation has to produce an
-                            // `Err` to carry its flag, and would fail here.
-                            outcome.expect(
-                                "an uncancelled run must complete with cleanup verified, \
-                                 so the flag above discriminates rather than always firing",
-                            );
+                            // The same command without cancellation must finish
+                            // every request and its cleanup.
+                            outcome.expect("an uncancelled run must complete with cleanup verified");
                         }
                         sibling_root.checkpoint().unwrap();
                         let releases = sibling.join(&sibling_root).await.unwrap();
