@@ -15761,8 +15761,12 @@ IFS= read -r end
         use fastmcp_protocol::JsonRpcRequest;
         use fastmcp_transport::http::{HttpMethod, HttpRequest, HttpStatus};
         use std::future::Future;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::task::Poll;
+
+        // Concurrent probes can read the same clock value, so a process-wide
+        // sequence keeps each control directory unique.
+        static PROBES: AtomicUsize = AtomicUsize::new(0);
 
         // Same peer and operation: 0=success, 1=upstream error, 2=cancel,
         // 3=deadline, 4=drop. Every negative retries on the same connection.
@@ -15777,8 +15781,9 @@ IFS= read -r end
             .build()
             .unwrap();
         let control = std::env::temp_dir().join(format!(
-            "fastmcp-resource-hooks-{}-{}",
+            "fastmcp-resource-hooks-{}-{}-{}",
             std::process::id(),
+            PROBES.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -16100,6 +16105,33 @@ IFS= read -r end
                 for interrupt in 1..=4 {
                     proxy_resource_hooks_caller_runtime_probe(http, unsubscribe, interrupt);
                 }
+            }
+        }
+    }
+
+    /// The positive probe has failed only inside the full lib suite, where
+    /// other tests compete for CPU, threads, descriptors and child processes.
+    /// Running every positive combination concurrently puts that contention
+    /// on one test, so a load-only stall can recur without the rest of the
+    /// suite and reports the probe's own diagnostics when it does.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn proxy_resource_hooks_caller_runtime_positive_under_concurrent_probes() {
+        let probes = thread::available_parallelism().map_or(4, |cores| cores.get().clamp(4, 16));
+        let running: Vec<_> = (0..probes)
+            .map(|index| {
+                thread::spawn(move || {
+                    proxy_resource_hooks_caller_runtime_probe(
+                        index % 2 == 0,
+                        index / 2 % 2 == 1,
+                        0,
+                    );
+                })
+            })
+            .collect();
+        for probe in running {
+            if let Err(panic) = probe.join() {
+                std::panic::resume_unwind(panic);
             }
         }
     }
