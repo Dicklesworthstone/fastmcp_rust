@@ -3677,14 +3677,18 @@ fn uses_compact_nullable_schema(ty: &Type) -> bool {
     };
     match segment.ident.to_string().as_str() {
         "String" | "str" | "char" | "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8"
-        | "u16" | "u32" | "u64" | "u128" | "usize" | "f32" | "f64" | "bool" | "Vec"
-        | "HashSet" | "BTreeSet" | "HashMap" | "BTreeMap" | "Value" => true,
+        | "u16" | "u32" | "u64" | "u128" | "usize" | "f32" | "f64" | "bool" | "Vec" | "HashSet"
+        | "BTreeSet" | "HashMap" | "BTreeMap" | "Value" => true,
         "Option" => option_inner_type(ty).is_some_and(uses_compact_nullable_schema),
         _ => false,
     }
 }
 
 /// Generates a JSON schema type for a Rust type.
+///
+/// The result may be a block expression. `json!` reads a brace-delimited
+/// value as an object literal, so a splice into a `json!` value position must
+/// be parenthesized.
 fn type_to_json_schema(ty: &Type) -> TokenStream2 {
     match ty {
         Type::Tuple(tuple) if tuple.elems.is_empty() => {
@@ -3696,7 +3700,7 @@ fn type_to_json_schema(ty: &Type) -> TokenStream2 {
             return quote! {
                 serde_json::json!({
                     "type": "array",
-                    "prefixItems": [#(#items),*],
+                    "prefixItems": [#((#items)),*],
                     "minItems": #length,
                     "maxItems": #length,
                 })
@@ -3711,7 +3715,7 @@ fn type_to_json_schema(ty: &Type) -> TokenStream2 {
                 // Unit arrays carry no element payload, even for large lengths.
                 serde_json::json!({
                     "type": "array",
-                    "items": #items,
+                    "items": (#items),
                     "minItems": ([(); #length].len()),
                     "maxItems": ([(); #length].len()),
                 })
@@ -3720,7 +3724,7 @@ fn type_to_json_schema(ty: &Type) -> TokenStream2 {
         Type::Slice(slice) => {
             let items = type_to_json_schema(&slice.elem);
             return quote! {
-                serde_json::json!({ "type": "array", "items": #items })
+                serde_json::json!({ "type": "array", "items": (#items) })
             };
         }
         Type::Paren(paren) => return type_to_json_schema(&paren.elem),
@@ -3838,7 +3842,7 @@ fn type_to_json_schema(ty: &Type) -> TokenStream2 {
                     return quote! {
                         serde_json::json!({
                             "type": "array",
-                            "items": #inner_schema
+                            "items": (#inner_schema)
                         })
                     };
                 }
@@ -3853,7 +3857,7 @@ fn type_to_json_schema(ty: &Type) -> TokenStream2 {
                     return quote! {
                         serde_json::json!({
                             "type": "array",
-                            "items": #inner_schema,
+                            "items": (#inner_schema),
                             "uniqueItems": true
                         })
                     };
@@ -3872,7 +3876,7 @@ fn type_to_json_schema(ty: &Type) -> TokenStream2 {
                         return quote! {
                             serde_json::json!({
                                 "type": "object",
-                                "additionalProperties": #value_schema
+                                "additionalProperties": (#value_schema)
                             })
                         };
                     }
@@ -6170,7 +6174,9 @@ pub fn derive_json_schema(input: TokenStream) -> TokenStream {
         syn::Data::Struct(data_struct) => {
             generate_struct_schema(data_struct, &type_desc_tokens, &serde_attrs)
         }
-        syn::Data::Enum(data_enum) => generate_enum_schema(data_enum, &type_desc_tokens, &serde_attrs),
+        syn::Data::Enum(data_enum) => {
+            generate_enum_schema(data_enum, &type_desc_tokens, &serde_attrs)
+        }
         syn::Data::Union(_) => {
             return syn::Error::new_spanned(input, "JsonSchema cannot be derived for unions")
                 .to_compile_error()
@@ -6410,9 +6416,8 @@ fn symmetric_schema_serde_name(meta: &Meta) -> syn::Result<String> {
             }
         }
     } else if let Meta::List(list) = meta {
-        let entries = list.parse_args_with(
-            syn::punctuated::Punctuated::<Meta, Token![,]>::parse_terminated,
-        )?;
+        let entries =
+            list.parse_args_with(syn::punctuated::Punctuated::<Meta, Token![,]>::parse_terminated)?;
         let mut serialize = None;
         let mut deserialize = None;
         for entry in entries {
@@ -6437,7 +6442,10 @@ fn symmetric_schema_serde_name(meta: &Meta) -> syn::Result<String> {
             "JsonSchema needs identical serialize and deserialize names; use a shared serde rename or implement json_schema() explicitly",
         ));
     }
-    Err(syn::Error::new_spanned(meta, "expected a serde name string"))
+    Err(syn::Error::new_spanned(
+        meta,
+        "expected a serde name string",
+    ))
 }
 
 /// Generates JSON Schema for a struct.
@@ -6695,7 +6703,7 @@ fn generate_enum_schema(
                             serde_json::json!({
                                 "type": "object",
                                 "properties": {
-                                    #variant_name: #payload_schema
+                                    #variant_name: (#payload_schema)
                                 },
                                 "required": [#variant_name],
                                 "additionalProperties": false

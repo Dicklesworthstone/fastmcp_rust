@@ -3801,9 +3801,11 @@ fn json_schema_external_enum_accepts_actual_serde_payloads() {
     schema
         .validate(&json!({"Record": {"count": 3}}))
         .expect("omitted Option field stays optional inside a variant");
-    assert!(schema.schema()["oneOf"][4]["properties"]["EmptyTuple"]
-        .get("prefixItems")
-        .is_none());
+    assert!(
+        schema.schema()["oneOf"][4]["properties"]["EmptyTuple"]
+            .get("prefixItems")
+            .is_none()
+    );
     assert_eq!(
         schema.schema()["oneOf"][3]["properties"]["Record"]["properties"]["count"]["description"],
         "Required work count."
@@ -3874,9 +3876,11 @@ fn json_schema_external_enum_reaches_registered_modern_tool() {
         assert!(response.error.is_none(), "{:?}", response.error);
         let result = response.result.expect("enum tool produced a result");
         assert_eq!(result["resultType"], "complete");
-        assert!(result["content"][0]["text"]
-            .as_str()
-            .is_some_and(|text| !text.is_empty()));
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        );
     }
 }
 
@@ -4033,6 +4037,71 @@ fn json_schema_recursive_generic_instances_and_shared_pointers_do_not_alias() {
     let mut invalid = valid;
     invalid["shared"]["value"] = json!(false);
     assert!(pointers.validate(&invalid).is_err());
+}
+
+/// Every container splices its element schema into a `json!` value position;
+/// a derived element expands to a block there.
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DerivedElementContainers {
+    array: [RecursiveSchemaNode; 2],
+    pair: (RecursiveSchemaNode, u8),
+    by_name: std::collections::BTreeMap<String, RecursiveSchemaNode>,
+    unique: std::collections::BTreeSet<ContainerElementTag>,
+    maybe: Vec<Option<RecursiveSchemaNode>>,
+}
+
+#[derive(
+    Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
+enum ContainerElementTag {
+    Hot,
+    Cold(u8),
+}
+
+#[test]
+fn json_schema_derived_elements_inside_every_container_admit_serde_payloads() {
+    let schema = fastmcp_rust::schema::admit_final_schema(DerivedElementContainers::json_schema())
+        .expect("container element schemas are valid final-dialect schemas");
+    let leaf = || RecursiveSchemaNode {
+        value: 1,
+        children: Vec::new(),
+    };
+    let value = DerivedElementContainers {
+        array: [leaf(), leaf()],
+        pair: (leaf(), 7),
+        by_name: [("a".to_owned(), leaf())].into_iter().collect(),
+        unique: [ContainerElementTag::Hot, ContainerElementTag::Cold(2)]
+            .into_iter()
+            .collect(),
+        maybe: vec![Some(leaf()), None],
+    };
+    let encoded = serde_json::to_value(&value).expect("containers serialize");
+    schema
+        .validate(&encoded)
+        .expect("actual Serde payload must be admitted");
+    for (pointer, wrong) in [
+        ("/array/1/value", json!("one")),
+        ("/pair/0/children", json!({})),
+        ("/by_name/a/extra", json!(true)),
+        ("/unique/1", json!({"Cold": "two"})),
+        ("/maybe/0/value", json!(null)),
+    ] {
+        let mut invalid = encoded.clone();
+        let (parent, key) = pointer.rsplit_once('/').unwrap();
+        let target = invalid.pointer_mut(parent).unwrap();
+        match target {
+            serde_json::Value::Array(items) => items[key.parse::<usize>().unwrap()] = wrong,
+            serde_json::Value::Object(map) => {
+                map.insert(key.to_owned(), wrong);
+            }
+            other => panic!("{pointer} parent is not a container: {other}"),
+        }
+        assert!(
+            schema.validate(&invalid).is_err(),
+            "{pointer} must reject a wrong element payload"
+        );
+    }
 }
 
 static RECURSIVE_SCHEMA_TOOL_CALLS: std::sync::atomic::AtomicUsize =
@@ -4290,7 +4359,10 @@ fn optional_schema_argument_pairs() -> [(serde_json::Value, serde_json::Value); 
             json!({"mixed": {"Pair": ["work", 3]}}),
             json!({"mixed": {"Pair": ["work"]}}),
         ),
-        (json!({"constant": "Allowed"}), json!({"constant": "Denied"})),
+        (
+            json!({"constant": "Allowed"}),
+            json!({"constant": "Denied"}),
+        ),
         (
             json!({"conjunction": "Allowed"}),
             json!({"conjunction": "Denied"}),
@@ -4416,8 +4488,7 @@ fn json_schema_optional_custom_types_reach_registered_modern_tool() {
         json!({"unit": "First", "mixed": {"Pair": ["work", 3]}, "constant": "Allowed",
             "conjunction": "Allowed", "already_nullable": "Allowed"}),
     ] {
-        let expected: OptionalSchemaArguments =
-            serde_json::from_value(arguments.clone()).unwrap();
+        let expected: OptionalSchemaArguments = serde_json::from_value(arguments.clone()).unwrap();
         let before = OPTIONAL_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
         let response = server
             .dispatch_stateless(&facade_final_inbound(&connection), &request(arguments))
@@ -4638,7 +4709,10 @@ enum SerdeWireEnum {
 }
 
 #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
-#[serde(rename_all(serialize = "SCREAMING-KEBAB-CASE", deserialize = "SCREAMING-KEBAB-CASE"))]
+#[serde(rename_all(
+    serialize = "SCREAMING-KEBAB-CASE",
+    deserialize = "SCREAMING-KEBAB-CASE"
+))]
 enum SerdeWireUnitEnum {
     HTTP2Ready,
     #[serde(rename(serialize = "ready-now", deserialize = "ready-now"))]
@@ -4674,7 +4748,10 @@ fn json_schema_serde_enum_names_and_field_rules_match_wire_values() {
         assert!(serde_json::from_value::<SerdeWireEnum>(value).is_err());
     }
     let units = fastmcp_rust::schema::admit_final_schema(SerdeWireUnitEnum::json_schema()).unwrap();
-    assert_eq!(units.schema()["enum"], json!(["H-T-T-P2-READY", "ready-now"]));
+    assert_eq!(
+        units.schema()["enum"],
+        json!(["H-T-T-P2-READY", "ready-now"])
+    );
     for value in [SerdeWireUnitEnum::HTTP2Ready, SerdeWireUnitEnum::ReadyNow] {
         let encoded = serde_json::to_value(&value).unwrap();
         units.validate(&encoded).unwrap();
@@ -4917,10 +4994,9 @@ fn json_schema_tuple_and_array_shapes_match_serde() {
     {
         // The array type gives these unsuffixed literals a usize context.
         // Losing that context produces a negative bound or overflows an i32 shift.
-        let inferred = fastmcp_rust::schema::admit_final_schema(
-            ShapedSchemaInferredArray::json_schema(),
-        )
-        .unwrap();
+        let inferred =
+            fastmcp_rust::schema::admit_final_schema(ShapedSchemaInferredArray::json_schema())
+                .unwrap();
         let value = ShapedSchemaInferredArray([7]);
         let encoded = serde_json::to_value(&value).unwrap();
         inferred.validate(&encoded).unwrap();
@@ -4932,10 +5008,8 @@ fn json_schema_tuple_and_array_shapes_match_serde() {
         assert_eq!(inferred.schema()["maxItems"], 1);
         assert!(inferred.validate(&json!([7, 8])).is_err());
     }
-    let hygienic = fastmcp_rust::schema::admit_final_schema(
-        ShapedSchemaHygienicArray::json_schema(),
-    )
-    .unwrap();
+    let hygienic =
+        fastmcp_rust::schema::admit_final_schema(ShapedSchemaHygienicArray::json_schema()).unwrap();
     let value = ShapedSchemaHygienicArray([[7, 8]]);
     let encoded = serde_json::to_value(&value).unwrap();
     hygienic.validate(&encoded).unwrap();
