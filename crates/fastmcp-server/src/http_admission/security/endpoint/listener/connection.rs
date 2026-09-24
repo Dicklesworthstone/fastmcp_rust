@@ -29,7 +29,7 @@ use crate::{
     h1_request_to_transport, h1_transport_authorization, http_endpoint_error_response,
     http_endpoint_response_to_static, http_request_accepts_sse, native_http1_codec,
     next_live_modern_http_response_body_generation, next_modern_http_stream_generation,
-    request_id_to_u64, send_h1_bad_request_response, send_h1_response,
+    pop_sse_body_event, request_id_to_u64, send_h1_bad_request_response, send_h1_response,
     spawn_modern_sse_dispatch, sse_response_head,
 };
 
@@ -442,7 +442,7 @@ async fn sse(
         loop {
             if let Some(lease) = lease.as_mut() { lease.check(cx).map_err(|_| ())?; }
             if terminal.is_settled() { return Err(()); }
-            match response.pop_event() {
+            match pop_sse_body_event(&response) {
                 Ok(Some(event)) => {
                     let control = final_subscription_terminal_event(&event);
                     let complete = final_subscription_terminal_response_event(&event);

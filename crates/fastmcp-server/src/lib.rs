@@ -4342,16 +4342,7 @@ impl ServerHttpSseResponse {
         if self.terminal_delivery.is_settled() {
             return Err(ServerHttpEndpointError::Closed);
         }
-        let popped = match self.inner.pop_event() {
-            // `pop_event` is a non-blocking observation. A producer may hold
-            // the response mailbox for the few instructions needed to
-            // commit an event; that contention means "nothing observable
-            // yet", not that the public response body has failed.
-            Err(DualEraHttpEndpointError::Transport(error))
-                if retryable_http_sse_transport_error(&error) =>
-            {
-                return Ok(None);
-            }
+        let popped = match pop_sse_body_event(&self.inner) {
             // A peer/session close cancels the transport body directly; with
             // no committed terminal sequence that is this body's clean close,
             // not a transport failure the reader must distinguish.
@@ -4417,6 +4408,27 @@ fn retryable_http_sse_endpoint_error(error: &DualEraHttpEndpointError) -> bool {
         error,
         DualEraHttpEndpointError::Transport(error) if retryable_http_sse_transport_error(error)
     )
+}
+
+/// Observes one event of a request-owned SSE body without blocking. Every
+/// server-side reader (the public response and both live writers) uses this.
+fn pop_sse_body_event(
+    response: &DualEraHttpSseResponse,
+) -> Result<Option<SseEvent>, DualEraHttpEndpointError> {
+    sse_body_observation(response.pop_event())
+}
+
+/// A producer may hold the response mailbox for the few instructions needed to
+/// commit an event. That contention means "nothing observable yet", not that
+/// the body failed; a writer that treated it as fatal dropped a live
+/// `subscriptions/listen` connection mid-stream.
+fn sse_body_observation(
+    popped: Result<Option<SseEvent>, DualEraHttpEndpointError>,
+) -> Result<Option<SseEvent>, DualEraHttpEndpointError> {
+    match popped {
+        Err(error) if retryable_http_sse_endpoint_error(&error) => Ok(None),
+        popped => popped,
+    }
 }
 
 /// Serializes a request-owned modern HTTP SSE commit through transient
@@ -11087,7 +11099,7 @@ async fn send_modern_sse_stream(
             if terminal_delivery.is_settled() {
                 return Err(());
             }
-            match response.pop_event() {
+            match pop_sse_body_event(&response) {
                 Ok(Some(event)) => {
                     let terminal_control = final_subscription_terminal_event(&event);
                     let terminal_response = final_subscription_terminal_response_event(&event);
@@ -54460,6 +54472,124 @@ mod lib_unit_tests {
             1,
             "server termination must discard the queued event and modern HTTP emits no stdio cancellation control"
         );
+    }
+
+    #[test]
+    fn sse_body_observation_treats_only_mailbox_contention_as_pending() {
+        let busy = DualEraHttpEndpointError::Transport(TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "streamable response mailbox is busy",
+        )));
+        assert!(matches!(sse_body_observation(Err(busy)), Ok(None)));
+        // Near-identical negative: the same transport I/O failure of another
+        // kind is a real body failure and must still end the stream.
+        let broken = DualEraHttpEndpointError::Transport(TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "streamable response mailbox is busy",
+        )));
+        assert!(matches!(
+            sse_body_observation(Err(broken)),
+            Err(DualEraHttpEndpointError::Transport(TransportError::Io(error)))
+                if error.kind() == std::io::ErrorKind::BrokenPipe
+        ));
+    }
+
+    /// bd-a8tbq: a live writer read its body while a handler committed a
+    /// notification, saw the mailbox busy, and dropped the listen connection.
+    #[test]
+    fn live_listen_body_reader_survives_concurrent_notification_commits() {
+        const COMMITS: usize = 2_000;
+        run_live_http_test(|cx| async move {
+            let endpoint = Server::new("public-http-listen-contention", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
+                .build_http_endpoint("http://legacy.test")
+                .map_err(|error| format!("public endpoint setup failed: {error}"))?;
+            let mut session = endpoint
+                .open_session(&cx)
+                .map_err(|error| format!("public listen session failed: {error}"))?;
+            let listen = JsonRpcRequest::new(
+                SUBSCRIPTIONS_LISTEN,
+                Some(serde_json::json!({
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                    },
+                    "notifications": {"toolsListChanged": true},
+                })),
+                RequestId::Number(885),
+            );
+            let request = HttpRequest::new(HttpMethod::Post, "/mcp")
+                .with_header("content-type", "application/json")
+                .with_header("accept", "text/event-stream")
+                .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+                .with_header("mcp-method", SUBSCRIPTIONS_LISTEN)
+                .with_body(
+                    serde_json::to_vec(&listen).expect("typed listen request must serialize"),
+                );
+            let ServerHttpEndpointResponse::ModernSse(sse) = session
+                .handle_async(&cx, request)
+                .await
+                .map_err(|error| format!("public listen failed: {error}"))?
+            else {
+                return Err("public listen did not return SSE".to_owned());
+            };
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match sse.pop_event() {
+                    Ok(Some(_acknowledgement)) => break,
+                    Ok(None) if Instant::now() < deadline => {
+                        asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                    }
+                    Ok(None) => return Err("public listen acknowledgement timed out".to_owned()),
+                    Err(error) => return Err(format!("public listen closed early: {error}")),
+                }
+            }
+
+            // Commit from another thread while this one keeps reading, so the
+            // two sides contend for the response mailbox as a live handler
+            // and the listen writer do.
+            let sender = sse.inner.sender();
+            let producer = thread::spawn(move || {
+                let cx = Cx::for_testing();
+                for index in 0..COMMITS {
+                    let notification = JsonRpcRequest::notification(
+                        "notifications/resources/updated",
+                        Some(serde_json::json!({"uri": format!("file:///contention/{index}")})),
+                    );
+                    loop {
+                        match sender.send_notification(&cx, notification.clone()) {
+                            Ok(()) => break,
+                            Err(error) if retryable_http_sse_transport_error(&error) => {
+                                thread::yield_now();
+                            }
+                            Err(error) => return Err(format!("commit {index} failed: {error}")),
+                        }
+                    }
+                }
+                Ok(())
+            });
+            let mut received = 0;
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while received < COMMITS {
+                match pop_sse_body_event(&sse.inner) {
+                    Ok(Some(_)) => received += 1,
+                    Ok(None) if Instant::now() < deadline => thread::yield_now(),
+                    Ok(None) => {
+                        return Err(format!("only {received} of {COMMITS} commits were observed"));
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "contention ended the live body after {received} events: {error}"
+                        ));
+                    }
+                }
+            }
+            producer
+                .join()
+                .map_err(|_| "notification producer panicked".to_owned())??;
+            Ok(())
+        });
     }
 
     #[test]
