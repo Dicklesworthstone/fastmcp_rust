@@ -2361,7 +2361,7 @@ mod bd_6rfrg_sampling_bridge {
     /// handler, differing only in which trait method carries the body, that
     /// demonstrates the assertion there CAN come out the other way.
     #[test]
-    #[ignore = "bd-6rfrg: this host structurally cannot sample. A hand-rolled in-memory Transport has no reverse-request sender, so `bidirectional_senders` returns None at lib.rs:1413 before capabilities are read (legacy era), and the `_meta` capability reader exists only in serve_modern_http_connection (modern era). The live fixture is e2e_public_http_bd_6rfrg_sync_call_cannot_complete_the_sampling_body in crates/fastmcp/tests/e2e_modern_http.rs. Rung 0 below still runs and still asserts something true about THIS transport, so it is not ignored."]
+    #[ignore = "bd-6rfrg: this host structurally cannot sample. A hand-rolled in-memory Transport has no reverse-request sender, so `bidirectional_senders` returns None at lib.rs:1413 before capabilities are read (legacy era), and the `_meta` capability reader exists only in serve_modern_http_connection (modern era). The live fixtures are e2e_public_http_bd_6rfrg_sync_bridge_completes_the_sampling_round_trip and e2e_public_http_bd_6rfrg_driver_bridge_is_diagnosed_not_hung in crates/fastmcp/tests/e2e_modern_http.rs. Rung 0 below still runs and still asserts something true about THIS transport, so it is not ignored."]
     fn bd_6rfrg_sampling_is_live_when_the_handler_awaits_it_directly() {
         let outcome = run_sampling_arm(SamplingArm::DeclaredAsync);
         require_the_harness_answered(&outcome, "control");
@@ -2392,7 +2392,7 @@ mod bd_6rfrg_sampling_bridge {
     /// `NoOutcomeWithinBound` is the silent hang the bead was filed for, while
     /// `Errored` would mean the failure is already nameable.
     #[test]
-    #[ignore = "bd-6rfrg: this host structurally cannot sample. A hand-rolled in-memory Transport has no reverse-request sender, so `bidirectional_senders` returns None at lib.rs:1413 before capabilities are read (legacy era), and the `_meta` capability reader exists only in serve_modern_http_connection (modern era). The live fixture is e2e_public_http_bd_6rfrg_sync_call_cannot_complete_the_sampling_body in crates/fastmcp/tests/e2e_modern_http.rs. Rung 0 below still runs and still asserts something true about THIS transport, so it is not ignored."]
+    #[ignore = "bd-6rfrg: this host structurally cannot sample. A hand-rolled in-memory Transport has no reverse-request sender, so `bidirectional_senders` returns None at lib.rs:1413 before capabilities are read (legacy era), and the `_meta` capability reader exists only in serve_modern_http_connection (modern era). The live fixtures are e2e_public_http_bd_6rfrg_sync_bridge_completes_the_sampling_round_trip and e2e_public_http_bd_6rfrg_driver_bridge_is_diagnosed_not_hung in crates/fastmcp/tests/e2e_modern_http.rs. Rung 0 below still runs and still asserts something true about THIS transport, so it is not ignored."]
     fn bd_6rfrg_the_required_sync_call_cannot_complete_the_same_sampling_body() {
         let outcome = run_sampling_arm(SamplingArm::RequiredSyncCall);
         println!("bd-6rfrg G1 sync arm: {outcome:?}");
@@ -2452,7 +2452,7 @@ mod bd_6rfrg_sampling_bridge {
     /// run reports `Completed`, this test is asserting a false rejection and the
     /// remedy must be reverted rather than this test kept.
     #[test]
-    #[ignore = "bd-6rfrg: this host structurally cannot sample. A hand-rolled in-memory Transport has no reverse-request sender, so `bidirectional_senders` returns None at lib.rs:1413 before capabilities are read (legacy era), and the `_meta` capability reader exists only in serve_modern_http_connection (modern era). The live fixture is e2e_public_http_bd_6rfrg_sync_call_cannot_complete_the_sampling_body in crates/fastmcp/tests/e2e_modern_http.rs. Rung 0 below still runs and still asserts something true about THIS transport, so it is not ignored."]
+    #[ignore = "bd-6rfrg: this host structurally cannot sample. A hand-rolled in-memory Transport has no reverse-request sender, so `bidirectional_senders` returns None at lib.rs:1413 before capabilities are read (legacy era), and the `_meta` capability reader exists only in serve_modern_http_connection (modern era). The live fixtures are e2e_public_http_bd_6rfrg_sync_bridge_completes_the_sampling_round_trip and e2e_public_http_bd_6rfrg_driver_bridge_is_diagnosed_not_hung in crates/fastmcp/tests/e2e_modern_http.rs. Rung 0 below still runs and still asserts something true about THIS transport, so it is not ignored."]
     fn bd_6rfrg_the_sync_sampling_bridge_is_diagnosed_not_silent() {
         let subject = run_sampling_arm(SamplingArm::RequiredSyncCall);
         let negative = run_sampling_arm(SamplingArm::DeclaredAsync);

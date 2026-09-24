@@ -28917,6 +28917,52 @@ impl ToolHandler for PublicHttpSyncSampleTool {
     }
 }
 
+const PUBLIC_HTTP_DRIVER_BRIDGE_SAMPLE_TOOL_NAME: &str = "public-http-e2e-driver-bridge-sample";
+
+/// bd-6rfrg: the same `block_on(ctx.sample(..))` bridge, but from an async
+/// hook, so exact-2024 HTTP polls it on the connection's runtime driver rather
+/// than on the blocking lane. That position cannot deliver the reply, so the
+/// bridge must be refused by name instead of parking.
+struct PublicHttpDriverBridgeSampleTool;
+
+impl ToolHandler for PublicHttpDriverBridgeSampleTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PUBLIC_HTTP_DRIVER_BRIDGE_SAMPLE_TOOL_NAME.to_owned(),
+            description: Some("bd-6rfrg: bridges sampling from the runtime driver".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        Err(McpError::internal_error(
+            "public-http-e2e-driver-bridge-sample is request-owned async",
+        ))
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Async
+    }
+
+    fn call_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
+        Box::pin(async move {
+            match fastmcp_core::block_on(ctx.sample("echo", 16)) {
+                Ok(response) => Outcome::Ok(vec![Content::text(response.text)]),
+                Err(error) => Outcome::Err(error),
+            }
+        })
+    }
+}
+
 fn spawn_legacy_sample_http_server() -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
@@ -28936,6 +28982,7 @@ fn spawn_legacy_sample_http_server() -> HttpServerFixture {
                 .expect("LegacyOnly is available")
                 .tool(PublicHttpSampleTool)
                 .tool(PublicHttpSyncSampleTool)
+                .tool(PublicHttpDriverBridgeSampleTool)
                 .build();
             let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
                 Ok(bound) => bound,
@@ -29386,25 +29433,11 @@ fn e2e_public_http_legacy_sampling_callback_reaches_context() {
     server.shutdown();
 }
 
-/// bd-6rfrg G1 and G5, on the harness that PROVES the round trip.
-///
-/// THE LADDER COLLAPSES TO ONE TEST HERE, because this file already supplies
-/// the rungs beneath it as passing tests:
-///   rung 0, the harness answers a tools/call --
-///     `e2e_public_http_legacy_filesystem_provider_lists_and_reads_live_file`
-///   rung 1, sampling is LIVE through this exact fixture --
-///     `e2e_public_http_legacy_sampling_callback_reaches_context`, which asserts
-///     the async twin returns PUBLIC_HTTP_SAMPLED_TEXT and that the client's
-///     callback fired exactly once.
-/// Three hand-built fixtures failed to reach a live sample before this; the
-/// defect each time was building a harness instead of borrowing a proven one.
-///
-/// `callback_calls` is the discriminator this harness gives away for free:
-///   0 -> the reverse request NEVER WENT OUT; the bridge failed before the peer.
-///   1 -> it went out and was answered, and the bridge did not deliver it.
-#[test]
-#[ignore = "bd-6rfrg G3 END-TO-END, GATED ON bd-fnd04-b7-4rkp9. This arm asserts the user-visible diagnosis and CANNOT pass while fastmcp-server/src/lib.rs:11465 bridges the HTTP dispatch with the framework's own block_on: a user handler's block_on is then a NESTED bridge, BridgeEntry::enter's pre-existing assert panics before ctx.sample is polled, and the router redacts it to \"Internal server error\". The cause is 4rkp9's shipped block_on site, not a missing remedy here -- the diagnosis exists and is demonstrated bridge-independently by bd_6rfrg_sampling_bridged_from_a_task_position_is_diagnosed in fastmcp-core/tests/ephemeral_continuations.rs, both arms green. UN-IGNORE THIS THE MOMENT 11465 IS REMOVED: it is 4rkp9's regression witness as much as this bead's evidence, and it should flip from Err(InternalError) to the typed diagnosis with callbacks=0."]
-fn e2e_public_http_bd_6rfrg_sync_call_cannot_complete_the_sampling_body() {
+/// Calls one tool on the exact-2024 sample server through a client whose
+/// sampling callback counts reverse requests, and returns the typed tool result
+/// with that count (bd-6rfrg). The count separates "the reverse request never
+/// went out" (0) from "it was answered" (1), which a sanitized error cannot.
+fn bd_6rfrg_http_sampling_round(tool: &str) -> (legacy_2024::CallToolResult, usize) {
     let cx = Cx::for_request();
     let server = spawn_legacy_sample_http_server();
     let callback_calls = Arc::new(AtomicUsize::new(0));
@@ -29441,72 +29474,59 @@ fn e2e_public_http_bd_6rfrg_sync_call_cannot_complete_the_sampling_body() {
     )
     .expect("the bd-6rfrg sampling callback is configured before exact-2024 HTTP initialization");
 
-    // NOT `.expect(..)`. The reverse-request COUNTER is this arm's discriminator
-    // and an unwrap here fires before it can be read -- which is exactly what
-    // happened on the first run: the arm failed with a generic "Internal server
-    // error" and the one number that separates its causes was never printed.
-    // A discriminator downstream of the failure it discriminates is not a
-    // discriminator.
+    // Not `.expect(..)`: read the counter before any failure can hide it.
     let called = runtime_block_on_bounded_named(
         &cx,
-        "bd-6rfrg sync sampling tools/call",
+        "bd-6rfrg sampling tools/call",
         client.call_tool(
             &cx,
             legacy_2024::CallToolParams {
-                name: PUBLIC_HTTP_SYNC_SAMPLE_TOOL_NAME.to_owned(),
+                name: tool.to_owned(),
                 arguments: Some(json!({})),
                 meta: None,
             },
         ),
     );
     let callbacks = callback_calls.load(Ordering::Relaxed);
-    println!("bd-6rfrg sync arm: callbacks={callbacks} raw={called:?}");
-    // callbacks is read BEFORE any assertion, and it separates the two causes a
-    // sanitized error cannot:
-    //   0 -> the reverse request NEVER WENT OUT. `fastmcp_core::block_on`
-    //        aborted before polling `ctx.sample` -- its nested-bridge assert
-    //        (runtime.rs `BridgeEntry::enter`) fires BEFORE the future is
-    //        polled, so the typed diagnosis in `sample_with_request` is
-    //        unreachable on that path and the panic is redacted to
-    //        SANITIZED_HANDLER_PANIC_MESSAGE, which is literally
-    //        "Internal server error" (router.rs:1726).
-    //   1 -> it went out and was answered, and the failure is downstream of the
-    //        peer rather than in the bridge.
-    let outcome = match called {
-        Ok(outcome) => outcome,
-        Err(error) => panic!(
-            "the sync-sampling tool returned a JSON-RPC ERROR rather than a typed tool result. \
-             callbacks={callbacks}. Note that \"Internal server error\" has TWO producers -- a \
-             handler panic and a handler-returned InternalError both sanitize to it \
-             (router.rs:1932 and :1944) -- so the code alone does not name the cause; the \
-             counter above does. error={error:?}"
-        ),
-    };
-    let text = legacy_http_tool_text(&outcome).unwrap_or_default();
-    println!(
-        "bd-6rfrg sync arm: is_error={} callbacks={callbacks} text={text:?}",
-        outcome.is_error
-    );
-
-    assert_ne!(
-        text.as_str(),
-        PUBLIC_HTTP_SAMPLED_TEXT,
-        "PREMISE NOT REPRODUCED: the obvious sync tool completed a REAL sampling round trip \
-         through the required `call` method. Report this as a finding about bd-6rfrg's premise; \
-         do not adjust the fixture until it fails, and treat the bead's disposition as the \
-         orchestrator's call rather than this test's. callbacks={callbacks}"
-    );
-    assert!(
-        outcome.is_error && text.contains("block_on") && text.contains("ToolExecutionMode::Async"),
-        "G3/G5: the sync bridge must be DIAGNOSED by an error naming both block_on and the async \
-         hook that replaces it, not left silent. callbacks={callbacks} (0 = the reverse request \
-         never went out; 1 = it was answered and the bridge did not deliver it). is_error={} \
-         text={text:?}",
-        outcome.is_error
-    );
-
+    let outcome = called.unwrap_or_else(|error| {
+        panic!("{tool} returned a JSON-RPC error, not a typed tool result: callbacks={callbacks} {error:?}")
+    });
     drop(client);
     server.shutdown();
+    (outcome, callbacks)
+}
+
+/// The obvious synchronous tool, `block_on(ctx.sample(..))` in the required
+/// `call`, completes the real round trip: exact-2024 HTTP runs it on the
+/// blocking lane, where the bridge cannot starve the reply (bd-6rfrg).
+#[test]
+fn e2e_public_http_bd_6rfrg_sync_bridge_completes_the_sampling_round_trip() {
+    let (outcome, callbacks) = bd_6rfrg_http_sampling_round(PUBLIC_HTTP_SYNC_SAMPLE_TOOL_NAME);
+    assert!(!outcome.is_error, "callbacks={callbacks} {outcome:?}");
+    assert_eq!(
+        legacy_http_tool_text(&outcome).as_deref(),
+        Some(PUBLIC_HTTP_SAMPLED_TEXT),
+        "callbacks={callbacks}"
+    );
+    assert_eq!(
+        callbacks, 1,
+        "exactly one reverse sampling request is answered"
+    );
+}
+
+/// The same bridge from the runtime driver's position is refused by name before
+/// any reverse request is sent, instead of parking (bd-6rfrg).
+#[test]
+fn e2e_public_http_bd_6rfrg_driver_bridge_is_diagnosed_not_hung() {
+    let (outcome, callbacks) =
+        bd_6rfrg_http_sampling_round(PUBLIC_HTTP_DRIVER_BRIDGE_SAMPLE_TOOL_NAME);
+    let text = legacy_http_tool_text(&outcome).unwrap_or_default();
+    assert!(outcome.is_error, "callbacks={callbacks} {outcome:?}");
+    assert!(
+        text.contains("block_on") && text.contains("ToolExecutionMode::Async"),
+        "the diagnosis must name the bridge and its remedy: {text:?}"
+    );
+    assert_eq!(callbacks, 0, "the refused bridge sends no reverse request");
 }
 
 #[test]
