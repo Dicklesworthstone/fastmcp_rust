@@ -12605,7 +12605,7 @@ mod tests {
                         r#"
 IFS= read -r request || fail 92 request-eof
 case "$request" in
-    *'"method":"notifications/cancelled"'*) exit 0 ;;
+    *'"method":"notifications/cancelled"'*) fail 0 "$request" ;;
     *'"method":"{method}"'*'"id":{id}'*) ;;
     *) fail 93 "$request" ;;
 esac
