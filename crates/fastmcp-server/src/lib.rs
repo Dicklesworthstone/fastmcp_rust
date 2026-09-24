@@ -48292,14 +48292,13 @@ mod lib_unit_tests {
     // cannot pass silently. They are deliberately outside the family's
     // `returning_subscription_*` prefix and its denominator.
     //
-    // The first test of each pair pins the CURRENT outcome of a candidate
-    // defect as a mechanism proof, not as a contract: the pump-first test is
-    // bd-gl2we finding F1 (stdio shutdown loses a pending graceful election)
-    // and the under-recv-lock test is F2 (an acknowledgement sent during an
-    // unsplit transport's `recv` fails the connection), both in comment 5412.
-    // A fix ruled by the subscription surface's owner must INVERT that
-    // expectation under a separate RH-3 semantic review; never regenerate
-    // these assertions to green without it.
+    // The pump-first test pins the CURRENT outcome of bd-gl2we finding F1
+    // (stdio shutdown loses a pending graceful election, bd-81cct) as a
+    // mechanism proof, not as a contract; its fix must invert it. The
+    // under-recv-lock test was F2 (an acknowledgement sent during an unsplit
+    // transport's `recv` failed the connection). bd-8bcfq fixed that by
+    // queueing such output, so it now asserts the contract: the
+    // acknowledgement is written as soon as the owning `recv` returns.
 
     #[test]
     fn forced_subscription_ack_order_pump_first_loses_graceful_completion() {
@@ -48312,7 +48311,7 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn forced_subscription_ack_order_under_recv_lock_reports_notification_stage() {
+    fn forced_subscription_ack_order_under_recv_lock_is_written_when_recv_returns() {
         forced_subscription_recv_lock_order_case(true);
     }
 
@@ -48498,16 +48497,17 @@ mod lib_unit_tests {
     /// An invalid response frame after an acknowledged listen, on an unsplit
     /// transport. Both variants send the same frames and run the same
     /// release-then-wait-for-`Active` step; only its location differs.
-    /// `ack_under_recv_lock` runs it inside `recv`, which `SharedTransport`
-    /// calls with its mutex held, so the acknowledgement's `try_lock` fails and
-    /// the post-receive connection-failure guard wins. Otherwise it runs in
-    /// middleware for an inline request, after `recv` has released the mutex.
+    /// `ack_under_recv_lock` runs it inside `recv`, while `SharedTransport`'s
+    /// pump owns the I/O handle, so the acknowledgement is queued and written
+    /// when that `recv` returns (receive phase 4). Otherwise it runs in
+    /// middleware for an inline request, after `recv` has released the handle,
+    /// and is written directly (receive phase 3).
     fn forced_subscription_recv_lock_order_case(ack_under_recv_lock: bool) {
         struct ForcedAckOrderTransport {
             control: Arc<NonQuiescentLegacyControl>,
             registry: Arc<FinalSubscriptionRegistry>,
             forced: Arc<AtomicBool>,
-            acknowledgements_written: Arc<AtomicUsize>,
+            acknowledgement_phases: Arc<Mutex<Vec<usize>>>,
             phase: usize,
             ack_under_recv_lock: bool,
         }
@@ -48546,7 +48546,10 @@ mod lib_unit_tests {
                 if let JsonRpcMessage::Request(request) = message
                     && request.method == "notifications/subscriptions/acknowledged"
                 {
-                    self.acknowledgements_written.fetch_add(1, Ordering::AcqRel);
+                    self.acknowledgement_phases
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(self.phase);
                 }
                 Ok(())
             }
@@ -48584,7 +48587,7 @@ mod lib_unit_tests {
 
         let control = Arc::new(NonQuiescentLegacyControl::default());
         let forced = Arc::new(AtomicBool::new(false));
-        let acknowledgements_written = Arc::new(AtomicUsize::new(0));
+        let acknowledgement_phases = Arc::new(Mutex::new(Vec::new()));
         let registry_cell = Arc::new(std::sync::OnceLock::new());
         let runtime = RuntimeBuilder::current_thread()
             .with_reactor(create_reactor().expect("forced recv-lock reactor"))
@@ -48608,7 +48611,7 @@ mod lib_unit_tests {
             control: Arc::clone(&control),
             registry,
             forced: Arc::clone(&forced),
-            acknowledgements_written: Arc::clone(&acknowledgements_written),
+            acknowledgement_phases: Arc::clone(&acknowledgement_phases),
             phase: 0,
             ack_under_recv_lock,
         };
@@ -48636,23 +48639,20 @@ mod lib_unit_tests {
         );
         let error = result.expect_err("an invalid response frame terminates the connection");
         let data = error.data.as_ref().expect("typed run failure");
-        if ack_under_recv_lock {
-            assert_eq!(
-                acknowledgements_written.load(Ordering::Acquire),
-                0,
-                "{error:?}"
-            );
-            assert_eq!(data["stage"], "notification", "{error:?}");
-            assert_eq!(data["kind"], "send_failure", "{error:?}");
-        } else {
-            assert_eq!(
-                acknowledgements_written.load(Ordering::Acquire),
-                1,
-                "{error:?}"
-            );
-            assert_eq!(data["stage"], "receive", "{error:?}");
-            assert_eq!(data["kind"], "invalid_response", "{error:?}");
-        }
+        // Exactly one acknowledgement reaches the wire either way. Under the
+        // receive lock it is queued and written right after the fourth `recv`
+        // returns, before the pump classifies that frame; otherwise it is
+        // written directly while the pump dispatches the third frame.
+        let expected_phase = if ack_under_recv_lock { 4 } else { 3 };
+        assert_eq!(
+            *acknowledgement_phases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            [expected_phase],
+            "{error:?}"
+        );
+        assert_eq!(data["stage"], "receive", "{error:?}");
+        assert_eq!(data["kind"], "invalid_response", "{error:?}");
         assert!(active.lock().unwrap().is_empty());
     }
 
