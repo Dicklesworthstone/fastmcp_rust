@@ -46,7 +46,6 @@
 // in the all-features WebSocket tests overflows rustc's default limit.
 #![recursion_limit = "512"]
 #![forbid(unsafe_code)]
-#![allow(dead_code)]
 
 mod builder;
 mod cache;
@@ -1421,6 +1420,7 @@ fn remove_tasks_client_extension(parameters: &mut serde_json::Value) {
 
 /// Overlays inbound sampling/elicitation/roots without replacing extension
 /// advertisements already stamped on `_meta` client capabilities.
+#[cfg(feature = "tasks")]
 fn overlay_inbound_core_client_capabilities_on_metadata(
     metadata: &mut serde_json::Map<String, serde_json::Value>,
     inbound: &ClientCapabilities,
@@ -2962,7 +2962,6 @@ struct ClientProgressParams {
     progress: f64,
     total: Option<f64>,
     message: Option<String>,
-    meta: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl<'de> serde::Deserialize<'de> for ClientProgressParams {
@@ -2978,8 +2977,9 @@ impl<'de> serde::Deserialize<'de> for ClientProgressParams {
             progress: f64,
             total: Option<f64>,
             message: Option<String>,
+            // Admitted (it must still be an object) but not relayed.
             #[serde(rename = "_meta")]
-            meta: Option<serde_json::Map<String, serde_json::Value>>,
+            _meta: Option<serde_json::Map<String, serde_json::Value>>,
         }
 
         let wire = <Wire as serde::Deserialize>::deserialize(deserializer)?;
@@ -2999,7 +2999,6 @@ impl<'de> serde::Deserialize<'de> for ClientProgressParams {
             progress: wire.progress,
             total: wire.total,
             message: wire.message,
-            meta: wire.meta,
         })
     }
 }
@@ -3048,14 +3047,6 @@ fn invalid_notification_request_response(request: &JsonRpcRequest) -> Option<Jso
     ));
     let response = JsonRpcResponse::error(Some(id), error.into());
     Some(JsonRpcMessage::Response(response))
-}
-
-fn server_request_response(request: &JsonRpcRequest) -> Option<JsonRpcMessage> {
-    request.id.as_ref()?;
-    if request.method.starts_with("notifications/") {
-        return invalid_notification_request_response(request);
-    }
-    method_not_found_response(request)
 }
 
 fn reverse_request_response<T>(request_id: RequestId, result: McpResult<T>) -> JsonRpcMessage
@@ -3130,6 +3121,7 @@ fn invoke_shared_reverse_request_handler<P, R>(
 ///
 /// The handler call and every poll of its future stay behind the redacting
 /// panic boundary, and the error mapping is the synchronous helper's.
+#[cfg(feature = "legacy-2024-11-05")]
 async fn invoke_reverse_request_handler_async<P, R>(
     cx: &Cx,
     handler: &(
@@ -3152,10 +3144,10 @@ async fn invoke_reverse_request_handler_async<P, R>(
         .map_err(|_| McpError::internal_error("Client reverse request handler failed"))?
 }
 
-const MAX_REVERSE_CALLBACK_WORKERS: usize = 4;
 const MAX_QUEUED_REVERSE_CALLBACKS: usize = 16;
 const REVERSE_CALLBACK_POLL_SLICE: Duration = Duration::from_millis(10);
 const REVERSE_CALLBACK_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(feature = "websocket-experimental")]
 const REVERSE_CALLBACK_SHUTDOWN_POLLS: usize = 25;
 const REVERSE_CALLBACK_SHUTDOWN_TIMEOUT_ERROR: &str =
     "Client reverse callback workers did not stop within the shutdown bound";
@@ -3707,16 +3699,19 @@ pub const MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS: usize = 64;
 /// late terminal response. This bounded owner set keeps a reused connection
 /// aligned even when several callers cancel before any compliant or tardy peer
 /// produces its suppressed terminal response.
+#[cfg(feature = "websocket-experimental")]
 const MAX_QUEUED_WEBSOCKET_CANCELLED_RESPONSE_KEYS: usize = 64;
 
 // A cancelled caller must not be held hostage by a peer that stops consuming
 // frames. This is deliberately a short, connection-owned commit boundary: the
 // cancellation notification is either committed or the connection fails
 // closed; no detached sender survives the caller's cancellation.
+#[cfg(feature = "websocket-experimental")]
 const WEBSOCKET_CANCELLATION_CONTROL_SEND_TIMEOUT_NANOS: u64 = 100_000_000;
 /// Wake the one owned ingress reader often enough to observe a caller-owned
 /// cancellation domain without waiting for a peer frame. Exact-2024 peers may
 /// suppress a cancelled request's terminal JSON-RPC result forever.
+#[cfg(feature = "websocket-experimental")]
 const WEBSOCKET_CANCELLED_RECV_POLL_NANOS: u64 = 20_000_000;
 
 const FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR: &str =
@@ -3759,19 +3754,6 @@ fn final_log_message_sink_projection(message: &FinalLogMessageParams) -> LogMess
         logger: message.logger.clone(),
         data: message.data.clone(),
     }
-}
-
-const INITIALIZE_REQUEST_ID: i64 = 1;
-
-fn validate_initialize_response_id(response: &JsonRpcResponse) -> McpResult<()> {
-    validate_response_envelope(response)?;
-
-    let expected = RequestId::Number(INITIALIZE_REQUEST_ID);
-    if response.id.as_ref() == Some(&expected) {
-        return Ok(());
-    }
-
-    Err(McpError::internal_error(INITIALIZE_RESPONSE_ID_ERROR))
 }
 
 fn validate_response_envelope(response: &JsonRpcResponse) -> McpResult<()> {
@@ -3841,16 +3823,6 @@ fn final_projection_error(field: &str) -> McpError {
 
 fn ensure_absent_final_field<T>(field: &str, value: Option<T>) -> McpResult<()> {
     if value.is_some() {
-        return Err(final_projection_error(field));
-    }
-    Ok(())
-}
-
-fn ensure_empty_final_fields(
-    field: &str,
-    values: &std::collections::BTreeMap<String, serde_json::Value>,
-) -> McpResult<()> {
-    if !values.is_empty() {
         return Err(final_projection_error(field));
     }
     Ok(())
@@ -4388,12 +4360,6 @@ impl<R, S> SynchronousWebSocketClientTransport<R, S> {
     pub fn from_split(receiver: R, sender: S) -> Self {
         Self { receiver, sender }
     }
-
-    /// Returns the owned ingress and egress halves.
-    #[must_use]
-    pub fn into_split(self) -> (R, S) {
-        (self.receiver, self.sender)
-    }
 }
 
 #[cfg(test)]
@@ -4569,12 +4535,6 @@ where
         })
     }
 
-    /// Returns the immutable session established by discovery or initialize.
-    #[must_use]
-    pub const fn session(&self) -> &ClientSession {
-        &self.session
-    }
-
     /// Returns the exact protocol era frozen by the completed handshake.
     #[must_use]
     pub const fn selected_protocol_era(&self) -> ProtocolEra {
@@ -4602,25 +4562,6 @@ where
             .execute(&self.cx, JsonRpcRequest::new(method.into(), params, id))
     }
 
-    /// Waits for one request result while routing all peer traffic on this connection.
-    pub fn wait(
-        &self,
-        execution: &mut RequestExecution<SynchronousWebSocketClientTransport<R, S>>,
-    ) -> McpResult<JsonRpcResponse> {
-        self.executor.wait(&self.cx, execution)
-    }
-
-    /// Waits for one response and returns its exact admitted `result` source.
-    ///
-    /// The source is `None` only for JSON-RPC error envelopes. It is never
-    /// reconstructed from a decoded `serde_json::Value`.
-    pub fn wait_with_raw_result(
-        &self,
-        execution: &mut RequestExecution<SynchronousWebSocketClientTransport<R, S>>,
-    ) -> McpResult<(JsonRpcResponse, Option<String>)> {
-        self.executor.wait_with_raw_result(&self.cx, execution)
-    }
-
     /// Takes a response that was already routed by [`Self::drive`].
     pub fn try_take_response_with_raw_result(
         &self,
@@ -4643,11 +4584,13 @@ where
     }
 
     /// Returns exact-2024 reverse requests admitted while driving this connection.
+    #[cfg(feature = "legacy-2024-11-05")]
     pub fn take_reverse_requests(&self) -> Vec<ReverseRequest> {
         self.executor.take_reverse_requests()
     }
 
     /// Responds to one currently live exact-2024 reverse request.
+    #[cfg(feature = "legacy-2024-11-05")]
     pub fn respond_to_reverse_request(
         &self,
         request: &ReverseRequest,
@@ -4655,11 +4598,6 @@ where
     ) -> McpResult<()> {
         self.executor
             .respond_to_reverse_request(&self.cx, request, result)
-    }
-
-    /// Returns connection-level notifications that did not belong to a request stream.
-    pub fn take_notifications(&self) -> Vec<JsonRpcRequest> {
-        self.executor.take_notifications()
     }
 
     /// Closes the WebSocket halves after cancelling every live request owner.
@@ -6243,10 +6181,6 @@ where
             ProtocolEra::Modern2026 => self.request_final_core(cx, method, parameters).await,
             ProtocolEra::Legacy2024 => self.request_selected_core(cx, method, parameters).await,
         }
-    }
-
-    fn websocket_list_parameters(cursor: Option<&str>) -> serde_json::Value {
-        list_catalog_wire_parameters(cursor, None, None)
     }
 
     /// Lists one page of tools through the negotiated WebSocket era.
@@ -9673,18 +9607,6 @@ where
     fn new(receiver: R, sender: S) -> Self {
         Self { receiver, sender }
     }
-
-    fn recv(&mut self, cx: &Cx) -> Result<ReceivedTransportFrame, TransportError> {
-        self.receiver.recv_with_source(cx)
-    }
-
-    fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
-        self.sender.send(cx, message)
-    }
-
-    fn into_parts(self) -> (R, S) {
-        (self.receiver, self.sender)
-    }
 }
 
 /// Shared adapter over the client-owned stdio ingress half.
@@ -9958,27 +9880,6 @@ fn recv_shared_child_transport(
     recv_child_transport(&mut receiver, cx, deadline)
 }
 
-#[cfg(unix)]
-fn recv_initializing_child_transport(
-    transport: &mut StdioTransport<ChildStdout, ChildStdin>,
-    cx: &Cx,
-    deadline: Option<Instant>,
-) -> Result<(JsonRpcMessage, Instant), TransportError> {
-    transport.recv_until_with_completion(cx, deadline)
-}
-
-#[cfg(not(unix))]
-fn recv_initializing_child_transport(
-    transport: &mut StdioTransport<ChildStdout, ChildStdin>,
-    cx: &Cx,
-    deadline: Option<Instant>,
-) -> Result<(JsonRpcMessage, Instant), TransportError> {
-    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-        return Err(TransportError::ReceiveDeadlineExceeded);
-    }
-    transport.recv_with_completion(cx)
-}
-
 #[cfg(not(unix))]
 fn recv_child_transport(
     transport: &mut StdioRecvHalf<ChildStdout>,
@@ -10024,136 +9925,6 @@ fn send_child_server_response_during_receive(
         .map_err(|_| McpError::internal_error("Client stdio response writer failed"))?
         .send(cx, message)
         .map_err(transport_error_to_mcp)
-}
-
-fn stdio_cancellation_control_message(
-    peer_era: ProtocolEra,
-    request_id: &RequestId,
-) -> McpResult<JsonRpcMessage> {
-    let cancellation = match peer_era {
-        ProtocolEra::Legacy2024 => CancellationWireMessage::Legacy2024 {
-            sender: CancellationSender::Client,
-            params: CancelledParams {
-                request_id: request_id.clone(),
-                reason: None,
-                meta: None,
-            },
-        },
-        ProtocolEra::Modern2026 => CancellationWireMessage::Modern2026 {
-            sender: CancellationSender::Client,
-            params: FinalCancelledNotificationParams {
-                request_id: request_id.clone(),
-                reason: None,
-                meta: None,
-                additional: BTreeMap::default(),
-            },
-        },
-    };
-    cancellation
-        .encode()
-        .map(JsonRpcMessage::Request)
-        .map_err(|error| {
-            McpError::invalid_params(format!("Invalid cancellation control parameters: {error}"))
-        })
-}
-
-#[cfg(unix)]
-fn send_initializing_child_server_response(
-    transport: &mut StdioTransport<ChildStdout, ChildStdin>,
-    _cx: &Cx,
-    message: &JsonRpcMessage,
-) -> McpResult<()> {
-    transport
-        .try_send_control_message(message)
-        .map_err(transport_error_to_mcp)
-}
-
-#[cfg(not(unix))]
-fn send_initializing_child_server_response(
-    transport: &mut StdioTransport<ChildStdout, ChildStdin>,
-    cx: &Cx,
-    message: &JsonRpcMessage,
-) -> McpResult<()> {
-    transport.send(cx, message).map_err(transport_error_to_mcp)
-}
-
-fn initialize_child_transport(
-    transport: &mut StdioTransport<ChildStdout, ChildStdin>,
-    cx: &Cx,
-    client_info: &ClientInfo,
-    capabilities: &ClientCapabilities,
-    timeout_policy: RequestTimeoutPolicy,
-) -> McpResult<InitializeResult> {
-    timeout_policy.validate()?;
-    let params = InitializeParams {
-        protocol_version: PROTOCOL_VERSION.to_string(),
-        capabilities: capabilities.clone(),
-        client_info: client_info.clone(),
-    };
-    let params = serde_json::to_value(params).map_err(|error| {
-        McpError::internal_error(format!("Failed to serialize params: {error}"))
-    })?;
-    let request = JsonRpcRequest::new("initialize", Some(params), INITIALIZE_REQUEST_ID);
-    let message = JsonRpcMessage::Request(request);
-    #[cfg(unix)]
-    transport
-        .send_until(cx, &message, Instant::now() + CHILD_STDIO_COMMIT_TIMEOUT)
-        .map_err(transport_error_to_mcp)?;
-    #[cfg(not(unix))]
-    transport
-        .send(cx, &message)
-        .map_err(transport_error_to_mcp)?;
-    // Both timers start at the observed successful commit boundary. The
-    // initialization exchange has no request-owned progress token, so its idle
-    // timer is never reset. Unix commits have their own bounded native write;
-    // cancellation remains a preflight checkpoint before that commit.
-    let committed_at = Instant::now();
-    let deadlines = RequestDeadlines::start_at(timeout_policy, committed_at)?;
-
-    let response = loop {
-        let (message, received_at) = recv_initializing_child_transport(
-            transport,
-            cx,
-            Some(deadlines.next()),
-        )
-        .map_err(|error| match error {
-            TransportError::ReceiveDeadlineExceeded => request_timeout_error(deadlines.next_kind()),
-            other => transport_error_to_mcp(other),
-        })?;
-        if let Some(source) = deadlines.expired_at(received_at) {
-            return Err(request_timeout_error(source));
-        }
-        validate_inbound_typed_message(&message)?;
-        match message {
-            JsonRpcMessage::Response(response) => {
-                validate_initialize_response_id(&response)?;
-                break response;
-            }
-            JsonRpcMessage::Request(request) => {
-                if let Some(response) = server_request_response(&request) {
-                    send_initializing_child_server_response(transport, cx, &response)?;
-                }
-            }
-        }
-    };
-
-    if let Some(error) = response.error {
-        return Err(json_rpc_error_to_mcp(error));
-    }
-    let result = response
-        .result
-        .ok_or_else(|| McpError::invalid_request("Initialize response has no result"))?;
-    let result: InitializeResult = serde_json::from_value(result)
-        .map_err(|_| McpError::invalid_request(INVALID_INITIALIZE_PAYLOAD_ERROR))?;
-    validate_initialize_result(&result)?;
-
-    transport
-        .send(
-            cx,
-            &JsonRpcMessage::Request(JsonRpcRequest::initialized_notification()),
-        )
-        .map_err(transport_error_to_mcp)?;
-    Ok(result)
 }
 
 /// Maximum number of uncorrelated-response warnings emitted per connection.
@@ -10206,8 +9977,6 @@ const CONTROL_FRAME_CAPACITY_ERROR: &str = "MCP stdio control frame exceeds atom
 const INVALID_RESPONSE_ENVELOPE_ERROR: &str = "Invalid JSON-RPC response";
 const INVALID_RESPONSE_PAYLOAD_ERROR: &str = "Invalid MCP response payload";
 const TRANSPORT_CODEC_ERROR: &str = "Invalid MCP transport frame";
-const INVALID_INITIALIZE_PAYLOAD_ERROR: &str = "Invalid MCP initialize response payload";
-const INITIALIZE_RESPONSE_ID_ERROR: &str = "Initialize response ID mismatch";
 const UNSUPPORTED_PROTOCOL_VERSION_ERROR: &str =
     "Server selected an unsupported MCP protocol version";
 const REDACTED_CLIENT_CALLBACK_PANIC: &[u8] =
@@ -10263,9 +10032,11 @@ fn catch_client_callback_unwind<R>(callback: impl FnOnce() -> R) -> Result<R, Bo
 /// Each caller chooses explicitly: the exact-2024 inline reverse dispatch
 /// redacts, as its synchronous predecessor did, while the WebSocket callback
 /// path keeps its unredacted panic output (bd-84om4, owner ruling 5578).
+#[cfg(any(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClientCallbackPanicRedaction {
     Redacted,
+    #[cfg(feature = "websocket-experimental")]
     Unredacted,
 }
 
@@ -10276,6 +10047,7 @@ enum ClientCallbackPanicRedaction {
 /// This is the async counterpart of [`catch_client_callback_unwind`] for
 /// callers already on an asupersync runtime, where a nested `block_on` would
 /// re-enter the runtime.
+#[cfg(any(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
 async fn catch_client_callback_unwind_async<F>(
     future: F,
     redaction: ClientCallbackPanicRedaction,
@@ -10827,6 +10599,7 @@ impl ResponseRegistry {
         Ok(ResponseWaiter { id, receiver })
     }
 
+    #[cfg(test)]
     fn route(&mut self, response: JsonRpcResponse) -> ResponseRoute {
         self.route_with_raw_result(response, None)
     }
@@ -11050,10 +10823,6 @@ impl SharedResponseRegistry {
             .map_err(|_| McpError::internal_error("Client response registry is unavailable"))
     }
 
-    fn ptr_eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-
     fn register(&self, id: RequestId) -> McpResult<ResponseWaiter> {
         self.lock()?.register(id)
     }
@@ -11156,6 +10925,7 @@ pub struct HttpClient {
     client_info: ClientInfo,
     client_capabilities: ClientCapabilities,
     server_info: ServerInfo,
+    #[cfg(feature = "legacy-2024-11-05")]
     legacy_server_capabilities: Option<ServerCapabilities>,
     /// Handshake instructions retained from modern discovery or exact-2024
     /// initialize. `None` means the peer did not advertise instructions.
@@ -11710,11 +11480,15 @@ impl HttpClient {
             return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
         }
 
+        // Only the exact-2024 accessor reads the legacy capabilities.
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        let _: Option<ServerCapabilities> = legacy_server_capabilities;
         Ok(Self {
             connection,
             client_info,
             client_capabilities,
             server_info,
+            #[cfg(feature = "legacy-2024-11-05")]
             legacy_server_capabilities,
             instructions,
             next_id: AtomicU64::new(2),
@@ -12339,10 +12113,6 @@ impl HttpClient {
         );
         self.request_final_core(cx, "completion/complete", parameters)
             .await
-    }
-
-    fn http_list_parameters(cursor: Option<&str>) -> serde_json::Value {
-        list_catalog_wire_parameters(cursor, None, None)
     }
 
     /// Lists one page of tools through the negotiated HTTP era.
@@ -14365,9 +14135,6 @@ pub struct Client {
     /// cancellation controls are also unavailable there, so a required cancel
     /// or timeout control fails the connection explicitly.
     timeout_policy: RequestTimeoutPolicy,
-    /// Whether auto-initialization is enabled (for documentation/debugging).
-    #[allow(dead_code)]
-    auto_initialize: bool,
     /// Whether the client has been initialized.
     initialized: AtomicBool,
     /// Terminal auto-initialization failure, preventing lifecycle retries on
@@ -14822,7 +14589,6 @@ impl Client {
             reverse_request_handlers: ReverseRequestHandlers::new(),
             reverse_callback_pool,
             timeout_policy: RequestTimeoutPolicy::default(),
-            auto_initialize: false,
             initialized: AtomicBool::new(false),
             initialization_error: None,
             pending_initialization: None,
@@ -14951,9 +14717,8 @@ impl Client {
         .map_err(|error| HttpClientError::CoreResult(McpError::invalid_params(error.to_string())))
     }
 
-    /// Creates a client from its component parts.
-    ///
-    /// This is an internal constructor used by the builder.
+    /// Creates a client from its component parts for unit tests.
+    #[cfg(test)]
     pub(crate) fn from_parts(
         child: Child,
         transport: StdioTransport<ChildStdout, ChildStdin>,
@@ -14972,6 +14737,7 @@ impl Client {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn from_parts_with_ownership(
         child: Child,
         child_ownership: ChildOwnership,
@@ -15020,7 +14786,6 @@ impl Client {
             reverse_request_handlers: ReverseRequestHandlers::new(),
             reverse_callback_pool,
             timeout_policy,
-            auto_initialize: false,
             initialized: AtomicBool::new(true), // Already initialized by builder
             initialization_error: None,
             pending_initialization: None,
@@ -15031,9 +14796,8 @@ impl Client {
         client
     }
 
-    /// Creates an uninitialized client for auto-initialize mode.
-    ///
-    /// This is an internal constructor used by the builder when auto_initialize is enabled.
+    /// Creates an uninitialized auto-initialize client for unit tests.
+    #[cfg(test)]
     pub(crate) fn from_parts_uninitialized(
         child: Child,
         transport: StdioTransport<ChildStdout, ChildStdin>,
@@ -15094,7 +14858,6 @@ impl Client {
             reverse_request_handlers: ReverseRequestHandlers::new(),
             reverse_callback_pool,
             timeout_policy,
-            auto_initialize: true,
             initialized: AtomicBool::new(false),
             initialization_error: None,
             pending_initialization: None,
@@ -17555,6 +17318,7 @@ impl Client {
     /// listen: the listen is the selected ingress owner, and a second reader
     /// can terminate the connection. I/O stays on the connection `Cx`; the
     /// caller `Cx` only checkpoints cancellation.
+    #[cfg(feature = "tasks")]
     fn send_prepared_request_through_stdio_executor(
         &mut self,
         cx: &Cx,
@@ -18438,27 +18202,6 @@ impl Client {
         false
     }
 
-    /// Sends a notification (no response expected).
-    fn send_notification<P: serde::Serialize>(&mut self, method: &str, params: P) -> McpResult<()> {
-        let params_value = serde_json::to_value(params)
-            .map_err(|e| McpError::internal_error(format!("Failed to serialize params: {e}")))?;
-        let params_value = self.prepare_request_parameters(params_value)?;
-
-        // Create a notification (request without id)
-        let request = JsonRpcRequest {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            method: method.to_string(),
-            params: Some(params_value),
-            id: None,
-        };
-
-        if let Err(error) = self.send_to_server(&JsonRpcMessage::Request(request)) {
-            return Err(self.record_send_failure(None, error));
-        }
-
-        Ok(())
-    }
-
     fn send_initialized_notification(&mut self) -> McpResult<()> {
         let notification = JsonRpcRequest::initialized_notification();
         if let Err(error) = self.send_to_server(&JsonRpcMessage::Request(notification)) {
@@ -18801,6 +18544,7 @@ impl Client {
     }
 
     /// Receives a response from the transport, validating the response ID.
+    #[cfg(all(test, feature = "legacy-2024-11-05"))]
     fn recv_response(
         &mut self,
         waiter: ResponseWaiter,
@@ -20263,6 +20007,7 @@ impl Client {
     }
 
     /// Sends a request and waits for response, handling progress notifications.
+    #[cfg(all(test, feature = "legacy-2024-11-05"))]
     fn send_request_with_progress<P: serde::Serialize, R: serde::de::DeserializeOwned>(
         &mut self,
         method: &str,
@@ -23127,6 +22872,7 @@ mod tests {
     #[cfg(feature = "websocket-experimental")]
     use std::io;
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn wait_for_test_flag(flag: &AtomicBool, description: &str) {
         let deadline = Instant::now() + Duration::from_secs(2);
         while !flag.load(Ordering::Acquire) {
@@ -27207,13 +26953,12 @@ mod tests {
     }
 
     #[test]
-    fn negotiated_client_io_preserves_memory_source_from_one_admission() {
+    fn client_receive_half_preserves_memory_source_from_one_admission() {
         use fastmcp_transport::memory::create_memory_transport_pair;
 
         let (client, server) = create_memory_transport_pair();
-        let (client_recv, client_send) = client.into_split();
+        let (mut client_recv, mut client_send) = client.into_split();
         let (mut server_recv, mut server_send) = server.into_split();
-        let mut io = NegotiatedClientIo::new(client_recv, client_send);
         let cx = Cx::for_testing();
         let response = JsonRpcResponse::success(
             RequestId::Number(61),
@@ -27226,8 +26971,8 @@ mod tests {
         server_send
             .send(&cx, &JsonRpcMessage::Response(response.clone()))
             .expect("peer commits one response");
-        let received = io
-            .recv(&cx)
+        let received = client_recv
+            .recv_with_source(&cx)
             .expect("transport-neutral ingress retains the committed source");
         let JsonRpcMessage::Response(typed) = received.message().clone() else {
             panic!("memory peer sent one response");
@@ -27244,11 +26989,12 @@ mod tests {
         .expect("committed result serializes");
         assert_eq!(raw_result.as_deref(), Some(expected_raw_result.as_str()));
 
-        io.send(
-            &cx,
-            &JsonRpcMessage::Request(JsonRpcRequest::new("after/admission", None, 62_i64)),
-        )
-        .expect("admitted source retention does not mutate the selected transport");
+        client_send
+            .send(
+                &cx,
+                &JsonRpcMessage::Request(JsonRpcRequest::new("after/admission", None, 62_i64)),
+            )
+            .expect("admitted source retention does not mutate the selected transport");
         let JsonRpcMessage::Request(request) = server_recv
             .recv(&cx)
             .expect("peer receives the only outbound request")
@@ -29938,7 +29684,7 @@ mod tests {
         assert_eq!(next_id, 4);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "tasks"))]
     #[derive(Clone, Copy)]
     enum PublicFinalTaskCancellationEntryPoint {
         Direct,
@@ -31281,19 +31027,6 @@ mod tests {
         server
             .join()
             .expect("the real Apps HTTP wrong-ID server joins");
-    }
-
-    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
-    fn make_scripted_initialized_client(response: JsonRpcMessage) -> Client {
-        let response_line = serde_json::to_string(&response).expect("serialize scripted response");
-        assert!(
-            !response_line.contains('\''),
-            "the shell fixture requires a single-quote-free JSON line"
-        );
-        // Keep the peer alive briefly so the client can write its request, but
-        // make the fixture self-terminating without an orphanable watchdog.
-        let script = format!("printf '%s\\n' '{response_line}'; exec sleep 2");
-        make_shell_scripted_initialized_client(&script, Duration::from_secs(1))
     }
 
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
@@ -34099,7 +33832,7 @@ exec sleep 30
             let request = JsonRpcRequest::new(method, None, "invalid-notification");
             assert_eq!(server_notification_kind(&request), None);
 
-            let response = server_request_response(&request)
+            let response = invalid_notification_request_response(&request)
                 .expect("ID-bearing notification must receive an error response");
             let JsonRpcMessage::Response(response) = response else {
                 panic!("expected response");
@@ -34165,26 +33898,6 @@ exec sleep 30
     }
 
     #[test]
-    fn initializing_server_ping_request_is_not_serviced_before_era_selection() {
-        let request = JsonRpcRequest::new("ping", None, "server-ping");
-        let response = server_request_response(&request).expect("ping request has an ID");
-        let JsonRpcMessage::Response(response) = response else {
-            panic!("expected response");
-        };
-
-        assert_eq!(
-            response.id,
-            Some(RequestId::String("server-ping".to_string()))
-        );
-        assert!(response.result.is_none());
-        assert!(matches!(
-            response.error,
-            Some(error)
-                if error.code == JsonInteger::from(i64::from(i32::from(McpErrorCode::MethodNotFound)))
-        ));
-    }
-
-    #[test]
     fn response_envelope_requires_exact_version_and_one_outcome() {
         let valid = JsonRpcResponse::success(RequestId::Number(1), serde_json::Value::Null);
         assert!(validate_response_envelope(&valid).is_ok());
@@ -34227,16 +33940,6 @@ exec sleep 30
             validate_response_envelope(&response).expect_err("an invalid version must fail closed");
         assert_eq!(envelope_error.message, INVALID_RESPONSE_ENVELOPE_ERROR);
         assert!(!envelope_error.message.contains(version_canary));
-
-        let id_canary = "PEER-ID-SECRET-CANARY\n";
-        let mismatched = JsonRpcResponse::success(
-            RequestId::String(id_canary.to_string()),
-            serde_json::Value::Null,
-        );
-        let id_error = validate_initialize_response_id(&mismatched)
-            .expect_err("a mismatched initialize ID must fail closed");
-        assert_eq!(id_error.message, INITIALIZE_RESPONSE_ID_ERROR);
-        assert!(!id_error.message.contains(id_canary));
 
         let payload_canary = "PEER-PAYLOAD-SECRET-CANARY";
         let payload_error =
@@ -34318,28 +34021,6 @@ exec sleep 30
                 .to_string(),
             "-326e2"
         );
-    }
-
-    #[test]
-    fn initialize_response_requires_the_exact_request_id() {
-        let matching = JsonRpcResponse::success(
-            RequestId::Number(INITIALIZE_REQUEST_ID),
-            serde_json::Value::Null,
-        );
-        assert!(validate_initialize_response_id(&matching).is_ok());
-
-        for response in [
-            JsonRpcResponse::success(RequestId::Number(2), serde_json::Value::Null),
-            JsonRpcResponse::success(
-                RequestId::String(INITIALIZE_REQUEST_ID.to_string()),
-                serde_json::Value::Null,
-            ),
-            JsonRpcResponse::error(None, McpError::internal_error("missing correlation").into()),
-        ] {
-            let error = validate_initialize_response_id(&response)
-                .expect_err("a mismatched initialize response must fail closed");
-            assert_eq!(error.message, INITIALIZE_RESPONSE_ID_ERROR);
-        }
     }
 
     #[test]
@@ -34463,7 +34144,6 @@ exec sleep 30
         assert_eq!(params.marker, ProgressMarker::String("tok-1".to_string()));
         assert!(params.total.is_none());
         assert!(params.message.is_none());
-        assert!(params.meta.is_none());
     }
 
     #[test]
@@ -34478,10 +34158,6 @@ exec sleep 30
         let first =
             parse_valid_client_progress(&valid, None).expect("first finite update is valid");
         assert_eq!(first.progress.to_bits(), (-1.5_f64).to_bits());
-        assert_eq!(
-            first.meta.as_ref().and_then(|meta| meta.get("trace")),
-            Some(&serde_json::json!("accepted"))
-        );
         assert!(parse_valid_client_progress(&valid, Some(-1.5)).is_none());
         assert!(parse_valid_client_progress(&valid, Some(0.0)).is_none());
 
@@ -36293,7 +35969,7 @@ exec sleep 30
             instructions: None,
         };
         let response = JsonRpcMessage::Response(JsonRpcResponse::success(
-            RequestId::Number(INITIALIZE_REQUEST_ID),
+            RequestId::Number(1),
             serde_json::to_value(initialize_result).expect("serialize initialize result"),
         ));
         let response_line = serde_json::to_string(&response).expect("serialize response envelope");
@@ -36334,7 +36010,7 @@ exec sleep 30
         // the correlated error response exceed the atomic capacity.
         let request =
             JsonRpcRequest::new(format!("notifications/{}", "x".repeat(600)), None, 7_i64);
-        let response = server_request_response(&request)
+        let response = invalid_notification_request_response(&request)
             .expect("an ID-bearing notification-shaped method receives an error response");
         let response_size = serde_json::to_vec(&response)
             .expect("serialize the bounded-write response precondition")
@@ -36801,36 +36477,6 @@ exec sleep 30
 
     #[cfg(unix)]
     #[cfg(feature = "tasks")]
-    fn modern_incremental_tasks_listener_client_script(
-        requested_task_id: &str,
-        notification_task_id: &str,
-        subscription_id: i64,
-    ) -> String {
-        let discovery_response = modern_tasks_discovery_response(
-            "incremental-tasks-listener-server",
-            serde_json::json!({}),
-        );
-        let acknowledgement = format!(
-            r#"{{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":{subscription_id}}},"notifications":{{"taskIds":["{requested_task_id}"]}}}}}}"#
-        );
-        let task_notification = format!(
-            r#"{{"jsonrpc":"2.0","method":"notifications/tasks","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":{subscription_id}}},"taskId":"{notification_task_id}","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null}}}}"#
-        );
-        format!(
-            "IFS= read -r first || exit 1; \
-             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
-             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
-             IFS= read -r request || exit 1; \
-             case \"$request\" in *subscriptions/listen*io.modelcontextprotocol/protocolVersion*2026-07-28*'\\\"taskIds\\\":[\\\"{requested_task_id}\\\"]'*) ;; *) exit 1 ;; esac; \
-             printf '%s\\n' '{acknowledgement}'; \
-             printf '%s\\n' '{task_notification}'; \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":2}}}}}}'; \
-             exec sleep 2"
-        )
-    }
-
-    #[cfg(unix)]
-    #[cfg(feature = "tasks")]
     fn live_tasks_listener_fixture(
         requested_task_id: &str,
         notification_task_id: &str,
@@ -37217,7 +36863,7 @@ exec sleep 30
         )
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn legacy_raw_extension_no_contact_client_script() -> &'static str {
         "IFS= read -r initialize || exit 1; \\
          case \"$initialize\" in *'\"method\":\"initialize\"'*) \\
@@ -37343,7 +36989,7 @@ exec sleep 30
          exec sleep 2"
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn auto_discovery_refusal_client_script(refusal_code: i32) -> String {
         format!(
             "IFS= read -r first || exit 1; \
@@ -37362,7 +37008,7 @@ exec sleep 30
         )
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn legacy_reverse_ping_client_script() -> &'static str {
         "IFS= read -r first || exit 1; \
          case \"$first\" in *initialize*2024-11-05*) \
@@ -37379,7 +37025,7 @@ exec sleep 30
          exec sleep 2"
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn legacy_resource_subscription_client_script() -> &'static str {
         "IFS= read -r first || exit 1; \
          case \"$first\" in *initialize*2024-11-05*) \
@@ -37395,7 +37041,7 @@ exec sleep 30
          exec sleep 2"
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn legacy_typed_call_client_script() -> &'static str {
         "IFS= read -r first || exit 1; \
          case \"$first\" in *initialize*2024-11-05*) \
@@ -37409,7 +37055,7 @@ exec sleep 30
          exec sleep 2"
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn legacy_typed_list_client_script() -> &'static str {
         "IFS= read -r first || exit 1; \
          case \"$first\" in *initialize*2024-11-05*) \
@@ -37423,7 +37069,7 @@ exec sleep 30
          exec sleep 2"
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn legacy_progress_client_script(progress_token: i64) -> String {
         format!(
             "IFS= read -r first || exit 1; \
@@ -37442,7 +37088,7 @@ exec sleep 30
         )
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn legacy_log_level_client_script() -> &'static str {
         "IFS= read -r first || exit 1; \
          case \"$first\" in *initialize*2024-11-05*) \
@@ -37457,7 +37103,7 @@ exec sleep 30
          exec sleep 2"
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn auto_legacy_log_level_client_script() -> &'static str {
         "IFS= read -r first || exit 1; \
          case \"$first\" in \
@@ -37475,7 +37121,7 @@ exec sleep 30
          exec sleep 2"
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn legacy_completion_client_script() -> &'static str {
         "IFS= read -r first || exit 1; \
          case \"$first\" in *initialize*2024-11-05*) \
@@ -37489,7 +37135,7 @@ exec sleep 30
          exec sleep 2"
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn auto_legacy_completion_client_script() -> &'static str {
         "IFS= read -r first || exit 1; \
          case \"$first\" in \
@@ -37507,6 +37153,7 @@ exec sleep 30
          exec sleep 2"
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn completion_params() -> CompletionParams {
         CompletionParams {
             reference: CompletionReference::Prompt {
@@ -37539,6 +37186,7 @@ exec sleep 30
         }
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn completion_params_with_context() -> CompletionParams {
         let mut params = completion_params();
         params.context = Some(CompletionContext {
@@ -43271,7 +42919,6 @@ exec sleep 2
             progress: 0.5,
             total: Some(1.0),
             message: Some("half".into()),
-            meta: None,
         };
         let debug = format!("{:?}", params);
         assert!(debug.contains("progress"));
