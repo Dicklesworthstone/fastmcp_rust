@@ -767,7 +767,9 @@ impl ClientBuilder {
         certificate: asupersync::tls::Certificate,
     ) -> Result<Self, ModernHttpExecutorError> {
         crate::http_executor::ResourceTlsTrust::add_root(
-            &mut self.http_resource_tls, resource, certificate,
+            &mut self.http_resource_tls,
+            resource,
+            certificate,
         )?;
         Ok(self)
     }
@@ -2231,34 +2233,37 @@ exec sleep 5
         )
     }
 
-    /// Connects through the builder's yielding initializer, which polls
-    /// `initialize` under this bounded absolute deadline.
+    /// Connects `builder` through its yielding initializer, which polls the
+    /// handshake under this bounded absolute deadline.
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
-    fn connect_legacy_yielding(script: &str) -> McpResult<Client> {
+    fn connect_yielding(builder: ClientBuilder, script: &str) -> McpResult<Client> {
         block_on(
-            ClientBuilder::new()
-                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+            builder
                 .max_retries(0)
                 .request_timeout_policy(
                     RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(1))
-                        .expect("bounded legacy initialize timeout is valid"),
+                        .expect("bounded handshake timeout is valid"),
                 )
                 .connect_stdio_with_cx("sh", &["-c", script], &Cx::for_request()),
         )
     }
 
-    /// Connects through both shipped initializers: the builder's yielding
-    /// poll and the synchronous public constructor's request path.
+    /// Connects under `policy` through both shipped initializers: the
+    /// builder's yielding poll and the synchronous public constructor.
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
-    fn connect_legacy_on_both_initializers(script: &str) -> [(&'static str, McpResult<Client>); 2] {
+    fn connect_on_both_initializers(
+        policy: ProtocolPolicy,
+        script: &str,
+    ) -> [(&'static str, McpResult<Client>); 2] {
         let direct = Client::stdio_with_protocol_plan_with_cx(
             "sh",
             &["-c", script],
-            ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            ClientProtocolPlan::stdio(policy),
             Cx::for_request(),
         );
+        let builder = ClientBuilder::new().protocol_plan(ClientProtocolPlan::stdio(policy));
         [
-            ("builder", connect_legacy_yielding(script)),
+            ("builder", connect_yielding(builder, script)),
             ("constructor", direct),
         ]
     }
@@ -2278,7 +2283,8 @@ exec sleep 5
         ] {
             let foreign_reply = foreign.map(|id| legacy_initialize_reply(id, "foreign-id-server"));
             let script = legacy_exact_id_script(foreign_reply.as_deref(), true);
-            for (path, result) in connect_legacy_on_both_initializers(&script) {
+            for (path, result) in connect_on_both_initializers(ProtocolPolicy::LegacyOnly, &script)
+            {
                 let mut client =
                     result.unwrap_or_else(|error| panic!("{path} with {foreign:?}: {error}"));
                 assert_eq!(
@@ -2306,7 +2312,9 @@ exec sleep 5
         let foreign = legacy_initialize_reply(&format!("\"{canary}\""), "foreign-id-server");
         for exact_follows in [false, true] {
             let script = legacy_exact_id_script(Some(&foreign), exact_follows);
-            let yielding = connect_legacy_yielding(&script);
+            let legacy = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly));
+            let yielding = connect_yielding(legacy, &script);
             if exact_follows {
                 let mut client =
                     yielding.expect("the exact reply behind the canary ID initializes");
@@ -2328,7 +2336,7 @@ exec sleep 5
         let missing =
             r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"no correlation"}}"#;
         let script = legacy_exact_id_script(Some(missing), true);
-        for (path, result) in connect_legacy_on_both_initializers(&script) {
+        for (path, result) in connect_on_both_initializers(ProtocolPolicy::LegacyOnly, &script) {
             assert!(
                 result.is_err(),
                 "{path}: a missing-ID reply must fail initialize closed"
@@ -2336,45 +2344,117 @@ exec sleep 5
         }
     }
 
-    /// Before `initialize` selects an era, a server `ping` request is answered
-    /// with method-not-found under its exact ID; after legacy selection the
-    /// same request is serviced with an empty result. The peer exits on any
-    /// other answer, which fails the handshake or the public ping.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    const INITIALIZING_PING: &str = r#"{"jsonrpc":"2.0","id":"init-request","method":"ping"}"#;
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    const PING_ANSWERED: &str = r#""result":{}"#;
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    const METHOD_NOT_FOUND: &str = r#""code":-32601"#;
+
+    /// A peer that sends `request` (ID `init-request`) while the client's
+    /// handshake is in flight, exits unless the client answers it under that
+    /// ID with `expected`, and only then completes the handshake. `discover`
+    /// is the shell branch taken when the first line is `server/discover`.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn initializing_server_request_script(discover: &str, request: &str, expected: &str) -> String {
+        let legacy = legacy_initialize_reply("1", "initializing-request-server");
+        let modern = r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"initializing-request-server","version":"1"}}}}"#;
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*) {discover} ;; *initialize*2024-11-05*) era=legacy ;; *) exit 1 ;; esac; \
+             printf '%s\\n' '{request}'; \
+             IFS= read -r early || exit 2; \
+             case \"$early\" in *'\"id\":\"init-request\"'*) ;; *) exit 3 ;; esac; \
+             case \"$early\" in *'{expected}'*) ;; *) exit 4 ;; esac; \
+             if [ \"$era\" = legacy ]; then \
+             printf '%s\\n' '{legacy}'; \
+             IFS= read -r lifecycle || exit 5; case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 6 ;; esac; \
+             else printf '%s\\n' '{modern}'; fi; \
+             exec sleep 5"
+        )
+    }
+
+    /// MCP 2024-11-05 lets a server ping before `initialized`, so a ping sent
+    /// while a legacy `initialize` is in flight gets `{}` under its exact ID
+    /// on both shipped initializers, and under Auto after it falls back to
+    /// the legacy handshake. The peer exits on any other answer.
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     #[test]
-    fn legacy_server_ping_is_refused_until_initialize_selects_the_era() {
-        let script = format!(
-            "IFS= read -r first || exit 1; case \"$first\" in *initialize*2024-11-05*) ;; *) exit 1 ;; esac; \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":\"init-ping\",\"method\":\"ping\"}}'; \
-             IFS= read -r early || exit 2; \
-             case \"$early\" in *'\"id\":\"init-ping\"'*) ;; *) exit 3 ;; esac; \
-             case \"$early\" in *'\"code\":-32601'*) ;; *) exit 4 ;; esac; \
-             printf '%s\\n' '{}'; \
-             IFS= read -r lifecycle || exit 5; case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 6 ;; esac; \
-             IFS= read -r client_ping || exit 7; case \"$client_ping\" in *'\"method\":\"ping\"'*) ;; *) exit 8 ;; esac; \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":\"server-ping\",\"method\":\"ping\"}}'; \
-             IFS= read -r late || exit 9; \
-             case \"$late\" in *'\"id\":\"server-ping\"'*) ;; *) exit 10 ;; esac; \
-             case \"$late\" in *'\"result\":{{}}'*) ;; *) exit 11 ;; esac; \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{}}}}'; \
-             exec sleep 5",
-            legacy_initialize_reply("1", "initializing-ping-server")
-        );
-        for (path, result) in connect_legacy_on_both_initializers(&script) {
+    fn legacy_server_ping_is_answered_while_initialize_is_in_flight() {
+        let script = initializing_server_request_script("exit 1", INITIALIZING_PING, PING_ANSWERED);
+        for (path, result) in connect_on_both_initializers(ProtocolPolicy::LegacyOnly, &script) {
             let mut client = result.unwrap_or_else(|error| {
-                panic!("{path}: the pre-selection ping must be refused under its ID: {error}")
+                panic!("{path}: a ping during legacy initialize must get {{}}: {error}")
             });
             assert_eq!(
                 client.session.server_info().name,
-                "initializing-ping-server"
+                "initializing-request-server"
             );
-            client.ping().unwrap_or_else(|error| {
-                panic!("{path}: a selected legacy session services ping: {error}")
-            });
             client
                 .close()
                 .expect("legacy initializing-ping client cleanup");
         }
+
+        let refuse_discovery = r#"printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"no discovery"}}'; exec sleep 5"#;
+        let script =
+            initializing_server_request_script(refuse_discovery, INITIALIZING_PING, PING_ANSWERED);
+        let auto =
+            ClientBuilder::new().protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::Auto));
+        let mut client = connect_yielding(auto, &script)
+            .unwrap_or_else(|error| panic!("Auto's legacy fallback must answer the ping: {error}"));
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024)
+        );
+        client
+            .close()
+            .expect("Auto fallback initializing-ping client cleanup");
+    }
+
+    /// The same ping while a modern `server/discover` is in flight gets
+    /// method-not-found, and so does a `roots/list` during a legacy
+    /// `initialize` even with a roots handler configured: the spec allows
+    /// only pings and logging before `initialized`.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn server_requests_during_the_handshake_other_than_legacy_ping_are_refused() {
+        let script =
+            initializing_server_request_script("era=modern", INITIALIZING_PING, METHOD_NOT_FOUND);
+        for (path, result) in connect_on_both_initializers(ProtocolPolicy::ModernOnly, &script) {
+            let mut client = result.unwrap_or_else(|error| {
+                panic!("{path}: a ping during server/discover must be refused: {error}")
+            });
+            assert_eq!(
+                client.session.server_info().name,
+                "initializing-request-server"
+            );
+            client
+                .close()
+                .expect("modern initializing-ping client cleanup");
+        }
+
+        let roots = r#"{"jsonrpc":"2.0","id":"init-request","method":"roots/list"}"#;
+        let script = initializing_server_request_script("exit 1", roots, METHOD_NOT_FOUND);
+        let mut capabilities = ClientCapabilities::default();
+        capabilities.roots = Some(fastmcp_protocol::RootsCapability { list_changed: true });
+        let legacy = ClientBuilder::new()
+            .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+            .capabilities(capabilities)
+            .reverse_request_handlers(ReverseRequestHandlers::new().with_roots_list(
+                |_cx, _cancellation, _params| {
+                    Box::pin(async { Ok(fastmcp_protocol::ListRootsResult::new(Vec::new())) })
+                },
+            ));
+        let mut client = connect_yielding(legacy, &script).unwrap_or_else(|error| {
+            panic!("roots/list during initialize must be refused: {error}")
+        });
+        assert_eq!(
+            client.session.server_info().name,
+            "initializing-request-server"
+        );
+        client
+            .close()
+            .expect("legacy initializing-roots client cleanup");
     }
 
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
