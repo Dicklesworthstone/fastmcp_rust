@@ -272,9 +272,19 @@ fn tool_resume_panic_is_redacted_and_does_not_poison_the_shared_lane() {
 }
 
 async fn route(router: &Arc<Router>, state: &SessionState, id: i64, params: Value) -> McpResult<Value> {
+    route_with_owner(router, state, id, params, true).await
+}
+
+/// Modern transport admission marks each request as the owner of its retained
+/// continuations (`Router`'s request context does this); the router refuses an
+/// MRTR-capable handler for a context without that binding.
+async fn route_with_owner(
+    router: &Arc<Router>, state: &SessionState, id: i64, params: Value, owner: bool,
+) -> McpResult<Value> {
     let cx = Cx::current().unwrap();
     let ctx = McpContext::with_state(cx.clone(), id as u64, state.clone())
         .with_operation_deadline(Some(cx.now().saturating_add_nanos(5_000_000_000)));
+    let ctx = if owner { ctx.with_retained_continuation_owner() } else { ctx };
     router.clone().dispatch_stateless_owned(ctx, JsonRpcRequest::new("tools/call", Some(params), id)).await
 }
 
@@ -296,6 +306,9 @@ fn router_owns_multi_round_tokens_and_refuses_wrong_inputs_without_running_the_h
         router.add_tool(tool).unwrap();
         let router = Arc::new(router);
         let state = SessionState::new();
+        let unbound = route_with_owner(&router, &state, 0, params(), false).await.unwrap_err();
+        assert_eq!(unbound.message, "MRTR-capable handlers require a bound modern connection");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         let first = route(&router, &state, 1, params()).await.unwrap();
         assert_eq!(first["resultType"], "input_required");
         assert_eq!(first["inputRequests"]["first"]["method"], "roots/list");
