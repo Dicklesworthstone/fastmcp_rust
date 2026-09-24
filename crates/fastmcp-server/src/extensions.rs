@@ -463,6 +463,7 @@ impl ExtensionHandlerRegistry {
     /// Builder-only composition must add every descriptor before typed handlers
     /// are frozen under their shared receipt. Once frozen, neither descriptor
     /// nor handler mutation is admitted.
+    #[cfg(feature = "tasks")]
     pub(crate) fn descriptor_registry_mut(
         &mut self,
     ) -> Result<&mut ExtensionDescriptorRegistry, ExtensionHandlerRegistrationError> {

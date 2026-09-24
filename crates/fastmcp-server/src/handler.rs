@@ -58,8 +58,6 @@ use crate::tasks::FinalTaskWorkDescriptor;
 pub(crate) enum FinalResourceUriUse {
     /// A resource identity in `resources/list`.
     CatalogResource,
-    /// A resource-template identity in `resources/templates/list`.
-    CatalogTemplate,
     /// The target of a locally handled `resources/read` request.
     ResourceReadTarget,
     /// One embedded resource identity in a `resources/read` complete result.
@@ -107,9 +105,7 @@ impl ResourceUriUsePolicy {
         self.client_direct_https
             && matches!(
                 use_site,
-                FinalResourceUriUse::CatalogResource
-                    | FinalResourceUriUse::CatalogTemplate
-                    | FinalResourceUriUse::PromptResourceLink
+                FinalResourceUriUse::CatalogResource | FinalResourceUriUse::PromptResourceLink
             )
     }
 
@@ -1479,6 +1475,7 @@ pub struct UpstreamFinalToolSchemaRegistration {
 }
 
 impl UpstreamFinalToolSchemaRegistration {
+    #[cfg(any(feature = "proxy", test))]
     pub(crate) const fn exact_proxy() -> Self {
         Self {
             _proxy_registration: (),

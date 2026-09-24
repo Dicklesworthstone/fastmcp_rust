@@ -442,25 +442,6 @@ impl<'a> TagFilters<'a> {
     }
 }
 
-fn decode_cursor_offset(cursor: Option<&str>) -> McpResult<usize> {
-    let Some(cursor) = cursor else {
-        return Ok(0);
-    };
-
-    let decoded = BASE64_STANDARD.decode(cursor).map_err(|_| {
-        McpError::invalid_params("Invalid cursor (base64 decode failed)".to_string())
-    })?;
-    let v: serde_json::Value = serde_json::from_slice(&decoded)
-        .map_err(|_| McpError::invalid_params("Invalid cursor (JSON parse failed)".to_string()))?;
-    let offset = v
-        .get("offset")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| McpError::invalid_params("Invalid cursor (missing offset)".to_string()))?;
-
-    usize::try_from(offset)
-        .map_err(|_| McpError::invalid_params("Invalid cursor (offset too large)".to_string()))
-}
-
 /// The catalog a continuation cursor was minted for.
 ///
 /// Paged list cursors bind the offset to this catalog discriminator, the
@@ -581,23 +562,6 @@ fn decode_final_catalog_cursor_offset(
         ));
     }
     Ok(offset)
-}
-
-fn parse_stateless_params<T: serde::de::DeserializeOwned>(
-    params: Option<serde_json::Value>,
-) -> McpResult<T> {
-    let value = params.ok_or_else(|| McpError::invalid_params("Missing required parameters"))?;
-    serde_json::from_value(value).map_err(|error| McpError::invalid_params(error.to_string()))
-}
-
-fn parse_stateless_params_or_default<T: serde::de::DeserializeOwned + Default>(
-    params: Option<serde_json::Value>,
-) -> McpResult<T> {
-    match params {
-        Some(value) => serde_json::from_value(value)
-            .map_err(|error| McpError::invalid_params(error.to_string())),
-        None => Ok(T::default()),
-    }
 }
 
 /// Converts a completed stateless handler result through the final result
@@ -987,6 +951,7 @@ struct AdmittedToolRegistration {
 struct AdmittedFinalToolRegistration {
     final_definition: FinalTool,
     schemas: FinalToolSchemas,
+    #[cfg(feature = "tasks")]
     declares_final_tasks: bool,
 }
 
@@ -1024,6 +989,10 @@ impl AdmittedToolRegistration {
             .map_err(|_payload| {
                 McpError::internal_error("tool metadata hook panicked during admission")
             })?;
+        // The hook still runs under the admission unwind guard; only the Tasks
+        // dispatch path reads its declaration.
+        #[cfg(not(feature = "tasks"))]
+        let _ = declares_final_tasks;
         let final_definition = match exact_final_definition {
             Some(definition) => definition,
             None => {
@@ -1069,6 +1038,7 @@ impl AdmittedToolRegistration {
             final_registration: Some(AdmittedFinalToolRegistration {
                 final_definition,
                 schemas,
+                #[cfg(feature = "tasks")]
                 declares_final_tasks,
             }),
             legacy_enabled,
@@ -1573,80 +1543,6 @@ fn legacy_prompt_messages_from_handler(
         .collect()
 }
 
-/// Promotes exact legacy resource content into a final resource result.
-///
-/// Legacy open members remain inert but are retained verbatim. In particular,
-/// an untyped legacy `_meta` value stays in `additional` rather than acquiring
-/// final-era metadata authority during the cross-era projection.
-fn promote_legacy_resource_content(
-    resource: LegacyResourceContent,
-) -> McpResult<EmbeddedResourceContents> {
-    let (uri, content, mime_type, additional) = match resource {
-        LegacyResourceContent::Text {
-            uri,
-            text,
-            mime_type,
-            additional,
-        } => (
-            uri,
-            LegacyEmbeddedContent::Text(text),
-            mime_type,
-            additional,
-        ),
-        LegacyResourceContent::Blob {
-            uri,
-            blob,
-            mime_type,
-            additional,
-        } => (
-            uri,
-            LegacyEmbeddedContent::Blob(blob),
-            mime_type,
-            additional,
-        ),
-    };
-    let uri = AbsoluteUri::parse(uri).map_err(|error| {
-        McpError::internal_error(format!(
-            "legacy resource content cannot be projected into the final result: {error}",
-        ))
-    })?;
-
-    match content {
-        LegacyEmbeddedContent::Text(text) => Ok(EmbeddedResourceContents::Text {
-            uri,
-            text,
-            mime_type,
-            meta: None,
-            additional,
-        }),
-        LegacyEmbeddedContent::Blob(blob) => Ok(EmbeddedResourceContents::Blob {
-            uri,
-            blob,
-            mime_type,
-            meta: None,
-            additional,
-        }),
-    }
-}
-
-enum LegacyEmbeddedContent {
-    Text(String),
-    Blob(String),
-}
-
-fn legacy_read_resource_params(params: FinalReadResourceParams) -> ReadResourceParams {
-    ReadResourceParams {
-        uri: params.uri.as_str().to_owned(),
-        meta: None,
-    }
-}
-
-fn encode_cursor_offset(offset: usize) -> String {
-    let payload = serde_json::json!({ "offset": offset });
-    let bytes = serde_json::to_vec(&payload).expect("cursor state must serialize");
-    BASE64_STANDARD.encode(bytes)
-}
-
 fn encode_final_catalog_cursor(
     catalog: FinalCatalogKind,
     revision: u64,
@@ -1812,6 +1708,7 @@ fn duplicate_registration_error(component: &'static str, key: &str) -> McpError 
 /// Prefixed `as_proxy_typed` may skip one colliding catalog member under
 /// [`crate::DuplicateBehavior::Error`]. Other admission failures (schema,
 /// metadata, panic-during-definition) must still fail the install.
+#[cfg(any(feature = "proxy", test))]
 pub(crate) fn is_duplicate_registration_error(error: &McpError) -> bool {
     error.code == McpErrorCode::InvalidRequest
         && error.message.contains(" already exists; component_key=")
@@ -2428,6 +2325,7 @@ impl Router {
     }
 
     /// Adds an exact-final-only tool with duplicate handling.
+    #[cfg(feature = "proxy")]
     pub(crate) fn add_final_tool_with_behavior<H: ToolHandler + 'static>(
         &mut self,
         handler: H,
@@ -2441,6 +2339,7 @@ impl Router {
     /// This is deliberately narrower than ordinary tool registration: callers
     /// must first install the Apps extension through the builder, and the tool
     /// is never projected into exact MCP 2024-11-05 discovery or dispatch.
+    #[cfg(any(feature = "apps", test))]
     pub(crate) fn add_mcp_apps_tool_with_behavior<H: ToolHandler + 'static>(
         &mut self,
         handler: H,
@@ -2642,6 +2541,7 @@ impl Router {
     /// Builder-level composition uses this inventory before consuming a child
     /// server. Invalid retained final metadata is treated as Apps-bound so a
     /// malformed child cannot bypass the destination's Apps opt-in gate.
+    #[cfg(feature = "apps")]
     #[must_use]
     pub(crate) fn has_mcp_apps_bound_components(&self) -> bool {
         self.final_resources.values().any(|registration| {
@@ -2682,6 +2582,7 @@ impl Router {
     ///
     /// This route takes precedence over the legacy server-wide fallback and is
     /// removed atomically when `Replace` admits a new prompt at the same name.
+    #[cfg(any(feature = "proxy", test))]
     pub(crate) fn add_legacy_prompt_completion_handler<H: CompletionHandler + 'static>(
         &mut self,
         prompt_name: impl Into<String>,
@@ -2811,6 +2712,7 @@ impl Router {
     }
 
     /// Adds an exact-final-only resource or resource template with duplicate handling.
+    #[cfg(any(feature = "proxy", test))]
     pub(crate) fn add_final_resource_with_behavior<H: ResourceHandler + 'static>(
         &mut self,
         handler: H,
@@ -2820,6 +2722,7 @@ impl Router {
     }
 
     /// Adds one final-only MCP Apps HTML resource after builder-level Apps opt-in.
+    #[cfg(any(feature = "apps", test))]
     pub(crate) fn add_mcp_apps_ui_resource_with_behavior<H: ResourceHandler + 'static>(
         &mut self,
         handler: H,
@@ -3224,6 +3127,7 @@ impl Router {
     }
 
     /// Adds an exact-final-only prompt with duplicate handling.
+    #[cfg(any(feature = "proxy", test))]
     pub(crate) fn add_final_prompt_with_behavior<H: PromptHandler + 'static>(
         &mut self,
         handler: H,
@@ -3594,6 +3498,7 @@ impl Router {
 
     /// Returns whether an admitted exact-2024 request selects a handler frozen
     /// as async at registration and therefore stays on the caller's runtime.
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     pub(crate) fn legacy_request_uses_transport_owned_async_dispatch(
         &self,
         request: &JsonRpcRequest,
@@ -3654,6 +3559,7 @@ impl Router {
     }
 
     /// Awaits the resolved handler's subscription hook on the request runtime.
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     pub(crate) async fn notify_resource_subscribed_async(
         &self,
         ctx: &McpContext,
@@ -3668,6 +3574,7 @@ impl Router {
     }
 
     /// Awaits the resolved handler's unsubscription hook on the request runtime.
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     pub(crate) async fn notify_resource_unsubscribed_async(
         &self,
         ctx: &McpContext,
@@ -4120,6 +4027,7 @@ impl Router {
     /// complete-result contract. State-bearing lifecycle methods and exact
     /// 2024-11-05 wire results stay on the legacy adapter rather than
     /// acquiring accidental modern semantics.
+    #[cfg(test)]
     pub(crate) async fn dispatch_stateless(
         &self,
         request_ctx: &McpContext,
@@ -4139,6 +4047,7 @@ impl Router {
     /// Callers that received an ingress raw-parameter sidecar must use this
     /// entry point so final MRTR retries retain ordered response entries and
     /// reject duplicate keys before registry admission.
+    #[cfg(test)]
     pub(crate) async fn dispatch_stateless_with_raw_params(
         &self,
         request_ctx: &McpContext,
@@ -4155,6 +4064,7 @@ impl Router {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn dispatch_stateless_with_continuation_cancellation(
         &self,
         request_ctx: &McpContext,
@@ -4197,6 +4107,7 @@ impl Router {
     /// close without claiming that cleanup has already finished. Request-local
     /// cancellation affects this subtree, never sibling requests. Direct callers
     /// without a runtime gateway retain the inline dispatch path.
+    #[cfg(test)]
     pub(crate) async fn dispatch_stateless_owned(
         self: Arc<Self>,
         request_ctx: McpContext,
@@ -4215,6 +4126,7 @@ impl Router {
     /// request cancellation: an `input_required` response ends one JSON-RPC
     /// request normally, while its retry remains valid until its connection
     /// disconnects or the continuation expires.
+    #[cfg(test)]
     pub(crate) async fn dispatch_stateless_owned_with_continuation_cancellation(
         self: Arc<Self>,
         request_ctx: McpContext,
@@ -7965,6 +7877,8 @@ fn nested_tool_content_from_final(block: ContentBlock) -> ToolContentItem {
 /// handlers, enabling cross-component access.
 #[derive(Clone)]
 enum RouterAccess {
+    /// Test-only: production handles never extend a request's router lifetime.
+    #[cfg(test)]
     Shared(Arc<Router>),
     RequestScoped(Weak<Router>),
 }
@@ -7972,6 +7886,7 @@ enum RouterAccess {
 impl RouterAccess {
     fn upgrade(&self) -> McpResult<Arc<Router>> {
         match self {
+            #[cfg(test)]
             Self::Shared(router) => Ok(Arc::clone(router)),
             Self::RequestScoped(router) => router.upgrade().ok_or_else(|| {
                 McpError::new(
@@ -7992,6 +7907,7 @@ pub(crate) struct RouterResourceReader {
 
 impl RouterResourceReader {
     /// Creates a new resource reader with the given router and session state.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn new(router: Arc<Router>, session_state: SessionState) -> Self {
         Self {
@@ -8293,6 +8209,7 @@ pub(crate) struct RouterToolCaller {
 
 impl RouterToolCaller {
     /// Creates a new tool caller with the given router and session state.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn new(router: Arc<Router>, session_state: SessionState) -> Self {
         Self {
@@ -8621,6 +8538,7 @@ pub(crate) struct RouterPromptCaller {
 }
 
 impl RouterPromptCaller {
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn new(router: Arc<Router>, session_state: SessionState) -> Self {
         Self {
@@ -8949,51 +8867,9 @@ mod safe_log_label_tests {
 #[cfg(test)]
 mod cursor_tests {
     use super::{
-        FinalCatalogKind, FinalCatalogQuery, decode_cursor_offset,
-        decode_final_catalog_cursor_offset, encode_cursor_offset, encode_final_catalog_cursor,
+        FinalCatalogKind, FinalCatalogQuery, decode_final_catalog_cursor_offset,
+        encode_final_catalog_cursor,
     };
-
-    #[test]
-    fn roundtrip_zero() {
-        let encoded = encode_cursor_offset(0);
-        let decoded = decode_cursor_offset(Some(&encoded)).unwrap();
-        assert_eq!(decoded, 0);
-    }
-
-    #[test]
-    fn roundtrip_large_offset() {
-        let encoded = encode_cursor_offset(12345);
-        let decoded = decode_cursor_offset(Some(&encoded)).unwrap();
-        assert_eq!(decoded, 12345);
-    }
-
-    #[test]
-    fn none_cursor_returns_zero() {
-        assert_eq!(decode_cursor_offset(None).unwrap(), 0);
-    }
-
-    #[test]
-    fn invalid_base64_returns_error() {
-        let err = decode_cursor_offset(Some("not-valid-base64!!!")).unwrap_err();
-        assert!(err.message.contains("base64"));
-    }
-
-    #[test]
-    fn valid_base64_but_not_json_returns_error() {
-        let encoded =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"not json");
-        let err = decode_cursor_offset(Some(&encoded)).unwrap_err();
-        assert!(err.message.contains("JSON"));
-    }
-
-    #[test]
-    fn valid_json_but_no_offset_returns_error() {
-        let payload = serde_json::json!({"other": 1});
-        let bytes = serde_json::to_vec(&payload).unwrap();
-        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
-        let err = decode_cursor_offset(Some(&encoded)).unwrap_err();
-        assert!(err.message.contains("offset"));
-    }
 
     #[test]
     fn final_catalog_cursor_binds_the_catalog_revision_and_query() {
@@ -9304,38 +9180,6 @@ mod router_tests {
                     "role": "user",
                     "content": {"type": "text", "text": "summarize"}
                 }]
-            })
-        );
-    }
-
-    #[test]
-    fn legacy_resource_adapter_preserves_open_members_when_promoted() {
-        let resource = LegacyResourceContent::Text {
-            uri: "file:///open.txt".to_owned(),
-            text: "preserve me".to_owned(),
-            mime_type: Some("text/plain".to_owned()),
-            additional: BTreeMap::from([
-                (
-                    "_meta".to_owned(),
-                    serde_json::json!({"legacy": "uninterpreted"}),
-                ),
-                (
-                    "com.example/legacy".to_owned(),
-                    serde_json::json!({"retained": true}),
-                ),
-            ]),
-        };
-
-        let promoted = promote_legacy_resource_content(resource)
-            .expect("schema-valid legacy resource is promotable");
-        assert_eq!(
-            serde_json::to_value(promoted).expect("promoted resource serializes"),
-            serde_json::json!({
-                "uri": "file:///open.txt",
-                "mimeType": "text/plain",
-                "text": "preserve me",
-                "_meta": {"legacy": "uninterpreted"},
-                "com.example/legacy": {"retained": true}
             })
         );
     }
@@ -16390,23 +16234,6 @@ mod router_tests {
         );
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
         assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
-    }
-
-    fn handle_prompts_get_success() {
-        let mut r = Router::new();
-        r.add_prompt(NamedPrompt::new("greet"));
-        let cx = Cx::for_testing();
-        let budget = Budget::INFINITE;
-        let params = GetPromptParams {
-            name: "greet".to_string(),
-            arguments: None,
-            meta: None,
-        };
-        let state = SessionState::new();
-        let request_ctx = request_context(&cx, 1, budget, &state);
-        let result = block_on(r.handle_prompts_get(&request_ctx, params, state, None, None))
-            .unwrap();
-        assert!(result.description.is_some());
     }
 
     // ── handle_prompts_get: not found ────────────────────────────────────
