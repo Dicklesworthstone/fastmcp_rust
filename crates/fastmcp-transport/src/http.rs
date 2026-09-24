@@ -2839,37 +2839,300 @@ fn body_mcp_name(request: &JsonRpcRequest) -> Option<&str> {
 }
 
 fn response_representation(request: &HttpRequest) -> Result<HttpResponseRepresentation, HttpError> {
-    let Some(accept) = request.header("accept") else {
-        return Ok(HttpResponseRepresentation::Json);
-    };
+    HttpResponsePreferences::from_headers(
+        request
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+    )
+    .map(HttpResponsePreferences::preferred)
+}
 
-    if accepts_media_type(accept, "application", "json") {
-        Ok(HttpResponseRepresentation::Json)
-    } else if accepts_media_type(accept, "text", "event-stream") {
-        Ok(HttpResponseRepresentation::Sse)
-    } else {
-        Err(HttpError::NotAcceptable)
+const MAX_ACCEPT_MEMBERS: usize = 16;
+const MAX_ACCEPT_PARAMETERS: usize = 16;
+const MAX_IGNORED_ACCEPT_EMPTY_ELEMENTS: usize = 16;
+
+/// Admitted preferences for the parameter-free JSON and SSE response types.
+///
+/// A single bounded parser supplies both ordinary response selection and the
+/// acceptance check for a method that requires SSE. More-specific ranges take
+/// precedence over wildcards, including an explicit quality of zero. Duplicate
+/// equally specific ranges use the lower quality independent of field order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpResponsePreferences {
+    json_quality: u16,
+    sse_quality: u16,
+}
+
+impl HttpResponsePreferences {
+    /// Admits all `Accept` field lines without allocating combined header data.
+    ///
+    /// Callers apply their HTTP header byte/count limits before this operation.
+    /// Negotiation additionally bounds media ranges, parameters, and ignored
+    /// empty list members to 16 each. Quoted delimiters cannot introduce a new
+    /// range, and malformed syntax never grants acceptance through a wildcard.
+    /// An absent `Accept` permits both representations and prefers JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HttpError::NotAcceptable`] for malformed or over-limit input,
+    /// or when neither offered representation has a positive quality.
+    pub fn from_headers<'a>(
+        headers: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Result<Self, HttpError> {
+        let mut members = 0_usize;
+        let mut empty_elements = 0_usize;
+        let mut saw_accept = false;
+        let mut json = AcceptPreference::default();
+        let mut sse = AcceptPreference::default();
+
+        for (name, value) in headers {
+            if !name.eq_ignore_ascii_case("accept") {
+                continue;
+            }
+            saw_accept = true;
+            for member in AcceptQuotedParts::new(value, b',') {
+                let member = member
+                    .map_err(|()| HttpError::NotAcceptable)?
+                    .trim_matches([' ', '\t']);
+                if member.is_empty() {
+                    empty_elements += 1;
+                    if empty_elements > MAX_IGNORED_ACCEPT_EMPTY_ELEMENTS {
+                        return Err(HttpError::NotAcceptable);
+                    }
+                    continue;
+                }
+                members += 1;
+                if members > MAX_ACCEPT_MEMBERS {
+                    return Err(HttpError::NotAcceptable);
+                }
+                let range =
+                    AcceptMediaRange::parse(member).map_err(|()| HttpError::NotAcceptable)?;
+                if let Some(specificity) = range.specificity_for("application", "json") {
+                    json.consider(specificity, range.quality);
+                }
+                if let Some(specificity) = range.specificity_for("text", "event-stream") {
+                    sse.consider(specificity, range.quality);
+                }
+            }
+        }
+
+        let preferences = if saw_accept {
+            Self {
+                json_quality: json.quality(),
+                sse_quality: sse.quality(),
+            }
+        } else {
+            Self {
+                json_quality: 1000,
+                sse_quality: 1000,
+            }
+        };
+        if preferences.json_quality == 0 && preferences.sse_quality == 0 {
+            return Err(HttpError::NotAcceptable);
+        }
+        Ok(preferences)
+    }
+
+    /// Returns the highest-quality acceptable representation; JSON wins ties.
+    #[must_use]
+    pub const fn preferred(self) -> HttpResponseRepresentation {
+        if self.json_quality >= self.sse_quality {
+            HttpResponseRepresentation::Json
+        } else {
+            HttpResponseRepresentation::Sse
+        }
+    }
+
+    /// Whether a required representation is acceptable, independently of which
+    /// representation has the higher quality.
+    #[must_use]
+    pub const fn accepts(self, representation: HttpResponseRepresentation) -> bool {
+        match representation {
+            HttpResponseRepresentation::Json => self.json_quality > 0,
+            HttpResponseRepresentation::Sse => self.sse_quality > 0,
+        }
     }
 }
 
-fn accepts_media_type(value: &str, expected_type: &str, expected_subtype: &str) -> bool {
-    value.split(',').any(|entry| {
-        let mut parameters = entry.split(';');
-        let media_type = parameters.next().unwrap_or("").trim();
-        let Some((type_part, subtype_part)) = media_type.split_once('/') else {
-            return false;
-        };
-        let quality_is_zero = parameters.any(|parameter| {
-            parameter
-                .trim()
-                .strip_prefix("q=")
-                .or_else(|| parameter.trim().strip_prefix("Q="))
-                .is_some_and(|quality| matches!(quality, "0" | "0.0" | "0.00" | "0.000"))
+#[derive(Default)]
+struct AcceptPreference {
+    matched: Option<(u8, u16)>,
+}
+
+impl AcceptPreference {
+    fn consider(&mut self, specificity: u8, quality: u16) {
+        self.matched = Some(match self.matched {
+            Some((previous, weight)) if previous > specificity => (previous, weight),
+            Some((previous, weight)) if previous == specificity => (previous, weight.min(quality)),
+            _ => (specificity, quality),
         });
-        !quality_is_zero
-            && (type_part.eq_ignore_ascii_case(expected_type) || type_part == "*")
-            && (subtype_part.eq_ignore_ascii_case(expected_subtype) || subtype_part == "*")
-    })
+    }
+
+    fn quality(&self) -> u16 {
+        self.matched.map_or(0, |(_, quality)| quality)
+    }
+}
+
+struct AcceptMediaRange<'a> {
+    media_type: &'a str,
+    subtype: &'a str,
+    quality: u16,
+    requires_parameters: bool,
+}
+
+impl<'a> AcceptMediaRange<'a> {
+    fn parse(member: &'a str) -> Result<Self, ()> {
+        let mut parts = AcceptQuotedParts::new(member, b';');
+        let essence = parts.next().ok_or(())??.trim_matches([' ', '\t']);
+        let (media_type, subtype) = essence.split_once('/').ok_or(())?;
+        if !is_http_token(media_type)
+            || !is_http_token(subtype)
+            || (media_type == "*" && subtype != "*")
+        {
+            return Err(());
+        }
+        let mut quality = None;
+        let mut requires_parameters = false;
+        for (index, parameter) in parts.enumerate() {
+            if index >= MAX_ACCEPT_PARAMETERS {
+                return Err(());
+            }
+            let parameter = parameter?.trim_matches([' ', '\t']);
+            // RFC 9110's parameters production permits empty parameter slots.
+            if parameter.is_empty() {
+                continue;
+            }
+            let (name, value) = parameter.split_once('=').ok_or(())?;
+            if !is_http_token(name) || !is_accept_parameter_value(value) {
+                return Err(());
+            }
+            if name.eq_ignore_ascii_case("q") {
+                if quality.is_some() {
+                    return Err(());
+                }
+                quality = Some(parse_accept_quality(value).ok_or(())?);
+            } else {
+                requires_parameters = true;
+            }
+        }
+        Ok(Self {
+            media_type,
+            subtype,
+            quality: quality.unwrap_or(1000),
+            requires_parameters,
+        })
+    }
+
+    fn specificity_for(&self, media_type: &str, subtype: &str) -> Option<u8> {
+        if self.requires_parameters {
+            return None;
+        }
+        if self.media_type == "*" && self.subtype == "*" {
+            Some(0)
+        } else if !self.media_type.eq_ignore_ascii_case(media_type) {
+            None
+        } else if self.subtype == "*" {
+            Some(1)
+        } else if self.subtype.eq_ignore_ascii_case(subtype) {
+            Some(2)
+        } else {
+            None
+        }
+    }
+}
+
+/// Exact thousandths preserve RFC 9110's quality grammar without rounding.
+fn parse_accept_quality(value: &str) -> Option<u16> {
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if !matches!(whole, "0" | "1")
+        || fraction.len() > 3
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    if whole == "1" {
+        return fraction.bytes().all(|byte| byte == b'0').then_some(1000);
+    }
+    let mut quality = 0_u16;
+    for byte in fraction.bytes() {
+        quality = quality * 10 + u16::from(byte - b'0');
+    }
+    for _ in fraction.len()..3 {
+        quality *= 10;
+    }
+    Some(quality)
+}
+
+fn is_accept_parameter_value(value: &str) -> bool {
+    if is_http_token(value) {
+        return true;
+    }
+    let Some(quoted) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return false;
+    };
+    let mut escaped = false;
+    for byte in quoted.bytes() {
+        if byte < b' ' && byte != b'\t' || byte == 0x7f {
+            return false;
+        }
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            return false;
+        }
+    }
+    !escaped
+}
+
+/// Splits on unquoted ASCII delimiters without allocation or UTF-8 slicing.
+struct AcceptQuotedParts<'a> {
+    rest: Option<&'a str>,
+    separator: u8,
+}
+
+impl<'a> AcceptQuotedParts<'a> {
+    fn new(value: &'a str, separator: u8) -> Self {
+        Self {
+            rest: Some(value),
+            separator,
+        }
+    }
+}
+
+impl<'a> Iterator for AcceptQuotedParts<'a> {
+    type Item = Result<&'a str, ()>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let value = self.rest.take()?;
+        let mut quoted = false;
+        let mut escaped = false;
+        for (index, byte) in value.bytes().enumerate() {
+            if byte < b' ' && byte != b'\t' || byte == 0x7f {
+                return Some(Err(()));
+            }
+            if escaped {
+                escaped = false;
+            } else if quoted && byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = !quoted;
+            } else if !quoted && byte == self.separator {
+                self.rest = Some(&value[index + 1..]);
+                return Some(Ok(&value[..index]));
+            }
+        }
+        Some(if quoted || escaped {
+            Err(())
+        } else {
+            Ok(value)
+        })
+    }
 }
 
 // =============================================================================
@@ -12461,6 +12724,170 @@ Content-Length: {}\r\n\
             .admit_modern_request(&task_lifecycle_http_request("tasks/get", None))
             .expect_err("removing only Mcp-Name must reject before Tasks dispatch");
         assert!(matches!(error, HttpError::ProtocolAdmission(_)));
+    }
+
+    fn modern_http_accept_request(accept: Option<&str>) -> HttpRequest {
+        let request = HttpRequest::new(HttpMethod::Post, "/mcp")
+            .with_header("content-type", "application/json")
+            .with_header("mcp-protocol-version", "2026-07-28")
+            .with_header("mcp-method", "server/discover")
+            .with_body(
+                serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 271,
+                    "method": "server/discover",
+                    "params": {
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                    },
+                }))
+                .expect("modern discovery request serializes"),
+            );
+        match accept {
+            Some(accept) => request.with_header("accept", accept),
+            None => request,
+        }
+    }
+
+    #[test]
+    fn modern_http_handler_accept_preferences_positive() {
+        let handler = task_lifecycle_handler();
+        for (accept, expected) in [
+            (None, HttpResponseRepresentation::Json),
+            (Some("*/*"), HttpResponseRepresentation::Json),
+            (Some("application/*"), HttpResponseRepresentation::Json),
+            (Some("text/*"), HttpResponseRepresentation::Sse),
+            (
+                Some("application/json;q=0, */*;q=1"),
+                HttpResponseRepresentation::Sse,
+            ),
+            (
+                Some("*/*;q=1, application/json;q=0"),
+                HttpResponseRepresentation::Sse,
+            ),
+            (
+                Some("text/event-stream;q=0, */*;q=1"),
+                HttpResponseRepresentation::Json,
+            ),
+            (
+                Some("application/json;q=0.1, text/event-stream;q=0.9"),
+                HttpResponseRepresentation::Sse,
+            ),
+            (
+                Some("application/json;q=0.7, text/event-stream;q=0.7"),
+                HttpResponseRepresentation::Json,
+            ),
+            (
+                Some("application/json, APPLICATION/JSON;q=0, text/event-stream"),
+                HttpResponseRepresentation::Sse,
+            ),
+        ] {
+            let request = modern_http_accept_request(accept);
+            let original_body = request.body.clone();
+            let admitted = handler
+                .admit_modern_request(&request)
+                .expect("valid HTTP preferences admit through the public handler");
+            assert_eq!(admitted.response_representation(), expected, "{accept:?}");
+            assert_eq!(admitted.request().id, Some(271_i64.into()));
+            assert_eq!(admitted.request().method, "server/discover");
+            assert_eq!(request.body, original_body);
+        }
+    }
+
+    #[test]
+    fn modern_http_handler_accept_preferences_planted_negative() {
+        let handler = task_lifecycle_handler();
+        for accept in [
+            "*/*;q=1, application/json;q=0, text/event-stream;q=0",
+            "application/json;q=NaN, text/event-stream",
+            "application/json;q=1;Q=0, text/event-stream",
+            "application/json;q=0.0001, text/event-stream",
+            "application/json;q=1.0000, text/event-stream",
+            "application/json;q=\"0.5\", text/event-stream",
+            "application/json;q =1, text/event-stream",
+            "*/json, text/event-stream",
+            "application/json;profile=\"x, text/event-stream;q=1\"",
+            "application/json;profile=\"unterminated, text/event-stream",
+            "",
+        ] {
+            let request = modern_http_accept_request(Some(accept));
+            let original_body = request.body.clone();
+            assert!(matches!(
+                handler.admit_modern_request(&request),
+                Err(HttpError::NotAcceptable)
+            ));
+            assert_eq!(request.body, original_body);
+        }
+        let admitted = handler
+            .admit_modern_request(&modern_http_accept_request(Some("application/json")))
+            .expect("refused preferences do not affect a later request");
+        assert_eq!(
+            admitted.response_representation(),
+            HttpResponseRepresentation::Json,
+        );
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn dual_era_modern_accept_preferences_select_body_and_reject_before_enqueue() {
+        let endpoint = dual_era_endpoint();
+        let mut session = endpoint.open_session().expect("endpoint opens a session");
+        let cx = Cx::for_testing();
+        let accepted = modern_http_accept_request(Some("application/json;q=0, */*;q=1"));
+        let rejected = accepted.clone().with_header(
+            "accept",
+            "application/json;q=0, text/event-stream;q=0, */*;q=1",
+        );
+        assert!(matches!(
+            session.handle(&cx, rejected),
+            Err(DualEraHttpEndpointError::Http(HttpError::NotAcceptable))
+        ));
+        assert_eq!(session.modern_transport.pending_requests(), 0);
+        assert_eq!(session.modern_responses.live_request_bodies().unwrap(), 0);
+
+        let response = session
+            .handle(&cx, accepted)
+            .expect("an exact JSON exclusion leaves the wildcard SSE offer");
+        let DualEraHttpEndpointResponse::ModernSse(response) = response else {
+            panic!("the public transport endpoint must not select explicitly excluded JSON");
+        };
+        assert_eq!(response.response().status, HttpStatus::OK);
+        assert_eq!(
+            response
+                .response()
+                .headers
+                .get("content-type")
+                .map(String::as_str),
+            Some("text/event-stream"),
+        );
+        assert_eq!(session.modern_transport.pending_requests(), 1);
+        assert_eq!(
+            session.recv_modern_request(&cx).unwrap().id,
+            Some(271_i64.into()),
+        );
+        assert_eq!(session.modern_transport.pending_requests(), 0);
+        response
+            .sender()
+            .send_response(
+                &cx,
+                JsonRpcResponse::success(
+                    271_i64.into(),
+                    serde_json::json!({"resultType": "complete"}),
+                ),
+            )
+            .expect("the selected SSE body accepts its terminal result");
+        let event = response.recv_event(&cx).expect("terminal result is emitted");
+        assert!(matches!(
+            Codec::new().decode_complete_message(event.data.as_bytes()),
+            Ok(JsonRpcMessage::Response(message)) if message.id == Some(271_i64.into())
+        ));
+        assert!(response.is_finished());
+        assert!(matches!(
+            response.pop_event(),
+            Err(DualEraHttpEndpointError::Transport(TransportError::Closed))
+        ));
     }
 
     #[cfg(feature = "legacy-2024-11-05")]

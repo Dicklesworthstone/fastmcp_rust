@@ -3927,77 +3927,10 @@ impl ServerHttpEndpointError {
 
 fn http_request_accepts_sse(request: &HttpRequest) -> bool {
     request.header("accept").is_some_and(|value| {
-        const MAX_ACCEPT_ENTRIES: usize = 64;
-        const MAX_ACCEPT_PARAMETERS: usize = 32;
-        const MAX_QVALUE_BYTES: usize = 32;
-
-        let mut entries = value.split(',');
-        for _ in 0..MAX_ACCEPT_ENTRIES {
-            let Some(entry) = entries.next() else {
-                return false;
-            };
-            let mut parameters = entry.split(';');
-            let media_type = parameters.next().unwrap_or("").trim_matches([' ', '\t']);
-            let Some((kind, subtype)) = media_type.split_once('/') else {
-                continue;
-            };
-            if !(kind.eq_ignore_ascii_case("text") || kind == "*")
-                || !(subtype.eq_ignore_ascii_case("event-stream") || subtype == "*")
-            {
-                continue;
-            }
-
-            let mut quality = None;
-            let mut parameter_count = 0;
-            let mut malformed = false;
-            for parameter in parameters {
-                parameter_count += 1;
-                if parameter_count > MAX_ACCEPT_PARAMETERS {
-                    malformed = true;
-                    break;
-                }
-                let Some((name, value)) = parameter.split_once('=') else {
-                    continue;
-                };
-                if !name.trim_matches([' ', '\t']).eq_ignore_ascii_case("q") {
-                    continue;
-                }
-                if quality.is_some() {
-                    malformed = true;
-                    break;
-                }
-                let value = value.trim_matches([' ', '\t']);
-                if value.len() > MAX_QVALUE_BYTES || value.is_empty() {
-                    malformed = true;
-                    break;
-                }
-                quality = Some(match value.split_once('.') {
-                    Some(("0", fraction))
-                        if fraction.len() <= 3
-                            && fraction.bytes().all(|byte| byte.is_ascii_digit()) =>
-                    {
-                        fraction.bytes().any(|byte| byte != b'0')
-                    }
-                    Some(("1", fraction))
-                        if fraction.len() <= 3
-                            && fraction.bytes().all(|byte| byte.is_ascii_digit())
-                            && fraction.bytes().all(|byte| byte == b'0') =>
-                    {
-                        true
-                    }
-                    None if value == "0" => false,
-                    None if value == "1" => true,
-                    _ => {
-                        malformed = true;
-                        false
-                    }
-                });
-            }
-            if !malformed && quality.unwrap_or(true) {
-                return true;
-            }
-        }
-        false
+        fastmcp_transport::http::HttpResponsePreferences::from_headers([("accept", value)])
+            .is_ok_and(|preferences| {
+                preferences.accepts(fastmcp_transport::http::HttpResponseRepresentation::Sse)
+            })
     })
 }
 
@@ -52423,10 +52356,38 @@ mod lib_unit_tests {
                 &HttpRequest::new(HttpMethod::Post, "/mcp").with_header("accept", value),
             )
         };
-        assert!(accepts("  */* ; unrelated=value ; Q = 1. "));
-        assert!(!accepts("  */* ; unrelated=value ; Q = 0. "));
+        assert!(accepts("  */* ; Q=1. "));
+        assert!(!accepts("  */* ; Q=0. "));
+        assert!(!accepts("*/*; Q = 1."));
+        assert!(!accepts("*/*; unrelated=value; Q=1."));
         assert!(!accepts("text/event-stream; q=1.0000"));
         assert!(!accepts("text/event-stream; q=0.0000"));
+    }
+
+    #[test]
+    fn http_sse_accept_exclusions_override_wildcards_before_stream_allocation() {
+        for value in [
+            "text/event-stream;q=0, */*;q=1",
+            "*/*;q=1, text/event-stream;q=0",
+            "text/*;q=0, */*;q=1",
+            "text/event-stream, text/event-stream;q=0, application/json",
+            "application/json;profile=\"x, text/event-stream\"",
+        ] {
+            assert!(
+                !http_request_accepts_sse(
+                    &HttpRequest::new(HttpMethod::Post, "/mcp").with_header("accept", value),
+                ),
+                "a required SSE body must honor the full admitted preference: {value}",
+            );
+        }
+        assert!(http_request_accepts_sse(
+            &HttpRequest::new(HttpMethod::Post, "/mcp")
+                .with_header("accept", "text/event-stream;q=0.1, */*;q=1"),
+        ));
+        assert!(!http_request_accepts_sse(&HttpRequest::new(
+            HttpMethod::Post,
+            "/mcp",
+        )));
     }
 
     #[test]
@@ -53702,28 +53663,64 @@ mod lib_unit_tests {
             })),
             811_i64,
         );
-        let response = block_on(
-            session.handle_async(
-                &cx,
-                HttpRequest::new(HttpMethod::Post, "/mcp")
-                    .with_header("content-type", "application/json")
-                    .with_header("accept", "application/json, text/event-stream; Q=0.")
-                    .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
-                    .with_header("mcp-method", "tools/call")
-                    .with_header("mcp-name", "http_request_scoped_progress")
-                    .with_body(serde_json::to_vec(&request).expect("final request must encode")),
-            ),
-        )
-        .expect("zero-quality SSE request must be rejected before dispatch");
+        let request = HttpRequest::new(HttpMethod::Post, "/mcp")
+            .with_header("content-type", "application/json")
+            .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+            .with_header("mcp-method", "tools/call")
+            .with_header("mcp-name", "http_request_scoped_progress")
+            .with_body(serde_json::to_vec(&request).expect("final request must encode"));
+        for accept in [
+            "application/json, text/event-stream; Q=0.",
+            "text/event-stream;q=0, */*;q=1",
+            "*/*;q=1, text/event-stream;q=0",
+            "text/*;q=0, */*;q=1",
+            "text/event-stream, text/event-stream;q=0, application/json",
+        ] {
+            let response = block_on(
+                session.handle_async(&cx, request.clone().with_header("accept", accept)),
+            )
+            .expect("zero-quality SSE request must be rejected before dispatch");
+            assert!(matches!(
+                response,
+                ServerHttpEndpointResponse::Immediate(response)
+                    if response.status == HttpStatus::NOT_ACCEPTABLE && response.body.is_empty()
+            ));
+            assert_eq!(
+                calls.load(Ordering::Acquire),
+                0,
+                "an SSE exclusion must prevent handler entry even with a wildcard: {accept}",
+            );
+        }
+
+        // Change only the exact SSE quality. JSON remains preferred by the
+        // wildcard, but a positive SSE weight permits this method's stream.
+        let response = block_on(session.handle_async(
+            &cx,
+            request.with_header("accept", "text/event-stream;q=0.1, */*;q=1"),
+        ))
+        .expect("an accepted required SSE representation must dispatch after refusals");
+        let ServerHttpEndpointResponse::ModernSse(sse) = response else {
+            panic!("the notification-capable method requires its accepted SSE body");
+        };
+        let progress = sse.recv_event(&cx).expect("progress frame must be queued");
+        let log = sse.recv_event(&cx).expect("log frame must be queued");
+        let terminal = sse.recv_event(&cx).expect("terminal response must be queued");
         assert!(matches!(
-            response,
-            ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::NOT_ACCEPTABLE
+            Codec::new().decode_complete_message(progress.data.as_bytes()),
+            Ok(JsonRpcMessage::Request(notification))
+                if notification.method == "notifications/progress"
         ));
-        assert_eq!(
-            calls.load(Ordering::Acquire),
-            0,
-            "changing only the SSE quality from one to zero must prevent handler entry"
-        );
+        assert!(matches!(
+            Codec::new().decode_complete_message(log.data.as_bytes()),
+            Ok(JsonRpcMessage::Request(notification))
+                if notification.method == "notifications/message"
+        ));
+        assert!(matches!(
+            Codec::new().decode_complete_message(terminal.data.as_bytes()),
+            Ok(JsonRpcMessage::Response(response))
+                if response.id == Some(811_i64.into()) && response.error.is_none()
+        ));
+        assert_eq!(calls.load(Ordering::Acquire), 1);
     }
 
     #[test]

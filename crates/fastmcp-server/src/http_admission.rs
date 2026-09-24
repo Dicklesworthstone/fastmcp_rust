@@ -56,11 +56,6 @@ pub const MODERN_MCP_HTTP_METHOD: &str = "POST";
 /// value, mirroring the client-side bound: framing noise stays finite.
 const MAX_IGNORED_CONTENT_ENCODING_EMPTY_ELEMENTS: usize = 16;
 
-/// Maximum parsed `Accept` media-range members across all `Accept` field
-/// lines. `Accept` is a list field, so multiple lines merge; the bound keeps
-/// negotiation work finite regardless.
-const MAX_ACCEPT_MEMBERS: usize = 16;
-
 /// Singleton request fields this boundary refuses to see twice.
 const SINGLETON_HEADERS: [&str; 6] = [
     "content-type",
