@@ -11,11 +11,14 @@
 //!   application-owned runtime instead, and [`crate::Server::final_task_runtime`]
 //!   returns whichever runtime is installed.
 //! - Creating a task needs a ready task service, which no server has by
-//!   default. The application calls [`FinalTaskRuntime::install_task_service`]
-//!   with its [`ApplicationTaskSupervisor`], then polls the returned
-//!   [`AuthorizedTaskServiceRunner::run_service`] in its own region; FastMCP
-//!   never spawns it. Until then a task-creating request is refused with
-//!   "Final task creation requires an installed ready task service".
+//!   default. [`crate::ServerBuilder::task_supervisor`] installs one for an
+//!   [`ApplicationTaskSupervisor`], and every serve path then hosts its runner
+//!   as a child of the serve scope: started and ready before traffic,
+//!   settled within a bound before the serve returns. An embedding that owns
+//!   its own region may instead call [`FinalTaskRuntime::install_task_service`]
+//!   and poll [`AuthorizedTaskServiceRunner::run_service`] itself. Without
+//!   either, a task-creating request is refused with "Final task creation
+//!   requires an installed ready task service".
 //!
 //! The legacy `TaskManager` (Docket/SEP-1686) in this file is compiled only for
 //! tests and is not part of the shipped API.
@@ -6309,6 +6312,15 @@ impl FinalTaskRuntime {
         Self::task_service_is_ready(signal.as_ref())
     }
 
+    /// Whether a Task service is installed, ready or not. A builder uses this
+    /// to refuse hosting a second service on a caller-installed runtime.
+    pub(crate) fn has_installed_task_service(&self) -> bool {
+        self.service_signal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
     /// Verifies, without mutation, that a live entered task-service runner
     /// currently owns this runtime's readiness generation.
     ///
@@ -6871,6 +6883,217 @@ impl AuthorizedTaskServiceRunner {
             return result;
         }
     }
+}
+
+/// Wakeup-queue capacity of a Task service installed through
+/// [`crate::ServerBuilder::task_supervisor`].
+pub(crate) const HOSTED_TASK_SERVICE_QUEUE_CAPACITY: usize = 64;
+/// How long a serve path waits for its hosted Task service to become ready.
+pub(crate) const HOSTED_TASK_SERVICE_STARTUP_BOUND: StdDuration = StdDuration::from_secs(2);
+/// How long a serve path waits for its hosted Task service to settle on exit.
+pub(crate) const HOSTED_TASK_SERVICE_SETTLEMENT_BOUND: StdDuration = StdDuration::from_secs(4);
+const HOSTED_TASK_SERVICE_POLL: StdDuration = StdDuration::from_millis(1);
+
+type HostedRunnerSlot = Arc<Mutex<Option<AuthorizedTaskServiceRunner>>>;
+
+/// A builder-installed Task service that each serve path hosts in its own
+/// structured scope.
+///
+/// Between serves the runner waits in its slot. [`Self::start`] moves it into
+/// a child task of the serving `Cx`, and a drop guard returns it when that
+/// child finishes, is cancelled or is dropped. A runner therefore cannot
+/// outlive the serve that started it, and a later serve can re-enter it.
+#[derive(Clone)]
+pub(crate) struct TaskServiceHost {
+    runtime: FinalTaskRuntime,
+    slot: HostedRunnerSlot,
+}
+
+/// The hosted Task service child of one serve.
+#[must_use = "a hosted Task service must be settled before its serve returns"]
+pub(crate) struct HostedTaskService {
+    runtime: FinalTaskRuntime,
+    handle: asupersync::runtime::TaskHandle<McpResult<()>>,
+}
+
+struct ReturnRunnerOnDrop {
+    slot: HostedRunnerSlot,
+    runner: Option<AuthorizedTaskServiceRunner>,
+}
+
+impl Drop for ReturnRunnerOnDrop {
+    fn drop(&mut self) {
+        let runner = self.runner.take();
+        *self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = runner;
+    }
+}
+
+impl TaskServiceHost {
+    /// Installs `supervisor` as the one Task service of `runtime`.
+    pub(crate) fn install(
+        runtime: &FinalTaskRuntime,
+        supervisor: Arc<dyn ApplicationTaskSupervisor>,
+    ) -> McpResult<Self> {
+        let runner =
+            runtime.install_task_service(HOSTED_TASK_SERVICE_QUEUE_CAPACITY, supervisor)?;
+        Ok(Self {
+            runtime: runtime.clone(),
+            slot: Arc::new(Mutex::new(Some(runner))),
+        })
+    }
+
+    /// Starts the runner as a child task of `cx`. Readiness is not awaited.
+    pub(crate) fn start(&self, cx: &Cx) -> McpResult<HostedTaskService> {
+        let runner = self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| {
+                McpError::internal_error("The hosted Task service is already running")
+            })?;
+        let mut guard = ReturnRunnerOnDrop {
+            slot: Arc::clone(&self.slot),
+            runner: Some(runner),
+        };
+        // A refused spawn drops the closure, and with it the guard, which
+        // returns the runner to its slot.
+        let handle = cx
+            .spawn(move |service_cx| async move {
+                let Some(runner) = guard.runner.as_mut() else {
+                    return Ok(());
+                };
+                runner.run_service(&service_cx).await
+            })
+            .map_err(|error| {
+                McpError::internal_error(format!("Hosted Task service admission failed: {error}"))
+            })?;
+        Ok(HostedTaskService {
+            runtime: self.runtime.clone(),
+            handle,
+        })
+    }
+
+    /// Starts the runner and waits for readiness. A runner that fails to
+    /// become ready is settled before the error returns.
+    pub(crate) async fn start_ready(&self, cx: &Cx) -> McpResult<HostedTaskService> {
+        let mut hosted = self.start(cx)?;
+        match hosted.ready(cx).await {
+            Ok(()) => Ok(hosted),
+            Err(error) => {
+                let _ = hosted.settle(cx).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Blocking form of [`Self::start_ready`] for the synchronous serve loops,
+    /// which already occupy a blocking-pool thread.
+    pub(crate) fn start_ready_blocking(&self, cx: &Cx) -> McpResult<HostedTaskService> {
+        let mut hosted = self.start(cx)?;
+        match hosted.ready_blocking() {
+            Ok(()) => Ok(hosted),
+            Err(error) => {
+                let _ = hosted.settle_blocking();
+                Err(error)
+            }
+        }
+    }
+}
+
+impl HostedTaskService {
+    fn not_ready(&mut self) -> McpResult<bool> {
+        if self.runtime.is_task_service_ready() {
+            return Ok(false);
+        }
+        if self.handle.is_finished() {
+            return Err(McpError::internal_error(
+                "The hosted Task service stopped before publishing readiness",
+            ));
+        }
+        Ok(true)
+    }
+
+    async fn ready(&mut self, cx: &Cx) -> McpResult<()> {
+        let deadline = cx.now() + HOSTED_TASK_SERVICE_STARTUP_BOUND;
+        while self.not_ready()? {
+            asupersync::time::timeout_at(
+                deadline,
+                asupersync::time::sleep(cx.now(), HOSTED_TASK_SERVICE_POLL),
+            )
+            .await
+            .map_err(|_| hosted_task_service_not_ready())?;
+        }
+        Ok(())
+    }
+
+    fn ready_blocking(&mut self) -> McpResult<()> {
+        let deadline = Instant::now() + HOSTED_TASK_SERVICE_STARTUP_BOUND;
+        while self.not_ready()? {
+            if Instant::now() >= deadline {
+                return Err(hosted_task_service_not_ready());
+            }
+            std::thread::sleep(HOSTED_TASK_SERVICE_POLL);
+        }
+        Ok(())
+    }
+
+    /// Cancels the child and waits, within the settlement bound, for it to
+    /// finish. The runner is back in its slot once the child is gone.
+    pub(crate) async fn settle(mut self, cx: &Cx) -> McpResult<()> {
+        self.handle.abort();
+        match asupersync::time::timeout(
+            cx.now(),
+            HOSTED_TASK_SERVICE_SETTLEMENT_BOUND,
+            self.handle.join(cx),
+        )
+        .await
+        {
+            Ok(joined) => hosted_task_service_exit(joined),
+            Err(_) => Err(hosted_task_service_unsettled()),
+        }
+    }
+
+    /// Blocking form of [`Self::settle`] for the synchronous serve loops.
+    pub(crate) fn settle_blocking(mut self) -> McpResult<()> {
+        self.handle.abort();
+        let deadline = Instant::now() + HOSTED_TASK_SERVICE_SETTLEMENT_BOUND;
+        loop {
+            match self.handle.try_join() {
+                Ok(Some(result)) => return result,
+                Ok(None) => {}
+                Err(error) => return hosted_task_service_exit(Err(error)),
+            }
+            if Instant::now() >= deadline {
+                return Err(hosted_task_service_unsettled());
+            }
+            std::thread::sleep(HOSTED_TASK_SERVICE_POLL);
+        }
+    }
+}
+
+fn hosted_task_service_exit(
+    joined: Result<McpResult<()>, asupersync::runtime::JoinError>,
+) -> McpResult<()> {
+    match joined {
+        Ok(result) => result,
+        // The settlement abort itself; the runner stopped as asked.
+        Err(asupersync::runtime::JoinError::Cancelled(_)) => Ok(()),
+        Err(error) => Err(McpError::internal_error(format!(
+            "Hosted Task service join failed: {error:?}"
+        ))),
+    }
+}
+
+fn hosted_task_service_not_ready() -> McpError {
+    McpError::internal_error("The hosted Task service did not become ready within its bound")
+}
+
+fn hosted_task_service_unsettled() -> McpError {
+    McpError::internal_error("The hosted Task service did not settle within its bound")
 }
 
 fn final_task_handoff_task_id(handoff: &FinalTaskSupervisorHandoff) -> &FinalTaskId {
@@ -20524,5 +20747,101 @@ mod tests {
                 .status,
             OfficialTaskStatus::InputRequired
         );
+    }
+
+    struct IdleSupervisor;
+
+    impl ApplicationTaskSupervisor for IdleSupervisor {
+        fn resume<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn hosted_runtime() -> (FinalTaskRuntime, TaskServiceHost) {
+        let runtime = FinalTaskRuntime::in_memory(
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000)).expect("valid timing policy"),
+            Arc::new(|_| {}),
+        );
+        let host =
+            TaskServiceHost::install(&runtime, Arc::new(IdleSupervisor)).expect("install host");
+        (runtime, host)
+    }
+
+    fn hosting_runtime() -> asupersync::runtime::Runtime {
+        RuntimeBuilder::current_thread()
+            .blocking_threads(1, 4)
+            .build()
+            .expect("caller-owned runtime")
+    }
+
+    #[test]
+    fn hosted_task_service_is_ready_only_while_hosted_and_serves_again() {
+        let (runtime, host) = hosted_runtime();
+        assert!(runtime.has_installed_task_service());
+        assert!(!runtime.is_task_service_ready(), "installing is not readiness");
+        hosting_runtime().block_on(async {
+            let cx = Cx::current().expect("caller execution context");
+            for serve in 0..2 {
+                let hosted = host.start_ready(&cx).await.expect("hosted service ready");
+                assert!(runtime.is_task_service_ready(), "serve {serve}: ready while hosted");
+                hosted.settle(&cx).await.expect("hosted service settles");
+                assert!(!runtime.is_task_service_ready(), "serve {serve}: settled");
+            }
+        });
+    }
+
+    #[test]
+    fn a_second_start_while_hosted_is_refused_and_leaves_the_first_ready() {
+        let (runtime, host) = hosted_runtime();
+        hosting_runtime().block_on(async {
+            let cx = Cx::current().expect("caller execution context");
+            let hosted = host.start_ready(&cx).await.expect("hosted service ready");
+            assert!(host.start(&cx).is_err(), "one runner cannot be hosted twice");
+            assert!(runtime.is_task_service_ready());
+            hosted.settle(&cx).await.expect("hosted service settles");
+            assert!(!runtime.is_task_service_ready());
+        });
+    }
+
+    #[test]
+    fn blocking_serve_loops_host_and_settle_the_same_runner() {
+        let (runtime, host) = hosted_runtime();
+        hosting_runtime().block_on(async {
+            let cx = Cx::current().expect("caller execution context");
+            let observed = runtime.clone();
+            let mut serve = cx
+                .spawn_blocking(move |serve_cx| {
+                    let hosted = host.start_ready_blocking(&serve_cx)?;
+                    let ready = observed.is_task_service_ready();
+                    hosted.settle_blocking()?;
+                    Ok::<_, McpError>((ready, observed.is_task_service_ready()))
+                })
+                .expect("blocking serve admitted");
+            let (while_hosted, after_settle) = serve
+                .join(&cx)
+                .await
+                .expect("blocking serve joins")
+                .expect("blocking serve hosts its service");
+            assert!(while_hosted);
+            assert!(!after_settle);
+        });
+    }
+
+    #[test]
+    fn a_runtime_with_a_caller_installed_service_cannot_host_another() {
+        let runtime = FinalTaskRuntime::in_memory(
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000)).expect("valid timing policy"),
+            Arc::new(|_| {}),
+        );
+        assert!(!runtime.has_installed_task_service());
+        let _caller_runner = runtime
+            .install_task_service(1, Arc::new(IdleSupervisor))
+            .expect("caller installs its own service");
+        assert!(runtime.has_installed_task_service());
+        assert!(TaskServiceHost::install(&runtime, Arc::new(IdleSupervisor)).is_err());
     }
 }

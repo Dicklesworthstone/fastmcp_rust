@@ -23383,10 +23383,10 @@ mod lib_unit_tests {
                 // Read the value from the completed blocking closure itself;
                 // the wrapper join is cancellation-dominant during shutdown.
                 Ok(_pump) => {
-                    let deadline = cx.now().saturating_add_nanos(
-                        u64::try_from(completion_timeout.as_nanos())
-                            .expect("split transport completion timeout must fit in nanoseconds"),
-                    );
+                    // Counted in runnable time, so a loaded full suite cannot
+                    // expire the bound while a stalled transport still does.
+                    let host = RunnableClock::start();
+                    let started = host.mark();
                     loop {
                         match receiver.try_recv() {
                             Ok(result) => break result.map_err(|error| error.to_string()),
@@ -23396,14 +23396,14 @@ mod lib_unit_tests {
                                 );
                             }
                             Err(TryRecvError::Empty) => {
-                                asupersync::time::timeout_at(
-                                    deadline,
-                                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)),
-                                )
-                                .await
-                                .map_err(|_| {
-                                    live_http_test_timeout("live split transport result")
-                                })?;
+                                if host.expired(started, completion_timeout) {
+                                    return Err(format!(
+                                        "{} after {}",
+                                        live_http_test_timeout("live split transport result"),
+                                        host.describe(started)
+                                    ));
+                                }
+                                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
                             }
                         }
                     }
@@ -30453,9 +30453,22 @@ mod lib_unit_tests {
         let shutdown_called = Arc::new(AtomicBool::new(false));
         let shutdown_observer = Arc::clone(&shutdown_called);
         let release_control = Arc::clone(&control);
+        // Scheduling the modern child can take longer than a couple of wall
+        // seconds in a loaded full suite, so its start bound counts runnable
+        // time; a child that never starts still fails.
+        const START_BOUND: Duration = Duration::from_secs(5);
         let release_thread = std::thread::spawn(move || {
-            let started = release_control.wait_for_started(Duration::from_secs(2));
-            if started {
+            let host = RunnableClock::start();
+            let waiting = host.mark();
+            let started = loop {
+                if release_control.wait_for_started(Duration::from_millis(20)) {
+                    break Ok(());
+                }
+                if host.expired(waiting, START_BOUND) {
+                    break Err(host.describe(waiting));
+                }
+            };
+            if started.is_ok() {
                 std::thread::sleep(
                     DISPATCH_WORKER_SHUTDOWN_TIMEOUT * 2 + Duration::from_millis(500),
                 );
@@ -30468,11 +30481,11 @@ mod lib_unit_tests {
         });
         let started = Instant::now();
         // The handler deliberately outlives both five-second product drain
-        // windows. Include its two-second start bound and two seconds for
-        // joined cleanup instead of expiring the harness before release.
+        // windows. Include its start bound and two seconds for joined cleanup
+        // instead of expiring the harness before release.
         let completion_timeout = DISPATCH_WORKER_SHUTDOWN_TIMEOUT * 2
             + Duration::from_millis(500)
-            + Duration::from_secs(2)
+            + START_BOUND
             + Duration::from_secs(2);
         let run_result = run_live_split_transport(
             completion_timeout,
@@ -30488,12 +30501,9 @@ mod lib_unit_tests {
             NonQuiescentLegacySplitSend,
         );
         let elapsed = started.elapsed();
-        let release_observed_start = release_thread.join().expect("release thread must finish");
-
-        assert!(
-            release_observed_start,
-            "modern child must start before its delayed release"
-        );
+        if let Err(waited) = release_thread.join().expect("release thread must finish") {
+            panic!("modern child must start before its delayed release: waited {waited}");
+        }
         assert!(control.has_started());
         assert!(control.has_finished());
         assert!(elapsed >= DISPATCH_WORKER_SHUTDOWN_TIMEOUT);

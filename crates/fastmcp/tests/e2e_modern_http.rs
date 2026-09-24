@@ -698,20 +698,6 @@ enum AsProxyGatewayAuth {
     Custom,
 }
 
-/// Fixed owner supplied through the real server authentication boundary for
-/// loopback relay tests. These fixtures prove Task ownership and transport
-/// behavior; they do not claim to verify an HTTP credential. Separate bearer
-/// admission tests exercise the actual token verifiers.
-#[cfg(all(feature = "proxy", feature = "tasks"))]
-struct ProxyTaskFixtureOwner;
-
-#[cfg(all(feature = "proxy", feature = "tasks"))]
-impl fastmcp_rust::AuthProvider for ProxyTaskFixtureOwner {
-    fn authenticate(&self, _ctx: &McpContext, _request: AuthRequest<'_>) -> McpResult<AuthContext> {
-        Ok(AuthContext::with_subject("facade-proxy-task-fixture-owner"))
-    }
-}
-
 /// Sends one bounded native HTTP POST with optional Authorization plus the
 /// routed Mcp-Method/Mcp-Name headers and returns the raw response bytes for
 /// as_proxy gateway admission proofs.
@@ -4591,7 +4577,12 @@ fn spawn_modern_task_http_server() -> HttpServerFixture {
     }
 }
 
-#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
 fn spawn_modern_http_task_proxy_gateway(upstream: SocketAddr) -> HttpServerFixture {
     let _startup_guard = proxy_gateway_startup_guard();
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
@@ -4662,8 +4653,18 @@ fn spawn_modern_http_task_proxy_gateway(upstream: SocketAddr) -> HttpServerFixtu
                     "live HTTP task proxy catalog omitted {PUBLIC_HTTP_TASK_TOOL_NAME}: {tool_names:?}"
                 ));
             }
+            // Relayed Tasks need a verified owner; tests reach this gateway
+            // through a TLS front with the owner's bearer.
             let server = modern::ServerBuilder::new("e2e-http-task-gateway", "1.0.0")
-                .auth_provider(ProxyTaskFixtureOwner)
+                .auth_provider(TokenAuthProvider::new(
+                    StaticTokenVerifier::new([(
+                        "alpha",
+                        AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
+                    )])
+                    .expect("the task proxy gateway owner verifier is valid")
+                    .with_allowed_schemes(["Bearer"])
+                    .expect("the task proxy gateway bearer scheme is valid"),
+                ))
                 .as_proxy_typed("ext", proxy, catalog)
                 .map_err(|error| format!("as_proxy_typed task install failed: {error}"))?
                 .build();
@@ -4741,18 +4742,37 @@ fn spawn_modern_http_task_proxy_gateway(upstream: SocketAddr) -> HttpServerFixtu
     }
 }
 
-#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
 #[test]
 fn e2e_public_http_prefixed_as_proxy_controls_its_issued_task_handle() {
+    as_proxy_owner_isolated(
+        "e2e_public_http_prefixed_as_proxy_controls_its_issued_task_handle",
+        e2e_public_http_prefixed_as_proxy_controls_its_issued_task_handle_case,
+    );
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+fn e2e_public_http_prefixed_as_proxy_controls_its_issued_task_handle_case() {
     let cx = Cx::for_request();
     let upstream = spawn_modern_task_http_server();
-    let gateway = spawn_modern_http_task_proxy_gateway(upstream.address());
+    let gateway =
+        AsProxyOwnerGateway::fronting(spawn_modern_http_task_proxy_gateway(upstream.address()));
 
     let mut creator = runtime_block_on_bounded(
         &cx,
-        modern::ClientBuilder::new()
-            .client_info("e2e-public-http-task-gateway-creator", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+        gateway
+            .owner("e2e-public-http-task-gateway-creator")
+            .connect_http_with_cx(gateway.target(), &cx),
     )
     .expect("the public facade connects to the Task-issuing HTTP gateway");
     let created = runtime_block_on_bounded(
@@ -4777,9 +4797,9 @@ fn e2e_public_http_prefixed_as_proxy_controls_its_issued_task_handle() {
 
     let mut gateway_client = runtime_block_on_bounded(
         &cx,
-        modern::ClientBuilder::new()
-            .client_info("e2e-public-http-task-gateway-client", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+        gateway
+            .owner("e2e-public-http-task-gateway-client")
+            .connect_http_with_cx(gateway.target(), &cx),
     )
     .expect("the public facade connects to the live prefixed as_proxy Tasks gateway");
 
@@ -4966,12 +4986,31 @@ fn e2e_public_http_prefixed_as_proxy_controls_its_issued_task_handle() {
     upstream.shutdown();
 }
 
-#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
 #[test]
 fn e2e_public_http_as_proxy_refuses_unissued_upstream_task_ids() {
+    as_proxy_owner_isolated(
+        "e2e_public_http_as_proxy_refuses_unissued_upstream_task_ids",
+        e2e_public_http_as_proxy_refuses_unissued_upstream_task_ids_case,
+    );
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+fn e2e_public_http_as_proxy_refuses_unissued_upstream_task_ids_case() {
     let cx = Cx::for_request();
     let upstream = spawn_modern_task_http_server();
-    let gateway = spawn_modern_http_task_proxy_gateway(upstream.address());
+    let gateway =
+        AsProxyOwnerGateway::fronting(spawn_modern_http_task_proxy_gateway(upstream.address()));
     let mut creator = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -4988,9 +5027,9 @@ fn e2e_public_http_as_proxy_refuses_unissued_upstream_task_ids() {
     let raw_id = created.task.base().task_id.clone();
     let mut client = runtime_block_on_bounded(
         &cx,
-        modern::ClientBuilder::new()
-            .client_info("e2e-http-unissued-task-client", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+        gateway
+            .owner("e2e-http-unissued-task-client")
+            .connect_http_with_cx(gateway.target(), &cx),
     ).expect("the fixed-owner client connects to the gateway");
     let get_error = runtime_block_on_bounded(
         &cx, client.get_task(&cx, RequestId::Number(2), raw_id.clone(), 1 << 20),
@@ -5018,45 +5057,382 @@ fn e2e_public_http_as_proxy_refuses_unissued_upstream_task_ids() {
     upstream.shutdown();
 }
 
-#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
-fn spawn_modern_http_stdio_as_proxy_gateway() -> (HttpServerFixture, FinalTaskId) {
-    let (gateway, task_id) = spawn_modern_http_stdio_as_proxy_gateway_configured(true, Vec::new());
-    (
-        gateway,
-        task_id.expect("the precreate path always records one official Task"),
-    )
-}
-
-/// Same live stdio `as_proxy("ext")` HTTP gateway, but without occupying the
-/// shipped echo in-memory store (capacity 1). Create-through-gateway proofs
-/// use this so `ext/durable_task` is not immediately capacity-refused.
+/// The live stdio `as_proxy("ext")` HTTP gateway without occupying the shipped
+/// echo in-memory store (capacity 1), so `ext/durable_task` is not
+/// immediately capacity-refused.
 #[cfg(all(unix, feature = "proxy", feature = "tasks"))]
 fn spawn_modern_http_stdio_as_proxy_gateway_without_precreated_task() -> HttpServerFixture {
-    spawn_modern_http_stdio_as_proxy_gateway_configured(false, Vec::new()).0
+    spawn_modern_http_stdio_as_proxy_gateway_configured(Vec::new())
+}
+
+// bd-v0vo6: a Task relayed by as_proxy belongs to a verified owner (AUTH-00).
+// Native HTTP takes a bearer only from `Authorization`, and the shipped client
+// attaches one only over https, so the owner-gateway tests front the plain
+// gateway with TLS, as a deployment does, and run in a child of this binary
+// whose only trust root is the TEST ONLY CA (the HTTP-05 A pattern).
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+const AS_PROXY_OWNER_CHILD: &str = "FASTMCP_E2E_AS_PROXY_OWNER_CASE";
+/// The bearer both owner gateways' static verifiers admit.
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+const AS_PROXY_OWNER_TOKEN: &str = "alpha";
+
+/// Runs `case` in a child of this test binary whose `SSL_CERT_FILE` holds only
+/// the TEST ONLY CA; this process's environment is never mutated.
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+fn as_proxy_owner_isolated(name: &str, case: impl FnOnce()) {
+    if let Ok(selected) = std::env::var(AS_PROXY_OWNER_CHILD) {
+        assert_eq!(
+            selected, name,
+            "the child must run exactly the selected case"
+        );
+        case();
+        return;
+    }
+    let roots = std::env::temp_dir().join(format!("fastmcp-e2e-{name}-ca.pem"));
+    std::fs::write(&roots, HTTP_05_A_ROOT).expect("materialize the TEST ONLY root");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(AS_PROXY_OWNER_CHILD, name)
+        .env("SSL_CERT_FILE", &roots)
+        .env_remove("SSL_CERT_DIR")
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .expect("launch the isolated owner-gateway child");
+    // The child owns its own operation bounds; this only reaps a stuck child.
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        if let Some(status) = child.try_wait().expect("poll the owner-gateway child") {
+            assert!(
+                status.success(),
+                "owner-gateway case {name} failed in its child"
+            );
+            return;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("owner-gateway case {name} exceeded its child-process bound");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Terminates TLS with the TEST ONLY identity in front of a plain-http
+/// gateway, the way a deployment fronts one; bytes pass through unchanged.
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+struct AsProxyTlsFront {
+    address: SocketAddr,
+    owner: Cx,
+    join: Option<JoinHandle<()>>,
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+impl AsProxyTlsFront {
+    fn spawn(upstream: SocketAddr) -> Self {
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<(SocketAddr, Cx)>(1);
+        let join = thread::spawn(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .with_reactor(
+                    asupersync::runtime::reactor::create_reactor()
+                        .expect("TLS front reactor initializes"),
+                )
+                .build()
+                .expect("TLS front runtime builds");
+            runtime.block_on(async move {
+                let cx = Cx::current().expect("the TLS front runtime installs a context");
+                let listener = asupersync::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind the TLS front");
+                let acceptor = asupersync::tls::TlsAcceptorBuilder::new(
+                    asupersync::tls::CertificateChain::from_pem(HTTP_05_A_LEAF)
+                        .expect("TEST ONLY leaf"),
+                    asupersync::tls::PrivateKey::from_pem(HTTP_05_A_KEY).expect("TEST ONLY key"),
+                )
+                .alpn_protocols(vec![b"http/1.1".to_vec()])
+                .build()
+                .expect("TLS front acceptor builds");
+                let address = listener.local_addr().expect("TLS front address");
+                if ready_tx.send((address, cx.clone())).is_err() {
+                    return;
+                }
+                while cx.checkpoint().is_ok() {
+                    let Ok(Ok((socket, _))) = asupersync::time::timeout(
+                        cx.now(),
+                        Duration::from_millis(20),
+                        listener.accept(),
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    let acceptor = acceptor.clone();
+                    let _ = cx.spawn(move |_| async move {
+                        let Ok(mut tls) = acceptor.accept(socket).await else {
+                            return;
+                        };
+                        let Ok(mut plain) = asupersync::net::TcpStream::connect(upstream).await
+                        else {
+                            return;
+                        };
+                        let _ = asupersync::io::copy_bidirectional(&mut tls, &mut plain).await;
+                    });
+                }
+            });
+        });
+        let (address, owner) = ready_rx
+            .recv_timeout(HTTP_OPERATION_BOUND)
+            .expect("the TLS front starts");
+        Self {
+            address,
+            owner,
+            join: Some(join),
+        }
+    }
+
+    fn target(&self) -> CanonicalHttpUrl {
+        CanonicalHttpUrl::parse(&format!("https://{}/mcp", self.address))
+            .expect("the TLS front forms a canonical https target")
+    }
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+impl Drop for AsProxyTlsFront {
+    fn drop(&mut self) {
+        self.owner.set_cancel_requested(true);
+        if let Some(join) = self.join.take() {
+            let deadline = Instant::now() + HTTP_SERVER_TEARDOWN_BOUND;
+            while !join.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if join.is_finished() {
+                let _ = join.join();
+            }
+        }
+    }
+}
+
+/// A plain-http gateway fixture whose static bearer verifier admits
+/// [`AS_PROXY_OWNER_TOKEN`], reachable only through its TLS front.
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+struct AsProxyOwnerGateway {
+    front: AsProxyTlsFront,
+    gateway: HttpServerFixture,
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+impl AsProxyOwnerGateway {
+    fn fronting(gateway: HttpServerFixture) -> Self {
+        Self {
+            front: AsProxyTlsFront::spawn(gateway.address()),
+            gateway,
+        }
+    }
+
+    fn target(&self) -> CanonicalHttpUrl {
+        self.front.target()
+    }
+
+    /// A client for the verified owner: the bearer binds this exact https target.
+    fn owner(&self, client_name: &str) -> modern::ClientBuilder {
+        modern::ClientBuilder::new()
+            .client_info(client_name, "1.0.0")
+            .http_bearer_credential(
+                fastmcp_rust::BoundBearerCredential::bind(self.target(), AS_PROXY_OWNER_TOKEN)
+                    .expect("the owner bearer binds the https gateway target"),
+            )
+    }
+
+    fn shutdown(self) {
+        let Self { front, gateway } = self;
+        gateway.shutdown();
+        drop(front);
+    }
+
+    fn shutdown_named(self, owner: &str) {
+        let Self { front, gateway } = self;
+        gateway.shutdown_named(owner);
+        drop(front);
+    }
+}
+
+/// The live stdio `as_proxy("ext")` gateway with its static bearer owner
+/// behind TLS; no Task is created until a test's owner creates one.
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+fn spawn_https_stdio_as_proxy_owner_gateway() -> AsProxyOwnerGateway {
+    AsProxyOwnerGateway::fronting(spawn_modern_http_stdio_as_proxy_gateway_with_options(
+        Vec::new(),
+        false,
+        None,
+        None,
+        false,
+        false,
+        true,
+        false,
+        None,
+    ))
+}
+
+/// Creates one official Task through the gateway as its verified owner and
+/// returns the gateway-issued handle.
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+fn create_owner_task_through_gateway(gateway: &AsProxyOwnerGateway, tool: &str) -> FinalTaskId {
+    let cx = Cx::for_request();
+    let mut creator = runtime_block_on_bounded(
+        &cx,
+        gateway
+            .owner("e2e-http-as-proxy-owner-bootstrap")
+            .connect_http_with_cx(gateway.target(), &cx),
+    )
+    .expect("the owner connects to the https gateway");
+    let created = runtime_block_on_bounded(
+        &cx,
+        creator.call_tool_outcome(&cx, RequestId::Number(2), tool, json!({}), 1 << 20),
+    )
+    .expect("the owner's tools/call must cross the gateway and issue a Task handle");
+    let FinalToolCallOutcome::Task(created) = created else {
+        panic!("the task-capable tool must return the official Task branch: {created:?}");
+    };
+    created.task.base().task_id.clone()
+}
+
+/// Near-identical negative for an owner gateway: the same https target, trust
+/// and task-capable tool, with only the bearer removed. The owner's call is
+/// the positive control in the same case.
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+fn assert_owner_gateway_refuses_a_caller_without_its_bearer(
+    gateway: AsProxyOwnerGateway,
+    tool: &str,
+) {
+    let task_id = create_owner_task_through_gateway(&gateway, tool);
+    assert!(
+        !task_id.as_str().is_empty(),
+        "the owner's bearer creates a Task"
+    );
+    let cx = Cx::for_request();
+    let refused = match runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-http-as-proxy-owner-without-bearer", "1.0.0")
+            .connect_http_with_cx(gateway.target(), &cx),
+    ) {
+        Ok(_) => panic!("a caller without the owner's bearer must not reach the Task relay"),
+        Err(refused) => refused,
+    };
+    assert!(
+        format!("{refused:?}").contains("status: 401"),
+        "the gateway must answer 401 before any Task call: {refused:?}"
+    );
+    gateway.shutdown();
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_owner_gateway_refuses_a_caller_without_its_bearer() {
+    as_proxy_owner_isolated(
+        "e2e_public_http_as_proxy_stdio_owner_gateway_refuses_a_caller_without_its_bearer",
+        || {
+            assert_owner_gateway_refuses_a_caller_without_its_bearer(
+                spawn_https_stdio_as_proxy_owner_gateway(),
+                "ext/durable_task",
+            );
+        },
+    );
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+#[test]
+fn e2e_public_http_as_proxy_owner_gateway_refuses_a_caller_without_its_bearer() {
+    as_proxy_owner_isolated(
+        "e2e_public_http_as_proxy_owner_gateway_refuses_a_caller_without_its_bearer",
+        || {
+            let upstream = spawn_modern_task_http_server();
+            assert_owner_gateway_refuses_a_caller_without_its_bearer(
+                AsProxyOwnerGateway::fronting(spawn_modern_http_task_proxy_gateway(
+                    upstream.address(),
+                )),
+                &format!("ext/{PUBLIC_HTTP_TASK_TOOL_NAME}"),
+            );
+            upstream.shutdown();
+        },
+    );
 }
 
 #[cfg(all(unix, feature = "proxy", feature = "tasks"))]
 fn spawn_modern_http_stdio_as_proxy_gateway_configured(
-    precreate_task: bool,
     extra_env: Vec<(String, String)>,
-) -> (HttpServerFixture, Option<FinalTaskId>) {
+) -> HttpServerFixture {
     spawn_modern_http_stdio_as_proxy_gateway_with_options(
-        precreate_task,
-        extra_env,
-        false,
-        None,
-        None,
-        false,
-        false,
-        false,
-        false,
-        None,
+        extra_env, false, None, None, false, false, false, false, None,
     )
 }
 
 #[cfg(all(unix, feature = "proxy", feature = "tasks"))]
 fn spawn_modern_http_stdio_as_proxy_gateway_with_options(
-    precreate_task: bool,
     extra_env: Vec<(String, String)>,
     mask_error_details: bool,
     request_timeout_secs: Option<u64>,
@@ -5066,9 +5442,8 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_options(
     static_token: bool,
     strict_input: bool,
     list_page_size: Option<usize>,
-) -> (HttpServerFixture, Option<FinalTaskId>) {
+) -> HttpServerFixture {
     spawn_modern_http_stdio_as_proxy_gateway_with_duplicate(
-        precreate_task,
         extra_env,
         mask_error_details,
         request_timeout_secs,
@@ -5084,7 +5459,6 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_options(
 
 #[cfg(all(unix, feature = "proxy", feature = "tasks"))]
 fn spawn_modern_http_stdio_as_proxy_gateway_with_auth(
-    precreate_task: bool,
     extra_env: Vec<(String, String)>,
     mask_error_details: bool,
     request_timeout_secs: Option<u64>,
@@ -5095,11 +5469,10 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_auth(
     strict_input: bool,
     list_page_size: Option<usize>,
     on_duplicate: Option<DuplicateBehavior>,
-) -> (HttpServerFixture, Option<FinalTaskId>) {
+) -> HttpServerFixture {
     let _startup_guard = proxy_gateway_startup_guard();
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
-    let (ready_tx, ready_rx) =
-        mpsc::sync_channel::<Result<(SocketAddr, Option<FinalTaskId>), String>>(1);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
     let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
     let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
     let join = Some(thread::spawn(move || {
@@ -5189,9 +5562,11 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_auth(
                 );
             }
             match gateway_auth {
-                AsProxyGatewayAuth::None => {
-                    builder = builder.auth_provider(ProxyTaskFixtureOwner);
-                }
+                // No provider: native HTTP answers 401 to any request without
+                // `Authorization` once one is installed, and the modern client
+                // attaches a bearer only to https, so a plain-http fixture
+                // owner would refuse every client of this gateway.
+                AsProxyGatewayAuth::None => {}
                 AsProxyGatewayAuth::Static => {
                     let verifier = StaticTokenVerifier::new([(
                         "alpha",
@@ -5243,7 +5618,7 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_auth(
                     return Err(message);
                 }
             };
-            if ready_tx.send(Ok((address, None))).is_err() {
+            if ready_tx.send(Ok(address)).is_err() {
                 cx.set_cancel_requested(true);
                 return Err("stdio as_proxy gateway HTTP server startup receiver went away".to_owned());
             }
@@ -5264,7 +5639,7 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_auth(
         join,
     };
     let startup_deadline = Instant::now() + PROXY_GATEWAY_STARTUP_BOUND;
-    let (address, _) = loop {
+    let address = loop {
         startup.capture_server_cx();
         let remaining = startup_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -5283,7 +5658,7 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_auth(
     startup.capture_server_cx();
     let (server_cx, finished, join) = startup.into_parts();
 
-    let gateway = HttpServerFixture {
+    HttpServerFixture {
         address,
         server_cx,
         finished,
@@ -5291,35 +5666,10 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_auth(
         join,
         nonquiescent: None,
         handler_calls,
-    };
-    let task_id = if precreate_task {
-        assert!(matches!(gateway_auth, AsProxyGatewayAuth::None),
-            "bootstrap Task creation uses the fixed-owner relay fixture");
-        let cx = Cx::for_request();
-        let mut creator = runtime_block_on_bounded(
-            &cx,
-            modern::ClientBuilder::new()
-                .client_info("e2e-http-stdio-as-proxy-bootstrap", "1.0.0")
-                .connect_http_with_cx(public_http_target(address, "/mcp"), &cx),
-        ).expect("the Task bootstrap client connects after the relay starts serving");
-        let created = runtime_block_on_bounded(
-            &cx,
-            creator.call_tool_outcome(&cx, RequestId::Number(2), "ext/durable_task", json!({}), 1 << 20),
-        ).expect("bootstrap creation must cross the gateway and issue a downstream Task handle");
-        let FinalToolCallOutcome::Task(created) = created else {
-            panic!("the shipped durable_task must return the official Task branch: {created:?}");
-        };
-        let task_id = created.task.base().task_id.clone();
-        assert_eq!(task_id.as_str().len(), 43, "the stdio relay issues an opaque downstream handle");
-        Some(task_id)
-    } else {
-        None
-    };
-    (gateway, task_id)
+    }
 }
 #[cfg(all(unix, feature = "proxy", feature = "tasks"))]
 fn spawn_modern_http_stdio_as_proxy_gateway_with_duplicate(
-    precreate_task: bool,
     extra_env: Vec<(String, String)>,
     mask_error_details: bool,
     request_timeout_secs: Option<u64>,
@@ -5330,9 +5680,8 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_duplicate(
     strict_input: bool,
     list_page_size: Option<usize>,
     on_duplicate: Option<DuplicateBehavior>,
-) -> (HttpServerFixture, Option<FinalTaskId>) {
+) -> HttpServerFixture {
     spawn_modern_http_stdio_as_proxy_gateway_with_auth(
-        precreate_task,
         extra_env,
         mask_error_details,
         request_timeout_secs,
@@ -5350,16 +5699,35 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_duplicate(
     )
 }
 
-#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
 #[test]
 fn e2e_public_http_as_proxy_stdio_forwards_prefixed_echo() {
+    as_proxy_owner_isolated(
+        "e2e_public_http_as_proxy_stdio_forwards_prefixed_echo",
+        e2e_public_http_as_proxy_stdio_forwards_prefixed_echo_case,
+    );
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+fn e2e_public_http_as_proxy_stdio_forwards_prefixed_echo_case() {
     let cx = Cx::for_request();
-    let (gateway, task_id) = spawn_modern_http_stdio_as_proxy_gateway();
+    let gateway = spawn_https_stdio_as_proxy_owner_gateway();
+    let task_id = create_owner_task_through_gateway(&gateway, "ext/durable_task");
     let mut client = runtime_block_on_bounded(
         &cx,
-        modern::ClientBuilder::new()
-            .client_info("e2e-public-http-stdio-as-proxy-client", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+        gateway
+            .owner("e2e-public-http-stdio-as-proxy-client")
+            .connect_http_with_cx(gateway.target(), &cx),
     )
     .expect("the public facade connects to the live stdio as_proxy HTTP gateway");
 
@@ -5613,9 +5981,9 @@ fn e2e_public_http_as_proxy_stdio_forwards_prefixed_echo() {
     );
     let mut fresh_after_hide = runtime_block_on_bounded(
         &cx,
-        modern::ClientBuilder::new()
-            .client_info("e2e-public-http-stdio-as-proxy-hide-catalog", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+        gateway
+            .owner("e2e-public-http-stdio-as-proxy-hide-catalog")
+            .connect_http_with_cx(gateway.target(), &cx),
     )
     .expect("a second HTTP client connects after hide_catalog");
     let disabled_resource = runtime_block_on_bounded(
@@ -5658,9 +6026,9 @@ fn e2e_public_http_as_proxy_stdio_forwards_prefixed_echo() {
     );
     let mut fresh_after_show = runtime_block_on_bounded(
         &cx,
-        modern::ClientBuilder::new()
-            .client_info("e2e-public-http-stdio-as-proxy-show-catalog", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+        gateway
+            .owner("e2e-public-http-stdio-as-proxy-show-catalog")
+            .connect_http_with_cx(gateway.target(), &cx),
     )
     .expect("a third HTTP client connects after show_catalog");
     let restored_resource =
@@ -11397,18 +11765,37 @@ fn e2e_public_http_catalog_and_tasks_listen_stay_live_on_the_same_client() {
     server.shutdown();
 }
 
-#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
 #[test]
 fn e2e_public_http_as_proxy_tasks_listen_retains_status_through_the_gateway() {
+    as_proxy_owner_isolated(
+        "e2e_public_http_as_proxy_tasks_listen_retains_status_through_the_gateway",
+        e2e_public_http_as_proxy_tasks_listen_retains_status_through_the_gateway_case,
+    );
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+fn e2e_public_http_as_proxy_tasks_listen_retains_status_through_the_gateway_case() {
     let upstream = spawn_modern_task_http_server();
-    let gateway = spawn_modern_http_task_proxy_gateway(upstream.address());
+    let gateway =
+        AsProxyOwnerGateway::fronting(spawn_modern_http_task_proxy_gateway(upstream.address()));
     let cx = Cx::for_request();
 
     let mut creator = runtime_block_on_bounded(
         &cx,
-        modern::ClientBuilder::new()
-            .client_info("e2e-http-as-proxy-tasks-listen-creator", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+        gateway
+            .owner("e2e-http-as-proxy-tasks-listen-creator")
+            .connect_http_with_cx(gateway.target(), &cx),
     )
     .expect("the public facade connects to the Task-issuing gateway");
     let created = runtime_block_on_bounded(
@@ -11432,17 +11819,17 @@ fn e2e_public_http_as_proxy_tasks_listen_retains_status_through_the_gateway() {
 
     let mut controller = runtime_block_on_bounded(
         &cx,
-        modern::ClientBuilder::new()
-            .client_info("e2e-http-as-proxy-tasks-listen-controller", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+        gateway
+            .owner("e2e-http-as-proxy-tasks-listen-controller")
+            .connect_http_with_cx(gateway.target(), &cx),
     )
     .expect("the public facade connects to the live as_proxy Tasks gateway");
 
     let mut watcher = runtime_block_on_bounded(
         &cx,
-        modern::ClientBuilder::new()
-            .client_info("e2e-http-as-proxy-tasks-listen-watcher", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+        gateway
+            .owner("e2e-http-as-proxy-tasks-listen-watcher")
+            .connect_http_with_cx(gateway.target(), &cx),
     )
     .expect("the public facade connects a second as_proxy Tasks watch client");
     let mut handle = runtime_block_on_bounded(&cx, watcher.attach_final_task(&cx, task_id.clone()))
@@ -11517,18 +11904,37 @@ fn e2e_public_http_as_proxy_tasks_listen_retains_status_through_the_gateway() {
     upstream.shutdown();
 }
 
-#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
 #[test]
 fn e2e_public_http_as_proxy_forwards_resource_updated_on_catalog_listen() {
+    as_proxy_owner_isolated(
+        "e2e_public_http_as_proxy_forwards_resource_updated_on_catalog_listen",
+        e2e_public_http_as_proxy_forwards_resource_updated_on_catalog_listen_case,
+    );
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+fn e2e_public_http_as_proxy_forwards_resource_updated_on_catalog_listen_case() {
     let upstream = spawn_modern_task_http_server();
-    let gateway = spawn_modern_http_task_proxy_gateway(upstream.address());
+    let gateway =
+        AsProxyOwnerGateway::fronting(spawn_modern_http_task_proxy_gateway(upstream.address()));
     let cx = Cx::for_request();
 
     let mut silent = runtime_block_on_bounded(
         &cx,
-        modern::ClientBuilder::new()
-            .client_info("e2e-http-as-proxy-resource-updated-silent", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+        gateway
+            .owner("e2e-http-as-proxy-resource-updated-silent")
+            .connect_http_with_cx(gateway.target(), &cx),
     )
     .expect("the public facade connects a silent as_proxy catalog client");
     let silent_touch = runtime_block_on_bounded(
@@ -11559,9 +11965,9 @@ fn e2e_public_http_as_proxy_forwards_resource_updated_on_catalog_listen() {
 
     let mut client = runtime_block_on_bounded(
         &cx,
-        modern::ClientBuilder::new()
-            .client_info("e2e-http-as-proxy-resource-updated", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+        gateway
+            .owner("e2e-http-as-proxy-resource-updated")
+            .connect_http_with_cx(gateway.target(), &cx),
     )
     .expect("the public facade connects the as_proxy catalog listener");
     let limits = modern::SseLimits::new(64 * 1024, 2 * 1024 * 1024, 256)
@@ -11619,17 +12025,36 @@ fn e2e_public_http_as_proxy_forwards_resource_updated_on_catalog_listen() {
     upstream.shutdown();
 }
 
-#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
 #[test]
 fn e2e_public_http_as_proxy_catalog_and_tasks_listen_stay_live_on_the_same_client() {
+    as_proxy_owner_isolated(
+        "e2e_public_http_as_proxy_catalog_and_tasks_listen_stay_live_on_the_same_client",
+        e2e_public_http_as_proxy_catalog_and_tasks_listen_stay_live_on_the_same_client_case,
+    );
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+fn e2e_public_http_as_proxy_catalog_and_tasks_listen_stay_live_on_the_same_client_case() {
     let upstream = spawn_modern_task_http_server();
-    let gateway = spawn_modern_http_task_proxy_gateway(upstream.address());
+    let gateway =
+        AsProxyOwnerGateway::fronting(spawn_modern_http_task_proxy_gateway(upstream.address()));
     let cx = Cx::for_request();
     let mut client = runtime_block_on_bounded(
         &cx,
-        modern::ClientBuilder::new()
-            .client_info("e2e-http-as-proxy-dual-listen", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+        gateway
+            .owner("e2e-http-as-proxy-dual-listen")
+            .connect_http_with_cx(gateway.target(), &cx),
     )
     .expect("the public facade connects to the live as_proxy dual-listen gateway");
 
@@ -11770,18 +12195,36 @@ fn e2e_public_http_as_proxy_catalog_and_tasks_listen_stay_live_on_the_same_clien
     upstream.shutdown_named("dual-listen upstream");
 }
 
-#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
 #[test]
 fn e2e_public_http_as_proxy_stdio_catalog_and_tasks_listen_stay_live_on_the_same_client() {
+    as_proxy_owner_isolated(
+        "e2e_public_http_as_proxy_stdio_catalog_and_tasks_listen_stay_live_on_the_same_client",
+        e2e_public_http_as_proxy_stdio_catalog_and_tasks_listen_stay_live_on_the_same_client_case,
+    );
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+fn e2e_public_http_as_proxy_stdio_catalog_and_tasks_listen_stay_live_on_the_same_client_case() {
     // Create through the gateway so the route-bound relay records the handle.
-    // The precreate spawn occupies echo's in-memory store (capacity 1).
-    let gateway = spawn_modern_http_stdio_as_proxy_gateway_without_precreated_task();
+    // No Task is precreated: echo's in-memory store has capacity 1.
+    let gateway = spawn_https_stdio_as_proxy_owner_gateway();
     let cx = Cx::for_request();
     let mut client = runtime_block_on_bounded(
         &cx,
-        modern::ClientBuilder::new()
-            .client_info("e2e-http-as-proxy-stdio-dual-listen", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+        gateway
+            .owner("e2e-http-as-proxy-stdio-dual-listen")
+            .connect_http_with_cx(gateway.target(), &cx),
     )
     .expect("the public facade connects to the live stdio as_proxy dual-listen gateway");
 
@@ -11960,7 +12403,7 @@ fn e2e_public_http_as_proxy_stdio_catalog_and_tasks_listen_stay_live_on_the_same
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_as_proxy_stdio_forwards_resource_template_completion() {
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway();
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_without_precreated_task();
     let cx = Cx::for_request();
     let mut client = runtime_block_on_bounded(
         &cx,
@@ -12026,7 +12469,7 @@ fn e2e_public_http_as_proxy_stdio_forwards_resource_template_completion() {
 #[cfg(all(unix, feature = "proxy", feature = "tasks"))]
 #[test]
 fn e2e_public_http_as_proxy_stdio_advertises_completions_when_echo_supports() {
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(false, Vec::new());
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_configured(Vec::new());
     let cx = Cx::for_request();
     let mut client = runtime_block_on_bounded(
         &cx,
@@ -12069,10 +12512,10 @@ fn e2e_public_http_as_proxy_stdio_advertises_completions_when_echo_supports() {
 #[cfg(all(unix, feature = "proxy", feature = "tasks"))]
 #[test]
 fn e2e_public_http_as_proxy_stdio_omits_completions_when_echo_has_none() {
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(
-        false,
-        vec![("FASTMCP_NO_COMPLETIONS".to_owned(), "1".to_owned())],
-    );
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_configured(vec![(
+        "FASTMCP_NO_COMPLETIONS".to_owned(),
+        "1".to_owned(),
+    )]);
     let cx = Cx::for_request();
     let mut client = runtime_block_on_bounded(
         &cx,
@@ -12137,17 +12580,13 @@ fn spawn_modern_http_stdio_as_proxy_filesystem_gateway() -> HttpServerFixture {
         .to_str()
         .expect("the modern stdio as_proxy filesystem e2e root is utf-8")
         .to_owned();
-    spawn_modern_http_stdio_as_proxy_gateway_configured(
-        false,
-        vec![
-            ("FASTMCP_FS_ROOT".to_owned(), root_path),
-            (
-                "FASTMCP_FS_PREFIX".to_owned(),
-                PUBLIC_HTTP_FS_PREFIX.to_owned(),
-            ),
-        ],
-    )
-    .0
+    spawn_modern_http_stdio_as_proxy_gateway_configured(vec![
+        ("FASTMCP_FS_ROOT".to_owned(), root_path),
+        (
+            "FASTMCP_FS_PREFIX".to_owned(),
+            PUBLIC_HTTP_FS_PREFIX.to_owned(),
+        ),
+    ])
 }
 
 #[cfg(all(
@@ -12338,25 +12777,44 @@ fn e2e_public_http_as_proxy_omits_completions_when_upstream_has_none() {
     upstream.shutdown();
 }
 
-#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
 #[test]
 fn e2e_public_http_as_proxy_stdio_tasks_listen_retains_status_through_the_gateway() {
-    let (gateway, task_id) = spawn_modern_http_stdio_as_proxy_gateway();
+    as_proxy_owner_isolated(
+        "e2e_public_http_as_proxy_stdio_tasks_listen_retains_status_through_the_gateway",
+        e2e_public_http_as_proxy_stdio_tasks_listen_retains_status_through_the_gateway_case,
+    );
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+fn e2e_public_http_as_proxy_stdio_tasks_listen_retains_status_through_the_gateway_case() {
+    let gateway = spawn_https_stdio_as_proxy_owner_gateway();
+    let task_id = create_owner_task_through_gateway(&gateway, "ext/durable_task");
     let cx = Cx::for_request();
 
     let mut controller = runtime_block_on_bounded(
         &cx,
-        modern::ClientBuilder::new()
-            .client_info("e2e-http-as-proxy-stdio-tasks-listen-controller", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+        gateway
+            .owner("e2e-http-as-proxy-stdio-tasks-listen-controller")
+            .connect_http_with_cx(gateway.target(), &cx),
     )
     .expect("the public facade connects to the live stdio as_proxy Tasks gateway");
 
     let mut watcher = runtime_block_on_bounded(
         &cx,
-        modern::ClientBuilder::new()
-            .client_info("e2e-http-as-proxy-stdio-tasks-listen-watcher", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+        gateway
+            .owner("e2e-http-as-proxy-stdio-tasks-listen-watcher")
+            .connect_http_with_cx(gateway.target(), &cx),
     )
     .expect("the public facade connects a second stdio as_proxy Tasks watch client");
     let mut handle = runtime_block_on_bounded(&cx, watcher.attach_final_task(&cx, task_id.clone()))
@@ -12436,7 +12894,7 @@ fn e2e_public_http_as_proxy_stdio_tasks_listen_retains_status_through_the_gatewa
 #[cfg(all(unix, feature = "proxy", feature = "tasks"))]
 #[test]
 fn e2e_public_http_as_proxy_stdio_forwards_resource_updated_on_catalog_listen() {
-    let (gateway, _precreated) = spawn_modern_http_stdio_as_proxy_gateway();
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_without_precreated_task();
     let cx = Cx::for_request();
 
     let mut silent = runtime_block_on_bounded(
@@ -12531,19 +12989,38 @@ fn e2e_public_http_as_proxy_stdio_forwards_resource_updated_on_catalog_listen() 
     gateway.shutdown();
 }
 
-#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
 #[test]
 fn e2e_public_http_as_proxy_creates_official_task_through_the_gateway() {
+    as_proxy_owner_isolated(
+        "e2e_public_http_as_proxy_creates_official_task_through_the_gateway",
+        e2e_public_http_as_proxy_creates_official_task_through_the_gateway_case,
+    );
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+fn e2e_public_http_as_proxy_creates_official_task_through_the_gateway_case() {
     let cx = Cx::for_request();
     let upstream = spawn_modern_task_http_server();
-    let gateway = spawn_modern_http_task_proxy_gateway(upstream.address());
+    let gateway =
+        AsProxyOwnerGateway::fronting(spawn_modern_http_task_proxy_gateway(upstream.address()));
     let prefixed = format!("ext/{PUBLIC_HTTP_TASK_TOOL_NAME}");
 
     let mut client = runtime_block_on_bounded(
         &cx,
-        modern::ClientBuilder::new()
-            .client_info("e2e-http-as-proxy-tasks-create", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+        gateway
+            .owner("e2e-http-as-proxy-tasks-create")
+            .connect_http_with_cx(gateway.target(), &cx),
     )
     .expect("the public facade connects to the live as_proxy Tasks gateway");
 
@@ -12611,20 +13088,39 @@ fn e2e_public_http_as_proxy_creates_official_task_through_the_gateway() {
     upstream.shutdown();
 }
 
-#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
 #[test]
 fn e2e_public_http_as_proxy_creates_official_task_with_progress_marker() {
+    as_proxy_owner_isolated(
+        "e2e_public_http_as_proxy_creates_official_task_with_progress_marker",
+        e2e_public_http_as_proxy_creates_official_task_with_progress_marker_case,
+    );
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+fn e2e_public_http_as_proxy_creates_official_task_with_progress_marker_case() {
     let cx = Cx::for_request();
     let upstream = spawn_modern_task_http_server();
-    let gateway = spawn_modern_http_task_proxy_gateway(upstream.address());
+    let gateway =
+        AsProxyOwnerGateway::fronting(spawn_modern_http_task_proxy_gateway(upstream.address()));
     let prefixed = format!("ext/{PUBLIC_HTTP_TASK_TOOL_NAME}");
     let marker = modern::ProgressMarker::from("as-proxy-task-create-progress");
 
     let mut client = runtime_block_on_bounded(
         &cx,
-        modern::ClientBuilder::new()
-            .client_info("e2e-http-as-proxy-tasks-create-progress", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+        gateway
+            .owner("e2e-http-as-proxy-tasks-create-progress")
+            .connect_http_with_cx(gateway.target(), &cx),
     )
     .expect("the public facade connects to the live as_proxy Tasks gateway");
 
@@ -12681,18 +13177,36 @@ fn e2e_public_http_as_proxy_creates_official_task_with_progress_marker() {
     upstream.shutdown();
 }
 
-#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
 #[test]
 fn e2e_public_http_as_proxy_stdio_creates_official_task_through_the_gateway() {
+    as_proxy_owner_isolated(
+        "e2e_public_http_as_proxy_stdio_creates_official_task_through_the_gateway",
+        e2e_public_http_as_proxy_stdio_creates_official_task_through_the_gateway_case,
+    );
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+fn e2e_public_http_as_proxy_stdio_creates_official_task_through_the_gateway_case() {
     let cx = Cx::for_request();
-    let gateway = spawn_modern_http_stdio_as_proxy_gateway_without_precreated_task();
+    let gateway = spawn_https_stdio_as_proxy_owner_gateway();
     let prefixed = "ext/durable_task";
 
     let mut client = runtime_block_on_bounded(
         &cx,
-        modern::ClientBuilder::new()
-            .client_info("e2e-http-as-proxy-stdio-tasks-create", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+        gateway
+            .owner("e2e-http-as-proxy-stdio-tasks-create")
+            .connect_http_with_cx(gateway.target(), &cx),
     )
     .expect("the public facade connects to the live stdio as_proxy Tasks gateway");
 
@@ -12758,19 +13272,37 @@ fn e2e_public_http_as_proxy_stdio_creates_official_task_through_the_gateway() {
     gateway.shutdown();
 }
 
-#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
 #[test]
 fn e2e_public_http_as_proxy_stdio_creates_official_task_with_progress_marker() {
+    as_proxy_owner_isolated(
+        "e2e_public_http_as_proxy_stdio_creates_official_task_with_progress_marker",
+        e2e_public_http_as_proxy_stdio_creates_official_task_with_progress_marker_case,
+    );
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+fn e2e_public_http_as_proxy_stdio_creates_official_task_with_progress_marker_case() {
     let cx = Cx::for_request();
-    let gateway = spawn_modern_http_stdio_as_proxy_gateway_without_precreated_task();
+    let gateway = spawn_https_stdio_as_proxy_owner_gateway();
     let prefixed = "ext/durable_task";
     let marker = modern::ProgressMarker::from("stdio-as-proxy-task-create-progress");
 
     let mut client = runtime_block_on_bounded(
         &cx,
-        modern::ClientBuilder::new()
-            .client_info("e2e-http-as-proxy-stdio-tasks-create-progress", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+        gateway
+            .owner("e2e-http-as-proxy-stdio-tasks-create-progress")
+            .connect_http_with_cx(gateway.target(), &cx),
     )
     .expect("the public facade connects to the live stdio as_proxy Tasks gateway");
 
@@ -12946,10 +13478,10 @@ fn e2e_public_http_as_proxy_stdio_adopts_upstream_implementation() {
 #[test]
 fn e2e_public_http_as_proxy_stdio_bare_upstream_omits_implementation() {
     let cx = Cx::for_request();
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(
-        false,
-        vec![("FASTMCP_NO_IDENTITY".to_owned(), "1".to_owned())],
-    );
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_configured(vec![(
+        "FASTMCP_NO_IDENTITY".to_owned(),
+        "1".to_owned(),
+    )]);
     let client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -13002,10 +13534,10 @@ fn e2e_public_http_as_proxy_stdio_adopts_upstream_instructions() {
 #[test]
 fn e2e_public_http_as_proxy_stdio_bare_upstream_omits_instructions() {
     let cx = Cx::for_request();
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(
-        false,
-        vec![("FASTMCP_NO_INSTRUCTIONS".to_owned(), "1".to_owned())],
-    );
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_configured(vec![(
+        "FASTMCP_NO_INSTRUCTIONS".to_owned(),
+        "1".to_owned(),
+    )]);
     let client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -14148,8 +14680,7 @@ fn e2e_public_http_legacy_as_proxy_mask_error_details_hides_upstream_resource_se
 #[test]
 fn e2e_public_http_as_proxy_stdio_mask_error_details_hides_upstream_resource_secret() {
     let cx = Cx::for_request();
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_with_options(
-        false,
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_with_options(
         Vec::new(),
         true,
         None,
@@ -14194,8 +14725,7 @@ fn e2e_public_http_as_proxy_stdio_mask_error_details_hides_upstream_resource_sec
 #[test]
 fn e2e_public_http_as_proxy_stdio_unmask_error_details_keeps_upstream_resource_secret() {
     let cx = Cx::for_request();
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_with_options(
-        false,
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_with_options(
         Vec::new(),
         false,
         None,
@@ -14452,7 +14982,7 @@ fn e2e_public_http_legacy_as_proxy_forwards_handler_timeout_of_prefixed_slow_too
 #[test]
 fn e2e_public_http_as_proxy_stdio_forwards_handler_timeout_of_prefixed_slow_tool() {
     let cx = Cx::for_request();
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(false, Vec::new());
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_configured(Vec::new());
     let mut client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -14724,7 +15254,7 @@ fn e2e_public_http_legacy_as_proxy_include_tags_filters_prefixed_tools() {
 #[test]
 fn e2e_public_http_as_proxy_stdio_composes_nested_tool_and_resource() {
     let cx = Cx::for_request();
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(false, Vec::new());
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_configured(Vec::new());
     let mut client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -14855,7 +15385,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_composes_nested_tool_and_resource() {
 #[test]
 fn e2e_public_http_as_proxy_stdio_composes_nested_prompt() {
     let cx = Cx::for_request();
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(false, Vec::new());
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_configured(Vec::new());
     let mut client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -14986,7 +15516,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_composes_nested_prompt() {
 #[test]
 fn e2e_public_http_as_proxy_stdio_resource_composes_nested_tool_and_resource() {
     let cx = Cx::for_request();
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(false, Vec::new());
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_configured(Vec::new());
     let mut client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -15103,7 +15633,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_resource_composes_nested_tool_and_resou
 #[test]
 fn e2e_public_http_as_proxy_stdio_prompt_composes_nested_tool_and_resource() {
     let cx = Cx::for_request();
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(false, Vec::new());
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_configured(Vec::new());
     let mut client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -15254,7 +15784,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_prompt_composes_nested_tool_and_resourc
 #[test]
 fn e2e_public_http_as_proxy_stdio_from_prompt_composes_nested_prompt() {
     let cx = Cx::for_request();
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(false, Vec::new());
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_configured(Vec::new());
     let mut client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -15492,7 +16022,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_forwards_inbound_completion_progress_ma
 #[test]
 fn e2e_public_http_as_proxy_stdio_resource_composes_nested_prompt() {
     let cx = Cx::for_request();
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(false, Vec::new());
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_configured(Vec::new());
     let mut client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -16558,10 +17088,10 @@ fn e2e_public_http_legacy_as_proxy_sanitizes_prefixed_handler_panic() {
 #[test]
 fn e2e_public_http_as_proxy_stdio_sanitizes_prefixed_handler_panic() {
     let cx = Cx::for_request();
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(
-        false,
-        vec![("FASTMCP_PANIC_TOOL".to_owned(), "1".to_owned())],
-    );
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_configured(vec![(
+        "FASTMCP_PANIC_TOOL".to_owned(),
+        "1".to_owned(),
+    )]);
     let mut client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -17077,13 +17607,10 @@ fn e2e_public_http_legacy_as_proxy_sanitizes_prefixed_catalog_and_completion_pan
 #[test]
 fn e2e_public_http_as_proxy_stdio_sanitizes_prefixed_catalog_and_completion_panic() {
     let cx = Cx::for_request();
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(
-        false,
-        vec![
-            ("FASTMCP_PANIC_CATALOG".to_owned(), "1".to_owned()),
-            ("FASTMCP_PANIC_COMPLETE".to_owned(), "1".to_owned()),
-        ],
-    );
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_configured(vec![
+        ("FASTMCP_PANIC_CATALOG".to_owned(), "1".to_owned()),
+        ("FASTMCP_PANIC_COMPLETE".to_owned(), "1".to_owned()),
+    ]);
     let mut client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -18851,8 +19378,7 @@ fn e2e_public_http_legacy_as_proxy_gateway_list_page_size_pages_prefixed_tools()
 #[test]
 fn e2e_public_http_as_proxy_stdio_gateway_list_page_size_pages_prefixed_tools() {
     let cx = Cx::for_request();
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_with_options(
-        false,
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_with_options(
         Vec::new(),
         false,
         None,
@@ -18912,7 +19438,7 @@ fn e2e_public_http_as_proxy_stdio_gateway_list_page_size_pages_prefixed_tools() 
 #[test]
 fn e2e_public_http_as_proxy_stdio_gateway_default_list_is_not_page_size_1() {
     let cx = Cx::for_request();
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(false, Vec::new());
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_configured(Vec::new());
     let mut client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -19621,7 +20147,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_gateway_session_state_uses_shared_upstr
 #[test]
 fn e2e_public_http_as_proxy_stdio_gateway_session_state_uses_shared_upstream_bag() {
     let cx = Cx::for_request();
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(false, Vec::new());
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_configured(Vec::new());
     let mut client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -19680,7 +20206,6 @@ fn spawn_modern_http_stdio_as_proxy_duplicate_gateway(
     behavior: DuplicateBehavior,
 ) -> HttpServerFixture {
     spawn_modern_http_stdio_as_proxy_gateway_with_duplicate(
-        false,
         Vec::new(),
         false,
         None,
@@ -19692,7 +20217,6 @@ fn spawn_modern_http_stdio_as_proxy_duplicate_gateway(
         None,
         Some(behavior),
     )
-    .0
 }
 
 #[cfg(all(unix, feature = "proxy"))]
@@ -19884,8 +20408,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_gateway_on_duplicate_replace_installs_e
 #[test]
 fn e2e_public_http_as_proxy_stdio_gateway_strict_input_refuses_unknown_property() {
     let cx = Cx::for_request();
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_with_options(
-        false,
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_with_options(
         Vec::new(),
         false,
         None,
@@ -19945,8 +20468,7 @@ fn e2e_public_http_as_proxy_stdio_gateway_strict_input_refuses_unknown_property(
 #[test]
 fn e2e_public_http_as_proxy_stdio_gateway_lenient_input_admits_unknown_property() {
     let cx = Cx::for_request();
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_with_options(
-        false,
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_with_options(
         Vec::new(),
         false,
         None,
@@ -20421,8 +20943,7 @@ fn e2e_public_http_legacy_as_proxy_forwards_transformed_prefixed_tool() {
 #[test]
 fn e2e_public_http_as_proxy_stdio_gateway_cache_hits_prefixed_allowlisted_tool() {
     let cx = Cx::for_request();
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_with_options(
-        false,
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_with_options(
         Vec::new(),
         false,
         None,
@@ -20594,8 +21115,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_gateway_cache_hits_prefixed_allowlisted
 #[test]
 fn e2e_public_http_as_proxy_stdio_gateway_rate_limit_refuses_second_prefixed_call() {
     let cx = Cx::for_request();
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_with_options(
-        false,
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_with_options(
         Vec::new(),
         false,
         None,
@@ -20729,8 +21249,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_gateway_rate_limit_refuses_second_prefi
 #[test]
 fn e2e_public_http_as_proxy_stdio_gateway_sliding_window_refuses_second_prefixed_call() {
     let cx = Cx::for_request();
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_with_options(
-        false,
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_with_options(
         Vec::new(),
         false,
         None,
@@ -20904,8 +21423,7 @@ fn e2e_public_http_as_proxy_stdio_gateway_static_token_refuses_missing_and_wrong
         response
     }
 
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_with_options(
-        false,
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_with_options(
         Vec::new(),
         false,
         None,
@@ -20966,8 +21484,7 @@ fn e2e_public_http_as_proxy_stdio_gateway_static_token_refuses_missing_and_wrong
 #[test]
 fn e2e_public_http_as_proxy_stdio_gateway_custom_verifier_refuses_missing_and_static_admits_gamma()
 {
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_with_auth(
-        false,
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_with_auth(
         Vec::new(),
         false,
         None,
@@ -21238,10 +21755,10 @@ fn e2e_public_http_legacy_as_proxy_stdio_gateway_custom_verifier_refuses_missing
 #[test]
 fn e2e_public_http_as_proxy_stdio_forwards_transformed_prefixed_tool() {
     let cx = Cx::for_request();
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(
-        false,
-        vec![("FASTMCP_TRANSFORM_ECHO".to_owned(), "1".to_owned())],
-    );
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_configured(vec![(
+        "FASTMCP_TRANSFORM_ECHO".to_owned(),
+        "1".to_owned(),
+    )]);
     let mut client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -21645,8 +22162,7 @@ fn e2e_public_http_legacy_as_proxy_request_timeout_of_hold_tool_without_handler_
 #[test]
 fn e2e_public_http_as_proxy_stdio_request_timeout_of_hold_tool_without_handler_timeout() {
     let cx = Cx::for_request();
-    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_with_options(
-        false,
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_with_options(
         Vec::new(),
         false,
         Some(1),
