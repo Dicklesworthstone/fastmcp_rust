@@ -7012,61 +7012,23 @@ impl BoundHttpServer {
 
             let connection_scope = cx.scope();
             let connection_shutdown = HttpListenerShutdown::new(cx);
-            let reaper_sessions = Arc::clone(&self.modern_sessions);
-            let mut modern_session_reaper = cx
-                .spawn_in(&connection_scope, move |reaper_cx| async move {
-                    // Shutdown aborts this task and then joins it, but an abort
-                    // cannot preempt a timer park: a task sleeping the full reap
-                    // interval holds the joined shutdown hostage for up to the
-                    // whole interval. Park in short chunks so cancellation is
-                    // observed promptly while reaping keeps its coarse cadence.
-                    const REAP_PARK_CHUNK: Duration = Duration::from_millis(100);
-                    let mut parked = Duration::ZERO;
-                    #[cfg(test)]
-                    lib_unit_tests::record_f2ndd_reaper_stage(41);
-                    loop {
-                        // DIAGNOSTIC (bd-f2ndd): the cancellation check below sits
-                        // AFTER this sleep, so the short-chunk mitigation only works
-                        // if the sleep returns. 42 before, 43 after: if 42 is the
-                        // high-water mark the sleep never returned and checkpoint was
-                        // never evaluated -- a different failure from it returning Ok.
-                        #[cfg(test)]
-                        lib_unit_tests::record_f2ndd_reaper_stage(42);
-                        #[cfg(test)]
-                        lib_unit_tests::record_f2ndd_reaper_park(reaper_cx.is_cancel_requested());
-                        asupersync::time::sleep(reaper_cx.now(), REAP_PARK_CHUNK).await;
-                        #[cfg(test)]
-                        lib_unit_tests::record_f2ndd_reaper_stage(43);
-                        #[cfg(test)]
-                        lib_unit_tests::record_f2ndd_reaper_sleep_return();
-                        if reaper_cx.checkpoint().is_err() {
-                            #[cfg(test)]
-                            lib_unit_tests::record_f2ndd_reaper_stage(44);
-                            break;
-                        }
-                        parked += REAP_PARK_CHUNK;
-                        if parked >= MODERN_HTTP_SESSION_REAP_INTERVAL {
-                            parked = Duration::ZERO;
-                            expire_live_modern_http_sessions(&reaper_sessions);
-                        }
-                    }
-                    // Nothing follows the loop, so 45 should be immediate after 44.
-                    // If 44 fires and 45 does not, the task body itself is not
-                    // finishing; if 45 fires and the join still parks, the stall is
-                    // in join/teardown rather than anywhere in this closure.
-                    #[cfg(test)]
-                    lib_unit_tests::record_f2ndd_reaper_stage(45);
-                })
-                .map_err(|error| {
-                    McpError::internal_error(format!(
-                        "HTTP modern-session reaper admission failed: {error}"
-                    ))
-                })?;
+            // Expired modern sessions are reaped from this accept loop, which
+            // already wakes every HTTP_ACCEPT_CANCEL_POLL. A dedicated reaper
+            // task had to be aborted and joined during shutdown, and that join
+            // parked the whole listener shutdown (bd-f2ndd).
+            let reap_interval_nanos =
+                u64::try_from(MODERN_HTTP_SESSION_REAP_INTERVAL.as_nanos()).unwrap_or(u64::MAX);
+            let mut last_session_reap = cx.now();
             let mut connection_children = HttpConnectionChildren::default();
             let result = loop {
                 connection_children.reap_finished();
                 if cx.checkpoint().is_err() {
                     break Ok(());
+                }
+                let now = cx.now();
+                if now.duration_since(last_session_reap) >= reap_interval_nanos {
+                    last_session_reap = now;
+                    expire_live_modern_http_sessions(&self.modern_sessions);
                 }
                 #[cfg(test)]
                 lib_unit_tests::record_live_http_listener_wait();
@@ -7154,12 +7116,6 @@ impl BoundHttpServer {
             // children a bounded scheduling window to flush and close before
             // aborting any unrelated or uncooperative connection.
             let terminal_receipt = server.final_subscriptions.terminate_with_receipt();
-            modern_session_reaper.abort();
-            #[cfg(test)]
-            lib_unit_tests::record_f2ndd_serve_stage(32);
-            #[cfg(test)]
-            lib_unit_tests::record_f2ndd_children_at_join(connection_children.tasks.len());
-            let _ = modern_session_reaper.join(cx).await;
             #[cfg(test)]
             lib_unit_tests::record_f2ndd_serve_stage(33);
             #[cfg(any(feature = "legacy-2024-11-05", test))]
@@ -11466,15 +11422,25 @@ fn dispatch_http_request(
     legacy_admission: Option<Box<HttpLegacyIngressAdmission>>,
     legacy_dispatch_mode: LiveHttpLegacyDispatchMode,
 ) -> HttpResponse {
-    block_on(dispatch_http_request_async(
+    // Drive the dispatch on the caller's runtime handles, as modern owned
+    // dispatch does, and not inside `fastmcp_core::block_on`. The live arm
+    // runs this on a blocking-pool thread, and the synchronous tool it reaches
+    // runs inline here. A handler that bridges `ctx.sample` with `block_on`
+    // would otherwise nest a second bridge on this thread, which panics, so
+    // the reverse request was never sent and the peer waited on SSE for it
+    // (bd-f2ndd, bd-6rfrg).
+    poll_on_cx(
         cx,
-        endpoint,
-        legacy_sessions,
-        modern_sessions,
-        request,
-        legacy_admission,
-        legacy_dispatch_mode,
-    ))
+        dispatch_http_request_async(
+            cx,
+            endpoint,
+            legacy_sessions,
+            modern_sessions,
+            request,
+            legacy_admission,
+            legacy_dispatch_mode,
+        ),
+    )
 }
 
 #[cfg(any(feature = "legacy-2024-11-05", test))]
@@ -15076,8 +15042,9 @@ impl Server {
     {
         self.init_rich_logging();
 
-        let shared = SharedTransport::new(transport);
         let notification_failure = Arc::new(AtomicBool::new(false));
+        let shared =
+            SharedTransport::with_output_failure(transport, Arc::clone(&notification_failure));
         let notification_sender = create_transport_notification_sender(
             shared.clone(),
             cx.clone(),
@@ -15160,6 +15127,12 @@ impl Server {
     /// the caller. Calling the loop directly on a cooperative runtime worker
     /// can prevent that same runtime from polling the request children.
     ///
+    /// An unsplit transport cannot write while its `recv` blocks. Output that
+    /// request workers produce in that window (subscription acknowledgements,
+    /// notifications, responses) is queued in order and written as soon as
+    /// `recv` returns. Use [`Server::run_split_transport_returning_with_cx`]
+    /// when that output must not wait for the next inbound frame.
+    ///
     /// # Errors
     ///
     /// Returns an error when startup fails, a fatal receive/protocol failure is
@@ -15185,8 +15158,9 @@ impl Server {
     {
         self.init_rich_logging();
 
-        let shared = SharedTransport::new(transport);
         let notification_failure = Arc::new(AtomicBool::new(false));
+        let shared =
+            SharedTransport::with_output_failure(transport, Arc::clone(&notification_failure));
         let notification_sender = create_transport_notification_sender(
             shared.clone(),
             cx.clone(),
@@ -21402,8 +21376,165 @@ fn stable_hash_request_id(value: &str) -> u64 {
     if hash == 0 { FNV_OFFSET } else { hash }
 }
 
+/// An unsplit [`Transport`] shared by the receive pump and every writer.
+///
+/// `recv` and `send` both need `&mut T`, so the pump owns the I/O handle for as
+/// long as a `recv` blocks. A send from another thread in that window (a listen
+/// acknowledgement, a notification, a worker's response) is queued in
+/// [`UnsplitOutput`] instead of failing, and the owner writes the queue in
+/// order before it gives the handle up. Output produced while `recv` blocks
+/// therefore reaches the peer as soon as that `recv` returns, ahead of anything
+/// written later (bd-8bcfq).
 struct SharedTransport<T> {
     inner: Arc<Mutex<Option<T>>>,
+    output: Arc<UnsplitOutput>,
+}
+
+/// Output queued behind one owner of an unsplit transport is bounded; past
+/// this a send fails instead of growing without limit.
+const UNSPLIT_OUTPUT_QUEUE_LIMIT: usize = 1024;
+
+struct UnsplitOutput {
+    state: Mutex<UnsplitOutputState>,
+    released: Condvar,
+    /// Latched when queued output cannot be written. Its senders were already
+    /// told `Ok`, so the pump must fail the connection rather than lose it.
+    failure: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct UnsplitOutputState {
+    owned: bool,
+    queue: VecDeque<JsonRpcMessage>,
+    failed: bool,
+}
+
+impl UnsplitOutput {
+    fn new(failure: Arc<AtomicBool>) -> Self {
+        Self {
+            state: Mutex::new(UnsplitOutputState::default()),
+            released: Condvar::new(),
+            failure,
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, UnsplitOutputState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Takes the handle for a receive or close, waiting out a writer.
+    fn claim(&self) -> UnsplitOwnership<'_> {
+        let mut state = self.state();
+        while state.owned {
+            state = self
+                .released
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.owned = true;
+        UnsplitOwnership {
+            output: self,
+            released: false,
+        }
+    }
+
+    /// Takes the handle for a send, or queues `message` behind the current
+    /// owner, which writes it before releasing the handle (`Ok(None)`).
+    fn claim_or_queue(
+        &self,
+        message: &JsonRpcMessage,
+    ) -> Result<Option<UnsplitOwnership<'_>>, TransportError> {
+        let mut state = self.state();
+        if state.failed {
+            return Err(TransportError::Io(std::io::Error::other(
+                "an earlier queued send on this unsplit transport failed",
+            )));
+        }
+        if !state.owned {
+            state.owned = true;
+            return Ok(Some(UnsplitOwnership {
+                output: self,
+                released: false,
+            }));
+        }
+        if state.queue.len() >= UNSPLIT_OUTPUT_QUEUE_LIMIT {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "unsplit transport output queue is full while another caller owns the I/O handle",
+            )));
+        }
+        state.queue.push_back(message.clone());
+        Ok(None)
+    }
+
+    fn fail(&self, error: &TransportError) {
+        self.state().failed = true;
+        self.failure.store(true, Ordering::Release);
+        log::error!(
+            target: targets::TRANSPORT,
+            "Failed to send queued unsplit transport output: {}",
+            error
+        );
+    }
+}
+
+/// Ownership of an unsplit transport's I/O handle. Releasing it writes all
+/// output queued behind it first; an unwind releases it without writing.
+struct UnsplitOwnership<'a> {
+    output: &'a UnsplitOutput,
+    released: bool,
+}
+
+impl UnsplitOwnership<'_> {
+    fn release<T: Transport>(mut self, cx: &Cx, mut transport: Option<&mut T>) {
+        loop {
+            let batch = {
+                let mut state = self.output.state();
+                if state.queue.is_empty() {
+                    // Checked and released under one lock, so a sender either
+                    // queued before this point or finds the handle free.
+                    state.owned = false;
+                    drop(state);
+                    self.released = true;
+                    self.output.released.notify_all();
+                    return;
+                }
+                std::mem::take(&mut state.queue)
+            };
+            let Some(writer) = transport.as_deref_mut() else {
+                // Closed (or already failed): nothing queued can be written.
+                continue;
+            };
+            for message in &batch {
+                if let Err(error) = writer.send(cx, message) {
+                    if !error.is_cancelled() {
+                        self.output.fail(&error);
+                    }
+                    transport = None;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for UnsplitOwnership<'_> {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let mut state = self.output.state();
+        state.owned = false;
+        if !state.queue.is_empty() {
+            state.queue.clear();
+            state.failed = true;
+            self.output.failure.store(true, Ordering::Release);
+        }
+        drop(state);
+        self.output.released.notify_all();
+    }
 }
 
 struct SharedRecvHalf<R> {
@@ -21478,45 +21609,57 @@ impl<T> Clone for SharedTransport<T> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            output: Arc::clone(&self.output),
         }
     }
 }
 
 impl<T: Transport> SharedTransport<T> {
+    #[cfg(test)]
     fn new(transport: T) -> Self {
+        Self::with_output_failure(transport, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// `output_failure` is latched when output queued during another owner's
+    /// I/O cannot be written; the pump checks it after every `recv`.
+    fn with_output_failure(transport: T, output_failure: Arc<AtomicBool>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Some(transport))),
+            output: Arc::new(UnsplitOutput::new(output_failure)),
         }
     }
 
     fn recv(&self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        let ownership = self.output.claim();
         let mut guard = self.inner.lock().map_err(|_| transport_lock_error())?;
-        guard
+        let result = guard
             .as_mut()
-            .map_or(Err(TransportError::Closed), |transport| transport.recv(cx))
+            .map_or(Err(TransportError::Closed), |transport| transport.recv(cx));
+        // Output queued while this `recv` blocked goes out before the pump
+        // dispatches what it returned.
+        ownership.release(cx, guard.as_mut());
+        result
     }
 
     fn send(&self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
-        let mut guard = match self.inner.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(_)) => return Err(transport_lock_error()),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                return Err(TransportError::Io(std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    "transport receive owns the unsplit I/O handle",
-                )));
-            }
+        let Some(ownership) = self.output.claim_or_queue(message)? else {
+            return Ok(());
         };
-        guard
+        let mut guard = self.inner.lock().map_err(|_| transport_lock_error())?;
+        let result = guard
             .as_mut()
             .map_or(Err(TransportError::Closed), |transport| {
                 transport.send(cx, message)
-            })
+            });
+        ownership.release(cx, guard.as_mut());
+        result
     }
 
     fn close(&self, cx: &Cx) -> Result<(), TransportError> {
+        let ownership = self.output.claim();
         let transport = {
             let mut guard = self.inner.lock().map_err(|_| transport_lock_error())?;
+            ownership.release(cx, guard.as_mut());
             guard.take()
         };
         let Some(mut transport) = transport else {
@@ -23574,53 +23717,9 @@ mod lib_unit_tests {
         http_overlap_control().record_lock_contention(session);
     }
 
-    /// DIAGNOSTIC (bd-f2ndd). Under async dispatch the client completes and
-    /// cancels, yet `serve` still does not return -- so the stall moved to the
-    /// server and has no stage. This records how far serve's shutdown gets.
+    /// DIAGNOSTIC (bd-f2ndd). Records how far serve's shutdown gets, so a
+    /// probe that times out names the shutdown await it is parked in.
     pub(super) static F2NDD_SERVE_STAGE: AtomicUsize = AtomicUsize::new(0);
-
-    /// DIAGNOSTIC (bd-f2ndd). Separate from the serve counter so a reaper
-    /// stage cannot mask a serve stage under fetch_max.
-    pub(super) static F2NDD_REAPER_STAGE: AtomicUsize = AtomicUsize::new(0);
-
-    /// DIAGNOSTIC (bd-f2ndd). Live siblings in `connection_scope` at the moment
-    /// the reaper is joined. The reaper and every connection child are spawned
-    /// into the SAME scope, and the reaper is joined BEFORE any child is
-    /// drained -- so a non-zero count here is the sibling the join may be
-    /// waiting on. +1 is stored so "recorded zero" is distinguishable from
-    /// "never recorded".
-    pub(super) static F2NDD_CHILDREN_AT_JOIN: AtomicUsize = AtomicUsize::new(0);
-
-    pub(super) fn record_f2ndd_children_at_join(count: usize) {
-        F2NDD_CHILDREN_AT_JOIN.fetch_max(count + 1, Ordering::SeqCst);
-    }
-
-    pub(super) fn record_f2ndd_reaper_stage(stage: usize) {
-        F2NDD_REAPER_STAGE.fetch_max(stage, Ordering::SeqCst);
-    }
-
-    /// DIAGNOSTIC (bd-f2ndd). How many REAP_PARK_CHUNK sleeps have RETURNED.
-    /// Zero at a stage-42 stall means the timer never fired once in this
-    /// process; a positive count means sleeps did wake until one did not.
-    /// Like every f2ndd counter this is process-global and never reset, so it
-    /// is only attributable to one probe when that probe runs alone in its
-    /// own test process (`--exact`, one name per invocation).
-    pub(super) static F2NDD_REAPER_SLEEP_RETURNS: AtomicUsize = AtomicUsize::new(0);
-
-    /// DIAGNOSTIC (bd-f2ndd). Whether cancellation had already been requested
-    /// on the reaper's cx when its MOST RECENT sleep began: 0 never recorded,
-    /// 1 not yet requested, 2 already requested. A stage-42 stall with 1 is a
-    /// sleep that began before the abort and was never polled again after it.
-    pub(super) static F2NDD_REAPER_CANCEL_AT_LAST_PARK: AtomicUsize = AtomicUsize::new(0);
-
-    pub(super) fn record_f2ndd_reaper_sleep_return() {
-        F2NDD_REAPER_SLEEP_RETURNS.fetch_add(1, Ordering::SeqCst);
-    }
-
-    pub(super) fn record_f2ndd_reaper_park(cancel_requested: bool) {
-        let state = if cancel_requested { 2 } else { 1 };
-        F2NDD_REAPER_CANCEL_AT_LAST_PARK.store(state, Ordering::SeqCst);
-    }
 
     pub(super) fn record_f2ndd_serve_stage(stage: usize) {
         F2NDD_SERVE_STAGE.fetch_max(stage, Ordering::SeqCst);
@@ -31308,18 +31407,11 @@ mod lib_unit_tests {
         }
     }
 
-    /// DIAGNOSTIC (bd-f2ndd). Same tool NAME and schema as
-    /// `LiveLegacyRuntimeConnectionTool`, but declares `ToolExecutionMode::Async`
-    /// and awaits `ctx.sample` directly instead of bridging it with `block_on`.
-    ///
-    /// This exists to answer one question and fixes nothing: would `ctx.sample`
-    /// have completed if the handler thread were free? Stage 21/22/23 distinguish
-    /// this hook from the blocking one's 1/2/3, so a run also reports WHICH hook
-    /// actually dispatched.
-    ///
-    /// It is a separate type rather than a change to the shared fixture because
-    /// `LiveLegacyRuntimeConnectionTool` is registered at eight sites and seven
-    /// of them pass today. Only the reverse-response probe swaps to this one.
+    /// Same tool NAME and schema as `LiveLegacyRuntimeConnectionTool`, but
+    /// declares `ToolExecutionMode::Async` and awaits `ctx.sample` directly
+    /// instead of bridging it with `block_on`, so legacy HTTP dispatches it on
+    /// the caller-owned path rather than the blocking pool. Stage 21/22/23
+    /// distinguish this hook from the blocking one's 1/2/3 (bd-f2ndd).
     ///
     /// Note `call_async`'s trait default delegates to `call`, so declaring the
     /// mode without supplying this hook would route straight back into the
@@ -42962,12 +43054,20 @@ mod lib_unit_tests {
         wrong_reverse_response_id: bool,
         plant_exact_admission_negatives: bool,
         reverse_response_token: Option<&'static str>,
+        async_handler: bool,
     ) -> Result<(), String> {
         const INITIALIZE_ID: i64 = 842;
         const TOOL_CALL_ID: i64 = 843;
 
-        let server = Server::new("live-http-legacy-reverse-response", "1.0.0")
-            .tool(LiveLegacyReverseResponseAsyncTool);
+        // The synchronous tool bridges `ctx.sample` with `block_on` from its
+        // `call` method, which is the obvious user code (bd-6rfrg). The async
+        // tool awaits it on the caller-owned path instead.
+        let server = Server::new("live-http-legacy-reverse-response", "1.0.0");
+        let server = if async_handler {
+            server.tool(LiveLegacyReverseResponseAsyncTool)
+        } else {
+            server.tool(LiveLegacyRuntimeConnectionTool)
+        };
         let server = if reverse_response_token.is_some() {
             let verifier = StaticTokenVerifier::new([
                 ("alpha", AuthContext::with_subject("alice")),
@@ -43401,38 +43501,20 @@ mod lib_unit_tests {
                 format!(
                     "DIAGNOSTIC (bd-f2ndd): `bound.serve(cx)` was still pending at its bound. \
                      serve completes only when the client cancels caller_cx, so this alone does \
-                     not localise the stall. {client_state}. SERVE SHUTDOWN STAGE {}: {}.{}{} \
-                     REAPER SLEEP RETURNS {}; CANCEL AT LAST PARK {} (0 unrecorded, 1 not yet \
-                     requested, 2 already requested). \
+                     not localise the stall. {client_state}. SERVE SHUTDOWN STAGE {}: {}. \
                      The stall is NOT fixed; do not raise this bound.",
                     F2NDD_SERVE_STAGE.load(Ordering::SeqCst),
                     match F2NDD_SERVE_STAGE.load(Ordering::SeqCst) {
                         // Each marker is recorded BEFORE its await, so stage N
                         // means the code reached N and is parked in what follows.
                         0 => "serve never left its accept loop -- cancellation was not observed",
-                        31 => "left the loop but parked before the reaper join, in request/abort, which are synchronous",
-                        32 => "parked at modern_session_reaper.join",
+                        31 => "left the loop but never reached close_live_http_sessions",
                         33 => "parked at close_live_http_sessions",
                         34 => "parked at drain_terminal_controls",
                         35 => "parked at finish_live_modern_http_sessions",
                         36 => "parked at drain_cooperative_shutdown",
                         _ => "past every shutdown await -- the stall is after them",
                     },
-                    match F2NDD_REAPER_STAGE.load(Ordering::SeqCst) {
-                        0 => " REAPER never started",
-                        41 => " REAPER entered but never reached its first sleep",
-                        42 => " REAPER PARKED IN sleep() AND NEVER RETURNED -- checkpoint() was NEVER EVALUATED, so the short-chunk mitigation never ran; this is a sleep that does not wake, not a cancellation that is not observed",
-                        43 => " REAPER completed a sleep but checkpoint() returned Ok despite the abort -- the mitigation ran and did not see cancellation",
-                        44 => " REAPER broke out of its loop but its TASK BODY NEVER FINISHED -- nothing follows the loop, so this would itself be a finding",
-                        _ => " REAPER ran to completion (task body finished) and the join STILL parked -- the stall is in join/teardown, not in the loop",
-                    },
-                    match F2NDD_CHILDREN_AT_JOIN.load(Ordering::SeqCst) {
-                        0 => " (children-at-join NOT RECORDED)",
-                        1 => " (ZERO live connection children in connection_scope at the reaper join, so a live sibling is NOT what it waits on)",
-                        _ => " (LIVE connection children in connection_scope at the reaper join -- the reaper and every connection share that scope and the children are not drained until later in this same shutdown)",
-                    },
-                    F2NDD_REAPER_SLEEP_RETURNS.load(Ordering::SeqCst),
-                    F2NDD_REAPER_CANCEL_AT_LAST_PARK.load(Ordering::SeqCst),
                 )
             })?;
         let join_deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
@@ -43452,14 +43534,23 @@ mod lib_unit_tests {
     #[test]
     fn live_http_legacy_reverse_response_bypasses_the_originating_session_mutex() {
         run_live_http_test(|cx| async move {
-            live_http_legacy_reverse_response_post_probe(&cx, false, false, None).await
+            live_http_legacy_reverse_response_post_probe(&cx, false, false, None, false).await
+        });
+    }
+
+    #[test]
+    fn live_http_legacy_reverse_response_reaches_an_async_handler() {
+        run_live_http_test(|cx| async move {
+            // Differs from the synchronous positive only in the handler's
+            // execution mode, which moves dispatch to the caller-owned path.
+            live_http_legacy_reverse_response_post_probe(&cx, false, false, None, true).await
         });
     }
 
     #[test]
     fn live_http_legacy_reverse_response_exact_admission_precedes_pending_mutation() {
         run_live_http_test(|cx| async move {
-            live_http_legacy_reverse_response_post_probe(&cx, false, true, None).await
+            live_http_legacy_reverse_response_post_probe(&cx, false, true, None, false).await
         });
     }
 
@@ -43468,14 +43559,15 @@ mod lib_unit_tests {
         run_live_http_test(|cx| async move {
             // This differs from the positive only in the reverse-response
             // correlation ID, so it must not complete the waiting handler.
-            live_http_legacy_reverse_response_post_probe(&cx, true, false, None).await
+            live_http_legacy_reverse_response_post_probe(&cx, true, false, None, false).await
         });
     }
 
     #[test]
     fn live_http_legacy_reverse_response_accepts_opener_principal() {
         run_live_http_test(|cx| async move {
-            live_http_legacy_reverse_response_post_probe(&cx, false, false, Some("alpha")).await
+            live_http_legacy_reverse_response_post_probe(&cx, false, false, Some("alpha"), false)
+                .await
         });
     }
 
@@ -43484,7 +43576,8 @@ mod lib_unit_tests {
         run_live_http_test(|cx| async move {
             // The only behavioral change from the authenticated positive is
             // the bearer principal on the first reverse-response POST.
-            live_http_legacy_reverse_response_post_probe(&cx, false, false, Some("beta")).await
+            live_http_legacy_reverse_response_post_probe(&cx, false, false, Some("beta"), false)
+                .await
         });
     }
 
@@ -47213,6 +47306,143 @@ mod lib_unit_tests {
         });
         assert!(sibling.send(&Cx::for_testing(), &message).is_ok());
         assert_eq!(sibling_send_calls.load(Ordering::Acquire), 1);
+    }
+
+    /// Unsplit transport whose `recv` blocks until the test releases it, and
+    /// which records each written method with whether `recv` had returned.
+    struct BlockingRecvTransport {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        recv_returned: bool,
+        fail_send: bool,
+        written: Arc<Mutex<Vec<(String, bool)>>>,
+    }
+
+    impl Transport for BlockingRecvTransport {
+        fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+            let JsonRpcMessage::Request(request) = message else {
+                panic!("this fixture only writes requests");
+            };
+            self.written
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((request.method.clone(), self.recv_returned));
+            if self.fail_send {
+                return Err(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "peer closed",
+                )));
+            }
+            Ok(())
+        }
+
+        fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+            self.entered.send(()).expect("test observes recv entry");
+            self.release.recv().expect("test releases recv");
+            self.recv_returned = true;
+            Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                "ping", None, 1_i64,
+            )))
+        }
+
+        fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    /// bd-8bcfq: sends issued while an unsplit transport's `recv` blocks must
+    /// neither fail nor wait for it; they are written in order once it returns.
+    /// Returns what was written, the latched output failure, and the result of
+    /// one more send issued after `recv` returned.
+    fn shared_transport_send_during_blocked_recv_case(
+        fail_send: bool,
+    ) -> (Vec<(String, bool)>, bool, Result<(), TransportError>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let failure = Arc::new(AtomicBool::new(false));
+        let shared = SharedTransport::with_output_failure(
+            BlockingRecvTransport {
+                entered: entered_tx,
+                release: release_rx,
+                recv_returned: false,
+                fail_send,
+                written: Arc::clone(&written),
+            },
+            Arc::clone(&failure),
+        );
+        let receiver = shared.clone();
+        let pump = std::thread::spawn(move || receiver.recv(&Cx::for_testing()));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("recv must be entered");
+
+        let sender = shared.clone();
+        let (sent_tx, sent_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            for method in ["notifications/first", "notifications/second"] {
+                let notification =
+                    JsonRpcMessage::Request(JsonRpcRequest::notification(method, None));
+                sent_tx
+                    .send(sender.send(&Cx::for_testing(), &notification))
+                    .expect("test collects send results");
+            }
+        });
+        for _ in 0..2 {
+            let sent = sent_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a send must not wait for a blocked recv");
+            assert!(sent.is_ok(), "{sent:?}");
+        }
+        writer.join().expect("writer thread");
+        assert!(
+            written
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "nothing can be written while recv owns the handle"
+        );
+        assert!(!failure.load(Ordering::Acquire));
+
+        release_tx.send(()).expect("recv is still blocked");
+        let received = pump.join().expect("pump thread");
+        assert!(matches!(received, Ok(JsonRpcMessage::Request(_))));
+
+        let after = shared.send(
+            &Cx::for_testing(),
+            &JsonRpcMessage::Request(JsonRpcRequest::notification("notifications/third", None)),
+        );
+        let written = written
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        (written, failure.load(Ordering::Acquire), after)
+    }
+
+    #[test]
+    fn shared_transport_writes_sends_queued_during_recv_in_order_positive() {
+        let (written, failed, after) = shared_transport_send_during_blocked_recv_case(false);
+        assert_eq!(
+            written,
+            [
+                ("notifications/first".to_owned(), true),
+                ("notifications/second".to_owned(), true),
+                ("notifications/third".to_owned(), true),
+            ]
+        );
+        assert!(!failed);
+        assert!(after.is_ok(), "{after:?}");
+    }
+
+    #[test]
+    fn shared_transport_latches_failure_of_queued_send_negative() {
+        let (written, failed, after) = shared_transport_send_during_blocked_recv_case(true);
+        // The first queued write fails, so the rest of the queue is dropped,
+        // the pump's failure flag is latched, and later sends are refused
+        // rather than written out of order.
+        assert_eq!(written, [("notifications/first".to_owned(), true)]);
+        assert!(failed);
+        assert!(after.is_err(), "{after:?}");
     }
 
     #[test]
