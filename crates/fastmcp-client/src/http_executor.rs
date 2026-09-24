@@ -4,6 +4,9 @@
 //! negotiation, and the public response stream surface. It neither retries an
 //! MCP request nor follows redirects.
 
+/// Explicitly reviewed, resource-bound tool parameter headers.
+pub mod parameter_headers;
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::future::{Future, poll_fn};
@@ -353,7 +356,9 @@ pub struct ModernHttpRequest {
     protocol_version: String,
     method: String,
     name: Option<String>,
+    name_header: Option<String>,
     authorization: Option<String>,
+    parameter_headers: Option<Vec<(String, String)>>,
     include_method_header: bool,
 }
 
@@ -366,6 +371,7 @@ impl fmt::Debug for ModernHttpRequest {
             .field("method", &self.method)
             .field("name", &self.name)
             .field("body_bytes", &self.body.len())
+            .field("parameter_header_count", &self.parameter_headers.as_ref().map_or(0, Vec::len))
             .field("include_method_header", &self.include_method_header)
             .field(
                 "authorization",
@@ -392,18 +398,37 @@ impl ModernHttpRequest {
         }
         if [target.as_str(), protocol_version.as_str(), method.as_str()]
             .into_iter()
-            .chain(name.as_deref())
             .any(contains_header_control)
+            || name.as_deref().is_some_and(|name| {
+                if protocol_version == fastmcp_protocol::FINAL_PROTOCOL_VERSION {
+                    name.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+                } else {
+                    contains_header_control(name)
+                }
+            })
         {
             return Err(ModernHttpExecutorError::InvalidRequestMetadata);
         }
+        // Preserve the logical name for exact body/header identity checks.
+        // The sentinel convention belongs to final HTTP: legacy construction
+        // retains its existing validation and verbatim header spelling.
+        let name_header = if protocol_version == fastmcp_protocol::FINAL_PROTOCOL_VERSION {
+            name.as_deref()
+                .map(fastmcp_protocol::http_headers::encode_mcp_header_value)
+                .transpose()
+                .map_err(|_| ModernHttpExecutorError::InvalidRequestMetadata)?
+        } else {
+            name.clone()
+        };
         Ok(Self {
             target,
             body,
             protocol_version,
             method,
             name,
+            name_header,
             authorization: None,
+            parameter_headers: None,
             include_method_header: true,
         })
     }
@@ -434,7 +459,9 @@ impl ModernHttpRequest {
             protocol_version,
             method: String::new(),
             name: None,
+            name_header: None,
             authorization: None,
+            parameter_headers: None,
             include_method_header: false,
         })
     }
@@ -472,7 +499,7 @@ impl ModernHttpRequest {
         &self.body
     }
 
-    /// Builds the fixed, uncoded MCP request headers.
+    /// Builds the admitted MCP request headers, including opted-in mirrors.
     ///
     /// `Accept-Encoding` explicitly requests the canonical identity coding;
     /// the request itself deliberately omits `Content-Encoding` because its
@@ -504,8 +531,11 @@ impl ModernHttpRequest {
         if self.include_method_header {
             headers.push(("Mcp-Method".to_owned(), self.method.clone()));
         }
-        if let Some(name) = &self.name {
+        if let Some(name) = &self.name_header {
             headers.push(("Mcp-Name".to_owned(), name.clone()));
+        }
+        if let Some(parameters) = &self.parameter_headers {
+            headers.extend(parameters.iter().cloned());
         }
         let authorization = match credential {
             Some(credential) => self.bound_authorization(credential),

@@ -9,7 +9,8 @@
 //! A definition is a contract, not permission to execute a tool. The host must
 //! approve the invocation and invalidate this client when its catalog or policy
 //! changes. Server annotations never grant consent, retry or header-disclosure
-//! authority. This module does not add parameter-header projection.
+//! authority. Parameter headers require explicit `review_headers` or
+//! `with_reviewed_headers` approval, retained by every continuation.
 
 use std::fmt;
 use std::io::{self, Write};
@@ -25,11 +26,15 @@ use serde_json::Value;
 
 use super::managed::ManagedOAuthSession;
 use super::rpc::{ManagedCoreCall, ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits};
+use super::rpc::tool_headers::ManagedToolHeaderError;
+use crate::http_executor::parameter_headers::{ReviewedToolHeaders, ToolHeaderDispatchError};
 
 /// Explicit multi-round tool operations retaining this same schema contract.
 pub mod interaction;
 /// Caller-driven catalog watches publishing invalidation-bound tool clients.
 pub mod catalog;
+/// Disclosure review bound to this client's exact schema and invalidation.
+pub mod headers;
 
 mod validity;
 use validity::await_validity;
@@ -51,8 +56,10 @@ pub enum ManagedToolError {
     InvalidResult,
     MissingStructuredOutput,
     InvalidStructuredOutput,
+    HeaderBindingMismatch,
     Invalidated,
     Closed,
+    Headers(ToolHeaderDispatchError),
     Core(ManagedCoreError),
 }
 
@@ -68,8 +75,10 @@ impl fmt::Display for ManagedToolError {
             Self::InvalidResult => "managed tool result failed protocol admission",
             Self::MissingStructuredOutput => "successful tool result omitted required structured output",
             Self::InvalidStructuredOutput => "tool structured output does not satisfy its admitted schema",
+            Self::HeaderBindingMismatch => "header review does not match the bound tool contract",
             Self::Invalidated => "managed tool contract has been invalidated",
             Self::Closed => "managed tool call is closed",
+            Self::Headers(error) => return fmt::Display::fmt(error, f),
             Self::Core(error) => return fmt::Display::fmt(error, f),
         })
     }
@@ -80,6 +89,15 @@ impl std::error::Error for ManagedToolError {}
 impl From<ManagedCoreError> for ManagedToolError {
     fn from(error: ManagedCoreError) -> Self {
         Self::Core(error)
+    }
+}
+
+impl From<ManagedToolHeaderError> for ManagedToolError {
+    fn from(error: ManagedToolHeaderError) -> Self {
+        match error {
+            ManagedToolHeaderError::Headers(error) => Self::Headers(error),
+            ManagedToolHeaderError::Core(error) => Self::Core(error),
+        }
     }
 }
 
@@ -111,7 +129,7 @@ impl ToolContract {
         // Standard header annotations are part of the tool definition, not
         // permission to disclose arguments. Admit their syntax while retaining
         // the exact source and validating through the ordinary schema engine.
-        // No projection plan is executed by this wrapper or its continuations.
+        // Admission itself never executes this plan or approves disclosure.
         let input = AdmittedToolHeaderSchema::admit(tool.input_schema)
             .map_err(|_| ManagedToolError::InvalidInputSchema)?;
         let output = tool.output_schema.map(admit_final_schema).transpose()
@@ -217,12 +235,14 @@ impl Write for SchemaBytes {
 pub struct ManagedToolClient {
     session: ManagedOAuthSession,
     contract: Arc<ToolContract>,
+    header_review: Option<Arc<ReviewedToolHeaders>>,
 }
 
 impl fmt::Debug for ManagedToolClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ManagedToolClient")
             .field("has_output_schema", &self.contract.output.is_some())
+            .field("parameter_headers", &self.header_review.is_some())
             .field("invalidated", &self.is_invalidated())
             .finish_non_exhaustive()
     }
@@ -235,7 +255,7 @@ impl ManagedToolClient {
     /// server and approving its use with this exact managed login.
     pub fn new(session: ManagedOAuthSession, tool: FinalTool) -> Result<Self, ManagedToolError> {
         let contract = Arc::new(ToolContract::admit(tool)?);
-        Ok(Self { session, contract })
+        Ok(Self { session, contract, header_review: None })
     }
 
     pub fn tool_name(&self) -> &str { &self.contract.name }
@@ -282,11 +302,18 @@ impl ManagedToolClient {
         check_tool_call(cx, cancellation, &self.contract)?;
         self.contract.validate_request(&request)?;
         check_tool_call(cx, cancellation, &self.contract)?;
-        let call = await_validity(cx, cancellation, &self.contract,
-            self.session.request_core_with_cancellation(
-                cx, cancellation, request, request_id, limits,
-            ),
-        ).await??;
+        let call = match self.header_review.as_deref() {
+            Some(reviewed) => await_validity(cx, cancellation, &self.contract,
+                self.session.request_tool_with_headers_and_cancellation(
+                    cx, cancellation, request, request_id, reviewed, limits,
+                ),
+            ).await??,
+            None => await_validity(cx, cancellation, &self.contract,
+                self.session.request_core_with_cancellation(
+                    cx, cancellation, request, request_id, limits,
+                ),
+            ).await??,
+        };
         check_tool_call(cx, cancellation, &self.contract)?;
         Ok(ManagedToolCall {
             call: Some(call), contract: self.contract.clone(),

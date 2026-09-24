@@ -14,6 +14,7 @@
 
 use std::fmt;
 use std::future::Future;
+use std::sync::Arc;
 
 use asupersync::Cx;
 use asupersync::types::Time;
@@ -27,8 +28,10 @@ use fastmcp_protocol::{
 
 use super::{
     ManagedCoreCall, ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits,
-    ManagedOAuthSession, bounded_wait, call_deadline, check_call, prepare,
+    ManagedOAuthSession, bounded_wait, call_deadline, check_call,
 };
+use super::tool_headers::ManagedToolHeaderError;
+use crate::http_executor::parameter_headers::{ReviewedToolHeaders, ToolHeaderDispatchError};
 
 /// Explicit reply recovery for independently configured continuation journals.
 pub mod recovery;
@@ -93,6 +96,7 @@ pub enum ManagedInteractionError {
     /// The host declined further resolver or notification processing.
     AbortedByHost,
     Closed,
+    Headers(ToolHeaderDispatchError),
     Core(ManagedCoreError),
 }
 
@@ -111,6 +115,7 @@ impl fmt::Display for ManagedInteractionError {
             Self::RepeatedRequestId => "interaction continuation requires a fresh request ID",
             Self::AbortedByHost => "managed interaction aborted by its host",
             Self::Closed => "managed interaction is closed",
+            Self::Headers(error) => return fmt::Display::fmt(error, f),
             Self::Core(error) => return fmt::Display::fmt(error, f),
         })
     }
@@ -120,6 +125,15 @@ impl std::error::Error for ManagedInteractionError {}
 
 impl From<ManagedCoreError> for ManagedInteractionError {
     fn from(error: ManagedCoreError) -> Self { Self::Core(error) }
+}
+
+impl From<ManagedToolHeaderError> for ManagedInteractionError {
+    fn from(error: ManagedToolHeaderError) -> Self {
+        match error {
+            ManagedToolHeaderError::Headers(error) => Self::Headers(error),
+            ManagedToolHeaderError::Core(error) => Self::Core(error),
+        }
+    }
 }
 
 /// Notifications remain incremental across all rounds. An input-required
@@ -157,6 +171,7 @@ enum Step {
 pub struct ManagedInteraction {
     session: ManagedOAuthSession,
     original: CoreRequest,
+    header_review: Option<Arc<ReviewedToolHeaders>>,
     step: Option<Step>,
     cancellation: McpRequestCancellation,
     deadline: Time,
@@ -206,21 +221,39 @@ impl ManagedOAuthSession {
         request_id: RequestId,
         limits: ManagedInteractionLimits,
     ) -> Result<ManagedInteraction, ManagedInteractionError> {
+        self.start_core_interaction_configured(
+            cx, cancellation, request, request_id, limits, None,
+        ).await
+    }
+
+    // Configuration is immutable before the first POST. Only the explicit
+    // reviewed API and schema-bound client can install a disclosure plan.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn start_core_interaction_configured(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        request: CoreRequest,
+        request_id: RequestId,
+        limits: ManagedInteractionLimits,
+        header_review: Option<Arc<ReviewedToolHeaders>>,
+    ) -> Result<ManagedInteraction, ManagedInteractionError> {
         let deadline = call_deadline(cx, cancellation, limits.core.timeout)?;
         validate_initial(&request)?;
-        let (wire, decoder) = prepare(
-            self.resource().as_str(), request.clone(), request_id.clone(), limits.core,
-        )?;
+        let mut operation = ManagedInteraction {
+            session: self.clone(), original: request, header_review, step: None,
+            cancellation: cancellation.clone(), deadline, limits,
+            used_ids: vec![request_id.clone()], continuations: 0, input_responses: 0,
+            response_bytes: 0, notifications: 0, generation: 0,
+        };
+        let (wire, decoder) = operation.prepare_request(operation.original.clone(), request_id)?;
         let response = bounded_wait(cx, cancellation, deadline, async {
             self.execute_with_cancellation(cx, cancellation, &wire).await.map_err(ManagedCoreError::from)
         }).await?;
         let call = ManagedCoreCall::from_response(response, decoder, cancellation.clone(), deadline)?;
-        let generation = call.credential_generation();
-        Ok(ManagedInteraction {
-            session: self.clone(), original: request, step: Some(Step::Reading(Box::new(call))),
-            cancellation: cancellation.clone(), deadline, limits, used_ids: vec![request_id],
-            continuations: 0, input_responses: 0, response_bytes: 0, notifications: 0, generation,
-        })
+        operation.generation = call.credential_generation();
+        operation.step = Some(Step::Reading(Box::new(call)));
+        Ok(operation)
     }
 }
 
@@ -450,9 +483,7 @@ impl ManagedInteraction {
         // All fallible local validation happens before consuming the challenge.
         let count = responses.as_ref().map_or(0, FinalInputResponses::len);
         let next = continuation_request_selected(&self.original, input, responses, selection)?;
-        let (wire, mut decoder) = prepare(
-            self.session.resource().as_str(), next, request_id.clone(), self.limits.core,
-        )?;
+        let (wire, mut decoder) = self.prepare_request(next, request_id.clone())?;
         decoder.bytes = self.response_bytes;
         decoder.notifications = self.notifications;
         self.check(cx)?;
@@ -472,6 +503,20 @@ impl ManagedInteraction {
         self.generation = call.credential_generation();
         self.step = Some(Step::Reading(Box::new(call)));
         Ok(())
+    }
+
+    // Initial dispatch, ordinary resume and explicit journal recovery all use
+    // this same owner-bound preparation. No continuation can drop the review
+    // or accept a replacement schema, target or argument map from the host.
+    fn prepare_request(
+        &self,
+        request: CoreRequest,
+        request_id: RequestId,
+    ) -> Result<(crate::http_executor::ModernHttpRequest, super::CoreDecoder), ManagedInteractionError> {
+        Ok(super::tool_headers::prepare_optional(
+            self.session.resource().as_str(), request, request_id, self.limits.core,
+            self.header_review.as_deref(),
+        )?)
     }
 
     fn check(&mut self, cx: &Cx) -> Result<(), ManagedInteractionError> {

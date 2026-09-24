@@ -155,6 +155,7 @@ impl ManagedToolCatalogSnapshot {
         let client = self.0.contracts.get(name).map(|contract| ManagedToolClient {
             session: self.0.session.clone(),
             contract: Arc::clone(contract),
+            header_review: None,
         });
         if self.is_invalidated() { return Err(ManagedToolCatalogError::Invalidated); }
         Ok(client)

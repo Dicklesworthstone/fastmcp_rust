@@ -16,7 +16,7 @@ use super::{
     InputSelection, ManagedCoreCall, ManagedCoreError, ManagedCoreEvent,
     ManagedInteraction, ManagedInteractionError, ManagedInteractionEvent, Step,
     admit_challenge, admit_fresh_id, bounded_wait, continuation_request_selected,
-    input_required, prepare,
+    input_required,
 };
 use crate::http_auth::managed::OAuthSessionError;
 use crate::http_executor::{ModernHttpExecutorError, ModernHttpResponseKind};
@@ -166,7 +166,7 @@ impl ManagedInteraction {
         let request = recovery_request(&self.original, input, responses)?;
         // Check the complete retained request before handing out the owner.
         // This ID is used only for encoding admission, never dispatch/history.
-        let _ = prepare(self.session.resource().as_str(), request.clone(), RequestId::Number(0), self.limits.core)?;
+        let _ = self.prepare_request(request.clone(), RequestId::Number(0))?;
         self.step = None;
         Ok(RecoverableManagedContinuation {
             interaction: self, request: Some(request), call: None, phase: Phase::Prepared,
@@ -268,7 +268,7 @@ impl RecoverableManagedContinuation {
         let core = self.interaction.limits.core;
         let reserved = reserve_frame(self.interaction.response_bytes, core.frame_bytes, core.total_bytes)?;
         let request = self.request.as_ref().ok_or(ContinuationRecoveryError::WrongPhase)?.clone();
-        let (wire, mut decoder) = prepare(self.interaction.session.resource().as_str(), request, request_id.clone(), core)?;
+        let (wire, mut decoder) = self.interaction.prepare_request(request, request_id.clone())?;
         decoder.bytes = self.interaction.response_bytes;
         decoder.notifications = self.interaction.notifications;
         self.check(cx)?;

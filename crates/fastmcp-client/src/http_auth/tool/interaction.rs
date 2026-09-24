@@ -52,7 +52,8 @@ impl ManagedToolClient {
     /// Starts a schema-checked tool operation whose input-required results are
     /// answered explicitly through `resume` or `resume_partial`. Arguments are
     /// validated before credential renewal or network I/O. The original schema,
-    /// tool identity, arguments and login cannot change between rounds.
+    /// tool identity, arguments, login and optional header review cannot change
+    /// between rounds. Every continuation projects the original arguments.
     pub async fn start_interaction(
         &self,
         cx: &Cx,
@@ -79,8 +80,8 @@ impl ManagedToolClient {
         self.contract.validate_request(&request)?;
         check_tool_call(cx, cancellation, &self.contract)?;
         let operation = Box::pin(await_validity(cx, cancellation, &self.contract,
-            self.session.start_core_interaction_with_cancellation(
-                cx, cancellation, request, request_id, limits,
+            self.session.start_core_interaction_configured(
+                cx, cancellation, request, request_id, limits, self.header_review.clone(),
             ),
         )).await??;
         check_tool_call(cx, cancellation, &self.contract)?;

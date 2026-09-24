@@ -32,11 +32,12 @@ use fastmcp_client::http_auth::rpc::catalog::{
     CollectedCatalog, ManagedCatalogClient, ManagedCatalogError, ManagedCatalogLimits,
 };
 use fastmcp_client::http_auth::rpc::{ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits};
+use fastmcp_client::http_auth::tool::ManagedToolClient;
 use fastmcp_core::{CanonicalHttpUrl, McpRequestCancellation};
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
-    ClientCapabilities, CoreRequest, CoreResult, FinalCoreResult, FinalRequestMeta, RequestId,
-    ServerNotification,
+    ClientCapabilities, CoreRequest, CoreResult, FinalCoreResult, FinalRequestMeta, FinalTool,
+    RequestId, ServerNotification,
 };
 use serde_json::{Value, json};
 
@@ -83,6 +84,8 @@ enum Case {
     UntrustedResource,
     CatalogPages,
     CatalogRepeatedCursor,
+    ToolHeadersReviewed,
+    ToolHeadersUnreviewed,
 }
 
 fn isolated(name: &str, case: Case) {
@@ -277,6 +280,15 @@ impl Peer {
     }
 
     async fn request(&self, path: &str) -> (TlsStream<TcpStream>, Vec<u8>) {
+        let (tls, body, _) = self.request_with_headers(path).await;
+        (tls, body)
+    }
+
+    /// Also returns the received header block, names lowercased.
+    async fn request_with_headers(
+        &self,
+        path: &str,
+    ) -> (TlsStream<TcpStream>, Vec<u8>, BTreeMap<String, String>) {
         let (socket, _) = self.listener.accept().await.unwrap();
         let mut tls = self.acceptor.accept(socket).await.unwrap();
         let mut bytes = Vec::new();
@@ -333,7 +345,7 @@ impl Peer {
             }
             self.mcp_posts.fetch_add(1, Ordering::SeqCst);
         }
-        (tls, body)
+        (tls, body, headers)
     }
 
     async fn login(&self) {
@@ -475,6 +487,73 @@ async fn complete_catalog(session: &ManagedOAuthSession, cx: &Cx, id: i64) {
     assert!(encoded.contains("1.20e+4"));
     assert_eq!(call.credential_generation(), 1);
     assert!(call.next_event(cx).await.unwrap().is_none());
+}
+
+const HEADER_ARGUMENTS: &str = r#"{"text":"hello","region":"eu-west"}"#;
+
+/// `region` carries an `x-mcp-header` annotation; `text` is body-only.
+fn header_tool(session: &ManagedOAuthSession) -> ManagedToolClient {
+    ManagedToolClient::new(
+        session.clone(),
+        FinalTool {
+            name: "echo".to_owned(),
+            title: None,
+            description: None,
+            icons: None,
+            input_schema: json!({"type":"object", "properties":{
+                "text":{"type":"string"},
+                "region":{"type":"string","x-mcp-header":"Region"}
+            }, "required":["text"]}),
+            output_schema: None,
+            annotations: None,
+            meta: None,
+        },
+    )
+    .expect("the annotated tool definition is admissible")
+}
+
+/// Runs one public tools/call through `client` against a peer that records
+/// the received header block and JSON-RPC params. Both header cases call this
+/// verbatim; only how `client` was built differs between them.
+async fn header_tool_call(
+    peer: &Peer,
+    client: &ManagedToolClient,
+    cx: &Cx,
+) -> (BTreeMap<String, String>, Value) {
+    let server = async {
+        let (mut tls, body, headers) = peer.request_with_headers("/mcp").await;
+        let envelope: Value = serde_json::from_slice(&body).unwrap();
+        json_reply(&mut tls, 200, &terminal(51, TOOL_RESULT)).await;
+        (headers, envelope["params"].clone())
+    };
+    let application = async {
+        let arguments: Value = serde_json::from_str(HEADER_ARGUMENTS).unwrap();
+        let request = core("tools/call", json!({"name":"echo","arguments":arguments}));
+        let mut call = client
+            .request(
+                cx,
+                request,
+                RequestId::Number(51),
+                ManagedCoreLimits::default(),
+            )
+            .await
+            .expect("an admitted tool call dispatches");
+        let Some(ManagedCoreEvent::Result(result)) = call.next_event(cx).await.unwrap() else {
+            panic!("typed tool result expected")
+        };
+        assert!(result.encode().unwrap().contains("hello from TLS"));
+        assert!(call.next_event(cx).await.unwrap().is_none());
+    };
+    let (observed, ()) = Box::pin(pair(server, application)).await;
+    observed
+}
+
+fn parameter_header_names(headers: &BTreeMap<String, String>) -> Vec<&str> {
+    headers
+        .keys()
+        .map(String::as_str)
+        .filter(|name| name.starts_with("mcp-param-"))
+        .collect()
 }
 
 fn run(case: Case) {
@@ -637,6 +716,28 @@ fn run(case: Case) {
                         "a cache hit must not issue a POST"
                     );
                 }
+                Case::ToolHeadersReviewed | Case::ToolHeadersUnreviewed => {
+                    let client = if matches!(case, Case::ToolHeadersReviewed) {
+                        header_tool(&session)
+                            .review_headers(|binding| binding.header_name() == "Mcp-Param-Region")
+                            .expect("the host approves the single annotated binding")
+                    } else {
+                        header_tool(&session)
+                    };
+                    let (headers, params) = header_tool_call(&peer, &client, &cx).await;
+                    // The body is identical either way: disclosure mirrors a
+                    // value into a header, it never moves or rewrites it.
+                    assert_eq!(params["arguments"], serde_json::from_str::<Value>(HEADER_ARGUMENTS).unwrap());
+                    assert!(!headers.values().any(|value| value.contains("hello")), "body-only text must never reach a header");
+                    if matches!(case, Case::ToolHeadersReviewed) {
+                        assert_eq!(parameter_header_names(&headers), vec!["mcp-param-region"]);
+                        assert_eq!(headers["mcp-param-region"], "eu-west");
+                    } else {
+                        assert!(parameter_header_names(&headers).is_empty(), "unreviewed call disclosed {headers:?}");
+                        assert!(!headers.values().any(|value| value.contains("eu-west")), "an annotation alone must not disclose");
+                    }
+                    assert_eq!(peer.mcp_posts.load(Ordering::SeqCst), 1);
+                }
                 Case::CatalogRepeatedCursor => {
                     // Identical to Case::CatalogPages up to ONE token in the
                     // second page: its nextCursor repeats page one's instead
@@ -749,5 +850,19 @@ fn managed_catalog_rejects_repeated_cursor_without_extra_post() {
     isolated(
         "managed_catalog_rejects_repeated_cursor_without_extra_post",
         Case::CatalogRepeatedCursor,
+    );
+}
+#[test]
+fn managed_tool_reviewed_parameter_header_reaches_the_wire() {
+    isolated(
+        "managed_tool_reviewed_parameter_header_reaches_the_wire",
+        Case::ToolHeadersReviewed,
+    );
+}
+#[test]
+fn managed_tool_unreviewed_annotation_sends_no_parameter_header() {
+    isolated(
+        "managed_tool_unreviewed_annotation_sends_no_parameter_header",
+        Case::ToolHeadersUnreviewed,
     );
 }
