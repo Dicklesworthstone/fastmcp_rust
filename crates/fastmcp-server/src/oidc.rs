@@ -551,7 +551,11 @@ impl DiscoveryDocument {
     #[must_use]
     pub fn new(issuer: impl Into<String>, base_url: impl Into<String>) -> Self {
         let issuer = issuer.into();
-        let base = base_url.into();
+        let base_url = base_url.into();
+        // Endpoints are appended to the base, and `OAuthHttpRoutes` serves
+        // `/authorize` for `https://a.example` and `https://a.example/` alike,
+        // so a trailing slash must not be advertised as `//authorize`.
+        let base = base_url.trim_end_matches('/');
 
         Self {
             issuer: issuer.clone(),
@@ -1902,10 +1906,11 @@ impl OidcProvider {
     #[must_use]
     pub fn discovery_document(&self, base_url: impl Into<String>) -> DiscoveryDocument {
         let base_url = base_url.into();
-        let mut doc = DiscoveryDocument::new(&self.config.issuer, base_url.clone());
+        let mut doc = DiscoveryDocument::new(&self.config.issuer, base_url.as_str());
         doc.scopes_supported = self.config.supported_scopes.clone();
         if self.oauth.config().allow_public_clients {
-            doc.registration_endpoint = Some(format!("{base_url}/register"));
+            let base = base_url.trim_end_matches('/');
+            doc.registration_endpoint = Some(format!("{base}/register"));
         }
         doc.claims_supported = Some(self.config.supported_claims.clone());
         // Discovery must describe this exact OAuthServer configuration, not
@@ -2560,6 +2565,44 @@ mod non_signing_tests {
             if let Some(endpoint) = &doc.registration_endpoint {
                 assert_eq!(endpoint, "https://issuer.example/register");
             }
+        }
+    }
+
+    #[test]
+    fn discovery_advertises_the_served_routes_for_either_base_spelling() {
+        use crate::oauth::OAuthHttpRoutes;
+
+        // The two bases differ only in a trailing slash; both serve `/token`.
+        for base in ["https://issuer.example", "https://issuer.example/"] {
+            let oauth = Arc::new(
+                OAuthServer::try_new(OAuthServerConfig {
+                    issuer: base.to_string(),
+                    allow_public_clients: true,
+                    ..OAuthServerConfig::default()
+                })
+                .unwrap(),
+            );
+            let routes = OAuthHttpRoutes::new(Arc::clone(&oauth), base).unwrap();
+            let doc = OidcProvider::with_defaults(oauth)
+                .unwrap()
+                .discovery_document(routes.public_endpoint_base());
+            let served = |path: &str| format!("https://issuer.example{path}");
+            assert_eq!(
+                doc.authorization_endpoint,
+                served(routes.authorization_path()),
+                "{base}"
+            );
+            assert_eq!(doc.token_endpoint, served(routes.token_path()), "{base}");
+            assert_eq!(
+                doc.revocation_endpoint,
+                Some(served(routes.revocation_path())),
+                "{base}"
+            );
+            assert_eq!(
+                doc.registration_endpoint,
+                routes.registration_path().map(served),
+                "{base}"
+            );
         }
     }
 
