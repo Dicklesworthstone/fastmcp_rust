@@ -12,10 +12,12 @@ use std::collections::BTreeSet;
 
 use admission::PreparedReceive;
 use fastmcp_protocol::JsonInteger;
+#[cfg(feature = "legacy-2024-11-05")]
+use fastmcp_protocol::methods::Legacy2024Direction;
 use fastmcp_protocol::methods::Legacy2024EnvelopeError;
 use fastmcp_protocol::methods::{
     COMPLETION_COMPLETE, INITIALIZE, LEGACY_2024_11_05_PROTOCOL_VERSION, LOGGING_SET_LEVEL,
-    Legacy2024Capability, Legacy2024ClientCapabilities, Legacy2024Direction, Legacy2024Envelope,
+    Legacy2024Capability, Legacy2024ClientCapabilities, Legacy2024Envelope,
     Legacy2024ServerCapabilities, NOTIFICATIONS_CANCELLED, NOTIFICATIONS_INITIALIZED,
     NOTIFICATIONS_MESSAGE, NOTIFICATIONS_PROGRESS, NOTIFICATIONS_PROMPTS_LIST_CHANGED,
     NOTIFICATIONS_RESOURCES_LIST_CHANGED, NOTIFICATIONS_RESOURCES_UPDATED,
@@ -84,6 +86,7 @@ impl LegacyAuthenticatedPeerPartition {
         Self { bytes }
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn bytes(self) -> [u8; Self::BYTE_LEN] {
         self.bytes
     }
@@ -118,6 +121,7 @@ impl LegacyPeerBinding {
         self.generation
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn canonical_bytes(self) -> [u8; LegacyAuthenticatedPeerPartition::BYTE_LEN + 8] {
         let mut bytes = [0; LegacyAuthenticatedPeerPartition::BYTE_LEN + 8];
         bytes[..LegacyAuthenticatedPeerPartition::BYTE_LEN]
@@ -173,6 +177,7 @@ pub struct LegacyServerAdapterInstalledReceipt {
 
 impl LegacyServerAdapterInstalledReceipt {
     /// Returns the exact protocol era bound by the real installation.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[must_use]
     pub const fn protocol_version(&self) -> &'static str {
         self.protocol_version
@@ -182,6 +187,7 @@ impl LegacyServerAdapterInstalledReceipt {
     ///
     /// This is an observation surface only; there is no public constructor for
     /// a receipt from these bytes or their constituent facts.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = b"fastmcp-legacy-server-install-v2\0".to_vec();
@@ -381,6 +387,7 @@ impl Legacy2024StateSnapshot {
     /// Returns the canonical byte representation used as a LEG-02 row's
     /// adapter-state digest. This contains every mutable adapter-owned field
     /// represented by this snapshot, in a stable order.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[must_use]
     pub fn canonical_digest(&self) -> Vec<u8> {
         let mut bytes = b"fastmcp-legacy-2024-state-v1\0".to_vec();
@@ -561,6 +568,7 @@ where
     }
 
     /// Applies one complete client-to-server JSON value without `block_on`.
+    #[cfg(feature = "legacy-2024-11-05")]
     pub async fn receive_async(
         &mut self,
         binding: LegacyPeerBinding,
@@ -583,6 +591,7 @@ where
     }
 
     /// Builds one capability-gated server-to-client notification for a live peer.
+    #[cfg(feature = "legacy-2024-11-05")]
     pub fn make_notification(
         &self,
         binding: LegacyPeerBinding,
@@ -684,6 +693,7 @@ where
     }
 
     /// Returns the binding that exclusively owns this lifecycle state.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[must_use]
     pub const fn binding(&self) -> LegacyPeerBinding {
         self.binding
@@ -1249,12 +1259,14 @@ fn response_id_from_wire(wire: &Value) -> Option<Value> {
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 fn append_length_prefixed(bytes: &mut Vec<u8>, field: &[u8]) {
     bytes.extend_from_slice(&(field.len() as u32).to_be_bytes());
     bytes.extend_from_slice(field);
 }
 
 /// Encodes the canonical LEG-02 A receipt digest preimage without hashing it.
+#[cfg(feature = "legacy-2024-11-05")]
 #[must_use]
 pub fn legacy_2024_a_digest_preimage(
     ordinal: u32,
@@ -1286,6 +1298,7 @@ pub fn legacy_2024_a_digest_preimage(
 
 /// Encodes the canonical LEG-02 B operating-isolation and teardown digest
 /// preimage without hashing it.
+#[cfg(feature = "legacy-2024-11-05")]
 #[must_use]
 pub fn legacy_2024_b_digest_preimage(
     partition_ordinal: u32,
@@ -1319,6 +1332,7 @@ pub fn legacy_2024_b_digest_preimage(
     bytes
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 const fn lifecycle_bytes(lifecycle: Legacy2024Lifecycle) -> &'static [u8] {
     match lifecycle {
         Legacy2024Lifecycle::AwaitInitialize => b"AwaitInitialize",
@@ -1328,6 +1342,7 @@ const fn lifecycle_bytes(lifecycle: Legacy2024Lifecycle) -> &'static [u8] {
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 const fn direction_bytes(direction: Legacy2024Direction) -> &'static [u8] {
     match direction {
         Legacy2024Direction::ClientToServer => b"ClientToServer",

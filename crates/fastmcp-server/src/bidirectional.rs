@@ -100,8 +100,10 @@ pub const HARD_MAX_MRTR_REQUEST_STATE_BYTES: usize = 256 * 1024;
 
 const FIRST_SERVER_REQUEST_ID: i64 = 1_000_000;
 /// The first exact-legacy ID is exactly representable by a JavaScript `Number`.
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 const FIRST_EXACT_LEGACY_SERVER_REQUEST_ID: i64 = -1;
 /// The inclusive lower bound of JavaScript's integer-safe `Number` range.
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 const LAST_EXACT_LEGACY_SERVER_REQUEST_ID: i64 = -9_007_199_254_740_991;
 const INVALID_LIMIT_ERROR: &str = "Invalid bidirectional request limit";
 const IN_FLIGHT_LIMIT_ERROR: &str = "Bidirectional request limit reached";
@@ -205,6 +207,7 @@ type ResponseReceiver = oneshot::Receiver<PendingResponse>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingIdDomain {
     Positive,
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     ExactLegacyNegative,
 }
 
@@ -212,6 +215,7 @@ impl PendingIdDomain {
     const fn first_id(self) -> i64 {
         match self {
             Self::Positive => FIRST_SERVER_REQUEST_ID,
+            #[cfg(any(feature = "legacy-2024-11-05", test))]
             Self::ExactLegacyNegative => FIRST_EXACT_LEGACY_SERVER_REQUEST_ID,
         }
     }
@@ -219,12 +223,14 @@ impl PendingIdDomain {
     fn next_id_after(self, candidate: i64) -> Option<i64> {
         match self {
             Self::Positive => candidate.checked_add(1),
+            #[cfg(any(feature = "legacy-2024-11-05", test))]
             Self::ExactLegacyNegative => candidate
                 .checked_sub(1)
                 .filter(|next| *next >= LAST_EXACT_LEGACY_SERVER_REQUEST_ID),
         }
     }
 
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     fn is_issued_negative_suffix(self, next_id: Option<i64>, id: &CorrelationKey) -> bool {
         let Self::ExactLegacyNegative = self else {
             return false;
@@ -273,6 +279,7 @@ struct PendingState {
 #[derive(Debug)]
 struct PendingRequest {
     sender: ResponseSender,
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     request_cancellation: Option<McpRequestCancellation>,
 }
 
@@ -345,6 +352,7 @@ impl PendingRequests {
     ///
     /// The domain is fixed for the tracker's full lifetime so a response for
     /// an issued-but-retired negative ID can be classified in O(1) space.
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     pub(crate) fn with_max_in_flight_for_exact_legacy(max_in_flight: usize) -> McpResult<Self> {
         Self::validate_max_in_flight(max_in_flight)?;
 
@@ -368,14 +376,14 @@ impl PendingRequests {
 
     /// Atomically allocates a collision-free ID and registers its response
     /// channel. Allocation scans at most `max_in_flight + 1` candidates.
-    fn register(&self) -> McpResult<(RequestId, ResponseReceiver)> {
-        self.register_with_cancellation(None)
-    }
-
     fn register_with_cancellation(
         &self,
         request_cancellation: Option<McpRequestCancellation>,
     ) -> McpResult<(RequestId, ResponseReceiver)> {
+        // Only the exact-legacy pump sweeps waiters by owner cancellation
+        // (`cancel_cancelled`), so other builds do not retain the handle.
+        #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+        let _ = request_cancellation;
         let mut state = self.lock_state();
         if state.closed {
             return Err(McpError::internal_error(CONNECTION_CLOSED_ERROR));
@@ -398,6 +406,7 @@ impl PendingRequests {
                 let (sender, receiver) = oneshot::channel();
                 entry.insert(PendingRequest {
                     sender,
+                    #[cfg(any(feature = "legacy-2024-11-05", test))]
                     request_cancellation,
                 });
                 return Ok((id, receiver));
@@ -434,10 +443,14 @@ impl PendingRequests {
         let (pending, retired_generic) = {
             let mut state = self.lock_state();
             let pending = state.requests.remove(&key);
+            #[cfg(any(feature = "legacy-2024-11-05", test))]
             let retired_generic = pending.is_none()
                 && self
                     .id_domain
                     .is_issued_negative_suffix(state.next_id, &key);
+            // Only the exact-legacy domain issues retirable negative IDs.
+            #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+            let retired_generic = false;
             (pending, retired_generic)
         };
 
@@ -469,6 +482,7 @@ impl PendingRequests {
 
     /// Wakes pending server-to-client calls whose owning incoming request is
     /// terminal, without mutating the caller-owned connection context.
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
     pub(crate) fn cancel_cancelled(&self) -> usize {
         let cancelled = {
             let mut state = self.lock_state();
@@ -1936,7 +1950,8 @@ impl MrtrExchangeRegistry {
     }
 
     /// Issues an `input_required` result bound to one router-admitted modern
-    /// operation. Only [`Self::accept_wire_bound`] can consume such a state.
+    /// operation. Only a bound accept, such as
+    /// [`Self::accept_final_input_responses_bound`], can consume such a state.
     pub(crate) fn issue_bound(
         &self,
         owner_cancellation: McpRequestCancellation,
@@ -1997,7 +2012,10 @@ impl MrtrExchangeRegistry {
     }
 
     /// Decodes and consumes a router retry only when its immutable request
-    /// facts exactly match the state that issued it.
+    /// facts exactly match the state that issued it. The router consumes
+    /// ordered entries through [`Self::accept_final_input_responses_bound`];
+    /// this map form remains for tests that drive the registry directly.
+    #[cfg(test)]
     pub(crate) fn accept_wire_bound(
         &self,
         request_state: &str,
@@ -2045,7 +2063,7 @@ impl MrtrExchangeRegistry {
     ///
     /// The distinct entry point preserves the final wire contract: only an
     /// absent member can resume a state-only exchange. An explicitly present
-    /// empty map still flows through [`Self::accept_wire_bound`] and remains
+    /// empty map still flows through [`Self::accept_final_input_responses_bound`] and remains
     /// invalid rather than silently becoming a state-only retry.
     pub(crate) fn accept_state_only_bound(
         &self,
@@ -4382,7 +4400,7 @@ mod tests {
         let pending = PendingRequests::new();
 
         // Register a request
-        let (id, receiver) = pending.register().unwrap();
+        let (id, receiver) = pending.register_with_cancellation(None).unwrap();
 
         // Simulate a response
         let response = JsonRpcResponse::success(id, serde_json::json!({"result": "ok"}));
@@ -4398,7 +4416,7 @@ mod tests {
     fn test_pending_requests_error_response() {
         let pending = PendingRequests::new();
 
-        let (id, receiver) = pending.register().unwrap();
+        let (id, receiver) = pending.register_with_cancellation(None).unwrap();
 
         // Simulate an error response
         let response = JsonRpcResponse::error(
@@ -4421,8 +4439,8 @@ mod tests {
     fn test_pending_requests_cancel_all() {
         let pending = PendingRequests::new();
 
-        let (_, receiver1) = pending.register().unwrap();
-        let (_, receiver2) = pending.register().unwrap();
+        let (_, receiver1) = pending.register_with_cancellation(None).unwrap();
+        let (_, receiver2) = pending.register_with_cancellation(None).unwrap();
 
         // Cancel all
         pending.cancel_all();
@@ -4587,7 +4605,7 @@ mod tests {
     #[test]
     fn exact_legacy_negative_response_disposition_delivers_issued_waiter() {
         let pending = PendingRequests::with_max_in_flight_for_exact_legacy(1).unwrap();
-        let (id, receiver) = pending.register().unwrap();
+        let (id, receiver) = pending.register_with_cancellation(None).unwrap();
         assert_eq!(id, RequestId::Number(-1));
 
         let RequestId::Number(first_emitted_id) = id.clone() else {
@@ -4612,8 +4630,8 @@ mod tests {
     fn exact_legacy_negative_ids_descend_from_minus_one() {
         let pending = PendingRequests::with_max_in_flight_for_exact_legacy(2).unwrap();
 
-        let (first_id, _first_receiver) = pending.register().unwrap();
-        let (next_id, _next_receiver) = pending.register().unwrap();
+        let (first_id, _first_receiver) = pending.register_with_cancellation(None).unwrap();
+        let (next_id, _next_receiver) = pending.register_with_cancellation(None).unwrap();
 
         assert_eq!(first_id, RequestId::Number(-1));
         assert_eq!(next_id, RequestId::Number(-2));
@@ -4622,7 +4640,7 @@ mod tests {
     #[test]
     fn exact_legacy_negative_response_disposition_retires_issued_removed_id() {
         let pending = PendingRequests::with_max_in_flight_for_exact_legacy(1).unwrap();
-        let (id, _receiver) = pending.register().unwrap();
+        let (id, _receiver) = pending.register_with_cancellation(None).unwrap();
         pending.remove(&id);
 
         let response = JsonRpcResponse::success(id, serde_json::json!(null));
@@ -4639,7 +4657,7 @@ mod tests {
     #[test]
     fn exact_legacy_negative_response_disposition_rejects_unissued_nearby_id() {
         let pending = PendingRequests::with_max_in_flight_for_exact_legacy(1).unwrap();
-        let (issued_id, _receiver) = pending.register().unwrap();
+        let (issued_id, _receiver) = pending.register_with_cancellation(None).unwrap();
         assert_eq!(issued_id, RequestId::Number(-1));
 
         let unissued_id = RequestId::Number(-2);
@@ -4657,7 +4675,7 @@ mod tests {
     #[test]
     fn pending_requests_deliver_equivalent_numeric_response_spelling() {
         let pending = PendingRequests::new();
-        let (id, receiver) = pending.register().unwrap();
+        let (id, receiver) = pending.register_with_cancellation(None).unwrap();
         assert_eq!(id, RequestId::Number(FIRST_SERVER_REQUEST_ID));
 
         let response = JsonRpcResponse::success(
@@ -4677,7 +4695,7 @@ mod tests {
     #[test]
     fn exact_legacy_retires_equivalent_numeric_response_spelling() {
         let pending = PendingRequests::with_max_in_flight_for_exact_legacy(1).unwrap();
-        let (id, _receiver) = pending.register().unwrap();
+        let (id, _receiver) = pending.register_with_cancellation(None).unwrap();
         assert_eq!(id, RequestId::Number(-1));
         pending.remove(&id);
 
@@ -4694,7 +4712,7 @@ mod tests {
     #[test]
     fn removed_positive_id_remains_unmatched() {
         let pending = PendingRequests::new();
-        let (id, _receiver) = pending.register().unwrap();
+        let (id, _receiver) = pending.register_with_cancellation(None).unwrap();
         pending.remove(&id);
 
         let response = JsonRpcResponse::success(id, serde_json::json!(null));
@@ -4709,7 +4727,7 @@ mod tests {
     fn exact_legacy_negative_ids_exhaust_at_js_safe_boundary_and_remain_retired() {
         let pending = PendingRequests::with_max_in_flight_for_exact_legacy(1).unwrap();
         pending.set_next_id_for_test(LAST_EXACT_LEGACY_SERVER_REQUEST_ID);
-        let (last_id, _receiver) = pending.register().unwrap();
+        let (last_id, _receiver) = pending.register_with_cancellation(None).unwrap();
         assert_eq!(
             last_id,
             RequestId::Number(LAST_EXACT_LEGACY_SERVER_REQUEST_ID)
@@ -4717,7 +4735,7 @@ mod tests {
         pending.remove(&last_id);
 
         let exhausted = pending
-            .register()
+            .register_with_cancellation(None)
             .expect_err("the exact-legacy negative ID domain ends at the JavaScript safe boundary");
         assert_eq!(exhausted.message, REQUEST_ID_EXHAUSTED_ERROR);
 
@@ -4746,7 +4764,7 @@ mod tests {
         );
 
         let permanently_exhausted = pending
-            .register()
+            .register_with_cancellation(None)
             .expect_err("retiring the final negative ID must not permit reuse");
         assert_eq!(permanently_exhausted.message, REQUEST_ID_EXHAUSTED_ERROR);
     }
@@ -4756,7 +4774,7 @@ mod tests {
     #[test]
     fn pending_requests_default_is_same_as_new() {
         let pr = PendingRequests::default();
-        let (id, _receiver) = pr.register().unwrap();
+        let (id, _receiver) = pr.register_with_cancellation(None).unwrap();
         // IDs start at 1_000_000
         assert_eq!(id, RequestId::Number(1_000_000));
         assert_eq!(pr.max_in_flight(), DEFAULT_MAX_IN_FLIGHT_REQUESTS);
@@ -4765,9 +4783,9 @@ mod tests {
     #[test]
     fn pending_requests_ids_are_sequential() {
         let pr = PendingRequests::new();
-        let (id1, _receiver1) = pr.register().unwrap();
-        let (id2, _receiver2) = pr.register().unwrap();
-        let (id3, _receiver3) = pr.register().unwrap();
+        let (id1, _receiver1) = pr.register_with_cancellation(None).unwrap();
+        let (id2, _receiver2) = pr.register_with_cancellation(None).unwrap();
+        let (id3, _receiver3) = pr.register_with_cancellation(None).unwrap();
         assert_eq!(id1, RequestId::Number(1_000_000));
         assert_eq!(id2, RequestId::Number(1_000_001));
         assert_eq!(id3, RequestId::Number(1_000_002));
@@ -4789,11 +4807,11 @@ mod tests {
     #[test]
     fn pending_requests_enforces_exact_in_flight_boundary_and_recovers_capacity() {
         let pr = PendingRequests::with_max_in_flight(2).unwrap();
-        let (id1, receiver1) = pr.register().unwrap();
-        let (_id2, _receiver2) = pr.register().unwrap();
+        let (id1, receiver1) = pr.register_with_cancellation(None).unwrap();
+        let (_id2, _receiver2) = pr.register_with_cancellation(None).unwrap();
         assert_eq!(pr.in_flight_len(), 2);
 
-        let error = pr.register().unwrap_err();
+        let error = pr.register_with_cancellation(None).unwrap_err();
         assert_eq!(error.code, McpErrorCode::InternalError);
         assert_eq!(error.message, IN_FLIGHT_LIMIT_ERROR);
 
@@ -4802,7 +4820,7 @@ mod tests {
         assert_eq!(receive_pending(receiver1).unwrap(), serde_json::json!(1));
         assert_eq!(pr.in_flight_len(), 1);
 
-        let (_id3, _receiver3) = pr.register().unwrap();
+        let (_id3, _receiver3) = pr.register_with_cancellation(None).unwrap();
         assert_eq!(pr.in_flight_len(), 2);
     }
 
@@ -4810,18 +4828,18 @@ mod tests {
     fn pending_request_ids_fail_closed_before_wrap_or_reuse() {
         let pr = PendingRequests::with_max_in_flight(4).unwrap();
         pr.set_next_id_for_test(i64::MAX);
-        let (max_id, _max_receiver) = pr.register().unwrap();
+        let (max_id, _max_receiver) = pr.register_with_cancellation(None).unwrap();
         assert_eq!(max_id, RequestId::Number(i64::MAX));
 
         let exhausted = pr
-            .register()
+            .register_with_cancellation(None)
             .expect_err("request IDs must never wrap back to an earlier value");
         assert_eq!(exhausted.message, REQUEST_ID_EXHAUSTED_ERROR);
         assert_eq!(pr.in_flight_len(), 1);
 
         pr.remove(&max_id);
         let still_exhausted = pr
-            .register()
+            .register_with_cancellation(None)
             .expect_err("exhaustion must remain permanent after the last waiter leaves");
         assert_eq!(still_exhausted.message, REQUEST_ID_EXHAUSTED_ERROR);
     }
@@ -4829,7 +4847,7 @@ mod tests {
     #[test]
     fn pending_requests_remove_prevents_routing() {
         let pr = PendingRequests::new();
-        let (id, _receiver) = pr.register().unwrap();
+        let (id, _receiver) = pr.register_with_cancellation(None).unwrap();
 
         // Remove the pending request
         pr.remove(&id);
@@ -4846,7 +4864,7 @@ mod tests {
     #[test]
     fn pending_requests_route_response_without_id_returns_false() {
         let pr = PendingRequests::new();
-        let (id, receiver) = pr.register().unwrap();
+        let (id, receiver) = pr.register_with_cancellation(None).unwrap();
         // A response with no id
         let response = JsonRpcResponse {
             jsonrpc: std::borrow::Cow::Borrowed("2.0"),
@@ -4865,7 +4883,7 @@ mod tests {
     #[test]
     fn pending_requests_route_response_with_explicit_null_result() {
         let pr = PendingRequests::new();
-        let (id, receiver) = pr.register().unwrap();
+        let (id, receiver) = pr.register_with_cancellation(None).unwrap();
 
         // An explicit JSON null is a present and valid success result.
         let response = JsonRpcResponse {
@@ -4898,7 +4916,7 @@ mod tests {
 
         for (result, error, version) in cases {
             let pr = PendingRequests::new();
-            let (id, receiver) = pr.register().unwrap();
+            let (id, receiver) = pr.register_with_cancellation(None).unwrap();
             let response = JsonRpcResponse {
                 jsonrpc: std::borrow::Cow::Borrowed(version),
                 result,
@@ -4918,7 +4936,7 @@ mod tests {
     #[test]
     fn pending_requests_route_after_receiver_dropped_does_not_panic() {
         let pr = PendingRequests::new();
-        let (id, receiver) = pr.register().unwrap();
+        let (id, receiver) = pr.register_with_cancellation(None).unwrap();
 
         // Drop the receiver
         drop(receiver);
@@ -4931,7 +4949,7 @@ mod tests {
     #[test]
     fn pending_requests_cancel_all_clears_pending() {
         let pr = PendingRequests::new();
-        let (id, _receiver) = pr.register().unwrap();
+        let (id, _receiver) = pr.register_with_cancellation(None).unwrap();
 
         pr.cancel_all();
 
@@ -4952,7 +4970,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let pending = Arc::new(PendingRequests::new());
-        let (_, receiver) = pending.register().unwrap();
+        let (_, receiver) = pending.register_with_cancellation(None).unwrap();
 
         pending.cancel_all();
         pending.cancel_all();
@@ -4962,7 +4980,7 @@ mod tests {
         assert_eq!(cancelled.message, CONNECTION_CLOSED_ERROR);
         assert_eq!(pending.in_flight_len(), 0);
 
-        let registration_error = pending.register().unwrap_err();
+        let registration_error = pending.register_with_cancellation(None).unwrap_err();
         assert_eq!(registration_error.code, McpErrorCode::InternalError);
         assert_eq!(registration_error.message, CONNECTION_CLOSED_ERROR);
 
@@ -5252,7 +5270,7 @@ mod tests {
     #[test]
     fn cancel_all_sends_connection_closed_error() {
         let pr = PendingRequests::new();
-        let (_, receiver) = pr.register().unwrap();
+        let (_, receiver) = pr.register_with_cancellation(None).unwrap();
         pr.cancel_all();
         let result = receive_pending(receiver);
         let err = result.unwrap_err();
@@ -5266,7 +5284,7 @@ mod tests {
     #[test]
     fn route_response_error_with_data() {
         let pr = PendingRequests::new();
-        let (id, receiver) = pr.register().unwrap();
+        let (id, receiver) = pr.register_with_cancellation(None).unwrap();
         let response = JsonRpcResponse::error(
             Some(id),
             JsonRpcError {
@@ -5288,9 +5306,9 @@ mod tests {
     #[test]
     fn pending_requests_multiple_register_and_route_independently() {
         let pr = PendingRequests::new();
-        let (id1, rx1) = pr.register().unwrap();
-        let (id2, rx2) = pr.register().unwrap();
-        let (id3, rx3) = pr.register().unwrap();
+        let (id1, rx1) = pr.register_with_cancellation(None).unwrap();
+        let (id2, rx2) = pr.register_with_cancellation(None).unwrap();
+        let (id3, rx3) = pr.register_with_cancellation(None).unwrap();
 
         // Route them out of order
         let r2 = JsonRpcResponse::success(id2.clone(), serde_json::json!("second"));
@@ -5309,8 +5327,8 @@ mod tests {
     fn pending_request_trackers_isolate_identical_wire_ids() {
         let connection_a = PendingRequests::new();
         let connection_b = PendingRequests::new();
-        let (id_a, receiver_a) = connection_a.register().unwrap();
-        let (id_b, receiver_b) = connection_b.register().unwrap();
+        let (id_a, receiver_a) = connection_a.register_with_cancellation(None).unwrap();
+        let (id_b, receiver_b) = connection_b.register_with_cancellation(None).unwrap();
         assert_eq!(id_a, id_b);
 
         let response = JsonRpcResponse::success(id_b, serde_json::json!("connection-b"));
@@ -5364,7 +5382,7 @@ mod tests {
     #[test]
     fn pending_requests_lock_state_recovers_from_poison() {
         let pr = Arc::new(PendingRequests::new());
-        let (id, receiver) = pr.register().unwrap();
+        let (id, receiver) = pr.register_with_cancellation(None).unwrap();
 
         // Poison the mutex by panicking while holding the lock
         let pr2 = Arc::clone(&pr);
