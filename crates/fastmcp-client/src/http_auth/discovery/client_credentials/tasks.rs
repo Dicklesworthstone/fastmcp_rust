@@ -743,8 +743,8 @@ mod tests {
             for requests in [
                 r#"{"a-roots":{"method":"roots/list"},"z-sample":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":8,"metadata":{"nested":{"key":1,"key":2}}}}}"#,
                 r#"{"a-roots":{"method":"roots/list"},"z-sample":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":8,"metadata":{"nested":{"key":1}},"tools":null}}}"#,
-                r#"[]"#,
-                r#"null"#,
+                r"[]",
+                r"null",
             ] {
                 assert!(matches!(
                     decode_result(decoder, &raw_input_task(result_type, requests), &RequestId::Number(2), 65536),
