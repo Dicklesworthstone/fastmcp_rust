@@ -301,7 +301,9 @@ fn run_private(case: PrivateCase) {
                         for mode in [1, 2, 3, 5] {
                             backend.mode.store(mode, Ordering::SeqCst);
                             let error = client.credential(&cx).await.err().unwrap();
-                            assert!(matches!(error, Error::AssertionSigning));
+                            // Name the mode and the error: a signer that outlives
+                            // SIGNING_TIMEOUT surfaces as Discovery(TimedOut) instead.
+                            assert!(matches!(error, Error::AssertionSigning), "signer mode {mode}: {error:?}");
                             assert!(!format!("{error:?} {error}").contains("service-client"));
                             assert_eq!(backend.in_flight.load(Ordering::SeqCst), 0);
                             assert_eq!(peer.grants.load(Ordering::SeqCst), 0);
