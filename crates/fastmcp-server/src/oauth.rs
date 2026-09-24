@@ -930,7 +930,7 @@ impl OAuthParameterAdmission {
     }
 }
 
-enum OAuthFormDecodeError {
+pub(crate) enum OAuthFormDecodeError {
     TooLarge,
     MalformedPercentEncoding,
     InvalidUtf8,
@@ -946,7 +946,7 @@ impl From<OAuthFormDecodeError> for OAuthParameterAdmissionError {
     }
 }
 
-fn decode_oauth_form_component(
+pub(crate) fn decode_oauth_form_component(
     input: &[u8],
     maximum_output_bytes: usize,
 ) -> Result<String, OAuthFormDecodeError> {
