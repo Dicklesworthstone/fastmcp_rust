@@ -31,7 +31,7 @@ mod tests {
     use fastmcp_core::McpRequestCancellation;
     use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 
-    use super::super::{BoundSecuredHttpServer, connection, tls::ConnectionIo};
+    use super::super::{BoundSecuredHttpServer, SecuredHttpIoLimits, connection, tls::ConnectionIo};
     use crate::{HttpListenerShutdown, Server};
     use crate::http_admission::{HttpAdmissionLimits, HttpEndpointConfig};
     use crate::http_admission::security::HttpSecurityPolicy;
@@ -157,6 +157,49 @@ mod tests {
                 assert_disconnected(&mut peer);
                 assert!(bound.inner.modern_sessions.sessions.lock().unwrap().is_empty());
                 assert!(runtime_cx.checkpoint().is_ok());
+            });
+    }
+
+    #[test]
+    fn driverless_caller_still_times_out_an_idle_request_head() {
+        // bd-if2ni: asupersync parks a timeout without a wake only through
+        // `poll_with_time`. An awaited timeout polls its Sleep, which falls
+        // back to the process-global timer, so the request timeout must fire
+        // for a caller Cx with no timer driver. The second pass differs only
+        // in owning a driver.
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build().unwrap().block_on(async {
+                let runtime_cx = Cx::current().unwrap();
+                let bound = bound(&runtime_cx).await;
+                let io = SecuredHttpIoLimits::new(Duration::from_millis(50), Duration::from_secs(1))
+                    .unwrap();
+                for with_driver in [false, true] {
+                    let cx = if with_driver { runtime_cx.clone() } else { Cx::for_testing() };
+                    assert_eq!(cx.timer_driver().is_some(), with_driver);
+                    let mut peer = std::net::TcpStream::connect(bound.local_addr().unwrap()).unwrap();
+                    let (stream, _) = bound.inner.listener.accept().await.unwrap();
+                    let connection = Box::pin(connection::serve(
+                        &cx,
+                        ConnectionIo::Plain(stream),
+                        Arc::clone(&bound.inner.endpoint),
+                        Arc::clone(&bound.inner.modern_sessions),
+                        HttpListenerShutdown::new(&cx),
+                        Arc::clone(&bound.policy),
+                        io,
+                    ));
+                    // The outer bound runs on the driver-owning runtime Cx, so
+                    // an inner timeout that never wakes fails here, not hangs.
+                    let result = asupersync::time::timeout(
+                        runtime_cx.now(), Duration::from_secs(5), drive(&cx, connection),
+                    ).await.expect("an idle request head must time out");
+                    assert_eq!(result, Ok(()));
+                    peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                    let mut response = Vec::new();
+                    let _ = peer.read_to_end(&mut response);
+                    assert!(response.starts_with(b"HTTP/1.1 408"),
+                        "with_driver={with_driver}: {:?}", String::from_utf8_lossy(&response));
+                }
             });
     }
 
