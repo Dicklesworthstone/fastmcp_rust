@@ -61,24 +61,62 @@ fn a_new_input_constraint_refuses_the_immutable_invocation_before_host_approval(
     assert!(approve_definition(&cx, &cancel, &source, &request(json!(10)), &fresh, |_| true).unwrap().is_some());
 }
 
+// SCH-01 admits schemas as Draft 2020-12, where an unknown keyword is an
+// annotation. Malformed means a real assertion with an invalid value. Both
+// roles carry the unknown keyword, so a pair differs only in `minimum`.
+fn with_minimum(minimum: Value) -> [FinalTool; 2] {
+    let mut input = definition("Fresh");
+    input.input_schema["properties"]["count"]["minimum"] = minimum.clone();
+    input.input_schema["unrecognizedValidationKeyword"] = json!(true);
+    let mut output = definition("Fresh");
+    output.output_schema = Some(json!({"type":"object","unrecognizedValidationKeyword":true,
+        "properties":{"total":{"type":"integer","minimum":minimum}}}));
+    [input, output]
+}
+
 #[test]
 fn malformed_input_output_and_wrong_identity_never_reach_approval() {
     let cx = Cx::for_testing();
     let cancel = McpRequestCancellation::new();
     let source = source();
-    let mut input = definition("Fresh");
-    input.input_schema["unrecognizedValidationKeyword"] = json!(true);
-    let mut output = definition("Fresh");
-    output.output_schema = Some(json!({"type":"object","unrecognizedValidationKeyword":true}));
+    let [input, output] = with_minimum(json!("not-a-number"));
     let mut named = definition("Fresh");
     named.name = "foreign-private-canary".to_owned();
     let mut calls = 0;
-    for fresh in [input, output, named] {
+    for (fresh, role) in [(input, "input"), (output, "output"), (named, "identity")] {
         let error = approve_definition(&cx, &cancel, &source, &request(json!(2)), &fresh,
             |_| { calls += 1; true }).err().unwrap();
+        assert!(match role {
+            "input" => matches!(error, ManagedToolError::InvalidInputSchema),
+            "output" => matches!(error, ManagedToolError::InvalidOutputSchema),
+            _ => matches!(error, ManagedToolError::RequestMismatch),
+        }, "{role}: {error:?}");
         assert!(!format!("{error:?} {error}").contains("private-canary"));
     }
     assert_eq!(calls, 0);
+    source.check().unwrap();
+}
+
+#[test]
+fn unknown_keyword_annotations_reach_approval_with_their_constraints() {
+    let cx = Cx::for_testing();
+    let cancel = McpRequestCancellation::new();
+    let source = source();
+    let [input, output] = with_minimum(json!(1));
+    // eb5160e3's former "malformed" input and output fixtures, verbatim.
+    let mut former_input = definition("Fresh");
+    former_input.input_schema["unrecognizedValidationKeyword"] = json!(true);
+    let mut former_output = definition("Fresh");
+    former_output.output_schema = Some(json!({"type":"object","unrecognizedValidationKeyword":true}));
+    let mut calls = 0;
+    for fresh in [input, output, former_input, former_output] {
+        let replacement = approve_definition(&cx, &cancel, &source, &request(json!(2)), &fresh,
+            |_| { calls += 1; true }).unwrap().unwrap();
+        assert_eq!(replacement.input.schema(), &fresh.input_schema);
+        assert!(matches!(approve_definition(&cx, &cancel, &source, &request(json!(0)), &fresh, |_| true),
+            Err(ManagedToolError::InvalidArguments)));
+    }
+    assert_eq!(calls, 4);
     source.check().unwrap();
 }
 
