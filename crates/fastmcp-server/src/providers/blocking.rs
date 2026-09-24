@@ -252,7 +252,11 @@ impl<F> PoolWork<F> {
     fn run<T>(mut self, sender: oneshot::Sender<McpResult<T>>)
     where F: FnOnce(&McpContext) -> McpResult<T>,
     {
-        let result = (|| {
+        // Contain every unwind before publication, not only the hook's own: a
+        // guard's drop or a discarded result's `Drop` can unwind after the
+        // handler ran. An unsent sender reads as `Closed`, which the caller
+        // reports as a pool rejection, i.e. "never ran" (bd-dtg73).
+        let result = catch_unwind(AssertUnwindSafe(|| {
             self.charge.0.process.verify()
                 .map_err(|_| unavailable("blocking handler process changed"))?;
             let _blocking_lane = fastmcp_core::runtime::enter_blocking_lane();
@@ -266,7 +270,8 @@ impl<F> PoolWork<F> {
                 .map_err(|_| unavailable("blocking handler panicked; payload redacted"))?;
             self.context.ensure_live().map_err(|_| McpError::request_cancelled())?;
             result
-        })();
+        }))
+        .unwrap_or_else(|_| Err(unavailable("blocking handler panicked; payload redacted")));
         // Self retains the reservation through publication and through the
         // destruction of a result whose receiver has disappeared.
         let _ = sender.send_blocking(result);
@@ -887,6 +892,51 @@ mod tests {
             assert_eq!(lane.in_flight().unwrap(), 0);
             assert_eq!(lane.execute(&context, context.cx(), |_| Ok(9)).await.unwrap(), 9);
         });
+    }
+
+    struct DropCanary(bool);
+    impl Drop for DropCanary {
+        fn drop(&mut self) {
+            if self.0 { panic!("private-result-drop-canary"); }
+        }
+    }
+
+    /// Runs one admitted pool job whose handler succeeds and then cancels its
+    /// request, so `run` discards the `Ok` value on its post-call liveness check.
+    fn discarded_result_publication(drop_panics: bool) -> McpResult<DropCanary> {
+        runtime(false).block_on(async {
+            let context = McpContext::new(Cx::current().unwrap(), 7);
+            let lane = BlockingHandlerLane::new(1).unwrap();
+            let (sender, mut receiver) = oneshot::channel();
+            let job = PoolWork {
+                work: Some(move |ctx: &McpContext| {
+                    ctx.request_cancellation().cancel();
+                    Ok::<_, McpError>(DropCanary(drop_panics))
+                }),
+                context,
+                charge: lane.reserve().unwrap(),
+                _completion: PoolCompletionGuard(Arc::new(PoolCompletion::default())),
+            };
+            assert!(catch_unwind(AssertUnwindSafe(|| job.run(sender))).is_ok(),
+                "an unwind before publication must not escape the pool closure");
+            assert_eq!(lane.in_flight().unwrap(), 0);
+            receiver.try_recv().expect("the admitted job must publish a result, not close its sender")
+        })
+    }
+
+    #[test]
+    fn unwind_after_the_handler_ran_is_published_as_a_panic_not_a_rejection() {
+        let Err(error) = discarded_result_publication(true) else { panic!("the job was cancelled") };
+        assert_eq!(error.message, "blocking handler panicked; payload redacted");
+        assert!(!format!("{error:?}").contains("private-result-drop-canary"));
+    }
+
+    #[test]
+    fn quietly_discarded_result_is_published_as_the_cancellation() {
+        // Differs from the panic case only in whether the discarded value's
+        // Drop unwinds.
+        let Err(error) = discarded_result_publication(false) else { panic!("the job was cancelled") };
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::RequestCancelled);
     }
 
     #[test]
