@@ -827,7 +827,9 @@ fn legacy_sse_http_post_requires_accepted(
             });
             if version == Some("HTTP/1.1")
                 && status == Some("202")
-                && reason.is_some_and(is_valid_http_header_value)
+                && reason.is_some_and(|reason| {
+                    !reason.is_empty() && is_valid_http_header_value(reason)
+                })
                 && headers_are_well_formed
             {
                 return Ok(());
@@ -991,7 +993,7 @@ impl HttpResponse {
     /// Sets CORS headers for cross-origin requests.
     #[must_use]
     pub fn with_cors(mut self, origin: &str) -> Self {
-        if !is_valid_http_header_value(origin) {
+        if !is_valid_http_field_value("origin", origin) {
             return self;
         }
         self.headers.insert(
@@ -2675,10 +2677,46 @@ fn is_http_token(value: &str) -> bool {
 }
 
 fn is_valid_http_header_value(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| byte == b'\t' || byte >= b' ' && byte != 0x7f)
+    // RFC 9110 section 5.5: field-value = *field-content. Empty extension
+    // fields are syntactically valid; field-specific requirements belong
+    // below, not in the shared control-byte check.
+    value
+        .bytes()
+        .all(|byte| byte == b'\t' || byte >= b' ' && byte != 0x7f)
+}
+
+fn is_valid_http_field_value(name: &str, value: &str) -> bool {
+    if !is_valid_http_header_value(value) {
+        return false;
+    }
+    if !value.trim_matches([' ', '\t']).is_empty() {
+        return true;
+    }
+
+    // Preserve nonempty values for the framing, authentication, origin and
+    // MCP metadata fields this transport relies on. This is a minimum bound,
+    // not a replacement for their existing field-specific parsers/policies.
+    // Match without allocating or depending on an adapter normalizing names.
+    ![
+        "authorization",
+        "proxy-authorization",
+        "www-authenticate",
+        "proxy-authenticate",
+        "content-type",
+        "content-length",
+        "content-encoding",
+        "transfer-encoding",
+        "host",
+        "origin",
+        "access-control-allow-origin",
+        "access-control-request-method",
+        "mcp-protocol-version",
+        "mcp-session-id",
+        "mcp-method",
+        "mcp-name",
+    ]
+    .iter()
+    .any(|required| name.eq_ignore_ascii_case(required))
 }
 
 /// Validates requests assembled through the public `HttpRequest` fields.
@@ -2695,7 +2733,7 @@ fn validate_http_request_headers(request: &HttpRequest) -> Result<(), HttpError>
                 "invalid request header name: {name}"
             )));
         }
-        if !is_valid_http_header_value(value) {
+        if !is_valid_http_field_value(name, value) {
             return Err(HttpError::InvalidHeader(format!(
                 "invalid value for request header {name}"
             )));
@@ -3661,7 +3699,7 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
                 )));
             }
             let value = raw_value.trim_matches([' ', '\t']);
-            if !is_valid_http_header_value(value) {
+            if !is_valid_http_field_value(name, value) {
                 return Err(HttpError::InvalidHeader(format!(
                     "invalid value for header {name}"
                 )));
@@ -3848,7 +3886,7 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
                     "invalid response header name: {name}"
                 )));
             }
-            if !is_valid_http_header_value(value) {
+            if !is_valid_http_field_value(name, value) {
                 return Err(HttpError::InvalidHeader(format!(
                     "invalid value for response header {name}"
                 )));
