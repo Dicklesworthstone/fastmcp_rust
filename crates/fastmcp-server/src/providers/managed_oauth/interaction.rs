@@ -20,6 +20,7 @@ use fastmcp_client::http_auth::rpc::ManagedCoreLimits;
 use fastmcp_client::http_auth::rpc::interaction::{
     ManagedInputReply, ManagedInteractionError, ManagedInteractionLimits,
 };
+use fastmcp_client::http_executor::parameter_headers::ReviewedToolHeaders;
 use fastmcp_core::{McpContext, McpError, McpErrorCode, McpResult};
 use fastmcp_protocol::{
     CoreRequest, CoreResult, FinalCoreRequest, FinalCoreResult, FinalInputResponses,
@@ -215,6 +216,7 @@ impl ManagedOAuthProvider {
                 policy,
                 handler,
                 next_id: Arc::clone(&self.forwarder.next_id),
+                header_review: None,
             }),
             next_id: Arc::clone(&self.forwarder.next_id),
             limits: self.forwarder.limits,
@@ -228,14 +230,28 @@ struct InteractiveBackend {
     policy: ManagedOAuthInputPolicy,
     handler: Arc<dyn ManagedOAuthInputHandler>,
     next_id: Arc<AtomicU64>,
+    header_review: Option<Arc<ReviewedToolHeaders>>,
 }
 
 impl CoreBackend for InteractiveBackend {
+    fn with_reviewed_headers(&self, reviewed: Arc<ReviewedToolHeaders>) -> McpResult<Arc<dyn CoreBackend>> {
+        super::headers::admit_resource(self.session.resource(), &reviewed)?;
+        if self.header_review.is_some() {
+            return Err(McpError::invalid_params("Managed OAuth tool headers are already configured"));
+        }
+        Ok(Arc::new(Self {
+            session: self.session.clone(), policy: self.policy,
+            handler: Arc::clone(&self.handler), next_id: Arc::clone(&self.next_id),
+            header_review: Some(reviewed),
+        }))
+    }
+
     fn execute<'a>(
         &'a self, ctx: &'a McpContext, cx: &'a Cx, request: CoreRequest,
         id: RequestId, limits: ManagedCoreLimits,
     ) -> BoxFuture<'a, McpResult<FinalCoreResult>> {
         Box::pin(async move {
+            admit_reviewed_method(&request, self.header_review.as_deref())?;
             let Some(interactive) = self.policy.select_request(&request)? else {
                 // completion/complete is not an MRTR method. Configuring a
                 // resolver must not disable the provider's completion handler.
@@ -244,9 +260,15 @@ impl CoreBackend for InteractiveBackend {
             ctx.checkpoint()?;
             check_cx(cx)?;
             let cancellation = ctx.request_cancellation();
-            let operation = self.session.start_core_interaction_with_cancellation(
-                cx, &cancellation, interactive, id, self.policy.limits(limits)?,
-            ).await.map_err(interaction_error)?;
+            let limits = self.policy.limits(limits)?;
+            let operation = match &self.header_review {
+                Some(reviewed) => self.session.start_tool_interaction_with_headers_and_cancellation(
+                    cx, &cancellation, interactive, id, Arc::clone(reviewed), limits,
+                ).await,
+                None => self.session.start_core_interaction_with_cancellation(
+                    cx, &cancellation, interactive, id, limits,
+                ).await,
+            }.map_err(interaction_error)?;
             // Both paths consume the same operation owner. In particular, a
             // partial reply must not reopen an interaction with renewed budgets
             // or make a lost intermediate response eligible for automatic retry.
@@ -272,6 +294,16 @@ impl CoreBackend for InteractiveBackend {
             }
         })
     }
+}
+
+// Header-bearing backends belong to one reviewed tool. Do not let method
+// fallback silently discard that plan or authorize unrelated prompt/resource
+// work. Exact body/name/resource checks remain in the native projector.
+fn admit_reviewed_method(request: &CoreRequest, reviewed: Option<&ReviewedToolHeaders>) -> McpResult<()> {
+    if reviewed.is_some() && !matches!(request, CoreRequest::Final(FinalCoreRequest::ToolsCall(_))) {
+        return Err(McpError::invalid_params("Reviewed tool headers require a modern tools/call"));
+    }
+    Ok(())
 }
 
 fn interaction_request(
@@ -444,6 +476,52 @@ mod tests {
         assert!(ManagedOAuthInputPolicy::new(roots(), 65, 1024).is_err());
         assert!(ManagedOAuthInputPolicy::new(roots(), 64, 1025).is_err());
         assert!(ManagedOAuthInputPolicy::new(roots(), 0, 0).is_ok());
+    }
+
+    #[test]
+    fn reviewed_tool_methods_cannot_fall_back_to_an_unreviewed_backend() {
+        let reviewed = ReviewedToolHeaders::new(
+            fastmcp_core::CanonicalHttpUrl::parse("https://upstream.example/mcp").unwrap(),
+            "work", json!({"type":"object"}), |_| true,
+        ).unwrap();
+        let tool = core_request("tools/call", json!({"name":"work"}), None).unwrap();
+        assert!(admit_reviewed_method(&tool, Some(&reviewed)).is_ok());
+        for (method, params) in [
+            ("tools/list", json!({})),
+            ("resources/read", json!({"uri":"file:///private"})),
+            ("prompts/get", json!({"name":"work"})),
+        ] {
+            let request = core_request(method, params, None).unwrap();
+            assert!(admit_reviewed_method(&request, None).is_ok());
+            assert!(admit_reviewed_method(&request, Some(&reviewed)).is_err());
+        }
+    }
+
+    #[test]
+    fn interactive_capabilities_preserve_the_reviewed_arguments_and_header_encoding() {
+        use fastmcp_client::http_executor::ModernHttpRequest;
+        use fastmcp_protocol::http_headers::decode_mcp_header_value;
+        let reviewed = ReviewedToolHeaders::new(
+            fastmcp_core::CanonicalHttpUrl::parse("https://upstream.example/mcp").unwrap(),
+            "work", json!({"type":"object","properties":{
+                "region":{"type":"string","x-mcp-header":"Region"}
+            }}), |_| true,
+        ).unwrap();
+        let arguments = json!({"region":"雪\r\n", "private":"body-only-canary"});
+        let request = core_request("tools/call", json!({"name":"work","arguments":arguments}), None).unwrap();
+        let request = interaction_request(&request, roots()).unwrap().unwrap();
+        let params = request.encode_params().unwrap().unwrap();
+        assert_eq!(params["arguments"], arguments);
+        assert_eq!(params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY], json!({"roots":{}}));
+        let source = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":params})).unwrap();
+        let wire = ModernHttpRequest::new(reviewed.resource().as_str(), source.clone(),
+            fastmcp_protocol::FINAL_PROTOCOL_VERSION, "tools/call", Some("work".to_owned()))
+            .unwrap().with_reviewed_tool_headers(&reviewed).unwrap();
+        assert_eq!(wire.body(), source);
+        let fields = wire.headers();
+        let region = &fields.iter().find(|(name, _)| name == "Mcp-Param-Region").unwrap().1;
+        assert_eq!(decode_mcp_header_value(region.as_bytes()).unwrap(), "雪\r\n");
+        assert!(!fields.iter().any(|(_, value)| value.contains("body-only-canary")));
     }
 
     #[test]

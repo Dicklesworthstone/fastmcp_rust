@@ -13,6 +13,8 @@ mod managed_provider;
 mod schema_bound;
 #[path = "http_continuation_recovery/schema_driver.rs"]
 mod schema_driver;
+#[path = "http_continuation_recovery/provider_headers.rs"]
+mod provider_headers;
 
 use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
@@ -301,7 +303,7 @@ async fn lose(peer:&Peer,cx:&Cx,pending:&mut RecoverableManagedContinuation,id:i
 }
 
 #[derive(Clone,Copy)]
-enum Case { Head, Body, Successor, NoJournal, Cancel, CloseOwner, Bytes, Attempts, Abandon, Endpoint, Provider(managed_provider::Case), SchemaBound(schema_bound::Case), SchemaDriver(schema_driver::Case) }
+enum Case { Head, Body, Successor, NoJournal, Cancel, CloseOwner, Bytes, Attempts, Abandon, Endpoint, Provider(managed_provider::Case), SchemaBound(schema_bound::Case), SchemaDriver(schema_driver::Case), ProviderHeaders(provider_headers::Case) }
 fn isolated(name:&str,case:Case) {
     if let Ok(selected)=std::env::var(CHILD) {assert_eq!(selected,name);run(case);return;}
     struct Root(std::path::PathBuf);
@@ -329,6 +331,10 @@ fn run(case:Case) {
         });
 }
 async fn scenario(cx:Cx,case:Case) {
+    if let Case::ProviderHeaders(selected) = case {
+        Box::pin(provider_headers::scenario(cx, selected)).await;
+        return;
+    }
     if let Case::SchemaDriver(selected) = case {
         Box::pin(schema_driver::scenario(cx, selected)).await;
         return;
