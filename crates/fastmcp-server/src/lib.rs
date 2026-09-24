@@ -38116,9 +38116,24 @@ mod lib_unit_tests {
             .expect("exchange userinfo access token")
             .access_token;
 
+        let provider = native_pending_oidc_provider(&oauth, "https://fastmcp.invalid/oidc/jwks");
+        let routes = OAuthHttpRoutes::new(oauth, base)
+            .expect("OAuth route base")
+            .with_oidc(provider)
+            .expect("OIDC routes");
+        (routes, access_token)
+    }
+
+    /// An OIDC provider over `oauth` whose signer activation is Pending on
+    /// `jwks_uri`, which fixes the JWKS route `with_oidc` will serve.
+    #[cfg(feature = "builtin-auth-server")]
+    fn native_pending_oidc_provider(
+        oauth: &Arc<oauth::OAuthServer>,
+        jwks_uri: &str,
+    ) -> Arc<oidc::OidcProvider> {
         let signer = oidc_public_canary_signer();
         let provider = Arc::new(
-            oidc::OidcProvider::with_defaults(Arc::clone(&oauth)).expect("default OIDC provider"),
+            oidc::OidcProvider::with_defaults(Arc::clone(oauth)).expect("default OIDC provider"),
         );
         provider
             .set_id_token_signing_activation_dependencies(
@@ -38131,13 +38146,38 @@ mod lib_unit_tests {
             )
             .expect("OIDC activation dependencies");
         provider
-            .begin_id_token_signing_activation(signer, "https://fastmcp.invalid/oidc/jwks")
+            .begin_id_token_signing_activation(signer, jwks_uri)
             .expect("OIDC Pending activation");
-        let routes = OAuthHttpRoutes::new(oauth, base)
-            .expect("OAuth route base")
-            .with_oidc(provider)
-            .expect("OIDC routes");
-        (routes, access_token)
+        provider
+    }
+
+    /// The UserInfo route shares the OAuth route prefix, so a JWKS URI that
+    /// lands on it would make one path answer two documents. `with_oidc` must
+    /// refuse that configuration; a JWKS path beside it is accepted.
+    #[cfg(feature = "builtin-auth-server")]
+    #[test]
+    fn native_oidc_routes_refuse_a_jwks_path_on_the_userinfo_route() {
+        for (jwks_uri, accepted) in [
+            ("https://fastmcp.invalid/oauth/jwks", true),
+            ("https://fastmcp.invalid/oauth/userinfo", false),
+        ] {
+            let oauth = Arc::new(oauth::OAuthServer::with_defaults());
+            let provider = native_pending_oidc_provider(&oauth, jwks_uri);
+            let routes = OAuthHttpRoutes::new(oauth, "https://fastmcp.invalid/oauth")
+                .expect("OAuth route base")
+                .with_oidc(provider);
+            if accepted {
+                let routes = routes.expect("a distinct JWKS path is accepted");
+                let oidc = routes.oidc_routes().expect("OIDC routes configured");
+                assert_eq!(oidc.jwks_path(), "/oauth/jwks");
+                assert_eq!(oidc.userinfo_path(), "/oauth/userinfo");
+            } else {
+                assert_eq!(
+                    routes.err(),
+                    Some(oauth::OAuthHttpRouteConfigurationError::InvalidPublicEndpointBase)
+                );
+            }
+        }
     }
 
     #[cfg(feature = "builtin-auth-server")]
