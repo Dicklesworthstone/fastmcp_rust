@@ -39,7 +39,6 @@
 //! this is the crate to extend.
 
 #![forbid(unsafe_code)]
-#![allow(dead_code)]
 
 mod async_io;
 mod codec;
