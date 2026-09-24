@@ -21185,6 +21185,155 @@ mod lib_unit_tests {
     // outer test watchdog so their exact invariant failure is observable.
     const LIVE_HTTP_STEP_TIMEOUT_NANOS: u64 = LIVE_HTTP_TEST_TIMEOUT_NANOS / 2;
 
+    /// A same-run control for host load. A heartbeat thread asks to sleep
+    /// [`Self::TICK`] at a time, and whatever it oversleeps is time a runnable
+    /// thread of this process waited for a CPU. A bound measured in runnable
+    /// time (wall time less that lag) stretches under host load but still
+    /// expires on a hang, where the process could run and made no progress.
+    /// Ten times the bound in wall time expires it regardless, so no amount of
+    /// lag removes a bound. Reports state the lag, which tells the two apart.
+    #[derive(Clone)]
+    pub(crate) struct RunnableClock {
+        lag_micros: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl RunnableClock {
+        const TICK: Duration = Duration::from_millis(5);
+
+        /// Starts the heartbeat; it stops once every clone is dropped.
+        pub(crate) fn start() -> Self {
+            let lag_micros = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let heartbeat = Arc::downgrade(&lag_micros);
+            thread::spawn(move || {
+                loop {
+                    let asked = Instant::now();
+                    thread::sleep(Self::TICK);
+                    let late = asked.elapsed().saturating_sub(Self::TICK);
+                    let Some(lag) = heartbeat.upgrade() else {
+                        break;
+                    };
+                    lag.fetch_add(
+                        u64::try_from(late.as_micros()).unwrap_or(u64::MAX),
+                        Ordering::AcqRel,
+                    );
+                }
+            });
+            Self { lag_micros }
+        }
+
+        fn lag(&self) -> Duration {
+            Duration::from_micros(self.lag_micros.load(Ordering::Acquire))
+        }
+
+        /// A point to measure from: the wall instant and the lag so far.
+        pub(crate) fn mark(&self) -> (Instant, Duration) {
+            (Instant::now(), self.lag())
+        }
+
+        /// Wall time from `mark` to `now`, less the lag accrued between them.
+        fn runnable_between(mark: (Instant, Duration), now: (Instant, Duration)) -> Duration {
+            now.0
+                .saturating_duration_since(mark.0)
+                .saturating_sub(now.1.saturating_sub(mark.1))
+        }
+
+        /// Whether `bound` of runnable time, or ten times it of wall time,
+        /// passed from `mark` to `now`.
+        fn expired_between(
+            mark: (Instant, Duration),
+            now: (Instant, Duration),
+            bound: Duration,
+        ) -> bool {
+            Self::runnable_between(mark, now) >= bound
+                || now.0.saturating_duration_since(mark.0) >= bound.saturating_mul(10)
+        }
+
+        pub(crate) fn expired(&self, mark: (Instant, Duration), bound: Duration) -> bool {
+            Self::expired_between(mark, self.mark(), bound)
+        }
+
+        #[cfg(all(unix, feature = "proxy", feature = "legacy-2024-11-05"))]
+        pub(crate) fn remaining(&self, mark: (Instant, Duration), bound: Duration) -> Duration {
+            bound.saturating_sub(Self::runnable_between(mark, self.mark()))
+        }
+
+        pub(crate) fn describe(&self, mark: (Instant, Duration)) -> String {
+            let now = self.mark();
+            format!(
+                "{:?} runnable ({:?} wall, {:?} host lag)",
+                Self::runnable_between(mark, now),
+                now.0.saturating_duration_since(mark.0),
+                now.1.saturating_sub(mark.1)
+            )
+        }
+    }
+
+    /// Awaits `future` for at most `bound` of runnable time from `started`.
+    /// Only the short wall-clock slice around it is re-armed, never the
+    /// future itself, so a slice expiring cancels nothing. `None` means the
+    /// bound expired and the future is still pending.
+    async fn within_runnable<F: Future>(
+        cx: &Cx,
+        host: &RunnableClock,
+        started: (Instant, Duration),
+        bound: Duration,
+        future: F,
+    ) -> Option<F::Output> {
+        let mut future = std::pin::pin!(future);
+        loop {
+            match asupersync::time::timeout(cx.now(), Duration::from_millis(50), future.as_mut())
+                .await
+            {
+                Ok(output) => return Some(output),
+                Err(_) if host.expired(started, bound) => return None,
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// One second of wall time between two marks; only the lag accrued in
+    /// it differs between the arms.
+    #[test]
+    fn runnable_clock_discounts_host_lag_and_keeps_a_wall_backstop() {
+        let start = Instant::now();
+        let mark = (start, Duration::from_millis(40));
+        let later = |lag_ms: u64| {
+            (
+                start + Duration::from_secs(1),
+                Duration::from_millis(40 + lag_ms),
+            )
+        };
+        let bound = Duration::from_millis(500);
+        // Unloaded: the whole second was runnable, so the bound expired.
+        assert_eq!(
+            RunnableClock::runnable_between(mark, later(0)),
+            Duration::from_secs(1)
+        );
+        assert!(RunnableClock::expired_between(mark, later(0), bound));
+        // Loaded: 900 ms of it was host lag, so the same bound has not.
+        assert_eq!(
+            RunnableClock::runnable_between(mark, later(900)),
+            Duration::from_millis(100)
+        );
+        assert!(!RunnableClock::expired_between(mark, later(900), bound));
+        // Nearly all lag: 10 ms runnable is under a 90 ms bound, but the
+        // second of wall time is past ten times it, so the backstop expires.
+        assert_eq!(
+            RunnableClock::runnable_between(mark, later(990)),
+            Duration::from_millis(10)
+        );
+        assert!(RunnableClock::expired_between(
+            mark,
+            later(990),
+            Duration::from_millis(90)
+        ));
+        assert!(!RunnableClock::expired_between(
+            mark,
+            later(990),
+            Duration::from_millis(101)
+        ));
+    }
+
     #[cfg(feature = "builtin-auth-server")]
     const OIDC_TEST_PUBLIC_MODULUS: &str = "jlHZ9nzuIuM4aiAQSAgEJMBaYS7qm7Z_3mtGYDdzReIkzxPHHr21oeXQyUJI89eQG13fsUdyoodcuh5kmndPCrODJekfr_zgor6sNspcB88iQEqEc9yf9YAf5v-cNH1Evh82KABuWb26LMaNAzZFR3BMhMEQ1FD6fLFGAbX76Drd5_UZ-1xcU07IXEc_9zvQvOwXckhO7P5Yil1fVzLTrHye_6zTbGWvdqi45095bKPnSqjrLBCTVrUW8o02Gi6mt7Ls9pZeWx2DXV8SqV06DdlqiovtKWRooQ1zV-v7BGsLsVk6T6d-8mNMGNrh0fpNb_5kdaHphAt_Ji6eE1wQPw";
     #[cfg(feature = "builtin-auth-server")]
@@ -43278,25 +43427,37 @@ mod lib_unit_tests {
         // Bound only the two outermost awaits, so a stall fails the test by
         // name instead of freezing the binary. Inner joins stay unbounded: a
         // timed join cancels, which would change the authority under test.
-        let serve_deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
-        let serve = asupersync::time::timeout_at(serve_deadline, bound.serve(cx))
+        // `serve` spans the whole client exchange, so its bound counts only
+        // runnable time: a loaded full suite stretches it, a stall does not.
+        let bound_limit = Duration::from_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+        let host = RunnableClock::start();
+        let serve_started = host.mark();
+        let Some(serve) =
+            within_runnable(cx, &host, serve_started, bound_limit, bound.serve(cx)).await
+        else {
+            // `serve` returns only after the client cancels `caller_cx`, and
+            // a client that fails early returns without cancelling. Report
+            // its outcome so that failure is not misread as a server stall.
+            let client_state = match client.try_join() {
+                Ok(None) => "the client is still pending".to_owned(),
+                Ok(Some(Ok(()))) => "the client completed and cancelled".to_owned(),
+                Ok(Some(Err(error))) => format!("the client failed first: {error}"),
+                Err(error) => format!("the client task could not be joined: {error:?}"),
+            };
+            return Err(format!(
+                "legacy reverse-response serve did not finish within {}; {client_state}",
+                host.describe(serve_started)
+            ));
+        };
+        let join_started = host.mark();
+        within_runnable(cx, &host, join_started, bound_limit, client.join(cx))
             .await
-            .map_err(|_| {
-                // `serve` returns only after the client cancels `caller_cx`, and
-                // a client that fails early returns without cancelling. Report
-                // its outcome so that failure is not misread as a server stall.
-                let client_state = match client.try_join() {
-                    Ok(None) => "the client is still pending".to_owned(),
-                    Ok(Some(Ok(()))) => "the client completed and cancelled".to_owned(),
-                    Ok(Some(Err(error))) => format!("the client failed first: {error}"),
-                    Err(error) => format!("the client task could not be joined: {error:?}"),
-                };
-                format!("legacy reverse-response serve did not finish; {client_state}")
-            })?;
-        let join_deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
-        asupersync::time::timeout_at(join_deadline, client.join(cx))
-            .await
-            .map_err(|_| "legacy reverse-response client did not finish".to_owned())?
+            .ok_or_else(|| {
+                format!(
+                    "legacy reverse-response client did not finish within {}",
+                    host.describe(join_started)
+                )
+            })?
             .map_err(|error| format!("legacy reverse-response client failed: {error:?}"))??;
         let shutdown =
             serve.map_err(|error| format!("legacy reverse-response server failed: {error}"))?;
@@ -52837,11 +52998,13 @@ mod lib_unit_tests {
         let server = Arc::new(Server::new("final-listen-peer-cancel-test", "1.0.0").build());
         let sent = Arc::new(Mutex::new(Vec::<JsonRpcRequest>::new()));
         let sent_for_sender = Arc::clone(&sent);
+        let (acknowledged, acknowledgement) = std::sync::mpsc::channel::<()>();
         let notification_sender: NotificationSender = Arc::new(move |notification| {
             sent_for_sender
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(notification);
+            let _ = acknowledged.send(());
         });
         let subscription_id = RequestId::Number(74);
         let metadata = OpenMetadata::try_from_entries([
@@ -52871,22 +53034,27 @@ mod lib_unit_tests {
             InboundRequestTransport::Stdio,
         );
         let request_cancellation = McpRequestCancellation::new();
+        // The peer closes the stream once the listener acknowledges. Waiting
+        // is bounded in runnable time, so a loaded suite cannot expire it
+        // while a missing acknowledgement still does. The peer closes either
+        // way, so the dispatch always ends and the assertion reports the wait.
         let canceller = {
-            let sent = Arc::clone(&sent);
             let request_cancellation = request_cancellation.clone();
+            let host = RunnableClock::start();
             std::thread::spawn(move || {
-                for _ in 0..100 {
-                    if !sent
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .is_empty()
-                    {
-                        request_cancellation.cancel();
-                        return true;
+                let started = host.mark();
+                let outcome = loop {
+                    match acknowledgement.recv_timeout(Duration::from_millis(20)) {
+                        Ok(()) => break Ok(()),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                            if !host.expired(started, Duration::from_secs(10)) => {}
+                        Err(error) => {
+                            break Err(format!("{error} after {}", host.describe(started)));
+                        }
                     }
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                false
+                };
+                request_cancellation.cancel();
+                outcome
             })
         };
         let response = block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
@@ -52902,12 +53070,12 @@ mod lib_unit_tests {
             notification_sender,
         ));
 
-        assert!(
-            canceller
-                .join()
-                .expect("peer cancellation helper must not panic"),
-            "the listener must acknowledge before the peer can close it"
-        );
+        if let Err(waited) = canceller
+            .join()
+            .expect("peer cancellation helper must not panic")
+        {
+            panic!("the listener must acknowledge before the peer can close it: {waited}");
+        }
         assert!(
             response.is_none(),
             "a peer-closed stream must not receive a result"
