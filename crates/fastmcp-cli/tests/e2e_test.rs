@@ -3470,6 +3470,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
 /// server, and modern `test` could pass while skipping every catalog request.
 ///
 /// These cases prove CLI/server composition, not aggregate MCP conformance.
+#[cfg(feature = "e2e-fixture")]
 mod shipped_pair {
     use std::io::{Read, Write};
     use std::path::PathBuf;
@@ -3490,20 +3491,10 @@ mod shipped_pair {
         r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
     const ONE_SHOT_LEGACY_TOOL_CALL: &str = r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"echo","arguments":{"message":"legacy-half-close"}},"id":2}"#;
 
+    /// The shipped `echo_server` source, compiled unchanged for this package as
+    /// `fastmcp_cli_echo_server`, so every e2e-fixture run exercises it.
     fn echo_server() -> PathBuf {
-        let server = std::env::var_os("FASTMCP_ECHO_SERVER_BIN")
-            .map(PathBuf::from)
-            .expect("FASTMCP_ECHO_SERVER_BIN must name a freshly built echo_server artifact");
-        assert!(
-            server.is_absolute(),
-            "FASTMCP_ECHO_SERVER_BIN must be absolute"
-        );
-        assert!(
-            server.is_file(),
-            "echo_server artifact missing at {}",
-            server.display()
-        );
-        server
+        PathBuf::from(env!("CARGO_BIN_EXE_fastmcp_cli_echo_server"))
     }
 
     struct CliRun {
@@ -3603,7 +3594,6 @@ mod shipped_pair {
     }
 
     #[test]
-    #[ignore = "requires an explicit freshly built FASTMCP_ECHO_SERVER_BIN artifact"]
     fn cli_inspect_reads_the_shipped_server_catalog_under_every_policy() {
         let (modern, modern_catalog) = inspect("modern-only");
         let (legacy, legacy_catalog) = inspect("legacy-only");
@@ -3656,7 +3646,6 @@ mod shipped_pair {
     }
 
     #[test]
-    #[ignore = "requires an explicit freshly built FASTMCP_ECHO_SERVER_BIN artifact"]
     fn cli_test_exercises_the_shipped_server_catalog_on_a_modern_session() {
         let report = test_report("modern-only");
         assert_eq!(report["success"], true, "{report}");
@@ -3678,7 +3667,6 @@ mod shipped_pair {
     }
 
     #[test]
-    #[ignore = "requires an explicit freshly built FASTMCP_ECHO_SERVER_BIN artifact"]
     fn cli_test_exercises_the_shipped_server_catalog_on_a_legacy_session() {
         let report = test_report("legacy-only");
         assert_eq!(report["success"], true, "{report}");
@@ -3693,7 +3681,6 @@ mod shipped_pair {
     }
 
     #[test]
-    #[ignore = "requires an explicit freshly built FASTMCP_ECHO_SERVER_BIN artifact"]
     fn cli_test_auto_selects_modern_and_exercises_the_shipped_catalog() {
         let report = test_report("auto");
         assert_eq!(report["success"], true, "{report}");
@@ -3774,7 +3761,6 @@ mod shipped_pair {
     }
 
     #[test]
-    #[ignore = "requires an explicit freshly built FASTMCP_ECHO_SERVER_BIN artifact"]
     fn echo_server_commits_modern_and_legacy_responses_after_request_ingress_eof() {
         let modern = run_echo_one_shot(
             "modern-only",
@@ -3820,7 +3806,6 @@ mod shipped_pair {
     }
 
     #[test]
-    #[ignore = "requires an explicit freshly built FASTMCP_ECHO_SERVER_BIN artifact"]
     fn echo_server_mid_connection_protocol_mismatch_is_nonzero_without_a_panic() {
         let mismatch = run_echo_one_shot(
             "legacy-only",
