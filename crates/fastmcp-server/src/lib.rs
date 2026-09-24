@@ -66,7 +66,6 @@
 // `serve_http_connection` overflows the default limit on newer rustc.
 #![recursion_limit = "512"]
 #![forbid(unsafe_code)]
-#![allow(dead_code)]
 
 // Proc-macros (fastmcp-derive) reference this crate by its external name
 // (`fastmcp_server::...`). This alias makes those macros usable inside this crate too
