@@ -42,8 +42,7 @@ impl JournalCase {
     fn completes(self) -> bool { matches!(self, Self::Order | Self::GateIntent | Self::GateAck | Self::Recovery) }
     fn updates(self) -> usize {
         if self.completes() { 2 }
-        else if self.pauses() || matches!(self, Self::FailAck | Self::LostAckReceipt | Self::LostUpdate | Self::RemoteAck | Self::DropAck) { 1 }
-        else { 0 }
+        else { usize::from(self.pauses() || matches!(self, Self::FailAck | Self::LostAckReceipt | Self::LostUpdate | Self::RemoteAck | Self::DropAck)) }
     }
     fn restarts(self) -> bool {
         self.pauses() || matches!(self, Self::LostIntentReceipt | Self::FailAck | Self::LostAckReceipt | Self::LostUpdate)
@@ -52,8 +51,7 @@ impl JournalCase {
     fn generation(self) -> u64 {
         if self.completes() { 4 }
         else if self.pauses() || matches!(self, Self::LostAckReceipt) { 2 }
-        else if self.updates() != 0 || matches!(self, Self::LostIntentReceipt) { 1 }
-        else { 0 }
+        else { u64::from(self.updates() != 0 || matches!(self, Self::LostIntentReceipt)) }
     }
     fn pending_generation(self) -> Option<u64> {
         match self {
@@ -73,8 +71,7 @@ impl JournalCase {
     fn saves(self) -> usize {
         if self.completes() { 4 }
         else if self.pauses() || matches!(self, Self::FailAck | Self::LostAckReceipt | Self::RemoteAck | Self::DropAck) { 2 }
-        else if matches!(self, Self::SnapshotLimit) { 0 }
-        else { 1 }
+        else { usize::from(!matches!(self, Self::SnapshotLimit)) }
     }
 }
 
@@ -121,7 +118,7 @@ impl Store {
         let record = self.record();
         assert_eq!(record.generation(), generation, "wire effect overtook its durable journal boundary");
         assert_eq!(record.update_state(), if generation == 0 { TaskInputUpdateState::NotAttempted }
-            else if generation % 2 == 0 { TaskInputUpdateState::Acknowledged } else { TaskInputUpdateState::Unconfirmed });
+            else if generation.is_multiple_of(2) { TaskInputUpdateState::Acknowledged } else { TaskInputUpdateState::Unconfirmed });
     }
     fn journal(&self, binding: TaskResumeBinding, case: JournalCase) -> TaskInputJournal {
         // Reconstruct from the simulated authoritative storage, not the failed
@@ -464,7 +461,7 @@ async fn restart(peer: &Peer, cx: &Cx, store: &Store, case: JournalCase) {
         }
         assert_eq!(resolutions.get(), usize::from(case.restart_completes()));
         assert_eq!(observations.get(), if case.restart_completes() { 2 }
-            else if matches!(case, JournalCase::ChangedTask) { 0 } else { 1 });
+            else { usize::from(!matches!(case, JournalCase::ChangedTask)) });
         assert_eq!(driver.input_journal().unwrap().record().unwrap(), &store.record());
         assert!(driver.input_journal().unwrap().pending_change().is_none());
         assert_eq!(driver.reconnection_attempts(), 0);

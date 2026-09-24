@@ -148,7 +148,7 @@ fn run(case: Case) {
                 let first = first_rx.recv(&cx).await.unwrap();
                 let old_tool = first.tool("calculate").unwrap().unwrap();
                 assert!(first.tool("missing").unwrap().is_none());
-                call(&old_tool, &cx, 100, 2).await;
+                Box::pin(call(&old_tool, &cx, 100, 2)).await;
                 first_done.send(&cx, ()).unwrap();
                 if case == Case::Cancel { cancellation.cancel(); return; }
                 changed_rx.recv(&cx).await.unwrap();
@@ -161,7 +161,7 @@ fn run(case: Case) {
                     let new_tool = second.tool("calculate").unwrap().unwrap();
                     assert!(matches!(new_tool.request(&cx, call_request(2), RequestId::Number(998), ManagedCoreLimits::default()).await,
                         Err(ManagedToolError::InvalidArguments)), "the replacement minimum must govern the new handle");
-                    call(&new_tool, &cx, 101, 10).await;
+                    Box::pin(call(&new_tool, &cx, 101, 10)).await;
                     second_done.send(&cx, ()).unwrap();
                 }
             };

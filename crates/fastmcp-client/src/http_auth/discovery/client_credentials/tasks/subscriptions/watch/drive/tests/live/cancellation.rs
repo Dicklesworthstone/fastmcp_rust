@@ -229,8 +229,8 @@ fn run_control(case: ControlCase) {
                     driver.close();
                     assert_eq!(driver.update_state(), state, "close cannot erase an uncertain update or receipt");
                     assert!(matches!(driver.drive(&cx, no_resolver, no_observer).await,
-                        Err(ClientCredentialsTaskWatchDriveError::CancellationRequested)
-                        | Err(ClientCredentialsTaskWatchDriveError::Watch(ClientCredentialsTaskWatchError::Closed))));
+                        Err(ClientCredentialsTaskWatchDriveError::CancellationRequested
+                            | ClientCredentialsTaskWatchDriveError::Watch(ClientCredentialsTaskWatchError::Closed))));
                     let repeated = handle.request_cancel(&cx).await;
                     if handle.state() == TaskCancellationState::Ready {
                         assert!(matches!(repeated, Err(ClientCredentialsTaskCancellationError::Closed)));

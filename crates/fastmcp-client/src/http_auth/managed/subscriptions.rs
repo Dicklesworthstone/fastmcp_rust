@@ -400,6 +400,10 @@ impl ManagedSubscription {
     }
 }
 
+// The Result is the refusal of a task notification on a core listener. Without
+// `tasks`, Core is the only profile and no record can fall outside it, so only
+// that build compiles to an unconditional `Ok`.
+#[cfg_attr(not(feature = "tasks"), allow(clippy::unnecessary_wraps))]
 fn select_record(
     record: ModernHttpSubscriptionListenEvent,
     profile: SubscriptionProfile,

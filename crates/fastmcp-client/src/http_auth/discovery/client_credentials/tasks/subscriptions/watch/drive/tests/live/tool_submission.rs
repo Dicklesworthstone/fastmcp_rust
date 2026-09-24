@@ -291,7 +291,7 @@ async fn application(machine: &ClientCredentialsTasksClient, owner: &mut ClientC
         }
     }
     let ClientCredentialsTaskSubmissionEvent::Result(result) = outcome else { panic!("final result required"); };
-    assert!(matches!(&*result, FinalCoreResult::ToolsCall { .. }) == matches!(case, SubmissionCase::Ordinary));
+    assert_eq!(matches!(&*result, FinalCoreResult::ToolsCall { .. }), matches!(case, SubmissionCase::Ordinary));
     let wire: serde_json::Value = serde_json::from_str(&CoreResult::Final(*result).encode().unwrap()).unwrap();
     if matches!(case, SubmissionCase::Ordinary) { assert_eq!(wire["isError"], true); }
     else { assert_eq!(wire["taskId"], "opaque / task-é"); assert_eq!(wire["resultType"], "task"); }

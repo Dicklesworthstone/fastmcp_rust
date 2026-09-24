@@ -717,8 +717,8 @@ mod input_driver {
         }
         let before = peer.posts.load(Ordering::SeqCst);
         let replay = driver.drive(cx, no_resolver, no_observer).await;
-        assert!(matches!(replay, Err(ManagedTaskWatchDriveError::CancellationRequested)
-            | Err(ManagedTaskWatchDriveError::Watch(ManagedTaskWatchError::Closed))));
+        assert!(matches!(replay, Err(ManagedTaskWatchDriveError::CancellationRequested
+            | ManagedTaskWatchDriveError::Watch(ManagedTaskWatchError::Closed))));
         let cancel_again = handle.clone().request_cancel(cx).await;
         assert!(matches!(cancel_again, Err(TaskCancellationError::Closed | TaskCancellationError::AlreadyAttempted)));
         let state = driver.update_state();

@@ -312,7 +312,7 @@ mod input_driver {
             }
         }
         fn reconnects(self) -> usize {
-            if matches!(self, Self::NoRecovery | Self::LostUpdate | Self::MalformedGet | Self::SnapshotLimit) { 0 } else { 1 }
+            usize::from(!matches!(self, Self::NoRecovery | Self::LostUpdate | Self::MalformedGet | Self::SnapshotLimit))
         }
     }
 
@@ -541,7 +541,7 @@ mod input_driver {
                             }
                         }
                     }
-                    let acknowledged = if case.successful() { 2 } else if matches!(case, InputCase::LostUpdate) { 0 } else { 1 };
+                    let acknowledged = if case.successful() { 2 } else { usize::from(!matches!(case, InputCase::LostUpdate)) };
                     assert_eq!(driver.acknowledged_updates(), acknowledged);
                     assert_eq!(driver.update_state(), if matches!(case, InputCase::LostUpdate) {
                         TaskInputUpdateState::Unconfirmed
@@ -940,8 +940,8 @@ mod input {
                         else if matches!(case, InputCase::ObservationGap) { 9 } else { 5 };
                     assert_eq!(driver.last_update_request_id(), Some(&RequestId::String(format!("{PREFIX}:{last_id}"))));
                     assert_eq!(resolutions.get(), if acknowledged == 2 { 2 } else { 1 });
-                    assert_eq!(driver.reconnection_attempts(), if matches!(case,
-                        InputCase::LostUpdate | InputCase::RejectedUpdate | InputCase::SnapshotLimit) { 0 } else { 1 });
+                    assert_eq!(driver.reconnection_attempts(), usize::from(!matches!(case,
+                        InputCase::LostUpdate | InputCase::RejectedUpdate | InputCase::SnapshotLimit)));
                     assert!(!format!("{driver:?}").contains("watched-access"));
                     assert!(driver.drive(&cx, no_resolver, no_observer).await.is_err());
                     assert_eq!(driver.update_state(), update_state);
