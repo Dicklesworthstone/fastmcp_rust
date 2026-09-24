@@ -91,16 +91,17 @@ fn send_memory_message(
     if *closed || sender.is_none() {
         return Err(TransportError::Closed);
     }
-    // Check before the nonblocking commit. Reporting cancellation after a
-    // successful `try_send` would incorrectly claim the message was not sent.
-    if cx.is_cancel_requested() {
-        return Err(TransportError::Cancelled);
-    }
+    // A raw cancellation flag ignores masking and does not enforce budgets.
+    // Stop before encoding, retaining the precise cancellation reason on Cx.
+    cx.checkpoint().map_err(|_| TransportError::Cancelled)?;
 
     // Share bounded encoding with async sends, without copying the serialized
     // source into a second allocation before queueing it.
     let queued = asynchronous::encode_message(codec, message)?;
 
+    // Encoding may have consumed the remaining budget. This is the final
+    // checkpoint before publication: a successful try_send must stay success.
+    cx.checkpoint().map_err(|_| TransportError::Cancelled)?;
     match sender
         .as_ref()
         .ok_or(TransportError::Closed)?
@@ -143,22 +144,16 @@ fn recv_memory_source(
     if *closed {
         return Err(TransportError::Closed);
     }
-    // Check for cancellation before receive.
-    if cx.is_cancel_requested() {
-        return Err(TransportError::Cancelled);
-    }
 
-    // Poll the bounded asupersync channel while retaining this synchronous
-    // transport trait's cancellation responsiveness.
+    // Check before every dequeue, including after a sleep. Budget exhaustion
+    // or cancellation must leave a newly arrived frame queued for a live Cx.
+    // Do not checkpoint after dequeue: that would discard committed input.
     loop {
+        cx.checkpoint().map_err(|_| TransportError::Cancelled)?;
         let recv_result = receiver.try_recv();
         match recv_result {
             Ok(frame) => return Ok(frame.source),
             Err(mpsc::RecvError::Empty) => {
-                // Check for cancellation between polls.
-                if cx.is_cancel_requested() {
-                    return Err(TransportError::Cancelled);
-                }
                 std::thread::sleep(poll_interval);
             }
             Err(mpsc::RecvError::Disconnected) => {
@@ -210,9 +205,11 @@ struct MemoryQueuedMessage {
 ///
 /// # Cancellation
 ///
-/// Synchronous recv operations poll for cancellation between sleeps. The
-/// [`Self::recv_async`] and [`Self::send_async`] methods instead await channel
-/// readiness and cooperate with the executor without blocking its thread.
+/// Synchronous operations checkpoint the caller's context before publication
+/// or dequeue, observing cancellation masks and deadline, poll, and cost
+/// budgets. Receives repeat that checkpoint between sleeps without consuming
+/// a message on refusal. The [`Self::recv_async`] and [`Self::send_async`]
+/// methods instead await channel readiness without blocking the executor.
 pub struct MemoryTransport {
     /// Channel for sending messages to the peer.
     sender: Option<mpsc::Sender<MemoryQueuedMessage>>,
@@ -1228,5 +1225,121 @@ mod tests {
         assert!(matches!(result, Err(TransportError::Cancelled)));
 
         handle.join().unwrap();
+    }
+
+    fn exhausted_contexts() -> [Cx; 3] {
+        [
+            Cx::for_testing_with_budget(
+                asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+            ),
+            Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(0)),
+            Cx::for_testing_with_budget(asupersync::Budget::new().with_cost_quota(0)),
+        ]
+    }
+
+    #[test]
+    fn memory_send_rejects_exhausted_budgets_without_publishing() {
+        for stopped in exhausted_contexts() {
+            let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
+            let request = JsonRpcRequest::new("budget/send", None, 71_i64);
+            assert!(matches!(
+                client.send_request(&stopped, &request),
+                Err(TransportError::Cancelled)
+            ));
+            assert!(stopped.cancel_reason().is_some());
+            assert_eq!(server.receiver.len(), 0);
+            assert!(!client.is_closed());
+
+            // Change only masking: the same exhausted context can finish
+            // bounded cleanup, without clearing its eventual cancellation.
+            stopped.masked(|| client.send_request(&stopped, &request).unwrap());
+            let live = Cx::for_testing();
+            let JsonRpcMessage::Request(received) = server.recv(&live).unwrap() else {
+                panic!("masked publication must retain request direction");
+            };
+            assert_eq!(received, request);
+            assert!(matches!(
+                client.send_request(&stopped, &request),
+                Err(TransportError::Cancelled)
+            ));
+            assert_eq!(server.receiver.len(), 0);
+
+            client.send_request(&live, &request).unwrap();
+            assert!(matches!(server.recv(&live), Ok(JsonRpcMessage::Request(_))));
+        }
+    }
+
+    #[test]
+    fn memory_receive_rejects_exhausted_budgets_without_consuming() {
+        for stopped in exhausted_contexts() {
+            let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
+            let live = Cx::for_testing();
+            let request = JsonRpcRequest::new("budget/receive", None, 72_i64);
+            client.send_request(&live, &request).unwrap();
+            assert!(matches!(server.recv(&stopped), Err(TransportError::Cancelled)));
+            assert!(stopped.cancel_reason().is_some());
+            assert_eq!(server.receiver.len(), 1);
+            assert!(!server.is_closed());
+
+            let JsonRpcMessage::Request(received) = server.recv(&live).unwrap() else {
+                panic!("a refused receive must leave the original message queued");
+            };
+            assert_eq!(received, request);
+            assert_eq!(server.receiver.len(), 0);
+        }
+    }
+
+    #[test]
+    fn memory_split_masked_cancellation_preserves_committed_source() {
+        let (client, server) = create_memory_transport_pair_with_capacity(1);
+        let (_client_recv, mut send) = client.into_split();
+        let (mut recv, _server_send) = server.into_split();
+        let stopped = Cx::for_testing();
+        stopped.set_cancel_requested(true);
+        let request = JsonRpcRequest::new("masked/round-trip", None, 73_i64);
+        let expected = Codec::new().encode_request(&request).unwrap();
+        let message = JsonRpcMessage::Request(request);
+
+        assert!(matches!(send.send(&stopped, &message), Err(TransportError::Cancelled)));
+        assert_eq!(recv.receiver.as_ref().unwrap().len(), 0);
+        stopped.masked(|| send.send(&stopped, &message).unwrap());
+        assert!(matches!(
+            recv.recv_with_source(&stopped),
+            Err(TransportError::Cancelled)
+        ));
+        assert_eq!(recv.receiver.as_ref().unwrap().len(), 1);
+        stopped.masked(|| {
+            let frame = recv.recv_with_source(&stopped).unwrap();
+            assert_eq!(frame.source(), expected.strip_suffix(b"\n").unwrap());
+            assert_eq!(frame.message(), &message);
+        });
+        assert_eq!(recv.receiver.as_ref().unwrap().len(), 0);
+        assert!(!send.is_closed());
+        assert!(!recv.is_closed());
+        assert!(matches!(recv.recv(&stopped), Err(TransportError::Cancelled)));
+    }
+
+    #[test]
+    fn memory_idle_receive_exhausts_poll_budget_without_peer_traffic() {
+        let (client, mut server) = MemoryTransportBuilder::new()
+            .poll_interval(Duration::from_millis(1))
+            .build();
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let handle = thread::spawn(move || {
+            let cx = Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(3));
+            let cancelled = matches!(server.recv(&cx), Err(TransportError::Cancelled));
+            let reason = cx.cancel_reason().map(|reason| reason.kind);
+            done_tx.send((cancelled, reason, server.is_closed())).unwrap();
+        });
+
+        // This is a deadlock watchdog, not a latency assertion. Even a broken
+        // receive is released by dropping the peer before joining the worker.
+        let completed = done_rx.recv_timeout(Duration::from_secs(5));
+        drop(client);
+        handle.join().unwrap();
+        assert!(matches!(
+            completed,
+            Ok((true, Some(asupersync::CancelKind::PollQuota), false))
+        ));
     }
 }
