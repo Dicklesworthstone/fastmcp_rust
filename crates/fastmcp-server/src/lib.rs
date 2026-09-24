@@ -2462,8 +2462,9 @@ mod era_admission_refusal_tests {
 
 fn is_quarantined_task_rpc(method: &str) -> bool {
     // Legacy 2024-era names. Official MCP 2026-07-28 Tasks methods are
-    // tasks/get, tasks/update, and tasks/cancel and are served when
-    // ServerBuilder::final_tasks installed the official extension.
+    // tasks/get, tasks/update, and tasks/cancel; with the `tasks` feature a
+    // built server serves them from a process-local in-memory store unless
+    // ServerBuilder::final_tasks (or a proxy relay) supplies the runtime.
     matches!(method, "tasks/list" | "tasks/submit")
 }
 
