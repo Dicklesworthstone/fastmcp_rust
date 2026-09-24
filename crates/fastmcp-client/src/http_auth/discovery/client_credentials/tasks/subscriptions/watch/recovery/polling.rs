@@ -3,11 +3,19 @@
 
 use std::future::{Future, poll_fn};
 use std::task::Poll;
+use std::time::Duration;
 
+use asupersync::Cx;
+use asupersync::time::Sleep;
 use asupersync::types::Time;
+use fastmcp_protocol::tasks_extension::Task;
 
-use super::*;
-use super::super::{ManagedTaskEvent, ManagedTaskRequest, request_pinned};
+use super::{ClientCredentialsTaskRecoveryError, RecoveryState, read_interval};
+use super::super::{
+    ClientCredentialsError, ClientCredentialsSnapshot, ClientCredentialsTaskWatch,
+    ClientCredentialsTaskWatchError, ManagedTaskEvent, ManagedTaskRequest, ManagedTaskSnapshot,
+    ManagedTaskSnapshotCause, OAuthDiscoveryError, active, check_watch, copy_binding, request_pinned,
+};
 
 #[derive(Clone, Copy)]
 struct Slot {
@@ -174,7 +182,14 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::task::{Context, Waker};
+    use std::time::Instant;
+    use fastmcp_core::McpRequestCancellation;
+    use fastmcp_protocol::tasks_extension::TaskId;
+    use super::super::ClientCredentialsTaskRecoveryPolicy;
     use super::super::super::tests::{consumer, runtime};
+    use super::super::super::{
+        ClientCredentialsTaskWatchPolicy, ClientCredentialsTasksError, ManagedTasksError, WatchState,
+    };
     use crate::http_auth::BoundBearerCredential;
 
     fn local_watch(cx: &Cx) -> ClientCredentialsTaskWatch {
@@ -308,7 +323,7 @@ mod tests {
                     _ => watch.state.snapshots = watch.state.maximum_snapshots,
                 }
                 let snapshots = watch.state.snapshots;
-                assert!(recovery.next_snapshot(&cx, &mut watch, None).await.is_err());
+                assert!(Box::pin(recovery.next_snapshot(&cx, &mut watch, None)).await.is_err());
                 assert_eq!(watch.ids.next, 0);
                 assert_eq!(watch.state.snapshots, snapshots);
                 assert_eq!(recovery.polling.as_ref().unwrap().attempts(), 0);

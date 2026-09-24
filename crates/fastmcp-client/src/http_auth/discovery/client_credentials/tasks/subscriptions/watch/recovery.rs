@@ -241,7 +241,7 @@ impl RecoveringClientCredentialsTaskWatch {
         let cancellation = watch.cancellation.clone();
         let deadline = watch.deadline;
         let snapshot = Box::pin(active(cx, deadline, &owner, &cancellation, None, async {
-            Ok(self.recovery.next_snapshot(cx, &mut watch, None).await)
+            Ok(Box::pin(self.recovery.next_snapshot(cx, &mut watch, None)).await)
         })).await??;
         self.finished = watch.finished;
         if !self.finished { self.watch = Some(watch); }
@@ -303,7 +303,7 @@ impl RecoveryState {
         loop {
             let observed = match self.fallback_deadline(cx, watch)? {
                 Some(due) if due <= cx.now() => None,
-                Some(due) => polling::until_due(watch.next_snapshot(cx), due).await,
+                Some(due) => Box::pin(polling::until_due(watch.next_snapshot(cx), due)).await,
                 None => Some(watch.next_snapshot(cx).await),
             };
             let Some(observed) = observed else {
