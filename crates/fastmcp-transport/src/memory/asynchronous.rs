@@ -46,7 +46,7 @@ fn send_error<T>(error: mpsc::SendError<T>) -> TransportError {
         mpsc::SendError::Full(_) => TransportError::Io(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
             "memory transport queue is full",
-        ))),
+        )),
     }
 }
 
