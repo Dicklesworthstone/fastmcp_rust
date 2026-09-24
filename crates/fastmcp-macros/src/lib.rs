@@ -855,30 +855,47 @@ fn generate_result_conversion(output: &syn::ReturnType) -> TokenStream2 {
     }
 }
 
-/// Generates the JSON-text content used by the legacy handler surface for a
-/// schema-bound result. The current handler trait returns `Vec<Content>`, so
-/// the protocol/server layer is responsible for promoting this JSON value to a
-/// structured tool result when that surface is available.
-fn generate_schema_bound_content(value: TokenStream2) -> TokenStream2 {
+/// Serializes a schema-bound success once and constructs its selected result
+/// surface. Final results retain the JSON value's exact root shape, including
+/// an explicit null, and mirror the same value in their text content.
+fn generate_schema_bound_content(value: TokenStream2, final_result: bool) -> TokenStream2 {
+    let content = if final_result {
+        quote! {
+            Ok(fastmcp_protocol::CompleteResult::new(
+                fastmcp_protocol::FinalCallToolResult {
+                    content: vec![fastmcp_protocol::ContentBlock::text(result_value.to_string())],
+                    is_error: false,
+                    structured_content: Some(result_value),
+                },
+                fastmcp_protocol::ResultMeta::empty(),
+            ))
+        }
+    } else {
+        quote! {
+            Ok(vec![fastmcp_protocol::Content::Text {
+                text: result_value.to_string(),
+            }])
+        }
+    };
     quote! {
         let result_value = serde_json::to_value(&(#value)).map_err(|error| {
             fastmcp_core::McpError::internal_error(format!(
                 "failed to serialize schema-bound tool result: {error}",
             ))
         })?;
-        Ok(vec![fastmcp_protocol::Content::Text {
-            text: result_value.to_string(),
-        }])
+        #content
     }
 }
 
-/// Generates conversion for a tool that opts into a typed output schema.
+/// Generates conversion for a tool that declares an output schema.
 ///
-/// This intentionally leaves the legacy conversion path untouched. Typed
-/// schemas make the generated handler serialize the returned value as JSON,
-/// which both checks the result's `Serialize` contract at compile time and
-/// keeps the content representation aligned with its advertised schema.
-fn generate_schema_bound_result_conversion(output: &syn::ReturnType) -> TokenStream2 {
+/// Final handlers serialize both typed and inline-schema results. The legacy
+/// surface also uses this conversion for typed schemas and for serializable
+/// return types outside its existing string/content conversions.
+fn generate_schema_bound_result_conversion(
+    output: &syn::ReturnType,
+    final_result: bool,
+) -> TokenStream2 {
     let wrapped_result = match output {
         syn::ReturnType::Type(_, output_type) => match output_type.as_ref() {
             Type::Path(type_path) => type_path
@@ -893,7 +910,7 @@ fn generate_schema_bound_result_conversion(output: &syn::ReturnType) -> TokenStr
     };
 
     if !wrapped_result {
-        return generate_schema_bound_content(quote! { result });
+        return generate_schema_bound_content(quote! { result }, final_result);
     }
 
     let is_mcp_result = match output {
@@ -908,17 +925,24 @@ fn generate_schema_bound_result_conversion(output: &syn::ReturnType) -> TokenStr
         _ => false,
     };
 
-    if is_mcp_result {
-        let content = generate_schema_bound_content(quote! { result_value });
+    if is_mcp_result
+        || (final_result && final_tool_outcome_result_preserves_mcp_error(output))
+    {
+        let content = generate_schema_bound_content(quote! { result_value }, final_result);
         quote! {
             let result_value = result?;
             #content
         }
     } else {
-        let content = generate_schema_bound_content(quote! { result_value });
+        let content = generate_schema_bound_content(quote! { result_value }, final_result);
+        let map_error = if final_result {
+            quote! { fastmcp_core::McpError::tool_error(error.to_string()) }
+        } else {
+            quote! { fastmcp_core::McpError::internal_error(error.to_string()) }
+        };
         quote! {
             let result_value = result
-                .map_err(|error| fastmcp_core::McpError::internal_error(error.to_string()))?;
+                .map_err(|error| #map_error)?;
             #content
         }
     }
@@ -927,7 +951,7 @@ fn generate_schema_bound_result_conversion(output: &syn::ReturnType) -> TokenStr
 /// Chooses the conversion policy for a tool result.
 fn generate_tool_result_conversion(
     output: &syn::ReturnType,
-    typed_output_schema: bool,
+    schema_bound_result: bool,
 ) -> TokenStream2 {
     if final_complete_return_kind(output, "FinalCallToolResult").is_some() {
         generate_result_conversion(output)
@@ -937,8 +961,8 @@ fn generate_tool_result_conversion(
                 "final #[tool] handlers must be invoked through ToolHandler::call_final_outcome",
             ))
         }
-    } else if typed_output_schema {
-        generate_schema_bound_result_conversion(output)
+    } else if schema_bound_result {
+        generate_schema_bound_result_conversion(output, false)
     } else {
         generate_result_conversion(output)
     }
@@ -1299,7 +1323,7 @@ fn generate_tool_execution_methods(
                 Box::pin(async move {
                     match self.call_async(ctx, arguments).await {
                         fastmcp_core::Outcome::Ok(content) => {
-                            match ::fastmcp_server::promote_legacy_tool_content(content) {
+                            match fastmcp_server::promote_legacy_tool_content(content) {
                                 Ok(complete) => fastmcp_core::Outcome::Ok(complete),
                                 Err(error) => fastmcp_core::Outcome::Err(error),
                             }
@@ -4017,6 +4041,8 @@ struct ToolAttrs {
     defaults: HashMap<String, Lit>,
     /// Output schema as a JSON literal or type name
     output_schema: Option<syn::Expr>,
+    /// Maps both framework-authored tool error kinds into the output schema.
+    error_mapper: Option<syn::ExprPath>,
     /// Tool version string (e.g., "1.0.0").
     version: Option<String>,
     /// Optional icon source URL or data URI.
@@ -4167,6 +4193,7 @@ impl Parse for ToolAttrs {
         let mut tags = Vec::new();
         let mut defaults: HashMap<String, Lit> = HashMap::new();
         let mut output_schema = None;
+        let mut error_mapper = None;
         let mut version = None;
         let mut icon = None;
         let mut annotations_read_only = None;
@@ -4265,6 +4292,13 @@ impl Parse for ToolAttrs {
                     let expr: syn::Expr = input.parse()?;
                     output_schema = Some(expr);
                 }
+                "error_mapper" => {
+                    if error_mapper.is_some() {
+                        return Err(syn::Error::new(ident.span(), "duplicate error_mapper"));
+                    }
+                    input.parse::<Token![=]>()?;
+                    error_mapper = Some(input.parse::<syn::ExprPath>()?);
+                }
                 "annotations" => {
                     let content;
                     syn::parenthesized!(content in input);
@@ -4308,6 +4342,15 @@ impl Parse for ToolAttrs {
             }
         }
 
+        if let Some(mapper) = error_mapper.as_ref()
+            && output_schema.is_none()
+        {
+            return Err(syn::Error::new_spanned(
+                mapper,
+                "error_mapper requires output_schema",
+            ));
+        }
+
         Ok(Self {
             name,
             description,
@@ -4318,6 +4361,7 @@ impl Parse for ToolAttrs {
             tags,
             defaults,
             output_schema,
+            error_mapper,
             version,
             icon,
             annotations_read_only,
@@ -4399,7 +4443,8 @@ fn parse_annotation_bool(input: ParseStream<'_>) -> syn::Result<bool> {
 
 /// The two supported sources for a tool output schema.
 ///
-/// An inline expression retains the exact legacy behavior. A bare type path
+/// An inline expression retains the established legacy string/content conversion.
+/// Serializable types outside that conversion use JSON text. A bare type path
 /// becomes the typed form only when it matches the tool's success return type;
 /// this lets legacy schema constants continue to work unchanged.
 #[derive(Clone, Copy)]
@@ -4607,9 +4652,31 @@ mod mrtr_resume_expansion_tests {
 #[allow(clippy::items_after_test_module)]
 mod schema_bound_tool_expansion_tests {
     use super::{
-        OutputSchemaSource, generate_tool_result_conversion, output_schema_source,
+        OutputSchemaSource, ToolAttrs, generate_tool_result_conversion, output_schema_source,
         output_schema_value, typed_output_schema_matches_return, validate_output_schema_expr,
     };
+
+    #[test]
+    fn schema_bound_tool_error_mapper_requires_output_schema() {
+        let attrs = syn::parse_str::<ToolAttrs>(
+            "output_schema = Response, error_mapper = responses::map_error",
+        )
+        .expect("a mapper path with an output schema is valid");
+        assert!(attrs.error_mapper.is_some());
+
+        let error = syn::parse_str::<ToolAttrs>("error_mapper = responses::map_error")
+            .expect_err("a mapper without a schema cannot be used");
+        assert_eq!(error.to_string(), "error_mapper requires output_schema");
+    }
+
+    #[test]
+    fn schema_bound_tool_error_mapper_rejects_duplicate_declarations() {
+        let error = syn::parse_str::<ToolAttrs>(
+            "output_schema = Response, error_mapper = first, error_mapper = second",
+        )
+        .expect_err("duplicate mappers must not silently replace one another");
+        assert_eq!(error.to_string(), "duplicate error_mapper");
+    }
 
     #[test]
     fn sch_02_a_unit_positive() {
@@ -4676,8 +4743,17 @@ mod schema_bound_tool_expansion_tests {
 /// - `description` - Tool description (default: doc comment)
 /// - `tags` - List of tool tags for filtering (`tags = ["api", "read"]`)
 /// - `icon` - Icon source URL or data URI (`icon = "https://example.com/icon.png"`)
-/// - `output_schema` - An inline JSON object (legacy form), or a bare return
-///   type path with `json_schema()` (typed result form)
+/// - `output_schema` - An inline JSON object, or a bare return type path with
+///   `json_schema()`. Ordinary return values must implement `Serialize` and
+///   become final `structuredContent` with a matching JSON text block. Explicit
+///   `CompleteResult<FinalCallToolResult>` and `FinalToolOutcome` remain exact.
+/// - `error_mapper` - A function path with signature
+///   `fn(ToolErrorKind) -> Option<serde_json::Value>`, required to register a
+///   local tool with `output_schema`. The router calls it once for each of
+///   `InputValidation` and `Handler` during registration, validates both values
+///   against the output schema, and reuses them for non-terminal tool errors.
+///   `None` or an invalid value rejects registration. This option requires
+///   `output_schema`.
 /// - `tasks` - With the `fastmcp-derive/tasks` feature enabled, opt a
 ///   canonical `FinalToolOutcome` return into final Tasks creation;
 ///   incompatible return types are rejected at compile time
@@ -4695,6 +4771,38 @@ mod schema_bound_tool_expansion_tests {
 /// ```
 ///
 /// If the argument is omitted in the JSON-RPC call, the default value is used.
+///
+/// # Schema-bound Tool Errors
+///
+/// A modern schema-bound handler returning `Result<T, E>` maps application
+/// errors into the registered `Handler` error shape and uses `E`'s display text
+/// as the error diagnostic. `McpResult<T>` and
+/// `Result<T, McpError>` preserve their error codes, so cancellation and internal
+/// framework errors remain terminal. Serialization failures are also terminal.
+/// The mapper supplies the structured value; the router supplies `isError` and
+/// the diagnostic text. To author per-call error values or result metadata,
+/// return an explicit final result instead.
+///
+/// ```ignore
+/// #[derive(serde::Serialize, JsonSchema)]
+/// struct Response {
+///     value: Option<String>,
+///     error: Option<String>,
+/// }
+///
+/// fn response_error(kind: ToolErrorKind) -> Option<serde_json::Value> {
+///     let message = match kind {
+///         ToolErrorKind::InputValidation => "invalid arguments",
+///         ToolErrorKind::Handler => "operation failed",
+///     };
+///     Some(serde_json::json!({ "value": null, "error": message }))
+/// }
+///
+/// #[tool(output_schema = Response, error_mapper = response_error)]
+/// fn lookup(name: String) -> McpResult<Response> {
+///     Ok(Response { value: Some(name), error: None })
+/// }
+/// ```
 #[proc_macro_attribute]
 #[allow(clippy::too_many_lines)]
 pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -4806,6 +4914,31 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             (quote! { None }, quote! {})
         };
+
+    // Resolve relative mapper paths beside the user's function, before entering
+    // the generated implementation module where `self` and `super` differ.
+    let (error_mapper_helper, error_mapper_method) = attrs.error_mapper.as_ref().map_or_else(
+        || (TokenStream2::new(), TokenStream2::new()),
+        |mapper| {
+            let helper = format_ident!("__fastmcp_tool_error_mapper_{}", fn_name);
+            (
+                quote! {
+                    #[doc(hidden)]
+                    fn #helper(kind: #server::ToolErrorKind) -> Option<#serde_json::Value> {
+                        (#mapper)(kind)
+                    }
+                },
+                quote! {
+                    fn final_tool_error_structured_content(
+                        &self,
+                        kind: fastmcp_server::ToolErrorKind,
+                    ) -> Option<serde_json::Value> {
+                        super::#helper(kind)
+                    }
+                },
+            )
+        },
+    );
 
     let tag_entries: Vec<TokenStream2> = attrs
         .tags
@@ -5045,9 +5178,15 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Analyze return type to determine conversion strategy
     let return_type = &input_fn.sig.output;
-    let result_conversion = generate_tool_result_conversion(return_type, typed_output_schema);
-    let final_result_conversion = generate_final_tool_result_conversion(return_type);
+    let serialize_legacy_result = typed_output_schema
+        || (attrs.output_schema.is_some()
+            && matches!(analyze_return_type(return_type), ReturnTypeKind::Other));
+    let result_conversion = generate_tool_result_conversion(return_type, serialize_legacy_result);
     let final_outcome_conversion = generate_final_tool_outcome_conversion(return_type);
+    let final_result_conversion = generate_final_tool_result_conversion(return_type).or_else(|| {
+        (attrs.output_schema.is_some() && final_outcome_conversion.is_none())
+            .then(|| generate_schema_bound_result_conversion(return_type, true))
+    });
     if mrtr_resume_param.is_some() && final_outcome_conversion.is_none() {
         return syn::Error::new_spanned(
             &input_fn.sig.output,
@@ -5092,6 +5231,8 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
         // Keep the original function
         #input_fn
+
+        #error_mapper_helper
 
         /// Handler for the #fn_name tool.
         #[derive(Clone)]
@@ -5138,6 +5279,8 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #icon_hooks
 
                 #output_schema_method
+
+                #error_mapper_method
 
                 #apps_metadata
 

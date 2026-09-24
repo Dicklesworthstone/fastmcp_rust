@@ -276,9 +276,8 @@ pub const MAX_MODERN_HTTP_PROBE_BODY_BYTES: usize = 64 * 1024;
 /// before a caller receives the next event.
 ///
 /// This is independent of the per-event [`SseLimits`] bound: one valid body
-/// frame can contain many individually valid events. LIMIT-01's guarded
-/// default for one stream queue is 256 events or 9 MiB.
-pub const MAX_PENDING_MODERN_HTTP_SSE_EVENTS: usize = 256;
+/// frame can contain many individually valid events.
+pub const MAX_PENDING_MODERN_HTTP_SSE_EVENTS: usize = 128;
 
 /// Maximum interleaved notifications and reverse requests accepted while one
 /// modern HTTP request waits for its correlated terminal response on SSE.
@@ -287,47 +286,36 @@ const MAX_MODERN_HTTP_INTERLEAVED_CONTROL_FRAMES: usize = 64;
 /// Maximum UTF-8 encoded bytes retained by pending modern HTTP SSE payloads
 /// from one or more native body frames before a caller receives the next
 /// event.
-///
-/// Every completed event passes through this budget, so it is also the
-/// largest single modern SSE event: LIMIT-01's 9 MiB stream-queue default,
-/// which admits the 8 MiB decoded message a single event may carry.
-pub const MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES: usize = 9 * 1024 * 1024;
+pub const MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES: usize = 64 * 1024;
 
-/// Maximum retained bytes in one legacy SSE event, including its field names
-/// (LIMIT-01 guarded default: 9 MiB).
+/// Maximum retained bytes in one legacy SSE event, including its field names.
 #[cfg(feature = "legacy-2024-11-05")]
-const MAX_LEGACY_SSE_EVENT_BYTES: usize = 9 * 1024 * 1024;
+const MAX_LEGACY_SSE_EVENT_BYTES: usize = 64 * 1024;
 
 /// Maximum bytes in one legacy SSE line before the connection is refused.
-///
-/// Each exact-2024 JSON-RPC message is a single `data:` line, so this bounds
-/// the largest message the legacy lane can receive (LIMIT-01 guarded default:
-/// 8 MiB plus the `data: ` prefix and line terminator).
 #[cfg(feature = "legacy-2024-11-05")]
-const MAX_LEGACY_SSE_LINE_BYTES: usize = 8 * 1024 * 1024 + 8;
+const MAX_LEGACY_SSE_LINE_BYTES: usize = 16 * 1024;
 
 /// Maximum ignored legacy SSE comment lines between dispatched events.
 #[cfg(feature = "legacy-2024-11-05")]
 const MAX_LEGACY_SSE_KEEPALIVE_LINES: usize = 64;
 
-/// Maximum JSON-RPC bytes accepted from one legacy `message` SSE event
-/// (LIMIT-01 guarded default for one decoded SSE JSON message: 8 MiB).
+/// Maximum JSON-RPC bytes accepted from one legacy `message` SSE event.
 #[cfg(feature = "legacy-2024-11-05")]
-const MAX_LEGACY_SSE_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_LEGACY_SSE_MESSAGE_BYTES: usize = 64 * 1024;
 
 /// Maximum complete legacy SSE events retained after one native body frame.
 ///
 /// The exact legacy lane shares one long-lived response body. Individual event
 /// limits alone do not bound the allocation caused by a native body frame
-/// containing many otherwise-valid events; this count and the byte budget
-/// below do (LIMIT-01: one stream queue, 256 events or 9 MiB).
+/// containing many otherwise-valid events.
 #[cfg(feature = "legacy-2024-11-05")]
-const MAX_PENDING_LEGACY_SSE_EVENTS: usize = 256;
+const MAX_PENDING_LEGACY_SSE_EVENTS: usize = 128;
 
 /// Maximum UTF-8 bytes retained by complete legacy SSE events waiting for the
-/// next caller read (LIMIT-01 guarded default: 9 MiB).
+/// next caller read.
 #[cfg(feature = "legacy-2024-11-05")]
-const MAX_PENDING_LEGACY_SSE_EVENT_BYTES: usize = 9 * 1024 * 1024;
+const MAX_PENDING_LEGACY_SSE_EVENT_BYTES: usize = 64 * 1024;
 
 /// Maximum interleaved notifications and reverse requests accepted while one
 /// legacy request waits for its correlated terminal response.
@@ -2859,6 +2847,10 @@ pub enum ModernHttpExecutorError {
     Timeout(RequestTimeoutSource),
     /// The caller's response policy cannot be represented by the runtime clock.
     InvalidTimeoutPolicy,
+    /// Additional TLS trust is invalid, duplicated, or exceeds its local bounds.
+    InvalidResourceTlsTrust,
+    /// The request does not name the exact HTTPS resource granted private trust.
+    ResourceTlsTargetMismatch,
     /// The native HTTP client could not complete the single exchange.
     Transport(ClientError),
     /// The exchange failed after the transport accepted request bytes and
@@ -2920,6 +2912,12 @@ impl fmt::Display for ModernHttpExecutorError {
             ),
             Self::InvalidTimeoutPolicy => {
                 formatter.write_str("invalid modern MCP response timeout policy")
+            }
+            Self::InvalidResourceTlsTrust => {
+                formatter.write_str("invalid modern MCP resource TLS trust")
+            }
+            Self::ResourceTlsTargetMismatch => {
+                formatter.write_str("request target differs from the trusted HTTPS resource")
             }
             Self::Transport(error) => write!(formatter, "native HTTP exchange failed: {error}"),
             Self::DispatchUncertain(error) => write!(
@@ -3019,12 +3017,59 @@ impl ModernHttpExecutorError {
     }
 }
 
+/// Immutable private trust for one exact resource. Keeping DER bytes also makes
+/// this policy part of the OAuth configuration's existing equality binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResourceTlsTrust {
+    resource: fastmcp_core::CanonicalHttpUrl,
+    roots: Vec<Vec<u8>>,
+}
+
+impl ResourceTlsTrust {
+    pub(crate) fn add_root(
+        policy: &mut Option<Self>,
+        resource: fastmcp_core::CanonicalHttpUrl,
+        certificate: asupersync::tls::Certificate,
+    ) -> Result<(), ModernHttpExecutorError> {
+        let der = certificate.as_der();
+        if resource.scheme() != "https"
+            || resource.has_userinfo()
+            || resource.query().is_some()
+            || resource.fragment().is_some()
+            || der.is_empty()
+            || der.len() > 16 * 1024
+        {
+            return Err(ModernHttpExecutorError::InvalidResourceTlsTrust);
+        }
+        if let Some(existing) = policy.as_ref() {
+            if existing.resource != resource {
+                return Err(ModernHttpExecutorError::ResourceTlsTargetMismatch);
+            }
+            if existing.roots.len() >= 8 || existing.roots.iter().any(|root| root == der) {
+                return Err(ModernHttpExecutorError::InvalidResourceTlsTrust);
+            }
+        }
+        asupersync::tls::RootCertStore::empty()
+            .add(&certificate)
+            .map_err(|_| ModernHttpExecutorError::InvalidResourceTlsTrust)?;
+        policy.get_or_insert_with(|| Self { resource, roots: Vec::new() })
+            .roots.push(der.to_vec());
+        Ok(())
+    }
+
+    fn admits(&self, target: &str) -> bool {
+        fastmcp_core::CanonicalHttpUrl::parse(target)
+            .is_ok_and(|target| target == self.resource)
+    }
+}
+
 /// Executes modern MCP HTTP POSTs through explicit native HTTP primitives.
 #[derive(Clone)]
 pub struct ModernHttpExecutor {
     request_timeout_policy: RequestTimeoutPolicy,
     subscription_timeout_policy: SubscriptionTimeoutPolicy,
     bearer_credential: Option<Arc<crate::http_auth::BoundBearerCredential>>,
+    resource_tls: Option<ResourceTlsTrust>,
 }
 
 impl Default for ModernHttpExecutor {
@@ -3041,6 +3086,7 @@ impl ModernHttpExecutor {
             request_timeout_policy: RequestTimeoutPolicy::default(),
             subscription_timeout_policy: SubscriptionTimeoutPolicy::default(),
             bearer_credential: None,
+            resource_tls: None,
         }
     }
 
@@ -3051,7 +3097,26 @@ impl ModernHttpExecutor {
             request_timeout_policy: RequestTimeoutPolicy::default(),
             subscription_timeout_policy: SubscriptionTimeoutPolicy::default(),
             bearer_credential: bearer_credential.map(Arc::new),
+            resource_tls: None,
         }
+    }
+
+    /// Adds a private CA for one exact HTTPS resource. Up to eight distinct
+    /// roots of at most 16 KiB each are admitted. Hostname and certificate
+    /// verification remain enabled; another path or origin is rejected before
+    /// opening a connection. Issuer trust and redirects cannot widen this grant.
+    pub fn with_resource_root_certificate(
+        mut self,
+        resource: fastmcp_core::CanonicalHttpUrl,
+        certificate: asupersync::tls::Certificate,
+    ) -> Result<Self, ModernHttpExecutorError> {
+        ResourceTlsTrust::add_root(&mut self.resource_tls, resource, certificate)?;
+        Ok(self)
+    }
+
+    pub(crate) fn with_resource_tls(mut self, policy: Option<ResourceTlsTrust>) -> Self {
+        self.resource_tls = policy;
+        self
     }
 
     /// Replaces the post-commit response timeout policy for ordinary requests.
@@ -3105,6 +3170,9 @@ impl ModernHttpExecutor {
             return Err(ModernHttpExecutorError::Cancelled);
         }
         check_modern_http_context(cx)?;
+        if self.resource_tls.as_ref().is_some_and(|trust| !trust.admits(request.target())) {
+            return Err(ModernHttpExecutorError::ResourceTlsTargetMismatch);
+        }
         self.request_timeout_policy
             .validate()
             .map_err(|_| ModernHttpExecutorError::InvalidTimeoutPolicy)?;
@@ -3139,6 +3207,7 @@ impl ModernHttpExecutor {
             cx,
             request,
             self.bearer_credential.as_deref(),
+            self.resource_tls.as_ref(),
             committed_at,
             Arc::clone(&request_bytes_sent),
         ));
@@ -3225,10 +3294,15 @@ async fn execute_native_modern_request(
     cx: &Cx,
     request: &ModernHttpRequest,
     credential: Option<&crate::http_auth::BoundBearerCredential>,
+    resource_tls: Option<&ResourceTlsTrust>,
     committed_at: Arc<OnceLock<Time>>,
     request_bytes_sent: Arc<AtomicBool>,
 ) -> Result<ClientStreamingResponse<ModernHttpIo>, ClientError> {
-    let parsed = ParsedUrl::parse(request.target())?;
+    // Admission compares canonical resources. Use that same spelling on the
+    // wire: native ParsedUrl deliberately preserves raw paths, including dot
+    // segments that must not select a different route under private trust.
+    let target = resource_tls.map_or(request.target(), |trust| trust.resource.as_str());
+    let parsed = ParsedUrl::parse(target)?;
     cx.checkpoint().map_err(|_| ClientError::Cancelled)?;
     let host = parsed.host.trim_start_matches('[').trim_end_matches(']');
     let stream = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
@@ -3249,6 +3323,12 @@ async fn execute_native_modern_request(
                 .map_err(|error| ClientError::TlsError(error.to_string()))?;
             #[cfg(not(feature = "native-tls-roots"))]
             let builder = builder.with_webpki_roots();
+            let builder = if let Some(trust) = resource_tls {
+                builder.add_root_certificates(trust.roots.iter().cloned()
+                    .map(asupersync::tls::Certificate::from_der))
+            } else {
+                builder
+            };
             let connector = builder
                 .build()
                 .map_err(|error| ClientError::TlsError(error.to_string()))?;
@@ -3298,6 +3378,7 @@ pub(crate) struct HttpConnectionSettings {
     pub(crate) mcp_apps: Option<McpAppsClientSettings>,
     pub(crate) extensions: Option<Arc<ClientExtensionRuntime>>,
     pub(crate) bearer: Option<crate::http_auth::BoundBearerCredential>,
+    pub(crate) resource_tls: Option<ResourceTlsTrust>,
     pub(crate) request_timeout_policy: RequestTimeoutPolicy,
     pub(crate) subscription_timeout_policy: SubscriptionTimeoutPolicy,
 }
@@ -6169,6 +6250,7 @@ impl ModernHttpClient {
             mcp_apps: mcp_apps_settings,
             extensions: client_extension_runtime,
             bearer: bearer_credential,
+            resource_tls,
             request_timeout_policy,
             subscription_timeout_policy,
         } = settings;
@@ -6180,6 +6262,15 @@ impl ModernHttpClient {
                 || matches!(protocol_plan.policy(), ProtocolPolicy::LegacyOnly)
             {
                 return Err(ModernHttpClientError::CredentialTargetMismatch);
+            }
+        }
+        if let Some(trust) = &resource_tls {
+            if matches!(protocol_plan.policy(), ProtocolPolicy::LegacyOnly)
+                || !protocol_plan.modern_post_target().is_some_and(|target| trust.admits(target))
+            {
+                return Err(ModernHttpClientError::Executor(
+                    ModernHttpExecutorError::ResourceTlsTargetMismatch,
+                ));
             }
         }
         if cx.checkpoint().is_err() {
@@ -6230,6 +6321,7 @@ impl ModernHttpClient {
         )?;
 
         let probe_response = ModernHttpExecutor::with_bearer_credential(bearer_credential.clone())
+            .with_resource_tls(resource_tls.clone())
             .with_timeout_policy(request_timeout_policy)
             .with_subscription_timeout_policy(subscription_timeout_policy)
             .execute(cx, &probe_request)
@@ -6287,6 +6379,7 @@ impl ModernHttpClient {
                         negotiated_extensions,
                     }),
                     executor: ModernHttpExecutor::with_bearer_credential(bearer_credential)
+                        .with_resource_tls(resource_tls)
                         .with_timeout_policy(request_timeout_policy)
                         .with_subscription_timeout_policy(subscription_timeout_policy),
                     reverse_request_handlers: ReverseRequestHandlers::new(),
@@ -6297,6 +6390,11 @@ impl ModernHttpClient {
             ClientHttpNegotiationDecision::LegacySseFallbackAuthorized => {
                 if bearer_credential.is_some() {
                     return Err(ModernHttpClientError::AuthenticatedLegacyFallback);
+                }
+                if resource_tls.is_some() {
+                    return Err(ModernHttpClientError::Executor(
+                        ModernHttpExecutorError::ResourceTlsTargetMismatch,
+                    ));
                 }
                 LegacySseHttpClient::connect(cx, protocol_plan)
                     .await
@@ -7363,11 +7461,8 @@ impl ModernHttpClient {
         progress_marker: &fastmcp_protocol::ProgressMarker,
         maximum_response_bytes: usize,
     ) -> Result<FinalToolCallOutcome, ModernHttpFinalCoreListenError> {
-        // One JSON-RPC message is one `data:` line, so the line bound must
-        // admit the whole message: LIMIT-01's 8 MiB plus `data: ` and the
-        // terminator, never more than the caller's response budget.
         let limits = SseLimits::new(
-            maximum_response_bytes.clamp(1, 8 * 1024 * 1024 + 8),
+            maximum_response_bytes.clamp(1, 64 * 1024),
             maximum_response_bytes.max(1),
             256,
         )
@@ -10139,9 +10234,7 @@ mod tests {
     };
     #[cfg(feature = "legacy-2024-11-05")]
     use super::{
-        LegacySseConnection, LegacySseEvent, LegacySseHttpClientError, LegacySseParser,
-        MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES, MAX_LEGACY_SSE_EVENT_BYTES,
-        MAX_LEGACY_SSE_LINE_BYTES, MAX_LEGACY_SSE_MESSAGE_BYTES,
+        LegacySseConnection, LegacySseHttpClientError, MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES,
         MAX_PENDING_LEGACY_SSE_EVENT_BYTES, MAX_PENDING_LEGACY_SSE_EVENTS,
     };
     #[cfg(feature = "tasks")]
@@ -10492,6 +10585,7 @@ mod tests {
                 ),
                 extensions: Some(generic_mcp_apps_runtime(generic_mime_type)),
                 bearer: None,
+                resource_tls: None,
                 request_timeout_policy: crate::RequestTimeoutPolicy::default(),
                 subscription_timeout_policy: crate::SubscriptionTimeoutPolicy::default(),
             },
@@ -11070,6 +11164,7 @@ mod tests {
                     mcp_apps: None,
                     extensions: Some(Arc::clone(&settings)),
                     bearer: None,
+                    resource_tls: None,
                     request_timeout_policy: crate::RequestTimeoutPolicy::default(),
                     subscription_timeout_policy: crate::SubscriptionTimeoutPolicy::default(),
                 },
@@ -14660,103 +14755,6 @@ mod tests {
             ))
         ));
         server.join().expect("overflowing legacy server must join");
-    }
-
-    /// Feeds one body chunk to a fresh legacy parser and collects its events.
-    #[cfg(feature = "legacy-2024-11-05")]
-    fn parse_legacy_sse(bytes: &[u8]) -> Result<Vec<LegacySseEvent>, LegacySseHttpClientError> {
-        let mut parser = LegacySseParser::default();
-        let mut events = Vec::new();
-        parser.push_with(bytes, |event| {
-            events.push(event);
-            Ok(())
-        })?;
-        Ok(events)
-    }
-
-    #[cfg(feature = "legacy-2024-11-05")]
-    fn legacy_message_event(payload_bytes: usize) -> Vec<u8> {
-        format!("event: message\ndata: {}\n\n", "m".repeat(payload_bytes)).into_bytes()
-    }
-
-    // LIMIT-01: one decoded SSE JSON message is 8 MiB. The retained data
-    // includes the trailing field newline, so the largest admitted `data:`
-    // value is one byte short of the bound and the next byte is refused.
-    #[cfg(feature = "legacy-2024-11-05")]
-    #[test]
-    fn legacy_sse_parser_admits_the_limit_01_message_and_refuses_one_more_byte() {
-        let admitted_bytes = MAX_LEGACY_SSE_MESSAGE_BYTES - 1;
-        let events = parse_legacy_sse(&legacy_message_event(admitted_bytes))
-            .expect("a message at the LIMIT-01 decoded bound is admitted");
-        assert!(
-            matches!(
-                events.as_slice(),
-                [LegacySseEvent::Message(payload)] if payload.len() == admitted_bytes
-            ),
-            "the bound-sized message must arrive whole: {} events",
-            events.len()
-        );
-
-        let refused = parse_legacy_sse(&legacy_message_event(admitted_bytes + 1));
-        assert!(
-            matches!(refused, Err(LegacySseHttpClientError::SseEventTooLarge)),
-            "one byte past the decoded bound must be refused: {:?}",
-            refused.map(|events| events.len())
-        );
-    }
-
-    // LIMIT-01: one SSE line is 8 MiB + 8 B. An ignored field isolates the
-    // line bound from the message bound.
-    #[cfg(feature = "legacy-2024-11-05")]
-    #[test]
-    fn legacy_sse_parser_admits_the_limit_01_line_and_refuses_one_more_byte() {
-        let line = |line_bytes: usize| {
-            let mut line = b"x-pad: ".to_vec();
-            line.resize(line_bytes, b'p');
-            line.extend_from_slice(b"\n\n");
-            line
-        };
-        let events = parse_legacy_sse(&line(MAX_LEGACY_SSE_LINE_BYTES))
-            .expect("a line at the LIMIT-01 line bound is admitted");
-        assert!(events.is_empty(), "an ignored field dispatches no event");
-
-        let refused = parse_legacy_sse(&line(MAX_LEGACY_SSE_LINE_BYTES + 1));
-        assert!(
-            matches!(refused, Err(LegacySseHttpClientError::SseLineTooLong)),
-            "one byte past the line bound must be refused: {:?}",
-            refused.map(|events| events.len())
-        );
-    }
-
-    // LIMIT-01: one SSE event is 9 MiB across all of its lines. Two ignored
-    // fields that each fit the line bound reach the event bound together.
-    #[cfg(feature = "legacy-2024-11-05")]
-    #[test]
-    fn legacy_sse_parser_admits_the_limit_01_event_and_refuses_one_more_byte() {
-        let event = |event_bytes: usize| {
-            // Each line counts its bytes plus the terminating newline.
-            let first_line_bytes = event_bytes / 2 - 1;
-            let second_line_bytes = event_bytes - event_bytes / 2 - 1;
-            let mut event = Vec::with_capacity(event_bytes + 1);
-            for line_bytes in [first_line_bytes, second_line_bytes] {
-                let mut line = b"x-pad: ".to_vec();
-                line.resize(line_bytes, b'p');
-                event.extend_from_slice(&line);
-                event.push(b'\n');
-            }
-            event.push(b'\n');
-            event
-        };
-        let events = parse_legacy_sse(&event(MAX_LEGACY_SSE_EVENT_BYTES))
-            .expect("an event at the LIMIT-01 event bound is admitted");
-        assert!(events.is_empty(), "ignored fields dispatch no event");
-
-        let refused = parse_legacy_sse(&event(MAX_LEGACY_SSE_EVENT_BYTES + 1));
-        assert!(
-            matches!(refused, Err(LegacySseHttpClientError::SseEventTooLarge)),
-            "one byte past the event bound must be refused: {:?}",
-            refused.map(|events| events.len())
-        );
     }
 
     #[cfg(feature = "legacy-2024-11-05")]

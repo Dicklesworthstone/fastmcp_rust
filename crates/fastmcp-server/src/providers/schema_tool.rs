@@ -368,6 +368,40 @@ mod tests {
     }
 
     #[test]
+    fn annotated_registered_schemas_retain_metadata_and_enforce_input_before_effects() {
+        let mut registry = SchemaResourceRegistry::default();
+        let input = json!({
+            "type":"object", "properties":{"value":{
+                "type":"integer", "minimum":1,
+                "x-ui":{"type":17,"$ref":"https://unregistered.example/schema"}
+            }},
+            "required":["value"], "additionalProperties":false,
+            "x-display":{"group":"Controls"}
+        });
+        registry.insert(INPUT, input.clone()).unwrap();
+        let handler = handler(json!({"value":2}));
+        let effects = handler.effects.clone();
+        let owned = handler.owned_calls.clone();
+        let tool = RegisteredSchemaTool::new(handler, definition(), &registry, INPUT, None).unwrap();
+        let catalog_schema = &tool.compiled_definition().input_schema;
+        assert_eq!(catalog_schema["x-display"], input["x-display"]);
+        assert_eq!(catalog_schema["properties"]["value"]["x-ui"], input["properties"]["value"]["x-ui"]);
+        let mut router = Router::new();
+        router.add_tool(tool).unwrap();
+        runtime().block_on(async {
+            let router = Arc::new(router);
+            let valid = call(router.clone(), 1, json!({"value":2})).await.unwrap();
+            assert_eq!(valid["structuredContent"], json!({"value":2}));
+            assert_eq!(effects.load(Ordering::SeqCst), 1);
+            assert_eq!(owned.load(Ordering::SeqCst), 1);
+            let invalid = call(router, 2, json!({"value":0})).await.unwrap();
+            assert_eq!(invalid["isError"], true);
+            assert_eq!(effects.load(Ordering::SeqCst), 1);
+            assert_eq!(owned.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
     fn router_refuses_invalid_structured_output_after_one_effect() {
         let handler = handler(json!({"value":0}));
         let effects = handler.effects.clone();

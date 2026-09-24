@@ -27,10 +27,13 @@ use fastmcp_core::McpRequestCancellation;
 use super::oauth::{OAuthClient, OAuthCredentials, OAuthError};
 use super::{BoundBearerCredential, CanonicalHttpUrl};
 use crate::http_executor::{
-    ModernHttpExecutor, ModernHttpExecutorError, ModernHttpRequest,
+    ModernHttpExecutorError, ModernHttpRequest,
     ModernHttpResponseMetadata, ModernHttpResponseStream, ModernHttpSseResponseStream,
 };
 use crate::sse::SseLimits;
+
+#[cfg(test)]
+use crate::http_executor::ModernHttpExecutor;
 
 /// Explicit logout with remote issuer revocation and local session closure.
 pub mod logout;
@@ -377,9 +380,9 @@ impl ManagedOAuthSession {
     /// is checked BEFORE renewal or peer contact. HTTP 401/403, redirects and
     /// transport failures never trigger automatic tool-call replay.
     ///
-    /// The default native executor supplies TLS verification and response
-    /// admission. Private token-issuer CA settings do not implicitly authorize
-    /// a private MCP-resource CA. The returned response retains local session
+    /// The native executor retains explicitly configured resource CA trust,
+    /// TLS verification and response admission. Private token-issuer CA settings
+    /// do not implicitly authorize a private MCP-resource CA. The response retains local session
     /// closure, request cancellation and the original access-token expiry for
     /// JSON/SSE reads. It does not perform issuer introspection or continuous
     /// policy revalidation and is not a full authorization lease.
@@ -402,7 +405,7 @@ impl ManagedOAuthSession {
         let snapshot = self.credential_with_cancellation(cx, cancellation).await?;
         let request = snapshot.authorize_request(request)?;
         let deadline = deadline_after(cx, self.inner.policy.response_head_timeout)?;
-        let executor = ModernHttpExecutor::new();
+        let executor = self.inner.client.resource_http_executor();
         let response = self.await_active(cx, cancellation, deadline, Some(snapshot.expires_at), async {
             executor.execute_with_cancellation(cx, cancellation, &request)
                 .await.map_err(OAuthSessionError::Http)

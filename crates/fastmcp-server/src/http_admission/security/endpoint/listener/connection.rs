@@ -82,6 +82,15 @@ pub(super) async fn serve(
     }
     let raw_path = request.uri.split_once('?').map_or(request.uri.as_str(), |(path, _)| path);
     if let Some(routes) = endpoint.server.oauth_http_routes.as_ref().filter(|routes| routes.has_path(raw_path)) {
+        if raw_path == routes.metadata_path() {
+            // This bounded document has no provider work or mutable issuer
+            // state. Keep discovery available when token/consent workers are
+            // unavailable, after the same Host, Origin and body admission.
+            let query = request.uri.split_once('?').map_or("", |(_, query)| query);
+            let response = crate::dispatch_oauth_h1_request(routes, &request, raw_path, query);
+            buffered(cx, &shutdown, &mut framed, response, Some(&cors), io).await;
+            return;
+        }
         issuer(cx, framed.into_inner(), endpoint.clone(), sessions, shutdown,
             routes.clone(), request, cors, io).await;
         return;

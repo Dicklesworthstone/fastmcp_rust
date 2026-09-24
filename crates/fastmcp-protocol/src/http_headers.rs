@@ -72,9 +72,9 @@ impl fmt::Display for McpHeaderError {
 impl std::error::Error for McpHeaderError {}
 
 /// An annotation-aware schema whose validation vocabulary was admitted by the
-/// shared Draft 2020-12 engine. That engine deliberately rejects unknown
-/// keywords. Only `x-mcp-header` at schema locations is separated from its
-/// validation copy; every other admission rule remains in force. The exact
+/// shared Draft 2020-12 engine. Only `x-mcp-header` at schema locations is
+/// separated from its validation copy; ordinary custom annotations remain
+/// opaque, and every assertion admission rule remains in force. The exact
 /// original schema, including annotations and literal examples, is retained.
 /// This is not registration-time exposure approval or operation authorization.
 pub struct AdmittedToolHeaderSchema {
@@ -98,16 +98,39 @@ impl AdmittedToolHeaderSchema {
     pub fn validate(&self, arguments: &Value) -> ValidationResult { self.validation.validate(arguments) }
 }
 
-/// Admits a tool's final input schema for local registration. A schema within
-/// the Draft 2020-12 vocabulary is admitted unchanged. Otherwise its
-/// `x-mcp-header` annotations are separated from the validation copy, every
-/// annotation rule is enforced, and that copy is returned. Any other
-/// unsupported keyword, or an invalid annotation, still refuses the schema.
+/// Admits a tool's final input schema for local registration. Ordinary custom
+/// annotations remain opaque. When schema-valued locations contain
+/// `x-mcp-header`, every header rule is enforced before returning the validation
+/// copy with those annotations separated. Generic schema admission alone never
+/// authorizes a parameter-header annotation.
 pub fn admit_final_tool_input_schema(source: Value) -> Result<AdmittedSchema, McpHeaderError> {
-    match crate::schema::admit_final_schema(source.clone()) {
-        Ok(schema) => Ok(schema),
-        Err(_) => AdmittedToolHeaderSchema::admit(source).map(|schema| schema.validation),
+    crate::schema::bound_schema_document(&source).map_err(|_| McpHeaderError::LimitExceeded)?;
+    if has_header_annotations(&source) {
+        AdmittedToolHeaderSchema::admit(source).map(|schema| schema.validation)
+    } else {
+        crate::schema::admit_final_schema(source).map_err(|_| McpHeaderError::InvalidSchema)
     }
+}
+
+// Only schema-valued locations grant annotation meaning. The complete tree was
+// bounded before this walk; examples/defaults and unknown keyword
+// payloads can contain header-shaped data without creating disclosure authority.
+fn has_header_annotations(schema: &Value) -> bool {
+    let Some(schema) = schema.as_object() else { return false; };
+    if schema.contains_key("x-mcp-header") { return true; }
+    schema.iter().any(|(keyword, value)| match keyword.as_str() {
+        "properties" | "$defs" | "patternProperties" | "dependentSchemas" => {
+            value.as_object().is_some_and(|children| children.values().any(has_header_annotations))
+        }
+        "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
+            value.as_array().is_some_and(|children| children.iter().any(has_header_annotations))
+        }
+        "items" | "contains" | "additionalProperties" | "unevaluatedProperties"
+        | "unevaluatedItems" | "propertyNames" | "not" | "if" | "then" | "else" | "contentSchema" => {
+            has_header_annotations(value)
+        }
+        _ => false,
+    })
 }
 impl fmt::Debug for AdmittedToolHeaderSchema {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -417,7 +440,7 @@ impl Compiler {
                         result?;
                     }
                 },
-                "$defs" | "definitions" | "patternProperties" | "dependentSchemas" | "dependencies" => {
+                "$defs" | "patternProperties" | "dependentSchemas" => {
                     if let Some(children) = value.as_object() {
                         for child in children.values() { self.visit(child, path, false, depth + 1)?; }
                     }
@@ -584,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn annotation_admission_preserves_schema_semantics_and_unknown_keyword_refusal() {
+    fn annotation_admission_preserves_custom_annotations_and_assertion_semantics() {
         let source = json!({"type":"object","properties":{
             "value":{"type":"integer","minimum":3,"x-mcp-header":"Value"}
         },"additionalProperties":false});
@@ -593,8 +616,15 @@ mod tests {
         admitted.validate(&json!({"value":3})).unwrap();
         assert!(admitted.validate(&json!({"value":2})).is_err());
         assert!(admitted.validate(&json!({"value":3,"other":true})).is_err());
-        let mut invalid = source;
-        invalid["properties"]["value"]["unknownValidationKeyword"] = json!(true);
+        let mut annotated = source;
+        annotated["properties"]["value"]["x-ui"] = json!({"type":17});
+        let custom = AdmittedToolHeaderSchema::admit(annotated.clone()).unwrap();
+        assert_eq!(custom.schema(), &annotated);
+        assert_eq!(custom.header_plan().bindings().len(), 1);
+        assert!(custom.validate(&json!({"value":3})).is_ok());
+        assert!(custom.validate(&json!({"value":2})).is_err());
+        let mut invalid = annotated;
+        invalid["properties"]["value"]["minimum"] = json!("not-a-number");
         assert!(matches!(AdmittedToolHeaderSchema::admit(invalid), Err(McpHeaderError::InvalidSchema)));
         let large = json!({"type":"object","default":"x".repeat(MAX_TOOL_HEADER_SCHEMA_BYTES + 1)});
         assert!(matches!(AdmittedToolHeaderSchema::admit(large), Err(McpHeaderError::LimitExceeded)));
@@ -744,7 +774,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_input_schema_admission_refuses_bad_annotations_and_other_keywords() {
+    fn tool_input_schema_admission_enforces_headers_while_preserving_other_annotations() {
         let nullable = json!({"type":"object","properties":{
             "region":{"type":["string","null"],"x-mcp-header":"Region"}
         }});
@@ -752,6 +782,51 @@ mod tests {
         let unknown = json!({"type":"object","properties":{
             "region":{"type":"string","x-mcp-header":"Region","x-other":true}
         }});
-        assert!(admit_final_tool_input_schema(unknown).is_err());
+        let admitted = admit_final_tool_input_schema(unknown).unwrap();
+        assert_eq!(admitted.schema()["properties"]["region"]["x-other"], true);
+        assert!(admitted.validate(&json!({"region":"eu-west"})).is_ok());
+        assert!(admitted.validate(&json!({"region":7})).is_err());
+    }
+
+    #[test]
+    fn generic_annotation_admission_never_bypasses_parameter_header_rules() {
+        for invalid in [
+            json!({"type":"object","properties":{"value":{"type":"string","x-mcp-header":false}}}),
+            json!({"type":"object","$defs":{"value":{"type":"string","x-mcp-header":"Value"}}}),
+            json!({"type":"object","properties":{
+                "first":{"type":"string","x-mcp-header":"Value"},
+                "second":{"type":"string","x-mcp-header":"value"}
+            }}),
+        ] {
+            assert!(crate::schema::admit_final_schema(invalid.clone()).is_ok());
+            assert!(admit_final_tool_input_schema(invalid).is_err());
+        }
+        for keyword in ["x-ui", "default", "vendorFields", "examplePayload"] {
+            let mut source = json!({"type":"object"});
+            source[keyword] = json!({"value":{"type":17,"x-mcp-header":false}});
+            let admitted = admit_final_tool_input_schema(source.clone()).unwrap();
+            assert_eq!(admitted.schema(), &source);
+            assert!(ToolParameterHeaderPlan::compile(&admitted).unwrap().bindings().is_empty());
+            assert!(AdmittedToolHeaderSchema::admit(source).unwrap().header_plan().bindings().is_empty());
+        }
+    }
+
+    #[test]
+    fn custom_dialect_header_annotations_keep_their_explicit_admission_path() {
+        let source = json!({
+            "$id":"https://schemas.example/root", "$schema":"https://schemas.example/meta",
+            "$defs":{"meta":{
+                "$id":"https://schemas.example/meta",
+                "$schema":crate::schema::FINAL_JSON_SCHEMA_DIALECT,
+                "$vocabulary":{"https://json-schema.org/draft/2020-12/vocab/core":true}
+            }},
+            "type":"object","properties":{"value":{"type":"integer","x-mcp-header":"Value"}}
+        });
+        let admitted = admit_final_tool_input_schema(source.clone()).unwrap();
+        assert!(admitted.validate(&json!({"value":3})).is_ok());
+        assert!(admitted.validate(&json!({"value":"3"})).is_err());
+        let mut custom = source;
+        custom["properties"]["value"]["x-other"] = json!(true);
+        assert!(admit_final_tool_input_schema(custom).is_err());
     }
 }

@@ -18,6 +18,8 @@
 //!
 //! - [`StdioTransport`]: Generic transport for any `Read`/`Write` types (for testing)
 //! - [`AsyncStdioTransport`]: Production transport using async I/O wrappers
+//!   by default, or genuinely awaitable caller-owned I/O through
+//!   [`AsyncStdioTransport::from_io`].
 //!
 //! An oversized NDJSON line is a terminal framing error. The bounded reader
 //! does not drain an attacker-controlled remainder after reporting the error;
@@ -66,6 +68,9 @@ use crate::{
     ClientTransportRecvHalf, Codec, CodecError, ReceivedTransportFrame, SendPermit, Transport,
     TransportError, TransportRecvHalf, TransportSendHalf, TwoPhaseTransport,
 };
+
+mod asynchronous;
+pub use asynchronous::{AsyncStdioRecvHalf, AsyncStdioSendHalf};
 
 #[cfg(unix)]
 const STDIO_READINESS_POLL_SLICE: Duration = Duration::from_millis(10);
@@ -1403,10 +1408,13 @@ impl<R: Read, W: Write> TwoPhaseTransport for StdioTransport<R, W> {
 // AsyncStdioTransport - Production async I/O transport
 // =============================================================================
 
-/// Async stdio transport with explicit context checkpoints.
+/// NDJSON transport over process stdio or caller-owned asynchronous I/O.
 ///
-/// This is the production transport for MCP servers. It uses async I/O
-/// wrappers and receives an asupersync capability context.
+/// [`Self::new`] retains the synchronous process-stdio adapter and its explicit
+/// checkpoints. [`Self::from_io`] accepts asupersync `AsyncRead`/`AsyncWrite`
+/// handles and exposes awaitable, cancellation-aware operations plus independent
+/// receive/send halves. The supplied handles must perform nonblocking polls;
+/// the transport does not create a runtime, thread, or blocking-I/O fallback.
 ///
 /// # Cancellation behavior
 ///
@@ -1436,11 +1444,13 @@ impl<R: Read, W: Write> TwoPhaseTransport for StdioTransport<R, W> {
 ///     }
 /// }
 /// ```
-pub struct AsyncStdioTransport {
-    reader: AsyncLineReader,
-    writer: AsyncStdout,
+pub struct AsyncStdioTransport<R = AsyncLineReader, W = AsyncStdout> {
+    reader: Option<R>,
+    writer: Option<W>,
     codec: Codec,
     closed: bool,
+    asynchronous: asynchronous::ReadState,
+    terminal: Arc<asynchronous::Terminal>,
 }
 
 impl AsyncStdioTransport {
@@ -1451,10 +1461,12 @@ impl AsyncStdioTransport {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            reader: AsyncLineReader::new(),
-            writer: AsyncStdout::new(),
+            reader: Some(AsyncLineReader::new()),
+            writer: Some(AsyncStdout::new()),
             codec: Codec::new(),
             closed: false,
+            asynchronous: asynchronous::ReadState::default(),
+            terminal: Arc::new(asynchronous::Terminal::default()),
         }
     }
 
@@ -1462,11 +1474,12 @@ impl AsyncStdioTransport {
         // Admission happens at the caller's full context checkpoint. Treat the
         // frame write and flush as one non-interruptible commit so a raw cancel
         // flag cannot defeat masking or split an admitted NDJSON frame.
-        if let Err(error) = self.writer.write_all_unchecked(bytes) {
+        let writer = self.writer.as_mut().ok_or(TransportError::Closed)?;
+        if let Err(error) = writer.write_all_unchecked(bytes) {
             self.closed = true;
             return Err(TransportError::Io(error));
         }
-        if let Err(error) = self.writer.flush_unchecked() {
+        if let Err(error) = writer.flush_unchecked() {
             self.closed = true;
             return Err(TransportError::Io(error));
         }
@@ -1478,7 +1491,7 @@ impl AsyncStdioTransport {
         // owns any partially consumed prefix only for the duration of one
         // call. Every error after admission therefore ends this byte stream.
         self.closed = true;
-        self.reader = AsyncLineReader::new();
+        self.reader = Some(AsyncLineReader::new());
         match error {
             BoundedLineReadError::Io(error) if error.kind() == std::io::ErrorKind::Interrupted => {
                 stdio_checkpoint(cx)
@@ -1494,7 +1507,7 @@ impl AsyncStdioTransport {
 
     fn latch_consumed_checkpoint_failure(&mut self, error: TransportError) -> TransportError {
         self.closed = true;
-        self.reader = AsyncLineReader::new();
+        self.reader = Some(AsyncLineReader::new());
         error
     }
 }
@@ -1531,6 +1544,8 @@ impl Transport for AsyncStdioTransport {
         // Read non-empty line with cancellation checking
         let line = match self
             .reader
+            .as_mut()
+            .ok_or(TransportError::Closed)?
             .read_non_empty_line_bounded(cx, self.codec.max_message_size())
         {
             Ok(Some(line)) => line,
@@ -1546,7 +1561,7 @@ impl Transport for AsyncStdioTransport {
             // and make the failure terminal rather than silently skipping it
             // on a retry.
             self.closed = true;
-            self.reader = AsyncLineReader::new();
+            self.reader = Some(AsyncLineReader::new());
             return Err(error);
         }
 
@@ -1581,7 +1596,10 @@ impl Transport for AsyncStdioTransport {
         // `flush_unchecked` is correct HERE and only here: its contract is the
         // commit phase of a two-phase send, where cancellation has already been
         // observed. The checkpoint above is that observation.
-        self.writer.flush_unchecked()?;
+        self.writer
+            .as_mut()
+            .ok_or(TransportError::Closed)?
+            .flush_unchecked()?;
         Ok(())
     }
 }
@@ -1634,7 +1652,7 @@ impl TwoPhaseTransport for AsyncStdioTransport {
         // Return permit that allows the send to proceed
         // The commit phase uses Write trait impl which bypasses cancellation checks
         Ok(SendPermit::new(
-            &mut self.writer,
+            self.writer.as_mut().ok_or(TransportError::Closed)?,
             &self.codec,
             &mut self.closed,
         ))
@@ -4258,12 +4276,16 @@ mod tests {
         assert!(!transport.closed, "a fresh transport is not terminal");
 
         let cx = Cx::for_testing();
-        transport.close(&cx).expect("a live budget must permit the terminal flush");
+        transport
+            .close(&cx)
+            .expect("a live budget must permit the terminal flush");
 
         assert!(transport.closed, "a permitted close takes terminal state");
         // Idempotence: the already-closed branch performs no I/O and spends no
         // budget, so a second close is Ok even though the first consumed one.
-        transport.close(&cx).expect("close is idempotent once terminal");
+        transport
+            .close(&cx)
+            .expect("close is idempotent once terminal");
     }
 
     /// PLANTED NEGATIVE: an EXPIRED budget refuses, and -- the point of the
@@ -4297,8 +4319,9 @@ mod tests {
         // And the refusal is attributable to the budget alone: the same
         // transport closes cleanly once given a live one.
         let live_cx = Cx::for_testing();
-        transport.close(&live_cx).expect("a retryable transport still closes");
+        transport
+            .close(&live_cx)
+            .expect("a retryable transport still closes");
         assert!(transport.closed, "the retry takes terminal state");
     }
-
 }

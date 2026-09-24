@@ -3,20 +3,19 @@
 //!
 //! # Why this module records a conflict instead of resolving it
 //!
-//! The frozen acceptance floors come from LIMIT-01, and this evaluator compares
-//! them with the bounds the shipped transport actually enforces. It
-//! **exercises the shipped bound** and **records any disagreement** as a
-//! first-class observation ([`LimitConflict`]), rather than restating a
-//! constant. Changing the evaluator can never resolve a conflict; only moving
-//! the product to the floor can.
+//! The frozen acceptance floors for the legacy SSE lane and the bounds the
+//! shipped transport actually enforces disagree, in one case by 512x. The
+//! shipped bound is not an oversight: the pending-queue bound carries an
+//! explicit rationale that the exact legacy lane shares one long-lived response
+//! body, so per-event limits alone do not bound the allocation a single native
+//! body frame can cause.
 //!
-//! That happened for `sse-line`. The legacy client once refused any line over
-//! 16 KiB, so it could not receive any exact-2024 message over 16 KiB, because
-//! each message is a single `data:` line. It was raised to LIMIT-01's guarded
-//! defaults (8 MiB + 8 B line, 8 MiB message, 9 MiB event). The allocation a
-//! single native body frame can cause stays bounded by the pending-queue budget
-//! (256 events or 9 MiB), which is the rationale the small per-line bound was
-//! once said to serve.
+//! Raising a production constant so an acceptance floor becomes reachable is the
+//! same defect class as regenerating a golden — it buys a green row by moving
+//! the thing being measured. So this evaluator **exercises the shipped bound**
+//! and **records the disagreement** as a first-class observation
+//! ([`LimitConflict`]). A red row naming both numbers and both rationales is the
+//! honest output; resolving it belongs to the structure owner.
 //!
 //! # Why the bounds are measured rather than declared
 //!
@@ -289,9 +288,12 @@ impl LimitConflict {
     pub fn render(&self) -> String {
         format!(
             "LIMIT CONFLICT on `{}`: the frozen acceptance floor demands >= {} {} but the shipped \
-             transport admitted at most {} and refused {} ({}x). The LIMIT-01 floor is the \
-             contract, so the shipped bound regressed below it; restore the product bound rather \
-             than lowering the floor.",
+             transport admitted at most {} and refused {} ({}x). This is recorded, not resolved: \
+             the shipped bound is deliberate - the exact legacy lane shares one long-lived response \
+             body, so per-event limits alone do not bound the allocation one native body frame can \
+             cause - and widening a production constant to reach an acceptance floor would buy a \
+             green row by moving the thing being measured. The structure owner decides which number \
+             is wrong.",
             self.limit,
             self.frozen_guarded,
             self.unit,

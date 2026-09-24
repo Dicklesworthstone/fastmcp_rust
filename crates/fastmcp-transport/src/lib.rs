@@ -79,7 +79,10 @@ pub use http::{
 };
 pub use memory::{MemoryRecvHalf, MemorySendHalf};
 pub use sse::{ModernSseDecoder, ModernSseEndOfStream, ModernSseLimits, ModernSseParseError};
-pub use stdio::{AsyncStdioTransport, StdioRecvHalf, StdioSendHalf, StdioTransport};
+pub use stdio::{
+    AsyncStdioRecvHalf, AsyncStdioSendHalf, AsyncStdioTransport, StdioRecvHalf, StdioSendHalf,
+    StdioTransport,
+};
 
 use asupersync::Cx;
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};

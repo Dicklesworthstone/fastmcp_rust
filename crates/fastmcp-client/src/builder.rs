@@ -219,6 +219,8 @@ pub struct ClientBuilder {
     client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
     /// Caller-supplied credential bound to the exact modern HTTPS resource.
     http_bearer_credential: Option<crate::http_auth::BoundBearerCredential>,
+    /// Explicit private CA trust bound to the modern HTTPS POST endpoint.
+    http_resource_tls: Option<crate::http_executor::ResourceTlsTrust>,
     /// Whether to defer initialization until first use.
     auto_initialize: bool,
     /// Whether the subprocess must be isolated in an owned Unix process group.
@@ -306,6 +308,7 @@ impl ClientBuilder {
             mcp_apps_settings: None,
             client_extension_runtime: None,
             http_bearer_credential: None,
+            http_resource_tls: None,
             auto_initialize: false,
             owned_process_group: false,
             protocol_plan: ClientProtocolPlan::stdio(DEFAULT_PROTOCOL_POLICY),
@@ -754,6 +757,21 @@ impl ClientBuilder {
         self
     }
 
+    /// Adds a private CA for the exact modern HTTPS endpoint in the protocol
+    /// plan. Discovery and subsequent MCP POSTs retain this trust; legacy
+    /// fallback and a mismatching endpoint are refused before contact. Up to
+    /// eight distinct roots of at most 16 KiB each may be configured.
+    pub fn http_resource_root_certificate(
+        mut self,
+        resource: fastmcp_core::CanonicalHttpUrl,
+        certificate: asupersync::tls::Certificate,
+    ) -> Result<Self, ModernHttpExecutorError> {
+        crate::http_executor::ResourceTlsTrust::add_root(
+            &mut self.http_resource_tls, resource, certificate,
+        )?;
+        Ok(self)
+    }
+
     /// Returns the immutable protocol plan that will be validated before connect.
     #[must_use]
     pub const fn selected_protocol_plan(&self) -> &ClientProtocolPlan {
@@ -827,6 +845,7 @@ impl ClientBuilder {
                 mcp_apps: builder.mcp_apps_settings,
                 extensions: builder.client_extension_runtime,
                 bearer: builder.http_bearer_credential,
+                resource_tls: builder.http_resource_tls,
                 request_timeout_policy: builder.timeout_policy,
                 subscription_timeout_policy: builder.subscription_timeout_policy,
             },
@@ -916,6 +935,7 @@ impl ClientBuilder {
                 mcp_apps: builder.mcp_apps_settings,
                 extensions: builder.client_extension_runtime,
                 bearer: builder.http_bearer_credential,
+                resource_tls: builder.http_resource_tls,
                 request_timeout_policy: builder.timeout_policy,
                 subscription_timeout_policy: builder.subscription_timeout_policy,
             },

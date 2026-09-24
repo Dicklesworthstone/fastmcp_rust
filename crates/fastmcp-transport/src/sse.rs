@@ -173,11 +173,7 @@ fn sse_commit_frame<W: Write>(
 }
 
 /// Maximum wire-line size for SSE events.
-///
-/// LIMIT-01's guarded default for one SSE line: 8 MiB of data plus the
-/// `data: ` prefix and line terminator. A JSON-RPC message is one `data:`
-/// line, so this is also the largest message any SSE lane can carry.
-const MAX_SSE_LINE_SIZE: usize = 8 * 1024 * 1024 + 8;
+const MAX_SSE_LINE_SIZE: usize = 64 * 1024;
 
 /// Bytes added around one serialized data line: `data: ` plus LF.
 const SSE_DATA_LINE_WIRE_OVERHEAD: usize = b"data: \n".len();

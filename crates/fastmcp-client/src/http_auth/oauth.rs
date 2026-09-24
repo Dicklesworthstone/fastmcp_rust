@@ -131,6 +131,7 @@ pub struct OAuthClientConfiguration {
     authorization_timeout: Duration,
     max_access_token_lifetime: Duration,
     extra_root_certificates: Vec<Vec<u8>>,
+    resource_tls: Option<crate::http_executor::ResourceTlsTrust>,
 }
 
 impl OAuthClientConfiguration {
@@ -187,6 +188,7 @@ impl OAuthClientConfiguration {
             authorization_timeout: Duration::from_secs(300),
             max_access_token_lifetime: Duration::from_secs(3600),
             extra_root_certificates: Vec::new(),
+            resource_tls: None,
         })
     }
 
@@ -231,6 +233,19 @@ impl OAuthClientConfiguration {
         self.extra_root_certificates.push(der.to_vec());
         Ok(self)
     }
+
+    /// Adds a private CA for this configuration's exact MCP resource. Managed
+    /// sessions retain this trust through login, refresh and protected POSTs.
+    /// It does not grant trust to token endpoints or the host's browser.
+    pub fn with_resource_root_certificate(
+        mut self,
+        certificate: asupersync::tls::Certificate,
+    ) -> Result<Self, OAuthError> {
+        crate::http_executor::ResourceTlsTrust::add_root(
+            &mut self.resource_tls, self.resource.clone(), certificate,
+        ).map_err(|_| OAuthError::InvalidConfiguration)?;
+        Ok(self)
+    }
 }
 
 /// An admitted grant bound to one issuer, registration and MCP resource.
@@ -273,6 +288,11 @@ pub struct OAuthClient {
 impl OAuthClient {
     pub fn new(configuration: OAuthClientConfiguration) -> Self {
         Self { configuration }
+    }
+
+    pub(crate) fn resource_http_executor(&self) -> crate::http_executor::ModernHttpExecutor {
+        crate::http_executor::ModernHttpExecutor::new()
+            .with_resource_tls(self.configuration.resource_tls.clone())
     }
 
     /// Runs a preregistered public-client authorization-code flow.

@@ -16,14 +16,15 @@ use fastmcp_protocol::{
     MAX_MCP_APPS_BRIDGE_IN_FLIGHT, MCP_APPS_HOST_VIEW_PROTOCOL_VERSION, McpAppsBridgeAdmission,
     McpAppsBridgeDirection, McpAppsBridgeError, McpAppsBridgeImplementation,
     McpAppsBridgeLifecycle, McpAppsBridgeRequestId, McpAppsCancelledControlParams,
-    McpAppsControlDisposition, McpAppsDisplayModeParams, McpAppsHostCapabilities,
+    McpAppsContentBlockModalities, McpAppsControlDisposition, McpAppsDisplayMode,
+    McpAppsDisplayModeParams, McpAppsHostCapabilities,
     McpAppsHostContext, McpAppsHostIdAllocator, McpAppsHostNotification, McpAppsHostRequest,
     McpAppsHostResponse, McpAppsHostToView, McpAppsInitializeParams, McpAppsInitializeResult,
     McpAppsJsonRpcEnvelope, McpAppsJsonRpcError, McpAppsJsonRpcRequestId, McpAppsOperationResult,
     McpAppsPinnedHostCapabilities, McpAppsPinnedHostContext, McpAppsPinnedInitializeParams,
     McpAppsPinnedInitializeResult, McpAppsProgressControlParams, McpAppsResourceTeardownParams,
     McpAppsRoutedMethod, McpAppsViewLifecycle, McpAppsViewNotification, McpAppsViewRequest,
-    McpAppsViewResponse, McpAppsViewToHost,
+    McpAppsUpdateModelContextParams, McpAppsViewResponse, McpAppsViewToHost,
 };
 use serde_json::{Value, json};
 
@@ -708,6 +709,46 @@ pub trait McpAppsWireHostPolicy {
         Ok(json!({ "isError": true }))
     }
 
+    /// Reviews and atomically accepts one replacement of this View's model
+    /// context. An empty request explicitly clears the previous context.
+    /// The whole payload's negotiated modalities have been checked before
+    /// this callback runs; its content remains untrusted application data.
+    ///
+    /// Success means the host accepted this replacement. Returning an error
+    /// must leave host state unchanged. The future is dropped if matching View
+    /// cancellation wins, so it must not detach work or leave a partial change.
+    /// The bridge then retains only the last accepted replacement and replies
+    /// with the pinned exact empty success object. No default grants consent.
+    async fn update_model_context(
+        &mut self,
+        _cx: &Cx,
+        _cancellation: &McpRequestCancellation,
+        _params: &McpAppsUpdateModelContextParams,
+    ) -> Result<(), McpAppsHostError> {
+        Err(wire_policy_denied())
+    }
+
+    /// Requests an actual renderer mode change and returns the resulting mode.
+    /// The requested mode has already passed both Host and View negotiation.
+    /// A policy decline may return the unchanged `current` mode. A successful
+    /// callback must report the actual mode, never merely echo an unperformed
+    /// request. The returned mode is checked against the same negotiated set.
+    ///
+    /// Implementations must observe cancellation at their effect boundary and
+    /// make their futures cancellation-correct on drop. The default declines
+    /// the change, preserving a known current mode, or refuses when it is absent.
+    async fn request_display_mode(
+        &mut self,
+        _cx: &Cx,
+        _cancellation: &McpRequestCancellation,
+        _params: McpAppsDisplayModeParams,
+        current: Option<McpAppsDisplayMode>,
+    ) -> Result<McpAppsDisplayModeParams, McpAppsHostError> {
+        current
+            .map(|mode| McpAppsDisplayModeParams { mode })
+            .ok_or_else(wire_policy_denied)
+    }
+
     async fn notification(
         &mut self,
         _method: McpAppsRoutedMethod,
@@ -770,9 +811,58 @@ pub struct McpAppsWireHost<T, P> {
     next_host_id: McpAppsHostIdAllocator,
     configuration: McpAppsWireHostConfiguration,
     policy: P,
+    state: McpAppsWireHostState,
     /// Frames received while an admitted View request is still executing.
     /// They are replayed through normal admission once that request resolves.
     deferred_view_frames: VecDeque<String>,
+}
+
+#[derive(Default)]
+struct McpAppsWireHostState {
+    capabilities: Option<McpAppsPinnedHostCapabilities>,
+    host_context: McpAppsPinnedHostContext,
+    /// Absence leaves mode selection to the Host; a present empty declaration
+    /// permits no mode. The typed initialization model alone loses this fact.
+    view_display_modes: Option<Vec<McpAppsDisplayMode>>,
+    model_context: Option<McpAppsUpdateModelContextParams>,
+}
+
+impl McpAppsWireHostState {
+    fn permits_mode(&self, mode: McpAppsDisplayMode) -> bool {
+        self.host_context.available_display_modes.contains(&mode)
+            && self
+                .view_display_modes
+                .as_ref()
+                .is_none_or(|modes| modes.contains(&mode))
+    }
+}
+
+fn wire_policy_denied() -> McpAppsHostError {
+    McpAppsHostError::Core(McpError::invalid_request("MCP Apps host policy refused the operation"))
+}
+
+fn wire_policy_checkpoint(
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+) -> Result<(), McpAppsHostError> {
+    if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+        return Err(McpAppsHostError::Core(McpError::request_cancelled()));
+    }
+    Ok(())
+}
+
+fn permits_content(
+    modalities: &McpAppsContentBlockModalities,
+    content: &[fastmcp_protocol::ContentBlock],
+) -> bool {
+    use fastmcp_protocol::ContentBlock;
+    content.iter().all(|block| match block {
+        ContentBlock::Text { .. } => modalities.text.is_some(),
+        ContentBlock::Image { .. } => modalities.image.is_some(),
+        ContentBlock::Audio { .. } => modalities.audio.is_some(),
+        ContentBlock::ResourceLink { .. } => modalities.resource_link.is_some(),
+        ContentBlock::Resource { .. } => modalities.resource.is_some(),
+    })
 }
 
 impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T, P> {
@@ -790,6 +880,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             next_host_id: McpAppsHostIdAllocator::default(),
             configuration,
             policy,
+            state: McpAppsWireHostState::default(),
             deferred_view_frames: VecDeque::new(),
         }
     }
@@ -797,6 +888,20 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
     #[must_use]
     pub const fn lifecycle(&self) -> McpAppsBridgeLifecycle {
         self.admission.lifecycle()
+    }
+
+    /// The last context replacement accepted by this View's host policy.
+    /// An accepted empty update is retained as an empty value, not a missing
+    /// update. The slot is cleared when teardown begins and grants no authority.
+    #[must_use]
+    pub fn model_context(&self) -> Option<&McpAppsUpdateModelContextParams> {
+        self.state.model_context.as_ref()
+    }
+
+    /// The actual mode from initialization or the last accepted mode operation.
+    #[must_use]
+    pub const fn display_mode(&self) -> Option<McpAppsDisplayMode> {
+        self.state.host_context.display_mode
     }
 
     /// Receives, decodes, and atomically admits exactly one View frame.
@@ -844,6 +949,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
         let mut execution = Box::pin(Self::dispatch_view_request(
             &mut self.policy,
             &self.configuration,
+            &mut self.state,
             cx,
             &cancellation,
             method,
@@ -859,7 +965,9 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                 Either::Left(result) => {
                     drop(incoming);
                     drop(execution);
-                    let completion = self.finish_view_request(cx, id, method, result).await;
+                    let completion = self
+                        .finish_view_request(cx, id, method, params.as_ref(), result)
+                        .await;
                     return match (completion, deferred_error) {
                         (Err(error), _) => Err(error),
                         (Ok(()), Some(error)) => Err(error),
@@ -919,12 +1027,27 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
         cx: &Cx,
         id: McpAppsJsonRpcRequestId,
         method: McpAppsRoutedMethod,
+        params: Option<&Value>,
         result: Result<Value, McpAppsHostError>,
     ) -> Result<(), McpAppsHostError> {
+        let result = result.and_then(|result| {
+            McpAppsJsonRpcEnvelope::validate_response_for(method, &result)
+                .map_err(McpAppsHostError::Bridge)?;
+            Ok(result)
+        });
         match result {
             Ok(result) => {
-                McpAppsJsonRpcEnvelope::validate_response_for(method, &result)
-                    .map_err(McpAppsHostError::Bridge)?;
+                let initialization = if method == McpAppsRoutedMethod::Initialize {
+                    let response: McpAppsPinnedInitializeResult = decode_params(Some(&result))?;
+                    let request: McpAppsPinnedInitializeParams = decode_params(params)?;
+                    let declared_modes = params
+                        .and_then(|params| params.get("appCapabilities"))
+                        .and_then(|capabilities| capabilities.get("availableDisplayModes"))
+                        .map(|_| request.app_capabilities.available_display_modes);
+                    Some((response, declared_modes))
+                } else {
+                    None
+                };
                 let response = McpAppsJsonRpcEnvelope::Response {
                     id: id.clone(),
                     result: result.clone(),
@@ -938,6 +1061,11 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                 self.admission
                     .complete_response(McpAppsBridgeDirection::ViewToHost, &id, &result)
                     .map_err(McpAppsHostError::Bridge)?;
+                if let Some((response, declared_modes)) = initialization {
+                    self.state.capabilities = Some(response.host_capabilities);
+                    self.state.host_context = response.host_context;
+                    self.state.view_display_modes = declared_modes;
+                }
                 Ok(())
             }
             Err(error) => {
@@ -958,6 +1086,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
     async fn dispatch_view_request(
         policy: &mut P,
         configuration: &McpAppsWireHostConfiguration,
+        state: &mut McpAppsWireHostState,
         cx: &Cx,
         cancellation: &McpRequestCancellation,
         method: McpAppsRoutedMethod,
@@ -970,18 +1099,76 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                     .map_err(|error| McpAppsHostError::Transport(error.to_string()))
             }
             McpAppsRoutedMethod::Ping => Ok(json!({})),
-            McpAppsRoutedMethod::UpdateModelContext => Ok(json!({})),
-            McpAppsRoutedMethod::RequestDisplayMode => params
-                .cloned()
-                .ok_or(McpAppsHostError::Bridge(McpAppsBridgeError::InvalidParams)),
-            McpAppsRoutedMethod::OpenLink
-            | McpAppsRoutedMethod::DownloadFile
-            | McpAppsRoutedMethod::Message => policy.operation(method, params).await,
+            McpAppsRoutedMethod::UpdateModelContext => {
+                let raw = params.ok_or(McpAppsHostError::Bridge(McpAppsBridgeError::InvalidParams))?;
+                if raw.get("content").is_some_and(Value::is_null)
+                    || raw.get("structuredContent").is_some_and(Value::is_null)
+                {
+                    return Err(McpAppsHostError::Bridge(McpAppsBridgeError::InvalidParams));
+                }
+                let params: McpAppsUpdateModelContextParams = decode_params(params)?;
+                let modalities = state.capabilities.as_ref()
+                    .and_then(|capabilities| capabilities.update_model_context.as_ref())
+                    .ok_or_else(wire_policy_denied)?;
+                if !permits_content(modalities, params.content.as_deref().unwrap_or(&[]))
+                    || (params.structured_content.is_some() && modalities.structured_content.is_none())
+                {
+                    return Err(wire_policy_denied());
+                }
+                wire_policy_checkpoint(cx, cancellation)?;
+                policy.update_model_context(cx, cancellation, &params).await?;
+                // Callback success is the effect commit. Retain its accepted
+                // value even if subsequent response delivery fails; a failed
+                // send cannot undo a host effect or authorize its replay.
+                state.model_context = Some(params);
+                Ok(json!({}))
+            }
+            McpAppsRoutedMethod::RequestDisplayMode => {
+                let params: McpAppsDisplayModeParams = decode_params(params)?;
+                if !state.permits_mode(params.mode) { return Err(wire_policy_denied()); }
+                wire_policy_checkpoint(cx, cancellation)?;
+                let result = policy.request_display_mode(
+                    cx, cancellation, params, state.host_context.display_mode,
+                ).await?;
+                if !state.permits_mode(result.mode) { return Err(wire_policy_denied()); }
+                state.host_context.display_mode = Some(result.mode);
+                encode_wire_host_request_params(result)
+            }
+            McpAppsRoutedMethod::OpenLink | McpAppsRoutedMethod::DownloadFile => {
+                let capabilities = state.capabilities.as_ref().ok_or_else(wire_policy_denied)?;
+                let permitted = if method == McpAppsRoutedMethod::OpenLink {
+                    capabilities.open_links.is_some()
+                } else {
+                    capabilities.download_file.is_some()
+                };
+                if !permitted { return Err(wire_policy_denied()); }
+                wire_policy_checkpoint(cx, cancellation)?;
+                policy.operation(method, params).await
+            }
+            McpAppsRoutedMethod::Message => {
+                let request: fastmcp_protocol::McpAppsMessageParams = decode_params(params)?;
+                let modalities = state.capabilities.as_ref()
+                    .and_then(|capabilities| capabilities.message.as_ref())
+                    .ok_or_else(wire_policy_denied)?;
+                if !permits_content(modalities, &request.content) { return Err(wire_policy_denied()); }
+                wire_policy_checkpoint(cx, cancellation)?;
+                policy.operation(method, params).await
+            }
             method @ (McpAppsRoutedMethod::ToolsCall
             | McpAppsRoutedMethod::ResourcesRead
             | McpAppsRoutedMethod::ResourcesList
             | McpAppsRoutedMethod::ResourceTemplatesList
             | McpAppsRoutedMethod::PromptsList) => {
+                if method != McpAppsRoutedMethod::PromptsList {
+                    let capabilities = state.capabilities.as_ref().ok_or_else(wire_policy_denied)?;
+                    let permitted = if method == McpAppsRoutedMethod::ToolsCall {
+                        capabilities.server_tools.is_some()
+                    } else {
+                        capabilities.server_resources.is_some()
+                    };
+                    if !permitted { return Err(wire_policy_denied()); }
+                }
+                wire_policy_checkpoint(cx, cancellation)?;
                 policy
                     .dispatch_reused_request(cx, cancellation, method, params.cloned())
                     .await
@@ -1141,6 +1328,25 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             ));
         }
         let (method, params) = wire_host_notification_parts(notification)?;
+        let merged_context = if method == McpAppsRoutedMethod::HostContextChanged {
+            let mut merged = serde_json::to_value(&self.state.host_context)
+                .map_err(|_| McpAppsHostError::Bridge(McpAppsBridgeError::InvalidParams))?;
+            let additions = params.as_ref().and_then(Value::as_object)
+                .ok_or(McpAppsHostError::Bridge(McpAppsBridgeError::InvalidParams))?;
+            let target = merged.as_object_mut()
+                .ok_or(McpAppsHostError::Bridge(McpAppsBridgeError::InvalidParams))?;
+            target.extend(additions.iter().map(|(key, value)| (key.clone(), value.clone())));
+            // Validate the bounded complete retained state, not only the
+            // smaller outgoing patch. Omitted fields keep their old values.
+            McpAppsJsonRpcEnvelope::Notification {
+                method,
+                params: Some(merged.clone()),
+            }.encode(McpAppsBridgeDirection::HostToView)
+                .map_err(McpAppsHostError::Bridge)?;
+            Some(decode_params::<McpAppsPinnedHostContext>(Some(&merged))?)
+        } else {
+            None
+        };
         let control = match method {
             McpAppsRoutedMethod::Progress | McpAppsRoutedMethod::Cancelled => Some(
                 self.admission
@@ -1151,6 +1357,9 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
         };
         self.send_envelope(cx, McpAppsJsonRpcEnvelope::Notification { method, params })
             .await?;
+        if let Some(context) = merged_context {
+            self.state.host_context = context;
+        }
         if let (
             McpAppsRoutedMethod::Cancelled,
             Some(McpAppsControlDisposition::Bound(request_id)),
@@ -1198,6 +1407,8 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             self.admission
                 .rollback_teardown()
                 .map_err(McpAppsHostError::Bridge)?;
+        } else {
+            self.state.model_context = None;
         }
         sent
     }
@@ -2149,9 +2360,428 @@ mod tests {
     fn wire_configuration() -> McpAppsWireHostConfiguration {
         McpAppsWireHostConfiguration {
             host_info: app(),
-            host_capabilities: McpAppsPinnedHostCapabilities::default(),
+            host_capabilities: McpAppsPinnedHostCapabilities {
+                server_tools: Some(fastmcp_protocol::McpAppsServerToolsCapability::default()),
+                server_resources: Some(fastmcp_protocol::McpAppsServerResourcesCapability::default()),
+                ..McpAppsPinnedHostCapabilities::default()
+            },
             host_context: McpAppsPinnedHostContext::default(),
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ContextDecision { Accept, Refuse, YieldOnce }
+
+    struct StateRecordingWirePolicy {
+        changes: Arc<Mutex<Vec<Value>>>,
+        entries: Arc<std::sync::atomic::AtomicUsize>,
+        context: ContextDecision,
+        display_result: Option<McpAppsDisplayMode>,
+        advertised: Option<McpAppsPinnedHostCapabilities>,
+    }
+
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "the public policy callbacks are async even for immediate test decisions"
+    )]
+    impl McpAppsWireHostPolicy for StateRecordingWirePolicy {
+        async fn initialize(
+            &mut self,
+            _params: &McpAppsPinnedInitializeParams,
+            configuration: &McpAppsWireHostConfiguration,
+        ) -> McpAppsPinnedInitializeResult {
+            let mut response = configuration.initialize_result();
+            if let Some(capabilities) = &self.advertised {
+                response.host_capabilities = capabilities.clone();
+            }
+            response
+        }
+
+        async fn update_model_context(
+            &mut self,
+            _cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: &McpAppsUpdateModelContextParams,
+        ) -> Result<(), McpAppsHostError> {
+            self.entries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.context {
+                ContextDecision::Refuse => return Err(wire_policy_denied()),
+                ContextDecision::YieldOnce => {
+                    let mut yielded = false;
+                    std::future::poll_fn(|task| {
+                        if yielded {
+                            std::task::Poll::Ready(())
+                        } else {
+                            yielded = true;
+                            task.waker().wake_by_ref();
+                            std::task::Poll::Pending
+                        }
+                    }).await;
+                }
+                ContextDecision::Accept => {}
+            }
+            if cancellation.is_cancel_requested() {
+                return Err(McpAppsHostError::Core(McpError::request_cancelled()));
+            }
+            self.changes.lock().unwrap().push(json!({"context": params}));
+            Ok(())
+        }
+
+        async fn request_display_mode(
+            &mut self,
+            _cx: &Cx,
+            _cancellation: &McpRequestCancellation,
+            params: McpAppsDisplayModeParams,
+            current: Option<McpAppsDisplayMode>,
+        ) -> Result<McpAppsDisplayModeParams, McpAppsHostError> {
+            self.entries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.changes.lock().unwrap().push(json!({"requested": params.mode, "current": current}));
+            Ok(McpAppsDisplayModeParams { mode: self.display_result.unwrap_or(params.mode) })
+        }
+
+        async fn operation(
+            &mut self,
+            _method: McpAppsRoutedMethod,
+            params: Option<&Value>,
+        ) -> Result<Value, McpAppsHostError> {
+            self.entries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.changes.lock().unwrap().push(json!({"operation": params}));
+            Ok(json!({}))
+        }
+
+        async fn dispatch_reused_request(
+            &mut self,
+            _cx: &Cx,
+            _cancellation: &McpRequestCancellation,
+            _method: McpAppsRoutedMethod,
+            params: Option<Value>,
+        ) -> Result<Value, McpAppsHostError> {
+            self.entries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.changes.lock().unwrap().push(json!({"forwarded": params}));
+            Ok(json!({"forwarded": true}))
+        }
+    }
+
+    fn state_recording_policy() -> StateRecordingWirePolicy {
+        StateRecordingWirePolicy {
+            changes: Arc::new(Mutex::new(Vec::new())),
+            entries: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            context: ContextDecision::Accept,
+            display_result: None,
+            advertised: None,
+        }
+    }
+
+    fn stateful_wire_configuration() -> McpAppsWireHostConfiguration {
+        McpAppsWireHostConfiguration {
+            host_info: app(),
+            host_capabilities: serde_json::from_value(json!({
+                "updateModelContext": {"text": {}, "image": {}, "structuredContent": {}},
+                "message": {"text": {}},
+                "openLinks": {}, "downloadFile": {},
+                "serverTools": {}, "serverResources": {}
+            })).unwrap(),
+            host_context: serde_json::from_value(json!({
+                "displayMode": "inline", "availableDisplayModes": ["inline", "fullscreen", "pip"],
+                "locale": "en-US"
+            })).unwrap(),
+        }
+    }
+
+    async fn activate_stateful_wire_host<T, P>(
+        host: &mut McpAppsWireHost<T, P>,
+        view: &mut McpAppsInMemoryWireViewTransport,
+        cx: &Cx,
+        view_modes: Option<Value>,
+    ) where T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy {
+        let mut capabilities = json!({});
+        if let Some(modes) = view_modes { capabilities["availableDisplayModes"] = modes; }
+        view.send_to_host(cx, json!({
+            "jsonrpc": "2.0", "id": "initialize", "method": "ui/initialize",
+            "params": {"appInfo": {"name": "view", "version": "1"},
+                "appCapabilities": capabilities,
+                "protocolVersion": MCP_APPS_HOST_VIEW_PROTOCOL_VERSION}
+        }).to_string()).await.unwrap();
+        host.process_next(cx).await.unwrap();
+        let response: Value = serde_json::from_str(&view.receive_from_host(cx).await.unwrap()).unwrap();
+        assert!(response.get("result").is_some(), "{response}");
+        view.send_to_host(cx, json!({
+            "jsonrpc": "2.0", "method": "ui/notifications/initialized"
+        }).to_string()).await.unwrap();
+        host.process_next(cx).await.unwrap();
+        assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+    }
+
+    async fn stateful_wire_request<T, P>(
+        host: &mut McpAppsWireHost<T, P>,
+        view: &mut McpAppsInMemoryWireViewTransport,
+        cx: &Cx,
+        id: &str,
+        method: &str,
+        params: Value,
+    ) -> Value where T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy {
+        view.send_to_host(cx, json!({
+            "jsonrpc": "2.0", "id": id, "method": method, "params": params
+        }).to_string()).await.unwrap();
+        host.process_next(cx).await.unwrap();
+        let response: Value = serde_json::from_str(&view.receive_from_host(cx).await.unwrap()).unwrap();
+        assert_eq!(response["id"], id);
+        response
+    }
+
+    #[test]
+    fn closed_wire_context_policy_commits_replacements_clearing_and_denial() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+            let mut host = McpAppsWireHost::new_negotiated(
+                transport, stateful_wire_configuration(), state_recording_policy(), activation_proof(),
+            );
+            activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+            let replacement = json!({"content": [
+                {"type": "text", "text": "a selected region"},
+                {"type": "image", "data": "YQ==", "mimeType": "image/png"}
+            ], "structuredContent": {"selected": [1, 2]}});
+            for (index, value) in [replacement.clone(), json!({"content": []}), json!({})].into_iter().enumerate() {
+                let response = stateful_wire_request(
+                    &mut host, &mut view, &cx, &format!("context-{index}"),
+                    "ui/update-model-context", value.clone(),
+                ).await;
+                assert_eq!(response["result"], json!({}));
+                assert_eq!(serde_json::to_value(host.model_context().unwrap()).unwrap(), value);
+                assert_eq!(host.policy.changes.lock().unwrap().last(), Some(&json!({"context": value})));
+            }
+            assert_eq!(host.policy.changes.lock().unwrap().len(), 3);
+            for invalid in [json!({"content": null}), json!({"structuredContent": null})] {
+                let response = stateful_wire_request(
+                    &mut host, &mut view, &cx, "invalid-null", "ui/update-model-context", invalid,
+                ).await;
+                assert!(response.get("error").is_some());
+                assert_eq!(serde_json::to_value(host.model_context().unwrap()).unwrap(), json!({}));
+                assert_eq!(host.policy.entries.load(std::sync::atomic::Ordering::SeqCst), 3);
+                assert_eq!(host.policy.changes.lock().unwrap().len(), 3);
+            }
+            host.policy.context = ContextDecision::Refuse;
+            let response = stateful_wire_request(
+                &mut host, &mut view, &cx, "refused", "ui/update-model-context", replacement,
+            ).await;
+            assert!(response.get("error").is_some());
+            assert_eq!(serde_json::to_value(host.model_context().unwrap()).unwrap(), json!({}));
+            assert_eq!(host.policy.changes.lock().unwrap().len(), 3);
+            assert_eq!(host.policy.entries.load(std::sync::atomic::Ordering::SeqCst), 4);
+            host.begin_teardown(&cx).await.unwrap();
+            assert!(host.model_context().is_none());
+        });
+    }
+
+    #[test]
+    fn closed_wire_context_admission_uses_committed_capabilities_before_any_host_effect() {
+        block_on(async {
+            for missing in [None, Some("method"), Some("text"), Some("image"), Some("structuredContent")] {
+                let cx = Cx::for_testing();
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+                let configuration = stateful_wire_configuration();
+                let mut advertised = serde_json::to_value(&configuration.host_capabilities).unwrap();
+                if let Some(missing) = missing {
+                    if missing == "method" {
+                        advertised.as_object_mut().unwrap().remove("updateModelContext");
+                    } else {
+                        advertised["updateModelContext"].as_object_mut().unwrap().remove(missing);
+                    }
+                }
+                let mut policy = state_recording_policy();
+                policy.advertised = Some(serde_json::from_value(advertised).unwrap());
+                let mut host = McpAppsWireHost::new_negotiated(transport, configuration, policy, activation_proof());
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                let response = stateful_wire_request(&mut host, &mut view, &cx, "mixed",
+                    "ui/update-model-context", json!({"content": [
+                        {"type": "text", "text": "first allowed block"},
+                        {"type": "image", "data": "YQ==", "mimeType": "image/png"}
+                    ], "structuredContent": {}}),
+                ).await;
+                let admitted = missing.is_none();
+                assert_eq!(response.get("result").is_some(), admitted, "{missing:?}: {response}");
+                assert_eq!(host.model_context().is_some(), admitted);
+                assert_eq!(host.policy.entries.load(std::sync::atomic::Ordering::SeqCst), usize::from(admitted));
+                assert_eq!(host.policy.changes.lock().unwrap().len(), usize::from(admitted));
+            }
+        });
+    }
+
+    #[test]
+    fn closed_wire_default_policy_refuses_context_and_returns_unchanged_display_mode() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+            let mut host = McpAppsWireHost::new_negotiated(
+                transport, stateful_wire_configuration(), WirePolicy, activation_proof(),
+            );
+            activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+            let response = stateful_wire_request(&mut host, &mut view, &cx, "context",
+                "ui/update-model-context", json!({"content": [{"type": "text", "text": "unapproved"}]}),
+            ).await;
+            assert!(response.get("error").is_some());
+            assert!(host.model_context().is_none());
+            let response = stateful_wire_request(&mut host, &mut view, &cx, "display",
+                "ui/request-display-mode", json!({"mode": "fullscreen"}),
+            ).await;
+            assert_eq!(response["result"], json!({"mode": "inline"}));
+            assert_eq!(host.display_mode(), Some(McpAppsDisplayMode::Inline));
+        });
+    }
+
+    #[test]
+    fn closed_wire_display_policy_returns_actual_mode_and_enforces_both_negotiated_sets() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+            let mut host = McpAppsWireHost::new_negotiated(
+                transport, stateful_wire_configuration(), state_recording_policy(), activation_proof(),
+            );
+            activate_stateful_wire_host(&mut host, &mut view, &cx, Some(json!(["inline", "fullscreen"]))).await;
+            let response = stateful_wire_request(&mut host, &mut view, &cx, "display",
+                "ui/request-display-mode", json!({"mode": "fullscreen"}),
+            ).await;
+            assert_eq!(response["result"], json!({"mode": "fullscreen"}));
+            assert_eq!(host.display_mode(), Some(McpAppsDisplayMode::Fullscreen));
+            assert_eq!(host.policy.changes.lock().unwrap().as_slice(), &[json!({"requested": "fullscreen", "current": "inline"})]);
+
+            let response = stateful_wire_request(&mut host, &mut view, &cx, "view-excluded",
+                "ui/request-display-mode", json!({"mode": "pip"}),
+            ).await;
+            assert!(response.get("error").is_some());
+            assert_eq!(host.policy.entries.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(host.display_mode(), Some(McpAppsDisplayMode::Fullscreen));
+
+            host.policy.display_result = Some(McpAppsDisplayMode::Pip);
+            let response = stateful_wire_request(&mut host, &mut view, &cx, "bad-host-result",
+                "ui/request-display-mode", json!({"mode": "inline"}),
+            ).await;
+            assert!(response.get("error").is_some());
+            assert_eq!(host.display_mode(), Some(McpAppsDisplayMode::Fullscreen));
+            // The rejected result retires its correlation instead of stranding
+            // the request ID and poisoning later permitted requests.
+            host.policy.display_result = None;
+            let response = stateful_wire_request(&mut host, &mut view, &cx, "bad-host-result",
+                "ui/request-display-mode", json!({"mode": "inline"}),
+            ).await;
+            assert_eq!(response["result"], json!({"mode": "inline"}));
+        });
+    }
+
+    #[test]
+    fn closed_wire_context_request_cancellation_suppresses_only_its_owned_effect() {
+        block_on(async {
+            for matching in [true, false] {
+                let cx = Cx::for_testing();
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+                let mut policy = state_recording_policy();
+                policy.context = ContextDecision::YieldOnce;
+                let mut host = McpAppsWireHost::new_negotiated(
+                    transport, stateful_wire_configuration(), policy, activation_proof(),
+                );
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                view.send_to_host(&cx, json!({"jsonrpc": "2.0", "id": "context", "method": "ui/update-model-context",
+                    "params": {"content": [{"type": "text", "text": "pending"}]}}).to_string()).await.unwrap();
+                view.send_to_host(&cx, json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                    "params": {"requestId": if matching { "context" } else { "other" }}}).to_string()).await.unwrap();
+                let outcome = host.process_next(&cx).await;
+                if matching {
+                    outcome.unwrap();
+                    assert!(host.model_context().is_none());
+                    assert!(host.policy.changes.lock().unwrap().is_empty());
+                } else {
+                    assert!(matches!(outcome, Err(McpAppsHostError::Bridge(McpAppsBridgeError::UnknownCorrelation))));
+                    assert!(host.model_context().is_some());
+                    assert_eq!(host.policy.changes.lock().unwrap().len(), 1);
+                    let response: Value = serde_json::from_str(&view.receive_from_host(&cx).await.unwrap()).unwrap();
+                    assert_eq!(response["id"], "context");
+                    assert_eq!(response["result"], json!({}));
+                }
+                let response = stateful_wire_request(&mut host, &mut view, &cx, "later", "ping", json!({})).await;
+                assert_eq!(response["result"], json!({}));
+            }
+        });
+    }
+
+    struct FailableWireTransport {
+        inner: McpAppsInMemoryWireHostTransport,
+        fail: bool,
+    }
+
+    impl McpAppsWireBridgeTransport for FailableWireTransport {
+        async fn send_to_view(&mut self, cx: &Cx, frame: String) -> Result<(), McpAppsHostError> {
+            if self.fail { return Err(McpAppsHostError::Transport("test send failed".into())); }
+            self.inner.send_to_view(cx, frame).await
+        }
+
+        async fn receive_from_view(&mut self, cx: &Cx) -> Result<String, McpAppsHostError> {
+            self.inner.receive_from_view(cx).await
+        }
+    }
+
+    #[test]
+    fn closed_wire_host_context_notification_commits_partial_state_only_after_send() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+            let mut host = McpAppsWireHost::new_negotiated(
+                FailableWireTransport { inner: transport, fail: false },
+                stateful_wire_configuration(), WirePolicy, activation_proof(),
+            );
+            activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+            let notification = McpAppsHostNotification::HostContextChanged(McpAppsHostContext {
+                display_mode: Some(McpAppsDisplayMode::Fullscreen),
+                available_display_modes: vec![McpAppsDisplayMode::Fullscreen, McpAppsDisplayMode::Pip],
+                locale: None,
+            });
+            host.transport.fail = true;
+            assert!(host.send_notification(&cx, notification.clone()).await.is_err());
+            assert_eq!(host.display_mode(), Some(McpAppsDisplayMode::Inline));
+            assert!(host.state.permits_mode(McpAppsDisplayMode::Inline));
+            host.transport.fail = false;
+            host.send_notification(&cx, notification).await.unwrap();
+            let _ = view.receive_from_host(&cx).await.unwrap();
+            assert_eq!(host.display_mode(), Some(McpAppsDisplayMode::Fullscreen));
+            assert_eq!(host.state.host_context.locale.as_deref(), Some("en-US"));
+            let response = stateful_wire_request(&mut host, &mut view, &cx, "declined",
+                "ui/request-display-mode", json!({"mode": "pip"}),
+            ).await;
+            assert_eq!(response["result"], json!({"mode": "fullscreen"}));
+            let response = stateful_wire_request(&mut host, &mut view, &cx, "withdrawn",
+                "ui/request-display-mode", json!({"mode": "inline"}),
+            ).await;
+            assert!(response.get("error").is_some());
+            assert_eq!(host.display_mode(), Some(McpAppsDisplayMode::Fullscreen));
+        });
+    }
+
+    #[test]
+    fn closed_wire_effect_and_forwarding_capabilities_refuse_before_callback() {
+        block_on(async {
+            for (capability, method, params) in [
+                ("openLinks", "ui/open-link", json!({"url": "https://example.com/"})),
+                ("message", "ui/message", json!({"role": "user", "content": [{"type": "text", "text": "hello"}]})),
+                ("serverTools", "tools/call", json!({"name": "weather", "arguments": {}})),
+                ("serverResources", "resources/list", json!({})),
+            ] {
+                for permitted in [true, false] {
+                    let cx = Cx::for_testing();
+                    let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+                    let configuration = stateful_wire_configuration();
+                    let mut advertised = serde_json::to_value(&configuration.host_capabilities).unwrap();
+                    if !permitted { advertised.as_object_mut().unwrap().remove(capability); }
+                    let mut policy = state_recording_policy();
+                    policy.advertised = Some(serde_json::from_value(advertised).unwrap());
+                    let mut host = McpAppsWireHost::new_negotiated(transport, configuration, policy, activation_proof());
+                    activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                    let response = stateful_wire_request(&mut host, &mut view, &cx, "operation", method, params.clone()).await;
+                    assert_eq!(response.get("result").is_some(), permitted, "{method}: {response}");
+                    assert_eq!(host.policy.entries.load(std::sync::atomic::Ordering::SeqCst), usize::from(permitted));
+                    assert_eq!(host.policy.changes.lock().unwrap().len(), usize::from(permitted));
+                }
+            }
+        });
     }
 
     #[test]

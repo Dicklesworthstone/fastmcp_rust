@@ -11565,6 +11565,32 @@ impl HttpClient {
         ))
     }
 
+    /// Starts a closed JSON-RPC Apps bridge with an explicit embedder policy.
+    /// The current connection must have negotiated Apps. The policy owns model
+    /// context, renderer operations, and fresh core forwarding; no effect is
+    /// supplied or authorized by constructing this host.
+    #[cfg(feature = "apps")]
+    pub fn mcp_apps_wire_host_with_policy<T, P>(
+        &self,
+        transport: T,
+        configuration: mcp_apps::McpAppsWireHostConfiguration,
+        policy: P,
+    ) -> Result<mcp_apps::McpAppsWireHost<T, P>, McpAppsHostError>
+    where
+        T: mcp_apps::McpAppsWireBridgeTransport,
+        P: mcp_apps::McpAppsWireHostPolicy,
+    {
+        let activation_receipt = self.current_mcp_apps_activation_receipt();
+        let activation_proof =
+            mcp_apps::McpAppsActivationProof::from_activation_receipt(activation_receipt.as_ref())?;
+        Ok(mcp_apps::McpAppsWireHost::new_negotiated(
+            transport,
+            configuration,
+            policy,
+            activation_proof,
+        ))
+    }
+
     /// Starts the closed JSON-RPC Apps bridge on this ready modern HTTP
     /// connection. Reused View methods allocate fresh HTTP core request IDs.
     #[cfg(feature = "apps")]
@@ -15329,6 +15355,32 @@ impl Client {
             self.session.mcp_apps_activation_receipt(),
         )?;
         Ok(McpAppsHost::new_negotiated(
+            transport,
+            configuration,
+            policy,
+            activation_proof,
+        ))
+    }
+
+    /// Starts a closed JSON-RPC Apps bridge with an explicit embedder policy.
+    /// The current connection must have negotiated Apps. The policy owns model
+    /// context, renderer operations, and fresh core forwarding; no effect is
+    /// supplied or authorized by constructing this host.
+    #[cfg(feature = "apps")]
+    pub fn mcp_apps_wire_host_with_policy<T, P>(
+        &self,
+        transport: T,
+        configuration: mcp_apps::McpAppsWireHostConfiguration,
+        policy: P,
+    ) -> Result<mcp_apps::McpAppsWireHost<T, P>, McpAppsHostError>
+    where
+        T: mcp_apps::McpAppsWireBridgeTransport,
+        P: mcp_apps::McpAppsWireHostPolicy,
+    {
+        let activation_proof = mcp_apps::McpAppsActivationProof::from_activation_receipt(
+            self.session.mcp_apps_activation_receipt(),
+        )?;
+        Ok(mcp_apps::McpAppsWireHost::new_negotiated(
             transport,
             configuration,
             policy,
@@ -30427,6 +30479,87 @@ mod tests {
 
     #[cfg(all(unix, feature = "apps"))]
     #[test]
+    fn public_mcp_apps_custom_wire_policy_requires_activation_and_receives_context() {
+        struct ContextPolicy(std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
+
+        #[allow(
+            clippy::unused_async_trait_impl,
+            reason = "the public wire policy uses async callbacks for immediate host decisions"
+        )]
+        impl mcp_apps::McpAppsWireHostPolicy for ContextPolicy {
+            async fn update_model_context(
+                &mut self,
+                _cx: &Cx,
+                _cancellation: &McpRequestCancellation,
+                params: &fastmcp_protocol::McpAppsUpdateModelContextParams,
+            ) -> Result<(), McpAppsHostError> {
+                self.0.lock().unwrap().push(serde_json::to_value(params).unwrap());
+                Ok(())
+            }
+
+            async fn dispatch_reused_request(
+                &mut self,
+                _cx: &Cx,
+                _cancellation: &McpRequestCancellation,
+                _method: fastmcp_protocol::McpAppsRoutedMethod,
+                _params: Option<serde_json::Value>,
+            ) -> Result<serde_json::Value, McpAppsHostError> {
+                Err(McpAppsHostError::Core(McpError::invalid_request("test refuses forwarding")))
+            }
+        }
+
+        let mut client = make_shell_scripted_initialized_client_for_version(
+            "exec sleep 2", Duration::from_secs(2), MODERN_PROTOCOL_VERSION,
+        );
+        let contexts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let configuration = mcp_apps::McpAppsWireHostConfiguration {
+            host_info: fastmcp_protocol::McpAppsBridgeImplementation {
+                name: "custom-policy-host".to_owned(), version: "1".to_owned(),
+            },
+            host_capabilities: serde_json::from_value(serde_json::json!({
+                "updateModelContext": {"text": {}}
+            })).unwrap(),
+            host_context: fastmcp_protocol::McpAppsPinnedHostContext::default(),
+        };
+        let (transport, _unnegotiated_view) = mcp_apps::mcp_apps_in_memory_wire_pair(4);
+        assert!(matches!(client.mcp_apps_wire_host_with_policy(
+            transport, configuration.clone(), ContextPolicy(std::sync::Arc::clone(&contexts)),
+        ), Err(McpAppsHostError::NotNegotiated)));
+        assert!(contexts.lock().unwrap().is_empty());
+        install_test_mcp_apps_activation(&mut client);
+        let (transport, mut view) = mcp_apps::mcp_apps_in_memory_wire_pair(4);
+        let mut host = client.mcp_apps_wire_host_with_policy(
+            transport, configuration, ContextPolicy(std::sync::Arc::clone(&contexts)),
+        ).expect("the public custom policy factory retains the negotiated activation proof");
+        let cx = Cx::for_testing();
+        block_on(async {
+            view.send_to_host(&cx, serde_json::json!({
+                "jsonrpc": "2.0", "id": "initialize", "method": "ui/initialize",
+                "params": {"appInfo": {"name": "view", "version": "1"},
+                    "appCapabilities": {}, "protocolVersion": fastmcp_protocol::MCP_APPS_HOST_VIEW_PROTOCOL_VERSION}
+            }).to_string()).await.unwrap();
+            host.process_next(&cx).await.unwrap();
+            let _ = view.receive_from_host(&cx).await.unwrap();
+            view.send_to_host(&cx, serde_json::json!({
+                "jsonrpc": "2.0", "method": "ui/notifications/initialized"
+            }).to_string()).await.unwrap();
+            host.process_next(&cx).await.unwrap();
+            let replacement = serde_json::json!({"content": [{"type": "text", "text": "host-visible selection"}]});
+            view.send_to_host(&cx, serde_json::json!({
+                "jsonrpc": "2.0", "id": "context", "method": "ui/update-model-context", "params": replacement
+            }).to_string()).await.unwrap();
+            host.process_next(&cx).await.unwrap();
+            let response: serde_json::Value = serde_json::from_str(&view.receive_from_host(&cx).await.unwrap()).unwrap();
+            assert_eq!(response["id"], "context");
+            assert_eq!(response["result"], serde_json::json!({}));
+            assert_eq!(contexts.lock().unwrap().as_slice(), &[replacement]);
+        });
+        drop(host);
+        client.close().expect("custom Apps policy client cleanup");
+    }
+
+    #[cfg(all(unix, feature = "apps"))]
+    #[test]
     fn public_mcp_apps_stdio_policy_cancellation_reaches_its_real_upstream_request() {
         let script = "IFS= read -r request; \\
             case \"$request\" in *'\"method\":\"tools/call\"'*'\"id\":2'*) request_ok=true;; *) request_ok=false;; esac; \\
@@ -30449,7 +30582,10 @@ mod tests {
                 name: "stdio-real-policy-host".to_owned(),
                 version: "1.0.0".to_owned(),
             },
-            host_capabilities: fastmcp_protocol::McpAppsPinnedHostCapabilities::default(),
+            host_capabilities: fastmcp_protocol::McpAppsPinnedHostCapabilities {
+                server_tools: Some(fastmcp_protocol::McpAppsServerToolsCapability::default()),
+                ..fastmcp_protocol::McpAppsPinnedHostCapabilities::default()
+            },
             host_context: fastmcp_protocol::McpAppsPinnedHostContext::default(),
         };
         let mut host = client
@@ -30543,7 +30679,10 @@ mod tests {
                 name: "stdio-real-policy-wrong-id-host".to_owned(),
                 version: "1.0.0".to_owned(),
             },
-            host_capabilities: fastmcp_protocol::McpAppsPinnedHostCapabilities::default(),
+            host_capabilities: fastmcp_protocol::McpAppsPinnedHostCapabilities {
+                server_tools: Some(fastmcp_protocol::McpAppsServerToolsCapability::default()),
+                ..fastmcp_protocol::McpAppsPinnedHostCapabilities::default()
+            },
             host_context: fastmcp_protocol::McpAppsPinnedHostContext::default(),
         };
         let mut host = client
@@ -30741,7 +30880,10 @@ mod tests {
                 name: "http-real-policy-host".to_owned(),
                 version: "1.0.0".to_owned(),
             },
-            host_capabilities: fastmcp_protocol::McpAppsPinnedHostCapabilities::default(),
+            host_capabilities: fastmcp_protocol::McpAppsPinnedHostCapabilities {
+                server_tools: Some(fastmcp_protocol::McpAppsServerToolsCapability::default()),
+                ..fastmcp_protocol::McpAppsPinnedHostCapabilities::default()
+            },
             host_context: fastmcp_protocol::McpAppsPinnedHostContext::default(),
         };
         let mut host = client
@@ -30940,7 +31082,10 @@ mod tests {
                 name: "http-real-policy-wrong-id-host".to_owned(),
                 version: "1.0.0".to_owned(),
             },
-            host_capabilities: fastmcp_protocol::McpAppsPinnedHostCapabilities::default(),
+            host_capabilities: fastmcp_protocol::McpAppsPinnedHostCapabilities {
+                server_tools: Some(fastmcp_protocol::McpAppsServerToolsCapability::default()),
+                ..fastmcp_protocol::McpAppsPinnedHostCapabilities::default()
+            },
             host_context: fastmcp_protocol::McpAppsPinnedHostContext::default(),
         };
         let mut host = client

@@ -27,8 +27,9 @@ use fastmcp_client::http_auth::discovery::issuer::{IssuerMetadataCause, IssuerMe
 use fastmcp_client::http_auth::discovery::registration::{
     NativeClientRegistration, OAuthRegistrationError, NATIVE_REGISTRATION_REDIRECT_URIS,
 };
-use fastmcp_client::http_auth::managed::OAuthSessionPolicy;
-use fastmcp_client::http_auth::oauth::OAuthError;
+use fastmcp_client::http_auth::managed::{ManagedOAuthSession, OAuthSessionError, OAuthSessionPolicy};
+use fastmcp_client::http_auth::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError};
+use fastmcp_client::http_executor::{ModernHttpExecutor, ModernHttpExecutorError, ModernHttpRequest};
 use fastmcp_core::CanonicalHttpUrl;
 use serde_json::{Value, json};
 
@@ -316,7 +317,7 @@ async fn callback_for_client(
 }
 
 #[test]
-fn public_discovery_fallbacks_feed_the_actual_managed_pkce_login() {
+fn public_discovery_fallbacks_feed_managed_pkce_login_and_private_resource_post() {
     run(async {
         let cx = Cx::current().unwrap();
         let peer = Peer::new().await;
@@ -339,6 +340,11 @@ fn public_discovery_fallbacks_feed_the_actual_managed_pkce_login() {
             reply(&mut tls, 200,
                 r#"{"access_token":"discovered-access","token_type":"Bearer","expires_in":300,"refresh_token":"discovered-refresh","scope":"tools:read"}"#,
             ).await;
+            let (mut tls, body) = peer.request_with_authorization(
+                "POST", "/mcp", Some("Bearer discovered-access"),
+            ).await;
+            assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["method"], "tools/list");
+            reply(&mut tls, 200, r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#).await;
         };
         let application = async {
             let session = plan.authorize_managed(&cx, OAuthSessionPolicy::default(), |authorization| {
@@ -348,11 +354,171 @@ fn public_discovery_fallbacks_feed_the_actual_managed_pkce_login() {
             let snapshot = session.credential(&cx).await.unwrap();
             assert_eq!(snapshot.generation(), 1);
             assert_eq!(snapshot.credential().authorization_for_target(&url(&resource)), Some("Bearer discovered-access".to_owned()));
+            let request = ModernHttpRequest::new(
+                resource.clone(),
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#.to_vec(),
+                "2026-07-28", "tools/list", None,
+            ).unwrap();
+            let response = session.clone().execute(&cx, &request).await.unwrap();
+            assert_eq!(response.credential_generation(), 1);
+            let body = response.read_to_end(&cx, 4096).await.unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["result"]["tools"], json!([]));
             session.close();
         };
         Box::pin(pair(server, application)).await;
         assert_eq!(launches.load(Ordering::SeqCst), 1);
-        assert_eq!(peer.paths.lock().unwrap().len(), 5);
+        assert_eq!(peer.paths.lock().unwrap().len(), 6);
+        peer.assert_no_extra_connections();
+    });
+}
+
+#[test]
+fn private_resource_trust_executes_only_the_exact_https_endpoint() {
+    run(async {
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
+        let other = Peer::new().await;
+        let resource = url(&peer.resource());
+        let executor = ModernHttpExecutor::new()
+            .with_resource_root_certificate(resource.clone(), root()).unwrap();
+        let request = |target: String| ModernHttpRequest::new(
+            target, b"{}".to_vec(), "2026-07-28", "tools/list", None,
+        ).unwrap();
+        let server = async {
+            for _ in 0..2 {
+                let (mut tls, body) = peer.request("POST", "/mcp").await;
+                assert_eq!(body, b"{}");
+                reply(&mut tls, 200, "{}").await;
+            }
+        };
+        let application = async {
+            for target in [peer.resource(), format!("{}/other/../mcp", peer.origin())] {
+                let response = executor.clone().execute(&cx, &request(target)).await.unwrap();
+                assert_eq!(response.read_to_end(&cx, 4096).await.unwrap(), b"{}");
+            }
+            for target in [
+                format!("{}/other", peer.origin()),
+                other.resource(),
+                peer.resource().replacen("https:", "http:", 1),
+                format!("{}?different", peer.resource()),
+            ] {
+                assert!(matches!(executor.execute(&cx, &request(target)).await,
+                    Err(ModernHttpExecutorError::ResourceTlsTargetMismatch)));
+            }
+        };
+        pair(server, application).await;
+        assert_eq!(*peer.paths.lock().unwrap(), ["/mcp", "/mcp"]);
+        peer.assert_no_extra_connections();
+        other.assert_no_extra_connections();
+        assert!(matches!(executor.clone().with_resource_root_certificate(resource.clone(), root()),
+            Err(ModernHttpExecutorError::InvalidResourceTlsTrust)));
+        assert!(matches!(executor.with_resource_root_certificate(url(&other.resource()), root()),
+            Err(ModernHttpExecutorError::ResourceTlsTargetMismatch)));
+        for certificate in [Certificate::from_der(vec![0; 32]), Certificate::from_der(vec![0; 16 * 1024 + 1])] {
+            assert!(matches!(ModernHttpExecutor::new().with_resource_root_certificate(resource.clone(), certificate),
+                Err(ModernHttpExecutorError::InvalidResourceTlsTrust)));
+        }
+    });
+}
+
+#[test]
+fn managed_private_resource_does_not_inherit_token_issuer_trust() {
+    run(async {
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
+        let issuer = peer.issuer();
+        let resource = peer.resource();
+        let configuration = OAuthClientConfiguration::from_trusted_endpoints(
+            issuer.clone(), url(&format!("{}/authorize", peer.origin())),
+            url(&format!("{}/token", peer.origin())), url(&resource),
+            "registered-native-client", vec!["tools:read".to_owned()],
+        ).unwrap().with_extra_root_certificate(root()).unwrap();
+        let server = async {
+            let (mut tls, _) = peer.request("POST", "/token").await;
+            reply(&mut tls, 200,
+                r#"{"access_token":"issuer-only-access","token_type":"Bearer","expires_in":300,"scope":"tools:read"}"#,
+            ).await;
+            let (socket, _) = peer.listener.accept().await.unwrap();
+            assert!(peer.acceptor.accept(socket).await.is_err(), "resource handshake must reject the issuer-only CA before sending HTTP");
+        };
+        let application = async {
+            let session = ManagedOAuthSession::authorize(
+                &cx, OAuthClient::new(configuration), OAuthSessionPolicy::default(),
+                |authorization| callback(authorization, &issuer, &resource),
+            ).await.unwrap();
+            let request = ModernHttpRequest::new(
+                resource.clone(), b"{}".to_vec(), "2026-07-28", "tools/list", None,
+            ).unwrap();
+            assert!(matches!(session.execute(&cx, &request).await,
+                Err(OAuthSessionError::Http(ModernHttpExecutorError::Transport(
+                    asupersync::http::h1::ClientError::TlsError(_),
+                )))));
+        };
+        Box::pin(pair(server, application)).await;
+        assert_eq!(*peer.paths.lock().unwrap(), ["/token"]);
+        peer.assert_no_extra_connections();
+    });
+}
+
+#[test]
+fn private_resource_trust_preserves_tls_hostname_verification() {
+    run(async {
+        let cx = Cx::current().unwrap();
+        let mut peer = Peer::new().await;
+        peer.listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        // The fixture certificate includes 127.0.0.1, but not 127.0.0.2.
+        let target = format!("https://127.0.0.2:{}/mcp", peer.listener.local_addr().unwrap().port());
+        let executor = ModernHttpExecutor::new()
+            .with_resource_root_certificate(url(&target), root()).unwrap();
+        let request = ModernHttpRequest::new(target, b"{}".to_vec(), "2026-07-28", "tools/list", None).unwrap();
+        let server = async {
+            let (socket, _) = peer.listener.accept().await.unwrap();
+            assert!(peer.acceptor.accept(socket).await.is_err());
+        };
+        let ((), result) = pair(server, executor.execute(&cx, &request)).await;
+        assert!(matches!(result, Err(ModernHttpExecutorError::Transport(
+            asupersync::http::h1::ClientError::TlsError(_),
+        ))));
+        assert!(peer.paths.lock().unwrap().is_empty());
+        peer.assert_no_extra_connections();
+    });
+}
+
+#[test]
+fn private_resource_trust_survives_public_builder_discovery_and_requests() {
+    run(async {
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
+        let resource = url(&peer.resource());
+        let plan = fastmcp_client::ClientProtocolPlan::http(
+            fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly,
+            Some(resource.clone()), None, None,
+            "private-resource".to_owned(), "private-resource".to_owned(), "native-h1".to_owned(),
+            1, 1, 0,
+        ).unwrap();
+        let builder = fastmcp_client::ClientBuilder::new().protocol_plan(plan)
+            .http_bearer_credential(BoundBearerCredential::bind(resource.clone(), "builder-access").unwrap())
+            .http_resource_root_certificate(resource, root()).unwrap();
+        let server = async {
+            for method in ["server/discover", "tools/list"] {
+                let (mut tls, body) = peer.request_with_authorization("POST", "/mcp", Some("Bearer builder-access")).await;
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request["method"], method);
+                let result = if method == "server/discover" {
+                    json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"})
+                } else {
+                    json!({"resultType":"complete","tools":[]})
+                };
+                reply(&mut tls, 200, &json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string()).await;
+            }
+        };
+        let application = async {
+            let mut client = builder.connect_http_with_cx(&cx).await.unwrap();
+            let response = client.request_json(&cx, "tools/list", json!({}), fastmcp_protocol::RequestId::Number(2), 4096).await.unwrap();
+            assert_eq!(response.result.unwrap()["tools"], json!([]));
+        };
+        Box::pin(pair(server, application)).await;
+        assert_eq!(*peer.paths.lock().unwrap(), ["/mcp", "/mcp"]);
         peer.assert_no_extra_connections();
     });
 }

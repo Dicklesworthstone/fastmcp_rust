@@ -3243,6 +3243,7 @@ mod signer_activation_tests {
                 redirect_uri: Some(TEST_REDIRECT_URI.to_string()),
                 client_id: TEST_CLIENT_ID.to_string(),
                 client_secret: None,
+                client_authentication_method: crate::oauth::TokenEndpointAuthMethod::None,
                 code_verifier: Some(TEST_CODE_VERIFIER.to_string()),
                 refresh_token: None,
                 scopes: None,
@@ -3435,7 +3436,12 @@ mod signer_activation_tests {
             Err(OidcError::OAuth(OAuthError::InvalidGrant(_)))
         ));
         oauth
-            .revoke(&issued.access_token, TEST_CLIENT_ID, None)
+            .revoke(
+                &issued.access_token,
+                TEST_CLIENT_ID,
+                None,
+                crate::oauth::TokenEndpointAuthMethod::None,
+            )
             .expect("revoke owned access credential");
 
         for credential in ["forged-opaque-credential".to_string(), issued.access_token] {

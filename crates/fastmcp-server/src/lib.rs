@@ -9756,14 +9756,23 @@ fn oauth_http_client_authentication_rejection() -> HttpResponse {
 fn oauth_http_client_credentials(
     admission: &mut OAuthParameterAdmission,
     authorization: Option<&str>,
-) -> Result<(String, Option<String>), HttpResponse> {
+) -> Result<(String, Option<String>, oauth::TokenEndpointAuthMethod), HttpResponse> {
     let Some(authorization) = authorization else {
         let client_id = oauth_required_parameter(admission, OAuthParameterName::ClientId)
             .map_err(oauth_http_error)?;
+        let client_secret_present = admission.parameters().iter().any(|parameter| {
+            parameter.is_defined() && parameter.name() == "client_secret"
+        });
         let client_secret = admission
             .take_defined_value(OAuthParameterName::ClientSecret)
-            .map(|value| value.into_string());
-        return Ok((client_id, client_secret));
+            .map(|value| value.into_string())
+            .or_else(|| client_secret_present.then(String::new));
+        let method = if client_secret.is_some() {
+            oauth::TokenEndpointAuthMethod::ClientSecretPost
+        } else {
+            oauth::TokenEndpointAuthMethod::None
+        };
+        return Ok((client_id, client_secret, method));
     };
 
     // Keep the raw parameter inventory: empty client_id/client_secret fields
@@ -9825,7 +9834,11 @@ fn oauth_http_client_credentials(
     }
     // An empty Basic password stays Some(""): it cannot downgrade to a
     // public client's no-secret authentication in the underlying verifier.
-    Ok((client_id.to_string(), Some(client_secret.to_string())))
+    Ok((
+        client_id.to_string(),
+        Some(client_secret.to_string()),
+        oauth::TokenEndpointAuthMethod::ClientSecretBasic,
+    ))
 }
 
 fn h1_oauth_singleton_header<'a>(
@@ -9920,6 +9933,7 @@ fn oauth_token_request(
     admission: &mut OAuthParameterAdmission,
     client_id: String,
     client_secret: Option<String>,
+    client_authentication_method: oauth::TokenEndpointAuthMethod,
 ) -> Result<TokenRequest, OAuthError> {
     let scopes = admission
         .take_defined_value(OAuthParameterName::Scope)
@@ -9940,6 +9954,7 @@ fn oauth_token_request(
             .map(|value| value.into_string()),
         client_id,
         client_secret,
+        client_authentication_method,
         code_verifier: admission
             .take_defined_value(OAuthParameterName::CodeVerifier)
             .map(|value| value.into_string()),
@@ -10014,6 +10029,18 @@ fn dispatch_oauth_h1_request(
         Ok(header) => header,
         Err(response) => return response,
     };
+    if raw_path == routes.metadata_path() {
+        if authorization_header.is_some() || request.uri.contains('?') || !request.body.is_empty() {
+            return oauth_http_invalid_request();
+        }
+        if !matches!(request.method, Http1Method::Get) {
+            return oauth_http_method_not_allowed("GET");
+        }
+        return match routes.authorization_server_metadata() {
+            Ok(metadata) => oauth_http_no_store(HttpResponse::ok().with_json(&metadata)),
+            Err(_) => oauth_http_no_store(HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE)),
+        };
+    }
     #[cfg(feature = "builtin-auth-server")]
     if let Some(oidc) = routes.oidc_routes() {
         if raw_path == oidc.userinfo_path() {
@@ -10128,12 +10155,17 @@ fn dispatch_oauth_h1_request(
             Ok(admission) => admission,
             Err(_) => return oauth_http_invalid_request(),
         };
-        let (client_id, client_secret) =
+        let (client_id, client_secret, client_authentication_method) =
             match oauth_http_client_credentials(&mut admission, authorization_header) {
                 Ok(credentials) => credentials,
                 Err(response) => return response,
             };
-        let token = match oauth_token_request(&mut admission, client_id, client_secret) {
+        let token = match oauth_token_request(
+            &mut admission,
+            client_id,
+            client_secret,
+            client_authentication_method,
+        ) {
             Ok(token) => token,
             Err(error) => return oauth_http_error(error),
         };
@@ -10161,14 +10193,19 @@ fn dispatch_oauth_h1_request(
         Ok(token) => token,
         Err(error) => return oauth_http_error(error),
     };
-    let (client_id, client_secret) =
+    let (client_id, client_secret, client_authentication_method) =
         match oauth_http_client_credentials(&mut admission, authorization_header) {
             Ok(credentials) => credentials,
             Err(response) => return response,
         };
     match routes
         .server()
-        .revoke(&token, &client_id, client_secret.as_deref())
+        .revoke(
+            &token,
+            &client_id,
+            client_secret.as_deref(),
+            client_authentication_method,
+        )
     {
         Ok(()) => oauth_http_no_store(HttpResponse::ok()),
         Err(error) => oauth_http_client_authentication_error(error, authorization_header.is_some()),
@@ -10180,6 +10217,7 @@ fn dispatch_oauth_h1_request(
 /// listener's MCP-sized body allowance from becoming an OAuth body allowance.
 #[derive(Clone)]
 struct OAuthNativeH1RouteLimits {
+    metadata: String,
     authorization: String,
     token: String,
     revocation: String,
@@ -10195,6 +10233,7 @@ struct OAuthNativeH1RouteLimits {
 impl OAuthNativeH1RouteLimits {
     fn from_routes(routes: &OAuthHttpRoutes) -> Self {
         Self {
+            metadata: routes.metadata_path().to_owned(),
             authorization: routes.authorization_path().to_owned(),
             token: routes.token_path().to_owned(),
             revocation: routes.revocation_path().to_owned(),
@@ -10213,7 +10252,7 @@ impl OAuthNativeH1RouteLimits {
     }
 
     fn body_limit_for_path(&self, path: &str) -> Option<usize> {
-        if path == self.authorization || {
+        if path == self.metadata || path == self.authorization || {
             #[cfg(feature = "builtin-auth-server")]
             {
                 self.oidc_discovery.as_deref() == Some(path)
@@ -10408,6 +10447,14 @@ where
             HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE),
         )
         .await;
+        return true;
+    }
+    // RFC 8414 metadata is derived only from immutable, bounded configuration.
+    // It never invokes consent, authentication, signing, or issuer state, so
+    // discovery remains available without occupying a blocking worker.
+    if raw_path == routes.metadata_path() {
+        let response = dispatch_oauth_h1_request(routes, request, raw_path, raw_query);
+        let _ = send_h1_response(cx, listener_shutdown, framed, response).await;
         return true;
     }
     let routes = routes.clone();
@@ -37347,6 +37394,12 @@ mod lib_unit_tests {
     }
 
     fn native_oauth_basic_fixture() -> (OAuthHttpRoutes, String, String) {
+        native_oauth_client_method_fixture(oauth::TokenEndpointAuthMethod::ClientSecretBasic)
+    }
+
+    fn native_oauth_client_method_fixture(
+        method: oauth::TokenEndpointAuthMethod,
+    ) -> (OAuthHttpRoutes, String, String) {
         let oauth = Arc::new(
             oauth::OAuthServer::try_with_approval_backend(
                 oauth::OAuthServerConfig::default(),
@@ -37358,6 +37411,7 @@ mod lib_unit_tests {
             .register_client(
                 oauth::OAuthClient::builder("native:basic+client")
                     .secret("S3cret:+ &=%")
+                    .token_endpoint_auth_method(method)
                     .redirect_uri("https://client.example.test/callback")
                     .scope("mcp")
                     .build()
@@ -37550,8 +37604,9 @@ mod lib_unit_tests {
         let basic = native_oauth_basic_header(&format!("{client_id}:{secret}"));
         let mut admission =
             OAuthParameterAdmission::admit(OAuthParameterEndpoint::TokenForm, b"").unwrap();
-        let (id, password) = oauth_http_client_credentials(&mut admission, Some(&basic))
+        let (id, password, method) = oauth_http_client_credentials(&mut admission, Some(&basic))
             .expect("exact maximum percent-expanded credentials");
+        assert_eq!(method, oauth::TokenEndpointAuthMethod::ClientSecretBasic);
         assert_eq!(id, "a".repeat(oauth::MAX_OAUTH_CLIENT_ID_BYTES));
         assert_eq!(
             password,
@@ -37603,6 +37658,19 @@ mod lib_unit_tests {
             "invalid_client",
             Some("Basic realm=\"oauth\""),
         );
+        for secret_field in ["client_secret=", "client%5Fsecret="] {
+            let request = native_oauth_form_request(
+                routes.revocation_path(),
+                &format!("token=unknown-token&client_id=public-client&{secret_field}"),
+                None,
+            );
+            assert_native_oauth_error(
+                &dispatch_oauth_h1_request(&routes, &request, routes.revocation_path(), ""),
+                HttpStatus::BAD_REQUEST,
+                "invalid_client",
+                None,
+            );
+        }
         let request = native_oauth_form_request(
             routes.revocation_path(),
             "token=unknown-token&client_id=public-client",
@@ -37613,6 +37681,76 @@ mod lib_unit_tests {
             HttpStatus::OK,
             "the same public client remains usable with none authentication",
         );
+    }
+
+    #[test]
+    fn native_oauth_registered_authentication_method_controls_code_refresh_and_revoke() {
+        for registered in [
+            oauth::TokenEndpointAuthMethod::ClientSecretBasic,
+            oauth::TokenEndpointAuthMethod::ClientSecretPost,
+        ] {
+            let (routes, code_form, basic) = native_oauth_client_method_fixture(registered);
+            let token_path = routes.token_path();
+            let revoke_path = routes.revocation_path();
+            let basic_registered = registered == oauth::TokenEndpointAuthMethod::ClientSecretBasic;
+            // The decoded client ID and secret are identical in both requests.
+            // Only their credential location differs from the registration.
+            let request = |path: &str, form: &str, use_basic: bool| {
+                if use_basic {
+                    native_oauth_form_request(path, form, Some(&basic))
+                } else {
+                    native_oauth_form_request(
+                        path,
+                        &format!(
+                            "{form}&client_id=native%3Abasic%2Bclient&client_secret=S3cret%3A%2B+%26%3D%25"
+                        ),
+                        None,
+                    )
+                }
+            };
+            let assert_method_rejection = |response: &HttpResponse| {
+                assert_native_oauth_error(
+                    response,
+                    if basic_registered {
+                        HttpStatus::BAD_REQUEST
+                    } else {
+                        HttpStatus::UNAUTHORIZED
+                    },
+                    "invalid_client",
+                    if basic_registered {
+                        None
+                    } else {
+                        Some("Basic realm=\"oauth\"")
+                    },
+                );
+            };
+            let denied = request(token_path, &code_form, !basic_registered);
+            assert_method_rejection(&dispatch_oauth_h1_request(&routes, &denied, token_path, ""));
+            let accepted = request(token_path, &code_form, basic_registered);
+            let issued = dispatch_oauth_h1_request(&routes, &accepted, token_path, "");
+            assert_eq!(issued.status, HttpStatus::OK, "same code remains redeemable");
+            let issued: serde_json::Value = serde_json::from_slice(&issued.body).unwrap();
+            let access = issued["access_token"].as_str().unwrap();
+            let refresh = issued["refresh_token"].as_str().unwrap();
+            let refresh_form = format!("grant_type=refresh_token&refresh_token={refresh}");
+            let denied = request(token_path, &refresh_form, !basic_registered);
+            assert_method_rejection(&dispatch_oauth_h1_request(&routes, &denied, token_path, ""));
+            let denied = request(revoke_path, &format!("token={refresh}"), !basic_registered);
+            assert_method_rejection(&dispatch_oauth_h1_request(&routes, &denied, revoke_path, ""));
+            assert!(routes.server().validate_access_token(access).is_some());
+            let accepted = request(token_path, &refresh_form, basic_registered);
+            let successor = dispatch_oauth_h1_request(&routes, &accepted, token_path, "");
+            assert_eq!(successor.status, HttpStatus::OK, "same refresh remains usable");
+            let successor: serde_json::Value = serde_json::from_slice(&successor.body).unwrap();
+            let access = successor["access_token"].as_str().unwrap();
+            let refresh = successor["refresh_token"].as_str().unwrap();
+            let accepted = request(revoke_path, &format!("token={refresh}"), basic_registered);
+            assert_eq!(
+                dispatch_oauth_h1_request(&routes, &accepted, revoke_path, "").status,
+                HttpStatus::OK,
+            );
+            assert!(routes.server().validate_access_token(access).is_none());
+        }
     }
 
     #[test]
@@ -37775,6 +37913,7 @@ mod lib_unit_tests {
                 redirect_uri: Some(REDIRECT_URI.to_string()),
                 client_id: CLIENT_ID.to_string(),
                 client_secret: None,
+                client_authentication_method: oauth::TokenEndpointAuthMethod::None,
                 code_verifier: Some(CODE_VERIFIER.to_string()),
                 refresh_token: None,
                 scopes: None,
@@ -38220,6 +38359,9 @@ mod lib_unit_tests {
                 .register_client(
                     oauth::OAuthClient::builder("live-redirect-client")
                         .secret("correct-secret")
+                        .token_endpoint_auth_method(
+                            oauth::TokenEndpointAuthMethod::ClientSecretPost,
+                        )
                         .redirect_uri("https://client.example.test/callback")
                         .scope("mcp")
                         .build()

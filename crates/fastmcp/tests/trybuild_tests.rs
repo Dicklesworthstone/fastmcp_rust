@@ -1948,6 +1948,22 @@ fn facade_tool(count: u64) -> String {
     count.to_string()
 }
 
+fn facade_schema_error(kind: mcp::ToolErrorKind) -> Option<mcp::serde_json::Value> {
+    let error = match kind {
+        mcp::ToolErrorKind::InputValidation => "invalid arguments",
+        mcp::ToolErrorKind::Handler => "operation failed",
+    };
+    Some(mcp::serde_json::json!({ "error": error }))
+}
+
+#[tool(
+    output_schema = mcp::serde_json::json!({ "type": "object" }),
+    error_mapper = facade_schema_error,
+)]
+async fn facade_structured_tool(count: u64) -> McpResult<mcp::serde_json::Value> {
+    Ok(mcp::serde_json::json!({ "count": count }))
+}
+
 #[tool]
 fn renamed_facade_final_task_tool() -> mcp::FinalToolOutcome {
     mcp::FinalToolOutcome::Complete(mcp::CompleteResult::new(
@@ -2017,6 +2033,7 @@ fn assert_generated_surface() -> McpResult<()> {
     fn prompt_handler<T: PromptHandler>(_: T) {}
 
     tool_handler(FacadeTool);
+    tool_handler(FacadeStructuredTool);
     tool_handler(RenamedFacadeFinalTaskTool);
     resource_handler(FacadeResourceResource);
     resource_handler(FacadeMrtrResumableResourceResource);
