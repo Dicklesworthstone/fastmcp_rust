@@ -36,7 +36,9 @@
   execution. Response and notification commits remain serialized at the
   output writer, while exact MCP 2024-11-05 traffic remains serialized through
   its lifecycle worker. Non-Unix stdio and custom/SSE/WebSocket entry points
-  retain sequential or blocking boundaries. A non-cooperative handler can
+  retain sequential or blocking boundaries, except that an unsplit custom
+  transport runs `subscriptions/listen` off its receive loop and queues output
+  produced while `recv` blocks until `recv` returns. A non-cooperative handler can
   still exceed the bounded process-exit drain, so end-to-end quiescence and
   reliable `awaitCleanup` semantics remain unverified.
 - **Bidirectional calls are only partly qualified:** the Unix stdio receive
