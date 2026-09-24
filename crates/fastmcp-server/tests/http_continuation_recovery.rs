@@ -9,6 +9,8 @@
 
 #[path = "http_continuation_recovery/managed_provider.rs"]
 mod managed_provider;
+#[path = "http_continuation_recovery/schema_bound.rs"]
+mod schema_bound;
 
 use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
@@ -297,7 +299,7 @@ async fn lose(peer:&Peer,cx:&Cx,pending:&mut RecoverableManagedContinuation,id:i
 }
 
 #[derive(Clone,Copy)]
-enum Case { Head, Body, Successor, NoJournal, Cancel, CloseOwner, Bytes, Attempts, Abandon, Endpoint, Provider(managed_provider::Case) }
+enum Case { Head, Body, Successor, NoJournal, Cancel, CloseOwner, Bytes, Attempts, Abandon, Endpoint, Provider(managed_provider::Case), SchemaBound(schema_bound::Case) }
 fn isolated(name:&str,case:Case) {
     if let Ok(selected)=std::env::var(CHILD) {assert_eq!(selected,name);run(case);return;}
     struct Root(std::path::PathBuf);
@@ -325,6 +327,10 @@ fn run(case:Case) {
         });
 }
 async fn scenario(cx:Cx,case:Case) {
+    if let Case::SchemaBound(selected) = case {
+        Box::pin(schema_bound::scenario(cx, selected)).await;
+        return;
+    }
     if let Case::Provider(selected) = case {
         managed_provider::scenario(cx, selected).await;
         return;
