@@ -1982,58 +1982,6 @@ fn read_handler_timeout(
         .map_err(|_payload| sanitized_handler_panic(cx, handler_class))
 }
 
-#[allow(
-    dead_code,
-    reason = "retained as the blocking dispatcher if a remaining session entry cannot yet take a request-owned child Cx"
-)]
-fn run_handler<'a, T>(
-    ctx: &McpContext,
-    budget: Budget,
-    handler_class: &'static str,
-    make_future: impl FnOnce() -> BoxFuture<'a, McpOutcome<T>>,
-) -> McpResult<McpOutcome<T>> {
-    if let Some(error) = budget_error(ctx) {
-        return Err(error);
-    }
-
-    let execution = crate::catch_extension_unwind(|| {
-        let future = make_future();
-        match budget.deadline {
-            Some(deadline) => block_on(async move {
-                asupersync::time::timeout_at(deadline, future)
-                    .await
-                    .map_err(|_elapsed| ())
-            }),
-            None => Ok(block_on(future)),
-        }
-    });
-
-    match execution {
-        Err(_payload) => Err(sanitized_handler_panic(ctx.cx(), handler_class)),
-        Ok(Err(())) => Err(McpError::new(
-            McpErrorCode::RequestCancelled,
-            "Request timeout exceeded",
-        )),
-        Ok(Ok(outcome)) => {
-            if let Some(error) = budget_error(ctx) {
-                // A synchronous handler cannot be preempted by timeout_at, so
-                // a late completion surfaces here; deadline expiry keeps its
-                // distinguishable timeout message.
-                if budget.is_past_deadline(ctx.cx().now()) {
-                    Err(McpError::new(
-                        McpErrorCode::RequestCancelled,
-                        "Request timeout exceeded",
-                    ))
-                } else {
-                    Err(error)
-                }
-            } else {
-                Ok(outcome)
-            }
-        }
-    }
-}
-
 /// Drives one handler future without entering the legacy blocking dispatcher.
 ///
 /// The future stays inside its request-owned child task: timeout drops the
