@@ -144,6 +144,11 @@ fn mask_non_code(source: &str) -> String {
                     out[i] = b'\n';
                 }
                 if bytes[i] == b'\\' {
+                    // A `\` line continuation escapes the newline itself. Keep
+                    // it, or every later line number drifts by one.
+                    if bytes.get(i + 1) == Some(&b'\n') {
+                        out[i + 1] = b'\n';
+                    }
                     i += 2;
                     continue;
                 }
@@ -952,6 +957,26 @@ fn fnd_04_b7_shipped_block_on_guard_bodyless_item_does_not_swallow_the_next() {
         shipped_block_on_sites(stacked),
         Vec::<usize>::new(),
         "further attributes between the cfg and its item do not detach the gate"
+    );
+}
+
+/// Masking keeps every newline, including one a `\` line continuation escapes
+/// inside a string, so reported lines match the source.
+#[test]
+fn fnd_04_b7_shipped_block_on_guard_keeps_lines_across_string_continuations() {
+    // runtime.rs has 7 `\` continuations; dropping their newlines put a planted
+    // call at line 795 instead of 802.
+    let continued = "const S: &str = \"a \\\n    b\";\nfn t() { block_on(async {}); }\n";
+    assert_eq!(
+        shipped_block_on_sites(continued),
+        vec![3],
+        "the call's line is counted through the continued string"
+    );
+    let single = "const S: &str = \"a b\";\n\nfn t() { block_on(async {}); }\n";
+    assert_eq!(
+        shipped_block_on_sites(single),
+        vec![3],
+        "CONTROL: the same layout without a continuation"
     );
 }
 
