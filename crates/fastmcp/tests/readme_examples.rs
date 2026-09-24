@@ -77,6 +77,17 @@ mod live {
             .collect()
     }
 
+    /// Arguments that fail a tool's input schema are refused before the handler
+    /// runs, as an MCP tool error result (`isError`), not a JSON-RPC error.
+    fn assert_schema_refused(outcome: Result<modern::FinalCallToolResult, McpError>) {
+        let result = outcome.expect("argument validation answers with a tool result");
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            texts(&result.content),
+            ["Tool arguments do not match the declared input schema."]
+        );
+    }
+
     fn assert_refused(outcome: Result<impl std::fmt::Debug, McpError>, expected: &str) {
         match outcome {
             Err(error) => assert!(error.message.contains(expected), "{error}"),
@@ -93,7 +104,7 @@ mod live {
         assert!(!greeting.is_error, "{greeting:?}");
         assert_eq!(texts(&greeting.content), ["Hello, Ada!"]);
         // Near-identical negative: the same call without its required argument.
-        assert!(client.call_tool("greet", json!({})).is_err());
+        assert_schema_refused(client.call_tool("greet", json!({})));
         client.close().expect("the README TL;DR client closes cleanly");
     }
 
@@ -169,7 +180,7 @@ mod live {
         assert!(!echoed.is_error, "{echoed:?}");
         assert_eq!(texts(&echoed.content), ["hello from the README"]);
         // Near-identical negative: the same call with a non-string message.
-        assert!(client.call_tool("echo", json!({"message": 7})).is_err());
+        assert_schema_refused(client.call_tool("echo", json!({"message": 7})));
         client
             .close()
             .expect("the README Quick Start client closes cleanly");
