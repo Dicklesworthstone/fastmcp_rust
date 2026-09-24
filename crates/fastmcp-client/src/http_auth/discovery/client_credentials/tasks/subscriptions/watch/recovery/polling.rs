@@ -236,7 +236,10 @@ mod tests {
         let minimum = Duration::from_secs(1);
         let mut polling = PollFallback::new(3, minimum);
         polling.record(0, &task("one", Some(3000))).unwrap();
-        polling.record(1, &task("two", Some(0))).unwrap();
+        // The smallest admitted peer hint, below the local minimum. Zero is not
+        // a valid Task duration (tasks_extension refuses it), so it cannot be
+        // the fixture's "too small" hint.
+        polling.record(1, &task("two", Some(1))).unwrap();
         polling.record(2, &task("three", None)).unwrap();
         assert_eq!(polling.next(&[false; 3], now).unwrap(), (1, after(now, minimum)));
         polling.reserve(1).unwrap();
