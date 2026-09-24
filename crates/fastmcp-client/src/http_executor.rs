@@ -2847,6 +2847,10 @@ pub enum ModernHttpExecutorError {
     Timeout(RequestTimeoutSource),
     /// The caller's response policy cannot be represented by the runtime clock.
     InvalidTimeoutPolicy,
+    /// Additional TLS trust is invalid, duplicated, or exceeds its local bounds.
+    InvalidResourceTlsTrust,
+    /// The request does not name the exact HTTPS resource granted private trust.
+    ResourceTlsTargetMismatch,
     /// The native HTTP client could not complete the single exchange.
     Transport(ClientError),
     /// The exchange failed after the transport accepted request bytes and
@@ -2908,6 +2912,12 @@ impl fmt::Display for ModernHttpExecutorError {
             ),
             Self::InvalidTimeoutPolicy => {
                 formatter.write_str("invalid modern MCP response timeout policy")
+            }
+            Self::InvalidResourceTlsTrust => {
+                formatter.write_str("invalid modern MCP resource TLS trust")
+            }
+            Self::ResourceTlsTargetMismatch => {
+                formatter.write_str("request target differs from the trusted HTTPS resource")
             }
             Self::Transport(error) => write!(formatter, "native HTTP exchange failed: {error}"),
             Self::DispatchUncertain(error) => write!(
@@ -3007,12 +3017,59 @@ impl ModernHttpExecutorError {
     }
 }
 
+/// Immutable private trust for one exact resource. Keeping DER bytes also makes
+/// this policy part of the OAuth configuration's existing equality binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResourceTlsTrust {
+    resource: fastmcp_core::CanonicalHttpUrl,
+    roots: Vec<Vec<u8>>,
+}
+
+impl ResourceTlsTrust {
+    pub(crate) fn add_root(
+        policy: &mut Option<Self>,
+        resource: fastmcp_core::CanonicalHttpUrl,
+        certificate: asupersync::tls::Certificate,
+    ) -> Result<(), ModernHttpExecutorError> {
+        let der = certificate.as_der();
+        if resource.scheme() != "https"
+            || resource.has_userinfo()
+            || resource.query().is_some()
+            || resource.fragment().is_some()
+            || der.is_empty()
+            || der.len() > 16 * 1024
+        {
+            return Err(ModernHttpExecutorError::InvalidResourceTlsTrust);
+        }
+        if let Some(existing) = policy.as_ref() {
+            if existing.resource != resource {
+                return Err(ModernHttpExecutorError::ResourceTlsTargetMismatch);
+            }
+            if existing.roots.len() >= 8 || existing.roots.iter().any(|root| root == der) {
+                return Err(ModernHttpExecutorError::InvalidResourceTlsTrust);
+            }
+        }
+        asupersync::tls::RootCertStore::empty()
+            .add(&certificate)
+            .map_err(|_| ModernHttpExecutorError::InvalidResourceTlsTrust)?;
+        policy.get_or_insert_with(|| Self { resource, roots: Vec::new() })
+            .roots.push(der.to_vec());
+        Ok(())
+    }
+
+    fn admits(&self, target: &str) -> bool {
+        fastmcp_core::CanonicalHttpUrl::parse(target)
+            .is_ok_and(|target| target == self.resource)
+    }
+}
+
 /// Executes modern MCP HTTP POSTs through explicit native HTTP primitives.
 #[derive(Clone)]
 pub struct ModernHttpExecutor {
     request_timeout_policy: RequestTimeoutPolicy,
     subscription_timeout_policy: SubscriptionTimeoutPolicy,
     bearer_credential: Option<Arc<crate::http_auth::BoundBearerCredential>>,
+    resource_tls: Option<ResourceTlsTrust>,
 }
 
 impl Default for ModernHttpExecutor {
@@ -3029,6 +3086,7 @@ impl ModernHttpExecutor {
             request_timeout_policy: RequestTimeoutPolicy::default(),
             subscription_timeout_policy: SubscriptionTimeoutPolicy::default(),
             bearer_credential: None,
+            resource_tls: None,
         }
     }
 
@@ -3039,7 +3097,26 @@ impl ModernHttpExecutor {
             request_timeout_policy: RequestTimeoutPolicy::default(),
             subscription_timeout_policy: SubscriptionTimeoutPolicy::default(),
             bearer_credential: bearer_credential.map(Arc::new),
+            resource_tls: None,
         }
+    }
+
+    /// Adds a private CA for one exact HTTPS resource. Up to eight distinct
+    /// roots of at most 16 KiB each are admitted. Hostname and certificate
+    /// verification remain enabled; another path or origin is rejected before
+    /// opening a connection. Issuer trust and redirects cannot widen this grant.
+    pub fn with_resource_root_certificate(
+        mut self,
+        resource: fastmcp_core::CanonicalHttpUrl,
+        certificate: asupersync::tls::Certificate,
+    ) -> Result<Self, ModernHttpExecutorError> {
+        ResourceTlsTrust::add_root(&mut self.resource_tls, resource, certificate)?;
+        Ok(self)
+    }
+
+    pub(crate) fn with_resource_tls(mut self, policy: Option<ResourceTlsTrust>) -> Self {
+        self.resource_tls = policy;
+        self
     }
 
     /// Replaces the post-commit response timeout policy for ordinary requests.
@@ -3093,6 +3170,9 @@ impl ModernHttpExecutor {
             return Err(ModernHttpExecutorError::Cancelled);
         }
         check_modern_http_context(cx)?;
+        if self.resource_tls.as_ref().is_some_and(|trust| !trust.admits(request.target())) {
+            return Err(ModernHttpExecutorError::ResourceTlsTargetMismatch);
+        }
         self.request_timeout_policy
             .validate()
             .map_err(|_| ModernHttpExecutorError::InvalidTimeoutPolicy)?;
@@ -3127,6 +3207,7 @@ impl ModernHttpExecutor {
             cx,
             request,
             self.bearer_credential.as_deref(),
+            self.resource_tls.as_ref(),
             committed_at,
             Arc::clone(&request_bytes_sent),
         ));
@@ -3213,10 +3294,15 @@ async fn execute_native_modern_request(
     cx: &Cx,
     request: &ModernHttpRequest,
     credential: Option<&crate::http_auth::BoundBearerCredential>,
+    resource_tls: Option<&ResourceTlsTrust>,
     committed_at: Arc<OnceLock<Time>>,
     request_bytes_sent: Arc<AtomicBool>,
 ) -> Result<ClientStreamingResponse<ModernHttpIo>, ClientError> {
-    let parsed = ParsedUrl::parse(request.target())?;
+    // Admission compares canonical resources. Use that same spelling on the
+    // wire: native ParsedUrl deliberately preserves raw paths, including dot
+    // segments that must not select a different route under private trust.
+    let target = resource_tls.map_or(request.target(), |trust| trust.resource.as_str());
+    let parsed = ParsedUrl::parse(target)?;
     cx.checkpoint().map_err(|_| ClientError::Cancelled)?;
     let host = parsed.host.trim_start_matches('[').trim_end_matches(']');
     let stream = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
@@ -3237,6 +3323,12 @@ async fn execute_native_modern_request(
                 .map_err(|error| ClientError::TlsError(error.to_string()))?;
             #[cfg(not(feature = "native-tls-roots"))]
             let builder = builder.with_webpki_roots();
+            let builder = if let Some(trust) = resource_tls {
+                builder.add_root_certificates(trust.roots.iter().cloned()
+                    .map(asupersync::tls::Certificate::from_der))
+            } else {
+                builder
+            };
             let connector = builder
                 .build()
                 .map_err(|error| ClientError::TlsError(error.to_string()))?;
@@ -3286,6 +3378,7 @@ pub(crate) struct HttpConnectionSettings {
     pub(crate) mcp_apps: Option<McpAppsClientSettings>,
     pub(crate) extensions: Option<Arc<ClientExtensionRuntime>>,
     pub(crate) bearer: Option<crate::http_auth::BoundBearerCredential>,
+    pub(crate) resource_tls: Option<ResourceTlsTrust>,
     pub(crate) request_timeout_policy: RequestTimeoutPolicy,
     pub(crate) subscription_timeout_policy: SubscriptionTimeoutPolicy,
 }
@@ -6157,6 +6250,7 @@ impl ModernHttpClient {
             mcp_apps: mcp_apps_settings,
             extensions: client_extension_runtime,
             bearer: bearer_credential,
+            resource_tls,
             request_timeout_policy,
             subscription_timeout_policy,
         } = settings;
@@ -6168,6 +6262,15 @@ impl ModernHttpClient {
                 || matches!(protocol_plan.policy(), ProtocolPolicy::LegacyOnly)
             {
                 return Err(ModernHttpClientError::CredentialTargetMismatch);
+            }
+        }
+        if let Some(trust) = &resource_tls {
+            if matches!(protocol_plan.policy(), ProtocolPolicy::LegacyOnly)
+                || !protocol_plan.modern_post_target().is_some_and(|target| trust.admits(target))
+            {
+                return Err(ModernHttpClientError::Executor(
+                    ModernHttpExecutorError::ResourceTlsTargetMismatch,
+                ));
             }
         }
         if cx.checkpoint().is_err() {
@@ -6218,6 +6321,7 @@ impl ModernHttpClient {
         )?;
 
         let probe_response = ModernHttpExecutor::with_bearer_credential(bearer_credential.clone())
+            .with_resource_tls(resource_tls.clone())
             .with_timeout_policy(request_timeout_policy)
             .with_subscription_timeout_policy(subscription_timeout_policy)
             .execute(cx, &probe_request)
@@ -6275,6 +6379,7 @@ impl ModernHttpClient {
                         negotiated_extensions,
                     }),
                     executor: ModernHttpExecutor::with_bearer_credential(bearer_credential)
+                        .with_resource_tls(resource_tls)
                         .with_timeout_policy(request_timeout_policy)
                         .with_subscription_timeout_policy(subscription_timeout_policy),
                     reverse_request_handlers: ReverseRequestHandlers::new(),
@@ -6285,6 +6390,11 @@ impl ModernHttpClient {
             ClientHttpNegotiationDecision::LegacySseFallbackAuthorized => {
                 if bearer_credential.is_some() {
                     return Err(ModernHttpClientError::AuthenticatedLegacyFallback);
+                }
+                if resource_tls.is_some() {
+                    return Err(ModernHttpClientError::Executor(
+                        ModernHttpExecutorError::ResourceTlsTargetMismatch,
+                    ));
                 }
                 LegacySseHttpClient::connect(cx, protocol_plan)
                     .await
@@ -10475,6 +10585,7 @@ mod tests {
                 ),
                 extensions: Some(generic_mcp_apps_runtime(generic_mime_type)),
                 bearer: None,
+                resource_tls: None,
                 request_timeout_policy: crate::RequestTimeoutPolicy::default(),
                 subscription_timeout_policy: crate::SubscriptionTimeoutPolicy::default(),
             },
@@ -11053,6 +11164,7 @@ mod tests {
                     mcp_apps: None,
                     extensions: Some(Arc::clone(&settings)),
                     bearer: None,
+                    resource_tls: None,
                     request_timeout_policy: crate::RequestTimeoutPolicy::default(),
                     subscription_timeout_policy: crate::SubscriptionTimeoutPolicy::default(),
                 },

@@ -350,7 +350,9 @@ impl OAuthDiscoveryPlan {
         Ok(self)
     }
 
-    /// Grants a private CA only for the configured resource's metadata GET.
+    /// Grants a private CA for the configured resource's metadata GET and
+    /// subsequent managed MCP POSTs to that exact resource. Issuer metadata
+    /// and token exchanges require their own separately configured trust.
     pub fn with_resource_root_certificate(mut self, root: Certificate) -> Result<Self, OAuthDiscoveryError> {
         admit_root(&mut self.resource_roots, root)?;
         Ok(self)
@@ -514,6 +516,10 @@ impl OAuthDiscoveryPlan {
         }
         for root in &issuer.roots {
             configuration = configuration.with_extra_root_certificate(root.clone())
+                .map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
+        }
+        for root in &self.resource_roots {
+            configuration = configuration.with_resource_root_certificate(root.clone())
                 .map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
         }
         Ok(configuration)

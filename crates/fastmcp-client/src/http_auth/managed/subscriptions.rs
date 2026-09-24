@@ -40,8 +40,6 @@ use crate::http_executor::{
     ModernHttpRequest, ModernHttpResponseKind, ModernHttpSubscriptionListenError,
     ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener,
 };
-#[cfg(feature = "tasks")]
-use crate::http_executor::ModernHttpExecutor;
 use crate::sse::SseLimits;
 
 /// Finite admission and lifetime bounds for one subscription.
@@ -286,7 +284,7 @@ impl ManagedOAuthSession {
         // withholding its header must not silently dispatch anonymously.
         let wire = credential.authorize_request(wire)?;
         let head_deadline = deadline.min(deadline_after(cx, self.inner.policy.response_head_timeout)?);
-        let executor = ModernHttpExecutor::new();
+        let executor = self.inner.client.resource_http_executor();
         let response = self.await_active(cx, cancellation, head_deadline, Some(credential.expires_at), async {
             executor.execute_with_cancellation(cx, cancellation, &wire).await.map_err(OAuthSessionError::Http)
         }).await?;

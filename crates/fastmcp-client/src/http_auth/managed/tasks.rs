@@ -34,7 +34,7 @@ use super::{
     ManagedOAuthResponse, ManagedOAuthSession, ManagedOAuthSseStream,
     OAuthCredentialSnapshot, OAuthSessionError, deadline_after,
 };
-use crate::http_executor::{ModernHttpExecutor, ModernHttpRequest, ModernHttpResponseKind};
+use crate::http_executor::{ModernHttpRequest, ModernHttpResponseKind};
 use crate::sse::SseLimits;
 
 /// Opt-in bounded Task polling and host input resolution.
@@ -244,7 +244,7 @@ impl ManagedTasksClient {
         // snapshot; withholding its header must never become anonymous dispatch.
         let wire = credential.authorize_request(wire)?;
         let head_deadline = deadline.min(deadline_after(cx, self.session.inner.policy.response_head_timeout)?);
-        let executor = ModernHttpExecutor::new();
+        let executor = self.session.inner.client.resource_http_executor();
         let response = self.session.await_active(cx, cancellation, head_deadline, Some(credential.expires_at), async {
             executor.execute_with_cancellation(cx, cancellation, &wire).await.map_err(OAuthSessionError::Http)
         }).await?;
