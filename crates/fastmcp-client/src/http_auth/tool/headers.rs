@@ -21,6 +21,9 @@ use super::{ManagedToolClient, ManagedToolError, ToolContract};
 use super::catalog::{ManagedToolCatalogError, ManagedToolCatalogSnapshot};
 use crate::http_executor::parameter_headers::{ReviewedToolHeaders, ToolHeaderDispatchError};
 
+/// Explicit one-shot header repair without dropping schema or invalidation checks.
+pub mod repair;
+
 impl ManagedToolClient {
     /// Reviews the exact schema already bound to this client, not a replacement
     /// supplied by the host. Refusing any binding refuses the entire approval.
