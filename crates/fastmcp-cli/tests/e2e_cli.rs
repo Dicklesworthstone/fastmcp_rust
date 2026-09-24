@@ -4726,3 +4726,107 @@ os.close(fd)
         check_watch_slow_initial_get(false, true);
     }
 }
+
+/// The shipped `fastmcp inspect` against the compiled framework server on a
+/// real `bind_http` listener over plain loopback HTTP. The TLS/bearer pair in
+/// `authenticated_http` covers a proxy in front of the same server.
+#[cfg(all(unix, feature = "e2e-fixture"))]
+mod plain_http {
+    use super::*;
+    use serde_json::Value;
+
+    /// Starts the fixture on `127.0.0.1:0` and returns its published endpoint.
+    fn serve(root: &Path) -> (ProcessGroupGuard, String) {
+        let ready = root.join("backend.ready");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fastmcp_cli_e2e_server"));
+        command
+            .arg("--http-ready")
+            .arg(&ready)
+            .stdout(std::fs::File::create(root.join("backend.stdout")).unwrap())
+            .stderr(std::fs::File::create(root.join("backend.stderr")).unwrap());
+        let process = ProcessGroupGuard::spawn(&mut command);
+        let start = Instant::now();
+        loop {
+            if let Ok(endpoint) = std::fs::read_to_string(&ready)
+                && endpoint.starts_with("http://")
+                && endpoint.ends_with("/mcp")
+            {
+                return (process, endpoint);
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "the HTTP fixture never published its endpoint"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn inspect(endpoint: &str, policy: &str) -> Output {
+        let mut command = Command::new(get_binary_path());
+        command.args([
+            "inspect",
+            "--http-url",
+            endpoint,
+            "--protocol-policy",
+            policy,
+            "--format",
+            "json",
+        ]);
+        run_command(command)
+    }
+
+    #[test]
+    fn cli_inspect_reads_a_real_http_servers_live_catalog() {
+        let root = TestTempDir::new("plain-http-inspect");
+        let (mut backend, endpoint) = serve(&root);
+        let output = inspect(&endpoint, "modern-only");
+        assert!(output.status.success(), "{}", stderr_str(&output));
+        let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            document["server"]["name"], "fastmcp-cli-e2e-server",
+            "{document}"
+        );
+        assert_eq!(document["protocol"]["policy"], "modern-only", "{document}");
+        assert_eq!(document["protocol"]["era"], "modern-2026", "{document}");
+        let members = |list: &str, key: &str| -> Vec<String> {
+            let mut members: Vec<String> = document[list]
+                .as_array()
+                .unwrap_or_else(|| panic!("{list} must be an array: {document}"))
+                .iter()
+                .map(|member| member[key].as_str().unwrap().to_owned())
+                .collect();
+            members.sort();
+            members
+        };
+        assert_eq!(members("tools", "name"), ["echo", "sized_output"]);
+        assert_eq!(members("resources", "uri"), ["test://status"]);
+        assert_eq!(members("prompts", "name"), ["greeting"]);
+        backend.kill_and_reap().expect("framework HTTP cleanup");
+    }
+
+    /// Planted negative: the same server, endpoint and flags, changing only
+    /// the policy. A legacy-only CLI must never treat the modern POST endpoint
+    /// as a legacy route; it refuses before contacting the server, with a
+    /// nonzero exit and no catalog.
+    #[test]
+    fn cli_inspect_legacy_only_refuses_a_modern_http_endpoint() {
+        let root = TestTempDir::new("plain-http-inspect-negative");
+        let (mut backend, endpoint) = serve(&root);
+        let output = inspect(&endpoint, "legacy-only");
+        assert!(
+            !output.status.success(),
+            "legacy-only must not read a modern endpoint"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "no catalog: {}",
+            stdout_str(&output)
+        );
+        assert!(
+            stderr_str(&output).contains("requires a configured legacy SSE GET target"),
+            "{}",
+            stderr_str(&output)
+        );
+        backend.kill_and_reap().expect("framework HTTP cleanup");
+    }
+}
