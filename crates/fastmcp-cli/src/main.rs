@@ -4520,6 +4520,12 @@ const DEV_PROCESS_REAP_PERIOD: std::time::Duration = std::time::Duration::from_s
 const DEV_GROUP_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 #[cfg(target_os = "linux")]
 const DEV_GROUP_INSPECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+// A group whose remaining members all exited is only waiting for delayed
+// orphan reaping, so cleanup checks for that state at this cadence instead of
+// only after DEV_GROUP_CLEANUP_TIMEOUT.
+#[cfg(unix)]
+const DEV_GROUP_ZOMBIE_INSPECTION_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(100);
 #[cfg(all(unix, not(target_os = "linux")))]
 const DEV_GROUP_STATUS_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 const DEV_BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(15);
@@ -4684,6 +4690,34 @@ fn non_linux_process_group_has_live_member(process_group_id: i32) -> McpResult<b
     }))
 }
 
+/// Whether two inspections a poll apart both find no live member of a group
+/// that `kill(-pgid, 0)` still reports.
+///
+/// Linux and BSD/macOS report zombie-only groups as present. Proving the group
+/// has no live member twice accepts that delayed orphan reaping is the only
+/// thing keeping the numeric group visible.
+#[cfg(unix)]
+fn owned_dev_group_is_zombie_only(process_group_id: i32) -> McpResult<bool> {
+    for inspection in 0..2 {
+        if inspection > 0 {
+            std::thread::sleep(DEV_PROCESS_POLL_INTERVAL);
+        }
+        #[cfg(target_os = "linux")]
+        let has_live_member = {
+            let inspection_deadline = std::time::Instant::now()
+                .checked_add(DEV_GROUP_INSPECTION_TIMEOUT)
+                .unwrap_or_else(std::time::Instant::now);
+            linux_process_group_has_live_member(process_group_id, inspection_deadline)?
+        };
+        #[cfg(not(target_os = "linux"))]
+        let has_live_member = non_linux_process_group_has_live_member(process_group_id)?;
+        if has_live_member {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn wait_for_owned_dev_group_cleanup(child: &mut asupersync::process::Child) -> McpResult<()> {
     // Closing the only owner-side writer releases the signal-immune watchdog.
     // It targets its still-pinned current group, never a remembered numeric
@@ -4696,47 +4730,30 @@ fn wait_for_owned_dev_group_cleanup(child: &mut asupersync::process::Child) -> M
                 "Owned development process has no managed process-group identifier",
             )
         })?;
-        let deadline = std::time::Instant::now() + DEV_GROUP_CLEANUP_TIMEOUT;
+        let started = std::time::Instant::now();
+        let deadline = started + DEV_GROUP_CLEANUP_TIMEOUT;
+        let mut next_inspection = started + DEV_GROUP_ZOMBIE_INSPECTION_INTERVAL;
         loop {
             if !kernel_process_group_exists(process_group_id)? {
                 return Ok(());
             }
-            if std::time::Instant::now() >= deadline {
-                #[cfg(target_os = "linux")]
-                {
-                    // Linux `kill(-pgid, 0)` reports zombie-only groups as
-                    // present. Prove the group has no live member twice before
-                    // accepting that delayed orphan reaping is the only thing
-                    // keeping the numeric group visible.
-                    let inspection_deadline = std::time::Instant::now()
-                        .checked_add(DEV_GROUP_INSPECTION_TIMEOUT)
-                        .unwrap_or_else(std::time::Instant::now);
-                    if !linux_process_group_has_live_member(process_group_id, inspection_deadline)?
-                    {
-                        std::thread::sleep(DEV_PROCESS_POLL_INTERVAL);
-                        let second_inspection_deadline = std::time::Instant::now()
-                            .checked_add(DEV_GROUP_INSPECTION_TIMEOUT)
-                            .unwrap_or_else(std::time::Instant::now);
-                        if !linux_process_group_has_live_member(
-                            process_group_id,
-                            second_inspection_deadline,
-                        )? {
-                            return Ok(());
-                        }
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    if !non_linux_process_group_has_live_member(process_group_id)? {
-                        std::thread::sleep(DEV_PROCESS_POLL_INTERVAL);
-                        if !non_linux_process_group_has_live_member(process_group_id)? {
-                            return Ok(());
-                        }
-                    }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                if owned_dev_group_is_zombie_only(process_group_id)? {
+                    return Ok(());
                 }
                 return Err(fastmcp_core::McpError::internal_error(
                     "Managed development process group remained live after leader reap",
                 ));
+            }
+            // A zombie-only group never gains a live member again, so it can be
+            // accepted as soon as it is seen. An inspection failure here only
+            // defers the decision to the deadline check above.
+            if now >= next_inspection {
+                if matches!(owned_dev_group_is_zombie_only(process_group_id), Ok(true)) {
+                    return Ok(());
+                }
+                next_inspection = std::time::Instant::now() + DEV_GROUP_ZOMBIE_INSPECTION_INTERVAL;
             }
             std::thread::sleep(DEV_PROCESS_POLL_INTERVAL);
         }
@@ -18753,6 +18770,78 @@ IFS= read -r end
             assert!(
                 !non_linux_process_group_has_live_member(process_group_id)
                     .expect("observe explicitly cleaned process group")
+            );
+        }
+
+        /// A group leader that exits when cleanup closes its stdin, plus one
+        /// extra member running `member` that this test process never reaps.
+        #[cfg(unix)]
+        fn dev_group_with_unreaped_member(
+            member: &str,
+        ) -> (asupersync::process::Child, std::process::Child) {
+            use std::os::unix::process::CommandExt;
+
+            let mut command = asupersync::process::Command::new("/bin/sh");
+            command
+                .args(["-c", "read _"])
+                .process_group_mode(asupersync::process::ProcessGroupMode::NewProcessGroup)
+                .kill_on_drop(false)
+                .stdin(asupersync::process::Stdio::Pipe)
+                .stdout(asupersync::process::Stdio::Null)
+                .stderr(asupersync::process::Stdio::Null);
+            let leader = command.spawn().expect("spawn the group leader");
+            let process_group_id = leader
+                .process_group_id()
+                .expect("the leader owns a process group");
+            let member = std::process::Command::new("/bin/sh")
+                .args(["-c", member])
+                .process_group(process_group_id)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("join the leader's process group");
+            (leader, member)
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn owned_dev_group_cleanup_accepts_a_zombie_only_group_before_its_timeout() {
+            let (mut leader, mut member) = dev_group_with_unreaped_member("exit 0");
+
+            let started = std::time::Instant::now();
+            let cleaned = wait_for_owned_dev_group_cleanup(&mut leader);
+            let elapsed = started.elapsed();
+            let _ = member.wait();
+            let _ = leader.try_wait();
+
+            cleaned.expect("a group of exited, unreaped members is released");
+            assert!(
+                elapsed < DEV_GROUP_CLEANUP_TIMEOUT,
+                "a zombie-only group waited {elapsed:?}, the whole cleanup timeout"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn owned_dev_group_cleanup_refuses_a_group_with_a_live_member_at_its_timeout() {
+            let (mut leader, mut member) = dev_group_with_unreaped_member("exec sleep 30");
+
+            let started = std::time::Instant::now();
+            let cleaned = wait_for_owned_dev_group_cleanup(&mut leader);
+            let elapsed = started.elapsed();
+            let _ = member.kill();
+            let _ = member.wait();
+            let _ = leader.try_wait();
+
+            let error = cleaned.expect_err("a sleeping member keeps the group live");
+            assert_eq!(
+                error.message,
+                "Managed development process group remained live after leader reap"
+            );
+            assert!(
+                elapsed >= DEV_GROUP_CLEANUP_TIMEOUT,
+                "a live group was refused after {elapsed:?}, before the cleanup timeout"
             );
         }
 
