@@ -9,7 +9,7 @@ use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use std::time::Duration;
 
 use asupersync::{Cx, Outcome};
-use fastmcp_core::{AuthContext, McpContext, McpError, McpOutcome, McpRequestCancellation, McpResult};
+use fastmcp_core::{AuthContext, McpContext, McpError, McpOutcome, McpRequestCancellation, McpResult, Sha256Digest};
 use fastmcp_core::ingress::{SecurityPartitionDescriptor, VerifiedAudienceBinding, VerifiedIdentityFacts, VerifiedIngressAuthentication};
 use fastmcp_core::partition::{ContinuationPartitionKey, DurableOwnerKey, PartitionAuthorization};
 use fastmcp_core::runtime::{ProcessGenerationGuard, SnapshotCloneStance};
@@ -44,8 +44,12 @@ impl Probe {
         let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let alice = format!("replay-alice-{}-{nonce}", std::process::id());
         let bob = format!("replay-bob-{}-{nonce}", std::process::id());
-        let mut a = AuthContext::with_subject("alice".to_owned());
-        let mut b = AuthContext::with_subject("bob".to_owned());
+        // Cross-POST MRTR state on stateless HTTP is keyed to a provider-scoped
+        // owner, never to a display subject; this provider supplies one each.
+        let mut a = AuthContext::with_subject("alice".to_owned())
+            .with_session_owner(Sha256Digest::from_bytes([0xA1; 32]));
+        let mut b = AuthContext::with_subject("bob".to_owned())
+            .with_session_owner(Sha256Digest::from_bytes([0xB0; 32]));
         a.scopes = vec!["tools:call".to_owned()];
         b.scopes = a.scopes.clone();
         let verifier = StaticTokenVerifier::new([(alice.clone(), a), (bob.clone(), b)]).unwrap();

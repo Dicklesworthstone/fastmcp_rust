@@ -100,9 +100,12 @@ impl ToolHandler for Probe {
 
 struct ApplicationMiddleware { probe: Probe, cached: bool }
 impl Middleware for ApplicationMiddleware {
-    fn on_request(&self, _: &McpContext, _: &JsonRpcRequest) -> McpResult<MiddlewareDecision> {
+    fn on_request(&self, ctx: &McpContext, _: &JsonRpcRequest) -> McpResult<MiddlewareDecision> {
         self.probe.counts.middleware.fetch_add(1, Ordering::SeqCst);
         if self.cached {
+            // A final result may be completed by middleware only as a recorded
+            // cache hit, exactly as the shipped response cache does.
+            assert!(ctx.mark_response_cache_hit(1), "the request scope must admit a cache hit");
             Ok(MiddlewareDecision::Respond(json!({
                 "resultType":"complete", "content":[{"type":"text","text":"cache-hit"}]
             })))

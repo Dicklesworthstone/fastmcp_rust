@@ -256,15 +256,23 @@ fn native_scope_invalid_missing_and_revoked_tokens_remain_authentication_failure
         assert!(probe.verifier.revoke_token(&probe.token).unwrap());
         let mut missing = call(&probe,false);
         missing.headers.remove("authorization");
-        for request in [call(&probe,false), call(&probe,true).with_header("authorization","Bearer wrong-token"), missing] {
+        // A presented credential reaches the provider and fails there. A missing
+        // Authorization header is refused before any provider call (75099bf1).
+        for (request, reaches_provider) in [
+            (call(&probe,false), true),
+            (call(&probe,true).with_header("authorization","Bearer wrong-token"), true),
+            (missing, false),
+        ] {
+            let before = probe.counts().0;
             let response = immediate(&cx,&endpoint,&policy,request).await;
             assert_eq!(response.status.0,401);
             let challenge = &response.headers["www-authenticate"];
             assert!(!challenge.contains("insufficient_scope"));
             assert!(!challenge.contains("scope=\""));
             assert!(challenge.contains("resource_metadata="));
+            assert_eq!(probe.counts().0 - before, usize::from(reaches_provider));
         }
-        assert_eq!(probe.counts(),(4,1,1));
+        assert_eq!(probe.counts(),(3,1,1));
     });
 }
 
@@ -505,6 +513,7 @@ fn native_scope_socket_invalid_credentials_cannot_be_promoted_by_scope_rules() {
             assert!(!response.headers["www-authenticate"].contains("scope=\""));
             assert!(!response.headers.contains_key("transfer-encoding"));
         }
-        assert_eq!(probe.counts(),(3,1,1));
+        // The valid and wrong tokens reach the provider; the missing header does not.
+        assert_eq!(probe.counts(),(2,1,1));
     });
 }

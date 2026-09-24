@@ -100,7 +100,8 @@ const CACHE_STATELESS_PARTITION_DOMAIN: &[u8] = b"fastmcp-response-cache-statele
 
 static NEXT_CACHE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
-fn next_cache_instance_id() -> u64 {
+/// Allocates a nonzero response-cache hit identity; 0 means the space is exhausted.
+pub(crate) fn next_cache_instance_id() -> u64 {
     NEXT_CACHE_INSTANCE_ID
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)

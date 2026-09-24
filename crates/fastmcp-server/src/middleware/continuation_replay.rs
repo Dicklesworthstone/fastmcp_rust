@@ -128,6 +128,9 @@ pub struct ContinuationReplayMiddleware {
     recover_successors: bool,
     authorize: Arc<Authorize>,
     journal: Mutex<Journal>,
+    /// A replay completes a final result without dispatch, which the router
+    /// admits only as a recorded response-cache hit under this identity.
+    replay_hit_id: u64,
 }
 impl ContinuationReplayMiddleware {
     pub fn new<F>(cx: &Cx, guard: &ProcessGenerationGuard, stance: SnapshotCloneStance,
@@ -137,9 +140,11 @@ impl ContinuationReplayMiddleware {
         let policy = EnvelopePolicy::new(limits.result_bytes, limits.lifetime, 4).map_err(|_| unavailable())?;
         let protector = EphemeralEnvelopeProtector::new(cx, guard, stance, EnvelopePurpose::Continuation, policy)
             .map_err(|_| unavailable())?;
+        let replay_hit_id = crate::caching::next_cache_instance_id();
+        if replay_hit_id == 0 { return Err(unavailable()); }
         Ok(Self { process: guard.token(), limits, recover_successors: false, authorize: Arc::new(authorize),
             journal: Mutex::new(Journal { protector, entries: BTreeMap::new(), successors: BTreeMap::new(),
-                retained_bytes: 0, closed: false }) })
+                retained_bytes: 0, closed: false }), replay_hit_id })
     }
 
     fn lock(&self) -> McpResult<MutexGuard<'_, Journal>> {
@@ -221,6 +226,7 @@ impl Middleware for ContinuationReplayMiddleware {
             let opened = state.protector.open(ctx.cx(), &identity.binding, ciphertext).map_err(|_| unavailable())?;
             let result: Value = serde_json::from_slice(opened.as_bytes()).map_err(|_| unavailable())?;
             check_entry(ctx, entry, &identity)?;
+            if !ctx.mark_response_cache_hit(self.replay_hit_id) { return Err(unavailable()); }
             return Ok(MiddlewareDecision::Respond(result));
         }
         // Validate the predecessor without changing it. A rejected operation,
