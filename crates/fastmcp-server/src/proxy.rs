@@ -15918,19 +15918,41 @@ IFS= read -r end
                         incoming.head.lines().next().unwrap_or_default(),
                         deadline.saturating_duration_since(Instant::now())
                     ));
+                    // Every refusal below names what the proxy actually sent,
+                    // in the phase file as well as the panic, because a dead
+                    // peer surfaces in the probe only as a reset connection.
+                    let request_line = incoming.head.lines().next().unwrap_or_default().to_owned();
+                    let refuse = |reason: String| -> String {
+                        let report = format!("peer refused connection #{connections}: {reason}");
+                        phase(&report);
+                        report
+                    };
                     if incoming.head.starts_with("GET /sse ") {
+                        if sse.is_some() {
+                            panic!("{}", refuse(format!("a second SSE GET `{request_line}`")));
+                        }
                         post.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
                         write_chunked_sse_event(
                             &mut post,
                             format!("event: endpoint\ndata: {endpoint}\n\n").as_bytes(),
                         );
                         post.flush().unwrap();
-                        assert!(sse.replace(post).is_none());
+                        sse = Some(post);
                         continue;
                     }
-                    assert!(incoming.head.starts_with("POST /messages "));
-                    let request: serde_json::Value =
-                        serde_json::from_slice(&incoming.body).unwrap();
+                    if !incoming.head.starts_with("POST /messages ") {
+                        panic!("{}", refuse(format!("unexpected request `{request_line}`")));
+                    }
+                    let request: serde_json::Value = serde_json::from_slice(&incoming.body)
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "{}",
+                                refuse(format!(
+                                    "`{request_line}` body is not JSON ({error}): {:?}",
+                                    String::from_utf8_lossy(&incoming.body)
+                                ))
+                            )
+                        });
                     use std::fs::OpenOptions;
                     writeln!(
                         OpenOptions::new()
@@ -15948,8 +15970,23 @@ IFS= read -r end
                     let response = if request["method"] == "initialize" {
                         serde_json::json!({"jsonrpc":"2.0","id":1,"result":peer_initialization})
                     } else {
-                        let response = peer_responses[index].clone();
-                        assert_eq!(request["id"], index + 2);
+                        let Some(response) = peer_responses.get(index).cloned() else {
+                            panic!(
+                                "{}",
+                                refuse(format!(
+                                    "an extra upstream request at response index {index}: {request}"
+                                ))
+                            );
+                        };
+                        if request["id"] != index + 2 {
+                            panic!(
+                                "{}",
+                                refuse(format!(
+                                    "expected id {} at response index {index}, got {request}",
+                                    index + 2
+                                ))
+                            );
+                        }
                         let hold = index == target;
                         index += 1;
                         if hold {
@@ -16026,7 +16063,12 @@ IFS= read -r end
                     assert!(matches!(session.handle_async(&cx, post(request)).await.unwrap(), crate::ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::ACCEPTED));
                     let event = stream.try_recv_event(&cx).unwrap().unwrap();
                     let response: serde_json::Value = serde_json::from_str(&event.data).unwrap();
-                    assert_eq!(response["result"], serde_json::json!({}));
+                    assert_eq!(
+                        response["result"],
+                        serde_json::json!({}),
+                        "pre-subscribe response {response}; peer phase: {:?}",
+                        std::fs::read_to_string(control.join("peer-phase")).ok()
+                    );
                 }
                 let snapshot = session.legacy_adapter.as_ref().unwrap().snapshot();
                 let rewrites = proxy.subscription_rewrites.lock().unwrap().clone();
@@ -16037,7 +16079,13 @@ IFS= read -r end
                 let deadline = Instant::now() + Duration::from_secs(10);
                 loop {
                     let polled = std::future::poll_fn(|task_cx| Poll::Ready(operation.as_mut().poll(task_cx))).await;
-                    assert!(polled.is_pending(), "subscription hook must yield until peer response; http={http}, unsubscribe={unsubscribe}, interrupt={interrupt}, event={:?}", stream.try_recv_event(&cx));
+                    assert!(
+                        polled.is_pending(),
+                        "subscription hook must yield until peer response; http={http}, unsubscribe={unsubscribe}, interrupt={interrupt}, event={:?}, upstream requests: {:?}, peer phase: {:?}",
+                        stream.try_recv_event(&cx),
+                        std::fs::read_to_string(control.join("requests")).ok(),
+                        std::fs::read_to_string(control.join("peer-phase")).ok()
+                    );
                     assert!(proxy.inner.try_lock().is_ok(), "proxy mutex is released while awaiting upstream");
                     if control.join("received").exists() { break; }
                     assert!(
@@ -16080,7 +16128,13 @@ IFS= read -r end
                         let response: serde_json::Value = serde_json::from_str(&event.data).unwrap();
                         assert_eq!(response["id"], request_id);
                         if interrupt == 0 {
-                            assert_eq!(response["result"], serde_json::json!({}));
+                            assert_eq!(
+                                response["result"],
+                                serde_json::json!({}),
+                                "http={http}, unsubscribe={unsubscribe}: terminal response {response}; upstream requests: {:?}, peer phase: {:?}",
+                                std::fs::read_to_string(control.join("requests")).ok(),
+                                std::fs::read_to_string(control.join("peer-phase")).ok()
+                            );
                             assert!(response.get("error").is_none());
                         } else {
                             assert_eq!(response["error"]["code"], i32::from(if interrupt == 1 { McpErrorCode::InvalidParams } else { McpErrorCode::RequestCancelled }));
@@ -16097,7 +16151,12 @@ IFS= read -r end
                     let event = stream.try_recv_event(&cx).unwrap().unwrap();
                     let response: serde_json::Value = serde_json::from_str(&event.data).unwrap();
                     assert_eq!(response["id"], request_id + 1);
-                    assert_eq!(response["result"], serde_json::json!({}));
+                    assert_eq!(
+                        response["result"],
+                        serde_json::json!({}),
+                        "retry response {response}; peer phase: {:?}",
+                        std::fs::read_to_string(control.join("peer-phase")).ok()
+                    );
                     assert!(response.get("error").is_none());
                 }
                 assert_eq!(session.legacy_adapter.as_ref().unwrap().snapshot().subscriptions.contains(&inbound_uri), !unsubscribe);
