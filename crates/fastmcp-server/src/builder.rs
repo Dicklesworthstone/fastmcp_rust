@@ -5754,6 +5754,7 @@ mod tests {
             let proxy = ordinary_proxy_tasks_client(Arc::clone(&calls), Arc::clone(&updates));
             let server = Arc::new(
                 ServerBuilder::new("ordinary-proxy-tasks", "1.0")
+                    .auth_provider(TestAuthProvider)
                     .proxy(proxy.clone(), final_proxy_catalog())
                     .expect("the ordinary public proxy path installs the admitted modern route")
                     .build(),
@@ -5823,15 +5824,17 @@ mod tests {
                     .and_then(|result| result.get("resultType")),
                 Some(&serde_json::json!("task"))
             );
-            assert_eq!(
-                task.result.as_ref().and_then(|result| result.get("taskId")),
-                Some(&serde_json::json!("ordinary-proxy-task-71"))
-            );
+            let downstream_id = task.result.as_ref()
+                .and_then(|result| result.get("taskId"))
+                .and_then(serde_json::Value::as_str)
+                .expect("the owner receives an issued downstream Task handle")
+                .to_owned();
+            assert_ne!(downstream_id, "ordinary-proxy-task-71");
             let relay_after_task = proxy
                 .final_task_registry_snapshot_for_test()
                 .expect("the retained ordinary proxy exposes its route-local Task snapshot");
             assert_eq!(
-                relay_after_task.pointer("/tasks/ordinary-proxy-task-71/status"),
+                relay_after_task["tasks"][&downstream_id].get("status"),
                 Some(&serde_json::json!("input_required")),
                 "the public tools/call task result is retained by the ordinary route-local relay"
             );
@@ -5841,7 +5844,7 @@ mod tests {
                 JsonRpcRequest::new(
                     "tasks/update",
                     Some(serde_json::json!({
-                        "taskId": "ordinary-proxy-task-71",
+                        "taskId": downstream_id,
                         "inputResponses": {},
                         "_meta": task_parameters["_meta"].clone(),
                     })),

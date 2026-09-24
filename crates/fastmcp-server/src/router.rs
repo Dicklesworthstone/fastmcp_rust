@@ -4770,9 +4770,9 @@ impl Router {
                     // A relayed task is already durable upstream. Decode its
                     // private carrier only after the downstream capability
                     // gate, retain the route-bound snapshot for controls, and
-                    // emit the exact upstream handle without local creation.
+                    // emit its owner-bound downstream handle without local creation.
                     require_final_tasks_capability(&request_metadata)?;
-                    if let Some(result) = relay.admit_carried_task(&work_descriptor)? {
+                    if let Some(result) = relay.admit_carried_task(request_ctx, &work_descriptor)? {
                         return encode_final_task_result(result);
                     }
                     return Err(McpError::internal_error(
