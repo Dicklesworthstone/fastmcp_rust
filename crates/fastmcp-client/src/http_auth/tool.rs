@@ -268,7 +268,7 @@ impl ManagedToolClient {
         request_id: RequestId,
         limits: ManagedCoreLimits,
     ) -> Result<ManagedToolCall, ManagedToolError> {
-        self.request_with_cancellation(cx, &McpRequestCancellation::new(), request, request_id, limits).await
+        Box::pin(self.request_with_cancellation(cx, &McpRequestCancellation::new(), request, request_id, limits)).await
     }
 
     pub async fn request_with_cancellation(

@@ -57,9 +57,9 @@ impl ManagedToolClient {
         request_id: RequestId,
         limits: ManagedInteractionLimits,
     ) -> Result<ManagedToolInteraction, ManagedToolInteractionError> {
-        self.start_interaction_with_cancellation(
+        Box::pin(self.start_interaction_with_cancellation(
             cx, &McpRequestCancellation::new(), request, request_id, limits,
-        ).await
+        )).await
     }
 
     /// Retains the request-local cancellation domain while reading, awaiting
@@ -75,11 +75,11 @@ impl ManagedToolClient {
         check_tool_call(cx, cancellation, &self.contract)?;
         self.contract.validate_request(&request)?;
         check_tool_call(cx, cancellation, &self.contract)?;
-        let operation = await_validity(cx, cancellation, &self.contract,
+        let operation = Box::pin(await_validity(cx, cancellation, &self.contract,
             self.session.start_core_interaction_with_cancellation(
                 cx, cancellation, request, request_id, limits,
             ),
-        ).await??;
+        )).await??;
         check_tool_call(cx, cancellation, &self.contract)?;
         Ok(ManagedToolInteraction {
             operation: Some(operation), contract: self.contract.clone(),
@@ -171,7 +171,7 @@ impl ManagedToolInteraction {
         request_id: RequestId,
         responses: Option<FinalInputResponses>,
     ) -> Result<(), ManagedToolInteractionError> {
-        self.resume_selected(cx, request_id, responses, false).await
+        Box::pin(self.resume_selected(cx, request_id, responses, false)).await
     }
 
     /// Submits a nonempty subset using the core interaction's partial-answer
@@ -182,7 +182,7 @@ impl ManagedToolInteraction {
         request_id: RequestId,
         responses: FinalInputResponses,
     ) -> Result<(), ManagedToolInteractionError> {
-        self.resume_selected(cx, request_id, Some(responses), true).await
+        Box::pin(self.resume_selected(cx, request_id, Some(responses), true)).await
     }
 
     async fn resume_selected(
