@@ -6,9 +6,15 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
+use std::future::{Future, poll_fn};
+use std::pin::pin;
+use std::sync::Arc;
+use std::task::Poll;
 
 use crate::{CoreResult, FinalCoreResult};
 use asupersync::Cx;
+use asupersync::time::Sleep;
+use asupersync::types::Time;
 use asupersync::channel::mpsc::{self, Receiver, Sender};
 use asupersync::combinator::select::{Either, Select};
 use fastmcp_core::{McpError, McpRequestCancellation, McpResult};
@@ -26,7 +32,87 @@ use fastmcp_protocol::{
     McpAppsRoutedMethod, McpAppsViewLifecycle, McpAppsViewNotification, McpAppsViewRequest,
     McpAppsUpdateModelContextParams, McpAppsViewResponse, McpAppsViewToHost,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+/// Aggregate encoded-data budget for this View's isolated tool catalog,
+/// pagination, and retained Host request outcomes. Shared descriptors are
+/// conservatively charged at every retained reference.
+pub const MAX_MCP_APPS_VIEW_TOOL_STATE_BYTES: usize = 1024 * 1024;
+/// Maximum tools in one complete, isolated View catalog.
+pub const MAX_MCP_APPS_VIEW_TOOLS: usize = 1_024;
+
+/// One admitted tool owned by exactly one Apps View. The descriptor remains
+/// untrusted display/policy input and is never added to an MCP server catalog.
+#[derive(Clone, Debug)]
+pub struct McpAppsViewTool {
+    descriptor: fastmcp_protocol::FinalTool,
+    input_schema: fastmcp_protocol::schema::AdmittedSchema,
+    output_schema: Option<fastmcp_protocol::schema::AdmittedSchema>,
+    retained_bytes: usize,
+}
+
+impl McpAppsViewTool {
+    /// The exact admitted descriptor, including untrusted hints and metadata.
+    #[must_use]
+    pub const fn descriptor(&self) -> &fastmcp_protocol::FinalTool {
+        &self.descriptor
+    }
+}
+
+/// One completely admitted page of the View's app-tool catalog.
+#[derive(Clone, Debug)]
+pub struct McpAppsViewToolsPage {
+    pub tools: Vec<Arc<McpAppsViewTool>>,
+    pub next_cursor: Option<String>,
+}
+
+/// The isolated pre-final Apps result of a Host invocation of a View tool.
+/// Absence of `isError` has effective false and stays absent in the value.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpAppsViewCallToolResult {
+    pub content: Vec<fastmcp_protocol::common_types::ContentBlock>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<BTreeMap<String, Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
+}
+
+impl McpAppsViewCallToolResult {
+    #[must_use]
+    pub fn is_error(&self) -> bool {
+        self.is_error.unwrap_or(false)
+    }
+}
+
+/// Exactly one terminal outcome for a Host-originated Apps request. Peer
+/// errors are data only: their codes cannot trigger retry or another protocol.
+#[derive(Clone, Debug)]
+pub enum McpAppsHostRequestOutcome {
+    ToolsList(McpAppsViewToolsPage),
+    ToolCall(McpAppsViewCallToolResult),
+    Ping,
+    PeerError(McpAppsJsonRpcError),
+    /// The matching peer response failed the isolated result/schema contract.
+    InvalidResponse,
+    /// The Host cancelled this exact request after committing its control.
+    Cancelled,
+    /// The catalog changed while this request was outstanding.
+    CatalogChanged,
+    /// This request's original idle or absolute deadline elapsed.
+    DeadlineExceeded,
+    /// The View closed before this request could deliver a terminal result.
+    ViewClosed,
+}
+
+/// A correlated, validated terminal result retained until the caller takes it.
+#[derive(Clone, Debug)]
+pub struct McpAppsWireHostResponse {
+    pub request_id: McpAppsJsonRpcRequestId,
+    pub method: McpAppsRoutedMethod,
+    pub outcome: McpAppsHostRequestOutcome,
+}
 
 /// Immutable witness that the owning MCP client completed bilateral Apps
 /// activation for the exact connection that created this Host. It cannot be
@@ -483,6 +569,8 @@ pub enum McpAppsHostError {
     DuplicateLiveRequest(McpAppsBridgeRequestId),
     UnsupportedAppsProtocolVersion(String),
     UnknownResponse(McpAppsBridgeRequestId),
+    DeadlineExceeded,
+    TimerUnavailable,
     Transport(String),
 }
 impl fmt::Display for McpAppsHostError {
@@ -505,6 +593,8 @@ impl fmt::Display for McpAppsHostError {
             Self::UnknownResponse(id) => {
                 write!(f, "MCP Apps bridge received unknown response {}", id.get())
             }
+            Self::DeadlineExceeded => f.write_str("MCP Apps request deadline exceeded"),
+            Self::TimerUnavailable => f.write_str("pending Apps operations require the caller's timer driver"),
             Self::Transport(error) => write!(f, "MCP Apps bridge transport: {error}"),
         }
     }
@@ -520,6 +610,8 @@ impl std::error::Error for McpAppsHostError {
             | Self::DuplicateLiveRequest(_)
             | Self::UnsupportedAppsProtocolVersion(_)
             | Self::UnknownResponse(_)
+            | Self::DeadlineExceeded
+            | Self::TimerUnavailable
             | Self::Transport(_) => None,
         }
     }
@@ -709,6 +801,21 @@ pub trait McpAppsWireHostPolicy {
         Ok(json!({ "isError": true }))
     }
 
+    /// Authorizes one invocation of this View's admitted tool. The Host has
+    /// checked the arguments and exact current catalog before calling this
+    /// hook, but descriptor annotations and metadata grant no authority.
+    /// Embedders must apply their View/origin policy and any required user
+    /// confirmation here. Success authorizes only this invocation; the
+    /// default refuses it. The hook must not invoke the tool itself.
+    async fn approve_view_tool_call(
+        &mut self,
+        _cx: &Cx,
+        _tool: &McpAppsViewTool,
+        _params: &fastmcp_protocol::McpAppsToolCallParams,
+    ) -> Result<(), McpAppsHostError> {
+        Err(wire_policy_denied())
+    }
+
     /// Reviews and atomically accepts one replacement of this View's model
     /// context. An empty request explicitly clears the previous context.
     /// The whole payload's negotiated modalities have been checked before
@@ -815,6 +922,80 @@ pub struct McpAppsWireHost<T, P> {
     /// Frames received while an admitted View request is still executing.
     /// They are replayed through normal admission once that request resolves.
     deferred_view_frames: VecDeque<String>,
+    deferred_view_requests: BTreeSet<McpAppsJsonRpcRequestId>,
+    host_requests: BTreeMap<McpAppsJsonRpcRequestId, WireHostRequest>,
+    view_tools: BTreeMap<String, Arc<McpAppsViewTool>>,
+    staged_view_tools: Option<StagedViewTools>,
+    teardown_request: Option<(McpAppsJsonRpcRequestId, WireHostDeadline)>,
+    disconnected: bool,
+}
+
+struct WireHostRequest {
+    method: McpAppsRoutedMethod,
+    state: WireHostRequestState,
+    retained_bytes: usize,
+    deadline: WireHostDeadline,
+    last_progress: Option<f64>,
+}
+
+#[derive(Clone)]
+struct WireHostDeadline {
+    owner: Cx,
+    idle: Time,
+    absolute: Time,
+}
+
+impl WireHostDeadline {
+    fn new(cx: &Cx) -> Self {
+        let now = cx.now();
+        let absolute = now.saturating_add_nanos(30 * 60 * 1_000_000_000);
+        Self {
+            owner: cx.clone(),
+            idle: now.saturating_add_nanos(60 * 1_000_000_000),
+            absolute: cx.budget().deadline.map_or(absolute, |caller| absolute.min(caller)),
+        }
+    }
+
+    fn next(&self) -> Time { self.idle.min(self.absolute) }
+    fn expired(&self) -> bool { self.owner.now() >= self.next() }
+    fn progress(&mut self) {
+        self.idle = self.owner.now().saturating_add_nanos(60 * 1_000_000_000);
+    }
+}
+
+enum WireHostRequestState {
+    List,
+    Call(Arc<McpAppsViewTool>),
+    Ping,
+    Complete(McpAppsHostRequestOutcome),
+}
+
+/// A carrier send that has not returned success has not exposed its ID to the
+/// caller. Dropping it retires that unobservable slot and terminally fences
+/// the View, because an embedder carrier may have accepted an uncertain send.
+struct WireHostSendGuard<'a> {
+    admission: &'a mut McpAppsBridgeAdmission,
+    requests: &'a mut BTreeMap<McpAppsJsonRpcRequestId, WireHostRequest>,
+    disconnected: &'a mut bool,
+    id: Option<McpAppsJsonRpcRequestId>,
+}
+
+impl Drop for WireHostSendGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            let _ = self.admission.complete_error(McpAppsBridgeDirection::HostToView, &id);
+            self.requests.remove(&id);
+            *self.disconnected = true;
+        }
+    }
+}
+
+#[derive(Clone)]
+struct StagedViewTools {
+    tools: BTreeMap<String, Arc<McpAppsViewTool>>,
+    next_cursor: String,
+    seen_cursors: BTreeSet<String>,
+    deadline: WireHostDeadline,
 }
 
 #[derive(Default)]
@@ -825,6 +1006,7 @@ struct McpAppsWireHostState {
     /// permits no mode. The typed initialization model alone loses this fact.
     view_display_modes: Option<Vec<McpAppsDisplayMode>>,
     model_context: Option<McpAppsUpdateModelContextParams>,
+    view_tools_capability: Option<fastmcp_protocol::McpAppsAppToolsCapability>,
 }
 
 impl McpAppsWireHostState {
@@ -835,6 +1017,277 @@ impl McpAppsWireHostState {
                 .as_ref()
                 .is_none_or(|modes| modes.contains(&mode))
     }
+}
+
+fn invalid_view_result() -> McpAppsHostError {
+    McpAppsHostError::Bridge(McpAppsBridgeError::InvalidParams)
+}
+
+fn view_tool_bytes(tool: &McpAppsViewTool) -> usize {
+    tool.retained_bytes
+}
+
+fn view_catalog_bytes(tools: &BTreeMap<String, Arc<McpAppsViewTool>>) -> usize {
+    tools.iter().map(|(name, tool)| name.len() + view_tool_bytes(tool)).sum()
+}
+
+fn staged_view_tool_bytes(stage: &StagedViewTools) -> usize {
+    view_catalog_bytes(&stage.tools) + stage.next_cursor.len()
+        + stage.seen_cursors.iter().map(String::len).sum::<usize>()
+}
+
+fn decode_view_tool_page(result: &Value) -> Result<McpAppsViewToolsPage, McpAppsHostError> {
+    admit_view_numbers(result)?;
+    let object = result.as_object().ok_or_else(invalid_view_result)?;
+    if object.keys().any(|key| !matches!(key.as_str(), "tools" | "nextCursor")) {
+        return Err(invalid_view_result());
+    }
+    let next_cursor = match object.get("nextCursor") {
+        None => None,
+        Some(Value::String(cursor)) if !cursor.is_empty() && cursor.len() <= 4 * 1024 => {
+            Some(cursor.clone())
+        }
+        _ => return Err(invalid_view_result()),
+    };
+    let raw_tools = object.get("tools").and_then(Value::as_array)
+        .ok_or_else(invalid_view_result)?;
+    if raw_tools.len() > MAX_MCP_APPS_VIEW_TOOLS {
+        return Err(invalid_view_result());
+    }
+    let mut tools = Vec::with_capacity(raw_tools.len());
+    let mut names = BTreeSet::new();
+    for raw in raw_tools {
+        // FinalTool is the strict shared descriptor vocabulary. The Apps
+        // intersection adds an object-root output requirement and excludes
+        // every final-core execution extension by its closed field set.
+        let descriptor: fastmcp_protocol::FinalTool = serde_json::from_value(raw.clone())
+            .map_err(|_| invalid_view_result())?;
+        if serde_json::to_value(&descriptor).map_err(|_| invalid_view_result())? != *raw
+            || descriptor.name.is_empty()
+            || descriptor.name.len() > fastmcp_protocol::MAX_MCP_APPS_BRIDGE_TEXT_BYTES
+            || !names.insert(descriptor.name.clone())
+            || ["title", "description", "icons", "outputSchema", "annotations", "_meta"]
+                .iter().any(|key| raw.get(*key).is_some_and(Value::is_null))
+        {
+            return Err(invalid_view_result());
+        }
+        let input_schema = fastmcp_protocol::schema::admit_final_schema(
+            descriptor.input_schema.clone(),
+        ).map_err(|_| invalid_view_result())?;
+        let output_schema = descriptor.output_schema.as_ref().map(|schema| {
+            if schema.get("type").and_then(Value::as_str) != Some("object") {
+                return Err(invalid_view_result());
+            }
+            fastmcp_protocol::schema::admit_final_schema(schema.clone())
+                .map_err(|_| invalid_view_result())
+        }).transpose()?;
+        let retained_bytes = serde_json::to_vec(raw).map_err(|_| invalid_view_result())?.len()
+            + serde_json::to_vec(input_schema.schema()).map_err(|_| invalid_view_result())?.len()
+            + output_schema.as_ref().map_or(Ok(0), |schema| {
+                serde_json::to_vec(schema.schema()).map(|bytes| bytes.len())
+                    .map_err(|_| invalid_view_result())
+            })?;
+        tools.push(Arc::new(McpAppsViewTool {
+            descriptor, input_schema, output_schema, retained_bytes,
+        }));
+    }
+    Ok(McpAppsViewToolsPage { tools, next_cursor })
+}
+
+fn decode_view_tool_result(
+    result: &Value,
+    tool: &McpAppsViewTool,
+) -> Result<McpAppsViewCallToolResult, McpAppsHostError> {
+    admit_view_numbers(result)?;
+    if ["isError", "structuredContent"].iter()
+        .any(|key| result.get(*key).is_some_and(Value::is_null))
+    {
+        return Err(invalid_view_result());
+    }
+    let response: McpAppsViewCallToolResult = serde_json::from_value(result.clone())
+        .map_err(|_| invalid_view_result())?;
+    if !response.is_error() {
+        if let Some(schema) = &tool.output_schema {
+            let structured = result.get("structuredContent").ok_or_else(invalid_view_result)?;
+            schema.validate(structured).map_err(|_| invalid_view_result())?;
+        }
+    }
+    Ok(response)
+}
+
+fn admit_view_numbers(value: &Value) -> Result<(), McpAppsHostError> {
+    fn visit(value: &Value, depth: usize, nodes: &mut usize) -> bool {
+        *nodes += 1;
+        if depth > fastmcp_protocol::MAX_MCP_APPS_BRIDGE_JSON_DEPTH || *nodes > 65_536 { return false; }
+        match value {
+            Value::Number(number) => {
+                let Some(binary) = number.as_f64().filter(|number| number.is_finite()) else { return false; };
+                if number.to_string().len() > 4 * 1024
+                    || (binary == 0.0 && binary.is_sign_negative())
+                    || (binary.fract() == 0.0 && binary.abs() > fastmcp_protocol::MAX_MCP_APPS_BRIDGE_SAFE_INTEGER as f64)
+                { return false; }
+                let Some(projected) = serde_json::Number::from_f64(binary) else { return false; };
+                // Compare exact decimal values using the existing bounded
+                // schema numeric semantics, not f64 equality after rounding.
+                fastmcp_protocol::schema::admit_final_schema(json!({"const": number}))
+                    .is_ok_and(|schema| schema.validate(&Value::Number(projected)).is_ok())
+            }
+            Value::Array(values) => values.len() <= fastmcp_protocol::MAX_MCP_APPS_BRIDGE_JSON_ARRAY_ITEMS
+                && values.iter().all(|value| visit(value, depth + 1, nodes)),
+            Value::Object(values) => values.len() <= fastmcp_protocol::MAX_MCP_APPS_BRIDGE_JSON_OBJECT_MEMBERS
+                && values.iter().all(|(key, value)| key.len() <= fastmcp_protocol::MAX_MCP_APPS_BRIDGE_TEXT_BYTES
+                    && visit(value, depth + 1, nodes)),
+            Value::String(value) => value.len() <= fastmcp_protocol::MAX_MCP_APPS_BRIDGE_TEXT_BYTES,
+            _ => true,
+        }
+    }
+    visit(value, 0, &mut 0).then_some(()).ok_or_else(invalid_view_result)
+}
+
+fn expire_wire_host_requests(
+    admission: &mut McpAppsBridgeAdmission,
+    requests: &mut BTreeMap<McpAppsJsonRpcRequestId, WireHostRequest>,
+    staged: &mut Option<StagedViewTools>,
+    teardown: &mut Option<(McpAppsJsonRpcRequestId, WireHostDeadline)>,
+) -> Result<bool, McpAppsHostError> {
+    let mut expired = false;
+    if teardown.as_ref().is_some_and(|(_, deadline)| deadline.expired()) {
+        for entry in requests.values_mut() {
+            if !matches!(entry.state, WireHostRequestState::Complete(_)) {
+                entry.state = WireHostRequestState::Complete(McpAppsHostRequestOutcome::ViewClosed);
+                entry.retained_bytes = 0;
+            }
+        }
+        admission.commit_teardown().map_err(McpAppsHostError::Bridge)?;
+        *teardown = None;
+        *staged = None;
+        return Ok(true);
+    }
+    let stage_expired = staged.as_ref().is_some_and(|stage| stage.deadline.expired());
+    for (id, entry) in requests {
+        if !matches!(entry.state, WireHostRequestState::Complete(_))
+            && (entry.deadline.expired() || (stage_expired && matches!(entry.state, WireHostRequestState::List)))
+        {
+            admission.complete_error(McpAppsBridgeDirection::HostToView, id)
+                .map_err(McpAppsHostError::Bridge)?;
+            if matches!(entry.state, WireHostRequestState::List) { *staged = None; }
+            entry.state = WireHostRequestState::Complete(McpAppsHostRequestOutcome::DeadlineExceeded);
+            entry.retained_bytes = 0;
+            expired = true;
+        }
+    }
+    if stage_expired {
+        *staged = None;
+        expired = true;
+    }
+    Ok(expired)
+}
+
+/// Await the carrier and all outstanding request clocks together. The clocks
+/// retain their original caller context; replacing a wait context cannot
+/// extend an already-issued request. No thread or private runtime is created.
+async fn receive_wire_host_frame<T: McpAppsWireBridgeTransport>(
+    cx: &Cx,
+    transport: &mut T,
+    requests: &BTreeMap<McpAppsJsonRpcRequestId, WireHostRequest>,
+    staged: &Option<StagedViewTools>,
+    teardown: &Option<(McpAppsJsonRpcRequestId, WireHostDeadline)>,
+) -> Result<Option<String>, McpAppsHostError> {
+    let mut timers: Vec<_> = requests.values()
+        .filter(|entry| !matches!(entry.state, WireHostRequestState::Complete(_)))
+        .map(|entry| (entry.deadline.owner.clone(), Box::pin(Sleep::new(entry.deadline.next()))))
+        .collect();
+    if let Some(stage) = staged {
+        timers.push((stage.deadline.owner.clone(), Box::pin(Sleep::new(stage.deadline.next()))));
+    }
+    if let Some((_, deadline)) = teardown {
+        timers.push((deadline.owner.clone(), Box::pin(Sleep::new(deadline.next()))));
+    }
+    let (_sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
+    let mut cancelled = pin!(receiver.recv(cx));
+    let mut caller_timer = cx.budget().deadline.map(|deadline| Box::pin(Sleep::new(deadline)));
+    let mut incoming = pin!(transport.receive_from_view(cx));
+    poll_fn(|task| {
+        for (owner, timer) in &mut timers {
+            if owner.now() >= timer.deadline() {
+                return Poll::Ready(Ok(None));
+            }
+            if owner.timer_driver().is_some() {
+                let _caller = Cx::set_current(Some(owner.clone()));
+                if timer.as_mut().poll(task).is_ready() { return Poll::Ready(Ok(None)); }
+            }
+        }
+        let _caller = Cx::set_current(Some(cx.clone()));
+        if cx.checkpoint().is_err() || cancelled.as_mut().poll(task).is_ready()
+            || caller_timer.as_mut().is_some_and(|timer| cx.timer_driver().is_some() && timer.as_mut().poll(task).is_ready())
+        {
+            return Poll::Ready(Err(McpAppsHostError::Core(McpError::request_cancelled())));
+        }
+        match incoming.as_mut().poll(task) {
+            Poll::Ready(result) => Poll::Ready(result.map(Some)),
+            Poll::Pending if timers.iter().any(|(owner, _)| owner.timer_driver().is_none())
+                || (caller_timer.is_some() && cx.timer_driver().is_none()) => {
+                Poll::Ready(Err(McpAppsHostError::TimerUnavailable))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }).await
+}
+
+async fn await_wire_operation<T>(
+    caller: &Cx,
+    deadline: &WireHostDeadline,
+    operation: impl Future<Output = Result<T, McpAppsHostError>>,
+) -> Result<T, McpAppsHostError> {
+    let mut operation = pin!(operation);
+    let mut timer = pin!(Sleep::new(deadline.next()));
+    let (_sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
+    let mut cancelled = pin!(receiver.recv(&deadline.owner));
+    let (_caller_sender, mut caller_receiver) = asupersync::channel::oneshot::channel::<()>();
+    let mut caller_cancelled = pin!(caller_receiver.recv(caller));
+    let mut caller_timer = caller.budget().deadline.map(|deadline| Box::pin(Sleep::new(deadline)));
+    poll_fn(|task| {
+        {
+            let _current_caller = Cx::set_current(Some(caller.clone()));
+            if caller.checkpoint().is_err() || caller_cancelled.as_mut().poll(task).is_ready()
+                || caller_timer.as_mut().is_some_and(|timer| caller.timer_driver().is_some() && timer.as_mut().poll(task).is_ready())
+            {
+                return Poll::Ready(Err(McpAppsHostError::Core(McpError::request_cancelled())));
+            }
+        }
+        let _caller = Cx::set_current(Some(deadline.owner.clone()));
+        if deadline.expired() { return Poll::Ready(Err(McpAppsHostError::DeadlineExceeded)); }
+        if deadline.owner.checkpoint().is_err() || cancelled.as_mut().poll(task).is_ready() {
+            return Poll::Ready(Err(McpAppsHostError::Core(McpError::request_cancelled())));
+        }
+        if deadline.owner.timer_driver().is_some() && timer.as_mut().poll(task).is_ready() {
+            return Poll::Ready(Err(McpAppsHostError::DeadlineExceeded));
+        }
+        match operation.as_mut().poll(task) {
+            Poll::Pending if deadline.owner.timer_driver().is_none()
+                || (caller_timer.is_some() && caller.timer_driver().is_none()) => Poll::Ready(Err(
+                McpAppsHostError::TimerUnavailable,
+            )),
+            other => other,
+        }
+    }).await
+}
+
+fn cancel_deferred_view_request(
+    admission: &mut McpAppsBridgeAdmission,
+    frames: &mut VecDeque<String>,
+    requests: &mut BTreeSet<McpAppsJsonRpcRequestId>,
+    cancelled: &McpAppsCancelledControlParams,
+) -> Result<bool, McpAppsHostError> {
+    let Some(id) = cancelled.request_id.as_ref().filter(|id| requests.contains(*id)) else { return Ok(false); };
+    admission.complete_error(McpAppsBridgeDirection::ViewToHost, id)
+        .map_err(McpAppsHostError::Bridge)?;
+    requests.remove(id);
+    frames.retain(|frame| !matches!(
+        McpAppsJsonRpcEnvelope::decode(McpAppsBridgeDirection::ViewToHost, frame),
+        Ok(McpAppsJsonRpcEnvelope::Request { id: queued, .. }) if &queued == id
+    ));
+    Ok(true)
 }
 
 fn wire_policy_denied() -> McpAppsHostError {
@@ -882,12 +1335,18 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             policy,
             state: McpAppsWireHostState::default(),
             deferred_view_frames: VecDeque::new(),
+            deferred_view_requests: BTreeSet::new(),
+            host_requests: BTreeMap::new(),
+            view_tools: BTreeMap::new(),
+            staged_view_tools: None,
+            teardown_request: None,
+            disconnected: false,
         }
     }
 
     #[must_use]
     pub const fn lifecycle(&self) -> McpAppsBridgeLifecycle {
-        self.admission.lifecycle()
+        if self.disconnected { McpAppsBridgeLifecycle::Closed } else { self.admission.lifecycle() }
     }
 
     /// The last context replacement accepted by this View's host policy.
@@ -895,13 +1354,61 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
     /// update. The slot is cleared when teardown begins and grants no authority.
     #[must_use]
     pub fn model_context(&self) -> Option<&McpAppsUpdateModelContextParams> {
-        self.state.model_context.as_ref()
+        if self.disconnected { None } else { self.state.model_context.as_ref() }
     }
 
     /// The actual mode from initialization or the last accepted mode operation.
     #[must_use]
     pub const fn display_mode(&self) -> Option<McpAppsDisplayMode> {
-        self.state.host_context.display_mode
+        if self.disconnected { None } else { self.state.host_context.display_mode }
+    }
+
+    /// Reads the last complete catalog for this View only. A partial or
+    /// rejected refresh never replaces the prior catalog.
+    pub fn view_tools(&self) -> impl Iterator<Item = &McpAppsViewTool> {
+        self.view_tools.values().filter(|_| !self.disconnected && self.lifecycle() == McpAppsBridgeLifecycle::Active)
+            .map(AsRef::as_ref)
+    }
+
+    /// Takes exactly one correlated Host request outcome, releasing its
+    /// retained byte and count budget. Pending and unknown IDs return `None`.
+    pub fn take_host_response(
+        &mut self,
+        request_id: &McpAppsJsonRpcRequestId,
+    ) -> Option<McpAppsWireHostResponse> {
+        if self.disconnected { self.disconnect_view(); }
+        if !matches!(self.host_requests.get(request_id)?.state, WireHostRequestState::Complete(_)) {
+            return None;
+        }
+        let entry = self.host_requests.remove(request_id)?;
+        let WireHostRequestState::Complete(outcome) = entry.state else {
+            return None;
+        };
+        Some(McpAppsWireHostResponse {
+            request_id: request_id.clone(),
+            method: entry.method,
+            outcome,
+        })
+    }
+
+    /// Drives this same View until one previously issued Host request has a
+    /// terminal outcome. Other request outcomes remain independently retained.
+    /// Cancelling this future leaves the request owned by the Host; callers
+    /// may resume waiting or explicitly send its cancellation control.
+    pub async fn wait_for_host_response(
+        &mut self,
+        cx: &Cx,
+        request_id: &McpAppsJsonRpcRequestId,
+    ) -> Result<McpAppsWireHostResponse, McpAppsHostError> {
+        loop {
+            if let Some(response) = self.take_host_response(request_id) {
+                return Ok(response);
+            }
+            if !self.host_requests.contains_key(request_id) {
+                return Err(McpAppsHostError::Bridge(McpAppsBridgeError::UnknownCorrelation));
+            }
+            self.process_next(cx).await?;
+        }
     }
 
     /// Receives, decodes, and atomically admits exactly one View frame.
@@ -911,31 +1418,273 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
     /// that work before committing the cancellation disposition. Other frames
     /// are deferred and replayed after the request reaches a terminal result.
     pub async fn process_next(&mut self, cx: &Cx) -> Result<(), McpAppsHostError> {
-        let frame = match self.deferred_view_frames.pop_front() {
-            Some(frame) => frame,
-            None => self.transport.receive_from_view(cx).await?,
-        };
-        let was_closing = self.admission.lifecycle() == McpAppsBridgeLifecycle::Closing;
-        let envelope = self
-            .admission
-            .decode_and_admit(McpAppsBridgeDirection::ViewToHost, &frame)
-            .map_err(McpAppsHostError::Bridge)?;
-        match envelope {
-            McpAppsJsonRpcEnvelope::Request {
-                id, method, params, ..
-            } => self.handle_view_request(cx, id, method, params).await,
-            McpAppsJsonRpcEnvelope::Notification { method, params } => {
-                self.handle_view_notification(cx, method, params).await
-            }
-            McpAppsJsonRpcEnvelope::Response { .. } | McpAppsJsonRpcEnvelope::Error { .. } => {
-                if was_closing {
-                    self.admission
-                        .commit_teardown()
-                        .map_err(McpAppsHostError::Bridge)?;
-                }
-                Ok(())
+        if self.disconnected {
+            self.disconnect_view();
+            return Err(McpAppsHostError::Transport("MCP Apps View is disconnected".to_owned()));
+        }
+        if self.lifecycle() != McpAppsBridgeLifecycle::Active {
+            self.deferred_view_frames.clear();
+            for id in std::mem::take(&mut self.deferred_view_requests) {
+                let _ = self.admission.complete_error(McpAppsBridgeDirection::ViewToHost, &id);
             }
         }
+        if expire_wire_host_requests(
+            &mut self.admission, &mut self.host_requests, &mut self.staged_view_tools,
+            &mut self.teardown_request,
+        )? {
+            if self.lifecycle() == McpAppsBridgeLifecycle::Closed {
+                self.view_tools.clear();
+                self.state = McpAppsWireHostState::default();
+            }
+            return Ok(());
+        }
+        // Policy callbacks execute serially. Preserve new View application
+        // requests until outstanding Host requests settle, while continuing
+        // to receive their correlated terminal/control frames immediately.
+        let host_pending = self.host_requests.values()
+            .any(|entry| !matches!(entry.state, WireHostRequestState::Complete(_)));
+        let frame = match if host_pending { None } else { self.deferred_view_frames.pop_front() } {
+            Some(frame) => frame,
+            None => match receive_wire_host_frame(
+                cx, &mut self.transport, &self.host_requests, &self.staged_view_tools,
+                &self.teardown_request,
+            ).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => {
+                    expire_wire_host_requests(
+                        &mut self.admission, &mut self.host_requests, &mut self.staged_view_tools,
+                        &mut self.teardown_request,
+                    )?;
+                    if self.lifecycle() == McpAppsBridgeLifecycle::Closed {
+                        self.view_tools.clear();
+                        self.state = McpAppsWireHostState::default();
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    if matches!(error, McpAppsHostError::Transport(_)) { self.disconnect_view(); }
+                    return Err(error);
+                }
+            },
+        };
+        let envelope = McpAppsJsonRpcEnvelope::decode(McpAppsBridgeDirection::ViewToHost, &frame)
+            .map_err(McpAppsHostError::Bridge)?;
+        if host_pending && matches!(envelope, McpAppsJsonRpcEnvelope::Request { .. }) {
+            if self.deferred_view_frames.len() >= MAX_MCP_APPS_BRIDGE_IN_FLIGHT
+                || self.retained_tool_bytes() + frame.len() > MAX_MCP_APPS_VIEW_TOOL_STATE_BYTES
+            {
+                return Err(McpAppsHostError::Bridge(McpAppsBridgeError::TooManyInFlight));
+            }
+            if let McpAppsJsonRpcEnvelope::Request { id, method, progress_token, .. } = &envelope {
+                self.admission.admit_request(McpAppsBridgeDirection::ViewToHost, id.clone(), *method, progress_token.clone())
+                    .map_err(McpAppsHostError::Bridge)?;
+                self.deferred_view_requests.insert(id.clone());
+            }
+            self.deferred_view_frames.push_back(frame);
+            return Ok(());
+        }
+        match envelope {
+            McpAppsJsonRpcEnvelope::Request {
+                id, method, params, progress_token,
+            } => {
+                if !self.deferred_view_requests.remove(&id) {
+                    self.admission.admit_request(
+                        McpAppsBridgeDirection::ViewToHost, id.clone(), method, progress_token,
+                    ).map_err(McpAppsHostError::Bridge)?;
+                }
+                self.handle_view_request(cx, id, method, params).await
+            }
+            McpAppsJsonRpcEnvelope::Notification { method, params } => {
+                self.admission.admit_notification(
+                    McpAppsBridgeDirection::ViewToHost, method, params.as_ref(),
+                ).map_err(McpAppsHostError::Bridge)?;
+                self.handle_view_notification(cx, method, params).await
+            }
+            McpAppsJsonRpcEnvelope::Response { id, result } => {
+                self.complete_host_request(cx, id, Ok(result)).await
+            }
+            McpAppsJsonRpcEnvelope::Error { id, error } => {
+                self.complete_host_request(cx, id, Err(error)).await
+            }
+        }
+    }
+
+    fn retained_tool_bytes(&self) -> usize {
+        view_catalog_bytes(&self.view_tools)
+            + self.staged_view_tools.as_ref().map_or(0, staged_view_tool_bytes)
+            + self.host_requests.values().map(|entry| entry.retained_bytes).sum::<usize>()
+            + self.deferred_view_frames.iter().map(String::len).sum::<usize>()
+    }
+
+    fn disconnect_view(&mut self) {
+        self.disconnected = true;
+        self.view_tools.clear();
+        self.staged_view_tools = None;
+        self.deferred_view_frames.clear();
+        self.deferred_view_requests.clear();
+        self.state = McpAppsWireHostState::default();
+        for (id, entry) in &mut self.host_requests {
+            if !matches!(entry.state, WireHostRequestState::Complete(_)) {
+                let _ = self.admission.complete_error(McpAppsBridgeDirection::HostToView, id);
+                entry.state = WireHostRequestState::Complete(McpAppsHostRequestOutcome::ViewClosed);
+                entry.retained_bytes = 0;
+            }
+        }
+        if self.admission.lifecycle() == McpAppsBridgeLifecycle::Active {
+            let _ = self.admission.begin_teardown();
+        }
+        if self.admission.lifecycle() == McpAppsBridgeLifecycle::Closing {
+            let _ = self.admission.commit_teardown();
+        }
+        self.teardown_request = None;
+    }
+
+    async fn complete_host_request(
+        &mut self,
+        cx: &Cx,
+        id: McpAppsJsonRpcRequestId,
+        result: Result<Value, McpAppsJsonRpcError>,
+    ) -> Result<(), McpAppsHostError> {
+        if self.teardown_request.as_ref().is_some_and(|(request_id, _)| request_id == &id) {
+            match &result {
+                Ok(value) => { self.admission.complete_response(McpAppsBridgeDirection::HostToView, &id, value) }
+                Err(_) => { self.admission.complete_error(McpAppsBridgeDirection::HostToView, &id) }
+            }.map_err(McpAppsHostError::Bridge)?;
+            self.admission.commit_teardown().map_err(McpAppsHostError::Bridge)?;
+            self.teardown_request = None;
+            self.view_tools.clear();
+            self.staged_view_tools = None;
+            self.state.model_context = None;
+            for entry in self.host_requests.values_mut() {
+                if !matches!(entry.state, WireHostRequestState::Complete(_)) {
+                    entry.state = WireHostRequestState::Complete(McpAppsHostRequestOutcome::ViewClosed);
+                    entry.retained_bytes = 0;
+                }
+            }
+            return Ok(());
+        }
+        let entry = self.host_requests.get(&id)
+            .filter(|entry| !matches!(entry.state, WireHostRequestState::Complete(_)))
+            .ok_or(McpAppsHostError::Bridge(McpAppsBridgeError::UnknownCorrelation))?;
+        let was_list = matches!(entry.state, WireHostRequestState::List);
+        let old_bytes = entry.retained_bytes;
+        let deadline = entry.deadline.clone();
+        let mut prepared_catalog = None;
+        let mut prepared_stage = None;
+        let parsed = match &result {
+            Err(error) => serde_json::to_vec(error)
+                .map(|bytes| (McpAppsHostRequestOutcome::PeerError(error.clone()), bytes.len()))
+                .map_err(|_| invalid_view_result()),
+            Ok(value) => McpAppsJsonRpcEnvelope::validate_response_for(entry.method, value)
+                .map_err(McpAppsHostError::Bridge)
+                .and_then(|()| match &entry.state {
+                    WireHostRequestState::List => {
+                        let page = decode_view_tool_page(value)?;
+                        let mut tools = self.staged_view_tools.as_ref()
+                            .map_or_else(BTreeMap::new, |stage| stage.tools.clone());
+                        for tool in &page.tools {
+                            if tools.insert(tool.descriptor.name.clone(), Arc::clone(tool)).is_some() {
+                                return Err(invalid_view_result());
+                            }
+                        }
+                        if tools.len() > MAX_MCP_APPS_VIEW_TOOLS { return Err(invalid_view_result()); }
+                        let mut seen_cursors = self.staged_view_tools.as_ref()
+                            .map_or_else(BTreeSet::new, |stage| stage.seen_cursors.clone());
+                        if let Some(cursor) = &page.next_cursor {
+                            if !seen_cursors.insert(cursor.clone()) || seen_cursors.len() > MAX_MCP_APPS_BRIDGE_IN_FLIGHT {
+                                return Err(invalid_view_result());
+                            }
+                            let mut cursor_deadline = self.staged_view_tools.as_ref()
+                                .map_or_else(|| deadline.clone(), |stage| stage.deadline.clone());
+                            cursor_deadline.progress();
+                            prepared_stage = Some(StagedViewTools {
+                                tools, next_cursor: cursor.clone(), seen_cursors, deadline: cursor_deadline,
+                            });
+                        } else {
+                            prepared_catalog = Some(tools);
+                        }
+                        let bytes = page.tools.iter().map(|tool| view_tool_bytes(tool)).sum::<usize>()
+                            + page.next_cursor.as_ref().map_or(0, String::len);
+                        Ok((McpAppsHostRequestOutcome::ToolsList(page), bytes))
+                    }
+                    WireHostRequestState::Call(tool) => {
+                        let response = decode_view_tool_result(value, tool)?;
+                        let bytes = serde_json::to_vec(value).map_err(|_| invalid_view_result())?.len();
+                        Ok((McpAppsHostRequestOutcome::ToolCall(response), bytes))
+                    }
+                    WireHostRequestState::Ping => Ok((McpAppsHostRequestOutcome::Ping, 0)),
+                    WireHostRequestState::Complete(_) => Err(invalid_view_result()),
+                }),
+        };
+        let staged_bytes = |stage: &StagedViewTools| {
+            view_catalog_bytes(&stage.tools) + stage.next_cursor.len()
+                + stage.seen_cursors.iter().map(String::len).sum::<usize>()
+        };
+        let (mut outcome, mut bytes) = parsed.unwrap_or((McpAppsHostRequestOutcome::InvalidResponse, 0));
+        let mut retained = self.retained_tool_bytes().saturating_sub(old_bytes) + bytes;
+        if was_list {
+            retained = retained.saturating_sub(self.staged_view_tools.as_ref().map_or(0, staged_bytes));
+            if let Some(tools) = &prepared_catalog {
+                retained = retained.saturating_sub(view_catalog_bytes(&self.view_tools)) + view_catalog_bytes(tools);
+            }
+            retained += prepared_stage.as_ref().map_or(0, staged_bytes);
+        }
+        if retained > MAX_MCP_APPS_VIEW_TOOL_STATE_BYTES {
+            outcome = McpAppsHostRequestOutcome::InvalidResponse;
+            bytes = 0;
+        }
+        // Every correlated terminal frame retires exactly once, including a
+        // malformed result. It cannot occupy a live slot forever or acquire
+        // authority by sending a later replacement response.
+        self.admission.complete_error(McpAppsBridgeDirection::HostToView, &id)
+            .map_err(McpAppsHostError::Bridge)?;
+        let commit_catalog = matches!(outcome, McpAppsHostRequestOutcome::ToolsList(_));
+        if was_list { self.staged_view_tools = None; }
+        let entry = self.host_requests.get_mut(&id).expect("correlation retained during validation");
+        entry.state = WireHostRequestState::Complete(outcome);
+        entry.retained_bytes = bytes;
+        if commit_catalog {
+            self.staged_view_tools = prepared_stage;
+            if let Some(tools) = prepared_catalog {
+                self.view_tools = tools;
+                self.retire_view_tool_requests(cx, McpAppsHostRequestOutcome::CatalogChanged).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn retire_view_tool_requests(
+        &mut self,
+        cx: &Cx,
+        outcome: McpAppsHostRequestOutcome,
+    ) -> Result<(), McpAppsHostError> {
+        let mut ids = Vec::new();
+        for (id, entry) in &mut self.host_requests {
+            if matches!(entry.state, WireHostRequestState::List | WireHostRequestState::Call(_)) {
+                self.admission.complete_error(McpAppsBridgeDirection::HostToView, id)
+                    .map_err(McpAppsHostError::Bridge)?;
+                entry.state = WireHostRequestState::Complete(outcome.clone());
+                entry.retained_bytes = 0;
+                ids.push(id.clone());
+            }
+        }
+        for id in ids {
+            if self.lifecycle() != McpAppsBridgeLifecycle::Active { break; }
+            self.send_envelope(cx, McpAppsJsonRpcEnvelope::Notification {
+                method: McpAppsRoutedMethod::Cancelled,
+                params: Some(json!({"requestId": id})),
+            }).await?;
+        }
+        Ok(())
+    }
+
+    /// Revokes this View's tool authority and retires its exact pending calls
+    /// and cursors. Embedders use this when consent, origin, or policy changes.
+    pub async fn revoke_view_tools(&mut self, cx: &Cx) -> Result<(), McpAppsHostError> {
+        self.state.view_tools_capability = None;
+        self.view_tools.clear();
+        self.staged_view_tools = None;
+        self.retire_view_tool_requests(cx, McpAppsHostRequestOutcome::Cancelled).await
     }
 
     async fn handle_view_request(
@@ -957,7 +1706,14 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
         ));
         let mut deferred_error = None;
         loop {
-            let mut incoming = Box::pin(self.transport.receive_from_view(cx));
+            expire_wire_host_requests(
+                &mut self.admission, &mut self.host_requests, &mut self.staged_view_tools,
+                &mut self.teardown_request,
+            )?;
+            let mut incoming = Box::pin(receive_wire_host_frame(
+                cx, &mut self.transport, &self.host_requests, &self.staged_view_tools,
+                &self.teardown_request,
+            ));
             let selected = Select::new(&mut execution, &mut incoming)
                 .await
                 .map_err(|error| McpAppsHostError::Transport(error.to_string()))?;
@@ -976,7 +1732,22 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                 }
                 Either::Right(frame) => {
                     drop(incoming);
-                    let frame = frame?;
+                    let frame = match frame {
+                        Ok(Some(frame)) => frame,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            drop(execution);
+                            if matches!(error, McpAppsHostError::Transport(_)) { self.disconnect_view(); }
+                            return Err(error);
+                        }
+                    };
+                    if let Ok(McpAppsJsonRpcEnvelope::Notification { method: McpAppsRoutedMethod::Cancelled, params }) =
+                        McpAppsJsonRpcEnvelope::decode(McpAppsBridgeDirection::ViewToHost, &frame)
+                    {
+                        let cancelled = decode_params(params.as_ref())?;
+                        if cancel_deferred_view_request(&mut self.admission, &mut self.deferred_view_frames,
+                            &mut self.deferred_view_requests, &cancelled)? { continue; }
+                    }
                     match Self::matching_view_cancellation(&self.admission, &id, &frame) {
                         Ok(Some(params)) => {
                             // Give the request-owned forwarding policy the
@@ -999,7 +1770,13 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                             return Ok(());
                         }
                         Ok(None) => {
-                            if self.deferred_view_frames.len() >= MAX_MCP_APPS_BRIDGE_IN_FLIGHT {
+                            let retained = self.deferred_view_frames.iter().map(String::len).sum::<usize>()
+                                + view_catalog_bytes(&self.view_tools)
+                                + self.staged_view_tools.as_ref().map_or(0, staged_view_tool_bytes)
+                                + self.host_requests.values().map(|entry| entry.retained_bytes).sum::<usize>();
+                            if self.deferred_view_frames.len() >= MAX_MCP_APPS_BRIDGE_IN_FLIGHT
+                                || retained + frame.len() > MAX_MCP_APPS_VIEW_TOOL_STATE_BYTES
+                            {
                                 drop(execution);
                                 self.admission
                                     .complete_error(McpAppsBridgeDirection::ViewToHost, &id)
@@ -1007,6 +1784,15 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                                 return Err(McpAppsHostError::Bridge(
                                     McpAppsBridgeError::TooManyInFlight,
                                 ));
+                            }
+                            if let Ok(McpAppsJsonRpcEnvelope::Request { id, method, progress_token, .. }) =
+                                McpAppsJsonRpcEnvelope::decode(McpAppsBridgeDirection::ViewToHost, &frame)
+                            {
+                                if let Err(error) = self.admission.admit_request(McpAppsBridgeDirection::ViewToHost, id.clone(), method, progress_token) {
+                                    deferred_error.get_or_insert(McpAppsHostError::Bridge(error));
+                                    continue;
+                                }
+                                self.deferred_view_requests.insert(id);
                             }
                             self.deferred_view_frames.push_back(frame);
                         }
@@ -1044,7 +1830,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                         .and_then(|params| params.get("appCapabilities"))
                         .and_then(|capabilities| capabilities.get("availableDisplayModes"))
                         .map(|_| request.app_capabilities.available_display_modes);
-                    Some((response, declared_modes))
+                    Some((response, declared_modes, request.app_capabilities.tools))
                 } else {
                     None
                 };
@@ -1061,10 +1847,11 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                 self.admission
                     .complete_response(McpAppsBridgeDirection::ViewToHost, &id, &result)
                     .map_err(McpAppsHostError::Bridge)?;
-                if let Some((response, declared_modes)) = initialization {
+                if let Some((response, declared_modes, view_tools_capability)) = initialization {
                     self.state.capabilities = Some(response.host_capabilities);
                     self.state.host_context = response.host_context;
                     self.state.view_display_modes = declared_modes;
+                    self.state.view_tools_capability = view_tools_capability;
                 }
                 Ok(())
             }
@@ -1234,8 +2021,22 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                     .admit_control(McpAppsBridgeDirection::ViewToHost, method, params.as_ref())
                     .map_err(McpAppsHostError::Bridge)?;
                 if let McpAppsControlDisposition::Bound(request_id) = disposition {
-                    let params = decode_params(params.as_ref())?;
-                    self.policy.progress(&request_id, &params).await?;
+                    let params: McpAppsProgressControlParams = decode_params(params.as_ref())?;
+                    if let Some(entry) = self.host_requests.get_mut(&request_id) {
+                        if entry.last_progress.is_none_or(|previous| params.progress > previous) {
+                            entry.last_progress = Some(params.progress);
+                            entry.deadline.progress();
+                        }
+                    }
+                    let mut callback_deadline = WireHostDeadline::new(cx);
+                    if let Some(remaining) = self.host_requests.values()
+                        .filter(|entry| !matches!(entry.state, WireHostRequestState::Complete(_)))
+                        .map(|entry| entry.deadline.next().as_nanos().saturating_sub(entry.deadline.owner.now().as_nanos()))
+                        .min()
+                    {
+                        callback_deadline.absolute = callback_deadline.absolute.min(cx.now().saturating_add_nanos(remaining));
+                    }
+                    await_wire_operation(cx, &callback_deadline, self.policy.progress(&request_id, &params)).await?;
                 }
                 return Ok(());
             }
@@ -1246,11 +2047,25 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                     .map_err(McpAppsHostError::Bridge)?;
                 if let McpAppsControlDisposition::Bound(request_id) = disposition {
                     let params = decode_params(params.as_ref())?;
-                    self.commit_view_cancellation(cx, &request_id, &params)?;
+                    if !cancel_deferred_view_request(&mut self.admission, &mut self.deferred_view_frames,
+                        &mut self.deferred_view_requests, &params)? {
+                        self.commit_view_cancellation(cx, &request_id, &params)?;
+                    }
                 }
                 return Ok(());
             }
             _ => {}
+        }
+        if self.admission.lifecycle() != McpAppsBridgeLifecycle::Active {
+            return Ok(());
+        }
+        if method == McpAppsRoutedMethod::AppToolsListChanged {
+            if !self.state.view_tools_capability.as_ref().is_some_and(|capability| capability.list_changed) {
+                return Err(wire_policy_denied());
+            }
+            self.view_tools.clear();
+            self.staged_view_tools = None;
+            self.retire_view_tool_requests(cx, McpAppsHostRequestOutcome::CatalogChanged).await?;
         }
         self.policy.notification(method, params.as_ref()).await?;
         if method == McpAppsRoutedMethod::RequestTeardown
@@ -1274,11 +2089,58 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
         request: McpAppsHostRequest,
         progress_token: Option<McpAppsJsonRpcRequestId>,
     ) -> Result<McpAppsJsonRpcRequestId, McpAppsHostError> {
-        if self.admission.lifecycle() != McpAppsBridgeLifecycle::Active {
+        expire_wire_host_requests(
+            &mut self.admission, &mut self.host_requests, &mut self.staged_view_tools,
+            &mut self.teardown_request,
+        )?;
+        if self.disconnected || self.admission.lifecycle() != McpAppsBridgeLifecycle::Active {
             return Err(McpAppsHostError::Bridge(
                 McpAppsBridgeError::InvalidLifecycle,
             ));
         }
+        if self.host_requests.len() >= MAX_MCP_APPS_BRIDGE_IN_FLIGHT {
+            return Err(McpAppsHostError::Bridge(McpAppsBridgeError::TooManyInFlight));
+        }
+        let mut restart_pagination = false;
+        let mut inherited_deadline = None;
+        let operation_deadline = WireHostDeadline::new(cx);
+        let state = match &request {
+            McpAppsHostRequest::ToolsList(params) => {
+                if self.state.view_tools_capability.is_none() { return Err(wire_policy_denied()); }
+                if self.host_requests.values().any(|entry| matches!(entry.state, WireHostRequestState::List)) {
+                    return Err(McpAppsHostError::Bridge(McpAppsBridgeError::TooManyInFlight));
+                }
+                match &params.cursor {
+                    Some(cursor) if self.staged_view_tools.as_ref()
+                        .is_some_and(|stage| &stage.next_cursor == cursor) => {
+                            let mut deadline = self.staged_view_tools.as_ref()
+                                .expect("matched live cursor").deadline.clone();
+                            deadline.progress();
+                            inherited_deadline = Some(deadline);
+                        }
+                    Some(_) => return Err(invalid_view_result()),
+                    None => restart_pagination = true,
+                }
+                WireHostRequestState::List
+            }
+            McpAppsHostRequest::CallTool(params) => {
+                if self.state.view_tools_capability.is_none() { return Err(wire_policy_denied()); }
+                let tool = self.view_tools.get(&params.name).cloned().ok_or_else(wire_policy_denied)?;
+                let arguments = params.arguments.as_ref().map_or_else(|| json!({}), |arguments| {
+                    Value::Object(arguments.clone().into_iter().collect())
+                });
+                admit_view_numbers(&arguments)?;
+                tool.input_schema.validate(&arguments).map_err(|_| invalid_view_result())?;
+                if cx.checkpoint().is_err() { return Err(McpAppsHostError::Core(McpError::request_cancelled())); }
+                await_wire_operation(cx, &operation_deadline, self.policy.approve_view_tool_call(cx, &tool, params)).await?;
+                if cx.checkpoint().is_err() { return Err(McpAppsHostError::Core(McpError::request_cancelled())); }
+                WireHostRequestState::Call(tool)
+            }
+            McpAppsHostRequest::Ping(_) => WireHostRequestState::Ping,
+            McpAppsHostRequest::ResourceTeardown(_) => {
+                return Err(McpAppsHostError::Bridge(McpAppsBridgeError::InvalidLifecycle));
+            }
+        };
         let (method, params) = wire_host_request_parts(request)?;
         let id = self
             .next_host_id
@@ -1293,6 +2155,13 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
         let frame = envelope
             .encode(McpAppsBridgeDirection::HostToView)
             .map_err(McpAppsHostError::Bridge)?;
+        let retained_bytes = frame.len() + match &state {
+            WireHostRequestState::Call(tool) => view_tool_bytes(tool),
+            _ => 0,
+        };
+        if self.retained_tool_bytes() + retained_bytes > MAX_MCP_APPS_VIEW_TOOL_STATE_BYTES {
+            return Err(McpAppsHostError::Bridge(McpAppsBridgeError::MessageTooLarge));
+        }
         self.admission
             .admit_request(
                 McpAppsBridgeDirection::HostToView,
@@ -1301,11 +2170,24 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                 progress_token,
             )
             .map_err(McpAppsHostError::Bridge)?;
-        let sent = self.transport.send_to_view(cx, frame).await;
-        if sent.is_err() {
-            self.admission
-                .complete_error(McpAppsBridgeDirection::HostToView, &id)
-                .map_err(McpAppsHostError::Bridge)?;
+        let deadline = inherited_deadline.unwrap_or(operation_deadline);
+        self.host_requests.insert(id.clone(), WireHostRequest {
+            method, state, retained_bytes, deadline: deadline.clone(), last_progress: None,
+        });
+        let mut guard = WireHostSendGuard {
+            admission: &mut self.admission,
+            requests: &mut self.host_requests,
+            disconnected: &mut self.disconnected,
+            id: Some(id.clone()),
+        };
+        let sent = await_wire_operation(cx, &deadline, self.transport.send_to_view(cx, frame)).await;
+        if sent.is_ok() { guard.id = None; }
+        drop(guard);
+        if sent.is_err() { self.disconnect_view(); }
+        else if restart_pagination {
+            self.staged_view_tools = None;
+        } else if method == McpAppsRoutedMethod::ToolsList {
+            if let Some(stage) = &mut self.staged_view_tools { stage.deadline = deadline; }
         }
         sent.map(|()| id)
     }
@@ -1322,6 +2204,10 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
         cx: &Cx,
         notification: McpAppsHostNotification,
     ) -> Result<(), McpAppsHostError> {
+        if self.disconnected {
+            self.disconnect_view();
+            return Err(McpAppsHostError::Bridge(McpAppsBridgeError::InvalidLifecycle));
+        }
         if self.admission.lifecycle() != McpAppsBridgeLifecycle::Active {
             return Err(McpAppsHostError::Bridge(
                 McpAppsBridgeError::InvalidLifecycle,
@@ -1368,6 +2254,11 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             self.admission
                 .complete_error(McpAppsBridgeDirection::HostToView, &request_id)
                 .map_err(McpAppsHostError::Bridge)?;
+            if let Some(entry) = self.host_requests.get_mut(&request_id) {
+                if matches!(entry.state, WireHostRequestState::List) { self.staged_view_tools = None; }
+                entry.state = WireHostRequestState::Complete(McpAppsHostRequestOutcome::Cancelled);
+                entry.retained_bytes = 0;
+            }
         }
         Ok(())
     }
@@ -1375,6 +2266,10 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
     /// Starts a Host-approved teardown. A failed carrier send restores the
     /// active admission state without dropping unrelated live correlations.
     pub async fn begin_teardown(&mut self, cx: &Cx) -> Result<(), McpAppsHostError> {
+        if self.disconnected {
+            self.disconnect_view();
+            return Err(McpAppsHostError::Bridge(McpAppsBridgeError::InvalidLifecycle));
+        }
         let id = self
             .next_host_id
             .allocate()
@@ -1399,8 +2294,11 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
         self.admission
             .begin_teardown()
             .map_err(McpAppsHostError::Bridge)?;
-        let sent = self.transport.send_to_view(cx, frame).await;
+        let deadline = WireHostDeadline::new(cx);
+        self.teardown_request = Some((id.clone(), deadline.clone()));
+        let sent = await_wire_operation(cx, &deadline, self.transport.send_to_view(cx, frame)).await;
         if sent.is_err() {
+            self.teardown_request = None;
             self.admission
                 .complete_error(McpAppsBridgeDirection::HostToView, &id)
                 .map_err(McpAppsHostError::Bridge)?;
@@ -1409,6 +2307,21 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                 .map_err(McpAppsHostError::Bridge)?;
         } else {
             self.state.model_context = None;
+            self.deferred_view_frames.clear();
+            for request_id in std::mem::take(&mut self.deferred_view_requests) {
+                self.admission.complete_error(McpAppsBridgeDirection::ViewToHost, &request_id)
+                    .map_err(McpAppsHostError::Bridge)?;
+            }
+            self.view_tools.clear();
+            self.staged_view_tools = None;
+            for (request_id, entry) in &mut self.host_requests {
+                if !matches!(entry.state, WireHostRequestState::Complete(_)) {
+                    self.admission.complete_error(McpAppsBridgeDirection::HostToView, request_id)
+                        .map_err(McpAppsHostError::Bridge)?;
+                    entry.state = WireHostRequestState::Complete(McpAppsHostRequestOutcome::ViewClosed);
+                    entry.retained_bytes = 0;
+                }
+            }
         }
         sent
     }
@@ -1421,7 +2334,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
         let frame = envelope
             .encode(McpAppsBridgeDirection::HostToView)
             .map_err(McpAppsHostError::Bridge)?;
-        self.transport.send_to_view(cx, frame).await
+        await_wire_operation(cx, &WireHostDeadline::new(cx), self.transport.send_to_view(cx, frame)).await
     }
 }
 
@@ -2209,6 +3122,500 @@ mod tests {
     }
 
     struct WirePolicy;
+
+    struct ViewToolPolicy {
+        allow: bool,
+        approvals: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[allow(clippy::unused_async_trait_impl, reason = "immediate bounded policy decisions implement async embedder hooks")]
+    impl McpAppsWireHostPolicy for ViewToolPolicy {
+        async fn approve_view_tool_call(
+            &mut self,
+            _cx: &Cx,
+            tool: &McpAppsViewTool,
+            params: &fastmcp_protocol::McpAppsToolCallParams,
+        ) -> Result<(), McpAppsHostError> {
+            assert_eq!(tool.descriptor().name, params.name);
+            self.approvals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.allow { Ok(()) } else { Err(wire_policy_denied()) }
+        }
+
+        async fn dispatch_reused_request(
+            &mut self,
+            _cx: &Cx,
+            _cancellation: &McpRequestCancellation,
+            _method: McpAppsRoutedMethod,
+            _params: Option<Value>,
+        ) -> Result<Value, McpAppsHostError> {
+            std::future::pending().await
+        }
+    }
+
+    fn view_tool_descriptor(name: &str) -> Value {
+        json!({
+            "name": name,
+            "inputSchema": {"type": "object", "properties": {"count": {"type": "integer", "minimum": 1}}, "required": ["count"]},
+            "outputSchema": {"type": "object", "properties": {"accepted": {"type": "integer", "minimum": 1}}, "required": ["accepted"]},
+            "annotations": {"readOnlyHint": true},
+            "_meta": {"untrusted": "View hint"}
+        })
+    }
+
+    fn view_tool_call(count: Value) -> McpAppsHostRequest {
+        McpAppsHostRequest::CallTool(serde_json::from_value(json!({
+            "name": "view_counter", "arguments": {"count": count}
+        })).unwrap())
+    }
+
+    async fn tool_wire_host(
+        cx: &Cx,
+        allow: bool,
+    ) -> (McpAppsWireHost<McpAppsInMemoryWireHostTransport, ViewToolPolicy>, McpAppsInMemoryWireViewTransport) {
+        let (transport, mut view) = mcp_apps_in_memory_wire_pair(128);
+        let mut host = McpAppsWireHost::new_negotiated(
+            transport, wire_configuration(),
+            ViewToolPolicy { allow, approvals: Arc::new(std::sync::atomic::AtomicUsize::new(0)) },
+            activation_proof(),
+        );
+        view.send_to_host(cx, json!({
+            "jsonrpc": "2.0", "id": "initialize", "method": "ui/initialize",
+            "params": {"appInfo": {"name": "view", "version": "1"},
+                "appCapabilities": {"tools": {"listChanged": true}},
+                "protocolVersion": MCP_APPS_HOST_VIEW_PROTOCOL_VERSION}
+        }).to_string()).await.unwrap();
+        host.process_next(cx).await.unwrap();
+        let _ = view.receive_from_host(cx).await.unwrap();
+        view.send_to_host(cx, json!({"jsonrpc":"2.0","method":"ui/notifications/initialized"}).to_string()).await.unwrap();
+        host.process_next(cx).await.unwrap();
+        (host, view)
+    }
+
+    async fn tool_wire_reply<P: McpAppsWireHostPolicy>(
+        host: &mut McpAppsWireHost<McpAppsInMemoryWireHostTransport, P>,
+        view: &mut McpAppsInMemoryWireViewTransport,
+        cx: &Cx,
+        id: &McpAppsJsonRpcRequestId,
+        result: Value,
+    ) -> McpAppsHostRequestOutcome {
+        view.send_to_host(cx, json!({"jsonrpc":"2.0","id":id,"result":result}).to_string()).await.unwrap();
+        host.process_next(cx).await.unwrap();
+        host.take_host_response(id).expect("one correlated terminal outcome").outcome
+    }
+
+    async fn install_view_tool_catalog<P: McpAppsWireHostPolicy>(
+        host: &mut McpAppsWireHost<McpAppsInMemoryWireHostTransport, P>,
+        view: &mut McpAppsInMemoryWireViewTransport,
+        cx: &Cx,
+    ) {
+        let id = host.send_host_request(cx, McpAppsHostRequest::ToolsList(Default::default()), None).await.unwrap();
+        let _ = view.receive_from_host(cx).await.unwrap();
+        assert!(matches!(tool_wire_reply(host, view, cx, &id, json!({
+            "tools": [view_tool_descriptor("view_counter")]
+        })).await, McpAppsHostRequestOutcome::ToolsList(_)));
+        assert_eq!(host.view_tools().count(), 1);
+    }
+
+    #[test]
+    fn closed_wire_view_tools_enforce_policy_arguments_and_deliver_correlated_output() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (mut host, mut view) = tool_wire_host(&cx, true).await;
+            install_view_tool_catalog(&mut host, &mut view, &cx).await;
+            assert!(host.send_host_request(&cx, view_tool_call(json!(0)), None).await.is_err());
+            assert_eq!(host.policy.approvals.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(host.host_requests.is_empty());
+            let id = host.send_host_request(&cx, view_tool_call(json!(3)), None).await.unwrap();
+            let sent: Value = serde_json::from_str(&view.receive_from_host(&cx).await.unwrap()).unwrap();
+            assert_eq!(sent["id"], serde_json::to_value(&id).unwrap());
+            assert_eq!(sent["params"], json!({"name":"view_counter","arguments":{"count":3}}));
+            let McpAppsHostRequestOutcome::ToolCall(result) = tool_wire_reply(
+                &mut host, &mut view, &cx, &id,
+                json!({"content":[{"type":"text","text":"accepted three"}],"structuredContent":{"accepted":3}}),
+            ).await else { panic!("validated tool result expected"); };
+            assert_eq!(result.structured_content.unwrap()["accepted"], 3);
+            assert_eq!(result.is_error, None);
+            assert!(host.take_host_response(&id).is_none());
+            host.policy.allow = false;
+            assert!(host.send_host_request(&cx, view_tool_call(json!(3)), None).await.is_err());
+            assert!(host.host_requests.is_empty());
+            assert_eq!(host.policy.approvals.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert_eq!(host.view_tools().count(), 1);
+        });
+    }
+
+    #[test]
+    fn closed_wire_view_catalog_rejects_invalid_schemas_without_partial_exposure() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (mut host, mut view) = tool_wire_host(&cx, true).await;
+            install_view_tool_catalog(&mut host, &mut view, &cx).await;
+            for (path, bad) in [
+                ("inputSchema", json!({"type":"object","minimum":"not-a-number"})),
+                ("inputSchema", json!({"type":"object","$ref":"#/$defs/missing"})),
+                ("outputSchema", json!({"type":"array"})),
+                ("execution", json!({"taskSupport":"optional"})),
+                ("annotations", json!({"readOnlyHint":null})),
+            ] {
+                let mut malformed = view_tool_descriptor("new_tool");
+                malformed[path] = bad;
+                let id = host.send_host_request(&cx, McpAppsHostRequest::ToolsList(Default::default()), None).await.unwrap();
+                let _ = view.receive_from_host(&cx).await.unwrap();
+                assert!(matches!(tool_wire_reply(&mut host, &mut view, &cx, &id,
+                    json!({"tools":[view_tool_descriptor("valid_first"), malformed]})).await,
+                    McpAppsHostRequestOutcome::InvalidResponse));
+                assert_eq!(host.view_tools().map(|tool| tool.descriptor().name.as_str()).collect::<Vec<_>>(), ["view_counter"]);
+                assert!(host.host_requests.is_empty());
+                assert!(host.staged_view_tools.is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn closed_wire_view_tool_output_errors_retire_only_the_exact_request() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (mut host, mut view) = tool_wire_host(&cx, true).await;
+            install_view_tool_catalog(&mut host, &mut view, &cx).await;
+            for invalid in [
+                json!({"content":[]}),
+                json!({"content":[],"structuredContent":{"accepted":0}}),
+                json!({"content":[],"structuredContent":null}),
+                json!({"content":[],"structuredContent":{"accepted":1},"isError":null}),
+                json!({"content":[],"structuredContent":{"accepted":1},"resultType":"complete"}),
+                json!({"content":[],"structuredContent":{"accepted":1},"_meta":{}}),
+            ] {
+                let a = host.send_host_request(&cx, view_tool_call(json!(1)), None).await.unwrap();
+                let b = host.send_host_request(&cx, view_tool_call(json!(2)), None).await.unwrap();
+                let _ = view.receive_from_host(&cx).await.unwrap();
+                let _ = view.receive_from_host(&cx).await.unwrap();
+                assert!(matches!(tool_wire_reply(&mut host, &mut view, &cx, &a, invalid).await, McpAppsHostRequestOutcome::InvalidResponse));
+                assert!(host.take_host_response(&b).is_none());
+                assert!(matches!(tool_wire_reply(&mut host, &mut view, &cx, &b,
+                    json!({"content":[],"isError":true})).await, McpAppsHostRequestOutcome::ToolCall(result) if result.is_error()));
+            }
+            let id = host.send_host_request(&cx, view_tool_call(json!(1)), None).await.unwrap();
+            let _ = view.receive_from_host(&cx).await.unwrap();
+            view.send_to_host(&cx, json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"View refusal"}}).to_string()).await.unwrap();
+            host.process_next(&cx).await.unwrap();
+            assert!(matches!(host.take_host_response(&id).unwrap().outcome, McpAppsHostRequestOutcome::PeerError(error) if error.code == -32601));
+            assert!(host.host_requests.is_empty());
+        });
+    }
+
+    #[test]
+    fn closed_wire_view_tools_page_chain_is_atomic_bound_and_expires_as_one_unit() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (mut host, mut view) = tool_wire_host(&cx, true).await;
+            install_view_tool_catalog(&mut host, &mut view, &cx).await;
+            for expire in [false, true] {
+                let first = host.send_host_request(&cx, McpAppsHostRequest::ToolsList(Default::default()), None).await.unwrap();
+                let _ = view.receive_from_host(&cx).await.unwrap();
+                assert!(matches!(tool_wire_reply(&mut host, &mut view, &cx, &first,
+                    json!({"tools":[view_tool_descriptor("first")],"nextCursor":"page-two"})).await, McpAppsHostRequestOutcome::ToolsList(_)));
+                let old = host.view_tools().map(|tool| tool.descriptor().name.clone()).collect::<Vec<_>>();
+                assert!(host.send_host_request(&cx, McpAppsHostRequest::ToolsList(fastmcp_protocol::McpAppsListParams { cursor: Some("wrong-page".into()) }), None).await.is_err());
+                let second = host.send_host_request(&cx, McpAppsHostRequest::ToolsList(fastmcp_protocol::McpAppsListParams { cursor: Some("page-two".into()) }), None).await.unwrap();
+                let _ = view.receive_from_host(&cx).await.unwrap();
+                if expire {
+                    host.staged_view_tools.as_mut().unwrap().deadline.absolute = Time::ZERO;
+                    host.process_next(&cx).await.unwrap();
+                    assert!(matches!(host.take_host_response(&second).unwrap().outcome, McpAppsHostRequestOutcome::DeadlineExceeded));
+                    assert!(host.staged_view_tools.is_none());
+                    view.send_to_host(&cx, json!({"jsonrpc":"2.0","id":second,"result":{"tools":[view_tool_descriptor("suffix_only")]}}).to_string()).await.unwrap();
+                    assert!(host.process_next(&cx).await.is_err());
+                    assert_eq!(host.view_tools().map(|tool| tool.descriptor().name.clone()).collect::<Vec<_>>(), old);
+                } else {
+                    assert!(matches!(tool_wire_reply(&mut host, &mut view, &cx, &second,
+                        json!({"tools":[view_tool_descriptor("second")]})).await, McpAppsHostRequestOutcome::ToolsList(_)));
+                    assert_eq!(host.view_tools().map(|tool| tool.descriptor().name.as_str()).collect::<Vec<_>>(), ["first", "second"]);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn closed_wire_view_tools_reject_javascript_value_changes_before_approval() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (mut host, mut view) = tool_wire_host(&cx, true).await;
+            install_view_tool_catalog(&mut host, &mut view, &cx).await;
+            for source in ["9007199254740993", "9007199254740992", "1.0000000000000001", "1e9999", "-0.0"] {
+                let value = serde_json::from_str(source).unwrap();
+                assert!(host.send_host_request(&cx, view_tool_call(value), None).await.is_err(), "{source}");
+                assert!(host.host_requests.is_empty());
+            }
+            assert_eq!(host.policy.approvals.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(admit_view_numbers(&serde_json::from_str::<Value>("[0.1,1.0,1e0,9007199254740991]").unwrap()).is_ok());
+            let id = host.send_host_request(&cx, view_tool_call(json!(9007199254740991u64)), None).await.unwrap();
+            let _ = view.receive_from_host(&cx).await.unwrap();
+            assert!(matches!(tool_wire_reply(&mut host, &mut view, &cx, &id,
+                json!({"content":[],"structuredContent":{"accepted":9007199254740991u64}})).await, McpAppsHostRequestOutcome::ToolCall(_)));
+        });
+    }
+
+    #[test]
+    fn closed_wire_host_results_are_received_while_new_view_work_is_deferred() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (mut host, mut view) = tool_wire_host(&cx, true).await;
+            install_view_tool_catalog(&mut host, &mut view, &cx).await;
+            let a = host.send_host_request(&cx, view_tool_call(json!(1)), None).await.unwrap();
+            let b = host.send_host_request(&cx, view_tool_call(json!(2)), None).await.unwrap();
+            let _ = view.receive_from_host(&cx).await.unwrap();
+            let _ = view.receive_from_host(&cx).await.unwrap();
+            // This policy deliberately never returns. Admitting it now would
+            // prevent either already-issued Host request from receiving results.
+            view.send_to_host(&cx, json!({"jsonrpc":"2.0","id":"other-direction","method":"tools/call","params":{"name":"server_tool"}}).to_string()).await.unwrap();
+            host.process_next(&cx).await.unwrap();
+            assert_eq!(host.deferred_view_frames.len(), 1);
+            view.send_to_host(&cx, json!({"jsonrpc":"2.0","id":b,"result":{"content":[],"structuredContent":{"accepted":2}}}).to_string()).await.unwrap();
+            let response = host.wait_for_host_response(&cx, &b).await.unwrap();
+            assert_eq!(response.request_id, b);
+            assert!(matches!(response.outcome, McpAppsHostRequestOutcome::ToolCall(_)));
+            assert_eq!(host.deferred_view_frames.len(), 1);
+            assert!(matches!(tool_wire_reply(&mut host, &mut view, &cx, &a,
+                json!({"content":[],"structuredContent":{"accepted":1}})).await, McpAppsHostRequestOutcome::ToolCall(_)));
+            assert_eq!(host.deferred_view_frames.len(), 1);
+        });
+    }
+
+    #[test]
+    fn closed_wire_deferred_view_request_cancellation_prevents_later_dispatch() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (mut host, mut view) = tool_wire_host(&cx, true).await;
+            let id = host.send_host_request(&cx, McpAppsHostRequest::Ping(Default::default()), None).await.unwrap();
+            let _ = view.receive_from_host(&cx).await.unwrap();
+            let queued = json!({"jsonrpc":"2.0","id":"queued","method":"tools/call","params":{"name":"server_tool"}}).to_string();
+            view.send_to_host(&cx, queued.clone()).await.unwrap();
+            host.process_next(&cx).await.unwrap();
+            view.send_to_host(&cx, queued).await.unwrap();
+            assert!(matches!(host.process_next(&cx).await, Err(McpAppsHostError::Bridge(McpAppsBridgeError::DuplicateLiveRequest))));
+            assert_eq!(host.deferred_view_frames.len(), 1);
+            view.send_to_host(&cx, json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"queued"}}).to_string()).await.unwrap();
+            host.process_next(&cx).await.unwrap();
+            assert!(host.deferred_view_frames.is_empty());
+            assert!(host.deferred_view_requests.is_empty());
+            assert!(matches!(tool_wire_reply(&mut host, &mut view, &cx, &id, json!({})).await, McpAppsHostRequestOutcome::Ping));
+            assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+        });
+    }
+
+    #[test]
+    fn closed_wire_catalog_change_and_explicit_cancel_retire_only_owned_calls() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (mut host, mut view) = tool_wire_host(&cx, true).await;
+            install_view_tool_catalog(&mut host, &mut view, &cx).await;
+            let a = host.send_host_request(&cx, view_tool_call(json!(1)), None).await.unwrap();
+            let b = host.send_host_request(&cx, view_tool_call(json!(2)), None).await.unwrap();
+            let _ = view.receive_from_host(&cx).await.unwrap();
+            let _ = view.receive_from_host(&cx).await.unwrap();
+            host.send_notification(&cx, McpAppsHostNotification::Cancelled(fastmcp_protocol::McpAppsCancelledNotification {
+                request_id: Some(McpAppsBridgeRequestId::new(a.as_number().unwrap()).unwrap()), reason: None,
+            })).await.unwrap();
+            let cancel: Value = serde_json::from_str(&view.receive_from_host(&cx).await.unwrap()).unwrap();
+            assert_eq!(cancel["params"]["requestId"], serde_json::to_value(&a).unwrap());
+            assert!(matches!(host.take_host_response(&a).unwrap().outcome, McpAppsHostRequestOutcome::Cancelled));
+            assert!(host.take_host_response(&b).is_none());
+            view.send_to_host(&cx, json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"}).to_string()).await.unwrap();
+            host.process_next(&cx).await.unwrap();
+            let cancel: Value = serde_json::from_str(&view.receive_from_host(&cx).await.unwrap()).unwrap();
+            assert_eq!(cancel["params"]["requestId"], serde_json::to_value(&b).unwrap());
+            assert!(matches!(host.take_host_response(&b).unwrap().outcome, McpAppsHostRequestOutcome::CatalogChanged));
+            assert_eq!(host.view_tools().count(), 0);
+            assert!(host.send_host_request(&cx, view_tool_call(json!(1)), None).await.is_err());
+            install_view_tool_catalog(&mut host, &mut view, &cx).await;
+            host.revoke_view_tools(&cx).await.unwrap();
+            assert!(host.send_host_request(&cx, McpAppsHostRequest::ToolsList(Default::default()), None).await.is_err());
+            assert_eq!(host.view_tools().count(), 0);
+        });
+    }
+
+    #[test]
+    fn closed_wire_retained_outcomes_and_catalog_bytes_have_finite_budgets() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (mut host, mut view) = tool_wire_host(&cx, true).await;
+            let mut completed = Vec::new();
+            for _ in 0..MAX_MCP_APPS_BRIDGE_IN_FLIGHT {
+                let id = host.send_host_request(&cx, McpAppsHostRequest::Ping(Default::default()), None).await.unwrap();
+                let _ = view.receive_from_host(&cx).await.unwrap();
+                view.send_to_host(&cx, json!({"jsonrpc":"2.0","id":id,"result":{}}).to_string()).await.unwrap();
+                host.process_next(&cx).await.unwrap();
+                completed.push(id);
+            }
+            assert!(matches!(host.send_host_request(&cx, McpAppsHostRequest::Ping(Default::default()), None).await,
+                Err(McpAppsHostError::Bridge(McpAppsBridgeError::TooManyInFlight))));
+            assert!(matches!(host.take_host_response(&completed[0]).unwrap().outcome, McpAppsHostRequestOutcome::Ping));
+            let extra = host.send_host_request(&cx, McpAppsHostRequest::Ping(Default::default()), None).await.unwrap();
+            let _ = view.receive_from_host(&cx).await.unwrap();
+            assert!(matches!(tool_wire_reply(&mut host, &mut view, &cx, &extra, json!({})).await, McpAppsHostRequestOutcome::Ping));
+            for id in &completed { let _ = host.take_host_response(id); }
+            install_view_tool_catalog(&mut host, &mut view, &cx).await;
+            let mut large_a = view_tool_descriptor("large_a");
+            large_a["description"] = json!("d".repeat(64 * 1024));
+            large_a["inputSchema"]["x-large"] = json!(["a".repeat(64 * 1024), "b".repeat(64 * 1024)]);
+            let mut large_b = large_a.clone();
+            large_b["name"] = json!("large_b");
+            let id = host.send_host_request(&cx, McpAppsHostRequest::ToolsList(Default::default()), None).await.unwrap();
+            let _ = view.receive_from_host(&cx).await.unwrap();
+            assert!(matches!(tool_wire_reply(&mut host, &mut view, &cx, &id,
+                json!({"tools":[large_a,large_b]})).await, McpAppsHostRequestOutcome::InvalidResponse));
+            assert_eq!(host.view_tools().count(), 1);
+            assert!(host.retained_tool_bytes() <= MAX_MCP_APPS_VIEW_TOOL_STATE_BYTES);
+        });
+    }
+
+    #[test]
+    fn closed_wire_host_request_timer_wakes_a_silent_view_on_the_caller_runtime() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let (mut host, mut view) = tool_wire_host(&cx, true).await;
+            let id = host.send_host_request(&cx, McpAppsHostRequest::Ping(Default::default()), None).await.unwrap();
+            let _ = view.receive_from_host(&cx).await.unwrap();
+            host.host_requests.get_mut(&id).unwrap().deadline.idle = cx.now().saturating_add_nanos(5_000_000);
+            let response = host.wait_for_host_response(&cx, &id).await.unwrap();
+            assert!(matches!(response.outcome, McpAppsHostRequestOutcome::DeadlineExceeded));
+            assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+            let next = host.send_host_request(&cx, McpAppsHostRequest::Ping(Default::default()), None).await.unwrap();
+            assert_ne!(id, next);
+            let _ = view.receive_from_host(&cx).await.unwrap();
+            assert!(matches!(tool_wire_reply(&mut host, &mut view, &cx, &next, json!({})).await, McpAppsHostRequestOutcome::Ping));
+        });
+    }
+
+    #[test]
+    fn closed_wire_short_wait_deadline_wakes_without_cancelling_the_live_host_request() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let (mut host, mut view) = tool_wire_host(&cx, true).await;
+            let id = host.send_host_request(&cx, McpAppsHostRequest::Ping(Default::default()), None).await.unwrap();
+            let _ = view.receive_from_host(&cx).await.unwrap();
+            let limited = runtime.request_cx_with_budget(asupersync::Budget::new()
+                .with_deadline(cx.now().saturating_add_nanos(5_000_000)));
+            assert!(host.wait_for_host_response(&limited, &id).await.is_err());
+            assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+            assert!(host.take_host_response(&id).is_none());
+            assert!(matches!(tool_wire_reply(&mut host, &mut view, &cx, &id, json!({})).await, McpAppsHostRequestOutcome::Ping));
+        });
+    }
+
+    #[test]
+    fn closed_wire_wait_cancellation_and_progress_preserve_original_request_lifetimes() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (mut host, mut view) = tool_wire_host(&cx, true).await;
+            let token = McpAppsJsonRpcRequestId::string("request-progress".into()).unwrap();
+            let id = host.send_host_request(&cx, McpAppsHostRequest::Ping(Default::default()), Some(token.clone())).await.unwrap();
+            let _ = view.receive_from_host(&cx).await.unwrap();
+            let absolute = host.host_requests[&id].deadline.absolute;
+            host.host_requests.get_mut(&id).unwrap().deadline.idle = cx.now().saturating_add_nanos(1_000_000_000);
+            view.send_to_host(&cx, json!({"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":token,"progress":1}}).to_string()).await.unwrap();
+            host.process_next(&cx).await.unwrap();
+            let idle = host.host_requests[&id].deadline.idle;
+            for progress in [1, 0] {
+                view.send_to_host(&cx, json!({"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":token,"progress":progress}}).to_string()).await.unwrap();
+                host.process_next(&cx).await.unwrap();
+                assert_eq!(host.host_requests[&id].deadline.idle, idle);
+                assert_eq!(host.host_requests[&id].deadline.absolute, absolute);
+            }
+            let cancelled = Cx::for_testing_with_budget(asupersync::Budget::new().with_deadline(Time::ZERO));
+            assert!(host.wait_for_host_response(&cancelled, &id).await.is_err());
+            assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+            assert!(host.take_host_response(&id).is_none());
+            assert!(matches!(tool_wire_reply(&mut host, &mut view, &cx, &id, json!({})).await, McpAppsHostRequestOutcome::Ping));
+        });
+    }
+
+    struct PendingWireSend;
+
+    impl McpAppsWireBridgeTransport for PendingWireSend {
+        async fn send_to_view(&mut self, _cx: &Cx, _frame: String) -> Result<(), McpAppsHostError> {
+            std::future::pending().await
+        }
+        async fn receive_from_view(&mut self, _cx: &Cx) -> Result<String, McpAppsHostError> {
+            std::future::pending().await
+        }
+    }
+
+    #[test]
+    fn closed_wire_abandoned_send_releases_the_unexposed_id_and_fences_the_view() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut host = McpAppsWireHost::new_negotiated(PendingWireSend, wire_configuration(), WirePolicy, activation_proof());
+            host.admission = active_wire_admission();
+            let mut sending = Box::pin(host.send_host_request(&cx, McpAppsHostRequest::Ping(Default::default()), None));
+            poll_fn(|task| {
+                assert!(sending.as_mut().poll(task).is_pending());
+                Poll::Ready(())
+            }).await;
+            drop(sending);
+            assert!(host.host_requests.is_empty());
+            assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Closed);
+            assert!(host.send_notification(&cx, McpAppsHostNotification::ToolsListChanged).await.is_err());
+            assert!(host.send_host_request(&cx, McpAppsHostRequest::Ping(Default::default()), None).await.is_err());
+        });
+    }
+
+    #[test]
+    fn closed_wire_abandoned_teardown_expires_every_live_call_once() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut host = McpAppsWireHost::new_negotiated(PendingWireSend, wire_configuration(), WirePolicy, activation_proof());
+            host.admission = active_wire_admission();
+            let id = McpAppsJsonRpcRequestId::host(200).unwrap();
+            host.admission.admit_request(McpAppsBridgeDirection::HostToView, id.clone(), McpAppsRoutedMethod::Ping, None).unwrap();
+            host.host_requests.insert(id.clone(), WireHostRequest {
+                method: McpAppsRoutedMethod::Ping, state: WireHostRequestState::Ping,
+                retained_bytes: 0, deadline: WireHostDeadline::new(&cx), last_progress: None,
+            });
+            let queued = McpAppsJsonRpcRequestId::string("queued-before-close".into()).unwrap();
+            host.admission.admit_request(McpAppsBridgeDirection::ViewToHost, queued.clone(), McpAppsRoutedMethod::ToolsCall, None).unwrap();
+            host.deferred_view_requests.insert(queued.clone());
+            host.deferred_view_frames.push_back(json!({"jsonrpc":"2.0","id":queued,"method":"tools/call","params":{"name":"never-dispatch"}}).to_string());
+            let mut closing = Box::pin(host.begin_teardown(&cx));
+            poll_fn(|task| { assert!(closing.as_mut().poll(task).is_pending()); Poll::Ready(()) }).await;
+            drop(closing);
+            host.teardown_request.as_mut().unwrap().1.absolute = Time::ZERO;
+            host.process_next(&cx).await.unwrap();
+            assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Closed);
+            assert!(host.deferred_view_frames.is_empty());
+            assert!(host.deferred_view_requests.is_empty());
+            assert!(matches!(host.take_host_response(&id).unwrap().outcome, McpAppsHostRequestOutcome::ViewClosed));
+            assert!(host.take_host_response(&id).is_none());
+        });
+    }
+
+    #[test]
+    fn closed_wire_teardown_discards_queued_work_and_requires_its_exact_response() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (mut host, mut view) = tool_wire_host(&cx, true).await;
+            let pending = host.send_host_request(&cx, McpAppsHostRequest::Ping(Default::default()), None).await.unwrap();
+            let _ = view.receive_from_host(&cx).await.unwrap();
+            view.send_to_host(&cx, json!({"jsonrpc":"2.0","id":"queued","method":"tools/call","params":{"name":"never-dispatch"}}).to_string()).await.unwrap();
+            host.process_next(&cx).await.unwrap();
+            assert_eq!(host.deferred_view_frames.len(), 1);
+            host.begin_teardown(&cx).await.unwrap();
+            let closing: Value = serde_json::from_str(&view.receive_from_host(&cx).await.unwrap()).unwrap();
+            assert!(host.deferred_view_frames.is_empty());
+            assert!(host.deferred_view_requests.is_empty());
+            view.send_to_host(&cx, json!({"jsonrpc":"2.0","id":pending,"result":{}}).to_string()).await.unwrap();
+            assert!(host.process_next(&cx).await.is_err());
+            assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Closing);
+            view.send_to_host(&cx, json!({"jsonrpc":"2.0","id":closing["id"],"result":{}}).to_string()).await.unwrap();
+            host.process_next(&cx).await.unwrap();
+            assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Closed);
+            assert!(matches!(host.take_host_response(&pending).unwrap().outcome, McpAppsHostRequestOutcome::ViewClosed));
+        });
+    }
 
     impl McpAppsWireHostPolicy for WirePolicy {
         #[allow(

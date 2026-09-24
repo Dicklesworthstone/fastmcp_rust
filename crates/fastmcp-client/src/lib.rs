@@ -167,6 +167,8 @@ pub mod websocket_experimental {
 }
 #[cfg(feature = "apps")]
 pub use mcp_apps::{
+    McpAppsHostRequestOutcome, McpAppsViewCallToolResult, McpAppsViewTool,
+    McpAppsViewToolsPage, McpAppsWireHostResponse,
     McpAppsBridgeTransport, McpAppsClientWirePolicy, McpAppsHost, McpAppsHostConfiguration,
     McpAppsHostError, McpAppsHostPolicy, McpAppsHttpClientWirePolicy, McpAppsInMemoryHostTransport,
     McpAppsInMemoryViewTransport, McpAppsInMemoryWireHostTransport,
@@ -30494,6 +30496,129 @@ mod tests {
             client.mcp_apps_active(),
             "the public wire-host constructor must receive its retained bilateral receipt"
         );
+    }
+
+    #[cfg(all(unix, feature = "apps"))]
+    #[test]
+    fn public_mcp_apps_view_tools_require_policy_and_return_validated_results() {
+        use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
+        use fastmcp_protocol::{McpAppsHostRequest, McpAppsListParams, McpAppsToolCallParams};
+
+        struct InvocationPolicy { allowed: Arc<AtomicBool>, calls: Arc<AtomicUsize> }
+        #[allow(clippy::unused_async_trait_impl, reason = "immediate embedding policy decision")]
+        impl McpAppsWireHostPolicy for InvocationPolicy {
+            async fn approve_view_tool_call(
+                &mut self, _cx: &Cx, tool: &McpAppsViewTool, params: &McpAppsToolCallParams,
+            ) -> Result<(), McpAppsHostError> {
+                assert_eq!(tool.descriptor().name, "increment");
+                assert_eq!(params.arguments.as_ref().unwrap()["value"], serde_json::json!(2));
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.allowed.load(Ordering::SeqCst) { Ok(()) }
+                else { Err(McpAppsHostError::Core(McpError::invalid_request("host denied invocation"))) }
+            }
+
+            async fn dispatch_reused_request(
+                &mut self, _cx: &Cx, _cancellation: &McpRequestCancellation,
+                _method: fastmcp_protocol::McpAppsRoutedMethod, _params: Option<serde_json::Value>,
+            ) -> Result<serde_json::Value, McpAppsHostError> {
+                panic!("View tools must never dispatch to the originating MCP server")
+            }
+        }
+        struct ObservedTransport {
+            inner: McpAppsInMemoryWireHostTransport,
+            sends: Arc<AtomicUsize>,
+        }
+        impl McpAppsWireBridgeTransport for ObservedTransport {
+            async fn send_to_view(&mut self, cx: &Cx, frame: String) -> Result<(), McpAppsHostError> {
+                self.inner.send_to_view(cx, frame).await?;
+                self.sends.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn receive_from_view(&mut self, cx: &Cx) -> Result<String, McpAppsHostError> {
+                self.inner.receive_from_view(cx).await
+            }
+        }
+
+        let mut client = make_shell_scripted_initialized_client_for_version(
+            "exec sleep 10", Duration::from_secs(10), MODERN_PROTOCOL_VERSION,
+        );
+        install_test_mcp_apps_activation(&mut client);
+        let allowed = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sends = Arc::new(AtomicUsize::new(0));
+        let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+        let mut host = client.mcp_apps_wire_host_with_policy(
+            ObservedTransport { inner: transport, sends: Arc::clone(&sends) },
+            McpAppsWireHostConfiguration {
+                host_info: fastmcp_protocol::McpAppsBridgeImplementation {
+                    name: "public-view-tool-host".to_owned(), version: "1".to_owned(),
+                },
+                host_capabilities: fastmcp_protocol::McpAppsPinnedHostCapabilities::default(),
+                host_context: fastmcp_protocol::McpAppsPinnedHostContext::default(),
+            },
+            InvocationPolicy { allowed: Arc::clone(&allowed), calls: Arc::clone(&calls) },
+        ).unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            view.send_to_host(&cx, serde_json::json!({
+                "jsonrpc":"2.0", "id":"initialize", "method":"ui/initialize",
+                "params":{"appInfo":{"name":"view","version":"1"},
+                    "appCapabilities":{"tools":{}},
+                    "protocolVersion":fastmcp_protocol::MCP_APPS_HOST_VIEW_PROTOCOL_VERSION}
+            }).to_string()).await.unwrap();
+            host.process_next(&cx).await.unwrap();
+            view.receive_from_host(&cx).await.unwrap();
+            view.send_to_host(&cx, serde_json::json!({
+                "jsonrpc":"2.0", "method":"ui/notifications/initialized"
+            }).to_string()).await.unwrap();
+            host.process_next(&cx).await.unwrap();
+            let listed = host.send_host_request(&cx,
+                McpAppsHostRequest::ToolsList(McpAppsListParams::default()), None).await.unwrap();
+            let request: serde_json::Value = serde_json::from_str(&view.receive_from_host(&cx).await.unwrap()).unwrap();
+            assert_eq!(request["id"], serde_json::to_value(&listed).unwrap());
+            assert_eq!(request["method"], "tools/list");
+            view.send_to_host(&cx, serde_json::json!({
+                "jsonrpc":"2.0", "id":listed, "result":{"tools":[{
+                    "name":"increment",
+                    "inputSchema":{"type":"object","properties":{"value":{"type":"integer","minimum":1}},"required":["value"]},
+                    "outputSchema":{"type":"object","properties":{"total":{"type":"integer"}},"required":["total"]}
+                }]}
+            }).to_string()).await.unwrap();
+            host.process_next(&cx).await.unwrap();
+            let McpAppsHostRequestOutcome::ToolsList(page) = host.take_host_response(&listed).unwrap().outcome
+                else { panic!("public host must return the admitted View catalog") };
+            assert_eq!(page.tools.len(), 1);
+            assert_eq!(host.view_tools().count(), 1);
+            let invoke = |value| McpAppsHostRequest::CallTool(McpAppsToolCallParams {
+                name: "increment".to_owned(),
+                arguments: Some(std::collections::BTreeMap::from([("value".to_owned(), serde_json::json!(value))])),
+            });
+            let before = sends.load(Ordering::SeqCst);
+            assert!(host.send_host_request(&cx, invoke(0), None).await.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "invalid arguments must fail before policy");
+            assert!(host.send_host_request(&cx, invoke(2), None).await.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(sends.load(Ordering::SeqCst), before, "denial must not send an invocation");
+            allowed.store(true, Ordering::SeqCst);
+            let called = host.send_host_request(&cx, invoke(2), None).await.unwrap();
+            let request: serde_json::Value = serde_json::from_str(&view.receive_from_host(&cx).await.unwrap()).unwrap();
+            assert_eq!(request["id"], serde_json::to_value(&called).unwrap());
+            assert_eq!(request["params"]["arguments"], serde_json::json!({"value":2}));
+            view.send_to_host(&cx, serde_json::json!({
+                "jsonrpc":"2.0", "id":called,
+                "result":{"content":[],"structuredContent":{"total":3}}
+            }).to_string()).await.unwrap();
+            let response = host.wait_for_host_response(&cx, &called).await.unwrap();
+            let McpAppsHostRequestOutcome::ToolCall(result) = response.outcome
+                else { panic!("public host must return the correlated View tool result") };
+            assert!(!result.is_error());
+            assert_eq!(result.structured_content.unwrap()["total"], serde_json::json!(3));
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert!(host.take_host_response(&called).is_none(), "terminal response is taken once");
+        });
+        drop(host);
+        client.close().unwrap();
     }
 
     #[cfg(all(unix, feature = "apps"))]
