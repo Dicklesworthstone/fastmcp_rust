@@ -140,6 +140,7 @@ impl Peer {
         client
     }
     async fn rpc(&self, method: &str) -> (TlsStream<TcpStream>, serde_json::Value) {
+        std::thread::sleep(Duration::from_millis(900)); // PLANT: stalled host
         let (socket,_) = self.listener.accept().await.unwrap();
         let mut socket = self.tls.accept(socket).await.unwrap();
         let (head, request) = request(&mut socket).await;
