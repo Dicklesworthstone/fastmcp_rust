@@ -1534,13 +1534,56 @@ impl JsonRpcResponse {
 }
 
 /// A JSON-RPC message (request, response, or notification).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Decoding requires a `serde_json` deserializer: the input is captured as
+/// raw JSON and re-parsed by the selected variant's own decoder.
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum JsonRpcMessage {
     /// A request or notification.
     Request(JsonRpcRequest),
     /// A response.
     Response(JsonRpcResponse),
+}
+
+// A derived untagged Deserialize buffers its input in serde's private
+// `Content`, and a `RawValue` cannot be read back from that buffer. Since
+// `JsonRpcRequest` keeps its params as their exact source (`RawValue`), every
+// request or notification carrying params failed to decode through this
+// type. Capture the whole input as raw JSON instead, choose the variant by
+// whether a `method` member is present, and re-parse the same text through
+// that variant's strict decoder so params keep their source bytes.
+impl<'de> Deserialize<'de> for JsonRpcMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Envelope {
+            #[serde(default, deserialize_with = "member_present")]
+            method: bool,
+        }
+
+        fn member_present<'de, D>(deserializer: D) -> Result<bool, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            serde::de::IgnoredAny::deserialize(deserializer).map(|_| true)
+        }
+
+        let raw = Box::<RawValue>::deserialize(deserializer)?;
+        let source = raw.get();
+        let envelope: Envelope = serde_json::from_str(source).map_err(D::Error::custom)?;
+        if envelope.method {
+            serde_json::from_str(source)
+                .map(Self::Request)
+                .map_err(D::Error::custom)
+        } else {
+            serde_json::from_str(source)
+                .map(Self::Response)
+                .map_err(D::Error::custom)
+        }
+    }
 }
 
 impl JsonRpcMessage {
@@ -2424,6 +2467,76 @@ mod tests {
         };
         assert!(!is_error);
         assert_eq!(id, Some(RequestId::Number(1)));
+    }
+
+    fn final_completion_request(context: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"completion/complete","params":{{"_meta":{{"io.modelcontextprotocol/protocolVersion":"{}","io.modelcontextprotocol/clientCapabilities":{{}}}},"ref":{{"type":"ref/prompt","name":"deploy"}},"argument":{{"name":"environment","value":"pro"}},{context}}},"id":1}}"#,
+            crate::FINAL_PROTOCOL_VERSION
+        )
+    }
+
+    /// Requests and notifications with params decode through the public
+    /// message type to exactly what the request type decodes from the same
+    /// text. The completion case goes through the request's raw-source params
+    /// validation, which only sees the exact source bytes.
+    #[test]
+    fn message_serde_decodes_requests_and_notifications_with_params() {
+        let completion = final_completion_request(r#""context":{"arguments":{"key":"one"}}"#);
+        for text in [
+            r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"probe","arguments":{}},"id":1}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"probe","progress":1}}"#,
+            completion.as_str(),
+        ] {
+            let direct = serde_json::from_str::<JsonRpcRequest>(text)
+                .unwrap_or_else(|error| panic!("the request type decodes {text}: {error}"));
+            let decoded = match serde_json::from_str::<JsonRpcMessage>(text) {
+                Ok(JsonRpcMessage::Request(request)) => request,
+                other => panic!("{text} must decode as a request, got {other:?}"),
+            };
+            assert!(decoded.params.is_some(), "{text}");
+            assert_eq!(decoded.jsonrpc, direct.jsonrpc);
+            assert_eq!(decoded.method, direct.method);
+            assert_eq!(decoded.params, direct.params);
+            assert_eq!(decoded.id, direct.id);
+        }
+
+        for text in [
+            r#"{"jsonrpc":"2.0","result":{"tools":[]},"id":1}"#,
+            r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"missing"},"id":1}"#,
+        ] {
+            assert!(
+                matches!(
+                    serde_json::from_str::<JsonRpcMessage>(text),
+                    Ok(JsonRpcMessage::Response(_))
+                ),
+                "{text} must still decode as a response"
+            );
+        }
+    }
+
+    /// The same texts differing in one member the request type refuses are
+    /// refused through the public message type too. The duplicate `context`
+    /// is caught only by the raw params validation, so this also fails if the
+    /// message decoder stops handing the request its exact source bytes.
+    #[test]
+    fn message_serde_refuses_what_the_request_type_refuses() {
+        let duplicate_context = final_completion_request(
+            r#""context":{"arguments":{"key":"one"}},"context":{"arguments":{"key":"two"}}"#,
+        );
+        for text in [
+            r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"probe","arguments":{}},"id":null}"#,
+            duplicate_context.as_str(),
+        ] {
+            assert!(
+                serde_json::from_str::<JsonRpcRequest>(text).is_err(),
+                "the request type refuses {text}"
+            );
+            assert!(
+                serde_json::from_str::<JsonRpcMessage>(text).is_err(),
+                "the message type must refuse {text}"
+            );
+        }
     }
 
     #[test]
