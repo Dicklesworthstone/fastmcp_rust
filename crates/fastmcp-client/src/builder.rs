@@ -2809,7 +2809,7 @@ exec sleep 5
 
     #[cfg(unix)]
     fn run_public_stdio_retry_probe(cancel_during_delay: bool) -> PublicStdioRetryProbe {
-        const RETRY_DELAY: Duration = Duration::from_secs(2);
+        const RETRY_DELAY_MS: u64 = 2_000;
         const FIRST_RESPONSE: [&str; 2] = ["spawn", "response"];
 
         let attempt_log = StdioRetryAttemptLog::new(if cancel_during_delay {
@@ -2862,8 +2862,12 @@ exec sleep 5
             ClientBuilder::new()
                 .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
                 .auto_initialize(false)
-                .connection_retry_policy(2, RETRY_DELAY, Duration::from_secs(5))
-                .expect("two-attempt public retry policy must be valid")
+                // One retry after the fixed delay, with no aggregate elapsed
+                // cap. The probe proves delay gating and the second real child;
+                // a wall-clock cap would instead measure how fast the host
+                // spawns `sh`, and loaded hosts exceeded 5s. The cap has its
+                // own test.
+                .application_retry_config(1, RETRY_DELAY_MS)
                 .connect_stdio_with_cx(
                     "sh",
                     &["-c", script, "fastmcp-stdio-retry-probe", attempt_log_arg],
