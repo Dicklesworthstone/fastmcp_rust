@@ -3378,8 +3378,11 @@ mod tests {
         }
     }
 
+    // Exact-2024 era: used only by the legacy completion-route test.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct CountingCompletion(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl crate::handler::CompletionHandler for CountingCompletion {
         fn complete_legacy(
             &self,

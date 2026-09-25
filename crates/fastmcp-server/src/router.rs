@@ -11789,8 +11789,11 @@ mod router_tests {
         )
     }
 
+    // Exact-2024 era: used only by legacy completion-route tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct EchoCompletion;
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl CompletionHandler for EchoCompletion {
         fn complete_legacy(
             &self,
@@ -13876,10 +13879,13 @@ mod router_tests {
         assert!(main.get_tool("query").is_some());
     }
 
+    // Exact-2024 era: used only by legacy completion-route mount tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct RecordingNameCompletion {
         names: Arc<Mutex<Vec<String>>>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl CompletionHandler for RecordingNameCompletion {
         fn complete_legacy(
             &self,

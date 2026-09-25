@@ -21471,6 +21471,8 @@ mod lib_unit_tests {
     /// Only the short wall-clock slice around it is re-armed, never the
     /// future itself, so a slice expiring cancels nothing. `None` means the
     /// bound expired and the future is still pending.
+    // Exact-2024 era: used only by legacy HTTP SSE tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     async fn within_runnable<F: Future>(
         cx: &Cx,
         host: &RunnableClock,
@@ -23850,6 +23852,8 @@ mod lib_unit_tests {
         Ok(())
     }
 
+    // Exact-2024 era: opens a legacy HTTP SSE session.
+    #[cfg(feature = "legacy-2024-11-05")]
     async fn open_live_legacy_http_session(
         address: SocketAddr,
         headers: &[(&str, &str)],
@@ -30992,6 +30996,8 @@ mod lib_unit_tests {
         Closed,
         Cancelled,
         Timeout,
+        // Exact-2024 era: an un-negotiated ping only the dual-era loop admits.
+        #[cfg(feature = "legacy-2024-11-05")]
         PingThenClosed,
     }
 
@@ -31070,8 +31076,11 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: used only by legacy runtime-context tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LiveLegacyRuntimeConnectionTool;
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl ToolHandler for LiveLegacyRuntimeConnectionTool {
         fn definition(&self) -> Tool {
             Tool {
@@ -31123,8 +31132,11 @@ mod lib_unit_tests {
     /// Note `call_async`'s trait default delegates to `call`, so declaring the
     /// mode without supplying this hook would route straight back into the
     /// `block_on` and be polled on the caller's runtime instead.
+    // Exact-2024 era: used only by legacy HTTP SSE reverse-response tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LiveLegacyReverseResponseAsyncTool;
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl ToolHandler for LiveLegacyReverseResponseAsyncTool {
         fn definition(&self) -> Tool {
             LiveLegacyRuntimeConnectionTool.definition()
@@ -31176,8 +31188,11 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: used only by legacy runtime-context tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LegacyRootsContextTool;
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl ToolHandler for LegacyRootsContextTool {
         fn definition(&self) -> Tool {
             Tool {
@@ -31675,11 +31690,14 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: used only by legacy HTTP SSE auth tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[derive(Clone)]
     struct CountingLegacyHttpAuthProvider {
         calls: Arc<AtomicUsize>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl AuthProvider for CountingLegacyHttpAuthProvider {
         fn authenticate(
             &self,
@@ -32565,11 +32583,14 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: used only by legacy HTTP SSE cancellation tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LiveLegacyCancellationTool {
         started: Arc<AtomicBool>,
         observed_cancellation: Arc<AtomicBool>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl ToolHandler for LiveLegacyCancellationTool {
         fn definition(&self) -> Tool {
             Tool {
@@ -32648,6 +32669,8 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: used only by the legacy HTTP SSE shutdown probe.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LiveHttpShutdownTool {
         name: &'static str,
         cooperate_with_cancellation: bool,
@@ -32657,6 +32680,7 @@ mod lib_unit_tests {
         finished: Arc<AtomicBool>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl ToolHandler for LiveHttpShutdownTool {
         fn definition(&self) -> Tool {
             Tool {
@@ -33603,12 +33627,15 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: scripts a legacy runtime connection.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LiveLegacyRuntimeSplitRecv {
         phase: u8,
         supports_sampling: bool,
         outbound: Receiver<JsonRpcMessage>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl LiveLegacyRuntimeSplitRecv {
         fn wait_for_response(&self, id: i64) -> Result<(), TransportError> {
             loop {
@@ -33646,6 +33673,7 @@ mod lib_unit_tests {
         }
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl TransportRecvHalf for LiveLegacyRuntimeSplitRecv {
         fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
             let phase = self.phase;
@@ -33720,12 +33748,15 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: scripts a legacy runtime connection.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LegacyRootsContextSplitRecv {
         phase: u8,
         supports_roots: bool,
         outbound: Receiver<JsonRpcMessage>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl LegacyRootsContextSplitRecv {
         fn wait_for_response(&self, id: i64) -> Result<(), TransportError> {
             loop {
@@ -33758,6 +33789,7 @@ mod lib_unit_tests {
         }
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl TransportRecvHalf for LegacyRootsContextSplitRecv {
         fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
             let phase = self.phase;
@@ -33900,11 +33932,14 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: records a legacy runtime connection's output.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LiveLegacyRuntimeSplitSend {
         sent: Arc<Mutex<Vec<JsonRpcMessage>>>,
         outbound: std::sync::mpsc::SyncSender<JsonRpcMessage>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl TransportSendHalf for LiveLegacyRuntimeSplitSend {
         fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
             self.sent
@@ -33921,6 +33956,8 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: scripts a legacy runtime connection.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn live_legacy_runtime_connection_transcript(supports_sampling: bool) -> Vec<JsonRpcMessage> {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let (outbound, inbound) = sync_channel(32);
@@ -33947,6 +33984,8 @@ mod lib_unit_tests {
             .clone()
     }
 
+    // Exact-2024 era: scripts a legacy runtime connection.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn legacy_roots_context_transcript(supports_roots: bool) -> Vec<JsonRpcMessage> {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let (outbound, inbound) = sync_channel(16);
@@ -33973,6 +34012,8 @@ mod lib_unit_tests {
             .clone()
     }
 
+    // Exact-2024 era: scripts legacy progress over a legacy opening.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn legacy_stdio_progress_transcript(include_progress_token: bool) -> Vec<JsonRpcMessage> {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let receive_calls = Arc::new(AtomicUsize::new(0));
@@ -34122,6 +34163,8 @@ mod lib_unit_tests {
         ))
     }
 
+    // Exact-2024 era: builds a legacy tools/call request.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn legacy_controlled_tool_request(id: i64) -> JsonRpcMessage {
         JsonRpcMessage::Request(JsonRpcRequest::new(
             "tools/call",
@@ -35303,6 +35346,7 @@ mod lib_unit_tests {
                 ReturningProbeReceive::Closed => Err(TransportError::Closed),
                 ReturningProbeReceive::Cancelled => Err(TransportError::Cancelled),
                 ReturningProbeReceive::Timeout => Err(TransportError::Timeout),
+                #[cfg(feature = "legacy-2024-11-05")]
                 ReturningProbeReceive::PingThenClosed => {
                     self.receive = ReturningProbeReceive::Closed;
                     Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
@@ -43556,6 +43600,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE reverse responses.
+    #[cfg(feature = "legacy-2024-11-05")]
     async fn live_http_legacy_reverse_response_post_probe(
         cx: &Cx,
         wrong_reverse_response_id: bool,
@@ -44197,6 +44243,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: drives both eras over one HTTP listener.
+    #[cfg(feature = "legacy-2024-11-05")]
     async fn live_bound_http_cross_era_transcript(
         cx: &Cx,
         policy: ProtocolPolicy,
@@ -44289,6 +44337,8 @@ mod lib_unit_tests {
         Ok(transcript)
     }
 
+    // Exact-2024 era: used only by the cross-era HTTP transcript.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn assert_cross_era_modern_discovery(response: &[u8]) -> Result<(), String> {
         if !response.starts_with(b"HTTP/1.1 200") {
             return Err(format!(
@@ -45202,6 +45252,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE peer close.
+    #[cfg(feature = "legacy-2024-11-05")]
     async fn live_http_legacy_sse_peer_close_probe(
         cx: &Cx,
         close_originating_peer: bool,
@@ -46739,6 +46791,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: scripts legacy queued cancellation.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LiveLegacyQueuedCancellationRecv {
         phase: usize,
         cancelled_request_id: i64,
@@ -46748,6 +46802,7 @@ mod lib_unit_tests {
         responses: Arc<LiveModernResponses>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl TransportRecvHalf for LiveLegacyQueuedCancellationRecv {
         fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
             let phase = self.phase;
@@ -46817,12 +46872,15 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: records legacy queued-cancellation output.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LiveLegacyFirstQueuedSend {
         initialize_send_started: Arc<BoundedTestSignal>,
         initialize_send_release: Arc<BoundedTestSignal>,
         responses: Arc<LiveModernResponses>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl TransportSendHalf for LiveLegacyFirstQueuedSend {
         fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
             self.responses.record(message.clone());
@@ -46843,6 +46901,8 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: scripts legacy queued cancellation.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn live_legacy_queued_cancellation_transcript(
         cancelled_request_id: i64,
     ) -> (
@@ -48130,6 +48190,8 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: used only by tests that open with a legacy handshake.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn run_returning_transport_with_test_runtime<T>(server: Server, transport: T) -> McpResult<()>
     where
         T: Transport + Send + 'static,
