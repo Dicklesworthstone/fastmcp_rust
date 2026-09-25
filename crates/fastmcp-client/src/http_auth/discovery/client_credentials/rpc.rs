@@ -171,6 +171,9 @@ enum Body {
 /// future, encountering an error, closing the call, or exhausting its lifetime
 /// closes the body instead of leaving a partially consumed parser reusable.
 /// Only delivery of a terminal result permits subsequent `Ok(None)`.
+/// A finite SSE result is withheld until clean HTTP EOF and complete SSE
+/// framing. A duplicate terminal, trailing notification, truncated body or
+/// incomplete trailing event cannot become a published or cacheable success.
 pub struct ClientCredentialsCoreCall {
     body: Option<Box<Body>>,
     decoder: CoreDecoder,
@@ -253,6 +256,32 @@ impl ClientCredentialsCoreCall {
                 }
             };
             let event = decoder.admit(&source, remaining.is_some())?;
+            if matches!(&event, ManagedCoreEvent::Result(_)) {
+                if let Some(remaining) = remaining {
+                    let Body::Sse(mut stream) = *remaining else {
+                        return Err(ManagedCoreError::InvalidResponse.into());
+                    };
+                    // Keep the terminal and its socket inside the SAME active
+                    // future as decoding. All body-tail work remains subject
+                    // to the opening credential, owner, caller and deadline.
+                    // No tail record is delivered or retained after refusal.
+                    if stream.next_event(cx).await
+                        .map_err(|_| ClientCredentialsError::UnexpectedResponse)?
+                        .is_some()
+                    {
+                        return Err(ManagedCoreError::InvalidResponse.into());
+                    }
+                    // The SSE parser intentionally reports discarded EOF
+                    // fragments rather than manufacturing an event. None
+                    // alone therefore does not establish clean framing.
+                    let framing = stream.end_of_stream()
+                        .ok_or(ManagedCoreError::MissingTerminal)?;
+                    if framing.discarded_pending_event || framing.discarded_partial_line {
+                        return Err(ManagedCoreError::InvalidResponse.into());
+                    }
+                }
+                return Ok((event, None));
+            }
             Ok::<_, ClientCredentialsCoreError>((event, remaining))
         };
         // Keep protocol admission inside active(): expiry or revocation during
@@ -413,11 +442,14 @@ mod tests {
             .unwrap()
     }
 
+    #[derive(Clone, Copy)]
+    enum NativeEnd { Complete, Hold, Truncate }
+
     async fn native_response(
         cx: &Cx,
-        body: &'static str,
+        body: &str,
         content_type: &'static str,
-        hold_partial_body: bool,
+        end: NativeEnd,
     ) -> (ClientCredentialsResponse, std::thread::JoinHandle<()>) {
         use std::io::{BufRead, Read, Write};
         use std::net::TcpListener;
@@ -426,6 +458,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
+        let body = body.to_owned();
         let peer = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut socket = loop {
@@ -461,12 +494,12 @@ mod tests {
                 let mut request = vec![0; length];
                 reader.read_exact(&mut request).unwrap();
             }
-            let length = body.len() + if hold_partial_body { 100 } else { 0 };
+            let length = body.len() + if matches!(end, NativeEnd::Complete) { 0 } else { 100 };
             write!(socket,
                 "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {length}\r\nMCP-Protocol-Version: 2026-07-28\r\nConnection: close\r\n\r\n{body}"
             ).unwrap();
             socket.flush().unwrap();
-            if hold_partial_body {
+            if matches!(end, NativeEnd::Hold) {
                 // A dropped pending read must release its real socket. The
                 // read timeout makes a missing close a bounded test failure.
                 let mut byte = [0];
@@ -514,7 +547,7 @@ mod tests {
                     "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}\n\n"
                 ), "text/event-stream", true),
             ] {
-                let (response, peer) = native_response(&cx, body, content_type, false).await;
+                let (response, peer) = native_response(&cx, body, content_type, NativeEnd::Complete).await;
                 let deadline = response.deadline;
                 let mut call = ClientCredentialsCoreCall::from_response(response, ManagedCoreLimits::default(), deadline).unwrap();
                 assert_eq!(call.request_id(), &RequestId::Number(7));
@@ -535,7 +568,7 @@ mod tests {
             let cx = Cx::current().unwrap();
             let (response, peer) = native_response(&cx,
                 "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n",
-                "text/event-stream", false).await;
+                "text/event-stream", NativeEnd::Complete).await;
             let deadline = response.deadline;
             let mut call = ClientCredentialsCoreCall::from_response(response, ManagedCoreLimits::default(), deadline).unwrap();
             assert!(matches!(call.next_event(&cx).await.unwrap(), Some(ManagedCoreEvent::Notification(_))));
@@ -554,7 +587,7 @@ mod tests {
             for case in 0..5 {
                 let (mut response, peer) = native_response(&cx,
                     r#"{"jsonrpc":"2.0","id":7,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
-                    "application/json", false).await;
+                    "application/json", NativeEnd::Complete).await;
                 match case {
                     0 => { response.cancellation.cancel(); },
                     1 => { response.owner.cancel(); },
@@ -579,7 +612,7 @@ mod tests {
 
         runtime().block_on(async {
             let cx = Cx::current().unwrap();
-            let (response, peer) = native_response(&cx, "data: {", "text/event-stream", true).await;
+            let (response, peer) = native_response(&cx, "data: {", "text/event-stream", NativeEnd::Hold).await;
             let deadline = response.deadline;
             let mut call = ClientCredentialsCoreCall::from_response(response, ManagedCoreLimits::default(), deadline).unwrap();
             {
@@ -592,6 +625,189 @@ mod tests {
             assert!(matches!(call.next_event(&cx).await,
                 Err(ClientCredentialsCoreError::Protocol(ManagedCoreError::Closed))));
             peer.join().unwrap();
+        });
+    }
+
+    const FINITE_TERMINAL: &str = concat!(
+        "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"resultType\":\"complete\",",
+        "\"tools\":[],\"ttlMs\":0,\"cacheScope\":\"private\",\"x-exact\":1.20e+4}}\n\n"
+    );
+
+    async fn finite_call(cx: &Cx, body: &str, hold: bool)
+        -> (ClientCredentialsCoreCall, std::thread::JoinHandle<()>)
+    {
+        let end = if hold { NativeEnd::Hold } else { NativeEnd::Complete };
+        let (response, peer) = native_response(cx, body, "text/event-stream", end).await;
+        let deadline = response.deadline;
+        (ClientCredentialsCoreCall::from_response(response, ManagedCoreLimits::default(), deadline).unwrap(), peer)
+    }
+
+    #[test]
+    fn native_machine_finite_terminal_allows_clean_comments_and_keeps_exact_payload() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            for tail in ["", ": keepalive\n\n", "event: ignored\n\n"] {
+                let (mut call, peer) = finite_call(&cx, &format!("{FINITE_TERMINAL}{tail}"), false).await;
+                let Some(ManagedCoreEvent::Result(result)) = call.next_event(&cx).await.unwrap() else {
+                    panic!("clean finite SSE must deliver its result");
+                };
+                assert!(result.encode().unwrap().contains("1.20e+4"));
+                assert!(call.finished && call.body.is_none());
+                assert!(call.next_event(&cx).await.unwrap().is_none());
+                peer.join().unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn native_machine_finite_terminal_rejects_every_trailing_data_record() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            for tail in [
+                FINITE_TERMINAL,
+                "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n",
+                "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":-32603,\"message\":\"private-tail\"}}\n\n",
+                "data: not-json-private-tail\n\n",
+            ] {
+                let (mut call, peer) = finite_call(&cx, &format!("{FINITE_TERMINAL}{tail}"), false).await;
+                let error = call.next_event(&cx).await.err().expect("tail must prevent publication");
+                assert!(matches!(error, ClientCredentialsCoreError::Protocol(ManagedCoreError::InvalidResponse)));
+                assert!(!format!("{error:?} {error}").contains("private-tail"));
+                assert!(!call.finished && call.body.is_none());
+                assert!(matches!(call.next_event(&cx).await,
+                    Err(ClientCredentialsCoreError::Protocol(ManagedCoreError::Closed))));
+                peer.join().unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn native_machine_finite_terminal_rejects_discarded_eof_fragments() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            for tail in ["data: {", "data: {}\n", ": unterminated-comment", "event: partial"] {
+                let (mut call, peer) = finite_call(&cx, &format!("{FINITE_TERMINAL}{tail}"), false).await;
+                assert!(matches!(call.next_event(&cx).await,
+                    Err(ClientCredentialsCoreError::Protocol(ManagedCoreError::InvalidResponse))));
+                assert!(!call.finished && call.body.is_none());
+                peer.join().unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn native_machine_finite_tail_failure_does_not_retract_earlier_notifications() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let notice = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n";
+            let (mut call, peer) = finite_call(&cx, &format!("{notice}{FINITE_TERMINAL}{notice}"), false).await;
+            assert!(matches!(call.next_event(&cx).await.unwrap(), Some(ManagedCoreEvent::Notification(_))));
+            assert!(call.next_event(&cx).await.is_err());
+            assert_eq!(call.decoder.usage().1, 1, "trailing notification is never published");
+            assert!(!call.finished);
+            peer.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn native_machine_input_challenge_is_not_published_before_clean_eof() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            for tail in ["", "data: {}\n\n", "data: incomplete"] {
+                let body = format!("data: {{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{{\"resultType\":\"input_required\",\"requestState\":\"opaque\"}}}}\n\n{tail}");
+                let (mut response, peer) = native_response(&cx, &body, "text/event-stream", NativeEnd::Complete).await;
+                let (_, original) = prepare(&resource(), &request("tools/call", json!({"name":"echo"})), &RequestId::Number(7)).unwrap();
+                response.request = original;
+                let deadline = response.deadline;
+                let mut call = ClientCredentialsCoreCall::from_response(response, ManagedCoreLimits::default(), deadline).unwrap();
+                let result = call.next_event(&cx).await;
+                if tail.is_empty() {
+                    assert!(matches!(result, Ok(Some(ManagedCoreEvent::Result(_)))));
+                } else {
+                    assert!(result.is_err());
+                    assert!(!call.finished && call.body.is_none());
+                }
+                peer.join().unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn native_machine_abandoned_eof_wait_discards_the_already_decoded_terminal() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let (mut call, peer) = finite_call(&cx, FINITE_TERMINAL, true).await;
+            let stop = cx.now().saturating_add_nanos(250_000_000);
+            assert!(asupersync::time::timeout_at(stop, Box::pin(call.next_event(&cx))).await.is_err(),
+                "a decoded terminal cannot escape while HTTP body bytes remain owed");
+            assert!(call.decoder.usage().0 > 0, "the terminal was actually decoded before abandonment");
+            assert!(!call.finished && call.body.is_none());
+            assert!(matches!(call.next_event(&cx).await,
+                Err(ClientCredentialsCoreError::Protocol(ManagedCoreError::Closed))));
+            peer.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn native_machine_eof_wait_obeys_original_deadline() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let (mut call, peer) = finite_call(&cx, FINITE_TERMINAL, true).await;
+            call.deadline = cx.now().saturating_add_nanos(250_000_000);
+            let result = call.next_event(&cx).await;
+            assert!(result.is_err(), "HTTP tail cannot reset the operation deadline");
+            assert!(call.decoder.usage().0 > 0);
+            assert!(!call.finished && call.body.is_none());
+            peer.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn native_machine_truncated_http_body_discards_an_otherwise_valid_terminal() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let (response, peer) = native_response(&cx, FINITE_TERMINAL,
+                "text/event-stream", NativeEnd::Truncate).await;
+            let deadline = response.deadline;
+            let mut call = ClientCredentialsCoreCall::from_response(response, ManagedCoreLimits::default(), deadline).unwrap();
+            assert!(call.next_event(&cx).await.is_err());
+            assert!(call.decoder.usage().0 > 0, "the response had a valid protocol terminal before HTTP truncation");
+            assert!(!call.finished && call.body.is_none());
+            peer.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn native_machine_eof_wait_keeps_caller_owner_and_token_revocation_live() {
+        use std::future::{Future, poll_fn};
+
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            for kind in 0..3 {
+                let (mut call, peer) = finite_call(&cx, FINITE_TERMINAL, true).await;
+                let caller = call.cancellation.clone();
+                let owner = call.owner.clone();
+                let credential = call.snapshot.bearer.clone();
+                let mut trigger = Box::pin(asupersync::time::sleep(cx.now(), Duration::from_millis(100)));
+                let mut pending = Box::pin(call.next_event(&cx));
+                let mut fired = false;
+                let result = poll_fn(|task| {
+                    if !fired && trigger.as_mut().poll(task).is_ready() {
+                        fired = true;
+                        match kind {
+                            0 => caller.cancel(),
+                            1 => owner.cancel(),
+                            _ => credential.revoke(),
+                        }
+                    }
+                    pending.as_mut().poll(task)
+                }).await;
+                drop(pending);
+                assert!(fired && result.is_err(), "neither success nor EOF may beat revocation while bytes are owed");
+                assert!(call.decoder.usage().0 > 0, "revocation must exercise the post-terminal wait");
+                assert!(!call.finished && call.body.is_none());
+                peer.join().unwrap();
+            }
         });
     }
 }
