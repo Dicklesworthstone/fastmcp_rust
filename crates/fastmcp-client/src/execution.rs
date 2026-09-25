@@ -16,6 +16,7 @@ use asupersync::Cx;
 use fastmcp_core::{McpError, McpErrorCode, McpResult, Sha256Digest, sha256_bounded};
 #[cfg(any(feature = "tasks", test))]
 use fastmcp_protocol::FinalCoreResult;
+use fastmcp_protocol::common_types::ExactNonNegativeJsonNumber;
 use fastmcp_protocol::methods::{
     FINAL_2026_07_28_METHODS, Final2026EnvelopeKind, Final2026Peer, INITIALIZE,
     LEGACY_2024_11_05_METHODS, Legacy2024Direction, Legacy2024EnvelopeKind, SUBSCRIPTIONS_LISTEN,
@@ -32,8 +33,8 @@ use fastmcp_protocol::{
     CancellationSender, CancellationWireMessage, CancelledParams, CoreRequest, CoreResult,
     CoreResultDiscriminatorPolicy, CorrelationKey, DecodedResult, FINAL_SUBSCRIPTION_ID_META_KEY,
     FinalCancelledNotificationParams, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
-    ProgressMarker, RequestId, ResultPeerDiagnostic, ResultPeerEra, decode_peer_result,
-    decode_strict_jsonrpc_response,
+    ProgressMarker, RequestId, ResultPeerDiagnostic, ResultPeerEra, ServerNotification,
+    decode_peer_result, decode_strict_jsonrpc_response,
 };
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::{
@@ -842,12 +843,13 @@ struct PendingExecution {
     record: PendingRequestRecord,
     owner_dropped: OwnerDropped,
     timeout_policy: ExecutionTimeoutPolicy,
-    /// The exact optional marker the request advertised in `_meta`.
+    /// Canonical identity of the optional marker advertised in `_meta`.
     ///
     /// Progress is never correlated from a JSON-RPC request ID alone: a peer
-    /// notification belongs to this request only when it repeats this marker.
-    advertised_progress_marker: Option<ProgressMarker>,
-    last_progress: Option<f64>,
+    /// notification belongs to this request only when its token has the same
+    /// string identity or exact mathematical integer value.
+    advertised_progress_key: Option<CorrelationKey>,
+    last_progress: Option<ExactNonNegativeJsonNumber>,
     method: String,
 }
 
@@ -898,6 +900,18 @@ fn progress_notification_marker(notification: &JsonRpcRequest) -> Option<Progres
         .and_then(Value::as_object)
         .and_then(|params| params.get("progressToken"))?;
     serde_json::from_value(marker.clone()).ok()
+}
+
+/// Progress tokens use the same exact integer/string identity as request IDs.
+/// Keep their wire spelling in the request while using one mathematical key
+/// for ownership, including integral decimal/exponent and signed-zero aliases.
+fn progress_marker_key(marker: &ProgressMarker) -> Option<CorrelationKey> {
+    match marker {
+        ProgressMarker::String(marker) => Some(CorrelationKey::String(marker.clone())),
+        ProgressMarker::Number(marker) => RequestId::Integer(marker.as_str().to_owned())
+            .correlation_key()
+            .ok(),
+    }
 }
 
 /// Shared dropped-owner marker. This replaces the executor's local
@@ -1434,11 +1448,14 @@ where
         let Some(marker) = progress_notification_marker(notification) else {
             return false;
         };
+        let Some(progress_key) = progress_marker_key(&marker) else {
+            return false;
+        };
         self.state
             .borrow()
             .pending
             .values()
-            .filter(|pending| pending.advertised_progress_marker.as_ref() == Some(&marker))
+            .filter(|pending| pending.advertised_progress_key.as_ref() == Some(&progress_key))
             .take(2)
             .count()
             == 1
@@ -1546,7 +1563,9 @@ where
         let correlation_key = request_id.correlation_key().map_err(|_| {
             McpError::invalid_params("Request execution requires a valid JSON-RPC request ID")
         })?;
-        let advertised_progress_marker = advertised_progress_marker(request.params.as_ref());
+        let advertised_progress_key = advertised_progress_marker(request.params.as_ref())
+            .as_ref()
+            .and_then(progress_marker_key);
 
         let mut state = self.state.borrow_mut();
         self.drain_abandoned_locked(cx, &mut state)?;
@@ -1562,6 +1581,16 @@ where
         }
         if state.pending.contains_key(&correlation_key) {
             return Err(McpError::invalid_request("Duplicate in-flight request ID"));
+        }
+        if let Some(progress_key) = advertised_progress_key.as_ref()
+            && state
+                .pending
+                .values()
+                .any(|pending| pending.advertised_progress_key.as_ref() == Some(progress_key))
+        {
+            return Err(McpError::invalid_request(
+                "Duplicate in-flight progress token",
+            ));
         }
         if state.tombstones.contains_key(&correlation_key) {
             return Err(McpError::invalid_request(
@@ -1627,7 +1656,7 @@ where
                 },
                 owner_dropped: owner_dropped.clone(),
                 timeout_policy,
-                advertised_progress_marker,
+                advertised_progress_key,
                 last_progress: None,
                 method: request.method.clone(),
             },
@@ -1802,7 +1831,7 @@ where
         let mut state = self.state.borrow_mut();
         self.claim_ingress_owner_locked(&mut state, IngressOwner::SelfReader)?;
         self.prepare_drive_locked(cx, &mut state)?;
-        let (message, raw_result) = match state.receive_frame {
+        let (message, raw_result, raw_progress_params) = match state.receive_frame {
             Some(receive_frame) => {
                 let frame = match receive_frame(&mut state.transport, cx) {
                     Ok(frame) => frame,
@@ -1820,14 +1849,22 @@ where
                         return Err(error);
                     }
                 };
-                (message, raw_result)
+                let raw_progress_params =
+                    match progress_params_source_from_admitted_frame(&message, &source) {
+                        Ok(raw_progress_params) => raw_progress_params,
+                        Err(error) => {
+                            state.fail_all(error.clone(), ExecutionTerminalReason::PeerProtocol);
+                            return Err(error);
+                        }
+                    };
+                (message, raw_result, raw_progress_params)
             }
             None => match state.transport.recv(cx) {
                 // A typed Transport has already discarded the exact frame
                 // spelling. Preserve that distinction: protocol admission may
                 // encode the typed value internally, but callers must never
                 // receive reconstructed JSON as a peer-authored raw source.
-                Ok(message) => (message, None),
+                Ok(message) => (message, None, None),
                 Err(error) => {
                     let error = transport_error_to_mcp(error);
                     state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
@@ -1835,7 +1872,7 @@ where
                 }
             },
         };
-        self.route_inbound_message_locked(cx, &mut state, message, raw_result)
+        self.route_inbound_message_locked(cx, &mut state, message, raw_result, raw_progress_params)
     }
 
     /// Drives one source-preserving peer frame through the correlation registry.
@@ -1862,7 +1899,15 @@ where
                 return Err(error);
             }
         };
-        self.route_inbound_message_locked(cx, &mut state, message, raw_result)
+        let raw_progress_params =
+            match progress_params_source_from_admitted_frame(&message, &source) {
+                Ok(raw_progress_params) => raw_progress_params,
+                Err(error) => {
+                    state.fail_all(error.clone(), ExecutionTerminalReason::PeerProtocol);
+                    return Err(error);
+                }
+            };
+        self.route_inbound_message_locked(cx, &mut state, message, raw_result, raw_progress_params)
     }
 
     fn claim_ingress_owner_locked(
@@ -1900,6 +1945,7 @@ where
         state: &mut ExecutorState<T>,
         message: JsonRpcMessage,
         raw_result: Option<String>,
+        raw_progress_params: Option<String>,
     ) -> McpResult<()> {
         if message.validate().is_err() {
             let error = McpError::invalid_request("Peer sent an invalid JSON-RPC message");
@@ -1937,9 +1983,17 @@ where
                     let handled = self
                         .route_task_subscription_acknowledgement_locked(state, &request)?
                         || self.route_task_subscription_notification_locked(state, &request)?
-                        || self.route_stream_notification_locked(state, &request)?;
+                        || self.route_stream_notification_locked(
+                            state,
+                            &request,
+                            raw_progress_params.as_deref(),
+                        )?;
                     #[cfg(not(feature = "tasks"))]
-                    let handled = self.route_stream_notification_locked(state, &request)?;
+                    let handled = self.route_stream_notification_locked(
+                        state,
+                        &request,
+                        raw_progress_params.as_deref(),
+                    )?;
                     if !handled && !state.retain_notification(request) {
                         let error = McpError::internal_error("Client peer-activity queue is full");
                         state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
@@ -3255,6 +3309,7 @@ where
         &self,
         state: &mut ExecutorState<T>,
         notification: &JsonRpcRequest,
+        raw_params: Option<&str>,
     ) -> McpResult<bool> {
         if notification.method != "notifications/progress" {
             return Ok(false);
@@ -3262,56 +3317,133 @@ where
         let Some(params) = notification.params.as_ref().and_then(Value::as_object) else {
             return Ok(false);
         };
-        let Some(marker) = progress_notification_marker(notification) else {
-            return Ok(false);
-        };
-        let Some(progress) = params.get("progress").and_then(Value::as_f64) else {
-            return Ok(false);
-        };
-        if !progress.is_finite() {
+        // Optional members must be absent or typed. In particular, a null or
+        // malformed total/message cannot acquire idle-timer authority.
+        if ["total", "message", "_meta"]
+            .iter()
+            .any(|key| params.get(*key).is_some_and(Value::is_null))
+        {
             return Ok(false);
         }
+        let decoded = match raw_params {
+            Some(raw_params) => {
+                ServerNotification::decode_with_raw_params(notification, raw_params)
+            }
+            None => ServerNotification::decode(notification),
+        };
+        let Ok(ServerNotification::Progress(progress)) = decoded else {
+            return Ok(false);
+        };
+        let Some(progress_key) = progress_marker_key(&progress.progress_token) else {
+            return Ok(false);
+        };
         let matching_keys = state
             .pending
             .iter()
             .filter_map(|(key, pending)| {
-                (pending.advertised_progress_marker.as_ref() == Some(&marker))
+                (pending.advertised_progress_key.as_ref() == Some(&progress_key))
                     .then_some(key.clone())
             })
             .collect::<Vec<_>>();
         let [correlation_key] = matching_keys.as_slice() else {
             return Ok(false);
         };
-        let Some(pending) = state.pending.get_mut(correlation_key) else {
+        let Some(pending) = state.pending.get(correlation_key) else {
             return Ok(false);
         };
-        if pending.last_progress.is_some_and(|prior| progress <= prior) {
+        if pending
+            .last_progress
+            .as_ref()
+            .is_some_and(|prior| progress.progress.cmp(prior).is_le())
+        {
             return Ok(false);
         }
-        pending.last_progress = Some(progress);
-        if pending.timeout_policy.resets_idle_on_matching_progress() {
+        let generation = pending.record.execution_generation;
+        let owned_request_id = pending.record.request_id.clone();
+        let stream_key = (owned_request_id, generation);
+        if state
+            .stream_notifications
+            .get(&stream_key)
+            .is_some_and(|stream| stream.len() >= MAX_RETAINED_PEER_ACTIVITY)
+        {
+            return Err(McpError::internal_error(
+                "Client request stream queue is full",
+            ));
+        }
+        let next_idle = if pending.timeout_policy.resets_idle_on_matching_progress() {
             let reset_at = Instant::now();
             let next_idle = reset_at
                 .checked_add(pending.timeout_policy.idle_timeout())
                 .ok_or_else(|| {
                     McpError::internal_error("Client idle deadline exceeds the clock range")
                 })?;
-            pending.record.idle_deadline = next_idle.min(pending.record.absolute_deadline);
+            Some(next_idle.min(pending.record.absolute_deadline))
+        } else {
+            None
+        };
+        // The public stream is a typed JSON-RPC value. Restore the admitted
+        // numeric lexemes directly instead of sending exact values through
+        // serde_json::to_value, which normalizes exponent spellings.
+        let mut retained = notification.clone();
+        let retained_params = retained
+            .params
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .expect("typed progress admission requires object parameters");
+        retained_params.insert(
+            "progress".to_owned(),
+            Value::Number(serde_json::Number::from_string_unchecked(
+                progress.progress.as_str().to_owned(),
+            )),
+        );
+        if let Some(total) = &progress.total {
+            retained_params.insert(
+                "total".to_owned(),
+                Value::Number(serde_json::Number::from_string_unchecked(
+                    total.as_str().to_owned(),
+                )),
+            );
         }
-        let generation = pending.record.execution_generation;
-        let owned_request_id = pending.record.request_id.clone();
-        let stream = state
-            .stream_notifications
-            .entry((owned_request_id, generation))
-            .or_default();
-        if stream.len() >= MAX_RETAINED_PEER_ACTIVITY {
-            return Err(McpError::internal_error(
-                "Client request stream queue is full",
-            ));
+        if let ProgressMarker::Number(marker) = &progress.progress_token {
+            retained_params.insert(
+                "progressToken".to_owned(),
+                Value::Number(marker.to_number()),
+            );
         }
-        stream.push_back(notification.clone());
+        let pending = state
+            .pending
+            .get_mut(correlation_key)
+            .expect("the admitted progress owner remains live until stream commit");
+        pending.last_progress = Some(progress.progress);
+        if let Some(next_idle) = next_idle {
+            pending.record.idle_deadline = next_idle;
+        }
+        let stream = state.stream_notifications.entry(stream_key).or_default();
+        stream.push_back(retained);
         Ok(true)
     }
+}
+
+fn progress_params_source_from_admitted_frame(
+    message: &JsonRpcMessage,
+    source: &[u8],
+) -> McpResult<Option<String>> {
+    if !matches!(message, JsonRpcMessage::Request(request)
+        if request.id.is_none() && request.method == "notifications/progress")
+    {
+        return Ok(None);
+    }
+    #[derive(serde::Deserialize)]
+    struct RawProgressEnvelope {
+        #[serde(default)]
+        params: Option<Box<serde_json::value::RawValue>>,
+    }
+    // ReceivedTransportFrame already owns duplicate-aware bounded admission;
+    // this pass only retains params from that same accepted source frame.
+    let raw = serde_json::from_slice::<RawProgressEnvelope>(source).map_err(|_| {
+        McpError::invalid_request("Admitted progress frame could not retain its exact parameters")
+    })?;
+    Ok(raw.params.map(|params| params.get().to_owned()))
 }
 
 fn exact_result_source_from_admitted_frame(
@@ -4092,6 +4224,280 @@ mod tests {
         assert_eq!(executor.state.borrow().transport.sent.len(), 1);
         assert!(executor.take_notifications().is_empty());
         assert_eq!(executor.take_uncorrelated_responses().len(), 0);
+    }
+
+    #[test]
+    fn executor_progress_preserves_exact_values_and_orders_mathematically() {
+        fn progress_frame(progress: &str) -> ReceivedTransportFrame {
+            let source = format!(
+                r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{{"progressToken":4.2e1,"progress":{progress},"total":-7.30E-12,"message":"bounded progress"}}}}"#,
+            );
+            ReceivedTransportFrame::admit(source.into_bytes().into_boxed_slice())
+                .expect("the source frame admits exact bounded progress numbers")
+        }
+
+        let increasing = [
+            "-1e400",
+            "-1",
+            "-1e-400",
+            "-0.00e+4",
+            "1e-400",
+            "1.0000000000000000000001e-400",
+            "9007199254740992",
+            "9007199254740993",
+            "1e400",
+        ];
+        for external_ingress in [false, true] {
+            let frames = increasing.iter().map(|value| Ok(progress_frame(value)));
+            let executor = RequestExecutor::with_source_frame_receiver(
+                ScriptedTransport::with_source_frames(frames),
+                ResultPeerEra::Modern,
+                (!external_ingress).then_some(receive_scripted_source_frame),
+            );
+            let cx = Cx::for_testing();
+            let mut execution = executor.execute(&cx, request(42)).expect("request commits");
+            let absolute = executor.pending_records()[0].absolute_deadline;
+            for value in increasing {
+                if external_ingress {
+                    executor
+                        .drive_frame(&cx, progress_frame(value))
+                        .expect("external ingress routes exact progress");
+                } else {
+                    executor
+                        .drive(&cx)
+                        .expect("self-owned ingress routes exact progress");
+                }
+                let stream = execution
+                    .take_stream_notifications()
+                    .expect("stream is live");
+                assert_eq!(
+                    stream.len(),
+                    1,
+                    "strictly increasing {value} must be delivered"
+                );
+                let params = stream[0].params.as_ref().expect("progress has parameters");
+                assert_eq!(params["progress"].as_number().unwrap().as_str(), value);
+                assert_eq!(params["total"].as_number().unwrap().as_str(), "-7.30E-12");
+                assert_eq!(
+                    params["progressToken"].as_number().unwrap().as_str(),
+                    "4.2e1"
+                );
+                assert_eq!(executor.pending_records()[0].absolute_deadline, absolute);
+            }
+            let before = executor.pending_records();
+            let repeated = progress_frame("10e399");
+            if external_ingress {
+                executor
+                    .drive_frame(&cx, repeated)
+                    .expect("equal value is ignored");
+            } else {
+                executor
+                    .state
+                    .borrow_mut()
+                    .transport
+                    .received_frames
+                    .push_back(Ok(repeated));
+                executor.drive(&cx).expect("equal value is ignored");
+            }
+            assert!(execution.take_stream_notifications().unwrap().is_empty());
+            assert_eq!(
+                executor.pending_records(),
+                before,
+                "equal values cannot reset idle"
+            );
+            assert_eq!(executor.take_notifications().len(), 1);
+        }
+    }
+
+    #[test]
+    fn executor_progress_invalid_optional_fields_leave_state_unchanged() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::with_protocol_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ProtocolEra::Modern2026,
+        );
+        let mut execution = executor.execute(&cx, request(42)).expect("request commits");
+        let valid = serde_json::json!({
+            "progressToken": 42, "progress": 1, "total": 0,
+            "message": "progress may exceed total", "_meta": {}
+        });
+        for (member, invalid) in [
+            ("total", serde_json::json!("2")),
+            ("total", Value::Null),
+            ("message", serde_json::json!(2)),
+            ("message", Value::Null),
+            ("_meta", serde_json::json!([])),
+            ("_meta", Value::Null),
+            (
+                "total",
+                Value::Number(serde_json::Number::from_string_unchecked(
+                    "1e10000".to_owned(),
+                )),
+            ),
+            (
+                "progress",
+                Value::Number(serde_json::Number::from_string_unchecked(
+                    "1e10000".to_owned(),
+                )),
+            ),
+        ] {
+            let before = executor.pending_records();
+            let mut invalid_params = valid.clone();
+            invalid_params[member] = invalid;
+            executor
+                .state
+                .borrow_mut()
+                .transport
+                .received
+                .push_back(Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                    "notifications/progress",
+                    Some(invalid_params),
+                ))));
+            executor
+                .drive(&cx)
+                .expect("invalid progress is uncorrelated activity");
+            assert_eq!(
+                executor.pending_records(),
+                before,
+                "invalid {member} cannot reset timers"
+            );
+            assert!(execution.take_stream_notifications().unwrap().is_empty());
+            assert!(
+                executor
+                    .state
+                    .borrow()
+                    .pending
+                    .values()
+                    .next()
+                    .unwrap()
+                    .last_progress
+                    .is_none()
+            );
+            assert_eq!(executor.take_notifications().len(), 1);
+        }
+        executor
+            .state
+            .borrow_mut()
+            .transport
+            .received
+            .push_back(Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                "notifications/progress",
+                Some(valid),
+            ))));
+        executor
+            .drive(&cx)
+            .expect("unchanged valid sibling is accepted");
+        assert_eq!(execution.take_stream_notifications().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn executor_progress_queue_overflow_leaves_state_unchanged() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
+        let mut execution = executor.execute(&cx, request(42)).expect("request commits");
+        for progress in 0..=MAX_RETAINED_PEER_ACTIVITY {
+            executor
+                .state
+                .borrow_mut()
+                .transport
+                .received
+                .push_back(Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                    "notifications/progress",
+                    Some(serde_json::json!({"progressToken": 42, "progress": progress})),
+                ))));
+        }
+        for _ in 0..MAX_RETAINED_PEER_ACTIVITY {
+            executor
+                .drive(&cx)
+                .expect("a bounded stream slot remains available");
+        }
+        let before = executor.pending_records();
+        let prior = executor
+            .state
+            .borrow()
+            .pending
+            .values()
+            .next()
+            .unwrap()
+            .last_progress
+            .clone();
+        assert!(
+            executor.drive(&cx).is_err(),
+            "one additional event exceeds stream capacity"
+        );
+        assert_eq!(
+            executor.pending_records(),
+            before,
+            "a rejected event cannot reset idle"
+        );
+        assert_eq!(
+            executor
+                .state
+                .borrow()
+                .pending
+                .values()
+                .next()
+                .unwrap()
+                .last_progress,
+            prior
+        );
+        assert_eq!(
+            execution.take_stream_notifications().unwrap().len(),
+            MAX_RETAINED_PEER_ACTIVITY
+        );
+        executor
+            .state
+            .borrow_mut()
+            .transport
+            .received
+            .push_back(Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                "notifications/progress",
+                Some(serde_json::json!({"progressToken": 42, "progress": MAX_RETAINED_PEER_ACTIVITY})),
+            ))));
+        executor
+            .drive(&cx)
+            .expect("the same rejected value is accepted after capacity returns");
+        assert_eq!(execution.take_stream_notifications().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn executor_progress_tokens_reject_active_numeric_aliases_and_allow_terminal_reuse() {
+        fn with_marker(id: i64, marker: &str) -> JsonRpcRequest {
+            let mut request = request(id);
+            request.params.as_mut().unwrap()["_meta"]["progressToken"] =
+                Value::Number(serde_json::Number::from_string_unchecked(marker.to_owned()));
+            request
+        }
+
+        for (first, alias) in [
+            ("1", "1.0"),
+            ("1", "1e0"),
+            ("0", "-0.0e+4"),
+            ("0", "0e-9999"),
+            ("9007199254740993", "9007199254740993e0"),
+        ] {
+            let cx = Cx::for_testing();
+            let executor = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
+            let mut initial = executor
+                .execute(&cx, with_marker(41, first))
+                .expect("the first exact token owner commits");
+            let before = executor.pending_records();
+            let generation = executor.state.borrow().next_generation;
+            let error = executor
+                .execute(&cx, with_marker(42, alias))
+                .expect_err("a numeric alias cannot create a second live token owner");
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            assert_eq!(executor.pending_records(), before);
+            assert_eq!(executor.state.borrow().next_generation, generation);
+            assert_eq!(executor.state.borrow().transport.sent.len(), 1);
+            executor
+                .cancel(&cx, &mut initial)
+                .expect("the exact first owner is retired");
+            let _successor = executor
+                .execute(&cx, with_marker(42, alias))
+                .expect("a retired progress token can serve another request ID");
+            assert_eq!(executor.pending_records().len(), 1);
+        }
     }
 
     #[test]

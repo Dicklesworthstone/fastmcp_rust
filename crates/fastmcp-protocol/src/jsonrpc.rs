@@ -1015,7 +1015,8 @@ fn is_mathematical_integer(lexeme: &str) -> bool {
         0
     };
     let scale = i64::try_from(fraction_digits).unwrap_or(i64::MAX) - exponent;
-    scale <= 0
+    coefficient.iter().all(|digit| matches!(digit, b'0' | b'.'))
+        || scale <= 0
         || usize::try_from(scale).is_ok_and(|required_zeroes| trailing_zeroes >= required_zeroes)
 }
 
@@ -1838,6 +1839,41 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn request_id_correlation_key_accepts_zero_at_negative_exponent_bound() {
+        let zero = RequestId::Number(0);
+        for lexeme in ["0e-9999", "-0.00e-10000", "0.0e-4"] {
+            let alias = RequestId::Integer(lexeme.to_owned());
+            assert!(
+                zero.correlates_with(&alias),
+                "{lexeme} remains mathematical zero"
+            );
+            assert_eq!(
+                alias.correlation_key().unwrap(),
+                CorrelationKey::Integer("0".to_owned())
+            );
+            let wire = serde_json::to_string(&alias).expect("zero alias is a valid request ID");
+            assert_eq!(
+                wire, lexeme,
+                "canonical correlation does not change exact echo"
+            );
+            let fractional = RequestId::Integer(lexeme.replacen('0', "1", 1));
+            assert!(
+                fractional.correlation_key().is_err(),
+                "a nonzero fractional sibling is rejected"
+            );
+            assert_eq!(
+                alias.correlation_key().unwrap(),
+                zero.correlation_key().unwrap()
+            );
+        }
+        assert!(
+            RequestId::Integer("0e-10001".to_owned())
+                .correlation_key()
+                .is_err()
+        );
     }
 
     #[test]
