@@ -261,24 +261,7 @@ impl ClientCredentialsCoreCall {
                     let Body::Sse(mut stream) = *remaining else {
                         return Err(ManagedCoreError::InvalidResponse.into());
                     };
-                    // Keep the terminal and its socket inside the SAME active
-                    // future as decoding. All body-tail work remains subject
-                    // to the opening credential, owner, caller and deadline.
-                    // No tail record is delivered or retained after refusal.
-                    if stream.next_event(cx).await
-                        .map_err(|_| ClientCredentialsError::UnexpectedResponse)?
-                        .is_some()
-                    {
-                        return Err(ManagedCoreError::InvalidResponse.into());
-                    }
-                    // The SSE parser intentionally reports discarded EOF
-                    // fragments rather than manufacturing an event. None
-                    // alone therefore does not establish clean framing.
-                    let framing = stream.end_of_stream()
-                        .ok_or(ManagedCoreError::MissingTerminal)?;
-                    if framing.discarded_pending_event || framing.discarded_partial_line {
-                        return Err(ManagedCoreError::InvalidResponse.into());
-                    }
+                    require_finite_sse_eof(cx, &mut stream).await?;
                 }
                 return Ok((event, None));
             }
@@ -300,8 +283,28 @@ impl ClientCredentialsCoreCall {
     }
 }
 
+// Shared by the machine core and Tasks response owners. This checks framing,
+// not authority: the caller MUST keep it inside its original active() guard.
+// No trailing event is decoded, published or retained in an error. Reading
+// EOF is not another protocol record and cannot extend a record allowance.
+pub(super) async fn require_finite_sse_eof(
+    cx: &Cx,
+    stream: &mut ModernHttpSseResponseStream,
+) -> Result<(), ManagedCoreError> {
+    if stream.next_event(cx).await.map_err(|_| ManagedCoreError::InvalidResponse)?.is_some() {
+        return Err(ManagedCoreError::InvalidResponse);
+    }
+    // None alone is insufficient: WHATWG SSE discards incomplete EOF data.
+    // The native parser reports those fragments without synthesizing an event.
+    let framing = stream.end_of_stream().ok_or(ManagedCoreError::MissingTerminal)?;
+    if framing.discarded_pending_event || framing.discarded_partial_line {
+        return Err(ManagedCoreError::InvalidResponse);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::time::Duration;
 
@@ -434,7 +437,7 @@ mod tests {
     // These tests isolate the shipped native response pipeline and credential
     // lifetime checks. The loopback peer is not an OAuth issuer: acquisition,
     // HTTPS credential delivery and discovery negotiation are not proved here.
-    fn runtime() -> asupersync::runtime::Runtime {
+    pub(in crate::http_auth::discovery::client_credentials) fn runtime() -> asupersync::runtime::Runtime {
         asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
             .blocking_threads(0, 2)
@@ -443,13 +446,29 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    enum NativeEnd { Complete, Hold, Truncate }
+    pub(in crate::http_auth::discovery::client_credentials) enum NativeEnd { Complete, Hold, Truncate }
 
     async fn native_response(
         cx: &Cx,
         body: &str,
         content_type: &'static str,
         end: NativeEnd,
+    ) -> (ClientCredentialsResponse, std::thread::JoinHandle<()>) {
+        let request = request("tools/list", json!({}));
+        let (_, request) = prepare(&resource(), &request, &RequestId::Number(7)).unwrap();
+        native_response_for(cx, body, content_type, end, request).await
+    }
+
+    // Test-only native framing fixture shared with Tasks. The caller supplies
+    // the actual typed operation, so method headers, wire body and decoder
+    // agree. Token/grant acquisition and discovery are deliberately not faked
+    // as having occurred: only an injected response credential is exercised.
+    pub(in crate::http_auth::discovery::client_credentials) async fn native_response_for(
+        cx: &Cx,
+        body: &str,
+        content_type: &'static str,
+        end: NativeEnd,
+        request: CoreRequest,
     ) -> (ClientCredentialsResponse, std::thread::JoinHandle<()>) {
         use std::io::{BufRead, Read, Write};
         use std::net::TcpListener;
@@ -511,12 +530,17 @@ mod tests {
                 }
             }
         });
-        let request = request("tools/list", json!({}));
         let request_id = RequestId::Number(7);
-        let (wire, request) = prepare(&resource(), &request, &request_id).unwrap();
+        let params = request.encode_params().unwrap().unwrap();
+        let name = if matches!(request.method(), "tools/call" | "prompts/get") {
+            params.get("name").and_then(Value::as_str).map(str::to_owned)
+        } else { None };
+        let bytes = serde_json::to_vec(&json!({
+            "jsonrpc":"2.0", "id":request_id, "method":request.method(), "params":params,
+        })).unwrap();
         let loopback = crate::http_executor::ModernHttpRequest::new(
-            &format!("http://{address}/mcp"), wire.body().to_vec(),
-            fastmcp_protocol::FINAL_PROTOCOL_VERSION, "tools/list", None,
+            &format!("http://{address}/mcp"), bytes,
+            fastmcp_protocol::FINAL_PROTOCOL_VERSION, request.method(), name,
         ).unwrap();
         let cancellation = McpRequestCancellation::new();
         let response = crate::http_executor::ModernHttpExecutor::new()
@@ -671,7 +695,7 @@ mod tests {
             ] {
                 let (mut call, peer) = finite_call(&cx, &format!("{FINITE_TERMINAL}{tail}"), false).await;
                 let error = call.next_event(&cx).await.err().expect("tail must prevent publication");
-                assert!(matches!(error, ClientCredentialsCoreError::Protocol(ManagedCoreError::InvalidResponse)));
+                assert!(matches!(&error, ClientCredentialsCoreError::Protocol(ManagedCoreError::InvalidResponse)));
                 assert!(!format!("{error:?} {error}").contains("private-tail"));
                 assert!(!call.finished && call.body.is_none());
                 assert!(matches!(call.next_event(&cx).await,
@@ -715,9 +739,8 @@ mod tests {
             let cx = Cx::current().unwrap();
             for tail in ["", "data: {}\n\n", "data: incomplete"] {
                 let body = format!("data: {{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{{\"resultType\":\"input_required\",\"requestState\":\"opaque\"}}}}\n\n{tail}");
-                let (mut response, peer) = native_response(&cx, &body, "text/event-stream", NativeEnd::Complete).await;
                 let (_, original) = prepare(&resource(), &request("tools/call", json!({"name":"echo"})), &RequestId::Number(7)).unwrap();
-                response.request = original;
+                let (response, peer) = native_response_for(&cx, &body, "text/event-stream", NativeEnd::Complete, original).await;
                 let deadline = response.deadline;
                 let mut call = ClientCredentialsCoreCall::from_response(response, ManagedCoreLimits::default(), deadline).unwrap();
                 let result = call.next_event(&cx).await;
@@ -795,9 +818,9 @@ mod tests {
                     if !fired && trigger.as_mut().poll(task).is_ready() {
                         fired = true;
                         match kind {
-                            0 => caller.cancel(),
-                            1 => owner.cancel(),
-                            _ => credential.revoke(),
+                            0 => { caller.cancel(); }
+                            1 => { owner.cancel(); }
+                            _ => { credential.revoke(); }
                         }
                     }
                     pending.as_mut().poll(task)
