@@ -2412,9 +2412,9 @@ exec sleep 5
     }
 
     /// The same ping while a modern `server/discover` is in flight gets
-    /// method-not-found, and so does a `roots/list` during a legacy
-    /// `initialize` even with a roots handler configured: the spec allows
-    /// only pings and logging before `initialized`.
+    /// method-not-found, and so do `roots/list` and `sampling/createMessage`
+    /// during a legacy `initialize`, each with its handler configured: the
+    /// spec allows only pings and logging before `initialized`.
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     #[test]
     fn server_requests_during_the_handshake_other_than_legacy_ping_are_refused() {
@@ -2455,6 +2455,34 @@ exec sleep 5
         client
             .close()
             .expect("legacy initializing-roots client cleanup");
+
+        let sampling = r#"{"jsonrpc":"2.0","id":"init-request","method":"sampling/createMessage","params":{"messages":[],"maxTokens":16}}"#;
+        let script = initializing_server_request_script("exit 1", sampling, METHOD_NOT_FOUND);
+        let mut capabilities = ClientCapabilities::default();
+        capabilities.sampling = Some(fastmcp_protocol::SamplingCapability::default());
+        let legacy = ClientBuilder::new()
+            .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+            .capabilities(capabilities)
+            .reverse_request_handlers(ReverseRequestHandlers::new().with_sampling_create_message(
+                |_cx, _cancellation, _params| {
+                    Box::pin(async {
+                        Ok(fastmcp_protocol::CreateMessageResult::text(
+                            "must not be produced before initialized",
+                            "test-model",
+                        ))
+                    })
+                },
+            ));
+        let mut client = connect_yielding(legacy, &script).unwrap_or_else(|error| {
+            panic!("sampling/createMessage during initialize must be refused: {error}")
+        });
+        assert_eq!(
+            client.session.server_info().name,
+            "initializing-request-server"
+        );
+        client
+            .close()
+            .expect("legacy initializing-sampling client cleanup");
     }
 
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
