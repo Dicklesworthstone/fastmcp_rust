@@ -196,6 +196,21 @@ pub fn admit_raw_jsonrpc_document(
         .map_err(RawJsonAdmissionFailure::into)
 }
 
+/// Whether the UTF-8 byte-order mark occurs anywhere in `bytes`. This is the
+/// predicate of comparing every three-byte window, found by seeking the mark's
+/// lead byte; the windowed comparison cost more than the admission scan itself.
+fn contains_byte_order_mark(bytes: &[u8]) -> bool {
+    const BYTE_ORDER_MARK: [u8; 3] = [0xef, 0xbb, 0xbf];
+    let mut rest = bytes;
+    while let Some(lead) = rest.iter().position(|byte| *byte == BYTE_ORDER_MARK[0]) {
+        if rest[lead..].starts_with(&BYTE_ORDER_MARK) {
+            return true;
+        }
+        rest = &rest[lead + 1..];
+    }
+    false
+}
+
 /// Admit one complete raw JSON document before any typed decoding.
 ///
 /// This is the single bounded streaming pass every FastMCP JSON consumer
@@ -222,7 +237,7 @@ pub fn admit_raw_json_document(
             RawJsonAdmissionError::DocumentTooLarge,
         ));
     }
-    if bytes.windows(3).any(|window| window == [0xef, 0xbb, 0xbf]) {
+    if contains_byte_order_mark(bytes) {
         return Err(RawJsonAdmissionFailure::at_root(
             RawJsonAdmissionError::ByteOrderMark,
         ));
@@ -300,28 +315,36 @@ impl JsonRpcRequest {
     ) -> Result<(Self, Option<String>), JsonRpcAdmissionError> {
         admit_raw_jsonrpc_document(bytes, document_byte_limit)
             .map_err(JsonRpcAdmissionError::Raw)?;
-        let wire =
-            JsonRpcRequestRawWire::deserialize(&mut serde_json::Deserializer::from_slice(bytes))
-                .map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)?;
-        let raw_params = wire.params.as_deref().map(RawValue::get).map(str::to_owned);
-        let params = raw_params
-            .as_deref()
-            .map(|source| {
-                crate::messages::validate_raw_final_completion_params(&wire.method, source)
-                    .map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)?;
-                serde_json::from_str(source).map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)
-            })
-            .transpose()?;
-        let request = Self {
-            jsonrpc: wire.jsonrpc,
-            method: wire.method,
-            params,
-            id: wire.id,
-        };
+        let (request, raw_params) = Self::decode_retaining_raw_params(bytes)
+            .map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)?;
         request
             .validate()
             .map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)?;
         Ok((request, raw_params))
+    }
+
+    /// Performs exactly this type's `Deserialize` decode of one document and
+    /// also returns the exact JSON source of its `params` member from that
+    /// same decode.
+    ///
+    /// It applies neither raw-document admission nor [`Self::validate`]. A
+    /// caller that has already admitted `bytes`, as the transport codec has,
+    /// keeps the parameter source this way instead of decoding the document
+    /// again. The attachment rule of [`Self::decode_strict_with_raw_params`]
+    /// applies to the returned source.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error `serde_json::from_slice::<JsonRpcRequest>` returns
+    /// for the same bytes.
+    pub fn decode_retaining_raw_params(
+        bytes: &[u8],
+    ) -> Result<(Self, Option<String>), serde_json::Error> {
+        let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+        let wire = JsonRpcRequestRawWire::deserialize(&mut deserializer)?;
+        deserializer.end()?;
+        let (request, raw_params) = wire.into_request::<serde_json::Error>()?;
+        Ok((request, raw_params.map(|source| source.get().to_owned())))
     }
 }
 
@@ -1144,24 +1167,36 @@ impl<'de> Deserialize<'de> for JsonRpcRequest {
     where
         D: Deserializer<'de>,
     {
-        let wire = JsonRpcRequestRawWire::deserialize(deserializer)?;
-        let params = wire
+        JsonRpcRequestRawWire::deserialize(deserializer)?
+            .into_request()
+            .map(|(request, _)| request)
+    }
+}
+
+impl<'a> JsonRpcRequestRawWire<'a> {
+    /// Types this envelope and hands back the exact `params` source it holds.
+    fn into_request<E: serde::de::Error>(
+        self,
+    ) -> Result<(JsonRpcRequest, Option<Cow<'a, RawValue>>), E> {
+        let params = self
             .params
             .as_deref()
             .map(RawValue::get)
             .map(|source| {
-                crate::messages::validate_raw_final_completion_params(&wire.method, source)
-                    .map_err(D::Error::custom)?;
-                serde_json::from_str(source).map_err(D::Error::custom)
+                crate::messages::validate_raw_final_completion_params(&self.method, source)
+                    .map_err(E::custom)?;
+                serde_json::from_str(source).map_err(E::custom)
             })
             .transpose()?;
-
-        Ok(Self {
-            jsonrpc: wire.jsonrpc,
-            method: wire.method,
-            params,
-            id: wire.id,
-        })
+        Ok((
+            JsonRpcRequest {
+                jsonrpc: self.jsonrpc,
+                method: self.method,
+                params,
+                id: self.id,
+            },
+            self.params,
+        ))
     }
 }
 
@@ -1769,6 +1804,29 @@ mod tests {
             state, state_before,
             "rejected raw bytes leave admitted state unchanged"
         );
+    }
+
+    #[test]
+    fn bom_after_a_lead_byte_near_miss_is_rejected_inside_a_string() {
+        // U+FEFB encodes as EF BB BB, sharing the mark's first two bytes, so
+        // the seek must continue past it to the U+FEFF (EF BB BF) behind it.
+        let planted =
+            "{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":\"a\u{fefb}\u{feff}\"}";
+        let near_miss =
+            "{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":\"a\u{fefb}\u{fefb}\"}";
+        let mut state = AdmittedFrames::default();
+
+        assert!(
+            matches!(
+                admit_frame(&mut state, planted.as_bytes()),
+                Err(JsonRpcAdmissionError::Raw(
+                    RawJsonAdmissionError::ByteOrderMark
+                ))
+            ),
+            "a mark inside a string value is refused like a leading one"
+        );
+        admit_frame(&mut state, near_miss.as_bytes())
+            .expect("changing only the mark's last byte leaves an admissible code point");
     }
 
     #[test]

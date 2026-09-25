@@ -192,6 +192,7 @@ pub trait TransportRecvHalf {
 pub struct ReceivedTransportFrame {
     message: JsonRpcMessage,
     source: Box<[u8]>,
+    raw_params: Option<Box<str>>,
 }
 
 impl ReceivedTransportFrame {
@@ -210,14 +211,28 @@ impl ReceivedTransportFrame {
 
         let mut codec = Codec::new();
         codec.set_max_message_size(MAX_CLIENT_TRANSPORT_SOURCE_BYTES);
-        let message = codec.decode_complete_message(&source)?;
-        Ok(Self { message, source })
+        let (message, raw_params) = codec.decode_complete_message_retaining_raw_params(&source)?;
+        Ok(Self {
+            message,
+            source,
+            raw_params: raw_params.map(String::into_boxed_str),
+        })
     }
 
     /// Returns the typed JSON-RPC message.
     #[must_use]
     pub const fn message(&self) -> &JsonRpcMessage {
         &self.message
+    }
+
+    /// Returns the exact JSON source of a request's `params` member.
+    ///
+    /// It comes from the same admitted document and single typed decode as
+    /// [`Self::message`], so a server can keep its exact parameter bytes
+    /// without admitting and decoding the frame a second time.
+    #[must_use]
+    pub fn raw_params(&self) -> Option<&str> {
+        self.raw_params.as_deref()
     }
 
     /// Returns the exact admitted JSON document without transport framing.
@@ -639,6 +654,27 @@ mod tests {
             panic!("the admitted response source must derive a response message");
         };
         assert_eq!(response.id, Some(RequestId::Number(73)));
+        assert_eq!(frame.raw_params(), None, "a response has no params source");
+    }
+
+    #[test]
+    fn received_transport_frame_retains_a_requests_exact_params_source() {
+        let params = r#"{ "name" : "probe", "arguments":{"n":1.0e0,"z":1,"a":2} }"#;
+        let source =
+            format!(r#"{{"jsonrpc":"2.0","id":74,"method":"tools/call","params":{params}}}"#);
+        let frame = ReceivedTransportFrame::admit(source.into_bytes().into_boxed_slice())
+            .expect("one bounded request source is strictly admitted");
+
+        assert_eq!(
+            frame.raw_params(),
+            Some(params),
+            "the source keeps whitespace, member order and number lexemes a value would drop"
+        );
+        // Removing only the params member leaves no source to retain.
+        let bare = br#"{"jsonrpc":"2.0","id":74,"method":"tools/call"}"#;
+        let frame = ReceivedTransportFrame::admit(bare.to_vec().into_boxed_slice())
+            .expect("a request without params is admitted");
+        assert_eq!(frame.raw_params(), None);
     }
 
     #[test]
