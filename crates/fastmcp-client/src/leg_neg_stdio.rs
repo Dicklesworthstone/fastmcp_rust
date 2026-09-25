@@ -400,7 +400,7 @@ pub fn evaluate_stdio_case(cx: &Cx, case: &StdioClassificationCase) -> StdioClas
     let plan = ClientProtocolPlan::stdio(case.policy());
     let args: Vec<&str> = case.args().iter().map(String::as_str).collect();
 
-    let outcome = Client::stdio_with_protocol_plan_with_cx(case.command(), &args, plan, cx.clone());
+    let outcome = Client::stdio_with_protocol_plan_with_cx(cx.clone(), case.command(), &args, plan);
 
     let (connected, selected_era, protocol_version, failure) = match outcome {
         Ok(mut client) => {

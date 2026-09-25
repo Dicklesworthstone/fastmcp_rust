@@ -4155,7 +4155,7 @@ async fn cmd_test(
             protocol_policy.server_launch_value(),
         )
         .owned_process_group(true)
-        .connect_stdio_with_cx(server, &args_refs, cx)
+        .connect_stdio_with_cx(cx, server, &args_refs)
         .await;
     let mut client = match client {
         Ok(client) => client,
@@ -6331,7 +6331,7 @@ async fn cmd_tasks(cx: &Cx, connection: &TaskConnection, action: &TaskAction) ->
             // Tasks owns this server launch, including workers it starts in
             // the same Unix process group, through success and failure cleanup.
             .owned_process_group(cfg!(unix))
-            .connect_stdio_with_cx(server, &args, cx)
+            .connect_stdio_with_cx(cx, server, &args)
             .await?;
         #[cfg(unix)]
         {
@@ -7015,7 +7015,7 @@ async fn cmd_inspect(
 
     // Connect to the server
     let mut client = client_builder_for_protocol_policy(protocol_policy)?
-        .connect_stdio_with_cx(server, &args_refs, cx)
+        .connect_stdio_with_cx(cx, server, &args_refs)
         .await?;
     let negotiated_protocol_version = client.protocol_version().to_owned();
 
@@ -12828,10 +12828,10 @@ IFS= read -r end
         runtime.block_on(async move {
             let root = Cx::current().unwrap();
             let mut client = Client::stdio_with_protocol_plan_with_cx(
+                root.clone(),
                 "sh",
                 &["-c", &script],
                 ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-                root.clone(),
             ).unwrap();
             client.set_request_timeout_policy(fastmcp_client::RequestTimeoutPolicy::new(
                 Duration::from_secs(5), Duration::from_secs(5),

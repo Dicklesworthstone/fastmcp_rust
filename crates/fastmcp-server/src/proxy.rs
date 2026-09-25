@@ -8404,7 +8404,7 @@ impl ProxyUpstreamBindingRegistry {
 
         let client = ClientBuilder::new()
             .protocol_plan(protocol_plan)
-            .connect_stdio_with_cx(command, args, cx)
+            .connect_stdio_with_cx(cx, command, args)
             .await?;
         context.ensure_live()?;
         let binding = binding_from_live_stdio_client(&client, configuration_generation)?;
@@ -12584,10 +12584,10 @@ IFS= read -r end
             );
             let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
             let mut client = Client::stdio_with_protocol_plan_with_cx(
+                cx.clone(),
                 "sh",
                 &["-c", &script],
                 ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-                cx.clone(),
             )
             .unwrap();
             client
@@ -13818,10 +13818,10 @@ IFS= read -r end
         );
         let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            cx.clone(),
             "sh",
             &["-c", &script],
             ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
-            cx.clone(),
         )
         .unwrap();
         client
@@ -14059,6 +14059,7 @@ IFS= read -r end
                 );
                 let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
                 let mut client = Client::stdio_with_protocol_plan_with_cx(
+                    cx.clone(),
                     "sh",
                     &["-c", &script],
                     ClientProtocolPlan::stdio(if modern {
@@ -14066,7 +14067,6 @@ IFS= read -r end
                     } else {
                         ProtocolPolicy::LegacyOnly
                     }),
-                    cx.clone(),
                 )
                 .unwrap();
                 client
@@ -14659,10 +14659,10 @@ IFS= read -r end
                 );
                 let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
                 let mut client = Client::stdio_with_protocol_plan_with_cx(
+                    cx.clone(),
                     "sh",
                     &["-c", &script],
                     ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-                    cx.clone(),
                 )
                 .unwrap();
                 client
@@ -21979,7 +21979,7 @@ expect_request notifications/initialized ''
                 .auto_initialize(true)
                 .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
                 .request_timeout_policy(scripted_peer_timeout_policy())
-                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &cx),
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script.as_str()]),
         )
         .expect("spawn exact-2024 paginated stdio peer");
         let proxy = ProxyClient::from_backend(client);
@@ -23961,10 +23961,10 @@ expect_request notifications/initialized ''
         );
         let script = modern_proxy_peer_script(&discovery, &tool_result);
         let client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_testing(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
-            Cx::for_testing(),
         )
         .expect("Auto retains its live modern selection");
         let proxy = ProxyClient::from_client(client)
@@ -24078,10 +24078,10 @@ exec sleep 2
         );
         let script = auto_legacy_proxy_peer_script(&discovery_refusal, &initialize, &tool_result);
         let client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_testing(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
-            Cx::for_testing(),
         )
         .expect("Auto selects exact legacy only after an authorized modern refusal");
         let proxy = ProxyClient::from_client(client)
@@ -24270,7 +24270,7 @@ exec sleep 2
                 .auto_initialize(true)
                 .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
                 .request_timeout_policy(scripted_peer_timeout_policy())
-                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &cx),
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script.as_str()]),
         )
         .expect("spawn scripted auto-initializing client");
         assert!(!client.is_initialized());
@@ -24299,7 +24299,7 @@ exec sleep 2
                 .auto_initialize(true)
                 .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
                 .request_timeout_policy(scripted_peer_timeout_policy())
-                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &cx),
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script.as_str()]),
         )
         .expect("spawn scripted auto-initializing client");
 

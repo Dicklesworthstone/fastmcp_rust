@@ -1814,7 +1814,7 @@ pub mod auto {
             args: &[&str],
             cx: &Cx,
         ) -> McpResult<Client> {
-            self.inner.connect_stdio_with_cx(command, args, cx).await
+            self.inner.connect_stdio_with_cx(cx, command, args).await
         }
 
         /// Negotiates Auto WebSocket discovery with caller-owned fresh transports.
@@ -3118,7 +3118,7 @@ pub mod modern {
             cx: &Cx,
         ) -> McpResult<Client> {
             self.inner
-                .connect_stdio_with_cx(command, args, cx)
+                .connect_stdio_with_cx(cx, command, args)
                 .await
                 .map(Client::from_inner)
         }
@@ -7932,12 +7932,12 @@ pub mod legacy_2024 {
         /// ```
         pub fn stdio_with_cx(command: &str, args: &[&str], cx: Cx) -> McpResult<Self> {
             fastmcp_client::Client::stdio_with_protocol_plan_with_cx(
+                cx,
                 command,
                 args,
                 fastmcp_client::ClientProtocolPlan::stdio(
                     fastmcp_protocol::protocol_policy::ProtocolPolicy::LegacyOnly,
                 ),
-                cx,
             )
             .map(Self::from_inner)
         }
@@ -8828,7 +8828,7 @@ pub mod legacy_2024 {
             cx: &Cx,
         ) -> McpResult<Client> {
             self.inner
-                .connect_stdio_with_cx(command, args, cx)
+                .connect_stdio_with_cx(cx, command, args)
                 .await
                 .map(Client::from_inner)
         }

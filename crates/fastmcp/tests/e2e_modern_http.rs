@@ -3318,9 +3318,9 @@ fn e2e_public_sse_constructor_invokes_live_legacy_handlers() {
     let mut client = runtime_block_on_bounded(
         &cx,
         fastmcp_rust::Client::sse_with_cx(
+            &cx,
             public_http_target(server.address(), "/sse"),
             public_http_target(server.address(), "/messages"),
-            &cx,
         ),
     )
     .expect("Client::sse_with_cx connects exact-2024 SSE without probing modern HTTP");
@@ -3551,9 +3551,9 @@ fn e2e_public_sse_constructor_carries_a_tool_result_over_64_kib() {
     let mut client = runtime_block_on_bounded(
         &cx,
         fastmcp_rust::Client::sse_with_cx(
+            &cx,
             public_http_target(server.address(), "/sse"),
             public_http_target(server.address(), "/messages"),
-            &cx,
         ),
     )
     .expect("Client::sse_with_cx connects exact-2024 SSE");
@@ -3847,9 +3847,9 @@ fn e2e_public_sse_compose_nested_tool_and_resource() {
     let mut client = runtime_block_on_bounded(
         &cx,
         fastmcp_rust::Client::sse_with_cx(
+            &cx,
             public_http_target(server.address(), "/sse"),
             public_http_target(server.address(), "/messages"),
-            &cx,
         ),
     )
     .expect("Client::sse_with_cx connects exact-2024 SSE to the compose server");
@@ -3919,9 +3919,9 @@ fn e2e_public_sse_prompt_composes_nested_tool_and_resource() {
     let mut client = runtime_block_on_bounded(
         &cx,
         fastmcp_rust::Client::sse_with_cx(
+            &cx,
             public_http_target(server.address(), "/sse"),
             public_http_target(server.address(), "/messages"),
-            &cx,
         ),
     )
     .expect("Client::sse_with_cx connects exact-2024 SSE to the prompt compose server");
@@ -3996,9 +3996,9 @@ fn e2e_public_sse_resource_composes_nested_tool_and_resource() {
     let mut client = runtime_block_on_bounded(
         &cx,
         fastmcp_rust::Client::sse_with_cx(
+            &cx,
             public_http_target(server.address(), "/sse"),
             public_http_target(server.address(), "/messages"),
-            &cx,
         ),
     )
     .expect("Client::sse_with_cx connects exact-2024 SSE to the resource compose server");

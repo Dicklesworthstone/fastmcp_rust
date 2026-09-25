@@ -472,7 +472,7 @@ async fn connect(cx: &Cx) -> McpResult<Client> {
     )?;
     ClientBuilder::new()
         .request_timeout_policy(policy)
-        .connect_stdio_with_cx("my-mcp-server", &[], cx)
+        .connect_stdio_with_cx(cx, "my-mcp-server", &[])
         .await
 }
 ```
