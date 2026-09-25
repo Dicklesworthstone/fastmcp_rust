@@ -3498,7 +3498,7 @@ impl Router {
 
     /// Returns whether an admitted exact-2024 request selects a handler frozen
     /// as async at registration and therefore stays on the caller's runtime.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     pub(crate) fn legacy_request_uses_transport_owned_async_dispatch(
         &self,
         request: &JsonRpcRequest,
@@ -3559,7 +3559,7 @@ impl Router {
     }
 
     /// Awaits the resolved handler's subscription hook on the request runtime.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     pub(crate) async fn notify_resource_subscribed_async(
         &self,
         ctx: &McpContext,
@@ -3574,7 +3574,7 @@ impl Router {
     }
 
     /// Awaits the resolved handler's unsubscription hook on the request runtime.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     pub(crate) async fn notify_resource_unsubscribed_async(
         &self,
         ctx: &McpContext,
@@ -12693,6 +12693,8 @@ mod router_tests {
         assert!(r.get_tool("other").is_none());
     }
 
+    // Exact-2024 era: legacy transport-owned async dispatch selection.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn caller_owned_legacy_dispatch_is_frozen_at_registration() {
         struct AsyncNamedTool;

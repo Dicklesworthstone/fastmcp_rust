@@ -7104,6 +7104,8 @@ mod tests {
     }
 
     fn assert_fresh_http_resource_admission(token_resource: Option<&str>) {
+        use crate::TestHttpEndpoint;
+
         let approval = Arc::new(CountingApprovalBackend::new(ApprovalTestMode::Exact));
         let oauth = Arc::new(server_with_counting_approval(Arc::clone(&approval)));
         oauth
@@ -7152,11 +7154,11 @@ mod tests {
             .middleware(AudienceMiddleware {
                 events: Arc::clone(&events),
             })
-            // This test build also carries an unused exact-legacy endpoint,
+            // A dual-era build also carries an unused exact-legacy endpoint,
             // whose POST sink accepts only a plain-HTTP origin. The modern
             // protected resource above is trusted HTTPS deployment policy;
             // this direct handler test does not model its TLS connection.
-            .build_http_endpoint("http://resource.example")
+            .test_http_endpoint("http://resource.example")
             .expect("real public HTTP endpoint");
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(asupersync::runtime::reactor::create_reactor().expect("test reactor"))

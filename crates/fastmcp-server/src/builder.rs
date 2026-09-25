@@ -264,12 +264,12 @@ pub struct ServerBuilder {
     strict_input_validation: bool,
     /// Per-connection ceiling for concurrent server-to-client requests.
     /// Only the exact 2024-11-05 lane enforces it.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     max_bidirectional_requests_per_connection: usize,
     /// Immutable protocol-era admission policy for live stdio/runtime connections.
     protocol_policy: ProtocolPolicy,
     /// Explicit application vocabulary for legacy tools/call results only.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     legacy_application_tool_content: bool,
     /// Reserved policy selected before construction by a launch setting or a
     /// sealed embedding component.
@@ -395,11 +395,11 @@ impl ServerBuilder {
             task_manager: None,
             on_duplicate: DuplicateBehavior::default(),
             strict_input_validation: false,
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             max_bidirectional_requests_per_connection:
                 crate::bidirectional::DEFAULT_MAX_IN_FLIGHT_REQUESTS,
             protocol_policy,
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             legacy_application_tool_content: false,
             launch_protocol_policy,
             http_config: HttpServerConfig::default(),
@@ -480,7 +480,7 @@ impl ServerBuilder {
     ///
     /// Returns `InvalidParams` when `max` is zero or exceeds the hard safety
     /// limit enforced by the bidirectional request tracker.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     pub fn max_bidirectional_requests_per_connection(
         mut self,
         max: usize,
@@ -632,7 +632,7 @@ impl ServerBuilder {
     /// cancellation, response metadata validation, and other methods retain
     /// their existing rules. The default and typed exact-legacy router APIs
     /// continue to require exact legacy content.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[must_use]
     pub fn legacy_application_tool_content(mut self, enabled: bool) -> Self {
         self.legacy_application_tool_content = enabled;
@@ -902,7 +902,7 @@ impl ServerBuilder {
     }
 
     /// Builds a live modern Streamable HTTP endpoint.
-    #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+    #[cfg(not(feature = "legacy-2024-11-05"))]
     pub fn build_http_endpoint(
         self,
     ) -> Result<crate::ServerHttpEndpoint, crate::ServerHttpEndpointError> {
@@ -918,7 +918,7 @@ impl ServerBuilder {
     /// The modern route remains at [`HttpServerConfig::mcp_path`], while the
     /// exact MCP 2024-11-05 SSE route advertises `legacy_origin` plus the
     /// configured legacy message path.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     pub fn build_http_endpoint(
         self,
         legacy_origin: impl Into<String>,
@@ -2913,11 +2913,11 @@ impl ServerBuilder {
             active_requests: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(all(test, feature = "tasks"))]
             task_manager: self.task_manager,
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             max_bidirectional_requests_per_connection: self
                 .max_bidirectional_requests_per_connection,
             protocol_policy: self.protocol_policy,
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             legacy_application_tool_content: self.legacy_application_tool_content,
             http_config: self.http_config,
             oauth_http_routes: self.oauth_http_routes,
@@ -3750,6 +3750,8 @@ mod tests {
         assert_eq!(builder.request_timeout_secs(), DEFAULT_REQUEST_TIMEOUT_SECS);
     }
 
+    // Exact-2024 era: only the exact-legacy lane has a bidirectional limit.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn builder_bidirectional_limit_has_exact_validated_boundaries() {
         let default = ServerBuilder::new("srv", "1.0");
@@ -3825,7 +3827,7 @@ mod tests {
     fn no_legacy_source_exposes_a_modern_endpoint_builder_and_gates_the_dual_era_one() {
         let source = include_str!("builder.rs").replace("\r\n", "\n");
         assert!(source.contains(
-            "/// Builds a live modern Streamable HTTP endpoint.\n    #[cfg(not(any(feature = \"legacy-2024-11-05\", test)))]\n    pub fn build_http_endpoint"
+            "/// Builds a live modern Streamable HTTP endpoint.\n    #[cfg(not(feature = \"legacy-2024-11-05\"))]\n    pub fn build_http_endpoint"
         ));
         assert!(
             source.contains(
@@ -3833,7 +3835,11 @@ mod tests {
             )
         );
         assert!(source.contains("crate::ServerHttpEndpointError"));
-        assert!(!source.contains("fastmcp_transport::http::DualEraHttpEndpointError"));
+        // Split so this assertion's own text cannot satisfy the scan.
+        assert!(!source.contains(concat!(
+            "fastmcp_transport::http::",
+            "DualEraHttpEndpointError"
+        )));
     }
 
     #[cfg(not(feature = "legacy-2024-11-05"))]

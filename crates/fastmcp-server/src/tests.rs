@@ -4647,6 +4647,8 @@ mod console_config_tests {
         );
     }
 
+    // Exact-2024 era: only the dual-era loop renders traffic.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn traffic_verbosity_is_the_single_enablement_source() {
         let disabled = Server::new("test", "1.0.0").build();
