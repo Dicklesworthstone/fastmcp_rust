@@ -379,3 +379,96 @@ fn async_refresh_invalidate_persists_tombstone_and_repeated_logout_is_read_only(
         done(&cx, &lane, owner.close(&cx)).await;
     });
 }
+
+#[test]
+fn async_refresh_try_write_returns_the_same_unexecuted_grant_when_lane_is_full() {
+    run(|cx| async move {
+        let f = Fixture::new(); let busy = Fixture::new(); let lane = lane();
+        let cfg = configuration(); let client = OAuthClient::new(cfg.clone());
+        let owner = f.open(&cx, &lane, &client).await;
+        let blocker = busy.open(&cx, &lane, &client).await;
+        let gate = Release(Gate::new()); busy.provider.0.lock().unwrap().seal_gate = Some(gate.0.clone());
+        let mut pending = blocker.store_refresh(&cx, busy.auth, None, credentials(&cfg)).unwrap();
+        gate.0.entered(&cx).await;
+        let original = credentials(&cfg);
+        let expiry = original.expires_at();
+        let header = original.bearer_credential().authorization_for_target(&cfg.resource);
+        let refusal = owner.try_store_refresh(&cx, f.auth, None, original).err().expect("lane is full");
+        assert!(matches!(refusal.cause(), AsyncOAuthRefreshError::Io(CredentialIoError::CapacityExceeded)));
+        assert!(!format!("{refusal:?} {refusal}").contains("refresh-secret"));
+        let (_, retained) = refusal.into_parts();
+        let (owner, original) = retained.expect("no command was handed to the runtime");
+        assert!(original.has_refresh_token());
+        assert_eq!(original.expires_at(), expiry);
+        assert_eq!(original.bearer_credential().authorization_for_target(&cfg.resource), header);
+        assert_eq!(owner.revision(), None);
+        assert_eq!(f.provider.0.lock().unwrap().seals, 0);
+        assert_eq!(lane.snapshot().unwrap().slots, 2);
+        gate.0.release();
+        let (blocker, (_, outcome)) = pending.wait(&cx).await.unwrap().into_parts();
+        outcome.unwrap(); settled(&cx, &lane).await;
+        // The returned owner still holds the real file lock, not a reconstructed
+        // facade that another opening can replace while admission is repaired.
+        let duplicate = done(&cx, &lane, f.opening(&cx, &lane, &client)).await;
+        assert!(matches!(duplicate, Err(OAuthRefreshStoreError::Storage(CoordinatedSlotError::Slot(
+            CredentialSlotError::Storage(crate::http_auth::secure_file::AtomicFileError::Busy))))));
+        let mut write = owner.try_store_refresh(&cx, f.auth, None, original).unwrap();
+        let (owner, (returned, outcome)) = write.wait(&cx).await.unwrap().into_parts();
+        outcome.unwrap(); assert!(!returned.has_refresh_token());
+        assert_eq!(f.provider.0.lock().unwrap().seals, 1);
+        done(&cx, &lane, owner.close(&cx)).await;
+        done(&cx, &lane, blocker.close(&cx)).await;
+    });
+}
+
+#[test]
+fn async_refresh_try_write_precancellation_returns_ownership_for_a_live_caller() {
+    run(|cx| async move {
+        let f = Fixture::new(); let lane = lane(); let cfg = configuration(); let client = OAuthClient::new(cfg.clone());
+        let owner = f.open(&cx, &lane, &client).await;
+        let stopped = Cx::for_testing_with_budget(asupersync::Budget::ZERO);
+        let failure = owner.try_store_refresh(&stopped, f.auth, None, credentials(&cfg)).err().unwrap();
+        assert!(matches!(failure.cause(), AsyncOAuthRefreshError::Io(CredentialIoError::SubmissionCancelled)));
+        let (_, retained) = failure.into_parts();
+        let (owner, original) = retained.unwrap();
+        assert!(original.has_refresh_token());
+        assert_eq!(f.provider.0.lock().unwrap().seals, 0);
+        assert_eq!(lane.snapshot().unwrap().operations, 0);
+        let mut pending = owner.try_store_refresh(&cx, f.auth, None, original).unwrap();
+        let (owner, (_, result)) = pending.wait(&cx).await.unwrap().into_parts();
+        result.unwrap();
+        assert_eq!(f.provider.0.lock().unwrap().seals, 1);
+        done(&cx, &lane, owner.close(&cx)).await;
+    });
+}
+
+#[test]
+fn async_refresh_try_take_and_invalidate_preserve_owner_after_shutdown() {
+    run(|cx| async move {
+        for invalidate in [false, true] {
+            let f = Fixture::new(); let lane = lane(); let cfg = configuration(); let client = OAuthClient::new(cfg.clone());
+            let owner = f.open(&cx, &lane, &client).await;
+            let (owner, (_, result)) = done(&cx, &lane,
+                owner.store_refresh(&cx, f.auth, None, credentials(&cfg))).await.into_parts();
+            let revision = result.unwrap();
+            let before = f.bytes(); let writes = f.provider.0.lock().unwrap().writes;
+            lane.begin_shutdown().unwrap();
+            let failure = if invalidate {
+                owner.try_invalidate(&cx, f.auth).err().unwrap()
+            } else {
+                owner.try_take_refresh(&cx, f.auth).err().unwrap()
+            };
+            assert!(matches!(failure.cause(), AsyncOAuthRefreshError::Io(CredentialIoError::LaneClosed)));
+            let (_, retained) = failure.into_parts();
+            let (owner, ()) = retained.unwrap();
+            assert_eq!(owner.revision(), Some(revision));
+            assert!(!owner.requires_recovery());
+            assert_eq!(f.provider.0.lock().unwrap().writes, writes);
+            assert_eq!(f.provider.0.lock().unwrap().opens, 0);
+            assert_eq!(f.bytes(), before);
+            done(&cx, &lane, owner.close(&cx)).await;
+            lane.wait_drained(&cx, Duration::from_secs(1)).await.unwrap();
+            assert_eq!(f.bytes(), before);
+        }
+    });
+}

@@ -34,9 +34,10 @@ const EXTRA_WORK_BYTES: usize = 4 * MAX_CONFIGURATION_BYTES
 const MAX_FILE_BYTES: usize = MAX_PROTECTED_REFRESH_GRANT_BYTES + 256;
 
 /// Submission/preflight failures, not a transaction's commit disposition.
-/// Inputs are consumed on submission failure; no worker can have executed the
-/// failed submission. Reopen to recover already-persisted custody. A transaction
-/// error is instead returned WITH its owner in `OAuthRefreshCompletion`.
+/// The simple methods consume inputs on submission failure; `try_*` methods
+/// wrap this cause with original custody when admission failed before scheduling.
+/// A transaction error is instead returned WITH its owner in
+/// `OAuthRefreshCompletion`.
 #[derive(Debug)]
 pub enum AsyncOAuthRefreshError {
     Io(CredentialIoError),
@@ -57,6 +58,32 @@ impl From<CredentialIoError> for AsyncOAuthRefreshError {
 impl From<OAuthRefreshStoreError> for AsyncOAuthRefreshError {
     fn from(error: OAuthRefreshStoreError) -> Self { Self::Store(error) }
 }
+
+/// Failed submission with ownership when admission refused before scheduling.
+/// `Some((store, input))` is the original unexecuted command custody, not a
+/// reconstructed credential or permission to replay a dispatched transaction.
+/// Runtime scheduling failure can consume the closure; that case returns None
+/// and requires reopening persisted custody rather than recreating its input.
+pub struct OAuthRefreshSubmissionFailure<A, P, I> {
+    cause: AsyncOAuthRefreshError,
+    retained: Option<(AsyncOAuthRefreshStore<A, P>, I)>,
+}
+impl<A, P, I> OAuthRefreshSubmissionFailure<A, P, I> {
+    pub fn cause(&self) -> &AsyncOAuthRefreshError { &self.cause }
+    pub fn into_parts(self) -> (AsyncOAuthRefreshError, Option<(AsyncOAuthRefreshStore<A, P>, I)>) {
+        (self.cause, self.retained)
+    }
+}
+impl<A, P, I> fmt::Debug for OAuthRefreshSubmissionFailure<A, P, I> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuthRefreshSubmissionFailure")
+            .field("cause", &self.cause).field("ownership_retained", &self.retained.is_some()).finish()
+    }
+}
+impl<A, P, I> fmt::Display for OAuthRefreshSubmissionFailure<A, P, I> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Display::fmt(&self.cause, f) }
+}
+impl<A, P, I> std::error::Error for OAuthRefreshSubmissionFailure<A, P, I> {}
 
 /// Completion custody: the same store owner plus the exact operation outcome.
 /// Store writes also return the original access credentials, even when sealing
@@ -97,6 +124,9 @@ pub type OAuthRefreshTake<A, P> = OAuthRefreshCompletion<
 /// its reserved cleanup path after shutdown. Provider memory and destructors
 /// remain provider-owned; destructors must not block. Failed submission/drop
 /// can release their ownership synchronously without calling provider methods.
+/// The `try_store_refresh`, `try_take_refresh` and `try_invalidate` variants
+/// instead return original ownership on admission refusal so the host can
+/// handle backpressure, choose a new live caller, or explicitly close the store.
 ///
 /// This does not supply a production protection service or independent anchor,
 /// renew a token automatically, or store access tokens. Both deployment-provider
@@ -148,22 +178,32 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
     /// uncertain storage failure returns it WITHOUT renewal ownership.
     pub fn store_refresh(
         self, cx: &Cx, authorization: PartitionAuthorization,
-        expected: Option<SlotRevision>, mut credentials: OAuthCredentials,
+        expected: Option<SlotRevision>, credentials: OAuthCredentials,
     ) -> Result<CredentialSlotTask<OAuthRefreshWrite<A, P>>, AsyncOAuthRefreshError> {
-        configuration_digest(&credentials.configuration)?;
+        self.try_store_refresh(cx, authorization, expected, credentials).map_err(|failure| failure.cause)
+    }
+
+    /// Like `store_refresh`, but pre-scheduling refusal returns the original
+    /// store and credentials in the error. No protection/anchor/file operation
+    /// has run when that ownership is present. Correct the admission condition
+    /// before explicitly submitting again; do not reconstruct credentials after
+    /// a failure with no retained owner or after a transaction error.
+    pub fn try_store_refresh(
+        self, cx: &Cx, authorization: PartitionAuthorization,
+        expected: Option<SlotRevision>, mut credentials: OAuthCredentials,
+    ) -> Result<CredentialSlotTask<OAuthRefreshWrite<A, P>>, OAuthRefreshSubmissionFailure<A, P, OAuthCredentials>> {
+        if let Err(error) = configuration_digest(&credentials.configuration) {
+            return Err(OAuthRefreshSubmissionFailure { cause: error.into(), retained: Some((self, credentials)) });
+        }
         // Credentials are native admitted values, but discard spare capacities
         // before queueing their secret/map buffers under a fixed reservation.
         if let Some(token) = &mut credentials.refresh_token { token.shrink_to_fit(); }
         for scope in &mut credentials.scopes { scope.shrink_to_fit(); }
         credentials.scopes.shrink_to_fit();
-        let Self { store, io } = self;
-        Ok(io.submit(cx, move |worker, io| {
-            // Reassemble before calling the provider so unwinding also drops
-            // the store/file lock before releasing its slot admission.
-            let mut owner = Self { store, io };
-            let result = owner.store.store_refresh(worker, &authorization, expected, &mut credentials);
-            OAuthRefreshCompletion { owner, outcome: (credentials, result) }
-        })?)
+        self.try_operate(cx, credentials, move |store, worker, mut credentials| {
+            let result = store.store_refresh(worker, &authorization, expected, &mut credentials);
+            (credentials, result)
+        })
     }
 
     /// Validates/decrypts and durably tombstones in one admitted worker before
@@ -172,12 +212,15 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
     pub fn take_refresh(self, cx: &Cx, authorization: PartitionAuthorization)
         -> Result<CredentialSlotTask<OAuthRefreshTake<A, P>>, AsyncOAuthRefreshError>
     {
-        let Self { store, io } = self;
-        Ok(io.submit(cx, move |worker, io| {
-            let mut owner = Self { store, io };
-            let outcome = owner.store.take_refresh(worker, &authorization);
-            OAuthRefreshCompletion { owner, outcome }
-        })?)
+        self.try_take_refresh(cx, authorization).map_err(|failure| failure.cause)
+    }
+
+    /// Returns the unexecuted command's owner on admission refusal. The retained
+    /// unit input carries no grant: no decryption or tombstone has occurred.
+    pub fn try_take_refresh(self, cx: &Cx, authorization: PartitionAuthorization)
+        -> Result<CredentialSlotTask<OAuthRefreshTake<A, P>>, OAuthRefreshSubmissionFailure<A, P, ()>>
+    {
+        self.try_operate(cx, (), move |store, worker, ()| store.take_refresh(worker, &authorization))
     }
 
     /// Persistent local invalidation, not issuer-side revocation. Already
@@ -185,12 +228,35 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
     pub fn invalidate(self, cx: &Cx, authorization: PartitionAuthorization)
         -> Result<CredentialSlotTask<OAuthRefreshCompletion<A, P, Result<SlotRevision, OAuthRefreshStoreError>>>, AsyncOAuthRefreshError>
     {
+        self.try_invalidate(cx, authorization).map_err(|failure| failure.cause)
+    }
+
+    /// Like `invalidate`, preserving the unexecuted owner on admission failure.
+    /// Lane shutdown is not silently reversed to admit an invalidation.
+    pub fn try_invalidate(self, cx: &Cx, authorization: PartitionAuthorization)
+        -> Result<CredentialSlotTask<OAuthRefreshCompletion<A, P, Result<SlotRevision, OAuthRefreshStoreError>>>, OAuthRefreshSubmissionFailure<A, P, ()>>
+    {
+        self.try_operate(cx, (), move |store, worker, ()| store.invalidate(worker, &authorization))
+    }
+
+    fn try_operate<I, T, F>(self, cx: &Cx, input: I, operation: F)
+        -> Result<CredentialSlotTask<OAuthRefreshCompletion<A, P, T>>, OAuthRefreshSubmissionFailure<A, P, I>>
+    where
+        I: Send + 'static,
+        T: Send + 'static,
+        F: FnOnce(&mut OAuthRefreshStore<A, P>, &Cx, I) -> T + Send + 'static,
+    {
         let Self { store, io } = self;
-        Ok(io.submit(cx, move |worker, io| {
+        io.try_submit(cx, (store, input), move |worker, io, (store, input)| {
+            // Reassemble before callbacks so unwinding releases providers and
+            // the file lock before returning this store's capacity.
             let mut owner = Self { store, io };
-            let outcome = owner.store.invalidate(worker, &authorization);
+            let outcome = operation(&mut owner.store, worker, input);
             OAuthRefreshCompletion { owner, outcome }
-        })?)
+        }).map_err(|(error, retained)| OAuthRefreshSubmissionFailure {
+            cause: error.into(),
+            retained: retained.map(|(io, (store, input))| (Self { store, io }, input)),
+        })
     }
 
     /// Drops the provider and retained file lock on the caller's blocking lane.

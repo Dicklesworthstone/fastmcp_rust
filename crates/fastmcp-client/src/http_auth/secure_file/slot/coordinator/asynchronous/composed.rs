@@ -42,6 +42,27 @@ impl ComposedCredentialIo {
         submit(cx, &lane, self.working_bytes, move |worker| work(worker, self))
     }
 
+    // Retain the consumer and input through every refusal before handing them
+    // to the runtime. A runtime spawn failure cannot return the consumed
+    // closure; distinguish that terminal loss from a retained admission refusal.
+    pub(crate) fn try_submit<I, T, F>(self, cx: &Cx, input: I, work: F)
+        -> Result<CredentialSlotTask<T>, (CredentialIoError, Option<(Self, I)>)>
+    where
+        I: Send + 'static,
+        T: Send + 'static,
+        F: FnOnce(&Cx, Self, I) -> T + Send + 'static,
+    {
+        let process = self.lane.process();
+        let admission = check_submission(cx, &process)
+            .and_then(|()| self.lane.reserve_job(self.working_bytes));
+        let lease = match admission {
+            Ok(lease) => lease,
+            Err(error) => return Err((error, Some((self, input)))),
+        };
+        spawn(cx, process, lease, move |worker| work(worker, self, input))
+            .map_err(|error| (error, None))
+    }
+
     // Permit teardown after shutdown and while ordinary work is saturated.
     // No second cancellation domain or cleanup executor is created.
     pub(crate) fn close<T: Send + 'static>(self, cx: &Cx, value: T)
