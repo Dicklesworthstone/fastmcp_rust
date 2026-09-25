@@ -7,6 +7,9 @@
 
 use std::fmt;
 
+// Transfers a repaired initial call into this same continuation owner.
+mod header_repair;
+
 use asupersync::Cx;
 use asupersync::http::h1::{ClientError, HttpError};
 use fastmcp_core::CanonicalHttpUrl;
