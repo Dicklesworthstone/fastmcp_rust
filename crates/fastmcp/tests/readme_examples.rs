@@ -219,11 +219,19 @@ mod troubleshooting_and_limitations {
     }
 
     #[tool(description = "Returns its text as a fallible String")]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "demonstrates the fallible McpResult tool return type"
+    )]
     fn echo_result(text: String) -> McpResult<String> {
         Ok(text)
     }
 
     #[tool(description = "Returns its text as fallible content blocks")]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "demonstrates the fallible McpResult tool return type"
+    )]
     fn echo_result_content(text: String) -> McpResult<Vec<Content>> {
         Ok(vec![Content::text(text)])
     }

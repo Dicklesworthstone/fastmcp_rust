@@ -5496,7 +5496,8 @@ impl AsProxyTlsFront {
                         else {
                             return;
                         };
-                        let _ = asupersync::io::copy_bidirectional(&mut tls, &mut plain).await;
+                        let _ = Box::pin(asupersync::io::copy_bidirectional(&mut tls, &mut plain))
+                            .await;
                     });
                 }
             });

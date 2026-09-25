@@ -237,10 +237,14 @@ impl Drop for ThreadJoins {
             }
             thread::sleep(Duration::from_millis(1));
         }
+        // Join every handle before deciding; `any` would stop joining at the
+        // first panic and leave the remaining threads unjoined.
         let panicked = self
             .0
             .drain(..)
-            .fold(false, |panicked, handle| handle.join().is_err() || panicked);
+            .map(|handle| handle.join().is_err())
+            .collect::<Vec<_>>()
+            .contains(&true);
         if panicked {
             fail_fixture(&format!(
                 "memory-transport server thread panicked during settlement in {:?}",
