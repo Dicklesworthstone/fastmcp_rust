@@ -66,6 +66,60 @@ fn ephemeral_envelope_owner_purpose_and_authorization_binding_are_separate() {
 }
 
 #[test]
+fn catalog_cursor_envelope_binds_context_expires_and_cannot_cross_purposes() {
+    let cx = context();
+    let guard = ProcessGenerationGuard::install().unwrap();
+    let mut catalog = EphemeralEnvelopeProtector::new(
+        &cx,
+        guard,
+        SnapshotCloneStance::NoLiveMemoryCloning,
+        EnvelopePurpose::CatalogCursor,
+        EnvelopePolicy::new(8, ttl(), 1).unwrap(),
+    )
+    .unwrap();
+    let digest = sha256_bounded(b"catalog/context/one", 128).unwrap();
+    let binding = EnvelopeBinding::catalog_cursor(&digest).unwrap();
+    let offset = 7_u64.to_be_bytes();
+    let sealed = catalog.seal(&cx, &binding, &offset, ttl()).unwrap();
+    assert_eq!(
+        catalog.open(&cx, &binding, &sealed).unwrap().as_bytes(),
+        offset
+    );
+    let other =
+        EnvelopeBinding::catalog_cursor(&sha256_bounded(b"catalog/context/two", 128).unwrap())
+            .unwrap();
+    assert!(matches!(
+        catalog.open(&cx, &other, &sealed),
+        Err(EnvelopeError::InvalidEnvelope)
+    ));
+    let wrong_purpose = EnvelopeBinding {
+        purpose: EnvelopePurpose::Continuation,
+        digest: binding.digest,
+    };
+    assert!(matches!(
+        catalog.open(&cx, &wrong_purpose, &sealed),
+        Err(EnvelopeError::InvalidEnvelope)
+    ));
+    assert_eq!(
+        catalog.open(&cx, &binding, &sealed).unwrap().as_bytes(),
+        offset
+    );
+    catalog.started = catalog
+        .started
+        .checked_sub(ttl() + Duration::from_secs(1))
+        .unwrap();
+    assert!(matches!(
+        catalog.open(&cx, &binding, &sealed),
+        Err(EnvelopeError::InvalidEnvelope)
+    ));
+    assert_eq!(
+        catalog.generation(),
+        1,
+        "expiry does not mint keys or mutate generations"
+    );
+}
+
+#[test]
 fn ephemeral_envelope_nonce_allocation_is_unique_and_never_wraps() {
     let cx = context();
     let mut owner = owner(EnvelopePolicy::default());
