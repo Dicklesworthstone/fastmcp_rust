@@ -20,7 +20,7 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::{AeadInOut, KeyInit}};
 use zeroize::Zeroizing;
 
 use crate::crypto::{
-    EphemeralKeyMaterial, NonceDomainMaterial, draw_ephemeral_key_material,
+    EphemeralKeyMaterial, NonceDomainMaterial, Sha256Digest, draw_ephemeral_key_material,
     draw_nonce_domain_material, draw_security_identifier, sha256_bounded,
 };
 use crate::partition::{ContinuationPartitionKey, CredentialStoreKey, PartitionAuthorization};
@@ -36,7 +36,11 @@ const MAX_LIFETIME: Duration = Duration::from_secs(3600);
 /// authentication or permission to act on a principal's behalf.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
-pub enum EnvelopePurpose { Continuation = 1, Credential = 2 }
+pub enum EnvelopePurpose {
+    Continuation = 1,
+    Credential = 2,
+    CatalogCursor = 3,
+}
 
 /// Binding derived from the caller's verified partition authorization. These
 /// digests are identities, not independent authorization grants. Callers must
@@ -44,6 +48,25 @@ pub enum EnvelopePurpose { Continuation = 1, Credential = 2 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct EnvelopeBinding { purpose: EnvelopePurpose, digest: [u8; 32] }
 impl EnvelopeBinding {
+    /// Binds a catalog cursor to the digest of the server's current catalog
+    /// and verified authorization facts. The consumer must include its exact
+    /// protocol era, list method, ordering/query/revision and page policy in
+    /// that digest, and derive caller identity only from authenticated ingress.
+    /// This constructor supplies domain separation, not authorization; an
+    /// anonymous binding is valid only for an auth-invariant public catalog.
+    pub fn catalog_cursor(context: &Sha256Digest) -> Result<Self, EnvelopeError> {
+        let mut aad = Vec::with_capacity(96);
+        aad.extend_from_slice(b"fastmcp/catalog-cursor-binding/v1\0");
+        aad.extend_from_slice(context.as_bytes());
+        let digest = sha256_bounded(&aad, 96)
+            .map_err(|_| EnvelopeError::InvalidBinding)?
+            .into_bytes();
+        Ok(Self {
+            purpose: EnvelopePurpose::CatalogCursor,
+            digest,
+        })
+    }
+
     pub fn continuation(
         key: &ContinuationPartitionKey, authorization: &PartitionAuthorization,
         namespace: &str,

@@ -712,10 +712,20 @@ impl Codec {
     /// violates the bounded JSON admission policy, or is not a JSON-RPC
     /// message.
     pub fn decode_complete_message(&self, frame: &[u8]) -> Result<JsonRpcMessage, CodecError> {
+        self.decode_complete_message_retaining_raw_params(frame)
+            .map(|(message, _)| message)
+    }
+
+    /// Decodes one complete frame like [`Self::decode_complete_message`] and
+    /// also returns a request's exact `params` source from that single decode.
+    pub(crate) fn decode_complete_message_retaining_raw_params(
+        &self,
+        frame: &[u8],
+    ) -> Result<(JsonRpcMessage, Option<String>), CodecError> {
         let admission = self.admit_complete_frame(frame, None)?;
         match admission.kind {
-            InvalidMessageKind::Request => serde_json::from_slice::<JsonRpcRequest>(frame)
-                .map(JsonRpcMessage::Request)
+            InvalidMessageKind::Request => JsonRpcRequest::decode_retaining_raw_params(frame)
+                .map(|(request, raw_params)| (JsonRpcMessage::Request(request), raw_params))
                 .map_err(|error| {
                     typed_message_codec_error(
                         error,
@@ -724,7 +734,7 @@ impl Codec {
                     )
                 }),
             InvalidMessageKind::Response => serde_json::from_slice::<JsonRpcResponse>(frame)
-                .map(JsonRpcMessage::Response)
+                .map(|response| (JsonRpcMessage::Response(response), None))
                 .map_err(|error| {
                     typed_message_codec_error(error, InvalidMessageKind::Response, None)
                 }),

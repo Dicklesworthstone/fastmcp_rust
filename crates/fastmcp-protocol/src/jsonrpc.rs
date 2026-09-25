@@ -196,6 +196,21 @@ pub fn admit_raw_jsonrpc_document(
         .map_err(RawJsonAdmissionFailure::into)
 }
 
+/// Whether the UTF-8 byte-order mark occurs anywhere in `bytes`. This is the
+/// predicate of comparing every three-byte window, found by seeking the mark's
+/// lead byte; the windowed comparison cost more than the admission scan itself.
+fn contains_byte_order_mark(bytes: &[u8]) -> bool {
+    const BYTE_ORDER_MARK: [u8; 3] = [0xef, 0xbb, 0xbf];
+    let mut rest = bytes;
+    while let Some(lead) = rest.iter().position(|byte| *byte == BYTE_ORDER_MARK[0]) {
+        if rest[lead..].starts_with(&BYTE_ORDER_MARK) {
+            return true;
+        }
+        rest = &rest[lead + 1..];
+    }
+    false
+}
+
 /// Admit one complete raw JSON document before any typed decoding.
 ///
 /// This is the single bounded streaming pass every FastMCP JSON consumer
@@ -222,7 +237,7 @@ pub fn admit_raw_json_document(
             RawJsonAdmissionError::DocumentTooLarge,
         ));
     }
-    if bytes.windows(3).any(|window| window == [0xef, 0xbb, 0xbf]) {
+    if contains_byte_order_mark(bytes) {
         return Err(RawJsonAdmissionFailure::at_root(
             RawJsonAdmissionError::ByteOrderMark,
         ));
@@ -300,28 +315,36 @@ impl JsonRpcRequest {
     ) -> Result<(Self, Option<String>), JsonRpcAdmissionError> {
         admit_raw_jsonrpc_document(bytes, document_byte_limit)
             .map_err(JsonRpcAdmissionError::Raw)?;
-        let wire =
-            JsonRpcRequestRawWire::deserialize(&mut serde_json::Deserializer::from_slice(bytes))
-                .map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)?;
-        let raw_params = wire.params.as_deref().map(RawValue::get).map(str::to_owned);
-        let params = raw_params
-            .as_deref()
-            .map(|source| {
-                crate::messages::validate_raw_final_completion_params(&wire.method, source)
-                    .map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)?;
-                serde_json::from_str(source).map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)
-            })
-            .transpose()?;
-        let request = Self {
-            jsonrpc: wire.jsonrpc,
-            method: wire.method,
-            params,
-            id: wire.id,
-        };
+        let (request, raw_params) = Self::decode_retaining_raw_params(bytes)
+            .map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)?;
         request
             .validate()
             .map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)?;
         Ok((request, raw_params))
+    }
+
+    /// Performs exactly this type's `Deserialize` decode of one document and
+    /// also returns the exact JSON source of its `params` member from that
+    /// same decode.
+    ///
+    /// It applies neither raw-document admission nor [`Self::validate`]. A
+    /// caller that has already admitted `bytes`, as the transport codec has,
+    /// keeps the parameter source this way instead of decoding the document
+    /// again. The attachment rule of [`Self::decode_strict_with_raw_params`]
+    /// applies to the returned source.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error `serde_json::from_slice::<JsonRpcRequest>` returns
+    /// for the same bytes.
+    pub fn decode_retaining_raw_params(
+        bytes: &[u8],
+    ) -> Result<(Self, Option<String>), serde_json::Error> {
+        let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+        let wire = JsonRpcRequestRawWire::deserialize(&mut deserializer)?;
+        deserializer.end()?;
+        let (request, raw_params) = wire.into_request::<serde_json::Error>()?;
+        Ok((request, raw_params.map(|source| source.get().to_owned())))
     }
 }
 
@@ -1015,7 +1038,8 @@ fn is_mathematical_integer(lexeme: &str) -> bool {
         0
     };
     let scale = i64::try_from(fraction_digits).unwrap_or(i64::MAX) - exponent;
-    scale <= 0
+    coefficient.iter().all(|digit| matches!(digit, b'0' | b'.'))
+        || scale <= 0
         || usize::try_from(scale).is_ok_and(|required_zeroes| trailing_zeroes >= required_zeroes)
 }
 
@@ -1144,24 +1168,36 @@ impl<'de> Deserialize<'de> for JsonRpcRequest {
     where
         D: Deserializer<'de>,
     {
-        let wire = JsonRpcRequestRawWire::deserialize(deserializer)?;
-        let params = wire
+        JsonRpcRequestRawWire::deserialize(deserializer)?
+            .into_request()
+            .map(|(request, _)| request)
+    }
+}
+
+impl<'a> JsonRpcRequestRawWire<'a> {
+    /// Types this envelope and hands back the exact `params` source it holds.
+    fn into_request<E: serde::de::Error>(
+        self,
+    ) -> Result<(JsonRpcRequest, Option<Cow<'a, RawValue>>), E> {
+        let params = self
             .params
             .as_deref()
             .map(RawValue::get)
             .map(|source| {
-                crate::messages::validate_raw_final_completion_params(&wire.method, source)
-                    .map_err(D::Error::custom)?;
-                serde_json::from_str(source).map_err(D::Error::custom)
+                crate::messages::validate_raw_final_completion_params(&self.method, source)
+                    .map_err(E::custom)?;
+                serde_json::from_str(source).map_err(E::custom)
             })
             .transpose()?;
-
-        Ok(Self {
-            jsonrpc: wire.jsonrpc,
-            method: wire.method,
-            params,
-            id: wire.id,
-        })
+        Ok((
+            JsonRpcRequest {
+                jsonrpc: self.jsonrpc,
+                method: self.method,
+                params,
+                id: self.id,
+            },
+            self.params,
+        ))
     }
 }
 
@@ -1534,13 +1570,56 @@ impl JsonRpcResponse {
 }
 
 /// A JSON-RPC message (request, response, or notification).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Decoding requires a `serde_json` deserializer: the input is captured as
+/// raw JSON and re-parsed by the selected variant's own decoder.
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum JsonRpcMessage {
     /// A request or notification.
     Request(JsonRpcRequest),
     /// A response.
     Response(JsonRpcResponse),
+}
+
+// A derived untagged Deserialize buffers its input in serde's private
+// `Content`, and a `RawValue` cannot be read back from that buffer. Since
+// `JsonRpcRequest` keeps its params as their exact source (`RawValue`), every
+// request or notification carrying params failed to decode through this
+// type. Capture the whole input as raw JSON instead, choose the variant by
+// whether a `method` member is present, and re-parse the same text through
+// that variant's strict decoder so params keep their source bytes.
+impl<'de> Deserialize<'de> for JsonRpcMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Envelope {
+            #[serde(default, deserialize_with = "member_present")]
+            method: bool,
+        }
+
+        fn member_present<'de, D>(deserializer: D) -> Result<bool, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            serde::de::IgnoredAny::deserialize(deserializer).map(|_| true)
+        }
+
+        let raw = Box::<RawValue>::deserialize(deserializer)?;
+        let source = raw.get();
+        let envelope: Envelope = serde_json::from_str(source).map_err(D::Error::custom)?;
+        if envelope.method {
+            serde_json::from_str(source)
+                .map(Self::Request)
+                .map_err(D::Error::custom)
+        } else {
+            serde_json::from_str(source)
+                .map(Self::Response)
+                .map_err(D::Error::custom)
+        }
+    }
 }
 
 impl JsonRpcMessage {
@@ -1729,6 +1808,29 @@ mod tests {
     }
 
     #[test]
+    fn bom_after_a_lead_byte_near_miss_is_rejected_inside_a_string() {
+        // U+FEFB encodes as EF BB BB, sharing the mark's first two bytes, so
+        // the seek must continue past it to the U+FEFF (EF BB BF) behind it.
+        let planted =
+            "{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":\"a\u{fefb}\u{feff}\"}";
+        let near_miss =
+            "{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":\"a\u{fefb}\u{fefb}\"}";
+        let mut state = AdmittedFrames::default();
+
+        assert!(
+            matches!(
+                admit_frame(&mut state, planted.as_bytes()),
+                Err(JsonRpcAdmissionError::Raw(
+                    RawJsonAdmissionError::ByteOrderMark
+                ))
+            ),
+            "a mark inside a string value is refused like a leading one"
+        );
+        admit_frame(&mut state, near_miss.as_bytes())
+            .expect("changing only the mark's last byte leaves an admissible code point");
+    }
+
+    #[test]
     fn request_id_correlation_key_normalizes_numeric_aliases() {
         let numeric = RequestId::Number(1);
         let string = RequestId::String("1".to_owned());
@@ -1795,6 +1897,41 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn request_id_correlation_key_accepts_zero_at_negative_exponent_bound() {
+        let zero = RequestId::Number(0);
+        for lexeme in ["0e-9999", "-0.00e-10000", "0.0e-4"] {
+            let alias = RequestId::Integer(lexeme.to_owned());
+            assert!(
+                zero.correlates_with(&alias),
+                "{lexeme} remains mathematical zero"
+            );
+            assert_eq!(
+                alias.correlation_key().unwrap(),
+                CorrelationKey::Integer("0".to_owned())
+            );
+            let wire = serde_json::to_string(&alias).expect("zero alias is a valid request ID");
+            assert_eq!(
+                wire, lexeme,
+                "canonical correlation does not change exact echo"
+            );
+            let fractional = RequestId::Integer(lexeme.replacen('0', "1", 1));
+            assert!(
+                fractional.correlation_key().is_err(),
+                "a nonzero fractional sibling is rejected"
+            );
+            assert_eq!(
+                alias.correlation_key().unwrap(),
+                zero.correlation_key().unwrap()
+            );
+        }
+        assert!(
+            RequestId::Integer("0e-10001".to_owned())
+                .correlation_key()
+                .is_err()
+        );
     }
 
     #[test]
@@ -2424,6 +2561,76 @@ mod tests {
         };
         assert!(!is_error);
         assert_eq!(id, Some(RequestId::Number(1)));
+    }
+
+    fn final_completion_request(context: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"completion/complete","params":{{"_meta":{{"io.modelcontextprotocol/protocolVersion":"{}","io.modelcontextprotocol/clientCapabilities":{{}}}},"ref":{{"type":"ref/prompt","name":"deploy"}},"argument":{{"name":"environment","value":"pro"}},{context}}},"id":1}}"#,
+            crate::FINAL_PROTOCOL_VERSION
+        )
+    }
+
+    /// Requests and notifications with params decode through the public
+    /// message type to exactly what the request type decodes from the same
+    /// text. The completion case goes through the request's raw-source params
+    /// validation, which only sees the exact source bytes.
+    #[test]
+    fn message_serde_decodes_requests_and_notifications_with_params() {
+        let completion = final_completion_request(r#""context":{"arguments":{"key":"one"}}"#);
+        for text in [
+            r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"probe","arguments":{}},"id":1}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"probe","progress":1}}"#,
+            completion.as_str(),
+        ] {
+            let direct = serde_json::from_str::<JsonRpcRequest>(text)
+                .unwrap_or_else(|error| panic!("the request type decodes {text}: {error}"));
+            let decoded = match serde_json::from_str::<JsonRpcMessage>(text) {
+                Ok(JsonRpcMessage::Request(request)) => request,
+                other => panic!("{text} must decode as a request, got {other:?}"),
+            };
+            assert!(decoded.params.is_some(), "{text}");
+            assert_eq!(decoded.jsonrpc, direct.jsonrpc);
+            assert_eq!(decoded.method, direct.method);
+            assert_eq!(decoded.params, direct.params);
+            assert_eq!(decoded.id, direct.id);
+        }
+
+        for text in [
+            r#"{"jsonrpc":"2.0","result":{"tools":[]},"id":1}"#,
+            r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"missing"},"id":1}"#,
+        ] {
+            assert!(
+                matches!(
+                    serde_json::from_str::<JsonRpcMessage>(text),
+                    Ok(JsonRpcMessage::Response(_))
+                ),
+                "{text} must still decode as a response"
+            );
+        }
+    }
+
+    /// The same texts differing in one member the request type refuses are
+    /// refused through the public message type too. The duplicate `context`
+    /// is caught only by the raw params validation, so this also fails if the
+    /// message decoder stops handing the request its exact source bytes.
+    #[test]
+    fn message_serde_refuses_what_the_request_type_refuses() {
+        let duplicate_context = final_completion_request(
+            r#""context":{"arguments":{"key":"one"}},"context":{"arguments":{"key":"two"}}"#,
+        );
+        for text in [
+            r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"probe","arguments":{}},"id":null}"#,
+            duplicate_context.as_str(),
+        ] {
+            assert!(
+                serde_json::from_str::<JsonRpcRequest>(text).is_err(),
+                "the request type refuses {text}"
+            );
+            assert!(
+                serde_json::from_str::<JsonRpcMessage>(text).is_err(),
+                "the message type must refuse {text}"
+            );
+        }
     }
 
     #[test]

@@ -8,12 +8,14 @@
 
 use std::collections::HashMap;
 use std::io::Write as _;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
+use fastmcp_core::runtime::{ProcessBoundToken, ProcessGenerationGuard};
 use fastmcp_core::{
-    AccessToken, AuthContext, MAX_ACCESS_TOKEN_BYTES, McpContext, McpError, McpErrorCode,
-    McpResult, Sha256Digest, sha256_bounded,
+    AccessToken, AuthContext, HmacSha256Key, MAX_ACCESS_SCHEME_BYTES, MAX_ACCESS_TOKEN_BYTES,
+    McpContext, McpError, McpErrorCode, McpResult, Sha256Digest, draw_hmac_sha256_key,
+    sha256_bounded,
 };
 
 const ACCESS_TOKEN_FIELDS: [&str; 6] = [
@@ -537,10 +539,70 @@ pub trait TokenVerifier: Send + Sync {
 }
 
 /// Token-based authentication provider.
+///
+/// A verifier's explicit provider-scoped owner is preserved. Otherwise this
+/// provider binds the verified credential to a process-local owner namespace
+/// shared by its clones. Different credentials and independently constructed
+/// providers cannot share an owner merely by returning the same subject.
+/// Rotating a credential changes this fallback owner; applications requiring
+/// identity continuity across rotation must supply their own verified owner.
 #[derive(Clone)]
 pub struct TokenAuthProvider {
     verifier: Arc<dyn TokenVerifier>,
     missing_token_error: McpError,
+    owner_namespace: Arc<OnceLock<Result<TokenOwnerNamespace, ()>>>,
+}
+
+const TOKEN_OWNER_DOMAIN: &[u8] = b"fastmcp/token-provider/session-owner/v1\0";
+const MAX_TOKEN_OWNER_INPUT_BYTES: usize =
+    TOKEN_OWNER_DOMAIN.len() + 8 + MAX_ACCESS_SCHEME_BYTES + 32 + 32;
+
+/// One fixed-purpose key, with no raw credential retention or caller-selected
+/// namespace. The once-cell admits key custody only after token verification;
+/// its failure is sticky so entropy or process failure has no weak fallback.
+struct TokenOwnerNamespace {
+    process: ProcessBoundToken,
+    key: HmacSha256Key,
+}
+
+impl TokenOwnerNamespace {
+    fn new() -> Result<Self, ()> {
+        let guard = ProcessGenerationGuard::install().map_err(|_| ())?;
+        let key = draw_hmac_sha256_key().map_err(|_| ())?;
+        guard.verify_current().map_err(|_| ())?;
+        Ok(Self {
+            process: guard.token(),
+            key,
+        })
+    }
+
+    fn owner(&self, access: &AccessToken, subject: &str) -> McpResult<Sha256Digest> {
+        self.process
+            .verify()
+            .map_err(|_| auth_error("Token owner protection unavailable"))?;
+        let credential = sha256_bounded(access.token.as_bytes(), MAX_ACCESS_TOKEN_BYTES)
+            .map_err(|_| auth_error("Invalid access token"))?;
+        let subject = sha256_bounded(subject.as_bytes(), MAX_AUTH_SUBJECT_BYTES)
+            .map_err(|_| auth_error("Token verifier returned invalid authentication facts"))?;
+        if access.scheme.len() > MAX_ACCESS_SCHEME_BYTES {
+            return Err(auth_error("Invalid access token"));
+        }
+        let scheme = access.scheme.to_ascii_lowercase();
+        let mut binding = Vec::with_capacity(MAX_TOKEN_OWNER_INPUT_BYTES);
+        binding.extend_from_slice(TOKEN_OWNER_DOMAIN);
+        binding.extend_from_slice(&(scheme.len() as u64).to_be_bytes());
+        binding.extend_from_slice(scheme.as_bytes());
+        binding.extend_from_slice(credential.as_bytes());
+        binding.extend_from_slice(subject.as_bytes());
+        let owner = self
+            .key
+            .authenticate_bounded(&binding, MAX_TOKEN_OWNER_INPUT_BYTES)
+            .map_err(|_| auth_error("Token owner protection unavailable"))?;
+        self.process
+            .verify()
+            .map_err(|_| auth_error("Token owner protection unavailable"))?;
+        Ok(Sha256Digest::from_bytes(*owner.as_bytes()))
+    }
 }
 
 impl TokenAuthProvider {
@@ -550,6 +612,7 @@ impl TokenAuthProvider {
         Self {
             verifier: Arc::new(verifier),
             missing_token_error: auth_error("Missing access token"),
+            owner_namespace: Arc::new(OnceLock::new()),
         }
     }
 
@@ -573,7 +636,35 @@ impl AuthProvider for TokenAuthProvider {
                 return Err(auth_error("Invalid access token"));
             }
         };
-        self.verifier.verify(ctx, request, &access)
+        let auth = self.verifier.verify(ctx, request, &access)?;
+        if principal_fingerprint(Some(&auth)).is_err() {
+            return Err(auth_error("Token verifier returned invalid authentication facts"));
+        }
+        if auth.session_owner().is_some() {
+            return Ok(auth);
+        }
+        let subject = auth
+            .subject
+            .as_deref()
+            .filter(|subject| !subject.is_empty())
+            .ok_or_else(|| auth_error("Token verifier returned invalid authentication facts"))?;
+        ctx.checkpoint()
+            .map_err(|_| McpError::request_cancelled())?;
+        if ctx.deadline_expired() {
+            return Err(McpError::new(McpErrorCode::RequestCancelled, "Request timeout exceeded"));
+        }
+        let namespace = self
+            .owner_namespace
+            .get_or_init(TokenOwnerNamespace::new)
+            .as_ref()
+            .map_err(|()| auth_error("Token owner protection unavailable"))?;
+        let owner = namespace.owner(&access, subject)?;
+        ctx.checkpoint()
+            .map_err(|_| McpError::request_cancelled())?;
+        if ctx.deadline_expired() {
+            return Err(McpError::new(McpErrorCode::RequestCancelled, "Request timeout exceeded"));
+        }
+        Ok(auth.with_session_owner(owner))
     }
 }
 
@@ -1533,6 +1624,203 @@ mod tests {
     }
 
     #[test]
+    fn token_auth_provider_owner_is_stable_for_clones_and_isolates_credentials() {
+        let mut facts = AuthContext::with_subject("shared-display-subject");
+        facts.scopes = vec!["catalog.read".to_owned()];
+        facts.claims = Some(serde_json::json!({"tenant": "shared"}));
+        let verifier = StaticTokenVerifier::new([
+            ("alpha-secret", facts.clone()),
+            ("beta-secret", facts.clone()),
+        ])
+        .unwrap();
+        let provider = TokenAuthProvider::new(verifier.clone());
+        let cloned = provider.clone();
+        let independent = TokenAuthProvider::new(verifier);
+        assert!(provider.owner_namespace.get().is_none());
+
+        let first = authenticate_header(&provider, "Bearer alpha-secret").unwrap();
+        let owner = first.session_owner().expect("verified token receives an owner");
+        for repeated in [
+            authenticate_header(&provider, "Bearer alpha-secret").unwrap(),
+            authenticate_header(&cloned, "bearer alpha-secret").unwrap(),
+        ] {
+            assert_eq!(repeated.session_owner(), Some(owner));
+            assert_eq!(
+                principal_fingerprint(Some(&repeated)).unwrap(),
+                principal_fingerprint(Some(&first)).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&repeated).unwrap(),
+                serde_json::to_value(&facts).unwrap(),
+                "owner custody never alters or exposes serialized verifier facts"
+            );
+        }
+        for separated in [
+            authenticate_header(&provider, "Bearer beta-secret").unwrap(),
+            authenticate_header(&provider, "Basic alpha-secret").unwrap(),
+            authenticate_header(&independent, "Bearer alpha-secret").unwrap(),
+        ] {
+            assert_ne!(separated.session_owner(), Some(owner));
+            assert_ne!(
+                principal_fingerprint(Some(&separated)).unwrap(),
+                principal_fingerprint(Some(&first)).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&separated).unwrap(),
+                serde_json::to_value(&facts).unwrap(),
+                "changing only token, scheme, or provider isolates identical visible facts"
+            );
+        }
+    }
+
+    #[test]
+    fn token_auth_provider_owner_changes_on_subject_reassignment_not_grant_refresh() {
+        let mut original = AuthContext::with_subject("alice");
+        original.scopes = vec!["catalog.read".to_owned()];
+        let verifier = StaticTokenVerifier::new([("same-secret", original.clone())]).unwrap();
+        let controls = verifier.clone();
+        let provider = TokenAuthProvider::new(verifier);
+        let before = authenticate_header(&provider, "Bearer same-secret").unwrap();
+        let mut refreshed = original;
+        refreshed.scopes.push("resources.read".to_owned());
+        refreshed.claims = Some(serde_json::json!({"policy_revision": 2}));
+        controls
+            .replace_tokens([("same-secret", refreshed.clone())])
+            .unwrap();
+        let after = authenticate_header(&provider, "Bearer same-secret").unwrap();
+        assert_eq!(after.session_owner(), before.session_owner());
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&refreshed).unwrap()
+        );
+
+        refreshed.subject = Some("bob".to_owned());
+        controls.replace_tokens([("same-secret", refreshed)]).unwrap();
+        let reassigned = authenticate_header(&provider, "Bearer same-secret").unwrap();
+        assert_ne!(reassigned.session_owner(), before.session_owner());
+        assert_ne!(
+            principal_fingerprint(Some(&reassigned)).unwrap(),
+            principal_fingerprint(Some(&before)).unwrap(),
+            "credential reuse for a different verified subject cannot inherit its connections"
+        );
+    }
+
+    #[test]
+    fn token_auth_provider_preserves_explicit_verified_owner_without_local_key() {
+        let owner = sha256_bounded(b"provider-owned-stable-identity", 128).unwrap();
+        let facts = AuthContext::with_subject("alice").with_session_owner(owner);
+        let provider = TokenAuthProvider::new(
+            StaticTokenVerifier::new([
+                ("before-rotation", facts.clone()),
+                ("after-rotation", facts.clone()),
+            ])
+            .unwrap(),
+        );
+        for header in ["Bearer before-rotation", "Bearer after-rotation"] {
+            let actual = authenticate_header(&provider, header).unwrap();
+            assert_eq!(actual.session_owner(), Some(owner));
+            assert_eq!(
+                serde_json::to_value(&actual).unwrap(),
+                serde_json::to_value(&facts).unwrap()
+            );
+        }
+        assert!(provider.owner_namespace.get().is_none());
+    }
+
+    #[test]
+    fn token_auth_provider_preserves_owner_only_custom_verifier_facts() {
+        struct OwnerOnlyVerifier {
+            owner: Option<Sha256Digest>,
+        }
+
+        impl TokenVerifier for OwnerOnlyVerifier {
+            fn verify(
+                &self,
+                _ctx: &McpContext,
+                _request: AuthRequest<'_>,
+                token: &AccessToken,
+            ) -> McpResult<AuthContext> {
+                if token.token != "owner-only-secret" {
+                    return Err(auth_error("Invalid access token"));
+                }
+                let mut facts = AuthContext::anonymous();
+                facts.scopes = vec!["catalog.read".to_owned()];
+                facts.claims = Some(serde_json::json!({"tenant": "verified-tenant"}));
+                Ok(match self.owner {
+                    Some(owner) => facts.with_session_owner(owner),
+                    None => facts,
+                })
+            }
+        }
+
+        let owner = sha256_bounded(b"verified-owner-without-display-subject", 128).unwrap();
+        let provider = TokenAuthProvider::new(OwnerOnlyVerifier { owner: Some(owner) });
+        assert!(authenticate_header(&provider, "Bearer wrong-secret").is_err());
+        let admitted = authenticate_header(&provider, "Bearer owner-only-secret").unwrap();
+        assert_eq!(admitted.subject, None);
+        assert_eq!(admitted.session_owner(), Some(owner));
+        assert_eq!(
+            serde_json::to_value(&admitted).unwrap(),
+            serde_json::json!({
+                "scopes": ["catalog.read"],
+                "claims": {"tenant": "verified-tenant"}
+            })
+        );
+        assert!(provider.owner_namespace.get().is_none());
+
+        let ownerless = TokenAuthProvider::new(OwnerOnlyVerifier { owner: None });
+        let refused = authenticate_header(&ownerless, "Bearer owner-only-secret")
+            .expect_err("removing only the verified owner cannot mint an anonymous token owner");
+        assert_eq!(refused.code, McpErrorCode::ResourceForbidden);
+        assert!(ownerless.owner_namespace.get().is_none());
+        assert_eq!(
+            authenticate_header(&provider, "Bearer owner-only-secret")
+                .unwrap()
+                .session_owner(),
+            Some(owner)
+        );
+    }
+
+    #[test]
+    fn token_auth_provider_owner_key_is_not_created_for_rejected_credentials() {
+        let provider = TokenAuthProvider::new(
+            StaticTokenVerifier::new([("valid-secret", AuthContext::with_subject("alice"))])
+                .unwrap(),
+        );
+        for header in ["Bearer wrong-secret", "Bearer invalid:secret", "Bearer "] {
+            assert!(authenticate_header(&provider, header).is_err());
+            assert!(provider.owner_namespace.get().is_none());
+        }
+        let admitted = authenticate_header(&provider, "Bearer valid-secret").unwrap();
+        assert!(admitted.session_owner().is_some());
+        assert!(provider.owner_namespace.get().is_some());
+        assert!(authenticate_header(&provider, "Bearer wrong-secret").is_err());
+        assert_eq!(
+            authenticate_header(&provider, "Bearer valid-secret")
+                .unwrap()
+                .session_owner(),
+            admitted.session_owner(),
+            "a failed verification cannot reset a previously established namespace"
+        );
+    }
+
+    #[test]
+    fn token_auth_provider_owner_namespace_failure_has_no_subject_fallback() {
+        let provider = TokenAuthProvider::new(
+            StaticTokenVerifier::new([("valid-secret", AuthContext::with_subject("alice"))])
+                .unwrap(),
+        );
+        assert!(provider.owner_namespace.set(Err(())).is_ok());
+        for installed in [&provider, &provider.clone()] {
+            let failure = authenticate_header(installed, "Bearer valid-secret")
+                .expect_err("failed protected ownership cannot fall back to a display subject");
+            assert_eq!(failure.code, McpErrorCode::ResourceForbidden);
+            assert_eq!(failure.message, "Token owner protection unavailable");
+            assert!(matches!(installed.owner_namespace.get(), Some(Err(()))));
+        }
+    }
+
+    #[test]
     fn auth_request_debug() {
         let params = serde_json::json!({"AUTH_PARAMS_DEBUG_CANARY": "AUTH_VALUE_DEBUG_CANARY"});
         let req = AuthRequest {
@@ -2287,10 +2575,13 @@ mod tests {
             .expect("provider authenticates");
         assert_eq!(auth.subject.as_deref(), Some("alice"));
         let fingerprint = principal_fingerprint(Some(&auth)).expect("fingerprint computed");
-        assert_eq!(
+        assert!(auth.session_owner().is_some());
+        assert_ne!(
             fingerprint,
             principal_fingerprint(Some(&AuthContext::with_subject("alice"))).unwrap()
         );
+        let repeated = provider.authenticate(&ctx(), req).expect("verified token retry");
+        assert_eq!(fingerprint, principal_fingerprint(Some(&repeated)).unwrap());
     }
 
     #[test]
