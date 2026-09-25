@@ -178,6 +178,10 @@ impl From<ManagedToolHeaderError> for ToolHeaderRepairError {
 /// Success owns the ordinary incremental core call. Only `Rejected` permits
 /// the separate, explicit refresh action; dropping it sends nothing further.
 #[must_use = "drive the call or explicitly decide whether to repair its rejection"]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "returned once per call and moved immediately; boxing buys nothing on this path"
+)]
 pub enum ToolHeaderRepairOutcome {
     Call(ManagedCoreCall),
     Rejected(RejectedToolHeaders),

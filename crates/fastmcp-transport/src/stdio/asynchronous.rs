@@ -634,6 +634,15 @@ mod tests {
     use asupersync::runtime::RuntimeBuilder;
     use fastmcp_protocol::{JsonRpcRequest, JsonRpcResponse, RequestId};
 
+    /// Counts frame delimiters in a small captured test buffer.
+    #[expect(
+        clippy::naive_bytecount,
+        reason = "a test counts a few delimiters; no bytecount dependency"
+    )]
+    fn newline_count(bytes: &[u8]) -> usize {
+        bytes.iter().filter(|byte| **byte == b'\n').count()
+    }
+
     struct ReadStarted<R> {
         reader: R,
         started: Arc<AtomicBool>,
@@ -999,7 +1008,7 @@ mod tests {
         output.allowance.store(usize::MAX, Ordering::SeqCst);
         ready(transport.send_async(&cx, &request(9))).unwrap();
         let bytes = output.bytes.lock().unwrap();
-        assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
+        assert_eq!(newline_count(&bytes), 1);
         assert!(std::str::from_utf8(&bytes).unwrap().contains("\"id\":9"));
     }
 
@@ -1086,16 +1095,7 @@ mod tests {
         ready(transport.send_async(&cx, &request(14))).unwrap();
         assert!(cx.is_cancel_requested());
         assert!(!transport.is_closed());
-        assert_eq!(
-            output
-                .bytes
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|byte| **byte == b'\n')
-                .count(),
-            1
-        );
+        assert_eq!(newline_count(&output.bytes.lock().unwrap()), 1);
     }
 
     #[test]

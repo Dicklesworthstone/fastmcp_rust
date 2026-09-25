@@ -3208,7 +3208,7 @@ mod tests {
         view: &mut McpAppsInMemoryWireViewTransport,
         cx: &Cx,
     ) {
-        let id = host.send_host_request(cx, McpAppsHostRequest::ToolsList(Default::default()), None).await.unwrap();
+        let id = host.send_host_request(cx, McpAppsHostRequest::ToolsList(fastmcp_protocol::McpAppsListParams::default()), None).await.unwrap();
         let _ = view.receive_from_host(cx).await.unwrap();
         assert!(matches!(tool_wire_reply(host, view, cx, &id, json!({
             "tools": [view_tool_descriptor("view_counter")]
@@ -3259,7 +3259,7 @@ mod tests {
             ] {
                 let mut malformed = view_tool_descriptor("new_tool");
                 malformed[path] = bad;
-                let id = host.send_host_request(&cx, McpAppsHostRequest::ToolsList(Default::default()), None).await.unwrap();
+                let id = host.send_host_request(&cx, McpAppsHostRequest::ToolsList(fastmcp_protocol::McpAppsListParams::default()), None).await.unwrap();
                 let _ = view.receive_from_host(&cx).await.unwrap();
                 assert!(matches!(tool_wire_reply(&mut host, &mut view, &cx, &id,
                     json!({"tools":[view_tool_descriptor("valid_first"), malformed]})).await,
@@ -3310,7 +3310,7 @@ mod tests {
             let (mut host, mut view) = tool_wire_host(&cx, true).await;
             install_view_tool_catalog(&mut host, &mut view, &cx).await;
             for expire in [false, true] {
-                let first = host.send_host_request(&cx, McpAppsHostRequest::ToolsList(Default::default()), None).await.unwrap();
+                let first = host.send_host_request(&cx, McpAppsHostRequest::ToolsList(fastmcp_protocol::McpAppsListParams::default()), None).await.unwrap();
                 let _ = view.receive_from_host(&cx).await.unwrap();
                 assert!(matches!(tool_wire_reply(&mut host, &mut view, &cx, &first,
                     json!({"tools":[view_tool_descriptor("first")],"nextCursor":"page-two"})).await, McpAppsHostRequestOutcome::ToolsList(_)));
@@ -3386,7 +3386,7 @@ mod tests {
         block_on(async {
             let cx = Cx::for_testing();
             let (mut host, mut view) = tool_wire_host(&cx, true).await;
-            let id = host.send_host_request(&cx, McpAppsHostRequest::Ping(Default::default()), None).await.unwrap();
+            let id = host.send_host_request(&cx, McpAppsHostRequest::Ping(fastmcp_protocol::McpAppsPingParams::default()), None).await.unwrap();
             let _ = view.receive_from_host(&cx).await.unwrap();
             let queued = json!({"jsonrpc":"2.0","id":"queued","method":"tools/call","params":{"name":"server_tool"}}).to_string();
             view.send_to_host(&cx, queued.clone()).await.unwrap();
@@ -3429,7 +3429,7 @@ mod tests {
             assert!(host.send_host_request(&cx, view_tool_call(json!(1)), None).await.is_err());
             install_view_tool_catalog(&mut host, &mut view, &cx).await;
             host.revoke_view_tools(&cx).await.unwrap();
-            assert!(host.send_host_request(&cx, McpAppsHostRequest::ToolsList(Default::default()), None).await.is_err());
+            assert!(host.send_host_request(&cx, McpAppsHostRequest::ToolsList(fastmcp_protocol::McpAppsListParams::default()), None).await.is_err());
             assert_eq!(host.view_tools().count(), 0);
         });
     }
@@ -3441,16 +3441,16 @@ mod tests {
             let (mut host, mut view) = tool_wire_host(&cx, true).await;
             let mut completed = Vec::new();
             for _ in 0..MAX_MCP_APPS_BRIDGE_IN_FLIGHT {
-                let id = host.send_host_request(&cx, McpAppsHostRequest::Ping(Default::default()), None).await.unwrap();
+                let id = host.send_host_request(&cx, McpAppsHostRequest::Ping(fastmcp_protocol::McpAppsPingParams::default()), None).await.unwrap();
                 let _ = view.receive_from_host(&cx).await.unwrap();
                 view.send_to_host(&cx, json!({"jsonrpc":"2.0","id":id,"result":{}}).to_string()).await.unwrap();
                 host.process_next(&cx).await.unwrap();
                 completed.push(id);
             }
-            assert!(matches!(host.send_host_request(&cx, McpAppsHostRequest::Ping(Default::default()), None).await,
+            assert!(matches!(host.send_host_request(&cx, McpAppsHostRequest::Ping(fastmcp_protocol::McpAppsPingParams::default()), None).await,
                 Err(McpAppsHostError::Bridge(McpAppsBridgeError::TooManyInFlight))));
             assert!(matches!(host.take_host_response(&completed[0]).unwrap().outcome, McpAppsHostRequestOutcome::Ping));
-            let extra = host.send_host_request(&cx, McpAppsHostRequest::Ping(Default::default()), None).await.unwrap();
+            let extra = host.send_host_request(&cx, McpAppsHostRequest::Ping(fastmcp_protocol::McpAppsPingParams::default()), None).await.unwrap();
             let _ = view.receive_from_host(&cx).await.unwrap();
             assert!(matches!(tool_wire_reply(&mut host, &mut view, &cx, &extra, json!({})).await, McpAppsHostRequestOutcome::Ping));
             for id in &completed { let _ = host.take_host_response(id); }
@@ -3460,7 +3460,7 @@ mod tests {
             large_a["inputSchema"]["x-large"] = json!(["a".repeat(64 * 1024), "b".repeat(64 * 1024)]);
             let mut large_b = large_a.clone();
             large_b["name"] = json!("large_b");
-            let id = host.send_host_request(&cx, McpAppsHostRequest::ToolsList(Default::default()), None).await.unwrap();
+            let id = host.send_host_request(&cx, McpAppsHostRequest::ToolsList(fastmcp_protocol::McpAppsListParams::default()), None).await.unwrap();
             let _ = view.receive_from_host(&cx).await.unwrap();
             assert!(matches!(tool_wire_reply(&mut host, &mut view, &cx, &id,
                 json!({"tools":[large_a,large_b]})).await, McpAppsHostRequestOutcome::InvalidResponse));
@@ -3475,13 +3475,13 @@ mod tests {
         runtime.block_on(async {
             let cx = Cx::current().unwrap();
             let (mut host, mut view) = tool_wire_host(&cx, true).await;
-            let id = host.send_host_request(&cx, McpAppsHostRequest::Ping(Default::default()), None).await.unwrap();
+            let id = host.send_host_request(&cx, McpAppsHostRequest::Ping(fastmcp_protocol::McpAppsPingParams::default()), None).await.unwrap();
             let _ = view.receive_from_host(&cx).await.unwrap();
             host.host_requests.get_mut(&id).unwrap().deadline.idle = cx.now().saturating_add_nanos(5_000_000);
             let response = host.wait_for_host_response(&cx, &id).await.unwrap();
             assert!(matches!(response.outcome, McpAppsHostRequestOutcome::DeadlineExceeded));
             assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
-            let next = host.send_host_request(&cx, McpAppsHostRequest::Ping(Default::default()), None).await.unwrap();
+            let next = host.send_host_request(&cx, McpAppsHostRequest::Ping(fastmcp_protocol::McpAppsPingParams::default()), None).await.unwrap();
             assert_ne!(id, next);
             let _ = view.receive_from_host(&cx).await.unwrap();
             assert!(matches!(tool_wire_reply(&mut host, &mut view, &cx, &next, json!({})).await, McpAppsHostRequestOutcome::Ping));
@@ -3494,7 +3494,7 @@ mod tests {
         runtime.block_on(async {
             let cx = Cx::current().unwrap();
             let (mut host, mut view) = tool_wire_host(&cx, true).await;
-            let id = host.send_host_request(&cx, McpAppsHostRequest::Ping(Default::default()), None).await.unwrap();
+            let id = host.send_host_request(&cx, McpAppsHostRequest::Ping(fastmcp_protocol::McpAppsPingParams::default()), None).await.unwrap();
             let _ = view.receive_from_host(&cx).await.unwrap();
             let limited = runtime.request_cx_with_budget(asupersync::Budget::new()
                 .with_deadline(cx.now().saturating_add_nanos(5_000_000)));
@@ -3511,7 +3511,7 @@ mod tests {
             let cx = Cx::for_testing();
             let (mut host, mut view) = tool_wire_host(&cx, true).await;
             let token = McpAppsJsonRpcRequestId::string("request-progress".into()).unwrap();
-            let id = host.send_host_request(&cx, McpAppsHostRequest::Ping(Default::default()), Some(token.clone())).await.unwrap();
+            let id = host.send_host_request(&cx, McpAppsHostRequest::Ping(fastmcp_protocol::McpAppsPingParams::default()), Some(token.clone())).await.unwrap();
             let _ = view.receive_from_host(&cx).await.unwrap();
             let absolute = host.host_requests[&id].deadline.absolute;
             host.host_requests.get_mut(&id).unwrap().deadline.idle = cx.now().saturating_add_nanos(1_000_000_000);
@@ -3550,7 +3550,7 @@ mod tests {
             let cx = Cx::current().unwrap();
             let mut host = McpAppsWireHost::new_negotiated(PendingWireSend, wire_configuration(), WirePolicy, activation_proof());
             host.admission = active_wire_admission();
-            let mut sending = Box::pin(host.send_host_request(&cx, McpAppsHostRequest::Ping(Default::default()), None));
+            let mut sending = Box::pin(host.send_host_request(&cx, McpAppsHostRequest::Ping(fastmcp_protocol::McpAppsPingParams::default()), None));
             poll_fn(|task| {
                 assert!(sending.as_mut().poll(task).is_pending());
                 Poll::Ready(())
@@ -3559,7 +3559,7 @@ mod tests {
             assert!(host.host_requests.is_empty());
             assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Closed);
             assert!(host.send_notification(&cx, McpAppsHostNotification::ToolsListChanged).await.is_err());
-            assert!(host.send_host_request(&cx, McpAppsHostRequest::Ping(Default::default()), None).await.is_err());
+            assert!(host.send_host_request(&cx, McpAppsHostRequest::Ping(fastmcp_protocol::McpAppsPingParams::default()), None).await.is_err());
         });
     }
 
@@ -3598,7 +3598,7 @@ mod tests {
         block_on(async {
             let cx = Cx::for_testing();
             let (mut host, mut view) = tool_wire_host(&cx, true).await;
-            let pending = host.send_host_request(&cx, McpAppsHostRequest::Ping(Default::default()), None).await.unwrap();
+            let pending = host.send_host_request(&cx, McpAppsHostRequest::Ping(fastmcp_protocol::McpAppsPingParams::default()), None).await.unwrap();
             let _ = view.receive_from_host(&cx).await.unwrap();
             view.send_to_host(&cx, json!({"jsonrpc":"2.0","id":"queued","method":"tools/call","params":{"name":"never-dispatch"}}).to_string()).await.unwrap();
             host.process_next(&cx).await.unwrap();

@@ -473,7 +473,8 @@ fn persisted_grant_reopen_renews_over_native_https_with_rotation_and_scope_narro
                 tls.shutdown().await.map_err(|_| OAuthError::TransportFailed)?;
                 Ok(())
             });
-            let (server, result) = native::pair(server, client.refresh_grant(&cx, grant)).await;
+            let (server, result) =
+                Box::pin(native::pair(server, client.refresh_grant(&cx, grant))).await;
             assert_eq!(server, Ok(()));
             let credentials = result.unwrap();
             assert_eq!(credentials.access.authorization_for_target(&configuration.resource), Some("Bearer resumed-access".to_owned()));
@@ -516,7 +517,8 @@ fn resumed_grant_rejects_scope_expansion_and_never_retries_lost_or_redirected_ex
                 if mode != 0 { tls.shutdown().await.map_err(|_| OAuthError::TransportFailed)?; }
                 Ok(())
             });
-            let (server, result) = native::pair(server, client.refresh_grant(&cx, grant)).await;
+            let (server, result) =
+                Box::pin(native::pair(server, client.refresh_grant(&cx, grant))).await;
             assert_eq!(server, Ok(()));
             assert_eq!(result.err(), Some(match mode {
                 0 => OAuthError::TransportFailed,

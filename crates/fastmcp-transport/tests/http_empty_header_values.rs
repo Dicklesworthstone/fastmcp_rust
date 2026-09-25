@@ -26,8 +26,8 @@ fn wire_request(name: &str, value: &str) -> Vec<u8> {
         ("Content-Type", "application/json".to_string()),
         ("Content-Length", INITIALIZE.len().to_string()),
     ] {
-        if !name.eq_ignore_ascii_case(default_name)
-            && !(name.eq_ignore_ascii_case("transfer-encoding") && default_name == "Content-Length")
+        if !(name.eq_ignore_ascii_case(default_name)
+            || (name.eq_ignore_ascii_case("transfer-encoding") && default_name == "Content-Length"))
         {
             wire.push_str(&format!("{default_name}: {default_value}\r\n"));
         }
