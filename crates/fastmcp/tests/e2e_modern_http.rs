@@ -10786,10 +10786,6 @@ fn spawn_modern_template_http_server() -> (HttpServerFixture, Arc<AtomicUsize>) 
     )
 }
 
-fn spawn_modern_lossy_template_http_server() -> HttpServerFixture {
-    spawn_modern_resource_http_server("lossy-template", PublicHttpLossyTemplatedResource)
-}
-
 fn spawn_modern_resource_http_server<H: ResourceHandler + 'static>(
     name: &'static str,
     handler: H,
@@ -10880,37 +10876,20 @@ fn spawn_modern_resource_http_server<H: ResourceHandler + 'static>(
 #[test]
 fn e2e_public_http_resource_template_lists_and_reads_matched_uri() {
     let cx = Cx::for_request();
-    let lossy_server = spawn_modern_lossy_template_http_server();
-    let mut lossy_client = runtime_block_on_bounded(
-        &cx,
-        modern::ClientBuilder::new()
-            .client_info("e2e-public-http-lossy-template", "1.0.0")
-            .connect_http_with_cx(public_http_target(lossy_server.address(), "/mcp"), &cx),
-    )
-    .expect("the ModernOnly public facade still connects when a lossy template is refused");
-    let lossy_listed =
-        runtime_block_on_bounded(&cx, lossy_client.list_resource_templates(&cx, None))
-            .expect("refusing a lossy template must still serve resources/templates/list");
+    // A lossy prefix modifier cannot be reverse-matched. The builder refuses
+    // the whole build and names the template, rather than starting a server
+    // with the registration silently dropped (bd-cfqqo).
+    let refusal = modern::ServerBuilder::new("lossy-template", "1.0.0")
+        .resource(PublicHttpLossyTemplatedResource)
+        .try_build()
+        .err()
+        .expect("a lossy prefix template must refuse the build instead of being dropped")
+        .to_string();
     assert!(
-        lossy_listed.resource_templates.is_empty(),
-        "a lossy prefix modifier must not be advertised as a reverse-matchable template: {:?}",
-        lossy_listed.resource_templates
+        refusal.contains("test://public-http-e2e/item/{id:3}")
+            && refusal.contains("cannot be matched reversibly"),
+        "the refusal must name the lossy template and its reason: {refusal}"
     );
-    let lossy_read = runtime_block_on_bounded(
-        &cx,
-        lossy_client.read_resource(&cx, "test://public-http-e2e/item/alp"),
-    )
-    .expect_err("a dropped lossy template must not guess a three-character prefix match");
-    assert!(
-        matches!(
-            lossy_read,
-            modern::HttpClientError::CoreResult(ref error)
-                if error.code == McpErrorCode::InvalidParams
-        ),
-        "the unregistered lossy template must stay InvalidParams: {lossy_read:?}"
-    );
-    drop(lossy_client);
-    lossy_server.shutdown();
 
     let (server, reads) = spawn_modern_template_http_server();
     let mut client = runtime_block_on_bounded(
