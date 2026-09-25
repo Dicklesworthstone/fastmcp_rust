@@ -8743,11 +8743,11 @@ impl ProxyClient {
     /// binding cache.
     #[cfg(feature = "legacy-2024-11-05")]
     pub async fn connect_legacy_http_with_protocol_plan_and_catalog(
+        cx: Cx,
         configuration_generation: u64,
         protocol_plan: ClientProtocolPlan,
         client_info: ClientInfo,
         client_capabilities: ClientCapabilities,
-        cx: Cx,
     ) -> McpResult<(Self, ProxyTypedCatalog)> {
         if protocol_plan.http_endpoints().is_none() {
             return Err(McpError::invalid_params(
