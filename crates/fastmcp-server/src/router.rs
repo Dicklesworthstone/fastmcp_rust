@@ -2275,7 +2275,11 @@ impl Router {
                 self.list_page_size,
                 query,
                 &self.final_cache_hints.list_ttl_ms,
-                self.final_cache_hints.scope,
+                // Bind the scope by its `cacheScope` wire value.
+                match self.final_cache_hints.scope {
+                    CacheScope::Public => "public",
+                    CacheScope::Private => "private",
+                },
                 owner.as_ref().map(fastmcp_core::Sha256Digest::as_bytes),
                 auth,
             ),
