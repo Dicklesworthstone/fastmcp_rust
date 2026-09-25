@@ -3588,7 +3588,7 @@ fn live_server_request_dispatch(
     if selected_era != Some(ProtocolEra::Legacy2024)
         && matches!(
             request.method.as_str(),
-            "sampling/createMessage" | "roots/list"
+            "roots/list"
         )
     {
         return method_not_found_response(request).map(LiveServerRequestDispatch::Immediate);
