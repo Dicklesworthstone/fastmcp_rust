@@ -20,9 +20,9 @@ fn recovery() -> ManagedTaskRecoveryPolicy {
 }
 fn selection() -> Vec<TaskId> { vec![TaskId::parse("one").unwrap(), TaskId::parse("two").unwrap()] }
 async fn login(peer: &Peer, cx: &Cx) -> (ManagedOAuthSession, ManagedTasksClient) {
-    let ((), session) = pair(peer.login(), ManagedOAuthSession::authorize(
+    let ((), session) = Box::pin(pair(peer.login(), ManagedOAuthSession::authorize(
         cx, peer.client(), OAuthSessionPolicy::default(), browser,
-    )).await;
+    ))).await;
     let session = session.unwrap();
     let client = ManagedTasksClient::new(session.clone(), FinalRequestMeta::new(ClientCapabilities::default()), ManagedTasksLimits::default()).unwrap();
     (session, client)
@@ -35,7 +35,7 @@ fn isolated_checkpoint(name: &str, case: CheckpointCase) {
             let test = Box::pin(async {
                 let peer = Peer::new().await;
                 match case {
-                    CheckpointCase::Restart | CheckpointCase::Recovering => restart(&peer, &cx, matches!(case, CheckpointCase::Recovering)).await,
+                    CheckpointCase::Restart | CheckpointCase::Recovering => Box::pin(restart(&peer, &cx, matches!(case, CheckpointCase::Recovering))).await,
                     _ => Box::pin(refusals(&peer, &cx, case)).await,
                 }
             });
@@ -47,7 +47,7 @@ fn isolated_checkpoint(name: &str, case: CheckpointCase) {
 
 async fn restart(peer: &Peer, cx: &Cx, recovering: bool) {
     let bytes = {
-        let (session, client) = login(peer, cx).await;
+        let (session, client) = Box::pin(login(peer, cx)).await;
         let server = Box::pin(async {
             let (mut stream, _) = peer.listen(json!(["one", "two"]), false).await;
             peer.get("one", "working", Case::Multi).await;
@@ -84,7 +84,7 @@ async fn restart(peer: &Peer, cx: &Cx, recovering: bool) {
     drop(bytes);
     let checkpoint = ManagedTaskWatchCheckpoint::decode(&std::fs::read(path).unwrap()).unwrap();
     assert_eq!(checkpoint.task_ids(), selection());
-    let (session, client) = login(peer, cx).await;
+    let (session, client) = Box::pin(login(peer, cx)).await;
     let server = Box::pin(async {
         let (mut stream, _) = peer.listen(json!(["one", "two"]), false).await;
         peer.get("one", if recovering { "working" } else { "cancelled" }, Case::Multi).await;
@@ -145,7 +145,7 @@ async fn restart(peer: &Peer, cx: &Cx, recovering: bool) {
 }
 
 async fn refusals(peer: &Peer, cx: &Cx, case: CheckpointCase) {
-    let (session, client) = login(peer, cx).await;
+    let (session, client) = Box::pin(login(peer, cx)).await;
     let checkpoint = client.task_watch_checkpoint(selection()).unwrap();
     let original = checkpoint.encode().unwrap();
     match case {

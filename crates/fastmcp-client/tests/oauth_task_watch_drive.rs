@@ -273,9 +273,9 @@ fn run_case(case: Case) {
         let cx = Cx::current().unwrap();
         let test = Box::pin(async {
             let peer = Peer::new().await;
-            let ((), session) = pair(peer.login(), ManagedOAuthSession::authorize(
+            let ((), session) = Box::pin(pair(peer.login(), ManagedOAuthSession::authorize(
                 &cx, peer.client(), OAuthSessionPolicy::default(), browser,
-            )).await;
+            ))).await;
             let session = session.unwrap();
             let capabilities: ClientCapabilities = serde_json::from_value(
                 if matches!(case, Case::MissingCapability) { json!({}) } else { json!({"roots":{}}) }
