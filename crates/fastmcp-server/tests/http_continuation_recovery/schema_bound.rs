@@ -54,14 +54,14 @@ impl std::task::Wake for WakeCount {
 }
 
 async fn lost_reply(peer: &Peer, cx: &Cx, pending: &mut RecoverableManagedToolContinuation) -> Value {
-    let (reply, ()) = pair(peer.dispatch(cx, Delivery::LoseHead), async {
+    let (reply, ()) = Box::pin(pair(peer.dispatch(cx, Delivery::LoseHead), async {
         let error = match pending.send(cx, RequestId::Number(2)).await {
             Err(error) => error,
             Ok(()) => pending.next_event(cx).await.err().expect("the native reply was lost"),
         };
         assert!(matches!(error, ManagedToolRecoveryError::Recovery(ContinuationRecoveryError::Interrupted)), "{error}");
         assert!(pending.is_recovery_pending());
-    }).await;
+    })).await;
     peer.quiet();
     reply
 }
@@ -123,7 +123,7 @@ pub(super) async fn scenario(cx: Cx, case: Case) {
                 assert!(!pending.is_recovery_pending());
             }
         }).await.0
-    } else { lost_reply(&peer, &cx, &mut pending).await };
+    } else { Box::pin(lost_reply(&peer, &cx, &mut pending)).await };
     assert!(lost.get("error").is_none(), "native dispatch must settle before injected loss: {lost}");
     assert_eq!(pending.attempts(), 1);
     assert_eq!(peer.probe.effects.load(Ordering::SeqCst), usize::from(!case.partial()));
@@ -181,10 +181,10 @@ pub(super) async fn scenario(cx: Cx, case: Case) {
                         assert!(matches!(operation.resume(&cx, RequestId::Number(4), Some(responses)).await,
                             Err(ManagedToolInteractionError::Tool(ManagedToolError::Invalidated))));
                     } else {
-                        let (final_wire, outcome) = pair(peer.dispatch(&cx, Delivery::Complete), async {
+                        let (final_wire, outcome) = Box::pin(pair(peer.dispatch(&cx, Delivery::Complete), async {
                             operation.resume(&cx, RequestId::Number(4), Some(responses)).await.unwrap();
                             operation.next_event(&cx).await
-                        }).await;
+                        })).await;
                         assert_eq!(final_wire["result"]["structuredContent"]["order"], json!(["left", "right"]));
                         if case.invalid_output() {
                             assert!(matches!(outcome, Err(ManagedToolInteractionError::Tool(ManagedToolError::InvalidStructuredOutput))));
