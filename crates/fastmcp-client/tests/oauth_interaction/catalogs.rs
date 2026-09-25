@@ -3,7 +3,7 @@
 use super::*;
 use fastmcp_client::http_auth::managed::OAuthSessionError;
 use fastmcp_client::http_auth::rpc::catalog::{
-    CollectedCatalog, ManagedCatalogClient, ManagedCatalogError, ManagedCatalogLimits,
+    CollectedCatalog, ManagedCatalogClient, ManagedCatalogConsistency, ManagedCatalogError, ManagedCatalogLimits,
 };
 use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta, JsonRpcRequest, ServerNotification};
 
@@ -16,6 +16,9 @@ enum CatalogCase {
     CursorLoop, Scope, PageLimit, ItemLimit, ByteLimit, NotificationLimit,
     RepeatedId, Cancel, Close, Drop, LateId, Preflight, Renewal,
     RevokedCache, RevokeBeforePost, ClearBeforePost, RevokeInObserver,
+    WholeCacheHit, WholeRefresh, WholeInvalidation, WholeRebuildLimit, WholePageLimit,
+    WholeItemLimit, WholeRepeatedId, WholeHostError, WholePreflight, RepeatedCursor,
+    WholeNotificationLimit, WholeByteLimit, WholeAmbiguousCache,
 }
 
 fn isolated_catalog(name: &str, case: CatalogCase) {
@@ -147,16 +150,25 @@ fn run_catalog(case: CatalogCase) {
             let ((), login) = pair(Box::pin(login), Box::pin(ManagedOAuthSession::authorize(&cx, peer.client(), policy, browser))).await;
             let session = login.unwrap();
             let core_limits = ManagedCoreLimits::new(4096,
-                if matches!(case, CatalogCase::ByteLimit) { 512 } else { 4096 },
-                if matches!(case, CatalogCase::ByteLimit) { 512 } else { 65536 },
-                if matches!(case, CatalogCase::NotificationLimit) { 1 } else { 8 },
+                if matches!(case, CatalogCase::ByteLimit | CatalogCase::WholeByteLimit) { 512 } else { 4096 },
+                if matches!(case, CatalogCase::ByteLimit | CatalogCase::WholeByteLimit) { 512 } else { 65536 },
+                if matches!(case, CatalogCase::NotificationLimit | CatalogCase::WholeNotificationLimit) { 1 } else { 8 },
                 if matches!(case, CatalogCase::LateId) { Duration::from_secs(1) } else { Duration::from_secs(15) },
             ).unwrap();
             let limits = ManagedCatalogLimits::new(core_limits,
-                if matches!(case, CatalogCase::PageLimit) { 1 } else { 16 },
-                if matches!(case, CatalogCase::ItemLimit) { 1 } else { 128 }, 16384,
+                if matches!(case, CatalogCase::PageLimit) { 1 }
+                    else if matches!(case, CatalogCase::CursorLoop | CatalogCase::WholePageLimit) { 2 }
+                    else if matches!(case, CatalogCase::WholeAmbiguousCache) { 4 } else { 16 },
+                if matches!(case, CatalogCase::ItemLimit) { 1 }
+                    else if matches!(case, CatalogCase::WholeItemLimit) { 2 } else { 128 }, 16384,
             ).unwrap();
             let client = ManagedCatalogClient::new(session.clone(), limits).with_cache_limits(16, 1024 * 1024).unwrap();
+            let client = if matches!(case, CatalogCase::WholeCacheHit | CatalogCase::WholeRefresh
+                | CatalogCase::WholeInvalidation | CatalogCase::WholeRebuildLimit | CatalogCase::WholePageLimit
+                | CatalogCase::WholeItemLimit | CatalogCase::WholeRepeatedId | CatalogCase::WholeHostError | CatalogCase::WholePreflight
+                | CatalogCase::WholeNotificationLimit | CatalogCase::WholeByteLimit)
+            { client.with_consistency(ManagedCatalogConsistency::RefreshWholeCatalog { maximum_rebuilds: 1 }).unwrap() }
+            else { client };
             let method = "tools/list";
             let first = Cell::new(41);
             let cancellation = McpRequestCancellation::new();
@@ -171,14 +183,14 @@ fn run_catalog(case: CatalogCase) {
                     }
                     assert_eq!(peer.posts.load(Ordering::SeqCst), 8);
                 }
-                CatalogCase::CacheHit | CatalogCase::Clear | CatalogCase::ExternalInvalidation | CatalogCase::Metadata | CatalogCase::ZeroTtl => {
+                CatalogCase::CacheHit | CatalogCase::WholeCacheHit | CatalogCase::Clear | CatalogCase::ExternalInvalidation | CatalogCase::Metadata | CatalogCase::ZeroTtl => {
                     let ttl = if matches!(case, CatalogCase::ZeroTtl) { 0 } else { 60000 };
                     let ((), result) = pair(Box::pin(pages(&peer, method, 41, ttl, "public")), Box::pin(client.collect(
                         &cx, catalog_request(method), || Ok(next_id(&first)), |_| Ok(()),
                     ))).await;
                     let original = result.unwrap();
                     assert_complete(&original, method);
-                    if matches!(case, CatalogCase::CacheHit) {
+                    if matches!(case, CatalogCase::CacheHit | CatalogCase::WholeCacheHit) {
                         let cached = Box::pin(client.clone().collect(&cx, catalog_request(method),
                             || panic!("cache hits must not allocate RPC IDs"), |_| panic!("cached results must not invent notifications"),
                         )).await.unwrap();
@@ -275,7 +287,7 @@ fn run_catalog(case: CatalogCase) {
                     }, |_| Ok(())))).await;
                     let error = result.err().unwrap();
                     match case {
-                        CatalogCase::CursorLoop => assert!(matches!(error, ManagedCatalogError::RepeatedCursor)),
+                        CatalogCase::CursorLoop => assert!(matches!(error, ManagedCatalogError::PageLimit)),
                         CatalogCase::Scope => assert!(matches!(error, ManagedCatalogError::ScopeChanged)),
                         CatalogCase::PageLimit => assert!(matches!(error, ManagedCatalogError::PageLimit)),
                         CatalogCase::ItemLimit => assert!(matches!(error, ManagedCatalogError::ItemLimit)),
@@ -405,6 +417,195 @@ fn run_catalog(case: CatalogCase) {
                     assert_eq!(peer.posts.load(Ordering::SeqCst), 1);
                     assert_eq!(client.cache_stats().unwrap().fills, 0);
                 }
+                CatalogCase::WholeRefresh | CatalogCase::WholePageLimit | CatalogCase::WholeItemLimit => {
+                    let ((), result) = pair(Box::pin(pages(&peer, method, 41, 0, "public")), Box::pin(client.collect(
+                        &cx, catalog_request(method), || Ok(next_id(&first)), |_| Ok(()),
+                    ))).await;
+                    assert_complete(&result.unwrap(), method);
+                    let server = Box::pin(async {
+                        // The old cursor must never be sent after the cache
+                        // miss: the replacement begins with cursor absent.
+                        serve_page(&peer, method, 43, None, &page(method, "fresh-one", Some("new-cursor"), 60000, "private")).await;
+                        if matches!(case, CatalogCase::WholePageLimit) { return; }
+                        serve_page(&peer, method, 44, Some("new-cursor"), &page(method, "fresh-two", None, 60000, "private")).await;
+                    });
+                    let ((), result) = pair(server, Box::pin(client.collect(
+                        &cx, catalog_request(method), || Ok(next_id(&first)), |_| Ok(()),
+                    ))).await;
+                    match case {
+                        CatalogCase::WholePageLimit => assert!(matches!(result, Err(ManagedCatalogError::PageLimit))),
+                        CatalogCase::WholeItemLimit => assert!(matches!(result, Err(ManagedCatalogError::ItemLimit))),
+                        _ => {
+                            let complete = result.unwrap();
+                            assert_complete(&complete, method);
+                            assert!(complete.pages()[0].encode().unwrap().contains("fresh-one"));
+                            assert!(complete.pages()[1].encode().unwrap().contains("fresh-two"));
+                        }
+                    }
+                    assert_eq!(peer.posts.load(Ordering::SeqCst), if matches!(case, CatalogCase::WholePageLimit) { 3 } else { 4 });
+                    assert_eq!(client.cache_stats().unwrap().hits, 1, "the discarded cached prefix consumes the original operation budget");
+                }
+                CatalogCase::WholeInvalidation => {
+                    let notices = Cell::new(0);
+                    let server = Box::pin(async {
+                        serve_page(&peer, method, 41, None, &page(method, "obsolete", Some(""), 60000, "private")).await;
+                        let (mut tls, body) = peer.request(false).await;
+                        let request: Value = serde_json::from_slice(&body).unwrap();
+                        assert_eq!(request["id"], 42);
+                        sse_head(&mut tls).await;
+                        event(&mut tls, CHANGED, false).await;
+                        let mut byte = [0];
+                        assert!(!matches!(tls.read(&mut byte).await, Ok(count) if count > 0));
+                        serve_page(&peer, method, 43, None, &page(method, "replacement-one", Some("next"), 60000, "private")).await;
+                        serve_page(&peer, method, 44, Some("next"), &page(method, "replacement-two", None, 60000, "private")).await;
+                    });
+                    let ((), result) = pair(server, Box::pin(client.collect(
+                        &cx, catalog_request(method), || Ok(next_id(&first)), |_| {
+                            notices.set(notices.get() + 1);
+                            assert_eq!(client.cache_stats().unwrap().hits, 0);
+                            Ok(())
+                        },
+                    ))).await;
+                    let complete = result.unwrap();
+                    assert_complete(&complete, method);
+                    assert!(complete.pages()[0].encode().unwrap().contains("replacement-one"));
+                    assert!(complete.pages().iter().all(|page| !page.encode().unwrap().contains("obsolete")));
+                    assert_eq!(notices.get(), 1);
+                    assert_eq!(peer.posts.load(Ordering::SeqCst), 4);
+                }
+                CatalogCase::WholeRebuildLimit | CatalogCase::WholeRepeatedId | CatalogCase::WholeNotificationLimit => {
+                    let server = Box::pin(async {
+                        let count = if matches!(case, CatalogCase::WholeRepeatedId) { 1 } else { 2 };
+                        for index in 0..count {
+                            let (mut tls, body) = peer.request(false).await;
+                            let request: Value = serde_json::from_slice(&body).unwrap();
+                            assert_eq!(request["id"], 41 + index);
+                            assert!(request["params"].get("cursor").is_none());
+                            sse_head(&mut tls).await;
+                            event(&mut tls, CHANGED, false).await;
+                            let mut byte = [0];
+                            assert!(!matches!(tls.read(&mut byte).await, Ok(count) if count > 0));
+                        }
+                    });
+                    let ((), result) = pair(server, Box::pin(client.collect(
+                        &cx, catalog_request(method), || {
+                            if matches!(case, CatalogCase::WholeRepeatedId) { Ok(RequestId::Number(41)) }
+                            else { Ok(next_id(&first)) }
+                        }, |_| Ok(()),
+                    ))).await;
+                    if matches!(case, CatalogCase::WholeRepeatedId) {
+                        assert!(matches!(result, Err(ManagedCatalogError::RepeatedRequestId)));
+                        assert_eq!(peer.posts.load(Ordering::SeqCst), 1);
+                    } else if matches!(case, CatalogCase::WholeNotificationLimit) {
+                        assert!(matches!(result, Err(ManagedCatalogError::Core(ManagedCoreError::NotificationLimit))));
+                        assert_eq!(peer.posts.load(Ordering::SeqCst), 2);
+                    } else {
+                        assert!(matches!(result, Err(ManagedCatalogError::RebuildLimit)));
+                        assert_eq!(peer.posts.load(Ordering::SeqCst), 2);
+                    }
+                    assert_eq!(client.cache_stats().unwrap().fills, 0);
+                }
+                CatalogCase::WholeByteLimit => {
+                    let server = Box::pin(async {
+                        let (mut tls, _) = peer.request(false).await;
+                        sse_head(&mut tls).await;
+                        event(&mut tls, CHANGED, false).await;
+                        let mut byte = [0];
+                        assert!(!matches!(tls.read(&mut byte).await, Ok(count) if count > 0));
+                        let base = r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","padding":""}"#;
+                        let length = 511 - terminal(42, base).len();
+                        let padded = base.replace("\"padding\":\"\"", &format!("\"padding\":\"{}\"", "x".repeat(length)));
+                        assert_eq!(terminal(42, &padded).len(), 511);
+                        assert!(terminal(42, &padded).len() + CHANGED.len() > 512);
+                        serve_page(&peer, method, 42, None, &padded).await;
+                    });
+                    let ((), result) = pair(server, Box::pin(client.collect(
+                        &cx, catalog_request(method), || Ok(next_id(&first)), |_| Ok(()),
+                    ))).await;
+                    assert!(matches!(result, Err(ManagedCatalogError::Core(ManagedCoreError::ResponseByteLimit))));
+                    assert_eq!(peer.posts.load(Ordering::SeqCst), 2);
+                    assert_eq!(client.cache_stats().unwrap().fills, 0);
+                }
+                CatalogCase::WholeHostError => {
+                    let calls = Cell::new(0);
+                    let result = Box::pin(client.collect(&cx, catalog_request(method), || {
+                        calls.set(calls.get() + 1);
+                        Err(ManagedCatalogError::Invalidated)
+                    }, |_| panic!("no response is sent"))).await;
+                    assert!(matches!(result, Err(ManagedCatalogError::Invalidated)));
+                    assert_eq!(calls.get(), 1, "a host error cannot authorize a rebuild");
+                    assert_eq!(peer.posts.load(Ordering::SeqCst), 0);
+                }
+                CatalogCase::WholePreflight => {
+                    let mut params = catalog_request(method).encode_params().unwrap().unwrap();
+                    params["cursor"] = json!("");
+                    let request = CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&params)).unwrap();
+                    let result = Box::pin(client.collect(&cx, request,
+                        || panic!("a suffix cannot allocate IDs under whole-catalog policy"), |_| Ok(()),
+                    )).await;
+                    assert!(matches!(result, Err(ManagedCatalogError::CursorNotAllowed)));
+                    for maximum_rebuilds in [0, 17] {
+                        assert!(matches!(client.clone().with_consistency(ManagedCatalogConsistency::RefreshWholeCatalog { maximum_rebuilds }), Err(ManagedCatalogError::InvalidLimits)));
+                    }
+                    assert_eq!(peer.posts.load(Ordering::SeqCst), 0);
+                }
+                CatalogCase::RepeatedCursor => {
+                    for initial in [41, 44] {
+                        let server = Box::pin(async {
+                            serve_page(&peer, method, initial, None, &page(method, "one", Some(""), 60000, "private")).await;
+                            serve_page(&peer, method, initial + 1, Some(""), &page(method, "two", Some(""), 60000, "private")).await;
+                            serve_page(&peer, method, initial + 2, Some(""), &page(method, "three", None, 60000, "private")).await;
+                        });
+                        let ((), result) = pair(server, Box::pin(client.collect(
+                            &cx, catalog_request(method), || Ok(next_id(&first)), |_| Ok(()),
+                        ))).await;
+                        let complete = result.unwrap();
+                        assert_eq!(complete.pages().len(), 3);
+                        assert_eq!(complete.item_count(), 3);
+                        for (page, expected) in complete.pages().iter().zip(["one", "two", "three"]) {
+                            assert!(page.encode().unwrap().contains(&format!("\"name\":\"{expected}\"")));
+                        }
+                    }
+                    assert_eq!(peer.posts.load(Ordering::SeqCst), 6);
+                    assert_eq!(client.cache_stats().unwrap().hits, 0, "ambiguous cursor pages must not be replayed as progress");
+                }
+                CatalogCase::WholeAmbiguousCache => {
+                    let server = Box::pin(async {
+                        serve_page(&peer, method, 41, None, &page(method, "old-start", Some("A"), 60000, "private")).await;
+                        serve_page(&peer, method, 42, Some("A"), &page(method, "old-a", Some("B"), 60000, "private")).await;
+                        serve_page(&peer, method, 43, Some("B"), &page(method, "old-b", None, 0, "private")).await;
+                    });
+                    let ((), result) = pair(server, Box::pin(client.collect(
+                        &cx, catalog_request(method), || Ok(next_id(&first)), |_| Ok(()),
+                    ))).await;
+                    assert_eq!(result.unwrap().pages().len(), 3);
+                    let mut params = catalog_request(method).encode_params().unwrap().unwrap();
+                    params["cursor"] = json!("W");
+                    let suffix = CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&params)).unwrap();
+                    let server = Box::pin(async {
+                        for (id, cursor, next) in [(44, "W", "X"), (45, "X", "Y"), (46, "Y", "B"), (47, "B", "A")] {
+                            serve_page(&peer, method, id, Some(cursor), &page(method, "suffix", Some(next), 60000, "private")).await;
+                        }
+                    });
+                    let ((), result) = pair(server, Box::pin(client.collect(
+                        &cx, suffix, || Ok(next_id(&first)), |_| Ok(()),
+                    ))).await;
+                    assert!(matches!(result, Err(ManagedCatalogError::PageLimit)));
+                    // Separate suffix traversal left individually cacheable
+                    // pages whose combined cursor chain now repeats A.
+                    let complete_client = client.clone().with_consistency(
+                        ManagedCatalogConsistency::RefreshWholeCatalog { maximum_rebuilds: 1 },
+                    ).unwrap();
+                    let ((), result) = pair(Box::pin(serve_page(&peer, method, 48, None,
+                        &page(method, "rebuilt-only", None, 60000, "private"))), Box::pin(complete_client.collect(
+                        &cx, catalog_request(method), || Ok(next_id(&first)), |_| Ok(()),
+                    ))).await;
+                    let complete = result.unwrap();
+                    assert_eq!(complete.pages().len(), 1);
+                    assert_eq!(complete.item_count(), 1);
+                    assert!(complete.pages()[0].encode().unwrap().contains("rebuilt-only"));
+                    assert_eq!(peer.posts.load(Ordering::SeqCst), 8);
+                }
             }
             if !matches!(case, CatalogCase::Renewal) { assert_eq!(peer.tokens.load(Ordering::SeqCst), 1); }
             peer.quiet();
@@ -431,7 +632,7 @@ fn invalidation_is_delivered_before_rejecting_the_partial_collection() { isolate
 #[test]
 fn unrelated_catalog_changes_do_not_break_collection() { isolated_catalog("unrelated_catalog_changes_do_not_break_collection", CatalogCase::Unrelated); }
 #[test]
-fn cursor_cycle_is_terminal_without_automatic_retry() { isolated_catalog("cursor_cycle_is_terminal_without_automatic_retry", CatalogCase::CursorLoop); }
+fn repeated_cursors_stop_only_at_the_page_budget() { isolated_catalog("repeated_cursors_stop_only_at_the_page_budget", CatalogCase::CursorLoop); }
 #[test]
 fn cache_scope_changes_cannot_produce_a_mixed_collection() { isolated_catalog("cache_scope_changes_cannot_produce_a_mixed_collection", CatalogCase::Scope); }
 #[test]
@@ -464,3 +665,29 @@ fn revocation_in_id_supplier_prevents_the_catalog_post() { isolated_catalog("rev
 fn cache_clear_in_id_supplier_prevents_the_catalog_post() { isolated_catalog("cache_clear_in_id_supplier_prevents_the_catalog_post", CatalogCase::ClearBeforePost); }
 #[test]
 fn observer_revocation_retires_the_unfinished_page_without_a_fill() { isolated_catalog("observer_revocation_retires_the_unfinished_page_without_a_fill", CatalogCase::RevokeInObserver); }
+#[test]
+fn whole_catalog_policy_reuses_a_fully_fresh_cached_inventory() { isolated_catalog("whole_catalog_policy_reuses_a_fully_fresh_cached_inventory", CatalogCase::WholeCacheHit); }
+#[test]
+fn whole_catalog_policy_rebuilds_every_page_after_a_partial_cache_hit() { isolated_catalog("whole_catalog_policy_rebuilds_every_page_after_a_partial_cache_hit", CatalogCase::WholeRefresh); }
+#[test]
+fn whole_catalog_policy_rebuilds_after_invalidation_without_exposing_old_pages() { isolated_catalog("whole_catalog_policy_rebuilds_after_invalidation_without_exposing_old_pages", CatalogCase::WholeInvalidation); }
+#[test]
+fn whole_catalog_rebuild_limit_stops_repeated_invalidations() { isolated_catalog("whole_catalog_rebuild_limit_stops_repeated_invalidations", CatalogCase::WholeRebuildLimit); }
+#[test]
+fn whole_catalog_page_budget_includes_the_discarded_cached_prefix() { isolated_catalog("whole_catalog_page_budget_includes_the_discarded_cached_prefix", CatalogCase::WholePageLimit); }
+#[test]
+fn whole_catalog_item_budget_includes_discarded_pages() { isolated_catalog("whole_catalog_item_budget_includes_discarded_pages", CatalogCase::WholeItemLimit); }
+#[test]
+fn whole_catalog_rebuild_cannot_reuse_a_previous_request_id() { isolated_catalog("whole_catalog_rebuild_cannot_reuse_a_previous_request_id", CatalogCase::WholeRepeatedId); }
+#[test]
+fn whole_catalog_policy_does_not_retry_a_host_invalidation_error() { isolated_catalog("whole_catalog_policy_does_not_retry_a_host_invalidation_error", CatalogCase::WholeHostError); }
+#[test]
+fn whole_catalog_policy_rejects_suffixes_and_invalid_rebuild_limits_before_posts() { isolated_catalog("whole_catalog_policy_rejects_suffixes_and_invalid_rebuild_limits_before_posts", CatalogCase::WholePreflight); }
+#[test]
+fn repeated_empty_cursors_complete_without_cached_response_replay() { isolated_catalog("repeated_empty_cursors_complete_without_cached_response_replay", CatalogCase::RepeatedCursor); }
+#[test]
+fn whole_catalog_notification_budget_spans_rebuilds() { isolated_catalog("whole_catalog_notification_budget_spans_rebuilds", CatalogCase::WholeNotificationLimit); }
+#[test]
+fn whole_catalog_payload_budget_spans_rebuilds() { isolated_catalog("whole_catalog_payload_budget_spans_rebuilds", CatalogCase::WholeByteLimit); }
+#[test]
+fn whole_catalog_rebuilds_ambiguous_cached_cursors_before_fetching() { isolated_catalog("whole_catalog_rebuilds_ambiguous_cached_cursors_before_fetching", CatalogCase::WholeAmbiguousCache); }

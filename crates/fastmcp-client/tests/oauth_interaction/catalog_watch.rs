@@ -3,7 +3,7 @@
 //! traverse native HTTP/SSE. The parent target requires native-tls-roots.
 use super::*;
 use fastmcp_client::http_auth::managed::OAuthSessionError;
-use fastmcp_client::http_auth::rpc::catalog::{ManagedCatalogClient, ManagedCatalogError, ManagedCatalogLimits};
+use fastmcp_client::http_auth::rpc::catalog::{ManagedCatalogClient, ManagedCatalogConsistency, ManagedCatalogError, ManagedCatalogLimits};
 use fastmcp_client::http_auth::rpc::catalog::watch::{
     ManagedCatalogWatchControl as Control, ManagedCatalogWatchEvent as WatchEvent,
     ManagedCatalogWatchError as WatchError, ManagedCatalogWatchLimits,
@@ -18,7 +18,7 @@ enum WatchCase {
     Live, Resources, Templates, Prompts, DuringPage, ChangeOnPage, NarrowAck,
     Gap, Terminal, Malformed, RebuildLimit, RepeatedId, Cancel, SessionClose,
     Drop, Timeout, Expired, StopAck, Preflight, Revoked, CallbackOverrun, ScopedCache,
-    ClearPublication,
+    ClearPublication, WholeLive, WholeClearPublication,
 }
 
 fn isolated_watch(name: &str, case: WatchCase) {
@@ -142,13 +142,16 @@ fn run_watch(case: WatchCase) {
             let credential = session.credential(&cx).await.unwrap();
             let limits = ManagedCatalogLimits::new(ManagedCoreLimits::new(4096,4096,65536,16,Duration::from_secs(15)).unwrap(), 16, 128, 16384).unwrap();
             let client = ManagedCatalogClient::new(session.clone(), limits).with_cache_limits(16, 1048576).unwrap();
+            let client = if matches!(case, WatchCase::WholeLive | WatchCase::WholeClearPublication) {
+                client.with_consistency(ManagedCatalogConsistency::RefreshWholeCatalog { maximum_rebuilds: 1 }).unwrap()
+            } else { client };
             let method = match case {
                 WatchCase::Resources => "resources/list",
                 WatchCase::Templates => "resources/templates/list",
                 WatchCase::Prompts => "prompts/list",
                 _ => "tools/list",
             };
-            if matches!(case, WatchCase::Live | WatchCase::ScopedCache) {
+            if matches!(case, WatchCase::Live | WatchCase::WholeLive | WatchCase::ScopedCache) {
                 let warm_method = if matches!(case, WatchCase::ScopedCache) { "prompts/list" } else { method };
                 let ((), result) = pair(Box::pin(serve_page(&peer, warm_method, 90, None, "old-cache", None)),
                     Box::pin(client.collect(&cx, request(warm_method), || Ok(RequestId::Number(90)), |_| Ok(())))).await;
@@ -208,12 +211,12 @@ fn run_watch(case: WatchCase) {
                     return;
                 }
                 serve_page(&peer, method, 2, None, "first", None).await;
-                if matches!(case, WatchCase::ClearPublication) {
+                if matches!(case, WatchCase::ClearPublication | WatchCase::WholeClearPublication) {
                     closed(listen).await;
                     return;
                 }
                 first_rx.recv(&cx).await.unwrap();
-                if matches!(case, WatchCase::Live | WatchCase::Resources | WatchCase::Templates | WatchCase::Prompts) {
+                if matches!(case, WatchCase::Live | WatchCase::WholeLive | WatchCase::Resources | WatchCase::Templates | WatchCase::Prompts) {
                     // The first snapshot has already reached the host while the
                     // original pending listen read must remain open and usable.
                     event(&mut listen, &notification(method), false).await;
@@ -278,7 +281,7 @@ fn run_watch(case: WatchCase) {
                         Ok(Control::Continue)
                     },
                 ));
-                if matches!(case, WatchCase::ClearPublication) {
+                if matches!(case, WatchCase::ClearPublication | WatchCase::WholeClearPublication) {
                     poll_fn(|task| {
                         assert!(watching.as_mut().poll(task).is_pending());
                         if client.cache_stats().unwrap().fills == 1 { Poll::Ready(()) } else { Poll::Pending }
@@ -300,7 +303,7 @@ fn run_watch(case: WatchCase) {
                 }
                 let result = watching.await;
                 match case {
-                    WatchCase::Live | WatchCase::Resources | WatchCase::Templates | WatchCase::Prompts | WatchCase::DuringPage | WatchCase::ChangeOnPage | WatchCase::StopAck | WatchCase::ScopedCache => {
+                    WatchCase::Live | WatchCase::WholeLive | WatchCase::Resources | WatchCase::Templates | WatchCase::Prompts | WatchCase::DuringPage | WatchCase::ChangeOnPage | WatchCase::StopAck | WatchCase::ScopedCache => {
                         assert_eq!(result.unwrap(), Outcome::StoppedByHost);
                     }
                     WatchCase::Terminal => assert_eq!(result.unwrap(), Outcome::SubscriptionEnded),
@@ -311,7 +314,7 @@ fn run_watch(case: WatchCase) {
                     WatchCase::Timeout | WatchCase::CallbackOverrun => assert!(matches!(result, Err(WatchError::Catalog(ManagedCatalogError::Core(ManagedCoreError::TimedOut))))),
                     WatchCase::Cancel => assert!(matches!(result, Err(WatchError::Catalog(ManagedCatalogError::Core(ManagedCoreError::Cancelled))))),
                     WatchCase::Revoked => assert!(matches!(result, Err(WatchError::Catalog(ManagedCatalogError::CredentialRevoked)))),
-                    WatchCase::ClearPublication => {
+                    WatchCase::ClearPublication | WatchCase::WholeClearPublication => {
                         assert!(matches!(result, Err(WatchError::Catalog(ManagedCatalogError::Invalidated))));
                         assert_eq!(snapshots.get(), 0, "an externally invalidated candidate must never be published");
                         assert_eq!(ids.get(), 2, "an external clear cannot trigger a hidden refetch");
@@ -327,7 +330,7 @@ fn run_watch(case: WatchCase) {
             pair(server, application).await;
             assert!(cx.checkpoint().is_ok(), "watch cancellation does not cancel its caller context");
             let expected = match case {
-                WatchCase::Live => 4,
+                WatchCase::Live | WatchCase::WholeLive => 4,
                 WatchCase::Resources | WatchCase::Templates | WatchCase::Prompts | WatchCase::ChangeOnPage | WatchCase::RebuildLimit => 3,
                 WatchCase::DuringPage => 5,
                 WatchCase::NarrowAck | WatchCase::RepeatedId | WatchCase::StopAck | WatchCase::CallbackOverrun => 1,
@@ -401,3 +404,7 @@ fn overdue_acknowledgment_callback_cannot_start_a_catalog_fetch() { isolated_wat
 fn closing_one_catalog_watch_does_not_flush_unrelated_catalogs() { isolated_watch("closing_one_catalog_watch_does_not_flush_unrelated_catalogs", WatchCase::ScopedCache); }
 #[test]
 fn external_clear_after_collection_prevents_snapshot_publication() { isolated_watch("external_clear_after_collection_prevents_snapshot_publication", WatchCase::ClearPublication); }
+#[test]
+fn whole_catalog_policy_composes_with_live_watch_snapshots() { isolated_watch("whole_catalog_policy_composes_with_live_watch_snapshots", WatchCase::WholeLive); }
+#[test]
+fn whole_catalog_policy_preserves_the_external_clear_publication_fence() { isolated_watch("whole_catalog_policy_preserves_the_external_clear_publication_fence", WatchCase::WholeClearPublication); }
