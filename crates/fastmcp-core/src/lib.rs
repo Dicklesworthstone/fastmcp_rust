@@ -2201,6 +2201,8 @@ pub mod limits {
 }
 
 pub use auth::{AccessToken, AuthContext, MAX_ACCESS_SCHEME_BYTES, MAX_ACCESS_TOKEN_BYTES};
+#[doc(hidden)]
+pub use context::ResponseCacheNotificationGuard;
 pub use context::{
     CancelledError, CatalogChangePublisher, ClientCapabilityInfo, ClientImplementationInfo,
     ClientRoot, ElicitationAction, ElicitationMode, ElicitationRequest, ElicitationResponse,

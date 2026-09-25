@@ -5,7 +5,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use asupersync::sync::Notify;
@@ -1512,6 +1512,9 @@ pub struct McpContext {
     /// Write-once middleware generation admissions shared by request clones.
     /// Each record is `(instance, fill generation, binding revision)`.
     response_cache_admissions: Arc<Mutex<Vec<(u64, u64, u64)>>>,
+    /// Sticky request-wide exclusion: memoization cannot replay streamed
+    /// notifications. Shared by every derived context, including nested calls.
+    response_cache_notifications: Arc<AtomicBool>,
     /// Request-scoped authentication context.
     auth: Arc<Mutex<Option<AuthContext>>>,
     /// Write-once authentication admission state, including committed anonymous
@@ -1693,6 +1696,24 @@ struct FrameworkMaskGuard<'a> {
     depth: &'a AtomicU32,
 }
 
+/// Read-only notification history retained by a memoized response.
+///
+/// This guard carries no request capability and cannot clear the history.
+/// Later response middleware may emit after a cache fill, so cache entries
+/// must consult this guard again before serving that result.
+#[derive(Clone, Debug)]
+#[doc(hidden)]
+pub struct ResponseCacheNotificationGuard {
+    emitted: Arc<AtomicBool>,
+}
+
+impl ResponseCacheNotificationGuard {
+    #[must_use]
+    pub fn has_notifications(&self) -> bool {
+        self.emitted.load(Ordering::Acquire)
+    }
+}
+
 /// RAII owner for a server-installed [`McpContext`] request lease.
 ///
 /// This is an internal cross-crate integration type. Dropping it rejects new
@@ -1754,6 +1775,7 @@ impl McpContext {
             cache_admission_partition: Arc::new(Mutex::new(None)),
             response_cache_hits: Arc::new(Mutex::new(Vec::new())),
             response_cache_admissions: Arc::new(Mutex::new(Vec::new())),
+            response_cache_notifications: Arc::new(AtomicBool::new(false)),
             auth: Arc::new(Mutex::new(None)),
             auth_state: Arc::new(AtomicU8::new(REQUEST_AUTH_UNCOMMITTED)),
             sampling_sender: None,
@@ -1801,6 +1823,7 @@ impl McpContext {
             cache_admission_partition: Arc::new(Mutex::new(None)),
             response_cache_hits: Arc::new(Mutex::new(Vec::new())),
             response_cache_admissions: Arc::new(Mutex::new(Vec::new())),
+            response_cache_notifications: Arc::new(AtomicBool::new(false)),
             auth: Arc::new(Mutex::new(None)),
             auth_state: Arc::new(AtomicU8::new(REQUEST_AUTH_UNCOMMITTED)),
             sampling_sender: None,
@@ -1849,6 +1872,7 @@ impl McpContext {
             cache_admission_partition: Arc::new(Mutex::new(None)),
             response_cache_hits: Arc::new(Mutex::new(Vec::new())),
             response_cache_admissions: Arc::new(Mutex::new(Vec::new())),
+            response_cache_notifications: Arc::new(AtomicBool::new(false)),
             auth: Arc::new(Mutex::new(None)),
             auth_state: Arc::new(AtomicU8::new(REQUEST_AUTH_UNCOMMITTED)),
             sampling_sender: None,
@@ -1901,6 +1925,7 @@ impl McpContext {
             cache_admission_partition: Arc::new(Mutex::new(None)),
             response_cache_hits: Arc::new(Mutex::new(Vec::new())),
             response_cache_admissions: Arc::new(Mutex::new(Vec::new())),
+            response_cache_notifications: Arc::new(AtomicBool::new(false)),
             auth: Arc::new(Mutex::new(None)),
             auth_state: Arc::new(AtomicU8::new(REQUEST_AUTH_UNCOMMITTED)),
             sampling_sender: None,
@@ -2336,6 +2361,7 @@ impl McpContext {
         if self.ensure_live().is_ok()
             && let Some(ref reporter) = self.progress_reporter
         {
+            self.note_notification_emission();
             reporter.report(progress, message);
         }
     }
@@ -2366,6 +2392,7 @@ impl McpContext {
         if self.ensure_live().is_ok()
             && let Some(ref reporter) = self.progress_reporter
         {
+            self.note_notification_emission();
             reporter.report_with_total(progress, total, message);
         }
     }
@@ -2384,6 +2411,7 @@ impl McpContext {
         if self.ensure_live().is_ok()
             && let Some(ref reporter) = self.progress_reporter
         {
+            self.note_notification_emission();
             reporter.report_exact(progress, total, message);
         }
     }
@@ -2874,6 +2902,7 @@ impl McpContext {
             return;
         }
         if let Some(sender) = self.log_sender.as_ref() {
+            self.note_notification_emission();
             sender.send_log(level, Some("fastmcp"), data);
         }
     }
@@ -2895,13 +2924,15 @@ impl McpContext {
             .is_some_and(|uris| uris.contains(uri))
             && let Some(sender) = self.log_sender.as_ref()
         {
+            self.note_notification_emission();
             sender.send_resource_updated(uri);
             delivered = true;
         }
-        if let Some(publisher) = self.catalog_publisher.as_ref()
-            && publisher.publish_resource_updated(uri)
-        {
-            delivered = true;
+        if let Some(publisher) = self.catalog_publisher.as_ref() {
+            // Mark before calling a user-supplied sink: it may deliver an
+            // event before returning, or fail after partial delivery.
+            self.note_notification_emission();
+            delivered |= publisher.publish_resource_updated(uri);
         }
         delivered
     }
@@ -3251,6 +3282,32 @@ impl McpContext {
         (self.state.as_ref()?.cache_admission_revision() == Some(admitted)).then_some(admitted)
     }
 
+    fn note_notification_emission(&self) {
+        self.response_cache_notifications
+            .store(true, Ordering::Release);
+    }
+
+    /// Returns whether this request handed a notification to an installed sink.
+    ///
+    /// The flag is set before delivery and remains set through all clones.
+    /// A sink may suppress or partially deliver an event, so such attempts
+    /// conservatively exclude memoization. Missing senders and log messages
+    /// below the negotiated floor do not set it.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn response_has_notifications(&self) -> bool {
+        self.response_cache_notifications.load(Ordering::Acquire)
+    }
+
+    /// Retains notification history without retaining the request context.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn response_cache_notification_guard(&self) -> ResponseCacheNotificationGuard {
+        ResponseCacheNotificationGuard {
+            emitted: Arc::clone(&self.response_cache_notifications),
+        }
+    }
+
     /// Records one middleware's generation before it admits a cache lookup or
     /// lets the request continue to its handler.
     ///
@@ -3267,7 +3324,11 @@ impl McpContext {
         binding_revision: u64,
     ) -> bool {
         const MAX_CACHE_MIDDLEWARE_PER_REQUEST: usize = 64;
-        if !self.request_scope_is_active() || cache_id == 0 || generation == 0 {
+        if !self.request_scope_is_active()
+            || self.response_has_notifications()
+            || cache_id == 0
+            || generation == 0
+        {
             return false;
         }
         let mut admissions = self
@@ -3295,7 +3356,7 @@ impl McpContext {
     #[doc(hidden)]
     #[must_use]
     pub fn response_cache_admission(&self, cache_id: u64) -> Option<(u64, u64)> {
-        if !self.request_scope_is_active() || cache_id == 0 {
+        if !self.request_scope_is_active() || self.response_has_notifications() || cache_id == 0 {
             return None;
         }
         self.response_cache_admissions
@@ -3311,7 +3372,7 @@ impl McpContext {
     #[doc(hidden)]
     pub fn mark_response_cache_hit(&self, cache_id: u64) -> bool {
         const MAX_CACHE_MIDDLEWARE_PER_REQUEST: usize = 64;
-        if !self.request_scope_is_active() || cache_id == 0 {
+        if !self.request_scope_is_active() || self.response_has_notifications() || cache_id == 0 {
             return false;
         }
         let mut hits = self
@@ -3601,9 +3662,11 @@ impl McpContext {
         // each owns its own delivery decision. Suppressing either one here
         // silently drops catalog changes for the sessions that rely on it.
         if let Some(sender) = self.log_sender.as_ref() {
+            self.note_notification_emission();
             sender.send_catalog_changed(kind);
         }
         if let Some(publisher) = self.catalog_publisher.as_ref() {
+            self.note_notification_emission();
             let _ = publisher.publish_catalog_changed(kind);
         }
     }
@@ -5697,6 +5760,49 @@ mod tests {
         assert_eq!(clone.response_cache_admission(1), None);
         assert!(!ctx.begin_response_cache_admission(1, 7, 9));
         assert!(!clone.begin_response_cache_admission(2, 7, 9));
+    }
+
+    #[test]
+    fn notification_emission_revokes_cache_admission_across_request_clones() {
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx.clone(), 1);
+        let emitter = ctx
+            .clone()
+            .with_progress_reporter(ProgressReporter::new(Arc::new(NoOpNotificationSender)));
+        assert!(ctx.begin_response_cache_admission(1, 7, 9));
+        assert!(!ctx.response_has_notifications());
+
+        emitter.report_progress(1.0, Some("finished"));
+
+        assert!(ctx.response_has_notifications());
+        assert!(ctx.clone().response_has_notifications());
+        assert_eq!(ctx.response_cache_admission(1), None);
+        assert!(!ctx.begin_response_cache_admission(1, 7, 9));
+        assert!(!emitter.begin_response_cache_admission(2, 7, 9));
+        assert!(!ctx.mark_response_cache_hit(1));
+        let sibling = McpContext::new(cx, 2);
+        assert!(!sibling.response_has_notifications());
+        assert!(sibling.begin_response_cache_admission(1, 7, 9));
+    }
+
+    #[test]
+    fn suppressed_notifications_preserve_cache_admission() {
+        let ctx =
+            McpContext::new(Cx::for_testing(), 1).with_log_sender(Arc::new(NoOpNotificationSender));
+        assert!(ctx.begin_response_cache_admission(1, 7, 9));
+        ctx.report_progress(1.0, None);
+        ctx.report_progress_with_total(1.0, 2.0, None);
+        ctx.report_progress_exact(1.into(), None, None);
+        ctx.info("no negotiated log floor");
+        assert!(!ctx.notify_resource_updated("file:///unsubscribed"));
+        let filtered = ctx.clone().with_min_log_level(Some(McpLogLevel::Warning));
+        filtered.info("below the negotiated floor");
+        assert!(!ctx.response_has_notifications());
+        assert_eq!(ctx.response_cache_admission(1), Some((7, 9)));
+
+        filtered.warning("admitted to the sink");
+        assert!(ctx.response_has_notifications());
+        assert_eq!(ctx.response_cache_admission(1), None);
     }
 
     #[test]

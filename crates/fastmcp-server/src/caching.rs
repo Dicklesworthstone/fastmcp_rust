@@ -11,6 +11,8 @@
 //! uncommitted authentication, or session state whose partition cannot be
 //! obtained, bypass lookup and storage. Direct anonymous contexts remain in a
 //! separate stateless domain for standalone middleware use and tests.
+//! Responses whose context emitted progress, logging, or change notifications
+//! bypass memoization: replaying only their result would omit those effects.
 //!
 //! # Cached Methods
 //!
@@ -56,7 +58,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use fastmcp_core::{McpContext, McpError, McpResult, Sha256Digest, sha256_bounded};
+use fastmcp_core::{
+    McpContext, McpError, McpResult, ResponseCacheNotificationGuard, Sha256Digest, sha256_bounded,
+};
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
     CacheTtl, FINAL_PROTOCOL_VERSION, FINAL_PROTOCOL_VERSION_META_KEY, JsonRpcRequest,
@@ -115,6 +119,7 @@ struct CacheEntry {
     encoded: Arc<[u8]>,
     expires_at: Instant,
     size_bytes: usize,
+    notification_guard: Option<ResponseCacheNotificationGuard>,
 }
 
 impl std::fmt::Debug for CacheEntry {
@@ -144,11 +149,20 @@ impl CacheEntry {
             encoded,
             expires_at,
             size_bytes,
+            notification_guard: None,
         })
     }
 
     fn is_expired(&self) -> bool {
         Instant::now() >= self.expires_at
+    }
+
+    fn is_reusable(&self) -> bool {
+        !self.is_expired()
+            && self
+                .notification_guard
+                .as_ref()
+                .is_none_or(|guard| !guard.has_notifications())
     }
 }
 
@@ -476,7 +490,7 @@ fn context_cache_commit_is_admissible(ctx: &McpContext) -> bool {
     // from being mistaken for a genuinely stateless request.
     let session_partition_is_current =
         !ctx.has_session_state() || ctx.complete_session_cache_partition().is_some();
-    session_partition_is_current && ctx.ensure_live().is_ok()
+    session_partition_is_current && !ctx.response_has_notifications() && ctx.ensure_live().is_ok()
 }
 
 /// Returns whether request parameters carry state from a multi-round-trip
@@ -726,11 +740,10 @@ impl LruCache {
         }
     }
 
-    fn get_encoded(&mut self, key: &CacheKey) -> Option<Arc<[u8]>> {
-        // Check if entry exists and is not expired
+    fn get_entry(&mut self, key: &CacheKey) -> Option<CacheEntry> {
+        // Late response hooks can revoke an entry after its original fill.
         if let Some(entry) = self.entries.get(key) {
-            if entry.is_expired() {
-                // Remove expired entry
+            if !entry.is_reusable() {
                 self.remove(key);
                 return None;
             }
@@ -741,15 +754,15 @@ impl LruCache {
                 self.order.push(k);
             }
 
-            return Some(Arc::clone(&entry.encoded));
+            return Some(entry.clone());
         }
         None
     }
 
     #[cfg(test)]
     fn get_value(&mut self, key: &CacheKey) -> Option<serde_json::Value> {
-        self.get_encoded(key)
-            .and_then(|encoded| decode_cached_json(&encoded))
+        self.get_entry(key)
+            .and_then(|entry| decode_cached_json(&entry.encoded))
     }
 
     #[cfg(test)]
@@ -766,13 +779,20 @@ impl LruCache {
         self.insert_entry(key, entry);
     }
 
-    fn insert_encoded(&mut self, key: CacheKey, encoded: Arc<[u8]>, ttl: Duration) {
+    fn insert_encoded(
+        &mut self,
+        key: CacheKey,
+        encoded: Arc<[u8]>,
+        ttl: Duration,
+        notification_guard: ResponseCacheNotificationGuard,
+    ) {
         if encoded.len() > self.max_item_size {
             return;
         }
-        let Some(entry) = CacheEntry::new_encoded(encoded, ttl) else {
+        let Some(mut entry) = CacheEntry::new_encoded(encoded, ttl) else {
             return;
         };
+        entry.notification_guard = Some(notification_guard);
         self.insert_entry(key, entry);
     }
 
@@ -782,6 +802,7 @@ impl LruCache {
         // replacement cannot destroy a valid cached entry.
         if self.max_entries == 0
             || self.max_size_bytes == 0
+            || !entry.is_reusable()
             || entry.encoded.len() > self.max_item_size
             || entry.size_bytes > self.max_size_bytes
         {
@@ -871,7 +892,7 @@ impl LruCache {
     fn evict_expired(&mut self) {
         let mut retained_size = self.current_size_bytes;
         self.entries.retain(|_, entry| {
-            if entry.is_expired() {
+            if !entry.is_reusable() {
                 retained_size = retained_size.saturating_sub(entry.size_bytes);
                 false
             } else {
@@ -1449,7 +1470,7 @@ impl Middleware for ResponseCachingMiddleware {
         ) else {
             return Ok(MiddlewareDecision::Continue);
         };
-        let (encoded, fill_generation) = {
+        let (entry, fill_generation) = {
             let mut cache = self
                 .cache
                 .lock()
@@ -1467,11 +1488,11 @@ impl Middleware for ResponseCachingMiddleware {
             {
                 return Ok(MiddlewareDecision::Continue);
             }
-            (cache.get_encoded(&key), cache.fill_generation)
+            (cache.get_entry(&key), cache.fill_generation)
         };
 
-        if let Some(encoded) = encoded {
-            if let Some(value) = decode_cached_json(&encoded) {
+        if let Some(entry) = entry {
+            if let Some(value) = decode_cached_json(&entry.encoded) {
                 // Invalidation may win after lookup releases the cache lock
                 // or while the retained bytes are decoded. Admit delivery
                 // under the same lock used to advance the fill epoch.
@@ -1481,6 +1502,7 @@ impl Middleware for ResponseCachingMiddleware {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if cache.fill_generation != fill_generation
                     || !self.cache_entry_binding_is_current(binding)
+                    || !entry.is_reusable()
                 {
                     self.record_miss();
                     return Ok(MiddlewareDecision::Continue);
@@ -1637,7 +1659,7 @@ impl Middleware for ResponseCachingMiddleware {
         {
             return Ok(response);
         }
-        cache.insert_encoded(key, encoded, ttl);
+        cache.insert_encoded(key, encoded, ttl, ctx.response_cache_notification_guard());
 
         Ok(response)
     }
@@ -1653,6 +1675,44 @@ mod tests {
     use super::*;
     use asupersync::Cx;
     use fastmcp_core::{AuthContext, SessionState};
+
+    #[derive(Default)]
+    struct CacheNotificationSink(AtomicU64);
+
+    impl fastmcp_core::NotificationSender for CacheNotificationSink {
+        fn send_progress(&self, _: f64, _: Option<f64>, _: Option<&str>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn send_progress_exact(
+            &self,
+            _: serde_json::Number,
+            _: Option<serde_json::Number>,
+            _: Option<&str>,
+        ) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn send_log(&self, _: fastmcp_core::McpLogLevel, _: Option<&str>, _: serde_json::Value) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn send_resource_updated(&self, _: &str) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl fastmcp_core::CatalogChangePublisher for CacheNotificationSink {
+        fn publish_catalog_changed(&self, _: fastmcp_core::McpCatalogKind) -> bool {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+
+        fn publish_resource_updated(&self, _: &str) -> bool {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+    }
 
     fn maximum_geometric_growth_events(max_bytes: usize) -> usize {
         if max_bytes == 0 {
@@ -2489,6 +2549,142 @@ mod tests {
             panic!("explicitly allowlisted tool did not produce a cache hit");
         };
         assert_eq!(cached, response);
+    }
+
+    #[test]
+    fn streamed_notifications_exclude_fills_while_silent_controls_cache() {
+        for notification in ["progress", "total", "exact", "log", "resource", "publisher"] {
+            for emit in [false, true] {
+                let middleware = ResponseCachingMiddleware::new();
+                let sink = Arc::new(CacheNotificationSink::default());
+                let ctx = test_context()
+                    .with_progress_reporter(fastmcp_core::ProgressReporter::new(sink.clone()))
+                    .with_log_sender(sink.clone())
+                    .with_min_log_level(Some(fastmcp_core::McpLogLevel::Info))
+                    .with_resource_subscriptions(["file:///catalog"]);
+                let emitter = if notification == "publisher" {
+                    ctx.clone().with_catalog_publisher(sink.clone())
+                } else {
+                    ctx.clone()
+                };
+                let request = test_request("tools/list", None);
+                let response = serde_json::json!({
+                    "resultType": "complete", "tools": [],
+                    "ttlMs": 300_000, "cacheScope": "private"
+                });
+                assert!(matches!(
+                    middleware.on_request(&ctx, &request).unwrap(),
+                    MiddlewareDecision::Continue
+                ));
+                if emit {
+                    match notification {
+                        "progress" => emitter.report_progress(1.0, None),
+                        "total" => emitter.report_progress_with_total(1.0, 2.0, None),
+                        "exact" => emitter.report_progress_exact(1.into(), Some(2.into()), None),
+                        "log" => emitter.info("catalog ready"),
+                        "resource" => assert!(emitter.notify_resource_updated("file:///catalog")),
+                        "publisher" => assert!(emitter.notify_resource_updated("file:///other")),
+                        _ => unreachable!("fixed test inventory"),
+                    }
+                }
+                assert_eq!(sink.0.load(Ordering::Relaxed), u64::from(emit));
+                // Protocol hints describe client policy independently of
+                // internal memoization, and must remain unchanged here.
+                assert_eq!(
+                    middleware
+                        .on_response(&ctx, &request, response.clone())
+                        .unwrap(),
+                    response
+                );
+                assert_eq!(middleware.stats().entries, usize::from(!emit));
+                let next = middleware.on_request(&test_context(), &request).unwrap();
+                if emit {
+                    assert!(
+                        matches!(next, MiddlewareDecision::Continue),
+                        "{notification}"
+                    );
+                } else {
+                    let MiddlewareDecision::Respond(cached) = next else {
+                        panic!("silent {notification} control must hit");
+                    };
+                    assert_eq!(cached, response);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn notification_before_lookup_bypasses_but_preserves_existing_cache_entry() {
+        let middleware = ResponseCachingMiddleware::new();
+        let request = test_request("tools/list", None);
+        let response = serde_json::json!({"tools": []});
+        let first = test_context();
+        middleware.on_request(&first, &request).unwrap();
+        let stored = middleware.on_response(&first, &request, response).unwrap();
+        let before = middleware.stats();
+
+        let sink = Arc::new(CacheNotificationSink::default());
+        let emitting = test_context()
+            .with_log_sender(sink.clone())
+            .with_min_log_level(Some(fastmcp_core::McpLogLevel::Info));
+        emitting
+            .clone()
+            .info("request middleware emitted a notification");
+        assert_eq!(sink.0.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            middleware.on_request(&emitting, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        middleware
+            .on_response(&emitting, &request, stored.clone())
+            .unwrap();
+        assert_eq!(middleware.stats().entries, before.entries);
+        assert_eq!(middleware.stats().size_bytes, before.size_bytes);
+        let MiddlewareDecision::Respond(cached) =
+            middleware.on_request(&test_context(), &request).unwrap()
+        else {
+            panic!("notification exclusion must preserve unrelated request reuse");
+        };
+        assert_eq!(cached, stored);
+    }
+
+    #[test]
+    fn late_response_notification_revokes_inserted_and_retained_cache_entries() {
+        let middleware = ResponseCachingMiddleware::new();
+        let sink = Arc::new(CacheNotificationSink::default());
+        let ctx = test_context()
+            .with_log_sender(sink.clone())
+            .with_min_log_level(Some(fastmcp_core::McpLogLevel::Info));
+        let request = test_request("tools/list", None);
+        middleware.on_request(&ctx, &request).unwrap();
+        middleware
+            .on_response(&ctx, &request, serde_json::json!({"tools": []}))
+            .unwrap();
+        assert_eq!(middleware.stats().entries, 1);
+
+        // Model a lookup that retained the original entry before releasing
+        // the cache lock for JSON decoding.
+        let retained = {
+            let mut cache = middleware.cache.lock().unwrap();
+            let key = cache.order[0].clone();
+            cache.get_entry(&key).unwrap()
+        };
+        assert!(retained.is_reusable());
+        assert!(decode_cached_json(&retained.encoded).is_some());
+
+        // Response hooks run in reverse order; an earlier registered hook
+        // may emit after the cache's own on_response has already filled.
+        let later_response_hook = ctx.clone();
+        drop(ctx);
+        later_response_hook.info("response middleware notification");
+        assert_eq!(sink.0.load(Ordering::Relaxed), 1);
+        assert!(!retained.is_reusable());
+        assert!(matches!(
+            middleware.on_request(&test_context(), &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        assert_eq!(middleware.stats().entries, 0);
+        assert_eq!(middleware.stats().size_bytes, 0);
     }
 
     #[test]
