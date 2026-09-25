@@ -19,10 +19,17 @@ use fastmcp_transport::{
     AsyncStdioRecvHalf, AsyncStdioSendHalf, AsyncStdioTransport, ReceivedTransportFrame,
 };
 
+// This module is split out of lib.rs and shares its private items. The set
+// it uses differs per feature profile, so an explicit list computed for one
+// profile would break the others.
+#[allow(
+    clippy::wildcard_imports,
+    reason = "split-out part of lib.rs; its parent-item set is feature-dependent"
+)]
 use super::*;
 
 const DOCUMENT_BYTES: usize = 10 * 1024 * 1024;
-const SUBSCRIPTION_LIFETIME: Duration = Duration::from_secs(60 * 60);
+const SUBSCRIPTION_LIFETIME: Duration = Duration::from_hours(1);
 
 type RequestWork = Pin<Box<dyn Future<Output = McpResult<()>> + Send>>;
 type ReadWork<R> = Pin<
@@ -1027,7 +1034,7 @@ mod tests {
     fn server(gate: &Arc<Gate>) -> Server {
         Server::new("async-stdio", "1.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
-            .expect("ModernOnly is available in every build")
+            .expect("modern-only policy is available")
             .tool(ProbeTool(Arc::clone(gate)))
             .build()
     }

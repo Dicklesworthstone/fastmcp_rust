@@ -193,11 +193,13 @@ async fn receive<R: AsyncRead + Unpin>(
                         let recoverable_request = server_ingress
                             && matches!(
                                 &error,
-                                TransportError::Codec(CodecError::Json(_))
-                                    | TransportError::Codec(CodecError::InvalidMessage {
-                                        kind: crate::InvalidMessageKind::Request,
-                                        ..
-                                    })
+                                TransportError::Codec(
+                                    CodecError::Json(_)
+                                        | CodecError::InvalidMessage {
+                                            kind: crate::InvalidMessageKind::Request,
+                                            ..
+                                        }
+                                )
                             );
                         if !recoverable_request {
                             fail_read(reader, state, terminal);
@@ -521,11 +523,26 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> AsyncStdioTransport<R, W> {
 }
 
 /// One source-preserving asynchronous NDJSON reader, independent of egress.
+///
+/// Dropping this endpoint closes the connection and wakes pending egress,
+/// unless all input has already been drained through a clean EOF. Dropping
+/// only a receive future instead retains this endpoint and its frame prefix.
 pub struct AsyncStdioRecvHalf<R> {
     reader: Option<R>,
     state: ReadState,
     codec: Codec,
     terminal: Arc<Terminal>,
+}
+
+impl<R> Drop for AsyncStdioRecvHalf<R> {
+    fn drop(&mut self) {
+        // Preserve the clean-EOF half-close: an already-owned response may
+        // still need to drain. Abandoning live ingress (including a retained
+        // frame prefix) must not leave its sibling asleep on backpressure.
+        if !self.state.eof || !self.state.buffer.is_empty() {
+            self.terminal.close();
+        }
+    }
 }
 
 impl<R: AsyncRead + Unpin> AsyncStdioRecvHalf<R> {
@@ -592,10 +609,21 @@ impl<R: AsyncRead + Unpin> AsyncStdioRecvHalf<R> {
 }
 
 /// One asynchronous NDJSON writer with a terminal partial-frame commit guard.
+///
+/// Dropping this endpoint closes the connection and wakes pending ingress,
+/// even when no send or asynchronous close operation is in progress.
 pub struct AsyncStdioSendHalf<W> {
     writer: Option<W>,
     codec: Codec,
     terminal: Arc<Terminal>,
+}
+
+impl<W> Drop for AsyncStdioSendHalf<W> {
+    fn drop(&mut self) {
+        // Closing the underlying handle alone cannot wake a reader parked on
+        // a different descriptor (or a caller-supplied in-memory reader).
+        self.terminal.close();
+    }
 }
 
 impl<W: AsyncWrite + Unpin> AsyncStdioSendHalf<W> {
@@ -631,6 +659,15 @@ mod tests {
     use asupersync::net::{TcpListener, TcpStream};
     use asupersync::runtime::RuntimeBuilder;
     use fastmcp_protocol::{JsonRpcRequest, JsonRpcResponse, RequestId};
+
+    /// Counts frame delimiters in a small captured test buffer.
+    #[expect(
+        clippy::naive_bytecount,
+        reason = "a test counts a few delimiters; no bytecount dependency"
+    )]
+    fn newline_count(bytes: &[u8]) -> usize {
+        bytes.iter().filter(|byte| **byte == b'\n').count()
+    }
 
     struct ReadStarted<R> {
         reader: R,
@@ -780,6 +817,128 @@ mod tests {
 
         fn poll_shutdown(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<io::Result<()>> {
             self.poll_flush(task)
+        }
+    }
+
+    #[test]
+    fn async_stdio_dropped_send_half_wakes_silent_ingress() {
+        let feed = Arc::new(Feed::default());
+        let output = Output::new(usize::MAX);
+        let (mut reader, writer) = AsyncStdioTransport::from_io(
+            FeedReader(Arc::clone(&feed)),
+            TestWriter(Arc::clone(&output)),
+        )
+        .into_split();
+        let cx = Cx::for_testing();
+        let count = Arc::new(WakeCount::default());
+        let waker = Waker::from(Arc::clone(&count));
+        {
+            let mut receiving = pin!(reader.recv_async(&cx));
+            assert!(poll(receiving.as_mut(), &waker).is_pending());
+            let before = count.0.load(Ordering::SeqCst);
+            drop(writer);
+            assert!(output.dropped.load(Ordering::SeqCst));
+            assert!(count.0.load(Ordering::SeqCst) > before);
+            assert!(matches!(
+                poll(receiving.as_mut(), &waker),
+                Poll::Ready(Err(TransportError::Closed))
+            ));
+        }
+        assert!(reader.is_closed());
+        assert_eq!(Arc::strong_count(&feed), 1, "ingress handle is released");
+    }
+
+    #[test]
+    fn async_stdio_dropped_recv_half_wakes_uncommitted_and_partial_sends() {
+        for allowance in [0, 5] {
+            let output = Output::new(allowance);
+            let (reader, mut writer) = AsyncStdioTransport::from_io(
+                FeedReader(Arc::new(Feed::default())),
+                TestWriter(Arc::clone(&output)),
+            )
+            .into_split();
+            let cx = Cx::for_testing();
+            let count = Arc::new(WakeCount::default());
+            let waker = Waker::from(Arc::clone(&count));
+            let message = request(81);
+            {
+                let mut sending = pin!(writer.send_async(&cx, &message));
+                assert!(poll(sending.as_mut(), &waker).is_pending());
+                // Complete a possible short-write yield, then park on I/O.
+                assert!(poll(sending.as_mut(), &waker).is_pending());
+                let before = count.0.load(Ordering::SeqCst);
+                drop(reader);
+                assert!(count.0.load(Ordering::SeqCst) > before);
+                assert!(matches!(
+                    poll(sending.as_mut(), &waker),
+                    Poll::Ready(Err(TransportError::Closed))
+                ));
+            }
+            assert!(writer.is_closed());
+            assert!(output.dropped.load(Ordering::SeqCst));
+            assert_eq!(output.bytes.lock().unwrap().len(), allowance);
+            output.allowance.store(usize::MAX, Ordering::SeqCst);
+            assert!(matches!(
+                ready(writer.send_async(&cx, &request(82))),
+                Err(TransportError::Closed)
+            ));
+            assert_eq!(output.bytes.lock().unwrap().len(), allowance);
+        }
+    }
+
+    #[test]
+    fn async_stdio_dropped_recv_half_discards_retained_prefix_and_closes_egress() {
+        let feed = Arc::new(Feed::default());
+        feed.push(b"{\"jsonrpc\":\"2.0\"");
+        let (mut reader, mut writer) = AsyncStdioTransport::from_io(
+            FeedReader(Arc::clone(&feed)),
+            Vec::<u8>::new(),
+        )
+        .into_split();
+        let cx = Cx::for_testing();
+        {
+            let mut receiving = pin!(reader.recv_async(&cx));
+            assert!(poll(receiving.as_mut(), Waker::noop()).is_pending());
+        }
+        assert!(!writer.is_closed(), "dropping only the operation is retryable");
+        assert!(!reader.state.buffer.is_empty());
+        drop(reader);
+        assert!(writer.is_closed());
+        assert_eq!(Arc::strong_count(&feed), 1);
+        assert!(matches!(
+            ready(writer.send_async(&cx, &request(83))),
+            Err(TransportError::Closed)
+        ));
+    }
+
+    #[test]
+    fn async_stdio_dropped_recv_half_after_final_eof_keeps_egress_drainable() {
+        let source = br#"{"jsonrpc":"2.0","method":"test/eof","id":84}"#;
+        // Returning a final unterminated document already observes clean EOF;
+        // a caller need not perform one extra receive before dropping ingress.
+        for receive_closed in [false, true] {
+            let output = Output::new(usize::MAX);
+            let (mut reader, mut writer) = AsyncStdioTransport::from_io(
+                source.as_slice(),
+                TestWriter(Arc::clone(&output)),
+            )
+            .into_split();
+            let cx = Cx::for_testing();
+            assert_eq!(
+                ready(reader.recv_with_source_async(&cx)).unwrap().source(),
+                source
+            );
+            if receive_closed {
+                assert!(matches!(
+                    ready(reader.recv_async(&cx)),
+                    Err(TransportError::Closed)
+                ));
+            }
+            drop(reader);
+            assert!(!writer.is_closed());
+            ready(writer.send_async(&cx, &request(85))).unwrap();
+            assert_eq!(newline_count(&output.bytes.lock().unwrap()), 1);
+            assert!(!output.dropped.load(Ordering::SeqCst));
         }
     }
 
@@ -997,7 +1156,7 @@ mod tests {
         output.allowance.store(usize::MAX, Ordering::SeqCst);
         ready(transport.send_async(&cx, &request(9))).unwrap();
         let bytes = output.bytes.lock().unwrap();
-        assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
+        assert_eq!(newline_count(&bytes), 1);
         assert!(std::str::from_utf8(&bytes).unwrap().contains("\"id\":9"));
     }
 
@@ -1084,16 +1243,7 @@ mod tests {
         ready(transport.send_async(&cx, &request(14))).unwrap();
         assert!(cx.is_cancel_requested());
         assert!(!transport.is_closed());
-        assert_eq!(
-            output
-                .bytes
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|byte| **byte == b'\n')
-                .count(),
-            1
-        );
+        assert_eq!(newline_count(&output.bytes.lock().unwrap()), 1);
     }
 
     #[test]

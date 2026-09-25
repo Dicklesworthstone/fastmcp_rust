@@ -10400,9 +10400,9 @@ pub mod legacy_2024 {
         message_post_endpoint: CanonicalHttpUrl,
         cx: &Cx,
     ) -> Result<HttpClient, HttpClientConnectError> {
-        http_client_builder(sse_endpoint, message_post_endpoint)
-            .map_err(HttpClientConnectError::Plan)?
-            .connect_http_client_with_cx(cx)
+        let builder = http_client_builder(sse_endpoint, message_post_endpoint)
+            .map_err(HttpClientConnectError::Plan)?;
+        Box::pin(builder.connect_http_client_with_cx(cx))
             .await
             .map_err(HttpClientConnectError::Connect)
     }

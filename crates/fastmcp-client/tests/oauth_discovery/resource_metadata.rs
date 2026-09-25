@@ -47,7 +47,7 @@ fn root_recovers_every_http_refusal_without_following_its_location() {
                 peer.serve(PATH, status, "").await;
                 root_and_issuer(&peer).await;
             };
-            let ((), result) = pair(server, plan.discover(&cx)).await;
+            let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
             assert_eq!(result.unwrap(), expected(&peer, &peer.resource()));
             assert_eq!(*peer.paths.lock().unwrap(), [PATH, ROOT_PATH, ISSUER_PATH]);
             peer.assert_no_extra_connections();
@@ -82,7 +82,7 @@ fn root_recovery_requires_full_metadata_admission_not_just_http_success() {
                 peer.serve(PATH, 200, &raw).await;
                 root_and_issuer(&peer).await;
             };
-            let ((), result) = pair(server, plan.discover(&cx)).await;
+            let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
             assert_eq!(result.unwrap(), expected(&peer, &peer.resource()));
             assert_eq!(*peer.paths.lock().unwrap(), [PATH, ROOT_PATH, ISSUER_PATH]);
             peer.assert_no_extra_connections();
@@ -110,7 +110,7 @@ fn malformed_representation_does_not_erase_the_reserved_root_attempt() {
                 drop(socket);
                 root_and_issuer(&peer).await;
             };
-            let ((), result) = pair(server, plan.discover(&cx)).await;
+            let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
             assert_eq!(result.unwrap(), expected(&peer, &peer.resource()));
             assert_eq!(*peer.paths.lock().unwrap(), [PATH, ROOT_PATH, ISSUER_PATH]);
             peer.assert_no_extra_connections();
@@ -136,7 +136,7 @@ fn stalled_first_head_or_body_cannot_starve_root_or_issuer() {
                 assert_closed(socket).await;
                 root_and_issuer(&peer).await;
             };
-            let ((), result) = pair(server, plan.discover(&cx)).await;
+            let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
             assert_eq!(result.unwrap(), expected(&peer, &peer.resource()));
             assert!(cx.checkpoint().is_ok());
             assert_eq!(*peer.paths.lock().unwrap(), [PATH, ROOT_PATH, ISSUER_PATH]);
@@ -156,7 +156,7 @@ fn lost_first_connection_does_not_retry_its_url_or_skip_root() {
             drop(socket);
             root_and_issuer(&peer).await;
         };
-        let ((), result) = pair(server, plan.discover(&cx)).await;
+        let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
         assert_eq!(result.unwrap(), expected(&peer, &peer.resource()));
         assert_eq!(*peer.paths.lock().unwrap(), [PATH, ROOT_PATH, ISSUER_PATH]);
         peer.assert_no_extra_connections();
@@ -177,7 +177,7 @@ fn each_resource_candidate_keeps_an_independent_full_body_allowance() {
             peer.serve(ROOT_PATH, 200, &valid).await;
             peer.serve(ISSUER_PATH, 200, &peer.issuer_document().to_string()).await;
         };
-        let ((), result) = pair(server, plan.discover(&cx)).await;
+        let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
         assert_eq!(result.unwrap(), expected(&peer, &peer.resource()));
         assert_eq!(*peer.paths.lock().unwrap(), [PATH, ROOT_PATH, ISSUER_PATH]);
         peer.assert_no_extra_connections();
@@ -197,7 +197,7 @@ fn an_oversized_first_body_is_retired_before_the_root_is_read() {
             assert_closed(socket).await;
             root_and_issuer(&peer).await;
         };
-        let ((), result) = pair(server, plan.discover(&cx)).await;
+        let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
         assert_eq!(result.unwrap(), expected(&peer, &peer.resource()));
         assert_eq!(*peer.paths.lock().unwrap(), [PATH, ROOT_PATH, ISSUER_PATH]);
         peer.assert_no_extra_connections();
@@ -249,7 +249,7 @@ fn two_stalled_candidates_settle_without_misreporting_caller_cancellation() {
                 assert_closed(socket).await;
             }
         };
-        let ((), result) = pair(server, plan.discover(&cx)).await;
+        let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
         let OAuthDiscoveryError::ResourceMetadataExhausted(failure) = result.unwrap_err() else { panic!("aggregate expected") };
         assert_eq!(failure.classification(), ResourceMetadataFailureClass::Transport);
         assert_eq!(failure.attempts().iter().map(|attempt| attempt.cause()).collect::<Vec<_>>(),
@@ -278,7 +278,7 @@ fn root_resource_fetches_one_exact_candidate_on_success_or_failure() {
                 peer.serve(ROOT_PATH, if valid { 200 } else { 404 }, &if valid { prm.to_string() } else { String::new() }).await;
                 if valid { peer.serve(ISSUER_PATH, 200, &issuer.to_string()).await; }
             };
-            let ((), result) = pair(server, plan.discover(&cx)).await;
+            let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
             if valid {
                 assert_eq!(result.unwrap(), expected(&peer, &resource));
                 assert_eq!(*peer.paths.lock().unwrap(), [ROOT_PATH, ISSUER_PATH]);

@@ -20,6 +20,7 @@ use fastmcp_client::http_auth::managed::{ManagedOAuthSession, OAuthSessionPolicy
 use fastmcp_client::http_auth::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError};
 use fastmcp_client::http_auth::rpc::{ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits};
 use fastmcp_client::http_auth::rpc::catalog::ManagedCatalogError;
+use fastmcp_client::http_auth::rpc::interaction::{ManagedInteractionError, ManagedInteractionEvent};
 use fastmcp_client::http_auth::rpc::tool_headers::repair::{
     ToolHeaderRepairContract, ToolHeaderRepairError, ToolHeaderRepairLimits, ToolHeaderRepairOutcome,
 };
@@ -41,7 +42,7 @@ enum Case {
     Repair, Fresh, DropRejection, CancelBeforeRefresh, DefinitionDenied, HeaderDenied,
     CancelDefinition, ReusedListId, ReusedRetryId, DuplicateTool, MissingTool,
     WrongProjection, SecondRejection, WrongId, WrongCode, Opaque, Status200, Truncated, LostHead,
-    RootsView, InputView, ExperimentalView,
+    RootsView, InputView, ExperimentalView, Interaction, InteractionLimits,
 }
 
 impl Case {
@@ -262,12 +263,20 @@ impl Peer {
             if index == 0 { result["nextCursor"] = json!("page-two"); }
             reply(&mut socket, 200, "application/json", &json!({"jsonrpc":"2.0","id":11+index,"result":result}).to_string(), false).await;
         }
-        if matches!(case, Case::Repair | Case::RootsView | Case::InputView | Case::ExperimentalView | Case::SecondRejection) {
+        if matches!(case, Case::Repair | Case::RootsView | Case::InputView | Case::ExperimentalView | Case::SecondRejection | Case::Interaction) {
             let (mut socket, _) = self.rpc("tools/call", 13, Some("mcp-param-fresh")).await;
             let (status, body) = if matches!(case, Case::SecondRejection) { (400, error(13, -32020)) }
+                else if matches!(case, Case::Interaction) { (200, json!({"jsonrpc":"2.0","id":13,"result":{
+                    "resultType":"input_required","requestState":"repair-state"}}).to_string()) }
                 else { (200, complete(13)) };
             reply(&mut socket, status, "application/json", &body, false).await;
         }
+    }
+    // The continuation must still carry the freshly reviewed projection.
+    async fn continuation(&self) {
+        let (mut socket, request) = self.rpc("tools/call", 14, Some("mcp-param-fresh")).await;
+        assert_eq!(request["params"]["requestState"], "repair-state");
+        reply(&mut socket, 200, "application/json", &complete(14), false).await;
     }
     async fn sibling(&self) {
         let (mut socket, _) = self.rpc("tools/list", 900, None).await;
@@ -344,6 +353,42 @@ async fn scenario(cx: &Cx, case: Case) {
             assert!(matches!(case, Case::WrongId | Case::WrongCode | Case::Opaque | Case::Truncated | Case::LostHead));
             assert!(!format!("{error:?} {error}").contains("private-peer-canary"));
         }
+        Ok(ToolHeaderRepairOutcome::Rejected(rejected)) if matches!(case, Case::Interaction | Case::InteractionLimits) => {
+            let refused = matches!(case, Case::InteractionLimits);
+            let mut ids = VecDeque::from(vec![11, 12, 13]);
+            let server = async { if !refused { peer.refresh(case).await; } };
+            let start = rejected.refresh_and_start_interaction(cx, if refused { 65 } else { 2 }, 2,
+                || Ok(RequestId::Number(ids.pop_front().expect("no extra page or retry"))),
+                |definition| definition.name == "lookup",
+                |binding| matches!(binding.header_name(), "Mcp-Param-Fresh" | "Mcp-Param-Verbose"),
+            );
+            let ((), started) = pair(server, start).await;
+            if refused {
+                assert!(matches!(started, Err(ToolHeaderRepairError::Interaction(ManagedInteractionError::InvalidLimits))));
+                assert_eq!(ids.len(), 3, "limits are refused before any catalog or retry ID is drawn");
+            } else {
+                expected_posts += 3;
+                let mut operation = started.unwrap();
+                let Some(ManagedInteractionEvent::InputRequired(input)) = operation.next_event(cx).await.unwrap()
+                    else { panic!("the repaired retry's own challenge"); };
+                assert_eq!(input.request_state(), Some("repair-state"));
+                // The rejected call, both catalog pages and the retry stay reserved.
+                for reused in [10, 11, 12, 13] {
+                    assert!(matches!(operation.resume(cx, RequestId::Number(reused), None).await,
+                        Err(ManagedInteractionError::RepeatedRequestId)), "id {reused}");
+                    assert!(operation.pending_input().is_some(), "a refused ID leaves the challenge for correction");
+                }
+                peer.quiet();
+                let ((), resumed) = pair(peer.continuation(), operation.resume(cx, RequestId::Number(14), None)).await;
+                resumed.unwrap();
+                expected_posts += 1;
+                let Some(ManagedInteractionEvent::Complete(result)) = operation.next_event(cx).await.unwrap()
+                    else { panic!("continuation result"); };
+                assert!(result.encode().unwrap().contains("1.20e+4"));
+                assert!(operation.next_event(cx).await.unwrap().is_none());
+                assert_eq!(operation.continuation_count(), 1);
+            }
+        }
         Ok(ToolHeaderRepairOutcome::Rejected(rejected)) => {
             if matches!(case, Case::DropRejection) { drop(rejected); }
             else {
@@ -416,7 +461,12 @@ async fn scenario(cx: &Cx, case: Case) {
         let requests = peer.requests.lock().unwrap();
         assert_eq!(requests.len(), expected_posts);
         for request in requests.iter().filter(|request| request["method"] == "tools/call") {
-            assert_eq!(request["params"], original, "neither refresh nor approval may replace invocation data");
+            let mut params = request["params"].clone();
+            // A continuation adds exactly the server-issued state, nothing else.
+            if request["id"] == 14 {
+                assert_eq!(params.as_object_mut().unwrap().remove("requestState"), Some(json!("repair-state")));
+            }
+            assert_eq!(params, original, "neither refresh nor approval may replace invocation data");
         }
     }
     assert!(cx.checkpoint().is_ok());
@@ -460,6 +510,8 @@ cases! {
     repair_200_error_never_grants_custody => Status200,
     repair_truncated_error_never_grants_custody => Truncated,
     repair_lost_response_head_never_grants_custody => LostHead,
+    repair_hands_its_retry_to_one_resumable_interaction => Interaction,
+    repair_interaction_limits_refuse_before_catalog_refresh => InteractionLimits,
 }
 
 #[path = "oauth_tool_header_repair/schema.rs"]

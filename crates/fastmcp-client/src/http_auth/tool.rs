@@ -108,6 +108,9 @@ struct ToolContract {
     invalidated: AtomicBool,
     invalidation: McpRequestCancellation,
     catalog_invalidated: Option<Arc<AtomicBool>>,
+    // A repair-only contract keeps its original validity owner alive. It is
+    // never published as a reusable client, and inheritance is one hop only.
+    source_contract: Option<Arc<ToolContract>>,
 }
 
 impl ToolContract {
@@ -144,7 +147,8 @@ impl ToolContract {
                 .map_err(|_| ManagedToolError::SchemaTooLarge)?;
         }
         Ok(Self { name: tool.name, input, output, invalidated: AtomicBool::new(false),
-            invalidation: McpRequestCancellation::new(), catalog_invalidated: None })
+            invalidation: McpRequestCancellation::new(), catalog_invalidated: None,
+            source_contract: None })
     }
 
     fn invalidate(&self) {
@@ -155,6 +159,7 @@ impl ToolContract {
     fn is_invalidated(&self) -> bool {
         self.invalidated.load(Ordering::Acquire)
             || self.catalog_invalidated.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire))
+            || self.source_contract.as_ref().is_some_and(|source| source.is_invalidated())
     }
 
     fn check(&self) -> Result<(), ManagedToolError> {

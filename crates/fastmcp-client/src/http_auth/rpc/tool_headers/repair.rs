@@ -14,6 +14,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, Write};
+use std::sync::Arc;
 
 use asupersync::{Cx, types::Time};
 use fastmcp_core::{CanonicalHttpUrl, McpRequestCancellation};
@@ -32,6 +33,7 @@ use super::{
     bounded_wait, call_deadline, prepare_optional,
 };
 use super::super::check_call;
+use super::super::interaction::{ManagedInteraction, ManagedInteractionError, ManagedInteractionLimits};
 use super::super::catalog::{ManagedCatalogClient, ManagedCatalogError, ManagedCatalogLimits};
 use crate::http_executor::ModernHttpErrorBodyAdmission;
 
@@ -136,6 +138,7 @@ pub enum ToolHeaderRepairError {
     ToolUnavailable,
     DuplicateTool,
     DefinitionDeclined,
+    Interaction(ManagedInteractionError),
     Headers(ToolHeaderDispatchError),
     Catalog(ManagedCatalogError),
     Core(ManagedCoreError),
@@ -151,6 +154,7 @@ impl fmt::Display for ToolHeaderRepairError {
             Self::ToolUnavailable => "refreshed catalog no longer contains the requested tool",
             Self::DuplicateTool => "refreshed catalog contains duplicate tool names",
             Self::DefinitionDeclined => "host declined the refreshed tool definition",
+            Self::Interaction(error) => return error.fmt(f),
             Self::Headers(error) => return error.fmt(f),
             Self::Catalog(error) => return error.fmt(f),
             Self::Core(error) => return error.fmt(f),
@@ -159,6 +163,9 @@ impl fmt::Display for ToolHeaderRepairError {
 }
 
 impl std::error::Error for ToolHeaderRepairError {}
+impl From<ManagedInteractionError> for ToolHeaderRepairError {
+    fn from(error: ManagedInteractionError) -> Self { Self::Interaction(error) }
+}
 impl From<ManagedCoreError> for ToolHeaderRepairError {
     fn from(error: ManagedCoreError) -> Self { Self::Core(error) }
 }
@@ -178,6 +185,10 @@ impl From<ManagedToolHeaderError> for ToolHeaderRepairError {
 /// Success owns the ordinary incremental core call. Only `Rejected` permits
 /// the separate, explicit refresh action; dropping it sends nothing further.
 #[must_use = "drive the call or explicitly decide whether to repair its rejection"]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "returned once per call and moved immediately; boxing buys nothing on this path"
+)]
 pub enum ToolHeaderRepairOutcome {
     Call(ManagedCoreCall),
     Rejected(RejectedToolHeaders),
@@ -276,8 +287,52 @@ impl RejectedToolHeaders {
     /// typed input-required results. It grants no automatic continuation/replay
     /// permission and does not mutate or resurrect previously invalidated tools.
     pub async fn refresh_and_retry<I, A, R>(
-        mut self, cx: &Cx, mut next_id: I, approve: A, mut review: R,
+        self, cx: &Cx, next_id: I, approve: A, review: R,
     ) -> Result<ManagedCoreCall, ToolHeaderRepairError>
+    where
+        I: FnMut() -> Result<RequestId, ManagedCatalogError>,
+        A: FnOnce(&FinalTool) -> bool,
+        R: FnMut(&ParameterHeaderBinding) -> bool,
+    {
+        Ok(Box::pin(self.refresh_owned(cx, next_id, approve, review)).await?.into_call())
+    }
+
+    /// Performs the same one-shot repair, retaining its successful retry as a
+    /// resumable operation before reading any response event. This is an
+    /// ownership handoff, not a second invocation. The first event may be a
+    /// notification, a complete result, or an input-required challenge.
+    ///
+    /// Explicit continuation/answer limits cannot enlarge the original core
+    /// byte, notification, or time budgets. All rejected-call, catalog-page and
+    /// retry IDs remain reserved. Every later round reuses the approved schema
+    /// projection and immutable arguments. No input resolver runs automatically.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn refresh_and_start_interaction<I, A, R>(
+        self, cx: &Cx, maximum_continuations: usize, maximum_input_responses: usize,
+        next_id: I, approve: A, review: R,
+    ) -> Result<ManagedInteraction, ToolHeaderRepairError>
+    where
+        I: FnMut() -> Result<RequestId, ManagedCatalogError>,
+        A: FnOnce(&FinalTool) -> bool,
+        R: FnMut(&ParameterHeaderBinding) -> bool,
+    {
+        self.admit_interaction_limits(maximum_continuations, maximum_input_responses)?;
+        Box::pin(self.refresh_owned(cx, next_id, approve, review)).await?
+            .into_interaction(cx, maximum_continuations, maximum_input_responses)
+    }
+
+    pub(crate) fn admit_interaction_limits(&self, continuations: usize, responses: usize)
+        -> Result<(), ToolHeaderRepairError>
+    {
+        ManagedInteractionLimits::new(self.limits.core, continuations, responses)?;
+        Ok(())
+    }
+
+    // Only this path can construct RepairedToolCall: it owns the actual retry
+    // body together with the complete history and freshly reviewed projection.
+    pub(crate) async fn refresh_owned<I, A, R>(
+        mut self, cx: &Cx, mut next_id: I, approve: A, mut review: R,
+    ) -> Result<RepairedToolCall, ToolHeaderRepairError>
     where
         I: FnMut() -> Result<RequestId, ManagedCatalogError>,
         A: FnOnce(&FinalTool) -> bool,
@@ -314,10 +369,31 @@ impl RejectedToolHeaders {
                 check_call(cx, &self.cancellation, self.deadline)?;
                 // Intentionally NOT the repair entrypoint: a second 400 can
                 // only fail. Returned reads retain the original absolute bound.
-                ManagedCoreCall::from_response(response, decoder, self.cancellation.clone(), self.deadline)
-                    .map_err(ToolHeaderRepairError::from)
+                let call = ManagedCoreCall::from_response(response, decoder, self.cancellation.clone(), self.deadline)?;
+                Ok(RepairedToolCall { call, session: self.session.clone(),
+                    reviewed: Arc::new(reviewed), ids: self.ids.ids })
             }.await)
         })).await?
+    }
+}
+
+// Not public and not Clone: no caller can attach fabricated history or a new
+// disclosure review to an already-dispatched request, or split its ownership.
+pub(crate) struct RepairedToolCall {
+    call: ManagedCoreCall,
+    session: ManagedOAuthSession,
+    reviewed: Arc<ReviewedToolHeaders>,
+    ids: Vec<RequestId>,
+}
+
+impl RepairedToolCall {
+    pub(crate) fn into_call(self) -> ManagedCoreCall { self.call }
+
+    pub(crate) fn into_interaction(self, cx: &Cx, continuations: usize, responses: usize)
+        -> Result<ManagedInteraction, ToolHeaderRepairError>
+    {
+        Ok(ManagedInteraction::from_repaired_call(cx, self.session, self.call,
+            self.reviewed, self.ids, continuations, responses)?)
     }
 }
 

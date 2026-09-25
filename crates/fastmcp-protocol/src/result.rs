@@ -16,14 +16,20 @@ use crate::common_types::{Implementation, JsonInteger, OpenMetadata};
 use crate::jsonrpc::{RawJsonAdmissionError, admit_raw_jsonrpc_document};
 use crate::protocol_policy::ProtocolEra;
 
-/// Maximum encoded bytes accepted by the result codec.
-pub const MAX_RESULT_ENCODED_BYTES: usize = 1_048_576;
+/// Maximum encoded bytes accepted by the result codec (LIMIT-01 guarded
+/// default for complete result content, excluding the JSON-RPC envelope).
+pub const MAX_RESULT_ENCODED_BYTES: usize = 6 * 1024 * 1024;
 /// Maximum nesting depth accepted by the result codec.
 pub const MAX_RESULT_DEPTH: usize = 64;
 /// Maximum members/elements accepted by one JSON object or array.
 pub const MAX_RESULT_CONTAINER_MEMBERS: usize = 1_024;
-/// Maximum decoded bytes in one JSON string or object key.
-pub const MAX_RESULT_STRING_BYTES: usize = 65_536;
+/// Maximum decoded bytes in one JSON string value. This admits one LIMIT-01
+/// decoded binary content block (3 MiB) as Base64, `4 * ceil(3 MiB / 3)`
+/// bytes. Text blocks share the bound.
+pub const MAX_RESULT_STRING_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum decoded bytes in one JSON object key. No LIMIT-01 row asks for a
+/// larger key, so keys keep the narrow bound.
+pub const MAX_RESULT_KEY_BYTES: usize = 64 * 1024;
 /// Maximum source bytes in one JSON number lexeme.
 pub const MAX_RESULT_NUMBER_BYTES: usize = 1_024;
 
@@ -574,7 +580,7 @@ fn exact_json_members_len(
     }
     let mut encoded_bytes = 2_usize;
     for (index, member) in members.iter().enumerate() {
-        if member.name.len() > MAX_RESULT_STRING_BYTES {
+        if member.name.len() > MAX_RESULT_KEY_BYTES {
             return Err(ResultDecodeError::new(
                 ResultDecodeErrorKind::BoundExceeded,
                 "$.<extra-name>",
@@ -1827,7 +1833,9 @@ impl<'a> ExactJsonParser<'a> {
             Some(b'n') if self.consume(b"null") => Ok(ExactJsonValue::Null),
             Some(b't') if self.consume(b"true") => Ok(ExactJsonValue::Bool(true)),
             Some(b'f') if self.consume(b"false") => Ok(ExactJsonValue::Bool(false)),
-            Some(b'"') => self.string(path).map(ExactJsonValue::String),
+            Some(b'"') => self
+                .string(path, MAX_RESULT_STRING_BYTES)
+                .map(ExactJsonValue::String),
             Some(b'[') => self.array(depth, path),
             Some(b'{') => self.object(depth, path),
             Some(b'-' | b'0'..=b'9') => self.number(path).map(ExactJsonValue::Number),
@@ -1852,7 +1860,7 @@ impl<'a> ExactJsonParser<'a> {
         }
     }
 
-    fn string(&mut self, path: &str) -> Result<String, ResultDecodeError> {
+    fn string(&mut self, path: &str, max_bytes: usize) -> Result<String, ResultDecodeError> {
         self.offset += 1;
         let mut value = String::new();
         loop {
@@ -1865,7 +1873,7 @@ impl<'a> ExactJsonParser<'a> {
             match byte {
                 b'"' => {
                     self.offset += 1;
-                    if value.len() > MAX_RESULT_STRING_BYTES {
+                    if value.len() > max_bytes {
                         return Err(ResultDecodeError::new(
                             ResultDecodeErrorKind::BoundExceeded,
                             path,
@@ -1912,7 +1920,7 @@ impl<'a> ExactJsonParser<'a> {
                     self.offset += character.len_utf8();
                 }
             }
-            if value.len() > MAX_RESULT_STRING_BYTES {
+            if value.len() > max_bytes {
                 return Err(ResultDecodeError::new(
                     ResultDecodeErrorKind::BoundExceeded,
                     path,
@@ -2085,7 +2093,7 @@ impl<'a> ExactJsonParser<'a> {
                     path,
                 ));
             }
-            let name = self.string(path)?;
+            let name = self.string(path, MAX_RESULT_KEY_BYTES)?;
             if members
                 .iter()
                 .any(|member: &ExactJsonMember| member.name == name)
@@ -2131,6 +2139,50 @@ impl<'a> ExactJsonParser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // LIMIT-01: one string value admits a 3 MiB decoded binary block as
+    // Base64 (4 MiB). One more byte is refused.
+    #[test]
+    fn exact_json_string_value_admits_its_bound_and_refuses_one_more_byte() {
+        let document = |bytes: usize| format!("{{\"text\":\"{}\"}}", "a".repeat(bytes));
+        parse_exact_json(&document(MAX_RESULT_STRING_BYTES))
+            .expect("a string value at its bound is admitted");
+        let error = parse_exact_json(&document(MAX_RESULT_STRING_BYTES + 1))
+            .expect_err("one byte past the string bound is refused");
+        assert_eq!(error.kind(), ResultDecodeErrorKind::BoundExceeded);
+    }
+
+    // Object keys keep the narrow bound; only string values grew.
+    #[test]
+    fn exact_json_object_key_keeps_its_narrow_bound() {
+        let document = |bytes: usize| format!("{{\"{}\":1}}", "k".repeat(bytes));
+        parse_exact_json(&document(MAX_RESULT_KEY_BYTES)).expect("a key at its bound is admitted");
+        let error = parse_exact_json(&document(MAX_RESULT_KEY_BYTES + 1))
+            .expect_err("one byte past the key bound is refused");
+        assert_eq!(error.kind(), ResultDecodeErrorKind::BoundExceeded);
+    }
+
+    // LIMIT-01: complete result content is 6 MiB. Two string values, each
+    // under the string bound, fill the document to exactly that size.
+    #[test]
+    fn exact_json_document_admits_its_bound_and_refuses_one_more_byte() {
+        let document = |bytes: usize| {
+            // `{"a":"` + `","b":"` + `"}` is 15 bytes of structure.
+            let payload = bytes - 15;
+            let first = payload / 2;
+            format!(
+                "{{\"a\":\"{}\",\"b\":\"{}\"}}",
+                "a".repeat(first),
+                "b".repeat(payload - first)
+            )
+        };
+        let at_bound = document(MAX_RESULT_ENCODED_BYTES);
+        assert_eq!(at_bound.len(), MAX_RESULT_ENCODED_BYTES);
+        parse_exact_json(&at_bound).expect("a document at its bound is admitted");
+        let error = parse_exact_json(&document(MAX_RESULT_ENCODED_BYTES + 1))
+            .expect_err("one byte past the document bound is refused");
+        assert_eq!(error.kind(), ResultDecodeErrorKind::BoundExceeded);
+    }
 
     #[test]
     fn cache_ttl_retains_the_unbounded_wire_value_until_runtime_conversion() {

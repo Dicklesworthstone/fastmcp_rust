@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 #[cfg(feature = "tasks")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use asupersync::Cx;
 #[cfg(feature = "tasks")]

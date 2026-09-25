@@ -64,7 +64,7 @@ fn isolated_persistence(name: &str, case: PersistenceCase) {
                 let peer = Peer::new().await;
                 match case {
                     PersistenceCase::Redelivery => Box::pin(redelivery(&peer, &cx)).await,
-                    PersistenceCase::Preflight => preflight(&peer, &cx).await,
+                    PersistenceCase::Preflight => Box::pin(preflight(&peer, &cx)).await,
                     _ => Box::pin(lifecycle(&peer, &cx, case)).await,
                 }
                 peer.no_extra_request();
@@ -78,7 +78,7 @@ fn isolated_persistence(name: &str, case: PersistenceCase) {
 }
 
 async fn lifecycle(peer: &Peer, cx: &Cx, case: PersistenceCase) {
-    let (session, _) = login(peer, cx).await;
+    let (session, _) = Box::pin(login(peer, cx)).await;
     let caps = serde_json::from_value(json!({"roots":{"listChanged":true}})).unwrap();
     let client = ManagedTasksClient::new(session.clone(), FinalRequestMeta::new(caps), ManagedTasksLimits::default()).unwrap();
     let current = bound(&peer.resource(), "subject");
@@ -251,7 +251,7 @@ async fn redelivery(peer: &Peer, cx: &Cx) {
     let memory = Rc::new(RefCell::new(Some(original.clone())));
     let calls = Cell::new(0);
     for round in 0..2 {
-        let (session, client) = login(peer, cx).await;
+        let (session, client) = Box::pin(login(peer, cx)).await;
         let server = Box::pin(async {
             let (mut stream, _) = peer.listen(json!(["one"]), false).await;
             get_controls(peer, controls("completed", 4)).await;
@@ -288,7 +288,7 @@ async fn redelivery(peer: &Peer, cx: &Cx) {
 }
 
 async fn preflight(peer: &Peer, cx: &Cx) {
-    let (session, client) = login(peer, cx).await;
+    let (session, client) = Box::pin(login(peer, cx)).await;
     let current = bound(&peer.resource(), "subject");
     let original = seed(cx, &current);
     let calls = Cell::new(0);
@@ -413,7 +413,7 @@ mod remote_cancellation {
 
     async fn exercise(cx: &Cx, case: Case) {
         let peer = Peer::new().await;
-        let (session, client) = login(&peer, cx).await;
+        let (session, client) = Box::pin(login(&peer, cx)).await;
         let current = bound(&peer.resource(), "subject");
         let original = seed(cx, &current);
         let memory = Rc::new(RefCell::new(Some(original.clone())));

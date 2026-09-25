@@ -39,7 +39,7 @@ fn second_issuer_location_recovers_http_failures_without_redirect_or_url_retry()
                 peer.serve(A, status, "").await;
                 peer.serve(B, 200, &peer.issuer_document().to_string()).await;
             };
-            let ((), result) = pair(server, plan.discover(&cx)).await;
+            let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
             assert_eq!(result.unwrap(), expected(&peer));
             assert_eq!(*peer.paths.lock().unwrap(), [PRM, A, B]);
             peer.assert_no_extra_connections();
@@ -62,7 +62,7 @@ fn last_issuer_location_wins_after_mismatched_identity_and_malformed_json() {
             peer.serve(B, 200, "{broken").await;
             peer.serve(C, 200, &peer.issuer_document().to_string()).await;
         };
-        let ((), result) = pair(server, plan.discover(&cx)).await;
+        let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
         assert_eq!(result.unwrap(), expected(&peer));
         assert_eq!(*peer.paths.lock().unwrap(), [PRM, A, B, C]);
         peer.assert_no_extra_connections();
@@ -94,7 +94,7 @@ fn native_candidate_election_checks_the_entire_unchanged_host_flow() {
                 peer.serve(A, 200, &body).await;
                 peer.serve(B, 200, &peer.issuer_document().to_string()).await;
             };
-            let ((), result) = pair(server, plan.discover(&cx)).await;
+            let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
             assert_eq!(result.unwrap(), expected(&peer));
             assert_eq!(*peer.paths.lock().unwrap(), [PRM, A, B]);
             peer.assert_no_extra_connections();
@@ -118,7 +118,7 @@ fn stalled_first_and_second_issuer_candidates_leave_a_live_third_attempt() {
             closed(socket).await;
             peer.serve(C, 200, &peer.issuer_document().to_string()).await;
         };
-        let ((), result) = pair(server, plan.discover(&cx)).await;
+        let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
         assert_eq!(result.unwrap(), expected(&peer));
         assert!(cx.checkpoint().is_ok());
         assert_eq!(*peer.paths.lock().unwrap(), [PRM, A, B, C]);
@@ -145,7 +145,7 @@ fn oversized_issuer_head_and_lost_connection_do_not_consume_the_next_budget() {
                 } else { drop(socket); }
                 peer.serve(B, 200, &valid).await;
             };
-            let ((), result) = pair(server, plan.discover(&cx)).await;
+            let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
             assert_eq!(result.unwrap(), expected(&peer));
             assert_eq!(*peer.paths.lock().unwrap(), [PRM, A, B]);
             peer.assert_no_extra_connections();
@@ -171,7 +171,7 @@ fn root_issuer_has_two_candidates_and_keeps_its_exact_trailing_slash_identity() 
                 peer.serve("/.well-known/oauth-authorization-server", 503, "").await;
                 peer.serve("/.well-known/openid-configuration", 200, &metadata.to_string()).await;
             };
-            let ((), result) = pair(server, plan.discover(&cx)).await;
+            let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
             let expected = OAuthClientConfiguration::from_trusted_endpoints(identifier,
                 url(&format!("{}/authorize", peer.origin())), url(&format!("{}/token", peer.origin())),
                 url(&peer.resource()), "registered-native-client", vec!["tools:read".to_owned()],
@@ -348,7 +348,7 @@ fn exhausted_candidate_time_preserves_each_deadline_cause_without_cancelling_cal
             peer.serve(PRM, 200, &peer.resource_document().to_string()).await;
             for path in [A, B, C] { let (socket, _) = peer.request("GET", path).await; closed(socket).await; }
         };
-        let ((), result) = pair(server, plan.discover(&cx)).await;
+        let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
         let OAuthDiscoveryError::IssuerMetadataExhausted(failure) = result.unwrap_err() else { panic!("aggregate expected") };
         assert_eq!(failure.classification(), Class::Transport);
         assert_eq!(failure.attempts().iter().map(|attempt| attempt.cause()).collect::<Vec<_>>(), [Cause::CandidateDeadline; 3]);

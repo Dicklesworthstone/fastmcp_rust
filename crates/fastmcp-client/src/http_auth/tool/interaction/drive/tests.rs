@@ -216,6 +216,10 @@ fn public_drive_futures_are_send_for_send_callbacks() {
     fn resolve(_: Box<InputRequiredResult>) -> std::future::Ready<Result<ManagedInputReply, ManagedInteractionError>> {
         ready(Ok(reply()))
     }
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "must match the drive notify callback signature"
+    )]
     fn notify(_: Box<ServerNotification>) -> Result<(), ManagedInteractionError> { Ok(()) }
     fn tool_drivers(complete: ManagedToolInteraction, partial: ManagedToolInteraction, cx: &Cx) {
         assert_send(&complete.drive(cx, resolve, notify));
