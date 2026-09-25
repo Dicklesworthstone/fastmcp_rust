@@ -557,9 +557,9 @@ impl Serialize for JsonInteger {
 
 /// serde_json's private raw-value newtype token (stable: serde_json is
 /// pinned exactly).
-const SERDE_JSON_RAW_VALUE_TOKEN: &str = "$serde_json::private::RawValue";
+pub(crate) const SERDE_JSON_RAW_VALUE_TOKEN: &str = "$serde_json::private::RawValue";
 /// serde_json's private arbitrary-precision number map key (stable: pinned).
-const SERDE_JSON_NUMBER_TOKEN: &str = "$serde_json::private::Number";
+pub(crate) const SERDE_JSON_NUMBER_TOKEN: &str = "$serde_json::private::Number";
 
 impl<'de> Deserialize<'de> for JsonInteger {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>

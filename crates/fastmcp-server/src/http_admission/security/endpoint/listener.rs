@@ -256,6 +256,14 @@ impl BoundSecuredHttpServer {
                 server.graceful_shutdown_returning();
                 return Err(McpError::internal_error("secured HTTP startup hook failed"));
             }
+            #[cfg(feature = "tasks")]
+            let hosted_task_service = match server.start_hosted_task_service(cx).await {
+                Ok(hosted) => hosted,
+                Err(error) => {
+                    server.graceful_shutdown_returning();
+                    return Err(error);
+                }
+            };
             let scope = cx.scope();
             let shutdown = HttpListenerShutdown::new(cx);
             let sessions = Arc::clone(&bound.modern_sessions);
@@ -276,13 +284,23 @@ impl BoundSecuredHttpServer {
             let mut reaper = match reaper {
                 Ok(reaper) => reaper,
                 Err(_) => {
+                    #[cfg(feature = "tasks")]
+                    let task_service_result = Server::settle_hosted_task_service(hosted_task_service, cx).await;
                     server.graceful_shutdown_returning();
+                    #[cfg(feature = "tasks")]
+                    task_service_result?;
                     return Err(McpError::internal_error("secured HTTP reaper admission failed"));
                 }
             };
             let result = loop {
                 children.reap_finished();
                 if cx.checkpoint().is_err() { break Ok(()); }
+                #[cfg(feature = "tasks")]
+                if let Some(hosted) = hosted_task_service.as_ref()
+                    && let Err(error) = hosted.check_running()
+                {
+                    break Err(error);
+                }
                 let accepted = match asupersync::time::timeout(
                     cx.now(), HTTP_ACCEPT_CANCEL_POLL, bound.listener.accept(),
                 ).await {
@@ -352,7 +370,12 @@ impl BoundSecuredHttpServer {
             let _ = children.drain_cooperative_shutdown().await;
             children.tasks.extend(take_unsettled_retired_modern_http_dispatches(&bound.modern_sessions));
             children.reap_finished();
+            #[cfg(feature = "tasks")]
+            let task_service_result = Server::settle_hosted_task_service(hosted_task_service, cx).await;
+            #[cfg(not(feature = "tasks"))]
+            let task_service_result: McpResult<()> = Ok(());
             server.graceful_shutdown_returning();
+            let result = result.and(task_service_result);
             if children.tasks.is_empty() {
                 if !children.terminal_failures.is_empty() {
                     return Err(McpError::internal_error("secured HTTP child settlement failed"));
