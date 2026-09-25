@@ -2796,7 +2796,7 @@ exec sleep 5
         // Cleanup may kill the peer as soon as its error is parsed. Keep the
         // outer closing brace unpublished until the response log is committed;
         // even EOF cannot turn the incomplete prefix into a valid response.
-        let script = r#"printf '%s\n' spawn >> "$1" || exit 90;
+        let script = r#"sleep 2; printf '%s\n' spawn >> "$1" || exit 90;
             IFS= read -r request || exit 91;
             case "$request" in *server/discover*) ;; *) exit 92 ;; esac;
             printf '%s' '{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"planned retry probe failure"}' || exit 93;
