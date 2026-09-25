@@ -1018,6 +1018,20 @@ mod tests {
             serde_json::json!({"name":"async_probe", "arguments":{"hold":hold}}),
         )
     }
+    /// A `tools/call` frame whose exact `params` source is `raw_bytes` long,
+    /// padded with insignificant whitespace so its typed value stays small.
+    fn padded_call(id: i64, hold: bool, raw_bytes: usize) -> Vec<u8> {
+        let JsonRpcMessage::Request(request) = call(id, hold) else {
+            unreachable!()
+        };
+        let params = serde_json::to_string(request.params.as_ref().unwrap()).unwrap();
+        format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\"params\":{{{}{}}}}}\n",
+            " ".repeat(raw_bytes - params.len()),
+            &params[1..params.len() - 1]
+        )
+        .into_bytes()
+    }
     fn cancel(id: i64) -> JsonRpcMessage {
         JsonRpcMessage::Request(JsonRpcRequest::notification(
             "notifications/cancelled",
@@ -1050,14 +1064,42 @@ mod tests {
             .unwrap();
         runtime.block_on(async { test(Cx::current().unwrap()).await });
     }
-    async fn until(cx: &Cx, predicate: impl Fn() -> bool) {
-        asupersync::time::timeout(cx.now(), Duration::from_secs(3), async {
+    /// Names the awaiting call site on expiry; every test shares this helper.
+    #[track_caller]
+    fn until<'a>(cx: &'a Cx, predicate: impl Fn() -> bool + 'a) -> impl Future<Output = ()> + 'a {
+        within_budget(cx, std::panic::Location::caller(), predicate, String::new)
+    }
+
+    /// Like [`until`], and on expiry also reports what the probe observed.
+    #[track_caller]
+    fn until_io<'a>(
+        cx: &'a Cx,
+        io: &'a IoProbe,
+        predicate: impl Fn() -> bool + 'a,
+    ) -> impl Future<Output = ()> + 'a {
+        within_budget(cx, std::panic::Location::caller(), predicate, move || {
+            io.observed()
+        })
+    }
+
+    async fn within_budget(
+        cx: &Cx,
+        site: &std::panic::Location<'_>,
+        predicate: impl Fn() -> bool,
+        observed: impl FnOnce() -> String,
+    ) {
+        if let Err(elapsed) = asupersync::time::timeout(cx.now(), Duration::from_secs(3), async {
             while !predicate() {
                 asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
             }
         })
         .await
-        .expect("public async stdio observation must arrive within its test budget");
+        {
+            panic!(
+                "public async stdio observation at {site} must arrive within its test budget: {elapsed:?}; {}",
+                observed()
+            );
+        }
     }
 
     #[derive(Default)]
@@ -1106,15 +1148,48 @@ mod tests {
                 waker.wake();
             }
         }
+        /// Decodes every complete output frame the way a client transport
+        /// does. The derived untagged `JsonRpcMessage` decoder cannot read a
+        /// request's raw `params`, so it would drop every parameterized
+        /// notification; an undecodable complete frame fails loudly instead.
         fn messages(&self) -> Vec<JsonRpcMessage> {
             self.0
                 .lock()
                 .unwrap()
                 .outbound
+                .split_inclusive(|byte| *byte == b'\n')
+                .filter_map(|line| line.strip_suffix(b"\n"))
+                .filter(|line| !line.is_empty())
+                .map(|line| {
+                    ReceivedTransportFrame::admit(line.to_vec())
+                        .map(ReceivedTransportFrame::into_message)
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "async stdio wrote an undecodable frame {:?}: {error}",
+                                String::from_utf8_lossy(line)
+                            )
+                        })
+                })
+                .collect()
+        }
+        /// What the server did with this probe so far.
+        fn observed(&self) -> String {
+            let state = self.0.lock().unwrap();
+            let frames: Vec<String> = state
+                .outbound
                 .split(|byte| *byte == b'\n')
                 .filter(|line| !line.is_empty())
-                .filter_map(|line| serde_json::from_slice(line).ok())
-                .collect()
+                .map(|line| String::from_utf8_lossy(&line[..line.len().min(240)]).into_owned())
+                .collect();
+            format!(
+                "{} inbound bytes unread (eof {}), {} reads, {} writes, reader dropped {}, writer dropped {}, outbound {frames:?}",
+                state.inbound.len(),
+                state.eof,
+                state.reads,
+                state.writes,
+                state.reader_dropped,
+                state.writer_dropped,
+            )
         }
         fn response(&self, id: i64) -> Option<JsonRpcResponse> {
             self.messages()
@@ -1142,10 +1217,10 @@ mod tests {
                 state.read_waker = Some(task.waker().clone());
                 return Poll::Pending;
             }
-            let count = output.remaining().min(state.inbound.len());
-            for _ in 0..count {
-                output.put_slice(&[state.inbound.pop_front().unwrap()]);
-            }
+            let (front, _) = state.inbound.as_slices();
+            let count = output.remaining().min(front.len());
+            output.put_slice(&front[..count]);
+            state.inbound.drain(..count);
             Poll::Ready(Ok(()))
         }
     }
@@ -1386,7 +1461,7 @@ mod tests {
                 SUBSCRIPTIONS_LISTEN,
                 serde_json::json!({"notifications":{"toolsListChanged":true}}),
             )));
-            until(&cx, || io.messages().iter().any(|message| matches!(message, JsonRpcMessage::Request(request) if request.method == fastmcp_protocol::methods::NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED))).await;
+            until_io(&cx, &io, || io.messages().iter().any(|message| matches!(message, JsonRpcMessage::Request(request) if request.method == fastmcp_protocol::methods::NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED))).await;
             io.feed(&encoded(&call(51, false)));
             until(&cx, || io.response(51).is_some()).await;
             io.feed(&encoded(&cancel(50)));
@@ -1418,19 +1493,17 @@ mod tests {
                         .await
                 })
                 .unwrap();
+            // Each exact source sits at the per-document bound, so two fit the
+            // shared admission bound and the third is refused only because
+            // its retained raw bytes are charged; its typed value is tiny.
             for id in [60, 61, 62] {
-                let JsonRpcMessage::Request(request) = call(id, true) else {
-                    unreachable!()
-                };
-                let params = serde_json::to_string(request.params.as_ref().unwrap()).unwrap();
-                let padded = format!(
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\"params\":{{{}{}}}}}\n",
-                    " ".repeat(6 * 1024 * 1024),
-                    &params[1..params.len() - 1]
-                );
-                io.feed(padded.as_bytes());
+                io.feed(&padded_call(
+                    id,
+                    true,
+                    fastmcp_protocol::MAX_RESULT_ENCODED_BYTES,
+                ));
             }
-            until(&cx, || io.response(62).is_some()).await;
+            until_io(&cx, &io, || io.response(62).is_some()).await;
             assert_eq!(
                 io.response(62).unwrap().error.unwrap().code.as_i32(),
                 Some(RESOURCE_EXHAUSTED_ERROR_CODE)
@@ -1448,6 +1521,77 @@ mod tests {
             io.eof();
             serving.join(&cx).await.unwrap().unwrap();
         });
+    }
+
+    #[test]
+    fn async_stdio_server_refuses_raw_parameters_beyond_the_document_bound() {
+        run(|cx| async move {
+            let gate = Arc::new(Gate::default());
+            let io = Arc::new(IoProbe::default());
+            io.allow(usize::MAX);
+            let service = server(&gate);
+            let stream = Arc::clone(&io);
+            let mut serving = cx
+                .spawn(move |server_cx| async move {
+                    service
+                        .serve_stdio_io(
+                            &server_cx,
+                            ProbeReader(Arc::clone(&stream)),
+                            ProbeWriter(stream),
+                        )
+                        .await
+                })
+                .unwrap();
+            // Differs from the admitted call below only by one byte of
+            // insignificant whitespace past the per-document bound.
+            io.feed(&padded_call(
+                70,
+                false,
+                fastmcp_protocol::MAX_RESULT_ENCODED_BYTES + 1,
+            ));
+            until_io(&cx, &io, || io.response(70).is_some()).await;
+            assert_eq!(
+                io.response(70).unwrap().error.unwrap().code.as_i32(),
+                Some(-32602)
+            );
+            assert_eq!(gate.entered.load(Ordering::Acquire), 0);
+            io.feed(&padded_call(
+                71,
+                false,
+                fastmcp_protocol::MAX_RESULT_ENCODED_BYTES,
+            ));
+            until_io(&cx, &io, || io.response(71).is_some()).await;
+            assert!(io.response(71).unwrap().error.is_none());
+            assert_eq!(gate.entered.load(Ordering::Acquire), 1);
+            io.eof();
+            serving.join(&cx).await.unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn async_stdio_probe_decodes_parameterized_frames_and_fails_on_undecodable_ones() {
+        // The acknowledgement exactly as the async stdio server writes it.
+        let acknowledgement = br#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":50},"notifications":{"toolsListChanged":true}}}"#;
+        let probe = |frame: &[u8]| {
+            let io = IoProbe::default();
+            let mut state = io.0.lock().unwrap();
+            state.outbound.extend_from_slice(frame);
+            state.outbound.push(b'\n');
+            drop(state);
+            io
+        };
+        assert!(matches!(
+            probe(&acknowledgement[..]).messages().as_slice(),
+            [JsonRpcMessage::Request(request)]
+                if request.method == fastmcp_protocol::methods::NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED
+        ));
+        // The same complete frame without its closing brace must fail the
+        // observation rather than read as an absent acknowledgement.
+        let truncated = probe(&acknowledgement[..acknowledgement.len() - 1]);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| truncated.messages()))
+                .is_err()
+        );
     }
 
     #[test]
