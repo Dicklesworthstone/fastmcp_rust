@@ -1,4 +1,4 @@
-//! Transfer one actual, unread header-repair retry into the normal MRTR owner.
+//! Transfer one actual, unread reviewed tool response into the normal MRTR owner.
 //! There is no response decoder, send, catalog lookup, or replacement budget here.
 
 use std::sync::Arc;
@@ -20,7 +20,7 @@ impl ManagedInteraction {
     pub(crate) fn from_repaired_call(
         cx: &Cx,
         session: ManagedOAuthSession,
-        mut call: ManagedCoreCall,
+        call: ManagedCoreCall,
         reviewed: Arc<ReviewedToolHeaders>,
         ids: Vec<RequestId>,
         continuations: usize,
@@ -29,6 +29,36 @@ impl ManagedInteraction {
         let limits = ManagedInteractionLimits::new(call.decoder.limits, continuations, responses)?;
         validate_initial(&call.decoder.request)?;
         admit_history(&ids, call.request_id())?;
+        Self::adopt_header_call(cx, session, call, reviewed, ids, limits)
+    }
+
+    /// Fresh success has only its initial ID and no rejection/catalog charge.
+    /// The caller has already dispatched through the reviewed repair boundary;
+    /// this handoff does not send, read, or manufacture a rejection history.
+    pub(in crate::http_auth::rpc) fn from_initial_header_call(
+        cx: &Cx,
+        session: ManagedOAuthSession,
+        call: ManagedCoreCall,
+        reviewed: Arc<ReviewedToolHeaders>,
+        continuations: usize,
+        responses: usize,
+    ) -> Result<Self, ManagedInteractionError> {
+        let limits = ManagedInteractionLimits::new(call.decoder.limits, continuations, responses)?;
+        validate_initial(&call.decoder.request)?;
+        if call.decoder.bytes != 0 { return Err(ManagedCoreError::InvalidResponse.into()); }
+        let ids = vec![call.request_id().clone()];
+        admit_fresh_id(&[], &ids[0])?;
+        Self::adopt_header_call(cx, session, call, reviewed, ids, limits)
+    }
+
+    fn adopt_header_call(
+        cx: &Cx,
+        session: ManagedOAuthSession,
+        mut call: ManagedCoreCall,
+        reviewed: Arc<ReviewedToolHeaders>,
+        ids: Vec<RequestId>,
+        limits: ManagedInteractionLimits,
+    ) -> Result<Self, ManagedInteractionError> {
         if call.finished || call.body.is_none() || call.decoder.notifications != 0
             || call.decoder.last_progress.is_some()
             || call.decoder.request.method() != "tools/call"
@@ -43,13 +73,19 @@ impl ManagedInteraction {
         if call.decoder.bytes >= limits.core.total_bytes {
             return Err(ManagedCoreError::ResponseByteLimit.into());
         }
-        Ok(Self {
+        let mut operation = Self {
             session, original: call.decoder.request.clone(), header_review: Some(reviewed),
             cancellation: call.cancellation.clone(), deadline: call.deadline, limits,
             used_ids: ids, continuations: 0, input_responses: 0,
             response_bytes: call.decoder.bytes, notifications: call.decoder.notifications,
-            generation: call.credential_generation(), step: Some(Step::Reading(Box::new(call))),
-        })
+            generation: call.credential_generation(), step: None,
+        };
+        // Verify plan, endpoint, name and original parameters through the same
+        // local preparation as later continuations, without credential or I/O.
+        let _ = operation.prepare_request(operation.original.clone(), call.request_id().clone())?;
+        operation.check(cx)?;
+        operation.step = Some(Step::Reading(Box::new(call)));
+        Ok(operation)
     }
 }
 

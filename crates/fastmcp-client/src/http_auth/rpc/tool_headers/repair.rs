@@ -16,6 +16,9 @@ use std::fmt;
 use std::io::{self, Write};
 use std::sync::Arc;
 
+/// Caller-driven continuations with repair policy fixed before the first POST.
+pub mod interaction;
+
 use asupersync::{Cx, types::Time};
 use fastmcp_core::{CanonicalHttpUrl, McpRequestCancellation};
 use fastmcp_protocol::http_headers::ParameterHeaderBinding;
