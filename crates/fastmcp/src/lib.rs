@@ -1810,9 +1810,9 @@ pub mod auto {
         /// ```
         pub async fn connect_stdio_with_cx(
             self,
+            cx: &Cx,
             command: &str,
             args: &[&str],
-            cx: &Cx,
         ) -> McpResult<Client> {
             self.inner.connect_stdio_with_cx(cx, command, args).await
         }
@@ -3129,9 +3129,9 @@ pub mod modern {
         /// ```
         pub async fn connect_stdio_with_cx(
             self,
+            cx: &Cx,
             command: &str,
             args: &[&str],
-            cx: &Cx,
         ) -> McpResult<Client> {
             self.inner
                 .connect_stdio_with_cx(cx, command, args)
@@ -3180,8 +3180,8 @@ pub mod modern {
         /// ```
         pub async fn connect_http_with_cx(
             self,
-            endpoint: CanonicalHttpUrl,
             cx: &Cx,
+            endpoint: CanonicalHttpUrl,
         ) -> Result<HttpClient, HttpClientConnectError> {
             let plan = modern_http_plan(endpoint).map_err(HttpClientConnectError::Plan)?;
             self.inner
@@ -5136,7 +5136,7 @@ pub mod modern {
             Box::pin(ClientBuilder::new()
                 .client_info(client_info.name, client_info.version)
                 .capabilities(client_capabilities)
-                .connect_http_with_cx(endpoint, cx))
+                .connect_http_with_cx(cx, endpoint))
                 .await
         }
 
@@ -7962,7 +7962,7 @@ pub mod legacy_2024 {
         ///
         /// let _client = legacy_2024::Client::stdio("server", &[]);
         /// ```
-        pub fn stdio_with_cx(command: &str, args: &[&str], cx: Cx) -> McpResult<Self> {
+        pub fn stdio_with_cx(cx: Cx, command: &str, args: &[&str]) -> McpResult<Self> {
             fastmcp_client::Client::stdio_with_protocol_plan_with_cx(
                 cx,
                 command,
@@ -8855,9 +8855,9 @@ pub mod legacy_2024 {
         /// ```
         pub async fn connect_stdio_with_cx(
             self,
+            cx: &Cx,
             command: &str,
             args: &[&str],
-            cx: &Cx,
         ) -> McpResult<Client> {
             self.inner
                 .connect_stdio_with_cx(cx, command, args)
@@ -10428,9 +10428,9 @@ pub mod legacy_2024 {
     /// let _client = legacy_2024::connect_http(sse, post);
     /// ```
     pub async fn connect_http_with_cx(
+        cx: &Cx,
         sse_endpoint: CanonicalHttpUrl,
         message_post_endpoint: CanonicalHttpUrl,
-        cx: &Cx,
     ) -> Result<HttpClient, HttpClientConnectError> {
         let builder = http_client_builder(sse_endpoint, message_post_endpoint)
             .map_err(HttpClientConnectError::Plan)?;
@@ -12991,7 +12991,7 @@ mod tests {
             legacy_builder.protocol_policy(),
             legacy_2024::ProtocolPolicy::LegacyOnly
         );
-        let _: fn(&str, &[&str], legacy_2024::Cx) -> McpResult<legacy_2024::Client> =
+        let _: fn(legacy_2024::Cx, &str, &[&str]) -> McpResult<legacy_2024::Client> =
             legacy_2024::Client::stdio_with_cx;
 
         let _: Option<auto::ClientHttpConnection> = None;
@@ -13011,7 +13011,7 @@ mod tests {
             legacy.protocol_policy(),
             legacy_2024::ProtocolPolicy::LegacyOnly
         );
-        let _: fn(&str, &[&str], super::Cx) -> super::McpResult<legacy_2024::Client> =
+        let _: fn(super::Cx, &str, &[&str]) -> super::McpResult<legacy_2024::Client> =
             legacy_2024::Client::stdio_with_cx;
 
         // Only the selected namespace differs: root and `auto` retain their
@@ -13062,7 +13062,7 @@ mod tests {
             let cx = Cx::current().expect("facade callback runtime installs its context");
             let mut client = legacy_2024::Client::builder()
                 .reverse_request_handlers(handlers)
-                .connect_stdio_with_cx("sh", &["-c", script], &cx)
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script])
                 .await
                 .expect("sealed legacy facade initializes before the callback request");
 
@@ -13163,7 +13163,7 @@ mod tests {
             builder: legacy_2024::ClientBuilder,
             cx: &Cx,
         ) -> McpResult<legacy_2024::Client> {
-            builder.connect_stdio_with_cx("server", &[], cx).await
+            builder.connect_stdio_with_cx(cx, "server", &[]).await
         }
 
         fn legacy_builder_connects_http_with_cx(builder: legacy_2024::ClientBuilder, cx: &Cx) {

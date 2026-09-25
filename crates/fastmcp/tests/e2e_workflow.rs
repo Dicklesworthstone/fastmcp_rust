@@ -2810,7 +2810,7 @@ fn workflow_final_tasks_public_facade_lifecycle_and_legacy_negative() {
         &cx,
         modern::client_builder()
             .client_info("final-tasks-watch-client", "1.0.0")
-            .connect_http_with_cx(modern_endpoint, &cx),
+            .connect_http_with_cx(&cx, modern_endpoint),
     )
     .expect("modern facade connects to the real final Tasks listener");
     let mut task_handle = final_tasks_runtime_block_on_bounded(

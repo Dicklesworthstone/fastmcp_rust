@@ -1378,7 +1378,7 @@ fn connect_auto_stdio_to_shipped_echo_server(server_policy: &str) -> Client {
     );
 
     let cx = Cx::for_request();
-    block_on(builder.connect_stdio_with_cx(command, &[], &cx))
+    block_on(builder.connect_stdio_with_cx(&cx, command, &[]))
         .expect("the public Auto facade client connects to the shipped stdio example")
 }
 
@@ -1397,7 +1397,7 @@ fn connect_modern_stdio_to_shipped_echo_server_with_env(
     for (key, value) in extra_env {
         builder = builder.env(*key, *value);
     }
-    block_on(builder.connect_stdio_with_cx(command, &[], &Cx::for_request()))
+    block_on(builder.connect_stdio_with_cx(&Cx::for_request(), command, &[]))
 }
 
 // LIVENESS bounds, not performance budgets. These are handed to the product's
@@ -1464,7 +1464,7 @@ fn connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
     for (key, value) in extra_env {
         builder = builder.env(*key, *value);
     }
-    block_on(builder.connect_stdio_with_cx(command, &[], &Cx::for_request()))
+    block_on(builder.connect_stdio_with_cx(&Cx::for_request(), command, &[]))
 }
 
 #[cfg(unix)]
@@ -1517,7 +1517,7 @@ fn connect_bounded_modern_stdio_with_mrtr(
             )
             .capabilities(capabilities)
             .modern_reverse_request_handlers(handlers)
-            .connect_stdio_with_cx(command, &[], &Cx::for_request()),
+            .connect_stdio_with_cx(&Cx::for_request(), command, &[]),
     )
 }
 
@@ -1602,7 +1602,7 @@ fn connect_legacy_stdio_to_shipped_echo_server_with_reverse_handlers_and_env(
         legacy_2024::ProtocolPolicy::LegacyOnly
     );
 
-    block_on(builder.connect_stdio_with_cx(command, &[], &Cx::for_request()))
+    block_on(builder.connect_stdio_with_cx(&Cx::for_request(), command, &[]))
 }
 
 #[cfg(unix)]
@@ -1901,7 +1901,7 @@ fn connect_bounded_modern_stdio_with_client_title(
     if let Some(title) = title {
         builder = builder.title(title);
     }
-    block_on(builder.connect_stdio_with_cx(command, &[], &Cx::for_request()))
+    block_on(builder.connect_stdio_with_cx(&Cx::for_request(), command, &[]))
 }
 
 #[cfg(unix)]
@@ -1972,7 +1972,7 @@ fn connect_legacy_stdio_with_client_name(
                 )
                 .expect("the public completion timeout policy is valid"),
             )
-            .connect_stdio_with_cx(command, &[], &Cx::for_request()),
+            .connect_stdio_with_cx(&Cx::for_request(), command, &[]),
     )
 }
 
@@ -3154,7 +3154,7 @@ fn e2e_public_stdio_read_resource_and_get_prompt_follow_installed_roots_handler(
                     },
                 ),
             )
-            .connect_stdio_with_cx(shipped_echo_server_executable(), &[], &Cx::for_request()),
+            .connect_stdio_with_cx(&Cx::for_request(), shipped_echo_server_executable(), &[]),
     )
     .expect("a ModernOnly facade client installs a roots handler before discovery");
 
@@ -4489,7 +4489,7 @@ fn e2e_public_stdio_legacy_handler_timeout_refuses_late_tool_and_admits_fast_pee
                 )
                 .expect("the public handler-timeout client policy is valid"),
             )
-            .connect_stdio_with_cx(shipped_echo_server_executable(), &[], &Cx::for_request()),
+            .connect_stdio_with_cx(&Cx::for_request(), shipped_echo_server_executable(), &[]),
     )
     .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
 
@@ -8134,7 +8134,7 @@ fn e2e_public_stdio_legacy_roots_list_changed_is_admitted_and_unadvertised_peer_
                     },
                 ),
             )
-            .connect_stdio_with_cx(command, &[], &Cx::for_request()),
+            .connect_stdio_with_cx(&Cx::for_request(), command, &[]),
     )
     .expect("an advertised roots.listChanged stdio client completes the exact legacy lifecycle");
 
