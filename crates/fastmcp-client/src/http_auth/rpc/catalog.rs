@@ -14,8 +14,11 @@
 //! Feed notifications received outside these catalog calls to
 //! `invalidate_notification`, and call `clear` after a subscription gap or a
 //! local policy change. Those operations also fence collections already running.
-//! Observed invalidation, changed cache scope, or credential renewal prevents a
-//! mixed collection. No server-side snapshot isolation or gap recovery is claimed.
+//! The default policy permits fresh cached pages beside newly fetched pages.
+//! `RefreshWholeCatalog` instead rebuilds from the first page after a cache miss
+//! or observed invalidation. Rebuilds share all operation budgets and never retry
+//! transport, protocol, authorization, or host errors. Neither policy supplies
+//! server-side snapshot isolation or gap recovery.
 //! Local bearer revocation is checked even on cache-only paths. It cannot recall
 //! results already returned, and does not wake an idle socket by itself; caller
 //! cancellation, session closure and the response deadlines own those wakes.
@@ -86,6 +89,24 @@ impl ManagedCatalogLimits {
     }
 }
 
+/// How a complete catalog may combine cached pages with network responses.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ManagedCatalogConsistency {
+    /// Reuse each fresh page independently. An observed invalidation aborts the
+    /// operation; a missing or stale page is fetched with its exact cursor.
+    #[default]
+    PerPage,
+    /// Reuse a wholly cached catalog, or fetch the whole catalog from its first
+    /// page. A cache miss after a cached prefix or a concurrent invalidation
+    /// discards that traversal and consumes one bounded rebuild. An initial
+    /// cache miss starts a fresh traversal without consuming a rebuild.
+    ///
+    /// The initial request must omit its cursor. Page, item, payload, state,
+    /// notification, request-ID and deadline budgets span discarded traversals.
+    /// This is a local freshness policy, not an atomic server snapshot.
+    RefreshWholeCatalog { maximum_rebuilds: usize },
+}
+
 /// Sanitized collection errors do not retain cursors, request IDs, metadata,
 /// result contents or host-provided diagnostics.
 #[derive(Debug)]
@@ -97,6 +118,8 @@ pub enum ManagedCatalogError {
     ItemLimit,
     StateLimit,
     RepeatedCursor,
+    CursorNotAllowed,
+    RebuildLimit,
     RepeatedRequestId,
     ScopeChanged,
     Invalidated,
@@ -119,6 +142,8 @@ impl fmt::Display for ManagedCatalogError {
                 Self::ItemLimit => "catalog item limit exceeded",
                 Self::StateLimit => "catalog traversal state limit exceeded",
                 Self::RepeatedCursor => "catalog peer repeated an opaque cursor",
+                Self::CursorNotAllowed => "whole-catalog refresh requires an absent initial cursor",
+                Self::RebuildLimit => "catalog refresh rebuild limit exceeded",
                 Self::RepeatedRequestId => "catalog request ID was already used in this collection",
                 Self::ScopeChanged => "catalog cache scope changed between pages",
                 Self::Invalidated => "catalog was invalidated during collection",
@@ -145,6 +170,7 @@ pub struct CollectedCatalog {
     pages: Vec<CoreResult>,
     item_count: usize,
     credential_generation: u64,
+    cache_generation: FinalCacheGeneration,
 }
 
 impl CollectedCatalog {
@@ -162,6 +188,7 @@ impl CollectedCatalog {
 pub struct ManagedCatalogClient {
     session: ManagedOAuthSession,
     limits: ManagedCatalogLimits,
+    consistency: ManagedCatalogConsistency,
     cache: Arc<Mutex<FinalResultCache>>,
 }
 
@@ -171,7 +198,17 @@ impl ManagedCatalogClient {
     pub fn new(session: ManagedOAuthSession, limits: ManagedCatalogLimits) -> Self {
         let mut cache = FinalResultCache::default();
         cache.set_enabled(false);
-        Self { session, limits, cache: Arc::new(Mutex::new(cache)) }
+        Self { session, limits, consistency: ManagedCatalogConsistency::default(), cache: Arc::new(Mutex::new(cache)) }
+    }
+
+    /// Selects the collection freshness policy without replacing the shared
+    /// cache. Clones keep the policy selected when they were cloned.
+    pub fn with_consistency(mut self, consistency: ManagedCatalogConsistency) -> Result<Self, ManagedCatalogError> {
+        if matches!(consistency, ManagedCatalogConsistency::RefreshWholeCatalog { maximum_rebuilds } if !(1..=16).contains(&maximum_rebuilds)) {
+            return Err(ManagedCatalogError::InvalidLimits);
+        }
+        self.consistency = consistency;
+        Ok(self)
     }
 
     /// Explicitly enables a fresh bounded cache for this returned client.
@@ -235,6 +272,13 @@ impl ManagedCatalogClient {
     {
         let deadline = call_deadline(cx, cancellation, self.limits.core.timeout)?;
         let kind = CatalogKind::of(&request)?;
+        let maximum_rebuilds = match self.consistency {
+            ManagedCatalogConsistency::PerPage => None,
+            ManagedCatalogConsistency::RefreshWholeCatalog { maximum_rebuilds } => {
+                if list_params(&request)?.cursor.is_some() { return Err(ManagedCatalogError::CursorNotAllowed); }
+                Some(maximum_rebuilds)
+            }
+        };
         // Reuse the actual RPC preparation boundary before any credential read.
         // The provisional ID does not escape into the transport or ID history.
         let _ = prepare(self.session.resource().as_str(), request.clone(), RequestId::Number(0), self.limits.core)?;
@@ -246,17 +290,26 @@ impl ManagedCatalogClient {
                 require_unrevoked(credential.credential())?;
                 let generation = credential.generation();
                 let result_set = kind.result_set();
-                let cache_generation = self.cache()?.begin_fetch(&result_set);
+                let mut rebuilds = 0;
+                let mut bypass_cache = false;
+                loop {
+                let mut cache_generation = self.cache()?.begin_fetch(&result_set);
                 let mut pages = Vec::new();
+                let initial_items = state.items;
+                let mut cache_writes = true;
+                let mut host_failed = false;
+                let attempt = async {
                 loop {
                     check_call(cx, cancellation, deadline)?;
                     require_unrevoked(credential.credential())?;
                     self.require_generation(&result_set, cache_generation)?;
-                    if pages.len() >= self.limits.maximum_pages { return Err(ManagedCatalogError::PageLimit); }
+                    if state.pages >= self.limits.maximum_pages { return Err(ManagedCatalogError::PageLimit); }
                     let key = cache_key(self.session.resource().as_str(), &request, generation)?;
-                    let lookup = self.cache()?.lookup(&key);
+                    let lookup = if bypass_cache { FinalCacheLookup::Miss(crate::cache::FinalCacheMiss::Disabled) }
+                        else { self.cache()?.lookup(&key) };
                     let (result, receipt, fetched) = match lookup {
                         FinalCacheLookup::Fresh(result) => {
+                            state.pages += 1;
                             // A replay has no JSON-RPC envelope or notifications;
                             // charge its complete retained result to the same
                             // aggregate payload budget used by the RPC decoder.
@@ -265,7 +318,20 @@ impl ManagedCatalogClient {
                             (result, Instant::now(), false)
                         }
                         FinalCacheLookup::Miss(_) => {
-                            let id = next_id()?;
+                            if maximum_rebuilds.is_some() && !bypass_cache {
+                                if !pages.is_empty() { return Err(ManagedCatalogError::Invalidated); }
+                                // Start with one fresh result-set generation and
+                                // bypass every remaining cached continuation.
+                                let mut cache = self.cache()?;
+                                if cache.begin_fetch(&result_set) != cache_generation {
+                                    return Err(ManagedCatalogError::Invalidated);
+                                }
+                                cache.invalidate_result_set(&result_set);
+                                cache_generation = cache.begin_fetch(&result_set);
+                                bypass_cache = true;
+                            }
+                            state.pages += 1;
+                            let id = next_id().inspect_err(|_| host_failed = true)?;
                             check_call(cx, cancellation, deadline)?;
                             // Host callbacks can revoke a shared credential or
                             // invalidate this catalog without yielding first.
@@ -292,7 +358,7 @@ impl ManagedCatalogClient {
                                 match event {
                                     ManagedCoreEvent::Notification(notification) => {
                                         self.invalidate_notification(&notification)?;
-                                        observe(notification)?;
+                                        observe(notification).inspect_err(|_| host_failed = true)?;
                                         check_call(cx, cancellation, deadline)?;
                                         require_unrevoked(credential.credential())?;
                                         self.require_generation(&result_set, cache_generation)?;
@@ -315,7 +381,21 @@ impl ManagedCatalogClient {
                             return Err(ManagedCatalogError::Invalidated);
                         }
                         require_unrevoked(credential.credential())?;
-                        if fetched && cache.is_enabled() {
+                        if state.cache_ambiguous && cache_writes {
+                            if maximum_rebuilds.is_some() && !bypass_cache {
+                                // A cached cycle cannot authorize mixing its
+                                // cached prefix with newly fetched successors.
+                                return Err(ManagedCatalogError::Invalidated);
+                            }
+                            // Repeated opaque cursors still require another
+                            // POST. Their pages share a cache key, so retaining
+                            // or replaying one would invent pagination progress.
+                            cache.invalidate_result_set(&result_set);
+                            cache_generation = cache.begin_fetch(&result_set);
+                            cache_writes = false;
+                            bypass_cache = true;
+                        }
+                        if fetched && cache.is_enabled() && cache_writes {
                             if cache.insert_if_current_at(key, cache_generation, result.clone(), receipt)
                                 == FinalCacheInsert::InvalidatedDuringFetch
                             { return Err(ManagedCatalogError::Invalidated); }
@@ -336,7 +416,24 @@ impl ManagedCatalogClient {
                 check_call(cx, cancellation, deadline)?;
                 require_unrevoked(credential.credential())?;
                 require_unrevoked(current.credential())?;
-                Ok(CollectedCatalog { kind, pages, item_count: state.items, credential_generation: generation })
+                Ok(CollectedCatalog { kind, pages, item_count: state.items - initial_items, credential_generation: generation, cache_generation })
+                }.await;
+                match attempt {
+                    Err(ManagedCatalogError::Invalidated) if maximum_rebuilds.is_some() && !host_failed => {
+                        check_call(cx, cancellation, deadline)?;
+                        require_unrevoked(credential.credential())?;
+                        if rebuilds >= maximum_rebuilds.unwrap_or(0) { return Err(ManagedCatalogError::RebuildLimit); }
+                        rebuilds += 1;
+                        self.cache()?.invalidate_result_set(&result_set);
+                        list_params_mut(&mut request)?.cursor = None;
+                        state.scope = None;
+                        state.cursors.clear();
+                        state.cache_ambiguous = false;
+                        bypass_cache = true;
+                    }
+                    result => return result,
+                }
+                }
             }.await)
         })).await?
     }
@@ -423,7 +520,9 @@ fn page_facts(kind: CatalogKind, result: &CoreResult) -> Result<PageFacts<'_>, M
 #[derive(Default)]
 struct Traversal {
     cursors: HashSet<String>,
+    cache_ambiguous: bool,
     ids: Vec<RequestId>,
+    pages: usize,
     state_bytes: usize,
     items: usize,
     bytes: usize,
@@ -461,9 +560,10 @@ impl Traversal {
         if self.scope.is_some_and(|scope| scope != page.scope) { return Err(ManagedCatalogError::ScopeChanged); }
         if page.count > limits.maximum_items.saturating_sub(self.items) { return Err(ManagedCatalogError::ItemLimit); }
         if let Some(cursor) = page.cursor {
-            if self.cursors.contains(cursor) { return Err(ManagedCatalogError::RepeatedCursor); }
             self.charge_state(cursor.len().saturating_add(1), limits.maximum_state_bytes)?;
-            self.cursors.insert(cursor.to_owned());
+            // Equality affects cache eligibility only, never cursor progression
+            // or collection termination. All cursor bytes remain opaque.
+            self.cache_ambiguous |= !self.cursors.insert(cursor.to_owned());
         }
         self.items += page.count;
         self.scope = Some(page.scope);
@@ -527,16 +627,30 @@ mod tests {
     }
 
     #[test]
-    fn empty_cursor_is_a_real_page_and_repetition_does_not_mutate_state() {
+    fn repeated_empty_cursors_continue_without_granting_cache_replay() {
         let limits = ManagedCatalogLimits::default();
         let mut state = Traversal::new(None, limits).unwrap();
         let page = || PageFacts { count: 1, cursor: Some(""), scope: CacheScope::Private };
         assert_eq!(state.admit_page(page(), limits).unwrap(), Some(String::new()));
-        let before = (state.items, state.state_bytes);
-        assert!(matches!(state.admit_page(page(), limits), Err(ManagedCatalogError::RepeatedCursor)));
-        assert_eq!((state.items, state.state_bytes), before);
+        assert!(!state.cache_ambiguous);
+        assert_eq!(state.admit_page(page(), limits).unwrap(), Some(String::new()));
+        assert_eq!((state.items, state.state_bytes), (2, 2));
+        assert!(state.cache_ambiguous);
         let mut suffix = Traversal::new(Some(""), limits).unwrap();
-        assert!(matches!(suffix.admit_page(page(), limits), Err(ManagedCatalogError::RepeatedCursor)));
+        assert_eq!(suffix.admit_page(page(), limits).unwrap(), Some(String::new()));
+        assert!(suffix.cache_ambiguous);
+        assert_eq!(suffix.admit_page(PageFacts { count: 0, cursor: None, scope: CacheScope::Private }, limits).unwrap(), None);
+    }
+
+    #[test]
+    fn repeated_cursor_bytes_still_consume_the_cumulative_state_bound() {
+        let mut limits = ManagedCatalogLimits::default();
+        limits.maximum_state_bytes = 2;
+        let mut state = Traversal::new(Some(""), limits).unwrap();
+        let page = || PageFacts { count: 0, cursor: Some(""), scope: CacheScope::Private };
+        assert_eq!(state.admit_page(page(), limits).unwrap(), Some(String::new()));
+        assert!(matches!(state.admit_page(page(), limits), Err(ManagedCatalogError::StateLimit)));
+        assert_eq!((state.items, state.state_bytes), (0, 2));
     }
 
     #[test]

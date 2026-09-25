@@ -3318,9 +3318,9 @@ fn e2e_public_sse_constructor_invokes_live_legacy_handlers() {
     let mut client = runtime_block_on_bounded(
         &cx,
         fastmcp_rust::Client::sse_with_cx(
+            &cx,
             public_http_target(server.address(), "/sse"),
             public_http_target(server.address(), "/messages"),
-            &cx,
         ),
     )
     .expect("Client::sse_with_cx connects exact-2024 SSE without probing modern HTTP");
@@ -3551,9 +3551,9 @@ fn e2e_public_sse_constructor_carries_a_tool_result_over_64_kib() {
     let mut client = runtime_block_on_bounded(
         &cx,
         fastmcp_rust::Client::sse_with_cx(
+            &cx,
             public_http_target(server.address(), "/sse"),
             public_http_target(server.address(), "/messages"),
-            &cx,
         ),
     )
     .expect("Client::sse_with_cx connects exact-2024 SSE");
@@ -3847,9 +3847,9 @@ fn e2e_public_sse_compose_nested_tool_and_resource() {
     let mut client = runtime_block_on_bounded(
         &cx,
         fastmcp_rust::Client::sse_with_cx(
+            &cx,
             public_http_target(server.address(), "/sse"),
             public_http_target(server.address(), "/messages"),
-            &cx,
         ),
     )
     .expect("Client::sse_with_cx connects exact-2024 SSE to the compose server");
@@ -3919,9 +3919,9 @@ fn e2e_public_sse_prompt_composes_nested_tool_and_resource() {
     let mut client = runtime_block_on_bounded(
         &cx,
         fastmcp_rust::Client::sse_with_cx(
+            &cx,
             public_http_target(server.address(), "/sse"),
             public_http_target(server.address(), "/messages"),
-            &cx,
         ),
     )
     .expect("Client::sse_with_cx connects exact-2024 SSE to the prompt compose server");
@@ -3996,9 +3996,9 @@ fn e2e_public_sse_resource_composes_nested_tool_and_resource() {
     let mut client = runtime_block_on_bounded(
         &cx,
         fastmcp_rust::Client::sse_with_cx(
+            &cx,
             public_http_target(server.address(), "/sse"),
             public_http_target(server.address(), "/messages"),
-            &cx,
         ),
     )
     .expect("Client::sse_with_cx connects exact-2024 SSE to the resource compose server");
@@ -4760,27 +4760,14 @@ fn spawn_modern_task_http_server() -> HttpServerFixture {
                     .expect("task HTTP server timing policy is valid"),
                 Arc::new(|_| {}),
             );
-            let task_runner = task_runtime
-                .install_task_service(1, Arc::new(PublicHttpHoldingTaskSupervisor))
-                .map_err(|error| format!("task HTTP server service install failed: {error}"))?;
             let server = modern::ServerBuilder::new("facade-http-task", "1.0.0")
                 .tool(PublicHttpTaskTool)
                 .tool(PublicHttpTouchTool)
                 .tool(PublicHttpHideTool)
-                .final_tasks(task_runtime)
+                .final_tasks(task_runtime.clone())
                 .map_err(|error| format!("task HTTP server final_tasks install failed: {error}"))?
+                .task_supervisor(Arc::new(PublicHttpHoldingTaskSupervisor))
                 .build();
-            let mut service = std::pin::pin!(task_runner.run(&cx));
-            std::future::poll_fn(|task_context| match service.as_mut().poll(task_context) {
-                std::task::Poll::Pending => std::task::Poll::Ready(Ok(())),
-                std::task::Poll::Ready(Ok(())) => {
-                    std::task::Poll::Ready(Err("task HTTP service stopped before bind".to_owned()))
-                }
-                std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
-                    "task HTTP service failed before bind: {error}"
-                ))),
-            })
-            .await?;
             let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
                 Ok(bound) => bound,
                 Err(error) => {
@@ -4801,35 +4788,13 @@ fn spawn_modern_task_http_server() -> HttpServerFixture {
                 cx.set_cancel_requested(true);
                 return Err("task HTTP server startup receiver went away".to_owned());
             }
-            let mut serving = std::pin::pin!(bound.serve(&cx));
-            let mut service_stopped = false;
-            std::future::poll_fn(|task_context| {
-                if !service_stopped {
-                    match service.as_mut().poll(task_context) {
-                        std::task::Poll::Ready(Ok(())) if cx.checkpoint().is_ok() => {
-                            return std::task::Poll::Ready(Err(
-                                "task HTTP service stopped while the server remained live"
-                                    .to_owned(),
-                            ));
-                        }
-                        std::task::Poll::Ready(Err(error)) if cx.checkpoint().is_ok() => {
-                            return std::task::Poll::Ready(Err(format!(
-                                "task HTTP service failed while the server remained live: {error}"
-                            )));
-                        }
-                        std::task::Poll::Ready(_) => service_stopped = true,
-                        std::task::Poll::Pending => {}
-                    }
-                }
-                match serving.as_mut().poll(task_context) {
-                    std::task::Poll::Ready(Ok(shutdown)) => std::task::Poll::Ready(Ok(shutdown)),
-                    std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
-                        "task facade HTTP server stopped unexpectedly: {error}"
-                    ))),
-                    std::task::Poll::Pending => std::task::Poll::Pending,
-                }
-            })
-            .await
+            let shutdown = bound.serve(&cx).await.map_err(|error| {
+                format!("task facade HTTP server stopped unexpectedly: {error}")
+            })?;
+            if task_runtime.is_task_service_ready() {
+                return Err("hosted Task service outlived the HTTP serve".to_owned());
+            }
+            Ok(shutdown)
         });
         if let Err(message) = &outcome {
             let _ = ready_for_spawn_failure.send(Err(message.clone()));

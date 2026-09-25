@@ -231,6 +231,7 @@ exec sleep 5
                 )
                 .max_retries(0)
                 .connect_stdio_with_cx(
+                    &connection_cx,
                     "sh",
                     &[
                         "-c",
@@ -242,7 +243,6 @@ exec sleep 5
                         if task_declared { "true" } else { "false" },
                         log_argument,
                     ],
-                    &connection_cx,
                 )
                 .await
                 .unwrap();

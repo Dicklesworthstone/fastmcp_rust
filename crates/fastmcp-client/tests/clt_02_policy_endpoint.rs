@@ -52,9 +52,9 @@ fn clt_02_a_positive() {
     let builder = default_builder.clone().protocol_plan(plan.clone());
     let state_before_connect = builder.selected_protocol_plan().clone();
     let error = match block_on(builder.clone().connect_stdio_with_cx(
+        &Cx::for_request(),
         ABSENT_STDIO_COMMAND,
         &[],
-        &Cx::for_request(),
     )) {
         Ok(_) => panic!("accepted modern policy must reach command admission"),
         Err(error) => error,
@@ -105,9 +105,9 @@ fn clt_02_a_planted_negative() {
     let refusal_builder = ClientBuilder::new().protocol_plan(refusal.clone());
     let refusal_state = refusal_builder.selected_protocol_plan().clone();
     let error = match block_on(refusal_builder.clone().connect_stdio_with_cx(
+        &Cx::for_request(),
         ABSENT_STDIO_COMMAND,
         &[],
-        &Cx::for_request(),
     )) {
         Ok(_) => {
             panic!("auto policy without the legacy adapter must be refused before spawn")

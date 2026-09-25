@@ -4360,6 +4360,44 @@ mod tests {
     }
 
     #[test]
+    fn executor_progress_token_owns_by_canonical_identity_not_spelling() {
+        fn progress_frame(token: &str) -> ReceivedTransportFrame {
+            let source = format!(
+                r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{{"progressToken":{token},"progress":1,"total":2,"message":"bounded progress"}}}}"#,
+            );
+            ReceivedTransportFrame::admit(source.into_bytes().into_boxed_slice())
+                .expect("the source frame admits an exact progress token")
+        }
+
+        let executor = RequestExecutor::with_source_frame_receiver(
+            ScriptedTransport::with_source_frames(std::iter::empty()),
+            ResultPeerEra::Modern,
+            None,
+        );
+        let cx = Cx::for_testing();
+        let mut execution = executor.execute(&cx, request(42)).expect("request commits");
+        let before = executor.pending_records();
+        // One digit away from 4.2e1, this spelling names 43: not the owner.
+        executor
+            .drive_frame(&cx, progress_frame("4.3e1"))
+            .expect("an unowned progress token is an ordinary notification");
+        assert!(execution.take_stream_notifications().unwrap().is_empty());
+        assert_eq!(executor.pending_records(), before);
+        assert_eq!(executor.take_notifications().len(), 1);
+        // Another spelling of 42 is the owner, and keeps its own lexeme.
+        executor
+            .drive_frame(&cx, progress_frame("420e-1"))
+            .expect("the canonical owner receives progress");
+        let stream = execution.take_stream_notifications().unwrap();
+        assert_eq!(stream.len(), 1);
+        let params = stream[0].params.as_ref().expect("progress has parameters");
+        assert_eq!(
+            params["progressToken"].as_number().unwrap().as_str(),
+            "420e-1"
+        );
+    }
+
+    #[test]
     fn executor_progress_invalid_optional_fields_leave_state_unchanged() {
         let cx = Cx::for_testing();
         let executor = RequestExecutor::with_protocol_era(

@@ -18,9 +18,9 @@
 //! use fastmcp_rust::{Client, Cx};
 //!
 //! let mut client = Client::stdio_with_cx(
+//!     Cx::for_request(),
 //!     "uvx",
 //!     &["my-mcp-server"],
-//!     Cx::for_request(),
 //! )?;
 //!
 //! // List tools
@@ -4858,6 +4858,38 @@ pub struct WebSocketResponse {
     pub raw_result: Option<String>,
 }
 
+/// A cancelled write may have committed no bytes or only a frame prefix.
+/// Until commitment is proven, abandoning that send makes the connection
+/// unusable. Explicit close still drains its owned transport because it uses
+/// the separate `close_settled` election.
+#[cfg(feature = "websocket-experimental")]
+struct WebSocketCancellationSendGuard<'a, IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    closed: &'a mut bool,
+    callbacks: &'a WebSocketReverseCallbackPool<IO>,
+    committed: bool,
+}
+
+#[cfg(feature = "websocket-experimental")]
+impl<IO> Drop for WebSocketCancellationSendGuard<'_, IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    fn drop(&mut self) {
+        if !self.committed {
+            *self.closed = true;
+            self.callbacks
+                .state
+                .fail_connection(McpError::internal_error(
+                    "WebSocket cancellation control did not commit",
+                ));
+            self.callbacks.cancel_all();
+        }
+    }
+}
+
 /// Connection-owned exact-2024 callback workers for one split WebSocket.
 ///
 /// The client retains the only receive half. Callback workers share only the
@@ -5263,6 +5295,12 @@ struct LiveWebSocketTaskSubscription {
     terminal_response: Option<(JsonRpcResponse, Option<String>)>,
 }
 
+#[cfg(feature = "websocket-experimental")]
+struct RetiredWebSocketRequest {
+    key: CorrelationKey,
+    subscription: bool,
+}
+
 /// Caller-`Cx` asynchronous MCP client over a native WebSocket transport.
 ///
 /// The client owns one source-preserving receive half and one independently
@@ -5286,7 +5324,7 @@ where
     final_progress_notifications: VecDeque<FinalProgressNotificationParams>,
     /// Exact-2024 server notifications retained from the WebSocket receive loop.
     legacy_server_notifications: VecDeque<JsonRpcRequest>,
-    retired_response_keys: VecDeque<CorrelationKey>,
+    retired_requests: VecDeque<RetiredWebSocketRequest>,
     live_catalog_subscription: Option<LiveWebSocketCatalogSubscription>,
     #[cfg(feature = "tasks")]
     live_task_subscription: Option<LiveWebSocketTaskSubscription>,
@@ -5523,7 +5561,7 @@ where
             final_server_notifications: VecDeque::new(),
             final_progress_notifications: VecDeque::new(),
             legacy_server_notifications: VecDeque::new(),
-            retired_response_keys: VecDeque::new(),
+            retired_requests: VecDeque::new(),
             live_catalog_subscription: None,
             #[cfg(feature = "tasks")]
             live_task_subscription: None,
@@ -5734,7 +5772,9 @@ where
 
         loop {
             if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
-                return Err(self.retire_committed_request_after_cancellation(id).await);
+                return Err(self
+                    .retire_committed_request_after_cancellation(id, false)
+                    .await);
             }
             if let Err(error) = self.drain_completed_reverse_callbacks() {
                 return Err(self.terminal_callback_error(cx, error).await);
@@ -5756,7 +5796,9 @@ where
                         || cancellation
                             .is_some_and(McpRequestCancellation::is_cancel_requested) =>
                 {
-                    return Err(self.retire_committed_request_after_cancellation(id).await);
+                    return Err(self
+                        .retire_committed_request_after_cancellation(id, false)
+                        .await);
                 }
                 Err(error) => return Err(self.terminal_transport_error(cx, error).await),
             };
@@ -5850,15 +5892,101 @@ where
     fn discard_retired_websocket_response(&mut self, response: &JsonRpcResponse) -> bool {
         let Some(retired_position) = response.id.as_ref().and_then(|response_id| {
             response_id.correlation_key().ok().and_then(|response_key| {
-                self.retired_response_keys
+                self.retired_requests
                     .iter()
-                    .position(|retired_key| retired_key == &response_key)
+                    .position(|retired| retired.key == response_key)
             })
         }) else {
             return false;
         };
-        self.retired_response_keys.remove(retired_position);
+        self.retired_requests.remove(retired_position);
         true
+    }
+
+    /// Events already sent before cancellation can arrive before the peer's
+    /// late final response. They remain owned by that cancelled subscription,
+    /// never by a new listener or the connection notification queue.
+    fn discard_retired_websocket_subscription_notification(
+        &self,
+        request: &JsonRpcRequest,
+    ) -> McpResult<bool> {
+        if request.id.is_some()
+            || !matches!(
+                request.method.as_str(),
+                "notifications/subscriptions/acknowledged"
+                    | "notifications/resources/updated"
+                    | "notifications/resources/list_changed"
+                    | "notifications/tools/list_changed"
+                    | "notifications/prompts/list_changed"
+                    | "notifications/cancelled"
+                    | "notifications/tasks"
+            )
+        {
+            return Ok(false);
+        }
+        let Some(key) = request
+            .params
+            .as_ref()
+            .and_then(|params| params.get("_meta"))
+            .and_then(|meta| meta.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+            .and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok())
+            .and_then(|id| id.correlation_key().ok())
+        else {
+            return Ok(false);
+        };
+        if !self
+            .retired_requests
+            .iter()
+            .any(|retired| retired.subscription && retired.key == key)
+        {
+            return Ok(false);
+        }
+        #[cfg(feature = "tasks")]
+        if request.method == TASK_STATUS_NOTIFICATION {
+            serde_json::to_value(request)
+                .and_then(serde_json::from_value::<FinalTaskStatusNotification>)
+                .map_err(|_| {
+                    McpError::invalid_request(
+                        "WebSocket retired subscription received an invalid Tasks event",
+                    )
+                })?;
+            return Ok(true);
+        }
+        ServerNotification::decode(request).map_err(|_| {
+            McpError::invalid_request(
+                "WebSocket retired subscription received an invalid notification",
+            )
+        })?;
+        if request.method == "notifications/cancelled" {
+            CancellationWireMessage::decode(
+                ProtocolEra::Modern2026,
+                CancellationSender::Server,
+                request,
+            )
+            .map_err(|_| McpError::invalid_request("WebSocket server cancellation is invalid"))?;
+        }
+        Ok(true)
+    }
+
+    fn websocket_notification_belongs_to_subscription(
+        notification: &ServerNotification,
+        request_id: &RequestId,
+    ) -> bool {
+        let metadata = match notification {
+            ServerNotification::SubscriptionsAcknowledged(params) => params.meta.as_ref(),
+            ServerNotification::ResourceUpdated(params) => params.meta.as_ref(),
+            ServerNotification::Cancelled(params) => params.meta.as_ref(),
+            ServerNotification::ResourcesListChanged(params)
+            | ServerNotification::ToolsListChanged(params)
+            | ServerNotification::PromptsListChanged(params) => {
+                params.as_ref().and_then(|params| params.meta.as_ref())
+            }
+            ServerNotification::Message(_) | ServerNotification::Progress(_) => None,
+        };
+        metadata
+            .and_then(|meta| meta.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+            .and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok())
+            .is_some_and(|id| id.correlates_with(request_id))
     }
 
     fn retain_modern_websocket_notification(
@@ -5935,6 +6063,9 @@ where
             ));
         };
         if self.selected_protocol_era() == ProtocolEra::Modern2026 {
+            if self.discard_retired_websocket_subscription_notification(request)? {
+                return Ok(());
+            }
             #[cfg(feature = "tasks")]
             if self.retain_live_task_status_notification(frame)? {
                 return Ok(());
@@ -5978,6 +6109,7 @@ where
     async fn retire_committed_request_after_cancellation(
         &mut self,
         request_id: RequestId,
+        subscription: bool,
     ) -> McpError
     where
         IO: Send + 'static,
@@ -5990,7 +6122,7 @@ where
                 ));
             }
         };
-        if self.retired_response_keys.len() >= MAX_QUEUED_WEBSOCKET_CANCELLED_RESPONSE_KEYS {
+        if self.retired_requests.len() >= MAX_QUEUED_WEBSOCKET_CANCELLED_RESPONSE_KEYS {
             let connection_cx = self.connection_cx.clone();
             return self
                 .close_after_protocol_error(
@@ -6028,14 +6160,32 @@ where
         };
         // Install before sending control so a peer racing a terminal response
         // cannot make the next receive owner mis-correlate it.
-        self.retired_response_keys.push_back(request_key);
+        self.retired_requests.push_back(RetiredWebSocketRequest {
+            key: request_key,
+            subscription,
+        });
         let connection_cx = self.connection_cx.clone();
+        if self.reverse_callback_pool.terminal_error().is_some() {
+            return self
+                .terminal_transport_error(&connection_cx, TransportError::Closed)
+                .await;
+        }
+        let sender = Arc::clone(&self.sender);
+        let mut commitment = WebSocketCancellationSendGuard {
+            closed: &mut self.closed,
+            callbacks: &self.reverse_callback_pool,
+            committed: false,
+        };
         // Cancellation notification delivery is the short commit-critical
         // boundary after tombstone installation. Mask only its individual
         // polls so a caller that reused the connection Cx for its operation
         // cannot suppress the required control frame.
         let cancellation_send = {
-            let mut send = Box::pin(self.send_message(&connection_cx, &control));
+            let mut send = Box::pin(send_websocket_callback_message(
+                &sender,
+                &connection_cx,
+                &control,
+            ));
             let masked_send = std::future::poll_fn(|task_cx| {
                 connection_cx.masked(|| send.as_mut().poll(task_cx))
             });
@@ -6047,6 +6197,8 @@ where
             )
             .await
         };
+        commitment.committed = matches!(cancellation_send, Ok(Ok(())));
+        drop(commitment);
         match cancellation_send {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return self.terminal_transport_error(&connection_cx, error).await,
@@ -7616,6 +7768,11 @@ where
     /// request (for example `tools/list`) is in flight are harvested from the
     /// connection-level queue, so the same client can observe `list_changed`
     /// without collecting this stream to terminal.
+    ///
+    /// Dropping a pending receive preserves the listener and the sole receive
+    /// half, including any incomplete peer frame. Explicit cancellation wakes
+    /// an idle receive and retires only this listener with a bounded control
+    /// write; other listeners and ordinary requests retain the connection.
     pub async fn next_subscription_event(
         &mut self,
         cx: &Cx,
@@ -7624,26 +7781,34 @@ where
     where
         IO: Send + 'static,
     {
-        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-            self.cancel_live_catalog_subscription(cx).await?;
-            return Err(McpError::request_cancelled());
+        if self.closed {
+            return Err(McpError::internal_error("WebSocket client is closed"));
         }
         loop {
+            if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+                self.cancel_live_catalog_subscription().await?;
+                return Err(McpError::request_cancelled());
+            }
             if let Err(error) = self.harvest_live_catalog_subscription_notifications() {
                 return Err(self.close_after_protocol_error(cx, &error.message).await);
             }
             if let Some(event) = self.take_ready_catalog_subscription_event()? {
                 return Ok(event);
             }
-            if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-                self.cancel_live_catalog_subscription(cx).await?;
-                return Err(McpError::request_cancelled());
-            }
             if let Err(error) = self.drain_completed_reverse_callbacks() {
                 return Err(self.terminal_callback_error(cx, error).await);
             }
-            let frame = match self.recv_with_callback_terminal(cx, None).await {
+            let frame = match self
+                .recv_with_callback_terminal(cx, Some(cancellation))
+                .await
+            {
                 Ok(frame) => frame,
+                Err(TransportError::Cancelled)
+                    if cancellation.is_cancel_requested() || cx.checkpoint().is_err() =>
+                {
+                    self.cancel_live_catalog_subscription().await?;
+                    return Err(McpError::request_cancelled());
+                }
                 Err(_) if self.reverse_callback_pool.terminal_error().is_some() => {
                     return Err(self
                         .terminal_callback_error(
@@ -7921,50 +8086,31 @@ where
         }
     }
 
-    async fn cancel_live_catalog_subscription(&mut self, cx: &Cx) -> McpResult<()>
+    async fn cancel_live_catalog_subscription(&mut self) -> McpResult<()>
     where
         IO: Send + 'static,
     {
         let request_id = self
             .live_catalog_subscription
-            .as_ref()
+            .take()
             .ok_or_else(|| {
                 McpError::invalid_request("No live final catalog WebSocket subscription is active")
             })?
-            .request_id
-            .clone();
-        let request_key = request_id.correlation_key().map_err(|_| {
-            McpError::invalid_request("WebSocket catalog listener request ID is not correlatable")
-        })?;
-        if self.retired_response_keys.len() >= MAX_QUEUED_WEBSOCKET_CANCELLED_RESPONSE_KEYS {
-            self.live_catalog_subscription = None;
-            return Err(self
-                .close_after_protocol_error(
-                    cx,
-                    "WebSocket cancelled-response tombstone capacity exceeded",
-                )
-                .await);
+            .request_id;
+        self.final_server_notifications.retain(|notification| {
+            !Self::websocket_notification_belongs_to_subscription(notification, &request_id)
+        });
+        // Retire the local route before the first await. The shared request
+        // cancellation path installs its tombstone before writing, bounds the
+        // control send, and uses the retained connection context.
+        let outcome = self
+            .retire_committed_request_after_cancellation(request_id, true)
+            .await;
+        if outcome.code == McpErrorCode::RequestCancelled {
+            Ok(())
+        } else {
+            Err(outcome)
         }
-        let control = CancellationWireMessage::Modern2026 {
-            sender: CancellationSender::Client,
-            params: FinalCancelledNotificationParams {
-                request_id,
-                reason: None,
-                meta: None,
-                additional: BTreeMap::default(),
-            },
-        }
-        .encode()
-        .map(JsonRpcMessage::Request)
-        .map_err(|error| {
-            McpError::invalid_params(format!("invalid WebSocket cancellation: {error}"))
-        })?;
-        self.retired_response_keys.push_back(request_key);
-        if let Err(error) = self.send_message(cx, &control).await {
-            return Err(self.terminal_transport_error(cx, error).await);
-        }
-        self.live_catalog_subscription = None;
-        Ok(())
     }
 
     /// Starts a real, incrementally driven official Tasks subscription on this
@@ -8045,6 +8191,10 @@ where
     /// `tasks/cancel`) is in flight are harvested from the connection-level
     /// queue, so the same client can observe `Cancelled` without collecting
     /// this stream to terminal.
+    ///
+    /// A dropped wait preserves the receive half and partial peer frame.
+    /// Explicit cancellation interrupts a silent peer and retires only this
+    /// Tasks listener; an active catalog listener remains usable.
     #[cfg(feature = "tasks")]
     pub async fn next_final_task_subscription_event(
         &mut self,
@@ -8054,26 +8204,34 @@ where
     where
         IO: Send + 'static,
     {
-        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-            self.cancel_live_task_subscription(cx).await?;
-            return Err(McpError::request_cancelled());
+        if self.closed {
+            return Err(McpError::internal_error("WebSocket client is closed"));
         }
         loop {
+            if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+                self.cancel_live_task_subscription().await?;
+                return Err(McpError::request_cancelled());
+            }
             if let Err(error) = self.harvest_live_task_subscription_notifications() {
                 return Err(self.close_after_protocol_error(cx, &error.message).await);
             }
             if let Some(event) = self.take_ready_task_subscription_event()? {
                 return Ok(event);
             }
-            if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-                self.cancel_live_task_subscription(cx).await?;
-                return Err(McpError::request_cancelled());
-            }
             if let Err(error) = self.drain_completed_reverse_callbacks() {
                 return Err(self.terminal_callback_error(cx, error).await);
             }
-            let frame = match self.recv_with_callback_terminal(cx, None).await {
+            let frame = match self
+                .recv_with_callback_terminal(cx, Some(cancellation))
+                .await
+            {
                 Ok(frame) => frame,
+                Err(TransportError::Cancelled)
+                    if cancellation.is_cancel_requested() || cx.checkpoint().is_err() =>
+                {
+                    self.cancel_live_task_subscription().await?;
+                    return Err(McpError::request_cancelled());
+                }
                 Err(_) if self.reverse_callback_pool.terminal_error().is_some() => {
                     return Err(self
                         .terminal_callback_error(
@@ -8346,50 +8504,28 @@ where
     }
 
     #[cfg(feature = "tasks")]
-    async fn cancel_live_task_subscription(&mut self, cx: &Cx) -> McpResult<()>
+    async fn cancel_live_task_subscription(&mut self) -> McpResult<()>
     where
         IO: Send + 'static,
     {
         let request_id = self
             .live_task_subscription
-            .as_ref()
+            .take()
             .ok_or_else(|| {
                 McpError::invalid_request("No live final Tasks WebSocket subscription is active")
             })?
-            .request_id
-            .clone();
-        let request_key = request_id.correlation_key().map_err(|_| {
-            McpError::invalid_request("WebSocket Tasks listener request ID is not correlatable")
-        })?;
-        if self.retired_response_keys.len() >= MAX_QUEUED_WEBSOCKET_CANCELLED_RESPONSE_KEYS {
-            self.live_task_subscription = None;
-            return Err(self
-                .close_after_protocol_error(
-                    cx,
-                    "WebSocket cancelled-response tombstone capacity exceeded",
-                )
-                .await);
+            .request_id;
+        self.final_server_notifications.retain(|notification| {
+            !Self::websocket_notification_belongs_to_subscription(notification, &request_id)
+        });
+        let outcome = self
+            .retire_committed_request_after_cancellation(request_id, true)
+            .await;
+        if outcome.code == McpErrorCode::RequestCancelled {
+            Ok(())
+        } else {
+            Err(outcome)
         }
-        let control = CancellationWireMessage::Modern2026 {
-            sender: CancellationSender::Client,
-            params: FinalCancelledNotificationParams {
-                request_id,
-                reason: None,
-                meta: None,
-                additional: BTreeMap::default(),
-            },
-        }
-        .encode()
-        .map(JsonRpcMessage::Request)
-        .map_err(|error| {
-            McpError::invalid_params(format!("invalid WebSocket cancellation: {error}"))
-        })?;
-        self.retired_response_keys.push_back(request_key);
-        if let Err(error) = self.send_message(cx, &control).await {
-            return Err(self.terminal_transport_error(cx, error).await);
-        }
-        self.live_task_subscription = None;
-        Ok(())
     }
 
     /// Calls a Tasks-capable modern tool without projecting its result algebra.
@@ -9150,8 +9286,15 @@ where
     where
         IO: Send + 'static,
     {
-        let mut receiver = self.receiver.take().ok_or(TransportError::Closed)?;
-        let outcome = loop {
+        // Borrow in place: the native reader retains its framing buffers, and
+        // dropping this future must not drop the connection's only receiver.
+        // The operation context controls the wait, while the retained
+        // connection context owns I/O. Otherwise native cancellation would
+        // close both halves before the selected listener can be retired.
+        let connection_cx = self.connection_cx.clone();
+        let receiver = self.receiver.as_mut().ok_or(TransportError::Closed)?;
+        let mut cancelled = cancellation.map(|signal| Box::pin(signal.cancelled()));
+        loop {
             if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
                 || cx.checkpoint().is_err()
             {
@@ -9164,19 +9307,28 @@ where
                     TransportError::Closed
                 });
             }
+            let mut receive = std::pin::pin!(receiver.recv_with_source(&connection_cx));
+            let interruptible = std::future::poll_fn(|task_cx| {
+                if cx.checkpoint().is_err()
+                    || cancelled
+                        .as_mut()
+                        .is_some_and(|signal| signal.as_mut().poll(task_cx).is_ready())
+                {
+                    return std::task::Poll::Ready(Err(TransportError::Cancelled));
+                }
+                receive.as_mut().poll(task_cx)
+            });
             match asupersync::time::timeout(
                 cx.now(),
                 Duration::from_nanos(WEBSOCKET_CANCELLED_RECV_POLL_NANOS),
-                receiver.recv_with_source(cx),
+                interruptible,
             )
             .await
             {
                 Ok(result) => break result,
                 Err(_) => continue,
             }
-        };
-        self.receiver = Some(receiver);
-        outcome
+        }
     }
 
     async fn send_message(&self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
@@ -14466,7 +14618,7 @@ impl Client {
     ///
     /// let _client = Client::stdio("server", &[]);
     /// ```
-    pub fn stdio_with_cx(command: &str, args: &[&str], cx: Cx) -> McpResult<Self> {
+    pub fn stdio_with_cx(cx: Cx, command: &str, args: &[&str]) -> McpResult<Self> {
         // The public convenience constructor follows the same modern-first,
         // bounded Auto selection as ClientBuilder. A correlated discovery
         // MethodNotFound or Unix-observable clean first-probe timeout closes
@@ -14474,10 +14626,10 @@ impl Client {
         // malformed discoveries and every other failure are never replayed as
         // legacy traffic.
         Self::stdio_with_protocol_plan_with_cx(
+            cx,
             command,
             args,
             ClientProtocolPlan::stdio(DEFAULT_STDIO_PROTOCOL_POLICY),
-            cx,
         )
     }
 
@@ -14498,10 +14650,10 @@ impl Client {
     /// let _client = Client::stdio_with_protocol_plan("server", &[], plan);
     /// ```
     pub fn stdio_with_protocol_plan_with_cx(
+        cx: Cx,
         command: &str,
         args: &[&str],
         protocol_plan: ClientProtocolPlan,
-        cx: Cx,
     ) -> McpResult<Self> {
         validate_protocol_plan_feature(&protocol_plan)?;
         match protocol_plan.policy() {
@@ -14693,8 +14845,8 @@ impl Client {
     /// let _client = Client::http(plan);
     /// ```
     pub async fn http_with_cx(
-        protocol_plan: ClientProtocolPlan,
         cx: &Cx,
+        protocol_plan: ClientProtocolPlan,
     ) -> Result<HttpClient, HttpClientError> {
         ClientBuilder::new()
             .protocol_plan(protocol_plan)
@@ -14720,13 +14872,13 @@ impl Client {
     /// ```
     #[cfg(feature = "legacy-2024-11-05")]
     pub async fn sse_with_cx(
+        cx: &Cx,
         sse_endpoint: CanonicalHttpUrl,
         message_post_endpoint: CanonicalHttpUrl,
-        cx: &Cx,
     ) -> Result<HttpClient, HttpClientError> {
         Self::http_with_cx(
-            Self::legacy_sse_plan(sse_endpoint, message_post_endpoint)?,
             cx,
+            Self::legacy_sse_plan(sse_endpoint, message_post_endpoint)?,
         )
         .await
     }
@@ -24122,6 +24274,700 @@ mod tests {
 
     #[cfg(feature = "websocket-experimental")]
     #[test]
+    fn websocket_async_catalog_listener_cancel_interrupts_silent_receive_and_keeps_client() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            for (acknowledged, cancel_context) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let (client_io, mut peer_io) = async_websocket_pair();
+                write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+                let mut client = WebSocketClient::connect_with_cx(
+                    &cx,
+                    ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                    async_websocket_client_info(),
+                    ClientCapabilities::default(),
+                    AsyncWsClientTransport::from_upgraded(client_io),
+                )
+                .await
+                .expect("client discovers before opening the listener");
+                client
+                    .open_subscriptions_listener(
+                        &cx,
+                        SubscriptionFilter {
+                            tools_list_changed: Some(true),
+                            ..SubscriptionFilter::default()
+                        },
+                    )
+                    .await
+                    .expect("listener request commits");
+                let cancellation = McpRequestCancellation::new();
+                let request_region = cx
+                    .open_child_region(asupersync::cx::child_region::ChildRegionSpec::inherit())
+                    .await
+                    .expect("listener waiter derives an independent caller region");
+                let request_cx = request_region.cx();
+                if acknowledged {
+                    write_server_text_frame(
+                        &mut peer_io,
+                        r#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2},"notifications":{"toolsListChanged":true}}}"#,
+                    )
+                    .await;
+                    assert!(matches!(
+                        client.next_subscription_event(&cx, &cancellation).await,
+                        Ok(StdioSubscriptionEvent::Acknowledged(_))
+                    ));
+                }
+                {
+                    let mut waiting =
+                        Box::pin(client.next_subscription_event(request_cx, &cancellation));
+                    assert!(
+                        std::future::poll_fn(|task_cx| Poll::Ready(waiting.as_mut().poll(task_cx)))
+                            .await
+                            .is_pending(),
+                        "the peer is silent after listen commitment"
+                    );
+                    if cancel_context {
+                        request_region
+                            .cancel(asupersync::types::CancelReason::user(
+                                "cancel only the listener waiter",
+                            ))
+                            .unwrap();
+                    } else {
+                        assert!(cancellation.cancel());
+                    }
+                    let error = asupersync::time::timeout(
+                        cx.now(),
+                        Duration::from_millis(500),
+                        waiting.as_mut(),
+                    )
+                    .await
+                    .expect("request-local cancellation wakes the parked reader")
+                    .expect_err("a cancelled listener cannot deliver an event");
+                    assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                }
+                assert!(!client.closed);
+                assert!(cx.checkpoint().is_ok(), "connection context remains live");
+                assert!(client.receiver.is_some());
+                assert!(client.live_catalog_subscription.is_none());
+                request_region.close().await.unwrap();
+
+                let mut server = AsyncWsServerTransport::from_upgraded(peer_io);
+                for expected_method in [SERVER_DISCOVER_METHOD, "subscriptions/listen"] {
+                    let JsonRpcMessage::Request(request) = server.recv(&cx).await.unwrap() else {
+                        panic!("client emitted a request");
+                    };
+                    assert_eq!(request.method, expected_method);
+                }
+                let JsonRpcMessage::Request(control) = server.recv(&cx).await.unwrap() else {
+                    panic!("listener cancellation is a notification");
+                };
+                let CancellationWireMessage::Modern2026 { params, .. } =
+                    CancellationWireMessage::decode(
+                        ProtocolEra::Modern2026,
+                        CancellationSender::Client,
+                        &control,
+                    )
+                    .expect("exact modern cancellation shape")
+                else {
+                    panic!("modern listener uses modern cancellation");
+                };
+                assert!(params.request_id.correlates_with(&RequestId::Number(2)));
+                assert!(params.meta.is_none());
+                // The peer may race one late final response. It must remain
+                // owned by the retired listener, before the new request result.
+                server
+                    .send(
+                        &cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            RequestId::Number(2),
+                            serde_json::json!({
+                                "resultType": "complete",
+                                "_meta": {"io.modelcontextprotocol/subscriptionId": 2}
+                            }),
+                        )),
+                    )
+                    .await
+                    .unwrap();
+                server
+                    .send(
+                        &cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            RequestId::Number(3),
+                            async_modern_tools_list_result(),
+                        )),
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    client.list_tools(&cx, None).await,
+                    Ok(CoreResult::Final(FinalCoreResult::ToolsList { .. }))
+                ));
+                let JsonRpcMessage::Request(next) = server.recv(&cx).await.unwrap() else {
+                    panic!("ordinary request follows exactly one cancellation");
+                };
+                assert_eq!(next.method, "tools/list");
+                client.close(&cx).await.unwrap();
+                assert!(matches!(
+                    server.recv(&cx).await,
+                    Err(TransportError::Closed)
+                ));
+            }
+        });
+    }
+
+    #[cfg(all(feature = "websocket-experimental", feature = "tasks"))]
+    #[test]
+    fn websocket_async_task_listener_cancel_interrupts_silent_receive_and_keeps_catalog() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = async_websocket_pair();
+            let mut discovery = async_modern_discovery_result();
+            discovery["capabilities"] = serde_json::json!({
+                "extensions": {"io.modelcontextprotocol/tasks": {}}
+            });
+            write_server_text_frame(
+                &mut peer_io,
+                &serde_json::to_string(&JsonRpcResponse::success(RequestId::Number(1), discovery))
+                    .unwrap(),
+            )
+            .await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .unwrap();
+            client
+                .open_subscriptions_listener(
+                    &cx,
+                    SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        ..SubscriptionFilter::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let tasks = serde_json::from_value(serde_json::json!({"taskIds": ["job-a"]})).unwrap();
+            client
+                .open_final_task_subscription_listener(&cx, tasks)
+                .await
+                .unwrap();
+            let cancellation = McpRequestCancellation::new();
+            {
+                let mut waiting =
+                    Box::pin(client.next_final_task_subscription_event(&cx, &cancellation));
+                assert!(
+                    std::future::poll_fn(|task_cx| Poll::Ready(waiting.as_mut().poll(task_cx)))
+                        .await
+                        .is_pending()
+                );
+                cancellation.cancel();
+                let error = asupersync::time::timeout(
+                    cx.now(),
+                    Duration::from_millis(500),
+                    waiting.as_mut(),
+                )
+                .await
+                .expect("Tasks cancellation wakes a silent receive")
+                .expect_err("selected Tasks listener is cancelled");
+                assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            }
+            assert!(!client.closed);
+            assert!(client.live_task_subscription.is_none());
+            assert!(client.live_catalog_subscription.is_some());
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3},"notifications":{"taskIds":["job-a"]}}}"#,
+            )
+            .await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/tasks","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3},"taskId":"job-a","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null}}"#,
+            )
+            .await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2},"notifications":{"toolsListChanged":true}}}"#,
+            )
+            .await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
+            )
+            .await;
+            let live = McpRequestCancellation::new();
+            assert!(matches!(
+                client.next_subscription_event(&cx, &live).await,
+                Ok(StdioSubscriptionEvent::Acknowledged(_))
+            ));
+            assert!(matches!(
+                client.next_subscription_event(&cx, &live).await,
+                Ok(StdioSubscriptionEvent::Notification(
+                    ServerNotification::ToolsListChanged(_)
+                ))
+            ));
+            let mut server = AsyncWsServerTransport::from_upgraded(peer_io);
+            for _ in 0..3 {
+                assert!(matches!(
+                    server.recv(&cx).await,
+                    Ok(JsonRpcMessage::Request(_))
+                ));
+            }
+            let JsonRpcMessage::Request(control) = server.recv(&cx).await.unwrap() else {
+                panic!("Tasks cancellation is a notification");
+            };
+            let CancellationWireMessage::Modern2026 { params, .. } =
+                CancellationWireMessage::decode(
+                    ProtocolEra::Modern2026,
+                    CancellationSender::Client,
+                    &control,
+                )
+                .unwrap()
+            else {
+                panic!("modern cancellation shape");
+            };
+            assert!(params.request_id.correlates_with(&RequestId::Number(3)));
+            client.close(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_catalog_listener_dropped_receive_resumes_partial_frame() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let acknowledgement = br#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2},"notifications":{"toolsListChanged":true}}}"#;
+            let mut frame = vec![0x81, 126];
+            frame.extend_from_slice(&u16::try_from(acknowledgement.len()).unwrap().to_be_bytes());
+            frame.extend_from_slice(acknowledgement);
+            for split in [1, 3, 17, frame.len() - 1] {
+                let (client_io, mut peer_io) = async_websocket_pair();
+                write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+                let mut client = WebSocketClient::connect_with_cx(
+                    &cx,
+                    ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                    async_websocket_client_info(),
+                    ClientCapabilities::default(),
+                    AsyncWsClientTransport::from_upgraded(client_io),
+                )
+                .await
+                .unwrap();
+                client
+                    .open_subscriptions_listener(
+                        &cx,
+                        SubscriptionFilter {
+                            tools_list_changed: Some(true),
+                            ..SubscriptionFilter::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                peer_io.write_all(&frame[..split]).await.unwrap();
+                let cancellation = McpRequestCancellation::new();
+                {
+                    let mut waiting = Box::pin(client.next_subscription_event(&cx, &cancellation));
+                    assert!(
+                        std::future::poll_fn(|task_cx| Poll::Ready(waiting.as_mut().poll(task_cx)))
+                            .await
+                            .is_pending(),
+                        "partial frame at byte {split} must park"
+                    );
+                }
+                assert!(client.receiver.is_some(), "drop retains the sole receiver");
+                assert!(client.live_catalog_subscription.is_some());
+                assert!(!cancellation.is_cancel_requested());
+                peer_io.write_all(&frame[split..]).await.unwrap();
+                assert!(matches!(
+                    client.next_subscription_event(&cx, &cancellation).await,
+                    Ok(StdioSubscriptionEvent::Acknowledged(ref accepted))
+                        if accepted.tools_list_changed == Some(true)
+                ));
+                write_server_text_frame(
+                    &mut peer_io,
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
+                )
+                .await;
+                assert!(matches!(
+                    client.next_subscription_event(&cx, &cancellation).await,
+                    Ok(StdioSubscriptionEvent::Terminal)
+                ));
+                client.close(&cx).await.unwrap();
+            }
+        });
+    }
+
+    #[cfg(all(feature = "websocket-experimental", feature = "tasks"))]
+    #[test]
+    fn websocket_async_task_listener_dropped_receive_resumes_partial_frame() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = async_websocket_pair();
+            let mut discovery = async_modern_discovery_result();
+            discovery["capabilities"] = serde_json::json!({
+                "extensions": {"io.modelcontextprotocol/tasks": {}}
+            });
+            write_server_text_frame(
+                &mut peer_io,
+                &serde_json::to_string(&JsonRpcResponse::success(RequestId::Number(1), discovery))
+                    .unwrap(),
+            )
+            .await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .unwrap();
+            let filter = serde_json::from_value(serde_json::json!({"taskIds": ["job-a"]})).unwrap();
+            client
+                .open_final_task_subscription_listener(&cx, filter)
+                .await
+                .unwrap();
+            let acknowledgement = br#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2},"notifications":{"taskIds":["job-a"]}}}"#;
+            let mut frame = vec![0x81, 126];
+            frame.extend_from_slice(&u16::try_from(acknowledgement.len()).unwrap().to_be_bytes());
+            frame.extend_from_slice(acknowledgement);
+            peer_io.write_all(&frame[..17]).await.unwrap();
+            let cancellation = McpRequestCancellation::new();
+            {
+                let mut waiting =
+                    Box::pin(client.next_final_task_subscription_event(&cx, &cancellation));
+                assert!(
+                    std::future::poll_fn(|task_cx| Poll::Ready(waiting.as_mut().poll(task_cx)))
+                        .await
+                        .is_pending()
+                );
+            }
+            assert!(client.receiver.is_some());
+            assert!(client.live_task_subscription.is_some());
+            peer_io.write_all(&frame[17..]).await.unwrap();
+            assert!(matches!(
+                client
+                    .next_final_task_subscription_event(&cx, &cancellation)
+                    .await,
+                Ok(StdioTaskSubscriptionEvent::Acknowledged(_))
+            ));
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
+            )
+            .await;
+            assert!(matches!(
+                client
+                    .next_final_task_subscription_event(&cx, &cancellation)
+                    .await,
+                Ok(StdioTaskSubscriptionEvent::Terminal)
+            ));
+            client.close(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_subscription_cancellation_bounds_stalled_control_send() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = stalled_cancellation_async_websocket_pair();
+            write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .unwrap();
+            client
+                .open_subscriptions_listener(
+                    &cx,
+                    SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        ..SubscriptionFilter::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let cancellation = McpRequestCancellation::new();
+            {
+                let mut waiting = Box::pin(client.next_subscription_event(&cx, &cancellation));
+                assert!(
+                    std::future::poll_fn(|task_cx| Poll::Ready(waiting.as_mut().poll(task_cx)))
+                        .await
+                        .is_pending()
+                );
+                cancellation.cancel();
+                let error = asupersync::time::timeout(
+                    cx.now(),
+                    Duration::from_millis(500),
+                    waiting.as_mut(),
+                )
+                .await
+                .expect("a stalled cancellation write cannot strand the listener")
+                .expect_err("an uncommitted cancellation fails closed");
+                assert_eq!(error.code, McpErrorCode::InternalError);
+                assert_eq!(error.message, "Request timed out");
+            }
+            assert!(client.closed);
+            assert!(client.live_catalog_subscription.is_none());
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_dropped_subscription_cancellation_refuses_reuse_and_still_closes() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = stalled_cancellation_async_websocket_pair();
+            write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .unwrap();
+            client
+                .open_subscriptions_listener(
+                    &cx,
+                    SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        ..SubscriptionFilter::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let cancellation = McpRequestCancellation::new();
+            {
+                let mut waiting = Box::pin(client.next_subscription_event(&cx, &cancellation));
+                assert!(
+                    std::future::poll_fn(|task_cx| Poll::Ready(waiting.as_mut().poll(task_cx)))
+                        .await
+                        .is_pending()
+                );
+                cancellation.cancel();
+                assert!(
+                    std::future::poll_fn(|task_cx| Poll::Ready(waiting.as_mut().poll(task_cx)))
+                        .await
+                        .is_pending(),
+                    "the control write is parked before its first writable byte"
+                );
+                // Abandon exactly while the selected cancellation is awaiting
+                // transport commitment, rather than while waiting for a peer.
+            }
+            assert!(client.closed, "uncertain control commitment forbids reuse");
+            assert!(!client.close_settled, "transport cleanup remains owed");
+            assert!(client.live_catalog_subscription.is_none());
+            assert!(client.reverse_callback_pool.terminal_error().is_some());
+            let next_id = client.next_id;
+            let error = client.list_tools(&cx, None).await.unwrap_err();
+            assert_eq!(error.message, "WebSocket client is closed");
+            assert_eq!(
+                client.next_id, next_id,
+                "terminal refusal makes no new request"
+            );
+            client
+                .close(&cx)
+                .await
+                .expect("explicit close still settles both halves");
+            assert!(client.close_settled);
+            let mut server = AsyncWsServerTransport::from_upgraded(peer_io);
+            for expected_method in [SERVER_DISCOVER_METHOD, "subscriptions/listen"] {
+                let JsonRpcMessage::Request(request) = server.recv(&cx).await.unwrap() else {
+                    panic!("the two committed requests precede close");
+                };
+                assert_eq!(request.method, expected_method);
+            }
+            assert!(matches!(
+                server.recv(&cx).await,
+                Err(TransportError::Closed)
+            ));
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_cancelled_catalog_events_cannot_transfer_to_a_reopened_listener() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = async_websocket_pair();
+            write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .unwrap();
+            let filter = SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            };
+            client
+                .open_subscriptions_listener(&cx, filter.clone())
+                .await
+                .unwrap();
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2},"notifications":{"toolsListChanged":true}}}"#,
+            )
+            .await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
+            )
+            .await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
+            )
+            .await;
+            client.list_tools(&cx, None).await.unwrap();
+            assert_eq!(client.final_server_notifications.len(), 2);
+            let cancelled = McpRequestCancellation::new();
+            cancelled.cancel();
+            assert_eq!(
+                client
+                    .next_subscription_event(&cx, &cancelled)
+                    .await
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::RequestCancelled
+            );
+            assert!(client.final_server_notifications.is_empty());
+            client
+                .open_subscriptions_listener(&cx, filter)
+                .await
+                .unwrap();
+            for subscription_id in [2, 4] {
+                write_server_text_frame(
+                    &mut peer_io,
+                    &format!(
+                        r#"{{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":{subscription_id}}},"notifications":{{"toolsListChanged":true}}}}}}"#
+                    ),
+                )
+                .await;
+                if subscription_id == 2 {
+                    write_server_text_frame(
+                        &mut peer_io,
+                        r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
+                    )
+                    .await;
+                }
+            }
+            let live = McpRequestCancellation::new();
+            assert!(matches!(
+                client.next_subscription_event(&cx, &live).await,
+                Ok(StdioSubscriptionEvent::Acknowledged(_))
+            ));
+            {
+                let mut waiting = Box::pin(client.next_subscription_event(&cx, &live));
+                assert!(
+                    std::future::poll_fn(|task_cx| Poll::Ready(waiting.as_mut().poll(task_cx)))
+                        .await
+                        .is_pending(),
+                    "neither queued nor late events from listener 2 belong to listener 4"
+                );
+            }
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":4}}}"#,
+            )
+            .await;
+            assert!(matches!(
+                client.next_subscription_event(&cx, &live).await,
+                Ok(StdioSubscriptionEvent::Notification(
+                    ServerNotification::ToolsListChanged(_)
+                ))
+            ));
+            client.close(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(all(feature = "websocket-experimental", feature = "tasks"))]
+    #[test]
+    fn websocket_async_retired_subscription_rejects_invalid_or_unowned_task_events() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            for (subscription_id, status) in [(2, "invalid-status"), (99, "working")] {
+                let (client_io, mut peer_io) = async_websocket_pair();
+                let mut discovery = async_modern_discovery_result();
+                discovery["capabilities"] = serde_json::json!({
+                    "extensions": {"io.modelcontextprotocol/tasks": {}}
+                });
+                write_server_text_frame(
+                    &mut peer_io,
+                    &serde_json::to_string(&JsonRpcResponse::success(
+                        RequestId::Number(1),
+                        discovery,
+                    ))
+                    .unwrap(),
+                )
+                .await;
+                let mut client = WebSocketClient::connect_with_cx(
+                    &cx,
+                    ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                    async_websocket_client_info(),
+                    ClientCapabilities::default(),
+                    AsyncWsClientTransport::from_upgraded(client_io),
+                )
+                .await
+                .unwrap();
+                let filter =
+                    serde_json::from_value(serde_json::json!({"taskIds": ["job-a"]})).unwrap();
+                client
+                    .open_final_task_subscription_listener(&cx, filter)
+                    .await
+                    .unwrap();
+                let cancellation = McpRequestCancellation::new();
+                cancellation.cancel();
+                assert_eq!(
+                    client
+                        .next_final_task_subscription_event(&cx, &cancellation)
+                        .await
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::RequestCancelled
+                );
+                write_server_text_frame(
+                    &mut peer_io,
+                    &serde_json::json!({
+                        "jsonrpc": "2.0", "method": "notifications/tasks",
+                        "params": {
+                            "_meta": {"io.modelcontextprotocol/subscriptionId": subscription_id},
+                            "taskId": "job-a", "status": status,
+                            "createdAt": "2026-07-28T12:00:00.000Z",
+                            "lastUpdatedAt": "2026-07-28T12:00:00.000Z", "ttlMs": null
+                        }
+                    })
+                    .to_string(),
+                )
+                .await;
+                assert_eq!(
+                    client.list_tools(&cx, None).await.unwrap_err().code,
+                    McpErrorCode::InvalidRequest
+                );
+                assert!(
+                    client.closed,
+                    "a tombstone cannot authorize invalid or unowned traffic"
+                );
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
     fn websocket_incremental_catalog_listener_keeps_issuing_tools_list() {
         run_test(|| async {
             let cx = Cx::current().expect("test runtime installs caller context");
@@ -26994,10 +27840,10 @@ mod tests {
 
         for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
             let error = match Client::stdio_with_protocol_plan_with_cx(
+                Cx::for_testing(),
                 "fastmcp-client-feature-off-must-not-spawn",
                 &[],
                 ClientProtocolPlan::stdio(policy),
-                Cx::for_testing(),
             ) {
                 Ok(_) => panic!("feature-off legacy policies must fail before command resolution"),
                 Err(error) => error,
@@ -31847,10 +32693,10 @@ IFS= read -r remaining
              exec sleep 2"
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the cancellation client");
 
@@ -31905,10 +32751,10 @@ IFS= read -r remaining
              exec sleep 2"
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the peer-cancellation client");
 
@@ -32825,7 +33671,7 @@ exec sleep 6
                     .reverse_request_handlers(handlers)
                     .request_timeout_policy(RequestTimeoutPolicy::new(Duration::from_secs(4), Duration::from_secs(4)).unwrap())
                     .max_retries(0)
-                    .connect_stdio_with_cx("sh", &["-c", script, "bounded-send-peer", if drains { "1" } else { "0" }, if callback { "1" } else { "0" }], &cx)
+                    .connect_stdio_with_cx(&cx, "sh", &["-c", script, "bounded-send-peer", if drains { "1" } else { "0" }, if callback { "1" } else { "0" }])
                     .await.unwrap();
                 let params = if callback { serde_json::json!({}) } else { serde_json::json!({"payload": "x".repeat(2 * 1024 * 1024)}) };
                 let started = Instant::now();
@@ -32996,7 +33842,7 @@ exec sleep 2
                 let mut client = Box::pin(ClientBuilder::new()
                     .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
                     .max_retries(0)
-                    .connect_stdio_with_cx("sh", &["-c", script], &cx))
+                    .connect_stdio_with_cx(&cx, "sh", &["-c", script]))
                     .await.unwrap();
                 // The short deadline belongs to the split-frame request;
                 // process startup is setup and must complete before it begins.
@@ -33141,7 +33987,7 @@ exit 0
                     .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
                     .reverse_request_handlers(handlers)
                     .max_retries(0)
-                    .connect_stdio_with_cx("sh", &["-c", script], &cx)
+                    .connect_stdio_with_cx(&cx, "sh", &["-c", script])
                     .await
                     .unwrap();
                 let result = client.request_core_with_cx(
@@ -33256,7 +34102,7 @@ exec sleep 30
                         .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
                         .owned_process_group(owned_group)
                         .max_retries(0)
-                        .connect_stdio_with_cx("sh", &["-c", script], &cx))
+                        .connect_stdio_with_cx(&cx, "sh", &["-c", script]))
                         .await.unwrap();
                     client.ping_with_cx(&cx, &McpRequestCancellation::new()).await.unwrap();
                     let peer_id = client.child.as_ref().unwrap().id();
@@ -34071,7 +34917,7 @@ exec sleep 30
     fn cancelled_context_rejects_direct_client_before_spawn() {
         let cx = Cx::for_testing();
         cx.set_cancel_requested(true);
-        let error = match Client::stdio_with_cx("definitely-not-a-command", &[], cx) {
+        let error = match Client::stdio_with_cx(cx, "definitely-not-a-command", &[]) {
             Ok(_) => panic!("cancelled context must be rejected before spawn"),
             Err(error) => error,
         };
@@ -36098,7 +36944,7 @@ exec sleep 30
             message_post_endpoint: CanonicalHttpUrl,
             cx: &Cx,
         ) -> Result<HttpClient, HttpClientError> {
-            Client::sse_with_cx(sse_endpoint, message_post_endpoint, cx).await
+            Client::sse_with_cx(cx, sse_endpoint, message_post_endpoint).await
         }
 
         let _ = connect;
@@ -36109,7 +36955,7 @@ exec sleep 30
     #[allow(clippy::err_expect)] // Client deliberately has no Debug surface
     fn client_stdio_fails_for_nonexistent_command() {
         let result =
-            Client::stdio_with_cx("definitely-not-a-real-command-xyz", &[], Cx::for_testing());
+            Client::stdio_with_cx(Cx::for_testing(), "definitely-not-a-real-command-xyz", &[]);
         assert!(result.is_err());
         let err = result.err().expect("should be error");
         assert_eq!(err.code, fastmcp_core::McpErrorCode::InternalError);
@@ -36120,9 +36966,9 @@ exec sleep 30
     #[test]
     fn feature_off_stdio_auto_refuses_before_command_resolution_or_spawn() {
         let error = match Client::stdio_with_cx(
+            Cx::for_testing(),
             "fastmcp-client-feature-off-must-not-spawn",
             &[],
-            Cx::for_testing(),
         ) {
             Ok(_) => panic!("the feature-off direct constructor must not find the absent command"),
             Err(error) => error,
@@ -36143,7 +36989,7 @@ exec sleep 30
         let script = modern_typed_call_client_script(
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"public auto modern"}],"isError":false}}"#,
         );
-        let mut client = Client::stdio_with_cx("sh", &["-c", script.as_str()], Cx::for_testing())
+        let mut client = Client::stdio_with_cx(Cx::for_testing(), "sh", &["-c", script.as_str()])
             .expect("the public stdio constructor completes its modern Auto probe");
 
         assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
@@ -36166,7 +37012,7 @@ exec sleep 30
     #[test]
     fn clt_02_public_stdio_auto_reopens_one_fresh_exact_legacy_child() {
         let script = auto_discovery_refusal_client_script(-32_601);
-        let mut client = Client::stdio_with_cx("sh", &["-c", script.as_str()], Cx::for_testing())
+        let mut client = Client::stdio_with_cx(Cx::for_testing(), "sh", &["-c", script.as_str()])
             .expect("only a discovery MethodNotFound authorizes the fresh legacy child");
 
         assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
@@ -36190,7 +37036,7 @@ exec sleep 30
         // Only the discovery refusal code differs from the paired fallback
         // positive. No second process may be used as a legacy replay path.
         let script = auto_discovery_refusal_client_script(-32_602);
-        let error = match Client::stdio_with_cx("sh", &["-c", script.as_str()], Cx::for_testing()) {
+        let error = match Client::stdio_with_cx(Cx::for_testing(), "sh", &["-c", script.as_str()]) {
             Ok(_) => panic!("InvalidParams discovery refusal cannot authorize legacy fallback"),
             Err(error) => error,
         };
@@ -36203,10 +37049,10 @@ exec sleep 30
         let cx = Cx::for_request();
         cx.set_cancel_requested(true);
         let result = Client::stdio_with_protocol_plan_with_cx(
+            cx,
             "echo",
             &["hello"],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            cx,
         );
         // Cancellation is admitted before command resolution in every feature profile.
         assert!(result.is_err());
@@ -36269,10 +37115,10 @@ exec sleep 30
         let script = format!("printf '%s\\n' '{response_line}'; exec sleep 2");
 
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
-            Cx::for_request(),
         )
         .expect("direct exact-legacy stdio initialization succeeds");
         assert_eq!(
@@ -36324,7 +37170,7 @@ exec sleep 30
                     RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(1))
                         .unwrap(),
                 )
-                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request()),
+                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script.as_str()]),
         );
         let error = result
             .err()
@@ -37493,10 +38339,10 @@ exec sleep 30
         let modern_result = modern_discovery_response("modern-server", &[MODERN_PROTOCOL_VERSION]);
         let script = modern_public_client_script(&modern_result);
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern-only discovery initializes the public client");
 
@@ -37514,10 +38360,10 @@ exec sleep 30
     fn clt_01_modern_ping_is_a_dual_era_connection_health_check() {
         let script = modern_ping_client_script();
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the client");
 
@@ -37535,10 +38381,10 @@ exec sleep 30
     fn clt_01_modern_server_ping_is_rejected_during_public_request() {
         let script = modern_reverse_ping_client_script();
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the public client");
 
@@ -37556,10 +38402,10 @@ exec sleep 30
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"typed result","annotations":{"audience":["user"]},"_meta":{"io.fastmcp.retained":true},"io.fastmcp/extension":"retained"}],"isError":false,"structuredContent":{"answer":"typed result"}}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the public client");
 
@@ -37603,10 +38449,10 @@ exec sleep 30
             r#"{"jsonrpc":"2.0","id":2,"result":{"content":[],"zeta":{"second":2,"first":1},"isError":false,"alpha":1.20e+4}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the exact-source client");
         assert!(
@@ -37660,10 +38506,10 @@ exec sleep 30
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","taskId":"task-1","status":"input_required","createdAt":"2026-07-28T00:00:00Z","lastUpdatedAt":"2026-07-28T00:00:00Z","ttlMs":null,"inputRequests":{}}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("Tasks-capable modern discovery initializes the client");
         let task_id = FinalTaskId::parse("task-1").expect("typed final task ID");
@@ -37705,10 +38551,10 @@ exec sleep 30
             modern_discovery_response("tasks-undeclared-server", &[MODERN_PROTOCOL_VERSION]);
         let script = modern_public_client_script(&discovery);
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes before the extension gate");
         let next_id_before = client.next_id.load(Ordering::SeqCst);
@@ -37735,10 +38581,10 @@ exec sleep 30
         );
         let script = modern_public_client_script(&discovery);
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery retains extension settings before method admission");
         let next_id_before = client.next_id.load(Ordering::SeqCst);
@@ -37765,7 +38611,7 @@ exec sleep 30
             ClientBuilder::new()
                 .extension_registry(registry, discovery, || accept_raw_extension_settings)
                 .expect("frozen raw extension registry is builder-owned")
-                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request()),
+                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script.as_str()]),
         )
         .expect("raw extension discovery negotiates the public stdio client");
 
@@ -37875,9 +38721,9 @@ exec sleep 30
             "mode": "raw"
         })));
         let mut first = block_on(builder.clone().connect_stdio_with_cx(
+            &Cx::for_request(),
             "sh",
             &["-c", first_script.as_str()],
-            &Cx::for_request(),
         ))
         .expect("the first cloned builder gets an isolated resolver");
         first
@@ -37889,9 +38735,9 @@ exec sleep 30
                 "mode": "raw"
             })));
         let mut second = block_on(builder.connect_stdio_with_cx(
+            &Cx::for_request(),
             "sh",
             &["-c", second_script.as_str()],
-            &Cx::for_request(),
         ))
         .expect("a sibling cloned builder cannot inherit the first resolver state");
         second
@@ -37913,7 +38759,7 @@ exec sleep 30
             ClientBuilder::new()
                 .extension_registry(registry, discovery, || accept_raw_extension_settings)
                 .expect("raw extension registry is frozen before raw API admission")
-                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request()),
+                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script.as_str()]),
         )
         .expect("modern discovery negotiates the registered raw method");
         let next_id_before = client.next_id.load(Ordering::SeqCst);
@@ -37959,7 +38805,7 @@ exec sleep 30
             ClientBuilder::new()
                 .extension_registry(registry, discovery, || accept_raw_extension_settings)
                 .expect("raw extension registry permits the inactive fallback")
-                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request()),
+                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script.as_str()]),
         )
         .expect("modern discovery retains inactive raw extension state");
         let next_id_before = client.next_id.load(Ordering::SeqCst);
@@ -37989,7 +38835,7 @@ exec sleep 30
             ClientBuilder::new()
                 .extension_registry(registry, discovery, || accept_raw_extension_settings)
                 .expect("server-to-client raw descriptor freezes for discovery")
-                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request()),
+                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script.as_str()]),
         )
         .expect("raw extension negotiation itself remains bilateral");
         let next_id_before = client.next_id.load(Ordering::SeqCst);
@@ -38018,9 +38864,9 @@ exec sleep 30
                 .expect("raw extension registry may be configured before era selection")
                 .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
                 .connect_stdio_with_cx(
+                    &Cx::for_request(),
                     "sh",
                     &["-c", legacy_raw_extension_no_contact_client_script()],
-                    &Cx::for_request(),
                 ),
         )
         .expect("exact legacy lifecycle completes before raw extension rejection");
@@ -38067,10 +38913,10 @@ exec sleep 30
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","taskId":"task-2","status":"input_required","createdAt":"2026-07-28T00:00:00Z","lastUpdatedAt":"2026-07-28T00:00:00Z","ttlMs":null,"inputRequests":{}}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("Tasks-capable modern discovery initializes the client");
 
@@ -38140,10 +38986,10 @@ exec sleep 30
         let script = modern_final_tool_task_client_script(&result.to_string());
         let cx = Cx::for_request();
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            cx.clone(),
             "sh",
             &["-c", &script],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            cx.clone(),
         )
         .unwrap();
         let mut execution = client
@@ -38269,10 +39115,10 @@ IFS= read -r end
         );
         let cx = Cx::for_request();
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            cx.clone(),
             "sh",
             &["-c", &script],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            cx.clone(),
         )
         .unwrap();
         let task: FinalTask = serde_json::from_value(serde_json::json!({
@@ -38477,7 +39323,7 @@ IFS= read -r end
                     .unwrap();
                 runtime.block_on(async move {
                     let root = Cx::current().unwrap();
-                    let client = Client::stdio_with_protocol_plan_with_cx("sh", &["-c", &script], ClientProtocolPlan::stdio(policy), root.clone()).unwrap();
+                    let client = Client::stdio_with_protocol_plan_with_cx(root.clone(), "sh", &["-c", &script], ClientProtocolPlan::stdio(policy)).unwrap();
                     let mut work = root.spawn(move |cx| async move {
                         let mut client = client;
                         client.set_request_timeout_policy(RequestTimeoutPolicy::new(Duration::from_secs(5), Duration::from_secs(5)).unwrap()).unwrap();
@@ -38592,10 +39438,10 @@ IFS= read -r end
 "#
             );
             let mut client = Client::stdio_with_protocol_plan_with_cx(
+                Cx::for_request(),
                 "sh",
                 &["-c", &script],
                 ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-                Cx::for_request(),
             )
             .unwrap();
             client
@@ -38714,10 +39560,10 @@ IFS= read -r end
                 );
                 let cx = Cx::for_request();
                 let mut client = Client::stdio_with_protocol_plan_with_cx(
+                    cx.clone(),
                     "sh",
                     &["-c", &script],
                     ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-                    cx.clone(),
                 )
                 .unwrap();
                 let mut params = serde_json::json!({"taskId": "control-task"});
@@ -38814,10 +39660,10 @@ IFS= read -r end
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"task","taskId":"task-73","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern Tasks discovery initializes the forced-race client");
         let parameters = client
@@ -38877,10 +39723,10 @@ IFS= read -r end
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"task","taskId":"task-73","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("Tasks-capable discovery initializes the tool client");
 
@@ -39081,7 +39927,7 @@ exec sleep 5
                     .auto_initialize(mode == "deferred")
                     .request_timeout_policy(RequestTimeoutPolicy::new(timeout, timeout).unwrap())
                     .max_retries(0)
-                    .connect_stdio_with_cx("sh", &["-c", script, "mrtr-peer", &discovery, method, &subject, mode, &complete.to_string(), &first_input, &second_input], &connection_cx)
+                    .connect_stdio_with_cx(&connection_cx, "sh", &["-c", script, "mrtr-peer", &discovery, method, &subject, mode, &complete.to_string(), &first_input, &second_input])
                     .await.unwrap();
                 assert_eq!(client.is_initialized(), mode != "deferred");
                 if mode == "pre-cancel" { cancellation.cancel(); }
@@ -39388,7 +40234,7 @@ exec sleep 5
                     .auto_initialize(mode == "deferred")
                     .request_timeout_policy(RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2)).unwrap())
                     .max_retries(0)
-                    .connect_stdio_with_cx("sh", &["-c", script, "creation-peer", &discovery, &response_tail, &snapshot.to_string(), &subject, mode], &connection_cx)
+                    .connect_stdio_with_cx(&connection_cx, "sh", &["-c", script, "creation-peer", &discovery, &response_tail, &snapshot.to_string(), &subject, mode])
                     .await.unwrap();
                 let caller_cx = Cx::for_request();
                 let cancellation = McpRequestCancellation::new();
@@ -39571,10 +40417,10 @@ exec sleep 5
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","taskId":"task-73","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("Tasks-capable discovery initializes before the planted response");
 
@@ -39596,10 +40442,10 @@ exec sleep 5
             r#"{"resultType":"complete","content":[],"isError":false}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the MRTR tool client");
         assert!(matches!(
@@ -39617,10 +40463,10 @@ exec sleep 5
             r#"{"resultType":"complete","contents":[],"ttlMs":0,"cacheScope":"private"}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the MRTR resource client");
         assert!(matches!(
@@ -39636,10 +40482,10 @@ exec sleep 5
             r#"{"resultType":"complete","messages":[]}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the MRTR prompt client");
         assert!(matches!(
@@ -39689,7 +40535,7 @@ exec sleep 5
                 .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
                 .client_info("fnd04-sync-reverse", "1.0.0")
                 .reverse_request_handlers(handlers)
-                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &caller)
+                .connect_stdio_with_cx(&caller, "sh", &["-c", script.as_str()])
                 .await
                 .expect("modern stdio client connects with a roots handler");
             let result = client.call_tool_typed("retry-tool", serde_json::json!({}));
@@ -39732,10 +40578,10 @@ exec sleep 5
     fn clt_01_mrtr_retry_continues_only_after_every_requested_input_key() {
         let script = modern_mrtr_two_input_client_script(true);
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the two-input MRTR client");
 
@@ -39766,10 +40612,10 @@ exec sleep 5
     fn clt_01_mrtr_partial_input_map_rejects_without_a_retry_or_state_change() {
         let script = modern_mrtr_two_input_client_script(false);
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes before the partial MRTR map");
         let mut callback_count = 0_usize;
@@ -39803,10 +40649,10 @@ exec sleep 5
     fn clt_01_mrtr_multi_round_rebuilds_original_params_and_allows_state_only() {
         let script = modern_mrtr_multi_round_client_script();
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the multi-round MRTR client");
 
@@ -39852,10 +40698,10 @@ exec sleep 5
     fn clt_01_mrtr_round_bound_rejects_one_extra_continuation_before_callback_or_send() {
         let script = modern_mrtr_round_bound_client_script();
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the bound MRTR client");
 
@@ -39881,10 +40727,10 @@ exec sleep 5
     #[test]
     fn clt_01_mrtr_retry_keeps_exact_legacy_tool_behavior() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", legacy_typed_call_client_script()],
             ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
-            Cx::for_request(),
         )
         .expect("legacy initialization succeeds before the MRTR entry point");
 
@@ -39912,10 +40758,10 @@ exec sleep 5
             r#"{"resultType":"complete","content":[],"isError":false}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes before the planted MRTR response key");
 
@@ -39943,10 +40789,10 @@ exec sleep 5
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"exact tool result","_meta":{"io.fastmcp.retained":true},"io.fastmcp/extension":"retained"}],"isError":false,"structuredContent":{"answer":"exact tool result"}}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the final tool convenience client");
 
@@ -39981,10 +40827,10 @@ exec sleep 5
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","contents":[{"uri":"file:///exact.txt","text":"exact resource","mimeType":"text/plain","_meta":{"io.fastmcp.retained":true},"io.fastmcp/extension":"retained"}],"ttlMs":7.3e1,"cacheScope":"public"}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the final resource convenience client");
 
@@ -40030,10 +40876,10 @@ exec sleep 5
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","description":"exact prompt","messages":[{"role":"user","content":{"type":"text","text":"exact prompt content","_meta":{"io.fastmcp.retained":true},"io.fastmcp/extension":"retained"}}]}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the final prompt convenience client");
 
@@ -40070,10 +40916,10 @@ exec sleep 5
     #[test]
     fn clt_01_exact_final_conveniences_reject_one_field_cross_era_before_request_mutation() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", legacy_public_client_script()],
             ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
-            Cx::for_request(),
         )
         .expect("legacy-only initializes the exact client");
         let next_id_before = client.next_id.load(Ordering::SeqCst);
@@ -40111,10 +40957,10 @@ exec sleep 5
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"convenience result"}],"isError":false}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the public client");
 
@@ -40137,10 +40983,10 @@ exec sleep 5
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"convenience result"}],"isError":false,"structuredContent":{"answer":"convenience result"}}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("same modern discovery initializes the public client");
 
@@ -40162,10 +41008,10 @@ exec sleep 5
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"resource_link","name":"manual","uri":"https://example.com/manual"}],"isError":false}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the public client");
 
@@ -40187,10 +41033,10 @@ exec sleep 5
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":null,"content":[{"type":"text","text":"convenience result"}],"isError":false}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("same modern discovery initializes the public client");
 
@@ -40207,10 +41053,10 @@ exec sleep 5
     fn clt_01_remaining_typed_core_methods_return_final_results() {
         let script = modern_remaining_core_client_script();
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the public client");
 
@@ -40267,10 +41113,10 @@ exec sleep 5
     fn clt_01_modern_log_level_metadata_is_absent_until_configured() {
         let script = modern_log_level_absence_client_script();
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("same modern discovery initializes the public client");
 
@@ -40289,10 +41135,10 @@ exec sleep 5
     fn clt_01_auto_modern_log_level_uses_later_request_metadata() {
         let script = modern_log_level_metadata_client_script();
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
-            Cx::for_request(),
         )
         .expect("recognized final discovery selects modern under Auto");
 
@@ -40313,10 +41159,10 @@ exec sleep 5
     #[test]
     fn leg_03_log_level_preserves_exact_legacy_rpc() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", legacy_log_level_client_script()],
             ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
-            Cx::for_request(),
         )
         .expect("legacy-only initializes the exact client");
 
@@ -40331,10 +41177,10 @@ exec sleep 5
     #[test]
     fn clt_01_auto_legacy_log_level_preserves_exact_rpc() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", auto_legacy_log_level_client_script()],
             ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
-            Cx::for_request(),
         )
         .expect("recognized final refusal selects exact legacy under Auto");
 
@@ -40355,10 +41201,10 @@ exec sleep 5
             ],
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the subscription client");
 
@@ -40392,10 +41238,10 @@ exec sleep 5
             ],
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the incremental catalog listener");
         client
@@ -40559,7 +41405,7 @@ exec sleep 5
                     .auto_initialize(true)
                     .request_timeout_policy(RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2)).unwrap())
                     .max_retries(0)
-                    .connect_stdio_with_cx("sh", &["-c", script, "yielding-listener", &discovery, filter, &notification, mode], &connection_cx)
+                    .connect_stdio_with_cx(&connection_cx, "sh", &["-c", script, "yielding-listener", &discovery, filter, &notification, mode])
                     .await.unwrap();
                 let caller_cx = Cx::for_request();
                 let mut cancellation = McpRequestCancellation::new();
@@ -40725,10 +41571,10 @@ exec sleep 5
     fn live_catalog_listener_keeps_issuing_tools_call_on_the_same_client() {
         let script = modern_incremental_catalog_listener_with_tool_call_script();
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the interleaved catalog listener");
         client
@@ -40811,10 +41657,10 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete"}}'
 exec sleep 2
 "#;
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script, "--", &discovery],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         ).unwrap();
         client.set_request_timeout_policy(
             RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(5)).unwrap(),
@@ -40861,10 +41707,10 @@ exec sleep 2
              exec sleep 2"
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the before-ack catalog listener");
         client
@@ -40891,10 +41737,10 @@ exec sleep 2
     fn live_catalog_listener_rejects_an_empty_filter() {
         let script = modern_subscriptions_listen_client_script(2, &[]);
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the empty-filter catalog listener");
         let error = client
@@ -40922,10 +41768,10 @@ exec sleep 2
             ],
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the exclusive catalog listener");
         let filter = SubscriptionFilter {
@@ -40951,10 +41797,10 @@ exec sleep 2
     #[test]
     fn live_catalog_listener_is_rejected_on_exact_legacy() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", legacy_public_client_script()],
             ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
-            Cx::for_request(),
         )
         .expect("legacy-only initializes the exact client");
 
@@ -40979,10 +41825,10 @@ exec sleep 2
         let script =
             modern_tasks_subscriptions_listen_client_script(task_id.as_str(), task_id.as_str());
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern Tasks discovery initializes the subscription client");
         let mut filter = SubscriptionFilter {
@@ -41013,10 +41859,10 @@ exec sleep 2
         let task_id = FinalTaskId::parse("task-live-73").expect("bounded task id");
         let script = live_tasks_listener_fixture(task_id.as_str(), task_id.as_str(), 2);
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern Tasks discovery initializes the live listener client");
         let mut filter = SubscriptionFilter::default();
@@ -41068,10 +41914,10 @@ exec sleep 2
         let foreign = FinalTaskId::parse("task-live-74").expect("bounded foreign task id");
         let script = live_tasks_listener_fixture(requested.as_str(), foreign.as_str(), 2);
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern Tasks discovery initializes the foreign-task listener client");
         let mut filter = SubscriptionFilter::default();
@@ -41106,10 +41952,10 @@ exec sleep 2
         let task_id = FinalTaskId::parse("task-live-73").expect("bounded task id");
         let script = live_tasks_listener_fixture(task_id.as_str(), task_id.as_str(), 3);
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern Tasks discovery initializes the foreign-subscription listener client");
         let mut filter = SubscriptionFilter::default();
@@ -41138,10 +41984,10 @@ exec sleep 2
         let task_id = FinalTaskId::parse("task-live-73").expect("bounded task id");
         let script = live_tasks_listener_fixture(task_id.as_str(), task_id.as_str(), 2);
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern Tasks discovery initializes the cancellation listener client");
         let mut filter = SubscriptionFilter::default();
@@ -41187,10 +42033,10 @@ exec sleep 2
         let script =
             modern_tasks_subscriptions_listen_client_script(requested.as_str(), foreign.as_str());
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern Tasks discovery initializes the subscription client");
         let mut filter = SubscriptionFilter {
@@ -41223,10 +42069,10 @@ exec sleep 2
             ],
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the subscription client");
 
@@ -41250,10 +42096,10 @@ exec sleep 2
         ];
         let script = modern_subscriptions_listen_client_script(2, &stream_frames);
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the subscription client");
 
@@ -41283,10 +42129,10 @@ exec sleep 2
             ],
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the subscription client");
 
@@ -41323,10 +42169,10 @@ exec sleep 2
             ],
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the subscription client");
 
@@ -41353,10 +42199,10 @@ exec sleep 2
     fn clt_01_subscriptions_listen_cancellation_consumes_terminal_before_next_request() {
         let script = modern_subscription_cancellation_late_terminal_client_script();
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the subscription client");
 
@@ -41390,10 +42236,10 @@ exec sleep 2
     fn clt_01_subscriptions_listen_rejects_eof_before_terminal_complete_result() {
         let script = modern_subscriptions_listen_client_script(2, &[]);
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the subscription client");
 
@@ -41426,10 +42272,10 @@ exec sleep 2
     #[test]
     fn leg_03_subscriptions_listen_is_rejected_without_mutating_legacy_request_state() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", legacy_public_client_script()],
             ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
-            Cx::for_request(),
         )
         .expect("legacy-only initializes the exact client");
 
@@ -41453,10 +42299,10 @@ exec sleep 2
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the public client");
 
@@ -41476,10 +42322,10 @@ exec sleep 2
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":30000,"cacheScope":"private","x-retained":9007199254740993123456789}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the cache client");
         client
@@ -41527,10 +42373,10 @@ exec sleep 2
              exec sleep 2"
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the invalidation client");
 
@@ -41571,10 +42417,10 @@ exec sleep 2
              exec sleep 2"
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the idle-invalidation client");
 
@@ -41603,10 +42449,10 @@ exec sleep 2
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":1000,"cacheScope":"private"}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the cancellation client");
         client
@@ -41645,10 +42491,10 @@ exec sleep 2
              exec sleep 2"
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the TTL compatibility client");
 
@@ -41699,10 +42545,10 @@ exec sleep 2
              exec sleep 2"
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the list-restart client");
 
@@ -41743,10 +42589,10 @@ exec sleep 2
              exec sleep 2"
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the disabled-cache list client");
         client.set_final_result_cache_enabled(false);
@@ -41787,10 +42633,10 @@ exec sleep 2
              exec sleep 2"
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the cursor-flush client");
 
@@ -41835,10 +42681,10 @@ exec sleep 2
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"echo","description":"representable","inputSchema":{"type":"object"}}],"ttlMs":0,"cacheScope":"private"}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the public client");
 
@@ -41861,10 +42707,10 @@ exec sleep 2
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"echo","description":"representable","inputSchema":{"type":"object"}}],"ttlMs":0,"cacheScope":"public"}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("same modern discovery initializes the public client");
 
@@ -42046,10 +42892,10 @@ exec sleep 2
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":null,"tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("same modern discovery initializes the public client");
 
@@ -42069,10 +42915,10 @@ exec sleep 2
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":null,"content":[{"type":"text","text":"typed result"}],"isError":false}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("same modern discovery initializes the public client");
 
@@ -42091,10 +42937,10 @@ exec sleep 2
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","completion":{"values":["staging"],"total":922337203685477580812345678901234567890,"hasMore":false}}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the public client");
 
@@ -42122,10 +42968,10 @@ exec sleep 2
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":null,"completion":{"values":["staging"],"total":1,"hasMore":false}}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("same modern discovery initializes the public client");
 
@@ -42145,10 +42991,10 @@ exec sleep 2
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","completion":{"values":["staging"],"total":1,"hasMore":false}}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
-            Cx::for_request(),
         )
         .expect("Auto retains a successful modern selection");
 
@@ -42172,10 +43018,10 @@ exec sleep 2
     #[test]
     fn clt_02_auto_legacy_completion_losslessly_maps_compatible_input() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", auto_legacy_completion_client_script()],
             ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
-            Cx::for_request(),
         )
         .expect("recognized modern refusal authorizes one exact legacy selection");
 
@@ -42199,10 +43045,10 @@ exec sleep 2
     #[test]
     fn clt_02_auto_legacy_completion_rejects_unrepresentable_context_without_sending() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", auto_legacy_completion_client_script()],
             ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
-            Cx::for_request(),
         )
         .expect("recognized modern refusal authorizes one exact legacy selection");
 
@@ -42228,10 +43074,10 @@ exec sleep 2
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"progress result"}],"isError":false}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the public client");
         let mut observed_progress = Vec::new();
@@ -42262,10 +43108,10 @@ exec sleep 2
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"progress result"}],"isError":false}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the public client");
         let mut legacy_progress = Vec::new();
@@ -42307,10 +43153,10 @@ exec sleep 2
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"progress result"}],"isError":false}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("same modern discovery initializes the public client");
         let mut on_progress = |_progress: f64, _total: Option<f64>, _message: Option<&str>| {};
@@ -42341,10 +43187,10 @@ exec sleep 2
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":null,"content":[{"type":"text","text":"progress result"}],"isError":false}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("same modern discovery initializes the public client");
         let mut on_progress = |_progress: f64, _total: Option<f64>, _message: Option<&str>| {};
@@ -42369,10 +43215,10 @@ exec sleep 2
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"notification result"}],"isError":false}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the public client");
 
@@ -42402,10 +43248,10 @@ exec sleep 2
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"notification result"}],"isError":false}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the public client");
 
@@ -42437,10 +43283,10 @@ exec sleep 2
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"notification result"}],"isError":false}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("same modern discovery initializes the public client");
 
@@ -42459,10 +43305,10 @@ exec sleep 2
         let modern_result = modern_discovery_response_with_final_state("stateful-modern", "public");
         let script = modern_public_client_script(&modern_result);
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery retains its final session state");
 
@@ -42515,10 +43361,10 @@ exec sleep 2
             modern_discovery_response_with_final_state("stateful-modern", "not-a-cache-scope");
         let script = modern_public_client_script(&modern_result);
         let error = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .err()
         .expect("invalid final cache semantics must reject the modern session");
@@ -42536,10 +43382,10 @@ exec sleep 2
         let legacy_advertisement = modern_discovery_response("modern-server", &[PROTOCOL_VERSION]);
         let script = modern_public_client_script(&legacy_advertisement);
         let error = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .err()
         .expect("modern-only must reject a legacy-only discovery success");
@@ -42555,10 +43401,10 @@ exec sleep 2
             modern_discovery_response("auto-modern-server", &[MODERN_PROTOCOL_VERSION]);
         let script = modern_public_client_script(&modern_result);
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
-            Cx::for_request(),
         )
         .expect("auto retains a successful modern selection");
 
@@ -42595,10 +43441,10 @@ exec sleep 2
             .expect("missing-discriminator discovery response re-encodes");
         let script = modern_public_client_script(&response);
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("an otherwise-valid missing discriminator establishes modern");
 
@@ -42644,10 +43490,10 @@ exec sleep 2
                 .expect("invalid-discriminator response remains JSON");
             let script = modern_public_client_script(&response);
             let error = Client::stdio_with_protocol_plan_with_cx(
+                Cx::for_request(),
                 "sh",
                 &["-c", script.as_str()],
                 ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-                Cx::for_request(),
             )
             .err()
             .expect("every non-complete discriminator rejects discovery");
@@ -42669,10 +43515,10 @@ exec sleep 2
                 .expect("contradictory discovery response remains JSON");
             let script = modern_public_client_script(&response);
             let error = Client::stdio_with_protocol_plan_with_cx(
+                Cx::for_request(),
                 "sh",
                 &["-c", script.as_str()],
                 ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-                Cx::for_request(),
             )
             .err()
             .expect("a contradictory final shape rejects discovery before negotiation");
@@ -42691,10 +43537,10 @@ exec sleep 2
             modern_discovery_response("auto-modern-server", &[PROTOCOL_VERSION]);
         let script = modern_public_client_script(&legacy_advertisement);
         let error = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
-            Cx::for_request(),
         )
         .err()
         .expect("auto must not downgrade from a malformed modern discovery result");
@@ -42707,10 +43553,10 @@ exec sleep 2
     #[test]
     fn leg_03_i_positive() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", legacy_public_client_script()],
             ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
-            Cx::for_request(),
         )
         .expect("legacy-only runs exact initialize and lifecycle acknowledgement");
 
@@ -42735,10 +43581,10 @@ exec sleep 2
     #[test]
     fn leg_03_ping_preserves_the_exact_legacy_request_path() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", legacy_public_client_script()],
             ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
-            Cx::for_request(),
         )
         .expect("legacy initialization succeeds before the exact ping request");
 
@@ -42753,10 +43599,10 @@ exec sleep 2
     #[test]
     fn leg_03_server_ping_succeeds_during_public_request() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", legacy_reverse_ping_client_script()],
             ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
-            Cx::for_request(),
         )
         .expect("legacy initialization succeeds before the reverse ping request");
 
@@ -42771,10 +43617,10 @@ exec sleep 2
     #[test]
     fn leg_03_resource_subscriptions_use_the_exact_legacy_request_path() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", legacy_resource_subscription_client_script()],
             ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
-            Cx::for_request(),
         )
         .expect("legacy initialization succeeds before resource subscription requests");
 
@@ -42798,10 +43644,10 @@ exec sleep 2
         );
         let script = modern_public_client_script(&discovery);
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes before legacy resource rejection");
         let next_id_before = client.next_id.load(Ordering::SeqCst);
@@ -42827,10 +43673,10 @@ exec sleep 2
     #[cfg(feature = "tasks")]
     fn leg_03_final_tasks_rejects_exact_legacy_before_request_mutation() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", legacy_public_client_script()],
             ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
-            Cx::for_request(),
         )
         .expect("legacy initialization succeeds before final Tasks admission");
         let next_id_before = client.next_id.load(Ordering::SeqCst);
@@ -42848,10 +43694,10 @@ exec sleep 2
     #[test]
     fn leg_03_typed_client_result_preserves_exact_legacy_decode() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", legacy_typed_call_client_script()],
             ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
-            Cx::for_request(),
         )
         .expect("legacy-only runs exact initialize and lifecycle acknowledgement");
 
@@ -42882,10 +43728,10 @@ exec sleep 2
     #[test]
     fn leg_03_exact_legacy_tool_convenience_retains_the_pinned_result() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", legacy_typed_call_client_script()],
             ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
-            Cx::for_request(),
         )
         .expect("legacy-only runs exact initialize and lifecycle acknowledgement");
 
@@ -42920,10 +43766,10 @@ exec sleep 2
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"modern result"}],"isError":false}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .expect("modern discovery initializes the final client");
         let next_id_before = client.next_id.load(Ordering::SeqCst);
@@ -42941,10 +43787,10 @@ exec sleep 2
     #[test]
     fn leg_03_convenience_tool_preserves_exact_legacy_decode() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", legacy_typed_call_client_script()],
             ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
-            Cx::for_request(),
         )
         .expect("legacy-only runs exact initialize and lifecycle acknowledgement");
 
@@ -42976,10 +43822,10 @@ exec sleep 2
     #[test]
     fn leg_03_remaining_typed_list_preserves_exact_legacy_decode() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", legacy_typed_list_client_script()],
             ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
-            Cx::for_request(),
         )
         .expect("legacy-only runs exact initialize and lifecycle acknowledgement");
 
@@ -42998,10 +43844,10 @@ exec sleep 2
     fn leg_03_progress_client_result_preserves_exact_legacy_decode() {
         let script = legacy_progress_client_script(2);
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
-            Cx::for_request(),
         )
         .expect("legacy-only runs exact initialize and lifecycle acknowledgement");
         let mut observed_progress = Vec::new();
@@ -43030,10 +43876,10 @@ exec sleep 2
     fn leg_03_progress_nonmatching_token_leaves_callback_state_unchanged() {
         let script = legacy_progress_client_script(3);
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
-            Cx::for_request(),
         )
         .expect("legacy-only runs exact initialize and lifecycle acknowledgement");
         let mut observed_progress = Vec::new();
@@ -43062,10 +43908,10 @@ exec sleep 2
     #[test]
     fn leg_03_completion_client_result_preserves_exact_legacy_decode() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", legacy_completion_client_script()],
             ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
-            Cx::for_request(),
         )
         .expect("legacy-only runs exact initialize and lifecycle acknowledgement");
 
@@ -43092,10 +43938,10 @@ exec sleep 2
         // Only the immutable policy differs from the accepted legacy path.
         // The modern probe is not permitted to reuse the 2024 lifecycle.
         let error = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", legacy_public_client_script()],
             ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            Cx::for_request(),
         )
         .err()
         .expect("modern-only must reject a legacy-only peer before initialization");

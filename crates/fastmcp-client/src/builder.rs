@@ -20,7 +20,7 @@
 //!         .retry_delay_ms(1000)
 //!         .working_dir("/tmp")
 //!         .env("DEBUG", "1")
-//!         .connect_stdio_with_cx("uvx", &["my-server"], cx)
+//!         .connect_stdio_with_cx(cx, "uvx", &["my-server"])
 //!         .await
 //! }
 //! ```
@@ -691,7 +691,7 @@ impl ClientBuilder {
     /// # async fn connect(cx: &Cx) -> McpResult<()> {
     /// let mut client = ClientBuilder::new()
     ///     .auto_initialize(true)
-    ///     .connect_stdio_with_cx("uvx", &["my-server"], cx)
+    ///     .connect_stdio_with_cx(cx, "uvx", &["my-server"])
     ///     .await?;
     ///
     /// // Subprocess is running but not yet initialized
@@ -972,9 +972,9 @@ impl ClientBuilder {
     /// all bounded retry attempts are exhausted.
     pub async fn connect_stdio_with_cx(
         self,
+        cx: &Cx,
         command: &str,
         args: &[&str],
-        cx: &Cx,
     ) -> McpResult<Client> {
         // Keep the retry and failed-client cleanup state out of callers' futures.
         Box::pin(async move {
@@ -2057,7 +2057,7 @@ exec sleep 5
                 let args = ["-c", script, "yielding-startup-peer", events.path.to_str().unwrap(), mode, release.path.to_str().unwrap()];
                 let worker = std::thread::current().id();
                 let started = Instant::now();
-                let mut connecting = Box::pin(builder.connect_stdio_with_cx("sh", &args, &cx));
+                let mut connecting = Box::pin(builder.connect_stdio_with_cx(&cx, "sh", &args));
                 let first = std::future::poll_fn(|task_cx| Poll::Ready(connecting.as_mut().poll(task_cx))).await;
                 assert!(first.is_pending(), "eager initialization must yield before the peer completes");
                 // (c) KNOWN LOAD-DEPENDENT SITE, kept deliberately. The
@@ -2244,7 +2244,7 @@ exec sleep 5
                     RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(1))
                         .expect("bounded handshake timeout is valid"),
                 )
-                .connect_stdio_with_cx("sh", &["-c", script], &Cx::for_request()),
+                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script]),
         )
     }
 
@@ -2256,10 +2256,10 @@ exec sleep 5
         script: &str,
     ) -> [(&'static str, McpResult<Client>); 2] {
         let direct = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
             "sh",
             &["-c", script],
             ClientProtocolPlan::stdio(policy),
-            Cx::for_request(),
         );
         let builder = ClientBuilder::new().protocol_plan(ClientProtocolPlan::stdio(policy));
         [
@@ -2609,7 +2609,7 @@ exec sleep 5
                         Duration::from_millis(900), Duration::from_millis(900),
                     ).unwrap())
                     .max_retries(0)
-                    .connect_stdio_with_cx("sh", &["-c", script, "deferred-peer", events.path.to_str().unwrap(), mode, release.path.to_str().unwrap()], &cx)
+                    .connect_stdio_with_cx(&cx, "sh", &["-c", script, "deferred-peer", events.path.to_str().unwrap(), mode, release.path.to_str().unwrap()])
                     .await.unwrap();
                 assert!(!client.is_initialized());
                 let mut cancellation = crate::McpRequestCancellation::new();
@@ -2869,9 +2869,9 @@ exec sleep 5
                 // own test.
                 .application_retry_config(1, RETRY_DELAY_MS)
                 .connect_stdio_with_cx(
+                    &cx,
                     "sh",
                     &["-c", script, "fastmcp-stdio-retry-probe", attempt_log_arg],
-                    &cx,
                 ),
         );
         let elapsed = started.elapsed();
@@ -3098,7 +3098,7 @@ exec sleep 5
             let mut client = ClientBuilder::new()
                 .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
                 .reverse_request_handlers(handlers)
-                .connect_stdio_with_cx("sh", &["-c", script], &cx)
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script])
                 .await
                 .expect("legacy callback configuration completes initialize before exposure");
 
@@ -3216,7 +3216,7 @@ exec sleep 5
             let mut client = ClientBuilder::new()
                 .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
                 .reverse_request_handlers(handlers)
-                .connect_stdio_with_cx("sh", &["-c", script], &cx)
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script])
                 .await
                 .expect("legacy callback cancellation configuration initializes");
 
@@ -3340,7 +3340,7 @@ exec sleep 5
             let mut client = ClientBuilder::new()
                 .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
                 .reverse_request_handlers(handlers)
-                .connect_stdio_with_cx("sh", &["-c", script], &cx)
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script])
                 .await
                 .expect("legacy callback panic configuration initializes");
 
@@ -3389,7 +3389,7 @@ exec sleep 5
         let mut client = block_on(
             ClientBuilder::new()
                 .reverse_request_handlers(handlers)
-                .connect_stdio_with_cx("sh", &["-c", script], &Cx::for_request()),
+                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script]),
         )
         .expect("Auto probes the final handshake before considering legacy callbacks");
 
@@ -3445,7 +3445,7 @@ exec sleep 5
             let cx = Cx::current().expect("callback test runtime installs a current context");
             let mut client = ClientBuilder::new()
                 .reverse_request_handlers(handlers)
-                .connect_stdio_with_cx("sh", &["-c", script], &cx)
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script])
                 .await
                 .expect("MethodNotFound authorizes a fresh legacy client with its callbacks");
 
@@ -3479,9 +3479,9 @@ exec sleep 5
                 ClientBuilder::new()
                     .protocol_plan(ClientProtocolPlan::stdio(policy))
                     .connect_stdio_with_cx(
+                        &Cx::for_testing(),
                         "fastmcp-client-builder-feature-off-must-not-spawn",
                         &[],
-                        &Cx::for_testing(),
                     ),
             )
             .err()
@@ -3505,9 +3505,9 @@ exec sleep 5
                     )
                     .protocol_plan(ClientProtocolPlan::stdio(policy))
                     .connect_stdio_with_cx(
+                        &Cx::for_testing(),
                         "fastmcp-client-builder-apps-feature-off-must-not-spawn",
                         &[],
-                        &Cx::for_testing(),
                     ),
             )
             .err()
@@ -3689,7 +3689,7 @@ exec sleep 5
             ClientBuilder::new()
                 .max_retries(2)
                 .retry_delay_ms(100)
-                .connect_stdio_with_cx("definitely-not-a-real-command", &[], &cx),
+                .connect_stdio_with_cx(&cx, "definitely-not-a-real-command", &[]),
         );
 
         assert!(
@@ -3879,7 +3879,7 @@ IFS= read -r remaining
                 .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
                 .request_timeout_policy(timeout)
                 .application_retry_config(u32::MAX, u64::MAX)
-                .connect_stdio_with_cx("sh", &["-c", script], &cx)
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script])
                 .await
                 .expect("large local settings must not reject a successful first child");
             assert_eq!(client.server_info().name, "application-policy-peer");
@@ -3925,7 +3925,7 @@ exec sleep 2
                 .request_timeout_policy(requested)
                 .connection_retry_policy(1, Duration::ZERO, Duration::from_secs(1))
                 .expect("one-attempt aggregate deadline is valid")
-                .connect_stdio_with_cx("sh", &["-c", script], &cx)
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script])
                 .await
                 .expect("modern initialization completes within its aggregate deadline");
 
@@ -4073,7 +4073,7 @@ exit 73
                 ClientBuilder::new()
                     .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
                     .application_retry_config(u32::MAX, u64::MAX)
-                    .connect_stdio_with_cx("sh", &args, &cx),
+                    .connect_stdio_with_cx(&cx, "sh", &args),
             );
             let observation_deadline = Instant::now().checked_add(Duration::from_secs(5)).unwrap();
             let mut observation_tick =
@@ -4227,7 +4227,7 @@ exit 73
             ClientBuilder::new()
                 .max_retries(u32::MAX)
                 .retry_delay_ms(1)
-                .connect_stdio_with_cx("definitely-not-a-real-command", &[], &cx),
+                .connect_stdio_with_cx(&cx, "definitely-not-a-real-command", &[]),
         );
 
         assert!(
@@ -4291,9 +4291,9 @@ exit 73
     #[test]
     fn connect_stdio_nonexistent_command_fails() {
         let result = block_on(ClientBuilder::new().max_retries(0).connect_stdio_with_cx(
+            &Cx::for_testing(),
             "fastmcp_nonexistent_binary_xyz",
             &["--version"],
-            &Cx::for_testing(),
         ));
         assert!(result.is_err());
     }
@@ -4323,7 +4323,7 @@ exit 73
                     RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(3))
                         .expect("bounded probe timeout is valid"),
                 )
-                .connect_stdio_with_cx("sh", &["-c", script], &Cx::for_request()),
+                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script]),
         )
         .expect("a clean first-probe timeout authorizes one fresh legacy child");
 
@@ -4386,7 +4386,7 @@ exit 73
                         RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(5))
                             .expect("bounded probe timeout is valid"),
                     )
-                    .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request()),
+                    .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script.as_str()]),
             );
             assert!(
                 result.is_err(),
@@ -4418,7 +4418,7 @@ exit 73
                     RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(1))
                         .expect("bounded cancellation probe timeout is valid"),
                 )
-                .connect_stdio_with_cx("sh", &["-c", script], &cx),
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script]),
         );
         canceller
             .join()
@@ -4440,7 +4440,7 @@ exit 73
                     RequestTimeoutPolicy::new(Duration::from_millis(20), Duration::from_millis(40))
                         .unwrap(),
                 )
-                .connect_stdio_with_cx("sh", &["-c", "exec sleep 5"], &Cx::for_testing()),
+                .connect_stdio_with_cx(&Cx::for_testing(), "sh", &["-c", "exec sleep 5"]),
         );
 
         let Err(error) = result else {
@@ -4472,9 +4472,9 @@ exit 73
             .expect("bounded retry policy is valid");
 
         let error = match block_on(builder.connect_stdio_with_cx(
+            &Cx::for_testing(),
             "sh",
             &["-c", "exec sleep 5"],
-            &Cx::for_testing(),
         )) {
             Ok(mut client) => {
                 let _ = client.close();
@@ -4501,7 +4501,7 @@ exit 73
                     McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
                         .expect("valid Apps MIME settings"),
                 )
-                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request()),
+                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script.as_str()]),
         )
         .expect("recognized discovery refusal starts a fresh exact legacy client");
 
@@ -4532,9 +4532,9 @@ exit 73
         let state_before_connect = builder.selected_protocol_plan().clone();
 
         let error = match block_on(builder.clone().connect_stdio_with_cx(
+            &Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
-            &Cx::for_request(),
         )) {
             Ok(_) => panic!("invalid discovery parameters must not authorize legacy fallback"),
             Err(error) => error,
@@ -4559,9 +4559,9 @@ exit 73
         let state_before_connect = builder.selected_protocol_plan().clone();
 
         let error = match block_on(builder.clone().connect_stdio_with_cx(
+            &Cx::for_request(),
             "sh",
             &["-c", script.as_str()],
-            &Cx::for_request(),
         )) {
             Ok(_) => panic!("changing only the discovery error must not authorize legacy fallback"),
             Err(error) => error,
@@ -4583,7 +4583,7 @@ exit 73
                         .expect("valid Apps MIME settings"),
                 )
                 .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
-                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request()),
+                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script.as_str()]),
         )
         .expect("active modern discovery initializes the public Apps client");
 
@@ -4606,7 +4606,7 @@ exit 73
                         .expect("valid Apps MIME settings"),
                 )
                 .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
-                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request()),
+                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script.as_str()]),
         )
         .expect("one missing server Apps declaration initializes modern inactive Apps state");
 
@@ -4695,9 +4695,9 @@ exit 73
     #[test]
     fn connect_stdio_spawn_failure_error_message() {
         let result = block_on(ClientBuilder::new().max_retries(0).connect_stdio_with_cx(
+            &Cx::for_testing(),
             "fastmcp_no_such_binary_abc123",
             &[],
-            &Cx::for_testing(),
         ));
         match result {
             Err(err) => assert!(

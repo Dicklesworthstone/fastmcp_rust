@@ -249,10 +249,6 @@ impl ManagedCatalogClient {
                         check_binding(cx, cancellation, deadline, &binding)?;
                         if attempts >= limits.maximum_collections { return Err(ManagedCatalogWatchError::CollectionLimit); }
                         let Some(local_cancel) = signal.begin(revision)? else { continue };
-                        // Capture the shared cache epoch independently of this
-                        // stream's revision. Another clone may clear it without
-                        // delivering a notification through this watch.
-                        let cache_generation = self.cache()?.begin_fetch(&kind.result_set());
                         attempts += 1;
                         let result = Box::pin(self.collect_with_cancellation(
                             cx, &local_cancel, request.clone(),
@@ -289,6 +285,13 @@ impl ManagedCatalogClient {
                         if catalog.credential_generation() != binding.generation() {
                             return Err(ManagedCatalogError::CredentialChanged.into());
                         }
+                        // The collector may deliberately rebuild its cache
+                        // generation under the selected whole-catalog policy.
+                        // Retain its admitted generation, rather than assuming
+                        // the generation from before collection must survive.
+                        // Another clone's clear after admission still fences
+                        // publication, even if it happens before this yield.
+                        let cache_generation = catalog.cache_generation;
                         // Let the monitor drain currently ready notifications
                         // before publishing a candidate. Crucially, its pending
                         // read is never dropped just because a list completed.

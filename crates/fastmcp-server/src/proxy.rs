@@ -4432,6 +4432,9 @@ pub(crate) struct ProxyFinalTaskRelay {
 struct ProxyFinalTaskRegistry {
     tasks: HashMap<FinalTaskId, ProxyRelayedFinalTask>,
     pending_creations: HashSet<FinalTaskId>,
+    /// Local observation order only; upstream wall-clock timestamps are not
+    /// revisions and can repeat or move backwards.
+    next_snapshot_revision: u64,
 }
 
 /// An issued handle's exact upstream result, stable owner, and retention clock.
@@ -4451,6 +4454,7 @@ struct ProxyRelayedFinalTask {
     expires_at: Option<Instant>,
     retained_at: Instant,
     wall_origin: chrono::DateTime<chrono::Utc>,
+    snapshot_revision: u64,
 }
 
 /// One bounded upstream Task creation admitted before its non-reversible
@@ -4483,6 +4487,7 @@ struct AdmittedProxyFinalTaskListener {
     inner: Box<dyn ProxyFinalTaskListener>,
     relay: Arc<ProxyFinalTaskRelay>,
     owner: fastmcp_core::Sha256Digest,
+    context: McpContext,
     mappings: Vec<(FinalTaskId, FinalTaskId)>,
     upstream_filter: SubscriptionFilter,
     downstream_filter: SubscriptionFilter,
@@ -4497,6 +4502,7 @@ impl AdmittedProxyFinalTaskListener {
         inner: Box<dyn ProxyFinalTaskListener>,
         relay: Arc<ProxyFinalTaskRelay>,
         owner: fastmcp_core::Sha256Digest,
+        context: McpContext,
         mappings: Vec<(FinalTaskId, FinalTaskId)>,
         upstream_filter: SubscriptionFilter,
         downstream_filter: SubscriptionFilter,
@@ -4505,6 +4511,7 @@ impl AdmittedProxyFinalTaskListener {
             inner,
             relay,
             owner,
+            context,
             mappings,
             upstream_filter,
             downstream_filter,
@@ -4519,7 +4526,10 @@ impl AdmittedProxyFinalTaskListener {
         Err(McpError::invalid_request(message))
     }
 
-    fn take_pending_notification(&mut self) -> McpResult<Option<ProxyFinalTaskListenerEvent>> {
+    async fn take_pending_notification(
+        &mut self,
+        ctx: &McpContext,
+    ) -> McpResult<Option<ProxyFinalTaskListenerEvent>> {
         let Some(handle) = self.pending_handles.pop_front() else {
             return Ok(None);
         };
@@ -4531,20 +4541,27 @@ impl AdmittedProxyFinalTaskListener {
         } else {
             self.pending.as_ref().expect("pending handles retain their source notification").clone()
         };
-        if let Err(error) = self.relay.record_task(
-            self.owner, &handle, notification.params.task.clone(),
-        ) {
-            self.phase = ProxyFinalTaskListenerPhase::Terminated;
-            self.pending = None;
-            self.pending_handles.clear();
-            return Err(error);
+        notification.params.task = match self.relay.reconcile_task(
+            ctx, self.owner, &handle, notification.params.task, None,
+        ).await {
+            Ok(task) => task,
+            Err(error) => {
+                self.phase = ProxyFinalTaskListenerPhase::Terminated;
+                self.pending = None;
+                self.pending_handles.clear();
+                return Err(error);
+            }
+        };
+        if let Some(pending) = self.pending.as_mut() {
+            pending.params.task = notification.params.task.clone();
         }
         set_relayed_task_id(&mut notification.params.task, handle);
         Ok(Some(ProxyFinalTaskListenerEvent::Notification(notification)))
     }
 
-    fn admit_event(
+    async fn admit_event(
         &mut self,
+        ctx: &McpContext,
         event: ProxyFinalTaskListenerEvent,
     ) -> McpResult<ProxyFinalTaskListenerEvent> {
         match (self.phase, event) {
@@ -4582,7 +4599,7 @@ impl AdmittedProxyFinalTaskListener {
                 }
                 self.pending = Some(notification);
                 self.pending_handles = handles.into();
-                self.take_pending_notification()?.ok_or_else(|| {
+                self.take_pending_notification(ctx).await?.ok_or_else(|| {
                     McpError::internal_error("Proxy Tasks listener lost its admitted event")
                 })
             }
@@ -4595,11 +4612,8 @@ impl AdmittedProxyFinalTaskListener {
             }
         }
     }
-}
 
-#[cfg(feature = "tasks")]
-impl ProxyFinalTaskListener for AdmittedProxyFinalTaskListener {
-    fn next(
+    async fn next_event(
         &mut self,
         cx: &Cx,
         request_cancellation: &fastmcp_core::McpRequestCancellation,
@@ -4609,24 +4623,37 @@ impl ProxyFinalTaskListener for AdmittedProxyFinalTaskListener {
                 "Proxy final Tasks listener was polled after terminal completion",
             ));
         }
-        if request_cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+        let ctx = self.context.clone()
+            .with_request_cx(cx.clone())
+            .with_request_cancellation(request_cancellation.clone());
+        if let Err(error) = ctx.ensure_live() {
             self.phase = ProxyFinalTaskListenerPhase::Terminated;
             self.pending = None;
             self.pending_handles.clear();
-            return Err(McpError::request_cancelled());
+            return Err(error.into());
         }
-        if let Some(notification) = self.take_pending_notification()? {
+        if let Some(notification) = self.take_pending_notification(&ctx).await? {
             return Ok(notification);
         }
-
-        let event = self.inner.next(cx, request_cancellation)?;
-        if request_cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+        let event = self.inner.next_async(cx, request_cancellation).await?;
+        if let Err(error) = ctx.ensure_live() {
             self.phase = ProxyFinalTaskListenerPhase::Terminated;
             self.pending = None;
             self.pending_handles.clear();
-            return Err(McpError::request_cancelled());
+            return Err(error.into());
         }
-        self.admit_event(event)
+        self.admit_event(&ctx, event).await
+    }
+}
+
+#[cfg(feature = "tasks")]
+impl ProxyFinalTaskListener for AdmittedProxyFinalTaskListener {
+    fn next(
+        &mut self,
+        cx: &Cx,
+        request_cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<ProxyFinalTaskListenerEvent> {
+        poll_on_cx(cx, self.next_event(cx, request_cancellation))
     }
 
     fn next_async<'a>(
@@ -4634,30 +4661,7 @@ impl ProxyFinalTaskListener for AdmittedProxyFinalTaskListener {
         cx: &'a Cx,
         request_cancellation: &'a fastmcp_core::McpRequestCancellation,
     ) -> Pin<Box<dyn Future<Output = McpResult<ProxyFinalTaskListenerEvent>> + Send + 'a>> {
-        Box::pin(async move {
-            if self.phase == ProxyFinalTaskListenerPhase::Terminated {
-                return Err(McpError::invalid_request(
-                    "Proxy final Tasks listener was polled after terminal completion",
-                ));
-            }
-            if request_cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-                self.phase = ProxyFinalTaskListenerPhase::Terminated;
-                self.pending = None;
-                self.pending_handles.clear();
-                return Err(McpError::request_cancelled());
-            }
-            if let Some(notification) = self.take_pending_notification()? {
-                return Ok(notification);
-            }
-            let event = self.inner.next_async(cx, request_cancellation).await?;
-            if request_cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-                self.phase = ProxyFinalTaskListenerPhase::Terminated;
-                self.pending = None;
-                self.pending_handles.clear();
-                return Err(McpError::request_cancelled());
-            }
-            self.admit_event(event)
-        })
+        Box::pin(self.next_event(cx, request_cancellation))
     }
 }
 
@@ -4920,7 +4924,9 @@ impl ProxyFinalTaskRelay {
         let handle = serde_json::from_value::<FinalTaskId>(value.clone()).map_err(|_| {
             McpError::invalid_request("Proxy relayed final Task carrier is invalid")
         })?;
-        let mut result = self.resolve_task(proxy_task_owner(ctx)?, &handle)?.1.creation;
+        let retained = self.resolve_task(proxy_task_owner(ctx)?, &handle)?.1;
+        let mut result = retained.creation;
+        result.task = retained.task;
         set_relayed_task_id(&mut result.task, handle);
         Ok(Some(result))
     }
@@ -4992,7 +4998,7 @@ impl ProxyFinalTaskRelay {
         }
         let retained_at = Instant::now();
         let wall_origin = chrono::Utc::now();
-        let retained = ProxyRelayedFinalTask {
+        let mut retained = ProxyRelayedFinalTask {
             expires_at: Self::task_expiry(&result.task, retained_at, wall_origin)?,
             task: result.task.clone(),
             creation: result,
@@ -5000,6 +5006,7 @@ impl ProxyFinalTaskRelay {
             owner: reservation.owner,
             retained_at,
             wall_origin,
+            snapshot_revision: 0,
         };
         let mut registry = self
             .tasks
@@ -5017,24 +5024,42 @@ impl ProxyFinalTaskRelay {
                 "Proxy final Tasks registry exceeded its admitted capacity",
             ));
         }
+        // Repeated upstream IDs are aliases of one owned Task, not new
+        // observations that can reset an existing Task's terminal state.
+        if let Some(existing) = registry.tasks.values().find(|existing| {
+            existing.binding == self.binding && existing.owner == reservation.owner
+                && existing.task.base().task_id == retained.task.base().task_id
+                && existing.task.base().created_at == retained.task.base().created_at
+                && existing.expires_at.is_none_or(|deadline| deadline > retained_at)
+        }) {
+            retained.task = existing.task.clone();
+            retained.expires_at = Self::task_expiry(
+                &retained.task, retained_at, wall_origin,
+            )?;
+            retained.snapshot_revision = existing.snapshot_revision;
+        }
         registry.tasks.insert(reservation.handle.clone(), retained);
         registry.pending_creations.remove(&reservation.handle);
         reservation.active = false;
         Ok(())
     }
 
+    /// Commits a complete observation only when its locally captured revision
+    /// still owns the read. `None` asks the caller for a bounded fresh get; it
+    /// never guesses an upstream revision from the displayed wall clock.
     fn record_task(
         &self,
         owner: fastmcp_core::Sha256Digest,
         handle: &FinalTaskId,
-        task: FinalTask,
-    ) -> McpResult<()> {
+        task: &FinalTask,
+        expected_revision: Option<u64>,
+    ) -> McpResult<Option<FinalTask>> {
         let mut registry = self
             .tasks
             .lock()
             .map_err(|_| McpError::internal_error("Proxy final Tasks registry lock poisoned"))?;
         let now = Instant::now();
-        let retained = registry.tasks.get_mut(handle)
+        let retained = registry.tasks.get(handle)
             .filter(|retained| {
                 retained.binding == self.binding && retained.owner == owner
                     && retained.expires_at.is_none_or(|deadline| deadline > now)
@@ -5047,9 +5072,82 @@ impl ProxyFinalTaskRelay {
                 "Proxy upstream Task snapshot changed its admitted identity",
             ));
         }
-        retained.expires_at = Self::task_expiry(&task, retained.retained_at, retained.wall_origin)?;
-        retained.task = task;
-        Ok(())
+        if proxy_task_snapshots_match(&retained.task, task)? {
+            return Ok(Some(retained.task.clone()));
+        }
+        if proxy_task_is_terminal(&retained.task) && !proxy_task_is_terminal(task) {
+            // A late poll/event may observe a pre-completion snapshot. It
+            // cannot resurrect a terminal Task or roll back its TTL.
+            return Ok(Some(retained.task.clone()));
+        }
+        if expected_revision != Some(retained.snapshot_revision) {
+            // Every differing unsolicited snapshot needs an authoritative
+            // get. Even a later-looking timestamp can belong to an older
+            // input round after the upstream wall clock moves backwards.
+            // Only a read fenced by this local revision may replace state.
+            return Ok(None);
+        }
+        if proxy_task_is_terminal(&retained.task)
+            && !proxy_task_terminal_payloads_match(&retained.task, task)?
+        {
+            return Err(McpError::invalid_request(
+                "Proxy upstream Task changed an observed terminal outcome",
+            ));
+        }
+        let revision = registry.next_snapshot_revision.checked_add(1).ok_or_else(|| {
+            McpError::internal_error("Proxy final Task observation revision exhausted")
+        })?;
+        // Validate every alias's new deadline before changing any record.
+        // Upstream IDs only select within this immutable route and owner.
+        let mut updates = Vec::new();
+        for (alias, retained) in &registry.tasks {
+            if retained.binding == self.binding && retained.owner == owner
+                && retained.task.base().task_id == task.base().task_id
+                && retained.task.base().created_at == task.base().created_at
+                && retained.expires_at.is_none_or(|deadline| deadline > now)
+            {
+                let expiry = Self::task_expiry(task, retained.retained_at, retained.wall_origin)?;
+                updates.push((alias.clone(), expiry));
+            }
+        }
+        for (alias, expiry) in updates {
+            let retained = registry.tasks.get_mut(&alias).expect("validated alias is retained");
+            retained.task = task.clone();
+            retained.expires_at = expiry;
+            retained.snapshot_revision = revision;
+        }
+        registry.next_snapshot_revision = revision;
+        Ok(Some(task.clone()))
+    }
+
+    async fn reconcile_task(
+        &self,
+        ctx: &McpContext,
+        owner: fastmcp_core::Sha256Digest,
+        handle: &FinalTaskId,
+        mut task: FinalTask,
+        mut expected_revision: Option<u64>,
+    ) -> McpResult<FinalTask> {
+        // A conflicting event gets at most two fresh reads. Further races
+        // remain explicit instead of spinning or overwriting a newer state.
+        for attempt in 0..=2 {
+            ctx.ensure_live()?;
+            if proxy_task_owner(ctx)? != owner {
+                return Err(unknown_proxy_task());
+            }
+            if let Some(admitted) = self.record_task(owner, handle, &task, expected_revision)? {
+                return Ok(admitted);
+            }
+            if attempt == 2 {
+                break;
+            }
+            let current = self.known_mapping(owner, handle)?;
+            expected_revision = Some(current.snapshot_revision);
+            task = self.client.get_final_task(ctx, current.task.base().task_id.clone()).await?.task;
+        }
+        Err(McpError::invalid_request(
+            "Proxy upstream Task reconciliation raced newer observations",
+        ))
     }
 
     fn task_expiry(
@@ -5119,7 +5217,9 @@ impl ProxyFinalTaskRelay {
             .client
             .get_final_task(ctx, retained.task.base().task_id.clone())
             .await?;
-        route.record_task(owner, &parameters.task_id, result.task.clone())?;
+        result.task = route.reconcile_task(
+            ctx, owner, &parameters.task_id, result.task, Some(retained.snapshot_revision),
+        ).await?;
         set_relayed_task_id(&mut result.task, parameters.task_id);
         serde_json::to_value(result).map_err(|_| {
             McpError::internal_error("Proxy final tasks/get response serialization failed")
@@ -5241,7 +5341,8 @@ impl ProxyFinalTaskRelay {
             .await
             .map(|listener| {
                 Box::new(AdmittedProxyFinalTaskListener::new(
-                    listener, Arc::clone(self), owner, mappings, upstream_filter, notifications,
+                    listener, Arc::clone(self), owner, ctx.clone(), mappings,
+                    upstream_filter, notifications,
                 ))
                     as Box<dyn ProxyFinalTaskListener>
             })
@@ -5263,6 +5364,38 @@ impl ProxyFinalTaskRelay {
 #[cfg(feature = "tasks")]
 fn unknown_proxy_task() -> McpError {
     McpError::invalid_params("Unknown proxy-relayed final Task handle")
+}
+
+#[cfg(feature = "tasks")]
+fn proxy_task_snapshots_match(left: &FinalTask, right: &FinalTask) -> McpResult<bool> {
+    let encode = |task: &FinalTask| serde_json::to_vec(task).map_err(|_| {
+        McpError::internal_error("Proxy final Task snapshot serialization failed")
+    });
+    // The typed serializer retains completed-result numeric lexemes and open
+    // sibling order; a serde_json::Value comparison would erase that evidence.
+    Ok(encode(left)? == encode(right)?)
+}
+
+#[cfg(feature = "tasks")]
+const fn proxy_task_is_terminal(task: &FinalTask) -> bool {
+    matches!(task, FinalTask::Completed { .. } | FinalTask::Failed { .. } | FinalTask::Cancelled(_))
+}
+
+#[cfg(feature = "tasks")]
+fn proxy_task_terminal_payloads_match(left: &FinalTask, right: &FinalTask) -> McpResult<bool> {
+    let mut normalized = right.clone();
+    let base = match &mut normalized {
+        FinalTask::Completed { base, .. } | FinalTask::Failed { base, .. }
+        | FinalTask::Cancelled(base) => base,
+        FinalTask::Working(_) | FinalTask::InputRequired { .. } => return Ok(false),
+    };
+    if base.status != left.base().status {
+        return Ok(false);
+    }
+    // A terminal result is immutable; an authoritative retention update may
+    // still change common metadata, TTL or polling guidance.
+    *base = left.base().clone();
+    proxy_task_snapshots_match(left, &normalized)
 }
 
 /// The server's current AuthProvider and configured scope policy authorize
@@ -8404,7 +8537,7 @@ impl ProxyUpstreamBindingRegistry {
 
         let client = ClientBuilder::new()
             .protocol_plan(protocol_plan)
-            .connect_stdio_with_cx(command, args, cx)
+            .connect_stdio_with_cx(cx, command, args)
             .await?;
         context.ensure_live()?;
         let binding = binding_from_live_stdio_client(&client, configuration_generation)?;
@@ -12584,10 +12717,10 @@ IFS= read -r end
             );
             let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
             let mut client = Client::stdio_with_protocol_plan_with_cx(
+                cx.clone(),
                 "sh",
                 &["-c", &script],
                 ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-                cx.clone(),
             )
             .unwrap();
             client
@@ -13818,10 +13951,10 @@ IFS= read -r end
         );
         let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
         let mut client = Client::stdio_with_protocol_plan_with_cx(
+            cx.clone(),
             "sh",
             &["-c", &script],
             ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
-            cx.clone(),
         )
         .unwrap();
         client
@@ -14059,6 +14192,7 @@ IFS= read -r end
                 );
                 let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
                 let mut client = Client::stdio_with_protocol_plan_with_cx(
+                    cx.clone(),
                     "sh",
                     &["-c", &script],
                     ClientProtocolPlan::stdio(if modern {
@@ -14066,7 +14200,6 @@ IFS= read -r end
                     } else {
                         ProtocolPolicy::LegacyOnly
                     }),
-                    cx.clone(),
                 )
                 .unwrap();
                 client
@@ -14659,10 +14792,10 @@ IFS= read -r end
                 );
                 let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
                 let mut client = Client::stdio_with_protocol_plan_with_cx(
+                    cx.clone(),
                     "sh",
                     &["-c", &script],
                     ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-                    cx.clone(),
                 )
                 .unwrap();
                 client
@@ -18028,7 +18161,7 @@ IFS= read -r end
         let proxy = ProxyClient::from_backend_with_upstream_binding(
             FinalTaskRelayBackend {
                 calls: Arc::new(Mutex::new(Vec::new())),
-                task: initial.clone(),
+                task: CreateTaskResult { task: update.clone(), ..initial.clone() },
                 listener_events: Some(VecDeque::from([
                     ProxyFinalTaskListenerEvent::Acknowledged(upstream_filter),
                     ProxyFinalTaskListenerEvent::Notification(relay_test_notification(update)),
@@ -18044,6 +18177,387 @@ IFS= read -r end
         let issued = issue_relay_test_task(&relay, &owner, initial.task);
         let handle = issued.task.base().task_id.clone();
         (proxy, relay, owner, handle)
+    }
+
+    #[cfg(feature = "tasks")]
+    struct TaskReconciliationReply {
+        result: fastmcp_core::McpResult<fastmcp_protocol::Task>,
+        before_reply: Option<Box<dyn FnOnce() + Send>>,
+    }
+
+    #[cfg(feature = "tasks")]
+    struct TaskReconciliationBackend {
+        backend: FinalTaskRelayBackend,
+        replies: Arc<Mutex<VecDeque<TaskReconciliationReply>>>,
+    }
+
+    #[cfg(feature = "tasks")]
+    impl ProxyBackend for TaskReconciliationBackend {
+        fn list_tools(&mut self) -> fastmcp_core::McpResult<Vec<Tool>> {
+            self.backend.list_tools()
+        }
+        fn list_resources(&mut self) -> fastmcp_core::McpResult<Vec<Resource>> {
+            self.backend.list_resources()
+        }
+        fn list_resource_templates(&mut self) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceTemplate>> {
+            self.backend.list_resource_templates()
+        }
+        fn list_prompts(&mut self) -> fastmcp_core::McpResult<Vec<Prompt>> {
+            self.backend.list_prompts()
+        }
+        fn call_tool(&mut self, name: &str, arguments: serde_json::Value) -> fastmcp_core::McpResult<Vec<Content>> {
+            self.backend.call_tool(name, arguments)
+        }
+        fn call_tool_with_progress(
+            &mut self, name: &str, arguments: serde_json::Value, progress: super::ProgressCallback<'_>,
+        ) -> fastmcp_core::McpResult<Vec<Content>> {
+            self.backend.call_tool_with_progress(name, arguments, progress)
+        }
+        fn read_resource(&mut self, uri: &str) -> fastmcp_core::McpResult<Vec<ResourceContent>> {
+            self.backend.read_resource(uri)
+        }
+        fn get_prompt(&mut self, name: &str, arguments: HashMap<String, String>) -> fastmcp_core::McpResult<Vec<PromptMessage>> {
+            self.backend.get_prompt(name, arguments)
+        }
+        fn supports_final_tasks_relay(&mut self) -> fastmcp_core::McpResult<bool> {
+            Ok(true)
+        }
+        fn get_final_task(&mut self, task_id: fastmcp_protocol::FinalTaskId) -> fastmcp_core::McpResult<FinalGetTaskResult> {
+            self.backend.record("tasks/get");
+            assert_eq!(task_id, self.backend.task.task.base().task_id);
+            let reply = self.replies.lock().unwrap().pop_front().expect("reconciliation read is bounded");
+            if let Some(before_reply) = reply.before_reply {
+                before_reply();
+            }
+            Ok(FinalGetTaskResult { task: reply.result?, meta: None, additional: BTreeMap::new() })
+        }
+        fn open_final_task_listener(
+            &mut self, notifications: SubscriptionFilter,
+        ) -> fastmcp_core::McpResult<Box<dyn ProxyFinalTaskListener>> {
+            self.backend.open_final_task_listener(notifications)
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    struct TaskReconciliationFixture {
+        proxy: ProxyClient,
+        relay: Arc<super::ProxyFinalTaskRelay>,
+        context: McpContext,
+        handle: fastmcp_protocol::FinalTaskId,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        replies: Arc<Mutex<VecDeque<TaskReconciliationReply>>>,
+    }
+
+    #[cfg(feature = "tasks")]
+    fn task_reconciliation_fixture(
+        initial: fastmcp_protocol::Task,
+        notifications: Vec<fastmcp_protocol::Task>,
+    ) -> TaskReconciliationFixture {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let replies = Arc::new(Mutex::new(VecDeque::new()));
+        let filter = relay_test_filter(vec![initial.base().task_id.clone()]);
+        let mut events = VecDeque::from([ProxyFinalTaskListenerEvent::Acknowledged(filter)]);
+        events.extend(notifications.into_iter().map(|task| {
+            ProxyFinalTaskListenerEvent::Notification(relay_test_notification(task))
+        }));
+        events.push_back(ProxyFinalTaskListenerEvent::Terminal);
+        let proxy = ProxyClient::from_backend_with_upstream_binding(TaskReconciliationBackend {
+            backend: FinalTaskRelayBackend {
+                calls: Arc::clone(&calls),
+                task: CreateTaskResult { task: initial.clone(), meta: None, additional: BTreeMap::new() },
+                listener_events: Some(events), cancel_after_task_commit: None, final_progress: None,
+            },
+            replies: Arc::clone(&replies),
+        }, final_task_relay_binding(ProtocolEra::Modern2026), "2026-07-28").unwrap();
+        let relay = proxy.final_tasks_relay().unwrap().unwrap();
+        let context = relay_test_context(Cx::for_testing(), 861);
+        let handle = issue_relay_test_task(&relay, &context, initial).task.base().task_id.clone();
+        TaskReconciliationFixture { proxy, relay, context, handle, calls, replies }
+    }
+
+    #[cfg(feature = "tasks")]
+    fn task_reconciliation_get(fixture: &TaskReconciliationFixture) -> fastmcp_core::McpResult<serde_json::Value> {
+        let metadata = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
+        block_on(fixture.relay.dispatch_get(&fixture.context,
+            serde_json::json!({"_meta": metadata, "taskId": fixture.handle})))
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_reconciliation_accepts_equal_and_regressed_timestamps_via_authoritative_get() {
+        for timestamp in ["2026-07-28T14:00:00+02:00", "2026-07-28T12:00:00.000Z",
+            "2026-07-28T11:59:59.999999999Z"] {
+            let initial = final_task_relay_result().task;
+            let mut update = serde_json::to_value(&initial).unwrap();
+            update["lastUpdatedAt"] = serde_json::json!(timestamp);
+            update["statusMessage"] = serde_json::json!("fresh authoritative input request");
+            let update: fastmcp_protocol::Task = serde_json::from_value(update).unwrap();
+            let fixture = task_reconciliation_fixture(initial, vec![update.clone()]);
+            fixture.replies.lock().unwrap().push_back(TaskReconciliationReply {
+                result: Ok(update.clone()), before_reply: None,
+            });
+            let mut listener = block_on(fixture.relay.open_listener_async(&fixture.context,
+                relay_test_filter(vec![fixture.handle.clone()]))).unwrap();
+            let cancellation = McpRequestCancellation::new();
+            assert!(matches!(listener.next(fixture.context.cx(), &cancellation).unwrap(),
+                ProxyFinalTaskListenerEvent::Acknowledged(_)));
+            let ProxyFinalTaskListenerEvent::Notification(event) =
+                block_on(listener.next_async(fixture.context.cx(), &cancellation)).unwrap()
+                else { panic!("a legal equal/regressed timestamp cannot suppress a fresh state") };
+            assert_eq!(event.params.task.base().last_updated_at.as_str(), timestamp);
+            assert_eq!(event.params.task.base().status_message.as_deref(), Some("fresh authoritative input request"));
+            assert_eq!(fixture.calls.lock().unwrap().as_slice(), ["subscriptions/listen", "tasks/get"]);
+            assert!(super::proxy_task_snapshots_match(&fixture.relay.known_task(&fixture.context,
+                &fixture.handle).unwrap(), &update).unwrap());
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_reconciliation_confirms_newer_looking_events_and_deduplicates_retained_snapshots() {
+        let initial = final_task_relay_result().task;
+        let mut update = serde_json::to_value(&initial).unwrap();
+        update["lastUpdatedAt"] = serde_json::json!("2026-07-28T10:00:01-02:00");
+        update["statusMessage"] = serde_json::json!("one second later in another offset");
+        let update: fastmcp_protocol::Task = serde_json::from_value(update).unwrap();
+        let fixture = task_reconciliation_fixture(initial, vec![update.clone(), update.clone()]);
+        fixture.replies.lock().unwrap().push_back(TaskReconciliationReply {
+            result: Ok(update.clone()), before_reply: None,
+        });
+        let mut listener = block_on(fixture.relay.open_listener_async(&fixture.context,
+            relay_test_filter(vec![fixture.handle.clone()]))).unwrap();
+        let cancellation = McpRequestCancellation::new();
+        assert!(matches!(listener.next(fixture.context.cx(), &cancellation).unwrap(),
+            ProxyFinalTaskListenerEvent::Acknowledged(_)));
+        assert!(matches!(listener.next(fixture.context.cx(), &cancellation).unwrap(),
+            ProxyFinalTaskListenerEvent::Notification(_)));
+        let revision = fixture.relay.tasks.lock().unwrap().tasks[&fixture.handle].snapshot_revision;
+        assert!(revision > 0);
+        assert!(matches!(listener.next(fixture.context.cx(), &cancellation).unwrap(),
+            ProxyFinalTaskListenerEvent::Notification(_)));
+        assert_eq!(fixture.relay.tasks.lock().unwrap().tasks[&fixture.handle].snapshot_revision, revision,
+            "byte-equivalent notifications do not invent a new upstream observation");
+        assert!(super::proxy_task_snapshots_match(&fixture.relay.known_task(&fixture.context,
+            &fixture.handle).unwrap(), &update).unwrap());
+        assert_eq!(fixture.calls.lock().unwrap().as_slice(), ["subscriptions/listen", "tasks/get"]);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_reconciliation_delayed_newer_timestamp_cannot_restore_an_old_input_round() {
+        let initial = final_task_relay_result().task;
+        let mut working = serde_json::to_value(&initial).unwrap();
+        working.as_object_mut().unwrap().remove("inputRequests");
+        working["status"] = serde_json::json!("working");
+        working["lastUpdatedAt"] = serde_json::json!("2026-07-28T11:59:59Z");
+        working["statusMessage"] = serde_json::json!("input accepted after clock rollback");
+        let working: fastmcp_protocol::Task = serde_json::from_value(working).unwrap();
+        let fixture = task_reconciliation_fixture(initial.clone(), vec![initial]);
+        fixture.replies.lock().unwrap().extend([
+            TaskReconciliationReply { result: Ok(working.clone()), before_reply: None },
+            TaskReconciliationReply { result: Ok(working.clone()), before_reply: None },
+        ]);
+        // The first authoritative read legitimately moves to Working while
+        // its wall-clock timestamp regresses. The delayed original event has
+        // a greater timestamp but no authority to reopen its old input round.
+        assert_eq!(task_reconciliation_get(&fixture).unwrap()["status"], "working");
+        let before = fixture.proxy.final_task_registry_snapshot_for_test().unwrap();
+        let revision = fixture.relay.tasks.lock().unwrap().tasks[&fixture.handle].snapshot_revision;
+        let mut listener = block_on(fixture.relay.open_listener_async(&fixture.context,
+            relay_test_filter(vec![fixture.handle.clone()]))).unwrap();
+        let cancellation = McpRequestCancellation::new();
+        assert!(matches!(listener.next(fixture.context.cx(), &cancellation).unwrap(),
+            ProxyFinalTaskListenerEvent::Acknowledged(_)));
+        let ProxyFinalTaskListenerEvent::Notification(event) =
+            block_on(listener.next_async(fixture.context.cx(), &cancellation)).unwrap()
+            else { panic!("the event must expose only the reconciled current state") };
+        assert!(matches!(event.params.task, fastmcp_protocol::Task::Working(_)));
+        assert_eq!(event.params.task.base().last_updated_at.as_str(), "2026-07-28T11:59:59Z");
+        assert_eq!(fixture.proxy.final_task_registry_snapshot_for_test().unwrap(), before);
+        assert_eq!(fixture.relay.tasks.lock().unwrap().tasks[&fixture.handle].snapshot_revision, revision);
+        assert_eq!(fixture.calls.lock().unwrap().as_slice(), ["tasks/get", "subscriptions/listen", "tasks/get"]);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_reconciliation_preserves_state_when_authoritative_get_fails() {
+        let initial = final_task_relay_result().task;
+        let mut update = serde_json::to_value(&initial).unwrap();
+        update["statusMessage"] = serde_json::json!("ambiguous event");
+        let fixture = task_reconciliation_fixture(initial, vec![serde_json::from_value(update).unwrap()]);
+        fixture.replies.lock().unwrap().push_back(TaskReconciliationReply {
+            result: Err(fastmcp_core::McpError::internal_error("upstream unavailable")), before_reply: None,
+        });
+        let before = fixture.proxy.final_task_registry_snapshot_for_test().unwrap();
+        let mut listener = block_on(fixture.relay.open_listener_async(&fixture.context,
+            relay_test_filter(vec![fixture.handle.clone()]))).unwrap();
+        let cancellation = McpRequestCancellation::new();
+        assert!(matches!(listener.next(fixture.context.cx(), &cancellation).unwrap(),
+            ProxyFinalTaskListenerEvent::Acknowledged(_)));
+        assert_eq!(listener.next(fixture.context.cx(), &cancellation).unwrap_err().message, "upstream unavailable");
+        assert_eq!(fixture.proxy.final_task_registry_snapshot_for_test().unwrap(), before);
+        assert_eq!(listener.next(fixture.context.cx(), &cancellation).unwrap_err().code, McpErrorCode::InvalidRequest);
+        assert_eq!(fixture.calls.lock().unwrap().as_slice(), ["subscriptions/listen", "tasks/get"]);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_reconciliation_terminal_snapshot_survives_stale_poll_and_preserves_exact_result() {
+        let initial = final_task_relay_result_with_ttl("terminal-race", Some(60_000)).task;
+        let base = initial.base().clone();
+        let result: fastmcp_protocol::Task = serde_json::from_str(&format!(
+            r#"{{"taskId":"terminal-race","status":"completed","createdAt":{},"lastUpdatedAt":{},"ttlMs":120000,"result":{{"content":[{{"type":"text","text":"finished"}}],"z-extra":1.2300e+17,"a-extra":{{"exact":9007199254740993123456789}}}}}}"#,
+            serde_json::to_string(&base.created_at).unwrap(), serde_json::to_string(&base.last_updated_at).unwrap(),
+        )).unwrap();
+        let fixture = task_reconciliation_fixture(initial.clone(), vec![result.clone(), initial.clone()]);
+        fixture.replies.lock().unwrap().extend([
+            TaskReconciliationReply { result: Ok(result.clone()), before_reply: None },
+            TaskReconciliationReply { result: Ok(initial), before_reply: None },
+        ]);
+        let mut listener = block_on(fixture.relay.open_listener_async(&fixture.context,
+            relay_test_filter(vec![fixture.handle.clone()]))).unwrap();
+        let cancellation = McpRequestCancellation::new();
+        assert!(matches!(listener.next(fixture.context.cx(), &cancellation).unwrap(),
+            ProxyFinalTaskListenerEvent::Acknowledged(_)));
+        assert!(matches!(listener.next(fixture.context.cx(), &cancellation).unwrap(),
+            ProxyFinalTaskListenerEvent::Notification(_)));
+        let deadline = fixture.relay.tasks.lock().unwrap().tasks[&fixture.handle].expires_at;
+        let polled = task_reconciliation_get(&fixture).unwrap();
+        assert_eq!(polled["status"], "completed");
+        assert_eq!(polled["ttlMs"], 120_000);
+        let ProxyFinalTaskListenerEvent::Notification(stale) =
+            listener.next(fixture.context.cx(), &cancellation).unwrap()
+            else { panic!("stale event can only expose the observed terminal snapshot") };
+        assert!(matches!(stale.params.task, fastmcp_protocol::Task::Completed { .. }));
+        let exact = serde_json::to_string(&stale.params.task).unwrap();
+        assert!(exact.contains(r#""z-extra":1.2300e+17,"a-extra":{"exact":9007199254740993123456789}"#));
+        assert_eq!(fixture.relay.tasks.lock().unwrap().tasks[&fixture.handle].expires_at, deadline);
+        assert_eq!(fixture.calls.lock().unwrap().as_slice(), ["subscriptions/listen", "tasks/get", "tasks/get"]);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_reconciliation_retries_a_racing_poll_and_updates_only_owned_aliases() {
+        let initial = final_task_relay_result_with_ttl("same-upstream", Some(60_000)).task;
+        let mut concurrent = serde_json::to_value(&initial).unwrap();
+        concurrent["statusMessage"] = serde_json::json!("notification won");
+        concurrent["ttlMs"] = serde_json::json!(120_000);
+        let concurrent: fastmcp_protocol::Task = serde_json::from_value(concurrent).unwrap();
+        let mut confirmed = concurrent.clone();
+        let fastmcp_protocol::Task::InputRequired { base, .. } = &mut confirmed else { unreachable!() };
+        base.last_updated_at = fastmcp_protocol::TaskTimestamp::parse("2026-07-28T00:00:00Z").unwrap();
+        base.status_message = Some("authoritative read after race".to_owned());
+        let fixture = task_reconciliation_fixture(initial.clone(), Vec::new());
+        let alias = issue_relay_test_task(&fixture.relay, &fixture.context, initial.clone()).task.base().task_id.clone();
+        let foreign = McpContext::new(Cx::for_testing(), 862)
+            .with_auth(fastmcp_core::AuthContext::with_subject("another-owner"));
+        let foreign_handle = issue_relay_test_task(&fixture.relay, &foreign, initial.clone()).task.base().task_id.clone();
+        let route = Arc::downgrade(&fixture.relay);
+        let owner = super::proxy_task_owner(&fixture.context).unwrap();
+        let handle = fixture.handle.clone();
+        fixture.replies.lock().unwrap().extend([
+            TaskReconciliationReply { result: Ok(initial.clone()), before_reply: Some(Box::new(move || {
+                let route = route.upgrade().unwrap();
+                let revision = route.known_mapping(owner, &handle).unwrap().snapshot_revision;
+                assert!(route.record_task(owner, &handle, &concurrent, Some(revision)).unwrap().is_some());
+            })) },
+            TaskReconciliationReply { result: Ok(confirmed.clone()), before_reply: None },
+        ]);
+        assert_eq!(task_reconciliation_get(&fixture).unwrap()["statusMessage"], "authoritative read after race");
+        assert_eq!(fixture.calls.lock().unwrap().as_slice(), ["tasks/get", "tasks/get"]);
+        for handle in [&fixture.handle, &alias] {
+            assert!(super::proxy_task_snapshots_match(&fixture.relay.known_task(&fixture.context, handle).unwrap(), &confirmed).unwrap());
+        }
+        assert!(super::proxy_task_snapshots_match(&fixture.relay.known_task(&foreign, &foreign_handle).unwrap(), &initial).unwrap());
+        // The identical lastUpdatedAt is not a total order: a fresh read may
+        // shorten retention too, while a stale racing read cannot do so.
+        let mut shorter = confirmed;
+        let fastmcp_protocol::Task::InputRequired { base, .. } = &mut shorter else { unreachable!() };
+        base.ttl_ms = Some(serde_json::from_value(serde_json::json!(90_000)).unwrap());
+        fixture.replies.lock().unwrap().push_back(TaskReconciliationReply { result: Ok(shorter), before_reply: None });
+        let before = fixture.relay.tasks.lock().unwrap().tasks[&fixture.handle].expires_at.unwrap();
+        assert_eq!(task_reconciliation_get(&fixture).unwrap()["ttlMs"], 90_000);
+        assert_eq!(fixture.relay.tasks.lock().unwrap().tasks[&fixture.handle].expires_at.unwrap(), before - Duration::from_secs(30));
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_reconciliation_rejects_conflicting_terminal_outcome_without_mutation() {
+        let initial = terminal_task("terminal-conflict");
+        let mut conflict = serde_json::to_value(&initial).unwrap();
+        conflict["status"] = serde_json::json!("completed");
+        conflict["result"] = serde_json::json!({"content": [{"type": "text", "text": "different terminal"}]});
+        let conflict: fastmcp_protocol::Task = serde_json::from_value(conflict).unwrap();
+        let fixture = task_reconciliation_fixture(initial, vec![conflict.clone()]);
+        fixture.replies.lock().unwrap().push_back(TaskReconciliationReply {
+            result: Ok(conflict), before_reply: None,
+        });
+        let before = fixture.proxy.final_task_registry_snapshot_for_test().unwrap();
+        let mut listener = block_on(fixture.relay.open_listener_async(&fixture.context,
+            relay_test_filter(vec![fixture.handle.clone()]))).unwrap();
+        let cancellation = McpRequestCancellation::new();
+        assert!(matches!(listener.next(fixture.context.cx(), &cancellation).unwrap(),
+            ProxyFinalTaskListenerEvent::Acknowledged(_)));
+        let error = block_on(listener.next_async(fixture.context.cx(), &cancellation)).unwrap_err();
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(error.message, "Proxy upstream Task changed an observed terminal outcome");
+        assert_eq!(fixture.proxy.final_task_registry_snapshot_for_test().unwrap(), before);
+        assert_eq!(fixture.calls.lock().unwrap().as_slice(), ["subscriptions/listen", "tasks/get"]);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_reconciliation_bounds_repeated_poll_races() {
+        let initial = final_task_relay_result().task;
+        let fixture = task_reconciliation_fixture(initial.clone(), Vec::new());
+        for index in 0..3 {
+            let route = Arc::downgrade(&fixture.relay);
+            let owner = super::proxy_task_owner(&fixture.context).unwrap();
+            let handle = fixture.handle.clone();
+            let mut concurrent = initial.clone();
+            let fastmcp_protocol::Task::InputRequired { base, .. } = &mut concurrent else { unreachable!() };
+            base.status_message = Some(format!("concurrent update {index}"));
+            fixture.replies.lock().unwrap().push_back(TaskReconciliationReply {
+                result: Ok(initial.clone()), before_reply: Some(Box::new(move || {
+                    let route = route.upgrade().unwrap();
+                    let revision = route.known_mapping(owner, &handle).unwrap().snapshot_revision;
+                    assert!(route.record_task(owner, &handle, &concurrent, Some(revision)).unwrap().is_some());
+                })),
+            });
+        }
+        let error = task_reconciliation_get(&fixture).unwrap_err();
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(error.message, "Proxy upstream Task reconciliation raced newer observations");
+        assert_eq!(fixture.calls.lock().unwrap().as_slice(), ["tasks/get", "tasks/get", "tasks/get"]);
+        assert!(fixture.replies.lock().unwrap().is_empty());
+        assert_eq!(fixture.relay.known_task(&fixture.context, &fixture.handle).unwrap()
+            .base().status_message.as_deref(), Some("concurrent update 2"));
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_reconciliation_cancellation_discards_a_ready_reconciliation_reply() {
+        let initial = final_task_relay_result().task;
+        let mut update = serde_json::to_value(&initial).unwrap();
+        update["statusMessage"] = serde_json::json!("must not be committed after cancellation");
+        let update: fastmcp_protocol::Task = serde_json::from_value(update).unwrap();
+        let fixture = task_reconciliation_fixture(initial, vec![update.clone()]);
+        let cancellation = McpRequestCancellation::new();
+        let cancel_at_reply = cancellation.clone();
+        fixture.replies.lock().unwrap().push_back(TaskReconciliationReply {
+            result: Ok(update), before_reply: Some(Box::new(move || { assert!(cancel_at_reply.cancel()); })),
+        });
+        let before = fixture.proxy.final_task_registry_snapshot_for_test().unwrap();
+        let mut listener = block_on(fixture.relay.open_listener_async(&fixture.context,
+            relay_test_filter(vec![fixture.handle.clone()]))).unwrap();
+        assert!(matches!(listener.next(fixture.context.cx(), &cancellation).unwrap(),
+            ProxyFinalTaskListenerEvent::Acknowledged(_)));
+        assert_eq!(block_on(listener.next_async(fixture.context.cx(), &cancellation)).unwrap_err().code,
+            McpErrorCode::RequestCancelled);
+        assert_eq!(fixture.proxy.final_task_registry_snapshot_for_test().unwrap(), before);
+        assert_eq!(listener.next(fixture.context.cx(), &cancellation).unwrap_err().code,
+            McpErrorCode::InvalidRequest);
+        assert_eq!(fixture.calls.lock().unwrap().as_slice(), ["subscriptions/listen", "tasks/get"]);
     }
 
     #[cfg(feature = "tasks")]
@@ -18399,7 +18913,7 @@ IFS= read -r end
                     ProxyFinalTaskListenerEvent::Acknowledged(upstream_filter.clone()),
                     ProxyFinalTaskListenerEvent::Notification(relay_test_notification(update)),
                 ]))),
-                relay.clone(), super::proxy_task_owner(&owner).unwrap(),
+                relay.clone(), super::proxy_task_owner(&owner).unwrap(), owner.clone(),
                 vec![(handle, initial.task.base().task_id.clone())],
                 upstream_filter, downstream_filter,
             );
@@ -21979,7 +22493,7 @@ expect_request notifications/initialized ''
                 .auto_initialize(true)
                 .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
                 .request_timeout_policy(scripted_peer_timeout_policy())
-                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &cx),
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script.as_str()]),
         )
         .expect("spawn exact-2024 paginated stdio peer");
         let proxy = ProxyClient::from_backend(client);
@@ -23961,10 +24475,10 @@ expect_request notifications/initialized ''
         );
         let script = modern_proxy_peer_script(&discovery, &tool_result);
         let client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_testing(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
-            Cx::for_testing(),
         )
         .expect("Auto retains its live modern selection");
         let proxy = ProxyClient::from_client(client)
@@ -24078,10 +24592,10 @@ exec sleep 2
         );
         let script = auto_legacy_proxy_peer_script(&discovery_refusal, &initialize, &tool_result);
         let client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_testing(),
             "sh",
             &["-c", script.as_str()],
             ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
-            Cx::for_testing(),
         )
         .expect("Auto selects exact legacy only after an authorized modern refusal");
         let proxy = ProxyClient::from_client(client)
@@ -24270,7 +24784,7 @@ exec sleep 2
                 .auto_initialize(true)
                 .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
                 .request_timeout_policy(scripted_peer_timeout_policy())
-                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &cx),
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script.as_str()]),
         )
         .expect("spawn scripted auto-initializing client");
         assert!(!client.is_initialized());
@@ -24299,7 +24813,7 @@ exec sleep 2
                 .auto_initialize(true)
                 .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
                 .request_timeout_policy(scripted_peer_timeout_policy())
-                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &cx),
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script.as_str()]),
         )
         .expect("spawn scripted auto-initializing client");
 

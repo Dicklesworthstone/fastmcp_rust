@@ -14,7 +14,8 @@
 //!   default. [`crate::ServerBuilder::task_supervisor`] installs one for an
 //!   [`ApplicationTaskSupervisor`], and every serve path then hosts its runner
 //!   as a child of the serve scope: started and ready before traffic,
-//!   settled within a bound before the serve returns. An embedding that owns
+//!   awaited through quiescence before the serve returns, reporting a failure
+//!   if settlement exceeds its grace period. An embedding that owns
 //!   its own region may instead call [`FinalTaskRuntime::install_task_service`]
 //!   and poll [`AuthorizedTaskServiceRunner::run_service`] itself. Without
 //!   either, a task-creating request is refused with "Final task creation
@@ -32,7 +33,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::RwLock;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicU64, Ordering as TaskServiceOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as TaskServiceOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -6313,10 +6314,6 @@ impl FinalTaskRuntime {
 
     /// Whether a Task service is installed, ready or not. A builder uses this
     /// to refuse hosting a second service on a caller-installed runtime.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
-    )]
     pub(crate) fn has_installed_task_service(&self) -> bool {
         self.service_signal
             .lock()
@@ -6890,33 +6887,14 @@ impl AuthorizedTaskServiceRunner {
 
 /// Wakeup-queue capacity of a Task service installed through
 /// [`crate::ServerBuilder::task_supervisor`].
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
-)]
 pub(crate) const HOSTED_TASK_SERVICE_QUEUE_CAPACITY: usize = 64;
 /// How long a serve path waits for its hosted Task service to become ready.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
-)]
 pub(crate) const HOSTED_TASK_SERVICE_STARTUP_BOUND: StdDuration = StdDuration::from_secs(2);
-/// How long a serve path waits for its hosted Task service to settle on exit.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
-)]
+/// Grace period before settlement records a deadline failure. The service
+/// remains owned and awaited until it actually exits after this threshold.
 pub(crate) const HOSTED_TASK_SERVICE_SETTLEMENT_BOUND: StdDuration = StdDuration::from_secs(4);
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
-)]
 const HOSTED_TASK_SERVICE_POLL: StdDuration = StdDuration::from_millis(1);
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
-)]
 type HostedRunnerSlot = Arc<Mutex<Option<AuthorizedTaskServiceRunner>>>;
 
 /// A builder-installed Task service that each serve path hosts in its own
@@ -6927,10 +6905,6 @@ type HostedRunnerSlot = Arc<Mutex<Option<AuthorizedTaskServiceRunner>>>;
 /// child finishes, is cancelled or is dropped. A runner therefore cannot
 /// outlive the serve that started it, and a later serve can re-enter it.
 #[derive(Clone)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
-)]
 pub(crate) struct TaskServiceHost {
     runtime: FinalTaskRuntime,
     slot: HostedRunnerSlot,
@@ -6938,22 +6912,31 @@ pub(crate) struct TaskServiceHost {
 
 /// The hosted Task service child of one serve.
 #[must_use = "a hosted Task service must be settled before its serve returns"]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
-)]
 pub(crate) struct HostedTaskService {
     runtime: FinalTaskRuntime,
     handle: asupersync::runtime::TaskHandle<McpResult<()>>,
+    failure_signal: Arc<AtomicBool>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
-)]
 struct ReturnRunnerOnDrop {
     slot: HostedRunnerSlot,
     runner: Option<AuthorizedTaskServiceRunner>,
+}
+
+struct HostedServiceExitSignal {
+    cx: Cx,
+    failed: Arc<AtomicBool>,
+}
+
+impl Drop for HostedServiceExitSignal {
+    fn drop(&mut self) {
+        // Unwinding must wake native synchronous ingress just as a returned
+        // service failure does. Caller-requested cancellation is already an
+        // ingress stop signal and must not turn a clean shutdown into failure.
+        if !self.cx.is_cancel_requested() {
+            self.failed.store(true, TaskServiceOrdering::Release);
+        }
+    }
 }
 
 impl Drop for ReturnRunnerOnDrop {
@@ -6966,10 +6949,6 @@ impl Drop for ReturnRunnerOnDrop {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
-)]
 impl TaskServiceHost {
     /// Installs `supervisor` as the one Task service of `runtime`.
     pub(crate) fn install(
@@ -6986,6 +6965,12 @@ impl TaskServiceHost {
 
     /// Starts the runner as a child task of `cx`. Readiness is not awaited.
     pub(crate) fn start(&self, cx: &Cx) -> McpResult<HostedTaskService> {
+        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+        if cx.timer_driver().is_none() {
+            return Err(McpError::internal_error(
+                "A hosted Task service requires the caller's timer driver",
+            ));
+        }
         let runner = self
             .slot
             .lock()
@@ -6998,10 +6983,16 @@ impl TaskServiceHost {
             slot: Arc::clone(&self.slot),
             runner: Some(runner),
         };
+        let failure_signal = Arc::new(AtomicBool::new(false));
+        let service_failure = Arc::clone(&failure_signal);
         // A refused spawn drops the closure, and with it the guard, which
         // returns the runner to its slot.
         let handle = cx
             .spawn(move |service_cx| async move {
+                let _exit_signal = HostedServiceExitSignal {
+                    cx: service_cx.clone(),
+                    failed: service_failure,
+                };
                 let Some(runner) = guard.runner.as_mut() else {
                     return Ok(());
                 };
@@ -7013,6 +7004,7 @@ impl TaskServiceHost {
         Ok(HostedTaskService {
             runtime: self.runtime.clone(),
             handle,
+            failure_signal,
         })
     }
 
@@ -7043,11 +7035,22 @@ impl TaskServiceHost {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
-)]
 impl HostedTaskService {
+    /// A task-service fault terminates its owning serve, even when the next
+    /// request has not arrived. Synchronous pumps share this with their
+    /// existing receive-interruption signal.
+    pub(crate) fn failure_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.failure_signal)
+    }
+
+    pub(crate) fn check_running(&self) -> McpResult<()> {
+        if self.handle.is_finished() {
+            Err(McpError::internal_error("The hosted Task service stopped while serving"))
+        } else {
+            Ok(())
+        }
+    }
+
     fn not_ready(&mut self) -> McpResult<bool> {
         if self.runtime.is_task_service_ready() {
             return Ok(false);
@@ -7063,6 +7066,7 @@ impl HostedTaskService {
     async fn ready(&mut self, cx: &Cx) -> McpResult<()> {
         let deadline = cx.now() + HOSTED_TASK_SERVICE_STARTUP_BOUND;
         while self.not_ready()? {
+            cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
             asupersync::time::timeout_at(
                 deadline,
                 asupersync::time::sleep(cx.now(), HOSTED_TASK_SERVICE_POLL),
@@ -7084,19 +7088,37 @@ impl HostedTaskService {
         Ok(())
     }
 
-    /// Cancels the child and waits, within the settlement bound, for it to
-    /// finish. The runner is back in its slot once the child is gone.
+    /// Cancels the child and waits for it to finish. Crossing the settlement
+    /// bound records an error, but retains the child until it actually exits:
+    /// an uncooperative application future must never outlive a returning
+    /// serve operation. The runner is back in its slot before this returns.
     pub(crate) async fn settle(mut self, cx: &Cx) -> McpResult<()> {
         self.handle.abort();
-        match asupersync::time::timeout(
-            cx.now(),
-            HOSTED_TASK_SERVICE_SETTLEMENT_BOUND,
-            self.handle.join(cx),
-        )
-        .await
-        {
-            Ok(joined) => hosted_task_service_exit(joined),
-            Err(_) => Err(hosted_task_service_unsettled()),
+        let deadline = cx.now() + HOSTED_TASK_SERVICE_SETTLEMENT_BOUND;
+        let mut exceeded_bound = false;
+        loop {
+            // Joining through an already cancelled serve context can stop the
+            // wait before the service has retired its readiness lease. Poll
+            // completion without that cancellation gate while retaining the
+            // independent, finite settlement deadline.
+            exceeded_bound |= cx.now() >= deadline;
+            let joined = match self.handle.try_join() {
+                Ok(Some(result)) => Some(result),
+                Ok(None) => None,
+                Err(error) => Some(hosted_task_service_exit(Err(error))),
+            };
+            if let Some(result) = joined {
+                return if exceeded_bound {
+                    Err(hosted_task_service_unsettled())
+                } else {
+                    result
+                };
+            }
+            // Sleep completes immediately in a cancelled ambient Cx. Always
+            // yield independently so settlement cannot spin on that Ready
+            // result and starve the child whose completion it is awaiting.
+            asupersync::runtime::yield_now().await;
+            asupersync::time::sleep(cx.now(), HOSTED_TASK_SERVICE_POLL).await;
         }
     }
 
@@ -7104,24 +7126,35 @@ impl HostedTaskService {
     pub(crate) fn settle_blocking(mut self) -> McpResult<()> {
         self.handle.abort();
         let deadline = Instant::now() + HOSTED_TASK_SERVICE_SETTLEMENT_BOUND;
+        let mut exceeded_bound = false;
         loop {
-            match self.handle.try_join() {
-                Ok(Some(result)) => return result,
-                Ok(None) => {}
-                Err(error) => return hosted_task_service_exit(Err(error)),
-            }
-            if Instant::now() >= deadline {
-                return Err(hosted_task_service_unsettled());
+            exceeded_bound |= Instant::now() >= deadline;
+            let joined = match self.handle.try_join() {
+                Ok(Some(result)) => Some(result),
+                Ok(None) => None,
+                Err(error) => Some(hosted_task_service_exit(Err(error))),
+            };
+            if let Some(result) = joined {
+                return if exceeded_bound {
+                    Err(hosted_task_service_unsettled())
+                } else {
+                    result
+                };
             }
             std::thread::sleep(HOSTED_TASK_SERVICE_POLL);
         }
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
-)]
+impl Drop for HostedTaskService {
+    fn drop(&mut self) {
+        // Dropping a serve future must revoke the owned runner even if the
+        // normal settlement tail is never polled. Its task remains owned by
+        // the caller's structured region until cancellation completes.
+        self.handle.abort();
+    }
+}
+
 fn hosted_task_service_exit(
     joined: Result<McpResult<()>, asupersync::runtime::JoinError>,
 ) -> McpResult<()> {
@@ -7135,18 +7168,10 @@ fn hosted_task_service_exit(
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
-)]
 fn hosted_task_service_not_ready() -> McpError {
     McpError::internal_error("The hosted Task service did not become ready within its bound")
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
-)]
 fn hosted_task_service_unsettled() -> McpError {
     McpError::internal_error("The hosted Task service did not settle within its bound")
 }
