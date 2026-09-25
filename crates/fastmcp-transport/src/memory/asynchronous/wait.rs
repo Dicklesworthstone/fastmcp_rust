@@ -76,6 +76,11 @@ mod tests {
         JsonRpcMessage::Request(JsonRpcRequest::new("test/wake", None, id))
     }
 
+    /// JSON-RPC messages have no `PartialEq`; compare what they serialize to.
+    fn json(message: &JsonRpcMessage) -> serde_json::Value {
+        serde_json::to_value(message).expect("a JSON-RPC message serializes")
+    }
+
     #[test]
     fn cancellation_wakes_idle_receive_without_peer_activity() {
         let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
@@ -98,7 +103,10 @@ mod tests {
         assert!(!server.is_closed());
         let live = Cx::for_testing();
         client.send(&live, &request(1)).unwrap();
-        assert_eq!(ready(server.recv_async(&live)).unwrap(), request(1));
+        assert_eq!(
+            json(&ready(server.recv_async(&live)).unwrap()),
+            json(&request(1))
+        );
     }
 
     #[test]
@@ -122,9 +130,9 @@ mod tests {
             ));
         }
         assert!(!client.is_closed());
-        assert_eq!(server.recv(&live).unwrap(), request(1));
+        assert_eq!(json(&server.recv(&live).unwrap()), json(&request(1)));
         ready(client.send_async(&live, &request(3))).unwrap();
-        assert_eq!(server.recv(&live).unwrap(), request(3));
+        assert_eq!(json(&server.recv(&live).unwrap()), json(&request(3)));
     }
 
     #[test]
@@ -148,12 +156,12 @@ mod tests {
             ));
         }
         assert!(!send.is_closed());
-        assert_eq!(server.recv(&live).unwrap(), request(1));
+        assert_eq!(json(&server.recv(&live).unwrap()), json(&request(1)));
         ready(send.reserve_send_async(&live))
             .unwrap()
             .send(&request(3))
             .unwrap();
-        assert_eq!(server.recv(&live).unwrap(), request(3));
+        assert_eq!(json(&server.recv(&live).unwrap()), json(&request(3)));
     }
 
     #[test]

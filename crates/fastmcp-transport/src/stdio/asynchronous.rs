@@ -193,11 +193,13 @@ async fn receive<R: AsyncRead + Unpin>(
                         let recoverable_request = server_ingress
                             && matches!(
                                 &error,
-                                TransportError::Codec(CodecError::Json(_))
-                                    | TransportError::Codec(CodecError::InvalidMessage {
-                                        kind: crate::InvalidMessageKind::Request,
-                                        ..
-                                    })
+                                TransportError::Codec(
+                                    CodecError::Json(_)
+                                        | CodecError::InvalidMessage {
+                                            kind: crate::InvalidMessageKind::Request,
+                                            ..
+                                        }
+                                )
                             );
                         if !recoverable_request {
                             fail_read(reader, state, terminal);
