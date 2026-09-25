@@ -121,6 +121,16 @@ impl fmt::Debug for ManagedToolInteraction {
 }
 
 impl ManagedToolInteraction {
+    // Only the repair adapter supplies this unread core owner and its already
+    // admitted replacement. No public conversion can bypass output validation.
+    pub(in crate::http_auth::tool) fn from_repaired_call(
+        cx: &Cx, operation: ManagedInteraction, contract: Arc<ToolContract>,
+        cancellation: McpRequestCancellation,
+    ) -> Result<Self, ManagedToolError> {
+        check_tool_call(cx, &cancellation, &contract)?;
+        Ok(Self { operation: Some(operation), contract, cancellation, finished: false })
+    }
+
     /// Borrows the current challenge without authorizing any requested action.
     /// A cancelled or invalidated operation exposes no pending host work.
     pub fn pending_input(&self) -> Option<&InputRequiredResult> {
