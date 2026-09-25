@@ -299,8 +299,7 @@ mod modern_http_only {
 
         pub fn open_session(&self) -> Result<DualEraHttpSession, DualEraHttpEndpointError> {
             let mut transport = StreamableHttpTransport::with_capacity(self.capacity)?;
-            let ingress = transport.request_ingress()?;
-            let responses = transport.response_stream()?;
+            let (ingress, responses) = transport.split_handles()?;
             Ok(DualEraHttpSession {
                 handler: Arc::clone(&self.handler),
                 transport,
@@ -477,8 +476,22 @@ mod modern_http_only {
                 .send_notification_for_request(cx, cancellation, notification)?;
             Ok(())
         }
+        /// Closes the session, cancels every live response body, and discards
+        /// queued work, exactly as the transport's dual-era session ends its
+        /// modern half.
         pub fn close(&mut self) {
+            if self.closed {
+                return;
+            }
             self.closed = true;
+            self.transport
+                .terminate_split_session(&self.ingress, &self.responses);
+        }
+    }
+
+    impl Drop for DualEraHttpSession {
+        fn drop(&mut self) {
+            self.close();
         }
     }
 }
@@ -55124,6 +55137,87 @@ mod lib_unit_tests {
                         .to_owned(),
                 );
             }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn public_http_live_session_keeps_acknowledged_listen_open_without_peer_close() {
+        // Differs from the peer-close test above only in that the session
+        // stays open: the listen must stay pending, registered and silent.
+        run_live_http_test(|cx| async move {
+            let endpoint = Server::new("public-http-last-session-drop", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
+                .test_http_endpoint("http://legacy.test")
+                .map_err(|error| format!("public endpoint setup failed: {error}"))?;
+            let mut session = endpoint
+                .open_session(&cx)
+                .map_err(|error| format!("public listen session failed: {error}"))?;
+            let listen = JsonRpcRequest::new(
+                SUBSCRIPTIONS_LISTEN,
+                Some(serde_json::json!({
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                    },
+                    "notifications": {"toolsListChanged": true},
+                })),
+                RequestId::Number(889),
+            );
+            let response = session
+                .handle_async(
+                    &cx,
+                    HttpRequest::new(HttpMethod::Post, "/mcp")
+                        .with_header("content-type", "application/json")
+                        .with_header("accept", "text/event-stream")
+                        .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+                        .with_header("mcp-method", SUBSCRIPTIONS_LISTEN)
+                        .with_body(
+                            serde_json::to_vec(&listen)
+                                .expect("typed listen request must serialize"),
+                        ),
+                )
+                .await
+                .map_err(|error| format!("public listen failed: {error}"))?;
+            let ServerHttpEndpointResponse::ModernSse(sse) = response else {
+                return Err("public listen did not return SSE".to_owned());
+            };
+            let guard = sse.cancellation();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match sse.pop_event() {
+                    Ok(Some(_acknowledgement)) => break,
+                    Ok(None) if Instant::now() < deadline => {
+                        asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                    }
+                    Ok(None) => return Err("public listen acknowledgement timed out".to_owned()),
+                    Err(error) => return Err(format!("public listen closed early: {error}")),
+                }
+            }
+            if guard.checkpoint(&cx).is_err() {
+                return Err("acknowledged listen was not pending before session drop".to_owned());
+            }
+
+            if guard.checkpoint(&cx).is_err()
+                || endpoint
+                    .server
+                    .final_subscriptions
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entries
+                    .is_empty()
+            {
+                return Err("an open session revoked its acknowledged listen".to_owned());
+            }
+            if !matches!(sse.pop_event(), Ok(None)) {
+                return Err(
+                    "an open session's listen emitted an event or closed without a peer close"
+                        .to_owned(),
+                );
+            }
+            drop(session);
             Ok(())
         });
     }

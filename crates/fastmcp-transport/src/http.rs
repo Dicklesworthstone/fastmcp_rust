@@ -5880,6 +5880,24 @@ impl StreamableHttpTransport {
         // first settles bounded in-flight admissions and seals production;
         // extant response-stream handles can then drain the bounded mailbox.
     }
+
+    /// Ends a session built on this transport and the two handles that
+    /// [`Self::split_handles`] externalized, without a `Cx`.
+    ///
+    /// Request admission closes, every live request body is cancelled, queued
+    /// response messages are discarded, and the owner's queues close. A live
+    /// SSE body then reports closed instead of delivering a message queued
+    /// before its session ended. Unlike `Transport::close`, this needs no
+    /// `Cx`, so a synchronous session close or destructor can run it.
+    pub fn terminate_split_session(
+        &mut self,
+        ingress: &StreamableHttpRequestIngress,
+        responses: &StreamableHttpResponseStream,
+    ) {
+        ingress.close();
+        responses.terminate();
+        self.close_queues();
+    }
 }
 
 impl Drop for StreamableHttpTransport {
@@ -7174,16 +7192,13 @@ impl DualEraHttpSession {
             return;
         }
         self.closed = true;
-        self.modern_ingress.close();
-        self.modern_responses.terminate();
         // `Transport::close` now takes the caller's `&Cx`, and this method is
         // reachable from `Drop for DualEraHttpSession` (below), where no `Cx`
-        // exists and none can be conjured. The trait method was never needed
-        // here: `StreamableHttpTransport::close` is exactly `close_queues()`
-        // plus `Ok(())`, and that type's own `Drop` already calls
-        // `close_queues()`. Calling it directly keeps the destructor path
-        // synchronous and loses no behaviour.
-        self.modern_transport.close_queues();
+        // exists and none can be conjured. The Cx-free teardown also serves
+        // the server's no-legacy session, so both compositions end a modern
+        // session identically.
+        self.modern_transport
+            .terminate_split_session(&self.modern_ingress, &self.modern_responses);
         let _lifecycle_guard = self
             .legacy_post_lifecycle_guard
             .lock()
