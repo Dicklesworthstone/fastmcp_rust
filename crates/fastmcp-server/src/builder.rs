@@ -3663,6 +3663,8 @@ mod tests {
         );
     }
 
+    // Exact-2024 era: exercises the exact-legacy completion route.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn builder_completion_handler_rejects_final_metadata_before_handler_state_changes() {
         let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));

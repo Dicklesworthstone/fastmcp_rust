@@ -8312,6 +8312,8 @@ mod helper_function_tests {
         }
     }
 
+    // Exact-2024 era: opens with a legacy initialize handshake.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn receive_pump_cancels_a_running_handler_in_band() {
         let barrier = Arc::new(Barrier::new(1));
@@ -8446,6 +8448,8 @@ mod helper_function_tests {
         ));
     }
 
+    // Exact-2024 era: opens with a legacy initialize handshake.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn receive_pump_routes_sampling_response_while_handler_waits() {
         let server = Server::new("receive-pump-sampling", "1.0.0")

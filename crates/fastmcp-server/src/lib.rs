@@ -26974,6 +26974,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: exercises the exact-legacy completion route.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn session_dispatch_serves_legacy_completion_complete() {
         let server = Server::new("session-completion", "1.0.0")
@@ -27060,6 +27062,8 @@ mod lib_unit_tests {
         assert!(without.capabilities().completions.is_none());
     }
 
+    // Exact-2024 era: legacy initialize completion capability.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_completion_handler_is_advertised_on_initialize_only() {
         let server = Server::new("legacy-advertise-completion", "1.0.0")
@@ -30198,6 +30202,8 @@ mod lib_unit_tests {
         assert_eq!(exit_code, 1);
     }
 
+    // Exact-2024 era: dispatches an un-negotiated ping, which only the dual-era pump admits.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn dispatch_worker_panic_trips_failure_latch_and_returns_failure_status() {
         let emitted = Arc::new(AtomicBool::new(false));
@@ -30647,7 +30653,8 @@ mod lib_unit_tests {
         assert_eq!(exit_code, 1);
     }
 
-    #[cfg(unix)]
+    // Exact-2024 era: dispatches an un-negotiated ping, which only the dual-era pump admits.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     #[test]
     fn reality_check_regression_dispatch_worker_send_failure_wakes_unix_stdio_receive() {
         use std::os::unix::net::UnixStream;
@@ -35295,6 +35302,8 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: tests Auto classification, which a no-legacy build refuses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn stdio_initialize_proposals_select_legacy_negotiation() {
         for proposal in ["2024-11-05", "2025-03-26", "2025-06-18", "2099-01-01"] {
@@ -35924,6 +35933,8 @@ mod lib_unit_tests {
         ));
     }
 
+    // Exact-2024 era: legacy runtime context after a legacy opening.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_split_transport_legacy_runtime_retains_state_notifications_and_sampling() {
         let sent = live_legacy_runtime_connection_transcript(true);
@@ -35983,6 +35994,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy runtime context after a legacy opening.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_split_transport_legacy_context_installs_roots_provider_after_negotiation() {
         let sent = legacy_roots_context_transcript(true);
@@ -36007,6 +36020,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy runtime context after a legacy opening.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_split_transport_legacy_context_withholds_roots_provider_without_capability() {
         let sent = legacy_roots_context_transcript(false);
@@ -36031,6 +36046,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy progress after a legacy opening.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_stdio_legacy_progress_token_installs_f64_notification_sender() {
         let sent = legacy_stdio_progress_transcript(true);
@@ -36058,6 +36075,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy progress after a legacy opening.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_stdio_legacy_progress_sender_is_absent_when_only_token_is_removed() {
         let sent = legacy_stdio_progress_transcript(false);
@@ -36209,6 +36228,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy runtime context after a legacy opening.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_split_transport_legacy_runtime_rejects_sampling_when_only_capability_is_removed() {
         let sent = live_legacy_runtime_connection_transcript(false);
@@ -43020,6 +43041,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE endpoint event.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_sse_advertises_the_request_host_on_wildcard_bind() {
         run_live_http_test(|cx| async move {
@@ -43657,6 +43680,8 @@ mod lib_unit_tests {
         require_quiescent_http_shutdown(shutdown, "legacy reverse-response").await
     }
 
+    // Exact-2024 era: legacy HTTP SSE reverse responses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_reverse_response_bypasses_the_originating_session_mutex() {
         run_live_http_test(|cx| async move {
@@ -43664,6 +43689,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE reverse responses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_reverse_response_reaches_an_async_handler() {
         run_live_http_test(|cx| async move {
@@ -43673,6 +43700,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE reverse responses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_reverse_response_exact_admission_precedes_pending_mutation() {
         run_live_http_test(|cx| async move {
@@ -43680,6 +43709,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE reverse responses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_reverse_response_wrong_id_remains_blocked_until_cancellation() {
         run_live_http_test(|cx| async move {
@@ -43689,6 +43720,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE reverse responses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_reverse_response_accepts_opener_principal() {
         run_live_http_test(|cx| async move {
@@ -43697,6 +43730,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE reverse responses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_reverse_response_rejects_foreign_principal_before_pending_mutation() {
         run_live_http_test(|cx| async move {
@@ -43707,6 +43742,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE reverse responses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_unmatched_response_uses_one_auth_provider_evaluation() {
         run_live_http_test(|cx| async move {
@@ -44145,6 +44182,8 @@ mod lib_unit_tests {
         Ok(response)
     }
 
+    // Exact-2024 era: tests Auto classification over HTTP.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_bound_http_auto_coexists_with_exact_legacy_and_modern_requests() {
         run_live_http_test(|cx| async move {
@@ -44164,6 +44203,10 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: a dual-era build's ModernOnly refusal of its legacy route.
+    // A no-legacy build has no such route; see
+    // no_legacy_http_routes_are_not_found_without_pinning_or_adapter_admission.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_bound_http_modern_only_rejects_the_identical_legacy_half() {
         run_live_http_test(|cx| async move {
@@ -45043,6 +45086,8 @@ mod lib_unit_tests {
         Ok(())
     }
 
+    // Exact-2024 era: legacy HTTP SSE peer close.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_sse_peer_close_cancels_its_busy_request() {
         run_live_http_test(
@@ -45050,6 +45095,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy HTTP SSE peer close.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_sse_peer_close_does_not_cancel_another_session() {
         run_live_http_test(|cx| async move {
@@ -45058,6 +45105,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: hosts its child in a legacy HTTP SSE session.
+    #[cfg(feature = "legacy-2024-11-05")]
     async fn live_http_shutdown_ownership_probe(
         cx: &Cx,
         cooperate_with_cancellation: bool,
@@ -45233,11 +45282,15 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: hosts its child in a legacy HTTP SSE session.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_shutdown_joins_a_cooperative_child() {
         run_live_http_test(|cx| async move { live_http_shutdown_ownership_probe(&cx, true).await });
     }
 
+    // Exact-2024 era: hosts its child in a legacy HTTP SSE session.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_shutdown_returns_caller_owned_noncooperative_child_for_later_join() {
         run_live_http_test(|cx| async move {
@@ -46557,6 +46610,8 @@ mod lib_unit_tests {
         (result, control, responses)
     }
 
+    // Exact-2024 era: legacy queued cancellation after a legacy opening.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_exact_legacy_first_queued_cancellation_suppresses_only_the_target_response() {
         let (result, control, responses) = live_legacy_queued_cancellation_transcript(80);
@@ -46574,6 +46629,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy queued cancellation after a legacy opening.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_exact_legacy_first_queued_unknown_cancellation_preserves_the_request() {
         // This differs from the positive only in the cancellation request ID.
@@ -47443,6 +47500,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: answers an un-negotiated ping, which only the dual-era loop admits.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn reality_check_regression_returning_transport_propagates_response_send_error() {
         let error = Server::new("returning-send-failure-test", "1.0.0")
@@ -48991,6 +49050,8 @@ mod lib_unit_tests {
         assert!(active.lock().unwrap().is_empty());
     }
 
+    // Exact-2024 era: negotiates the connection with a legacy initialize.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn returning_loop_replies_to_bounded_codec_error_then_reads_next_frame() {
         use std::collections::VecDeque;
@@ -49074,6 +49135,8 @@ mod lib_unit_tests {
         assert!(wire.get("id").is_none());
     }
 
+    // Exact-2024 era: negotiates the connection with a legacy initialize.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn returning_loop_correlates_invalid_request_only_when_codec_proves_unique_id() {
         use std::collections::VecDeque;
