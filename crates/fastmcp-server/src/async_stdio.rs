@@ -347,27 +347,23 @@ fn prepare_request(
     cx: &Cx,
     frame: ReceivedTransportFrame,
 ) -> McpResult<Option<RequestWork>> {
-    let JsonRpcMessage::Request(_) = frame.message() else {
+    // `ReceivedTransportFrame::admit`, its only constructor, already applied
+    // the shared raw-document admission and decoded this frame once, keeping
+    // the exact `params` source. Decoding it again repeats both passes.
+    let raw_params = frame.raw_params().map(str::to_owned);
+    let JsonRpcMessage::Request(request) = frame.into_message() else {
         return Err(server_run_error(
             "receive",
             "direction",
             "Modern stdio received a client response",
         ));
     };
-    let (request, raw_params) =
-        match JsonRpcRequest::decode_strict_with_raw_params(frame.source(), DOCUMENT_BYTES) {
-            Ok(request) => request,
-            Err(_) => {
-                let id = match frame.message() {
-                    JsonRpcMessage::Request(request) => request.id.clone(),
-                    _ => None,
-                };
-                lifetime
-                    .output
-                    .enqueue(error_response(id, -32600, "Invalid Request"), None);
-                return Ok(None);
-            }
-        };
+    if request.validate().is_err() {
+        lifetime
+            .output
+            .enqueue(error_response(request.id, -32600, "Invalid Request"), None);
+        return Ok(None);
+    }
     if request.method != "initialize"
         && modern_protocol_version(&request) != Some(MODERN_PROTOCOL_VERSION)
     {
@@ -1563,6 +1559,78 @@ mod tests {
             until_io(&cx, &io, || io.response(71).is_some()).await;
             assert!(io.response(71).unwrap().error.is_none());
             assert_eq!(gate.entered.load(Ordering::Acquire), 1);
+            io.eof();
+            serving.join(&cx).await.unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn async_stdio_server_admits_each_frame_once_and_still_refuses_bom_and_duplicates() {
+        run(|cx| async move {
+            let gate = Arc::new(Gate::default());
+            let io = Arc::new(IoProbe::default());
+            io.allow(usize::MAX);
+            let service = server(&gate);
+            let stream = Arc::clone(&io);
+            let mut serving = cx
+                .spawn(move |server_cx| async move {
+                    service
+                        .serve_stdio_io(
+                            &server_cx,
+                            ProbeReader(Arc::clone(&stream)),
+                            ProbeWriter(stream),
+                        )
+                        .await
+                })
+                .unwrap();
+            let named = |id: &str| {
+                let JsonRpcMessage::Request(mut request) = call(0, false) else {
+                    unreachable!()
+                };
+                request.id = Some(RequestId::String(id.to_owned()));
+                encoded(&JsonRpcMessage::Request(request))
+            };
+            let responses_to = |id: &RequestId| -> Vec<JsonRpcResponse> {
+                io.messages()
+                    .into_iter()
+                    .filter_map(|message| match message {
+                        JsonRpcMessage::Response(response) if response.id.as_ref() == Some(id) => {
+                            Some(response)
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
+            // Only the transport admits each frame now. Its shared raw
+            // admission must still refuse a byte-order mark (U+FEFF) that
+            // differs from the admitted U+FEFB only in its last byte.
+            io.feed(&named("a\u{feff}"));
+            io.feed(&named("a\u{fefb}"));
+            let admitted = RequestId::String("a\u{fefb}".to_owned());
+            until_io(&cx, &io, || !responses_to(&admitted).is_empty()).await;
+            assert!(io.messages().iter().any(|message| matches!(
+                message,
+                JsonRpcMessage::Response(response)
+                    if response.id.is_none()
+                        && response.error.as_ref().unwrap().code.as_i32() == Some(-32700)
+            )));
+            assert!(responses_to(&admitted)[0].error.is_none());
+            // A duplicated params member is the only change from the call
+            // that follows it under the same id.
+            let admitted_bytes = encoded(&call(81, false));
+            let duplicated = String::from_utf8(admitted_bytes.clone()).unwrap().replacen(
+                "\"name\":\"async_probe\"",
+                "\"name\":\"async_probe\",\"name\":\"async_probe\"",
+                1,
+            );
+            io.feed(duplicated.as_bytes());
+            io.feed(&admitted_bytes);
+            let id = RequestId::Number(81);
+            until_io(&cx, &io, || responses_to(&id).len() == 2).await;
+            let [refused, answered]: [JsonRpcResponse; 2] = responses_to(&id).try_into().unwrap();
+            assert_eq!(refused.error.unwrap().code.as_i32(), Some(-32600));
+            assert!(answered.error.is_none());
+            assert_eq!(gate.entered.load(Ordering::Acquire), 2);
             io.eof();
             serving.join(&cx).await.unwrap().unwrap();
         });
