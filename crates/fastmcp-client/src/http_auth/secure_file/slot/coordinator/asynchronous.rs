@@ -32,6 +32,7 @@ use super::super::{CredentialSlotError, SlotCommit, SlotRecoveryOutcome, SlotRev
 use super::super::super::{AtomicFileError, SecureAtomicFile, MAX_ATOMIC_FILE_BYTES};
 
 mod admission;
+pub(crate) mod composed;
 pub use admission::{CredentialDrainError, CredentialIoLane, CredentialIoLimits, CredentialIoSnapshot};
 use admission::{CONTROL_BYTES, JobLease, SlotLease, operation_bytes};
 
