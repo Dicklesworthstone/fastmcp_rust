@@ -4538,10 +4538,11 @@ pub enum ServerHttpEndpointResponse {
 /// request transport; this registry never creates a background runtime.
 const MAX_FINAL_SUBSCRIPTION_STREAMS: usize = 64;
 
-/// Upper bound for events admitted while one subscription's acknowledgement
-/// callback is in flight. Publishers never wait on application callbacks;
-/// exceeding this bound fails the opening stream closed.
-const MAX_FINAL_SUBSCRIPTION_OPENING_EVENTS: usize = 64;
+/// Per-subscription bounds for events retained by the registry, including its
+/// sole active callback. Concurrent publishers enqueue without waiting for
+/// that callback; exceeding either bound retires only that subscription.
+const MAX_FINAL_SUBSCRIPTION_QUEUED_EVENTS: usize = 64;
+const MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES: usize = 256 * 1024;
 
 /// Modern Streamable HTTP has no protocol session identifier.  A listen
 /// response nevertheless owns one connection-local cancellation domain, so
@@ -4614,6 +4615,7 @@ struct FinalSubscriptionRegistryState {
 
 #[derive(Clone)]
 struct FinalSubscriptionEntry {
+    registry_key: usize,
     subscription_id: RequestId,
     modern_http_owner: Option<u64>,
     accepted_filter: SubscriptionFilter,
@@ -4690,7 +4692,8 @@ enum FinalSubscriptionPhase {
     /// the callback already selected for delivery.
     OpeningDelivery,
     Active,
-    /// One or more notification callbacks are in flight.
+    /// Exactly one notification callback owns the FIFO drain. The count is
+    /// retained for the shared terminal-election representation.
     EventDelivery(usize),
     /// Server termination won and is waiting for the acknowledgement callback
     /// (`0`) or this many already-admitted event callbacks (`> 0`) to finish.
@@ -4701,15 +4704,79 @@ enum FinalSubscriptionPhase {
 
 struct FinalSubscriptionElection {
     phase: Mutex<FinalSubscriptionPhase>,
-    opening_events: Mutex<VecDeque<JsonRpcRequest>>,
+    opening_events: Mutex<FinalSubscriptionEventQueue>,
     graceful_completion: AtomicBool,
+}
+
+#[derive(Default)]
+struct FinalSubscriptionEventQueue {
+    events: VecDeque<(JsonRpcRequest, usize)>,
+    retained_events: usize,
+    retained_bytes: usize,
+}
+
+impl FinalSubscriptionEventQueue {
+    fn try_push(&mut self, notification: JsonRpcRequest, bytes: usize) -> bool {
+        if self.retained_events >= MAX_FINAL_SUBSCRIPTION_QUEUED_EVENTS
+            || bytes > MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES.saturating_sub(self.retained_bytes)
+        {
+            return false;
+        }
+        self.retained_events += 1;
+        self.retained_bytes += bytes;
+        self.events.push_back((notification, bytes));
+        true
+    }
+
+    fn pop_front(&mut self) -> Option<(JsonRpcRequest, usize)> {
+        // Keep the popped event charged until its callback returns. A blocked
+        // callback cannot permit another full queue in addition to its bytes.
+        self.events.pop_front()
+    }
+
+    fn finish_delivery(&mut self, bytes: usize) {
+        self.retained_events = self.retained_events.saturating_sub(1);
+        self.retained_bytes = self.retained_bytes.saturating_sub(bytes);
+    }
+
+    fn clear(&mut self) {
+        self.events.clear();
+        self.retained_events = 0;
+        self.retained_bytes = 0;
+    }
+}
+
+/// Measure without allocating a second encoded copy or accepting an
+/// arbitrarily large application-authored event into a listener's queue.
+fn final_subscription_event_bytes<T: serde::Serialize>(notification: &T) -> Option<usize> {
+    struct BoundedSize(usize);
+
+    impl std::io::Write for BoundedSize {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES.saturating_sub(self.0) {
+                return Err(std::io::Error::other(
+                    "subscription event byte limit exceeded",
+                ));
+            }
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut size = BoundedSize(0);
+    serde_json::to_writer(&mut size, notification).ok()?;
+    Some(size.0)
 }
 
 impl FinalSubscriptionElection {
     fn opening() -> Self {
         Self {
             phase: Mutex::new(FinalSubscriptionPhase::Opening),
-            opening_events: Mutex::new(VecDeque::new()),
+            opening_events: Mutex::new(FinalSubscriptionEventQueue::default()),
             graceful_completion: AtomicBool::new(false),
         }
     }
@@ -4957,6 +5024,7 @@ impl FinalSubscriptionRegistry {
         let previous = state.entries.insert(
             key,
             FinalSubscriptionEntry {
+                registry_key: key,
                 subscription_id: subscription_id.clone(),
                 modern_http_owner,
                 accepted_filter,
@@ -5017,6 +5085,7 @@ impl FinalSubscriptionRegistry {
         // cannot overtake an already-admitted event.
         loop {
             let queued_notification;
+            let queued_bytes;
             let mut phase = election
                 .phase
                 .lock()
@@ -5027,9 +5096,10 @@ impl FinalSubscriptionRegistry {
                         .opening_events
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if let Some(notification) = opening_events.pop_front() {
+                    if let Some((notification, bytes)) = opening_events.pop_front() {
                         *phase = FinalSubscriptionPhase::OpeningDelivery;
                         queued_notification = notification;
+                        queued_bytes = bytes;
                     } else {
                         *phase = FinalSubscriptionPhase::Active;
                         break;
@@ -5098,6 +5168,11 @@ impl FinalSubscriptionRegistry {
                 .phase
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            election
+                .opening_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .finish_delivery(queued_bytes);
             match *phase {
                 FinalSubscriptionPhase::OpeningDelivery
                     if sent && !request_cancellation.is_cancel_requested() =>
@@ -5167,6 +5242,26 @@ impl FinalSubscriptionRegistry {
                 "only final catalog or resource change notifications may use subscriptions/listen",
             ));
         }
+        // Bound application-owned data before cloning it into recipient-
+        // specific metadata and wire objects. The exact tagged frame is
+        // measured again at each queue, including its subscription ID.
+        let bounded = match &notification {
+            ServerNotification::ResourceUpdated(params) => {
+                final_subscription_event_bytes(params).is_some()
+            }
+            ServerNotification::ResourcesListChanged(params)
+            | ServerNotification::ToolsListChanged(params)
+            | ServerNotification::PromptsListChanged(params) => params
+                .as_ref()
+                .is_none_or(|params| final_subscription_event_bytes(params).is_some()),
+            _ => unreachable!("only subscription events passed admission above"),
+        };
+        if !bounded {
+            return Err(McpError::new(
+                McpErrorCode::Custom(RESOURCE_EXHAUSTED_ERROR_CODE),
+                "subscription event byte limit exceeded",
+            ));
+        }
         let targets = {
             let state = self
                 .inner
@@ -5207,6 +5302,12 @@ impl FinalSubscriptionRegistry {
         notification: FinalTaskStatusNotification,
         principal: Option<Sha256Digest>,
     ) -> McpResult<usize> {
+        if final_subscription_event_bytes(&notification).is_none() {
+            return Err(McpError::new(
+                McpErrorCode::Custom(RESOURCE_EXHAUSTED_ERROR_CODE),
+                "subscription event byte limit exceeded",
+            ));
+        }
         let task_id = notification.params.task.base().task_id.as_str();
         let targets = {
             let state = self
@@ -5246,65 +5347,76 @@ impl FinalSubscriptionRegistry {
     ) -> usize {
         let mut count = 0;
         for (entry, notification) in deliveries {
+            let bytes = final_subscription_event_bytes(&notification);
             let mut phase = entry
                 .election
                 .phase
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match *phase {
-                FinalSubscriptionPhase::Opening | FinalSubscriptionPhase::OpeningDelivery => {
-                    if entry.request_cancellation.is_cancel_requested() {
-                        *phase = FinalSubscriptionPhase::PeerTerminated;
-                        entry
-                            .election
-                            .opening_events
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .clear();
-                        if let Some(delivery) = &entry.terminal_delivery {
-                            delivery.mark_failed();
-                        }
-                        continue;
-                    }
-                    let mut opening_events = entry
-                        .election
-                        .opening_events
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if opening_events.len() >= MAX_FINAL_SUBSCRIPTION_OPENING_EVENTS {
-                        opening_events.clear();
-                        *phase = FinalSubscriptionPhase::PeerTerminated;
-                        if let Some(delivery) = &entry.terminal_delivery {
-                            delivery.mark_failed();
-                        }
-                        entry.request_cancellation.cancel();
-                        continue;
-                    }
-                    opening_events.push_back(notification);
-                    count += 1;
-                    continue;
-                }
-                FinalSubscriptionPhase::Active => {
-                    if entry.request_cancellation.is_cancel_requested() {
-                        *phase = FinalSubscriptionPhase::PeerTerminated;
-                        continue;
-                    }
-                    *phase = FinalSubscriptionPhase::EventDelivery(1);
-                }
-                FinalSubscriptionPhase::EventDelivery(in_flight) => {
-                    let Some(in_flight) = in_flight.checked_add(1) else {
-                        *phase = FinalSubscriptionPhase::PeerTerminated;
-                        entry.request_cancellation.cancel();
-                        continue;
-                    };
-                    *phase = FinalSubscriptionPhase::EventDelivery(in_flight);
-                }
                 FinalSubscriptionPhase::ServerTerminationPending(_)
                 | FinalSubscriptionPhase::PeerTerminated
                 | FinalSubscriptionPhase::ServerTerminated => continue,
+                FinalSubscriptionPhase::Opening
+                | FinalSubscriptionPhase::OpeningDelivery
+                | FinalSubscriptionPhase::Active
+                | FinalSubscriptionPhase::EventDelivery(_) => {}
             }
+            let mut events = entry
+                .election
+                .opening_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if entry.request_cancellation.is_cancel_requested()
+                || !bytes.is_some_and(|bytes| events.try_push(notification, bytes))
+            {
+                events.clear();
+                *phase = FinalSubscriptionPhase::PeerTerminated;
+                drop(events);
+                drop(phase);
+                self.retire_failed_subscription(&entry);
+                continue;
+            }
+            if *phase != FinalSubscriptionPhase::Active {
+                // Opening and active callbacks share the same bounded FIFO.
+                // A reentrant publisher returns after admission, without
+                // recursively entering the sender or waiting for itself.
+                count += 1;
+                continue;
+            }
+            let first = events
+                .pop_front()
+                .expect("the active publisher just admitted its first event");
+            *phase = FinalSubscriptionPhase::EventDelivery(1);
+            drop(events);
             drop(phase);
+            count += usize::from(self.drain_subscription_events(&entry, first, panic_boundary));
+        }
+        count
+    }
 
+    fn retire_failed_subscription(&self, entry: &FinalSubscriptionEntry) {
+        if let Some(delivery) = &entry.terminal_delivery {
+            delivery.mark_failed();
+        }
+        entry.request_cancellation.cancel();
+        self.remove_entry(entry.registry_key);
+    }
+
+    /// The publisher that claims an idle subscription drives it synchronously.
+    /// Concurrent publishers only append; they never invoke its callback in
+    /// parallel. The return value counts this publisher's first event alone,
+    /// since each queued event was already counted by its admitting publisher.
+    fn drain_subscription_events(
+        &self,
+        entry: &FinalSubscriptionEntry,
+        mut next: (JsonRpcRequest, usize),
+        panic_boundary: &'static str,
+    ) -> bool {
+        let mut first = true;
+        let mut first_delivered = false;
+        loop {
+            let (notification, bytes) = next;
             let sent = catch_extension_unwind(|| (entry.notification_sender)(notification)).is_ok();
             if !sent {
                 let _ = extension_panic_error(panic_boundary);
@@ -5314,29 +5426,32 @@ impl FinalSubscriptionRegistry {
                 .phase
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut events = entry
+                .election
+                .opening_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            events.finish_delivery(bytes);
             match *phase {
-                FinalSubscriptionPhase::EventDelivery(in_flight)
+                FinalSubscriptionPhase::EventDelivery(1)
                     if sent && !entry.request_cancellation.is_cancel_requested() =>
                 {
-                    *phase = if in_flight == 1 {
-                        FinalSubscriptionPhase::Active
-                    } else {
-                        FinalSubscriptionPhase::EventDelivery(in_flight - 1)
+                    if first {
+                        first_delivered = true;
+                    }
+                    let Some(queued) = events.pop_front() else {
+                        *phase = FinalSubscriptionPhase::Active;
+                        return first_delivered;
                     };
-                    count += 1;
-                }
-                FinalSubscriptionPhase::ServerTerminationPending(in_flight)
-                    if in_flight > 1
-                        && sent
-                        && !entry.request_cancellation.is_cancel_requested() =>
-                {
-                    *phase = FinalSubscriptionPhase::ServerTerminationPending(in_flight - 1);
-                    count += 1;
+                    next = queued;
+                    first = false;
                 }
                 FinalSubscriptionPhase::ServerTerminationPending(1)
                     if sent && !entry.request_cancellation.is_cancel_requested() =>
                 {
+                    events.clear();
                     *phase = FinalSubscriptionPhase::ServerTerminated;
+                    drop(events);
                     drop(phase);
                     if complete_final_subscription_server_termination(
                         &entry.election,
@@ -5346,7 +5461,7 @@ impl FinalSubscriptionRegistry {
                         &entry.notification_sender,
                         &entry.request_cancellation,
                     ) {
-                        count += 1;
+                        first_delivered |= first;
                     } else {
                         *entry
                             .election
@@ -5355,29 +5470,24 @@ impl FinalSubscriptionRegistry {
                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
                             FinalSubscriptionPhase::PeerTerminated;
                     }
+                    return first_delivered;
                 }
                 FinalSubscriptionPhase::EventDelivery(_)
-                | FinalSubscriptionPhase::ServerTerminationPending(_) => {
-                    *phase = FinalSubscriptionPhase::PeerTerminated;
-                    entry
-                        .election
-                        .opening_events
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clear();
-                    if let Some(delivery) = &entry.terminal_delivery {
-                        delivery.mark_failed();
-                    }
-                    entry.request_cancellation.cancel();
-                }
-                FinalSubscriptionPhase::Opening
+                | FinalSubscriptionPhase::ServerTerminationPending(_)
+                | FinalSubscriptionPhase::Opening
                 | FinalSubscriptionPhase::OpeningDelivery
                 | FinalSubscriptionPhase::Active
                 | FinalSubscriptionPhase::PeerTerminated
-                | FinalSubscriptionPhase::ServerTerminated => {}
+                | FinalSubscriptionPhase::ServerTerminated => {
+                    *phase = FinalSubscriptionPhase::PeerTerminated;
+                    events.clear();
+                    drop(events);
+                    drop(phase);
+                    self.retire_failed_subscription(entry);
+                    return first_delivered;
+                }
             }
         }
-        count
     }
 
     fn terminate(&self) -> usize {
@@ -5500,6 +5610,12 @@ impl FinalSubscriptionRegistry {
                 (true, entry.terminal_delivery)
             }
             FinalSubscriptionPhase::EventDelivery(in_flight) => {
+                entry
+                    .election
+                    .opening_events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
                 if entry.request_cancellation.is_cancel_requested() {
                     *phase = FinalSubscriptionPhase::PeerTerminated;
                     if let Some(delivery) = &entry.terminal_delivery {
@@ -6988,6 +7104,14 @@ impl BoundHttpServer {
                 server.graceful_shutdown_returning();
                 return Err(McpError::internal_error("HTTP server startup hook failed"));
             }
+            #[cfg(feature = "tasks")]
+            let hosted_task_service = match server.start_hosted_task_service(cx).await {
+                Ok(hosted) => hosted,
+                Err(error) => {
+                    server.graceful_shutdown_returning();
+                    return Err(error);
+                }
+            };
 
             let connection_scope = cx.scope();
             let connection_shutdown = HttpListenerShutdown::new(cx);
@@ -7003,6 +7127,12 @@ impl BoundHttpServer {
                 connection_children.reap_finished();
                 if cx.checkpoint().is_err() {
                     break Ok(());
+                }
+                #[cfg(feature = "tasks")]
+                if let Some(hosted) = hosted_task_service.as_ref()
+                    && let Err(error) = hosted.check_running()
+                {
+                    break Err(error);
                 }
                 let now = cx.now();
                 if now.duration_since(last_session_reap) >= reap_interval_nanos {
@@ -7120,7 +7250,13 @@ impl BoundHttpServer {
                     &self.modern_sessions,
                 ));
             connection_children.reap_finished();
+            #[cfg(feature = "tasks")]
+            let task_service_result =
+                Server::settle_hosted_task_service(hosted_task_service, cx).await;
+            #[cfg(not(feature = "tasks"))]
+            let task_service_result: McpResult<()> = Ok(());
             server.graceful_shutdown_returning();
+            let result = result.and(task_service_result);
             match (connection_shutdown, connection_children.tasks.len()) {
                 (_, 0) if connection_children.terminal_failures.is_empty() => {
                     result?;
@@ -7289,6 +7425,14 @@ impl BoundWebSocketServer {
                 "WebSocket server startup hook failed",
             ));
         }
+        #[cfg(feature = "tasks")]
+        let hosted_task_service = match self.server.start_hosted_task_service(cx).await {
+            Ok(hosted) => hosted,
+            Err(error) => {
+                self.server.graceful_shutdown_returning();
+                return Err(error);
+            }
+        };
 
         let connection_scope = cx.scope();
         let mut children = WebSocketConnectionChildren::default();
@@ -7296,6 +7440,12 @@ impl BoundWebSocketServer {
             children.reap_finished();
             if cx.checkpoint().is_err() {
                 break Ok(());
+            }
+            #[cfg(feature = "tasks")]
+            if let Some(hosted) = hosted_task_service.as_ref()
+                && let Err(error) = hosted.check_running()
+            {
+                break Err(error);
             }
             let accepted = match asupersync::time::timeout(
                 cx.now(),
@@ -7362,6 +7512,12 @@ impl BoundWebSocketServer {
                 asupersync::runtime::yield_now().await;
             }
         }
+        #[cfg(feature = "tasks")]
+        let task_service_result =
+            Server::settle_hosted_task_service(hosted_task_service, cx).await;
+        #[cfg(not(feature = "tasks"))]
+        let task_service_result: McpResult<()> = Ok(());
+        let accept_result = accept_result.and(task_service_result);
         if children.tasks.is_empty() {
             let terminal_failure = children.terminal_failure();
             self.server.graceful_shutdown_returning();
@@ -12454,6 +12610,9 @@ pub struct Server {
     /// Application-owned final Tasks state retained for the caller's supervisor.
     #[cfg(feature = "tasks")]
     final_task_runtime: Option<FinalTaskRuntime>,
+    /// Application service entered and settled by the owning serve lifetime.
+    #[cfg(feature = "tasks")]
+    task_service_host: Option<tasks::TaskServiceHost>,
     /// One route-bound upstream final Tasks relay, distinct from local durable
     /// task state because its identifiers and lifecycle remain upstream-owned.
     #[cfg(all(feature = "proxy", feature = "tasks"))]
@@ -12531,6 +12690,47 @@ impl Server {
         self.final_task_runtime.as_ref()
     }
 
+    #[cfg(feature = "tasks")]
+    async fn start_hosted_task_service(&self, cx: &Cx) -> McpResult<Option<tasks::HostedTaskService>> {
+        match self.task_service_host.as_ref() {
+            Some(host) => host.start_ready(cx).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    fn start_hosted_task_service_blocking(
+        &self,
+        cx: &Cx,
+        owns_server_lifecycle: bool,
+    ) -> McpResult<Option<tasks::HostedTaskService>> {
+        match self.task_service_host.as_ref().filter(|_| owns_server_lifecycle) {
+            Some(host) => host.start_ready_blocking(cx).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    async fn settle_hosted_task_service(
+        hosted: Option<tasks::HostedTaskService>,
+        cx: &Cx,
+    ) -> McpResult<()> {
+        match hosted {
+            Some(hosted) => hosted.settle(cx).await,
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    fn settle_hosted_task_service_blocking(
+        hosted: Option<tasks::HostedTaskService>,
+    ) -> McpResult<()> {
+        match hosted {
+            Some(hosted) => hosted.settle_blocking(),
+            None => Ok(()),
+        }
+    }
+
     /// Publishes one final catalog or resource change notification to every
     /// live `subscriptions/listen` request whose accepted filter matches it.
     ///
@@ -12538,10 +12738,18 @@ impl Server {
     /// subscription ID. Request-scoped notifications such as progress and
     /// messages are rejected rather than being broadcast.
     ///
+    /// Each listener retains at most 64 events and 256 KiB of encoded event
+    /// data, including its active callback. Concurrent and reentrant publishes
+    /// queue in admission order behind that callback; their return count means
+    /// queue admission. Overflow cancels and unregisters only that listener.
+    /// The caller that starts a drain invokes callbacks synchronously, so an
+    /// application callback must still bound its own work.
+    ///
     /// # Errors
     ///
     /// Returns `InvalidParams` when `notification` is not a final
-    /// subscription event, or an internal error when it cannot be encoded.
+    /// subscription event, a capacity error for oversized application event
+    /// data, or an internal error when it cannot be encoded.
     pub fn publish_subscription_notification(
         &self,
         notification: ServerNotification,
@@ -15826,10 +16034,26 @@ impl Server {
             server.graceful_shutdown_returning();
             return 1;
         }
+        #[cfg(feature = "tasks")]
+        let hosted_task_service = match server
+            .start_hosted_task_service_blocking(dispatch_cx, owns_server_lifecycle)
+        {
+            Ok(hosted) => hosted,
+            Err(error) => {
+                error!(target: targets::SERVER, "Hosted Task service startup failed: {error}");
+                server.graceful_shutdown_returning();
+                return 1;
+            }
+        };
 
         let modern_connection = ModernConnection::new();
         let send = Arc::new(Mutex::new(send));
         let mut classifier = StdioEraClassifier::new(runtime_stdio_policy(server.protocol_policy));
+        #[cfg(feature = "tasks")]
+        let worker_failed = hosted_task_service
+            .as_ref()
+            .map_or_else(|| Arc::new(AtomicBool::new(false)), tasks::HostedTaskService::failure_signal);
+        #[cfg(not(feature = "tasks"))]
         let worker_failed = Arc::new(AtomicBool::new(false));
         let queue = Arc::new(DispatchQueueState::default());
         let mut children: Vec<asupersync::runtime::TaskHandle<()>> = Vec::new();
@@ -16193,6 +16417,15 @@ impl Server {
                 quiescent = true;
             }
         }
+        #[cfg(feature = "tasks")]
+        let task_service_succeeded =
+            Self::settle_hosted_task_service_blocking(hosted_task_service).is_ok();
+        #[cfg(not(feature = "tasks"))]
+        let task_service_succeeded = true;
+        if !task_service_succeeded {
+            error!(target: targets::SERVER, "Hosted Task service did not settle successfully");
+            exit_code = 1;
+        }
         if quiescent {
             for child in blocking_children {
                 child.0.wait();
@@ -16256,6 +16489,17 @@ impl Server {
             self.graceful_shutdown_returning();
             return 1;
         }
+        #[cfg(feature = "tasks")]
+        let hosted_task_service = match self
+            .start_hosted_task_service_blocking(dispatch_cx, owns_server_lifecycle)
+        {
+            Ok(hosted) => hosted,
+            Err(error) => {
+                error!(target: targets::SERVER, "Hosted Task service startup failed: {error}");
+                self.graceful_shutdown_returning();
+                return 1;
+            }
+        };
 
         let traffic_renderer = self.configured_traffic_renderer();
 
@@ -16265,6 +16509,11 @@ impl Server {
         let session_principal = session.principal_binding();
         let send = Arc::new(Mutex::new(send));
         let queue_state = Arc::new(DispatchQueueState::default());
+        #[cfg(feature = "tasks")]
+        let worker_failed = hosted_task_service
+            .as_ref()
+            .map_or_else(|| Arc::new(AtomicBool::new(false)), tasks::HostedTaskService::failure_signal);
+        #[cfg(not(feature = "tasks"))]
         let worker_failed = Arc::new(AtomicBool::new(false));
         let pending_requests = Arc::new(
             PendingRequests::with_max_in_flight_for_exact_legacy(
@@ -17565,6 +17814,15 @@ impl Server {
         {
             exit_code = 1;
         }
+        #[cfg(feature = "tasks")]
+        let task_service_succeeded =
+            Self::settle_hosted_task_service_blocking(hosted_task_service).is_ok();
+        #[cfg(not(feature = "tasks"))]
+        let task_service_succeeded = true;
+        if !task_service_succeeded {
+            error!(target: targets::SERVER, "Hosted Task service did not settle successfully");
+            exit_code = 1;
+        }
         if owns_server_lifecycle {
             if worker_quiesced && modern_children_quiesced {
                 server.run_shutdown_hook();
@@ -17637,6 +17895,8 @@ impl Server {
         // Complete the operation first so temporary output guards are released
         // before shutdown waits for active request owners. Every exit retains
         // cleanup failure, including protocol and response-send failures.
+        #[cfg(feature = "tasks")]
+        let mut hosted_task_service = None;
         let run_result = (|| {
             // Run startup hook
             if !server.run_startup_hook() {
@@ -17647,12 +17907,20 @@ impl Server {
                     "Server startup hook failed",
                 ));
             }
+            #[cfg(feature = "tasks")]
+            {
+                hosted_task_service = server.start_hosted_task_service_blocking(cx, true)?;
+            }
 
             // Create traffic renderer if enabled
             let traffic_renderer = server.configured_traffic_renderer();
 
             // Main request loop
             loop {
+                #[cfg(feature = "tasks")]
+                if let Some(hosted) = hosted_task_service.as_ref() {
+                    hosted.check_running()?;
+                }
                 if let Some(error) = background_send_failure
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -18028,7 +18296,12 @@ impl Server {
                 }
             }
         })();
+        #[cfg(feature = "tasks")]
+        let task_service_result = Self::settle_hosted_task_service_blocking(hosted_task_service);
+        #[cfg(not(feature = "tasks"))]
+        let task_service_result: McpResult<()> = Ok(());
         let cleanup = server.graceful_shutdown_returning();
+        let run_result = run_result.and(task_service_result);
         // A worker can finish its response attempt during the shutdown drain.
         // Read its failure after ownership retirement, including on clean EOF.
         let send_error = background_send_failure
@@ -50609,7 +50882,7 @@ mod lib_unit_tests {
         }
         drop(state);
 
-        for admitted in 0..MAX_FINAL_SUBSCRIPTION_OPENING_EVENTS {
+        for admitted in 0..MAX_FINAL_SUBSCRIPTION_QUEUED_EVENTS {
             assert_eq!(
                 registry
                     .publish(ServerNotification::ToolsListChanged(None))
@@ -51019,6 +51292,471 @@ mod lib_unit_tests {
         ));
     }
 
+    struct HeldFinalSubscription {
+        handle: SubscriptionListenHandle,
+        frames: Arc<Mutex<Vec<JsonRpcRequest>>>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        entered: std::sync::mpsc::Receiver<()>,
+        max_active: Arc<AtomicUsize>,
+    }
+
+    impl HeldFinalSubscription {
+        fn open(server: &Arc<Server>, id: i64) -> Self {
+            let frames = Arc::new(Mutex::new(Vec::new()));
+            let release = Arc::new((Mutex::new(false), Condvar::new()));
+            let active = Arc::new(AtomicUsize::new(0));
+            let max_active = Arc::new(AtomicUsize::new(0));
+            let (entered_sender, entered) = std::sync::mpsc::channel();
+            let sender_frames = Arc::clone(&frames);
+            let sender_release = Arc::clone(&release);
+            let sender_active = Arc::clone(&active);
+            let sender_max_active = Arc::clone(&max_active);
+            let held = AtomicBool::new(false);
+            let sender: NotificationSender = Arc::new(move |notification| {
+                let acknowledgement =
+                    final_subscription_acknowledgement_notification(&notification);
+                sender_frames.lock().unwrap().push(notification);
+                if acknowledgement {
+                    return;
+                }
+                let active = sender_active.fetch_add(1, Ordering::AcqRel) + 1;
+                sender_max_active.fetch_max(active, Ordering::AcqRel);
+                if !held.swap(true, Ordering::AcqRel) {
+                    entered_sender
+                        .send(())
+                        .expect("first callback observer remains live");
+                    let (lock, ready) = &*sender_release;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = ready.wait(released).unwrap();
+                    }
+                }
+                sender_active.fetch_sub(1, Ordering::AcqRel);
+            });
+            let handle = server
+                .open_subscription_listen(
+                    RequestId::Number(id),
+                    SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        resources_list_changed: Some(true),
+                        ..SubscriptionFilter::default()
+                    },
+                    sender,
+                )
+                .expect("public listener must acknowledge before publication");
+            Self {
+                handle,
+                frames,
+                release,
+                entered,
+                max_active,
+            }
+        }
+
+        fn release(&self) {
+            let (lock, ready) = &*self.release;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+    }
+
+    impl Drop for HeldFinalSubscription {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    #[test]
+    fn final_subscription_active_publications_are_serial_and_fifo() {
+        let server = Arc::new(Server::new("active-subscription-fifo", "1.0.0").build());
+        let held = HeldFinalSubscription::open(&server, 730);
+        let first_server = Arc::clone(&server);
+        let first = thread::spawn(move || {
+            first_server
+                .publish_subscription_notification(ServerNotification::ToolsListChanged(None))
+        });
+        held.entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first event must enter");
+        let second_server = Arc::clone(&server);
+        let (done_sender, done) = std::sync::mpsc::channel();
+        let second = thread::spawn(move || {
+            let result = second_server
+                .publish_subscription_notification(ServerNotification::ResourcesListChanged(None));
+            done_sender
+                .send(result)
+                .expect("second publisher observer remains live");
+        });
+        let admitted = done.recv_timeout(Duration::from_secs(2));
+        let frames_before_release = held.frames.lock().unwrap().len();
+        held.release();
+        assert_eq!(
+            first
+                .join()
+                .expect("first publisher must not panic")
+                .expect("first event publishes"),
+            1
+        );
+        second.join().expect("second publisher must not panic");
+        assert_eq!(
+            admitted
+                .expect("concurrent publisher must not wait for callback")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            frames_before_release, 2,
+            "only acknowledgement and first callback may enter"
+        );
+        assert_eq!(held.max_active.load(Ordering::Acquire), 1);
+        let frames = held.frames.lock().unwrap();
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.method.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "notifications/subscriptions/acknowledged",
+                "notifications/tools/list_changed",
+                "notifications/resources/list_changed",
+            ]
+        );
+        for frame in frames.iter() {
+            assert_eq!(
+                frame.params.as_ref().unwrap()["_meta"][FINAL_SUBSCRIPTION_ID_META_KEY],
+                serde_json::json!(730)
+            );
+        }
+        let queue = held.handle._lease.election.opening_events.lock().unwrap();
+        assert_eq!((queue.retained_events, queue.retained_bytes), (0, 0));
+    }
+
+    #[test]
+    fn final_subscription_active_overflow_retires_only_slow_listener() {
+        let server = Arc::new(Server::new("active-subscription-overflow", "1.0.0").build());
+        let held = HeldFinalSubscription::open(&server, 731);
+        let fast_frames = Arc::new(AtomicUsize::new(0));
+        let sender_frames = Arc::clone(&fast_frames);
+        let _fast = server
+            .open_subscription_listen(
+                RequestId::Number(732),
+                SubscriptionFilter {
+                    tools_list_changed: Some(true),
+                    ..SubscriptionFilter::default()
+                },
+                Arc::new(move |_| {
+                    sender_frames.fetch_add(1, Ordering::AcqRel);
+                }),
+            )
+            .expect("unrelated listener must acknowledge");
+        let first_server = Arc::clone(&server);
+        let first = thread::spawn(move || {
+            first_server
+                .publish_subscription_notification(ServerNotification::ToolsListChanged(None))
+        });
+        held.entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("slow event must enter");
+        for _ in 1..MAX_FINAL_SUBSCRIPTION_QUEUED_EVENTS {
+            assert_eq!(
+                server
+                    .publish_subscription_notification(ServerNotification::ToolsListChanged(None))
+                    .unwrap(),
+                2
+            );
+        }
+        {
+            let queue = held.handle._lease.election.opening_events.lock().unwrap();
+            assert_eq!(queue.retained_events, MAX_FINAL_SUBSCRIPTION_QUEUED_EVENTS);
+            assert!(queue.retained_bytes > 0);
+        }
+        assert_eq!(
+            server
+                .publish_subscription_notification(ServerNotification::ToolsListChanged(None))
+                .unwrap(),
+            1,
+            "one extra event must retire only the listener at its bound"
+        );
+        {
+            let queue = held.handle._lease.election.opening_events.lock().unwrap();
+            assert_eq!(
+                (
+                    queue.retained_events,
+                    queue.retained_bytes,
+                    queue.events.len()
+                ),
+                (0, 0, 0)
+            );
+        }
+        assert!(
+            !server
+                .final_subscriptions
+                .inner
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key(&held.handle._lease.key),
+            "capacity must be released while the failed callback and public handle remain live"
+        );
+        assert_eq!(
+            server
+                .publish_subscription_notification(ServerNotification::ToolsListChanged(None))
+                .unwrap(),
+            1
+        );
+        held.release();
+        assert_eq!(
+            first
+                .join()
+                .expect("first publisher must not panic")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            held.frames.lock().unwrap().len(),
+            2,
+            "queued events must never run after overflow"
+        );
+        assert_eq!(
+            fast_frames.load(Ordering::Acquire),
+            MAX_FINAL_SUBSCRIPTION_QUEUED_EVENTS + 3,
+            "the sibling receives acknowledgement and every publication exactly once"
+        );
+        assert_eq!(held.max_active.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn final_subscription_active_byte_limit_rejects_before_retaining() {
+        for excess in [0, 1] {
+            let server = Arc::new(Server::new("active-subscription-bytes", "1.0.0").build());
+            let held = HeldFinalSubscription::open(&server, 733);
+            let first_server = Arc::clone(&server);
+            let first = thread::spawn(move || {
+                first_server
+                    .publish_subscription_notification(ServerNotification::ToolsListChanged(None))
+            });
+            held.entered
+                .recv_timeout(Duration::from_secs(2))
+                .expect("first event must enter");
+            let first_bytes = held
+                .handle
+                ._lease
+                .election
+                .opening_events
+                .lock()
+                .unwrap()
+                .retained_bytes;
+            let event = |size| {
+                ServerNotification::ToolsListChanged(Some(
+                    fastmcp_protocol::FinalEmptyNotificationParams {
+                        meta: None,
+                        additional: BTreeMap::from([(
+                            "payload".to_owned(),
+                            serde_json::json!("x".repeat(size)),
+                        )]),
+                    },
+                ))
+            };
+            let empty = tag_subscription_notification(&event(0), &RequestId::Number(733))
+                .unwrap()
+                .encode()
+                .unwrap();
+            let overhead = final_subscription_event_bytes(&empty).unwrap();
+            let payload = MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES - first_bytes - overhead + excess;
+            let admitted = server
+                .publish_subscription_notification(event(payload))
+                .unwrap();
+            {
+                let queue = held.handle._lease.election.opening_events.lock().unwrap();
+                if excess == 0 {
+                    assert_eq!(
+                        (admitted, queue.retained_events, queue.retained_bytes),
+                        (1, 2, MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES)
+                    );
+                } else {
+                    assert_eq!(
+                        (admitted, queue.retained_events, queue.retained_bytes),
+                        (0, 0, 0)
+                    );
+                    assert!(
+                        !server
+                            .final_subscriptions
+                            .inner
+                            .lock()
+                            .unwrap()
+                            .entries
+                            .contains_key(&held.handle._lease.key)
+                    );
+                }
+            }
+            held.release();
+            assert_eq!(
+                first
+                    .join()
+                    .expect("first publisher must not panic")
+                    .unwrap(),
+                usize::from(excess == 0)
+            );
+            assert_eq!(
+                held.frames.lock().unwrap().len(),
+                if excess == 0 { 3 } else { 2 }
+            );
+            let queue = held.handle._lease.election.opening_events.lock().unwrap();
+            assert_eq!((queue.retained_events, queue.retained_bytes), (0, 0));
+        }
+
+        // An individually oversized payload is rejected before recipient
+        // copies or queue mutation, leaving even a matching listener usable.
+        let server = Server::new("subscription-prefanout-bound", "1.0.0").build();
+        let frames = Arc::new(AtomicUsize::new(0));
+        let sender_frames = Arc::clone(&frames);
+        let handle = server
+            .open_subscription_listen(
+                RequestId::Number(735),
+                SubscriptionFilter {
+                    tools_list_changed: Some(true),
+                    ..SubscriptionFilter::default()
+                },
+                Arc::new(move |_| {
+                    sender_frames.fetch_add(1, Ordering::AcqRel);
+                }),
+            )
+            .unwrap();
+        let oversized = ServerNotification::ToolsListChanged(Some(
+            fastmcp_protocol::FinalEmptyNotificationParams {
+                meta: None,
+                additional: BTreeMap::from([(
+                    "payload".to_owned(),
+                    serde_json::json!("x".repeat(MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES + 1)),
+                )]),
+            },
+        ));
+        let error = server
+            .publish_subscription_notification(oversized)
+            .expect_err("oversized source data must be rejected before fanout");
+        assert_eq!(
+            error.code,
+            McpErrorCode::Custom(RESOURCE_EXHAUSTED_ERROR_CODE)
+        );
+        assert_eq!(frames.load(Ordering::Acquire), 1);
+        assert!(
+            server
+                .final_subscriptions
+                .inner
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key(&handle._lease.key)
+        );
+        let queue = handle._lease.election.opening_events.lock().unwrap();
+        assert_eq!((queue.retained_events, queue.retained_bytes), (0, 0));
+        drop(queue);
+        assert_eq!(
+            server
+                .publish_subscription_notification(ServerNotification::ToolsListChanged(None))
+                .unwrap(),
+            1
+        );
+        assert_eq!(frames.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn final_subscription_active_reentrant_publish_and_teardown_preserve_order() {
+        for (terminate, panic_after_enqueue) in [(false, false), (true, false), (false, true)] {
+            let server = Arc::new(Server::new("active-subscription-reentrant", "1.0.0").build());
+            let sender_server = Arc::downgrade(&server);
+            let frames = Arc::new(Mutex::new(Vec::new()));
+            let sender_frames = Arc::clone(&frames);
+            let active = AtomicUsize::new(0);
+            let max_active = Arc::new(AtomicUsize::new(0));
+            let sender_max = Arc::clone(&max_active);
+            let queued = Arc::new(AtomicUsize::new(usize::MAX));
+            let sender_queued = Arc::clone(&queued);
+            let sender: NotificationSender = Arc::new(move |notification| {
+                let active_count = active.fetch_add(1, Ordering::AcqRel) + 1;
+                sender_max.fetch_max(active_count, Ordering::AcqRel);
+                let publish = notification.method == "notifications/tools/list_changed";
+                sender_frames.lock().unwrap().push(notification);
+                if publish {
+                    let server = sender_server
+                        .upgrade()
+                        .expect("public publisher remains live");
+                    sender_queued.store(
+                        server
+                            .publish_subscription_notification(
+                                ServerNotification::ResourcesListChanged(None),
+                            )
+                            .unwrap(),
+                        Ordering::Release,
+                    );
+                    if panic_after_enqueue {
+                        panic!("planted sender panic after reentrant queue admission");
+                    }
+                    if terminate {
+                        assert_eq!(server.terminate_subscription_streams(), 1);
+                    }
+                }
+                active.fetch_sub(1, Ordering::AcqRel);
+            });
+            let handle = server
+                .open_subscription_listen(
+                    RequestId::Number(734),
+                    SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        resources_list_changed: Some(true),
+                        ..SubscriptionFilter::default()
+                    },
+                    sender,
+                )
+                .unwrap();
+            assert_eq!(
+                server
+                    .publish_subscription_notification(ServerNotification::ToolsListChanged(None))
+                    .unwrap(),
+                usize::from(!panic_after_enqueue)
+            );
+            assert_eq!(queued.load(Ordering::Acquire), 1);
+            assert_eq!(
+                max_active.load(Ordering::Acquire),
+                1,
+                "reentrant publication must not reenter the callback"
+            );
+            let frames = frames.lock().unwrap();
+            let mut expected = vec![
+                "notifications/subscriptions/acknowledged",
+                "notifications/tools/list_changed",
+            ];
+            if !panic_after_enqueue {
+                expected.push(if terminate {
+                    "notifications/cancelled"
+                } else {
+                    "notifications/resources/list_changed"
+                });
+            }
+            assert_eq!(
+                frames
+                    .iter()
+                    .map(|frame| frame.method.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(handle._lease.has_graceful_completion(), terminate);
+            if panic_after_enqueue {
+                assert!(
+                    server
+                        .final_subscriptions
+                        .inner
+                        .lock()
+                        .unwrap()
+                        .entries
+                        .is_empty()
+                );
+            }
+            let queue = handle._lease.election.opening_events.lock().unwrap();
+            assert_eq!((queue.retained_events, queue.retained_bytes), (0, 0));
+        }
+    }
+
     #[test]
     fn final_subscription_concurrent_publications_are_not_silently_dropped() {
         let registry = Arc::new(FinalSubscriptionRegistry::default());
@@ -51071,12 +51809,18 @@ mod lib_unit_tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("first publication callback should start");
         let second_registry = Arc::clone(&registry);
+        let (admitted_sender, admitted_receiver) = std::sync::mpsc::channel();
         let second = thread::spawn(move || {
-            second_registry.publish(ServerNotification::ToolsListChanged(None))
+            let result = second_registry.publish(ServerNotification::ToolsListChanged(None));
+            admitted_sender
+                .send(())
+                .expect("second admission observer remains live");
+            result
         });
-        let second_entered = entered_receiver
+        let second_admitted = admitted_receiver
             .recv_timeout(Duration::from_secs(2))
             .is_ok();
+        let second_entered = entered_receiver.try_recv().is_ok();
 
         let (lock, ready) = &*release;
         *lock
@@ -51093,8 +51837,8 @@ mod lib_unit_tests {
             .expect("second concurrent publisher should not panic")
             .expect("second concurrent publication should remain valid");
         assert!(
-            second_entered,
-            "an in-flight callback must not make a concurrent accepted event disappear"
+            second_admitted && !second_entered,
+            "the second event must be admitted without a concurrent callback or a dropped event"
         );
         assert_eq!(first_result, 1);
         assert_eq!(second_result, 1);

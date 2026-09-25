@@ -62,7 +62,7 @@ mod live {
         block_on(
             modern::client_builder()
                 .request_timeout_policy(policy)
-                .connect_stdio_with_cx(binary, &[], &Cx::for_request()),
+                .connect_stdio_with_cx(&Cx::for_request(), binary, &[]),
         )
         .unwrap_or_else(|error| panic!("{binary} completes modern discovery: {error}"))
     }

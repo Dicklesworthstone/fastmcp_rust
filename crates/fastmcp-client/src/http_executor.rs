@@ -8558,9 +8558,36 @@ fn advertised_legacy_target_is_admissible(configured: &str, advertised: &str) ->
     }
 }
 
+/// Resolves the peer's URI reference before granting it the exact configured
+/// message resource. Canonicalization alone grants neither origin nor path
+/// authority; its original syntax evidence is checked before serialization.
+#[cfg(feature = "legacy-2024-11-05")]
+fn resolve_legacy_message_post_target(
+    sse_target: &fastmcp_core::CanonicalHttpUrl,
+    configured: &str,
+    reference: &str,
+) -> Result<String, LegacySseHttpClientError> {
+    let resolved = sse_target
+        .resolve_reference(reference)
+        .map_err(|_| LegacySseHttpClientError::InvalidAdvertisedMessagePostTarget)?;
+    if resolved.has_syntax_violation() || resolved.has_userinfo() || resolved.fragment().is_some() {
+        return Err(LegacySseHttpClientError::InvalidAdvertisedMessagePostTarget);
+    }
+    let advertised = resolved.as_str();
+    if !advertised_legacy_target_is_admissible(configured, advertised) {
+        return Err(
+            LegacySseHttpClientError::AdvertisedMessagePostTargetMismatch {
+                configured: configured.to_owned(),
+                advertised: advertised.to_owned(),
+            },
+        );
+    }
+    Ok(advertised.to_owned())
+}
+
 #[cfg(all(test, feature = "legacy-2024-11-05"))]
 mod legacy_target_admission_tests {
-    use super::advertised_legacy_target_is_admissible;
+    use super::{advertised_legacy_target_is_admissible, resolve_legacy_message_post_target};
 
     #[test]
     fn byte_equal_targets_are_admitted() {
@@ -8610,13 +8637,55 @@ mod legacy_target_admission_tests {
             "http://127.0.0.1:9/messages",
         ));
     }
+
+    #[test]
+    fn resolved_legacy_targets_preserve_canonical_origins_and_exact_query_state() {
+        let sse = fastmcp_core::CanonicalHttpUrl::parse("https://example.test/tenant/sse").unwrap();
+        for reference in [
+            "/tenant/messages?session=a%2Fb?part=2",
+            "messages?session=a%2Fb?part=2",
+            "HTTPS://EXAMPLE.TEST:443/tenant/messages?session=a%2Fb?part=2",
+            "//EXAMPLE.TEST:443/tenant/messages?session=a%2Fb?part=2",
+        ] {
+            assert_eq!(
+                resolve_legacy_message_post_target(
+                    &sse,
+                    "https://example.test/tenant/messages",
+                    reference
+                )
+                .unwrap(),
+                "https://example.test/tenant/messages?session=a%2Fb?part=2"
+            );
+        }
+        for query in ["", "session=one", "session=a%2Fb?part=2"] {
+            let configured = format!("https://example.test/tenant/messages?{query}");
+            assert_eq!(
+                resolve_legacy_message_post_target(&sse, &configured, &format!("messages?{query}"))
+                    .unwrap(),
+                configured
+            );
+            assert!(resolve_legacy_message_post_target(&sse, &configured, "messages").is_err());
+            assert!(
+                resolve_legacy_message_post_target(&sse, &configured, "messages?different")
+                    .is_err()
+            );
+        }
+        assert!(
+            resolve_legacy_message_post_target(
+                &sse,
+                "https://example.test/tenant/messages",
+                &format!("messages?session={}", "x".repeat(16 * 1024)),
+            )
+            .is_err()
+        );
+    }
 }
 
 #[cfg(feature = "legacy-2024-11-05")]
 impl LegacySseHttpClient {
-    /// Opens the configured exact-2024 SSE GET endpoint and admits its first
-    /// `endpoint` event only when it names the immutable configured POST
-    /// resource.
+    /// Opens the configured exact-2024 SSE GET endpoint and resolves its first
+    /// `endpoint` URI reference against that URL. The resolved target must name
+    /// the immutable configured POST resource on the same origin.
     #[cfg(feature = "legacy-2024-11-05")]
     pub async fn connect(
         cx: &Cx,
@@ -8648,6 +8717,18 @@ impl LegacySseHttpClient {
             .legacy_message_post_target()
             .ok_or(LegacySseHttpClientError::MissingMessagePostTarget)?
             .to_owned();
+        let sse_url = fastmcp_core::CanonicalHttpUrl::parse(&sse_target)
+            .map_err(|_| LegacySseHttpClientError::InvalidEndpointConfiguration)?;
+        let message_url = fastmcp_core::CanonicalHttpUrl::parse(&configured_message_post_target)
+            .map_err(|_| LegacySseHttpClientError::InvalidEndpointConfiguration)?;
+        if [&sse_url, &message_url].iter().any(|target| {
+            target.has_syntax_violation() || target.has_userinfo() || target.fragment().is_some()
+        }) || sse_url.scheme() != message_url.scheme()
+            || sse_url.host() != message_url.host()
+            || sse_url.effective_port() != message_url.effective_port()
+        {
+            return Err(LegacySseHttpClientError::InvalidEndpointConfiguration);
+        }
 
         let response = native_http_client()
             .request_streaming(
@@ -8679,17 +8760,11 @@ impl LegacySseHttpClient {
             }
             None => return Err(LegacySseHttpClientError::SseEndedBeforeEndpoint),
         };
-        if !advertised_legacy_target_is_admissible(
+        let advertised_message_post_target = resolve_legacy_message_post_target(
+            &sse_url,
             &configured_message_post_target,
             &advertised_message_post_target,
-        ) {
-            return Err(
-                LegacySseHttpClientError::AdvertisedMessagePostTargetMismatch {
-                    configured: configured_message_post_target,
-                    advertised: advertised_message_post_target,
-                },
-            );
-        }
+        )?;
 
         Ok(Self {
             protocol_plan,
@@ -8843,6 +8918,8 @@ impl LegacySseHttpOutbound {
         validate_content_encoding(&response.head.headers)
             .map_err(LegacySseHttpClientError::Executor)
             .map_err(LegacySseOutboundSendError::submitted)?;
+        reject_legacy_response_session_header(&response.head.headers)
+            .map_err(LegacySseOutboundSendError::submitted)?;
         if (300..400).contains(&response.head.status) {
             return Err(LegacySseOutboundSendError::submitted(
                 LegacySseHttpClientError::MessagePostRedirect {
@@ -8887,6 +8964,8 @@ pub enum LegacySseHttpClientError {
     MissingSseTarget,
     /// The immutable plan omitted its legacy message POST target.
     MissingMessagePostTarget,
+    /// Configured SSE and POST resources are unsafe or do not share an origin.
+    InvalidEndpointConfiguration,
     /// The caller's context was cancelled.
     Cancelled,
     /// Native HTTP setup, framing, or body consumption failed.
@@ -8903,6 +8982,11 @@ pub enum LegacySseHttpClientError {
     FirstEventWasNotEndpoint,
     /// The first `endpoint` event had an empty data value.
     EmptyAdvertisedMessagePostTarget,
+    /// The peer's endpoint URI is malformed, oversized, or contains unsafe
+    /// syntax, userinfo, or a fragment.
+    InvalidAdvertisedMessagePostTarget,
+    /// A legacy response attempted to introduce Streamable HTTP session state.
+    ForbiddenResponseSessionHeader,
     /// The advertised POST route differed from the configured immutable one.
     AdvertisedMessagePostTargetMismatch {
         configured: String,
@@ -8942,6 +9026,9 @@ impl fmt::Display for LegacySseHttpClientError {
             Self::MissingMessagePostTarget => {
                 formatter.write_str("the plan has no legacy message POST target")
             }
+            Self::InvalidEndpointConfiguration => formatter.write_str(
+                "legacy SSE and message POST targets must be safe resources on the same origin",
+            ),
             Self::Cancelled => formatter.write_str("legacy SSE HTTP operation was cancelled"),
             Self::Executor(error) => error.fmt(formatter),
             Self::SseGetRedirect { status } => {
@@ -8967,6 +9054,12 @@ impl fmt::Display for LegacySseHttpClientError {
             }
             Self::EmptyAdvertisedMessagePostTarget => {
                 formatter.write_str("legacy SSE advertised an empty message POST target")
+            }
+            Self::InvalidAdvertisedMessagePostTarget => {
+                formatter.write_str("legacy SSE advertised an invalid message POST URI")
+            }
+            Self::ForbiddenResponseSessionHeader => {
+                formatter.write_str("legacy HTTP response included forbidden MCP-Session-Id")
             }
             Self::AdvertisedMessagePostTargetMismatch {
                 configured,
@@ -9021,6 +9114,7 @@ impl std::error::Error for LegacySseHttpClientError {
             Self::Executor(error) => Some(error),
             Self::MissingSseTarget
             | Self::MissingMessagePostTarget
+            | Self::InvalidEndpointConfiguration
             | Self::Cancelled
             | Self::SseGetRedirect { .. }
             | Self::SseGetRejected { .. }
@@ -9028,6 +9122,8 @@ impl std::error::Error for LegacySseHttpClientError {
             | Self::SseEndedBeforeEndpoint
             | Self::FirstEventWasNotEndpoint
             | Self::EmptyAdvertisedMessagePostTarget
+            | Self::InvalidAdvertisedMessagePostTarget
+            | Self::ForbiddenResponseSessionHeader
             | Self::AdvertisedMessagePostTargetMismatch { .. }
             | Self::UnexpectedEndpointEvent
             | Self::SseLineTooLong
@@ -9349,6 +9445,7 @@ fn validate_legacy_sse_response_head(
     headers: &[(String, String)],
 ) -> Result<(), LegacySseHttpClientError> {
     validate_content_encoding(headers).map_err(LegacySseHttpClientError::Executor)?;
+    reject_legacy_response_session_header(headers)?;
     if (300..400).contains(&status) {
         return Err(LegacySseHttpClientError::SseGetRedirect { status });
     }
@@ -9364,6 +9461,19 @@ fn validate_legacy_sse_response_head(
         Some(content_type) if content_type.eq_ignore_ascii_case("text/event-stream") => Ok(()),
         None | Some(_) => Err(LegacySseHttpClientError::UnsupportedSseContentType),
     }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+fn reject_legacy_response_session_header(
+    headers: &[(String, String)],
+) -> Result<(), LegacySseHttpClientError> {
+    if headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("mcp-session-id"))
+    {
+        return Err(LegacySseHttpClientError::ForbiddenResponseSessionHeader);
+    }
+    Ok(())
 }
 
 /// Preserve the runtime's deadline reason rather than collapsing every failed
@@ -10119,8 +10229,6 @@ mod tests {
     use asupersync::{CancelKind, Cx};
     #[cfg(feature = "legacy-2024-11-05")]
     use fastmcp_core::McpError;
-    #[cfg(feature = "legacy-2024-11-05")]
-    use fastmcp_protocol::JsonRpcRequest;
     #[cfg(feature = "apps")]
     use fastmcp_protocol::extensions::{
         ClientExtensionDiscovery, ExtensionDescriptorRegistry, McpAppsClientSettings,
@@ -10138,6 +10246,8 @@ mod tests {
         FinalCoreResult, FinalCreateMessageResult, FinalProgressNotificationParams,
         JsonRpcResponse, RequestId, ServerNotification, SubscriptionFilter,
     };
+    #[cfg(feature = "legacy-2024-11-05")]
+    use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest};
 
     #[cfg(feature = "apps")]
     use super::merge_client_extensions;
@@ -15299,6 +15409,256 @@ mod tests {
             !accepted,
             "the stopped peer must not accept a connection after the pre-connect failure"
         );
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    fn exercise_legacy_endpoint_reference(
+        reference: &str,
+        session_header_stage: Option<&str>,
+    ) -> (
+        Result<String, LegacySseHttpClientError>,
+        Vec<CapturedHttpRequest>,
+        bool,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind endpoint-reference peer");
+        listener
+            .set_nonblocking(true)
+            .expect("bound endpoint-reference accepts");
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        let sse_target = format!("{origin}/tenant/sse");
+        let message_target = format!("{origin}/tenant/messages");
+        let advertised = reference
+            .replace("{origin}", &origin)
+            .replace("{authority}", &address.to_string());
+        let session_header_on_get = session_header_stage == Some("get");
+        let session_header_on_post = session_header_stage == Some("post");
+        let (stop, stopped) = mpsc::sync_channel(1);
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + LEGACY_TEST_PEER_BOUND;
+            let mut stream = accept_legacy_test_peer(&listener, &stopped, deadline)
+                .expect("accept endpoint-reference GET")
+                .expect("the configured SSE GET reaches its peer");
+            let request = read_request(&mut stream);
+            assert!(request.head.starts_with("GET /tenant/sse HTTP/1.1\r\n"));
+            if session_header_on_get {
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nmCp-SeSsIoN-iD: \r\n\r\n").unwrap();
+                stream.flush().unwrap();
+            } else {
+                begin_chunked_sse(&mut stream);
+                write_chunked_sse_event(
+                    &mut stream,
+                    &format!("event: endpoint\ndata: {advertised}\n\n"),
+                );
+            }
+            let mut posts = Vec::new();
+            if let Some(mut post) = accept_legacy_test_peer(&listener, &stopped, deadline)
+                .expect("bound endpoint-reference message POST")
+            {
+                let request = read_request(&mut post);
+                let message: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(message["method"], "ping");
+                assert_eq!(message["id"], 44);
+                posts.push(request);
+                if session_header_on_post {
+                    write!(post, "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nMCP-Session-Id: planted-session\r\nConnection: close\r\n\r\n").unwrap();
+                    post.flush().unwrap();
+                } else {
+                    write_response(&mut post, 202, "application/json", b"");
+                    write_chunked_sse_event(
+                        &mut stream,
+                        "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":44,\"result\":{}}\n\n",
+                    );
+                }
+            }
+            let mut byte = [0_u8; 1];
+            let closed = match stream.read(&mut byte) {
+                Ok(0) => true,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    true
+                }
+                Ok(_) | Err(_) => false,
+            };
+            (posts, closed)
+        });
+        let protocol_plan = plan(
+            "http://127.0.0.1:9/unused",
+            &sse_target,
+            &message_target,
+            ProtocolPolicy::LegacyOnly,
+        );
+        let cx = Cx::for_request();
+        let result = runtime_block_on(async {
+            let mut client = super::LegacySseHttpClient::connect(&cx, protocol_plan).await?;
+            let admitted_target = client.advertised_message_post_target().to_owned();
+            client
+                .send(
+                    &cx,
+                    &JsonRpcMessage::Request(JsonRpcRequest::new("ping", None, 44)),
+                )
+                .await?;
+            let message = client.next_message(&cx).await?;
+            assert!(
+                matches!(message, Some(JsonRpcMessage::Response(response)) if response.id == Some(RequestId::Number(44)) && response.result == Some(serde_json::json!({})))
+            );
+            assert_eq!(client.advertised_message_post_target(), admitted_target);
+            Ok(admitted_target)
+        });
+        signal_legacy_test_peer_stop(&stop);
+        let (posts, closed) = server.join().expect("endpoint-reference peer terminates");
+        (result, posts, closed)
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_relative_endpoint_reference_routes_exact_post_resource() {
+        for reference in [
+            "/tenant/messages?session=one",
+            "messages?session=one",
+            "./messages?session=one",
+            "../tenant/messages?session=one",
+            "{origin}/tenant/messages?session=one",
+            "//{authority}/tenant/messages?session=one",
+        ] {
+            let (result, posts, closed) = exercise_legacy_endpoint_reference(reference, None);
+            assert!(
+                result.unwrap().ends_with("/tenant/messages?session=one"),
+                "{reference}"
+            );
+            assert_eq!(posts.len(), 1, "{reference}");
+            assert!(
+                posts[0]
+                    .head
+                    .starts_with("POST /tenant/messages?session=one HTTP/1.1\r\n"),
+                "{reference}"
+            );
+            assert!(
+                closed,
+                "the admitted SSE stream closes after its owner drops: {reference}"
+            );
+        }
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_relative_endpoint_reference_rejects_authority_resource_and_unsafe_mutations() {
+        for reference in [
+            "http://127.0.0.1:9/tenant/messages?session=one",
+            "//127.0.0.1:9/tenant/messages?session=one",
+            "../messages?session=one",
+            "messages/other?session=one",
+            "messages?session=one#fragment",
+            "messages?session=one#",
+            "http://user:secret@{authority}/tenant/messages?session=one",
+            "http://@{authority}/tenant/messages?session=one",
+            "mess\tages?session=one",
+            "\\tenant\\messages?session=one",
+            "messages?session=%q0",
+        ] {
+            let (result, posts, closed) = exercise_legacy_endpoint_reference(reference, None);
+            assert!(
+                matches!(
+                    result,
+                    Err(LegacySseHttpClientError::InvalidAdvertisedMessagePostTarget
+                        | LegacySseHttpClientError::AdvertisedMessagePostTargetMismatch { .. })
+                ),
+                "{reference}: {result:?}"
+            );
+            assert!(
+                posts.is_empty(),
+                "a refused reference cannot receive a POST: {reference}"
+            );
+            assert!(closed, "refusal releases its SSE stream: {reference}");
+        }
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_transport_rejects_streamable_http_session_headers() {
+        let (control, posts, closed) =
+            exercise_legacy_endpoint_reference("messages?session=one", None);
+        assert!(control.is_ok());
+        assert_eq!(posts.len(), 1);
+        assert!(closed);
+        for stage in ["get", "post"] {
+            let (result, posts, closed) =
+                exercise_legacy_endpoint_reference("messages?session=one", Some(stage));
+            assert!(
+                matches!(
+                    result,
+                    Err(LegacySseHttpClientError::ForbiddenResponseSessionHeader)
+                ),
+                "{stage}: {result:?}"
+            );
+            assert_eq!(posts.len(), usize::from(stage == "post"));
+            assert!(
+                closed,
+                "session-header refusal releases its stream: {stage}"
+            );
+        }
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_endpoint_configuration_rejects_foreign_origin_and_credentials_before_get() {
+        for (sse_reference, post_reference) in [
+            (
+                "http://{authority}/tenant/sse",
+                "http://127.0.0.1:9/tenant/messages",
+            ),
+            (
+                "http://user:secret@{authority}/tenant/sse",
+                "http://{authority}/tenant/messages",
+            ),
+            (
+                "http://{authority}/tenant/sse",
+                "http://user:secret@{authority}/tenant/messages",
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let authority = listener.local_addr().unwrap().to_string();
+            let sse_target = sse_reference.replace("{authority}", &authority);
+            let message_target = post_reference.replace("{authority}", &authority);
+            let (stop, stopped) = mpsc::sync_channel(1);
+            let server = thread::spawn(move || {
+                let accepted = accept_legacy_test_peer(
+                    &listener,
+                    &stopped,
+                    Instant::now() + LEGACY_TEST_PEER_BOUND,
+                )
+                .unwrap();
+                if let Some(mut stream) = accepted {
+                    let _ = read_request(&mut stream);
+                    write_response(&mut stream, 404, "text/plain", b"");
+                    true
+                } else {
+                    false
+                }
+            });
+            let protocol_plan = plan(
+                "http://127.0.0.1:9/unused",
+                &sse_target,
+                &message_target,
+                ProtocolPolicy::LegacyOnly,
+            );
+            let result = runtime_block_on(super::LegacySseHttpClient::connect(
+                &Cx::for_request(),
+                protocol_plan,
+            ));
+            signal_legacy_test_peer_stop(&stop);
+            let accepted = server.join().expect("configuration peer terminates");
+            assert!(matches!(
+                result,
+                Err(LegacySseHttpClientError::InvalidEndpointConfiguration)
+            ));
+            assert!(!accepted, "invalid endpoint configuration opened a GET");
+        }
     }
 
     #[cfg(feature = "legacy-2024-11-05")]

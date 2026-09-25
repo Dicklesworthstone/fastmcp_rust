@@ -978,6 +978,31 @@ impl CanonicalHttpUrl {
         parse_canonical_http_url(input, max_bytes).map(|parsed| parsed.url)
     }
 
+    /// Resolves an HTTP(S) URI reference against this URL using the pinned
+    /// canonicalization policy and the default input/output byte bound.
+    ///
+    /// Relative paths use the base URL's directory; a leading slash selects
+    /// the origin root. Absolute references may select another origin, so
+    /// callers must apply their own origin and resource admission afterward.
+    /// Userinfo, fragments, and non-fatal syntax violations remain observable
+    /// on the result and are never silently promoted to security authority.
+    pub fn resolve_reference(&self, reference: &str) -> Result<Self, CanonicalHttpUrlError> {
+        self.resolve_reference_with_max_bytes(reference, DEFAULT_CANONICAL_URL_MAX_BYTES)
+    }
+
+    /// Bounded form of [`resolve_reference`](Self::resolve_reference).
+    ///
+    /// Both the reference before parsing and the complete resolved URL must
+    /// fit `max_bytes`, which cannot exceed the canonical-URL hard ceiling.
+    pub fn resolve_reference_with_max_bytes(
+        &self,
+        reference: &str,
+        max_bytes: usize,
+    ) -> Result<Self, CanonicalHttpUrlError> {
+        parse_canonical_http_url_with_base(reference, max_bytes, Some(self))
+            .map(|parsed| parsed.url)
+    }
+
     /// Returns the exact named policy applied by this type.
     #[must_use]
     pub const fn policy() -> CanonicalUrlPolicy {
@@ -1045,7 +1070,12 @@ impl CanonicalHttpUrl {
         self.url.authority().contains('@')
     }
 
-    fn has_syntax_violation(&self) -> bool {
+    /// Returns whether parsing repaired non-fatal URL syntax. For a resolved
+    /// reference this also preserves syntax violations from its base URL.
+    /// Security-sensitive consumers can reject repairs before retaining the
+    /// canonical serialization, which no longer carries that evidence.
+    #[must_use]
+    pub fn has_syntax_violation(&self) -> bool {
         self.syntax_flags.any
     }
 
@@ -1069,6 +1099,14 @@ fn parse_canonical_http_url(
     input: &str,
     max_bytes: usize,
 ) -> Result<ParsedCanonicalHttpUrl, CanonicalHttpUrlError> {
+    parse_canonical_http_url_with_base(input, max_bytes, None)
+}
+
+fn parse_canonical_http_url_with_base(
+    input: &str,
+    max_bytes: usize,
+    base: Option<&CanonicalHttpUrl>,
+) -> Result<ParsedCanonicalHttpUrl, CanonicalHttpUrlError> {
     if max_bytes > CANONICAL_URL_HARD_MAX_BYTES {
         return Err(CanonicalHttpUrlError::LimitExceedsHardCeiling {
             requested_max_bytes: max_bytes,
@@ -1086,7 +1124,20 @@ fn parse_canonical_http_url(
         return Err(CanonicalHttpUrlError::MissingHost);
     }
 
-    let syntax_flags = Cell::new(UrlSyntaxFlags::default());
+    let mut initial_syntax_flags =
+        base.map_or_else(UrlSyntaxFlags::default, |base| base.syntax_flags);
+    // The pinned parser's callback does not report every reference repair:
+    // tabs/newlines can disappear and backslashes can become path separators.
+    // Preserve those original bytes as evidence before relative resolution.
+    // Percent-encoded bytes remain opaque and are not decoded by this guard.
+    if base.is_some()
+        && input
+            .bytes()
+            .any(|byte| byte <= b' ' || byte == 0x7f || byte == b'\\')
+    {
+        initial_syntax_flags.any = true;
+    }
+    let syntax_flags = Cell::new(initial_syntax_flags);
     let callback = |violation: SyntaxViolation| {
         let mut flags = syntax_flags.get();
         flags.any = true;
@@ -1099,6 +1150,7 @@ fn parse_canonical_http_url(
         syntax_flags.set(flags);
     };
     let url = Url::options()
+        .base_url(base.map(|base| &base.url))
         .syntax_violation_callback(Some(&callback))
         .parse(input)
         .map_err(CanonicalHttpUrlError::Parse)?;
@@ -2013,6 +2065,77 @@ mod tests {
                 syntax_violations: SyntaxViolationPolicy::UrlCrateV2_5_8,
             }
         );
+    }
+
+    #[test]
+    fn canonical_http_reference_resolution_preserves_security_evidence_and_bounds() {
+        let base = CanonicalHttpUrl::parse("https://example.test/tenant/sse").unwrap();
+        for (reference, expected) in [
+            (
+                "messages?session=a%2Fb",
+                "https://example.test/tenant/messages?session=a%2Fb",
+            ),
+            ("../messages", "https://example.test/messages"),
+            ("/messages", "https://example.test/messages"),
+            (
+                "//EXAMPLE.TEST:443/messages",
+                "https://example.test/messages",
+            ),
+            (
+                "?session=one",
+                "https://example.test/tenant/sse?session=one",
+            ),
+        ] {
+            let resolved = base.resolve_reference(reference).unwrap();
+            assert_eq!(resolved.as_str(), expected);
+            assert!(!resolved.has_syntax_violation(), "{reference}");
+        }
+        let credentials = base
+            .resolve_reference("https://user:secret@example.test/messages#fragment")
+            .unwrap();
+        assert!(credentials.has_userinfo());
+        assert_eq!(credentials.fragment(), Some("fragment"));
+        assert!(credentials.has_syntax_violation());
+        for repaired in ["/mess\tages", "/messages\n", "\\messages"] {
+            assert!(
+                base.resolve_reference(repaired)
+                    .unwrap()
+                    .has_syntax_violation(),
+                "{repaired:?}"
+            );
+        }
+        let repaired_base = CanonicalHttpUrl::parse("https:example.test/tenant/sse").unwrap();
+        assert!(
+            repaired_base
+                .resolve_reference("messages")
+                .unwrap()
+                .has_syntax_violation()
+        );
+        assert!(matches!(
+            base.resolve_reference("/messages?session=%q0"),
+            Err(CanonicalHttpUrlError::InvalidPercentEncoding { .. })
+        ));
+        assert!(matches!(
+            base.resolve_reference("file:///messages"),
+            Err(CanonicalHttpUrlError::SchemeNotHttp)
+        ));
+        let resolved_bytes = "https://example.test/messages".len();
+        assert!(
+            base.resolve_reference_with_max_bytes("/messages", resolved_bytes)
+                .is_ok()
+        );
+        assert!(matches!(
+            base.resolve_reference_with_max_bytes("/messages", resolved_bytes - 1),
+            Err(CanonicalHttpUrlError::CanonicalOutputTooLong { .. })
+        ));
+        assert!(matches!(
+            base.resolve_reference_with_max_bytes(&"x".repeat(33), 32),
+            Err(CanonicalHttpUrlError::InputTooLong { .. })
+        ));
+        assert!(matches!(
+            base.resolve_reference_with_max_bytes("/messages", CANONICAL_URL_HARD_MAX_BYTES + 1),
+            Err(CanonicalHttpUrlError::LimitExceedsHardCeiling { .. })
+        ));
     }
 
     #[test]

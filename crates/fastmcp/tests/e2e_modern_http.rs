@@ -3011,7 +3011,7 @@ fn invoke_modern_public_handlers(cx: &Cx, address: SocketAddr) -> PublicHttpHand
         cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-modern-handler-client", "1.0.0")
-            .connect_http_with_cx(public_http_target(address, "/mcp"), cx),
+            .connect_http_with_cx(cx, public_http_target(address, "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the live modern route");
 
@@ -3588,7 +3588,7 @@ fn e2e_public_http_sse_body_carries_a_tool_result_over_64_kib() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-large-sse", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects");
     client
@@ -3634,7 +3634,7 @@ fn e2e_public_http_tools_call_carries_one_text_block_over_64_kib() {
             &cx,
             modern::ClientBuilder::new()
                 .client_info("e2e-public-http-one-large-block", "1.0.0")
-                .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+                .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
         )
         .expect("the ModernOnly public facade connects");
         if sse_body {
@@ -3694,7 +3694,7 @@ fn e2e_public_http_tools_call_carries_one_image_block_over_64_kib() {
             &cx,
             modern::ClientBuilder::new()
                 .client_info("e2e-public-http-one-large-image", "1.0.0")
-                .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+                .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
         )
         .expect("the ModernOnly public facade connects");
         if sse_body {
@@ -4479,7 +4479,7 @@ fn e2e_public_http_proxy_gateway_forwards_live_bind_http_tool() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-proxy-client", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live HTTP proxy gateway");
 
@@ -4607,7 +4607,7 @@ fn e2e_public_http_prefixed_as_proxy_forwards_prefixed_tool_and_unprefixed_resou
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-as-proxy-client", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live prefixed as_proxy HTTP gateway");
 
@@ -4760,27 +4760,14 @@ fn spawn_modern_task_http_server() -> HttpServerFixture {
                     .expect("task HTTP server timing policy is valid"),
                 Arc::new(|_| {}),
             );
-            let task_runner = task_runtime
-                .install_task_service(1, Arc::new(PublicHttpHoldingTaskSupervisor))
-                .map_err(|error| format!("task HTTP server service install failed: {error}"))?;
             let server = modern::ServerBuilder::new("facade-http-task", "1.0.0")
                 .tool(PublicHttpTaskTool)
                 .tool(PublicHttpTouchTool)
                 .tool(PublicHttpHideTool)
-                .final_tasks(task_runtime)
+                .final_tasks(task_runtime.clone())
                 .map_err(|error| format!("task HTTP server final_tasks install failed: {error}"))?
+                .task_supervisor(Arc::new(PublicHttpHoldingTaskSupervisor))
                 .build();
-            let mut service = std::pin::pin!(task_runner.run(&cx));
-            std::future::poll_fn(|task_context| match service.as_mut().poll(task_context) {
-                std::task::Poll::Pending => std::task::Poll::Ready(Ok(())),
-                std::task::Poll::Ready(Ok(())) => {
-                    std::task::Poll::Ready(Err("task HTTP service stopped before bind".to_owned()))
-                }
-                std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
-                    "task HTTP service failed before bind: {error}"
-                ))),
-            })
-            .await?;
             let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
                 Ok(bound) => bound,
                 Err(error) => {
@@ -4801,35 +4788,13 @@ fn spawn_modern_task_http_server() -> HttpServerFixture {
                 cx.set_cancel_requested(true);
                 return Err("task HTTP server startup receiver went away".to_owned());
             }
-            let mut serving = std::pin::pin!(bound.serve(&cx));
-            let mut service_stopped = false;
-            std::future::poll_fn(|task_context| {
-                if !service_stopped {
-                    match service.as_mut().poll(task_context) {
-                        std::task::Poll::Ready(Ok(())) if cx.checkpoint().is_ok() => {
-                            return std::task::Poll::Ready(Err(
-                                "task HTTP service stopped while the server remained live"
-                                    .to_owned(),
-                            ));
-                        }
-                        std::task::Poll::Ready(Err(error)) if cx.checkpoint().is_ok() => {
-                            return std::task::Poll::Ready(Err(format!(
-                                "task HTTP service failed while the server remained live: {error}"
-                            )));
-                        }
-                        std::task::Poll::Ready(_) => service_stopped = true,
-                        std::task::Poll::Pending => {}
-                    }
-                }
-                match serving.as_mut().poll(task_context) {
-                    std::task::Poll::Ready(Ok(shutdown)) => std::task::Poll::Ready(Ok(shutdown)),
-                    std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
-                        "task facade HTTP server stopped unexpectedly: {error}"
-                    ))),
-                    std::task::Poll::Pending => std::task::Poll::Pending,
-                }
-            })
-            .await
+            let shutdown = bound.serve(&cx).await.map_err(|error| {
+                format!("task facade HTTP server stopped unexpectedly: {error}")
+            })?;
+            if task_runtime.is_task_service_ready() {
+                return Err("hosted Task service outlived the HTTP serve".to_owned());
+            }
+            Ok(shutdown)
         });
         if let Err(message) = &outcome {
             let _ = ready_for_spawn_failure.send(Err(message.clone()));
@@ -5069,7 +5034,7 @@ fn e2e_public_http_prefixed_as_proxy_controls_its_issued_task_handle_case() {
         &cx,
         gateway
             .owner("e2e-public-http-task-gateway-creator")
-            .connect_http_with_cx(gateway.target(), &cx),
+            .connect_http_with_cx(&cx, gateway.target()),
     )
     .expect("the public facade connects to the Task-issuing HTTP gateway");
     let created = runtime_block_on_bounded(
@@ -5096,7 +5061,7 @@ fn e2e_public_http_prefixed_as_proxy_controls_its_issued_task_handle_case() {
         &cx,
         gateway
             .owner("e2e-public-http-task-gateway-client")
-            .connect_http_with_cx(gateway.target(), &cx),
+            .connect_http_with_cx(&cx, gateway.target()),
     )
     .expect("the public facade connects to the live prefixed as_proxy Tasks gateway");
 
@@ -5312,7 +5277,7 @@ fn e2e_public_http_as_proxy_refuses_unissued_upstream_task_ids_case() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-http-raw-task-creator", "1.0.0")
-            .connect_http_with_cx(public_http_target(upstream.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(upstream.address(), "/mcp")),
     ).expect("the direct client connects to the real Task upstream");
     let created = runtime_block_on_bounded(
         &cx,
@@ -5326,7 +5291,7 @@ fn e2e_public_http_as_proxy_refuses_unissued_upstream_task_ids_case() {
         &cx,
         gateway
             .owner("e2e-http-unissued-task-client")
-            .connect_http_with_cx(gateway.target(), &cx),
+            .connect_http_with_cx(&cx, gateway.target()),
     ).expect("the fixed-owner client connects to the gateway");
     let get_error = runtime_block_on_bounded(
         &cx, client.get_task(&cx, RequestId::Number(2), raw_id.clone(), 1 << 20),
@@ -5629,7 +5594,7 @@ fn create_owner_task_through_gateway(gateway: &AsProxyOwnerGateway, tool: &str) 
         &cx,
         gateway
             .owner("e2e-http-as-proxy-owner-bootstrap")
-            .connect_http_with_cx(gateway.target(), &cx),
+            .connect_http_with_cx(&cx, gateway.target()),
     )
     .expect("the owner connects to the https gateway");
     let created = runtime_block_on_bounded(
@@ -5666,7 +5631,7 @@ fn assert_owner_gateway_refuses_a_caller_without_its_bearer(
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-http-as-proxy-owner-without-bearer", "1.0.0")
-            .connect_http_with_cx(gateway.target(), &cx),
+            .connect_http_with_cx(&cx, gateway.target()),
     ) {
         Ok(_) => panic!("a caller without the owner's bearer must not reach the Task relay"),
         Err(refused) => refused,
@@ -5802,7 +5767,7 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_auth(
                 match builder
                     .max_retries(2)
                     .retry_delay_ms(150)
-                    .connect_stdio_with_cx(env!("CARGO_BIN_EXE_echo_server"), &[], &cx)
+                    .connect_stdio_with_cx(&cx, env!("CARGO_BIN_EXE_echo_server"), &[])
                     .await
                 {
                     Ok(mut client) => {
@@ -6025,7 +5990,7 @@ fn e2e_public_http_as_proxy_stdio_forwards_prefixed_echo_case() {
         &cx,
         gateway
             .owner("e2e-public-http-stdio-as-proxy-client")
-            .connect_http_with_cx(gateway.target(), &cx),
+            .connect_http_with_cx(&cx, gateway.target()),
     )
     .expect("the public facade connects to the live stdio as_proxy HTTP gateway");
 
@@ -6281,7 +6246,7 @@ fn e2e_public_http_as_proxy_stdio_forwards_prefixed_echo_case() {
         &cx,
         gateway
             .owner("e2e-public-http-stdio-as-proxy-hide-catalog")
-            .connect_http_with_cx(gateway.target(), &cx),
+            .connect_http_with_cx(&cx, gateway.target()),
     )
     .expect("a second HTTP client connects after hide_catalog");
     let disabled_resource = runtime_block_on_bounded(
@@ -6326,7 +6291,7 @@ fn e2e_public_http_as_proxy_stdio_forwards_prefixed_echo_case() {
         &cx,
         gateway
             .owner("e2e-public-http-stdio-as-proxy-show-catalog")
-            .connect_http_with_cx(gateway.target(), &cx),
+            .connect_http_with_cx(&cx, gateway.target()),
     )
     .expect("a third HTTP client connects after show_catalog");
     let restored_resource =
@@ -6514,7 +6479,7 @@ fn e2e_public_stdio_hide_catalog_refuses_later_read_and_prompt() {
             .env("FASTMCP_PROTOCOL_POLICY", "modern-only")
             .max_retries(2)
             .retry_delay_ms(150)
-            .connect_stdio_with_cx(env!("CARGO_BIN_EXE_echo_server"), &[], &cx),
+            .connect_stdio_with_cx(&cx, env!("CARGO_BIN_EXE_echo_server"), &[]),
     )
     .expect("a ModernOnly facade client connects to the shipped echo server");
 
@@ -6768,7 +6733,7 @@ fn e2e_public_http_prefixed_as_proxy_forwards_unprefixed_resource_template() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-as-proxy-template-client", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live template as_proxy HTTP gateway");
 
@@ -6848,7 +6813,7 @@ fn e2e_public_http_mount_forwards_prefixed_tool_and_unprefixed_resource() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-mount-client", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the public facade connects to the live mounted HTTP server");
 
@@ -7073,7 +7038,7 @@ fn e2e_public_http_filesystem_provider_lists_and_reads_live_file() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-fs-client", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the public facade connects to the live filesystem HTTP server");
 
@@ -7129,7 +7094,7 @@ fn e2e_public_http_prefixed_as_proxy_forwards_filesystem_template() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-as-proxy-fs-client", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live filesystem as_proxy HTTP gateway");
 
@@ -7194,7 +7159,7 @@ fn e2e_public_http_mount_forwards_unprefixed_filesystem_template() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-mount-fs-client", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the public facade connects to the live mounted filesystem HTTP server");
 
@@ -7547,7 +7512,7 @@ fn assert_modern_stdio_cache_diagnostic_drain_preserves_entry() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-modern-facade-cache-diagnostic", "1.0.0")
-            .connect_stdio_with_cx("sh", &["-c", script], &cx),
+            .connect_stdio_with_cx(&cx, "sh", &["-c", script]),
     )
     .expect("the public modern stdio facade completes final discovery");
 
@@ -7605,7 +7570,7 @@ fn evaluate_modern_facade_final_cache_controls(cache_enabled: bool) {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-modern-facade-cache-controls", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the public modern HTTP facade completes live discovery");
 
@@ -7716,7 +7681,7 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-final-cursor-cache-admission-client", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the public typed HTTP client admits the live final discovery response");
     let discovery = admitted_client.server_discovery();
@@ -7914,7 +7879,7 @@ fn e2e_public_http_modern_list_tools_include_and_exclude_tags() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-modern-tag-filter", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the tagged HTTP peer");
 
@@ -8034,7 +7999,7 @@ fn e2e_public_http_modern_list_resources_prompts_and_templates_include_and_exclu
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-modern-catalog-tag-filter", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the tagged HTTP catalog");
 
@@ -8392,7 +8357,7 @@ fn e2e_modern_facade_native_http_completion_returns_typed_result_and_rejects_und
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-modern-completion-client", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the live completion provider");
     let params = modern::CompletionParams {
@@ -8532,7 +8497,7 @@ fn e2e_public_http_cross_era_refusals_leave_handler_observables_unchanged() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-modern-handler-client", "1.0.0")
-            .connect_http_with_cx(public_http_target(legacy_server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(legacy_server.address(), "/mcp")),
     ) {
         Err(error) => error,
         Ok(_) => {
@@ -9541,7 +9506,7 @@ fn e2e_public_http_result_verbs_return_live_input_required() {
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-mrtr-client", "1.0.0")
             .capabilities(capabilities)
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the live MRTR route");
 
@@ -9574,7 +9539,7 @@ fn e2e_public_http_result_verbs_return_live_input_required() {
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-mrtr-no-roots", "1.0.0")
             .capabilities(no_roots_capabilities)
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects without advertising roots");
     let missing_roots = runtime_block_on_bounded(
@@ -9620,7 +9585,7 @@ fn e2e_public_http_result_verbs_return_live_input_required() {
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-mrtr-no-url", "1.0.0")
             .capabilities(no_url_capabilities)
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects without advertising URL elicitation");
     let missing_url = runtime_block_on_bounded(
@@ -9680,7 +9645,7 @@ fn e2e_public_http_typed_verbs_cannot_resume_stateless_elicitation_request_state
             .client_info("e2e-public-http-elicit-stateless", "1.0.0")
             .capabilities(capabilities)
             .modern_reverse_request_handlers(public_modern_elicitation_follow_handlers())
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade installs an elicitation handler before discovery");
 
@@ -9712,7 +9677,7 @@ fn e2e_public_http_typed_verbs_honor_pre_send_cancellation() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-pre-send-cancel", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects before pre-send cancellation");
     runtime_block_on_bounded(&cx, client.ping(&cx))
@@ -10025,7 +9990,7 @@ fn e2e_public_http_set_log_level_stamps_request_metadata() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-log-level", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects before logLevel configuration");
     runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
@@ -10057,7 +10022,7 @@ fn e2e_public_http_set_log_level_retains_request_scoped_message_notifications() 
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-log-notify", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects before log notification retention");
 
@@ -10282,7 +10247,7 @@ fn e2e_public_http_ctx_info_is_retained_after_set_log_level() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-ctx-info", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects before handler log emission");
 
@@ -10549,7 +10514,7 @@ fn e2e_public_http_progress_marker_is_retained_from_request_sse() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-progress", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects before progress emission");
 
@@ -10897,7 +10862,7 @@ fn e2e_public_http_resource_template_lists_and_reads_matched_uri() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-template", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects before template expansion");
 
@@ -11288,7 +11253,7 @@ fn e2e_public_http_resource_updated_is_retained_on_incremental_listen() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-listen", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects before subscriptions/listen");
 
@@ -11350,7 +11315,7 @@ fn e2e_public_http_tools_list_changed_is_retained_on_incremental_listen() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-list-changed", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects before subscriptions/listen");
 
@@ -11444,7 +11409,7 @@ fn e2e_public_http_tools_list_changed_is_retained_on_incremental_listen() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-list-changed-other", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("a second ModernOnly facade client connects after the first disable");
     let other_tools = runtime_block_on_bounded(&cx, other_client.list_tools(&cx, None))
@@ -11636,7 +11601,7 @@ fn e2e_public_http_proxy_client_tasks_listen_retains_status_and_catalog_listen_r
 
         let mut creator = Box::pin(modern::ClientBuilder::new()
             .client_info("e2e-http-proxy-tasks-listen-creator", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx))
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")))
             .await
             .map_err(|error| format!("public HTTP creator connect failed: {error}"))?;
         let created = creator
@@ -11776,7 +11741,7 @@ fn e2e_public_http_tasks_listen_retains_status_and_catalog_listen_refuses_task_i
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-tasks-listen", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the public facade connects to the live official Tasks HTTP server");
 
@@ -11900,7 +11865,7 @@ fn e2e_public_http_catalog_and_tasks_listen_stay_live_on_the_same_client() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-dual-listen", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the public facade connects to the live official Tasks HTTP server");
 
@@ -12072,7 +12037,7 @@ fn e2e_public_http_as_proxy_tasks_listen_retains_status_through_the_gateway_case
         &cx,
         gateway
             .owner("e2e-http-as-proxy-tasks-listen-creator")
-            .connect_http_with_cx(gateway.target(), &cx),
+            .connect_http_with_cx(&cx, gateway.target()),
     )
     .expect("the public facade connects to the Task-issuing gateway");
     let created = runtime_block_on_bounded(
@@ -12098,7 +12063,7 @@ fn e2e_public_http_as_proxy_tasks_listen_retains_status_through_the_gateway_case
         &cx,
         gateway
             .owner("e2e-http-as-proxy-tasks-listen-controller")
-            .connect_http_with_cx(gateway.target(), &cx),
+            .connect_http_with_cx(&cx, gateway.target()),
     )
     .expect("the public facade connects to the live as_proxy Tasks gateway");
 
@@ -12106,7 +12071,7 @@ fn e2e_public_http_as_proxy_tasks_listen_retains_status_through_the_gateway_case
         &cx,
         gateway
             .owner("e2e-http-as-proxy-tasks-listen-watcher")
-            .connect_http_with_cx(gateway.target(), &cx),
+            .connect_http_with_cx(&cx, gateway.target()),
     )
     .expect("the public facade connects a second as_proxy Tasks watch client");
     let mut handle = runtime_block_on_bounded(&cx, watcher.attach_final_task(&cx, task_id.clone()))
@@ -12211,7 +12176,7 @@ fn e2e_public_http_as_proxy_forwards_resource_updated_on_catalog_listen_case() {
         &cx,
         gateway
             .owner("e2e-http-as-proxy-resource-updated-silent")
-            .connect_http_with_cx(gateway.target(), &cx),
+            .connect_http_with_cx(&cx, gateway.target()),
     )
     .expect("the public facade connects a silent as_proxy catalog client");
     let silent_touch = runtime_block_on_bounded(
@@ -12244,7 +12209,7 @@ fn e2e_public_http_as_proxy_forwards_resource_updated_on_catalog_listen_case() {
         &cx,
         gateway
             .owner("e2e-http-as-proxy-resource-updated")
-            .connect_http_with_cx(gateway.target(), &cx),
+            .connect_http_with_cx(&cx, gateway.target()),
     )
     .expect("the public facade connects the as_proxy catalog listener");
     let limits = modern::SseLimits::new(64 * 1024, 2 * 1024 * 1024, 256)
@@ -12331,7 +12296,7 @@ fn e2e_public_http_as_proxy_catalog_and_tasks_listen_stay_live_on_the_same_clien
         &cx,
         gateway
             .owner("e2e-http-as-proxy-dual-listen")
-            .connect_http_with_cx(gateway.target(), &cx),
+            .connect_http_with_cx(&cx, gateway.target()),
     )
     .expect("the public facade connects to the live as_proxy dual-listen gateway");
 
@@ -12501,7 +12466,7 @@ fn e2e_public_http_as_proxy_stdio_catalog_and_tasks_listen_stay_live_on_the_same
         &cx,
         gateway
             .owner("e2e-http-as-proxy-stdio-dual-listen")
-            .connect_http_with_cx(gateway.target(), &cx),
+            .connect_http_with_cx(&cx, gateway.target()),
     )
     .expect("the public facade connects to the live stdio as_proxy dual-listen gateway");
 
@@ -12686,7 +12651,7 @@ fn e2e_public_http_as_proxy_stdio_forwards_resource_template_completion() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-http-as-proxy-stdio-template-complete", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live stdio as_proxy completion gateway");
 
@@ -12752,7 +12717,7 @@ fn e2e_public_http_as_proxy_stdio_advertises_completions_when_echo_supports() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-http-as-proxy-stdio-complete-advertise", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live stdio as_proxy completion-advertise gateway");
 
@@ -12798,7 +12763,7 @@ fn e2e_public_http_as_proxy_stdio_omits_completions_when_echo_has_none() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-http-as-proxy-stdio-complete-omit", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live stdio as_proxy completion-omit gateway");
 
@@ -12880,7 +12845,7 @@ fn e2e_public_http_as_proxy_stdio_forwards_filesystem_template() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-http-as-proxy-stdio-filesystem", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live stdio as_proxy filesystem gateway");
 
@@ -12941,7 +12906,7 @@ fn e2e_public_http_as_proxy_forwards_resource_template_completion() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-http-as-proxy-template-complete", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live HTTP as_proxy template-completion gateway");
 
@@ -12979,7 +12944,7 @@ fn e2e_public_http_as_proxy_advertises_completions_when_upstream_supports() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-http-as-proxy-complete-advertise", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live HTTP as_proxy completion-advertise gateway");
 
@@ -13017,7 +12982,7 @@ fn e2e_public_http_as_proxy_omits_completions_when_upstream_has_none() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-http-as-proxy-complete-omit", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live HTTP as_proxy completion-omit gateway");
 
@@ -13083,7 +13048,7 @@ fn e2e_public_http_as_proxy_stdio_tasks_listen_retains_status_through_the_gatewa
         &cx,
         gateway
             .owner("e2e-http-as-proxy-stdio-tasks-listen-controller")
-            .connect_http_with_cx(gateway.target(), &cx),
+            .connect_http_with_cx(&cx, gateway.target()),
     )
     .expect("the public facade connects to the live stdio as_proxy Tasks gateway");
 
@@ -13091,7 +13056,7 @@ fn e2e_public_http_as_proxy_stdio_tasks_listen_retains_status_through_the_gatewa
         &cx,
         gateway
             .owner("e2e-http-as-proxy-stdio-tasks-listen-watcher")
-            .connect_http_with_cx(gateway.target(), &cx),
+            .connect_http_with_cx(&cx, gateway.target()),
     )
     .expect("the public facade connects a second stdio as_proxy Tasks watch client");
     let mut handle = runtime_block_on_bounded(&cx, watcher.attach_final_task(&cx, task_id.clone()))
@@ -13178,7 +13143,7 @@ fn e2e_public_http_as_proxy_stdio_forwards_resource_updated_on_catalog_listen() 
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-http-as-proxy-stdio-resource-updated-silent", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects a silent stdio as_proxy catalog client");
     let silent_touch = runtime_block_on_bounded(
@@ -13205,7 +13170,7 @@ fn e2e_public_http_as_proxy_stdio_forwards_resource_updated_on_catalog_listen() 
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-http-as-proxy-stdio-resource-updated", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects the stdio as_proxy catalog listener");
     let limits = modern::SseLimits::new(64 * 1024, 2 * 1024 * 1024, 256)
@@ -13297,7 +13262,7 @@ fn e2e_public_http_as_proxy_creates_official_task_through_the_gateway_case() {
         &cx,
         gateway
             .owner("e2e-http-as-proxy-tasks-create")
-            .connect_http_with_cx(gateway.target(), &cx),
+            .connect_http_with_cx(&cx, gateway.target()),
     )
     .expect("the public facade connects to the live as_proxy Tasks gateway");
 
@@ -13397,7 +13362,7 @@ fn e2e_public_http_as_proxy_creates_official_task_with_progress_marker_case() {
         &cx,
         gateway
             .owner("e2e-http-as-proxy-tasks-create-progress")
-            .connect_http_with_cx(gateway.target(), &cx),
+            .connect_http_with_cx(&cx, gateway.target()),
     )
     .expect("the public facade connects to the live as_proxy Tasks gateway");
 
@@ -13483,7 +13448,7 @@ fn e2e_public_http_as_proxy_stdio_creates_official_task_through_the_gateway_case
         &cx,
         gateway
             .owner("e2e-http-as-proxy-stdio-tasks-create")
-            .connect_http_with_cx(gateway.target(), &cx),
+            .connect_http_with_cx(&cx, gateway.target()),
     )
     .expect("the public facade connects to the live stdio as_proxy Tasks gateway");
 
@@ -13579,7 +13544,7 @@ fn e2e_public_http_as_proxy_stdio_creates_official_task_with_progress_marker_cas
         &cx,
         gateway
             .owner("e2e-http-as-proxy-stdio-tasks-create-progress")
-            .connect_http_with_cx(gateway.target(), &cx),
+            .connect_http_with_cx(&cx, gateway.target()),
     )
     .expect("the public facade connects to the live stdio as_proxy Tasks gateway");
 
@@ -13646,14 +13611,14 @@ fn e2e_public_http_as_proxy_stdio_forwards_inbound_client_implementation() {
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-identity", "1.0.0")
             .title("Caller Title")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the identified public facade connects to the live stdio as_proxy gateway");
     let mut bare = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-identity-bare", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the bare public facade connects to the live stdio as_proxy gateway");
 
@@ -13719,7 +13684,7 @@ fn e2e_public_http_as_proxy_stdio_adopts_upstream_implementation() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-server-identity", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live stdio as_proxy gateway");
     let discovered = client.server_discovery();
@@ -13763,7 +13728,7 @@ fn e2e_public_http_as_proxy_stdio_bare_upstream_omits_implementation() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-server-identity-bare", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the bare-identity stdio as_proxy gateway");
     let discovered = client.server_discovery();
@@ -13792,7 +13757,7 @@ fn e2e_public_http_as_proxy_stdio_adopts_upstream_instructions() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-server-instructions", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live stdio as_proxy gateway");
     assert_eq!(
@@ -13819,7 +13784,7 @@ fn e2e_public_http_as_proxy_stdio_bare_upstream_omits_instructions() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-server-instructions-bare", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the bare-instructions stdio as_proxy gateway");
     assert_eq!(
@@ -14076,14 +14041,14 @@ fn e2e_public_http_as_proxy_forwards_inbound_client_implementation() {
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-identity", "1.0.0")
             .title("Caller Title")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the identified public facade connects to the live HTTP as_proxy gateway");
     let mut bare = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-identity-bare", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the bare public facade connects to the live HTTP as_proxy gateway");
 
@@ -14145,7 +14110,7 @@ fn e2e_public_http_as_proxy_adopts_upstream_implementation() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-server-identity", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the identified HTTP as_proxy gateway");
     let discovered = client.server_discovery();
@@ -14188,7 +14153,7 @@ fn e2e_public_http_as_proxy_bare_upstream_omits_implementation() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-server-identity-bare", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the bare HTTP as_proxy gateway");
     let discovered = client.server_discovery();
@@ -14233,8 +14198,8 @@ fn e2e_public_http_as_proxy_adopts_upstream_instructions() {
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-server-instructions", "1.0.0")
             .connect_http_with_cx(
-                public_http_target(instructed_gateway.address(), "/mcp"),
                 &cx,
+                public_http_target(instructed_gateway.address(), "/mcp"),
             ),
     )
     .expect("the public facade connects to the instructed HTTP as_proxy gateway");
@@ -14242,7 +14207,7 @@ fn e2e_public_http_as_proxy_adopts_upstream_instructions() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-server-instructions-override", "1.0.0")
-            .connect_http_with_cx(public_http_target(override_gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(override_gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the override HTTP as_proxy gateway");
     assert_eq!(
@@ -14278,7 +14243,7 @@ fn e2e_public_http_as_proxy_bare_upstream_omits_instructions() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-server-instructions-bare", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the bare HTTP as_proxy gateway");
     assert_eq!(
@@ -14301,7 +14266,7 @@ fn e2e_public_http_as_proxy_forwards_hide_as_request_local_on_stateless_http() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-hide", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live HTTP as_proxy hide gateway");
     let prefixed_hide = format!("ext/{PUBLIC_HTTP_HIDE_TOOL_NAME}");
@@ -14803,14 +14768,14 @@ fn e2e_public_http_as_proxy_mask_error_details_hides_upstream_resource_secret() 
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-mask", "1.0.0")
-            .connect_http_with_cx(public_http_target(masked_gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(masked_gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the masked HTTP as_proxy leak gateway");
     let mut unmasked = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-unmask", "1.0.0")
-            .connect_http_with_cx(public_http_target(unmasked_gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(unmasked_gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the unmasked HTTP as_proxy leak gateway");
 
@@ -14972,7 +14937,7 @@ fn e2e_public_http_as_proxy_stdio_mask_error_details_hides_upstream_resource_sec
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-mask", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the masked stdio as_proxy leak gateway");
 
@@ -15017,7 +14982,7 @@ fn e2e_public_http_as_proxy_stdio_unmask_error_details_keeps_upstream_resource_s
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-unmask", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the unmasked stdio as_proxy leak gateway");
 
@@ -15144,7 +15109,7 @@ fn e2e_public_http_as_proxy_forwards_handler_timeout_of_prefixed_slow_tool() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-timeout", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live HTTP as_proxy timeout gateway");
     let prefixed_slow = format!("ext/{PUBLIC_HTTP_SLOW_TOOL_NAME}");
@@ -15264,7 +15229,7 @@ fn e2e_public_http_as_proxy_stdio_forwards_handler_timeout_of_prefixed_slow_tool
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-timeout", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live stdio as_proxy timeout gateway");
 
@@ -15536,7 +15501,7 @@ fn e2e_public_http_as_proxy_stdio_composes_nested_tool_and_resource() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-compose", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live stdio as_proxy compose gateway");
 
@@ -15667,7 +15632,7 @@ fn e2e_public_http_as_proxy_stdio_composes_nested_prompt() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-compose-prompt", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live stdio as_proxy compose-prompt gateway");
 
@@ -15798,7 +15763,7 @@ fn e2e_public_http_as_proxy_stdio_resource_composes_nested_tool_and_resource() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-resource-compose", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live stdio as_proxy resource-compose gateway");
 
@@ -15915,7 +15880,7 @@ fn e2e_public_http_as_proxy_stdio_prompt_composes_nested_tool_and_resource() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-prompt-compose", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live stdio as_proxy prompt-compose gateway");
 
@@ -16066,7 +16031,7 @@ fn e2e_public_http_as_proxy_stdio_from_prompt_composes_nested_prompt() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-from-prompt", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live stdio as_proxy from-prompt gateway");
 
@@ -16304,7 +16269,7 @@ fn e2e_public_http_as_proxy_stdio_resource_composes_nested_prompt() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-resource-compose-prompt", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect(
         "the public facade connects to the live stdio as_proxy resource-compose-prompt gateway",
@@ -16434,7 +16399,7 @@ fn e2e_public_http_as_proxy_composes_nested_tool_and_resource() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-compose", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live HTTP as_proxy compose gateway");
     let prefixed = format!("ext/{PUBLIC_HTTP_COMPOSE_TOOL_NAME}");
@@ -16569,7 +16534,7 @@ fn e2e_public_http_as_proxy_composes_nested_prompt() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-compose-prompt", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live HTTP as_proxy compose-prompt gateway");
     let prefixed = format!("ext/{PUBLIC_HTTP_PROMPT_COMPOSE_TOOL_NAME}");
@@ -16708,7 +16673,7 @@ fn e2e_public_http_as_proxy_resource_composes_nested_tool_and_resource() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-resource-compose", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live HTTP as_proxy resource-compose gateway");
 
@@ -16838,7 +16803,7 @@ fn e2e_public_http_as_proxy_prompt_composes_nested_tool_and_resource() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-prompt-compose-handler", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live HTTP as_proxy prompt-compose gateway");
     let prefixed = format!("ext/{PUBLIC_HTTP_COMPOSE_PROMPT_NAME}");
@@ -16995,7 +16960,7 @@ fn e2e_public_http_as_proxy_from_prompt_composes_nested_prompt() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-from-prompt", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live HTTP as_proxy from-prompt gateway");
     let prefixed = format!("ext/{PUBLIC_HTTP_FROM_PROMPT_NAME}");
@@ -17234,7 +17199,7 @@ fn e2e_public_http_as_proxy_sanitizes_prefixed_handler_panic() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-panic", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live HTTP as_proxy panic gateway");
     let prefixed = format!("ext/{PUBLIC_HTTP_PANIC_TOOL_NAME}");
@@ -17373,7 +17338,7 @@ fn e2e_public_http_as_proxy_stdio_sanitizes_prefixed_handler_panic() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-panic", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live stdio as_proxy panic gateway");
 
@@ -17505,7 +17470,7 @@ fn e2e_public_http_as_proxy_sanitizes_prefixed_catalog_and_completion_panic() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-catalog-panic", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live HTTP as_proxy catalog-panic gateway");
     let prefixed_prompt = format!("ext/{PUBLIC_HTTP_PANIC_PROMPT_NAME}");
@@ -17892,7 +17857,7 @@ fn e2e_public_http_as_proxy_stdio_sanitizes_prefixed_catalog_and_completion_pani
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-catalog-panic", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live stdio as_proxy catalog-panic gateway");
 
@@ -18276,7 +18241,7 @@ fn e2e_public_http_as_proxy_gateway_cache_hits_prefixed_allowlisted_tool() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-cache", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live HTTP as_proxy cache gateway");
 
@@ -18483,7 +18448,7 @@ fn e2e_public_http_as_proxy_gateway_rate_limit_refuses_second_prefixed_call() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-rate-limit", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live HTTP as_proxy rate-limit gateway");
     let prefixed = format!("ext/{PUBLIC_HTTP_TOOL_NAME}");
@@ -18545,7 +18510,7 @@ fn e2e_public_http_as_proxy_gateway_sliding_window_refuses_second_prefixed_call(
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-sliding", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live HTTP as_proxy sliding-window gateway");
     let prefixed = format!("ext/{PUBLIC_HTTP_TOOL_NAME}");
@@ -18915,7 +18880,7 @@ fn e2e_public_http_as_proxy_gateway_session_state_is_request_local_across_posts(
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-state", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live HTTP as_proxy session-state gateway");
     let prefixed = format!("ext/{PUBLIC_HTTP_STATE_TOOL_NAME}");
@@ -18982,7 +18947,7 @@ fn e2e_public_http_as_proxy_gateway_strict_input_refuses_unknown_property() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-strict-on", "1.0.0")
-            .connect_http_with_cx(public_http_target(strict_gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(strict_gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the strict as_proxy gateway");
     let admitted = runtime_block_on_bounded(
@@ -19025,7 +18990,7 @@ fn e2e_public_http_as_proxy_gateway_strict_input_refuses_unknown_property() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-strict-off", "1.0.0")
-            .connect_http_with_cx(public_http_target(lenient_gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(lenient_gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the lenient as_proxy gateway");
     let extra = runtime_block_on_bounded(
@@ -19501,7 +19466,7 @@ fn e2e_public_http_as_proxy_gateway_list_page_size_pages_prefixed_tools() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-page-size", "1.0.0")
-            .connect_http_with_cx(public_http_target(paged.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(paged.address(), "/mcp")),
     )
     .expect("the public facade connects to the paged as_proxy gateway");
     let first = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
@@ -19544,7 +19509,7 @@ fn e2e_public_http_as_proxy_gateway_list_page_size_pages_prefixed_tools() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-page-size-off", "1.0.0")
-            .connect_http_with_cx(public_http_target(default_gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(default_gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the default as_proxy gateway");
     let listed = runtime_block_on_bounded(&cx, unpaged.list_tools(&cx, None))
@@ -19670,7 +19635,7 @@ fn e2e_public_http_as_proxy_stdio_gateway_list_page_size_pages_prefixed_tools() 
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-page-size", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the paged stdio as_proxy gateway");
 
@@ -19720,7 +19685,7 @@ fn e2e_public_http_as_proxy_stdio_gateway_default_list_is_not_page_size_1() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-page-size-off", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the default stdio as_proxy gateway");
     let listed = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
@@ -19989,7 +19954,7 @@ fn e2e_public_http_as_proxy_gateway_on_duplicate_error_keeps_local_prefixed_tool
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-duplicate-error", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the Error-on-duplicate as_proxy gateway");
     let prefixed = format!("ext/{PUBLIC_HTTP_TOOL_NAME}");
@@ -20037,7 +20002,7 @@ fn e2e_public_http_as_proxy_gateway_on_duplicate_replace_installs_proxied_tool()
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-duplicate-replace", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the Replace-on-duplicate as_proxy gateway");
     let prefixed = format!("ext/{PUBLIC_HTTP_TOOL_NAME}");
@@ -20429,7 +20394,7 @@ fn e2e_public_http_as_proxy_stdio_gateway_session_state_uses_shared_upstream_bag
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-state", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the stdio as_proxy session-state gateway");
 
@@ -20523,7 +20488,7 @@ fn e2e_public_http_as_proxy_stdio_gateway_on_duplicate_error_keeps_local_echo() 
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-duplicate-error", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the Error-on-duplicate stdio as_proxy gateway");
 
@@ -20573,7 +20538,7 @@ fn e2e_public_http_as_proxy_stdio_gateway_on_duplicate_replace_installs_echo() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-duplicate-replace", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the Replace-on-duplicate stdio as_proxy gateway");
 
@@ -20701,7 +20666,7 @@ fn e2e_public_http_as_proxy_stdio_gateway_strict_input_refuses_unknown_property(
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-strict-on", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the strict stdio as_proxy gateway");
     let admitted = runtime_block_on_bounded(
@@ -20761,7 +20726,7 @@ fn e2e_public_http_as_proxy_stdio_gateway_lenient_input_admits_unknown_property(
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-strict-off", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the lenient stdio as_proxy gateway");
     let extra = runtime_block_on_bounded(
@@ -21058,7 +21023,7 @@ fn e2e_public_http_as_proxy_forwards_transformed_prefixed_tool() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-transform", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live HTTP as_proxy transform gateway");
     let prefixed = format!("ext/{PUBLIC_HTTP_TRANSFORMED_TOOL_NAME}");
@@ -21235,7 +21200,7 @@ fn e2e_public_http_as_proxy_stdio_gateway_cache_hits_prefixed_allowlisted_tool()
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-cache", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live stdio as_proxy cache gateway");
 
@@ -21407,7 +21372,7 @@ fn e2e_public_http_as_proxy_stdio_gateway_rate_limit_refuses_second_prefixed_cal
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-rate-limit", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live stdio as_proxy rate-limit gateway");
 
@@ -21541,7 +21506,7 @@ fn e2e_public_http_as_proxy_stdio_gateway_sliding_window_refuses_second_prefixed
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-sliding", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live stdio as_proxy sliding-window gateway");
 
@@ -22040,7 +22005,7 @@ fn e2e_public_http_as_proxy_stdio_forwards_transformed_prefixed_tool() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-transform", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live stdio as_proxy transform gateway");
 
@@ -22164,7 +22129,7 @@ fn e2e_public_http_as_proxy_resource_composes_nested_prompt() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-resource-compose-prompt", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live HTTP as_proxy resource-compose-prompt gateway");
 
@@ -22308,7 +22273,7 @@ fn e2e_public_http_as_proxy_request_timeout_of_hold_tool_without_handler_timeout
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-request-timeout", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live HTTP as_proxy request_timeout gateway");
     let prefixed_hold = format!("ext/{PUBLIC_HTTP_HOLD_TOOL_NAME}");
@@ -22454,7 +22419,7 @@ fn e2e_public_http_as_proxy_stdio_request_timeout_of_hold_tool_without_handler_t
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-request-timeout", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live stdio as_proxy request_timeout gateway");
 
@@ -22588,7 +22553,7 @@ fn e2e_public_http_as_proxy_forwards_inbound_log_level() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-log", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live HTTP as_proxy log gateway");
 
@@ -22669,7 +22634,7 @@ fn e2e_public_http_as_proxy_stdio_forwards_inbound_log_level() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-log", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live stdio as_proxy log gateway");
 
@@ -22767,7 +22732,7 @@ fn e2e_public_http_as_proxy_forwards_inbound_sampling_capability() {
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-sampling", "1.0.0")
             .capabilities(capabilities)
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the sampling public facade connects to the live HTTP as_proxy gateway");
 
@@ -22856,7 +22821,7 @@ fn e2e_public_http_as_proxy_forwards_inbound_sampling_capability() {
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-sampling-no-form", "1.0.0")
             .capabilities(no_form_capabilities)
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the url-only public facade connects to the live HTTP as_proxy gateway");
     let missing_form = runtime_block_on_bounded(
@@ -22882,7 +22847,7 @@ fn e2e_public_http_as_proxy_forwards_inbound_sampling_capability() {
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-sampling-no-url", "1.0.0")
             .capabilities(no_url_capabilities)
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the form-only public facade connects to the live HTTP as_proxy gateway");
     let missing_url = runtime_block_on_bounded(
@@ -22908,7 +22873,7 @@ fn e2e_public_http_as_proxy_forwards_inbound_sampling_capability() {
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-sampling-bare", "1.0.0")
             .capabilities(bare_capabilities)
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the bare public facade connects to the live HTTP as_proxy gateway");
     let refused =
@@ -22948,7 +22913,7 @@ fn e2e_public_http_as_proxy_stdio_forwards_inbound_sampling_capability() {
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-sampling", "1.0.0")
             .capabilities(capabilities)
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the sampling public facade connects to the live stdio as_proxy gateway");
 
@@ -23042,7 +23007,7 @@ fn e2e_public_http_as_proxy_stdio_forwards_inbound_sampling_capability() {
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-sampling-no-form", "1.0.0")
             .capabilities(no_form_capabilities)
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the url-only public facade connects to the live stdio as_proxy gateway");
     let missing_form =
@@ -23066,7 +23031,7 @@ fn e2e_public_http_as_proxy_stdio_forwards_inbound_sampling_capability() {
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-sampling-no-url", "1.0.0")
             .capabilities(no_url_capabilities)
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the form-only public facade connects to the live stdio as_proxy gateway");
     let missing_url = runtime_block_on_bounded(
@@ -23094,7 +23059,7 @@ fn e2e_public_http_as_proxy_stdio_forwards_inbound_sampling_capability() {
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-sampling-bare", "1.0.0")
             .capabilities(bare_capabilities)
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the bare public facade connects to the live stdio as_proxy gateway");
     let refused = runtime_block_on_bounded(
@@ -23149,7 +23114,7 @@ fn as_proxy_roots_follow_client(cx: &Cx, gateway: SocketAddr, refuse: bool) -> m
             .client_info("e2e-as-proxy-roots-follow", "1.0.0")
             .capabilities(capabilities)
             .modern_reverse_request_handlers(as_proxy_downstream_roots_handlers(refuse))
-            .connect_http_with_cx(public_http_target(gateway, "/mcp"), cx),
+            .connect_http_with_cx(cx, public_http_target(gateway, "/mcp")),
     )
     .expect("the roots-follow facade connects to the live as_proxy gateway")
 }
@@ -24150,7 +24115,7 @@ fn http_05_b_retry_run(case: Http05BRetryCase) {
             let mut client = Box::pin(
                 modern::ClientBuilder::new()
                     .client_info("e2e-http-05-b-retry", "1.0.0")
-                    .connect_http_with_cx(endpoint.clone(), &cx),
+                    .connect_http_with_cx(&cx, endpoint.clone()),
             )
             .await
             .expect("the client connects through the TLS relay");
@@ -24323,7 +24288,7 @@ fn e2e_public_http_as_proxy_forwards_inbound_progress_marker() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-progress", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live HTTP as_proxy progress gateway");
 
@@ -24436,7 +24401,7 @@ fn e2e_public_http_as_proxy_stdio_forwards_inbound_progress_marker() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-progress", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live stdio as_proxy progress gateway");
 
@@ -24567,7 +24532,7 @@ fn e2e_public_http_as_proxy_forwards_inbound_completion_progress_marker() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-http-complete-progress", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live HTTP as_proxy completion gateway");
 
@@ -24645,7 +24610,7 @@ fn e2e_public_http_as_proxy_stdio_forwards_inbound_completion_progress_marker() 
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-as-proxy-stdio-complete-progress", "1.0.0")
-            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(gateway.address(), "/mcp")),
     )
     .expect("the public facade connects to the live stdio as_proxy completion gateway");
 
@@ -24816,7 +24781,7 @@ fn e2e_public_http_mask_error_details_hides_resource_execution_secret() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-mask", "1.0.0")
-            .connect_http_with_cx(public_http_target(masked_server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(masked_server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the masked HTTP server");
     let masked = runtime_block_on_bounded(
@@ -24841,7 +24806,7 @@ fn e2e_public_http_mask_error_details_hides_resource_execution_secret() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-unmask", "1.0.0")
-            .connect_http_with_cx(public_http_target(unmasked_server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(unmasked_server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the unmasked HTTP server");
     let unmasked = runtime_block_on_bounded(
@@ -24951,7 +24916,7 @@ fn e2e_public_http_rate_limit_refuses_second_same_method_and_admits_another() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-rate-limit", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the rate-limited HTTP server");
 
@@ -25089,7 +25054,7 @@ fn e2e_public_http_sliding_window_refuses_second_same_method_and_admits_another(
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-sliding-window", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the sliding-window HTTP server");
 
@@ -25223,7 +25188,7 @@ fn e2e_public_http_transformed_tool_renames_catalog_and_argument() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-transform", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the transformed-tool HTTP server");
 
@@ -25387,7 +25352,7 @@ fn e2e_public_http_transformed_tool_hides_argument_and_injects_default() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-hide-arg", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the hide-arg HTTP server");
 
@@ -25532,7 +25497,7 @@ fn e2e_public_http_strict_input_validation_refuses_unknown_property_and_admits_d
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-strict-on", "1.0.0")
-            .connect_http_with_cx(public_http_target(strict_server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(strict_server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the strict-validation HTTP server");
 
@@ -25584,7 +25549,7 @@ fn e2e_public_http_strict_input_validation_refuses_unknown_property_and_admits_d
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-strict-off", "1.0.0")
-            .connect_http_with_cx(public_http_target(lenient_server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(lenient_server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the lenient-validation HTTP server");
 
@@ -25622,7 +25587,7 @@ fn e2e_public_http_official_tasks_create_get_and_cancel_on_bind_http() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-direct-tasks", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the official Tasks HTTP server");
 
@@ -25891,7 +25856,7 @@ fn e2e_public_http_on_duplicate_error_refuses_the_build_and_replace_installs_sec
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-duplicate-replace", "1.0.0")
-            .connect_http_with_cx(public_http_target(replace_server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(replace_server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the Replace-on-duplicate HTTP server");
     let replaced = runtime_block_on_bounded(
@@ -26010,7 +25975,7 @@ fn e2e_public_http_response_cache_hits_same_allowlisted_call_and_misses_changed_
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-cache", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the cached HTTP server");
 
@@ -26429,7 +26394,7 @@ fn e2e_public_http_handler_timeout_refuses_late_tool_and_admits_fast_peer() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-handler-timeout", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the handler-timeout HTTP server");
 
@@ -26565,7 +26530,7 @@ fn e2e_public_http_handler_panic_is_sanitized_and_admits_fast_peer() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-handler-panic", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the handler-panic HTTP server");
 
@@ -26609,7 +26574,7 @@ fn e2e_public_http_catalog_panic_is_sanitized_and_admits_fast_peer() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-catalog-panic", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the catalog-panic HTTP server");
 
@@ -26681,7 +26646,7 @@ fn e2e_public_http_completion_panic_is_sanitized_and_admits_fast_peer() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-completion-panic", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the completion-panic HTTP server");
 
@@ -26836,7 +26801,7 @@ fn e2e_public_http_resource_template_completion_is_retained_and_unregistered_tem
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-template-complete", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the template-completion HTTP server");
 
@@ -26902,7 +26867,7 @@ fn e2e_public_http_resource_and_prompt_list_changed_are_retained_on_incremental_
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-catalog-changed", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects before subscriptions/listen");
 
@@ -27625,7 +27590,7 @@ fn e2e_public_http_list_tools_retains_final_icons_title_and_annotations() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-catalog-metadata", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the catalog metadata HTTP server");
 
@@ -27717,14 +27682,14 @@ fn e2e_public_http_two_clients_call_the_same_tool_independently() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-multi-client-a", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the first ModernOnly public facade connects to the shared HTTP server");
     let mut second = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-multi-client-b", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the second ModernOnly public facade connects to the same HTTP server");
 
@@ -27771,7 +27736,7 @@ fn e2e_public_http_ping_then_tools_call_on_bind_http() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-ping", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects before ping");
 
@@ -27898,7 +27863,7 @@ fn e2e_public_http_output_schema_retains_structured_content_and_peer_stays_bare(
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-output-schema", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the output-schema HTTP server");
 
@@ -28080,7 +28045,7 @@ fn e2e_public_http_handler_ctx_call_tool_and_read_resource() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-compose", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the compose HTTP server");
 
@@ -28195,7 +28160,7 @@ fn e2e_public_http_prompt_composes_nested_tool_and_resource() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-prompt-compose", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the prompt compose HTTP server");
 
@@ -28317,7 +28282,7 @@ fn e2e_public_http_macro_prompt_composes_nested_tool_and_resource() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-macro-compose", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the macro prompt compose HTTP server");
 
@@ -28401,7 +28366,7 @@ fn e2e_public_http_macro_tool_composes_nested_tool_and_resource() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-macro-tool-compose", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the macro tool compose HTTP server");
 
@@ -28483,7 +28448,7 @@ fn e2e_public_http_macro_resource_composes_nested_tool_and_resource() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-macro-resource-compose", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the macro resource compose HTTP server");
 
@@ -28547,7 +28512,7 @@ fn e2e_public_http_resource_composes_nested_tool_and_resource() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-resource-compose", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the resource compose HTTP server");
 
@@ -28814,7 +28779,7 @@ fn e2e_public_http_session_state_is_request_local_across_posts() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-state", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the session-state HTTP server");
 
@@ -28980,7 +28945,7 @@ fn e2e_public_http_handler_sees_client_and_server_capabilities() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-caps-default", "1.0.0")
-            .connect_http_with_cx(public_http_target(with_resources.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(with_resources.address(), "/mcp")),
     )
     .expect("the default ModernOnly client connects to the capability HTTP server");
     let default = runtime_block_on_bounded(
@@ -29004,7 +28969,7 @@ fn e2e_public_http_handler_sees_client_and_server_capabilities() {
                 roots: Some(Default::default()),
                 ..Default::default()
             })
-            .connect_http_with_cx(public_http_target(with_resources.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(with_resources.address(), "/mcp")),
     )
     .expect("the sampling/roots ModernOnly client connects to the capability HTTP server");
     let sampling = runtime_block_on_bounded(
@@ -29022,7 +28987,7 @@ fn e2e_public_http_handler_sees_client_and_server_capabilities() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-caps-bare", "1.0.0")
-            .connect_http_with_cx(public_http_target(without_resources.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(without_resources.address(), "/mcp")),
     )
     .expect("the default client connects to the tool-only capability HTTP server");
     let bare = runtime_block_on_bounded(
@@ -29242,14 +29207,14 @@ fn e2e_public_http_discovery_retains_instructions_and_peer_stays_bare() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-instructions", "1.0.0")
-            .connect_http_with_cx(public_http_target(instructed.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(instructed.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the instructed HTTP server");
     let bare_client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-instructions-bare", "1.0.0")
-            .connect_http_with_cx(public_http_target(bare.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(bare.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the bare HTTP server");
 
@@ -29420,14 +29385,14 @@ fn e2e_public_http_discovery_retains_implementation_identity_and_peer_stays_bare
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-identity", "1.0.0")
-            .connect_http_with_cx(public_http_target(identified.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(identified.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the identified HTTP server");
     let bare_client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-identity-bare", "1.0.0")
-            .connect_http_with_cx(public_http_target(bare.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(bare.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the bare identity HTTP server");
 
@@ -29490,14 +29455,14 @@ fn e2e_public_http_client_implementation_is_visible_to_handler() {
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-client-identity", "1.0.0")
             .title("Client Title")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the identified ModernOnly public facade connects to the client-identity HTTP server");
     let mut bare_client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-client-identity-bare", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the bare ModernOnly public facade connects to the client-identity HTTP server");
 
@@ -32571,7 +32536,7 @@ fn e2e_public_http_composes_nested_prompt_and_refuses_missing_name() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-compose-prompt", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the compose-prompt HTTP server");
 
@@ -32710,7 +32675,7 @@ fn e2e_public_http_resource_and_prompt_compose_nested_prompt_and_refuse_missing_
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-catalog-compose-prompt", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the catalog compose-prompt HTTP server");
 
@@ -35781,7 +35746,7 @@ fn spawn_legacy_http_stdio_as_proxy_gateway_with_auth(
                 match builder
                     .max_retries(2)
                     .retry_delay_ms(150)
-                    .connect_stdio_with_cx(env!("CARGO_BIN_EXE_echo_server"), &[], &cx)
+                    .connect_stdio_with_cx(&cx, env!("CARGO_BIN_EXE_echo_server"), &[])
                     .await
                 {
                     Ok(client) => {
@@ -38747,7 +38712,7 @@ fn e2e_public_http_lifespan_hooks_run_once_and_peer_stays_unhooked() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-lifespan", "1.0.0")
-            .connect_http_with_cx(public_http_target(hooked.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(hooked.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects after the startup hook");
     runtime_block_on_bounded(
@@ -38779,7 +38744,7 @@ fn e2e_public_http_lifespan_hooks_run_once_and_peer_stays_unhooked() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-lifespan-bare", "1.0.0")
-            .connect_http_with_cx(public_http_target(bare.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(bare.address(), "/mcp")),
     )
     .expect("the unhooked peer must still admit a client");
     runtime_block_on_bounded(
@@ -38809,14 +38774,14 @@ fn e2e_public_http_discovery_advertises_completions_only_when_handler_is_install
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-completions", "1.0.0")
-            .connect_http_with_cx(public_http_target(advertised.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(advertised.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the completion HTTP server");
     let mut omitted_client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-completions-omitted", "1.0.0")
-            .connect_http_with_cx(public_http_target(omitted.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(omitted.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the completion-omitted HTTP server");
 
@@ -38993,7 +38958,7 @@ fn e2e_public_http_tool_default_parameter_is_injected_and_overridable() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-default", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the default-parameter HTTP server");
 
@@ -39094,7 +39059,7 @@ fn e2e_public_http_rich_content_retains_image_and_audio_blocks() {
         &cx,
         modern::ClientBuilder::new()
             .client_info("e2e-public-http-rich", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
     )
     .expect("the ModernOnly public facade connects to the rich-content HTTP server");
 
@@ -39891,7 +39856,7 @@ mod live_websocket_bind {
                     .env("FASTMCP_PROTOCOL_POLICY", "modern-only")
                     .max_retries(2)
                     .retry_delay_ms(150)
-                    .connect_stdio_with_cx(env!("CARGO_BIN_EXE_echo_server"), &[], cx),
+                    .connect_stdio_with_cx(cx, env!("CARGO_BIN_EXE_echo_server"), &[]),
             ) {
                 Ok(mut client) => match client.list_tools(None) {
                     Ok(_) => return client,
@@ -42087,7 +42052,7 @@ mod live_websocket_bind {
                 "live modern WebSocket as_proxy Tasks listen upstream create",
                 modern::ClientBuilder::new()
                     .client_info("e2e-ws-as-proxy-tasks-listen-creator", "1.0.0")
-                    .connect_http_with_cx(public_http_target(upstream.address(), "/mcp"), &cx),
+                    .connect_http_with_cx(&cx, public_http_target(upstream.address(), "/mcp")),
             ))
             .await
             .expect("the public facade connects to the live Tasks upstream");

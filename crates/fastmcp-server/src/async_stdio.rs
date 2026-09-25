@@ -30,6 +30,8 @@ use super::*;
 
 const DOCUMENT_BYTES: usize = 10 * 1024 * 1024;
 const SUBSCRIPTION_LIFETIME: Duration = Duration::from_hours(1);
+#[cfg(feature = "tasks")]
+const TASK_SERVICE_HEALTH_INTERVAL: Duration = Duration::from_millis(100);
 
 type RequestWork = Pin<Box<dyn Future<Output = McpResult<()>> + Send>>;
 type ReadWork<R> = Pin<
@@ -594,6 +596,8 @@ enum Event<R, W> {
     Written(AsyncStdioSendHalf<W>, Result<(), TransportError>, usize),
     Completed(usize, McpResult<()>),
     Output,
+    #[cfg(feature = "tasks")]
+    TaskServiceCheck,
     Stop(Option<McpError>),
     DrainExpired,
 }
@@ -646,10 +650,13 @@ impl Server {
     /// Input EOF permits a five-second response drain, including graceful
     /// subscription completion. At that bound, cancellation, or failure, all
     /// remaining request regions are cancelled and closed before the shutdown
-    /// hook runs. Non-cooperative spawned children remain owned and awaited;
-    /// this API never detaches them merely to report a timeout. Dropping this
-    /// future closes I/O and transfers region cleanup to the caller runtime's
-    /// structured close machinery; it does not run a premature shutdown hook.
+    /// hook runs. A configured Task supervisor is ready before ingress starts
+    /// and is settled before that hook runs, including after transport failure
+    /// or caller cancellation. Non-cooperative spawned children remain owned
+    /// and awaited; this API never detaches them merely to report a timeout.
+    /// Dropping this future closes I/O and transfers region cleanup to the
+    /// caller runtime's structured close machinery; it does not run a premature
+    /// shutdown hook.
     ///
     /// # Errors
     ///
@@ -685,6 +692,24 @@ impl Server {
                 "Server startup hook failed",
             ));
         }
+        #[cfg(feature = "tasks")]
+        let hosted_tasks = match server.task_service_host.as_ref() {
+            // Recovery can invoke application work immediately, so it must
+            // follow successful application startup and precede ingress.
+            Some(host) => match host.start_ready(cx).await {
+                Ok(hosted) => Some(hosted),
+                Err(failure) => {
+                    // start_ready settles a failed child before returning.
+                    server.run_shutdown_hook();
+                    return Err(failure);
+                }
+            },
+            None => None,
+        };
+        #[cfg(feature = "tasks")]
+        let mut task_service_check = hosted_tasks.as_ref().map(|_| {
+            Box::pin(asupersync::time::sleep(cx.now(), TASK_SERVICE_HEALTH_INTERVAL))
+        });
         if let Some(stats) = &server.stats {
             stats.connection_opened();
         }
@@ -737,6 +762,19 @@ impl Server {
                     }
                     if cx.checkpoint().is_err() {
                         return Poll::Ready(Event::Stop(None));
+                    }
+                    #[cfg(feature = "tasks")]
+                    if let Some(hosted_tasks) = hosted_tasks.as_ref() {
+                        if let Err(failure) = hosted_tasks.check_running() {
+                            return Poll::Ready(Event::Stop(Some(failure)));
+                        }
+                        // A failed service must stop a silent connection as
+                        // well as one actively supplying request frames.
+                        if task_service_check.as_mut().is_some_and(|check| {
+                            check.as_mut().poll(task).is_ready()
+                        }) {
+                            return Poll::Ready(Event::TaskServiceCheck);
+                        }
                     }
                     if drain
                         .as_mut()
@@ -843,6 +881,13 @@ impl Server {
                     }
                 }
                 Event::Output => {}
+                #[cfg(feature = "tasks")]
+                Event::TaskServiceCheck => {
+                    task_service_check = Some(Box::pin(asupersync::time::sleep(
+                        cx.now(),
+                        TASK_SERVICE_HEALTH_INTERVAL,
+                    )));
+                }
                 Event::Stop(failure) => {
                     if let Some(failure) = failure {
                         error.get_or_insert(failure);
@@ -891,6 +936,14 @@ impl Server {
                 Err(_) => {
                     error.get_or_insert(transport_run_error("close", &TransportError::Timeout));
                 }
+            }
+        }
+        #[cfg(feature = "tasks")]
+        if let Some(hosted_tasks) = hosted_tasks {
+            if let Err(failure) = hosted_tasks.settle(cx).await {
+                // Settlement retains ownership through actual child exit,
+                // including when it reports a deadline or supervisor error.
+                error.get_or_insert(failure);
             }
         }
         if request_regions_quiescent {
@@ -1707,5 +1760,502 @@ mod tests {
             let state = io.0.lock().unwrap();
             assert!(state.reader_dropped && state.writer_dropped);
         });
+    }
+
+    #[cfg(feature = "tasks")]
+    mod hosted_tasks {
+        use super::*;
+        use crate::tasks::{
+            ApplicationTaskSupervisor, FinalTaskRuntime, FinalTaskRuntimeConfig,
+            FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
+            InMemoryFinalTaskStore,
+        };
+        use fastmcp_protocol::{FinalTaskCallToolResult, FinalTaskId, Task, TaskInputRequests};
+
+        #[derive(Default)]
+        struct TaskProbe {
+            initialized: AtomicBool,
+            fail: AtomicBool,
+            panic_on_failure: AtomicBool,
+            changed: Notify,
+            tool_calls: AtomicUsize,
+            initial: AtomicUsize,
+            resumed: AtomicUsize,
+            active: AtomicUsize,
+        }
+
+        struct TaskTool(Arc<TaskProbe>);
+
+        impl ToolHandler for TaskTool {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "async_task_probe".to_owned(),
+                    description: None,
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"subject": {"type": "string"}, "hold": {"type": "boolean"}},
+                        "required": ["subject", "hold"],
+                        "additionalProperties": false,
+                    }),
+                    output_schema: None,
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                    annotations: None,
+                }
+            }
+
+            fn execution_mode(&self) -> ToolExecutionMode {
+                ToolExecutionMode::Async
+            }
+
+            fn declares_final_tasks(&self) -> bool {
+                true
+            }
+
+            fn call(&self, _: &McpContext, _: serde_json::Value) -> McpResult<Vec<Content>> {
+                panic!("modern Tasks must use the final outcome hook")
+            }
+
+            fn call_final_outcome(
+                &self,
+                _: &McpContext,
+                arguments: serde_json::Value,
+            ) -> McpResult<crate::FinalToolOutcome> {
+                self.0.tool_calls.fetch_add(1, Ordering::AcqRel);
+                Ok(crate::FinalToolOutcome::CreateTask {
+                    work_descriptor: FinalTaskWorkDescriptor::new(arguments)?,
+                    status_message: Some("queued by async stdio".to_owned()),
+                })
+            }
+        }
+
+        struct TaskSupervisor(Arc<TaskProbe>);
+
+        impl ApplicationTaskSupervisor for TaskSupervisor {
+            fn resume<'a>(
+                &'a self,
+                _: &'a Cx,
+                handoff: FinalTaskSupervisorHandoff,
+            ) -> FinalTaskSupervisorFuture<'a> {
+                Box::pin(async move {
+                    assert!(
+                        self.0.initialized.load(Ordering::Acquire),
+                        "application startup must precede supervised Task work"
+                    );
+                    struct Active<'a>(&'a AtomicUsize);
+                    impl Drop for Active<'_> {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, Ordering::AcqRel);
+                        }
+                    }
+                    self.0.active.fetch_add(1, Ordering::AcqRel);
+                    let _active = Active(&self.0.active);
+                    match handoff {
+                        FinalTaskSupervisorHandoff::Initial(initial) => {
+                            self.0.initial.fetch_add(1, Ordering::AcqRel);
+                            if initial.work_descriptor().as_value()["hold"] == true {
+                                self.0
+                                    .changed
+                                    .wait_until(|| self.0.fail.load(Ordering::Acquire))
+                                    .await;
+                                assert!(
+                                    !self.0.panic_on_failure.load(Ordering::Acquire),
+                                    "planted supervised Task panic"
+                                );
+                                return Err(McpError::internal_error(
+                                    "planted supervised Task failure",
+                                ));
+                            }
+                            let requests: TaskInputRequests = serde_json::from_value(
+                                serde_json::json!({"roots": {"method": "roots/list"}}),
+                            )
+                            .expect("valid roots input descriptor");
+                            initial.require_input(requests, Some("awaiting roots".to_owned()))?;
+                        }
+                        FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                            let inputs = serde_json::to_value(accepted.input_responses())
+                                .expect("accepted input serializes");
+                            let result: FinalTaskCallToolResult = serde_json::from_value(
+                                serde_json::json!({
+                                    "content": [
+                                        {"type": "text", "text": accepted.work_descriptor().as_value()["subject"]},
+                                        {"type": "text", "text": inputs["roots"]["roots"][0]["uri"]},
+                                    ],
+                                    "isError": false,
+                                }),
+                            )
+                            .expect("work and accepted roots produce a final tool result");
+                            accepted.complete_task(
+                                result,
+                                Some("resumed and completed".to_owned()),
+                            )?;
+                            self.0.resumed.fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
+                    Ok(())
+                })
+            }
+        }
+
+        fn task_request(id: i64, method: &str, params: serde_json::Value) -> JsonRpcMessage {
+            let JsonRpcMessage::Request(mut request) = request(id, method, params) else {
+                unreachable!()
+            };
+            request.params.as_mut().unwrap()["_meta"]
+                [fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY] = serde_json::json!({
+                "roots": {},
+                "extensions": {fastmcp_protocol::TASKS_EXTENSION: {}},
+            });
+            JsonRpcMessage::Request(request)
+        }
+
+        fn task_call(id: i64, hold: bool) -> JsonRpcMessage {
+            task_request(
+                id,
+                "tools/call",
+                serde_json::json!({
+                    "name": "async_task_probe",
+                    "arguments": {"subject": "stdio durable work", "hold": hold},
+                }),
+            )
+        }
+
+        struct TaskServer {
+            server: Server,
+            runtime: FinalTaskRuntime,
+            store: Arc<InMemoryFinalTaskStore>,
+            shutdown: Arc<AtomicBool>,
+        }
+
+        fn task_server(probe: &Arc<TaskProbe>, supervised: bool) -> TaskServer {
+            let store = Arc::new(InMemoryFinalTaskStore::default());
+            let runtime = FinalTaskRuntime::new(
+                store.clone(),
+                FinalTaskRuntimeConfig::new(60_000, Some(1_000)).unwrap(),
+                Arc::new(|_| {}),
+            );
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_flag = Arc::clone(&shutdown);
+            let shutdown_runtime = runtime.clone();
+            let shutdown_probe = Arc::clone(probe);
+            let startup_runtime = runtime.clone();
+            let startup_probe = Arc::clone(probe);
+            let builder = Server::new("hosted-stdio-tasks", "1.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .unwrap()
+                .tool(TaskTool(Arc::clone(probe)))
+                .final_tasks(runtime.clone())
+                .unwrap()
+                .on_startup(move || {
+                    assert!(
+                        !startup_runtime.is_task_service_ready(),
+                        "Task recovery must not start before application initialization"
+                    );
+                    startup_probe.initialized.store(true, Ordering::Release);
+                    Ok::<(), io::Error>(())
+                })
+                .on_shutdown(move || {
+                    assert!(!shutdown_runtime.is_task_service_ready());
+                    assert_eq!(shutdown_probe.active.load(Ordering::Acquire), 0);
+                    shutdown_flag.store(true, Ordering::Release);
+                });
+            let builder = if supervised {
+                builder.task_supervisor(Arc::new(TaskSupervisor(Arc::clone(probe))))
+            } else {
+                builder
+            };
+            TaskServer {
+                server: builder.build(),
+                runtime,
+                store,
+                shutdown,
+            }
+        }
+
+        fn serve_tasks(
+            cx: &Cx,
+            server: Server,
+            io: &Arc<IoProbe>,
+        ) -> asupersync::runtime::TaskHandle<McpResult<()>> {
+            let stream = Arc::clone(io);
+            cx.spawn(move |serve_cx| async move {
+                server
+                    .serve_stdio_io(
+                        &serve_cx,
+                        ProbeReader(Arc::clone(&stream)),
+                        ProbeWriter(stream),
+                    )
+                    .await
+            })
+            .expect("serve child is admitted")
+        }
+
+        #[test]
+        fn async_stdio_hosted_tasks_create_resume_and_settle() {
+            run(|cx| async move {
+                let probe = Arc::new(TaskProbe::default());
+                let TaskServer {
+                    server,
+                    runtime,
+                    store,
+                    shutdown,
+                } = task_server(&probe, true);
+                assert!(!runtime.is_task_service_ready());
+                let io = Arc::new(IoProbe::default());
+                io.allow(usize::MAX);
+                // The first call is already waiting when serve begins. Its
+                // acceptance proves readiness precedes request ingress.
+                io.feed(&encoded(&task_call(201, false)));
+                let mut serving = serve_tasks(&cx, server, &io);
+                until_io(&cx, &io, || io.response(201).is_some()).await;
+                let created = io.response(201).unwrap();
+                assert!(created.error.is_none(), "{created:?}");
+                let created = created.result.unwrap();
+                assert_eq!(created["resultType"], "task");
+                let task_id = FinalTaskId::parse(created["taskId"].as_str().unwrap()).unwrap();
+                assert_eq!(store.task_count(), 1);
+                until(&cx, || {
+                    matches!(
+                        runtime.get_task(&task_id).unwrap().task,
+                        Task::InputRequired { .. }
+                    )
+                })
+                .await;
+                io.feed(&encoded(&task_request(
+                    202,
+                    "tasks/get",
+                    serde_json::json!({"taskId": task_id.as_str()}),
+                )));
+                until_io(&cx, &io, || io.response(202).is_some()).await;
+                let waiting = io.response(202).unwrap().result.unwrap();
+                assert_eq!(waiting["taskId"], task_id.as_str());
+                assert_eq!(waiting["status"], "input_required");
+                assert_eq!(waiting["inputRequests"]["roots"]["method"], "roots/list");
+
+                io.feed(&encoded(&task_request(
+                    203,
+                    "tasks/update",
+                    serde_json::json!({
+                        "taskId": task_id.as_str(),
+                        "inputResponses": {"roots": {"roots": [{"uri": "file:///stdio-input"}]}},
+                    }),
+                )));
+                until_io(&cx, &io, || io.response(203).is_some()).await;
+                assert_eq!(
+                    io.response(203).unwrap().result,
+                    Some(serde_json::json!({"resultType": "complete"})),
+                );
+                until(&cx, || probe.resumed.load(Ordering::Acquire) == 1).await;
+                io.feed(&encoded(&task_request(
+                    204,
+                    "tasks/get",
+                    serde_json::json!({"taskId": task_id.as_str()}),
+                )));
+                until_io(&cx, &io, || io.response(204).is_some()).await;
+                let completed = io.response(204).unwrap().result.unwrap();
+                assert_eq!(completed["taskId"], task_id.as_str());
+                assert_eq!(completed["status"], "completed");
+                assert_eq!(
+                    completed["result"]["content"][0]["text"],
+                    "stdio durable work"
+                );
+                assert_eq!(
+                    completed["result"]["content"][1]["text"],
+                    "file:///stdio-input"
+                );
+                assert_eq!(probe.tool_calls.load(Ordering::Acquire), 1);
+                assert_eq!(probe.initial.load(Ordering::Acquire), 1);
+                assert!(runtime.is_task_service_ready());
+                io.eof();
+                serving.join(&cx).await.unwrap().unwrap();
+                assert!(!runtime.is_task_service_ready());
+                assert_eq!(probe.active.load(Ordering::Acquire), 0);
+                assert!(shutdown.load(Ordering::Acquire));
+                assert_eq!(
+                    store.task_count(),
+                    1,
+                    "settlement retains accepted task state"
+                );
+            });
+        }
+
+        #[test]
+        fn async_stdio_tasks_without_supervisor_refuse_creation_without_store_mutation() {
+            run(|cx| async move {
+                let probe = Arc::new(TaskProbe::default());
+                let TaskServer {
+                    server,
+                    runtime,
+                    store,
+                    shutdown,
+                } = task_server(&probe, false);
+                let io = Arc::new(IoProbe::default());
+                io.allow(usize::MAX);
+                // Same server, runtime and request as the positive test;
+                // only the builder's supervisor registration is absent.
+                io.feed(&encoded(&task_call(201, false)));
+                let mut serving = serve_tasks(&cx, server, &io);
+                until_io(&cx, &io, || io.response(201).is_some()).await;
+                let refused = io.response(201).unwrap();
+                assert!(refused.result.is_none());
+                let error = refused.error.unwrap();
+                assert_eq!(error.code.as_i32(), Some(-32602));
+                assert_eq!(
+                    error.message,
+                    "Final task creation requires an installed ready task service"
+                );
+                assert_eq!(probe.tool_calls.load(Ordering::Acquire), 1);
+                assert_eq!(probe.initial.load(Ordering::Acquire), 0);
+                assert_eq!(probe.resumed.load(Ordering::Acquire), 0);
+                assert_eq!(store.task_count(), 0);
+                assert_eq!(store.retained_payload_bytes(), 0);
+                assert!(!runtime.is_task_service_ready());
+                io.eof();
+                serving.join(&cx).await.unwrap().unwrap();
+                assert!(shutdown.load(Ordering::Acquire));
+            });
+        }
+
+        #[test]
+        fn async_stdio_hosted_tasks_settle_on_transport_failure_and_cancellation() {
+            run(|cx| async move {
+                for cancel_serve in [false, true] {
+                    let probe = Arc::new(TaskProbe::default());
+                    let TaskServer {
+                        server,
+                        runtime,
+                        store,
+                        shutdown,
+                    } = task_server(&probe, true);
+                    let io = Arc::new(IoProbe::default());
+                    io.allow(usize::MAX);
+                    io.feed(&encoded(&task_call(201, true)));
+                    let mut serving = serve_tasks(&cx, server, &io);
+                    until_io(&cx, &io, || io.response(201).is_some()).await;
+                    assert!(io.response(201).unwrap().error.is_none());
+                    until(&cx, || probe.active.load(Ordering::Acquire) == 1).await;
+                    assert!(runtime.is_task_service_ready());
+                    if cancel_serve {
+                        serving.abort();
+                    } else {
+                        // A client response violates the server-only receive
+                        // direction and terminates this same active service.
+                        io.feed(b"{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}\n");
+                    }
+                    let outcome = asupersync::time::timeout(
+                        cx.now(),
+                        Duration::from_secs(6),
+                        serving.join(&cx),
+                    )
+                    .await
+                    .expect("serve settles its Task service within its bound")
+                    .expect("serve child joins");
+                    assert_eq!(outcome.is_ok(), cancel_serve, "{outcome:?}");
+                    assert!(!runtime.is_task_service_ready());
+                    assert_eq!(probe.active.load(Ordering::Acquire), 0);
+                    assert_eq!(store.task_count(), 1);
+                    assert!(shutdown.load(Ordering::Acquire));
+                    let state = io.0.lock().unwrap();
+                    assert!(state.reader_dropped && state.writer_dropped);
+                }
+            });
+        }
+
+        #[test]
+        fn async_stdio_hosted_task_service_failure_stops_silent_ingress() {
+            run(|cx| async move {
+                for panic_on_failure in [false, true] {
+                    let probe = Arc::new(TaskProbe::default());
+                    probe.panic_on_failure.store(panic_on_failure, Ordering::Release);
+                    let TaskServer {
+                        server,
+                        runtime,
+                        store,
+                        shutdown,
+                    } = task_server(&probe, true);
+                    let io = Arc::new(IoProbe::default());
+                    io.allow(usize::MAX);
+                    io.feed(&encoded(&task_call(201, true)));
+                    let mut serving = serve_tasks(&cx, server, &io);
+                    until_io(&cx, &io, || io.response(201).is_some()).await;
+                    assert!(io.response(201).unwrap().error.is_none());
+                    until(&cx, || probe.active.load(Ordering::Acquire) == 1).await;
+                    assert!(runtime.is_task_service_ready());
+                    // The peer supplies no EOF or further traffic. Either a
+                    // returned failure or a panic must stop this same service.
+                    probe.fail.store(true, Ordering::Release);
+                    probe.changed.notify_waiters();
+                    let outcome = asupersync::time::timeout(
+                        cx.now(),
+                        Duration::from_secs(3),
+                        serving.join(&cx),
+                    )
+                    .await
+                    .expect("service failure must wake silent ingress")
+                    .expect("serve child joins");
+                    assert!(
+                        outcome.is_err(),
+                        "supervisor failure must reach the embedding (panic={panic_on_failure})"
+                    );
+                    assert!(!runtime.is_task_service_ready());
+                    assert_eq!(probe.active.load(Ordering::Acquire), 0);
+                    assert_eq!(store.task_count(), 1);
+                    assert!(shutdown.load(Ordering::Acquire));
+                    let state = io.0.lock().unwrap();
+                    assert!(!state.eof);
+                    assert!(state.reader_dropped && state.writer_dropped);
+                }
+            });
+        }
+
+        #[test]
+        fn async_stdio_hosted_tasks_do_not_start_on_startup_failure() {
+            run(|cx| async move {
+                let probe = Arc::new(TaskProbe::default());
+                let runtime = FinalTaskRuntime::in_memory(
+                    FinalTaskRuntimeConfig::new(60_000, Some(1_000)).unwrap(),
+                    Arc::new(|_| {}),
+                );
+                let startup_idle = Arc::new(AtomicBool::new(false));
+                let startup_flag = Arc::clone(&startup_idle);
+                let startup_runtime = runtime.clone();
+                let server = Server::new("hosted-stdio-startup-failure", "1.0")
+                    .protocol_policy(ProtocolPolicy::ModernOnly)
+                    .unwrap()
+                    .final_tasks(runtime.clone())
+                    .unwrap()
+                    .task_supervisor(Arc::new(TaskSupervisor(Arc::clone(&probe))))
+                    .on_startup(move || {
+                        startup_flag.store(
+                            !startup_runtime.is_task_service_ready(),
+                            Ordering::Release,
+                        );
+                        Err(io::Error::other("planted startup failure"))
+                    })
+                    .build();
+                let io = Arc::new(IoProbe::default());
+                io.feed(&encoded(&task_call(201, false)));
+                let error = server
+                    .serve_stdio_io(
+                        &cx,
+                        ProbeReader(Arc::clone(&io)),
+                        ProbeWriter(Arc::clone(&io)),
+                    )
+                    .await
+                    .expect_err("startup hook rejects this serve");
+                assert_eq!(error.message, "Server startup hook failed");
+                assert!(startup_idle.load(Ordering::Acquire));
+                assert!(!runtime.is_task_service_ready());
+                assert!(!probe.initialized.load(Ordering::Acquire));
+                assert_eq!(probe.tool_calls.load(Ordering::Acquire), 0);
+                assert_eq!(probe.initial.load(Ordering::Acquire), 0);
+                assert_eq!(probe.active.load(Ordering::Acquire), 0);
+                let state = io.0.lock().unwrap();
+                assert_eq!(state.reads, 0);
+                assert_eq!(state.writes, 0);
+                assert!(state.reader_dropped && state.writer_dropped);
+            });
+        }
     }
 }

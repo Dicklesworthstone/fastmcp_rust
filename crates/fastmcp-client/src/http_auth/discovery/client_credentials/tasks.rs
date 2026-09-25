@@ -285,7 +285,9 @@ impl ClientCredentialsTaskCall {
     /// A polled read takes socket custody before suspension. Error or drop
     /// permanently removes the parser; partially consumed bytes are not reused.
     /// EOF without a correlated final result fails. A final result is delivered
-    /// once, and only then do later reads return `None`.
+    /// once, and only then do later reads return `None`. SSE terminal results
+    /// are withheld until clean HTTP EOF and complete SSE framing; a Task or
+    /// input challenge cannot escape ahead of a truncated or contradictory tail.
     /// For `tasks/get` only, a native body-read failure retains MissingTerminal
     /// so an explicitly recovering observer can reconcile through fresh
     /// discovery. Complete invalid JSON is never classified as interruption.
@@ -311,6 +313,14 @@ impl ClientCredentialsTaskCall {
                             .ok_or(ManagedTasksError::MissingTerminal)?;
                         let event = decode_record(&self.decoder, frame.as_bytes(), &self.request_id,
                             self.limits.frame_bytes, self.progress.as_ref(), &mut progress)?;
+                        if !matches!(&event, ManagedTaskEvent::Notification(_)) {
+                            // Keep both terminal and socket under the opening
+                            // credential and original request deadline. This
+                            // tail check is not an additional protocol record.
+                            super::rpc::require_finite_sse_eof(cx, &mut stream).await
+                                .map_err(|_| ManagedTasksError::InvalidResponse)?;
+                            return Ok((event, None));
+                        }
                         Ok((event, Some(Box::new(Body::Sse(stream)))))
                     }
                 }
@@ -500,6 +510,7 @@ fn decode_record(
 mod tests {
     use super::*;
     use fastmcp_protocol::ClientCapabilities;
+    use super::super::rpc::tests::{NativeEnd, native_response_for, runtime};
 
     fn metadata() -> Value { task_metadata(FinalRequestMeta::new(ClientCapabilities::default())).unwrap() }
     fn id() -> TaskId { TaskId::parse("owned-task").unwrap() }
@@ -806,5 +817,158 @@ mod tests {
             decode_result(&Decoder::Cancel, &acknowledgement, &RequestId::Number(2), 65536),
             Ok(ManagedTaskEvent::Cancelled(_))
         ));
+    }
+
+    fn finite_tool_results() -> [Value; 3] {
+        let mut background = serde_json::to_value(task()).unwrap();
+        background["resultType"] = json!("task");
+        [json!({"resultType":"complete","content":[]}),
+            json!({"resultType":"input_required","requestState":"opaque"}), background]
+    }
+
+    async fn finite_tool_call(cx: &Cx, body: &str, end: NativeEnd, records: usize)
+        -> (ClientCredentialsTaskCall, std::thread::JoinHandle<()>)
+    {
+        let mut meta = metadata();
+        meta["progressToken"] = json!("owned-progress");
+        let prepared = prepare("https://machine.example/mcp", &meta, &RequestId::Number(7),
+            ManagedTaskRequest::CallTool { name:"compute".to_owned(), arguments:None },
+            ClientCredentialsTasksLimits::default()).unwrap();
+        let Decoder::Tool(request) = &prepared.decoder else { panic!("tool fixture expected"); };
+        let response = native_response_for(cx, body, "text/event-stream", end, (**request).clone()).await;
+        let (super::super::ClientCredentialsResponse {
+            response, snapshot, owner, cancellation, request_id, deadline, ..
+        }, peer) = response;
+        let limits = ClientCredentialsTasksLimits::new(4096, 4096, records, Duration::from_secs(5)).unwrap();
+        (ClientCredentialsTaskCall::new(response, prepared.decoder, prepared.progress,
+            snapshot, owner, cancellation, request_id, deadline, limits).unwrap(), peer)
+    }
+
+    fn finite_tool_frame(result: &Value) -> String {
+        format!("data: {}\n\n", json!({"jsonrpc":"2.0","id":7,"result":result}))
+    }
+
+    #[test]
+    fn native_machine_tasks_preserve_all_result_families_at_clean_eof() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            for (index, result) in finite_tool_results().iter().enumerate() {
+                let body = format!("{}: final keepalive\n\n", finite_tool_frame(result));
+                let (mut call, peer) = finite_tool_call(&cx, &body, NativeEnd::Complete, 1).await;
+                let Some(ManagedTaskEvent::ToolResult(result)) = call.next_event(&cx).await.unwrap() else {
+                    panic!("finite tool result expected");
+                };
+                assert!(matches!((index, &*result),
+                    (0, FinalCoreResult::ToolsCall { .. })
+                    | (1, FinalCoreResult::ToolsCallInputRequired { .. })
+                    | (2, FinalCoreResult::ToolsCallTask { .. })));
+                assert_eq!(call.records, 1, "EOF does not spend an extra record");
+                assert!(call.finished && call.body.is_none());
+                assert!(call.next_event(&cx).await.unwrap().is_none());
+                peer.join().unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn native_machine_tasks_reject_duplicate_or_trailing_records_before_publication() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            for result in finite_tool_results() {
+                let terminal = finite_tool_frame(&result);
+                for suffix in [terminal.as_str(), "data: private-malformed-tail\n\n",
+                    "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n"]
+                {
+                    let (mut call, peer) = finite_tool_call(&cx, &format!("{terminal}{suffix}"), NativeEnd::Complete, 1).await;
+                    let error = call.next_event(&cx).await.err().expect("trailing record must invalidate terminal");
+                    assert!(matches!(&error, ClientCredentialsTasksError::Protocol(ManagedTasksError::InvalidResponse)));
+                    assert!(!format!("{error:?} {error}").contains("private-malformed-tail"));
+                    assert_eq!(call.records, 0);
+                    assert!(!call.finished && call.body.is_none());
+                    assert!(matches!(call.next_event(&cx).await,
+                        Err(ClientCredentialsTasksError::Protocol(ManagedTasksError::Closed))));
+                    peer.join().unwrap();
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn native_machine_tasks_reject_incomplete_sse_and_http_tails() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let terminal = finite_tool_frame(&finite_tool_results()[2]);
+            for (suffix, end) in [("data: {}\n", NativeEnd::Complete),
+                ("data: {", NativeEnd::Complete), ("", NativeEnd::Truncate)]
+            {
+                let (mut call, peer) = finite_tool_call(&cx, &format!("{terminal}{suffix}"), end, 1).await;
+                assert!(call.next_event(&cx).await.is_err());
+                assert_eq!(call.records, 0);
+                assert!(!call.finished && call.body.is_none());
+                peer.join().unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn native_machine_tasks_keep_delivered_progress_without_publishing_invalid_terminal() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let progress = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":\"owned-progress\",\"progress\":1}}\n\n";
+            let terminal = finite_tool_frame(&finite_tool_results()[2]);
+            let (mut call, peer) = finite_tool_call(&cx,
+                &format!("{progress}{terminal}{terminal}"), NativeEnd::Complete, 2).await;
+            assert!(matches!(call.next_event(&cx).await.unwrap(), Some(ManagedTaskEvent::Notification(_))));
+            let before = call.last_progress.clone();
+            assert!(before.is_some());
+            assert!(call.next_event(&cx).await.is_err());
+            assert_eq!(call.last_progress, before);
+            assert_eq!(call.records, 1);
+            assert!(!call.finished);
+            peer.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn native_machine_tasks_abandoned_eof_wait_cannot_publish_a_task() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let terminal = finite_tool_frame(&finite_tool_results()[2]);
+            let (mut call, peer) = finite_tool_call(&cx, &terminal, NativeEnd::Hold, 1).await;
+            let stop = cx.now().saturating_add_nanos(250_000_000);
+            assert!(asupersync::time::timeout_at(stop, Box::pin(call.next_event(&cx))).await.is_err());
+            assert_eq!(call.records, 0);
+            assert!(!call.finished && call.body.is_none());
+            assert!(matches!(call.next_event(&cx).await,
+                Err(ClientCredentialsTasksError::Protocol(ManagedTasksError::Closed))));
+            peer.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn native_machine_tasks_eof_wait_keeps_owner_cancellation_effective() {
+        use std::future::{Future, poll_fn};
+
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let terminal = finite_tool_frame(&finite_tool_results()[2]);
+            let (mut call, peer) = finite_tool_call(&cx, &terminal, NativeEnd::Hold, 1).await;
+            let owner = call.owner.clone();
+            let mut trigger = Box::pin(asupersync::time::sleep(cx.now(), Duration::from_millis(100)));
+            let mut pending = Box::pin(call.next_event(&cx));
+            let mut cancelled = false;
+            let result = poll_fn(|task| {
+                if !cancelled && trigger.as_mut().poll(task).is_ready() {
+                    cancelled = true;
+                    owner.cancel();
+                }
+                pending.as_mut().poll(task)
+            }).await;
+            drop(pending);
+            assert!(cancelled && result.is_err());
+            assert_eq!(call.records, 0);
+            assert!(!call.finished && call.body.is_none());
+            peer.join().unwrap();
+        });
     }
 }

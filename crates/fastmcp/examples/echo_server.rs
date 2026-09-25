@@ -23,7 +23,7 @@ use std::time::Duration;
 use fastmcp_rust::modern::{FinalMethodOutcome, MrtrCompletedInputs};
 use fastmcp_rust::prelude::*;
 use fastmcp_rust::{
-    ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, CacheScope, CompleteResult,
+    ApplicationTaskSupervisor, CacheScope, CompleteResult,
     ContentBlock, EmbeddedResourceContents, FinalAbsoluteUri, FinalCallToolResult,
     FinalCompletionParams, FinalCompletionReference, FinalCompletionValues,
     FinalElicitationContextExt, FinalEmbeddedRootsListParams, FinalPromptMessage,
@@ -1124,8 +1124,8 @@ impl ToolHandler for DurableTaskTool {
 }
 
 /// Advances initial Task work to `input_required`, then waits for caller
-/// input or cancellation. The framework never creates this service or its
-/// runtime; the embedding owns both in `run_tasks_stdio`.
+/// input or cancellation. The application supplies the supervisor; the server
+/// hosts its service within the caller-owned serve lifetime.
 struct DurableTaskSupervisor;
 
 impl ApplicationTaskSupervisor for DurableTaskSupervisor {
@@ -1161,71 +1161,10 @@ impl ApplicationTaskSupervisor for DurableTaskSupervisor {
     }
 }
 
-const TASK_SERVICE_STARTUP_BOUND: Duration = Duration::from_secs(2);
-const TASK_SERVICE_SETTLEMENT_BOUND: Duration = Duration::from_secs(4);
 // The shipped example is exercised through long live-proxy scenarios in the
 // fully parallel workspace suite. Keep retention finite without letting batch
 // scheduler contention expire a Task before the scenario first observes it.
 const TASK_RETENTION_MS: u64 = 10 * 60 * 1_000;
-
-async fn run_tasks_stdio(
-    server: fastmcp_server::Server,
-    runtime: FinalTaskRuntime,
-    runner: AuthorizedTaskServiceRunner,
-    cx: &Cx,
-) -> McpResult<()> {
-    let mut service = cx
-        .spawn(move |service_cx| async move { runner.run(&service_cx).await })
-        .map_err(|error| {
-            McpError::internal_error(format!("Task service admission failed: {error}"))
-        })?;
-    let readiness_deadline = cx.now() + TASK_SERVICE_STARTUP_BOUND;
-    while !runtime.is_task_service_ready() {
-        if service.is_finished() {
-            return Err(McpError::internal_error(
-                "Caller-owned Task service stopped before publishing readiness",
-            ));
-        }
-        asupersync::time::timeout_at(
-            readiness_deadline,
-            asupersync::time::sleep(cx.now(), Duration::from_millis(1)),
-        )
-        .await
-        .map_err(|_| {
-            McpError::internal_error("Caller-owned Task service did not become ready within bound")
-        })?;
-    }
-
-    let mut stdio = cx
-        .spawn_blocking(move |stdio_cx| {
-            let (recv_half, send_half) = StdioTransport::stdio().into_split();
-            server.run_split_transport_returning_with_cx(&stdio_cx, recv_half, send_half)
-        })
-        .map_err(|error| {
-            McpError::internal_error(format!("stdio service admission failed: {error}"))
-        })?;
-    let server_result = stdio.join(cx).await.map_err(|error| {
-        McpError::internal_error(format!("stdio service join failed: {error:?}"))
-    })?;
-
-    service.abort();
-    match asupersync::time::timeout(cx.now(), TASK_SERVICE_SETTLEMENT_BOUND, service.join(cx)).await
-    {
-        Ok(Ok(result)) => result?,
-        Ok(Err(asupersync::runtime::JoinError::Cancelled(_))) => {}
-        Ok(Err(error)) => {
-            return Err(McpError::internal_error(format!(
-                "Task service join failed: {error:?}"
-            )));
-        }
-        Err(_) => {
-            return Err(McpError::internal_error(
-                "Task service did not settle within bound",
-            ));
-        }
-    }
-    server_result
-}
 
 async fn run_stdio(server: fastmcp_server::Server, cx: &Cx) -> McpResult<()> {
     let mut stdio = cx
@@ -1253,10 +1192,6 @@ fn main() -> ExitCode {
         std::sync::Arc::new(|_| {}),
     )
     .expect("the example Task store has a positive capacity");
-    let task_runner = task_runtime
-        .install_task_service(1, std::sync::Arc::new(DurableTaskSupervisor))
-        .expect("the caller-owned example Task service installs once");
-
     let builder = ServerBuilder::new("echo-server", "1.0.0")
         // Register tools
         .tool(Echo)
@@ -1433,12 +1368,16 @@ fn main() -> ExitCode {
         }
         _ => builder,
     };
+    let builder = if builder.configured_protocol_policy() == ProtocolPolicy::LegacyOnly {
+        builder
+    } else {
+        builder.task_supervisor(std::sync::Arc::new(DurableTaskSupervisor))
+    };
     let server = builder
         .tool(DurableTaskTool)
-        .final_tasks(task_runtime.clone())
+        .final_tasks(task_runtime)
         .expect("the official Tasks extension installs on the modern-capable example server")
         .build();
-    let protocol_policy = server.protocol_policy();
 
     let application_runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .with_reactor(
@@ -1450,15 +1389,7 @@ fn main() -> ExitCode {
         .expect("the example caller runtime initializes");
     match application_runtime.block_on(async move {
         let cx = Cx::current().expect("the example caller runtime installs its Cx");
-        match protocol_policy {
-            // The component builder read FASTMCP_PROTOCOL_POLICY before
-            // registration. Exact 2024 gets no Task service and its
-            // dispatch remains blind to the modern Tasks extension.
-            ProtocolPolicy::LegacyOnly => run_stdio(server, &cx).await,
-            ProtocolPolicy::Auto | ProtocolPolicy::ModernOnly => {
-                run_tasks_stdio(server, task_runtime, task_runner, &cx).await
-            }
-        }
+        run_stdio(server, &cx).await
     }) {
         Ok(()) => ExitCode::SUCCESS,
         Err(_error) => {

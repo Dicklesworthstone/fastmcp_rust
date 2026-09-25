@@ -446,7 +446,9 @@ async fn two_page_catalog_peer(peer: &Peer, second: &'static str) {
 /// A cached collector over one login. `new` disables caching, so the cache
 /// limits are what make the reuse half of the positive observable at all.
 fn catalog_client(session: &ManagedOAuthSession) -> ManagedCatalogClient {
-    ManagedCatalogClient::new(session.clone(), ManagedCatalogLimits::default())
+    let limits = ManagedCatalogLimits::new(ManagedCoreLimits::default(), 2, 100_000, 1024 * 1024)
+        .expect("bounded two-page traversal limits are valid");
+    ManagedCatalogClient::new(session.clone(), limits)
         .with_cache_limits(4, 64 * 1024)
         .expect("bounded cache limits are valid")
 }
@@ -752,17 +754,17 @@ fn run(case: Case) {
                     // does not implement Debug, so the Err-extracting helpers
                     // are unavailable here.
                     let Err(error) = collected else {
-                        panic!("a repeated opaque cursor must be refused, not collected");
+                        panic!("a present cursor cannot complete a two-page-bounded catalog");
                     };
                     assert!(
-                        matches!(error, ManagedCatalogError::RepeatedCursor),
-                        "the refusal must be the typed RepeatedCursor, got {error:?}"
+                        matches!(error, ManagedCatalogError::PageLimit),
+                        "the refusal must be the typed PageLimit, got {error:?}"
                     );
-                    // No third request: the refusal happens on admission of the
-                    // repeating page, before any further POST is prepared.
+                    // Cursor contents never decide termination. The configured
+                    // page bound prevents preparing any third request.
                     assert_eq!(
                         peer.mcp_posts.load(Ordering::SeqCst), 2,
-                        "refusing a repeated cursor must not issue a third POST"
+                        "exhausting the page budget must not issue a third POST"
                     );
                 }
             }
@@ -846,9 +848,9 @@ fn managed_catalog_collects_all_pages_and_reuses_cache() {
     );
 }
 #[test]
-fn managed_catalog_rejects_repeated_cursor_without_extra_post() {
+fn managed_catalog_bounds_repeated_cursor_without_extra_post() {
     isolated(
-        "managed_catalog_rejects_repeated_cursor_without_extra_post",
+        "managed_catalog_bounds_repeated_cursor_without_extra_post",
         Case::CatalogRepeatedCursor,
     );
 }
