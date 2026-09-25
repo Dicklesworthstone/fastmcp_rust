@@ -516,3 +516,6 @@ cases! {
 
 #[path = "oauth_tool_header_repair/schema.rs"]
 mod schema;
+
+#[path = "oauth_tool_header_repair/interaction.rs"]
+mod interaction;
