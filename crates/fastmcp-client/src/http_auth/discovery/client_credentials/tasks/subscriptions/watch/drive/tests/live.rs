@@ -141,6 +141,7 @@ impl Peer {
     }
     async fn rpc(&self, method: &str) -> (TlsStream<TcpStream>, serde_json::Value) {
         let (socket,_) = self.listener.accept().await.unwrap();
+        std::thread::sleep(Duration::from_millis(900)); // PLANT: stall between TCP accept and TLS accept
         let mut socket = self.tls.accept(socket).await.unwrap();
         let (head, request) = request(&mut socket).await;
         assert!(head.starts_with("POST /mcp HTTP/1.1\r\n"));
