@@ -637,17 +637,17 @@ impl AuthProvider for TokenAuthProvider {
             }
         };
         let auth = self.verifier.verify(ctx, request, &access)?;
-        let subject = auth
-            .subject
-            .as_deref()
-            .filter(|subject| !subject.is_empty())
-            .ok_or_else(|| auth_error("Token verifier returned invalid authentication facts"))?;
         if principal_fingerprint(Some(&auth)).is_err() {
             return Err(auth_error("Token verifier returned invalid authentication facts"));
         }
         if auth.session_owner().is_some() {
             return Ok(auth);
         }
+        let subject = auth
+            .subject
+            .as_deref()
+            .filter(|subject| !subject.is_empty())
+            .ok_or_else(|| auth_error("Token verifier returned invalid authentication facts"))?;
         ctx.checkpoint()
             .map_err(|_| McpError::request_cancelled())?;
         if ctx.deadline_expired() {
@@ -1725,6 +1725,60 @@ mod tests {
             );
         }
         assert!(provider.owner_namespace.get().is_none());
+    }
+
+    #[test]
+    fn token_auth_provider_preserves_owner_only_custom_verifier_facts() {
+        struct OwnerOnlyVerifier {
+            owner: Option<Sha256Digest>,
+        }
+
+        impl TokenVerifier for OwnerOnlyVerifier {
+            fn verify(
+                &self,
+                _ctx: &McpContext,
+                _request: AuthRequest<'_>,
+                token: &AccessToken,
+            ) -> McpResult<AuthContext> {
+                if token.token != "owner-only-secret" {
+                    return Err(auth_error("Invalid access token"));
+                }
+                let mut facts = AuthContext::anonymous();
+                facts.scopes = vec!["catalog.read".to_owned()];
+                facts.claims = Some(serde_json::json!({"tenant": "verified-tenant"}));
+                Ok(match self.owner {
+                    Some(owner) => facts.with_session_owner(owner),
+                    None => facts,
+                })
+            }
+        }
+
+        let owner = sha256_bounded(b"verified-owner-without-display-subject", 128).unwrap();
+        let provider = TokenAuthProvider::new(OwnerOnlyVerifier { owner: Some(owner) });
+        assert!(authenticate_header(&provider, "Bearer wrong-secret").is_err());
+        let admitted = authenticate_header(&provider, "Bearer owner-only-secret").unwrap();
+        assert_eq!(admitted.subject, None);
+        assert_eq!(admitted.session_owner(), Some(owner));
+        assert_eq!(
+            serde_json::to_value(&admitted).unwrap(),
+            serde_json::json!({
+                "scopes": ["catalog.read"],
+                "claims": {"tenant": "verified-tenant"}
+            })
+        );
+        assert!(provider.owner_namespace.get().is_none());
+
+        let ownerless = TokenAuthProvider::new(OwnerOnlyVerifier { owner: None });
+        let refused = authenticate_header(&ownerless, "Bearer owner-only-secret")
+            .expect_err("removing only the verified owner cannot mint an anonymous token owner");
+        assert_eq!(refused.code, McpErrorCode::ResourceForbidden);
+        assert!(ownerless.owner_namespace.get().is_none());
+        assert_eq!(
+            authenticate_header(&provider, "Bearer owner-only-secret")
+                .unwrap()
+                .session_owner(),
+            Some(owner)
+        );
     }
 
     #[test]
