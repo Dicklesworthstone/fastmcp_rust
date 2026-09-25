@@ -1127,7 +1127,7 @@ struct Tombstone {
 }
 
 #[derive(Debug)]
-struct DeferredDropCancellation {
+struct PendingCancellationControl {
     request_id: RequestId,
     generation: u64,
     message: JsonRpcMessage,
@@ -1149,7 +1149,7 @@ struct ExecutorState<T> {
     terminal_records: HashMap<(RequestId, u64), ExecutionTerminalRecord>,
     terminal_expirations: HashMap<(RequestId, u64), Instant>,
     cancellation_events: VecDeque<CancellationRequested>,
-    deferred_drop_cancellations: VecDeque<DeferredDropCancellation>,
+    deferred_drop_cancellations: VecDeque<PendingCancellationControl>,
     #[cfg(feature = "tasks")]
     task_subscriptions: HashMap<(RequestId, u64), TaskSubscription>,
     next_generation: u64,
@@ -1828,20 +1828,47 @@ where
     /// peer. Notifications are retained separately and never consume a final
     /// response slot.
     pub fn drive(&self, cx: &Cx) -> McpResult<()> {
+        self.drive_for_owner(cx, None)
+    }
+
+    fn drive_for_owner(&self, cx: &Cx, waiting_owner: Option<(&RequestId, u64)>) -> McpResult<()> {
         let mut state = self.state.borrow_mut();
         self.claim_ingress_owner_locked(&mut state, IngressOwner::SelfReader)?;
         self.prepare_drive_locked(cx, &mut state)?;
-        let (message, raw_result, raw_progress_params) = match state.receive_frame {
-            Some(receive_frame) => {
-                let frame = match receive_frame(&mut state.transport, cx) {
-                    Ok(frame) => frame,
-                    Err(error) => {
-                        let error = transport_error_to_mcp(error);
-                        state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
-                        return Err(error);
-                    }
-                };
-                let (message, source) = frame.into_parts();
+        if waiting_owner.is_some_and(|(request_id, generation)| {
+            state
+                .completed
+                .contains_key(&(request_id.clone(), generation))
+        }) {
+            // Expiry may have just elected this waiter's outcome while a
+            // sibling remains live. No further peer read belongs to this wait.
+            return Ok(());
+        }
+        let (received, source) = match state.receive_frame {
+            Some(receive_frame) => match receive_frame(&mut state.transport, cx) {
+                Ok(frame) => {
+                    let (message, source) = frame.into_parts();
+                    (Ok(message), Some(source))
+                }
+                Err(error) => (Err(error), None),
+            },
+            // A typed Transport cannot retain the original source spelling.
+            None => (state.transport.recv(cx), None),
+        };
+        // An arbitrary synchronous Transport may block inside recv. This
+        // check cannot preempt that call, but a late frame or read failure
+        // must never replace a deadline that elapsed while it was blocked.
+        self.expire_timeouts_locked(cx, &mut state, Instant::now())?;
+        let message = match received {
+            Ok(message) => message,
+            Err(error) => {
+                let error = transport_error_to_mcp(error);
+                state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
+                return Err(error);
+            }
+        };
+        let (raw_result, raw_progress_params) = match source {
+            Some(source) => {
                 let raw_result = match exact_result_source_from_admitted_frame(&message, &source) {
                     Ok(raw_result) => raw_result,
                     Err(error) => {
@@ -1857,20 +1884,9 @@ where
                             return Err(error);
                         }
                     };
-                (message, raw_result, raw_progress_params)
+                (raw_result, raw_progress_params)
             }
-            None => match state.transport.recv(cx) {
-                // A typed Transport has already discarded the exact frame
-                // spelling. Preserve that distinction: protocol admission may
-                // encode the typed value internally, but callers must never
-                // receive reconstructed JSON as a peer-authored raw source.
-                Ok(message) => (message, None, None),
-                Err(error) => {
-                    let error = transport_error_to_mcp(error);
-                    state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
-                    return Err(error);
-                }
-            },
+            None => (None, None),
         };
         self.route_inbound_message_locked(cx, &mut state, message, raw_result, raw_progress_params)
     }
@@ -2663,13 +2679,18 @@ where
             if let Some(outcome) = execution.take_terminal_outcome()? {
                 return Ok(outcome);
             }
-            if cx.checkpoint().is_err() {
-                self.cancel(cx, execution)?;
-                return Ok(execution
-                    .take_terminal_outcome()?
-                    .expect("caller cancellation selects a terminal execution outcome"));
+            let drive_result = if cx.checkpoint().is_err() {
+                self.cancel(cx, execution)
+            } else {
+                self.drive_for_owner(cx, Some((&execution.request_id, execution.generation)))
+            };
+            // Cancellation selects its local terminal before attempting the
+            // bounded control write. Preserve that elected outcome even when
+            // the subsequent write or connection cleanup fails.
+            if let Some(outcome) = execution.take_terminal_outcome()? {
+                return Ok(outcome);
             }
-            self.drive(cx)?;
+            drive_result?;
         }
     }
 
@@ -2817,18 +2838,28 @@ where
         state: &mut ExecutorState<T>,
     ) -> McpResult<()> {
         while let Some(cancellation) = state.deferred_drop_cancellations.pop_front() {
-            if let Some(record) = state
-                .terminal_records
-                .get_mut(&(cancellation.request_id.clone(), cancellation.generation))
-            {
-                record.cancellation_transport_attempts =
-                    record.cancellation_transport_attempts.saturating_add(1);
-            }
-            if let Err(error) = state.transport.send(cx, &cancellation.message) {
-                let error = transport_error_to_mcp(error);
-                state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
-                return Err(error);
-            }
+            self.send_cancellation_control_locked(cx, state, cancellation)?;
+        }
+        Ok(())
+    }
+
+    fn send_cancellation_control_locked(
+        &self,
+        cx: &Cx,
+        state: &mut ExecutorState<T>,
+        cancellation: PendingCancellationControl,
+    ) -> McpResult<()> {
+        if let Some(record) = state
+            .terminal_records
+            .get_mut(&(cancellation.request_id, cancellation.generation))
+        {
+            record.cancellation_transport_attempts =
+                record.cancellation_transport_attempts.saturating_add(1);
+        }
+        if let Err(error) = state.transport.send(cx, &cancellation.message) {
+            let error = transport_error_to_mcp(error);
+            state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
+            return Err(error);
         }
         Ok(())
     }
@@ -2861,11 +2892,26 @@ where
         reason: ExecutionTerminalReason,
         notify_peer: bool,
     ) -> McpResult<()> {
+        if let Some(cancellation) =
+            self.select_pending_cancellation_locked(state, request_id, reason, notify_peer)?
+        {
+            self.send_cancellation_control_locked(cx, state, cancellation)?;
+        }
+        Ok(())
+    }
+
+    fn select_pending_cancellation_locked(
+        &self,
+        state: &mut ExecutorState<T>,
+        request_id: &RequestId,
+        reason: ExecutionTerminalReason,
+        notify_peer: bool,
+    ) -> McpResult<Option<PendingCancellationControl>> {
         let correlation_key = request_id.correlation_key().map_err(|_| {
             McpError::invalid_params("Request cancellation requires a valid JSON-RPC request ID")
         })?;
         let Some(pending) = state.pending.get(&correlation_key) else {
-            return Ok(());
+            return Ok(None);
         };
         // MCP forbids client cancellation of initialize. A local owner still
         // transitions to cancellation, but no peer notification is emitted.
@@ -2878,7 +2924,7 @@ where
             None
         };
         let Some(mut pending) = state.pending.remove(&correlation_key) else {
-            return Ok(());
+            return Ok(None);
         };
         let owned_request_id = pending.record.request_id.clone();
         pending.record.cancellation_committed = true;
@@ -2923,7 +2969,7 @@ where
                 terminal_reason: reason,
                 final_delivered: false,
                 cancellation_committed: true,
-                cancellation_transport_attempts: u8::from(notify_peer),
+                cancellation_transport_attempts: 0,
                 local_cancellation_event: true,
                 waiter_release: true,
                 tombstone: true,
@@ -2937,21 +2983,14 @@ where
             let _ = state.cancellation_events.pop_front();
         }
         state.cancellation_events.push_back(CancellationRequested {
-            request_id: owned_request_id,
+            request_id: owned_request_id.clone(),
             reason,
         });
-        if !notify_peer {
-            return Ok(());
-        }
-        let Some(cancellation) = cancellation else {
-            return Ok(());
-        };
-        if let Err(error) = state.transport.send(cx, &cancellation) {
-            let error = transport_error_to_mcp(error);
-            state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
-            return Err(error);
-        }
-        Ok(())
+        Ok(cancellation.map(|message| PendingCancellationControl {
+            request_id: owned_request_id,
+            generation,
+            message,
+        }))
     }
 
     fn route_cancellation_notification_locked(
@@ -3299,8 +3338,19 @@ where
                 Some((pending.record.request_id.clone(), reason))
             })
             .collect::<Vec<_>>();
+        let mut controls = Vec::with_capacity(expired.len());
+        // Every timeout observed in this pass wins its local terminal before
+        // any fallible I/O. HashMap iteration order must not turn a sibling's
+        // already-expired deadline into connection loss on the first failure.
         for (request_id, reason) in expired {
-            self.cancel_pending_locked(cx, state, &request_id, reason)?;
+            if let Some(control) =
+                self.select_pending_cancellation_locked(state, &request_id, reason, true)?
+            {
+                controls.push(control);
+            }
+        }
+        for control in controls {
+            self.send_cancellation_control_locked(cx, state, control)?;
         }
         Ok(())
     }
@@ -3818,7 +3868,7 @@ impl<T> Drop for RequestExecution<T> {
         if let Some(message) = cancellation {
             state
                 .deferred_drop_cancellations
-                .push_back(DeferredDropCancellation {
+                .push_back(PendingCancellationControl {
                     request_id: self.request_id.clone(),
                     generation: self.generation,
                     message,
@@ -4498,6 +4548,258 @@ mod tests {
                 .expect("a retired progress token can serve another request ID");
             assert_eq!(executor.pending_records().len(), 1);
         }
+    }
+
+    #[test]
+    fn executor_wait_observes_timeout_before_receiving_sibling_frame() {
+        for source_ingress in [false, true] {
+            let sibling_response = response(42, serde_json::json!({"kind": "complete"}));
+            let transport = if source_ingress {
+                let source = serde_json::to_vec(&sibling_response).unwrap();
+                ScriptedTransport::with_source_frames([Ok(ReceivedTransportFrame::admit(
+                    source.into_boxed_slice(),
+                )
+                .unwrap())])
+            } else {
+                ScriptedTransport::new([Ok(sibling_response)])
+            };
+            let executor = RequestExecutor::with_source_frame_receiver(
+                transport,
+                ResultPeerEra::Legacy,
+                source_ingress.then_some(receive_scripted_source_frame),
+            );
+            let cx = Cx::for_testing();
+            let mut expired = executor.execute(&cx, request(41)).unwrap();
+            let mut sibling = executor.execute(&cx, request(42)).unwrap();
+            let key = RequestId::Number(41).correlation_key().unwrap();
+            executor
+                .state
+                .borrow_mut()
+                .pending
+                .get_mut(&key)
+                .unwrap()
+                .record
+                .idle_deadline = Instant::now();
+
+            let error = executor
+                .wait(&cx, &mut expired)
+                .expect_err("idle timeout wins");
+            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            assert_eq!(
+                error.data,
+                Some(serde_json::json!({"timeoutSource": "idle"}))
+            );
+            {
+                let state = executor.state.borrow();
+                assert_eq!(
+                    state.transport.received.len() + state.transport.received_frames.len(),
+                    1,
+                    "an expired waiter must not consume or block on a sibling's frame"
+                );
+            }
+            assert_eq!(executor.pending_records().len(), 1);
+            let result = executor
+                .wait(&cx, &mut sibling)
+                .expect("the sibling remains usable");
+            assert_eq!(result.id, Some(RequestId::Number(42)));
+            assert_eq!(executor.take_cancellation_events().len(), 1);
+            assert!(executor.take_uncorrelated_responses().is_empty());
+        }
+    }
+
+    #[test]
+    fn executor_drive_expires_owner_before_routing_late_response() {
+        struct DelayedTransport {
+            receive_after: Option<Instant>,
+            received: Option<Result<JsonRpcMessage, TransportError>>,
+            sent: Vec<JsonRpcMessage>,
+        }
+
+        impl Transport for DelayedTransport {
+            fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+                self.sent.push(message.clone());
+                Ok(())
+            }
+
+            fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+                if let Some(receive_after) = self.receive_after {
+                    std::thread::sleep(receive_after.saturating_duration_since(Instant::now()));
+                }
+                self.received.take().unwrap_or(Err(TransportError::Closed))
+            }
+
+            fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        for (late, failed_read) in [(false, false), (true, false), (true, true)] {
+            let executor = RequestExecutor::new(DelayedTransport {
+                receive_after: None,
+                received: Some(if failed_read {
+                    Err(TransportError::Closed)
+                } else {
+                    Ok(response(42, serde_json::json!({"kind": "complete"})))
+                }),
+                sent: Vec::new(),
+            });
+            let cx = Cx::for_testing();
+            let policy = RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(2))
+                .expect("finite receive test policy");
+            let mut execution = executor
+                .execute_with_timeout_policy(&cx, request(42), policy)
+                .expect("request commits before the response-wait deadline");
+            if late {
+                let deadline = executor.pending_records()[0].idle_deadline;
+                executor.state.borrow_mut().transport.receive_after =
+                    Some(deadline + Duration::from_millis(1));
+            }
+            let drive_result = executor.drive(&cx);
+            assert_eq!(drive_result.is_err(), failed_read);
+            let outcome = executor.wait(&cx, &mut execution);
+            if late {
+                let error = outcome.expect_err("a post-deadline receive cannot replace timeout");
+                assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                assert_eq!(
+                    error.data,
+                    Some(serde_json::json!({"timeoutSource": "idle"}))
+                );
+                assert_eq!(executor.take_cancellation_events().len(), 1);
+                assert_eq!(executor.state.borrow().transport.sent.len(), 2);
+            } else {
+                assert_eq!(outcome.unwrap().id, Some(RequestId::Number(42)));
+                assert!(executor.take_cancellation_events().is_empty());
+                assert_eq!(executor.state.borrow().transport.sent.len(), 1);
+            }
+            assert!(executor.pending_records().is_empty());
+            assert!(executor.take_uncorrelated_responses().is_empty());
+        }
+    }
+
+    #[test]
+    fn executor_wait_preserves_selected_timeout_when_control_send_fails() {
+        for caller_cancelled in [false, true] {
+            let cx = Cx::for_testing();
+            let executor = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
+            let mut execution = executor.execute(&cx, request(41)).unwrap();
+            let mut sibling = executor.execute(&cx, request(42)).unwrap();
+            executor.state.borrow_mut().transport.send_error = Some(std::io::ErrorKind::BrokenPipe);
+            if caller_cancelled {
+                cx.set_cancel_requested(true);
+            } else {
+                let key = RequestId::Number(41).correlation_key().unwrap();
+                executor
+                    .state
+                    .borrow_mut()
+                    .pending
+                    .get_mut(&key)
+                    .unwrap()
+                    .record
+                    .idle_deadline = Instant::now();
+            }
+            let error = executor
+                .wait(&cx, &mut execution)
+                .expect_err("local cancellation wins");
+            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            if !caller_cancelled {
+                assert_eq!(
+                    error.data,
+                    Some(serde_json::json!({"timeoutSource": "idle"}))
+                );
+            }
+            assert_eq!(executor.take_cancellation_events().len(), 1);
+            assert_eq!(
+                executor
+                    .wait(&cx, &mut sibling)
+                    .expect_err("the sibling receives connection loss")
+                    .code,
+                McpErrorCode::InternalError,
+            );
+            assert!(executor.pending_records().is_empty());
+            assert!(executor.terminal_records().is_empty());
+        }
+    }
+
+    #[test]
+    fn executor_timeout_batch_elects_all_expired_owners_before_failed_control_send() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
+        let mut idle = executor.execute(&cx, request(41)).unwrap();
+        let mut absolute = executor.execute(&cx, request(42)).unwrap();
+        let mut live = executor.execute(&cx, request(43)).unwrap();
+        let observed_at = Instant::now();
+        {
+            let mut state = executor.state.borrow_mut();
+            state
+                .pending
+                .get_mut(&RequestId::Number(41).correlation_key().unwrap())
+                .unwrap()
+                .record
+                .idle_deadline = observed_at;
+            let absolute_owner = state
+                .pending
+                .get_mut(&RequestId::Number(42).correlation_key().unwrap())
+                .unwrap();
+            absolute_owner.record.idle_deadline = observed_at;
+            absolute_owner.record.absolute_deadline = observed_at;
+            state.transport.send_error = Some(std::io::ErrorKind::BrokenPipe);
+        }
+        assert!(executor.poll_timeouts_at(&cx, observed_at).is_err());
+        {
+            let state = executor.state.borrow();
+            let idle_record = &state.terminal_records[&(idle.request_id.clone(), idle.generation)];
+            let absolute_record =
+                &state.terminal_records[&(absolute.request_id.clone(), absolute.generation)];
+            let live_record = &state.terminal_records[&(live.request_id.clone(), live.generation)];
+            assert_eq!(
+                idle_record.terminal_reason,
+                ExecutionTerminalReason::IdleTimeout
+            );
+            assert_eq!(
+                absolute_record.terminal_reason,
+                ExecutionTerminalReason::AbsoluteTimeout
+            );
+            assert_eq!(
+                live_record.terminal_reason,
+                ExecutionTerminalReason::ConnectionLost
+            );
+            assert_eq!(
+                idle_record.cancellation_transport_attempts
+                    + absolute_record.cancellation_transport_attempts,
+                1,
+                "only the first attempted control write fails, independent of owner iteration order"
+            );
+            assert_eq!(live_record.cancellation_transport_attempts, 0);
+        }
+        let events = executor.take_cancellation_events();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|event| {
+            event.request_id == RequestId::Number(41)
+                && event.reason == ExecutionTerminalReason::IdleTimeout
+        }));
+        assert!(events.iter().any(|event| {
+            event.request_id == RequestId::Number(42)
+                && event.reason == ExecutionTerminalReason::AbsoluteTimeout
+        }));
+        for (execution, source) in [(&mut idle, "idle"), (&mut absolute, "absolute")] {
+            let error = executor
+                .wait(&cx, execution)
+                .expect_err("each elapsed deadline wins");
+            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            assert_eq!(
+                error.data,
+                Some(serde_json::json!({"timeoutSource": source}))
+            );
+        }
+        assert_eq!(
+            executor
+                .wait(&cx, &mut live)
+                .expect_err("only the live sibling loses its connection")
+                .code,
+            McpErrorCode::InternalError,
+        );
+        assert!(executor.pending_records().is_empty());
+        assert!(executor.terminal_records().is_empty());
     }
 
     #[test]
