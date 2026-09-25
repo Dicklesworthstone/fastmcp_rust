@@ -33,16 +33,21 @@ use asupersync::time::wall_now;
 use asupersync::types::Time;
 use asupersync::{Budget, Cx, Outcome};
 use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
 #[cfg(test)]
 use fastmcp_core::block_on;
 use fastmcp_core::logging::{debug, targets, trace};
+use fastmcp_core::runtime::envelope::{
+    EnvelopeBinding, EnvelopeError, EnvelopePolicy, EnvelopePurpose, EphemeralEnvelopeProtector,
+};
+use fastmcp_core::runtime::{ProcessGenerationGuard, SnapshotCloneStance};
 use fastmcp_core::{
     McpContext, McpError, McpErrorCode, McpOutcome, McpResult, PromptCaller, PromptGetResult,
     PromptMessageItem, PromptMessageRole, SessionState, sha256_bounded,
 };
 use fastmcp_protocol::common_types::{
-    AbsoluteUri, Annotations, ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
+    AbsoluteUri, Annotations, ContentBlock, EmbeddedResourceContents, MAX_CURSOR_BYTES,
+    OpenMetadata, RawIcon,
 };
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::extensions::OFFICIAL_TASKS_EXTENSION_ID;
@@ -442,13 +447,9 @@ impl<'a> TagFilters<'a> {
     }
 }
 
-/// The catalog a continuation cursor was minted for.
-///
-/// Paged list cursors bind the offset to this catalog discriminator, the
-/// router catalog revision, the normalized query filters, and—for exact-2024
-/// lists that filter session-disabled members—the visible-member digest so a
-/// continuation cannot cross list methods, observe a changed catalog, replay
-/// under different tag filters, or silently skip after a session disable.
+/// The list method bound into a catalog continuation. Modern cursors protect
+/// it as authenticated context; the exact-2024 adapter uses it in its isolated
+/// JSON payload together with the session-visible member digest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum FinalCatalogKind {
@@ -500,6 +501,8 @@ fn canonical_final_catalog_tags(tags: Option<&[String]>) -> Vec<String> {
     canonical
 }
 
+/// The isolated exact-2024 cursor payload. Modern requests never decode or
+/// issue this unauthenticated format.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FinalCatalogCursor {
@@ -509,11 +512,56 @@ struct FinalCatalogCursor {
     offset: u64,
     /// Digest of the exact-2024 visible member keys after session filtering.
     ///
-    /// Final catalogs are connection-independent and omit this member. A
-    /// session-filtered list binds it so a later disable cannot reuse an
-    /// offset into a shorter snapshot.
+    /// A session-filtered list binds it so a later disable cannot reuse an
+    /// offset into a shorter snapshot. Legacy calls without session filtering
+    /// omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     visibility_digest: Option<String>,
+}
+
+const MODERN_CATALOG_CURSOR_PREFIX: &str = "fc1.";
+const MODERN_CATALOG_CURSOR_LIFETIME: Duration = Duration::from_secs(5 * 60);
+const MAX_CATALOG_BINDING_BYTES: usize = 64 * 1024;
+const INVALID_MODERN_CATALOG_CURSOR: &str = "Invalid catalog cursor";
+
+fn invalid_modern_catalog_cursor() -> McpError {
+    McpError::invalid_params(INVALID_MODERN_CATALOG_CURSOR)
+}
+
+/// Bounded serialization of query and verified authorization facts. Hashing
+/// after `to_vec` would allow a large local claim set to allocate without the
+/// bound being enforced.
+struct CatalogBindingBytes(Vec<u8>);
+
+impl Write for CatalogBindingBytes {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > MAX_CATALOG_BINDING_BYTES.saturating_sub(self.0.len()) {
+            return Err(io::Error::other("catalog binding exceeds its byte limit"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn catalog_envelope_error(error: EnvelopeError) -> McpError {
+    match error {
+        EnvelopeError::Cancelled => McpError::request_cancelled(),
+        EnvelopeError::Deadline => {
+            McpError::new(McpErrorCode::RequestCancelled, "Request timeout exceeded")
+        }
+        _ => invalid_modern_catalog_cursor(),
+    }
+}
+
+fn catalog_cursor_issuance_error(error: EnvelopeError) -> McpError {
+    match error {
+        EnvelopeError::Cancelled | EnvelopeError::Deadline => catalog_envelope_error(error),
+        _ => McpError::internal_error("catalog cursor protection unavailable"),
+    }
 }
 
 fn decode_final_catalog_cursor_offset(
@@ -1582,13 +1630,10 @@ where
     Ok(BASE64_STANDARD.encode(digest.as_bytes()))
 }
 
-/// Pages an already-filtered catalog snapshot.
-///
-/// Filtering must precede cursor arithmetic so a legacy-only or tag-filtered
-/// entry cannot create an empty modern page or shift a final peer's cursor.
-/// Exact-2024 session-disabled filtering additionally binds
-/// `visibility_digest` so a later disable cannot reuse an offset into a
-/// shorter snapshot.
+/// Pages an already-filtered exact-2024 catalog snapshot. Session-disabled
+/// filtering binds `visibility_digest` so a later disable cannot reuse an
+/// offset into a shorter snapshot. Modern lists use `page_modern_catalog` and
+/// its authenticated cursor format instead.
 fn page_final_catalog<T: Clone>(
     items: Vec<T>,
     cursor: Option<&str>,
@@ -2082,6 +2127,9 @@ pub struct Router {
     /// This advances after each successful catalog mutation so a retained
     /// cursor cannot observe a later catalog snapshot.
     final_catalog_revision: u64,
+    /// One process-bound owner protects modern cursors without retaining one
+    /// record per page. Independent routers/endpoints cannot open its state.
+    final_catalog_protector: std::sync::Mutex<Option<EphemeralEnvelopeProtector>>,
     /// Cache policy emitted on exact modern catalog and resource-read results.
     final_cache_hints: FinalCacheHintPolicy,
     /// Application-owned durable final Tasks runtime used only after the
@@ -2125,6 +2173,7 @@ impl Router {
             strict_input_validation: false,
             list_page_size: None,
             final_catalog_revision: 0,
+            final_catalog_protector: std::sync::Mutex::new(None),
             final_cache_hints: FinalCacheHintPolicy::default(),
             #[cfg(feature = "tasks")]
             final_task_runtime: None,
@@ -2160,9 +2209,214 @@ impl Router {
     ///
     /// When set, list methods (`tools/list`, `resources/list`,
     /// `resources/templates/list`, and `prompts/list`) will page results using
-    /// opaque base64 cursors.
+    /// opaque cursors. Modern cursors are authenticated, expire after five
+    /// minutes, and are scoped to this router and its current catalog, page
+    /// policy, and authenticated principal. They cannot survive a restart or
+    /// move to another server instance. Exact-2024 pagination uses its
+    /// isolated legacy cursor format.
     pub fn set_list_page_size(&mut self, page_size: Option<usize>) {
         self.list_page_size = page_size.filter(|n| *n > 0);
+    }
+
+    fn final_catalog_binding(
+        &self,
+        request_ctx: &McpContext,
+        catalog: FinalCatalogKind,
+        query: &FinalCatalogQuery,
+    ) -> McpResult<EnvelopeBinding> {
+        let mut auth = request_ctx.auth();
+        // AllowAllAuthProvider represents anonymous admission explicitly.
+        // It carries no owner or authorization facts and is equivalent to
+        // the ordinary anonymous path for these auth-invariant catalogs.
+        if auth.as_ref().is_some_and(|auth| {
+            auth.subject.is_none()
+                && auth.scopes.is_empty()
+                && auth.claims.is_none()
+                && auth.session_owner().is_none()
+        }) {
+            auth = None;
+        }
+        let owner = auth
+            .as_ref()
+            .map(|auth| {
+                auth.session_owner()
+                    .ok_or_else(invalid_modern_catalog_cursor)
+            })
+            .transpose()?;
+        if let Some(auth) = auth.as_mut() {
+            if auth.scopes.len() > MAX_CATALOG_BINDING_BYTES {
+                return Err(invalid_modern_catalog_cursor());
+            }
+            auth.scopes.sort_unstable();
+            auth.scopes.dedup();
+            if let Some(claims) = auth.claims.as_ref() {
+                admit_mrtr_raw_json_value(claims, MAX_CATALOG_BINDING_BYTES)
+                    .map_err(|_| invalid_modern_catalog_cursor())?;
+            }
+        }
+        // These four modern lists contain only immutable admitted router
+        // definitions and query-tag filtering. They never consult a principal
+        // or SessionState for visibility. That structural auth invariance is
+        // why the anonymous/public cursor branch is safe, even when the
+        // application's cache hints conservatively say Private. Introducing
+        // auth-dependent catalog filtering must replace this branch with a
+        // verified stable identity plus the visibility-policy fingerprint.
+        // Authenticated requests always bind both provider-scoped ownership
+        // and every current result-affecting fact, never a display subject
+        // alone. Normal public server admission has already authorized the
+        // list operation before this method is reached.
+        let mut context = CatalogBindingBytes(Vec::new());
+        serde_json::to_writer(
+            &mut context,
+            &(
+                "fastmcp/catalog/2026-07-28/registration-order/v1",
+                catalog,
+                self.final_catalog_revision,
+                self.list_page_size,
+                query,
+                &self.final_cache_hints.list_ttl_ms,
+                self.final_cache_hints.scope,
+                owner.as_ref().map(fastmcp_core::Sha256Digest::as_bytes),
+                auth,
+            ),
+        )
+        .map_err(|_| invalid_modern_catalog_cursor())?;
+        let digest = sha256_bounded(&context.0, MAX_CATALOG_BINDING_BYTES)
+            .map_err(|_| invalid_modern_catalog_cursor())?;
+        EnvelopeBinding::catalog_cursor(&digest).map_err(catalog_envelope_error)
+    }
+
+    fn decode_modern_catalog_cursor(
+        &self,
+        request_ctx: &McpContext,
+        cursor: &str,
+        binding: &EnvelopeBinding,
+        catalog_length: usize,
+    ) -> McpResult<usize> {
+        if cursor.len() > MAX_CURSOR_BYTES {
+            return Err(invalid_modern_catalog_cursor());
+        }
+        let encoded = cursor
+            .strip_prefix(MODERN_CATALOG_CURSOR_PREFIX)
+            .ok_or_else(invalid_modern_catalog_cursor)?;
+        let envelope = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| invalid_modern_catalog_cursor())?;
+        let owner = self
+            .final_catalog_protector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Unknown cursors never allocate key state or initialize an owner.
+        let owner = owner.as_ref().ok_or_else(invalid_modern_catalog_cursor)?;
+        let opened = owner
+            .open(request_ctx.cx(), binding, &envelope)
+            .map_err(catalog_envelope_error)?;
+        let bytes: [u8; 8] = opened
+            .as_bytes()
+            .try_into()
+            .map_err(|_| invalid_modern_catalog_cursor())?;
+        let offset = usize::try_from(u64::from_be_bytes(bytes))
+            .map_err(|_| invalid_modern_catalog_cursor())?;
+        if offset == 0 || offset >= catalog_length {
+            return Err(invalid_modern_catalog_cursor());
+        }
+        Ok(offset)
+    }
+
+    fn encode_modern_catalog_cursor(
+        &self,
+        request_ctx: &McpContext,
+        binding: &EnvelopeBinding,
+        offset: usize,
+    ) -> McpResult<String> {
+        let offset = u64::try_from(offset).map_err(|_| invalid_modern_catalog_cursor())?;
+        let mut owner = self
+            .final_catalog_protector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if owner.is_none() {
+            let guard = ProcessGenerationGuard::install()
+                .map_err(|_| McpError::internal_error("catalog cursor protection unavailable"))?;
+            let policy = EnvelopePolicy::new(8, MODERN_CATALOG_CURSOR_LIFETIME, 1)
+                .map_err(catalog_cursor_issuance_error)?;
+            *owner = Some(
+                EphemeralEnvelopeProtector::new(
+                    request_ctx.cx(),
+                    guard,
+                    SnapshotCloneStance::NoLiveMemoryCloning,
+                    EnvelopePurpose::CatalogCursor,
+                    policy,
+                )
+                .map_err(catalog_cursor_issuance_error)?,
+            );
+        }
+        let envelope = owner
+            .as_mut()
+            .ok_or_else(invalid_modern_catalog_cursor)?
+            .seal(
+                request_ctx.cx(),
+                binding,
+                &offset.to_be_bytes(),
+                MODERN_CATALOG_CURSOR_LIFETIME,
+            )
+            .map_err(catalog_cursor_issuance_error)?;
+        let cursor = format!(
+            "{MODERN_CATALOG_CURSOR_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(envelope)
+        );
+        if cursor.len() > MAX_CURSOR_BYTES {
+            return Err(invalid_modern_catalog_cursor());
+        }
+        Ok(cursor)
+    }
+
+    fn page_modern_catalog<T: Clone>(
+        &self,
+        request_ctx: &McpContext,
+        items: Vec<T>,
+        cursor: Option<&str>,
+        catalog: FinalCatalogKind,
+        query: &FinalCatalogQuery,
+    ) -> McpResult<(Vec<T>, Option<String>)> {
+        let Some(page_size) = self.list_page_size else {
+            return if cursor.is_none() {
+                Ok((items, None))
+            } else {
+                Err(invalid_modern_catalog_cursor())
+            };
+        };
+        if cursor.is_none() && items.len() <= page_size {
+            return Ok((items, None));
+        }
+        let binding = self.final_catalog_binding(request_ctx, catalog, query)?;
+        let offset = cursor
+            .map(|cursor| {
+                self.decode_modern_catalog_cursor(request_ctx, cursor, &binding, items.len())
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let end = offset
+            .checked_add(page_size)
+            .ok_or_else(invalid_modern_catalog_cursor)?
+            .min(items.len());
+        let next_cursor = (end < items.len())
+            .then(|| self.encode_modern_catalog_cursor(request_ctx, &binding, end))
+            .transpose()?;
+        Ok((items[offset..end].to_vec(), next_cursor))
+    }
+
+    fn final_catalog_cache_hints(&self) -> FinalCacheHintPolicy {
+        let mut hints = self.final_cache_hints.clone();
+        if self.list_page_size.is_some() {
+            // A cached copy cannot renew an expiring cursor's lifetime. Until
+            // every cache propagates exact age/remaining validity, return the
+            // same no-cache policy on all pages of a paginated catalog.
+            hints.list_ttl_ms = CacheTtl::milliseconds(0);
+            // The cursor itself is caller-bound even when its catalog rows
+            // are public. Its response cannot acquire shared-cache scope.
+            hints.scope = CacheScope::Private;
+        }
+        hints
     }
 
     fn advance_final_catalog_revision(&mut self) {
@@ -4867,17 +5121,15 @@ impl Router {
         })
         .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "tool_definition"))?;
 
-        let (tools, next_cursor) = page_final_catalog(
+        let (tools, next_cursor) = self.page_modern_catalog(
+            request_ctx,
             tools,
             params.cursor.as_deref(),
-            self.list_page_size,
             FinalCatalogKind::Tools,
-            self.final_catalog_revision,
             &query,
-            None,
         )?;
         let result = ListToolsResult { tools, next_cursor };
-        self.project_final_tools_list(request_ctx, result, self.final_cache_hints.clone())
+        self.project_final_tools_list(request_ctx, result, self.final_catalog_cache_hints())
     }
 
     fn project_final_tools_list(
@@ -4940,20 +5192,19 @@ impl Router {
                 Ok(entry.definition.clone())
             })
             .collect::<McpResult<Vec<_>>>()?;
-        let (resources, next_cursor) = page_final_catalog(
+        let (resources, next_cursor) = self.page_modern_catalog(
+            request_ctx,
             resources,
             params.cursor.as_deref(),
-            self.list_page_size,
             FinalCatalogKind::Resources,
-            self.final_catalog_revision,
             &query,
-            None,
         )?;
+        let hints = self.final_catalog_cache_hints();
         Ok(FinalListResourcesResult {
             resources,
             next_cursor,
-            ttl_ms: self.final_cache_hints.list_ttl_ms.clone(),
-            cache_scope: self.final_cache_hints.scope,
+            ttl_ms: hints.list_ttl_ms,
+            cache_scope: hints.scope,
         })
     }
 
@@ -4985,20 +5236,19 @@ impl Router {
                 Ok(definition.clone())
             })
             .collect::<McpResult<Vec<_>>>()?;
-        let (resource_templates, next_cursor) = page_final_catalog(
+        let (resource_templates, next_cursor) = self.page_modern_catalog(
+            request_ctx,
             resource_templates,
             params.cursor.as_deref(),
-            self.list_page_size,
             FinalCatalogKind::ResourceTemplates,
-            self.final_catalog_revision,
             &query,
-            None,
         )?;
+        let hints = self.final_catalog_cache_hints();
         Ok(FinalListResourceTemplatesResult {
             resource_templates,
             next_cursor,
-            ttl_ms: self.final_cache_hints.list_ttl_ms.clone(),
-            cache_scope: self.final_cache_hints.scope,
+            ttl_ms: hints.list_ttl_ms,
+            cache_scope: hints.scope,
         })
     }
 
@@ -5025,20 +5275,19 @@ impl Router {
             })
             .map(|(_, entry)| entry.definition.clone())
             .collect();
-        let (prompts, next_cursor) = page_final_catalog(
+        let (prompts, next_cursor) = self.page_modern_catalog(
+            request_ctx,
             prompts,
             params.cursor.as_deref(),
-            self.list_page_size,
             FinalCatalogKind::Prompts,
-            self.final_catalog_revision,
             &query,
-            None,
         )?;
+        let hints = self.final_catalog_cache_hints();
         Ok(FinalListPromptsResult {
             prompts,
             next_cursor,
-            ttl_ms: self.final_cache_hints.list_ttl_ms.clone(),
-            cache_scope: self.final_cache_hints.scope,
+            ttl_ms: hints.list_ttl_ms,
+            cache_scope: hints.scope,
         })
     }
 
@@ -15512,16 +15761,13 @@ mod router_tests {
         let include_tags = vec!["visible".to_owned()];
         let exclude_tags = vec!["excluded".to_owned()];
         let query = FinalCatalogQuery::from_tag_filters(Some(&include_tags), Some(&exclude_tags));
+        let binding = router
+            .final_catalog_binding(&request_ctx, FinalCatalogKind::Tools, &query)
+            .expect("the current catalog/query binding is available");
         assert_eq!(
-            decode_final_catalog_cursor_offset(
-                Some(cursor),
-                FinalCatalogKind::Tools,
-                router.final_catalog_revision,
-                &query,
-                None,
-                2,
-            )
-            .expect("cursor is router-generated for this exact final catalog revision"),
+            router
+                .decode_modern_catalog_cursor(&request_ctx, cursor, &binding, 2)
+                .expect("cursor is router-generated for this exact final catalog revision"),
             1,
             "the cursor advances across admitted entries"
         );
@@ -15537,7 +15783,7 @@ mod router_tests {
         ))
         .expect_err("changing only the final list filter rejects the continuation");
         assert_eq!(query_mismatch.code, McpErrorCode::InvalidParams);
-        assert!(query_mismatch.message.contains("query filters"));
+        assert_eq!(query_mismatch.message, INVALID_MODERN_CATALOG_CURSOR);
 
         let second_page = block_on(router.dispatch_stateless(
             &request_ctx,
@@ -15555,6 +15801,347 @@ mod router_tests {
             second_page.get("nextCursor").is_none(),
             "the second admitted entry terminates the filtered final sequence"
         );
+    }
+
+    #[test]
+    fn modern_catalog_cursors_authenticate_every_byte_and_preserve_valid_replays() {
+        let mut router = Router::new();
+        router.set_list_page_size(Some(1));
+        router.add_tool(NamedTool::new("cursor-a")).unwrap();
+        router.add_tool(NamedTool::new("cursor-b")).unwrap();
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let request = final_tools_list_request(None, None, None, 1_i64);
+        let first = block_on(router.dispatch_stateless(&ctx, &request)).unwrap();
+        let cursor = first["nextCursor"].as_str().unwrap();
+        assert!(cursor.len() <= MAX_CURSOR_BYTES);
+        assert_eq!(first["ttlMs"], 0);
+        let wire = URL_SAFE_NO_PAD
+            .decode(cursor.strip_prefix(MODERN_CATALOG_CURSOR_PREFIX).unwrap())
+            .unwrap();
+        assert!(serde_json::from_slice::<serde_json::Value>(&wire).is_err());
+        let retry = final_tools_list_request(Some(cursor), None, None, 2_i64);
+        let expected = block_on(router.dispatch_stateless(&ctx, &retry)).unwrap();
+        assert_eq!(expected["tools"][0]["name"], "cursor-b");
+        assert!(expected.get("nextCursor").is_none());
+        assert_eq!(expected["ttlMs"], 0);
+        for byte in 0..wire.len() {
+            let mut changed = wire.clone();
+            changed[byte] ^= 1;
+            let forged = format!(
+                "{MODERN_CATALOG_CURSOR_PREFIX}{}",
+                URL_SAFE_NO_PAD.encode(changed)
+            );
+            let error = block_on(router.dispatch_stateless(
+                &ctx,
+                &final_tools_list_request(Some(&forged), None, None, 3_i64),
+            ))
+            .expect_err("changing one envelope byte cannot select a catalog offset");
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert_eq!(error.message, INVALID_MODERN_CATALOG_CURSOR);
+        }
+        let query = FinalCatalogQuery::from_tag_filters(None, None);
+        let legacy_forgery = encode_final_catalog_cursor(
+            FinalCatalogKind::Tools,
+            router.final_catalog_revision,
+            &query,
+            1,
+            None,
+        );
+        for forged in [
+            String::new(),
+            legacy_forgery,
+            format!("{cursor}="),
+            "x".repeat(MAX_CURSOR_BYTES + 1),
+        ] {
+            let error = block_on(router.dispatch_stateless(
+                &ctx,
+                &final_tools_list_request(Some(&forged), None, None, 4_i64),
+            ))
+            .expect_err("unminted, legacy, noncanonical and oversized cursors are refused");
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert_eq!(error.message, INVALID_MODERN_CATALOG_CURSOR);
+        }
+        assert_eq!(
+            block_on(router.dispatch_stateless(&ctx, &retry)).unwrap(),
+            expected,
+            "all rejected mutations leave the original cursor usable"
+        );
+    }
+
+    #[test]
+    fn modern_catalog_cursor_binds_verified_owner_grants_and_claims() {
+        let mut router = Router::new();
+        router.set_list_page_size(Some(1));
+        router.add_tool(NamedTool::new("owned-a")).unwrap();
+        router.add_tool(NamedTool::new("owned-b")).unwrap();
+        let cx = Cx::for_testing();
+        let owner = sha256_bounded(b"verified-provider-owner-a", 128).unwrap();
+        let other_owner = sha256_bounded(b"verified-provider-owner-b", 128).unwrap();
+        let mut auth = fastmcp_core::AuthContext::with_subject("same-display-subject")
+            .with_session_owner(owner);
+        auth.scopes = vec!["catalog.read".to_owned(), "tools.use".to_owned()];
+        auth.claims = Some(serde_json::json!({"tenant": "a"}));
+        let ctx = McpContext::new(cx.clone(), 10).with_auth(auth.clone());
+        let first = block_on(
+            router.dispatch_stateless(&ctx, &final_tools_list_request(None, None, None, 10_i64)),
+        )
+        .unwrap();
+        let retry = final_tools_list_request(first["nextCursor"].as_str(), None, None, 11_i64);
+        let expected = block_on(router.dispatch_stateless(&ctx, &retry)).unwrap();
+        assert_eq!(expected["tools"][0]["name"], "owned-b");
+
+        let mut changed_grants = auth.clone();
+        changed_grants.scopes = vec!["catalog.read".to_owned()];
+        let mut changed_claims = auth.clone();
+        changed_claims.claims = Some(serde_json::json!({"tenant": "b"}));
+        for changed in [
+            auth.clone().with_session_owner(other_owner),
+            changed_grants,
+            changed_claims,
+            fastmcp_core::AuthContext::with_subject("same-display-subject"),
+        ] {
+            let changed_ctx = McpContext::new(cx.clone(), 12).with_auth(changed);
+            let error = block_on(router.dispatch_stateless(&changed_ctx, &retry))
+                .expect_err("a display subject or changed verified facts cannot replay the cursor");
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert_eq!(error.message, INVALID_MODERN_CATALOG_CURSOR);
+        }
+        let anonymous = McpContext::new(cx.clone(), 13);
+        let anonymous_error = block_on(router.dispatch_stateless(&anonymous, &retry))
+            .expect_err("a private cursor cannot be replayed by anonymous ingress");
+        assert_eq!(anonymous_error.message, INVALID_MODERN_CATALOG_CURSOR);
+
+        let mut equivalent = auth;
+        equivalent.scopes.reverse();
+        equivalent.scopes.push("catalog.read".to_owned());
+        let equivalent_ctx = McpContext::new(cx, 14).with_auth(equivalent);
+        assert_eq!(
+            block_on(router.dispatch_stateless(&equivalent_ctx, &retry)).unwrap(),
+            expected,
+            "equivalent grants and a fresh request preserve stateless pagination"
+        );
+    }
+
+    #[test]
+    fn modern_catalog_cursor_rejects_other_router_method_and_page_policy() {
+        fn catalog() -> Router {
+            let mut router = Router::new();
+            router.set_list_page_size(Some(1));
+            router.add_tool(NamedTool::new("instance-a")).unwrap();
+            router.add_tool(NamedTool::new("instance-b")).unwrap();
+            router.add_resource(NamedResource::new("file:///instance-a"));
+            router.add_resource(NamedResource::new("file:///instance-b"));
+            router
+        }
+        let mut one = catalog();
+        let two = catalog();
+        let ctx = McpContext::new(Cx::for_testing(), 20);
+        let initial = final_tools_list_request(None, None, None, 20_i64);
+        let first = block_on(one.dispatch_stateless(&ctx, &initial)).unwrap();
+        let second_first = block_on(two.dispatch_stateless(&ctx, &initial)).unwrap();
+        let cursor = first["nextCursor"].as_str().unwrap();
+        let retry = final_tools_list_request(Some(cursor), None, None, 21_i64);
+        let expected = block_on(one.dispatch_stateless(&ctx, &retry)).unwrap();
+        let cross_instance = block_on(two.dispatch_stateless(&ctx, &retry))
+            .expect_err("an identically configured endpoint has independent key custody");
+        assert_eq!(cross_instance.message, INVALID_MODERN_CATALOG_CURSOR);
+        let own_retry =
+            final_tools_list_request(second_first["nextCursor"].as_str(), None, None, 22_i64);
+        assert_eq!(
+            block_on(two.dispatch_stateless(&ctx, &own_retry)).unwrap(),
+            expected
+        );
+
+        let mut cross_method = retry.clone();
+        cross_method.method = "resources/list".to_owned();
+        let cross_method_error = block_on(one.dispatch_stateless(&ctx, &cross_method))
+            .expect_err("changing only the list method cannot reflect a tool cursor");
+        assert_eq!(cross_method_error.message, INVALID_MODERN_CATALOG_CURSOR);
+
+        one.set_list_page_size(Some(2));
+        let changed_policy = block_on(one.dispatch_stateless(&ctx, &retry))
+            .expect_err("changing only page size invalidates the continuation");
+        assert_eq!(changed_policy.message, INVALID_MODERN_CATALOG_CURSOR);
+        one.set_list_page_size(Some(1));
+        assert_eq!(
+            block_on(one.dispatch_stateless(&ctx, &retry)).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn modern_all_catalogs_allow_explicit_anonymous_provider_pagination() {
+        let mut router = Router::new();
+        router.set_list_page_size(Some(1));
+        router.add_tool(NamedTool::new("public-tool-a")).unwrap();
+        router.add_tool(NamedTool::new("public-tool-b")).unwrap();
+        router.add_resource(NamedResource::new("file:///public-resource-a"));
+        router.add_resource(NamedResource::new("file:///public-resource-b"));
+        router.add_resource_template(marked_template("resource://a/{id}", "public-template-a"));
+        router.add_resource_template(marked_template("resource://b/{id}", "public-template-b"));
+        router.add_prompt(NamedPrompt::new("public-prompt-a"));
+        router.add_prompt(NamedPrompt::new("public-prompt-b"));
+        let cx = Cx::for_testing();
+        let anonymous = McpContext::new(cx.clone(), 40);
+        let auth = crate::auth::AuthProvider::authenticate(
+            &crate::auth::AllowAllAuthProvider,
+            &anonymous,
+            AuthRequest {
+                method: "tools/list",
+                params: None,
+                transport_authorization: None,
+                request_id: 40,
+            },
+        )
+        .expect("the shipped allow-all provider admits anonymous access");
+        let explicit_anonymous = McpContext::new(cx, 41).with_auth(auth);
+        for (method, field, identity, expected) in [
+            ("tools/list", "tools", "name", "public-tool-b"),
+            (
+                "resources/list",
+                "resources",
+                "uri",
+                "file:///public-resource-b",
+            ),
+            (
+                "resources/templates/list",
+                "resourceTemplates",
+                "name",
+                "public-template-b",
+            ),
+            ("prompts/list", "prompts", "name", "public-prompt-b"),
+        ] {
+            let mut first_request = final_tools_list_request(None, None, None, 40_i64);
+            first_request.method = method.to_owned();
+            let first = block_on(router.dispatch_stateless(&explicit_anonymous, &first_request))
+                .expect("all four modern catalogs page through the explicit anonymous provider");
+            assert_eq!(first[field].as_array().map(Vec::len), Some(1));
+            assert_eq!(first["ttlMs"], 0);
+            let mut retry =
+                final_tools_list_request(first["nextCursor"].as_str(), None, None, 41_i64);
+            retry.method = method.to_owned();
+            let second = block_on(router.dispatch_stateless(&anonymous, &retry)).expect(
+                "ordinary and explicit anonymous contexts share the public catalog binding",
+            );
+            assert_eq!(second[field][0][identity], expected);
+            assert!(second.get("nextCursor").is_none());
+            assert_eq!(second["ttlMs"], 0);
+            let mut changed_query = retry;
+            changed_query.params.as_mut().unwrap()["includeTags"] =
+                serde_json::json!(["different"]);
+            let error = block_on(router.dispatch_stateless(&anonymous, &changed_query))
+                .expect_err("changing only a catalog query cannot reuse the cursor");
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert_eq!(error.message, INVALID_MODERN_CATALOG_CURSOR);
+        }
+    }
+
+    #[test]
+    fn modern_catalog_cursor_accepts_builtin_static_token_owner_and_isolates_credentials() {
+        let verifier = crate::auth::StaticTokenVerifier::new([
+            (
+                "catalog-token-one",
+                fastmcp_core::AuthContext::with_subject("alice"),
+            ),
+            (
+                "catalog-token-two",
+                fastmcp_core::AuthContext::with_subject("alice"),
+            ),
+        ])
+        .expect("the shipped verifier accepts stable subject-only registrations");
+        let provider = crate::auth::TokenAuthProvider::new(verifier);
+        let cx = Cx::for_testing();
+        let authenticate = |header: &str, id: u64| {
+            let context = McpContext::new(cx.clone(), id);
+            let auth = crate::auth::AuthProvider::authenticate(
+                &provider,
+                &context,
+                AuthRequest {
+                    method: "tools/list",
+                    params: None,
+                    transport_authorization: Some(header),
+                    request_id: id,
+                },
+            )
+            .expect("the built-in provider verifies and binds the registered credential");
+            context.with_auth(auth)
+        };
+        let mut router = Router::new();
+        router.set_list_page_size(Some(1));
+        router.set_final_cache_hint_policy(
+            CacheTtl::milliseconds(600_000),
+            CacheTtl::milliseconds(600_000),
+            CacheScope::Public,
+        );
+        router.add_tool(NamedTool::new("token-tool-a")).unwrap();
+        router.add_tool(NamedTool::new("token-tool-b")).unwrap();
+        let origin = authenticate("Bearer catalog-token-one", 50);
+        let first = block_on(
+            router.dispatch_stateless(&origin, &final_tools_list_request(None, None, None, 50_i64)),
+        )
+        .expect("subject-only static-token configuration retains working modern pagination");
+        assert_eq!(first["ttlMs"], 0);
+        assert_eq!(first["cacheScope"], "private");
+        let retry = final_tools_list_request(first["nextCursor"].as_str(), None, None, 51_i64);
+        let fresh_auth = authenticate("Bearer catalog-token-one", 51);
+        let expected = block_on(router.dispatch_stateless(&fresh_auth, &retry))
+            .expect("reverification of the same token preserves its cursor binding");
+        assert_eq!(expected["tools"][0]["name"], "token-tool-b");
+        assert!(expected.get("nextCursor").is_none());
+        assert_eq!(expected["ttlMs"], 0);
+        assert_eq!(expected["cacheScope"], "private");
+
+        let other_auth = authenticate("Bearer catalog-token-two", 52);
+        let error = block_on(router.dispatch_stateless(&other_auth, &retry)).expect_err(
+            "another credential with the same display subject cannot replay the cursor",
+        );
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(error.message, INVALID_MODERN_CATALOG_CURSOR);
+        assert_eq!(
+            block_on(router.dispatch_stateless(&fresh_auth, &retry)).unwrap(),
+            expected,
+            "the rejected credential leaves the verified owner's cursor usable"
+        );
+    }
+
+    #[test]
+    fn modern_catalog_rejected_cursor_does_not_initialize_protected_state() {
+        let mut router = Router::new();
+        router.set_list_page_size(Some(1));
+        router.add_tool(NamedTool::new("unminted-a")).unwrap();
+        router.add_tool(NamedTool::new("unminted-b")).unwrap();
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx.clone(), 30);
+        let forged = format!(
+            "{MODERN_CATALOG_CURSOR_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode([0; 126])
+        );
+        assert!(
+            block_on(router.dispatch_stateless(
+                &ctx,
+                &final_tools_list_request(Some(&forged), None, None, 30_i64),
+            ))
+            .is_err()
+        );
+        assert!(router.final_catalog_protector.lock().unwrap().is_none());
+
+        let ownerless = McpContext::new(cx, 31)
+            .with_auth(fastmcp_core::AuthContext::with_subject("unverified-owner"));
+        assert!(
+            block_on(router.dispatch_stateless(
+                &ownerless,
+                &final_tools_list_request(None, None, None, 31_i64),
+            ))
+            .is_err()
+        );
+        assert!(router.final_catalog_protector.lock().unwrap().is_none());
+        let page = block_on(
+            router.dispatch_stateless(&ctx, &final_tools_list_request(None, None, None, 32_i64)),
+        )
+        .expect("the auth-invariant public catalog still issues its first page");
+        assert_eq!(page["tools"][0]["name"], "unminted-a");
+        assert!(page["nextCursor"].as_str().is_some());
     }
 
     #[test]
@@ -15583,85 +16170,50 @@ mod router_tests {
         assert!(full.get("nextCursor").is_none());
 
         let query = FinalCatalogQuery::from_tag_filters(None, None);
-        let valid_cursor = encode_final_catalog_cursor(
+        let unprotected_cursor = encode_final_catalog_cursor(
             FinalCatalogKind::Tools,
             router.final_catalog_revision,
             &query,
             0,
             None,
         );
-        let validated_full = block_on(router.dispatch_stateless(
+        let unprotected = block_on(router.dispatch_stateless(
             &request_ctx,
-            &final_tools_list_request(Some(&valid_cursor), None, None, 168_i64),
+            &final_tools_list_request(Some(&unprotected_cursor), None, None, 168_i64),
         ))
-        .expect("a valid cursor remains admitted while default listing returns the full catalog");
-        assert_eq!(validated_full["tools"].as_array().map(Vec::len), Some(2));
-        assert!(validated_full.get("nextCursor").is_none());
+        .expect_err("legacy/base64 JSON cannot forge a modern cursor even with exact fields");
+        assert_eq!(unprotected.code, McpErrorCode::InvalidParams);
+        assert_eq!(unprotected.message, INVALID_MODERN_CATALOG_CURSOR);
 
-        let stale_revision = router
-            .final_catalog_revision
-            .checked_sub(1)
-            .expect("registered tools advance the final catalog revision");
-        let stale_cursor =
-            encode_final_catalog_cursor(FinalCatalogKind::Tools, stale_revision, &query, 0, None);
-        let stale = block_on(router.dispatch_stateless(
+        router.set_list_page_size(Some(1));
+        let first = block_on(router.dispatch_stateless(
             &request_ctx,
-            &final_tools_list_request(Some(&stale_cursor), None, None, 169_i64),
+            &final_tools_list_request(None, None, None, 169_i64),
         ))
-        .expect_err("changing only the revision rejects a default-list cursor");
-        assert_eq!(stale.code, McpErrorCode::InvalidParams);
-        assert!(stale.message.contains("stale catalog revision"));
+        .expect("enabled pagination mints an authenticated continuation");
+        let cursor = first["nextCursor"].as_str().expect("first-page cursor");
+        let second = block_on(router.dispatch_stateless(
+            &request_ctx,
+            &final_tools_list_request(Some(cursor), None, None, 170_i64),
+        ))
+        .expect("the authenticated cursor returns the actual continuation page");
+        assert_eq!(second["tools"][0]["name"], "default-cursor-second");
+        assert!(second.get("nextCursor").is_none());
 
-        let wrong_kind_cursor = encode_final_catalog_cursor(
-            FinalCatalogKind::Prompts,
-            router.final_catalog_revision,
-            &query,
-            0,
-            None,
-        );
-        let wrong_kind = block_on(router.dispatch_stateless(
+        router.set_list_page_size(None);
+        let retired_policy = block_on(router.dispatch_stateless(
             &request_ctx,
-            &final_tools_list_request(Some(&wrong_kind_cursor), None, None, 170_i64),
+            &final_tools_list_request(Some(cursor), None, None, 171_i64),
         ))
-        .expect_err("changing only the kind rejects a default-list cursor");
-        assert_eq!(wrong_kind.code, McpErrorCode::InvalidParams);
-        assert!(wrong_kind.message.contains("another list method"));
-
-        let other_tags = vec!["other".to_owned()];
-        let other_query = FinalCatalogQuery::from_tag_filters(Some(&other_tags), None);
-        let wrong_query_cursor = encode_final_catalog_cursor(
-            FinalCatalogKind::Tools,
-            router.final_catalog_revision,
-            &other_query,
-            0,
-            None,
-        );
-        let wrong_query = block_on(router.dispatch_stateless(
+        .expect_err("disabling pagination invalidates the previous page policy");
+        assert_eq!(retired_policy.code, McpErrorCode::InvalidParams);
+        assert_eq!(retired_policy.message, INVALID_MODERN_CATALOG_CURSOR);
+        let unchanged_full = block_on(router.dispatch_stateless(
             &request_ctx,
-            &final_tools_list_request(Some(&wrong_query_cursor), None, None, 171_i64),
+            &final_tools_list_request(None, None, None, 172_i64),
         ))
-        .expect_err("changing only the filters rejects a default-list cursor");
-        assert_eq!(wrong_query.code, McpErrorCode::InvalidParams);
-        assert!(wrong_query.message.contains("query filters"));
-
-        let out_of_range_cursor = encode_final_catalog_cursor(
-            FinalCatalogKind::Tools,
-            router.final_catalog_revision,
-            &query,
-            2,
-            None,
-        );
-        let out_of_range = block_on(router.dispatch_stateless(
-            &request_ctx,
-            &final_tools_list_request(Some(&out_of_range_cursor), None, None, 172_i64),
-        ))
-        .expect_err("changing only the offset rejects a default-list cursor");
-        assert_eq!(out_of_range.code, McpErrorCode::InvalidParams);
-        assert!(
-            out_of_range
-                .message
-                .contains("outside the requested catalog page")
-        );
+        .expect("rejected continuation leaves the unpaged catalog unchanged");
+        assert_eq!(unchanged_full["tools"], full["tools"]);
     }
 
     #[test]
@@ -15716,7 +16268,7 @@ mod router_tests {
         ))
         .expect_err("adding only one catalog resource invalidates the old continuation");
         assert_eq!(resource_stale.code, McpErrorCode::InvalidParams);
-        assert!(resource_stale.message.contains("stale catalog revision"));
+        assert_eq!(resource_stale.message, INVALID_MODERN_CATALOG_CURSOR);
 
         let prompt_first = block_on(router.dispatch_stateless(
             &request_ctx,
@@ -15741,7 +16293,7 @@ mod router_tests {
         ))
         .expect_err("adding only one catalog prompt invalidates the old continuation");
         assert_eq!(prompt_stale.code, McpErrorCode::InvalidParams);
-        assert!(prompt_stale.message.contains("stale catalog revision"));
+        assert_eq!(prompt_stale.message, INVALID_MODERN_CATALOG_CURSOR);
     }
 
     #[test]

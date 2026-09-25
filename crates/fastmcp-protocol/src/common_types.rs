@@ -768,8 +768,20 @@ impl Ord for ExactNonNegativeJsonNumber {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match (self.is_zero(), other.is_zero()) {
             (true, true) => return std::cmp::Ordering::Equal,
-            (true, false) => return std::cmp::Ordering::Less,
-            (false, true) => return std::cmp::Ordering::Greater,
+            (true, false) => {
+                return if other.negative {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                };
+            }
+            (false, true) => {
+                return if self.negative {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                };
+            }
             (false, false) => {}
         }
         match (self.negative, other.negative) {
@@ -3298,6 +3310,36 @@ mod tests {
             Err(CommonTypeError::TooLong("progress number exponent")),
             "the exact comparison representation bounds decimal exponents"
         );
+    }
+
+    #[test]
+    fn exact_finite_json_numbers_order_signed_zero_between_negative_and_positive() {
+        for zero_lexeme in ["0", "-0", "0.0", "-0.00e+4", "0e-9999"] {
+            let zero = ExactNonNegativeJsonNumber::parse(zero_lexeme)
+                .expect("every bounded signed-zero spelling is admitted");
+            let canonical_zero =
+                ExactNonNegativeJsonNumber::parse("0").expect("canonical zero is admitted");
+            assert_eq!(zero, canonical_zero);
+            for magnitude in ["1", "0.001", "1e-9999", "1e9999"] {
+                let positive = ExactNonNegativeJsonNumber::parse(magnitude)
+                    .expect("bounded positive progress is admitted");
+                let negative = ExactNonNegativeJsonNumber::parse(&format!("-{magnitude}"))
+                    .expect("changing only the sign remains valid progress");
+                assert!(negative < zero, "{negative:?} must precede {zero_lexeme}");
+                assert!(zero > negative, "zero comparison must be antisymmetric");
+                assert!(zero < positive, "{zero_lexeme} must precede {magnitude}");
+                assert!(positive > zero, "positive comparison must be antisymmetric");
+                assert!(
+                    negative < positive,
+                    "ordering must remain transitive across zero"
+                );
+            }
+            assert_eq!(
+                zero.as_str(),
+                zero_lexeme,
+                "comparison preserves wire spelling"
+            );
+        }
     }
 
     #[test]
