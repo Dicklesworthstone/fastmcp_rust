@@ -7105,6 +7105,14 @@ impl BoundHttpServer {
                 server.graceful_shutdown_returning();
                 return Err(McpError::internal_error("HTTP server startup hook failed"));
             }
+            #[cfg(feature = "tasks")]
+            let hosted_task_service = match server.start_hosted_task_service(cx).await {
+                Ok(hosted) => hosted,
+                Err(error) => {
+                    server.graceful_shutdown_returning();
+                    return Err(error);
+                }
+            };
 
             let connection_scope = cx.scope();
             let connection_shutdown = HttpListenerShutdown::new(cx);
@@ -7120,6 +7128,12 @@ impl BoundHttpServer {
                 connection_children.reap_finished();
                 if cx.checkpoint().is_err() {
                     break Ok(());
+                }
+                #[cfg(feature = "tasks")]
+                if let Some(hosted) = hosted_task_service.as_ref()
+                    && let Err(error) = hosted.check_running()
+                {
+                    break Err(error);
                 }
                 let now = cx.now();
                 if now.duration_since(last_session_reap) >= reap_interval_nanos {
@@ -7237,7 +7251,13 @@ impl BoundHttpServer {
                     &self.modern_sessions,
                 ));
             connection_children.reap_finished();
+            #[cfg(feature = "tasks")]
+            let task_service_result =
+                Server::settle_hosted_task_service(hosted_task_service, cx).await;
+            #[cfg(not(feature = "tasks"))]
+            let task_service_result: McpResult<()> = Ok(());
             server.graceful_shutdown_returning();
+            let result = result.and(task_service_result);
             match (connection_shutdown, connection_children.tasks.len()) {
                 (_, 0) if connection_children.terminal_failures.is_empty() => {
                     result?;
@@ -7406,6 +7426,14 @@ impl BoundWebSocketServer {
                 "WebSocket server startup hook failed",
             ));
         }
+        #[cfg(feature = "tasks")]
+        let hosted_task_service = match self.server.start_hosted_task_service(cx).await {
+            Ok(hosted) => hosted,
+            Err(error) => {
+                self.server.graceful_shutdown_returning();
+                return Err(error);
+            }
+        };
 
         let connection_scope = cx.scope();
         let mut children = WebSocketConnectionChildren::default();
@@ -7413,6 +7441,12 @@ impl BoundWebSocketServer {
             children.reap_finished();
             if cx.checkpoint().is_err() {
                 break Ok(());
+            }
+            #[cfg(feature = "tasks")]
+            if let Some(hosted) = hosted_task_service.as_ref()
+                && let Err(error) = hosted.check_running()
+            {
+                break Err(error);
             }
             let accepted = match asupersync::time::timeout(
                 cx.now(),
@@ -7479,6 +7513,12 @@ impl BoundWebSocketServer {
                 asupersync::runtime::yield_now().await;
             }
         }
+        #[cfg(feature = "tasks")]
+        let task_service_result =
+            Server::settle_hosted_task_service(hosted_task_service, cx).await;
+        #[cfg(not(feature = "tasks"))]
+        let task_service_result: McpResult<()> = Ok(());
+        let accept_result = accept_result.and(task_service_result);
         if children.tasks.is_empty() {
             let terminal_failure = children.terminal_failure();
             self.server.graceful_shutdown_returning();
@@ -12571,6 +12611,9 @@ pub struct Server {
     /// Application-owned final Tasks state retained for the caller's supervisor.
     #[cfg(feature = "tasks")]
     final_task_runtime: Option<FinalTaskRuntime>,
+    /// Application service entered and settled by the owning serve lifetime.
+    #[cfg(feature = "tasks")]
+    task_service_host: Option<tasks::TaskServiceHost>,
     /// One route-bound upstream final Tasks relay, distinct from local durable
     /// task state because its identifiers and lifecycle remain upstream-owned.
     #[cfg(all(feature = "proxy", feature = "tasks"))]
@@ -12646,6 +12689,47 @@ impl Server {
     #[cfg(feature = "tasks")]
     pub fn final_task_runtime(&self) -> Option<&FinalTaskRuntime> {
         self.final_task_runtime.as_ref()
+    }
+
+    #[cfg(feature = "tasks")]
+    async fn start_hosted_task_service(&self, cx: &Cx) -> McpResult<Option<tasks::HostedTaskService>> {
+        match self.task_service_host.as_ref() {
+            Some(host) => host.start_ready(cx).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    fn start_hosted_task_service_blocking(
+        &self,
+        cx: &Cx,
+        owns_server_lifecycle: bool,
+    ) -> McpResult<Option<tasks::HostedTaskService>> {
+        match self.task_service_host.as_ref().filter(|_| owns_server_lifecycle) {
+            Some(host) => host.start_ready_blocking(cx).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    async fn settle_hosted_task_service(
+        hosted: Option<tasks::HostedTaskService>,
+        cx: &Cx,
+    ) -> McpResult<()> {
+        match hosted {
+            Some(hosted) => hosted.settle(cx).await,
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    fn settle_hosted_task_service_blocking(
+        hosted: Option<tasks::HostedTaskService>,
+    ) -> McpResult<()> {
+        match hosted {
+            Some(hosted) => hosted.settle_blocking(),
+            None => Ok(()),
+        }
     }
 
     /// Publishes one final catalog or resource change notification to every
@@ -15936,10 +16020,26 @@ impl Server {
             server.graceful_shutdown_returning();
             return 1;
         }
+        #[cfg(feature = "tasks")]
+        let hosted_task_service = match server
+            .start_hosted_task_service_blocking(dispatch_cx, owns_server_lifecycle)
+        {
+            Ok(hosted) => hosted,
+            Err(error) => {
+                error!(target: targets::SERVER, "Hosted Task service startup failed: {error}");
+                server.graceful_shutdown_returning();
+                return 1;
+            }
+        };
 
         let modern_connection = ModernConnection::new();
         let send = Arc::new(Mutex::new(send));
         let mut classifier = StdioEraClassifier::new(runtime_stdio_policy(server.protocol_policy));
+        #[cfg(feature = "tasks")]
+        let worker_failed = hosted_task_service
+            .as_ref()
+            .map_or_else(|| Arc::new(AtomicBool::new(false)), tasks::HostedTaskService::failure_signal);
+        #[cfg(not(feature = "tasks"))]
         let worker_failed = Arc::new(AtomicBool::new(false));
         let queue = Arc::new(DispatchQueueState::default());
         let mut children: Vec<asupersync::runtime::TaskHandle<()>> = Vec::new();
@@ -16303,6 +16403,15 @@ impl Server {
                 quiescent = true;
             }
         }
+        #[cfg(feature = "tasks")]
+        let task_service_succeeded =
+            Self::settle_hosted_task_service_blocking(hosted_task_service).is_ok();
+        #[cfg(not(feature = "tasks"))]
+        let task_service_succeeded = true;
+        if !task_service_succeeded {
+            error!(target: targets::SERVER, "Hosted Task service did not settle successfully");
+            exit_code = 1;
+        }
         if quiescent {
             for child in blocking_children {
                 child.0.wait();
@@ -16366,6 +16475,17 @@ impl Server {
             self.graceful_shutdown_returning();
             return 1;
         }
+        #[cfg(feature = "tasks")]
+        let hosted_task_service = match self
+            .start_hosted_task_service_blocking(dispatch_cx, owns_server_lifecycle)
+        {
+            Ok(hosted) => hosted,
+            Err(error) => {
+                error!(target: targets::SERVER, "Hosted Task service startup failed: {error}");
+                self.graceful_shutdown_returning();
+                return 1;
+            }
+        };
 
         let traffic_renderer = self.configured_traffic_renderer();
 
@@ -16375,6 +16495,11 @@ impl Server {
         let session_principal = session.principal_binding();
         let send = Arc::new(Mutex::new(send));
         let queue_state = Arc::new(DispatchQueueState::default());
+        #[cfg(feature = "tasks")]
+        let worker_failed = hosted_task_service
+            .as_ref()
+            .map_or_else(|| Arc::new(AtomicBool::new(false)), tasks::HostedTaskService::failure_signal);
+        #[cfg(not(feature = "tasks"))]
         let worker_failed = Arc::new(AtomicBool::new(false));
         let pending_requests = Arc::new(
             PendingRequests::with_max_in_flight_for_exact_legacy(
@@ -17675,6 +17800,15 @@ impl Server {
         {
             exit_code = 1;
         }
+        #[cfg(feature = "tasks")]
+        let task_service_succeeded =
+            Self::settle_hosted_task_service_blocking(hosted_task_service).is_ok();
+        #[cfg(not(feature = "tasks"))]
+        let task_service_succeeded = true;
+        if !task_service_succeeded {
+            error!(target: targets::SERVER, "Hosted Task service did not settle successfully");
+            exit_code = 1;
+        }
         if owns_server_lifecycle {
             if worker_quiesced && modern_children_quiesced {
                 server.run_shutdown_hook();
@@ -17747,6 +17881,8 @@ impl Server {
         // Complete the operation first so temporary output guards are released
         // before shutdown waits for active request owners. Every exit retains
         // cleanup failure, including protocol and response-send failures.
+        #[cfg(feature = "tasks")]
+        let mut hosted_task_service = None;
         let run_result = (|| {
             // Run startup hook
             if !server.run_startup_hook() {
@@ -17757,12 +17893,20 @@ impl Server {
                     "Server startup hook failed",
                 ));
             }
+            #[cfg(feature = "tasks")]
+            {
+                hosted_task_service = server.start_hosted_task_service_blocking(cx, true)?;
+            }
 
             // Create traffic renderer if enabled
             let traffic_renderer = server.configured_traffic_renderer();
 
             // Main request loop
             loop {
+                #[cfg(feature = "tasks")]
+                if let Some(hosted) = hosted_task_service.as_ref() {
+                    hosted.check_running()?;
+                }
                 if let Some(error) = background_send_failure
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -18138,7 +18282,12 @@ impl Server {
                 }
             }
         })();
+        #[cfg(feature = "tasks")]
+        let task_service_result = Self::settle_hosted_task_service_blocking(hosted_task_service);
+        #[cfg(not(feature = "tasks"))]
+        let task_service_result: McpResult<()> = Ok(());
         let cleanup = server.graceful_shutdown_returning();
+        let run_result = run_result.and(task_service_result);
         // A worker can finish its response attempt during the shutdown drain.
         // Read its failure after ownership retirement, including on clean EOF.
         let send_error = background_send_failure

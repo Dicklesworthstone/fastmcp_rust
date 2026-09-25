@@ -67,14 +67,15 @@
   `tasks/update`, and `tasks/cancel` are served by default (process-local
   in-memory store). Call `ServerBuilder::final_tasks` to supply an
   application-owned store.
-- **A default server cannot create tasks.** A task-creating request is refused
-  with `Final task creation requires an installed ready task service` until the
-  application installs one: call `FinalTaskRuntime::install_task_service` with
-  an `ApplicationTaskSupervisor` on the runtime from `Server::final_task_runtime()`
-  (or on the runtime passed to `ServerBuilder::final_tasks`), then poll the
-  returned `AuthorizedTaskServiceRunner::run_service(cx)` in the application's
-  own region. FastMCP never spawns that runner. The shipped `echo_server`
-  binary does this (`crates/fastmcp/examples/echo_server.rs`).
+- **Task creation needs an application supervisor.** Configure
+  `ServerBuilder::task_supervisor(Arc::new(supervisor))` to host an
+  `ApplicationTaskSupervisor` on the default runtime or the runtime supplied
+  by `final_tasks`. The server starts the service within the caller-owned
+  serve lifetime, waits for readiness, and settles it on exit. The shipped
+  `echo_server` uses this hook. A server without a ready service still refuses
+  creation with `Final task creation requires an installed ready task service`.
+  Applications may instead install and drive `AuthorizedTaskServiceRunner`
+  explicitly; combining that installation with the builder hook is rejected.
 - **Authenticated local Tasks retain their caller:** task creation atomically
   stores a private principal binding. Request get/update/cancel and Tasks
   subscriptions enforce that binding; a refreshed credential for the same
@@ -905,7 +906,7 @@ fn commit_revision(
 | **Bidirectional Response Routing** | On Unix, stdio continuously routes inbound responses while exact-2024 lifecycle work or modern request children are active. The WebSocket server and custom split transports use the same routing, proven live for exact-2024 reverse sampling and roots over `bind_websocket`. Non-Unix stdio, unsplit custom transports, and SSE do not provide the same split routing. Public HTTP has separate dual-era routing, while end-to-end bidirectional lifecycle qualification remains open |
 | **Response Cache Partitioning** | Eligible entries are partitioned by committed authentication facts and opaque session identity/revision; ambiguous admission and state mutation fail closed. This does not promote OAuth/OIDC or establish protocol conformance |
 | **Authentication Admission** | Native HTTP requires `Authorization` for protected requests and rejects recognized body/meta and query credential fields before provider invocation. Other adapters retain a stripped legacy fallback. Complete authorization, lease/revocation, and OAuth challenge qualification remain open |
-| **Tasks RPC** | `tasks/list` and `tasks/submit` stay `MethodNotFound`. Official `tasks/get`, `tasks/update`, and `tasks/cancel` run by default on a process-local in-memory store; `ServerBuilder::final_tasks` replaces that store. Creating a task additionally needs an application-installed task service (`FinalTaskRuntime::install_task_service` plus a polled `AuthorizedTaskServiceRunner::run_service`); without one a default server refuses task creation |
+| **Tasks RPC** | `tasks/list` and `tasks/submit` stay `MethodNotFound`. Official `tasks/get`, `tasks/update`, and `tasks/cancel` run by default on a process-local in-memory store; `ServerBuilder::final_tasks` replaces that store. `ServerBuilder::task_supervisor(Arc::new(supervisor))` hosts the application's task service during each serve, waits for bounded readiness, and settles the service before returning. Without a ready service, task creation is refused |
 | **MCP Apps (opt-in `apps` feature)** | Off by default. The facade `apps` feature adds the official MCP Apps extension: server `ServerBuilder::mcp_apps` (bilateral capability negotiation and `server/discover` metadata; Apps owns no client-to-server method), `mcp_apps_ui_resource` for final-only `ui://` HTML documents and `mcp_apps_tool` for tools linked to one; client `ClientBuilder::mcp_apps` and the `mcp_apps` host bridge (`McpAppsHost`, `McpAppsBridgeTransport`). These are unit-tested (for example `builder_mcp_apps_ui_resource_binds_a_final_only_ui_catalog_entry`); Apps media rendering and Apps conformance are not claimed |
 | **Feature flags that gate nothing** | `fastmcp-server`'s `enterprise-auth`, `jwt-resource-auth` and `oauth-client-credentials` features gate no server code; each only enables `fastmcp-protocol`'s `jose` feature. The CLI's `jwt-resource-auth` only forwards to them, `fastmcp-console`'s `enterprise-auth`, `oauth-client-credentials`, `builtin-auth-server` and `jwt-resource-auth` are empty, and `fastmcp-transport`'s `websocket-experimental` is empty because WebSocket framing (`fastmcp_transport::websocket`) is always compiled. Enabling any of these adds no capability. The facade and client `websocket-experimental` features do gate code: `WebSocketClient`, `ClientBuilder::connect_websocket_with_cx`, and (through `fastmcp-server/websocket`) `bind_websocket` |
 | **HTTP as_proxy auto-follow** | A gateway HTTP `as_proxy` does not auto-follow an upstream server `input_required` task across POSTs; per-request dispatch is stateless and upstream request state cannot resume. Callers resume such upstream tasks through an explicit matching `tasks/update` |

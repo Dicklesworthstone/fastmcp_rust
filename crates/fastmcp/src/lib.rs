@@ -2152,6 +2152,22 @@ pub mod auto {
                 .map(|inner| Self { inner })
         }
 
+        /// Hosts the application's Tasks supervisor for the lifetime of each serve.
+        ///
+        /// Uses the default in-memory runtime or one supplied by [`Self::final_tasks`].
+        /// Building validates that the runtime has no other installed Task service. Serving waits
+        /// for readiness before admitting requests and settles the service on exit.
+        #[cfg(feature = "tasks")]
+        #[must_use]
+        pub fn task_supervisor(
+            self,
+            supervisor: std::sync::Arc<dyn crate::ApplicationTaskSupervisor>,
+        ) -> Self {
+            Self {
+                inner: self.inner.task_supervisor(supervisor),
+            }
+        }
+
         /// Registers an ordinary component available after either successful
         /// Auto-era admission.
         #[must_use]
@@ -6743,6 +6759,22 @@ pub mod modern {
             self.inner
                 .final_tasks(task_runtime)
                 .map(|inner| Self { inner })
+        }
+
+        /// Hosts the application's Tasks supervisor for the lifetime of each serve.
+        ///
+        /// Uses the default in-memory runtime or one supplied by [`Self::final_tasks`].
+        /// Building validates that the runtime has no other installed Task service. Serving waits
+        /// for readiness before admitting requests and settles the service on exit.
+        #[cfg(feature = "tasks")]
+        #[must_use]
+        pub fn task_supervisor(
+            self,
+            supervisor: std::sync::Arc<dyn crate::ApplicationTaskSupervisor>,
+        ) -> Self {
+            Self {
+                inner: self.inner.task_supervisor(supervisor),
+            }
         }
 
         /// Registers one tool handler.

@@ -204,15 +204,17 @@ Per-request dispatch is stateless and upstream `requestState` cannot
 resume on a later POST; callers resume such upstream Tasks only through an
 explicit matching `tasks/update`, as proven in the `tasks/update` row above.
 
-Task creation: a default server cannot create a task. The built-in in-memory
-runtime serves `tasks/get`, `tasks/update` and `tasks/cancel`, but a
-task-creating request is refused with `Final task creation requires an
-installed ready task service` until the application calls
-`FinalTaskRuntime::install_task_service` (on `Server::final_task_runtime()` or a
-runtime passed to `ServerBuilder::final_tasks`) and polls the returned
-`AuthorizedTaskServiceRunner::run_service(cx)` in its own region. The shipped
-`echo_server` binary does this. Evidence: `task_03_final_creation_requires_ready_service_and_recovers_initial_work`
-and `default_built_server_serves_official_tasks_get`.
+Task creation: `ServerBuilder::task_supervisor(Arc::new(supervisor))` hosts the
+application's supervisor on the default in-memory runtime or one supplied by
+`final_tasks`. Each serve starts the service, awaits bounded readiness before
+admitting work, and settles it on exit. The public Auto and ModernOnly facades
+forward this hook, and the shipped `echo_server` uses it. A caller-installed
+service and the builder hook are mutually exclusive. Without a ready service,
+creation still fails with `Final task creation requires an installed ready
+task service`; the existing-task RPCs remain available. Applications retaining
+an explicit service region can continue to install and poll
+`AuthorizedTaskServiceRunner::run_service(cx)` themselves. This hosting change
+does not add persistence or a distributed backend.
 
 The historical `TaskManager` (and `with_task_manager`) compile only under
 `cfg(test)`; they are not a shipped API.
