@@ -6313,6 +6313,10 @@ impl FinalTaskRuntime {
 
     /// Whether a Task service is installed, ready or not. A builder uses this
     /// to refuse hosting a second service on a caller-installed runtime.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
+    )]
     pub(crate) fn has_installed_task_service(&self) -> bool {
         self.service_signal
             .lock()
@@ -6886,13 +6890,33 @@ impl AuthorizedTaskServiceRunner {
 
 /// Wakeup-queue capacity of a Task service installed through
 /// [`crate::ServerBuilder::task_supervisor`].
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
+)]
 pub(crate) const HOSTED_TASK_SERVICE_QUEUE_CAPACITY: usize = 64;
 /// How long a serve path waits for its hosted Task service to become ready.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
+)]
 pub(crate) const HOSTED_TASK_SERVICE_STARTUP_BOUND: StdDuration = StdDuration::from_secs(2);
 /// How long a serve path waits for its hosted Task service to settle on exit.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
+)]
 pub(crate) const HOSTED_TASK_SERVICE_SETTLEMENT_BOUND: StdDuration = StdDuration::from_secs(4);
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
+)]
 const HOSTED_TASK_SERVICE_POLL: StdDuration = StdDuration::from_millis(1);
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
+)]
 type HostedRunnerSlot = Arc<Mutex<Option<AuthorizedTaskServiceRunner>>>;
 
 /// A builder-installed Task service that each serve path hosts in its own
@@ -6903,6 +6927,10 @@ type HostedRunnerSlot = Arc<Mutex<Option<AuthorizedTaskServiceRunner>>>;
 /// child finishes, is cancelled or is dropped. A runner therefore cannot
 /// outlive the serve that started it, and a later serve can re-enter it.
 #[derive(Clone)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
+)]
 pub(crate) struct TaskServiceHost {
     runtime: FinalTaskRuntime,
     slot: HostedRunnerSlot,
@@ -6910,11 +6938,19 @@ pub(crate) struct TaskServiceHost {
 
 /// The hosted Task service child of one serve.
 #[must_use = "a hosted Task service must be settled before its serve returns"]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
+)]
 pub(crate) struct HostedTaskService {
     runtime: FinalTaskRuntime,
     handle: asupersync::runtime::TaskHandle<McpResult<()>>,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
+)]
 struct ReturnRunnerOnDrop {
     slot: HostedRunnerSlot,
     runner: Option<AuthorizedTaskServiceRunner>,
@@ -6930,6 +6966,10 @@ impl Drop for ReturnRunnerOnDrop {
     }
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
+)]
 impl TaskServiceHost {
     /// Installs `supervisor` as the one Task service of `runtime`.
     pub(crate) fn install(
@@ -7003,6 +7043,10 @@ impl TaskServiceHost {
     }
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
+)]
 impl HostedTaskService {
     fn not_ready(&mut self) -> McpResult<bool> {
         if self.runtime.is_task_service_ready() {
@@ -7074,6 +7118,10 @@ impl HostedTaskService {
     }
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
+)]
 fn hosted_task_service_exit(
     joined: Result<McpResult<()>, asupersync::runtime::JoinError>,
 ) -> McpResult<()> {
@@ -7087,10 +7135,18 @@ fn hosted_task_service_exit(
     }
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
+)]
 fn hosted_task_service_not_ready() -> McpError {
     McpError::internal_error("The hosted Task service did not become ready within its bound")
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "bd-7ufr1 wires this into task_supervisor")
+)]
 fn hosted_task_service_unsettled() -> McpError {
     McpError::internal_error("The hosted Task service did not settle within its bound")
 }
