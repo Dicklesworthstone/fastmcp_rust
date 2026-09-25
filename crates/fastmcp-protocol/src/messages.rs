@@ -11,7 +11,8 @@ use serde_json::Value;
 
 use crate::common_types::{
     AbsoluteUri, ContentBlock, EmbeddedResourceContents, ExactNonNegativeJsonNumber,
-    Implementation, JsonInteger, LoggingLevel, OpenMetadata,
+    Implementation, JsonInteger, LoggingLevel, OpenMetadata, SERDE_JSON_NUMBER_TOKEN,
+    SERDE_JSON_RAW_VALUE_TOKEN,
 };
 use crate::jsonrpc::{JsonRpcRequest, JsonRpcResponse, RequestId};
 use crate::methods::{
@@ -46,13 +47,108 @@ use crate::types::{
 ///
 /// Per MCP spec, progress markers can be either strings or arbitrary-width
 /// JSON integers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum ProgressMarker {
     /// String progress marker.
     String(String),
     /// Arbitrary-width JSON integer progress marker.
     Number(JsonInteger),
+}
+
+impl<'de> Deserialize<'de> for ProgressMarker {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // A derived untagged decode buffers the token in serde's `Content`,
+        // where serde_json has already respelled a number (`4.2e1` becomes
+        // `4.2e+1`). Request the raw token as `JsonInteger` does, so the
+        // direct parser path keeps the exact wire lexeme, and choose the
+        // variant from the token itself. Buffered contexts decode as before.
+        struct ProgressMarkerVisitor;
+
+        impl<'de> Visitor<'de> for ProgressMarkerVisitor {
+            type Value = ProgressMarker;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a string or mathematically integral JSON number")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<ProgressMarker, E> {
+                Ok(ProgressMarker::String(value.to_owned()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<ProgressMarker, E> {
+                Ok(ProgressMarker::String(value))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<ProgressMarker, E> {
+                Ok(ProgressMarker::Number(JsonInteger::from(value)))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<ProgressMarker, E> {
+                Ok(ProgressMarker::Number(JsonInteger::from(value)))
+            }
+
+            fn visit_i128<E: serde::de::Error>(self, value: i128) -> Result<ProgressMarker, E> {
+                value
+                    .to_string()
+                    .parse()
+                    .map(ProgressMarker::Number)
+                    .map_err(E::custom)
+            }
+
+            fn visit_u128<E: serde::de::Error>(self, value: u128) -> Result<ProgressMarker, E> {
+                value
+                    .to_string()
+                    .parse()
+                    .map(ProgressMarker::Number)
+                    .map_err(E::custom)
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<ProgressMarker, E> {
+                serde_json::Number::from_f64(value)
+                    .ok_or_else(|| E::custom("JSON integer must be finite"))
+                    .and_then(|number| JsonInteger::try_from_number(number).map_err(E::custom))
+                    .map(ProgressMarker::Number)
+            }
+
+            fn visit_newtype_struct<D2>(self, deserializer: D2) -> Result<ProgressMarker, D2::Error>
+            where
+                D2: Deserializer<'de>,
+            {
+                deserializer.deserialize_any(self)
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<ProgressMarker, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let refused = || -> A::Error {
+                    serde::de::Error::custom("progress token cannot be an object")
+                };
+                let Some(key) = map.next_key::<std::borrow::Cow<'_, str>>()? else {
+                    return Err(refused());
+                };
+                if key != SERDE_JSON_RAW_VALUE_TOKEN && key != SERDE_JSON_NUMBER_TOKEN {
+                    return Err(refused());
+                }
+                let lexeme = map.next_value::<std::borrow::Cow<'_, str>>()?;
+                if key == SERDE_JSON_RAW_VALUE_TOKEN && lexeme.starts_with('"') {
+                    return serde_json::from_str(&lexeme)
+                        .map(ProgressMarker::String)
+                        .map_err(serde::de::Error::custom);
+                }
+                lexeme
+                    .parse()
+                    .map(ProgressMarker::Number)
+                    .map_err(serde::de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_newtype_struct(SERDE_JSON_RAW_VALUE_TOKEN, ProgressMarkerVisitor)
+    }
 }
 
 impl From<String> for ProgressMarker {
@@ -6382,6 +6478,30 @@ mod tests {
             serde_json::from_str::<ProgressMarker>("922337203685477580812345678901234567890.5")
                 .is_err(),
             "changing only the integer progress marker to a fractional number rejects it"
+        );
+    }
+
+    #[test]
+    fn progress_marker_keeps_an_integral_exponent_spelling_and_rejects_a_fractional_one() {
+        // The derived untagged decode respelled this token as 4.2e+1.
+        let accepted: ProgressMarker =
+            serde_json::from_str("4.2e1").expect("an integral exponent spelling parses");
+        assert!(matches!(
+            &accepted,
+            ProgressMarker::Number(value) if value.as_str() == "4.2e1"
+        ));
+        assert_eq!(
+            serde_json::to_string(&accepted).expect("the progress marker encodes"),
+            "4.2e1"
+        );
+        assert!(matches!(
+            serde_json::from_str::<ProgressMarker>(r#""4.2e1""#)
+                .expect("a string progress marker parses"),
+            ProgressMarker::String(value) if value == "4.2e1"
+        ));
+        assert!(
+            serde_json::from_str::<ProgressMarker>("4.25e1").is_err(),
+            "changing one digit so the value is fractional rejects it"
         );
     }
 

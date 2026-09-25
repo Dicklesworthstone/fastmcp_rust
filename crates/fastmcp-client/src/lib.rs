@@ -4858,6 +4858,38 @@ pub struct WebSocketResponse {
     pub raw_result: Option<String>,
 }
 
+/// A cancelled write may have committed no bytes or only a frame prefix.
+/// Until commitment is proven, abandoning that send makes the connection
+/// unusable. Explicit close still drains its owned transport because it uses
+/// the separate `close_settled` election.
+#[cfg(feature = "websocket-experimental")]
+struct WebSocketCancellationSendGuard<'a, IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    closed: &'a mut bool,
+    callbacks: &'a WebSocketReverseCallbackPool<IO>,
+    committed: bool,
+}
+
+#[cfg(feature = "websocket-experimental")]
+impl<IO> Drop for WebSocketCancellationSendGuard<'_, IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    fn drop(&mut self) {
+        if !self.committed {
+            *self.closed = true;
+            self.callbacks
+                .state
+                .fail_connection(McpError::internal_error(
+                    "WebSocket cancellation control did not commit",
+                ));
+            self.callbacks.cancel_all();
+        }
+    }
+}
+
 /// Connection-owned exact-2024 callback workers for one split WebSocket.
 ///
 /// The client retains the only receive half. Callback workers share only the
@@ -5263,6 +5295,12 @@ struct LiveWebSocketTaskSubscription {
     terminal_response: Option<(JsonRpcResponse, Option<String>)>,
 }
 
+#[cfg(feature = "websocket-experimental")]
+struct RetiredWebSocketRequest {
+    key: CorrelationKey,
+    subscription: bool,
+}
+
 /// Caller-`Cx` asynchronous MCP client over a native WebSocket transport.
 ///
 /// The client owns one source-preserving receive half and one independently
@@ -5286,7 +5324,7 @@ where
     final_progress_notifications: VecDeque<FinalProgressNotificationParams>,
     /// Exact-2024 server notifications retained from the WebSocket receive loop.
     legacy_server_notifications: VecDeque<JsonRpcRequest>,
-    retired_response_keys: VecDeque<CorrelationKey>,
+    retired_requests: VecDeque<RetiredWebSocketRequest>,
     live_catalog_subscription: Option<LiveWebSocketCatalogSubscription>,
     #[cfg(feature = "tasks")]
     live_task_subscription: Option<LiveWebSocketTaskSubscription>,
@@ -5523,7 +5561,7 @@ where
             final_server_notifications: VecDeque::new(),
             final_progress_notifications: VecDeque::new(),
             legacy_server_notifications: VecDeque::new(),
-            retired_response_keys: VecDeque::new(),
+            retired_requests: VecDeque::new(),
             live_catalog_subscription: None,
             #[cfg(feature = "tasks")]
             live_task_subscription: None,
@@ -5734,7 +5772,9 @@ where
 
         loop {
             if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
-                return Err(self.retire_committed_request_after_cancellation(id).await);
+                return Err(self
+                    .retire_committed_request_after_cancellation(id, false)
+                    .await);
             }
             if let Err(error) = self.drain_completed_reverse_callbacks() {
                 return Err(self.terminal_callback_error(cx, error).await);
@@ -5756,7 +5796,9 @@ where
                         || cancellation
                             .is_some_and(McpRequestCancellation::is_cancel_requested) =>
                 {
-                    return Err(self.retire_committed_request_after_cancellation(id).await);
+                    return Err(self
+                        .retire_committed_request_after_cancellation(id, false)
+                        .await);
                 }
                 Err(error) => return Err(self.terminal_transport_error(cx, error).await),
             };
@@ -5850,15 +5892,101 @@ where
     fn discard_retired_websocket_response(&mut self, response: &JsonRpcResponse) -> bool {
         let Some(retired_position) = response.id.as_ref().and_then(|response_id| {
             response_id.correlation_key().ok().and_then(|response_key| {
-                self.retired_response_keys
+                self.retired_requests
                     .iter()
-                    .position(|retired_key| retired_key == &response_key)
+                    .position(|retired| retired.key == response_key)
             })
         }) else {
             return false;
         };
-        self.retired_response_keys.remove(retired_position);
+        self.retired_requests.remove(retired_position);
         true
+    }
+
+    /// Events already sent before cancellation can arrive before the peer's
+    /// late final response. They remain owned by that cancelled subscription,
+    /// never by a new listener or the connection notification queue.
+    fn discard_retired_websocket_subscription_notification(
+        &self,
+        request: &JsonRpcRequest,
+    ) -> McpResult<bool> {
+        if request.id.is_some()
+            || !matches!(
+                request.method.as_str(),
+                "notifications/subscriptions/acknowledged"
+                    | "notifications/resources/updated"
+                    | "notifications/resources/list_changed"
+                    | "notifications/tools/list_changed"
+                    | "notifications/prompts/list_changed"
+                    | "notifications/cancelled"
+                    | "notifications/tasks"
+            )
+        {
+            return Ok(false);
+        }
+        let Some(key) = request
+            .params
+            .as_ref()
+            .and_then(|params| params.get("_meta"))
+            .and_then(|meta| meta.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+            .and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok())
+            .and_then(|id| id.correlation_key().ok())
+        else {
+            return Ok(false);
+        };
+        if !self
+            .retired_requests
+            .iter()
+            .any(|retired| retired.subscription && retired.key == key)
+        {
+            return Ok(false);
+        }
+        #[cfg(feature = "tasks")]
+        if request.method == TASK_STATUS_NOTIFICATION {
+            serde_json::to_value(request)
+                .and_then(serde_json::from_value::<FinalTaskStatusNotification>)
+                .map_err(|_| {
+                    McpError::invalid_request(
+                        "WebSocket retired subscription received an invalid Tasks event",
+                    )
+                })?;
+            return Ok(true);
+        }
+        ServerNotification::decode(request).map_err(|_| {
+            McpError::invalid_request(
+                "WebSocket retired subscription received an invalid notification",
+            )
+        })?;
+        if request.method == "notifications/cancelled" {
+            CancellationWireMessage::decode(
+                ProtocolEra::Modern2026,
+                CancellationSender::Server,
+                request,
+            )
+            .map_err(|_| McpError::invalid_request("WebSocket server cancellation is invalid"))?;
+        }
+        Ok(true)
+    }
+
+    fn websocket_notification_belongs_to_subscription(
+        notification: &ServerNotification,
+        request_id: &RequestId,
+    ) -> bool {
+        let metadata = match notification {
+            ServerNotification::SubscriptionsAcknowledged(params) => params.meta.as_ref(),
+            ServerNotification::ResourceUpdated(params) => params.meta.as_ref(),
+            ServerNotification::Cancelled(params) => params.meta.as_ref(),
+            ServerNotification::ResourcesListChanged(params)
+            | ServerNotification::ToolsListChanged(params)
+            | ServerNotification::PromptsListChanged(params) => {
+                params.as_ref().and_then(|params| params.meta.as_ref())
+            }
+            ServerNotification::Message(_) | ServerNotification::Progress(_) => None,
+        };
+        metadata
+            .and_then(|meta| meta.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+            .and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok())
+            .is_some_and(|id| id.correlates_with(request_id))
     }
 
     fn retain_modern_websocket_notification(
@@ -5935,6 +6063,9 @@ where
             ));
         };
         if self.selected_protocol_era() == ProtocolEra::Modern2026 {
+            if self.discard_retired_websocket_subscription_notification(request)? {
+                return Ok(());
+            }
             #[cfg(feature = "tasks")]
             if self.retain_live_task_status_notification(frame)? {
                 return Ok(());
@@ -5978,6 +6109,7 @@ where
     async fn retire_committed_request_after_cancellation(
         &mut self,
         request_id: RequestId,
+        subscription: bool,
     ) -> McpError
     where
         IO: Send + 'static,
@@ -5990,7 +6122,7 @@ where
                 ));
             }
         };
-        if self.retired_response_keys.len() >= MAX_QUEUED_WEBSOCKET_CANCELLED_RESPONSE_KEYS {
+        if self.retired_requests.len() >= MAX_QUEUED_WEBSOCKET_CANCELLED_RESPONSE_KEYS {
             let connection_cx = self.connection_cx.clone();
             return self
                 .close_after_protocol_error(
@@ -6028,14 +6160,32 @@ where
         };
         // Install before sending control so a peer racing a terminal response
         // cannot make the next receive owner mis-correlate it.
-        self.retired_response_keys.push_back(request_key);
+        self.retired_requests.push_back(RetiredWebSocketRequest {
+            key: request_key,
+            subscription,
+        });
         let connection_cx = self.connection_cx.clone();
+        if self.reverse_callback_pool.terminal_error().is_some() {
+            return self
+                .terminal_transport_error(&connection_cx, TransportError::Closed)
+                .await;
+        }
+        let sender = Arc::clone(&self.sender);
+        let mut commitment = WebSocketCancellationSendGuard {
+            closed: &mut self.closed,
+            callbacks: &self.reverse_callback_pool,
+            committed: false,
+        };
         // Cancellation notification delivery is the short commit-critical
         // boundary after tombstone installation. Mask only its individual
         // polls so a caller that reused the connection Cx for its operation
         // cannot suppress the required control frame.
         let cancellation_send = {
-            let mut send = Box::pin(self.send_message(&connection_cx, &control));
+            let mut send = Box::pin(send_websocket_callback_message(
+                &sender,
+                &connection_cx,
+                &control,
+            ));
             let masked_send = std::future::poll_fn(|task_cx| {
                 connection_cx.masked(|| send.as_mut().poll(task_cx))
             });
@@ -6047,6 +6197,8 @@ where
             )
             .await
         };
+        commitment.committed = matches!(cancellation_send, Ok(Ok(())));
+        drop(commitment);
         match cancellation_send {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return self.terminal_transport_error(&connection_cx, error).await,
@@ -7616,6 +7768,11 @@ where
     /// request (for example `tools/list`) is in flight are harvested from the
     /// connection-level queue, so the same client can observe `list_changed`
     /// without collecting this stream to terminal.
+    ///
+    /// Dropping a pending receive preserves the listener and the sole receive
+    /// half, including any incomplete peer frame. Explicit cancellation wakes
+    /// an idle receive and retires only this listener with a bounded control
+    /// write; other listeners and ordinary requests retain the connection.
     pub async fn next_subscription_event(
         &mut self,
         cx: &Cx,
@@ -7624,26 +7781,34 @@ where
     where
         IO: Send + 'static,
     {
-        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-            self.cancel_live_catalog_subscription(cx).await?;
-            return Err(McpError::request_cancelled());
+        if self.closed {
+            return Err(McpError::internal_error("WebSocket client is closed"));
         }
         loop {
+            if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+                self.cancel_live_catalog_subscription().await?;
+                return Err(McpError::request_cancelled());
+            }
             if let Err(error) = self.harvest_live_catalog_subscription_notifications() {
                 return Err(self.close_after_protocol_error(cx, &error.message).await);
             }
             if let Some(event) = self.take_ready_catalog_subscription_event()? {
                 return Ok(event);
             }
-            if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-                self.cancel_live_catalog_subscription(cx).await?;
-                return Err(McpError::request_cancelled());
-            }
             if let Err(error) = self.drain_completed_reverse_callbacks() {
                 return Err(self.terminal_callback_error(cx, error).await);
             }
-            let frame = match self.recv_with_callback_terminal(cx, None).await {
+            let frame = match self
+                .recv_with_callback_terminal(cx, Some(cancellation))
+                .await
+            {
                 Ok(frame) => frame,
+                Err(TransportError::Cancelled)
+                    if cancellation.is_cancel_requested() || cx.checkpoint().is_err() =>
+                {
+                    self.cancel_live_catalog_subscription().await?;
+                    return Err(McpError::request_cancelled());
+                }
                 Err(_) if self.reverse_callback_pool.terminal_error().is_some() => {
                     return Err(self
                         .terminal_callback_error(
@@ -7921,50 +8086,31 @@ where
         }
     }
 
-    async fn cancel_live_catalog_subscription(&mut self, cx: &Cx) -> McpResult<()>
+    async fn cancel_live_catalog_subscription(&mut self) -> McpResult<()>
     where
         IO: Send + 'static,
     {
         let request_id = self
             .live_catalog_subscription
-            .as_ref()
+            .take()
             .ok_or_else(|| {
                 McpError::invalid_request("No live final catalog WebSocket subscription is active")
             })?
-            .request_id
-            .clone();
-        let request_key = request_id.correlation_key().map_err(|_| {
-            McpError::invalid_request("WebSocket catalog listener request ID is not correlatable")
-        })?;
-        if self.retired_response_keys.len() >= MAX_QUEUED_WEBSOCKET_CANCELLED_RESPONSE_KEYS {
-            self.live_catalog_subscription = None;
-            return Err(self
-                .close_after_protocol_error(
-                    cx,
-                    "WebSocket cancelled-response tombstone capacity exceeded",
-                )
-                .await);
+            .request_id;
+        self.final_server_notifications.retain(|notification| {
+            !Self::websocket_notification_belongs_to_subscription(notification, &request_id)
+        });
+        // Retire the local route before the first await. The shared request
+        // cancellation path installs its tombstone before writing, bounds the
+        // control send, and uses the retained connection context.
+        let outcome = self
+            .retire_committed_request_after_cancellation(request_id, true)
+            .await;
+        if outcome.code == McpErrorCode::RequestCancelled {
+            Ok(())
+        } else {
+            Err(outcome)
         }
-        let control = CancellationWireMessage::Modern2026 {
-            sender: CancellationSender::Client,
-            params: FinalCancelledNotificationParams {
-                request_id,
-                reason: None,
-                meta: None,
-                additional: BTreeMap::default(),
-            },
-        }
-        .encode()
-        .map(JsonRpcMessage::Request)
-        .map_err(|error| {
-            McpError::invalid_params(format!("invalid WebSocket cancellation: {error}"))
-        })?;
-        self.retired_response_keys.push_back(request_key);
-        if let Err(error) = self.send_message(cx, &control).await {
-            return Err(self.terminal_transport_error(cx, error).await);
-        }
-        self.live_catalog_subscription = None;
-        Ok(())
     }
 
     /// Starts a real, incrementally driven official Tasks subscription on this
@@ -8045,6 +8191,10 @@ where
     /// `tasks/cancel`) is in flight are harvested from the connection-level
     /// queue, so the same client can observe `Cancelled` without collecting
     /// this stream to terminal.
+    ///
+    /// A dropped wait preserves the receive half and partial peer frame.
+    /// Explicit cancellation interrupts a silent peer and retires only this
+    /// Tasks listener; an active catalog listener remains usable.
     #[cfg(feature = "tasks")]
     pub async fn next_final_task_subscription_event(
         &mut self,
@@ -8054,26 +8204,34 @@ where
     where
         IO: Send + 'static,
     {
-        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-            self.cancel_live_task_subscription(cx).await?;
-            return Err(McpError::request_cancelled());
+        if self.closed {
+            return Err(McpError::internal_error("WebSocket client is closed"));
         }
         loop {
+            if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+                self.cancel_live_task_subscription().await?;
+                return Err(McpError::request_cancelled());
+            }
             if let Err(error) = self.harvest_live_task_subscription_notifications() {
                 return Err(self.close_after_protocol_error(cx, &error.message).await);
             }
             if let Some(event) = self.take_ready_task_subscription_event()? {
                 return Ok(event);
             }
-            if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-                self.cancel_live_task_subscription(cx).await?;
-                return Err(McpError::request_cancelled());
-            }
             if let Err(error) = self.drain_completed_reverse_callbacks() {
                 return Err(self.terminal_callback_error(cx, error).await);
             }
-            let frame = match self.recv_with_callback_terminal(cx, None).await {
+            let frame = match self
+                .recv_with_callback_terminal(cx, Some(cancellation))
+                .await
+            {
                 Ok(frame) => frame,
+                Err(TransportError::Cancelled)
+                    if cancellation.is_cancel_requested() || cx.checkpoint().is_err() =>
+                {
+                    self.cancel_live_task_subscription().await?;
+                    return Err(McpError::request_cancelled());
+                }
                 Err(_) if self.reverse_callback_pool.terminal_error().is_some() => {
                     return Err(self
                         .terminal_callback_error(
@@ -8346,50 +8504,28 @@ where
     }
 
     #[cfg(feature = "tasks")]
-    async fn cancel_live_task_subscription(&mut self, cx: &Cx) -> McpResult<()>
+    async fn cancel_live_task_subscription(&mut self) -> McpResult<()>
     where
         IO: Send + 'static,
     {
         let request_id = self
             .live_task_subscription
-            .as_ref()
+            .take()
             .ok_or_else(|| {
                 McpError::invalid_request("No live final Tasks WebSocket subscription is active")
             })?
-            .request_id
-            .clone();
-        let request_key = request_id.correlation_key().map_err(|_| {
-            McpError::invalid_request("WebSocket Tasks listener request ID is not correlatable")
-        })?;
-        if self.retired_response_keys.len() >= MAX_QUEUED_WEBSOCKET_CANCELLED_RESPONSE_KEYS {
-            self.live_task_subscription = None;
-            return Err(self
-                .close_after_protocol_error(
-                    cx,
-                    "WebSocket cancelled-response tombstone capacity exceeded",
-                )
-                .await);
+            .request_id;
+        self.final_server_notifications.retain(|notification| {
+            !Self::websocket_notification_belongs_to_subscription(notification, &request_id)
+        });
+        let outcome = self
+            .retire_committed_request_after_cancellation(request_id, true)
+            .await;
+        if outcome.code == McpErrorCode::RequestCancelled {
+            Ok(())
+        } else {
+            Err(outcome)
         }
-        let control = CancellationWireMessage::Modern2026 {
-            sender: CancellationSender::Client,
-            params: FinalCancelledNotificationParams {
-                request_id,
-                reason: None,
-                meta: None,
-                additional: BTreeMap::default(),
-            },
-        }
-        .encode()
-        .map(JsonRpcMessage::Request)
-        .map_err(|error| {
-            McpError::invalid_params(format!("invalid WebSocket cancellation: {error}"))
-        })?;
-        self.retired_response_keys.push_back(request_key);
-        if let Err(error) = self.send_message(cx, &control).await {
-            return Err(self.terminal_transport_error(cx, error).await);
-        }
-        self.live_task_subscription = None;
-        Ok(())
     }
 
     /// Calls a Tasks-capable modern tool without projecting its result algebra.
@@ -9150,8 +9286,15 @@ where
     where
         IO: Send + 'static,
     {
-        let mut receiver = self.receiver.take().ok_or(TransportError::Closed)?;
-        let outcome = loop {
+        // Borrow in place: the native reader retains its framing buffers, and
+        // dropping this future must not drop the connection's only receiver.
+        // The operation context controls the wait, while the retained
+        // connection context owns I/O. Otherwise native cancellation would
+        // close both halves before the selected listener can be retired.
+        let connection_cx = self.connection_cx.clone();
+        let receiver = self.receiver.as_mut().ok_or(TransportError::Closed)?;
+        let mut cancelled = cancellation.map(|signal| Box::pin(signal.cancelled()));
+        loop {
             if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
                 || cx.checkpoint().is_err()
             {
@@ -9164,19 +9307,28 @@ where
                     TransportError::Closed
                 });
             }
+            let mut receive = std::pin::pin!(receiver.recv_with_source(&connection_cx));
+            let interruptible = std::future::poll_fn(|task_cx| {
+                if cx.checkpoint().is_err()
+                    || cancelled
+                        .as_mut()
+                        .is_some_and(|signal| signal.as_mut().poll(task_cx).is_ready())
+                {
+                    return std::task::Poll::Ready(Err(TransportError::Cancelled));
+                }
+                receive.as_mut().poll(task_cx)
+            });
             match asupersync::time::timeout(
                 cx.now(),
                 Duration::from_nanos(WEBSOCKET_CANCELLED_RECV_POLL_NANOS),
-                receiver.recv_with_source(cx),
+                interruptible,
             )
             .await
             {
                 Ok(result) => break result,
                 Err(_) => continue,
             }
-        };
-        self.receiver = Some(receiver);
-        outcome
+        }
     }
 
     async fn send_message(&self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
@@ -24117,6 +24269,700 @@ mod tests {
                 .close(&cx)
                 .await
                 .expect("close incremental subscription client");
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_catalog_listener_cancel_interrupts_silent_receive_and_keeps_client() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            for (acknowledged, cancel_context) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let (client_io, mut peer_io) = async_websocket_pair();
+                write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+                let mut client = WebSocketClient::connect_with_cx(
+                    &cx,
+                    ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                    async_websocket_client_info(),
+                    ClientCapabilities::default(),
+                    AsyncWsClientTransport::from_upgraded(client_io),
+                )
+                .await
+                .expect("client discovers before opening the listener");
+                client
+                    .open_subscriptions_listener(
+                        &cx,
+                        SubscriptionFilter {
+                            tools_list_changed: Some(true),
+                            ..SubscriptionFilter::default()
+                        },
+                    )
+                    .await
+                    .expect("listener request commits");
+                let cancellation = McpRequestCancellation::new();
+                let request_region = cx
+                    .open_child_region(asupersync::cx::child_region::ChildRegionSpec::inherit())
+                    .await
+                    .expect("listener waiter derives an independent caller region");
+                let request_cx = request_region.cx();
+                if acknowledged {
+                    write_server_text_frame(
+                        &mut peer_io,
+                        r#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2},"notifications":{"toolsListChanged":true}}}"#,
+                    )
+                    .await;
+                    assert!(matches!(
+                        client.next_subscription_event(&cx, &cancellation).await,
+                        Ok(StdioSubscriptionEvent::Acknowledged(_))
+                    ));
+                }
+                {
+                    let mut waiting =
+                        Box::pin(client.next_subscription_event(request_cx, &cancellation));
+                    assert!(
+                        std::future::poll_fn(|task_cx| Poll::Ready(waiting.as_mut().poll(task_cx)))
+                            .await
+                            .is_pending(),
+                        "the peer is silent after listen commitment"
+                    );
+                    if cancel_context {
+                        request_region
+                            .cancel(asupersync::types::CancelReason::user(
+                                "cancel only the listener waiter",
+                            ))
+                            .unwrap();
+                    } else {
+                        assert!(cancellation.cancel());
+                    }
+                    let error = asupersync::time::timeout(
+                        cx.now(),
+                        Duration::from_millis(500),
+                        waiting.as_mut(),
+                    )
+                    .await
+                    .expect("request-local cancellation wakes the parked reader")
+                    .expect_err("a cancelled listener cannot deliver an event");
+                    assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                }
+                assert!(!client.closed);
+                assert!(cx.checkpoint().is_ok(), "connection context remains live");
+                assert!(client.receiver.is_some());
+                assert!(client.live_catalog_subscription.is_none());
+                request_region.close().await.unwrap();
+
+                let mut server = AsyncWsServerTransport::from_upgraded(peer_io);
+                for expected_method in [SERVER_DISCOVER_METHOD, "subscriptions/listen"] {
+                    let JsonRpcMessage::Request(request) = server.recv(&cx).await.unwrap() else {
+                        panic!("client emitted a request");
+                    };
+                    assert_eq!(request.method, expected_method);
+                }
+                let JsonRpcMessage::Request(control) = server.recv(&cx).await.unwrap() else {
+                    panic!("listener cancellation is a notification");
+                };
+                let CancellationWireMessage::Modern2026 { params, .. } =
+                    CancellationWireMessage::decode(
+                        ProtocolEra::Modern2026,
+                        CancellationSender::Client,
+                        &control,
+                    )
+                    .expect("exact modern cancellation shape")
+                else {
+                    panic!("modern listener uses modern cancellation");
+                };
+                assert!(params.request_id.correlates_with(&RequestId::Number(2)));
+                assert!(params.meta.is_none());
+                // The peer may race one late final response. It must remain
+                // owned by the retired listener, before the new request result.
+                server
+                    .send(
+                        &cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            RequestId::Number(2),
+                            serde_json::json!({
+                                "resultType": "complete",
+                                "_meta": {"io.modelcontextprotocol/subscriptionId": 2}
+                            }),
+                        )),
+                    )
+                    .await
+                    .unwrap();
+                server
+                    .send(
+                        &cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            RequestId::Number(3),
+                            async_modern_tools_list_result(),
+                        )),
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    client.list_tools(&cx, None).await,
+                    Ok(CoreResult::Final(FinalCoreResult::ToolsList { .. }))
+                ));
+                let JsonRpcMessage::Request(next) = server.recv(&cx).await.unwrap() else {
+                    panic!("ordinary request follows exactly one cancellation");
+                };
+                assert_eq!(next.method, "tools/list");
+                client.close(&cx).await.unwrap();
+                assert!(matches!(
+                    server.recv(&cx).await,
+                    Err(TransportError::Closed)
+                ));
+            }
+        });
+    }
+
+    #[cfg(all(feature = "websocket-experimental", feature = "tasks"))]
+    #[test]
+    fn websocket_async_task_listener_cancel_interrupts_silent_receive_and_keeps_catalog() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = async_websocket_pair();
+            let mut discovery = async_modern_discovery_result();
+            discovery["capabilities"] = serde_json::json!({
+                "extensions": {"io.modelcontextprotocol/tasks": {}}
+            });
+            write_server_text_frame(
+                &mut peer_io,
+                &serde_json::to_string(&JsonRpcResponse::success(RequestId::Number(1), discovery))
+                    .unwrap(),
+            )
+            .await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .unwrap();
+            client
+                .open_subscriptions_listener(
+                    &cx,
+                    SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        ..SubscriptionFilter::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let tasks = serde_json::from_value(serde_json::json!({"taskIds": ["job-a"]})).unwrap();
+            client
+                .open_final_task_subscription_listener(&cx, tasks)
+                .await
+                .unwrap();
+            let cancellation = McpRequestCancellation::new();
+            {
+                let mut waiting =
+                    Box::pin(client.next_final_task_subscription_event(&cx, &cancellation));
+                assert!(
+                    std::future::poll_fn(|task_cx| Poll::Ready(waiting.as_mut().poll(task_cx)))
+                        .await
+                        .is_pending()
+                );
+                cancellation.cancel();
+                let error = asupersync::time::timeout(
+                    cx.now(),
+                    Duration::from_millis(500),
+                    waiting.as_mut(),
+                )
+                .await
+                .expect("Tasks cancellation wakes a silent receive")
+                .expect_err("selected Tasks listener is cancelled");
+                assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            }
+            assert!(!client.closed);
+            assert!(client.live_task_subscription.is_none());
+            assert!(client.live_catalog_subscription.is_some());
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3},"notifications":{"taskIds":["job-a"]}}}"#,
+            )
+            .await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/tasks","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3},"taskId":"job-a","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null}}"#,
+            )
+            .await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2},"notifications":{"toolsListChanged":true}}}"#,
+            )
+            .await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
+            )
+            .await;
+            let live = McpRequestCancellation::new();
+            assert!(matches!(
+                client.next_subscription_event(&cx, &live).await,
+                Ok(StdioSubscriptionEvent::Acknowledged(_))
+            ));
+            assert!(matches!(
+                client.next_subscription_event(&cx, &live).await,
+                Ok(StdioSubscriptionEvent::Notification(
+                    ServerNotification::ToolsListChanged(_)
+                ))
+            ));
+            let mut server = AsyncWsServerTransport::from_upgraded(peer_io);
+            for _ in 0..3 {
+                assert!(matches!(
+                    server.recv(&cx).await,
+                    Ok(JsonRpcMessage::Request(_))
+                ));
+            }
+            let JsonRpcMessage::Request(control) = server.recv(&cx).await.unwrap() else {
+                panic!("Tasks cancellation is a notification");
+            };
+            let CancellationWireMessage::Modern2026 { params, .. } =
+                CancellationWireMessage::decode(
+                    ProtocolEra::Modern2026,
+                    CancellationSender::Client,
+                    &control,
+                )
+                .unwrap()
+            else {
+                panic!("modern cancellation shape");
+            };
+            assert!(params.request_id.correlates_with(&RequestId::Number(3)));
+            client.close(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_catalog_listener_dropped_receive_resumes_partial_frame() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let acknowledgement = br#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2},"notifications":{"toolsListChanged":true}}}"#;
+            let mut frame = vec![0x81, 126];
+            frame.extend_from_slice(&u16::try_from(acknowledgement.len()).unwrap().to_be_bytes());
+            frame.extend_from_slice(acknowledgement);
+            for split in [1, 3, 17, frame.len() - 1] {
+                let (client_io, mut peer_io) = async_websocket_pair();
+                write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+                let mut client = WebSocketClient::connect_with_cx(
+                    &cx,
+                    ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                    async_websocket_client_info(),
+                    ClientCapabilities::default(),
+                    AsyncWsClientTransport::from_upgraded(client_io),
+                )
+                .await
+                .unwrap();
+                client
+                    .open_subscriptions_listener(
+                        &cx,
+                        SubscriptionFilter {
+                            tools_list_changed: Some(true),
+                            ..SubscriptionFilter::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                peer_io.write_all(&frame[..split]).await.unwrap();
+                let cancellation = McpRequestCancellation::new();
+                {
+                    let mut waiting = Box::pin(client.next_subscription_event(&cx, &cancellation));
+                    assert!(
+                        std::future::poll_fn(|task_cx| Poll::Ready(waiting.as_mut().poll(task_cx)))
+                            .await
+                            .is_pending(),
+                        "partial frame at byte {split} must park"
+                    );
+                }
+                assert!(client.receiver.is_some(), "drop retains the sole receiver");
+                assert!(client.live_catalog_subscription.is_some());
+                assert!(!cancellation.is_cancel_requested());
+                peer_io.write_all(&frame[split..]).await.unwrap();
+                assert!(matches!(
+                    client.next_subscription_event(&cx, &cancellation).await,
+                    Ok(StdioSubscriptionEvent::Acknowledged(ref accepted))
+                        if accepted.tools_list_changed == Some(true)
+                ));
+                write_server_text_frame(
+                    &mut peer_io,
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
+                )
+                .await;
+                assert!(matches!(
+                    client.next_subscription_event(&cx, &cancellation).await,
+                    Ok(StdioSubscriptionEvent::Terminal)
+                ));
+                client.close(&cx).await.unwrap();
+            }
+        });
+    }
+
+    #[cfg(all(feature = "websocket-experimental", feature = "tasks"))]
+    #[test]
+    fn websocket_async_task_listener_dropped_receive_resumes_partial_frame() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = async_websocket_pair();
+            let mut discovery = async_modern_discovery_result();
+            discovery["capabilities"] = serde_json::json!({
+                "extensions": {"io.modelcontextprotocol/tasks": {}}
+            });
+            write_server_text_frame(
+                &mut peer_io,
+                &serde_json::to_string(&JsonRpcResponse::success(RequestId::Number(1), discovery))
+                    .unwrap(),
+            )
+            .await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .unwrap();
+            let filter = serde_json::from_value(serde_json::json!({"taskIds": ["job-a"]})).unwrap();
+            client
+                .open_final_task_subscription_listener(&cx, filter)
+                .await
+                .unwrap();
+            let acknowledgement = br#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2},"notifications":{"taskIds":["job-a"]}}}"#;
+            let mut frame = vec![0x81, 126];
+            frame.extend_from_slice(&u16::try_from(acknowledgement.len()).unwrap().to_be_bytes());
+            frame.extend_from_slice(acknowledgement);
+            peer_io.write_all(&frame[..17]).await.unwrap();
+            let cancellation = McpRequestCancellation::new();
+            {
+                let mut waiting =
+                    Box::pin(client.next_final_task_subscription_event(&cx, &cancellation));
+                assert!(
+                    std::future::poll_fn(|task_cx| Poll::Ready(waiting.as_mut().poll(task_cx)))
+                        .await
+                        .is_pending()
+                );
+            }
+            assert!(client.receiver.is_some());
+            assert!(client.live_task_subscription.is_some());
+            peer_io.write_all(&frame[17..]).await.unwrap();
+            assert!(matches!(
+                client
+                    .next_final_task_subscription_event(&cx, &cancellation)
+                    .await,
+                Ok(StdioTaskSubscriptionEvent::Acknowledged(_))
+            ));
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
+            )
+            .await;
+            assert!(matches!(
+                client
+                    .next_final_task_subscription_event(&cx, &cancellation)
+                    .await,
+                Ok(StdioTaskSubscriptionEvent::Terminal)
+            ));
+            client.close(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_subscription_cancellation_bounds_stalled_control_send() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = stalled_cancellation_async_websocket_pair();
+            write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .unwrap();
+            client
+                .open_subscriptions_listener(
+                    &cx,
+                    SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        ..SubscriptionFilter::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let cancellation = McpRequestCancellation::new();
+            {
+                let mut waiting = Box::pin(client.next_subscription_event(&cx, &cancellation));
+                assert!(
+                    std::future::poll_fn(|task_cx| Poll::Ready(waiting.as_mut().poll(task_cx)))
+                        .await
+                        .is_pending()
+                );
+                cancellation.cancel();
+                let error = asupersync::time::timeout(
+                    cx.now(),
+                    Duration::from_millis(500),
+                    waiting.as_mut(),
+                )
+                .await
+                .expect("a stalled cancellation write cannot strand the listener")
+                .expect_err("an uncommitted cancellation fails closed");
+                assert_eq!(error.code, McpErrorCode::InternalError);
+                assert_eq!(error.message, "Request timed out");
+            }
+            assert!(client.closed);
+            assert!(client.live_catalog_subscription.is_none());
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_dropped_subscription_cancellation_refuses_reuse_and_still_closes() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = stalled_cancellation_async_websocket_pair();
+            write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .unwrap();
+            client
+                .open_subscriptions_listener(
+                    &cx,
+                    SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        ..SubscriptionFilter::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let cancellation = McpRequestCancellation::new();
+            {
+                let mut waiting = Box::pin(client.next_subscription_event(&cx, &cancellation));
+                assert!(
+                    std::future::poll_fn(|task_cx| Poll::Ready(waiting.as_mut().poll(task_cx)))
+                        .await
+                        .is_pending()
+                );
+                cancellation.cancel();
+                assert!(
+                    std::future::poll_fn(|task_cx| Poll::Ready(waiting.as_mut().poll(task_cx)))
+                        .await
+                        .is_pending(),
+                    "the control write is parked before its first writable byte"
+                );
+                // Abandon exactly while the selected cancellation is awaiting
+                // transport commitment, rather than while waiting for a peer.
+            }
+            assert!(client.closed, "uncertain control commitment forbids reuse");
+            assert!(!client.close_settled, "transport cleanup remains owed");
+            assert!(client.live_catalog_subscription.is_none());
+            assert!(client.reverse_callback_pool.terminal_error().is_some());
+            let next_id = client.next_id;
+            let error = client.list_tools(&cx, None).await.unwrap_err();
+            assert_eq!(error.message, "WebSocket client is closed");
+            assert_eq!(
+                client.next_id, next_id,
+                "terminal refusal makes no new request"
+            );
+            client
+                .close(&cx)
+                .await
+                .expect("explicit close still settles both halves");
+            assert!(client.close_settled);
+            let mut server = AsyncWsServerTransport::from_upgraded(peer_io);
+            for expected_method in [SERVER_DISCOVER_METHOD, "subscriptions/listen"] {
+                let JsonRpcMessage::Request(request) = server.recv(&cx).await.unwrap() else {
+                    panic!("the two committed requests precede close");
+                };
+                assert_eq!(request.method, expected_method);
+            }
+            assert!(matches!(
+                server.recv(&cx).await,
+                Err(TransportError::Closed)
+            ));
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_cancelled_catalog_events_cannot_transfer_to_a_reopened_listener() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = async_websocket_pair();
+            write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .unwrap();
+            let filter = SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            };
+            client
+                .open_subscriptions_listener(&cx, filter.clone())
+                .await
+                .unwrap();
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2},"notifications":{"toolsListChanged":true}}}"#,
+            )
+            .await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
+            )
+            .await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
+            )
+            .await;
+            client.list_tools(&cx, None).await.unwrap();
+            assert_eq!(client.final_server_notifications.len(), 2);
+            let cancelled = McpRequestCancellation::new();
+            cancelled.cancel();
+            assert_eq!(
+                client
+                    .next_subscription_event(&cx, &cancelled)
+                    .await
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::RequestCancelled
+            );
+            assert!(client.final_server_notifications.is_empty());
+            client
+                .open_subscriptions_listener(&cx, filter)
+                .await
+                .unwrap();
+            for subscription_id in [2, 4] {
+                write_server_text_frame(
+                    &mut peer_io,
+                    &format!(
+                        r#"{{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":{subscription_id}}},"notifications":{{"toolsListChanged":true}}}}}}"#
+                    ),
+                )
+                .await;
+                if subscription_id == 2 {
+                    write_server_text_frame(
+                        &mut peer_io,
+                        r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
+                    )
+                    .await;
+                }
+            }
+            let live = McpRequestCancellation::new();
+            assert!(matches!(
+                client.next_subscription_event(&cx, &live).await,
+                Ok(StdioSubscriptionEvent::Acknowledged(_))
+            ));
+            {
+                let mut waiting = Box::pin(client.next_subscription_event(&cx, &live));
+                assert!(
+                    std::future::poll_fn(|task_cx| Poll::Ready(waiting.as_mut().poll(task_cx)))
+                        .await
+                        .is_pending(),
+                    "neither queued nor late events from listener 2 belong to listener 4"
+                );
+            }
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":4}}}"#,
+            )
+            .await;
+            assert!(matches!(
+                client.next_subscription_event(&cx, &live).await,
+                Ok(StdioSubscriptionEvent::Notification(
+                    ServerNotification::ToolsListChanged(_)
+                ))
+            ));
+            client.close(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(all(feature = "websocket-experimental", feature = "tasks"))]
+    #[test]
+    fn websocket_async_retired_subscription_rejects_invalid_or_unowned_task_events() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            for (subscription_id, status) in [(2, "invalid-status"), (99, "working")] {
+                let (client_io, mut peer_io) = async_websocket_pair();
+                let mut discovery = async_modern_discovery_result();
+                discovery["capabilities"] = serde_json::json!({
+                    "extensions": {"io.modelcontextprotocol/tasks": {}}
+                });
+                write_server_text_frame(
+                    &mut peer_io,
+                    &serde_json::to_string(&JsonRpcResponse::success(
+                        RequestId::Number(1),
+                        discovery,
+                    ))
+                    .unwrap(),
+                )
+                .await;
+                let mut client = WebSocketClient::connect_with_cx(
+                    &cx,
+                    ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                    async_websocket_client_info(),
+                    ClientCapabilities::default(),
+                    AsyncWsClientTransport::from_upgraded(client_io),
+                )
+                .await
+                .unwrap();
+                let filter =
+                    serde_json::from_value(serde_json::json!({"taskIds": ["job-a"]})).unwrap();
+                client
+                    .open_final_task_subscription_listener(&cx, filter)
+                    .await
+                    .unwrap();
+                let cancellation = McpRequestCancellation::new();
+                cancellation.cancel();
+                assert_eq!(
+                    client
+                        .next_final_task_subscription_event(&cx, &cancellation)
+                        .await
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::RequestCancelled
+                );
+                write_server_text_frame(
+                    &mut peer_io,
+                    &serde_json::json!({
+                        "jsonrpc": "2.0", "method": "notifications/tasks",
+                        "params": {
+                            "_meta": {"io.modelcontextprotocol/subscriptionId": subscription_id},
+                            "taskId": "job-a", "status": status,
+                            "createdAt": "2026-07-28T12:00:00.000Z",
+                            "lastUpdatedAt": "2026-07-28T12:00:00.000Z", "ttlMs": null
+                        }
+                    })
+                    .to_string(),
+                )
+                .await;
+                assert_eq!(
+                    client.list_tools(&cx, None).await.unwrap_err().code,
+                    McpErrorCode::InvalidRequest
+                );
+                assert!(
+                    client.closed,
+                    "a tombstone cannot authorize invalid or unowned traffic"
+                );
+            }
         });
     }
 

@@ -44,7 +44,7 @@ use crate::proxy::{
     ProxyTypedCatalog,
 };
 #[cfg(feature = "tasks")]
-use crate::tasks::FinalTaskRuntimeConfig;
+use crate::tasks::{ApplicationTaskSupervisor, FinalTaskRuntimeConfig, TaskServiceHost};
 #[cfg(all(test, feature = "tasks"))]
 use crate::tasks::SharedTaskManager;
 use crate::{
@@ -107,6 +107,8 @@ pub enum RegistrationKind {
     LegacyPrompt,
     /// A mounted child server, named by its prefix.
     Mount,
+    /// An application Task supervisor and its service ownership.
+    TaskService,
 }
 
 impl fmt::Display for RegistrationKind {
@@ -121,6 +123,7 @@ impl fmt::Display for RegistrationKind {
             Self::Prompt => "prompt",
             Self::LegacyPrompt => "exact-2024 prompt",
             Self::Mount => "mount",
+            Self::TaskService => "Task service",
         })
     }
 }
@@ -283,6 +286,9 @@ pub struct ServerBuilder {
     /// Application-owned state for the configured final Tasks extension.
     #[cfg(feature = "tasks")]
     final_task_runtime: Option<FinalTaskRuntime>,
+    /// Supervisor installed on the selected local runtime when building.
+    #[cfg(feature = "tasks")]
+    task_supervisor: Option<Arc<dyn ApplicationTaskSupervisor>>,
     /// One route-bound upstream final Tasks relay. The official Task methods
     /// cannot disambiguate two independent upstream task-ID namespaces.
     #[cfg(all(feature = "proxy", feature = "tasks"))]
@@ -407,6 +413,8 @@ impl ServerBuilder {
             extension_runtime: None,
             #[cfg(feature = "tasks")]
             final_task_runtime: None,
+            #[cfg(feature = "tasks")]
+            task_supervisor: None,
             #[cfg(all(feature = "proxy", feature = "tasks"))]
             final_task_relay: None,
             refused_registrations: Vec::new(),
@@ -837,6 +845,34 @@ impl ServerBuilder {
         }
         self.final_task_runtime = Some(task_runtime);
         Ok(self)
+    }
+
+    /// Hosts the application's Task supervisor for the lifetime of serving.
+    ///
+    /// This installs a service on the default in-memory Tasks runtime, or on
+    /// the runtime supplied through [`Self::final_tasks`], independent of the
+    /// order of these builder calls. Each serve path starts the service as a
+    /// child of the caller's context and waits for readiness before dispatch.
+    /// It cancels and settles that child before running the shutdown hook.
+    /// No runtime or detached worker is created.
+    ///
+    /// [`Self::try_build`] rejects a runtime with a caller-installed service,
+    /// a proxy Tasks owner, or a second supervisor. Direct request dispatch
+    /// does not start services; an embedding that drives individual requests
+    /// should install and run its own service instead.
+    #[cfg(feature = "tasks")]
+    #[must_use]
+    pub fn task_supervisor(mut self, supervisor: Arc<dyn ApplicationTaskSupervisor>) -> Self {
+        if self.task_supervisor.is_some() {
+            self.refused_registrations.push(RefusedRegistration {
+                kind: RegistrationKind::TaskService,
+                name: "task_supervisor".to_owned(),
+                reason: "only one hosted Task supervisor may be configured".to_owned(),
+            });
+        } else {
+            self.task_supervisor = Some(supervisor);
+        }
+        self
     }
 
     /// Installs a process-local official Tasks runtime when the builder has
@@ -2773,7 +2809,9 @@ impl ServerBuilder {
     /// installed a local or proxy Tasks owner, this installs a process-local
     /// in-memory official Tasks runtime so `tasks/get`, `tasks/update`, and
     /// `tasks/cancel` are served. Call [`Self::final_tasks`] to replace that
-    /// default with an application-owned store. The historical task-manager
+    /// default with an application-owned store. Use [`Self::task_supervisor`]
+    /// to let the serve lifetime host the worker that advances created Tasks.
+    /// The historical task-manager
     /// adapter is test-only and does not serve the official methods.
     ///
     /// # Panics
@@ -2802,10 +2840,53 @@ impl ServerBuilder {
                 &mut self.refused_registrations,
             )));
         }
-        Ok(self.build_admitted())
+        #[cfg(feature = "tasks")]
+        self.install_default_in_memory_final_tasks();
+        #[cfg(feature = "tasks")]
+        let task_service_host = match self.task_supervisor.take() {
+            Some(supervisor) => {
+                if self.protocol_policy == ProtocolPolicy::LegacyOnly {
+                    return Err(ServerBuildError::InvalidConfiguration(vec![RefusedRegistration {
+                        kind: RegistrationKind::TaskService,
+                        name: "task_supervisor".to_owned(),
+                        reason: "a hosted Task supervisor requires a modern-capable protocol policy".to_owned(),
+                    }]));
+                }
+                let runtime = self.final_task_runtime.as_ref().ok_or_else(|| {
+                    ServerBuildError::InvalidConfiguration(vec![RefusedRegistration {
+                        kind: RegistrationKind::TaskService,
+                        name: "task_supervisor".to_owned(),
+                        reason: "a hosted Task supervisor requires a local Tasks runtime".to_owned(),
+                    }])
+                })?;
+                if runtime.has_installed_task_service() {
+                    return Err(ServerBuildError::InvalidConfiguration(vec![RefusedRegistration {
+                        kind: RegistrationKind::TaskService,
+                        name: "task_supervisor".to_owned(),
+                        reason: "the Tasks runtime already has an installed service".to_owned(),
+                    }]));
+                }
+                let host = TaskServiceHost::install(runtime, supervisor).map_err(|_| {
+                    ServerBuildError::InvalidConfiguration(vec![RefusedRegistration {
+                        kind: RegistrationKind::TaskService,
+                        name: "task_supervisor".to_owned(),
+                        reason: "the Tasks runtime already has an installed service".to_owned(),
+                    }])
+                })?;
+                Some(host)
+            }
+            None => None,
+        };
+        Ok(self.build_admitted(
+            #[cfg(feature = "tasks")]
+            task_service_host,
+        ))
     }
 
-    fn build_admitted(mut self) -> Server {
+    fn build_admitted(
+        mut self,
+        #[cfg(feature = "tasks")] task_service_host: Option<TaskServiceHost>,
+    ) -> Server {
         // Configure router with strict input validation setting
         self.router
             .set_strict_input_validation(self.strict_input_validation);
@@ -2813,8 +2894,6 @@ impl ServerBuilder {
             self.console_config.should_use_rich(),
         );
         let final_subscriptions = Arc::new(FinalSubscriptionRegistry::default());
-        #[cfg(feature = "tasks")]
-        self.install_default_in_memory_final_tasks();
         #[cfg(feature = "tasks")]
         let final_task_runtime = self.final_task_runtime.clone();
         #[cfg(all(feature = "proxy", feature = "tasks"))]
@@ -2924,6 +3003,8 @@ impl ServerBuilder {
             extension_runtime,
             #[cfg(feature = "tasks")]
             final_task_runtime: self.final_task_runtime,
+            #[cfg(feature = "tasks")]
+            task_service_host,
             #[cfg(all(feature = "proxy", feature = "tasks"))]
             final_task_relay,
             final_subscriptions,
@@ -2934,6 +3015,143 @@ impl ServerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "tasks")]
+    mod hosted_tasks {
+        use super::*;
+
+        struct Supervisor;
+
+        impl ApplicationTaskSupervisor for Supervisor {
+            fn resume<'a>(
+                &'a self,
+                _cx: &'a asupersync::Cx,
+                _handoff: crate::FinalTaskSupervisorHandoff,
+            ) -> crate::FinalTaskSupervisorFuture<'a> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        fn builder() -> ServerBuilder {
+            ServerBuilder::try_new_with_fixed_protocol_policy(
+                "hosted-tasks",
+                "1.0",
+                ProtocolPolicy::ModernOnly,
+            )
+            .expect("ModernOnly is always available")
+        }
+
+        fn runtime() -> FinalTaskRuntime {
+            FinalTaskRuntime::in_memory(
+                FinalTaskRuntimeConfig::new(60_000, Some(5_000)).expect("valid timing"),
+                Arc::new(|_| {}),
+            )
+        }
+
+        fn assert_refused(result: Result<Server, ServerBuildError>, expected_reason: &str) {
+            let refused = match result {
+                Err(ServerBuildError::InvalidConfiguration(refused)) => refused,
+                Ok(_) => panic!("conflicting Task service configuration must fail"),
+            };
+            assert_eq!(refused.len(), 1);
+            assert_eq!(refused[0].kind, RegistrationKind::TaskService);
+            assert!(refused[0].reason.contains(expected_reason));
+        }
+
+        #[test]
+        fn task_supervisor_installs_on_default_runtime_without_starting_work() {
+            let server = builder().task_supervisor(Arc::new(Supervisor)).build();
+            let runtime = server.final_task_runtime().expect("default Tasks runtime");
+            assert!(runtime.has_installed_task_service());
+            assert!(!runtime.is_task_service_ready(), "build creates no task or runtime");
+            assert!(server.task_service_host.is_some());
+        }
+
+        #[test]
+        fn no_task_supervisor_keeps_default_runtime_without_a_service() {
+            let server = builder().build();
+            let runtime = server.final_task_runtime().expect("same default Tasks runtime");
+            assert!(!runtime.has_installed_task_service());
+            assert!(!runtime.is_task_service_ready());
+            assert!(server.task_service_host.is_none());
+        }
+
+        #[test]
+        fn task_supervisor_uses_explicit_runtime_in_either_builder_order() {
+            for supervisor_first in [false, true] {
+                let runtime = runtime();
+                let configured = if supervisor_first {
+                    builder()
+                        .task_supervisor(Arc::new(Supervisor))
+                        .final_tasks(runtime.clone())
+                        .expect("install explicit Tasks runtime")
+                } else {
+                    builder()
+                        .final_tasks(runtime.clone())
+                        .expect("install explicit Tasks runtime")
+                        .task_supervisor(Arc::new(Supervisor))
+                };
+                let server = configured.build();
+                assert!(runtime.has_installed_task_service());
+                assert!(!runtime.is_task_service_ready());
+                assert!(server.task_service_host.is_some());
+            }
+        }
+
+        #[test]
+        fn task_supervisor_rejects_a_caller_installed_service_without_replacing_it() {
+            let runtime = runtime();
+            let _caller_service = runtime
+                .install_task_service(1, Arc::new(Supervisor))
+                .expect("caller owns the first service");
+            assert_refused(
+                builder()
+                    .final_tasks(runtime.clone())
+                    .expect("install explicit Tasks runtime")
+                    .task_supervisor(Arc::new(Supervisor))
+                    .try_build(),
+                "already has an installed service",
+            );
+            assert!(runtime.has_installed_task_service());
+            assert!(!runtime.is_task_service_ready());
+        }
+
+        #[test]
+        fn task_supervisor_rejects_duplicate_configuration_before_runtime_mutation() {
+            let runtime = runtime();
+            assert_refused(
+                builder()
+                    .final_tasks(runtime.clone())
+                    .expect("install explicit Tasks runtime")
+                    .task_supervisor(Arc::new(Supervisor))
+                    .task_supervisor(Arc::new(Supervisor))
+                    .try_build(),
+                "only one hosted Task supervisor",
+            );
+            assert!(!runtime.has_installed_task_service());
+        }
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        #[test]
+        fn task_supervisor_rejects_legacy_only_without_installing_a_service() {
+            let runtime = runtime();
+            assert_refused(
+                ServerBuilder::try_new_with_fixed_protocol_policy(
+                    "hosted-tasks",
+                    "1.0",
+                    ProtocolPolicy::LegacyOnly,
+                )
+                .expect("legacy feature is enabled")
+                .final_tasks(runtime.clone())
+                .expect("install explicit Tasks runtime")
+                .task_supervisor(Arc::new(Supervisor))
+                .try_build(),
+                "modern-capable protocol policy",
+            );
+            assert!(!runtime.has_installed_task_service());
+        }
+    }
+
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     use crate::proxy::{ProxyFinalTaskListener, ProxyFinalTaskListenerEvent};
     #[cfg(feature = "proxy")]

@@ -969,6 +969,14 @@ fn assert_modern_companion_facade_exports() {
     let _: Option<modern::FinalTaskSupervisorHandoff> = None;
     let _: Option<modern::FinalTaskWorkDescriptor> = None;
     let _: Option<std::sync::Arc<dyn modern::ApplicationTaskSupervisor>> = None;
+    let _: fn(
+        modern::ServerBuilder,
+        std::sync::Arc<dyn modern::ApplicationTaskSupervisor>,
+    ) -> modern::ServerBuilder = modern::ServerBuilder::task_supervisor;
+    let _: fn(
+        fastmcp_rust::auto::ServerBuilder,
+        std::sync::Arc<dyn fastmcp_rust::ApplicationTaskSupervisor>,
+    ) -> fastmcp_rust::auto::ServerBuilder = fastmcp_rust::auto::ServerBuilder::task_supervisor;
     let _: Option<modern::AuthorizedTaskServiceRunner> = None;
     let _: Option<modern::PendingRequests> = None;
     let _: Option<modern::RequestSender> = None;
