@@ -633,7 +633,7 @@ async fn connect_modern_http_from_configured_builder(
     endpoint: modern::CanonicalHttpUrl,
     cx: &modern::Cx,
 ) -> Result<modern::HttpClient, modern::HttpClientConnectError> {
-    builder.connect_http_with_cx(endpoint, cx).await
+    builder.connect_http_with_cx(cx, endpoint).await
 }
 
 async fn connect_exact_legacy_http_with_explicit_context(
@@ -641,28 +641,28 @@ async fn connect_exact_legacy_http_with_explicit_context(
     message_post_endpoint: legacy_2024::CanonicalHttpUrl,
     cx: &legacy_2024::Cx,
 ) -> Result<legacy_2024::HttpClient, legacy_2024::HttpClientConnectError> {
-    legacy_2024::connect_http_with_cx(sse_endpoint, message_post_endpoint, cx).await
+    legacy_2024::connect_http_with_cx(cx, sse_endpoint, message_post_endpoint).await
 }
 
 async fn connect_auto_stdio_with_explicit_context(
     builder: auto::ClientBuilder,
     cx: &auto::Cx,
 ) -> auto::McpResult<auto::Client> {
-    builder.connect_stdio_with_cx("server", &[], cx).await
+    builder.connect_stdio_with_cx(cx, "server", &[]).await
 }
 
 async fn connect_modern_stdio_with_explicit_context(
     builder: modern::ClientBuilder,
     cx: &modern::Cx,
 ) -> modern::McpResult<modern::Client> {
-    builder.connect_stdio_with_cx("server", &[], cx).await
+    builder.connect_stdio_with_cx(cx, "server", &[]).await
 }
 
 async fn connect_exact_legacy_stdio_with_explicit_context(
     builder: legacy_2024::ClientBuilder,
     cx: &legacy_2024::Cx,
 ) -> legacy_2024::McpResult<legacy_2024::Client> {
-    builder.connect_stdio_with_cx("server", &[], cx).await
+    builder.connect_stdio_with_cx(cx, "server", &[]).await
 }
 
 fn assert_typed_facade_client_builder_exports() {
@@ -920,7 +920,7 @@ fn assert_final_typed_client_and_dual_era_http_surface() {
         legacy_builder.protocol_policy(),
         legacy_2024::ProtocolPolicy::LegacyOnly
     );
-    let _: fn(&str, &[&str], legacy_2024::Cx) -> fastmcp_rust::McpResult<legacy_2024::Client> =
+    let _: fn(legacy_2024::Cx, &str, &[&str]) -> fastmcp_rust::McpResult<legacy_2024::Client> =
         legacy_2024::Client::stdio_with_cx;
 
     let _: Option<fastmcp_rust::ModernHttpSubscriptionListenCollector> = None;

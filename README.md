@@ -632,7 +632,7 @@ let endpoint = CanonicalHttpUrl::parse("https://mcp.example.com/mcp")?;
 let credential = BoundBearerCredential::bind(endpoint.clone(), token)?;
 let client = modern::ClientBuilder::new()
     .http_bearer_credential(credential)
-    .connect_http_with_cx(endpoint, cx)
+    .connect_http_with_cx(cx, endpoint)
     .await?;
 ```
 
