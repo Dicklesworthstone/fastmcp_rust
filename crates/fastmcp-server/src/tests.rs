@@ -24,13 +24,16 @@ use fastmcp_core::{
 };
 use fastmcp_derive::tool;
 use fastmcp_protocol::{
-    CallToolParams, CancelledParams, ClientCapabilities, ClientInfo, Content, CreateMessageResult,
-    GetPromptParams, InitializeParams, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
-    LegacyContent, LegacyResourceContent, LogLevel, LogMessageParams, Prompt, PromptArgument,
-    PromptMessage, ReadResourceParams, RequestId, Resource, ResourceContent, ResourceTemplate,
-    ResourceUpdatedNotificationParams, Role, SamplingCapability, ServerCapabilities, ServerInfo,
-    SetLogLevelParams, Tool,
+    CallToolParams, CancelledParams, ClientCapabilities, ClientInfo, Content, GetPromptParams,
+    InitializeParams, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyContent,
+    LegacyResourceContent, LogLevel, LogMessageParams, Prompt, PromptArgument, PromptMessage,
+    ReadResourceParams, RequestId, Resource, ResourceContent, ResourceTemplate,
+    ResourceUpdatedNotificationParams, Role, ServerCapabilities, ServerInfo, SetLogLevelParams,
+    Tool,
 };
+// Exact-2024 era: used only by the legacy receive-pump sampling test.
+#[cfg(feature = "legacy-2024-11-05")]
+use fastmcp_protocol::{CreateMessageResult, SamplingCapability};
 
 #[cfg(feature = "tasks")]
 use crate::TaskManager;
@@ -48,6 +51,8 @@ use crate::{
     TokenAuthProvider,
 };
 
+// Exact-2024 era: used only by the receive-pump tests that open with a legacy handshake.
+#[cfg(feature = "legacy-2024-11-05")]
 fn run_returning_pump_with_caller_runtime<R, S>(
     server: Server,
     recv: R,
@@ -405,6 +410,8 @@ fn block_until_cancelled(ctx: &McpContext) -> McpResult<String> {
     Err(McpError::request_cancelled())
 }
 
+// Exact-2024 era: used only by the legacy receive-pump sampling test.
+#[cfg(feature = "legacy-2024-11-05")]
 #[tool(
     name = "sampling_round_trip",
     description = "Requests one sampling completion"
