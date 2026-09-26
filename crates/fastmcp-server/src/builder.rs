@@ -43,10 +43,13 @@ use crate::proxy::{
     ProxyResourceHandler, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyToolHandler,
     ProxyTypedCatalog,
 };
-#[cfg(feature = "tasks")]
-use crate::tasks::{ApplicationTaskSupervisor, FinalTaskRuntimeConfig, TaskServiceHost};
 #[cfg(all(test, feature = "tasks"))]
 use crate::tasks::SharedTaskManager;
+#[cfg(feature = "tasks")]
+use crate::tasks::{
+    ApplicationTaskSupervisor, DEFAULT_CONCURRENT_TASK_HANDOFFS, FinalTaskRuntimeConfig,
+    MAX_CONCURRENT_TASK_HANDOFFS, TaskServiceHost,
+};
 use crate::{
     AuthProvider, DuplicateBehavior, ExtensionHandlerRegistry, FinalSubscriptionRegistry,
     HttpServerConfig, LifespanHooks, LoggingConfig, PromptHandler, ResourceHandler, Router, Server,
@@ -289,6 +292,9 @@ pub struct ServerBuilder {
     /// Supervisor installed on the selected local runtime when building.
     #[cfg(feature = "tasks")]
     task_supervisor: Option<Arc<dyn ApplicationTaskSupervisor>>,
+    /// Maximum application handoffs polled by the hosted Tasks service.
+    #[cfg(feature = "tasks")]
+    max_concurrent_task_handoffs: usize,
     /// One route-bound upstream final Tasks relay. The official Task methods
     /// cannot disambiguate two independent upstream task-ID namespaces.
     #[cfg(all(feature = "proxy", feature = "tasks"))]
@@ -415,6 +421,8 @@ impl ServerBuilder {
             final_task_runtime: None,
             #[cfg(feature = "tasks")]
             task_supervisor: None,
+            #[cfg(feature = "tasks")]
+            max_concurrent_task_handoffs: DEFAULT_CONCURRENT_TASK_HANDOFFS,
             #[cfg(all(feature = "proxy", feature = "tasks"))]
             final_task_relay: None,
             refused_registrations: Vec::new(),
@@ -855,6 +863,8 @@ impl ServerBuilder {
     /// child of the caller's context and waits for readiness before dispatch.
     /// It cancels and settles that child before running the shutdown hook.
     /// No runtime or detached worker is created.
+    /// Up to 32 application handoffs may run concurrently; configure this
+    /// limit with [`Self::task_concurrency`].
     ///
     /// [`Self::try_build`] rejects a runtime with a caller-installed service,
     /// a proxy Tasks owner, or a second supervisor. Direct request dispatch
@@ -871,6 +881,35 @@ impl ServerBuilder {
             });
         } else {
             self.task_supervisor = Some(supervisor);
+        }
+        self
+    }
+
+    /// Sets the maximum concurrent handoffs for the hosted Task supervisor.
+    ///
+    /// The default is 32; valid values are 1 through 256. Set 1 for an
+    /// application that requires sequential task execution. A pending task
+    /// occupies one slot until it completes, yields input requirements, is
+    /// cancelled, or expires. Additional work remains in the Tasks store
+    /// until a slot becomes available.
+    ///
+    /// This limit applies to [`Self::task_supervisor`] in either builder-call
+    /// order. It does not install a supervisor or alter a caller-owned task
+    /// service. Invalid values make [`Self::try_build`] fail before installing
+    /// a service, including when no supervisor was configured.
+    #[cfg(feature = "tasks")]
+    #[must_use]
+    pub fn task_concurrency(mut self, max_concurrent_handoffs: usize) -> Self {
+        if !(1..=MAX_CONCURRENT_TASK_HANDOFFS).contains(&max_concurrent_handoffs) {
+            self.refused_registrations.push(RefusedRegistration {
+                kind: RegistrationKind::TaskService,
+                name: "task_concurrency".to_owned(),
+                reason: format!(
+                    "Task concurrency must be between 1 and {MAX_CONCURRENT_TASK_HANDOFFS}"
+                ),
+            });
+        } else {
+            self.max_concurrent_task_handoffs = max_concurrent_handoffs;
         }
         self
     }
@@ -2866,11 +2905,16 @@ impl ServerBuilder {
                         reason: "the Tasks runtime already has an installed service".to_owned(),
                     }]));
                 }
-                let host = TaskServiceHost::install(runtime, supervisor).map_err(|_| {
+                let host = TaskServiceHost::install(
+                    runtime,
+                    supervisor,
+                    self.max_concurrent_task_handoffs,
+                )
+                .map_err(|_| {
                     ServerBuildError::InvalidConfiguration(vec![RefusedRegistration {
                         kind: RegistrationKind::TaskService,
                         name: "task_supervisor".to_owned(),
-                        reason: "the Tasks runtime already has an installed service".to_owned(),
+                        reason: "the hosted Task service could not be installed".to_owned(),
                     }])
                 })?;
                 Some(host)
@@ -3074,6 +3118,57 @@ mod tests {
             assert!(!runtime.has_installed_task_service());
             assert!(!runtime.is_task_service_ready());
             assert!(server.task_service_host.is_none());
+        }
+
+        #[test]
+        fn task_concurrency_accepts_bounds_in_either_supervisor_order() {
+            for concurrency in [1, 2, MAX_CONCURRENT_TASK_HANDOFFS] {
+                for supervisor_first in [false, true] {
+                    let configured = if supervisor_first {
+                        builder()
+                            .task_supervisor(Arc::new(Supervisor))
+                            .task_concurrency(concurrency)
+                    } else {
+                        builder()
+                            .task_concurrency(concurrency)
+                            .task_supervisor(Arc::new(Supervisor))
+                    };
+                    let server = configured.try_build().expect("bounded concurrency builds");
+                    let runtime = server.final_task_runtime().expect("default Tasks runtime");
+                    assert!(runtime.has_installed_task_service());
+                    assert!(!runtime.is_task_service_ready());
+                }
+            }
+        }
+
+        #[test]
+        fn task_concurrency_refuses_invalid_bounds_before_runtime_mutation() {
+            for concurrency in [0, MAX_CONCURRENT_TASK_HANDOFFS + 1, usize::MAX] {
+                let runtime = runtime();
+                assert_refused(
+                    builder()
+                        .final_tasks(runtime.clone())
+                        .expect("install explicit Tasks runtime")
+                        .task_supervisor(Arc::new(Supervisor))
+                        .task_concurrency(concurrency)
+                        .try_build(),
+                    "Task concurrency must be between",
+                );
+                assert!(!runtime.has_installed_task_service());
+                assert!(!runtime.is_task_service_ready());
+            }
+        }
+
+        #[test]
+        fn task_concurrency_without_a_supervisor_does_not_install_a_service() {
+            let server = builder().task_concurrency(2).build();
+            let runtime = server.final_task_runtime().expect("default Tasks runtime");
+            assert!(!runtime.has_installed_task_service());
+            assert!(server.task_service_host.is_none());
+            assert_refused(
+                builder().task_concurrency(0).try_build(),
+                "Task concurrency must be between",
+            );
         }
 
         #[test]

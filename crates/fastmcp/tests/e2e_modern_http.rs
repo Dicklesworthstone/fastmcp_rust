@@ -5054,6 +5054,346 @@ fn e2e_public_http_without_task_supervisor_refuses_task_creation() {
     server.shutdown();
 }
 
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[derive(Debug, PartialEq, Eq)]
+enum PublicHttpTaskConcurrencyEvent {
+    Started(FinalTaskId),
+    Dropped(FinalTaskId),
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[derive(Default)]
+struct PublicHttpTaskConcurrencyCounters {
+    started: AtomicUsize,
+    dropped: AtomicUsize,
+    active: AtomicUsize,
+    peak_active: AtomicUsize,
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+struct PublicHttpTaskConcurrencyGuard {
+    task_id: FinalTaskId,
+    counters: Arc<PublicHttpTaskConcurrencyCounters>,
+    events: mpsc::Sender<PublicHttpTaskConcurrencyEvent>,
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+impl Drop for PublicHttpTaskConcurrencyGuard {
+    fn drop(&mut self) {
+        self.counters.active.fetch_sub(1, Ordering::SeqCst);
+        self.counters.dropped.fetch_add(1, Ordering::SeqCst);
+        let _ = self.events.send(PublicHttpTaskConcurrencyEvent::Dropped(
+            self.task_id.clone(),
+        ));
+    }
+}
+
+/// Each application invocation remains pending without a timer or wakeup.
+/// Only the real framework's cancellation path can retire its worker slot.
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+struct PublicHttpPendingTaskSupervisor {
+    counters: Arc<PublicHttpTaskConcurrencyCounters>,
+    events: mpsc::Sender<PublicHttpTaskConcurrencyEvent>,
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+impl ApplicationTaskSupervisor for PublicHttpPendingTaskSupervisor {
+    fn resume<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        handoff: FinalTaskSupervisorHandoff,
+    ) -> FinalTaskSupervisorFuture<'a> {
+        Box::pin(async move {
+            let FinalTaskSupervisorHandoff::Initial(initial) = handoff else {
+                return Err(McpError::internal_error(
+                    "the concurrency fixture only creates initial Task work",
+                ));
+            };
+            let active = self.counters.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.counters
+                .peak_active
+                .fetch_max(active, Ordering::SeqCst);
+            self.counters.started.fetch_add(1, Ordering::SeqCst);
+            let guard = PublicHttpTaskConcurrencyGuard {
+                task_id: initial.task_id().clone(),
+                counters: Arc::clone(&self.counters),
+                events: self.events.clone(),
+            };
+            self.events
+                .send(PublicHttpTaskConcurrencyEvent::Started(
+                    initial.task_id().clone(),
+                ))
+                .map_err(|_| McpError::internal_error("Task observation receiver was dropped"))?;
+            std::future::pending::<()>().await;
+            drop((initial, guard));
+            Ok(())
+        })
+    }
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+struct PublicHttpCountingTaskTool {
+    counters: Arc<PublicHttpHandlerCallCounters>,
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+impl ToolHandler for PublicHttpCountingTaskTool {
+    fn definition(&self) -> Tool {
+        PublicHttpTaskTool.definition()
+    }
+
+    fn call(&self, context: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        PublicHttpTaskTool.call(context, arguments)
+    }
+
+    fn declares_final_tasks(&self) -> bool {
+        true
+    }
+
+    fn call_final_outcome(
+        &self,
+        context: &McpContext,
+        arguments: serde_json::Value,
+    ) -> McpResult<FinalToolOutcome> {
+        self.counters.tool.fetch_add(1, Ordering::SeqCst);
+        PublicHttpTaskTool.call_final_outcome(context, arguments)
+    }
+}
+
+/// Both concurrency cases use this same public builder and live HTTP server.
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn spawn_task_concurrency_http_server(
+    concurrency: usize,
+    supervisor: Arc<PublicHttpPendingTaskSupervisor>,
+) -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let tool_calls = Arc::clone(&handler_calls);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("the application runtime installs its server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("Task concurrency server control receiver went away".to_owned());
+            }
+            let task_runtime = FinalTaskRuntime::in_memory(
+                FinalTaskRuntimeConfig::new(60_000, Some(5_000))
+                    .expect("Task concurrency timing policy is valid"),
+                Arc::new(|_| {}),
+            );
+            let server = modern::ServerBuilder::new("facade-http-task-concurrency", "1.0.0")
+                .tool(PublicHttpCountingTaskTool {
+                    counters: tool_calls,
+                })
+                .final_tasks(task_runtime.clone())
+                .map_err(|error| format!("Task concurrency runtime install failed: {error}"))?
+                .task_concurrency(concurrency)
+                .task_supervisor(supervisor)
+                .build();
+            let bound = server
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("Task concurrency HTTP bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("Task concurrency HTTP address failed: {error}"))?;
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("Task concurrency startup receiver went away".to_owned());
+            }
+            let shutdown = bound
+                .serve(&cx)
+                .await
+                .map_err(|error| format!("Task concurrency HTTP server stopped: {error}"))?;
+            if task_runtime.is_task_service_ready() {
+                return Err("the hosted Task service outlived HTTP serve".to_owned());
+            }
+            Ok(shutdown)
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "Task concurrency HTTP server startup exceeded its bound"
+        );
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("Task concurrency HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("Task concurrency HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn public_http_task_supervisor_concurrency_round(concurrency: usize) {
+    let cx = Cx::for_request();
+    let counters = Arc::new(PublicHttpTaskConcurrencyCounters::default());
+    let (events_tx, events_rx) = mpsc::channel();
+    let server = spawn_task_concurrency_http_server(
+        concurrency,
+        Arc::new(PublicHttpPendingTaskSupervisor {
+            counters: Arc::clone(&counters),
+            events: events_tx,
+        }),
+    );
+    let mut client = task_supervisor_http_client(&cx, &server);
+    let mut next_id = 2_i64;
+    let create = |client: &mut modern::HttpClient, next_id: &mut i64| {
+        let created = runtime_block_on_bounded(
+            &cx,
+            client.call_tool_outcome(
+                &cx,
+                RequestId::Number(*next_id),
+                PUBLIC_HTTP_TASK_TOOL_NAME,
+                json!({}),
+                1 << 20,
+            ),
+        )
+        .expect("live HTTP creates a Task without waiting for a free application worker");
+        *next_id += 1;
+        let FinalToolCallOutcome::Task(created) = created else {
+            panic!("tools/call must return the official Task branch: {created:?}");
+        };
+        assert!(matches!(created.task, FinalTask::Working(_)));
+        created.task.base().task_id.clone()
+    };
+    let get = |client: &mut modern::HttpClient, next_id: &mut i64, task_id: &FinalTaskId| {
+        let observed = runtime_block_on_bounded(
+            &cx,
+            client.get_task(&cx, RequestId::Number(*next_id), task_id.clone(), 1 << 20),
+        )
+        .expect("the accepted Task remains immediately readable over live HTTP");
+        *next_id += 1;
+        assert_eq!(&observed.task.base().task_id, task_id);
+        observed.task
+    };
+    let event = || {
+        events_rx
+            .recv_timeout(HTTP_OPERATION_BOUND)
+            .expect("the hosted application invocation reaches its bounded observable transition")
+    };
+    let cancel = |client: &mut modern::HttpClient, next_id: &mut i64, task_id: &FinalTaskId| {
+        runtime_block_on_bounded(
+            &cx,
+            client.cancel_task(&cx, RequestId::Number(*next_id), task_id.clone(), 1 << 20),
+        )
+        .expect("live tasks/cancel must wake a pending application invocation");
+        *next_id += 1;
+        let deadline = Instant::now() + HTTP_OPERATION_BOUND;
+        loop {
+            let observed = get(client, next_id, task_id);
+            if matches!(observed, FinalTask::Cancelled(_)) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "tasks/cancel must publish a terminal Task within its bound: {observed:?}"
+            );
+        }
+    };
+
+    let first = create(&mut client, &mut next_id);
+    assert_eq!(
+        event(),
+        PublicHttpTaskConcurrencyEvent::Started(first.clone())
+    );
+    let second = create(&mut client, &mut next_id);
+    assert_ne!(first, second);
+    assert!(matches!(
+        get(&mut client, &mut next_id, &second),
+        FinalTask::Working(_)
+    ));
+    if concurrency == 2 {
+        assert_eq!(
+            event(),
+            PublicHttpTaskConcurrencyEvent::Started(second.clone())
+        );
+        assert_eq!(counters.active.load(Ordering::SeqCst), 2);
+    } else {
+        assert_eq!(counters.started.load(Ordering::SeqCst), 1);
+        assert_eq!(events_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+    }
+    assert!(matches!(
+        get(&mut client, &mut next_id, &first),
+        FinalTask::Working(_)
+    ));
+    assert_eq!(counters.dropped.load(Ordering::SeqCst), 0);
+
+    cancel(&mut client, &mut next_id, &first);
+    assert_eq!(
+        event(),
+        PublicHttpTaskConcurrencyEvent::Dropped(first.clone())
+    );
+    if concurrency == 1 {
+        assert_eq!(
+            event(),
+            PublicHttpTaskConcurrencyEvent::Started(second.clone())
+        );
+    }
+    assert_eq!(counters.active.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.started.load(Ordering::SeqCst), 2);
+    assert!(matches!(
+        get(&mut client, &mut next_id, &second),
+        FinalTask::Working(_)
+    ));
+
+    cancel(&mut client, &mut next_id, &second);
+    assert_eq!(event(), PublicHttpTaskConcurrencyEvent::Dropped(second));
+    assert_eq!(server.handler_call_snapshot().tool, 2);
+    assert_eq!(events_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+    drop(client);
+    server.shutdown();
+    assert_eq!(counters.started.load(Ordering::SeqCst), 2);
+    assert_eq!(counters.dropped.load(Ordering::SeqCst), 2);
+    assert_eq!(counters.active.load(Ordering::SeqCst), 0);
+    assert_eq!(counters.peak_active.load(Ordering::SeqCst), concurrency);
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_task_supervisor_concurrency_starts_second_before_first_cancels() {
+    public_http_task_supervisor_concurrency_round(2);
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_task_supervisor_serial_limit_starts_second_only_after_first_cancels() {
+    public_http_task_supervisor_concurrency_round(1);
+}
+
 #[cfg(all(
     unix,
     feature = "proxy",
@@ -28551,6 +28891,118 @@ fn e2e_public_http_output_schema_retains_structured_content_and_peer_stays_bare(
 
     drop(client);
     server.shutdown();
+}
+
+const PUBLIC_HTTP_LARGE_SCHEMA_BYTES: usize = 256 * 1024;
+
+/// Reuses the structured echo handler with an explicit large-string schema
+/// on both sides, so the request and result pass the shipped validators.
+struct PublicHttpLargeSchemaTool {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ToolHandler for PublicHttpLargeSchemaTool {
+    fn definition(&self) -> Tool {
+        let mut tool = PublicHttpOutputTool.definition();
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "value": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": PUBLIC_HTTP_LARGE_SCHEMA_BYTES
+                }
+            },
+            "required": ["value"],
+            "additionalProperties": false
+        });
+        tool.input_schema = schema.clone();
+        tool.output_schema = Some(schema);
+        tool
+    }
+
+    fn final_tool_error_structured_content(
+        &self,
+        kind: ToolErrorKind,
+    ) -> Option<serde_json::Value> {
+        PublicHttpOutputTool.final_tool_error_structured_content(kind)
+    }
+
+    fn call(&self, context: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        PublicHttpOutputTool.call(context, arguments)
+    }
+
+    fn call_final(
+        &self,
+        context: &McpContext,
+        arguments: serde_json::Value,
+    ) -> McpResult<CompleteResult<FinalCallToolResult>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        PublicHttpOutputTool.call_final(context, arguments)
+    }
+}
+
+#[test]
+fn e2e_public_http_large_schema_validated_tool_arguments_and_result_round_trip() {
+    let cx = Cx::for_request();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = Arc::clone(&calls);
+    // This shared listener helper also hosts modern fixtures; the public
+    // builder below selects the protocol served on the real HTTP socket.
+    let server = spawn_legacy_http_server("modern large schema", move || {
+        ServerBuilder::new("facade-http-large-schema", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly is available")
+            .tool(PublicHttpLargeSchemaTool {
+                calls: handler_calls,
+            })
+            .build()
+    });
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-large-schema", "1.0.0")
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
+    )
+    .expect("the public modern client connects to the large-schema HTTP server");
+    let expected = public_http_large_result_text(PUBLIC_HTTP_LARGE_SCHEMA_BYTES);
+    let called = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            PUBLIC_HTTP_OUTPUT_TOOL_NAME,
+            json!({"value": expected}),
+        ),
+    )
+    .expect("a 256 KiB schema-validated argument and result pass the real HTTP router");
+    assert!(
+        !called.is_error,
+        "the large echo is a successful tool result"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let structured = called
+        .structured_content
+        .as_ref()
+        .and_then(|content| content.get("value"))
+        .and_then(serde_json::Value::as_str)
+        .expect("the output schema keeps the complete structured string");
+    assert_eq!(structured.len(), PUBLIC_HTTP_LARGE_SCHEMA_BYTES);
+    assert!(
+        structured.as_bytes() == expected.as_bytes(),
+        "the schema-validated structured result must retain every argument byte"
+    );
+    assert!(
+        matches!(
+            called.content.as_slice(),
+            [ContentBlock::Text { text, .. }]
+                if text.strip_prefix("tool:") == Some(expected.as_str())
+        ),
+        "the text result must independently echo the complete large argument"
+    );
+    drop(client);
+    server.shutdown();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 fn spawn_modern_compose_and_state_http_server() -> HttpServerFixture {
