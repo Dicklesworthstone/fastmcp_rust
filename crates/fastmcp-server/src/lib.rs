@@ -54550,4 +54550,99 @@ mod lib_unit_tests {
             Ok(())
         });
     }
+
+    #[cfg(feature = "tasks")]
+    struct IdleHostedTaskSupervisor;
+
+    #[cfg(feature = "tasks")]
+    impl ApplicationTaskSupervisor for IdleHostedTaskSupervisor {
+        fn resume<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Serves `bound` until `runtime` reports a ready Task service or a bound
+    /// passes, then cancels the serve. Returns whether the service was ready.
+    #[cfg(feature = "tasks")]
+    async fn serve_until_task_service_ready(
+        cx: &Cx,
+        bound: BoundHttpServer,
+        runtime: FinalTaskRuntime,
+    ) -> Result<bool, String> {
+        let caller_cx = cx.clone();
+        let mut observer = cx
+            .spawn(move |observer_cx| async move {
+                let mut ready = false;
+                for _ in 0..2_000 {
+                    if runtime.is_task_service_ready() {
+                        ready = true;
+                        break;
+                    }
+                    asupersync::time::sleep(observer_cx.now(), Duration::from_millis(1)).await;
+                }
+                caller_cx.cancel_with(CancelKind::User, Some("hosted Task service observed"));
+                ready
+            })
+            .map_err(|error| format!("observer admission failed: {error}"))?;
+        let serve = bound.serve(cx).await;
+        let ready = observer
+            .join(cx)
+            .await
+            .map_err(|error| format!("observer failed: {error:?}"))?;
+        let shutdown = serve.map_err(|error| format!("hosted Tasks serve failed: {error}"))?;
+        require_quiescent_http_shutdown(shutdown, "hosted Tasks serve").await?;
+        Ok(ready)
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn live_http_hosts_a_ready_task_service_and_settles_it_when_serve_is_cancelled() {
+        run_live_http_test(|cx| async move {
+            let server = Server::new("live-hosted-tasks", "1.0.0")
+                .task_supervisor(Arc::new(IdleHostedTaskSupervisor))
+                .build();
+            let runtime = server
+                .final_task_runtime()
+                .cloned()
+                .ok_or_else(|| "the default Tasks runtime is installed".to_owned())?;
+            if runtime.is_task_service_ready() {
+                return Err("building must not start the Task service".to_owned());
+            }
+            let bound = server
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("hosted Tasks bind failed: {error}"))?;
+            if !serve_until_task_service_ready(&cx, bound, runtime.clone()).await? {
+                return Err("the serve must host a ready Task service".to_owned());
+            }
+            if runtime.is_task_service_ready() {
+                return Err("no Task service runner may still run after serve returns".to_owned());
+            }
+            Ok(())
+        });
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn live_http_without_a_task_supervisor_hosts_no_task_service() {
+        run_live_http_test(|cx| async move {
+            let server = Server::new("live-unhosted-tasks", "1.0.0").build();
+            let runtime = server
+                .final_task_runtime()
+                .cloned()
+                .ok_or_else(|| "the default Tasks runtime is installed".to_owned())?;
+            let bound = server
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("unhosted Tasks bind failed: {error}"))?;
+            if serve_until_task_service_ready(&cx, bound, runtime).await? {
+                return Err("a server without task_supervisor must host no Task service".to_owned());
+            }
+            Ok(())
+        });
+    }
 }
