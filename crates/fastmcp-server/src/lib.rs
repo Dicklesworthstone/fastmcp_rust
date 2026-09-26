@@ -144,8 +144,8 @@ use fastmcp_protocol::{
 };
 #[cfg(feature = "proxy")]
 pub use proxy::{
-    FinalProgressCallback, ProgressCallback, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint,
-    ProxyClient, ProxyFinalCatalog, ProxyLegacyPeerNotifications, ProxyPromptCatalog,
+    FinalProgressCallback, ProgressCallback, ProxyAsyncRequest, ProxyBackend, ProxyCatalog,
+    ProxyCatalogCacheHint, ProxyClient, ProxyFinalCatalog, ProxyLegacyPeerNotifications, ProxyPromptCatalog,
     ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog,
     ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
 };
