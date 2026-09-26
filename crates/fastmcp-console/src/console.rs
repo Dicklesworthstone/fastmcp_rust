@@ -51,11 +51,117 @@ impl UntrustedDisplayText {
         Self(bounded_redacted_terminal_text(text, max_chars))
     }
 
+    /// Sanitize untrusted text into printable ASCII only.
+    ///
+    /// Credentials become `redaction_marker`. Every byte outside printable
+    /// ASCII, including each byte of non-ASCII UTF-8, becomes a `\xHH` escape,
+    /// so no control, bidi, line break, homoglyph, or wide character reaches
+    /// the terminal, and output bytes, characters, and columns coincide. At
+    /// most `max_bytes` bytes are produced, capped by the crate's internal hard
+    /// ceiling; truncated output ends with as much of `truncation_marker` as
+    /// fits. The returned [`DisplayMutation`] reports what changed.
+    #[must_use]
+    pub fn ascii(
+        text: &str,
+        max_bytes: usize,
+        redaction_marker: &str,
+        truncation_marker: &str,
+    ) -> (Self, DisplayMutation) {
+        let limit = max_bytes.min(TERMINAL_TEXT_HARD_MAX_CHARS);
+        if limit == 0 {
+            let mutation = DisplayMutation {
+                truncated: !text.is_empty(),
+                ..DisplayMutation::default()
+            };
+            return (Self(String::new()), mutation);
+        }
+
+        // Bound redaction work independently of input size while retaining
+        // look-ahead for a credential value close to the visible boundary.
+        let scan_limit = limit.saturating_mul(4);
+        let mut characters = text.chars();
+        let bounded_input: String = characters.by_ref().take(scan_limit).collect();
+        let source_was_truncated = characters.next().is_some();
+        let redacted = redact_free_text_credentials_with(&bounded_input, redaction_marker);
+        let (mut rendered, sanitized, escape_truncated) =
+            ascii_escaped(&redacted, limit, truncation_marker);
+        if source_was_truncated && !escape_truncated {
+            append_ascii_truncation_marker(&mut rendered, limit, truncation_marker);
+        }
+        let mutation = DisplayMutation {
+            redacted: redacted != bounded_input,
+            sanitized,
+            truncated: source_was_truncated || escape_truncated,
+        };
+        (Self(rendered), mutation)
+    }
+
     /// Borrow the sanitized terminal-safe representation.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Take the sanitized terminal-safe representation.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+/// What rendering an [`UntrustedDisplayText`] changed in its source text.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct DisplayMutation {
+    /// A credential was replaced.
+    pub redacted: bool,
+    /// A byte or character was escaped.
+    pub sanitized: bool,
+    /// The source did not fit the budget.
+    pub truncated: bool,
+}
+
+/// Escapes every byte outside printable ASCII as `\xHH` within `limit`
+/// output bytes. Returns the text and whether it escaped and truncated.
+fn ascii_escaped(value: &str, limit: usize, truncation_marker: &str) -> (String, bool, bool) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut escaped_text = String::with_capacity(value.len().min(limit));
+    let mut escaped = false;
+    for byte in value.bytes() {
+        let (encoded_len, byte_needs_escape) = if byte.is_ascii_graphic() || byte == b' ' {
+            (1, false)
+        } else {
+            (4, true)
+        };
+        if escaped_text.len().saturating_add(encoded_len) > limit {
+            append_ascii_truncation_marker(&mut escaped_text, limit, truncation_marker);
+            return (escaped_text, escaped, true);
+        }
+        escaped |= byte_needs_escape;
+        if encoded_len == 1 {
+            escaped_text.push(char::from(byte));
+        } else {
+            escaped_text.push('\\');
+            escaped_text.push('x');
+            escaped_text.push(char::from(HEX[usize::from(byte >> 4)]));
+            escaped_text.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    (escaped_text, escaped, false)
+}
+
+/// Replaces the tail of `output` with as much of `marker` as fits in `limit`.
+fn append_ascii_truncation_marker(output: &mut String, limit: usize, marker: &str) {
+    let mut marker_len = marker.len().min(limit);
+    while !marker.is_char_boundary(marker_len) {
+        marker_len -= 1;
+    }
+    let mut retained = limit.saturating_sub(marker_len).min(output.len());
+    while !output.is_char_boundary(retained) {
+        retained = retained.saturating_sub(1);
+    }
+    output.truncate(retained);
+    output.push_str(&marker[..marker_len]);
 }
 
 impl std::fmt::Display for UntrustedDisplayText {
@@ -1488,6 +1594,69 @@ mod tests {
         assert!(!safe.as_str().chars().any(terminal_text_is_unsafe));
         assert!(safe.as_str().contains("auth=[REDACTED]"));
         assert!(safe.as_str().ends_with("..."));
+    }
+
+    #[test]
+    fn ascii_display_text_escapes_every_non_printable_byte_and_reports_it() {
+        let (safe, mutation) = UntrustedDisplayText::ascii(
+            "evil\u{1b}[31m\u{202e}\ncaf\u{e9} api_key=secret-value",
+            4_096,
+            "<redacted>",
+            "...[truncated]",
+        );
+        assert_eq!(
+            safe.as_str(),
+            "evil\\x1B[31m\\xE2\\x80\\xAE\\x0Acaf\\xC3\\xA9 api_key=<redacted>"
+        );
+        assert!(
+            safe.as_str()
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+        );
+        assert_eq!(
+            mutation,
+            DisplayMutation {
+                redacted: true,
+                sanitized: true,
+                truncated: false,
+            }
+        );
+
+        // Printable ASCII alone changes nothing and reports nothing.
+        let (plain, mutation) =
+            UntrustedDisplayText::ascii("evil [31m cafe", 4_096, "<redacted>", "...[truncated]");
+        assert_eq!(plain.into_string(), "evil [31m cafe");
+        assert_eq!(mutation, DisplayMutation::default());
+    }
+
+    #[test]
+    fn ascii_display_text_bounds_bytes_and_marks_only_real_overflow() {
+        let marker = "...[truncated]";
+        let exact = UntrustedDisplayText::ascii("abcd", 4, "<redacted>", marker);
+        assert_eq!(exact.0.as_str(), "abcd");
+        assert!(!exact.1.truncated);
+
+        let over = UntrustedDisplayText::ascii("abcde", 4, "<redacted>", marker);
+        assert_eq!(over.0.as_str(), "...[");
+        assert!(over.1.truncated);
+
+        // An escape that would cross the budget is never split.
+        let split = UntrustedDisplayText::ascii("ab\n", 5, "<redacted>", ".");
+        assert_eq!(split.0.as_str(), "ab.");
+        assert!(split.1.truncated);
+
+        let empty_budget = UntrustedDisplayText::ascii("a", 0, "<redacted>", marker);
+        assert_eq!(empty_budget.0.as_str(), "");
+        assert!(empty_budget.1.truncated);
+        let empty_text = UntrustedDisplayText::ascii("", 0, "<redacted>", marker);
+        assert!(!empty_text.1.truncated);
+
+        let long = "x".repeat(TERMINAL_TEXT_HARD_MAX_CHARS * 8);
+        let (capped, mutation) =
+            UntrustedDisplayText::ascii(&long, usize::MAX, "<redacted>", marker);
+        assert_eq!(capped.as_str().len(), TERMINAL_TEXT_HARD_MAX_CHARS);
+        assert!(capped.as_str().ends_with(marker));
+        assert!(mutation.truncated);
     }
 
     #[test]

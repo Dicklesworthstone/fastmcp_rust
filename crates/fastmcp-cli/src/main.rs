@@ -1612,48 +1612,10 @@ fn sanitize_display_key_with_metadata(value: &str) -> (String, OutputMutationMet
     (sanitized, mutation)
 }
 
-/// Produces bounded, single-line ASCII for terminal-bound untrusted fields.
-/// Structured CLI output uses the same representation and reports every
-/// redaction, sanitation, and truncation through explicit root metadata.
+/// Produces bounded, single-line ASCII for terminal-bound text at the full
+/// terminal budget. See [`sanitize_peer_text_with_metadata`].
 fn sanitize_terminal_text(value: &str) -> String {
-    sanitize_terminal_text_with_limit(value, TERMINAL_TEXT_LIMIT)
-}
-
-fn sanitize_terminal_text_with_limit(value: &str, limit: usize) -> String {
-    sanitize_terminal_text_with_metadata(value, limit).0
-}
-
-fn sanitize_terminal_text_with_metadata(value: &str, limit: usize) -> (String, bool, bool) {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-
-    let limit = limit.min(TERMINAL_TEXT_LIMIT);
-    if limit == 0 {
-        return (String::new(), false, !value.is_empty());
-    }
-
-    let mut sanitized = String::with_capacity(value.len().min(limit));
-    let mut escaped = false;
-    for byte in value.bytes() {
-        let (encoded_len, byte_needs_escape) = if byte.is_ascii_graphic() || byte == b' ' {
-            (1, false)
-        } else {
-            (4, true)
-        };
-        if sanitized.len().saturating_add(encoded_len) > limit {
-            append_truncation_marker(&mut sanitized, limit);
-            return (sanitized, escaped, true);
-        }
-        escaped |= byte_needs_escape;
-        if encoded_len == 1 {
-            sanitized.push(char::from(byte));
-        } else {
-            sanitized.push('\\');
-            sanitized.push('x');
-            sanitized.push(char::from(HEX[usize::from(byte >> 4)]));
-            sanitized.push(char::from(HEX[usize::from(byte & 0x0f)]));
-        }
-    }
-    (sanitized, escaped, false)
+    sanitize_peer_text(value, TERMINAL_TEXT_LIMIT)
 }
 
 fn append_truncation_marker(output: &mut String, limit: usize) {
@@ -1683,37 +1645,23 @@ impl OutputMutationMetadata {
     }
 }
 
+/// Renders untrusted text as bounded, single-line printable ASCII through the
+/// shared [`UntrustedDisplayText::ascii`] path, with the CLI's redaction and
+/// truncation markers. Human and structured CLI output use the same
+/// representation and report every redaction, sanitation, and truncation.
 fn sanitize_peer_text_with_metadata(value: &str, limit: usize) -> (String, OutputMutationMetadata) {
-    let limit = limit.min(TERMINAL_TEXT_LIMIT);
-    if limit == 0 {
-        return (
-            String::new(),
-            OutputMutationMetadata {
-                truncated: !value.is_empty(),
-                ..OutputMutationMetadata::default()
-            },
-        );
-    }
-
-    // Bound redaction work independently of peer input size while retaining
-    // look-ahead for a credential value close to the visible boundary.
-    let scan_limit = limit.saturating_mul(4);
-    let mut characters = value.chars();
-    let bounded_input: String = characters.by_ref().take(scan_limit).collect();
-    let source_was_truncated = characters.next().is_some();
-    let redacted = redact_free_text_credentials_with(&bounded_input, REDACTED_ENV_VALUE);
-    let was_redacted = redacted != bounded_input;
-    let (mut rendered, terminal_sanitized, terminal_truncated) =
-        sanitize_terminal_text_with_metadata(&redacted, limit);
-    if source_was_truncated && !terminal_truncated {
-        append_truncation_marker(&mut rendered, limit);
-    }
+    let (rendered, mutation) = fastmcp_console::console::UntrustedDisplayText::ascii(
+        value,
+        limit.min(TERMINAL_TEXT_LIMIT),
+        REDACTED_ENV_VALUE,
+        TERMINAL_TRUNCATED,
+    );
     (
-        rendered,
+        rendered.into_string(),
         OutputMutationMetadata {
-            redacted: was_redacted,
-            sanitized: terminal_sanitized,
-            truncated: source_was_truncated || terminal_truncated,
+            redacted: mutation.redacted,
+            sanitized: mutation.sanitized,
+            truncated: mutation.truncated,
         },
     )
 }
@@ -4568,10 +4516,7 @@ fn render_test_result(result: &TestResult, verbose: bool) -> String {
         line
     };
     if line.len() > PEER_DETAIL_LIMIT.saturating_add(PEER_FIELD_LIMIT) {
-        line = sanitize_terminal_text_with_limit(
-            &line,
-            PEER_DETAIL_LIMIT.saturating_add(PEER_FIELD_LIMIT),
-        );
+        line = sanitize_peer_text(&line, PEER_DETAIL_LIMIT.saturating_add(PEER_FIELD_LIMIT));
     }
     line
 }
@@ -15481,10 +15426,10 @@ IFS= read -r end
 
         #[test]
         fn terminal_text_preserves_exact_fit_and_marks_only_real_overflow() {
-            assert_eq!(sanitize_terminal_text_with_limit("a", 1), "a");
-            assert_eq!(sanitize_terminal_text_with_limit("\n", 4), "\\x0A");
-            assert_eq!(sanitize_terminal_text_with_limit("ab", 1), ".");
-            assert_eq!(sanitize_terminal_text_with_limit("\nX", 4), "...[");
+            assert_eq!(sanitize_peer_text("a", 1), "a");
+            assert_eq!(sanitize_peer_text("\n", 4), "\\x0A");
+            assert_eq!(sanitize_peer_text("ab", 1), ".");
+            assert_eq!(sanitize_peer_text("\nX", 4), "...[");
         }
 
         #[test]
