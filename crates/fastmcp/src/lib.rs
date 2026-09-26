@@ -424,8 +424,8 @@ pub mod server {
     };
     #[cfg(feature = "proxy")]
     pub use fastmcp_server::{
-        FinalProgressCallback, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint, ProxyClient,
-        ProxyFinalCatalog, ProxyPromptCatalog, ProxyResourceCatalog, ProxyResourceTemplateCatalog,
+        FinalProgressCallback, ProxyAsyncRequest, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint,
+        ProxyClient, ProxyFinalCatalog, ProxyPromptCatalog, ProxyResourceCatalog, ProxyResourceTemplateCatalog,
         ProxyToolCatalog, ProxyTypedCatalog, ProxyUpstreamAdapter, ProxyUpstreamBinding,
         ProxyUpstreamBindingRegistry,
     };
@@ -813,8 +813,8 @@ pub use fastmcp_server::{
 /// Proxy APIs are available only with the proxy profile.
 #[cfg(feature = "proxy")]
 pub use fastmcp_server::{
-    FinalProgressCallback, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint, ProxyClient,
-    ProxyFinalCatalog, ProxyPromptCatalog, ProxyResourceCatalog, ProxyResourceTemplateCatalog,
+    FinalProgressCallback, ProxyAsyncRequest, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint,
+    ProxyClient, ProxyFinalCatalog, ProxyPromptCatalog, ProxyResourceCatalog, ProxyResourceTemplateCatalog,
     ProxyToolCatalog, ProxyTypedCatalog, ProxyUpstreamAdapter, ProxyUpstreamBinding,
     ProxyUpstreamBindingRegistry,
 };
@@ -10739,8 +10739,8 @@ pub mod prelude {
     };
     #[cfg(feature = "proxy")]
     pub use crate::{
-        FinalProgressCallback, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint, ProxyClient,
-        ProxyFinalCatalog, ProxyProgressCallback, ProxyPromptCatalog, ProxyResourceCatalog,
+        FinalProgressCallback, ProxyAsyncRequest, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint,
+        ProxyClient, ProxyFinalCatalog, ProxyProgressCallback, ProxyPromptCatalog, ProxyResourceCatalog,
         ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog, ProxyUpstreamAdapter,
         ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
     };
@@ -13623,12 +13623,13 @@ mod tests {
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     fn facade_reexports_final_proxy_listener_and_modern_progress_binding_surface() {
         use super::{
-            FinalProgressCallback, ProxyBackend, ProxyFinalTaskListener,
+            FinalProgressCallback, ProxyAsyncRequest, ProxyBackend, ProxyFinalTaskListener,
             ProxyFinalTaskListenerEvent, ProxyUpstreamAdapter, ProxyUpstreamBinding,
             ProxyUpstreamBindingRegistry, modern, prelude,
         };
 
         let _: Option<FinalProgressCallback<'_>> = None;
+        let _: Option<Box<dyn ProxyAsyncRequest>> = None;
         let _: Option<Box<dyn ProxyBackend>> = None;
         let _: Option<Box<dyn ProxyFinalTaskListener>> = None;
         let _: Option<ProxyFinalTaskListenerEvent> = None;
@@ -13637,10 +13638,12 @@ mod tests {
         let _: Option<ProxyUpstreamBindingRegistry> = None;
 
         let _: Option<modern::FinalProgressCallback<'_>> = None;
+        let _: Option<Box<dyn super::server::ProxyAsyncRequest>> = None;
         let _: Option<modern::ProxyUpstreamAdapter> = None;
         let _: Option<modern::ProxyUpstreamBinding> = None;
         let _: Option<modern::ProxyUpstreamBindingRegistry> = None;
 
+        let _: Option<Box<dyn prelude::ProxyAsyncRequest>> = None;
         let _: Option<Box<dyn prelude::ProxyBackend>> = None;
         let _: Option<Box<dyn prelude::ProxyFinalTaskListener>> = None;
         let _: Option<prelude::ProxyFinalTaskListenerEvent> = None;

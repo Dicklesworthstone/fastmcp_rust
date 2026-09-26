@@ -51,7 +51,7 @@ use fastmcp_core::{
 };
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_core::{SamplingRequest, SamplingRequestMessage, SamplingRole};
-use fastmcp_protocol::common_types::{AbsoluteUri, Implementation, LoggingLevel, RawIcon};
+use fastmcp_protocol::common_types::{Implementation, LoggingLevel, RawIcon};
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::extensions::{
     ExtensionLocalEnablement, OFFICIAL_TASKS_RESULT_DISCRIMINATOR, official_tasks_empty_settings,
@@ -66,7 +66,7 @@ use fastmcp_protocol::protocol_policy::{
 use fastmcp_protocol::{
     CacheScope, CacheTtl, CallToolResult, ClientCapabilities, ClientInfo, CompleteResult,
     CompletionValues, Content, CoreRequest, CoreResult, ElicitationCapability,
-    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY, FINAL_LOG_LEVEL_META_KEY,
+    FINAL_LOG_LEVEL_META_KEY,
     FinalCallToolResult, FinalCompletionParams, FinalCompletionValues, FinalCoreResult,
     FinalGetPromptResult, FinalLogMessageParams, FinalProgressNotificationParams,
     FinalReadResourceResult, FinalRequestMeta, FormElicitationCapability, GetPromptResult,
@@ -111,6 +111,47 @@ pub type ProgressCallback<'a> = &'a mut dyn FnMut(f64, Option<f64>, Option<Strin
 /// parameters, including their raw decimal/exponent lexemes.
 pub type FinalProgressCallback<'a> = &'a mut dyn FnMut(FinalProgressNotificationParams);
 
+/// One owned core request supplied by a custom [`ProxyBackend`].
+///
+/// A prepared request owns its transport reservation and all mutable request
+/// state independently of the backend. The proxy calls this method and polls
+/// the returned future only after releasing the route mutex, on the caller's
+/// runtime. Implementations must use the supplied context, perform I/O only
+/// inside the future, and release their reservation when either the request
+/// or its future is dropped. They must not detach work or construct a runtime.
+///
+/// The request contains admitted parameters in the backend's explicitly
+/// configured era and locally reconstructed modern metadata. No Tasks
+/// extension is negotiated by this core-only interface.
+/// Complete and input-required results must retain their exact typed payload;
+/// progress uses exact JSON numbers and the request's own progress token.
+/// The callback is final-only. Exact-2024 implementations retain their legacy
+/// progress semantics through [`McpContext::report_progress`] and
+/// [`McpContext::report_progress_with_total`] for this request's marker.
+/// Authentication in `ctx` describes the downstream caller; upstream
+/// credentials and authorization must come from the backend's own route.
+/// Exact-2024 executors also own forwarding of request logging intent before
+/// sending their core request; modern logging intent is in the typed metadata.
+pub trait ProxyAsyncRequest: Send + 'static {
+    /// Locally configured identity of this proxy on its upstream leg.
+    /// This must not be copied from downstream request metadata.
+    fn client_implementation(&self) -> Implementation;
+
+    /// Capabilities this owned request can fulfill on its upstream leg.
+    /// Downstream capability declarations never activate these implicitly.
+    fn client_capabilities(&self) -> ClientCapabilities {
+        ClientCapabilities::default()
+    }
+
+    /// Executes this request once under the caller's cancellation and budget.
+    fn execute<'a>(
+        self: Box<Self>,
+        ctx: &'a McpContext,
+        request: CoreRequest,
+        on_progress: &'a mut (dyn FnMut(FinalProgressNotificationParams) + Send),
+    ) -> BoxFuture<'a, McpResult<CoreResult>>;
+}
+
 /// One native HTTP core request reserved without starting I/O or holding the
 /// proxy backend lock while its response is awaited.
 #[doc(hidden)]
@@ -132,17 +173,8 @@ impl ProxyFinalCoreRequest {
             mut client,
             request_id,
         } = self;
-        if let Some(identity) = ctx
-            .client_implementation()
-            .and_then(implementation_from_request_identity)
-        {
-            client.set_client_implementation(identity);
-        }
         if let Some(level) = inbound_logging_level(ctx) {
             client.set_log_level(level);
-        }
-        if let Some(capabilities) = inbound_client_capabilities(ctx) {
-            client.overlay_client_capabilities(capabilities);
         }
         if let Some(marker) = ctx.progress_marker() {
             overlay_legacy_progress_token(&mut parameters, marker)?;
@@ -258,17 +290,8 @@ impl ProxyFinalTaskRequest {
             operation,
             maximum_response_bytes,
         } = self;
-        if let Some(identity) = ctx
-            .client_implementation()
-            .and_then(implementation_from_request_identity)
-        {
-            client.set_client_implementation(identity);
-        }
         if let Some(level) = inbound_logging_level(ctx) {
             client.set_log_level(level);
-        }
-        if let Some(capabilities) = inbound_client_capabilities(ctx) {
-            client.overlay_client_capabilities(capabilities);
         }
         match operation {
             ProxyFinalTaskOperation::CallTool { name, arguments } => {
@@ -1113,6 +1136,30 @@ impl ProxyTypedCatalog {
 
 /// Backend interface used by proxy handlers.
 pub trait ProxyBackend: Send {
+    /// Returns this custom backend's locally configured asynchronous era.
+    /// This is an immutable configuration fact, not downstream peer metadata.
+    /// Returning `None` means the custom owned execution interface is absent.
+    fn async_protocol_era(&self) -> Option<ProtocolEra> {
+        None
+    }
+
+    /// Reserves an independently owned asynchronous core request.
+    ///
+    /// This method runs under the route mutex, so it may only perform bounded
+    /// local preparation. It must not perform I/O, poll a future, spawn work,
+    /// or retain a borrow of the backend. Returning `None` has no effects and
+    /// means this backend provides no custom asynchronous implementation.
+    /// Returning an error must release any partial reservation. The returned
+    /// request must release its reservation on drop, including cancellation
+    /// before [`ProxyAsyncRequest::execute`] is called.
+    ///
+    /// Implement this for async custom backends. The explicitly synchronous
+    /// methods remain usable independently; async client entry points never
+    /// invoke them as a fallback.
+    fn prepare_async_request(&mut self) -> McpResult<Option<Box<dyn ProxyAsyncRequest>>> {
+        Ok(None)
+    }
+
     /// Lists available tools.
     fn list_tools(&mut self) -> McpResult<Vec<Tool>>;
 
@@ -1994,35 +2041,6 @@ fn sampling_request_from_create_message_params(
     Ok(request)
 }
 
-/// Projects a handler-visible inbound identity back onto the official
-/// Implementation object stamped on an upstream request.
-fn implementation_from_request_identity(
-    identity: &fastmcp_core::ClientImplementationInfo,
-) -> Option<fastmcp_protocol::common_types::Implementation> {
-    let mut implementation =
-        fastmcp_protocol::common_types::Implementation::try_new(&identity.name, &identity.version)
-            .ok()?;
-    implementation.title = identity.title.clone();
-    implementation.description = identity.description.clone();
-    if let Some(website_url) = identity.website_url.as_deref()
-        && let Ok(uri) = AbsoluteUri::parse(website_url)
-    {
-        implementation.website_url = Some(uri);
-    }
-    implementation.icons = identity
-        .icon_sources
-        .iter()
-        .filter_map(|src| RawIcon::try_new(src.clone()).ok())
-        .collect();
-    Some(implementation)
-}
-
-fn inbound_client_info_value(
-    identity: &fastmcp_core::ClientImplementationInfo,
-) -> Option<serde_json::Value> {
-    serde_json::to_value(implementation_from_request_identity(identity)?).ok()
-}
-
 fn inbound_logging_level(ctx: &McpContext) -> Option<LoggingLevel> {
     ctx.min_log_level().map(logging_level_from_mcp)
 }
@@ -2049,19 +2067,6 @@ fn inbound_client_capabilities(ctx: &McpContext) -> Option<ClientCapabilities> {
         });
     }
     Some(capabilities)
-}
-
-fn overlay_inbound_client_capabilities(
-    mut base: ClientCapabilities,
-    inbound: Option<ClientCapabilities>,
-) -> ClientCapabilities {
-    let Some(inbound) = inbound else {
-        return base;
-    };
-    base.sampling = inbound.sampling;
-    base.elicitation = inbound.elicitation;
-    base.roots = inbound.roots;
-    base
 }
 
 fn mrtr_input_responses_from_completed(
@@ -2137,19 +2142,17 @@ fn mcp_log_level_from_logging(level: LoggingLevel) -> McpLogLevel {
 fn stdio_parameters_with_inbound_identity(
     era: Option<ProtocolEra>,
     mut parameters: serde_json::Value,
-    identity: Option<&fastmcp_core::ClientImplementationInfo>,
+    _identity: Option<&fastmcp_core::ClientImplementationInfo>,
     log_level: Option<LoggingLevel>,
-    capabilities: Option<ClientCapabilities>,
+    _capabilities: Option<ClientCapabilities>,
 ) -> serde_json::Value {
-    // Exact-2024 decode rejects reserved final `_meta` members. Identity,
-    // logLevel, and clientCapabilities overlays are modern-only; a legacy
-    // stdio session keeps progressToken (stamped by the caller) and nothing
-    // else.
+    // Identity and capabilities belong to the configured upstream client.
+    // Downstream metadata may request a logging level but cannot replace
+    // either local field. Exact-2024 receives no reserved final metadata.
     if era != Some(ProtocolEra::Modern2026) {
         return parameters;
     }
-    let client_info = identity.and_then(inbound_client_info_value);
-    if client_info.is_none() && log_level.is_none() && capabilities.is_none() {
+    if log_level.is_none() {
         return parameters;
     }
     let Some(object) = parameters.as_object_mut() else {
@@ -2159,33 +2162,10 @@ fn stdio_parameters_with_inbound_identity(
         .entry("_meta")
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
     if let Some(metadata) = metadata.as_object_mut() {
-        if let Some(client_info) = client_info {
-            metadata.insert(FINAL_CLIENT_INFO_META_KEY.to_owned(), client_info);
-        }
         if let Some(log_level) = log_level
             && let Ok(value) = serde_json::to_value(log_level)
         {
             metadata.insert(FINAL_LOG_LEVEL_META_KEY.to_owned(), value);
-        }
-        if let Some(capabilities) = capabilities
-            && let Ok(value) = serde_json::to_value(capabilities)
-            && let Some(inbound) = value.as_object()
-        {
-            let existing = metadata
-                .entry(FINAL_CLIENT_CAPABILITIES_META_KEY.to_owned())
-                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-            if let Some(existing) = existing.as_object_mut() {
-                for key in ["sampling", "elicitation", "roots"] {
-                    match inbound.get(key) {
-                        Some(member) => {
-                            existing.insert(key.to_owned(), member.clone());
-                        }
-                        None => {
-                            existing.remove(key);
-                        }
-                    }
-                }
-            }
         }
     }
     parameters
@@ -3733,9 +3713,6 @@ impl ProxyBackend for Client {
             ));
         }
         let progress_marker = ctx_progress_marker(ctx);
-        let inbound_identity = ctx
-            .client_implementation()
-            .and_then(implementation_from_request_identity);
         let outcome = Client::call_tool_final_outcome_with_cancellation(
             self,
             ctx.cx(),
@@ -3743,9 +3720,9 @@ impl ProxyBackend for Client {
             name,
             arguments,
             progress_marker.as_ref(),
-            inbound_identity.as_ref(),
+            None,
             inbound_logging_level(ctx),
-            inbound_client_capabilities(ctx),
+            None,
         )?;
         relay_upstream_catalog_resource_updates(ctx, self)?;
         relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
@@ -5722,9 +5699,9 @@ impl ProxyHttpClient {
     fn request_parameters(
         &self,
         mut parameters: serde_json::Value,
-        inbound_identity: Option<&fastmcp_core::ClientImplementationInfo>,
+        _inbound_identity: Option<&fastmcp_core::ClientImplementationInfo>,
         inbound_log_level: Option<LoggingLevel>,
-        inbound_capabilities: Option<ClientCapabilities>,
+        _inbound_capabilities: Option<ClientCapabilities>,
     ) -> McpResult<serde_json::Value> {
         if self.binding.era() == ProtocolEra::Legacy2024 {
             return Ok(parameters);
@@ -5743,13 +5720,8 @@ impl ProxyHttpClient {
                     .and_then(|value| serde_json::from_value(value.clone()).ok())
             })
         });
-        let mut metadata = FinalRequestMeta::new(overlay_inbound_client_capabilities(
-            self.client_capabilities.clone(),
-            inbound_capabilities,
-        ));
-        metadata.client_info = inbound_identity
-            .and_then(implementation_from_request_identity)
-            .or_else(|| Some(self.client_info.to_implementation()));
+        let mut metadata = FinalRequestMeta::new(self.client_capabilities.clone());
+        metadata.client_info = Some(self.client_info.to_implementation());
         if let Some(progress_marker) = progress_marker {
             metadata
                 .additional_metadata
@@ -7940,6 +7912,12 @@ async fn await_proxy_request_or_cancellation<T>(
     .await
 }
 
+fn proxy_async_backend_unavailable() -> McpError {
+    McpError::invalid_request(
+        "Proxy backend has no asynchronous request implementation; implement ProxyBackend::prepare_async_request or use an explicitly synchronous API",
+    )
+}
+
 /// Decode the complete tool body before electing cancellation so an admitted
 /// Task handle can reach its relay. Ordinary results still lose that race.
 async fn await_proxy_final_tool_body_or_cancellation(
@@ -9073,17 +9051,18 @@ impl ProxyClient {
         Ok(catalog)
     }
 
-    /// Fetches a typed native HTTP or stdio catalog on the caller's runtime.
-    /// Releases the route lock before HTTP waits and between bounded stdio
-    /// ingress turns. All pages must succeed before a catalog is returned.
-    /// Backends without an upstream binding retain their synchronous catalog.
+    /// Fetches a typed catalog on the caller's runtime through native I/O or
+    /// an owned custom [`ProxyAsyncRequest`]. Releases the route lock while
+    /// waiting. All pages must succeed before a catalog is returned; custom
+    /// synchronous catalogs are available through [`Self::catalog_typed`].
     pub async fn catalog_typed_with_cx(&self, cx: &Cx) -> McpResult<ProxyTypedCatalog> {
         let ctx = McpContext::new(cx.clone(), 0);
         ctx.checkpoint()?;
-        let Some(binding) = self.upstream_binding else {
-            return self.catalog_typed();
-        };
-        let catalog = match binding.era() {
+        let era = self.upstream_binding.map(|binding| binding.era())
+            .or(self.observed_protocol_era()?)
+            .or(self.with_backend(|backend| Ok(backend.async_protocol_era()))?)
+            .ok_or_else(proxy_async_backend_unavailable)?;
+        let catalog = match era {
             ProtocolEra::Modern2026 => ProxyTypedCatalog {
                 tools: ProxyToolCatalog::Final(
                     self.collect_catalog_pages(&ctx, "tools/list", |result| {
@@ -9247,14 +9226,8 @@ impl ProxyClient {
         for _ in 0..MAX_MODERN_PROXY_CATALOG_PAGES {
             ctx.checkpoint()?;
             let parameters = ProxyHttpClient::modern_catalog_parameters(cursor.as_deref());
-            let prepared = self.with_backend(|backend| backend.prepare_final_core_request())?;
-            let result = if let Some(request) = prepared {
-                request
-                    .execute(ctx, method, parameters, false, &mut |_| {})
-                    .await?
-            } else if let Some(result) = self
-                .try_final_stdio_request(ctx, method, parameters.clone(), false)
-                .await?
+            let result = if let Some(result) = self
+                .try_final_mrtr_request(ctx, method, parameters.clone()).await?
             {
                 result
             } else {
@@ -9802,10 +9775,10 @@ impl ProxyClient {
                 self.relay_resource_updated_notifications(ctx)?;
                 return self.admit_upstream_result("completion/complete", result);
             }
-            self.complete_backend_typed(ctx, params)
+            Err(proxy_async_backend_unavailable())
         }
         #[cfg(not(feature = "legacy-2024-11-05"))]
-        self.complete_typed(ctx, params)
+        Err(proxy_async_backend_unavailable())
     }
 
     /// Calls a tool on the upstream.
@@ -10052,30 +10025,6 @@ impl ProxyClient {
         self.admit_upstream_result("tools/call", result)
     }
 
-    #[cfg(feature = "tasks")]
-    fn call_tool_typed_without_tasks_with_final_progress(
-        &self,
-        ctx: &McpContext,
-        name: &str,
-        arguments: serde_json::Value,
-        on_progress: FinalProgressCallback<'_>,
-    ) -> McpResult<CoreResult> {
-        ctx.checkpoint()?;
-        self.forward_inbound_log_level(ctx)?;
-        let _inbound_reverse = self.inbound_legacy_reverse_guard(ctx)?;
-        let result = self.with_backend(|backend| {
-            backend.call_tool_result_without_tasks_with_context_and_final_progress(
-                ctx,
-                name,
-                arguments,
-                on_progress,
-            )
-        })?;
-        ctx.checkpoint()?;
-        self.relay_resource_updated_notifications(ctx)?;
-        self.admit_upstream_result("tools/call", result)
-    }
-
     /// Calls a tool while retaining its selected protocol-era result and
     /// yielding native HTTP or stdio I/O to the caller's runtime.
     ///
@@ -10083,9 +10032,8 @@ impl ProxyClient {
     /// request's cancellation and deadline. Modern complete and input-required
     /// outcomes retain their exact typed result and progress notifications;
     /// this API does not negotiate creation of upstream Tasks.
-    /// Custom [`ProxyBackend`] implementations without native request hooks
-    /// retain their synchronous backend behavior and must not block an async
-    /// runtime worker.
+    /// Custom backends provide an owned [`ProxyAsyncRequest`]. A backend with
+    /// only synchronous hooks receives an actionable error before invocation.
     pub async fn call_tool_typed_async(
         &self,
         ctx: &McpContext,
@@ -10174,18 +10122,7 @@ impl ProxyClient {
             self.relay_resource_updated_notifications(ctx)?;
             return self.admit_upstream_result("tools/call", result);
         }
-        let mut ignore_final_progress = |_| {};
-        let result = self.with_backend(|backend| {
-            backend.call_tool_result_with_context_and_final_progress(
-                ctx,
-                name,
-                arguments,
-                &mut ignore_final_progress,
-            )
-        })?;
-        ctx.checkpoint()?;
-        self.relay_resource_updated_notifications(ctx)?;
-        self.admit_upstream_result("tools/call", result)
+        Err(proxy_async_backend_unavailable())
     }
 
     #[cfg(feature = "tasks")]
@@ -10318,6 +10255,13 @@ impl ProxyClient {
         } else {
             serde_json::json!({"name": name, "arguments": arguments.clone()})
         };
+        if !tasks_negotiated
+            && let Some(result) = self
+                .try_custom_async_request(ctx, fastmcp_protocol::methods::TOOLS_CALL, parameters.clone())
+                .await?
+        {
+            return Ok(result);
+        }
         let mut progress_error = None;
         let mut forward_progress = |progress: FinalProgressNotificationParams| {
             if let Err(error) = forward_final_progress_to_context(ctx, progress) {
@@ -10345,50 +10289,8 @@ impl ProxyClient {
             .await?
         {
             result
-        } else if resume_inputs.is_some() {
-            #[cfg(feature = "tasks")]
-            {
-                if tasks_negotiated {
-                    self.request_upstream_final_core(
-                        ctx,
-                        fastmcp_protocol::methods::TOOLS_CALL,
-                        parameters,
-                    )?
-                } else {
-                    self.request_upstream_final_core_without_tasks(
-                        ctx,
-                        fastmcp_protocol::methods::TOOLS_CALL,
-                        parameters,
-                    )?
-                }
-            }
-            #[cfg(not(feature = "tasks"))]
-            {
-                self.request_upstream_final_core(
-                    ctx,
-                    fastmcp_protocol::methods::TOOLS_CALL,
-                    parameters,
-                )?
-            }
         } else {
-            #[cfg(feature = "tasks")]
-            {
-                self.call_tool_typed_without_tasks_with_final_progress(
-                    ctx,
-                    name,
-                    arguments,
-                    &mut forward_progress,
-                )?
-            }
-            #[cfg(not(feature = "tasks"))]
-            {
-                self.call_tool_typed_with_final_progress(
-                    ctx,
-                    name,
-                    arguments,
-                    &mut forward_progress,
-                )?
-            }
+            return Err(proxy_async_backend_unavailable());
         };
         let result = self.admit_upstream_result(fastmcp_protocol::methods::TOOLS_CALL, result)?;
         #[cfg(feature = "tasks")]
@@ -10797,9 +10699,8 @@ impl ProxyClient {
     /// Native requests release the route mutex while waiting, observe request
     /// cancellation and deadlines, and retain complete or input-required
     /// results, cache hints, and exact final progress notifications.
-    /// Custom [`ProxyBackend`] implementations without native request hooks
-    /// retain their synchronous backend behavior and must not block an async
-    /// runtime worker.
+    /// Custom backends provide an owned [`ProxyAsyncRequest`]. A backend with
+    /// only synchronous hooks receives an actionable error before invocation.
     pub async fn read_resource_typed_async(
         &self,
         ctx: &McpContext,
@@ -10837,25 +10738,7 @@ impl ProxyClient {
             self.relay_resource_updated_notifications(ctx)?;
             return self.admit_upstream_result("resources/read", result);
         }
-        let mut progress_error = None;
-        let mut forward_progress = |progress: FinalProgressNotificationParams| {
-            if let Err(error) = forward_final_progress_to_context(ctx, progress) {
-                progress_error = Some(error);
-            }
-        };
-        let result = self.with_backend(|backend| {
-            backend.read_resource_result_with_context_and_final_progress(
-                ctx,
-                uri,
-                &mut forward_progress,
-            )
-        })?;
-        if let Some(error) = progress_error {
-            return Err(error);
-        }
-        ctx.checkpoint()?;
-        self.relay_resource_updated_notifications(ctx)?;
-        self.admit_upstream_result("resources/read", result)
+        Err(proxy_async_backend_unavailable())
     }
 
     /// Gets a prompt without erasing exact legacy fields or final result state.
@@ -10912,9 +10795,8 @@ impl ProxyClient {
     /// Native requests release the route mutex while waiting, observe request
     /// cancellation and deadlines, and retain complete or input-required
     /// results and exact final progress notifications.
-    /// Custom [`ProxyBackend`] implementations without native request hooks
-    /// retain their synchronous backend behavior and must not block an async
-    /// runtime worker.
+    /// Custom backends provide an owned [`ProxyAsyncRequest`]. A backend with
+    /// only synchronous hooks receives an actionable error before invocation.
     pub async fn get_prompt_typed_async(
         &self,
         ctx: &McpContext,
@@ -10953,26 +10835,7 @@ impl ProxyClient {
             self.relay_resource_updated_notifications(ctx)?;
             return self.admit_upstream_result("prompts/get", result);
         }
-        let mut progress_error = None;
-        let mut forward_progress = |progress: FinalProgressNotificationParams| {
-            if let Err(error) = forward_final_progress_to_context(ctx, progress) {
-                progress_error = Some(error);
-            }
-        };
-        let result = self.with_backend(|backend| {
-            backend.get_prompt_result_with_context_and_final_progress(
-                ctx,
-                name,
-                arguments,
-                &mut forward_progress,
-            )
-        })?;
-        if let Some(error) = progress_error {
-            return Err(error);
-        }
-        ctx.checkpoint()?;
-        self.relay_resource_updated_notifications(ctx)?;
-        self.admit_upstream_result("prompts/get", result)
+        Err(proxy_async_backend_unavailable())
     }
 
     fn call_tool_final(
@@ -11172,8 +11035,96 @@ impl ProxyClient {
         }
     }
 
-    /// Reserves native HTTP I/O outside the backend lock, or cooperatively
-    /// drives the selected stdio ingress. Custom backends return None.
+    /// Executes a custom request without keeping any borrow of the backend.
+    async fn try_custom_async_request(
+        &self,
+        ctx: &McpContext,
+        method: &str,
+        mut parameters: serde_json::Value,
+    ) -> McpResult<Option<CoreResult>> {
+        ctx.checkpoint()?;
+        let bound_era = self.upstream_binding.map(|binding| binding.era()).or(self.observed_protocol_era()?);
+        let Some((era, execution)) = self.with_backend(|backend| {
+            let Some(era) = backend.async_protocol_era() else { return Ok(None); };
+            if bound_era.is_some_and(|bound| bound != era) {
+                return Err(McpError::invalid_request("Proxy async backend era contradicts the selected route"));
+            }
+            backend.prepare_async_request().map(|request| request.map(|request| (era, request)))
+        })? else {
+            return Ok(None);
+        };
+        // A cancellation racing preparation drops the owned reservation
+        // without calling user execution code or authoring an upstream send.
+        ctx.ensure_live()?;
+        if era == ProtocolEra::Modern2026 {
+            let mut capabilities = execution.client_capabilities();
+            if let Some(extensions) = &mut capabilities.extensions {
+                extensions.remove("io.modelcontextprotocol/tasks");
+            }
+            let mut metadata = FinalRequestMeta::new(capabilities);
+            metadata.client_info = Some(execution.client_implementation());
+            if let Some(marker) = ctx.progress_marker() {
+                metadata.additional_metadata.insert("progressToken".to_owned(), marker.clone());
+            }
+            if let Some(level) = inbound_logging_level(ctx) {
+                metadata.additional_metadata.insert(
+                    FINAL_LOG_LEVEL_META_KEY.to_owned(),
+                    serde_json::to_value(level).map_err(McpError::from)?,
+                );
+            }
+            parameters.as_object_mut().ok_or_else(|| {
+                McpError::invalid_params("Proxy async request parameters must be an object")
+            })?.insert("_meta".to_owned(), serde_json::to_value(metadata).map_err(McpError::from)?);
+        } else if let Some(marker) = ctx.progress_marker() {
+            overlay_legacy_progress_token(&mut parameters, marker)?;
+        }
+        let request = CoreRequest::decode(era, method, Some(&parameters))
+            .map_err(|error| McpError::invalid_params(format!("Proxy async request is invalid: {error}")))?;
+        let expected_progress = ctx_progress_marker(ctx);
+        let mut previous_progress = None;
+        let progress_error = Mutex::new(None);
+        let mut forward_progress = |progress: FinalProgressNotificationParams| {
+            let mut failure = progress_error.lock().expect("request-local progress lock is not poisoned");
+            if failure.is_some() || ctx.ensure_live().is_err() {
+                return;
+            }
+            if era != ProtocolEra::Modern2026
+                || expected_progress.as_ref() != Some(&progress.progress_token)
+                || previous_progress.as_ref().is_some_and(|previous| &progress.progress <= previous)
+            {
+                *failure = Some(McpError::invalid_request(
+                    "Proxy async backend returned unowned or non-increasing progress",
+                ));
+                return;
+            }
+            previous_progress = Some(progress.progress.clone());
+            if let Err(error) = forward_final_progress_to_context(ctx, progress) {
+                *failure = Some(error);
+            }
+        };
+        // Delaying execute itself until this future is polled makes the
+        // cancellation-first boundary cover user future construction as well.
+        let result = await_proxy_request_or_cancellation(ctx, async {
+            let mut operation = execution.execute(ctx, request, &mut forward_progress);
+            std::future::poll_fn(|task_cx| {
+                let result = operation.as_mut().poll(task_cx);
+                if let Some(error) = progress_error.lock().expect("request-local progress lock is not poisoned").take() {
+                    return Poll::Ready(Err(error));
+                }
+                result
+            }).await
+        }).await?;
+        ctx.ensure_live()?;
+        if result.era() != era || final_result_retains_task(&result) {
+            return Err(McpError::invalid_request(
+                "Proxy async core backend returned a different era or an unnegotiated Task",
+            ));
+        }
+        self.admit_upstream_result(method, result).map(Some)
+    }
+
+    /// Awaits an owned custom or native HTTP request outside the route lock,
+    /// or cooperatively drives the selected stdio ingress.
     async fn try_final_mrtr_request(
         &self,
         ctx: &McpContext,
@@ -11181,6 +11132,9 @@ impl ProxyClient {
         parameters: serde_json::Value,
     ) -> McpResult<Option<CoreResult>> {
         ctx.checkpoint()?;
+        if let Some(result) = self.try_custom_async_request(ctx, method, parameters.clone()).await? {
+            return Ok(Some(result));
+        }
         let Some(request) = self.with_backend(|backend| backend.prepare_final_core_request())?
         else {
             return self
@@ -11215,7 +11169,7 @@ impl ProxyClient {
         {
             return Ok(result);
         }
-        self.request_upstream_final_core(ctx, method, parameters)
+        Err(proxy_async_backend_unavailable())
     }
 
     fn request_upstream_final_core(
@@ -11226,19 +11180,6 @@ impl ProxyClient {
     ) -> McpResult<CoreResult> {
         let result = self.with_backend(|backend| {
             backend.request_final_core_with_parameters(ctx, method, parameters)
-        })?;
-        self.admit_upstream_result(method, result)
-    }
-
-    #[cfg(feature = "tasks")]
-    fn request_upstream_final_core_without_tasks(
-        &self,
-        ctx: &McpContext,
-        method: &str,
-        parameters: serde_json::Value,
-    ) -> McpResult<CoreResult> {
-        let result = self.with_backend(|backend| {
-            backend.request_final_core_without_tasks_with_parameters(ctx, method, parameters)
         })?;
         self.admit_upstream_result(method, result)
     }
@@ -12756,13 +12697,11 @@ IFS= read -r end
 "#
             );
             let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
-            let mut client = Client::stdio_with_protocol_plan_with_cx(
-                cx.clone(),
-                "sh",
-                &["-c", &script],
-                ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-            )
-            .unwrap();
+            let mut client = runtime.block_on(fastmcp_client::ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .capabilities(proxy_owned_roots_capabilities())
+                .connect_stdio_with_cx(&cx, "sh", &["-c", &script]))
+                .unwrap();
             client
                 .set_request_timeout_policy(
                     RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(4))
@@ -12885,7 +12824,7 @@ IFS= read -r end
                     assert_eq!(wire["id"], index + 2);
                     assert_eq!(wire["method"], method);
                     assert_eq!(wire["params"]["taskId"], if index == 0 { first_id.as_str() } else { second_id.as_str() });
-                    assert_eq!(wire["params"]["_meta"][fastmcp_protocol::FINAL_CLIENT_INFO_META_KEY]["name"], subject);
+                    assert_eq!(wire["params"]["_meta"][fastmcp_protocol::FINAL_CLIENT_INFO_META_KEY]["name"], "fastmcp-client");
                     assert_eq!(wire["params"]["_meta"][fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"][fastmcp_protocol::TASKS_EXTENSION], serde_json::json!({}));
                     assert_eq!(wire["params"]["_meta"][fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]["roots"], serde_json::json!({}));
                     if method == "tasks/update" {
@@ -13242,6 +13181,13 @@ IFS= read -r end
         }
     }
 
+    fn proxy_owned_roots_capabilities() -> ClientCapabilities {
+        ClientCapabilities {
+            roots: Some(fastmcp_protocol::RootsCapability { list_changed: false }),
+            ..ClientCapabilities::default()
+        }
+    }
+
     fn proxy_public_typed_http_caller_runtime_probe(cancel: bool) {
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -13432,7 +13378,7 @@ IFS= read -r end
                                 1,
                                 plan,
                                 proxy_http_client_info(),
-                                ClientCapabilities::default(),
+                                proxy_owned_roots_capabilities(),
                             )
                             .await
                             .expect("public proxy establishment");
@@ -13542,6 +13488,470 @@ IFS= read -r end
     #[test]
     fn proxy_public_typed_http_caller_runtime_planted_negative() {
         proxy_public_typed_http_caller_runtime_probe(true);
+    }
+
+    #[derive(Default)]
+    struct OwnedAsyncState {
+        prepared: usize,
+        executed: usize,
+        dropped: usize,
+        synchronous_calls: usize,
+        hold: bool,
+        waker: Option<std::task::Waker>,
+        observed: Vec<(u64, String, serde_json::Value)>,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    enum OwnedAsyncFault {
+        #[default]
+        None,
+        WrongMethod,
+        WrongEra,
+        WrongProgressToken,
+        RegressingProgress,
+    }
+
+    struct OwnedAsyncBackend {
+        state: Arc<Mutex<OwnedAsyncState>>,
+        cancel_preparation: Option<McpRequestCancellation>,
+        disabled: bool,
+        input_required: bool,
+        fault: OwnedAsyncFault,
+    }
+
+    struct OwnedAsyncExecution {
+        state: Arc<Mutex<OwnedAsyncState>>,
+        input_required: bool,
+        fault: OwnedAsyncFault,
+    }
+
+    impl Drop for OwnedAsyncExecution {
+        fn drop(&mut self) {
+            self.state.lock().unwrap().dropped += 1;
+        }
+    }
+
+    fn owned_async_result(method: &str, input_required: bool) -> String {
+        if input_required {
+            return r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"owned-state","peerExtra":{"exact":1.20e+4}}"#.to_owned();
+        }
+        match method {
+            "tools/call" => r#"{"resultType":"complete","content":[{"type":"text","text":"owned"}],"peerExtra":{"exact":1.20e+4}}"#,
+            "resources/read" => r#"{"resultType":"complete","contents":[{"uri":"db://owned","text":"owned"}],"ttlMs":123,"cacheScope":"private","peerExtra":{"exact":1.20e+4}}"#,
+            "prompts/get" => r#"{"resultType":"complete","messages":[{"role":"user","content":{"type":"text","text":"owned"}}],"peerExtra":{"exact":1.20e+4}}"#,
+            "completion/complete" => r#"{"resultType":"complete","completion":{"values":["owned"]},"peerExtra":{"exact":1.20e+4}}"#,
+            "tools/list" => r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}"#,
+            "resources/list" => r#"{"resultType":"complete","resources":[],"ttlMs":0,"cacheScope":"private"}"#,
+            "resources/templates/list" => r#"{"resultType":"complete","resourceTemplates":[],"ttlMs":0,"cacheScope":"private"}"#,
+            "prompts/list" => r#"{"resultType":"complete","prompts":[],"ttlMs":0,"cacheScope":"private"}"#,
+            _ => panic!("unexpected owned request"),
+        }.to_owned()
+    }
+
+    impl super::ProxyAsyncRequest for OwnedAsyncExecution {
+        fn client_implementation(&self) -> fastmcp_protocol::common_types::Implementation {
+            fastmcp_protocol::common_types::Implementation::try_new("configured-proxy", "1").unwrap()
+        }
+
+        fn client_capabilities(&self) -> ClientCapabilities {
+            ClientCapabilities {
+                roots: Some(fastmcp_protocol::RootsCapability { list_changed: false }),
+                extensions: Some(BTreeMap::from([("io.modelcontextprotocol/tasks".to_owned(), serde_json::json!({}))])),
+                ..ClientCapabilities::default()
+            }
+        }
+
+        fn execute<'a>(
+            self: Box<Self>,
+            ctx: &'a McpContext,
+            request: fastmcp_protocol::CoreRequest,
+            on_progress: &'a mut (dyn FnMut(FinalProgressNotificationParams) + Send),
+        ) -> crate::handler::BoxFuture<'a, fastmcp_core::McpResult<CoreResult>> {
+            // Even future construction is outside the route lock. The
+            // actual operation below has no detached tasks or private runtime.
+            Box::pin(async move {
+                let method = request.method();
+                let params = request.encode_params().unwrap().unwrap();
+                {
+                    let mut state = self.state.lock().unwrap();
+                    state.executed += 1;
+                    state.observed.push((ctx.request_id(), method.to_owned(), params.clone()));
+                }
+                if let Some(marker) = ctx.progress_marker() {
+                    let token = if matches!(self.fault, OwnedAsyncFault::WrongProgressToken) {
+                        serde_json::json!("unrelated-request")
+                    } else {
+                        marker.clone()
+                    };
+                    on_progress(final_progress_from_wire(&format!(
+                        r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{{"progressToken":{token},"progress":1.20e+4,"total":12000.0,"message":"owned"}}}}"#,
+                    )));
+                    if matches!(self.fault, OwnedAsyncFault::RegressingProgress) {
+                        on_progress(final_progress_from_wire(&format!(
+                            r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{{"progressToken":{token},"progress":11999}}}}"#,
+                        )));
+                    }
+                }
+                std::future::poll_fn(|task_cx| {
+                    let mut state = self.state.lock().unwrap();
+                    if state.hold {
+                        state.waker = Some(task_cx.waker().clone());
+                        std::task::Poll::Pending
+                    } else {
+                        std::task::Poll::Ready(())
+                    }
+                }).await;
+                ctx.ensure_live()?;
+                if matches!(self.fault, OwnedAsyncFault::WrongEra) {
+                    return Ok(CoreResult::Legacy(LegacyCoreResult::ToolsCall(CallToolResult {
+                        content: Vec::new(), is_error: false, meta: None, additional: BTreeMap::new(),
+                    })));
+                }
+                if matches!(self.fault, OwnedAsyncFault::WrongMethod) {
+                    return Ok(final_tool_result_with_open_members());
+                }
+                request.decode_result(&owned_async_result(method, self.input_required))
+                    .map_err(|error| fastmcp_core::McpError::invalid_request(error.to_string()))
+            })
+        }
+    }
+
+    impl ProxyBackend for OwnedAsyncBackend {
+        fn async_protocol_era(&self) -> Option<ProtocolEra> {
+            (!self.disabled).then_some(ProtocolEra::Modern2026)
+        }
+        fn prepare_async_request(&mut self) -> fastmcp_core::McpResult<Option<Box<dyn super::ProxyAsyncRequest>>> {
+            if self.disabled {
+                return Ok(None);
+            }
+            self.state.lock().unwrap().prepared += 1;
+            let request = OwnedAsyncExecution { state: Arc::clone(&self.state), input_required: self.input_required, fault: self.fault };
+            if let Some(cancellation) = &self.cancel_preparation {
+                cancellation.cancel();
+            }
+            Ok(Some(Box::new(request)))
+        }
+
+        fn list_tools(&mut self) -> fastmcp_core::McpResult<Vec<Tool>> {
+            self.state.lock().unwrap().synchronous_calls += 1;
+            Ok(Vec::new())
+        }
+        fn list_resources(&mut self) -> fastmcp_core::McpResult<Vec<Resource>> { Ok(Vec::new()) }
+        fn list_resource_templates(&mut self) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceTemplate>> { Ok(Vec::new()) }
+        fn list_prompts(&mut self) -> fastmcp_core::McpResult<Vec<Prompt>> { Ok(Vec::new()) }
+        fn supports_completion(&mut self) -> fastmcp_core::McpResult<bool> { Ok(true) }
+        fn call_tool(&mut self, _name: &str, _arguments: serde_json::Value) -> fastmcp_core::McpResult<Vec<Content>> {
+            self.state.lock().unwrap().synchronous_calls += 1;
+            Ok(vec![Content::Text { text: "synchronous".to_owned() }])
+        }
+        fn call_tool_with_progress(&mut self, name: &str, arguments: serde_json::Value, _progress: super::ProgressCallback<'_>) -> fastmcp_core::McpResult<Vec<Content>> {
+            self.call_tool(name, arguments)
+        }
+        fn read_resource(&mut self, _uri: &str) -> fastmcp_core::McpResult<Vec<ResourceContent>> {
+            self.state.lock().unwrap().synchronous_calls += 1;
+            Ok(Vec::new())
+        }
+        fn get_prompt(&mut self, _name: &str, _arguments: HashMap<String, String>) -> fastmcp_core::McpResult<Vec<PromptMessage>> {
+            self.state.lock().unwrap().synchronous_calls += 1;
+            Ok(Vec::new())
+        }
+        fn complete_result(&mut self, _params: fastmcp_client::CompletionParams) -> fastmcp_core::McpResult<CoreResult> {
+            self.state.lock().unwrap().synchronous_calls += 1;
+            Err(fastmcp_core::McpError::invalid_request("synchronous completion invoked"))
+        }
+    }
+
+    fn owned_async_proxy(state: &Arc<Mutex<OwnedAsyncState>>, input_required: bool, fault: OwnedAsyncFault) -> ProxyClient {
+        ProxyClient::from_backend(OwnedAsyncBackend {
+            state: Arc::clone(state), cancel_preparation: None, disabled: false, input_required, fault,
+        })
+    }
+
+    async fn invoke_owned_async_method(proxy: &ProxyClient, ctx: &McpContext, method: &str) -> fastmcp_core::McpResult<CoreResult> {
+        if method == "completion/complete" {
+            return proxy.complete_typed_async(ctx, fastmcp_client::CompletionParams {
+                reference: fastmcp_client::CompletionReference::Prompt { name: "owned".to_owned() },
+                argument: fastmcp_client::CompletionArgument { name: "subject".to_owned(), value: "own".to_owned() },
+                context: None,
+            }).await;
+        }
+        invoke_public_typed_proxy_request(proxy, ctx, method, if method == "resources/read" { "db://owned" } else { "owned" }, "owned").await
+    }
+
+    fn proxy_custom_async_request_caller_runtime_probe(cancel: bool) {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        for method in ["tools/call", "resources/read", "prompts/get", "completion/complete"] {
+            for input_required in [false, true] {
+                if method == "completion/complete" && input_required { continue; }
+                let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+                let state = Arc::new(Mutex::new(OwnedAsyncState { hold: true, ..OwnedAsyncState::default() }));
+                let proxy = owned_async_proxy(&state, input_required, OwnedAsyncFault::None);
+                let cancellation = McpRequestCancellation::new();
+                let capture = Arc::new(ExactProgressCapture::default());
+                let ctx = McpContext::with_progress(cx.clone(), 4401, ProgressReporter::with_marker(
+                    serde_json::json!("owned-marker"), Arc::clone(&capture) as Arc<dyn NotificationSender>,
+                )).with_request_cancellation(cancellation.clone());
+                runtime.block_on(async {
+                    let sibling_state = Arc::clone(&state);
+                    let sibling_proxy = proxy.clone();
+                    let mut sibling = cx.spawn(move |sibling_cx| async move {
+                        let deadline = sibling_cx.now().saturating_add_nanos(2_000_000_000);
+                        loop {
+                            if sibling_state.lock().unwrap().executed == 1 { break; }
+                            assert!(sibling_cx.now() < deadline, "custom request must start within its bound");
+                            asupersync::runtime::yield_now().await;
+                        }
+                        assert!(sibling_proxy.inner.try_lock().is_ok(), "pending owned request releases the route lock");
+                        assert!(sibling_proxy.supports_completion().unwrap(), "same route remains callable while request awaits");
+                        assert!(!sibling_cx.is_cancel_requested());
+                        if cancel {
+                            assert!(cancellation.cancel());
+                        } else {
+                            let wake = { let mut state = sibling_state.lock().unwrap(); state.hold = false; state.waker.take() };
+                            if let Some(wake) = wake { wake.wake(); }
+                        }
+                    }).unwrap();
+                    let result = asupersync::time::timeout_at(cx.now().saturating_add_nanos(2_000_000_000), invoke_owned_async_method(&proxy, &ctx, method)).await.unwrap();
+                    sibling.join(&cx).await.unwrap();
+                    if cancel {
+                        assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+                        assert_eq!(proxy.observed_protocol_era().unwrap(), None);
+                    } else {
+                        let result = result.unwrap();
+                        assert_eq!(result.encode().unwrap(), owned_async_result(method, input_required), "exact result members and number spellings survive");
+                    }
+                    {
+                        let state = state.lock().unwrap();
+                        assert_eq!((state.prepared, state.executed, state.dropped, state.synchronous_calls), (1, 1, 1, 0));
+                        assert_eq!(state.observed[0].0, 4401);
+                        let metadata = &state.observed[0].2["_meta"];
+                        assert_eq!(metadata[fastmcp_protocol::FINAL_CLIENT_INFO_META_KEY]["name"], "configured-proxy");
+                        assert!(metadata[fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"].get("io.modelcontextprotocol/tasks").is_none());
+                    }
+                    assert!(!cx.is_cancel_requested());
+                    state.lock().unwrap().hold = false;
+                    let next = McpContext::new(cx.clone(), 4402);
+                    assert!(invoke_owned_async_method(&proxy, &next, method).await.is_ok());
+                    assert_eq!(state.lock().unwrap().dropped, 2);
+                });
+                assert_eq!(capture.values.lock().unwrap().as_slice(), &[("1.20e+4".to_owned(), Some("12000.0".to_owned()), Some("owned".to_owned()))]);
+            }
+        }
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn proxy_custom_async_request_caller_runtime_positive() {
+        proxy_custom_async_request_caller_runtime_probe(false);
+    }
+
+    #[test]
+    fn proxy_custom_async_request_caller_runtime_planted_negative() {
+        proxy_custom_async_request_caller_runtime_probe(true);
+    }
+
+    #[test]
+    fn proxy_custom_async_request_pre_cancelled_has_no_effects() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        for cancel_during_prepare in [false, true] {
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+            let cancellation = McpRequestCancellation::new();
+            let state = Arc::new(Mutex::new(OwnedAsyncState::default()));
+            let proxy = ProxyClient::from_backend(OwnedAsyncBackend {
+                state: Arc::clone(&state), cancel_preparation: cancel_during_prepare.then(|| cancellation.clone()),
+                disabled: false, input_required: false, fault: OwnedAsyncFault::None,
+            });
+            if !cancel_during_prepare { cancellation.cancel(); }
+            let ctx = McpContext::new(cx.clone(), 4403).with_request_cancellation(cancellation);
+            let error = runtime.block_on(proxy.call_tool_typed_async(&ctx, "owned", serde_json::json!({}))).unwrap_err();
+            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            let state = state.lock().unwrap();
+            assert_eq!(state.prepared, usize::from(cancel_during_prepare));
+            assert_eq!(state.dropped, state.prepared);
+            assert_eq!(state.executed, 0);
+            assert_eq!(state.synchronous_calls, 0);
+            assert!(state.observed.is_empty());
+            assert_eq!(proxy.observed_protocol_era().unwrap(), None);
+            assert!(!cx.is_cancel_requested());
+        }
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn proxy_custom_async_request_deadline_releases_silent_execution() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+        let state = Arc::new(Mutex::new(OwnedAsyncState { hold: true, ..OwnedAsyncState::default() }));
+        let proxy = owned_async_proxy(&state, false, OwnedAsyncFault::None);
+        let ctx = McpContext::new(cx.clone(), 4408)
+            .with_operation_deadline(Some(cx.now().saturating_add_nanos(100_000_000)));
+        let error = runtime.block_on(asupersync::time::timeout_at(
+            cx.now().saturating_add_nanos(2_000_000_000),
+            proxy.call_tool_typed_async(&ctx, "owned", serde_json::json!({})),
+        )).expect("request deadline wakes a silent custom future").unwrap_err();
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        let state = state.lock().unwrap();
+        assert_eq!((state.prepared, state.executed, state.dropped), (1, 1, 1));
+        assert!(!ctx.request_cancellation().is_cancel_requested());
+        assert!(!cx.is_cancel_requested());
+        drop(state);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn proxy_custom_async_request_rejects_mismatched_result() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        for fault in [OwnedAsyncFault::WrongMethod, OwnedAsyncFault::WrongEra, OwnedAsyncFault::WrongProgressToken, OwnedAsyncFault::RegressingProgress] {
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+            let state = Arc::new(Mutex::new(OwnedAsyncState {
+                hold: matches!(fault, OwnedAsyncFault::WrongProgressToken | OwnedAsyncFault::RegressingProgress),
+                ..OwnedAsyncState::default()
+            }));
+            let proxy = owned_async_proxy(&state, false, fault);
+            let capture = Arc::new(ExactProgressCapture::default());
+            let ctx = McpContext::with_progress(cx.clone(), 4404, ProgressReporter::with_marker(serde_json::json!("owned-marker"), Arc::clone(&capture) as Arc<dyn NotificationSender>));
+            let error = runtime.block_on(asupersync::time::timeout_at(
+                cx.now().saturating_add_nanos(2_000_000_000),
+                proxy.read_resource_typed_async(&ctx, "db://owned"),
+            )).expect("invalid progress retires even a silent custom request").unwrap_err();
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            assert_eq!(proxy.observed_protocol_era().unwrap(), None);
+            assert_eq!(state.lock().unwrap().dropped, 1);
+            assert_eq!(capture.values.lock().unwrap().len(), usize::from(!matches!(fault, OwnedAsyncFault::WrongProgressToken)));
+            assert!(!cx.is_cancel_requested());
+        }
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn proxy_custom_async_request_refuses_sync_fallback_and_keeps_sync_api() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+        let state = Arc::new(Mutex::new(OwnedAsyncState::default()));
+        let proxy = ProxyClient::from_backend(OwnedAsyncBackend { state: Arc::clone(&state), cancel_preparation: None, disabled: true, input_required: false, fault: OwnedAsyncFault::None });
+        let ctx = McpContext::new(cx.clone(), 4405);
+        runtime.block_on(async {
+            for method in ["tools/call", "resources/read", "prompts/get", "completion/complete"] {
+                let error = invoke_owned_async_method(&proxy, &ctx, method).await.unwrap_err();
+                assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                assert!(error.message.contains("prepare_async_request"));
+            }
+            assert!(proxy.catalog_typed_with_cx(&cx).await.is_err());
+        });
+        assert_eq!(state.lock().unwrap().synchronous_calls, 0);
+        assert!(proxy.call_tool(&ctx, "owned", serde_json::json!({})).is_ok());
+        assert_eq!(state.lock().unwrap().synchronous_calls, 1);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn proxy_custom_async_request_catalog_uses_owned_requests() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+        let state = Arc::new(Mutex::new(OwnedAsyncState::default()));
+        let proxy = owned_async_proxy(&state, false, OwnedAsyncFault::None);
+        let catalog = runtime.block_on(proxy.catalog_typed_with_cx(&cx)).unwrap();
+        assert!(catalog.final_tools().unwrap().is_empty());
+        assert!(catalog.final_resources().unwrap().is_empty());
+        assert!(catalog.final_resource_templates().unwrap().is_empty());
+        assert!(catalog.final_prompts().unwrap().is_empty());
+        let state = state.lock().unwrap();
+        assert_eq!((state.prepared, state.executed, state.dropped, state.synchronous_calls), (4, 4, 4, 0));
+        assert_eq!(state.observed.iter().map(|entry| entry.1.as_str()).collect::<Vec<_>>(), ["tools/list", "resources/list", "resources/templates/list", "prompts/list"]);
+        drop(state);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    fn proxy_custom_async_request_configured_identity_probe(substitute_downstream: bool) {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+        let state = Arc::new(Mutex::new(OwnedAsyncState::default()));
+        let proxy = owned_async_proxy(&state, false, OwnedAsyncFault::None);
+        for name in ["downstream-a", if substitute_downstream { "configured-proxy" } else { "downstream-a" }] {
+            let ctx = McpContext::new(cx.clone(), 4406).with_client_implementation(
+                fastmcp_core::ClientImplementationInfo::new(name, "untrusted-version"),
+            );
+            runtime.block_on(proxy.call_tool_typed_async(&ctx, "owned", serde_json::json!({}))).unwrap();
+        }
+        let state = state.lock().unwrap();
+        assert_eq!(state.observed.len(), 2);
+        assert_eq!(state.observed[0].2, state.observed[1].2);
+        assert_eq!(state.observed[0].2["_meta"][fastmcp_protocol::FINAL_CLIENT_INFO_META_KEY],
+            serde_json::json!({"name":"configured-proxy", "version":"1"}));
+        assert_eq!(state.synchronous_calls, 0);
+        drop(state);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn proxy_custom_async_request_configured_identity_positive() {
+        proxy_custom_async_request_configured_identity_probe(false);
+    }
+
+    #[test]
+    fn proxy_custom_async_request_configured_identity_planted_negative() {
+        proxy_custom_async_request_configured_identity_probe(true);
+    }
+
+    #[test]
+    fn proxy_completion_custom_async_backend_receives_log_metadata_once() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        for cancelled in [false, true] {
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+            let state = Arc::new(Mutex::new(OwnedAsyncState::default()));
+            let proxy = owned_async_proxy(&state, false, OwnedAsyncFault::None);
+            let cancellation = McpRequestCancellation::new();
+            let ctx = McpContext::new(cx.clone(), 4409)
+                .with_request_cancellation(cancellation.clone())
+                .with_min_log_level(Some(fastmcp_core::McpLogLevel::Info));
+            if cancelled { assert!(cancellation.cancel()); }
+            let result = runtime.block_on(invoke_owned_async_method(&proxy, &ctx, "completion/complete"));
+            if cancelled {
+                assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+            } else {
+                assert_eq!(result.unwrap().method(), "completion/complete");
+            }
+            let state = state.lock().unwrap();
+            let requests = usize::from(!cancelled);
+            assert_eq!((state.prepared, state.executed, state.dropped), (requests, requests, requests));
+            assert_eq!(state.synchronous_calls, 0);
+            assert_eq!(state.observed.len(), requests);
+            if !cancelled {
+                assert_eq!(state.observed[0].1, "completion/complete");
+                assert_eq!(state.observed[0].2["_meta"][fastmcp_protocol::FINAL_LOG_LEVEL_META_KEY], "info");
+            }
+        }
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn proxy_custom_async_request_legacy_preserves_progress_and_result() {
+        #[derive(Default)]
+        struct LegacyProgressCapture(Mutex<Vec<(f64, Option<f64>, Option<String>)>>);
+        impl NotificationSender for LegacyProgressCapture {
+            fn send_progress(&self, value: f64, total: Option<f64>, message: Option<&str>) {
+                self.0.lock().unwrap().push((value, total, message.map(str::to_owned)));
+            }
+        }
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+        let capture = Arc::new(LegacyProgressCapture::default());
+        let state = Arc::new(Mutex::new(TestState::default()));
+        let proxy = ProxyClient::from_backend(TestBackend {
+            state: Arc::clone(&state), legacy_progress: Some((0.5, Some(1.0), Some("legacy-owned".to_owned()))),
+            ..TestBackend::default()
+        });
+        let ctx = McpContext::with_progress(cx.clone(), 4407, ProgressReporter::with_marker(
+            serde_json::json!("legacy-marker"), Arc::clone(&capture) as Arc<dyn NotificationSender>,
+        ));
+        let result = runtime.block_on(proxy.call_tool_typed_async(&ctx, "legacy-owned", serde_json::json!({"subject":"owned"}))).unwrap();
+        assert_eq!(result.era(), ProtocolEra::Legacy2024);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&result.encode().unwrap()).unwrap(),
+            serde_json::json!({"content":[{"type":"text", "text":"ok"}]}));
+        assert_eq!(state.lock().unwrap().last_tool.as_ref(), Some(&("legacy-owned".to_owned(), serde_json::json!({"subject":"owned"}))));
+        assert_eq!(capture.0.lock().unwrap().as_slice(), &[(0.5, Some(1.0), Some("legacy-owned".to_owned()))]);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
     }
 
     fn proxy_tool_resume_caller_runtime_probe(cancel: bool, context_deadline: bool) {
@@ -13746,7 +14156,7 @@ IFS= read -r end
                             Some(CanonicalHttpUrl::parse(&format!("http://{address}/mcp")).unwrap()),
                             None, None, "resume-credential".to_owned(), "resume-owner".to_owned(),
                             "native-resume".to_owned(), 1, 1, 0).unwrap();
-                        let capabilities = ClientCapabilities::default();
+                        let capabilities = proxy_owned_roots_capabilities();
                         let connection = ClientHttpConnection::connect(&cx, plan, proxy_http_client_info(), capabilities.clone()).await.unwrap();
                         let binding = ProxyUpstreamBinding { adapter: ProxyUpstreamAdapter::ModernHttp, ..proxy_binding(ProtocolEra::Modern2026) };
                         let proxy = ProxyClient::from_backend_with_upstream_binding(
@@ -14023,7 +14433,7 @@ IFS= read -r end
                             assert_eq!(metadata["progressToken"], peer_subject);
                             assert_eq!(
                                 metadata[fastmcp_protocol::FINAL_CLIENT_INFO_META_KEY],
-                                serde_json::json!({"name": peer_subject, "version": "17"})
+                                serde_json::to_value(proxy_http_client_info()).unwrap()
                             );
                             assert_eq!(
                                 metadata[fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]["roots"],
@@ -14105,7 +14515,7 @@ IFS= read -r end
                         let plan = ClientProtocolPlan::http(ProtocolPolicy::ModernOnly,
                             Some(CanonicalHttpUrl::parse(&format!("http://{address}/mcp")).unwrap()),
                             None, None, "read-credential".to_owned(), "read-owner".to_owned(), "native-read".to_owned(), 1, 1, 0).unwrap();
-                        let capabilities = ClientCapabilities::default();
+                        let capabilities = proxy_owned_roots_capabilities();
                         let connection = ClientHttpConnection::connect(&cx, plan, proxy_http_client_info(), capabilities.clone()).await.unwrap();
                         let binding = ProxyUpstreamBinding { adapter: ProxyUpstreamAdapter::ModernHttp, ..proxy_binding(ProtocolEra::Modern2026) };
                         let proxy = ProxyClient::from_backend_with_upstream_binding(
@@ -14403,6 +14813,9 @@ IFS= read -r end
         proxy_logging_caller_runtime_probe(true);
     }
 
+    // Stateful logging forwarding is an exact-2024 operation; modern custom
+    // requests carry their logging level in their admitted request metadata.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn proxy_completion_custom_backend_forwards_logging_once() {
         for cancelled in [false, true] {
@@ -15160,13 +15573,11 @@ IFS= read -r end
 "#
                 );
                 let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
-                let mut client = Client::stdio_with_protocol_plan_with_cx(
-                    cx.clone(),
-                    "sh",
-                    &["-c", &script],
-                    ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-                )
-                .unwrap();
+                let mut client = runtime.block_on(fastmcp_client::ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                    .capabilities(proxy_owned_roots_capabilities())
+                    .connect_stdio_with_cx(&cx, "sh", &["-c", &script]))
+                    .unwrap();
                 client
                     .set_request_timeout_policy(
                         fastmcp_client::RequestTimeoutPolicy::new(
@@ -15342,7 +15753,7 @@ IFS= read -r end
                         let params = &wire["params"];
                         assert_eq!(params[if method == "resources/read" { "uri" } else { "name" }], target);
                         assert_eq!(params["_meta"]["io.modelcontextprotocol/protocolVersion"], "2026-07-28");
-                        assert_eq!(params["_meta"][FINAL_CLIENT_INFO_META_KEY]["name"], subject);
+                        assert_eq!(params["_meta"][FINAL_CLIENT_INFO_META_KEY]["name"], "fastmcp-client");
                         assert_eq!(params["_meta"]["progressToken"], if index % 2 == 0 { "first" } else { "second" });
                         let tasks = params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"].get("io.modelcontextprotocol/tasks");
                         if task_result.is_some() { assert_eq!(tasks, Some(&serde_json::json!({}))); }
@@ -18138,7 +18549,38 @@ IFS= read -r end
         final_progress: Option<FinalProgressNotificationParams>,
     }
 
+    struct OwnedTypedResult {
+        result: CoreResult,
+        final_progress: Option<FinalProgressNotificationParams>,
+    }
+
+    impl super::ProxyAsyncRequest for OwnedTypedResult {
+        fn client_implementation(&self) -> fastmcp_protocol::common_types::Implementation {
+            fastmcp_protocol::common_types::Implementation::try_new("typed-test-proxy", "1").unwrap()
+        }
+
+        fn execute<'a>(self: Box<Self>, ctx: &'a McpContext, _request: fastmcp_protocol::CoreRequest,
+            on_progress: &'a mut (dyn FnMut(FinalProgressNotificationParams) + Send),
+        ) -> crate::handler::BoxFuture<'a, fastmcp_core::McpResult<CoreResult>> {
+            Box::pin(async move {
+                ctx.checkpoint()?;
+                if let Some(progress) = self.final_progress
+                    && super::ctx_progress_marker(ctx).as_ref() == Some(&progress.progress_token)
+                {
+                    on_progress(progress);
+                }
+                Ok(self.result)
+            })
+        }
+    }
+
     impl ProxyBackend for TypedToolBackend {
+        fn async_protocol_era(&self) -> Option<ProtocolEra> { Some(self.result.era()) }
+
+        fn prepare_async_request(&mut self) -> fastmcp_core::McpResult<Option<Box<dyn super::ProxyAsyncRequest>>> {
+            Ok(Some(Box::new(OwnedTypedResult { result: self.result.clone(), final_progress: self.final_progress.clone() })))
+        }
+
         fn list_tools(&mut self) -> fastmcp_core::McpResult<Vec<Tool>> {
             Ok(Vec::new())
         }
@@ -18264,6 +18706,33 @@ IFS= read -r end
     }
 
     #[cfg(feature = "tasks")]
+    struct OwnedOrdinaryTaskCall {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[cfg(feature = "tasks")]
+    impl super::ProxyAsyncRequest for OwnedOrdinaryTaskCall {
+        fn client_implementation(&self) -> fastmcp_protocol::common_types::Implementation {
+            fastmcp_protocol::common_types::Implementation::try_new("task-test-proxy", "1").unwrap()
+        }
+
+        fn execute<'a>(self: Box<Self>, ctx: &'a McpContext, request: fastmcp_protocol::CoreRequest,
+            _on_progress: &'a mut (dyn FnMut(FinalProgressNotificationParams) + Send),
+        ) -> crate::handler::BoxFuture<'a, fastmcp_core::McpResult<CoreResult>> {
+            Box::pin(async move {
+                ctx.checkpoint()?;
+                assert_eq!(request.method(), "tools/call");
+                assert_eq!(request.era(), ProtocolEra::Modern2026);
+                let parameters = request.encode_params().unwrap().unwrap();
+                assert!(parameters["_meta"][fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]
+                    .get(fastmcp_protocol::TASKS_EXTENSION).is_none());
+                self.calls.lock().unwrap().push("ordinary-tools/call");
+                Ok(final_tool_result_with_open_members())
+            })
+        }
+    }
+
+    #[cfg(feature = "tasks")]
     impl ProxyFinalTaskListener for FinalTaskRelayListener {
         fn next(
             &mut self,
@@ -18280,6 +18749,12 @@ IFS= read -r end
 
     #[cfg(feature = "tasks")]
     impl ProxyBackend for FinalTaskRelayBackend {
+        fn async_protocol_era(&self) -> Option<ProtocolEra> { Some(ProtocolEra::Modern2026) }
+
+        fn prepare_async_request(&mut self) -> fastmcp_core::McpResult<Option<Box<dyn super::ProxyAsyncRequest>>> {
+            Ok(Some(Box::new(OwnedOrdinaryTaskCall { calls: Arc::clone(&self.calls) })))
+        }
+
         fn list_tools(&mut self) -> fastmcp_core::McpResult<Vec<Tool>> {
             Ok(Vec::new())
         }
@@ -20743,6 +21218,12 @@ IFS= read -r end
     }
 
     impl ProxyBackend for TestBackend {
+        fn async_protocol_era(&self) -> Option<ProtocolEra> { Some(ProtocolEra::Legacy2024) }
+
+        fn prepare_async_request(&mut self) -> fastmcp_core::McpResult<Option<Box<dyn super::ProxyAsyncRequest>>> {
+            Ok(Some(Box::new(self.clone())))
+        }
+
         fn set_log_level(
             &mut self,
             level: fastmcp_client::LoggingLevel,
@@ -20921,6 +21402,54 @@ IFS= read -r end
             state.incremental_final_task_listener_cancellations += 1;
             state.incremental_final_task_cleanup_cx_cancelled = Some(cx.is_cancel_requested());
             Ok(())
+        }
+    }
+
+    // These handlers only mutate finite in-memory fixture state. An owned
+    // clone can execute them directly inside its future without borrowing the
+    // proxy backend, blocking on I/O, or entering another runtime.
+    impl super::ProxyAsyncRequest for TestBackend {
+        fn client_implementation(&self) -> fastmcp_protocol::common_types::Implementation {
+            fastmcp_protocol::common_types::Implementation::try_new("legacy-test-proxy", "1").unwrap()
+        }
+
+        fn execute<'a>(mut self: Box<Self>, ctx: &'a McpContext, request: fastmcp_protocol::CoreRequest,
+            _on_progress: &'a mut (dyn FnMut(FinalProgressNotificationParams) + Send),
+        ) -> crate::handler::BoxFuture<'a, fastmcp_core::McpResult<CoreResult>> {
+            Box::pin(async move {
+                ctx.checkpoint()?;
+                let fastmcp_protocol::CoreRequest::Legacy(request) = request else {
+                    return Err(fastmcp_core::McpError::invalid_request("legacy fixture received final request"));
+                };
+                if let Some(level) = super::inbound_logging_level(ctx) {
+                    self.set_log_level(level)?;
+                }
+                match request {
+                    fastmcp_protocol::LegacyCoreRequest::ToolsCall(params) => {
+                        if ctx.progress_marker().is_some()
+                            && let Some((progress, total, message)) = &self.legacy_progress
+                        {
+                            if let Some(total) = total {
+                                ctx.report_progress_with_total(*progress, *total, message.as_deref());
+                            } else {
+                                ctx.report_progress(*progress, message.as_deref());
+                            }
+                        }
+                        self.call_tool_result(&params.name, params.arguments.unwrap_or_else(|| serde_json::json!({})))
+                    }
+                    fastmcp_protocol::LegacyCoreRequest::ResourcesRead(params) => self.read_resource_result(&params.uri),
+                    fastmcp_protocol::LegacyCoreRequest::PromptsGet(params) => self.get_prompt_result(&params.name, params.arguments.unwrap_or_default()),
+                    fastmcp_protocol::LegacyCoreRequest::Completion(params) => self.complete_result(fastmcp_client::CompletionParams {
+                        reference: match params.reference {
+                            fastmcp_protocol::LegacyCompletionReference::Prompt { name } => fastmcp_client::CompletionReference::Prompt { name },
+                            fastmcp_protocol::LegacyCompletionReference::Resource { uri } => fastmcp_client::CompletionReference::Resource { uri },
+                        },
+                        argument: fastmcp_client::CompletionArgument { name: params.argument.name, value: params.argument.value },
+                        context: None,
+                    }),
+                    _ => Err(fastmcp_core::McpError::invalid_request("legacy fixture does not implement this owned request")),
+                }
+            })
         }
     }
 

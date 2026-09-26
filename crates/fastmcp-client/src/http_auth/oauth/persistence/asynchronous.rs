@@ -9,6 +9,8 @@
 pub mod renewal;
 /// Explicit revocation of stored refresh grants and persistent logout custody.
 pub mod logout;
+/// Transfer an existing managed login's refresh ownership into protected storage.
+pub mod capture;
 
 use std::fmt;
 use std::fs::File;
