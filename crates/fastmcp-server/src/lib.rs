@@ -84,8 +84,6 @@ mod handler;
 pub mod http_admission;
 #[cfg(feature = "legacy-2024-11-05")]
 pub mod legacy_2024;
-#[cfg(all(not(feature = "legacy-2024-11-05"), test))]
-mod legacy_2024;
 mod middleware;
 pub mod oauth;
 pub mod oidc;
@@ -161,7 +159,7 @@ pub use router::{
 };
 use router::{RouterPromptCaller, RouterResourceReader, RouterToolCaller, TransportAuthorization};
 pub use session::Session;
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 use session::SessionPrincipalBinding;
 use session::{
     InitializationSnapshot, MAX_RESOURCE_SUBSCRIPTION_BYTES_PER_SESSION, SubscriptionAdmission,
@@ -201,7 +199,7 @@ use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_transport::http::{
     DualEraHttpEndpoint, DualEraHttpEndpointConfig, DualEraHttpEndpointError,
     DualEraHttpEndpointResponse, DualEraHttpLegacyLifecycle, DualEraHttpLegacySseResponse,
@@ -214,7 +212,7 @@ use fastmcp_transport::http::{
     StreamableHttpRequestResponseSender,
 };
 use fastmcp_transport::sse::SseEvent;
-#[cfg(all(not(feature = "legacy-2024-11-05"), not(test)))]
+#[cfg(not(feature = "legacy-2024-11-05"))]
 use modern_http_only::{
     DualEraHttpEndpoint, DualEraHttpEndpointConfig, DualEraHttpEndpointError,
     DualEraHttpEndpointResponse, DualEraHttpSession, DualEraHttpSseResponse,
@@ -224,7 +222,7 @@ use modern_http_only::{
 // adapter. The server still needs the modern request-owned HTTP primitives, so
 // provide a private modern-only composition with the same internal seam. It
 // has no `/sse` or legacy-message admission branch.
-#[cfg(all(not(feature = "legacy-2024-11-05"), not(test)))]
+#[cfg(not(feature = "legacy-2024-11-05"))]
 mod modern_http_only {
     use std::sync::Arc;
 
@@ -501,10 +499,10 @@ use crate::http_admission::{
 };
 
 use asupersync::bytes::BytesMut;
-#[cfg(any(feature = "legacy-2024-11-05", feature = "websocket", test))]
+#[cfg(any(feature = "legacy-2024-11-05", feature = "websocket"))]
 use asupersync::channel::mpsc as asupersync_mpsc;
 use asupersync::codec::{Decoder, Encoder, Framed};
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 use asupersync::cx::ChildRegionSpec;
 use asupersync::http::h1::{
     Http1Codec, HttpError as Http1DecodeError, Method as Http1Method, Response as Http1Response,
@@ -539,9 +537,9 @@ use fastmcp_protocol::extensions::{
     ExtensionLocalEnablement, ExtensionNegotiationError, ExtensionSettingsCompatibilityResolver,
     ExtensionSettingsResolution,
 };
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_protocol::methods::decode_legacy_2024_11_05_client_capabilities;
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_protocol::methods::{
     Legacy2024ListChangedCapability, Legacy2024ResourcesCapability, Legacy2024ServerCapabilities,
 };
@@ -575,7 +573,7 @@ use fastmcp_protocol::{
     UnsubscribeResourceParams,
 };
 use fastmcp_protocol::{CompleteResult, FinalSubscriptionsListenResult, ResultMeta};
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 use legacy_2024::{
     Legacy2024AdapterError, Legacy2024Handler, Legacy2024HandlerError, Legacy2024Outbound,
     Legacy2024ServerAdapter, Legacy2024ServerConfig, Legacy2024ServerInfo, Legacy2024StateSnapshot,
@@ -749,18 +747,23 @@ fn wait_for_stdio_progress_commit_fence(request_id: u64, notification: &JsonRpcR
     }) else {
         return;
     };
+    // A test that stops before releasing the interlock must fail rather than
+    // leave this progress writer blocked for the rest of the process.
+    const RELEASE_BOUND: Duration = Duration::from_secs(60);
     let mut state = interlock
         .state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     state.entered = true;
     interlock.changed.notify_all();
-    while !state.released {
-        state = interlock
-            .changed
-            .wait(state)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-    }
+    let (_state, waited) = interlock
+        .changed
+        .wait_timeout_while(state, RELEASE_BOUND, |state| !state.released)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        !waited.timed_out(),
+        "stdio progress commit interlock was not released within {RELEASE_BOUND:?}; its test stopped before releasing it"
+    );
 }
 
 /// Failure while installing the server-owned extension registry.
@@ -1307,7 +1310,7 @@ impl ServerExtensionRuntime {
 
 /// Request-owned state retained until the exact legacy response reaches its
 /// stdio commit boundary.
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 struct LiveLegacy2024ActiveRequest {
     cancellation: McpRequestCancellation,
     active_guard: ActiveRequestGuard,
@@ -1316,7 +1319,7 @@ struct LiveLegacy2024ActiveRequest {
 
 /// Result of a live exact-2024 dispatch together with its still-active
 /// cancellation authority.
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 struct LiveLegacy2024Dispatch {
     result: McpResult<serde_json::Value>,
     active_request: LiveLegacy2024ActiveRequest,
@@ -1329,7 +1332,7 @@ struct LiveLegacy2024Dispatch {
 /// together prevents an admitted legacy request from receiving a fresh state
 /// bag or a disconnected outbound request registry.
 #[derive(Clone)]
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 struct LiveLegacy2024ConnectionRuntime {
     session_state: SessionState,
     notification_sender: NotificationSender,
@@ -1342,7 +1345,7 @@ struct LiveLegacy2024ConnectionRuntime {
     logging_ceiling: LevelFilter,
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 fn map_legacy_log_level(level: &str, ceiling: LevelFilter) -> Option<LogLevel> {
     let mapped = match level {
         "debug" => LogLevel::Debug,
@@ -1379,7 +1382,7 @@ fn map_legacy_log_level(level: &str, ceiling: LevelFilter) -> Option<LogLevel> {
     })
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 impl LiveLegacy2024ConnectionRuntime {
     fn new(
         session_state: SessionState,
@@ -1462,7 +1465,7 @@ impl LiveLegacy2024ConnectionRuntime {
 
 /// Bridges an admitted exact-2024 operation to the server's legacy result
 /// surface while retaining the peer's original request identity.
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 struct LiveLegacy2024RuntimeHandler<'a> {
     server: &'a Server,
     cx: Cx,
@@ -1477,16 +1480,16 @@ struct LiveLegacy2024RuntimeHandler<'a> {
 /// The live exact-2024 runtime handlers are driven only through
 /// `Legacy2024ServerAdapter::receive_async`. Their synchronous hook would have
 /// to block on the request future, so it refuses instead of dispatching.
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 const LIVE_LEGACY_SYNC_DISPATCH_REFUSED: &str =
     "live exact-2024 runtime handlers dispatch only through receive_async";
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 fn live_legacy_sync_dispatch_refused() -> Legacy2024HandlerError {
     Legacy2024HandlerError::new(LIVE_LEGACY_SYNC_DISPATCH_REFUSED)
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 fn combine_legacy_dispatch_and_close<T>(
     dispatch: Result<T, Legacy2024HandlerError>,
     close: Result<(), Legacy2024HandlerError>,
@@ -1502,7 +1505,7 @@ fn combine_legacy_dispatch_and_close<T>(
     }
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 impl Legacy2024Handler for LiveLegacy2024RuntimeHandler<'_> {
     fn handle_legacy_2024(
         &mut self,
@@ -1598,7 +1601,7 @@ impl Legacy2024Handler for LiveLegacy2024RuntimeHandler<'_> {
 /// Owns a server reference for an exact-2024 HTTP session. The session updates
 /// the request context before every adapter call, while the adapter retains the
 /// lifecycle and original wire identity across independent HTTP requests.
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 struct HttpLegacy2024RuntimeHandler {
     server: Arc<Server>,
     session_id: u64,
@@ -1614,7 +1617,7 @@ struct HttpLegacy2024RuntimeHandler {
     auth_receipt: Arc<Mutex<Option<AuthAdmissionReceipt>>>,
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 impl Legacy2024Handler for HttpLegacy2024RuntimeHandler {
     fn handle_legacy_2024(
         &mut self,
@@ -2142,12 +2145,12 @@ fn runtime_stdio_policy(policy: ProtocolPolicy) -> ProtocolPolicy {
 /// Rejects a malformed receive failure as an Auto connection's terminal
 /// opening frame. Later malformed frames retain ordinary JSON-RPC recovery
 /// behavior because their era was already selected.
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 fn reject_initial_stdio_malformed(classifier: &mut StdioEraClassifier) -> StdioEraDecision {
     classifier.classify_opening(StdioOpeningFrame::Malformed)
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 fn runtime_legacy_binding(generation: u64) -> LegacyPeerBinding {
     let mut partition = [0_u8; LegacyAuthenticatedPeerPartition::BYTE_LEN];
     partition[..8].copy_from_slice(&generation.to_be_bytes());
@@ -2206,14 +2209,14 @@ fn poll_on_cx<F: Future>(cx: &Cx, future: F) -> F::Output {
 /// even when it races the first request's dispatch. Cancellation itself still
 /// uses `verify_existing`, so a control frame can never claim an unbound
 /// connection.
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 fn bind_anonymous_connection_principal(
     principal_binding: &SessionPrincipalBinding,
 ) -> McpResult<()> {
     bind_connection_principal(principal_binding, auth::principal_fingerprint(None)?)
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 fn bind_connection_principal(
     principal_binding: &SessionPrincipalBinding,
     fingerprint: Sha256Digest,
@@ -2228,7 +2231,7 @@ fn bind_connection_principal(
     }
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 async fn legacy_adapter_response_async<H: Legacy2024Handler>(
     adapter: &mut Legacy2024ServerAdapter<H>,
     binding: LegacyPeerBinding,
@@ -2249,7 +2252,7 @@ async fn legacy_adapter_response_async<H: Legacy2024Handler>(
     }
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 fn sync_live_legacy_runtime_from_adapter<H: Legacy2024Handler>(
     runtime: &LiveLegacy2024ConnectionRuntime,
     adapter: &Legacy2024ServerAdapter<H>,
@@ -2264,7 +2267,7 @@ fn sync_live_legacy_runtime_from_adapter<H: Legacy2024Handler>(
 /// Applies an exact legacy client response to the adapter that allocated its
 /// reverse-request ID. A response cannot produce peer output, so any other
 /// adapter result is a protocol failure.
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 fn legacy_adapter_accept_response<H: Legacy2024Handler>(
     adapter: &mut Legacy2024ServerAdapter<H>,
     binding: LegacyPeerBinding,
@@ -2280,7 +2283,7 @@ fn legacy_adapter_accept_response<H: Legacy2024Handler>(
     )
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 fn take_live_legacy_active_request(
     active_request: &Arc<Mutex<Option<LiveLegacy2024ActiveRequest>>>,
 ) -> Option<LiveLegacy2024ActiveRequest> {
@@ -2290,7 +2293,7 @@ fn take_live_legacy_active_request(
         .take()
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 fn legacy_handled_response(
     response: JsonRpcResponse,
     active_request: Option<LiveLegacy2024ActiveRequest>,
@@ -2366,7 +2369,7 @@ fn legacy_only_modern_refusal(request: &JsonRpcRequest) -> Option<JsonRpcRespons
 /// Selects the refusal shape for a request that failed era admission:
 /// a modern request under `LegacyOnly` is a method-not-found style typed
 /// refusal, every other mismatch is the negotiated-era `-32600` refusal.
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 fn era_admission_refusal(
     policy: ProtocolPolicy,
     request: &JsonRpcRequest,
@@ -2377,7 +2380,8 @@ fn era_admission_refusal(
     protocol_era_refusal(request)
 }
 
-#[cfg(test)]
+// Exact-2024 era: era_admission_refusal serves only the dual-era loop.
+#[cfg(all(test, feature = "legacy-2024-11-05"))]
 mod era_admission_refusal_tests {
     use super::*;
 
@@ -2531,7 +2535,7 @@ impl SessionMutationRollback {
     }
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DispatchPrincipalAdmissionState {
     Pending,
@@ -2539,13 +2543,13 @@ enum DispatchPrincipalAdmissionState {
     Rejected,
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 struct DispatchPrincipalAdmission {
     state: Mutex<DispatchPrincipalAdmissionState>,
     changed: Condvar,
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 impl DispatchPrincipalAdmission {
     fn pending() -> Self {
         Self {
@@ -2648,7 +2652,7 @@ enum DispatchCancellationDisposition {
     AlreadySettled,
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 struct QueuedDispatchRequest {
     request: JsonRpcRequest,
     era: ProtocolEra,
@@ -2656,7 +2660,7 @@ struct QueuedDispatchRequest {
     principal_admission: Arc<DispatchPrincipalAdmission>,
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 enum QueuedDispatchMessage {
     Request(QueuedDispatchRequest),
     /// Exact-2024 client responses are serialized through the same adapter
@@ -2940,7 +2944,7 @@ impl DispatchQueueState {
         }
     }
 
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn is_stopping(&self) -> bool {
         self.inner
             .lock()
@@ -2980,14 +2984,14 @@ impl DispatchQueueState {
 /// returned send failure, disconnected worker queue, or panic therefore closes
 /// admission and makes the pump report failure. Its drop path contains queue
 /// wake-up failures so a worker panic cannot turn into a double-panic abort.
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 struct DispatchWorkerFailureLatch {
     failed: Arc<AtomicBool>,
     queue: Arc<DispatchQueueState>,
     armed: bool,
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 impl DispatchWorkerFailureLatch {
     fn new(failed: Arc<AtomicBool>, queue: Arc<DispatchQueueState>) -> Self {
         Self {
@@ -3002,7 +3006,7 @@ impl DispatchWorkerFailureLatch {
     }
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 impl Drop for DispatchWorkerFailureLatch {
     fn drop(&mut self) {
         if !self.armed {
@@ -3013,10 +3017,10 @@ impl Drop for DispatchWorkerFailureLatch {
     }
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 struct DispatchWorkerCompletionSignal(Option<std::sync::mpsc::Sender<()>>);
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 impl Drop for DispatchWorkerCompletionSignal {
     fn drop(&mut self) {
         if let Some(sender) = self.0.take() {
@@ -3028,26 +3032,26 @@ impl Drop for DispatchWorkerCompletionSignal {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PumpIoMode {
     Split,
-    #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+    #[cfg(not(feature = "legacy-2024-11-05"))]
     Unsplit,
 }
 
 /// Longest an unsplit pump holds off its next `recv` for a listen that has
 /// neither acknowledged nor finished. Past it the pump reads again, and the
 /// acknowledgement is written when that `recv` returns.
-#[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+#[cfg(not(feature = "legacy-2024-11-05"))]
 const UNSPLIT_LISTEN_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Set once a listen dispatched off an unsplit pump has written its
 /// acknowledgement or finished (bd-4crkf).
-#[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+#[cfg(not(feature = "legacy-2024-11-05"))]
 #[derive(Default)]
 struct UnsplitListenOpened {
     opened: Mutex<bool>,
     changed: Condvar,
 }
 
-#[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+#[cfg(not(feature = "legacy-2024-11-05"))]
 impl UnsplitListenOpened {
     fn fire(&self) {
         *self
@@ -3078,10 +3082,10 @@ impl UnsplitListenOpened {
     }
 }
 
-#[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+#[cfg(not(feature = "legacy-2024-11-05"))]
 struct UnsplitListenOpenedOnDrop(Arc<UnsplitListenOpened>);
 
-#[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+#[cfg(not(feature = "legacy-2024-11-05"))]
 impl Drop for UnsplitListenOpenedOnDrop {
     fn drop(&mut self) {
         self.0.fire();
@@ -3338,7 +3342,7 @@ fn mask_peer_error(error: McpError, mask_error_details: bool) -> McpError {
     }
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 fn legacy_handler_error_from_mcp(
     error: McpError,
     mask_error_details: bool,
@@ -3729,10 +3733,10 @@ pub struct HttpServerConfig {
     /// Maximum requests buffered for one live HTTP session.
     pub request_capacity: usize,
     /// GET path for the exact MCP 2024-11-05 SSE stream.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     pub legacy_sse_path: String,
     /// POST path advertised to an exact MCP 2024-11-05 SSE client.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     pub legacy_message_path: String,
 }
 
@@ -3796,9 +3800,9 @@ impl Default for HttpServerConfig {
                 ..HttpHandlerConfig::default()
             },
             request_capacity: 64,
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             legacy_sse_path: "/sse".to_string(),
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             legacy_message_path: "/messages".to_string(),
         }
     }
@@ -3848,7 +3852,7 @@ impl HttpServerConfig {
 
     /// Sets the exact MCP 2024-11-05 SSE stream path.
     #[must_use]
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     pub fn legacy_sse_path(mut self, path: impl Into<String>) -> Self {
         self.legacy_sse_path = path.into();
         self
@@ -3856,7 +3860,7 @@ impl HttpServerConfig {
 
     /// Sets the exact MCP 2024-11-05 POST path advertised through SSE.
     #[must_use]
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     pub fn legacy_message_path(mut self, path: impl Into<String>) -> Self {
         self.legacy_message_path = path.into();
         self
@@ -3908,7 +3912,7 @@ impl ServerHttpEndpointError {
             }
             DualEraHttpEndpointError::Http(error) => Self::Http(error),
             DualEraHttpEndpointError::Transport(error) => Self::Transport(error),
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             DualEraHttpEndpointError::Session(error) => Self::Session(error),
             DualEraHttpEndpointError::Closed => Self::Closed,
         }
@@ -3940,7 +3944,7 @@ fn http_request_accepts_sse(request: &HttpRequest) -> bool {
 /// legacy feature is enabled.
 pub struct ServerHttpEndpoint {
     server: Arc<Server>,
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     legacy_origin: String,
 }
 
@@ -3954,7 +3958,7 @@ fn validate_server_http_route_configuration(
         server.http_config.handler_config.base_path.as_str(),
         server.http_config.health_path.as_str(),
     ];
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     let occupied = {
         let mut occupied = occupied;
         occupied.push(server.http_config.legacy_sse_path.as_str());
@@ -3976,34 +3980,34 @@ fn validate_server_http_route_configuration(
 pub struct ServerHttpSession {
     server: Arc<Server>,
     endpoint_session: Arc<Mutex<DualEraHttpSession>>,
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     legacy_session_id: String,
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     legacy_lifecycle: DualEraHttpLegacyLifecycle,
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     legacy_session: Session,
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     legacy_binding: LegacyPeerBinding,
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     legacy_adapter: Option<Legacy2024ServerAdapter<HttpLegacy2024RuntimeHandler>>,
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     legacy_active_request: Arc<Mutex<Option<LiveLegacy2024ActiveRequest>>>,
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     legacy_request_cx: Arc<Mutex<Cx>>,
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     legacy_admissions: Arc<HttpLegacyRequestAdmissions>,
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     legacy_auth_receipt: Arc<Mutex<Option<AuthAdmissionReceipt>>>,
     /// Principal admitted on the GET `/sse` that opened this generation.
     ///
     /// GET has no JSON-RPC body, so its receipt cannot be committed onto a
     /// later POST. The fingerprint must still bind the session: otherwise the
     /// first POST wins ownership and can stream results to a different opener.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     legacy_sse_open_fingerprint: Option<Sha256Digest>,
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     legacy_pending_requests: Arc<PendingRequests>,
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     legacy_runtime: LiveLegacy2024ConnectionRuntime,
     /// Embedding-session-owned modern mutable component state.
     ///
@@ -4530,7 +4534,7 @@ pub enum ServerHttpEndpointResponse {
     /// A finite modern request-scoped SSE response body.
     ModernSse(ServerHttpSseResponse),
     /// A live exact MCP 2024-11-05 SSE stream.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     LegacySse(DualEraHttpLegacySseResponse),
 }
 
@@ -5914,7 +5918,7 @@ fn tag_task_subscription_notification(
 /// The generation binds cleanup to this precise admission. It prevents a late
 /// response finalizer from removing a future admission that reused the same
 /// wire ID.
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 struct HttpLegacyRequestAdmission {
     generation: u64,
     cancellation: McpRequestCancellation,
@@ -5922,7 +5926,7 @@ struct HttpLegacyRequestAdmission {
 }
 
 #[derive(Default)]
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 struct HttpLegacyRequestAdmissionsInner {
     next_generation: u64,
     entries: HashMap<CorrelationKey, HttpLegacyRequestAdmission>,
@@ -5935,13 +5939,13 @@ struct HttpLegacyRequestAdmissionsInner {
 /// exact authority throughout admission, mutex wait, active dispatch, and
 /// response finalization without taking the session mutex.
 #[derive(Default)]
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 struct HttpLegacyRequestAdmissions {
     inner: Mutex<HttpLegacyRequestAdmissionsInner>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 enum HttpLegacyAdmissionCancellationDisposition {
     NotOwned,
     Protected,
@@ -5951,14 +5955,14 @@ enum HttpLegacyAdmissionCancellationDisposition {
 
 /// Retains an HTTP admission until its target POST has completed response
 /// finalization. Dropping the guard releases only its matching generation.
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 struct HttpLegacyRequestAdmissionGuard {
     admissions: Arc<HttpLegacyRequestAdmissions>,
     key: CorrelationKey,
     generation: u64,
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 impl HttpLegacyRequestAdmissions {
     fn admit(
         self: &Arc<Self>,
@@ -6086,7 +6090,7 @@ impl HttpLegacyRequestAdmissions {
     }
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 impl Drop for HttpLegacyRequestAdmissionGuard {
     fn drop(&mut self) {
         self.admissions.release(&self.key, self.generation);
@@ -6100,7 +6104,7 @@ impl Drop for HttpLegacyRequestAdmissionGuard {
 /// control frame authenticates first, then resolves the session admission map
 /// before falling back to the server active-request registry.
 #[derive(Clone)]
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 struct HttpLegacyCancellationControl {
     server: Arc<Server>,
     session_id: u64,
@@ -6112,7 +6116,7 @@ struct HttpLegacyCancellationControl {
     admissions: Arc<HttpLegacyRequestAdmissions>,
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 impl HttpLegacyCancellationControl {
     /// Revokes every exact-2024 request admitted by this SSE peer without
     /// taking the serialized `ServerHttpSession` mutex.  The transport must
@@ -6191,7 +6195,7 @@ impl HttpLegacyCancellationControl {
     }
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 struct LiveHttpSession {
     /// `None` while the owning connection child is driving request-owned
     /// handler futures. Cancellation and reverse-response routing stay
@@ -6217,14 +6221,14 @@ struct LiveHttpSession {
     legacy_pending_requests: Arc<PendingRequests>,
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 enum LiveHttpSessionTake {
     Acquired(Box<ServerHttpSession>),
     Cancelled,
     Unavailable,
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 fn take_live_http_session(
     cx: &Cx,
     session: &LiveHttpSession,
@@ -6254,7 +6258,7 @@ fn take_live_http_session(
     }
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 async fn take_live_http_session_async(
     cx: &Cx,
     session: &LiveHttpSession,
@@ -6286,7 +6290,7 @@ async fn take_live_http_session_async(
     }
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 fn restore_live_http_session(
     session: &LiveHttpSession,
     mut owned: ServerHttpSession,
@@ -6308,7 +6312,7 @@ fn restore_live_http_session(
     Vec::new()
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 type LiveHttpSessionRegistry = Arc<Mutex<HashMap<String, Arc<LiveHttpSession>>>>;
 
 const MODERN_HTTP_RESPONSE_BODY_TTL: Duration = Duration::from_mins(15);
@@ -6360,13 +6364,13 @@ impl Drop for BlockingTaskGuard {
     }
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 enum LegacyHttpBlockingDispatchOutcome {
     Response(HttpResponse),
     Panicked,
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 async fn quarantine_panicked_live_http_session(
     cx: &Cx,
     sessions: &LiveHttpSessionRegistry,
@@ -6392,7 +6396,7 @@ async fn quarantine_panicked_live_http_session(
     }
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 async fn run_live_http_legacy_blocking_dispatch<F>(
     cx: &Cx,
     sessions: &LiveHttpSessionRegistry,
@@ -6922,7 +6926,7 @@ impl HttpConnectionChildren {
 /// POST from observing a detached-but-still-routable session. A busy legacy
 /// handler may hold its session mutex while observing the server's earlier
 /// cancellation signal, so this cleanup never waits on that mutex.
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 async fn close_live_http_sessions(cx: &Cx, sessions: &LiveHttpSessionRegistry) {
     let sessions = {
         let mut sessions = sessions
@@ -7075,7 +7079,7 @@ impl HttpListenerShutdown {
 pub struct BoundHttpServer {
     listener: AsyncTcpListener,
     endpoint: Arc<ServerHttpEndpoint>,
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     legacy_sessions: LiveHttpSessionRegistry,
     modern_sessions: LiveModernHttpSessionRegistry,
     connection_limiter: Arc<HttpConnectionLimiter>,
@@ -7181,14 +7185,14 @@ impl BoundHttpServer {
                     continue;
                 };
                 let endpoint = Arc::clone(&self.endpoint);
-                #[cfg(any(feature = "legacy-2024-11-05", test))]
+                #[cfg(feature = "legacy-2024-11-05")]
                 let legacy_sessions = Arc::clone(&self.legacy_sessions);
                 let modern_sessions = Arc::clone(&self.modern_sessions);
                 let listener_shutdown = connection_shutdown.clone();
                 let connection = cx
                     .spawn_in(&connection_scope, move |connection_cx| async move {
                         let _permit = permit;
-                        #[cfg(any(feature = "legacy-2024-11-05", test))]
+                        #[cfg(feature = "legacy-2024-11-05")]
                         {
                             // Keep the nested connection future's Send proof in
                             // this crate instead of exhausting downstream crates'
@@ -7205,7 +7209,7 @@ impl BoundHttpServer {
                             ));
                             connection.await;
                         }
-                        #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+                        #[cfg(not(feature = "legacy-2024-11-05"))]
                         serve_modern_http_connection(
                             &connection_cx,
                             stream,
@@ -7235,7 +7239,7 @@ impl BoundHttpServer {
             // children a bounded scheduling window to flush and close before
             // aborting any unrelated or uncooperative connection.
             let terminal_receipt = server.final_subscriptions.terminate_with_receipt();
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             close_live_http_sessions(cx, &self.legacy_sessions).await;
             // Phase one closes response-body admission before any uninterruptible
             // connection-child join can begin. Leave the SSE queues alive until
@@ -8070,7 +8074,7 @@ impl Server {
     /// Consumes this server into a live HTTP endpoint.
     ///
     /// Modern Streamable HTTP remains at the configured MCP path.
-    #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+    #[cfg(not(feature = "legacy-2024-11-05"))]
     pub fn into_http_endpoint(self) -> Result<ServerHttpEndpoint, ServerHttpEndpointError> {
         validate_server_http_route_configuration(&self)?;
         let endpoint = ServerHttpEndpoint {
@@ -8086,7 +8090,7 @@ impl Server {
     ///
     /// `legacy_origin` is used only for the exact MCP 2024-11-05 SSE endpoint
     /// event. Modern Streamable HTTP remains at the configured MCP path.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     pub fn into_http_endpoint(
         self,
         legacy_origin: impl Into<String>,
@@ -8117,24 +8121,24 @@ impl Server {
             McpError::internal_error(format!("HTTP listener bind failed: {error}"))
         })?;
         let max_connections = self.http_config.max_connections;
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         let local_addr = listener.local_addr().map_err(|error| {
             McpError::internal_error(format!("HTTP listener address unavailable: {error}"))
         })?;
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         let endpoint = self
             .into_http_endpoint(format!("http://{local_addr}"))
             .map_err(|error| {
                 McpError::internal_error(format!("HTTP endpoint setup failed: {error}"))
             })?;
-        #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+        #[cfg(not(feature = "legacy-2024-11-05"))]
         let endpoint = self.into_http_endpoint().map_err(|error| {
             McpError::internal_error(format!("HTTP endpoint setup failed: {error}"))
         })?;
         Ok(BoundHttpServer {
             listener,
             endpoint: Arc::new(endpoint),
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             legacy_sessions: Arc::new(Mutex::new(HashMap::new())),
             modern_sessions: Arc::new(LiveModernHttpSessionRegistryState::new()),
             connection_limiter: Arc::new(HttpConnectionLimiter::new(max_connections)),
@@ -8161,14 +8165,14 @@ impl ServerHttpEndpoint {
     /// router-owned opaque, single-use state and may be resumed by a later
     /// stateless POST only when its operation and principal bindings match.
     pub fn open_session(&self, cx: &Cx) -> Result<ServerHttpSession, ServerHttpEndpointError> {
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         let session = self.open_session_with_legacy_origin(cx, &self.legacy_origin);
-        #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+        #[cfg(not(feature = "legacy-2024-11-05"))]
         let session = self.open_session_modern(cx);
         session.map_err(ServerHttpEndpointError::from_internal)
     }
 
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn transport_endpoint(
         &self,
         legacy_origin: &str,
@@ -8185,7 +8189,7 @@ impl ServerHttpEndpoint {
         )
     }
 
-    #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+    #[cfg(not(feature = "legacy-2024-11-05"))]
     fn transport_endpoint(&self) -> Result<DualEraHttpEndpoint, DualEraHttpEndpointError> {
         let mut config = DualEraHttpEndpointConfig::new();
         config.request_capacity = self.server.http_config.request_capacity;
@@ -8195,7 +8199,7 @@ impl ServerHttpEndpoint {
         )
     }
 
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn open_session_with_legacy_origin(
         &self,
         cx: &Cx,
@@ -8205,7 +8209,7 @@ impl ServerHttpEndpoint {
         self.open_session_from_transport(cx, endpoint)
     }
 
-    #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+    #[cfg(not(feature = "legacy-2024-11-05"))]
     fn open_session_modern(&self, cx: &Cx) -> Result<ServerHttpSession, DualEraHttpEndpointError> {
         let endpoint = self.transport_endpoint()?;
         self.open_session_from_transport(cx, endpoint)
@@ -8218,26 +8222,26 @@ impl ServerHttpEndpoint {
     ) -> Result<ServerHttpSession, DualEraHttpEndpointError> {
         let _ = cx;
         let endpoint_session = Arc::new(Mutex::new(endpoint.open_session()?));
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         let (legacy_session_id, legacy_lifecycle) = {
             let session = endpoint_session
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             (session.session_id().to_owned(), session.legacy_lifecycle())
         };
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         let legacy_session =
             Session::new(self.server.info.clone(), self.server.capabilities.clone());
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         let legacy_binding = runtime_legacy_binding(legacy_session.id());
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         let legacy_pending_requests = Arc::new(
             PendingRequests::with_max_in_flight_for_exact_legacy(
                 self.server.max_bidirectional_requests_per_connection,
             )
             .expect("ServerBuilder validates the bidirectional request limit"),
         );
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         let notification_sender: NotificationSender = {
             let endpoint_session = Arc::clone(&endpoint_session);
             Arc::new(move |notification| {
@@ -8247,7 +8251,7 @@ impl ServerHttpEndpoint {
                     .publish_legacy_message(&JsonRpcMessage::Request(notification));
             })
         };
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         let legacy_request_sender = RequestSender::new(Arc::clone(&legacy_pending_requests), {
             let endpoint_session = Arc::clone(&endpoint_session);
             Arc::new(move |message| {
@@ -8259,7 +8263,7 @@ impl ServerHttpEndpoint {
                 Ok(())
             })
         });
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         let legacy_runtime = LiveLegacy2024ConnectionRuntime::new(
             legacy_session.state().clone(),
             notification_sender,
@@ -8269,29 +8273,29 @@ impl ServerHttpEndpoint {
         Ok(ServerHttpSession {
             server: Arc::clone(&self.server),
             endpoint_session,
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             legacy_session_id,
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             legacy_lifecycle,
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             legacy_session,
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             legacy_binding,
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             legacy_adapter: None,
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             legacy_active_request: Arc::new(Mutex::new(None)),
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             legacy_request_cx: Arc::new(Mutex::new(cx.clone())),
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             legacy_admissions: Arc::new(HttpLegacyRequestAdmissions::default()),
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             legacy_auth_receipt: Arc::new(Mutex::new(None)),
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             legacy_sse_open_fingerprint: None,
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             legacy_pending_requests,
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             legacy_runtime,
             modern_connection: Arc::new(ModernConnection::new_request_local()),
             modern_dispatches: Arc::new(Mutex::new(Vec::new())),
@@ -8300,7 +8304,7 @@ impl ServerHttpEndpoint {
         })
     }
 
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn open_session_for_legacy_sse(
         &self,
         cx: &Cx,
@@ -8363,7 +8367,7 @@ impl AuthAdmissionReceipt {
     ///
     /// Legacy HTTP has no [`InboundRequestContext`]; method and wire-id
     /// equality are the binding between pre-admission and dispatch.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn commit_legacy(
         &self,
         ctx: &McpContext,
@@ -8457,7 +8461,7 @@ impl AuthDispatchCustody {
         }
     }
 
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn commit_legacy_connection(&self, ctx: &McpContext) -> Result<Sha256Digest, McpError> {
         let (authenticated, fingerprint) = match self {
             Self::Http(receipt) => (receipt.authenticated.clone(), receipt.fingerprint.clone()),
@@ -8479,7 +8483,7 @@ impl AuthDispatchCustody {
         }
     }
 
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn connection_fingerprint(&self) -> Sha256Digest {
         match self {
             Self::Http(receipt) => receipt.fingerprint.clone(),
@@ -8508,7 +8512,7 @@ fn sanitize_websocket_decoded_request(
 impl ServerHttpSession {
     /// Returns the exact opaque session value required by the legacy POST URI.
     #[must_use]
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     pub fn legacy_session_id(&self) -> &str {
         &self.legacy_session_id
     }
@@ -8528,7 +8532,7 @@ impl ServerHttpSession {
             .map_err(ServerHttpEndpointError::from_internal)
     }
 
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     async fn handle_preclassified_unmatched_legacy_response(
         &mut self,
         cx: &Cx,
@@ -8564,7 +8568,7 @@ impl ServerHttpSession {
     }
 
     #[cfg_attr(
-        not(any(feature = "legacy-2024-11-05", test)),
+        not(feature = "legacy-2024-11-05"),
         allow(clippy::unused_async, clippy::unused_async_trait_impl)
     )]
     async fn handle_with_modern_request_cancellation_and_transport_authorization_async(
@@ -8576,7 +8580,7 @@ impl ServerHttpSession {
         legacy_response_preclassified_unmatched: bool,
         legacy_auth_receipt: Option<AuthAdmissionReceipt>,
     ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
-        #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+        #[cfg(not(feature = "legacy-2024-11-05"))]
         let _ = (legacy_response_preclassified_unmatched, legacy_auth_receipt);
         self.reap_modern_dispatches();
         let mut request = request;
@@ -8592,18 +8596,18 @@ impl ServerHttpSession {
         let mut raw_params = None;
         let mut http_parameter_headers = None;
         let mut auth_receipt = None;
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         let is_legacy = (request.method == HttpMethod::Get
             && request.path == self.server.http_config.legacy_sse_path)
             || (request.method == HttpMethod::Post
                 && request.path == self.server.http_config.legacy_message_path);
-        #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+        #[cfg(not(feature = "legacy-2024-11-05"))]
         if matches!(self.server.protocol_policy, ProtocolPolicy::LegacyOnly) {
             return Ok(ServerHttpEndpointResponse::Immediate(HttpResponse::new(
                 HttpStatus::BAD_REQUEST,
             )));
         }
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         if (is_modern && matches!(self.server.protocol_policy, ProtocolPolicy::LegacyOnly))
             || (is_legacy && matches!(self.server.protocol_policy, ProtocolPolicy::ModernOnly))
         {
@@ -8611,7 +8615,7 @@ impl ServerHttpSession {
                 HttpStatus::BAD_REQUEST,
             )));
         }
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         let legacy_post_admission = if request.method == HttpMethod::Post
             && request.path == self.server.http_config.legacy_message_path
         {
@@ -8652,13 +8656,13 @@ impl ServerHttpSession {
                 Err(response) => return Ok(ServerHttpEndpointResponse::Immediate(response)),
             };
         }
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         let ingress_verified_legacy_response = legacy_response_preclassified_unmatched
             && matches!(
                 legacy_post_admission,
                 Some(Legacy2024HttpPostEnvelope::Response(_))
             );
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         if is_legacy && !ingress_verified_legacy_response {
             let admitted_request = match &legacy_post_admission {
                 Some(Legacy2024HttpPostEnvelope::ClientMessage(request)) => Some(request),
@@ -8717,7 +8721,7 @@ impl ServerHttpSession {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *stored = admitted_request.is_some().then_some(receipt);
         }
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         let request_era = if is_modern {
             Some(ProtocolEra::Modern2026)
         } else if is_legacy {
@@ -8725,7 +8729,7 @@ impl ServerHttpSession {
         } else {
             None
         };
-        #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+        #[cfg(not(feature = "legacy-2024-11-05"))]
         let request_era = is_modern.then_some(ProtocolEra::Modern2026);
         if request_era.is_some_and(|era| self.selected_era.is_some_and(|selected| selected != era))
         {
@@ -8740,14 +8744,14 @@ impl ServerHttpSession {
         // Modern requests retain the existing recognition-time pin; exact
         // legacy POSTs pin only after strict admission, and legacy GET pins
         // only after it successfully creates the response body below.
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         let defer_legacy_era_selection = matches!(request_era, Some(ProtocolEra::Legacy2024));
-        #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+        #[cfg(not(feature = "legacy-2024-11-05"))]
         let defer_legacy_era_selection = false;
         if let Some(era) = request_era.filter(|_| !defer_legacy_era_selection) {
             self.selected_era.get_or_insert(era);
         }
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         if let Some(Legacy2024HttpPostEnvelope::Response(response)) = legacy_post_admission {
             let lifecycle = self.legacy_lifecycle.clone();
             let result = lifecycle
@@ -8771,7 +8775,7 @@ impl ServerHttpSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .handle(cx, request)?;
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         if defer_legacy_era_selection
             && (matches!(
                 &endpoint_response,
@@ -8797,9 +8801,9 @@ impl ServerHttpSession {
                 )
                 .await;
         }
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         return self.handle_legacy(cx, endpoint_response).await;
-        #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+        #[cfg(not(feature = "legacy-2024-11-05"))]
         {
             let _ = endpoint_response;
             Ok(ServerHttpEndpointResponse::Immediate(HttpResponse::new(
@@ -8880,7 +8884,7 @@ impl ServerHttpSession {
     /// Authenticates an exact-2024 HTTP GET `/sse` or POST `/messages`
     /// request before the session era can pin or dispatch can run. GET uses a
     /// synthetic request identity because the SSE open has no JSON-RPC body.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn preauthenticate_legacy_http_request(
         &self,
         cx: &Cx,
@@ -8919,7 +8923,7 @@ impl ServerHttpSession {
     /// body generation. Reconnect must replace, rather than revive, these
     /// objects: retained providers and request senders otherwise close over
     /// the mutable transport session and could publish into the fresh body.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn install_legacy_generation(&mut self, cx: &Cx) {
         self.legacy_admissions.cancel_all();
         self.legacy_pending_requests.cancel_all();
@@ -8987,7 +8991,7 @@ impl ServerHttpSession {
     /// Returns a transport-backed roots provider after exact-2024 roots
     /// capability negotiation has completed for this HTTP connection.
     #[must_use]
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     pub fn legacy_roots_provider(&self) -> Option<TransportRootsProvider> {
         if !self.legacy_adapter.as_ref().is_some_and(|adapter| {
             let snapshot = adapter.snapshot();
@@ -9020,7 +9024,7 @@ impl ServerHttpSession {
     /// Returns `false` without emitting a message when the connection has not
     /// subscribed to the URI, has not completed legacy initialization, or its
     /// SSE stream is not live.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     pub fn notify_legacy_resource_updated(&mut self, uri: &str) -> bool {
         let Some(adapter) = self.legacy_adapter.as_mut() else {
             return false;
@@ -9050,7 +9054,7 @@ impl ServerHttpSession {
             .is_ok()
     }
 
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn handle_legacy_reverse_response(
         &mut self,
         response: JsonRpcResponse,
@@ -9069,7 +9073,7 @@ impl ServerHttpSession {
         self.handle_unmatched_legacy_reverse_response(response)
     }
 
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn handle_unmatched_legacy_reverse_response(
         &mut self,
         response: JsonRpcResponse,
@@ -9350,7 +9354,7 @@ impl ServerHttpSession {
                 debug_assert!(request.id.is_none());
                 Ok(ServerHttpEndpointResponse::Immediate(response))
             }
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             DualEraHttpEndpointResponse::LegacySse(_) => {
                 unreachable!("the modern route cannot create a legacy SSE response")
             }
@@ -9457,7 +9461,7 @@ impl ServerHttpSession {
         Ok(Ok((request, sse, raw_params, auth_receipt)))
     }
 
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     async fn handle_legacy(
         &mut self,
         cx: &Cx,
@@ -9606,9 +9610,9 @@ impl ServerHttpSession {
             self.modern_connection.disconnect();
         }
         let dispatches = cancel_modern_http_dispatches(&self.server, &self.modern_dispatches, None);
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         self.legacy_admissions.cancel_all();
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         if let Some(adapter) = self.legacy_adapter.as_mut() {
             let _ = adapter.close(self.legacy_binding);
         }
@@ -9642,7 +9646,7 @@ impl ServerHttpSession {
             .is_empty()
     }
 
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn cancellation_control(&self) -> HttpLegacyCancellationControl {
         HttpLegacyCancellationControl {
             server: Arc::clone(&self.server),
@@ -9672,7 +9676,7 @@ impl Drop for ServerHttpSession {
     }
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 fn legacy_origin_from_host(host: &str) -> Option<String> {
     if host.is_empty()
         || host.bytes().any(|byte| {
@@ -10743,7 +10747,7 @@ fn sse_response_head(response: &HttpResponse) -> Result<Vec<u8>, ()> {
     Ok(head)
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 async fn send_legacy_sse_stream(
     cx: &Cx,
     stream: AsyncTcpStream,
@@ -11401,16 +11405,16 @@ fn http_endpoint_response_to_static(cx: &Cx, response: ServerHttpEndpointRespons
             }
             response
         }
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         ServerHttpEndpointResponse::LegacySse(_) => HttpResponse::internal_error(),
     }
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct IngressVerifiedLegacyResponse;
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LiveHttpLegacyDispatchMode {
     Blocking,
@@ -11418,7 +11422,7 @@ enum LiveHttpLegacyDispatchMode {
     CallerOwnedAsync,
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 struct HttpLegacyIngressAdmission {
     // Notifications have no correlated cancellation guard, but still carry
     // their authenticated decision across the session-ownership wait.
@@ -11426,7 +11430,7 @@ struct HttpLegacyIngressAdmission {
     auth_receipt: AuthAdmissionReceipt,
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 enum LiveHttpLegacyIngress {
     Dispatch {
         admission: Option<Box<HttpLegacyIngressAdmission>>,
@@ -11435,7 +11439,7 @@ enum LiveHttpLegacyIngress {
     Immediate(HttpResponse),
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 fn admit_live_http_legacy_request(
     cx: &Cx,
     endpoint: &ServerHttpEndpoint,
@@ -11740,7 +11744,7 @@ async fn serve_modern_json_http_connection(
     let _ = send_h1_response(cx, &listener_shutdown, &mut response_framed, response).await;
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 fn dispatch_http_request(
     cx: &Cx,
     endpoint: &ServerHttpEndpoint,
@@ -11771,7 +11775,7 @@ fn dispatch_http_request(
     )
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 async fn dispatch_http_request_async(
     cx: &Cx,
     endpoint: &ServerHttpEndpoint,
@@ -11941,7 +11945,7 @@ async fn dispatch_http_request_async(
         })
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 async fn serve_http_connection(
     cx: &Cx,
     stream: AsyncTcpStream,
@@ -12335,7 +12339,7 @@ async fn serve_http_connection(
 /// request route admitted here is final Streamable HTTP. Historical `/sse`
 /// and `/messages` traffic reaches `ServerHttpSession::handle_async` as a 404 and
 /// can neither allocate a legacy session nor pin a legacy era.
-#[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+#[cfg(not(feature = "legacy-2024-11-05"))]
 async fn serve_modern_http_connection(
     cx: &Cx,
     stream: AsyncTcpStream,
@@ -12345,6 +12349,8 @@ async fn serve_modern_http_connection(
 ) {
     let http_config = &endpoint.server.http_config.handler_config;
     let mut framed = Framed::new(stream, native_http1_codec(&endpoint));
+    #[cfg(test)]
+    lib_unit_tests::record_live_http_connection_read_wait();
     let Some(request) = next_native_http1_request(cx, &listener_shutdown, &mut framed).await else {
         return;
     };
@@ -12607,11 +12613,11 @@ pub struct Server {
     #[cfg(all(test, feature = "tasks"))]
     task_manager: Option<SharedTaskManager>,
     /// Per-connection ceiling for pending server-to-client requests.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     max_bidirectional_requests_per_connection: usize,
     /// Immutable protocol-era admission policy selected by [`ServerBuilder`].
     protocol_policy: ProtocolPolicy,
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     legacy_application_tool_content: bool,
     /// Immutable configuration for the live dual-era HTTP endpoint.
     http_config: HttpServerConfig,
@@ -12654,7 +12660,7 @@ impl Server {
         &self.info
     }
 
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn new_pending_requests_for_connection(&self) -> Arc<bidirectional::PendingRequests> {
         Arc::new(
             bidirectional::PendingRequests::with_max_in_flight(
@@ -12871,7 +12877,7 @@ impl Server {
         runtime.negotiate(client)
     }
 
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn legacy_2024_server_config(&self) -> Legacy2024ServerConfig {
         Legacy2024ServerConfig {
             capabilities: Legacy2024ServerCapabilities {
@@ -12916,7 +12922,7 @@ impl Server {
         }
     }
 
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn install_legacy_2024_adapter<H: Legacy2024Handler>(
         &self,
         binding: LegacyPeerBinding,
@@ -14710,7 +14716,7 @@ impl Server {
     /// method-specific result serialization. In particular, it must never
     /// reuse [`Self::dispatch_stateless`]: that modern surface adds
     /// `resultType: "complete"`, which has no exact-2024 representation.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     async fn dispatch_legacy_2024(
         &self,
         cx: &Cx,
@@ -15426,7 +15432,7 @@ impl Server {
 
         let shared_recv = shared.clone();
         let shared_send = shared.clone();
-        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        #[cfg(feature = "legacy-2024-11-05")]
         let run_result = self.run_loop_returning(
             cx,
             move |cx| shared_recv.recv(cx),
@@ -15435,7 +15441,7 @@ impl Server {
             Some(notification_failure),
             label,
         );
-        #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+        #[cfg(not(feature = "legacy-2024-11-05"))]
         let run_result = match Arc::new(self).run_loop_pump_with_policy(
             cx,
             cx,
@@ -16020,8 +16026,8 @@ impl Server {
     /// Uses the shared bounded request admission and retains each child until
     /// it settles, without compiling a legacy adapter or reverse registry.
     /// The dual-era implementation below remains compiled only with the dated
-    /// feature (or crate unit tests).
-    #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+    /// feature.
+    #[cfg(not(feature = "legacy-2024-11-05"))]
     #[allow(clippy::too_many_arguments)]
     fn run_loop_pump_with_policy<R, S>(
         self: Arc<Self>,
@@ -16309,7 +16315,11 @@ impl Server {
                 let notification_cancellation = cancellation.clone();
                 let notification_failed = Arc::clone(&reservation.failed);
                 let notification_opened = listen_opened_by_dispatch;
+                #[cfg(test)]
+                let notification_request_id = request_id_to_u64(request.id.as_ref());
                 let committed_notifications: NotificationSender = Arc::new(move |notification| {
+                    #[cfg(test)]
+                    wait_for_stdio_progress_commit_fence(notification_request_id, &notification);
                     let acknowledgement = notification.method
                         == fastmcp_protocol::methods::NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED;
                     let mut writer = notification_send
@@ -16475,7 +16485,7 @@ impl Server {
         exit_code
     }
 
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[allow(clippy::too_many_lines)]
     fn run_loop_pump_with_policy<R, S>(
         self: Arc<Self>,
@@ -19796,7 +19806,7 @@ impl Server {
 
     /// Authenticates and parses an out-of-band cancellation before any queue,
     /// active-request, or bidirectional waiter state is mutated.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn authenticate_cancelled_control_notification(
         &self,
         cx: &Cx,
@@ -19840,7 +19850,7 @@ impl Server {
         Ok(cancellation)
     }
 
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn request_id_is_active(&self, session_id: u64, request_id: &RequestId) -> bool {
         let Ok(key) = ActiveRequestKey::new(session_id, request_id) else {
             return false;
@@ -20292,7 +20302,7 @@ impl Server {
         self.emit_log_notification_for_level(session.log_level(), sender, level, message);
     }
 
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn maybe_emit_log_notification_for_level(
         &self,
         min_level: Option<LogLevel>,
@@ -20818,7 +20828,7 @@ impl HandledRequest {
         self.response
     }
 
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn send_with<F>(
         mut self,
         session: &mut Session,
@@ -21351,6 +21361,55 @@ fn create_notification_sender(fatal_output: Arc<AtomicBool>) -> NotificationSend
     })
 }
 
+/// Test-only construction of this build's live HTTP endpoint.
+///
+/// The dual-era build takes the origin its exact-legacy SSE route advertises;
+/// a no-legacy build has no such route and takes none. A modern test names an
+/// origin once and runs in both feature lanes.
+#[cfg(test)]
+pub(crate) trait TestHttpEndpoint {
+    fn test_http_endpoint(
+        self,
+        legacy_origin: &str,
+    ) -> Result<ServerHttpEndpoint, ServerHttpEndpointError>;
+}
+
+#[cfg(test)]
+impl TestHttpEndpoint for Server {
+    fn test_http_endpoint(
+        self,
+        legacy_origin: &str,
+    ) -> Result<ServerHttpEndpoint, ServerHttpEndpointError> {
+        #[cfg(feature = "legacy-2024-11-05")]
+        {
+            self.into_http_endpoint(legacy_origin)
+        }
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        {
+            let _ = legacy_origin;
+            self.into_http_endpoint()
+        }
+    }
+}
+
+#[cfg(test)]
+impl TestHttpEndpoint for ServerBuilder {
+    fn test_http_endpoint(
+        self,
+        legacy_origin: &str,
+    ) -> Result<ServerHttpEndpoint, ServerHttpEndpointError> {
+        #[cfg(feature = "legacy-2024-11-05")]
+        {
+            self.build_http_endpoint(legacy_origin)
+        }
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        {
+            let _ = legacy_origin;
+            self.build_http_endpoint()
+        }
+    }
+}
+
 #[cfg(test)]
 mod lib_unit_tests {
     use super::*;
@@ -21491,6 +21550,8 @@ mod lib_unit_tests {
     /// Only the short wall-clock slice around it is re-armed, never the
     /// future itself, so a slice expiring cancels nothing. `None` means the
     /// bound expired and the future is still pending.
+    // Exact-2024 era: used only by legacy HTTP SSE tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     async fn within_runnable<F: Future>(
         cx: &Cx,
         host: &RunnableClock,
@@ -23423,6 +23484,20 @@ mod lib_unit_tests {
         }
     }
 
+    /// Runnable time one whole live HTTP test may take.
+    ///
+    /// Each client step has its own [`LIVE_HTTP_TEST_TIMEOUT_NANOS`] bound,
+    /// but `serve` returns only once its caller `Cx` is cancelled, and most
+    /// tests cancel it only on their client's success path. A client that
+    /// failed first therefore left `serve` waiting forever. In a no-legacy test
+    /// build that forced the legacy loop, four tests hung the process this way
+    /// until the runner killed it:
+    /// `live_http_legacy_initialize_is_peer_cancellation_protected`,
+    /// `live_http_legacy_sse_advertises_the_request_host_on_wildcard_bind`,
+    /// `live_http_legacy_sse_peer_close_cancels_its_busy_request` and
+    /// `live_http_legacy_sse_peer_close_does_not_cancel_another_session`.
+    const LIVE_HTTP_WHOLE_TEST_BOUND: Duration = Duration::from_secs(60);
+
     fn run_live_http_test<F, Fut>(operation: F)
     where
         F: FnOnce(Cx) -> Fut + Send + 'static,
@@ -23433,10 +23508,42 @@ mod lib_unit_tests {
             .blocking_threads(4, MAX_DISPATCH_QUEUE_DEPTH)
             .build()
             .expect("live HTTP test runtime must initialize");
-        let result = runtime.block_on(async move {
+        let host = RunnableClock::start();
+        let (result, expired) = runtime.block_on(async move {
             let cx = Cx::current().expect("the live HTTP test runtime must install an ambient Cx");
-            operation(cx).await
+            // On expiry the watchdog cancels the caller `Cx`, which is what
+            // lets a `serve` with no remaining canceller return, so the test
+            // fails with this bound's message instead of hanging.
+            let (finished, finished_signal) = sync_channel::<()>(0);
+            let watchdog_cx = cx.clone();
+            let watchdog = thread::spawn(move || {
+                let started = host.mark();
+                while !host.expired(started, LIVE_HTTP_WHOLE_TEST_BOUND) {
+                    if !matches!(
+                        finished_signal.recv_timeout(Duration::from_millis(50)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ) {
+                        return None;
+                    }
+                }
+                watchdog_cx.cancel_with(
+                    CancelKind::Deadline,
+                    Some("live HTTP test exceeded its whole-test bound"),
+                );
+                Some(host.describe(started))
+            });
+            let result = operation(cx).await;
+            drop(finished);
+            let expired = watchdog
+                .join()
+                .expect("the live HTTP test watchdog must not panic");
+            (result, expired)
         });
+        if let Some(elapsed) = expired {
+            panic!(
+                "live HTTP test exceeded its {LIVE_HTTP_WHOLE_TEST_BOUND:?} whole-test bound after {elapsed}; the watchdog cancelled its caller Cx so a serve left without a canceller could return. Test result: {result:?}"
+            );
+        }
         result.unwrap();
     }
 
@@ -23824,6 +23931,8 @@ mod lib_unit_tests {
         Ok(())
     }
 
+    // Exact-2024 era: opens a legacy HTTP SSE session.
+    #[cfg(feature = "legacy-2024-11-05")]
     async fn open_live_legacy_http_session(
         address: SocketAddr,
         headers: &[(&str, &str)],
@@ -23867,6 +23976,8 @@ mod lib_unit_tests {
         Ok((stream, session_id, received))
     }
 
+    // Exact-2024 era: waits on a legacy HTTP session's admissions.
+    #[cfg(feature = "legacy-2024-11-05")]
     async fn wait_for_live_http_legacy_admission(
         cx: &Cx,
         session: &LiveHttpSession,
@@ -24918,7 +25029,7 @@ mod lib_unit_tests {
             task: fastmcp_protocol::Task,
             notification: fastmcp_protocol::TaskStatusNotification,
             work_descriptor: FinalTaskWorkDescriptor,
-        ) -> McpResult<()> {
+        ) -> McpResult<FinalTaskSnapshot> {
             let task_id = task.base().task_id.clone();
             let ttl_ms = validate_server_final_task_durations(&task)?;
             ensure_server_final_task_notification_matches_task(&task, &notification)?;
@@ -24945,10 +25056,11 @@ mod lib_unit_tests {
                 .insert(task_id.clone(), work_descriptor.clone());
             state.initial_work.insert(task_id.clone(), work_descriptor);
             state.notifications.push(notification);
+            let committed = FinalTaskSnapshot::new(state.tasks[&task_id].clone(), generation);
             if let Some(expires_at) = expires_at {
                 state.expires_at.insert(task_id, expires_at);
             }
-            Ok(())
+            Ok(committed)
         }
 
         fn get_task(
@@ -25063,7 +25175,7 @@ mod lib_unit_tests {
             task: fastmcp_protocol::Task,
             notification: fastmcp_protocol::TaskStatusNotification,
             input_responses: fastmcp_protocol::TaskInputResponses,
-        ) -> McpResult<bool> {
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
             let task_id = task.base().task_id.clone();
             if expected.task().base().task_id != task_id {
                 return Err(McpError::invalid_params(
@@ -25078,13 +25190,14 @@ mod lib_unit_tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             reclaim_expired_server_final_task_handoffs(&mut state, self.now());
             if state.generations.get(&task_id) != Some(&expected.generation()) {
-                return Ok(false);
+                return Ok(None);
             }
             let generation = next_server_final_task_generation(&mut state)?;
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
             state.handoff_leases.remove(&task_id);
             state.initial_work.remove(&task_id);
+            let committed = FinalTaskSnapshot::new(state.tasks[&task_id].clone(), generation);
             if !input_responses.is_empty() {
                 state
                     .accepted_inputs
@@ -25093,7 +25206,7 @@ mod lib_unit_tests {
                     .extend(input_responses);
             }
             state.notifications.push(notification);
-            Ok(true)
+            Ok(Some(committed))
         }
 
         fn replace_task_and_clear_input_if_current(
@@ -25101,7 +25214,7 @@ mod lib_unit_tests {
             expected: &FinalTaskSnapshot,
             task: fastmcp_protocol::Task,
             notification: fastmcp_protocol::TaskStatusNotification,
-        ) -> McpResult<bool> {
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
             let task_id = task.base().task_id.clone();
             if expected.task().base().task_id != task_id {
                 return Err(McpError::invalid_params(
@@ -25116,7 +25229,7 @@ mod lib_unit_tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             reclaim_expired_server_final_task_handoffs(&mut state, self.now());
             if state.generations.get(&task_id) != Some(&expected.generation()) {
-                return Ok(false);
+                return Ok(None);
             }
             let generation = next_server_final_task_generation(&mut state)?;
             let terminal = matches!(
@@ -25134,7 +25247,10 @@ mod lib_unit_tests {
             if terminal {
                 state.cancellation_requests.remove(&task_id);
             }
-            Ok(true)
+            Ok(Some(FinalTaskSnapshot::new(
+                state.tasks[&task_id].clone(),
+                generation,
+            )))
         }
 
         fn replace_task_and_clear_input_for_handoff_if_current(
@@ -25145,7 +25261,7 @@ mod lib_unit_tests {
             cancellation_required: bool,
             task: fastmcp_protocol::Task,
             notification: fastmcp_protocol::TaskStatusNotification,
-        ) -> McpResult<bool> {
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
             if owner_id.is_empty() {
                 return Err(McpError::invalid_params(
                     "Final task handoff owner must be non-empty",
@@ -25178,7 +25294,7 @@ mod lib_unit_tests {
                 || !owns_exact_dispatch
                 || state.cancellation_requests.contains(&task_id) != cancellation_required
             {
-                return Ok(false);
+                return Ok(None);
             }
             let generation = next_server_final_task_generation(&mut state)?;
             let terminal = matches!(
@@ -25196,7 +25312,10 @@ mod lib_unit_tests {
             if terminal {
                 state.cancellation_requests.remove(&task_id);
             }
-            Ok(true)
+            Ok(Some(FinalTaskSnapshot::new(
+                state.tasks[&task_id].clone(),
+                generation,
+            )))
         }
 
         fn take_input_if_current(
@@ -26528,7 +26647,7 @@ mod lib_unit_tests {
             })
             .final_tasks(final_tasks_test_runtime(Arc::clone(&delivered)))
             .expect("final Tasks runtime must install for HTTP outcome admission")
-            .build_http_endpoint("http://final.test")
+            .test_http_endpoint("http://final.test")
             .expect("modern endpoint must build");
         let mut session = endpoint
             .open_session(&cx)
@@ -26774,7 +26893,7 @@ mod lib_unit_tests {
                 data: canonical_data.clone(),
                 emit_progress: true,
             })
-            .build_http_endpoint("http://final.test")
+            .test_http_endpoint("http://final.test")
             .expect("modern endpoint must build");
         let mut session = endpoint
             .open_session(&cx)
@@ -27219,6 +27338,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: exercises the exact-legacy completion route.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn session_dispatch_serves_legacy_completion_complete() {
         let server = Server::new("session-completion", "1.0.0")
@@ -27305,6 +27426,8 @@ mod lib_unit_tests {
         assert!(without.capabilities().completions.is_none());
     }
 
+    // Exact-2024 era: legacy initialize completion capability.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_completion_handler_is_advertised_on_initialize_only() {
         let server = Server::new("legacy-advertise-completion", "1.0.0")
@@ -28545,6 +28668,8 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: exact-2024 dispatch.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn exact_2024_dispatch_without_transport_custody_still_evaluates_auth_provider() {
         let verifier = StaticTokenVerifier::new([(
@@ -28830,6 +28955,8 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: legacy cancellation control-notification authentication.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn cancellation_control_cannot_claim_an_unbound_session_principal() {
         let server = Server::new("cancel-control-owner-test", "1.0.0").build();
@@ -29306,6 +29433,8 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: the legacy loop's dispatch-queue stop state.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn dispatch_queue_stop_rejects_admission_and_cancels_queued_start() {
         let queue = DispatchQueueState::default();
@@ -29417,6 +29546,8 @@ mod lib_unit_tests {
         assert!(!config.file_line);
     }
 
+    // Exact-2024 era: legacy logging/setLevel level mapping.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_logging_maps_all_eight_levels_without_losing_severity() {
         for (wire, ceiling, expected) in [
@@ -29455,6 +29586,8 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: legacy logging/setLevel level mapping.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_logging_clamps_to_server_ceiling_and_off() {
         assert_eq!(
@@ -29770,6 +29903,8 @@ mod lib_unit_tests {
         assert!(cancellation.is_cancel_requested());
     }
 
+    // Exact-2024 era: legacy active-request registry.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn invalid_or_unknown_cancellation_does_not_mutate_an_active_request() {
         let server = Server::new("ignored-cancellation-test", "1.0.0").build();
@@ -29976,6 +30111,8 @@ mod lib_unit_tests {
         assert!(session.protocol_version().is_none());
     }
 
+    // Exact-2024 era: legacy initialize response commit.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn initialize_encode_failure_restores_exact_prior_state() {
         let server = Server::new("initialize-encode-rollback-test", "1.0.0").build();
@@ -30019,6 +30156,8 @@ mod lib_unit_tests {
         assert_eq!(session.protocol_version(), Some("2024-11-05"));
     }
 
+    // Exact-2024 era: legacy logging/setLevel response commit.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn log_level_write_failure_restores_previous_level() {
         let server = Server::new("log-level-write-rollback-test", "1.0.0")
@@ -30063,6 +30202,8 @@ mod lib_unit_tests {
         assert_eq!(session.log_level(), Some(LogLevel::Warning));
     }
 
+    // Exact-2024 era: legacy handled-response commit.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn handled_response_retains_active_request_until_commit_and_late_cancellation_wins() {
         let server = Server::new("commit-race-test", "1.0.0").build();
@@ -30188,6 +30329,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy handled-response commit.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn failed_response_write_rolls_back_reversible_session_mutation() {
         let server = Server::new("commit-rollback-test", "1.0.0").build();
@@ -30415,6 +30558,8 @@ mod lib_unit_tests {
         assert_eq!(exit_code, 1);
     }
 
+    // Exact-2024 era: dispatches an un-negotiated ping, which only the dual-era pump admits.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn dispatch_worker_panic_trips_failure_latch_and_returns_failure_status() {
         let emitted = Arc::new(AtomicBool::new(false));
@@ -30455,6 +30600,8 @@ mod lib_unit_tests {
         assert!(!cx.is_cancel_requested());
     }
 
+    // Exact-2024 era: the non-quiescent handler is reached through a legacy opening.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn stdio_pump_returns_failure_and_skips_hooks_for_non_quiescent_legacy_handler() {
         let control = Arc::new(NonQuiescentLegacyControl::default());
@@ -30579,6 +30726,8 @@ mod lib_unit_tests {
         assert!(finished_after_release);
     }
 
+    // Exact-2024 era: the non-quiescent handler is reached through a legacy opening.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn returning_split_waits_for_non_quiescent_legacy_handler_before_owned_cleanup() {
         let control = Arc::new(NonQuiescentLegacyControl::default());
@@ -30670,8 +30819,8 @@ mod lib_unit_tests {
         let run_result = run_live_split_transport(
             completion_timeout,
             Server::new("returning-modern-worker-shutdown-test", "1.0.0")
-                .protocol_policy(ProtocolPolicy::Auto)
-                .expect("Auto must be available to this test build")
+                .protocol_policy(build_default_protocol_policy())
+                .expect("the build's default policy must be available")
                 .tool(NonQuiescentModernTool {
                     control: Arc::clone(&control),
                 })
@@ -30708,8 +30857,8 @@ mod lib_unit_tests {
         let phase_for_receive = Arc::clone(&phase);
         let control_for_receive = Arc::clone(&control);
         let server = Server::new("stdio-modern-worker-shutdown-test", "1.0.0")
-            .protocol_policy(ProtocolPolicy::Auto)
-            .expect("Auto must be available to this test build")
+            .protocol_policy(build_default_protocol_policy())
+            .expect("the build's default policy must be available")
             .tool(NonQuiescentModernTool {
                 control: Arc::clone(&control),
             })
@@ -30860,7 +31009,8 @@ mod lib_unit_tests {
         assert_eq!(exit_code, 1);
     }
 
-    #[cfg(unix)]
+    // Exact-2024 era: dispatches an un-negotiated ping, which only the dual-era pump admits.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     #[test]
     fn reality_check_regression_dispatch_worker_send_failure_wakes_unix_stdio_receive() {
         use std::os::unix::net::UnixStream;
@@ -30925,6 +31075,8 @@ mod lib_unit_tests {
         Closed,
         Cancelled,
         Timeout,
+        // Exact-2024 era: an un-negotiated ping only the dual-era loop admits.
+        #[cfg(feature = "legacy-2024-11-05")]
         PingThenClosed,
     }
 
@@ -30948,8 +31100,11 @@ mod lib_unit_tests {
         receive_calls: Arc<AtomicUsize>,
     }
 
+    // Exact-2024 era: used only by legacy HTTP SSE lifecycle tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LiveRuntimeListedTool;
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl ToolHandler for LiveRuntimeListedTool {
         fn definition(&self) -> Tool {
             Tool {
@@ -31000,8 +31155,11 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: used only by legacy runtime-context tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LiveLegacyRuntimeConnectionTool;
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl ToolHandler for LiveLegacyRuntimeConnectionTool {
         fn definition(&self) -> Tool {
             Tool {
@@ -31053,8 +31211,11 @@ mod lib_unit_tests {
     /// Note `call_async`'s trait default delegates to `call`, so declaring the
     /// mode without supplying this hook would route straight back into the
     /// `block_on` and be polled on the caller's runtime instead.
+    // Exact-2024 era: used only by legacy HTTP SSE reverse-response tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LiveLegacyReverseResponseAsyncTool;
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl ToolHandler for LiveLegacyReverseResponseAsyncTool {
         fn definition(&self) -> Tool {
             LiveLegacyRuntimeConnectionTool.definition()
@@ -31106,8 +31267,11 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: used only by legacy runtime-context tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LegacyRootsContextTool;
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl ToolHandler for LegacyRootsContextTool {
         fn definition(&self) -> Tool {
             Tool {
@@ -31605,11 +31769,14 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: used only by legacy HTTP SSE auth tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[derive(Clone)]
     struct CountingLegacyHttpAuthProvider {
         calls: Arc<AtomicUsize>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl AuthProvider for CountingLegacyHttpAuthProvider {
         fn authenticate(
             &self,
@@ -31789,7 +31956,7 @@ mod lib_unit_tests {
         run_live_http_test(move |cx| async move {
             let calls = Arc::new(AtomicUsize::new(0));
             let endpoint = auth_00_mrtr_server(owner, &calls)
-                .into_http_endpoint("http://auth-owner.test")
+                .test_http_endpoint("http://auth-owner.test")
                 .unwrap();
             let initial = auth_00_mrtr_http_call(&cx, &endpoint, None, 981).await;
             assert!(initial.error.is_none());
@@ -31816,7 +31983,7 @@ mod lib_unit_tests {
             // Same valid credential, subject, request and handler as the
             // positive; only the provider's stable owner is absent.
             let endpoint = auth_00_mrtr_server(Auth00Owner::Absent, &calls)
-                .into_http_endpoint("http://auth-owner.test")
+                .test_http_endpoint("http://auth-owner.test")
                 .unwrap();
             let response = auth_00_mrtr_http_call(&cx, &endpoint, None, 981).await;
             assert!(response.result.is_none());
@@ -31838,10 +32005,10 @@ mod lib_unit_tests {
             // Independent registries would reject even without owner checks.
             ownerless_server.router = Arc::clone(&owner_server.router);
             let owner = owner_server
-                .into_http_endpoint("http://auth-owner.test")
+                .test_http_endpoint("http://auth-owner.test")
                 .unwrap();
             let ownerless = ownerless_server
-                .into_http_endpoint("http://auth-owner.test")
+                .test_http_endpoint("http://auth-owner.test")
                 .unwrap();
             let initial = auth_00_mrtr_http_call(&cx, &owner, None, 991).await;
             assert!(initial.error.is_none());
@@ -31876,7 +32043,7 @@ mod lib_unit_tests {
                 .tool(ModernHttpAuthCounterTool {
                     calls: Arc::clone(&calls),
                 })
-                .build_http_endpoint("http://auth-owner.test")
+                .test_http_endpoint("http://auth-owner.test")
                 .unwrap();
             let request = modern_http_json_tool_request("modern_http_auth_counter", 995);
             let mut session = endpoint.open_session(&cx).unwrap();
@@ -31936,7 +32103,7 @@ mod lib_unit_tests {
             for state_only in [false, true] {
                 let calls = Arc::new(AtomicUsize::new(0));
                 let endpoint = auth_00_mrtr_server(Auth00Owner::Configured, &calls)
-                    .into_http_endpoint("http://auth-owner.test")
+                    .test_http_endpoint("http://auth-owner.test")
                     .unwrap();
                 let mut issuer = endpoint.open_session(&cx).unwrap();
                 let initial = auth_00_handle_mrtr_http_request(
@@ -32166,7 +32333,7 @@ mod lib_unit_tests {
                         calls: Arc::clone(&calls),
                         state_only,
                     })
-                    .build_http_endpoint("http://auth-grants.test")
+                    .test_http_endpoint("http://auth-grants.test")
                     .unwrap();
                 let subject = format!("private-result-{}-{state_only}", cx.now().as_nanos());
                 let request = |request_state: Option<&str>, bearer: &str, id: i64| {
@@ -32520,10 +32687,13 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: used only by legacy completion tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct CountingLegacyCompletionHandler {
         calls: Arc<AtomicUsize>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl CompletionHandler for CountingLegacyCompletionHandler {
         fn complete_legacy(
             &self,
@@ -32547,11 +32717,14 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: used only by legacy HTTP SSE cancellation tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LiveLegacyCancellationTool {
         started: Arc<AtomicBool>,
         observed_cancellation: Arc<AtomicBool>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl ToolHandler for LiveLegacyCancellationTool {
         fn definition(&self) -> Tool {
             Tool {
@@ -32630,6 +32803,8 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: used only by the legacy HTTP SSE shutdown probe.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LiveHttpShutdownTool {
         name: &'static str,
         cooperate_with_cancellation: bool,
@@ -32639,6 +32814,7 @@ mod lib_unit_tests {
         finished: Arc<AtomicBool>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl ToolHandler for LiveHttpShutdownTool {
         fn definition(&self) -> Tool {
             Tool {
@@ -32675,12 +32851,15 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: gates legacy HTTP request handlers.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[derive(Default)]
     struct LiveLegacyRequestGate {
         entered: AtomicBool,
         released: AtomicBool,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl LiveLegacyRequestGate {
         fn enter(&self, ctx: &McpContext) -> McpResult<()> {
             self.entered.store(true, Ordering::Release);
@@ -32706,21 +32885,26 @@ mod lib_unit_tests {
         }
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LiveLegacyRequestGateRelease {
         gate: Arc<LiveLegacyRequestGate>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl Drop for LiveLegacyRequestGateRelease {
         fn drop(&mut self) {
             self.gate.release();
         }
     }
 
+    // Exact-2024 era: holds a legacy HTTP session's mutex.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LiveHttpSessionMutexHold {
         release: Option<std::sync::mpsc::SyncSender<()>>,
         worker: Option<thread::JoinHandle<Result<(), String>>>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl LiveHttpSessionMutexHold {
         fn new(session: Arc<LiveHttpSession>) -> Result<Self, String> {
             let (started_sender, started_receiver) = sync_channel(1);
@@ -32767,16 +32951,20 @@ mod lib_unit_tests {
         }
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl Drop for LiveHttpSessionMutexHold {
         fn drop(&mut self) {
             let _ = self.release();
         }
     }
 
+    // Exact-2024 era: used only by legacy HTTP admission tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LiveLegacyAdmissionBlocker {
         gate: Arc<LiveLegacyRequestGate>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl ToolHandler for LiveLegacyAdmissionBlocker {
         fn definition(&self) -> Tool {
             Tool {
@@ -32799,10 +32987,13 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: used only by legacy HTTP admission tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LiveLegacyAdmissionTarget {
         calls: Arc<AtomicUsize>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl ToolHandler for LiveLegacyAdmissionTarget {
         fn definition(&self) -> Tool {
             Tool {
@@ -32842,6 +33033,11 @@ mod lib_unit_tests {
     }
 
     impl NonQuiescentLegacyControl {
+        /// How long a deliberately non-cooperative handler waits for its test
+        /// to release it. A test that fails before releasing would otherwise
+        /// leave the handler thread blocked and hang the process.
+        const RELEASE_BOUND: Duration = Duration::from_secs(60);
+
         fn wait_until_released(&self) {
             let state = self
                 .state
@@ -32850,10 +33046,15 @@ mod lib_unit_tests {
             let mut state = state;
             state.started = true;
             self.changed.notify_all();
-            let mut state = self
+            let (mut state, waited) = self
                 .changed
-                .wait_while(state, |state| !state.released)
+                .wait_timeout_while(state, Self::RELEASE_BOUND, |state| !state.released)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                !waited.timed_out(),
+                "non-quiescent test handler was not released within {:?}; its test stopped before releasing it",
+                Self::RELEASE_BOUND
+            );
             state.finished = true;
             self.changed.notify_all();
         }
@@ -32906,10 +33107,13 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: reached only through a legacy opening.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct NonQuiescentLegacyTool {
         control: Arc<NonQuiescentLegacyControl>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl ToolHandler for NonQuiescentLegacyTool {
         fn definition(&self) -> Tool {
             Tool {
@@ -32964,11 +33168,14 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: scripts a legacy opening.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct NonQuiescentLegacySplitRecv {
         phase: usize,
         control: Arc<NonQuiescentLegacyControl>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl TransportRecvHalf for NonQuiescentLegacySplitRecv {
         fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
             let phase = self.phase;
@@ -33554,12 +33761,15 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: scripts a legacy runtime connection.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LiveLegacyRuntimeSplitRecv {
         phase: u8,
         supports_sampling: bool,
         outbound: Receiver<JsonRpcMessage>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl LiveLegacyRuntimeSplitRecv {
         fn wait_for_response(&self, id: i64) -> Result<(), TransportError> {
             loop {
@@ -33597,6 +33807,7 @@ mod lib_unit_tests {
         }
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl TransportRecvHalf for LiveLegacyRuntimeSplitRecv {
         fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
             let phase = self.phase;
@@ -33671,12 +33882,15 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: scripts a legacy runtime connection.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LegacyRootsContextSplitRecv {
         phase: u8,
         supports_roots: bool,
         outbound: Receiver<JsonRpcMessage>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl LegacyRootsContextSplitRecv {
         fn wait_for_response(&self, id: i64) -> Result<(), TransportError> {
             loop {
@@ -33709,6 +33923,7 @@ mod lib_unit_tests {
         }
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl TransportRecvHalf for LegacyRootsContextSplitRecv {
         fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
             let phase = self.phase;
@@ -33757,6 +33972,8 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: scripts legacy server-to-client sampling.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LegacyCancelLateRecv {
         phase: u8,
         outbound: Receiver<JsonRpcMessage>,
@@ -33765,6 +33982,7 @@ mod lib_unit_tests {
         cancellation_request_id: RequestId,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl TransportRecvHalf for LegacyCancelLateRecv {
         fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
             let phase = self.phase;
@@ -33848,11 +34066,14 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: records a legacy runtime connection's output.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LiveLegacyRuntimeSplitSend {
         sent: Arc<Mutex<Vec<JsonRpcMessage>>>,
         outbound: std::sync::mpsc::SyncSender<JsonRpcMessage>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl TransportSendHalf for LiveLegacyRuntimeSplitSend {
         fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
             self.sent
@@ -33869,6 +34090,8 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: scripts a legacy runtime connection.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn live_legacy_runtime_connection_transcript(supports_sampling: bool) -> Vec<JsonRpcMessage> {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let (outbound, inbound) = sync_channel(32);
@@ -33895,6 +34118,8 @@ mod lib_unit_tests {
             .clone()
     }
 
+    // Exact-2024 era: scripts a legacy runtime connection.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn legacy_roots_context_transcript(supports_roots: bool) -> Vec<JsonRpcMessage> {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let (outbound, inbound) = sync_channel(16);
@@ -33921,6 +34146,8 @@ mod lib_unit_tests {
             .clone()
     }
 
+    // Exact-2024 era: scripts legacy progress over a legacy opening.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn legacy_stdio_progress_transcript(include_progress_token: bool) -> Vec<JsonRpcMessage> {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let receive_calls = Arc::new(AtomicUsize::new(0));
@@ -33999,6 +34226,18 @@ mod lib_unit_tests {
         masked_websocket_frame(0x01, &payload)
     }
 
+    /// The policy a server of this build selects by default: `Auto` with the
+    /// exact legacy adapter, `ModernOnly` without it. A test of modern
+    /// behaviour that does not depend on era classification selects it, so
+    /// each feature lane exercises the loop its own shipped build runs.
+    const fn build_default_protocol_policy() -> ProtocolPolicy {
+        if cfg!(feature = "legacy-2024-11-05") {
+            ProtocolPolicy::Auto
+        } else {
+            ProtocolPolicy::ModernOnly
+        }
+    }
+
     struct ProtocolPolicyScriptTransport {
         inbound: std::collections::VecDeque<JsonRpcMessage>,
         sent: Arc<Mutex<Vec<JsonRpcMessage>>>,
@@ -34058,6 +34297,8 @@ mod lib_unit_tests {
         ))
     }
 
+    // Exact-2024 era: builds a legacy tools/call request.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn legacy_controlled_tool_request(id: i64) -> JsonRpcMessage {
         JsonRpcMessage::Request(JsonRpcRequest::new(
             "tools/call",
@@ -34716,51 +34957,90 @@ mod lib_unit_tests {
         assert_public_split_stdio_subscription_shutdown(PublicSplitSubscriptionTerminal::Shutdown);
     }
 
+    /// Runs a two-message stdio script against a server built with the
+    /// no-legacy default policy.
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    fn no_legacy_stdio_script(
+        opening: JsonRpcMessage,
+        follow_up: JsonRpcMessage,
+    ) -> (McpResult<()>, usize, Vec<JsonRpcMessage>) {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let receive_calls = Arc::new(AtomicUsize::new(0));
+        let server = Server::new("no-legacy-stdio-route", "1.0.0").build();
+        assert_eq!(server.protocol_policy(), ProtocolPolicy::ModernOnly);
+        let result = server.run_transport_returning_with_cx(
+            &Cx::for_testing(),
+            ProtocolPolicyScriptTransport {
+                inbound: std::collections::VecDeque::from([opening, follow_up]),
+                sent: Arc::clone(&sent),
+                receive_calls: Arc::clone(&receive_calls),
+            },
+        );
+        let sent = sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        (result, receive_calls.load(Ordering::Acquire), sent)
+    }
+
     #[cfg(not(feature = "legacy-2024-11-05"))]
     #[test]
     fn no_legacy_stdio_refuses_the_opening_envelope_before_a_second_request_or_dispatch() {
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let receive_calls = Arc::new(AtomicUsize::new(0));
-        let result = Server::new("no-legacy-stdio-route", "1.0.0")
-            .protocol_policy(ProtocolPolicy::Auto)
-            .expect("Auto must be available to this test build")
-            .build()
-            .run_transport_returning_with_cx(
-                &Cx::for_testing(),
-                ProtocolPolicyScriptTransport {
-                    inbound: std::collections::VecDeque::from([
-                        exact_legacy_initialize_request(917, serde_json::json!("1.0.0")),
-                        JsonRpcMessage::Request(JsonRpcRequest::new(
-                            "tools/list",
-                            Some(serde_json::json!({})),
-                            918_i64,
-                        )),
-                    ]),
-                    sent: Arc::clone(&sent),
-                    receive_calls: Arc::clone(&receive_calls),
-                },
-            );
+        // A no-legacy build cannot select Auto, so the legacy opening below
+        // meets the ModernOnly default rather than a dual-era classifier.
+        assert!(matches!(
+            Server::new("no-legacy-stdio-route", "1.0.0").protocol_policy(ProtocolPolicy::Auto),
+            Err(ServerLaunchPolicyError::FeatureUnavailable)
+        ));
+        let (result, receive_calls, sent) = no_legacy_stdio_script(
+            exact_legacy_initialize_request(917, serde_json::json!("1.0.0")),
+            JsonRpcMessage::Request(JsonRpcRequest::new(
+                "tools/list",
+                Some(serde_json::json!({})),
+                918_i64,
+            )),
+        );
 
         assert!(
             result.is_err(),
             "a no-legacy stdio opening must be terminal"
         );
         assert_eq!(
-            receive_calls.load(Ordering::Acquire),
-            1,
+            receive_calls, 1,
             "the legacy opening must not admit a follow-up request into dispatch"
         );
         assert!(
-            sent.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .iter()
-                .all(|message| !matches!(
-                    message,
-                    JsonRpcMessage::Response(response)
-                        if response.id == Some(917_i64.into()) && response.error.is_none()
-                )),
+            sent.iter().all(|message| !matches!(
+                message,
+                JsonRpcMessage::Response(response)
+                    if response.id == Some(917_i64.into()) && response.error.is_none()
+            )),
             "the exact legacy initialize response proves adapter admission and must never be emitted"
         );
+    }
+
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    #[test]
+    fn no_legacy_stdio_admits_a_modern_opening_and_its_follow_up_request() {
+        // Differs from the refusal above only in the era of the opening.
+        let (result, receive_calls, sent) =
+            no_legacy_stdio_script(modern_discovery_request(917), modern_discovery_request(918));
+
+        result.expect("a modern opening must keep the no-legacy stdio connection open");
+        assert_eq!(
+            receive_calls, 3,
+            "both requests and the closing receive must reach the loop"
+        );
+        for id in [917_i64, 918] {
+            assert!(
+                sent.iter().any(|message| matches!(
+                    message,
+                    JsonRpcMessage::Response(response)
+                        if response.id == Some(id.into()) && response.error.is_none()
+                )),
+                "request {id} must be dispatched and answered: {sent:?}"
+            );
+        }
     }
 
     #[cfg(not(feature = "legacy-2024-11-05"))]
@@ -34778,7 +35058,8 @@ mod lib_unit_tests {
             )
         );
         assert!(source.contains("fn sse_response_head(response: &HttpResponse)"));
-        assert!(!source.contains("legacy_sse_response_head"));
+        // Split so this assertion's own text cannot satisfy the scan.
+        assert!(!source.contains(concat!("legacy_", "sse_response_head")));
     }
 
     #[test]
@@ -34819,28 +35100,43 @@ mod lib_unit_tests {
             "pub fn pop_event(&self) -> Result<Option<SseEvent>, ServerHttpEndpointError>"
         ));
         assert!(source.contains("pub request_capacity: usize,"));
+        assert!(
+            source.contains(
+                "#[cfg(feature = \"legacy-2024-11-05\")]\n    pub legacy_sse_path: String,"
+            )
+        );
         assert!(source.contains(
-            "#[cfg(any(feature = \"legacy-2024-11-05\", test))]\n    pub legacy_sse_path: String,"
+            "#[cfg(feature = \"legacy-2024-11-05\")]\n    pub legacy_message_path: String,"
         ));
-        assert!(source.contains(
-            "#[cfg(any(feature = \"legacy-2024-11-05\", test))]\n    pub legacy_message_path: String,"
-        ));
-        assert!(!source.contains("pub legacy_request_capacity"));
+        // Split so this assertion's own text cannot satisfy the scan.
+        assert!(!source.contains(concat!("pub legacy_", "request_capacity")));
+    }
+
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    fn no_legacy_http_session(name: &str) -> (Cx, ServerHttpEndpoint, ServerHttpSession) {
+        let cx = Cx::for_testing();
+        let endpoint = Server::new(name, "1.0.0")
+            .build()
+            .into_http_endpoint()
+            .expect("modern-only HTTP endpoint must construct without legacy transport support");
+        let session = endpoint
+            .open_session(&cx)
+            .expect("modern-only HTTP session must open");
+        (cx, endpoint, session)
     }
 
     #[cfg(not(feature = "legacy-2024-11-05"))]
     #[test]
     fn no_legacy_http_routes_are_not_found_without_pinning_or_adapter_admission() {
-        let cx = Cx::for_testing();
-        let endpoint = Server::new("no-legacy-http-routes", "1.0.0")
-            .protocol_policy(ProtocolPolicy::Auto)
-            .expect("Auto must be available to this test build")
-            .build()
-            .into_http_endpoint("http://localhost")
-            .expect("modern-only HTTP endpoint must construct without legacy transport support");
-        let mut session = endpoint
-            .open_session(&cx)
-            .expect("modern-only HTTP session must open");
+        // A no-legacy build cannot select Auto, so the legacy routes below
+        // meet the ModernOnly default rather than a dual-era classifier.
+        assert!(matches!(
+            Server::new("no-legacy-http-routes", "1.0.0").protocol_policy(ProtocolPolicy::Auto),
+            Err(ServerLaunchPolicyError::FeatureUnavailable)
+        ));
+        // This build has no legacy adapter field to populate, so the former
+        // `legacy_adapter.is_none()` check now holds at compile time.
+        let (cx, endpoint, mut session) = no_legacy_http_session("no-legacy-http-routes");
 
         for request in [
             HttpRequest::new(HttpMethod::Get, "/sse"),
@@ -34856,7 +35152,6 @@ mod lib_unit_tests {
                 })
             ));
             assert_eq!(session.selected_era, None);
-            assert!(session.legacy_adapter.is_none());
         }
         assert!(
             endpoint
@@ -34867,6 +35162,48 @@ mod lib_unit_tests {
                 .is_empty(),
             "zero-route HTTP rejection must not create request authority"
         );
+    }
+
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    #[test]
+    fn no_legacy_http_modern_route_is_admitted_and_pins_the_modern_era() {
+        // Differs from the refusal above only in the route and era of the request.
+        let (cx, _endpoint, mut session) = no_legacy_http_session("no-legacy-http-routes");
+        let request = JsonRpcRequest::new(
+            SERVER_DISCOVER_METHOD,
+            Some(serde_json::json!({
+                "_meta": {
+                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                },
+            })),
+            919_i64,
+        );
+
+        let response = block_on(
+            session.handle_async(
+                &cx,
+                HttpRequest::new(HttpMethod::Post, "/mcp")
+                    .with_header("content-type", "application/json")
+                    .with_header("accept", "application/json")
+                    .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+                    .with_header("mcp-method", SERVER_DISCOVER_METHOD)
+                    .with_body(
+                        serde_json::to_vec(&request)
+                            .expect("modern discovery request must serialize"),
+                    ),
+            ),
+        )
+        .expect("a modern request must be admitted by the no-legacy endpoint");
+        let ServerHttpEndpointResponse::Immediate(response) = response else {
+            panic!("modern JSON negotiation must produce an immediate HTTP response");
+        };
+        assert_eq!(response.status, HttpStatus::OK);
+        let response: JsonRpcResponse =
+            serde_json::from_slice(&response.body).expect("modern response must be JSON-RPC");
+        assert_eq!(response.id, Some(919_i64.into()));
+        assert!(response.error.is_none());
+        assert_eq!(session.selected_era, Some(ProtocolEra::Modern2026));
     }
 
     #[test]
@@ -35137,6 +35474,7 @@ mod lib_unit_tests {
                 ReturningProbeReceive::Closed => Err(TransportError::Closed),
                 ReturningProbeReceive::Cancelled => Err(TransportError::Cancelled),
                 ReturningProbeReceive::Timeout => Err(TransportError::Timeout),
+                #[cfg(feature = "legacy-2024-11-05")]
                 ReturningProbeReceive::PingThenClosed => {
                     self.receive = ReturningProbeReceive::Closed;
                     Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
@@ -35267,6 +35605,8 @@ mod lib_unit_tests {
         assert!(response.result.is_some());
     }
 
+    // Exact-2024 era: selects LegacyOnly, which a no-legacy build refuses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn server_builder_policy_rejects_same_modern_runtime_era_when_legacy_only() {
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -35314,6 +35654,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: tests Auto classification, which a no-legacy build refuses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn auto_runtime_keeps_a_modern_opening_on_the_modern_dispatch_path() {
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -35345,6 +35687,8 @@ mod lib_unit_tests {
         assert!(response.result.is_some());
     }
 
+    // Exact-2024 era: negotiates a legacy initialize.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn returning_transport_negotiates_initialize_proposals_before_tools_list() {
         for proposal in ["2024-11-05", "2025-03-26", "2025-06-18", "2099-01-01"] {
@@ -35403,6 +35747,8 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: tests Auto classification, which a no-legacy build refuses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn stdio_initialize_proposals_select_legacy_negotiation() {
         for proposal in ["2024-11-05", "2025-03-26", "2025-06-18", "2099-01-01"] {
@@ -35421,6 +35767,8 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: tests Auto classification, which a no-legacy build refuses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn stdio_auto_classifies_the_first_envelope_before_legacy_fallback() {
         let mut accepted = StdioEraClassifier::new(ProtocolPolicy::Auto);
@@ -35534,12 +35882,15 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: used only by legacy application content tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct ApplicationContentTool {
         content: Vec<Content>,
         calls: Arc<AtomicUsize>,
         fail: bool,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl ToolHandler for ApplicationContentTool {
         fn definition(&self) -> Tool {
             let mut definition = LiveRuntimeListedTool.definition();
@@ -35558,8 +35909,11 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: used only by legacy application content tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct ApplicationContentResultMiddleware(serde_json::Value);
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl Middleware for ApplicationContentResultMiddleware {
         fn on_response(
             &self,
@@ -35575,6 +35929,8 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: used only by legacy application content tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn application_content_transcript(builder: ServerBuilder) -> Vec<JsonRpcMessage> {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let call = |id| {
@@ -35632,6 +35988,8 @@ mod lib_unit_tests {
         messages
     }
 
+    // Exact-2024 era: used only by legacy application content tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn application_content_response(messages: &[JsonRpcMessage]) -> &JsonRpcResponse {
         messages
             .iter()
@@ -35644,6 +36002,8 @@ mod lib_unit_tests {
             .expect("tool call has its original response ID")
     }
 
+    // Exact-2024 era: legacy application tool content option.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_application_content_roundtrips_and_strict_mode_rejects_extensions() {
         for payload in [
@@ -35689,6 +36049,8 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: legacy application tool content option.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_application_content_rejects_malformed_results_and_forbidden_envelopes() {
         let mut rejected = vec![
@@ -35737,6 +36099,8 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: legacy application tool content option.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_application_content_preserves_open_metadata_and_content_fields() {
         let result = serde_json::json!({
@@ -35764,6 +36128,8 @@ mod lib_unit_tests {
         assert_eq!(response.result, Some(result));
     }
 
+    // Exact-2024 era: legacy application tool content option.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_application_content_does_not_bypass_authentication() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -35792,6 +36158,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy application tool content option.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_application_content_preserves_tool_errors() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -35815,6 +36183,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: routes legacy frames through the 2024 adapter.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_runtime_routes_exact_legacy_frames_through_the_2024_adapter() {
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -35883,6 +36253,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy cancellation on a legacy connection.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_legacy_runtime_ignores_invalid_cancellation_without_closing_the_connection() {
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -36006,6 +36378,8 @@ mod lib_unit_tests {
         ));
     }
 
+    // Exact-2024 era: legacy runtime context after a legacy opening.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_split_transport_legacy_runtime_retains_state_notifications_and_sampling() {
         let sent = live_legacy_runtime_connection_transcript(true);
@@ -36065,6 +36439,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy runtime context after a legacy opening.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_split_transport_legacy_context_installs_roots_provider_after_negotiation() {
         let sent = legacy_roots_context_transcript(true);
@@ -36089,6 +36465,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy runtime context after a legacy opening.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_split_transport_legacy_context_withholds_roots_provider_without_capability() {
         let sent = legacy_roots_context_transcript(false);
@@ -36113,6 +36491,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy progress after a legacy opening.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_stdio_legacy_progress_token_installs_f64_notification_sender() {
         let sent = legacy_stdio_progress_transcript(true);
@@ -36140,6 +36520,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy progress after a legacy opening.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_stdio_legacy_progress_sender_is_absent_when_only_token_is_removed() {
         let sent = legacy_stdio_progress_transcript(false);
@@ -36160,6 +36542,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy server-to-client sampling.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_split_legacy_sampling_cancel_late_reply_preserves_connection() {
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -36205,6 +36589,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy server-to-client sampling.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_split_legacy_sampling_numeric_cancellation_alias_retires_late_reply() {
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -36249,6 +36635,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy server-to-client sampling.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_split_legacy_sampling_next_negative_reply_remains_invalid() {
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -36285,6 +36673,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy runtime context after a legacy opening.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_split_transport_legacy_runtime_rejects_sampling_when_only_capability_is_removed() {
         let sent = live_legacy_runtime_connection_transcript(false);
@@ -36345,6 +36735,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy tools/call argument validation.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_runtime_rejects_only_non_object_legacy_tool_arguments_without_advancing_lifecycle() {
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -36430,6 +36822,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy completion/complete routing.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_runtime_routes_exact_legacy_completion_through_the_legacy_router_surface() {
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -36491,6 +36885,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: a legacy completion notification after a legacy initialize.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_runtime_rejects_completion_notification_without_invoking_handler() {
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -36559,7 +36955,7 @@ mod lib_unit_tests {
     fn builder_http_endpoint_dispatches_a_modern_request_end_to_end() {
         let cx = Cx::for_testing();
         let endpoint = Server::new("modern-http-endpoint", "1.0.0")
-            .build_http_endpoint("http://legacy.test")
+            .test_http_endpoint("http://legacy.test")
             .expect("builder must construct the configured dual-era endpoint");
         let mut session = endpoint
             .open_session(&cx)
@@ -37031,7 +37427,7 @@ mod lib_unit_tests {
         let cx = Cx::for_testing();
         let calls = Arc::new(AtomicUsize::new(0));
         let endpoint = extension_registry_test_server(Arc::clone(&calls))
-            .into_http_endpoint("http://legacy.test")
+            .test_http_endpoint("http://legacy.test")
             .expect("extension server must construct the configured HTTP endpoint");
         let mut session = endpoint
             .open_session(&cx)
@@ -37053,7 +37449,8 @@ mod lib_unit_tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    #[cfg(feature = "tasks")]
+    // Exact-2024 era: drives the dual-era internal HTTP dispatcher.
+    #[cfg(all(feature = "tasks", feature = "legacy-2024-11-05"))]
     #[test]
     fn builder_http_endpoint_rejects_one_variable_wrong_extension_version() {
         let cx = Cx::for_testing();
@@ -37131,6 +37528,8 @@ mod lib_unit_tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
+    // Exact-2024 era: selects LegacyOnly, which a no-legacy build refuses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_http_protocol_policy_rejects_opposite_era_requests_both_ways() {
         let modern_request = JsonRpcRequest::new(
@@ -39847,7 +40246,7 @@ mod lib_unit_tests {
             .auth_provider(probe.clone())
             .middleware(probe.clone())
             .tool(probe.clone())
-            .build_http_endpoint("http://auth.test")
+            .test_http_endpoint("http://auth.test")
             .expect("endpoint must build");
         let mut session = endpoint.open_session(&cx).expect("session must open");
         for request in [
@@ -39902,9 +40301,19 @@ mod lib_unit_tests {
         assert_eq!(session.selected_era, None);
         assert_eq!(probe.effects(), (0, 0, 0));
 
-        // The provider's numeric context ID is not a wire identity: a
-        // notification and request ID zero both map to zero. Receipt reuse
-        // must preserve that distinction without another provider call.
+        #[cfg(feature = "legacy-2024-11-05")]
+        auth_01_legacy_receipt_keeps_request_zero_and_notification_distinct(&endpoint, &probe);
+    }
+
+    /// The provider's numeric context ID is not a wire identity: a
+    /// notification and request ID zero both map to zero. Receipt reuse must
+    /// preserve that distinction without another provider call.
+    // Exact-2024 era: the receipt is committed through the legacy path.
+    #[cfg(feature = "legacy-2024-11-05")]
+    fn auth_01_legacy_receipt_keeps_request_zero_and_notification_distinct(
+        endpoint: &ServerHttpEndpoint,
+        probe: &HttpHeaderAuthProbe,
+    ) {
         let cx = Cx::for_testing();
         let authorization = transport_authorization_from_http_request(
             &HttpRequest::new(HttpMethod::Post, "/messages")
@@ -39933,6 +40342,8 @@ mod lib_unit_tests {
         assert_eq!(probe.effects(), (1, 0, 0));
     }
 
+    // Exact-2024 era: legacy HTTP SSE session registry.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn auth_01_http_legacy_cancellation_probe(reject_forbidden_locations: bool) {
         run_live_http_test(move |cx| async move {
             let probe = HttpHeaderAuthProbe::new();
@@ -40078,11 +40489,15 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE session registry.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn auth_01_http_legacy_cancellation_header_positive() {
         auth_01_http_legacy_cancellation_probe(false);
     }
 
+    // Exact-2024 era: legacy HTTP SSE session registry.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn auth_01_http_legacy_cancellation_body_planted_negative() {
         auth_01_http_legacy_cancellation_probe(true);
@@ -43093,6 +43508,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE endpoint event.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_sse_advertises_the_request_host_on_wildcard_bind() {
         run_live_http_test(|cx| async move {
@@ -43145,6 +43562,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE lifecycle.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_loopback_preserves_exact_legacy_sse_and_post_lifecycle() {
         run_live_http_test(|cx| async move {
@@ -43331,6 +43750,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE reverse responses.
+    #[cfg(feature = "legacy-2024-11-05")]
     async fn live_http_legacy_reverse_response_post_probe(
         cx: &Cx,
         wrong_reverse_response_id: bool,
@@ -43728,6 +44149,8 @@ mod lib_unit_tests {
         require_quiescent_http_shutdown(shutdown, "legacy reverse-response").await
     }
 
+    // Exact-2024 era: legacy HTTP SSE reverse responses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_reverse_response_bypasses_the_originating_session_mutex() {
         run_live_http_test(|cx| async move {
@@ -43735,6 +44158,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE reverse responses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_reverse_response_reaches_an_async_handler() {
         run_live_http_test(|cx| async move {
@@ -43744,6 +44169,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE reverse responses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_reverse_response_exact_admission_precedes_pending_mutation() {
         run_live_http_test(|cx| async move {
@@ -43751,6 +44178,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE reverse responses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_reverse_response_wrong_id_remains_blocked_until_cancellation() {
         run_live_http_test(|cx| async move {
@@ -43760,6 +44189,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE reverse responses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_reverse_response_accepts_opener_principal() {
         run_live_http_test(|cx| async move {
@@ -43768,6 +44199,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE reverse responses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_reverse_response_rejects_foreign_principal_before_pending_mutation() {
         run_live_http_test(|cx| async move {
@@ -43778,6 +44211,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE reverse responses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_unmatched_response_uses_one_auth_provider_evaluation() {
         run_live_http_test(|cx| async move {
@@ -43855,6 +44290,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP blocking dispatch bridge.
+    #[cfg(feature = "legacy-2024-11-05")]
     async fn live_http_legacy_blocking_bridge_probe(
         cx: &Cx,
         plant_dispatch_panic: bool,
@@ -43936,6 +44373,8 @@ mod lib_unit_tests {
         Ok(())
     }
 
+    // Exact-2024 era: legacy HTTP blocking dispatch bridge.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_blocking_bridge_returns_dispatch_response() {
         run_live_http_test(
@@ -43943,6 +44382,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy HTTP blocking dispatch bridge.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_blocking_bridge_maps_panic_and_quarantines_session_shell() {
         run_live_http_test(|cx| async move {
@@ -43952,6 +44393,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: drives both eras over one HTTP listener.
+    #[cfg(feature = "legacy-2024-11-05")]
     async fn live_bound_http_cross_era_transcript(
         cx: &Cx,
         policy: ProtocolPolicy,
@@ -44044,6 +44487,8 @@ mod lib_unit_tests {
         Ok(transcript)
     }
 
+    // Exact-2024 era: used only by the cross-era HTTP transcript.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn assert_cross_era_modern_discovery(response: &[u8]) -> Result<(), String> {
         if !response.starts_with(b"HTTP/1.1 200") {
             return Err(format!(
@@ -44210,6 +44655,8 @@ mod lib_unit_tests {
         Ok(response)
     }
 
+    // Exact-2024 era: tests Auto classification over HTTP.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_bound_http_auto_coexists_with_exact_legacy_and_modern_requests() {
         run_live_http_test(|cx| async move {
@@ -44229,6 +44676,10 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: a dual-era build's ModernOnly refusal of its legacy route.
+    // A no-legacy build has no such route; see
+    // no_legacy_http_routes_are_not_found_without_pinning_or_adapter_admission.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_bound_http_modern_only_rejects_the_identical_legacy_half() {
         run_live_http_test(|cx| async move {
@@ -44278,6 +44729,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE session registry.
+    #[cfg(feature = "legacy-2024-11-05")]
     async fn live_http_legacy_admission_cancellation_probe(
         cx: &Cx,
         cancellation_request_id: i64,
@@ -44533,6 +44986,8 @@ mod lib_unit_tests {
         Ok(target_calls.load(Ordering::Acquire))
     }
 
+    // Exact-2024 era: legacy HTTP SSE session registry.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_cancellation_survives_admission_to_active_transition() {
         run_live_http_test(|cx| async move {
@@ -44546,6 +45001,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE session registry.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_cancellation_rejects_the_one_id_negative() {
         run_live_http_test(|cx| async move {
@@ -44561,6 +45018,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE session registry.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_initialize_is_peer_cancellation_protected() {
         run_live_http_test(|cx| async move {
@@ -44683,6 +45142,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE session registry.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_cancellation_bypasses_the_busy_session_lock() {
         run_live_http_test(|cx| async move {
@@ -44941,6 +45402,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE peer close.
+    #[cfg(feature = "legacy-2024-11-05")]
     async fn live_http_legacy_sse_peer_close_probe(
         cx: &Cx,
         close_originating_peer: bool,
@@ -45098,6 +45561,8 @@ mod lib_unit_tests {
         Ok(())
     }
 
+    // Exact-2024 era: legacy HTTP SSE peer close.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_sse_peer_close_cancels_its_busy_request() {
         run_live_http_test(
@@ -45105,6 +45570,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy HTTP SSE peer close.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_legacy_sse_peer_close_does_not_cancel_another_session() {
         run_live_http_test(|cx| async move {
@@ -45113,6 +45580,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: hosts its child in a legacy HTTP SSE session.
+    #[cfg(feature = "legacy-2024-11-05")]
     async fn live_http_shutdown_ownership_probe(
         cx: &Cx,
         cooperate_with_cancellation: bool,
@@ -45288,11 +45757,15 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: hosts its child in a legacy HTTP SSE session.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_shutdown_joins_a_cooperative_child() {
         run_live_http_test(|cx| async move { live_http_shutdown_ownership_probe(&cx, true).await });
     }
 
+    // Exact-2024 era: hosts its child in a legacy HTTP SSE session.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_shutdown_returns_caller_owned_noncooperative_child_for_later_join() {
         run_live_http_test(|cx| async move {
@@ -45402,6 +45875,8 @@ mod lib_unit_tests {
         });
     }
 
+    // Exact-2024 era: legacy HTTP SSE lifecycle.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn builder_http_endpoint_dispatches_exact_legacy_lifecycle_end_to_end() {
         let cx = Cx::for_testing();
@@ -45495,6 +45970,8 @@ mod lib_unit_tests {
         ));
     }
 
+    // Exact-2024 era: legacy HTTP SSE opener binding.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_http_legacy_sse_binds_opener_principal_before_post() {
         let cx = Cx::for_testing();
@@ -45668,6 +46145,8 @@ mod lib_unit_tests {
         ));
     }
 
+    // Exact-2024 era: legacy HTTP SSE session runtime.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_http_runtime_retains_session_state_progress_and_log_level() {
         let cx = Cx::for_testing();
@@ -45788,6 +46267,8 @@ mod lib_unit_tests {
         assert_eq!(session.legacy_session.log_level(), Some(LogLevel::Debug));
     }
 
+    // Exact-2024 era: legacy resource subscriptions over HTTP SSE.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_http_delivers_resource_updates_only_to_the_subscribed_uri() {
         // resources/subscribe admits only URIs the router can resolve, so the
@@ -45906,6 +46387,8 @@ mod lib_unit_tests {
 
     /// The live exact-2024 HTTP handler serves requests only through its async
     /// hook; its synchronous hook refuses instead of blocking on the request.
+    // Exact-2024 era: legacy HTTP SSE session runtime.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_http_runtime_handler_serves_requests_only_through_the_async_hook() {
         struct ListedResource;
@@ -46003,6 +46486,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy roots provider over HTTP SSE.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_http_roots_provider_requires_only_the_roots_capability() {
         let cx = Cx::for_testing();
@@ -46079,6 +46564,8 @@ mod lib_unit_tests {
         assert_eq!(roots[0].uri, "file:///work");
     }
 
+    // Exact-2024 era: legacy roots provider over HTTP SSE.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_http_roots_provider_is_absent_without_roots_capability() {
         let cx = Cx::for_testing();
@@ -46132,6 +46619,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy HTTP SSE session lifecycle.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_http_wrong_session_rejection_leaves_the_live_lifecycle_unchanged() {
         let cx = Cx::for_testing();
@@ -46262,6 +46751,8 @@ mod lib_unit_tests {
         ));
     }
 
+    // Exact-2024 era: legacy HTTP SSE cancellation admissions.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_http_closed_stream_rejects_cancellation_before_authority_mutation() {
         let cx = Cx::for_testing();
@@ -46333,6 +46824,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: scripts legacy cancellation by original wire ID.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LiveLegacyActiveCancellationRecv {
         phase: usize,
         started: Arc<AtomicBool>,
@@ -46340,6 +46833,7 @@ mod lib_unit_tests {
         responses: Arc<LiveModernResponses>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl TransportRecvHalf for LiveLegacyActiveCancellationRecv {
         fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
             let phase = self.phase;
@@ -46410,16 +46904,22 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: legacy cancellation by original wire ID.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_runtime_cancels_exact_legacy_tool_by_its_original_wire_id() {
         run_live_legacy_active_cancellation(false);
     }
 
+    // Exact-2024 era: legacy application tool content option.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_application_content_preserves_active_wire_cancellation() {
         run_live_legacy_active_cancellation(true);
     }
 
+    // Exact-2024 era: legacy cancellation by original wire ID.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn run_live_legacy_active_cancellation(application_content: bool) {
         let started = Arc::new(AtomicBool::new(false));
         let observed_cancellation = Arc::new(AtomicBool::new(false));
@@ -46459,6 +46959,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: scripts legacy queued cancellation.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LiveLegacyQueuedCancellationRecv {
         phase: usize,
         cancelled_request_id: i64,
@@ -46468,6 +46970,7 @@ mod lib_unit_tests {
         responses: Arc<LiveModernResponses>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl TransportRecvHalf for LiveLegacyQueuedCancellationRecv {
         fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
             let phase = self.phase;
@@ -46537,12 +47040,15 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: records legacy queued-cancellation output.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LiveLegacyFirstQueuedSend {
         initialize_send_started: Arc<BoundedTestSignal>,
         initialize_send_release: Arc<BoundedTestSignal>,
         responses: Arc<LiveModernResponses>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl TransportSendHalf for LiveLegacyFirstQueuedSend {
         fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
             self.responses.record(message.clone());
@@ -46563,6 +47069,8 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: scripts legacy queued cancellation.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn live_legacy_queued_cancellation_transcript(
         cancelled_request_id: i64,
     ) -> (
@@ -46603,6 +47111,8 @@ mod lib_unit_tests {
         (result, control, responses)
     }
 
+    // Exact-2024 era: legacy queued cancellation after a legacy opening.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_exact_legacy_first_queued_cancellation_suppresses_only_the_target_response() {
         let (result, control, responses) = live_legacy_queued_cancellation_transcript(80);
@@ -46620,6 +47130,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: legacy queued cancellation after a legacy opening.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_exact_legacy_first_queued_unknown_cancellation_preserves_the_request() {
         // This differs from the positive only in the cancellation request ID.
@@ -46654,8 +47166,8 @@ mod lib_unit_tests {
 
         let exit_code = run_live_modern_pump(
             Server::new("live-modern-overlap", "1.0.0")
-                .protocol_policy(ProtocolPolicy::Auto)
-                .expect("Auto must be available to this test build")
+                .protocol_policy(build_default_protocol_policy())
+                .expect("the build's default policy must be available")
                 .tool(LiveModernControlledTool {
                     control: Arc::clone(&control),
                 })
@@ -46705,8 +47217,8 @@ mod lib_unit_tests {
         let run_result = run_live_split_transport(
             Duration::from_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS),
             Server::new("live-modern-split-overlap", "1.0.0")
-                .protocol_policy(ProtocolPolicy::Auto)
-                .expect("Auto must be available to this test build")
+                .protocol_policy(build_default_protocol_policy())
+                .expect("the build's default policy must be available")
                 .tool(LiveModernControlledTool {
                     control: Arc::clone(&control),
                 })
@@ -46741,6 +47253,8 @@ mod lib_unit_tests {
         run_result.expect("split transport must drain both independently owned modern requests");
     }
 
+    // Exact-2024 era: selects LegacyOnly, which a no-legacy build refuses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_modern_split_transport_legacy_only_policy_rejects_before_children_start() {
         let control = Arc::new(LiveModernControl::default());
@@ -46890,8 +47404,8 @@ mod lib_unit_tests {
 
         let probe = Arc::new(Probe::default());
         let server = Server::new("split-progress-write", "1.0.0")
-            .protocol_policy(ProtocolPolicy::Auto)
-            .expect("Auto must be available to this test build")
+            .protocol_policy(build_default_protocol_policy())
+            .expect("the build's default policy must be available")
             .tool(LiveModernControlledTool {
                 control: Arc::clone(&probe.control),
             })
@@ -46988,8 +47502,8 @@ mod lib_unit_tests {
 
         let exit_code = run_live_modern_pump(
             Server::new("live-modern-cancellation", "1.0.0")
-                .protocol_policy(ProtocolPolicy::Auto)
-                .expect("Auto must be available to this test build")
+                .protocol_policy(build_default_protocol_policy())
+                .expect("the build's default policy must be available")
                 .tool(LiveModernControlledTool {
                     control: Arc::clone(&control),
                 })
@@ -47081,8 +47595,8 @@ mod lib_unit_tests {
 
         let exit_code = run_live_modern_pump(
             Server::new("public-stdio-final-progress", "1.0.0")
-                .protocol_policy(ProtocolPolicy::Auto)
-                .expect("Auto must be available to this test build")
+                .protocol_policy(build_default_protocol_policy())
+                .expect("the build's default policy must be available")
                 .log_level(Level::Debug)
                 .tool(LiveModernControlledTool {
                     control: Arc::clone(&control),
@@ -47187,8 +47701,8 @@ mod lib_unit_tests {
 
         let exit_code = run_live_modern_pump(
             Server::new("public-stdio-final-progress-cancel", "1.0.0")
-                .protocol_policy(ProtocolPolicy::Auto)
-                .expect("Auto must be available to this test build")
+                .protocol_policy(build_default_protocol_policy())
+                .expect("the build's default policy must be available")
                 .log_level(Level::Debug)
                 .tool(LiveModernControlledTool {
                     control: Arc::clone(&control),
@@ -47272,8 +47786,8 @@ mod lib_unit_tests {
 
         let exit_code = run_live_modern_pump(
             Server::new("public-stdio-progress-cancellation-fence", "1.0.0")
-                .protocol_policy(ProtocolPolicy::Auto)
-                .expect("Auto must be available to this test build")
+                .protocol_policy(build_default_protocol_policy())
+                .expect("the build's default policy must be available")
                 .log_level(Level::Debug)
                 .tool(LiveModernControlledTool {
                     control: Arc::clone(&control),
@@ -47342,8 +47856,8 @@ mod lib_unit_tests {
 
         let exit_code = run_live_modern_pump(
             Server::new("live-modern-notification-shutdown", "1.0.0")
-                .protocol_policy(ProtocolPolicy::Auto)
-                .expect("Auto must be available to this test build")
+                .protocol_policy(build_default_protocol_policy())
+                .expect("the build's default policy must be available")
                 .middleware(LiveModernBlockingNotificationMiddleware {
                     control: Arc::clone(&control),
                 })
@@ -47381,8 +47895,8 @@ mod lib_unit_tests {
 
         let exit_code = run_live_modern_pump(
             Server::new("live-modern-backpressure", "1.0.0")
-                .protocol_policy(ProtocolPolicy::Auto)
-                .expect("Auto must be available to this test build")
+                .protocol_policy(build_default_protocol_policy())
+                .expect("the build's default policy must be available")
                 .tool(LiveModernControlledTool {
                     control: Arc::clone(&control),
                 })
@@ -47487,6 +48001,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: answers an un-negotiated ping, which only the dual-era loop admits.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn reality_check_regression_returning_transport_propagates_response_send_error() {
         let error = Server::new("returning-send-failure-test", "1.0.0")
@@ -47783,6 +48299,8 @@ mod lib_unit_tests {
         assert_eq!(data["close"]["data"]["kind"], "io");
     }
 
+    // Exact-2024 era: legacy dispatch and region-close error combination.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_request_dispatch_and_region_close_retain_simultaneous_failures() {
         let combined = combine_legacy_dispatch_and_close::<()>(
@@ -47796,11 +48314,14 @@ mod lib_unit_tests {
         assert!(combined.message().contains("region close failed"));
     }
 
+    // Exact-2024 era: used only by LegacyOnly returning-loop tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct LegacyReturningOwnershipTool {
         regions: Arc<Mutex<Vec<RegionId>>>,
         cancel_first: bool,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl ToolHandler for LegacyReturningOwnershipTool {
         fn definition(&self) -> Tool {
             Tool {
@@ -47837,6 +48358,8 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: used only by tests that open with a legacy handshake.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn run_returning_transport_with_test_runtime<T>(server: Server, transport: T) -> McpResult<()>
     where
         T: Transport + Send + 'static,
@@ -47882,6 +48405,8 @@ mod lib_unit_tests {
 
     /// Exact acceptance ID: successful legacy request completion followed by
     /// sibling reuse on the same caller-owned custom connection.
+    // Exact-2024 era: selects LegacyOnly, which a no-legacy build refuses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn fnd_04_b_positive() {
         let regions = Arc::new(Mutex::new(Vec::new()));
@@ -47949,6 +48474,8 @@ mod lib_unit_tests {
 
     /// Exact acceptance ID: near-identical cancellation/EOF case retaining
     /// sibling completion and both dispatch/close diagnostics.
+    // Exact-2024 era: selects LegacyOnly, which a no-legacy build refuses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn fnd_04_b_planted_negative() {
         let regions = Arc::new(Mutex::new(Vec::new()));
@@ -48028,6 +48555,8 @@ mod lib_unit_tests {
         );
     }
 
+    // Exact-2024 era: selects LegacyOnly, which a no-legacy build refuses.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_returning_completed_request_allows_sibling_reuse_after_eof() {
         let regions = Arc::new(Mutex::new(Vec::new()));
@@ -48138,8 +48667,8 @@ mod lib_unit_tests {
             .build()
             .expect("peer cancellation runtime");
         let server = Server::new("returning-peer-cancellation", "1.0.0")
-            .protocol_policy(ProtocolPolicy::Auto)
-            .expect("Auto is available in this test profile")
+            .protocol_policy(build_default_protocol_policy())
+            .expect("the build's default policy must be available")
             .build();
         let active = Arc::clone(&server.active_requests);
         let active_for_recv = Arc::clone(&active);
@@ -48269,8 +48798,8 @@ mod lib_unit_tests {
         let shutdown_calls = Arc::new(AtomicUsize::new(0));
         let shutdown_calls_for_hook = Arc::clone(&shutdown_calls);
         let server = Server::new("background-response-write", "1.0.0")
-            .protocol_policy(ProtocolPolicy::Auto)
-            .expect("Auto is available in this test profile")
+            .protocol_policy(build_default_protocol_policy())
+            .expect("the build's default policy must be available")
             .middleware(RejectListen)
             .on_shutdown(move || {
                 shutdown_calls_for_hook.fetch_add(1, Ordering::AcqRel);
@@ -48428,8 +48957,8 @@ mod lib_unit_tests {
         let shutdown_before_drain_for_hook = Arc::clone(&shutdown_before_drain);
         let shutdown_calls_for_hook = Arc::clone(&shutdown_calls);
         let server = Server::new("legacy-returning-bounded-cleanup", "1.0.0")
-            .protocol_policy(ProtocolPolicy::Auto)
-            .expect("Auto must be available to this test build")
+            .protocol_policy(build_default_protocol_policy())
+            .expect("the build's default policy must be available")
             .middleware(NonQuiescentSubscriptionMiddleware {
                 control: Arc::clone(&control),
             })
@@ -48694,8 +49223,8 @@ mod lib_unit_tests {
             .build()
             .expect("forced shutdown-order runtime");
         let server = Server::new("forced-subscription-shutdown-order", "1.0.0")
-            .protocol_policy(ProtocolPolicy::Auto)
-            .expect("Auto is available in this test profile")
+            .protocol_policy(build_default_protocol_policy())
+            .expect("the build's default policy must be available")
             .build();
         let active = Arc::clone(&server.active_requests);
         let active_for_callback = Arc::clone(&active);
@@ -48945,8 +49474,8 @@ mod lib_unit_tests {
             .build()
             .expect("forced recv-lock runtime");
         let server = Server::new("forced-subscription-recv-lock-order", "1.0.0")
-            .protocol_policy(ProtocolPolicy::Auto)
-            .expect("Auto is available in this test profile")
+            .protocol_policy(build_default_protocol_policy())
+            .expect("the build's default policy must be available")
             .middleware(ForcedAckOrderMiddleware {
                 control: Arc::clone(&control),
                 registry: Arc::clone(&registry_cell),
@@ -49006,6 +49535,8 @@ mod lib_unit_tests {
         assert!(active.lock().unwrap().is_empty());
     }
 
+    // Exact-2024 era: negotiates the connection with a legacy initialize.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn returning_loop_replies_to_bounded_codec_error_then_reads_next_frame() {
         use std::collections::VecDeque;
@@ -49345,7 +49876,7 @@ mod lib_unit_tests {
     fn modern_returning_loop_peer_response_case(invalid_version: bool) {
         let mut response = JsonRpcResponse::success(9900_i64.into(), serde_json::json!({}));
         if invalid_version {
-            response.jsonrpc = "1.0".to_owned();
+            response.jsonrpc = "1.0".into();
         }
         let received = Arc::new(AtomicUsize::new(0));
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -49460,6 +49991,8 @@ mod lib_unit_tests {
         }
     }
 
+    // Exact-2024 era: negotiates the connection with a legacy initialize.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn returning_loop_correlates_invalid_request_only_when_codec_proves_unique_id() {
         use std::collections::VecDeque;
@@ -52625,7 +53158,7 @@ mod lib_unit_tests {
             .tool(HttpSessionDisablingTool {
                 calls: Arc::clone(&calls),
             })
-            .build_http_endpoint("http://final.test")
+            .test_http_endpoint("http://final.test")
             .expect("modern endpoint must build");
         let mut first_client = endpoint
             .open_session(&cx)
@@ -52664,7 +53197,7 @@ mod lib_unit_tests {
             .tool(HttpSessionDisablingTool {
                 calls: Arc::clone(&calls),
             })
-            .build_http_endpoint("http://final.test")
+            .test_http_endpoint("http://final.test")
             .expect("modern endpoint must build");
         let mut first_client = endpoint
             .open_session(&cx)
@@ -52728,7 +53261,7 @@ mod lib_unit_tests {
             .tool(ModernHttpAuthCounterTool {
                 calls: Arc::clone(&handler_calls),
             })
-            .build_http_endpoint("http://final.test")
+            .test_http_endpoint("http://final.test")
             .expect("modern endpoint must build");
         let mut session = endpoint
             .open_session(&cx)
@@ -52811,7 +53344,7 @@ mod lib_unit_tests {
             .tool(ModernHttpAuthCounterTool {
                 calls: Arc::clone(&handler_calls),
             })
-            .build_http_endpoint("http://final.test")
+            .test_http_endpoint("http://final.test")
             .expect("modern endpoint must build");
         let mut session = endpoint
             .open_session(&cx)
@@ -52887,7 +53420,7 @@ mod lib_unit_tests {
             .tool(ModernHttpAuthCounterTool {
                 calls: Arc::clone(&handler_calls),
             })
-            .build_http_endpoint("http://final.test")
+            .test_http_endpoint("http://final.test")
             .expect("modern endpoint must build");
         let mut session = endpoint
             .open_session(&cx)
@@ -53243,7 +53776,7 @@ mod lib_unit_tests {
                 name: "other_live_http_mrtr",
                 calls: Arc::clone(&calls),
             })
-            .build_http_endpoint("http://final.test")
+            .test_http_endpoint("http://final.test")
             .expect("modern endpoint must build");
         let mut issuing_client = endpoint
             .open_session(&cx)
@@ -53478,7 +54011,7 @@ mod lib_unit_tests {
                 mode: PublicFinalElicitationMode::Form,
                 calls: Arc::clone(&calls),
             })
-            .build_http_endpoint("http://final.test")
+            .test_http_endpoint("http://final.test")
             .expect("modern endpoint must build");
         let mut issuing_client = endpoint
             .open_session(&cx)
@@ -53577,7 +54110,7 @@ mod lib_unit_tests {
             .tool(HttpRequestScopedProgressTool {
                 calls: Arc::clone(&calls),
             })
-            .build_http_endpoint("http://final.test")
+            .test_http_endpoint("http://final.test")
             .expect("modern endpoint must build");
         let mut session = endpoint
             .open_session(&cx)
@@ -53745,7 +54278,7 @@ mod lib_unit_tests {
             .tool(HttpRequestScopedProgressTool {
                 calls: Arc::new(AtomicUsize::new(0)),
             })
-            .build_http_endpoint("http://final.test")
+            .test_http_endpoint("http://final.test")
             .expect("modern endpoint must build");
         let mut session = endpoint
             .open_session(&cx)
@@ -53799,7 +54332,7 @@ mod lib_unit_tests {
             .expect("ModernOnly must be available to this test build")
             .log_level(Level::Debug)
             .tool(HttpFinalProgressCancellationTool)
-            .build_http_endpoint("http://final.test")
+            .test_http_endpoint("http://final.test")
             .expect("modern endpoint must build");
         let mut session = endpoint
             .open_session(&cx)
@@ -53863,7 +54396,7 @@ mod lib_unit_tests {
             .tool(HttpRequestScopedProgressTool {
                 calls: Arc::clone(&calls),
             })
-            .build_http_endpoint("http://final.test")
+            .test_http_endpoint("http://final.test")
             .expect("modern endpoint must build");
         let mut session = endpoint
             .open_session(&cx)
@@ -53952,7 +54485,7 @@ mod lib_unit_tests {
             .tool(HttpRequestScopedProgressTool {
                 calls: Arc::clone(&calls),
             })
-            .build_http_endpoint("http://final.test")
+            .test_http_endpoint("http://final.test")
             .expect("modern endpoint must build");
         let mut session = endpoint
             .open_session(&cx)
@@ -54002,7 +54535,7 @@ mod lib_unit_tests {
             .protocol_policy(ProtocolPolicy::ModernOnly)
             .expect("ModernOnly must be available to this test build")
             .log_level(Level::Debug)
-            .build_http_endpoint("http://final.test")
+            .test_http_endpoint("http://final.test")
             .expect("modern endpoint must build");
         let mut session = endpoint
             .open_session(&cx)
@@ -54078,7 +54611,7 @@ mod lib_unit_tests {
             .protocol_policy(ProtocolPolicy::ModernOnly)
             .expect("ModernOnly must be available to this test build")
             .log_level(Level::Debug)
-            .build_http_endpoint("http://final.test")
+            .test_http_endpoint("http://final.test")
             .expect("modern endpoint must build");
         let mut session = endpoint
             .open_session(&cx)
@@ -54689,7 +55222,7 @@ mod lib_unit_tests {
             let endpoint = Server::new("public-http-listen-contention", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
                 .expect("ModernOnly must be available to this test build")
-                .build_http_endpoint("http://legacy.test")
+                .test_http_endpoint("http://legacy.test")
                 .map_err(|error| format!("public endpoint setup failed: {error}"))?;
             let mut session = endpoint
                 .open_session(&cx)
@@ -54784,7 +55317,7 @@ mod lib_unit_tests {
             let endpoint = Server::new("public-http-listen", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
                 .expect("ModernOnly must be available to this test build")
-                .build_http_endpoint("http://legacy.test")
+                .test_http_endpoint("http://legacy.test")
                 .map_err(|error| format!("public endpoint setup failed: {error}"))?;
             let mut first_session = endpoint
                 .open_session(&cx)
@@ -55022,7 +55555,7 @@ mod lib_unit_tests {
             let endpoint = Server::new("public-http-last-session-drop", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
                 .expect("ModernOnly must be available to this test build")
-                .build_http_endpoint("http://legacy.test")
+                .test_http_endpoint("http://legacy.test")
                 .map_err(|error| format!("public endpoint setup failed: {error}"))?;
             let mut session = endpoint
                 .open_session(&cx)
@@ -55091,6 +55624,87 @@ mod lib_unit_tests {
                         .to_owned(),
                 );
             }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn public_http_live_session_keeps_acknowledged_listen_open_without_peer_close() {
+        // Differs from the peer-close test above only in that the session
+        // stays open: the listen must stay pending, registered and silent.
+        run_live_http_test(|cx| async move {
+            let endpoint = Server::new("public-http-last-session-drop", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
+                .test_http_endpoint("http://legacy.test")
+                .map_err(|error| format!("public endpoint setup failed: {error}"))?;
+            let mut session = endpoint
+                .open_session(&cx)
+                .map_err(|error| format!("public listen session failed: {error}"))?;
+            let listen = JsonRpcRequest::new(
+                SUBSCRIPTIONS_LISTEN,
+                Some(serde_json::json!({
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                    },
+                    "notifications": {"toolsListChanged": true},
+                })),
+                RequestId::Number(889),
+            );
+            let response = session
+                .handle_async(
+                    &cx,
+                    HttpRequest::new(HttpMethod::Post, "/mcp")
+                        .with_header("content-type", "application/json")
+                        .with_header("accept", "text/event-stream")
+                        .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+                        .with_header("mcp-method", SUBSCRIPTIONS_LISTEN)
+                        .with_body(
+                            serde_json::to_vec(&listen)
+                                .expect("typed listen request must serialize"),
+                        ),
+                )
+                .await
+                .map_err(|error| format!("public listen failed: {error}"))?;
+            let ServerHttpEndpointResponse::ModernSse(sse) = response else {
+                return Err("public listen did not return SSE".to_owned());
+            };
+            let guard = sse.cancellation();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match sse.pop_event() {
+                    Ok(Some(_acknowledgement)) => break,
+                    Ok(None) if Instant::now() < deadline => {
+                        asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                    }
+                    Ok(None) => return Err("public listen acknowledgement timed out".to_owned()),
+                    Err(error) => return Err(format!("public listen closed early: {error}")),
+                }
+            }
+            if guard.checkpoint(&cx).is_err() {
+                return Err("acknowledged listen was not pending before session drop".to_owned());
+            }
+
+            if guard.checkpoint(&cx).is_err()
+                || endpoint
+                    .server
+                    .final_subscriptions
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entries
+                    .is_empty()
+            {
+                return Err("an open session revoked its acknowledged listen".to_owned());
+            }
+            if !matches!(sse.pop_event(), Ok(None)) {
+                return Err(
+                    "an open session's listen emitted an event or closed without a peer close"
+                        .to_owned(),
+                );
+            }
+            drop(session);
             Ok(())
         });
     }

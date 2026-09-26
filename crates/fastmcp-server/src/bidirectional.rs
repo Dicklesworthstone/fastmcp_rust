@@ -100,10 +100,10 @@ pub const HARD_MAX_MRTR_REQUEST_STATE_BYTES: usize = 256 * 1024;
 
 const FIRST_SERVER_REQUEST_ID: i64 = 1_000_000;
 /// The first exact-legacy ID is exactly representable by a JavaScript `Number`.
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 const FIRST_EXACT_LEGACY_SERVER_REQUEST_ID: i64 = -1;
 /// The inclusive lower bound of JavaScript's integer-safe `Number` range.
-#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[cfg(feature = "legacy-2024-11-05")]
 const LAST_EXACT_LEGACY_SERVER_REQUEST_ID: i64 = -9_007_199_254_740_991;
 const INVALID_LIMIT_ERROR: &str = "Invalid bidirectional request limit";
 const IN_FLIGHT_LIMIT_ERROR: &str = "Bidirectional request limit reached";
@@ -207,7 +207,7 @@ type ResponseReceiver = oneshot::Receiver<PendingResponse>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingIdDomain {
     Positive,
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     ExactLegacyNegative,
 }
 
@@ -215,7 +215,7 @@ impl PendingIdDomain {
     const fn first_id(self) -> i64 {
         match self {
             Self::Positive => FIRST_SERVER_REQUEST_ID,
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::ExactLegacyNegative => FIRST_EXACT_LEGACY_SERVER_REQUEST_ID,
         }
     }
@@ -223,14 +223,14 @@ impl PendingIdDomain {
     fn next_id_after(self, candidate: i64) -> Option<i64> {
         match self {
             Self::Positive => candidate.checked_add(1),
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::ExactLegacyNegative => candidate
                 .checked_sub(1)
                 .filter(|next| *next >= LAST_EXACT_LEGACY_SERVER_REQUEST_ID),
         }
     }
 
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn is_issued_negative_suffix(self, next_id: Option<i64>, id: &CorrelationKey) -> bool {
         let Self::ExactLegacyNegative = self else {
             return false;
@@ -279,7 +279,7 @@ struct PendingState {
 #[derive(Debug)]
 struct PendingRequest {
     sender: ResponseSender,
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     request_cancellation: Option<McpRequestCancellation>,
 }
 
@@ -352,7 +352,7 @@ impl PendingRequests {
     ///
     /// The domain is fixed for the tracker's full lifetime so a response for
     /// an issued-but-retired negative ID can be classified in O(1) space.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     pub(crate) fn with_max_in_flight_for_exact_legacy(max_in_flight: usize) -> McpResult<Self> {
         Self::validate_max_in_flight(max_in_flight)?;
 
@@ -382,7 +382,7 @@ impl PendingRequests {
     ) -> McpResult<(RequestId, ResponseReceiver)> {
         // Only the exact-legacy pump sweeps waiters by owner cancellation
         // (`cancel_cancelled`), so other builds do not retain the handle.
-        #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+        #[cfg(not(feature = "legacy-2024-11-05"))]
         let _ = request_cancellation;
         let mut state = self.lock_state();
         if state.closed {
@@ -406,7 +406,7 @@ impl PendingRequests {
                 let (sender, receiver) = oneshot::channel();
                 entry.insert(PendingRequest {
                     sender,
-                    #[cfg(any(feature = "legacy-2024-11-05", test))]
+                    #[cfg(feature = "legacy-2024-11-05")]
                     request_cancellation,
                 });
                 return Ok((id, receiver));
@@ -443,13 +443,13 @@ impl PendingRequests {
         let (pending, retired_generic) = {
             let mut state = self.lock_state();
             let pending = state.requests.remove(&key);
-            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(feature = "legacy-2024-11-05")]
             let retired_generic = pending.is_none()
                 && self
                     .id_domain
                     .is_issued_negative_suffix(state.next_id, &key);
             // Only the exact-legacy domain issues retirable negative IDs.
-            #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+            #[cfg(not(feature = "legacy-2024-11-05"))]
             let retired_generic = false;
             (pending, retired_generic)
         };
@@ -482,7 +482,7 @@ impl PendingRequests {
 
     /// Wakes pending server-to-client calls whose owning incoming request is
     /// terminal, without mutating the caller-owned connection context.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     pub(crate) fn cancel_cancelled(&self) -> usize {
         let cancelled = {
             let mut state = self.lock_state();
@@ -4602,6 +4602,8 @@ mod tests {
         assert!(!pending.route_response(&response));
     }
 
+    // Exact-2024 era: exact-legacy negative request IDs.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn exact_legacy_negative_response_disposition_delivers_issued_waiter() {
         let pending = PendingRequests::with_max_in_flight_for_exact_legacy(1).unwrap();
@@ -4626,6 +4628,8 @@ mod tests {
         );
     }
 
+    // Exact-2024 era: exact-legacy negative request IDs.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn exact_legacy_negative_ids_descend_from_minus_one() {
         let pending = PendingRequests::with_max_in_flight_for_exact_legacy(2).unwrap();
@@ -4637,6 +4641,8 @@ mod tests {
         assert_eq!(next_id, RequestId::Number(-2));
     }
 
+    // Exact-2024 era: exact-legacy negative request IDs.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn exact_legacy_negative_response_disposition_retires_issued_removed_id() {
         let pending = PendingRequests::with_max_in_flight_for_exact_legacy(1).unwrap();
@@ -4654,6 +4660,8 @@ mod tests {
         );
     }
 
+    // Exact-2024 era: exact-legacy negative request IDs.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn exact_legacy_negative_response_disposition_rejects_unissued_nearby_id() {
         let pending = PendingRequests::with_max_in_flight_for_exact_legacy(1).unwrap();
@@ -4692,6 +4700,8 @@ mod tests {
         );
     }
 
+    // Exact-2024 era: exact-legacy negative request IDs.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn exact_legacy_retires_equivalent_numeric_response_spelling() {
         let pending = PendingRequests::with_max_in_flight_for_exact_legacy(1).unwrap();
@@ -4723,6 +4733,8 @@ mod tests {
         assert!(!pending.route_response(&response));
     }
 
+    // Exact-2024 era: exact-legacy negative request IDs.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn exact_legacy_negative_ids_exhaust_at_js_safe_boundary_and_remain_retired() {
         let pending = PendingRequests::with_max_in_flight_for_exact_legacy(1).unwrap();

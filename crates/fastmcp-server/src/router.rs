@@ -3756,7 +3756,7 @@ impl Router {
 
     /// Returns whether an admitted exact-2024 request selects a handler frozen
     /// as async at registration and therefore stays on the caller's runtime.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     pub(crate) fn legacy_request_uses_transport_owned_async_dispatch(
         &self,
         request: &JsonRpcRequest,
@@ -3817,7 +3817,7 @@ impl Router {
     }
 
     /// Awaits the resolved handler's subscription hook on the request runtime.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     pub(crate) async fn notify_resource_subscribed_async(
         &self,
         ctx: &McpContext,
@@ -3832,7 +3832,7 @@ impl Router {
     }
 
     /// Awaits the resolved handler's unsubscription hook on the request runtime.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[cfg(feature = "legacy-2024-11-05")]
     pub(crate) async fn notify_resource_unsubscribed_async(
         &self,
         ctx: &McpContext,
@@ -11789,8 +11789,11 @@ mod router_tests {
         )
     }
 
+    // Exact-2024 era: used only by legacy completion-route tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct EchoCompletion;
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl CompletionHandler for EchoCompletion {
         fn complete_legacy(
             &self,
@@ -12946,6 +12949,8 @@ mod router_tests {
         assert!(r.get_tool("other").is_none());
     }
 
+    // Exact-2024 era: legacy transport-owned async dispatch selection.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn caller_owned_legacy_dispatch_is_frozen_at_registration() {
         struct AsyncNamedTool;
@@ -13874,10 +13879,13 @@ mod router_tests {
         assert!(main.get_tool("query").is_some());
     }
 
+    // Exact-2024 era: used only by legacy completion-route mount tests.
+    #[cfg(feature = "legacy-2024-11-05")]
     struct RecordingNameCompletion {
         names: Arc<Mutex<Vec<String>>>,
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     impl CompletionHandler for RecordingNameCompletion {
         fn complete_legacy(
             &self,
@@ -13921,6 +13929,8 @@ mod router_tests {
         }
     }
 
+    // Exact-2024 era: observes the mount through the legacy completion route.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn mount_transfers_prompt_completion_providers_and_rewrites_prefixed_names() {
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -13994,6 +14004,8 @@ mod router_tests {
         );
     }
 
+    // Exact-2024 era: observes the mount through the legacy completion route.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn mount_without_prefix_keeps_completion_provider_keys() {
         let mut child = Router::new();
@@ -14025,6 +14037,8 @@ mod router_tests {
         );
     }
 
+    // Exact-2024 era: observes the mount through the legacy completion route.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn mount_transfers_resource_template_completion_providers_and_rewrites_prefixed_uris() {
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -14100,6 +14114,8 @@ mod router_tests {
         );
     }
 
+    // Exact-2024 era: observes the mount through the legacy completion route.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn prefixed_mount_strips_prefix_for_server_wide_completion_fallback() {
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -14145,6 +14161,8 @@ mod router_tests {
         );
     }
 
+    // Exact-2024 era: observes the mount through the legacy completion route.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn mount_prompts_does_not_replace_destination_fallback_completion_handler() {
         let mut dest = Router::new();
@@ -17867,6 +17885,8 @@ mod router_tests {
         assert_eq!(err.code, McpErrorCode::RequestCancelled);
     }
 
+    // Exact-2024 era: compares the legacy and final completion routes.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn completion_handler_dispatches_exact_legacy_and_final_contracts() {
         let mut router = Router::new();
@@ -18418,6 +18438,8 @@ mod router_tests {
         );
     }
 
+    // Exact-2024 era: exercises the exact-legacy completion route.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn explicit_legacy_completion_is_not_discovered_or_dispatched_as_final() {
         let mut router = Router::new();
@@ -18671,20 +18693,24 @@ mod router_tests {
         assert_eq!(unknown_argument_error.code, McpErrorCode::InvalidParams);
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
 
-        let legacy = block_on(router.dispatch_legacy_completion(
-            &request_ctx,
-            &JsonRpcRequest::new(
-                COMPLETION_COMPLETE,
-                Some(serde_json::json!({
-                    "ref": {"type": "ref/prompt", "name": "legacy-completion-prompt"},
-                    "argument": {"name": "unknown", "value": "sta"},
-                })),
-                190_i64,
-            ),
-        ))
-        .expect("exact-2024 completion retains its unvalidated target argument behavior");
-        assert!(legacy.get("resultType").is_none());
-        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+        // Exact-2024 era: only a dual-era build dispatches legacy completion.
+        #[cfg(feature = "legacy-2024-11-05")]
+        {
+            let legacy = block_on(router.dispatch_legacy_completion(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    COMPLETION_COMPLETE,
+                    Some(serde_json::json!({
+                        "ref": {"type": "ref/prompt", "name": "legacy-completion-prompt"},
+                        "argument": {"name": "unknown", "value": "sta"},
+                    })),
+                    190_i64,
+                ),
+            ))
+            .expect("exact-2024 completion retains its unvalidated target argument behavior");
+            assert!(legacy.get("resultType").is_none());
+            assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[test]
@@ -19561,6 +19587,8 @@ mod router_tests {
         assert_eq!(final_read["contents"][0]["text"], "final-template");
     }
 
+    // Exact-2024 era: exercises the exact-legacy completion route.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn completion_handler_rejects_one_field_final_metadata_in_legacy_request() {
         let mut router = Router::new();

@@ -13,6 +13,8 @@ use std::sync::{Arc, Barrier, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+// Exact-2024 era: used only by the legacy receive-pump runner.
+#[cfg(feature = "legacy-2024-11-05")]
 use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
 use asupersync::{Budget, CancelKind, Cx, time::wall_now};
 use base64::Engine as _;
@@ -24,13 +26,15 @@ use fastmcp_core::{
 };
 use fastmcp_derive::tool;
 use fastmcp_protocol::{
-    CallToolParams, CancelledParams, ClientCapabilities, ClientInfo, Content, CreateMessageResult,
-    GetPromptParams, InitializeParams, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
-    LegacyContent, LegacyResourceContent, LogLevel, LogMessageParams, Prompt, PromptArgument,
-    PromptMessage, ReadResourceParams, RequestId, Resource, ResourceContent, ResourceTemplate,
-    ResourceUpdatedNotificationParams, Role, SamplingCapability, ServerCapabilities, ServerInfo,
-    SetLogLevelParams, Tool,
+    CallToolParams, CancelledParams, ClientCapabilities, ClientInfo, Content, GetPromptParams,
+    InitializeParams, JsonRpcRequest, JsonRpcResponse, LegacyContent, LegacyResourceContent,
+    LogLevel, LogMessageParams, Prompt, PromptArgument, PromptMessage, ReadResourceParams,
+    RequestId, Resource, ResourceContent, ResourceTemplate, ResourceUpdatedNotificationParams,
+    Role, ServerCapabilities, ServerInfo, SetLogLevelParams, Tool,
 };
+// Exact-2024 era: used only by the legacy receive-pump tests and runner.
+#[cfg(feature = "legacy-2024-11-05")]
+use fastmcp_protocol::{CreateMessageResult, JsonRpcMessage, SamplingCapability};
 
 #[cfg(feature = "tasks")]
 use crate::TaskManager;
@@ -48,6 +52,8 @@ use crate::{
     TokenAuthProvider,
 };
 
+// Exact-2024 era: used only by the receive-pump tests that open with a legacy handshake.
+#[cfg(feature = "legacy-2024-11-05")]
 fn run_returning_pump_with_caller_runtime<R, S>(
     server: Server,
     recv: R,
@@ -405,6 +411,8 @@ fn block_until_cancelled(ctx: &McpContext) -> McpResult<String> {
     Err(McpError::request_cancelled())
 }
 
+// Exact-2024 era: used only by the legacy receive-pump sampling test.
+#[cfg(feature = "legacy-2024-11-05")]
 #[tool(
     name = "sampling_round_trip",
     description = "Requests one sampling completion"
@@ -8310,6 +8318,8 @@ mod helper_function_tests {
         }
     }
 
+    // Exact-2024 era: opens with a legacy initialize handshake.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn receive_pump_cancels_a_running_handler_in_band() {
         let barrier = Arc::new(Barrier::new(1));
@@ -8444,6 +8454,8 @@ mod helper_function_tests {
         ));
     }
 
+    // Exact-2024 era: opens with a legacy initialize handshake.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn receive_pump_routes_sampling_response_while_handler_waits() {
         let server = Server::new("receive-pump-sampling", "1.0.0")

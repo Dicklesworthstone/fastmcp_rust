@@ -80,10 +80,10 @@ fastmcp-derive.workspace = true
 # The OIDC external-custody adapter is exercised with a real RS256 operation
 # only in the cfg(test) module; this never enters the shipped server graph.
 ring = { workspace = true }
-# Unit tests exercise the dated adapter explicitly, without making it part of
-# the production dependency graph selected by a no-legacy facade profile.
-fastmcp-protocol = { workspace = true, features = ["legacy-2024-11-05"] }
-fastmcp-transport = { workspace = true, features = ["legacy-2024-11-05"] }
+# No dev-dependency enables legacy-2024-11-05 in fastmcp-protocol or
+# fastmcp-transport: a test build then compiles the same era surface as the
+# shipped build of the same feature set, and tests of the dated adapter are
+# gated on this package's own `legacy-2024-11-05` feature.
 # Test-only context construction and deterministic lab exercises.
 asupersync = { workspace = true, features = ["test-internals"] }
 
