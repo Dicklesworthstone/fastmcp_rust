@@ -10116,10 +10116,13 @@ const MAX_CANCELLATION_CONTROL_IDS: usize = 4_096;
 const CANCELLATION_CONTROL_RETENTION: Duration = MAX_CLIENT_ABSOLUTE_TIMEOUT;
 /// Maximum pages followed by one automatic pagination operation.
 const MAX_AUTO_PAGINATION_PAGES: usize = 1_024;
-/// Maximum aggregate items retained by one automatic pagination operation.
+/// Maximum aggregate items admitted by one automatic pagination operation.
 const MAX_AUTO_PAGINATION_ITEMS: usize = 100_000;
-/// Maximum aggregate compact-JSON bytes retained by automatic pagination.
+/// Maximum aggregate compact-JSON bytes admitted by automatic pagination.
 const MAX_AUTO_PAGINATION_SERIALIZED_BYTES: usize = 64 * 1_024 * 1_024;
+/// Absolute traversal/response-wait lifetime, including a cache rebuild.
+/// Blocking sends and later connection teardown retain their transport limits.
+const MAX_AUTO_PAGINATION_DURATION: Duration = Duration::from_mins(5);
 /// Maximum UTF-8 bytes admitted in a peer-provided pagination cursor.
 const MAX_PAGINATION_CURSOR_BYTES: usize = 4 * 1_024;
 /// Compact JSON for an empty retained list is exactly `[]`.
@@ -10134,8 +10137,7 @@ const PAGINATION_PAGE_LIMIT_ERROR: &str = "Automatic pagination page limit excee
 const PAGINATION_ITEM_LIMIT_ERROR: &str = "Automatic pagination item limit exceeded";
 const PAGINATION_BYTE_LIMIT_ERROR: &str = "Automatic pagination serialized-byte limit exceeded";
 const PAGINATION_CURSOR_LIMIT_ERROR: &str = "Automatic pagination cursor byte limit exceeded";
-const PAGINATION_CURSOR_CYCLE_ERROR: &str = "Automatic pagination cursor repeated";
-const PAGINATION_CURSOR_NO_PROGRESS_ERROR: &str = "Pagination response cursor did not advance";
+const PAGINATION_DEADLINE_ERROR: &str = "Automatic pagination absolute deadline elapsed";
 const PAGINATION_MEASUREMENT_ERROR: &str =
     "Automatic pagination response could not be measured safely";
 const LIST_PAGE_BYTE_LIMIT_ERROR: &str = "List page serialized-byte limit must be at least 2 bytes";
@@ -10259,14 +10261,15 @@ impl PaginationLimits {
 
 /// Bounded state for one automatic pagination operation.
 ///
-/// Only fixed-width cursor digests are retained. The peer's opaque cursor is
-/// never copied into diagnostics or the cycle-detection set.
+/// Present cursors always continue the operation, including empty and repeated
+/// values. Counts and one immutable deadline bound the entire traversal,
+/// including any pages discarded during a cache-generation rebuild.
 struct PaginationBudget {
     limits: PaginationLimits,
     pages: usize,
     items: usize,
     serialized_bytes: usize,
-    seen_cursors: std::collections::HashSet<Sha256Digest>,
+    deadline: Instant,
 }
 
 /// Caller-selected bounds for acquiring one page of a list operation.
@@ -10331,11 +10334,34 @@ impl PaginationBudget {
             pages: 0,
             items: 0,
             serialized_bytes: 0,
-            seen_cursors: std::collections::HashSet::new(),
+            deadline: Instant::now() + MAX_AUTO_PAGINATION_DURATION,
         }
     }
 
+    fn for_request(policy: RequestTimeoutPolicy) -> Self {
+        let mut budget = Self::new();
+        budget.deadline = Instant::now()
+            + MAX_AUTO_PAGINATION_DURATION.min(policy.absolute_timeout());
+        budget
+    }
+
+    fn check_deadline(&self) -> McpResult<()> {
+        self.check_deadline_at(Instant::now())
+    }
+
+    fn check_deadline_at(&self, now: Instant) -> McpResult<()> {
+        if now >= self.deadline {
+            return Err(McpError::with_data(
+                McpErrorCode::InternalError,
+                PAGINATION_DEADLINE_ERROR,
+                serde_json::json!({"timeoutSource": "absolute"}),
+            ));
+        }
+        Ok(())
+    }
+
     fn begin_page(&mut self) -> McpResult<()> {
+        self.check_deadline()?;
         let pages = self
             .pages
             .checked_add(1)
@@ -10347,19 +10373,18 @@ impl PaginationBudget {
         Ok(())
     }
 
-    fn admit_next_cursor(&mut self, cursor: Option<String>) -> McpResult<Option<String>> {
+    fn admit_next_cursor(&self, cursor: Option<String>) -> McpResult<Option<String>> {
         let Some(cursor) = cursor else {
             return Ok(None);
         };
-        let digest = sha256_bounded(cursor.as_bytes(), self.limits.cursor_bytes)
-            .map_err(|_| McpError::internal_error(PAGINATION_CURSOR_LIMIT_ERROR))?;
-        if !self.seen_cursors.insert(digest) {
-            return Err(McpError::internal_error(PAGINATION_CURSOR_CYCLE_ERROR));
+        if cursor.len() > self.limits.cursor_bytes {
+            return Err(McpError::internal_error(PAGINATION_CURSOR_LIMIT_ERROR));
         }
         Ok(Some(cursor))
     }
 
     fn account_page<T: serde::Serialize>(&mut self, items: &[T]) -> McpResult<()> {
+        self.check_deadline()?;
         let item_count = self
             .items
             .checked_add(items.len())
@@ -10382,6 +10407,7 @@ impl PaginationBudget {
             return Err(McpError::internal_error(PAGINATION_BYTE_LIMIT_ERROR));
         }
 
+        self.check_deadline()?;
         self.items = item_count;
         self.serialized_bytes = serialized_bytes;
         Ok(())
@@ -10433,7 +10459,6 @@ fn measure_serialized_bytes<T: serde::Serialize + ?Sized>(
 
 fn bounded_list_page<T: serde::Serialize>(
     items: Vec<T>,
-    request_cursor: Option<&str>,
     next_cursor: Option<String>,
     limits: ListPageLimits,
 ) -> McpResult<BoundedListPage<T>> {
@@ -10475,18 +10500,13 @@ fn bounded_list_page<T: serde::Serialize>(
         retained.push(item);
     }
 
-    let mut cursor_budget = PaginationBudget::with_limits(PaginationLimits {
+    let cursor_budget = PaginationBudget::with_limits(PaginationLimits {
         pages: 1,
         items: limits.max_items,
         serialized_bytes: limits.max_serialized_bytes,
         cursor_bytes: MAX_PAGINATION_CURSOR_BYTES,
     });
     let validated_next_cursor = cursor_budget.admit_next_cursor(next_cursor)?;
-    if request_cursor.is_some() && request_cursor == validated_next_cursor.as_deref() {
-        return Err(McpError::internal_error(
-            PAGINATION_CURSOR_NO_PROGRESS_ERROR,
-        ));
-    }
     let peer_has_more = validated_next_cursor.is_some();
     let next_cursor = if local_truncated {
         None
@@ -17667,8 +17687,8 @@ impl Client {
     /// Sends one prepared request under an optional operation-wide deadline.
     ///
     /// Ordinary public requests retain their existing per-request deadline
-    /// behavior. Multi-round MRTR passes one immutable operation deadline so
-    /// no continuation can restart the absolute response-wait budget.
+    /// behavior. MRTR and automatic pagination pass one immutable operation
+    /// deadline so no continuation can restart the absolute response-wait budget.
     fn send_prepared_request_with_cx(
         &mut self,
         cx: &Cx,
@@ -17682,9 +17702,7 @@ impl Client {
             return Err(McpError::request_cancelled());
         }
         if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return Err(McpError::internal_error(
-                "MRTR operation absolute deadline elapsed",
-            ));
+            return Err(request_timeout_error(RequestTimeoutSource::Absolute));
         }
         let id = self.next_request_id()?;
 
@@ -18303,22 +18321,37 @@ impl Client {
         semantic_parameters: serde_json::Value,
         cursor: Option<&str>,
         result_set: FinalCacheResultSet,
+        pagination: Option<&PaginationBudget>,
         fetch: F,
     ) -> McpResult<CoreResult>
     where
         F: FnOnce(&mut Self) -> McpResult<CoreResult>,
     {
+        if let Some(pagination) = pagination {
+            pagination.check_deadline()?;
+        }
         self.last_final_cache_page = None;
         if self.session.selected_era() != Some(ProtocolEra::Modern2026) {
             return fetch(self);
         }
 
-        self.drain_final_cache_invalidations()?;
+        self.drain_final_cache_invalidations(pagination)?;
         let key = self.final_cache_key(method, semantic_parameters, cursor, result_set)?;
-        match self.final_result_cache.lookup_page_at(&key, Instant::now()) {
-            FinalCachePageLookup::Fresh(page) => {
+        // A present nextCursor requires another peer page even when its opaque
+        // token repeats. Reusing a prior page here can trap a stateful cursor
+        // in a cached loop. Only the first page of an automatic traversal may
+        // read from cache; subsequent pages still populate the cache and carry
+        // the same generation/scope provenance as ordinary page requests.
+        let lookup = pagination
+            .is_none_or(|pagination| pagination.pages == 1)
+            .then(|| self.final_result_cache.lookup_page_at(&key, Instant::now()));
+        match lookup {
+            Some(FinalCachePageLookup::Fresh(page)) => {
                 if self.cx.checkpoint().is_err() {
                     return Err(McpError::request_cancelled());
+                }
+                if let Some(pagination) = pagination {
+                    pagination.check_deadline()?;
                 }
                 self.last_final_cache_page = Some(FinalCachePageState {
                     generation: page.generation,
@@ -18327,7 +18360,12 @@ impl Client {
                 });
                 Ok(page.result)
             }
-            FinalCachePageLookup::Miss(miss) => {
+            lookup => {
+                let miss = match lookup {
+                    Some(FinalCachePageLookup::Miss(miss)) => Some(miss),
+                    None => None,
+                    Some(FinalCachePageLookup::Fresh(_)) => unreachable!(),
+                };
                 let generation = self.final_result_cache.begin_fetch(key.result_set());
                 let result = match fetch(self) {
                     Ok(result) => result,
@@ -18339,6 +18377,9 @@ impl Client {
                         return Err(error);
                     }
                 };
+                if let Some(pagination) = pagination {
+                    pagination.check_deadline()?;
+                }
                 let scope = final_cache_hints(&result).map(|(_, scope)| scope);
                 let receipt = self
                     .last_core_result_receipt
@@ -18356,7 +18397,7 @@ impl Client {
                 let miss = if invalidated_during_fetch {
                     Some(FinalCacheMiss::Invalidated)
                 } else {
-                    Some(miss)
+                    miss
                 };
                 if let Some(scope) = scope {
                     self.last_final_cache_page = Some(FinalCachePageState {
@@ -18370,7 +18411,10 @@ impl Client {
         }
     }
 
-    fn drain_final_cache_invalidations(&mut self) -> McpResult<()> {
+    fn drain_final_cache_invalidations(
+        &mut self,
+        pagination: Option<&PaginationBudget>,
+    ) -> McpResult<()> {
         if self.cx.checkpoint().is_err() {
             return Err(McpError::request_cancelled());
         }
@@ -18380,10 +18424,18 @@ impl Client {
             let cx = self.cx.clone();
             let deadline = Instant::now() + FINAL_CACHE_NOTIFICATION_DRAIN_WINDOW;
             loop {
-                let receive_deadline = self.reverse_callback_poll_deadline(deadline);
+                if let Some(pagination) = pagination {
+                    pagination.check_deadline()?;
+                }
+                let receive_deadline = self.reverse_callback_poll_deadline(
+                    pagination.map_or(deadline, |pagination| deadline.min(pagination.deadline)),
+                );
                 let (frame, _) = match self.recv_next_child_frame(&cx, Some(receive_deadline)) {
                     Ok(received) => received,
                     Err(TransportError::ReceiveDeadlineExceeded) if !self.transport_is_closed() => {
+                        if let Some(pagination) = pagination {
+                            pagination.check_deadline()?;
+                        }
                         if receive_deadline < deadline {
                             self.drain_completed_reverse_callbacks()
                                 .map_err(|error| self.terminate_connection(error))?;
@@ -18404,9 +18456,48 @@ impl Client {
 
         #[cfg(not(unix))]
         {
+            if let Some(pagination) = pagination {
+                pagination.check_deadline()?;
+            }
             self.final_result_cache.clear();
             Ok(())
         }
+    }
+
+    /// Fetches one automatic-list page within the original traversal deadline.
+    fn request_paginated_catalog_page(
+        &mut self,
+        result_set: FinalCacheResultSet,
+        cursor: Option<&str>,
+        include_tags: Option<&Vec<String>>,
+        exclude_tags: Option<&Vec<String>>,
+        budget: &PaginationBudget,
+    ) -> McpResult<CoreResult> {
+        let method = match &result_set {
+            FinalCacheResultSet::Tools => "tools/list",
+            FinalCacheResultSet::Resources => "resources/list",
+            FinalCacheResultSet::ResourceTemplates => "resources/templates/list",
+            FinalCacheResultSet::Prompts => "prompts/list",
+            FinalCacheResultSet::ServerDiscovery | FinalCacheResultSet::Resource(_) => {
+                return Err(McpError::invalid_params(
+                    "Automatic pagination requires a catalog result set",
+                ));
+            }
+        };
+        let parameters = list_catalog_wire_parameters(cursor, include_tags, exclude_tags);
+        let semantic_parameters = list_catalog_semantic_parameters(include_tags, exclude_tags);
+        let cx = self.cx.clone();
+        let deadline = budget.deadline;
+        self.cached_final_core_request(
+            method,
+            semantic_parameters,
+            cursor,
+            result_set,
+            Some(budget),
+            move |client| {
+                client.send_typed_core_request_with_cx_until(&cx, deadline, method, parameters)
+            },
+        )
     }
 
     /// Routes one frame admitted by the selected connection reader.
@@ -18488,7 +18579,8 @@ impl Client {
         let Some(page) = self.last_final_cache_page.take() else {
             return false;
         };
-        let generation_drift = page.generation != self.final_result_cache.begin_fetch(result_set);
+        let generation_drift = page.generation != self.final_result_cache.begin_fetch(result_set)
+            || baseline.is_some_and(|(generation, _)| generation != page.generation);
         let invalidated_during_fetch = matches!(page.miss, Some(FinalCacheMiss::Invalidated));
         let scope_drift = baseline.is_some_and(|(_, scope)| scope != page.scope);
         if generation_drift || invalidated_during_fetch || scope_drift {
@@ -19572,6 +19664,7 @@ impl Client {
             semantic_parameters,
             cursor.as_deref(),
             FinalCacheResultSet::Tools,
+            None,
             move |client| client.send_typed_core_request("tools/list", params),
         )
     }
@@ -19723,6 +19816,13 @@ impl Client {
     /// legacy-compatible tool vector. Use [`Self::list_tools_typed`] to retain
     /// the negotiated, single-page core result.
     ///
+    /// The complete traversal, including its one permitted cache rebuild, has
+    /// bounded page/item/byte counts and an absolute response-wait deadline of
+    /// at most five minutes or the configured request absolute timeout, whichever
+    /// is earlier. A continuation cannot reset that deadline. Blocking sends
+    /// and later connection teardown retain the transport's existing limits.
+    /// Empty or repeated peer cursors are passed back verbatim.
+    ///
     /// # Errors
     ///
     /// Returns an error if the request fails.
@@ -19736,21 +19836,29 @@ impl Client {
         let include_tags = params.include_tags.clone();
         let exclude_tags = params.exclude_tags.clone();
         let mut restarts = 0;
+        let mut budget = PaginationBudget::for_request(self.timeout_policy);
         'rebuild: loop {
             let mut all = Vec::new();
-            let mut cursor: Option<String> = params.cursor.clone();
-            let mut budget = PaginationBudget::new();
+            let mut cursor = if restarts == 0 {
+                bounded_cursor_parameter(params.cursor.as_deref())?
+            } else {
+                None
+            };
             let mut baseline = None;
 
             loop {
                 budget.begin_page()?;
-                let page_params = ListToolsParams {
-                    cursor: cursor.clone(),
-                    include_tags: include_tags.clone(),
-                    exclude_tags: exclude_tags.clone(),
-                };
-                let (tools, next_cursor) =
-                    convenience_tools_page(self.list_tools_typed_with_params(page_params)?)?;
+                let (tools, next_cursor) = convenience_tools_page(
+                    self.request_paginated_catalog_page(
+                        FinalCacheResultSet::Tools,
+                        cursor.as_deref(),
+                        include_tags.as_ref(),
+                        exclude_tags.as_ref(),
+                        &budget,
+                    )?,
+                )?;
+                budget.account_page(&tools)?;
+                let next_cursor = budget.admit_next_cursor(next_cursor)?;
                 if self.final_list_restart_needed(&FinalCacheResultSet::Tools, &mut baseline) {
                     restarts += 1;
                     if restarts > 1 {
@@ -19760,9 +19868,9 @@ impl Client {
                     }
                     continue 'rebuild;
                 }
-                budget.account_page(&tools)?;
                 all.extend(tools);
-                cursor = budget.admit_next_cursor(next_cursor)?;
+                cursor = next_cursor;
+                budget.check_deadline()?;
                 if cursor.is_none() {
                     return Ok(all);
                 }
@@ -19780,7 +19888,7 @@ impl Client {
     /// # Errors
     ///
     /// Returns an error if the caller's limits or cursor are invalid, the
-    /// request fails, or the peer returns an oversized or non-advancing cursor.
+    /// request fails, or the peer returns an oversized cursor.
     pub fn list_tools_page(
         &mut self,
         cursor: Option<&str>,
@@ -19810,7 +19918,7 @@ impl Client {
         };
         let (tools, next_cursor) =
             convenience_tools_page(self.list_tools_typed_with_params(params)?)?;
-        bounded_list_page(tools, request_cursor.as_deref(), next_cursor, limits)
+        bounded_list_page(tools, next_cursor, limits)
     }
 
     /// Drives one stdio MRTR operation with one caller context and one
@@ -20707,11 +20815,14 @@ impl Client {
             semantic_parameters,
             cursor.as_deref(),
             FinalCacheResultSet::Resources,
+            None,
             move |client| client.send_typed_core_request("resources/list", params),
         )
     }
 
     /// Lists available resources.
+    ///
+    /// Uses the same operation-wide count and deadline bounds as [`Self::list_tools`].
     ///
     /// # Errors
     ///
@@ -20729,22 +20840,29 @@ impl Client {
         let include_tags = params.include_tags.clone();
         let exclude_tags = params.exclude_tags.clone();
         let mut restarts = 0;
+        let mut budget = PaginationBudget::for_request(self.timeout_policy);
         'rebuild: loop {
             let mut all = Vec::new();
-            let mut cursor: Option<String> = params.cursor.clone();
-            let mut budget = PaginationBudget::new();
+            let mut cursor = if restarts == 0 {
+                bounded_cursor_parameter(params.cursor.as_deref())?
+            } else {
+                None
+            };
             let mut baseline = None;
 
             loop {
                 budget.begin_page()?;
-                let page_params = ListResourcesParams {
-                    cursor: cursor.clone(),
-                    include_tags: include_tags.clone(),
-                    exclude_tags: exclude_tags.clone(),
-                };
                 let (resources, next_cursor) = convenience_resources_page(
-                    self.list_resources_typed_with_params(page_params)?,
+                    self.request_paginated_catalog_page(
+                        FinalCacheResultSet::Resources,
+                        cursor.as_deref(),
+                        include_tags.as_ref(),
+                        exclude_tags.as_ref(),
+                        &budget,
+                    )?,
                 )?;
+                budget.account_page(&resources)?;
+                let next_cursor = budget.admit_next_cursor(next_cursor)?;
                 if self.final_list_restart_needed(&FinalCacheResultSet::Resources, &mut baseline) {
                     restarts += 1;
                     if restarts > 1 {
@@ -20754,9 +20872,9 @@ impl Client {
                     }
                     continue 'rebuild;
                 }
-                budget.account_page(&resources)?;
                 all.extend(resources);
-                cursor = budget.admit_next_cursor(next_cursor)?;
+                cursor = next_cursor;
+                budget.check_deadline()?;
                 if cursor.is_none() {
                     return Ok(all);
                 }
@@ -20769,7 +20887,7 @@ impl Client {
     /// # Errors
     ///
     /// Returns an error if the caller's limits or cursor are invalid, the
-    /// request fails, or the peer returns an oversized or non-advancing cursor.
+    /// request fails, or the peer returns an oversized cursor.
     pub fn list_resources_page(
         &mut self,
         cursor: Option<&str>,
@@ -20799,7 +20917,7 @@ impl Client {
         };
         let (resources, next_cursor) =
             convenience_resources_page(self.list_resources_typed_with_params(params)?)?;
-        bounded_list_page(resources, request_cursor.as_deref(), next_cursor, limits)
+        bounded_list_page(resources, next_cursor, limits)
     }
 
     /// Lists one page of resource templates and returns its negotiated core
@@ -20835,11 +20953,14 @@ impl Client {
             semantic_parameters,
             cursor.as_deref(),
             FinalCacheResultSet::ResourceTemplates,
+            None,
             move |client| client.send_typed_core_request("resources/templates/list", params),
         )
     }
 
     /// Lists available resource templates.
+    ///
+    /// Uses the same operation-wide count and deadline bounds as [`Self::list_tools`].
     ///
     /// # Errors
     ///
@@ -20857,22 +20978,29 @@ impl Client {
         let include_tags = params.include_tags.clone();
         let exclude_tags = params.exclude_tags.clone();
         let mut restarts = 0;
+        let mut budget = PaginationBudget::for_request(self.timeout_policy);
         'rebuild: loop {
             let mut all = Vec::new();
-            let mut cursor: Option<String> = params.cursor.clone();
-            let mut budget = PaginationBudget::new();
+            let mut cursor = if restarts == 0 {
+                bounded_cursor_parameter(params.cursor.as_deref())?
+            } else {
+                None
+            };
             let mut baseline = None;
 
             loop {
                 budget.begin_page()?;
-                let page_params = ListResourceTemplatesParams {
-                    cursor: cursor.clone(),
-                    include_tags: include_tags.clone(),
-                    exclude_tags: exclude_tags.clone(),
-                };
                 let (resource_templates, next_cursor) = convenience_resource_templates_page(
-                    self.list_resource_templates_typed_with_params(page_params)?,
+                    self.request_paginated_catalog_page(
+                        FinalCacheResultSet::ResourceTemplates,
+                        cursor.as_deref(),
+                        include_tags.as_ref(),
+                        exclude_tags.as_ref(),
+                        &budget,
+                    )?,
                 )?;
+                budget.account_page(&resource_templates)?;
+                let next_cursor = budget.admit_next_cursor(next_cursor)?;
                 if self.final_list_restart_needed(
                     &FinalCacheResultSet::ResourceTemplates,
                     &mut baseline,
@@ -20885,9 +21013,9 @@ impl Client {
                     }
                     continue 'rebuild;
                 }
-                budget.account_page(&resource_templates)?;
                 all.extend(resource_templates);
-                cursor = budget.admit_next_cursor(next_cursor)?;
+                cursor = next_cursor;
+                budget.check_deadline()?;
                 if cursor.is_none() {
                     return Ok(all);
                 }
@@ -20900,7 +21028,7 @@ impl Client {
     /// # Errors
     ///
     /// Returns an error if the caller's limits or cursor are invalid, the
-    /// request fails, or the peer returns an oversized or non-advancing cursor.
+    /// request fails, or the peer returns an oversized cursor.
     pub fn list_resource_templates_page(
         &mut self,
         cursor: Option<&str>,
@@ -20933,7 +21061,6 @@ impl Client {
         )?;
         bounded_list_page(
             resource_templates,
-            request_cursor.as_deref(),
             next_cursor,
             limits,
         )
@@ -21008,6 +21135,7 @@ impl Client {
             serde_json::json!({"uri": uri}),
             None,
             FinalCacheResultSet::Resource(params.uri.clone()),
+            None,
             move |client| client.send_typed_core_request("resources/read", params),
         )
     }
@@ -21154,11 +21282,14 @@ impl Client {
             semantic_parameters,
             cursor.as_deref(),
             FinalCacheResultSet::Prompts,
+            None,
             move |client| client.send_typed_core_request("prompts/list", params),
         )
     }
 
     /// Lists available prompts.
+    ///
+    /// Uses the same operation-wide count and deadline bounds as [`Self::list_tools`].
     ///
     /// # Errors
     ///
@@ -21176,21 +21307,29 @@ impl Client {
         let include_tags = params.include_tags.clone();
         let exclude_tags = params.exclude_tags.clone();
         let mut restarts = 0;
+        let mut budget = PaginationBudget::for_request(self.timeout_policy);
         'rebuild: loop {
             let mut all = Vec::new();
-            let mut cursor: Option<String> = params.cursor.clone();
-            let mut budget = PaginationBudget::new();
+            let mut cursor = if restarts == 0 {
+                bounded_cursor_parameter(params.cursor.as_deref())?
+            } else {
+                None
+            };
             let mut baseline = None;
 
             loop {
                 budget.begin_page()?;
-                let page_params = ListPromptsParams {
-                    cursor: cursor.clone(),
-                    include_tags: include_tags.clone(),
-                    exclude_tags: exclude_tags.clone(),
-                };
-                let (prompts, next_cursor) =
-                    convenience_prompts_page(self.list_prompts_typed_with_params(page_params)?)?;
+                let (prompts, next_cursor) = convenience_prompts_page(
+                    self.request_paginated_catalog_page(
+                        FinalCacheResultSet::Prompts,
+                        cursor.as_deref(),
+                        include_tags.as_ref(),
+                        exclude_tags.as_ref(),
+                        &budget,
+                    )?,
+                )?;
+                budget.account_page(&prompts)?;
+                let next_cursor = budget.admit_next_cursor(next_cursor)?;
                 if self.final_list_restart_needed(&FinalCacheResultSet::Prompts, &mut baseline) {
                     restarts += 1;
                     if restarts > 1 {
@@ -21200,9 +21339,9 @@ impl Client {
                     }
                     continue 'rebuild;
                 }
-                budget.account_page(&prompts)?;
                 all.extend(prompts);
-                cursor = budget.admit_next_cursor(next_cursor)?;
+                cursor = next_cursor;
+                budget.check_deadline()?;
                 if cursor.is_none() {
                     return Ok(all);
                 }
@@ -21215,7 +21354,7 @@ impl Client {
     /// # Errors
     ///
     /// Returns an error if the caller's limits or cursor are invalid, the
-    /// request fails, or the peer returns an oversized or non-advancing cursor.
+    /// request fails, or the peer returns an oversized cursor.
     pub fn list_prompts_page(
         &mut self,
         cursor: Option<&str>,
@@ -21245,7 +21384,7 @@ impl Client {
         };
         let (prompts, next_cursor) =
             convenience_prompts_page(self.list_prompts_typed_with_params(params)?)?;
-        bounded_list_page(prompts, request_cursor.as_deref(), next_cursor, limits)
+        bounded_list_page(prompts, next_cursor, limits)
     }
 
     /// Gets a prompt and returns its negotiated, method-aware core result.
@@ -35761,11 +35900,12 @@ exec sleep 30
         assert_eq!(MAX_AUTO_PAGINATION_ITEMS, 100_000);
         assert_eq!(MAX_AUTO_PAGINATION_SERIALIZED_BYTES, 64 * 1_024 * 1_024);
         assert_eq!(MAX_PAGINATION_CURSOR_BYTES, 4 * 1_024);
+        assert_eq!(MAX_AUTO_PAGINATION_DURATION, Duration::from_mins(5));
     }
 
     #[test]
-    fn pagination_budget_rejects_oversized_and_repeated_cursors_without_echoing_them() {
-        let mut budget = PaginationBudget::new();
+    fn pagination_budget_rejects_oversized_cursors_without_echoing_them() {
+        let budget = PaginationBudget::new();
         let exact_limit = "x".repeat(MAX_PAGINATION_CURSOR_BYTES);
         assert_eq!(
             budget
@@ -35785,17 +35925,67 @@ exec sleep 30
         assert!(!oversized.message.contains(&oversized_canary));
         assert!(!oversized.message.contains("OVERSIZED-CURSOR-SECRET"));
         assert!(!oversized.message.chars().any(char::is_control));
+    }
 
-        let repeated_canary = "REPEATED-CURSOR-SECRET\n\u{1b}".to_string();
+    #[test]
+    fn pagination_budget_preserves_empty_and_repeated_cursors_until_a_count_bound() {
+        for cursor in ["", "REPEATED-CURSOR-SECRET\n\u{1b}", " opaque token "] {
+            let mut budget = PaginationBudget::with_limits(PaginationLimits {
+                pages: 3,
+                ..PaginationLimits::DEFAULT
+            });
+            for _ in 0..3 {
+                budget.begin_page().expect("page count permits continuation");
+                budget.account_page::<u8>(&[]).expect("empty pages count");
+                assert_eq!(
+                    budget.admit_next_cursor(Some(cursor.to_owned())).unwrap(),
+                    Some(cursor.to_owned()),
+                    "cursor bytes survive every repetition unchanged"
+                );
+            }
+            let error = budget.begin_page().expect_err("only the page bound stops this peer");
+            assert_eq!(error.message, PAGINATION_PAGE_LIMIT_ERROR);
+            assert_eq!(budget.pages, 3);
+            assert_eq!(budget.serialized_bytes, 6);
+            assert!(!error.message.contains("CURSOR-SECRET"));
+            assert_eq!(budget.admit_next_cursor(None).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn pagination_budget_deadline_is_absolute_and_preserves_rejected_state() {
+        let mut budget = PaginationBudget::new();
+        let deadline = budget.deadline;
         budget
-            .admit_next_cursor(Some(repeated_canary.clone()))
-            .expect("first cursor occurrence is admitted");
-        let repeated = budget
-            .admit_next_cursor(Some(repeated_canary.clone()))
-            .expect_err("cursor cycle must fail closed");
-        assert_eq!(repeated.message, PAGINATION_CURSOR_CYCLE_ERROR);
-        assert!(!repeated.message.contains(&repeated_canary));
-        assert!(!repeated.message.chars().any(char::is_control));
+            .check_deadline_at(deadline - Duration::from_nanos(1))
+            .expect("the last pre-deadline tick is admitted");
+        for instant in [deadline, deadline + Duration::from_nanos(1)] {
+            let error = budget.check_deadline_at(instant).expect_err("expiry is inclusive");
+            assert_eq!(error.message, PAGINATION_DEADLINE_ERROR);
+            assert_eq!(error.data, Some(serde_json::json!({"timeoutSource": "absolute"})));
+        }
+        budget.deadline = Instant::now() - Duration::from_millis(1);
+        assert_eq!(budget.begin_page().unwrap_err().message, PAGINATION_DEADLINE_ERROR);
+        assert_eq!(budget.account_page(&[1_u8]).unwrap_err().message, PAGINATION_DEADLINE_ERROR);
+        assert_eq!((budget.pages, budget.items, budget.serialized_bytes), (0, 0, 0));
+
+        let strict = PaginationBudget::for_request(
+            RequestTimeoutPolicy::new(Duration::from_millis(1), Duration::from_millis(2))
+                .unwrap(),
+        );
+        assert!(strict.deadline <= Instant::now() + Duration::from_millis(2));
+        let started = Instant::now();
+        let capped = PaginationBudget::for_request(
+            RequestTimeoutPolicy::new(Duration::from_secs(1), MAX_CLIENT_ABSOLUTE_TIMEOUT)
+                .unwrap(),
+        );
+        assert!(capped.deadline >= started + MAX_AUTO_PAGINATION_DURATION);
+        assert!(capped.deadline <= Instant::now() + MAX_AUTO_PAGINATION_DURATION);
+        let configured = PaginationBudget::for_request(
+            RequestTimeoutPolicy::from_application_timeout_ms(3_600_000).unwrap(),
+        );
+        assert!(configured.deadline <= Instant::now() + MAX_AUTO_PAGINATION_DURATION,
+            "trusted application request durations cannot disable the traversal ceiling");
     }
 
     #[test]
@@ -35869,7 +36059,6 @@ exec sleep 30
     fn bounded_list_page_suppresses_peer_cursor_after_local_item_truncation() {
         let page = bounded_list_page(
             vec![1_u8, 2, 3],
-            None,
             Some("next-page".to_owned()),
             ListPageLimits::new(2, 64),
         )
@@ -35882,10 +36071,9 @@ exec sleep 30
     }
 
     #[test]
-    fn bounded_list_page_preserves_advancing_peer_cursor_when_page_is_complete() {
+    fn bounded_list_page_preserves_peer_cursor_when_page_is_complete() {
         let page = bounded_list_page(
             vec![1_u8, 2],
-            Some("current-page"),
             Some("next-page".to_owned()),
             ListPageLimits::new(2, 64),
         )
@@ -35902,7 +36090,6 @@ exec sleep 30
         let page = bounded_list_page(
             vec!["small", "this item is too large"],
             None,
-            None,
             ListPageLimits::new(8, 10),
         )
         .expect("bounded page");
@@ -35916,30 +36103,30 @@ exec sleep 30
 
     #[test]
     fn bounded_list_page_counts_brackets_commas_and_items_in_byte_budget() {
-        let empty = bounded_list_page(Vec::<u8>::new(), None, None, ListPageLimits::new(0, 2))
+        let empty = bounded_list_page(Vec::<u8>::new(), None, ListPageLimits::new(0, 2))
             .expect("empty vector exactly fits two bytes");
         assert_eq!(empty.items.len(), 0);
         assert!(!empty.local_truncated);
         assert_eq!(measure_serialized_bytes(&empty.items, 2).unwrap(), 2);
 
         let bracket_only_budget =
-            bounded_list_page(vec![0_u8], None, None, ListPageLimits::new(1, 2))
+            bounded_list_page(vec![0_u8], None, ListPageLimits::new(1, 2))
                 .expect("the retained empty vector still fits");
         assert_eq!(bracket_only_budget.items.len(), 0);
         assert!(bracket_only_budget.local_truncated);
 
-        let single = bounded_list_page(vec![0_u8], None, None, ListPageLimits::new(1, 3))
+        let single = bounded_list_page(vec![0_u8], None, ListPageLimits::new(1, 3))
             .expect("[0] exactly fits three bytes");
         assert_eq!(single.items, vec![0]);
         assert!(!single.local_truncated);
 
-        let pair = bounded_list_page(vec![0_u8, 1], None, None, ListPageLimits::new(2, 5))
+        let pair = bounded_list_page(vec![0_u8, 1], None, ListPageLimits::new(2, 5))
             .expect("[0,1] exactly fits five bytes");
         assert_eq!(pair.items, vec![0, 1]);
         assert!(!pair.local_truncated);
 
         let missing_comma_budget =
-            bounded_list_page(vec![0_u8, 1], None, None, ListPageLimits::new(2, 4))
+            bounded_list_page(vec![0_u8, 1], None, ListPageLimits::new(2, 4))
                 .expect("the first item still fits");
         assert_eq!(missing_comma_budget.items, vec![0]);
         assert!(missing_comma_budget.local_truncated);
@@ -35951,7 +36138,7 @@ exec sleep 30
 
     #[test]
     fn bounded_list_page_accepts_zero_items_but_rejects_sub_empty_vec_byte_limits() {
-        let zero_items = bounded_list_page(vec![0_u8], None, None, ListPageLimits::new(0, 2))
+        let zero_items = bounded_list_page(vec![0_u8], None, ListPageLimits::new(0, 2))
             .expect("zero retained items is a valid caller budget");
         assert_eq!(zero_items.items.len(), 0);
         assert!(zero_items.local_truncated);
@@ -35963,7 +36150,7 @@ exec sleep 30
             assert_eq!(error.code, McpErrorCode::InvalidParams);
             assert_eq!(error.message, LIST_PAGE_BYTE_LIMIT_ERROR);
 
-            let internal_error = bounded_list_page::<u8>(Vec::new(), None, None, limits)
+            let internal_error = bounded_list_page::<u8>(Vec::new(), None, limits)
                 .expect_err("the bounded-page helper must enforce the same contract");
             assert_eq!(internal_error.code, McpErrorCode::InvalidParams);
             assert_eq!(internal_error.message, LIST_PAGE_BYTE_LIMIT_ERROR);
@@ -35975,7 +36162,6 @@ exec sleep 30
         let cursor = format!("CURSOR-SECRET{}", "x".repeat(MAX_PAGINATION_CURSOR_BYTES));
         let error = bounded_list_page::<u8>(
             Vec::new(),
-            None,
             Some(cursor.clone()),
             ListPageLimits::new(1, 16),
         )
@@ -35991,18 +36177,22 @@ exec sleep 30
     }
 
     #[test]
-    fn bounded_list_page_rejects_a_non_advancing_peer_cursor_without_echoing_it() {
-        let cursor = "NO-PROGRESS-CURSOR-SECRET";
-        let error = bounded_list_page::<u8>(
-            Vec::new(),
-            Some(cursor),
-            Some(cursor.to_owned()),
-            ListPageLimits::new(1, 16),
-        )
-        .expect_err("the response cursor must advance beyond the request cursor");
-
-        assert_eq!(error.message, PAGINATION_CURSOR_NO_PROGRESS_ERROR);
-        assert!(!error.message.contains(cursor));
+    fn bounded_list_page_preserves_every_present_cursor_on_an_empty_page() {
+        for cursor in ["", "REPEATED-CURSOR-SECRET", " opaque token "] {
+            let page = bounded_list_page::<u8>(
+                Vec::new(),
+                Some(cursor.to_owned()),
+                ListPageLimits::new(1, 16),
+            )
+            .expect("present cursors do not depend on item count or token contents");
+            assert_eq!(page.next_cursor.as_deref(), Some(cursor));
+            assert!(page.peer_has_more);
+            assert!(!page.local_truncated);
+        }
+        let page = bounded_list_page::<u8>(Vec::new(), None, ListPageLimits::new(1, 16))
+            .expect("absence completes the peer list");
+        assert_eq!(page.next_cursor, None);
+        assert!(!page.peer_has_more);
     }
 
     #[test]
@@ -36031,6 +36221,307 @@ exec sleep 30
         assert!(!client.is_initialized());
         assert!(client.initialization_error.is_none());
         assert!(client.child.is_some());
+    }
+
+    #[cfg(unix)]
+    fn pagination_catalog_entry(method: &str, name: &str) -> serde_json::Value {
+        match method {
+            "tools/list" => serde_json::json!({"name": name, "inputSchema": {"type": "object"}}),
+            "resources/list" => serde_json::json!({"name": name, "uri": format!("test://{name}")}),
+            "resources/templates/list" => serde_json::json!({
+                "name": name,
+                "uriTemplate": format!("test://{name}/{{value}}"),
+            }),
+            "prompts/list" => serde_json::json!({"name": name}),
+            _ => panic!("test method must be a paginated catalog"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn pagination_catalog_names(client: &mut Client, method: &str) -> McpResult<Vec<String>> {
+        match method {
+            "tools/list" => client.list_tools().map(|items| items.into_iter().map(|item| item.name).collect()),
+            "resources/list" => client.list_resources().map(|items| items.into_iter().map(|item| item.name).collect()),
+            "resources/templates/list" => client.list_resource_templates().map(|items| items.into_iter().map(|item| item.name).collect()),
+            "prompts/list" => client.list_prompts().map(|items| items.into_iter().map(|item| item.name).collect()),
+            _ => panic!("test method must be a paginated catalog"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_catalog_lists_preserve_repeated_empty_and_opaque_cursors() {
+        for (method, field) in [
+            ("tools/list", "tools"),
+            ("resources/list", "resources"),
+            ("resources/templates/list", "resourceTemplates"),
+            ("prompts/list", "prompts"),
+        ] {
+            let first = pagination_catalog_entry(method, "first");
+            let second = pagination_catalog_entry(method, "second");
+            let third = pagination_catalog_entry(method, "third");
+            let last = pagination_catalog_entry(method, "last");
+            let script = format!(r#"
+                IFS= read -r request || exit 1
+                case "$request" in *'"method":"{method}"'*) ;; *) exit 1 ;; esac
+                case "$request" in *'"cursor"'*) exit 1 ;; esac
+                printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"resultType":"complete","{field}":[{first}],"nextCursor":"","ttlMs":0,"cacheScope":"private"}}}}'
+                IFS= read -r request || exit 1
+                case "$request" in *'"cursor":""'*) ;; *) exit 1 ;; esac
+                printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"resultType":"complete","{field}":[],"nextCursor":"","ttlMs":0,"cacheScope":"private"}}}}'
+                IFS= read -r request || exit 1
+                case "$request" in *'"cursor":""'*) ;; *) exit 1 ;; esac
+                printf '%s\n' '{{"jsonrpc":"2.0","id":4,"result":{{"resultType":"complete","{field}":[{second},{third}],"nextCursor":" opaque token ","ttlMs":0,"cacheScope":"private"}}}}'
+                IFS= read -r request || exit 1
+                case "$request" in *'"cursor":" opaque token "'*) ;; *) exit 1 ;; esac
+                printf '%s\n' '{{"jsonrpc":"2.0","id":5,"result":{{"resultType":"complete","{field}":[{last}],"ttlMs":0,"cacheScope":"private"}}}}'
+                IFS= read -r request || exit 1
+                case "$request" in *'"method":"ping"'*) ;; *) exit 1 ;; esac
+                printf '%s\n' '{{"jsonrpc":"2.0","id":6,"result":{{"resultType":"complete"}}}}'
+                exec sleep 2
+            "#);
+            let mut client = make_shell_scripted_initialized_client_for_version(
+                &script,
+                Duration::from_secs(2),
+                MODERN_PROTOCOL_VERSION,
+            );
+            let names = pagination_catalog_names(&mut client, method)
+                .expect("all four list methods continue through repeated/empty cursors and empty pages");
+            assert_eq!(names, ["first", "second", "third", "last"]);
+            assert_eq!(client.next_id.load(Ordering::SeqCst), 6);
+            client.ping().expect("cursor absence stops before another list request");
+            client.close().expect("opaque pagination peer cleanup");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_catalog_pages_preserve_the_same_cursor_supplied_by_the_caller() {
+        for (method, field) in [
+            ("tools/list", "tools"),
+            ("resources/list", "resources"),
+            ("resources/templates/list", "resourceTemplates"),
+            ("prompts/list", "prompts"),
+        ] {
+            let script = format!(r#"
+                IFS= read -r request || exit 1
+                case "$request" in *'"cursor":"repeat"'*) ;; *) exit 1 ;; esac
+                printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"resultType":"complete","{field}":[],"nextCursor":"repeat","ttlMs":0,"cacheScope":"private"}}}}'
+                exec sleep 2
+            "#);
+            let mut client = make_shell_scripted_initialized_client_for_version(
+                &script,
+                Duration::from_secs(2),
+                MODERN_PROTOCOL_VERSION,
+            );
+            let limits = ListPageLimits::new(1, 2);
+            let cursor = match method {
+                "tools/list" => client.list_tools_page(Some("repeat"), limits).unwrap().next_cursor,
+                "resources/list" => client.list_resources_page(Some("repeat"), limits).unwrap().next_cursor,
+                "resources/templates/list" => client.list_resource_templates_page(Some("repeat"), limits).unwrap().next_cursor,
+                "prompts/list" => client.list_prompts_page(Some("repeat"), limits).unwrap().next_cursor,
+                _ => unreachable!(),
+            };
+            assert_eq!(cursor.as_deref(), Some("repeat"));
+            assert_eq!(client.next_id.load(Ordering::SeqCst), 3);
+            client.close().expect("single opaque page cleanup");
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_automatic_catalog_deadline(late_second_page: bool) {
+        for (method, field) in [
+            ("tools/list", "tools"),
+            ("resources/list", "resources"),
+            ("resources/templates/list", "resourceTemplates"),
+            ("prompts/list", "prompts"),
+        ] {
+            let delay = if late_second_page { "0.35" } else { "0.005" };
+            let cancellation_read = if late_second_page {
+                r#"IFS= read -r control || exit 1
+                   case "$control" in *'"method":"notifications/cancelled"'*) ;; *) exit 1 ;; esac
+                   case "$control" in *'"requestId":3'*) ;; *) exit 1 ;; esac"#
+            } else {
+                ""
+            };
+            let script = format!(r#"
+                IFS= read -r request || exit 1
+                case "$request" in *'"method":"{method}"'*) ;; *) exit 1 ;; esac
+                sleep 0.35
+                printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"resultType":"complete","{field}":[],"nextCursor":"","ttlMs":0,"cacheScope":"private"}}}}'
+                IFS= read -r request || exit 1
+                case "$request" in *'"cursor":""'*) ;; *) exit 1 ;; esac
+                sleep {delay}
+                printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"resultType":"complete","{field}":[],"ttlMs":0,"cacheScope":"private"}}}}'
+                {cancellation_read}
+                IFS= read -r request || exit 1
+                case "$request" in *'"method":"ping"'*) ;; *) exit 1 ;; esac
+                printf '%s\n' '{{"jsonrpc":"2.0","id":4,"result":{{"resultType":"complete"}}}}'
+                exec sleep 2
+            "#);
+            let mut client = make_shell_scripted_initialized_client_for_version(
+                &script,
+                Duration::from_millis(550),
+                MODERN_PROTOCOL_VERSION,
+            );
+            let outcome = pagination_catalog_names(&mut client, method);
+            if late_second_page {
+                let error = outcome.expect_err("the second request cannot restart the first request's absolute budget");
+                assert_eq!(error.data, Some(serde_json::json!({"timeoutSource": "absolute"})));
+            } else {
+                assert!(outcome.expect("the same second page completes inside the original deadline").is_empty());
+            }
+            assert_eq!(client.next_id.load(Ordering::SeqCst), 4, "no automatic retry or third list request");
+            assert_eq!(client.responses.pending_len(), 0);
+            client.ping().expect("late tombstoned output cannot poison the next request; the peer sees exactly one matching cancellation only after timeout");
+            client.close().expect("deadline peer cleanup");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_catalog_lists_expire_while_waiting_for_the_second_page() {
+        assert_automatic_catalog_deadline(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_catalog_lists_accept_the_same_second_page_before_the_deadline() {
+        assert_automatic_catalog_deadline(false);
+    }
+
+    #[test]
+    fn automatic_catalog_expiry_prevents_request_allocation_and_cache_mutation() {
+        let mut client = make_closed_client(true);
+        let mut budget = PaginationBudget::new();
+        budget.deadline = Instant::now() - Duration::from_nanos(1);
+        let next_id = client.next_id.load(Ordering::SeqCst);
+        let generation = client.final_result_cache.begin_fetch(&FinalCacheResultSet::Tools);
+        let error = client.request_paginated_catalog_page(
+            FinalCacheResultSet::Tools,
+            None,
+            None,
+            None,
+            &budget,
+        ).expect_err("an expired traversal cannot send even its next page");
+        assert_eq!(error.message, PAGINATION_DEADLINE_ERROR);
+        assert_eq!(client.next_id.load(Ordering::SeqCst), next_id);
+        assert_eq!(client.final_result_cache.begin_fetch(&FinalCacheResultSet::Tools), generation);
+        assert_eq!(client.responses.pending_len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_catalog_continuations_fetch_even_when_the_opaque_cursor_is_cached() {
+        let script = r#"
+            IFS= read -r request || exit 1
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"nextCursor":"","ttlMs":10000,"cacheScope":"private"}}'
+            IFS= read -r request || exit 1
+            case "$request" in *'"cursor":""'*) ;; *) exit 1 ;; esac
+            printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","tools":[],"nextCursor":"","ttlMs":10000,"cacheScope":"private"}}'
+            IFS= read -r request || exit 1
+            case "$request" in *'"cursor":""'*) ;; *) exit 1 ;; esac
+            printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete","tools":[],"ttlMs":10000,"cacheScope":"private"}}'
+            exec sleep 2
+        "#;
+        let mut client = make_shell_scripted_initialized_client_for_version(
+            script,
+            Duration::from_secs(2),
+            MODERN_PROTOCOL_VERSION,
+        );
+        let mut budget = PaginationBudget::for_request(client.timeout_policy);
+        let mut cursor = None;
+        for expected_cursor in [Some(""), Some(""), None] {
+            budget.begin_page().unwrap();
+            let result = client.request_paginated_catalog_page(
+                FinalCacheResultSet::Tools,
+                cursor.as_deref(),
+                None,
+                None,
+                &budget,
+            ).expect("each continuation acquires a peer page despite a reusable cache key");
+            let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = result else {
+                panic!("the selected core list result is retained");
+            };
+            assert_eq!(result.payload.next_cursor.as_deref(), expected_cursor);
+            cursor = budget.admit_next_cursor(result.payload.next_cursor).unwrap();
+        }
+        assert_eq!(client.next_id.load(Ordering::SeqCst), 5);
+        assert_eq!(client.final_result_cache_stats().hits, 0);
+        assert_eq!(client.final_result_cache_stats().fills, 3);
+        let cached = client.list_tools_typed(Some(""))
+            .expect("ordinary typed single-page requests still consume the fresh final page cache");
+        assert!(matches!(cached, CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) if result.payload.next_cursor.is_none()));
+        assert_eq!(client.final_result_cache_stats().hits, 1);
+        assert_eq!(client.next_id.load(Ordering::SeqCst), 5);
+        client.close().expect("cached cursor peer cleanup");
+    }
+
+    #[cfg(unix)]
+    fn assert_automatic_catalog_rebuild_deadline(late_rebuild: bool) {
+        let delay = if late_rebuild { "0.35" } else { "0.005" };
+        let cancellation_read = if late_rebuild {
+            r#"IFS= read -r control || exit 1
+               case "$control" in *'"method":"notifications/cancelled"'*) ;; *) exit 1 ;; esac
+               case "$control" in *'"requestId":4'*) ;; *) exit 1 ;; esac"#
+        } else {
+            ""
+        };
+        let script = format!(r#"
+            IFS= read -r request || exit 1
+            case "$request" in *'"cursor":"initial"'*) ;; *) exit 1 ;; esac
+            sleep 0.35
+            printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"resultType":"complete","tools":[{{"name":"stale","inputSchema":{{"type":"object"}}}}],"nextCursor":"next","ttlMs":0,"cacheScope":"private"}}}}'
+            IFS= read -r request || exit 1
+            case "$request" in *'"cursor":"next"'*) ;; *) exit 1 ;; esac
+            printf '%s\n' '{{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}}'
+            printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}}}'
+            IFS= read -r request || exit 1
+            case "$request" in *'"method":"tools/list"'*) ;; *) exit 1 ;; esac
+            case "$request" in *'"cursor"'*) exit 1 ;; esac
+            case "$request" in *'"includeTags":["keep"]'*) ;; *) exit 1 ;; esac
+            case "$request" in *'"excludeTags":["skip"]'*) ;; *) exit 1 ;; esac
+            sleep {delay}
+            printf '%s\n' '{{"jsonrpc":"2.0","id":4,"result":{{"resultType":"complete","tools":[{{"name":"fresh","inputSchema":{{"type":"object"}}}}],"ttlMs":0,"cacheScope":"private"}}}}'
+            {cancellation_read}
+            IFS= read -r request || exit 1
+            case "$request" in *'"method":"ping"'*) ;; *) exit 1 ;; esac
+            printf '%s\n' '{{"jsonrpc":"2.0","id":5,"result":{{"resultType":"complete"}}}}'
+            exec sleep 2
+        "#);
+        let mut client = make_shell_scripted_initialized_client_for_version(
+            &script,
+            Duration::from_millis(550),
+            MODERN_PROTOCOL_VERSION,
+        );
+        let result = client.list_tools_with_params(ListToolsParams {
+            cursor: Some("initial".to_owned()),
+            include_tags: Some(vec!["keep".to_owned()]),
+            exclude_tags: Some(vec!["skip".to_owned()]),
+        });
+        if late_rebuild {
+            assert_eq!(result.expect_err("a cache rebuild cannot restart the original deadline").data,
+                Some(serde_json::json!({"timeoutSource": "absolute"})));
+        } else {
+            let tools = result.expect("a timely rebuild discards the stale page and starts without a cursor");
+            assert_eq!(tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(), ["fresh"]);
+        }
+        assert_eq!(client.next_id.load(Ordering::SeqCst), 5);
+        assert_eq!(client.responses.pending_len(), 0);
+        client.ping().expect("a rebuild timeout cancels only its current page and discards its late response");
+        client.close().expect("cache rebuild peer cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_catalog_rebuild_retains_the_original_deadline() {
+        assert_automatic_catalog_rebuild_deadline(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_catalog_rebuild_starts_without_a_cursor_and_preserves_filters() {
+        assert_automatic_catalog_rebuild_deadline(false);
     }
 
     #[test]
@@ -42899,6 +43390,41 @@ exec sleep 2
             .expect("cursor rejection flushes the earlier cached page");
         assert_eq!(client.final_result_cache_stats().hits, 0);
         client.close().expect("modern cursor-flush client cleanup");
+    }
+
+    #[test]
+    fn cache_03_between_page_invalidation_requires_a_new_generation_even_before_fetch() {
+        let mut client = make_closed_client(false);
+        let result_set = FinalCacheResultSet::Tools;
+        let original = client.final_result_cache.begin_fetch(&result_set);
+        let mut baseline = Some((original, fastmcp_protocol::CacheScope::Private));
+        client.final_result_cache.invalidate_result_set(&result_set);
+        let refreshed = client.final_result_cache.begin_fetch(&result_set);
+        client.last_final_cache_page = Some(FinalCachePageState {
+            generation: refreshed,
+            scope: fastmcp_protocol::CacheScope::Private,
+            miss: Some(FinalCacheMiss::Absent),
+        });
+        assert_ne!(original, refreshed);
+        assert!(client.final_list_restart_needed(&result_set, &mut baseline),
+            "a newly fetched page cannot be appended to pages from an earlier generation");
+        assert_ne!(refreshed, client.final_result_cache.begin_fetch(&result_set));
+    }
+
+    #[test]
+    fn cache_03_unchanged_generation_does_not_restart_an_automatic_list() {
+        let mut client = make_closed_client(false);
+        let result_set = FinalCacheResultSet::Tools;
+        let original = client.final_result_cache.begin_fetch(&result_set);
+        let mut baseline = Some((original, fastmcp_protocol::CacheScope::Private));
+        client.last_final_cache_page = Some(FinalCachePageState {
+            generation: original,
+            scope: fastmcp_protocol::CacheScope::Private,
+            miss: Some(FinalCacheMiss::Absent),
+        });
+        assert!(!client.final_list_restart_needed(&result_set, &mut baseline));
+        assert_eq!(original, client.final_result_cache.begin_fetch(&result_set));
+        assert_eq!(baseline, Some((original, fastmcp_protocol::CacheScope::Private)));
     }
 
     #[test]
