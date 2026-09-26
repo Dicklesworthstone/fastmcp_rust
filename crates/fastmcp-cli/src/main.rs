@@ -850,7 +850,8 @@ impl Commands {
     }
 
     /// The command a machine-readable failure document names, when this
-    /// invocation selected a single-document JSON output mode.
+    /// invocation selected a single-document JSON output mode. `list` keeps
+    /// its atomic contract instead: a failed listing writes no stdout at all.
     const fn machine_output(&self) -> Option<&'static str> {
         match self {
             Self::Inspect {
@@ -858,10 +859,6 @@ impl Commands {
                 ..
             } => Some("inspect"),
             Self::Test { json: true, .. } => Some("test"),
-            Self::List {
-                format: ListFormat::Json,
-                ..
-            } => Some("list"),
             _ => None,
         }
     }
