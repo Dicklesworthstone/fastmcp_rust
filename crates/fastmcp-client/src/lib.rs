@@ -11221,6 +11221,16 @@ impl HttpSubscriptionListener<'_> {
         self.final_result_cache.stats()
     }
 
+    /// Cancels this listener by closing only its HTTP response body.
+    ///
+    /// This does not wait for a peer event, send a JSON-RPC cancellation
+    /// notification, or cancel the caller's context. Buffered events are
+    /// discarded. Drop the listener afterward to release its client-cache
+    /// borrow. Repeated cancellation is harmless and returns `false`.
+    pub fn cancel(&mut self) -> bool {
+        self.listener.cancel()
+    }
+
     /// Reads one live subscription record and immediately invalidates accepted
     /// catalog or resource result sets before yielding that record.
     pub async fn next_event(
@@ -13315,6 +13325,63 @@ impl HttpClient {
             .map_err(HttpClientError::Connection)?;
         self.live_subscription = Some(listener);
         Ok(())
+    }
+
+    /// Returns the request ID owned by the active incremental catalog listener.
+    ///
+    /// Retain this ID when using [`Self::cancel_http_subscription`] so a late
+    /// cancellation cannot stop a replacement listener opened afterward.
+    #[must_use]
+    pub fn active_http_subscription_request_id(&self) -> Option<&RequestId> {
+        self.live_subscription
+            .as_ref()
+            .map(ModernHttpSubscriptionListener::request_id)
+    }
+
+    /// Returns the request ID owned by the active incremental Tasks listener.
+    #[cfg(feature = "tasks")]
+    #[must_use]
+    pub fn active_final_task_subscription_request_id(&self) -> Option<&RequestId> {
+        self.live_task_subscription
+            .as_ref()
+            .map(ModernHttpSubscriptionListener::request_id)
+    }
+
+    /// Cancels the incremental HTTP listener owned by `request_id`.
+    ///
+    /// Only the matching catalog or Tasks response is closed. This performs
+    /// no network write, does not wait for a silent peer, and preserves other
+    /// listeners, ordinary requests, and the caller's cancellation context.
+    /// It also discards buffered events from the retired response. A new
+    /// listener may then be started and receives a fresh request ID.
+    ///
+    /// Returns `true` when the matching listener was retired. Unknown IDs,
+    /// IDs from a prior listener generation, and repeated cancellations return
+    /// `false` without changing active listeners. JSON-RPC numeric aliases
+    /// correlate by their exact integer value; string IDs remain distinct.
+    pub fn cancel_http_subscription(&mut self, request_id: &RequestId) -> bool {
+        if self
+            .live_subscription
+            .as_ref()
+            .is_some_and(|listener| listener.request_id().correlates_with(request_id))
+        {
+            if let Some(mut listener) = self.live_subscription.take() {
+                listener.cancel();
+            }
+            return true;
+        }
+        #[cfg(feature = "tasks")]
+        if self
+            .live_task_subscription
+            .as_ref()
+            .is_some_and(|listener| listener.request_id().correlates_with(request_id))
+        {
+            if let Some(mut listener) = self.live_task_subscription.take() {
+                listener.cancel();
+            }
+            return true;
+        }
+        false
     }
 
     /// Drives one incremental HTTP catalog listener event.

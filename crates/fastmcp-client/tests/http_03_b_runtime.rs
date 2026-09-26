@@ -2201,6 +2201,450 @@ fn http_03_b_subscription_expired_listener_closes_socket_sibling_ping_succeeds_n
     server.join().expect("isolation server must join");
 }
 
+fn respond_listener_cancellation_probe(stream: &mut TcpStream, capabilities: serde_json::Value) {
+    let request = read_request(stream);
+    assert_final_metadata(&request, "server/discover");
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": capabilities,
+            "ttlMs": 0,
+            "cacheScope": "private",
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": {
+                    "name": "listener-cancellation-peer",
+                    "version": "1.0.0",
+                },
+            },
+        },
+    });
+    write_response(
+        stream,
+        200,
+        "application/json",
+        &serde_json::to_vec(&response).expect("serialize cancellation discovery"),
+    );
+}
+
+fn subscription_ack_for_id(request_id: i64, filter: &SubscriptionFilter) -> serde_json::Value {
+    let mut event = subscription_ack_event(filter);
+    event["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"] =
+        serde_json::json!(request_id);
+    event
+}
+
+fn subscription_tools_changed_for_id(request_id: i64) -> serde_json::Value {
+    let mut event = subscription_tools_changed_event();
+    event["params"] = serde_json::json!({
+        "_meta": {"io.modelcontextprotocol/subscriptionId": request_id},
+    });
+    event
+}
+
+fn assert_subscription_request_id(request: &CapturedHttpRequest, request_id: i64) {
+    let body: serde_json::Value =
+        serde_json::from_slice(&request.body).expect("subscription request must be JSON-RPC");
+    assert_eq!(body["id"], request_id);
+}
+
+fn respond_listener_cancellation_ping(stream: &mut TcpStream, request_id: i64) {
+    let request = read_request(stream);
+    assert_final_metadata(&request, "ping");
+    assert_subscription_request_id(&request, request_id);
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {"resultType": "complete"},
+    });
+    write_response(
+        stream,
+        200,
+        "application/json",
+        &serde_json::to_vec(&response).expect("serialize cancellation sibling ping"),
+    );
+}
+
+fn assert_http_client_subscription_cancellation(cancel_matching_id: bool) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind cancellation listener");
+    let address = listener.local_addr().expect("read cancellation address");
+    let target = format!("http://{address}/mcp");
+    let filter = subscription_filter();
+    let server_filter = filter.clone();
+    let (attempt_tx, attempt_rx) = mpsc::channel();
+    let (closed_tx, closed_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let mut discovery = accept_bounded_stream(&listener);
+        respond_listener_cancellation_probe(&mut discovery, serde_json::json!({}));
+        let mut first = accept_bounded_stream(&listener);
+        let request = read_request(&mut first);
+        assert_subscription_request(&request, &server_filter);
+        assert_subscription_request_id(&request, 2);
+        begin_sse_response(&mut first);
+        attempt_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("client must attempt cancellation while peer is silent");
+        if !cancel_matching_id {
+            write_sse_event(&mut first, &subscription_ack_for_id(2, &server_filter))
+                .expect("unknown cancellation must preserve acknowledgement delivery");
+            write_sse_event(&mut first, &subscription_tools_changed_for_id(2))
+                .expect("unknown cancellation must preserve event delivery");
+        }
+        assert_connection_closed_by_client(&mut first);
+        closed_tx.send(()).expect("record immediate first close");
+
+        let mut replacement = accept_bounded_stream(&listener);
+        let request = read_request(&mut replacement);
+        assert_subscription_request(&request, &server_filter);
+        assert_subscription_request_id(&request, 3);
+        begin_sse_response(&mut replacement);
+        write_sse_event(&mut replacement, &subscription_ack_for_id(3, &server_filter))
+            .expect("write replacement acknowledgement");
+        write_sse_event(&mut replacement, &subscription_tools_changed_for_id(3))
+            .expect("write replacement event");
+        assert_connection_closed_by_client(&mut replacement);
+        closed_tx.send(()).expect("record replacement close");
+
+        let mut ping = accept_bounded_stream(&listener);
+        respond_listener_cancellation_ping(&mut ping, 4);
+    });
+
+    runtime_block_on(async {
+        let cx = Cx::current().expect("client runtime must provide a context");
+        let mut client = fastmcp_client::HttpClient::connect(
+            &cx,
+            plan(&target, &target, &target, ProtocolPolicy::ModernOnly),
+            client_info(),
+            ClientCapabilities::default(),
+        )
+        .await
+        .expect("connect cancellable HTTP client");
+        let limits = SseLimits::new(4_096, 65_536, 8).expect("bounded subscription parser");
+        assert!(client.active_http_subscription_request_id().is_none());
+        assert!(!client.cancel_http_subscription(&RequestId::Number(2)));
+        client
+            .start_subscriptions_listener(&cx, filter.clone(), limits)
+            .await
+            .expect("start silent subscription");
+        let first_id = client
+            .active_http_subscription_request_id()
+            .expect("first listener must have an owner")
+            .clone();
+        assert_eq!(first_id, RequestId::Number(2));
+        let attempted_id = if cancel_matching_id {
+            first_id.clone()
+        } else {
+            RequestId::String("2".to_owned())
+        };
+        let cache_before = client.final_result_cache_stats();
+        assert_eq!(
+            client.cancel_http_subscription(&attempted_id),
+            cancel_matching_id
+        );
+        assert_eq!(client.final_result_cache_stats(), cache_before);
+        attempt_tx.send(()).expect("release silent peer after cancel");
+        if !cancel_matching_id {
+            assert_eq!(client.active_http_subscription_request_id(), Some(&first_id));
+            assert!(matches!(
+                client.next_http_subscription_event(&cx).await,
+                Ok(Some(ModernHttpSubscriptionListenEvent::Acknowledged { .. }))
+            ));
+            assert!(matches!(
+                client.next_http_subscription_event(&cx).await,
+                Ok(Some(ModernHttpSubscriptionListenEvent::Notification(
+                    ServerNotification::ToolsListChanged(_)
+                )))
+            ));
+            assert!(client.cancel_http_subscription(&first_id));
+        }
+        assert!(client.active_http_subscription_request_id().is_none());
+        assert!(!client.cancel_http_subscription(&first_id));
+        // No subsequent poll, drop of the client, or peer event drives this close.
+        closed_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("cancel itself must close the silent response");
+        assert!(cx.checkpoint().is_ok(), "listener cancel must preserve Cx");
+
+        client
+            .start_subscriptions_listener(&cx, filter, limits)
+            .await
+            .expect("restart subscription on retained client");
+        let replacement_id = client
+            .active_http_subscription_request_id()
+            .expect("replacement must have its own ID")
+            .clone();
+        assert_eq!(replacement_id, RequestId::Number(3));
+        assert!(!client.cancel_http_subscription(&first_id));
+        assert_eq!(
+            client.active_http_subscription_request_id(),
+            Some(&replacement_id)
+        );
+        assert!(matches!(
+            client.next_http_subscription_event(&cx).await,
+            Ok(Some(ModernHttpSubscriptionListenEvent::Acknowledged { .. }))
+        ));
+        assert!(matches!(
+            client.next_http_subscription_event(&cx).await,
+            Ok(Some(ModernHttpSubscriptionListenEvent::Notification(
+                ServerNotification::ToolsListChanged(_)
+            )))
+        ));
+        let numeric_alias: RequestId = serde_json::from_str("3e0").expect("exact numeric alias");
+        assert!(client.cancel_http_subscription(&numeric_alias));
+        assert!(!client.cancel_http_subscription(&replacement_id));
+        closed_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("replacement cancellation must close its response");
+        client
+            .ping(&cx)
+            .await
+            .expect("retained client must stay usable");
+        assert!(cx.checkpoint().is_ok());
+    });
+
+    server.join().expect("subscription cancellation peer must join");
+}
+
+#[test]
+fn http_client_cancel_silent_subscription_restarts_with_new_id() {
+    assert_http_client_subscription_cancellation(true);
+}
+
+#[test]
+fn http_client_cancel_subscription_unknown_id_preserves_live_stream() {
+    assert_http_client_subscription_cancellation(false);
+}
+
+#[test]
+fn http_client_owned_listener_cancel_discards_buffered_events() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind owned listener cancellation");
+    let address = listener
+        .local_addr()
+        .expect("read owned cancellation address");
+    let target = format!("http://{address}/mcp");
+    let filter = subscription_filter();
+    let server_filter = filter.clone();
+    let (closed_tx, closed_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let mut discovery = accept_bounded_stream(&listener);
+        respond_listener_cancellation_probe(&mut discovery, serde_json::json!({}));
+        let mut subscription = accept_bounded_stream(&listener);
+        let request = read_request(&mut subscription);
+        assert_subscription_request(&request, &server_filter);
+        begin_sse_response(&mut subscription);
+        let acknowledgement = subscription_ack_for_id(2, &server_filter);
+        let changed = subscription_tools_changed_for_id(2);
+        write_sse_chunk(
+            &mut subscription,
+            format!("data: {acknowledgement}\n\ndata: {changed}\n\n").as_bytes(),
+        )
+        .expect("buffer acknowledgement and catalog event in one body frame");
+        assert_connection_closed_by_client(&mut subscription);
+        closed_tx.send(()).expect("record owned listener close");
+        let mut ping = accept_bounded_stream(&listener);
+        respond_listener_cancellation_ping(&mut ping, 3);
+    });
+
+    runtime_block_on(async {
+        let cx = Cx::current().expect("owned listener runtime must provide a context");
+        let mut client = fastmcp_client::HttpClient::connect(
+            &cx,
+            plan(&target, &target, &target, ProtocolPolicy::ModernOnly),
+            client_info(),
+            ClientCapabilities::default(),
+        )
+        .await
+        .expect("connect owned listener client");
+        let mut subscription = client
+            .open_subscriptions_listener(
+                &cx,
+                filter,
+                SseLimits::new(4_096, 65_536, 8).expect("bounded owned listener"),
+            )
+            .await
+            .expect("open owned HTTP listener");
+        assert!(matches!(
+            subscription.next_event(&cx).await,
+            Ok(Some(ModernHttpSubscriptionListenEvent::Acknowledged { .. }))
+        ));
+        let cache_before = subscription.final_result_cache_stats();
+        assert!(subscription.cancel());
+        assert!(!subscription.cancel());
+        closed_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("owned listener must close without another poll or drop");
+        assert!(matches!(
+            subscription.next_event(&cx).await,
+            Err(fastmcp_client::HttpClientError::Connection(
+                ClientHttpConnectionError::SubscriptionsListen(
+                    ModernHttpSubscriptionListenError::Executor(
+                        ModernHttpExecutorError::SseStreamClosed
+                    )
+                )
+            ))
+        ));
+        assert_eq!(subscription.final_result_cache_stats(), cache_before);
+        assert!(cx.checkpoint().is_ok());
+        drop(subscription);
+        client
+            .ping(&cx)
+            .await
+            .expect("client cache borrow must be released");
+    });
+
+    server
+        .join()
+        .expect("owned listener cancellation peer must join");
+}
+
+#[cfg(feature = "tasks")]
+#[test]
+fn http_client_cancel_catalog_preserves_task_listener() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind Tasks cancellation listener");
+    let address = listener
+        .local_addr()
+        .expect("read Tasks cancellation address");
+    let target = format!("http://{address}/mcp");
+    let catalog_filter = subscription_filter();
+    let mut task_filter = SubscriptionFilter::default();
+    fastmcp_protocol::set_task_subscription_ids(
+        &mut task_filter,
+        vec![fastmcp_protocol::FinalTaskId::parse("task-73").expect("bounded task ID")],
+    )
+    .expect("compose task subscription filter");
+    let server_catalog_filter = catalog_filter.clone();
+    let server_task_filter = task_filter.clone();
+    let (closed_tx, closed_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let mut discovery = accept_bounded_stream(&listener);
+        respond_listener_cancellation_probe(
+            &mut discovery,
+            serde_json::json!({"extensions": {"io.modelcontextprotocol/tasks": {}}}),
+        );
+        let mut catalog = accept_bounded_stream(&listener);
+        let request = read_request(&mut catalog);
+        assert_subscription_request(&request, &server_catalog_filter);
+        assert_subscription_request_id(&request, 2);
+        begin_sse_response(&mut catalog);
+        let mut tasks = accept_bounded_stream(&listener);
+        let request = read_request(&mut tasks);
+        assert_subscription_request(&request, &server_task_filter);
+        assert_subscription_request_id(&request, 3);
+        begin_sse_response(&mut tasks);
+        assert_connection_closed_by_client(&mut catalog);
+        closed_tx.send(()).expect("record only catalog close");
+        write_sse_event(&mut tasks, &subscription_ack_for_id(3, &server_task_filter))
+            .expect("catalog cancellation must preserve Tasks stream");
+
+        let mut replacement = accept_bounded_stream(&listener);
+        let request = read_request(&mut replacement);
+        assert_subscription_request(&request, &server_catalog_filter);
+        assert_subscription_request_id(&request, 4);
+        begin_sse_response(&mut replacement);
+        assert_connection_closed_by_client(&mut tasks);
+        closed_tx.send(()).expect("record only Tasks close");
+        write_sse_event(
+            &mut replacement,
+            &subscription_ack_for_id(4, &server_catalog_filter),
+        )
+        .expect("Tasks cancellation must preserve replacement catalog");
+        write_sse_event(&mut replacement, &subscription_tools_changed_for_id(4))
+            .expect("replacement catalog must continue delivering events");
+        assert_connection_closed_by_client(&mut replacement);
+        closed_tx.send(()).expect("record replacement catalog close");
+        let mut ping = accept_bounded_stream(&listener);
+        respond_listener_cancellation_ping(&mut ping, 5);
+    });
+
+    runtime_block_on(async {
+        let cx = Cx::current().expect("Tasks runtime must provide a context");
+        let mut client = fastmcp_client::HttpClient::connect(
+            &cx,
+            plan(&target, &target, &target, ProtocolPolicy::ModernOnly),
+            client_info(),
+            ClientCapabilities::default(),
+        )
+        .await
+        .expect("connect concurrent catalog and Tasks client");
+        let limits = SseLimits::new(4_096, 65_536, 8).expect("bounded task subscription");
+        assert!(client.active_final_task_subscription_request_id().is_none());
+        client
+            .start_subscriptions_listener(&cx, catalog_filter.clone(), limits)
+            .await
+            .expect("start catalog stream");
+        client
+            .open_final_task_subscription_listener(&cx, task_filter, limits)
+            .await
+            .expect("start separate Tasks stream");
+        let catalog_id = client
+            .active_http_subscription_request_id()
+            .expect("live catalog owner")
+            .clone();
+        let task_id = client
+            .active_final_task_subscription_request_id()
+            .expect("live Tasks owner")
+            .clone();
+        assert_ne!(catalog_id, task_id);
+        assert!(client.cancel_http_subscription(&catalog_id));
+        assert!(!client.cancel_http_subscription(&catalog_id));
+        assert_eq!(
+            client.active_final_task_subscription_request_id(),
+            Some(&task_id)
+        );
+        closed_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("catalog cancellation must close only its silent body");
+        assert!(matches!(
+            client.next_final_task_subscription_event(&cx).await,
+            Ok(fastmcp_client::StdioTaskSubscriptionEvent::Acknowledged(_))
+        ));
+
+        client
+            .start_subscriptions_listener(&cx, catalog_filter, limits)
+            .await
+            .expect("restart catalog while Tasks stream remains live");
+        let replacement_id = client
+            .active_http_subscription_request_id()
+            .expect("replacement catalog owner")
+            .clone();
+        assert_eq!(replacement_id, RequestId::Number(4));
+        assert!(!client.cancel_http_subscription(&catalog_id));
+        assert!(client.cancel_http_subscription(&task_id));
+        assert!(!client.cancel_http_subscription(&task_id));
+        assert!(client.active_final_task_subscription_request_id().is_none());
+        assert_eq!(
+            client.active_http_subscription_request_id(),
+            Some(&replacement_id)
+        );
+        closed_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("Tasks cancellation must close only its own body");
+        assert!(matches!(
+            client.next_http_subscription_event(&cx).await,
+            Ok(Some(ModernHttpSubscriptionListenEvent::Acknowledged { .. }))
+        ));
+        assert!(matches!(
+            client.next_http_subscription_event(&cx).await,
+            Ok(Some(ModernHttpSubscriptionListenEvent::Notification(
+                ServerNotification::ToolsListChanged(_)
+            )))
+        ));
+        assert!(client.cancel_http_subscription(&replacement_id));
+        closed_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("replacement catalog must release its body");
+        client
+            .ping(&cx)
+            .await
+            .expect("client must survive both listener cancellations");
+        assert!(cx.checkpoint().is_ok());
+    });
+
+    server.join().expect("Tasks cancellation peer must join");
+}
+
 struct RedirectTestRig {
     primary_listener: TcpListener,
     redirect_listener: TcpListener,
