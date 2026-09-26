@@ -178,7 +178,7 @@ fn renewal_consumes_exchanges_and_persists_before_delivering_fresh_access() {
         let store = fixture.seed(&cx, &client).await;
         let before = fixture.bytes();
         let mut renewal = fixture.begin(&cx, &client, store);
-        let (_, result) = native::pair(token_reply(&listener, Some(ROTATED)), renewal.run(&cx)).await;
+        let ((), result) = native::pair(token_reply(&listener, Some(ROTATED)), renewal.run(&cx)).await;
         result.unwrap();
         assert_eq!(renewal.stage(), OAuthRefreshRenewalStage::Complete);
         renewal.run(&cx).await.unwrap(); // observation, not redelivery or replay
@@ -208,7 +208,7 @@ fn renewal_omitted_rotation_persists_the_same_lineage_only_after_issuer_success(
         let store = fixture.seed(&cx, &client).await;
         let mut renewal = fixture.begin(&cx, &client, store);
         let body = r#"{"access_token":"renewed-access","token_type":"Bearer","expires_in":120,"scope":"tools:read"}"#;
-        let (_, result) = native::pair(token_reply(&listener, Some(body)), renewal.run(&cx)).await;
+        let ((), result) = native::pair(token_reply(&listener, Some(body)), renewal.run(&cx)).await;
         result.unwrap();
         let OAuthRefreshRenewalCustody::Complete { store, .. } = renewal.into_custody() else { panic!("completed custody"); };
         let (store, grant) = store.take_refresh(&cx, fixture.auth).unwrap().wait(&cx).await.unwrap().into_parts();
@@ -226,7 +226,7 @@ fn renewal_lost_or_invalid_token_reply_never_retries_or_restores_consumed_grant(
             let fixture = Fixture::new();
             let store = fixture.seed(&cx, &client).await;
             let mut renewal = fixture.begin(&cx, &client, store);
-            let (_, result) = native::pair(token_reply(&listener, body), renewal.run(&cx)).await;
+            let ((), result) = native::pair(token_reply(&listener, body), renewal.run(&cx)).await;
             assert!(matches!(result, Err(OAuthRefreshRenewalError::Context(_))));
             assert_eq!(renewal.stage(), OAuthRefreshRenewalStage::Stopped);
             assert!(matches!(renewal.run(&cx).await, Err(OAuthRefreshRenewalError::Stopped)));
@@ -285,7 +285,7 @@ fn renewal_failed_persistence_keeps_the_new_credentials_but_never_exchanges_agai
             let mut renewal = fixture.begin(&cx, &client, store);
             assert_eq!(renewal.advance(&cx).await.unwrap(), OAuthRefreshRenewalStage::Taking);
             assert_eq!(renewal.advance(&cx).await.unwrap(), OAuthRefreshRenewalStage::ReadyToExchange);
-            let (_, result) = native::pair(token_reply(&listener, Some(ROTATED)), renewal.advance(&cx)).await;
+            let ((), result) = native::pair(token_reply(&listener, Some(ROTATED)), renewal.advance(&cx)).await;
             assert_eq!(result.unwrap(), OAuthRefreshRenewalStage::ReadyToPersist);
             { let mut state = fixture.provider.0.lock().unwrap(); state.refuse_seal = !uncertain; state.uncertain_settlement = uncertain; }
             assert!(matches!(renewal.run(&cx).await, Err(OAuthRefreshRenewalError::Storage(_))));
@@ -307,7 +307,7 @@ fn renewal_shutdown_after_exchange_retains_new_grant_without_second_issuer_effec
         let store = fixture.seed(&cx, &client).await;
         let mut renewal = fixture.begin(&cx, &client, store);
         renewal.advance(&cx).await.unwrap(); renewal.advance(&cx).await.unwrap();
-        let (_, result) = native::pair(token_reply(&listener, Some(ROTATED)), renewal.advance(&cx)).await;
+        let ((), result) = native::pair(token_reply(&listener, Some(ROTATED)), renewal.advance(&cx)).await;
         assert_eq!(result.unwrap(), OAuthRefreshRenewalStage::ReadyToPersist);
         fixture.lane.begin_shutdown().unwrap();
         assert!(matches!(renewal.run(&cx).await, Err(OAuthRefreshRenewalError::Submission(AsyncOAuthRefreshError::Io(CredentialIoError::LaneClosed)))));

@@ -393,7 +393,7 @@ fn async_refresh_try_write_returns_the_same_unexecuted_grant_when_lane_is_full()
         let original = credentials(&cfg);
         let expiry = original.expires_at();
         let header = original.bearer_credential().authorization_for_target(&cfg.resource);
-        let refusal = owner.try_store_refresh(&cx, f.auth, None, original).err().expect("lane is full");
+        let refusal = owner.try_store_refresh(&cx, f.auth, None, original).expect_err("lane is full");
         assert!(matches!(refusal.cause(), AsyncOAuthRefreshError::Io(CredentialIoError::CapacityExceeded)));
         assert!(!format!("{refusal:?} {refusal}").contains("refresh-secret"));
         let (_, retained) = refusal.into_parts();

@@ -122,7 +122,7 @@ fn refresh_revocation_tls_preserves_each_status_without_followup_requests() {
                 tls.write_all(response.as_bytes()).await.unwrap();
                 tls.shutdown().await.unwrap();
             };
-            let (_, result) = Box::pin(native::pair(server, client.revoke_refresh_grant(&cx, grant(&config)))).await;
+            let ((), result) = Box::pin(native::pair(server, client.revoke_refresh_grant(&cx, grant(&config)))).await;
             let result = result.unwrap();
             assert_eq!(result, if status == 200 { OAuthTokenRevocationOutcome::Succeeded }
                 else { OAuthTokenRevocationOutcome::Rejected { status } });
@@ -139,7 +139,7 @@ fn refresh_revocation_lost_reply_is_uncertain_without_renewal_or_retry() {
         let (listener, config) = fixture().await;
         let client = OAuthClient::new(config.clone());
         let server = async { drop(peer_request(&listener).await); };
-        let (_, outcome) = Box::pin(native::pair(server, client.revoke_refresh_grant(&cx, grant(&config)))).await;
+        let ((), outcome) = Box::pin(native::pair(server, client.revoke_refresh_grant(&cx, grant(&config)))).await;
         assert_eq!(outcome.unwrap(), OAuthTokenRevocationOutcome::Uncertain);
         no_more_requests(&listener);
     });
@@ -160,7 +160,7 @@ fn refresh_revocation_does_not_need_a_live_access_token() {
             tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
             tls.shutdown().await.unwrap();
         };
-        let (_, outcome) = Box::pin(native::pair(server, client.revoke_refresh_grant(&cx, grant))).await;
+        let ((), outcome) = Box::pin(native::pair(server, client.revoke_refresh_grant(&cx, grant))).await;
         assert_eq!(outcome.unwrap(), OAuthTokenRevocationOutcome::Succeeded);
         assert!(credentials.bearer_credential().is_revoked());
         assert!(credentials.expires_at() <= Instant::now());
