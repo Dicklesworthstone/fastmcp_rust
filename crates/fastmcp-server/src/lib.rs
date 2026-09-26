@@ -31628,11 +31628,54 @@ mod lib_unit_tests {
         response
     }
 
-    fn auth_00_mrtr_server(stable_owner: bool, calls: &Arc<AtomicUsize>) -> Server {
-        Server::new("auth-00-mrtr-owner", "1.0.0")
+    /// How the MRTR test server's provider supplies the session owner.
+    #[derive(Clone, Copy)]
+    enum Auth00Owner {
+        /// The verifier configures an explicit provider-scoped owner.
+        Configured,
+        /// A subject-only verified context. `TokenAuthProvider` derives its
+        /// owner in a process-local namespace (756719c3).
+        Derived,
+        /// The same verified subject-only context, with no owner at all.
+        Absent,
+    }
+
+    /// Verifies the same credentials through `TokenAuthProvider`, then
+    /// rebuilds the admitted context without the owner that provider
+    /// derives. Owner admission therefore sees a verified subject that
+    /// really has no stable owner.
+    struct OwnerlessAuthProvider(TokenAuthProvider);
+
+    impl AuthProvider for OwnerlessAuthProvider {
+        fn authenticate(
+            &self,
+            ctx: &McpContext,
+            request: AuthRequest<'_>,
+        ) -> McpResult<AuthContext> {
+            let admitted = self.0.authenticate(ctx, request)?;
+            let subject = admitted
+                .subject
+                .clone()
+                .ok_or_else(|| McpError::internal_error("admitted context has no subject"))?;
+            let mut ownerless = AuthContext::with_subject(subject);
+            ownerless.scopes = admitted.scopes;
+            ownerless.claims = admitted.claims;
+            Ok(ownerless)
+        }
+    }
+
+    fn auth_00_mrtr_server(owner: Auth00Owner, calls: &Arc<AtomicUsize>) -> Server {
+        let builder = Server::new("auth-00-mrtr-owner", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
-            .expect("modern policy")
-            .auth_provider(auth_00_mrtr_provider(stable_owner))
+            .expect("modern policy");
+        let builder = match owner {
+            Auth00Owner::Configured => builder.auth_provider(auth_00_mrtr_provider(true)),
+            Auth00Owner::Derived => builder.auth_provider(auth_00_mrtr_provider(false)),
+            Auth00Owner::Absent => {
+                builder.auth_provider(OwnerlessAuthProvider(auth_00_mrtr_provider(false)))
+            }
+        };
+        builder
             .tool(LiveHttpMrtrTool {
                 name: "live_http_mrtr",
                 calls: Arc::clone(calls),
@@ -31652,9 +31695,21 @@ mod lib_unit_tests {
 
     #[test]
     fn auth_00_http_mrtr_stable_owner_completes_two_rounds() {
-        run_live_http_test(|cx| async move {
+        assert_auth_00_http_mrtr_completes_two_rounds(Auth00Owner::Configured);
+    }
+
+    /// Pins 756719c3: `TokenAuthProvider` derives an owner for a subject-only
+    /// verified context, so the same two rounds complete without a
+    /// verifier-configured owner.
+    #[test]
+    fn auth_00_http_mrtr_derived_owner_completes_two_rounds() {
+        assert_auth_00_http_mrtr_completes_two_rounds(Auth00Owner::Derived);
+    }
+
+    fn assert_auth_00_http_mrtr_completes_two_rounds(owner: Auth00Owner) {
+        run_live_http_test(move |cx| async move {
             let calls = Arc::new(AtomicUsize::new(0));
-            let endpoint = auth_00_mrtr_server(true, &calls)
+            let endpoint = auth_00_mrtr_server(owner, &calls)
                 .into_http_endpoint("http://auth-owner.test")
                 .unwrap();
             let initial = auth_00_mrtr_http_call(&cx, &endpoint, None, 981).await;
@@ -31681,7 +31736,7 @@ mod lib_unit_tests {
             let calls = Arc::new(AtomicUsize::new(0));
             // Same valid credential, subject, request and handler as the
             // positive; only the provider's stable owner is absent.
-            let endpoint = auth_00_mrtr_server(false, &calls)
+            let endpoint = auth_00_mrtr_server(Auth00Owner::Absent, &calls)
                 .into_http_endpoint("http://auth-owner.test")
                 .unwrap();
             let response = auth_00_mrtr_http_call(&cx, &endpoint, None, 981).await;
@@ -31698,8 +31753,8 @@ mod lib_unit_tests {
     fn auth_00_http_mrtr_ownerless_leaked_handle_preserves_owner_state() {
         run_live_http_test(|cx| async move {
             let calls = Arc::new(AtomicUsize::new(0));
-            let owner_server = auth_00_mrtr_server(true, &calls);
-            let mut ownerless_server = auth_00_mrtr_server(false, &calls);
+            let owner_server = auth_00_mrtr_server(Auth00Owner::Configured, &calls);
+            let mut ownerless_server = auth_00_mrtr_server(Auth00Owner::Absent, &calls);
             // Both public endpoints use the same real exchange registry.
             // Independent registries would reject even without owner checks.
             ownerless_server.router = Arc::clone(&owner_server.router);
@@ -31801,7 +31856,7 @@ mod lib_unit_tests {
         run_live_http_test(move |cx| async move {
             for state_only in [false, true] {
                 let calls = Arc::new(AtomicUsize::new(0));
-                let endpoint = auth_00_mrtr_server(true, &calls)
+                let endpoint = auth_00_mrtr_server(Auth00Owner::Configured, &calls)
                     .into_http_endpoint("http://auth-owner.test")
                     .unwrap();
                 let mut issuer = endpoint.open_session(&cx).unwrap();
@@ -39296,14 +39351,28 @@ mod lib_unit_tests {
                     .unwrap()
                     .as_nanos()
             );
-            let mut refreshed = AuthContext::with_subject(subject.clone());
+            // TokenAuthProvider derives a fallback owner per credential, so a
+            // rotated credential changes it (756719c3). Continuity across the
+            // refresh therefore needs the verifier's own owner, as auth.rs
+            // documents; the foreign caller has a distinct one.
+            let verified_owner = |subject: &str| {
+                sha256_bounded(subject.as_bytes(), 256).expect("bounded test owner subject")
+            };
+            let owner = verified_owner(&subject);
+            let mut refreshed =
+                AuthContext::with_subject(subject.clone()).with_session_owner(owner);
             refreshed.scopes = vec!["tasks".to_owned()];
+            let foreign_subject = format!("foreign-{subject}");
             let verifier = StaticTokenVerifier::new([
-                ("owner-first", AuthContext::with_subject(subject.clone())),
+                (
+                    "owner-first",
+                    AuthContext::with_subject(subject.clone()).with_session_owner(owner),
+                ),
                 ("owner-refreshed", refreshed),
                 (
                     "foreign-valid",
-                    AuthContext::with_subject(format!("foreign-{subject}")),
+                    AuthContext::with_subject(foreign_subject.clone())
+                        .with_session_owner(verified_owner(&foreign_subject)),
                 ),
             ])
             .map_err(|error| error.to_string())?;
@@ -45350,13 +45419,31 @@ mod lib_unit_tests {
         .expect("valid verifier configuration")
         .with_allowed_schemes(["Bearer"])
         .expect("valid scheme configuration");
-        let alice = crate::auth::principal_fingerprint(Some(&AuthContext::with_subject("alice")))
-            .expect("alice fingerprint");
-        let bob = crate::auth::principal_fingerprint(Some(&AuthContext::with_subject("bob")))
-            .expect("bob fingerprint");
+        // The session binds the context the installed provider admits. For
+        // these subject-only contexts that includes the owner the provider
+        // derives (756719c3), in a namespace its clones share. So derive each
+        // expected fingerprint by admitting the credential through it.
+        let provider = TokenAuthProvider::new(verifier);
+        let admitted_fingerprint = |token: &str| {
+            let authorization = format!("Bearer {token}");
+            let admitted = provider
+                .authenticate(
+                    &McpContext::new(cx.clone(), 0),
+                    AuthRequest {
+                        method: "initialize",
+                        params: None,
+                        transport_authorization: Some(&authorization),
+                        request_id: 0,
+                    },
+                )
+                .expect("the installed provider admits its own credential");
+            crate::auth::principal_fingerprint(Some(&admitted)).expect("admitted fingerprint")
+        };
+        let alice = admitted_fingerprint("alpha");
+        let bob = admitted_fingerprint("beta");
         let endpoint = Server::new("legacy-sse-owner", "1.0.0")
             .tool(LiveRuntimeListedTool)
-            .auth_provider(TokenAuthProvider::new(verifier))
+            .auth_provider(provider.clone())
             .build_http_endpoint("http://legacy.test")
             .expect("dual-era endpoint must build");
         let mut session = endpoint
