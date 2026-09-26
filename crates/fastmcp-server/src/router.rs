@@ -644,7 +644,9 @@ fn encode_mrtr_input_required_result(result: MrtrInputRequired) -> McpResult<ser
 }
 
 const MAX_MRTR_BINDING_BYTES: usize = 64 * 1024;
-const MAX_MRTR_RAW_PARAMS_BYTES: usize = 256 * 1024;
+// Ordinary tool arguments share LIMIT-01's JSON-RPC message budget. The
+// continuation response submap has its own, independently enforced bound.
+const MAX_FINAL_RAW_PARAMS_BYTES: usize = fastmcp_core::limits::DEFAULT_JSON_RPC_MAX_BODY_BYTES;
 const MAX_MRTR_RAW_INPUT_RESPONSES_BYTES: usize = 192 * 1024;
 const MAX_MRTR_RAW_JSON_DEPTH: usize = 32;
 const MAX_MRTR_RAW_JSON_VALUES: usize = 4_096;
@@ -720,9 +722,22 @@ enum FinalMrtrDispatch {
 }
 
 fn mrtr_digest(value: &impl serde::Serialize) -> McpResult<[u8; 32]> {
+    mrtr_digest_bounded(value, MAX_MRTR_BINDING_BYTES)
+}
+
+fn mrtr_digest_bounded(value: &impl serde::Serialize, max_bytes: usize) -> McpResult<[u8; 32]> {
+    // Refuse before allocating the encoded digest input. Ordinary arguments
+    // may fill the message budget; identity and authority material retain
+    // their independent, smaller bound through mrtr_digest.
+    let mut counter = MrtrRawJsonCounter {
+        max_bytes,
+        bytes: 0,
+    };
+    serde_json::to_writer(&mut counter, value)
+        .map_err(|_| McpError::invalid_params("MRTR operation binding exceeds its limit"))?;
     let bytes = serde_json::to_vec(value)
         .map_err(|_| McpError::invalid_params("invalid MRTR operation binding"))?;
-    let digest = sha256_bounded(&bytes, MAX_MRTR_BINDING_BYTES)
+    let digest = sha256_bounded(&bytes, max_bytes)
         .map_err(|_| McpError::invalid_params("MRTR operation binding exceeds its limit"))?;
     Ok(*digest.as_bytes())
 }
@@ -787,7 +802,7 @@ fn final_mrtr_binding(
         MrtrExchangeBinding::stateless(
             method,
             target,
-            mrtr_digest(arguments)?,
+            mrtr_digest_bounded(arguments, MAX_FINAL_RAW_PARAMS_BYTES)?,
             session_partition,
             principal_digest,
             verified_grants_digest,
@@ -796,7 +811,7 @@ fn final_mrtr_binding(
         MrtrExchangeBinding::new(
             method,
             target,
-            mrtr_digest(arguments)?,
+            mrtr_digest_bounded(arguments, MAX_FINAL_RAW_PARAMS_BYTES)?,
             session_partition,
             principal_digest,
             verified_grants_digest,
@@ -4786,13 +4801,14 @@ impl Router {
         Ok(result)
     }
 
-    /// Admits bounded raw retry values before final parameter decoding clones
-    /// them into method-specific fields or materializes `inputResponses`.
+    /// Admits the complete parameter document against its message byte budget
+    /// before applying the stricter continuation response-submap bound.
+    /// Both checks precede typed decoding and preserve depth/value preflight.
     fn admit_final_mrtr_response_map(&self, params: Option<&serde_json::Value>) -> McpResult<()> {
         let Some(params) = params else {
             return Ok(());
         };
-        admit_mrtr_raw_json_value(params, MAX_MRTR_RAW_PARAMS_BYTES)?;
+        admit_mrtr_raw_json_value(params, MAX_FINAL_RAW_PARAMS_BYTES)?;
         let Some(input_responses) = params
             .as_object()
             .and_then(|members| members.get("inputResponses"))
@@ -21757,6 +21773,107 @@ mod router_tests {
         assert_eq!(tool_calls.load(Ordering::SeqCst), 2);
         assert_eq!(resource_calls.load(Ordering::SeqCst), 2);
         assert_eq!(prompt_calls.load(Ordering::SeqCst), 2);
+    }
+
+    fn final_request_params_at_byte_limit(max_bytes: usize) -> serde_json::Value {
+        let mut params = serde_json::json!({"arguments": {"payload": ""}});
+        let overhead = serde_json::to_vec(&params).unwrap().len();
+        params["arguments"]["payload"] =
+            serde_json::Value::String("x".repeat(max_bytes - overhead));
+        params
+    }
+
+    #[test]
+    fn final_request_params_admit_message_byte_boundary() {
+        let router = Router::new();
+        let params = final_request_params_at_byte_limit(MAX_FINAL_RAW_PARAMS_BYTES);
+        assert_eq!(
+            serde_json::to_vec(&params).unwrap().len(),
+            MAX_FINAL_RAW_PARAMS_BYTES
+        );
+        router
+            .admit_final_mrtr_response_map(Some(&params))
+            .expect("ordinary arguments at the message byte boundary are admitted");
+    }
+
+    #[test]
+    fn final_request_params_reject_one_byte_over_message_boundary() {
+        let router = Router::new();
+        let params = final_request_params_at_byte_limit(MAX_FINAL_RAW_PARAMS_BYTES + 1);
+        assert_eq!(
+            serde_json::to_vec(&params).unwrap().len(),
+            MAX_FINAL_RAW_PARAMS_BYTES + 1
+        );
+        let error = router
+            .admit_final_mrtr_response_map(Some(&params))
+            .expect_err("one extra encoded byte must fail before handler admission");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn final_request_params_preserve_mrtr_response_byte_boundary() {
+        let router = Router::new();
+        let mut params = serde_json::json!({
+            "arguments": {"payload": "x".repeat(256 * 1024)},
+            "inputResponses": {"roots": ""},
+        });
+        let response_overhead = serde_json::to_vec(&params["inputResponses"]).unwrap().len();
+        let response_payload_bytes = MAX_MRTR_RAW_INPUT_RESPONSES_BYTES - response_overhead;
+        params["inputResponses"]["roots"] =
+            serde_json::Value::String("r".repeat(response_payload_bytes));
+        assert_eq!(
+            serde_json::to_vec(&params["inputResponses"]).unwrap().len(),
+            MAX_MRTR_RAW_INPUT_RESPONSES_BYTES
+        );
+        router
+            .admit_final_mrtr_response_map(Some(&params))
+            .expect("large ordinary arguments can accompany a bounded response map");
+
+        params["inputResponses"]["roots"] =
+            serde_json::Value::String("r".repeat(response_payload_bytes + 1));
+        let error = router
+            .admit_final_mrtr_response_map(Some(&params))
+            .expect_err("a larger message budget cannot widen the response-submap bound");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+    }
+
+    fn final_mrtr_argument_binding_at_byte_limit(
+        max_bytes: usize,
+    ) -> McpResult<Option<MrtrExchangeBinding>> {
+        let mut arguments = serde_json::json!({"payload": ""});
+        let overhead = serde_json::to_vec(&arguments).unwrap().len();
+        arguments["payload"] = serde_json::Value::String("x".repeat(max_bytes - overhead));
+        assert_eq!(serde_json::to_vec(&arguments).unwrap().len(), max_bytes);
+        let connection = ModernConnection::new();
+        let inbound = InboundRequestContext::with_modern_connection(
+            Cx::for_testing(),
+            301,
+            InboundRequestTransport::Http,
+            &connection,
+        );
+        final_mrtr_binding(
+            &inbound.request_context(),
+            "tools/call",
+            "schema-capacity-echo".to_owned(),
+            &arguments,
+        )
+    }
+
+    #[test]
+    fn final_mrtr_argument_binding_admits_message_byte_boundary() {
+        let binding = final_mrtr_argument_binding_at_byte_limit(MAX_FINAL_RAW_PARAMS_BYTES)
+            .expect("operation arguments can fill the message byte budget");
+        assert!(
+            binding.is_some(),
+            "the transport must install a real binding"
+        );
+    }
+
+    #[test]
+    fn final_mrtr_argument_binding_rejects_one_byte_over_message_boundary() {
+        let error = final_mrtr_argument_binding_at_byte_limit(MAX_FINAL_RAW_PARAMS_BYTES + 1)
+            .expect_err("one extra argument byte must be refused before binding");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
     }
 
     #[test]

@@ -24,6 +24,9 @@ use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{ClientCapabilities, CoreRequest, FinalRequestMeta, RequestId};
 use serde_json::{Value, json};
 
+#[path = "oauth_managed_sse_completion/revocation.rs"]
+mod revocation;
+
 // TEST ONLY: the existing oauth_core_rpc fixture, inlined so remote workers
 // need no transfer-excluded PEM/key files. Never installed in system trust.
 const ROOT: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBgzCCASmgAwIBAgICA+kwCgYIKoZIzj0EAwIwJzElMCMGA1UEAwwcRmFzdE1D\nUCBPQXV0aCBURVNUIE9OTFkgUm9vdDAeFw0yMDAxMDEwMDAwMDBaFw00OTEyMzEw\nMDAwMDBaMCcxJTAjBgNVBAMMHEZhc3RNQ1AgT0F1dGggVEVTVCBPTkxZIFJvb3Qw\nWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAS5t2O8JZ0hNjgI38E9Ov6i6mKoDRGo\nApMsykFkvgb6Zm9/5gCZ90eIKw7aWgK6iNs7lbtVY9mysZBIqm6pKQO2o0UwQzAS\nBgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQU6QNI\nrmvMiLoV3jIoCyohXARwI8gwCgYIKoZIzj0EAwIDSAAwRQIgCKOrW3vhzUJ2EyuY\nvQUTdqGFhy0zEHj4ITFLvXPz1X8CIQCLKD4EKCvS/zkBSu/6uee1WV9d97UpK3yW\nX/aCEJ5+hA==\n-----END CERTIFICATE-----\n";
@@ -329,7 +332,18 @@ mod tasks {
                 let reply = json!({"jsonrpc":"2.0","id":40,"result":{"resultType":"complete",
                     "supportedVersions":["2026-07-28"],"capabilities":{"extensions":{TASKS_EXTENSION:{}}},"ttlMs":0,"cacheScope":"private"}});
                 json_reply(&mut socket, &reply.to_string()).await;
-                peer.reply(if get {"tasks/get"} else {"tools/call"}, result, tail, false).await;
+                if get {
+                    // The existing managed tasks/get contract is JSON-only.
+                    // Exercise its actual body-completion boundary, not an SSE
+                    // response rejected before the snapshot decoder can run.
+                    let (mut socket, _) = peer.rpc("tasks/get", 41).await;
+                    let body = format!(r#"{{"jsonrpc":"2.0","id":41,"result":{result}}}"#);
+                    let length = body.len() + usize::from(matches!(tail, Tail::ShortHttp));
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}").as_bytes()).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                } else {
+                    peer.reply("tools/call", result, tail, false).await;
+                }
                 peer.follow_up().await;
             };
             let application = async {
@@ -345,6 +359,10 @@ mod tasks {
                     }
                     Tail::PartialLine | Tail::PendingEvent => {
                         assert!(matches!(event, Err(ManagedTasksError::Session(OAuthSessionError::IncompleteSseResponse))));
+                        assert!(matches!(call.next_event(&cx).await, Err(ManagedTasksError::Closed)));
+                    }
+                    Tail::ShortHttp => {
+                        assert!(matches!(event, Err(ManagedTasksError::Session(OAuthSessionError::Http(_)))));
                         assert!(matches!(call.next_event(&cx).await, Err(ManagedTasksError::Closed)));
                     }
                     _ => unreachable!(),
@@ -368,7 +386,7 @@ mod tasks {
         }
     }
     #[test]
-    fn managed_tasks_withhold_get_snapshots_on_incomplete_sse() {
-        for tail in [Tail::PartialLine, Tail::PendingEvent] { scenario(SNAPSHOT, tail, true); }
+    fn managed_tasks_withhold_get_snapshots_on_incomplete_http() {
+        scenario(SNAPSHOT, Tail::ShortHttp, true);
     }
 }
