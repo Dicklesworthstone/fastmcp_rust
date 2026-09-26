@@ -1,4 +1,4 @@
-//! Modern stdio framing driven entirely by the embedding's async task.
+//! Modern connection dispatch driven entirely by the embedding's async task.
 //!
 //! The connection polls ingress independently of egress and request work. No
 //! receive thread, blocking-pool pump, or nested runtime participates. Explicit
@@ -37,16 +37,90 @@ type RequestWork = Pin<Box<dyn Future<Output = McpResult<()>> + Send>>;
 type ReadWork<R> = Pin<
     Box<
         dyn Future<
-                Output = (
-                    AsyncStdioRecvHalf<R>,
-                    Result<ReceivedTransportFrame, TransportError>,
-                ),
+                Output = (R, Result<ReceivedTransportFrame, TransportError>),
             > + Send,
     >,
 >;
 type WriteWork<W> = Pin<
-    Box<dyn Future<Output = (AsyncStdioSendHalf<W>, Result<(), TransportError>, usize)> + Send>,
+    Box<dyn Future<Output = (W, Result<(), TransportError>, usize)> + Send>,
 >;
+
+/// Internal framing seam shared by native stdio and WebSocket connections.
+/// The read future remains owned until it completes or the connection stops.
+trait ConnectionReader: Send + 'static {
+    fn receive(&mut self, cx: &Cx)
+        -> impl Future<Output = Result<ReceivedTransportFrame, TransportError>> + Send;
+}
+
+/// A dropped partial send must latch `is_closed`; cancellation before its
+/// first byte may leave this independently owned writer usable.
+trait ConnectionWriter: Send + 'static {
+    fn send(&mut self, cx: &Cx, message: &JsonRpcMessage)
+        -> impl Future<Output = Result<(), TransportError>> + Send;
+    fn close(&mut self, cx: &Cx)
+        -> impl Future<Output = Result<(), TransportError>> + Send;
+    fn is_closed(&self) -> bool;
+}
+
+impl<R: AsyncRead + Unpin + Send + 'static> ConnectionReader for AsyncStdioRecvHalf<R> {
+    async fn receive(&mut self, cx: &Cx) -> Result<ReceivedTransportFrame, TransportError> {
+        self.recv_server_with_source_async(cx).await
+    }
+}
+
+impl<W: AsyncWrite + Unpin + Send + 'static> ConnectionWriter for AsyncStdioSendHalf<W> {
+    async fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        self.send_async(cx, message).await
+    }
+    async fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+        self.close_async(cx).await
+    }
+    fn is_closed(&self) -> bool {
+        Self::is_closed(self)
+    }
+}
+
+#[cfg(feature = "websocket")]
+impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ConnectionReader
+    for fastmcp_transport::websocket::AsyncWsServerRecvHalf<IO>
+{
+    async fn receive(&mut self, cx: &Cx) -> Result<ReceivedTransportFrame, TransportError> {
+        self.recv_with_source(cx).await
+    }
+}
+
+#[cfg(feature = "websocket")]
+impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ConnectionWriter
+    for fastmcp_transport::websocket::AsyncWsServerSendHalf<IO>
+{
+    async fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        Self::send(self, cx, message).await
+    }
+    async fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+        Self::close(self, cx).await
+    }
+    fn is_closed(&self) -> bool {
+        Self::is_closed(self)
+    }
+}
+
+struct ConnectionBinding {
+    transport: InboundRequestTransport,
+    authorization: TransportAuthorization,
+    auth_custody: Option<AuthDispatchCustody>,
+    auth_generation: Option<u64>,
+}
+
+impl ConnectionBinding {
+    fn stdio() -> Self {
+        Self {
+            transport: InboundRequestTransport::Stdio,
+            authorization: TransportAuthorization::default(),
+            auth_custody: None,
+            auth_generation: None,
+        }
+    }
+}
 
 /// The wire cancellation election is separate from the dispatcher's
 /// finalization election. A completed handler can still have an uncommitted
@@ -251,6 +325,7 @@ struct ConnectionLifetime {
     connection: ModernConnection,
     admission: Arc<DispatchQueueState>,
     output: Arc<OutputQueue>,
+    binding: ConnectionBinding,
 }
 
 impl Drop for ConnectionLifetime {
@@ -264,18 +339,18 @@ impl Drop for ConnectionLifetime {
     }
 }
 
-fn receive<R: AsyncRead + Unpin + Send + 'static>(
-    mut reader: AsyncStdioRecvHalf<R>,
+fn receive<R: ConnectionReader>(
+    mut reader: R,
     cx: Cx,
 ) -> ReadWork<R> {
     Box::pin(async move {
-        let result = reader.recv_server_with_source_async(&cx).await;
+        let result = reader.receive(&cx).await;
         (reader, result)
     })
 }
 
-fn write<W: AsyncWrite + Unpin + Send + 'static>(
-    mut writer: AsyncStdioSendHalf<W>,
+fn write<W: ConnectionWriter>(
+    mut writer: W,
     cx: Cx,
     frame: OutputFrame,
     output: Arc<OutputQueue>,
@@ -285,7 +360,7 @@ fn write<W: AsyncWrite + Unpin + Send + 'static>(
             return (writer, Ok(()), frame.bytes);
         }
         let result = {
-            let mut sending = pin!(writer.send_async(&cx, &frame.message));
+            let mut sending = pin!(writer.send(&cx, &frame.message));
             let mut timeout = pin!(asupersync::time::sleep(
                 cx.now(),
                 STDIO_OUTPUT_COMMIT_TIMEOUT
@@ -353,11 +428,11 @@ fn prepare_request(
     // the shared raw-document admission and decoded this frame once, keeping
     // the exact `params` source. Decoding it again repeats both passes.
     let raw_params = frame.raw_params().map(str::to_owned);
-    let JsonRpcMessage::Request(request) = frame.into_message() else {
+    let JsonRpcMessage::Request(mut request) = frame.into_message() else {
         return Err(server_run_error(
             "receive",
             "direction",
-            "Modern stdio received a client response",
+            "Modern connection received a client response",
         ));
     };
     if request.validate().is_err() {
@@ -384,7 +459,7 @@ fn prepare_request(
                 None => error_response(
                     Some(id),
                     -32600,
-                    "Modern stdio requires protocol version metadata",
+                    "Modern connection requires protocol version metadata",
                 ),
             };
             lifetime.output.enqueue(response, None);
@@ -397,17 +472,20 @@ fn prepare_request(
     let inbound = InboundRequestContext::with_modern_connection_and_transport_authorization(
         cx.clone(),
         request_id_to_u64(request.id.as_ref()),
-        InboundRequestTransport::Stdio,
+        lifetime.binding.transport,
         &lifetime.connection,
-        TransportAuthorization::default(),
+        lifetime.binding.authorization.clone(),
     );
     if request.id.is_none() && request.method == "notifications/cancelled" {
-        let mut request = request;
+        #[cfg(feature = "websocket")]
+        if let Some(AuthDispatchCustody::WebSocket(custody)) = &lifetime.binding.auth_custody {
+            sanitize_websocket_decoded_request(custody, &mut request);
+        }
         if let Ok(cancellation) = lifetime.server.authenticate_modern_cancelled_control(
             &inbound,
             &mut request,
-            None,
-            None,
+            lifetime.binding.auth_custody.as_ref(),
+            lifetime.binding.auth_generation,
         ) {
             lifetime
                 .admission
@@ -454,9 +532,22 @@ fn prepare_request(
     });
     // Authentication binds connection ownership before the next inbound
     // cancellation may be admitted, even if this child has not been polled.
+    #[cfg(feature = "websocket")]
+    if let Some(AuthDispatchCustody::WebSocket(custody)) = &lifetime.binding.auth_custody {
+        // The reservation stores only size/identity. Strip before retaining
+        // the request in child work, immediately before the matching custody
+        // fence consumes any mixed-source refusal. Capacity/invalid-envelope
+        // rejection therefore cannot leave an unconsumed registry entry.
+        sanitize_websocket_decoded_request(custody, &mut request);
+    }
     let receipt = match lifetime
         .server
-        .admit_modern_pump_authentication(&inbound, &request, None, None)
+        .admit_modern_pump_authentication(
+            &inbound,
+            &request,
+            lifetime.binding.auth_custody.as_ref(),
+            lifetime.binding.auth_generation,
+        )
     {
         Ok(receipt) => receipt,
         Err(error) => {
@@ -590,10 +681,10 @@ fn prepare_request(
 
 enum Event<R, W> {
     Read(
-        AsyncStdioRecvHalf<R>,
+        R,
         Result<ReceivedTransportFrame, TransportError>,
     ),
-    Written(AsyncStdioSendHalf<W>, Result<(), TransportError>, usize),
+    Written(W, Result<(), TransportError>, usize),
     Completed(usize, McpResult<()>),
     Output,
     #[cfg(feature = "tasks")]
@@ -706,6 +797,82 @@ impl Server {
             },
             None => None,
         };
+        let (reader, writer) = AsyncStdioTransport::from_io(reader, writer).into_split();
+        let (result, request_regions_quiescent) = Self::serve_modern_connection(
+            Arc::clone(&server),
+            cx,
+            reader,
+            writer,
+            ConnectionBinding::stdio(),
+            #[cfg(feature = "tasks")]
+            hosted_tasks.as_ref(),
+        )
+        .await;
+        #[cfg(feature = "tasks")]
+        let result = match hosted_tasks {
+            Some(hosted_tasks) => {
+                // Settlement retains ownership through actual child exit,
+                // including when it reports a deadline or supervisor error.
+                result.and(hosted_tasks.settle(cx).await)
+            }
+            None => result,
+        };
+        if request_regions_quiescent {
+            server.run_shutdown_hook();
+        }
+        result
+    }
+
+    /// The listener owns startup, the shared Task service, and shutdown.
+    /// Each upgraded modern connection owns only its native I/O, requests,
+    /// and output; closing it cannot terminate a sibling's subscriptions.
+    #[cfg(feature = "websocket")]
+    pub(super) async fn serve_modern_websocket<IO>(
+        self: Arc<Self>,
+        cx: &Cx,
+        transport: fastmcp_transport::websocket::AsyncWsServerTransport<IO>,
+        authorization: TransportAuthorization,
+        auth_custody: Arc<WebSocketAuthCustody>,
+        connection_generation: u64,
+    ) -> McpResult<()>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+        if cx.timer_driver().is_none() {
+            return Err(server_run_error(
+                "startup",
+                "timer",
+                "Native WebSocket serving requires the caller's timer driver",
+            ));
+        }
+        let (reader, writer) = transport.into_split();
+        Self::serve_modern_connection(
+            self,
+            cx,
+            reader,
+            writer,
+            ConnectionBinding {
+                transport: InboundRequestTransport::WebSocket,
+                authorization,
+                auth_custody: Some(AuthDispatchCustody::WebSocket(auth_custody)),
+                auth_generation: Some(connection_generation),
+            },
+            #[cfg(feature = "tasks")]
+            None,
+        )
+        .await
+        .0
+    }
+
+    async fn serve_modern_connection<R: ConnectionReader, W: ConnectionWriter>(
+        server: Arc<Self>,
+        cx: &Cx,
+        reader: R,
+        writer: W,
+        binding: ConnectionBinding,
+        #[cfg(feature = "tasks")] hosted_tasks: Option<&tasks::HostedTaskService>,
+    ) -> (McpResult<()>, bool) {
         #[cfg(feature = "tasks")]
         let mut task_service_check = hosted_tasks.as_ref().map(|_| {
             Box::pin(asupersync::time::sleep(cx.now(), TASK_SERVICE_HEALTH_INTERVAL))
@@ -718,8 +885,8 @@ impl Server {
             connection: ModernConnection::new(),
             admission: Arc::new(DispatchQueueState::default()),
             output: Arc::new(OutputQueue::default()),
+            binding,
         };
-        let (reader, writer) = AsyncStdioTransport::from_io(reader, writer).into_split();
         let mut reading = Some(receive(reader, cx.clone()));
         let mut available_writer = Some(writer);
         let mut writing: Option<WriteWork<W>> = None;
@@ -757,7 +924,7 @@ impl Server {
                         return Poll::Ready(Event::Stop(Some(server_run_error(
                             "send",
                             kind,
-                            "Async stdio output capacity exhausted",
+                            "Native connection output capacity exhausted",
                         ))));
                     }
                     if cx.checkpoint().is_err() {
@@ -831,12 +998,19 @@ impl Server {
                             }
                         },
                         Err(TransportError::Closed) => {
-                            let _ = server.terminate_subscription_streams_for_shutdown();
-                            lifetime.admission.cancel_uncorrelated_modern_children();
-                            drain = Some(Box::pin(asupersync::time::sleep(
-                                cx.now(),
-                                DISPATCH_WORKER_SHUTDOWN_TIMEOUT,
-                            )));
+                            if lifetime.binding.transport == InboundRequestTransport::Stdio {
+                                let _ = server.terminate_subscription_streams_for_shutdown();
+                                lifetime.admission.cancel_uncorrelated_modern_children();
+                                drain = Some(Box::pin(asupersync::time::sleep(
+                                    cx.now(),
+                                    DISPATCH_WORKER_SHUTDOWN_TIMEOUT,
+                                )));
+                            } else {
+                                // WebSocket Close has already closed output;
+                                // cancelling this connection's reservations
+                                // must preserve other live peer connections.
+                                stop = true;
+                            }
                         }
                         Err(TransportError::Cancelled) => stop = true,
                         Err(failure) => match classify_receive_error(&failure) {
@@ -898,7 +1072,7 @@ impl Server {
                     error.get_or_insert(server_run_error(
                         "shutdown",
                         "drain_timeout",
-                        "Async stdio response drain exceeded its deadline",
+                        "Native connection response drain exceeded its deadline",
                     ));
                     stop = true;
                 }
@@ -921,7 +1095,7 @@ impl Server {
             let mut closing = pin!(asupersync::time::timeout(
                 cx.now(),
                 STDIO_OUTPUT_COMMIT_TIMEOUT,
-                writer.close_async(cx),
+                writer.close(cx),
             ));
             let close = poll_fn(|task| {
                 let _caller = Cx::set_current(Some(cx.clone()));
@@ -938,19 +1112,8 @@ impl Server {
                 }
             }
         }
-        #[cfg(feature = "tasks")]
-        if let Some(hosted_tasks) = hosted_tasks {
-            if let Err(failure) = hosted_tasks.settle(cx).await {
-                // Settlement retains ownership through actual child exit,
-                // including when it reports a deadline or supervisor error.
-                error.get_or_insert(failure);
-            }
-        }
-        if request_regions_quiescent {
-            server.run_shutdown_hook();
-        }
         drop(lifetime);
-        error.map_or(Ok(()), Err)
+        (error.map_or(Ok(()), Err), request_regions_quiescent)
     }
 }
 
@@ -1114,6 +1277,267 @@ mod tests {
             .unwrap();
         runtime.block_on(async { test(Cx::current().unwrap()).await });
     }
+
+    #[cfg(feature = "websocket")]
+    mod native_websocket_tests {
+        use super::*;
+        use fastmcp_transport::websocket::AsyncWsClientTransport;
+
+        type Peer = AsyncWsClientTransport<TcpStream>;
+        type Serving = asupersync::runtime::TaskHandle<McpResult<WebSocketServerShutdown>>;
+
+        fn run_native<F, Fut>(test: F)
+        where
+            F: FnOnce(Cx) -> Fut,
+            Fut: Future<Output = ()>,
+        {
+            let runtime = RuntimeBuilder::current_thread()
+                .with_reactor(create_reactor().unwrap())
+                .blocking_threads(0, 0)
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let cx = Cx::current().unwrap();
+                assert!(cx.blocking_pool_handle().is_none());
+                // The old inline blocking bridge prevents even the runtime's
+                // timer from being polled. This test-only watchdog cancels
+                // its context so that regression fails rather than hanging.
+                let watchdog_cx = cx.clone();
+                let (finished, completion) = std::sync::mpsc::sync_channel::<()>(1);
+                let watchdog = std::thread::spawn(move || {
+                    if matches!(
+                        completion.recv_timeout(Duration::from_secs(10)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ) {
+                        watchdog_cx.cancel_with(
+                            CancelKind::Deadline,
+                            Some("native WebSocket test made no runtime progress"),
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                });
+                let result = asupersync::time::timeout(
+                    cx.now(),
+                    Duration::from_secs(8),
+                    test(cx.clone()),
+                )
+                .await;
+                let _ = finished.send(());
+                assert!(!watchdog.join().unwrap(), "native bridge blocked its runtime");
+                result.expect("native WebSocket operation exceeded its bound");
+            });
+        }
+
+        async fn connect(cx: &Cx, service: Server) -> (Peer, Serving, SocketAddr) {
+            let bound = service.bind_websocket(cx, "127.0.0.1:0").await.unwrap();
+            let address = bound.local_addr().unwrap();
+            let serving = cx
+                .spawn(move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .unwrap();
+            let peer = Peer::connect(cx, &format!("ws://{address}/mcp"))
+                .await
+                .unwrap();
+            (peer, serving, address)
+        }
+
+        async fn response(cx: &Cx, peer: &mut Peer, id: i64, forbidden: &[i64]) -> JsonRpcResponse {
+            loop {
+                let message = peer.recv(cx).await.unwrap();
+                if let JsonRpcMessage::Response(response) = message {
+                    assert!(
+                        !forbidden.iter().any(|id| response.id == Some((*id).into())),
+                        "cancelled request emitted a late result: {response:?}"
+                    );
+                    if response.id == Some(id.into()) {
+                        return response;
+                    }
+                    panic!("unexpected response while awaiting {id}: {response:?}");
+                }
+            }
+        }
+
+        async fn acknowledge(cx: &Cx, peer: &mut Peer, id: i64) {
+            peer.send(
+                cx,
+                &request(
+                    id,
+                    SUBSCRIPTIONS_LISTEN,
+                    serde_json::json!({"notifications":{"toolsListChanged":true}}),
+                ),
+            )
+            .await
+            .unwrap();
+            let JsonRpcMessage::Request(acknowledgement) = peer.recv(cx).await.unwrap() else {
+                panic!("listen must acknowledge before any terminal response");
+            };
+            assert_eq!(
+                acknowledgement.method,
+                fastmcp_protocol::methods::NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED,
+            );
+            assert_eq!(
+                acknowledgement.params.unwrap()["_meta"]["io.modelcontextprotocol/subscriptionId"],
+                serde_json::json!(id),
+            );
+        }
+
+        async fn stop(cx: &Cx, mut peer: Peer, mut serving: Serving) {
+            peer.close(cx).await.unwrap();
+            drop(peer);
+            serving.abort();
+            assert!(matches!(
+                serving.join(cx).await.unwrap().unwrap(),
+                WebSocketServerShutdown::Quiescent
+            ));
+        }
+
+        #[test]
+        fn native_websocket_server_multiplexes_without_blocking_pool() {
+            run_native(|cx| async move {
+                let gate = Arc::new(Gate::default());
+                let (mut peer, serving, _) = connect(&cx, server(&gate)).await;
+                peer.send(&cx, &discover(100)).await.unwrap();
+                assert!(response(&cx, &mut peer, 100, &[]).await.error.is_none());
+                peer.send(&cx, &call(101, true)).await.unwrap();
+                until(&cx, || gate.entered.load(Ordering::Acquire) == 1).await;
+                peer.send(&cx, &call(102, false)).await.unwrap();
+                assert!(response(&cx, &mut peer, 102, &[]).await.error.is_none());
+                assert_eq!(gate.dropped.load(Ordering::Acquire), 1);
+                gate.release();
+                assert!(response(&cx, &mut peer, 101, &[]).await.error.is_none());
+                stop(&cx, peer, serving).await;
+                assert_eq!(gate.dropped.load(Ordering::Acquire), 2);
+                assert!(cx.checkpoint().is_ok());
+            });
+        }
+
+        #[test]
+        fn native_websocket_server_cancellation_isolates_pending_call_and_listener() {
+            run_native(|cx| async move {
+                let gate = Arc::new(Gate::default());
+                let (mut peer, serving, _) = connect(&cx, server(&gate)).await;
+                peer.send(&cx, &call(201, true)).await.unwrap();
+                until(&cx, || gate.entered.load(Ordering::Acquire) == 1).await;
+                acknowledge(&cx, &mut peer, 202).await;
+                peer.send(&cx, &cancel(201)).await.unwrap();
+                until(&cx, || gate.dropped.load(Ordering::Acquire) == 1).await;
+                peer.send(&cx, &call(203, false)).await.unwrap();
+                assert!(response(&cx, &mut peer, 203, &[201, 202]).await.error.is_none());
+                peer.send(&cx, &cancel(202)).await.unwrap();
+                peer.send(&cx, &discover(204)).await.unwrap();
+                assert!(response(&cx, &mut peer, 204, &[201, 202]).await.error.is_none());
+                stop(&cx, peer, serving).await;
+                assert_eq!(gate.dropped.load(Ordering::Acquire), 2);
+                assert!(cx.checkpoint().is_ok());
+            });
+        }
+
+        #[test]
+        fn native_websocket_server_wrong_id_cancellation_preserves_pending_call() {
+            run_native(|cx| async move {
+                let gate = Arc::new(Gate::default());
+                let (mut peer, serving, _) = connect(&cx, server(&gate)).await;
+                peer.send(&cx, &call(201, true)).await.unwrap();
+                until(&cx, || gate.entered.load(Ordering::Acquire) == 1).await;
+                acknowledge(&cx, &mut peer, 202).await;
+                // This case changes only the cancellation target above.
+                peer.send(&cx, &cancel(999)).await.unwrap();
+                peer.send(&cx, &call(203, false)).await.unwrap();
+                assert!(response(&cx, &mut peer, 203, &[201, 202]).await.error.is_none());
+                assert_eq!(gate.dropped.load(Ordering::Acquire), 1);
+                gate.release();
+                assert!(response(&cx, &mut peer, 201, &[202]).await.error.is_none());
+                peer.send(&cx, &cancel(202)).await.unwrap();
+                peer.send(&cx, &discover(204)).await.unwrap();
+                assert!(response(&cx, &mut peer, 204, &[202]).await.error.is_none());
+                stop(&cx, peer, serving).await;
+                assert_eq!(gate.dropped.load(Ordering::Acquire), 2);
+            });
+        }
+
+        #[test]
+        fn native_websocket_server_rejects_cross_era_frame_before_dispatch() {
+            run_native(|cx| async move {
+                let gate = Arc::new(Gate::default());
+                let (mut peer, serving, _) = connect(&cx, server(&gate)).await;
+                peer.send(&cx, &discover(400)).await.unwrap();
+                assert!(response(&cx, &mut peer, 400, &[]).await.error.is_none());
+                let legacy = JsonRpcMessage::Request(JsonRpcRequest::new(
+                    "initialize",
+                    Some(serde_json::json!({
+                        "protocolVersion":"2024-11-05", "capabilities":{},
+                        "clientInfo":{"name":"cross-era-peer","version":"1"}
+                    })),
+                    401_i64,
+                ));
+                peer.send(&cx, &legacy).await.unwrap();
+                assert!(response(&cx, &mut peer, 401, &[]).await.error.is_some());
+                assert_eq!(gate.entered.load(Ordering::Acquire), 0);
+                peer.send(&cx, &call(402, false)).await.unwrap();
+                assert!(response(&cx, &mut peer, 402, &[]).await.error.is_none());
+                assert_eq!(gate.entered.load(Ordering::Acquire), 1);
+                stop(&cx, peer, serving).await;
+            });
+        }
+
+        #[test]
+        fn native_websocket_server_upgrade_custody_rejects_mixed_credentials() {
+            run_native(|cx| async move {
+                let gate = Arc::new(Gate::default());
+                let (mut peer, serving, _) = connect(&cx, server(&gate)).await;
+                let JsonRpcMessage::Request(mut mixed) = call(501, false) else {
+                    unreachable!()
+                };
+                mixed.params.as_mut().unwrap()["_meta"]["token"] =
+                    serde_json::json!("must-not-reach-application");
+                peer.send(&cx, &JsonRpcMessage::Request(mixed)).await.unwrap();
+                let refused = response(&cx, &mut peer, 501, &[]).await;
+                assert_eq!(
+                    refused.error.unwrap().code.as_i32(),
+                    Some(i32::from(McpErrorCode::ResourceForbidden)),
+                );
+                assert_eq!(gate.entered.load(Ordering::Acquire), 0);
+                // The same request ID without a second credential admits.
+                peer.send(&cx, &call(501, false)).await.unwrap();
+                assert!(response(&cx, &mut peer, 501, &[]).await.error.is_none());
+                assert_eq!(gate.entered.load(Ordering::Acquire), 1);
+                stop(&cx, peer, serving).await;
+            });
+        }
+
+        #[test]
+        fn native_websocket_server_peer_close_preserves_other_connection_subscription() {
+            run_native(|cx| async move {
+                let gate = Arc::new(Gate::default());
+                let service = server(&gate);
+                let subscriptions = Arc::clone(&service.final_subscriptions);
+                let (mut first, serving, address) = connect(&cx, service).await;
+                let mut second = Peer::connect(&cx, &format!("ws://{address}/mcp"))
+                    .await
+                    .unwrap();
+                acknowledge(&cx, &mut first, 601).await;
+                acknowledge(&cx, &mut second, 602).await;
+                first.close(&cx).await.unwrap();
+                drop(first);
+                // Wait until the closed connection has retired its own lease.
+                until(&cx, || subscriptions.inner.lock().unwrap().entries.len() == 1).await;
+                assert_eq!(
+                    subscriptions.publish(ServerNotification::ToolsListChanged(None)).unwrap(),
+                    1,
+                );
+                let JsonRpcMessage::Request(notification) = second.recv(&cx).await.unwrap() else {
+                    panic!("another peer's close must not complete this listen");
+                };
+                assert_eq!(notification.method, "notifications/tools/list_changed");
+                second.send(&cx, &call(603, false)).await.unwrap();
+                assert!(response(&cx, &mut second, 603, &[602]).await.error.is_none());
+                second.send(&cx, &cancel(602)).await.unwrap();
+                stop(&cx, second, serving).await;
+            });
+        }
+    }
+
     /// Names the awaiting call site on expiry; every test shares this helper.
     #[track_caller]
     fn until<'a>(cx: &'a Cx, predicate: impl Fn() -> bool + 'a) -> impl Future<Output = ()> + 'a {
