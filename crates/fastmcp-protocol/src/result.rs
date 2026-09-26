@@ -1757,7 +1757,19 @@ pub(crate) fn deserialize_exact_object<T>(
 where
     T: serde::de::DeserializeOwned,
 {
-    let source = encode_exact_object(&ExactJsonObject { members });
+    deserialize_exact_value(&ExactJsonValue::Object(ExactJsonObject { members }))
+}
+
+/// Deserializes one already-admitted exact value of any shape from its compact
+/// encoding, which keeps member order and number lexemes. The typed decode
+/// then reads only the value, not the whitespace or escape spellings of the
+/// source it was admitted from.
+pub(crate) fn deserialize_exact_value<T>(value: &ExactJsonValue) -> Result<T, ResultDecodeError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let mut source = String::new();
+    encode_exact_value(value, &mut source);
     serde_json::from_str(&source).map_err(|_| ResultDecodeError::invalid_known_member("$"))
 }
 

@@ -957,6 +957,7 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lib_unit_tests::RunnableClock;
     use asupersync::io::ReadBuf;
     use asupersync::net::{TcpListener, TcpStream};
     use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
@@ -1137,18 +1138,28 @@ mod tests {
         predicate: impl Fn() -> bool,
         observed: impl FnOnce() -> String,
     ) {
-        if let Err(elapsed) = asupersync::time::timeout(cx.now(), Duration::from_secs(3), async {
-            while !predicate() {
-                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        {
+        if let Some(waited) = budget_expiry(cx, predicate).await {
             panic!(
-                "public async stdio observation at {site} must arrive within its test budget: {elapsed:?}; {}",
+                "public async stdio observation at {site} must arrive within its test budget: {waited}; {}",
                 observed()
             );
         }
+    }
+
+    /// Polls `predicate` until it holds or three seconds of runnable time
+    /// pass, as the shared [`RunnableClock`] measures it: host load stretches
+    /// the budget, and a server that makes no progress still expires it. On
+    /// expiry, returns how long it waited.
+    async fn budget_expiry(cx: &Cx, predicate: impl Fn() -> bool) -> Option<String> {
+        let clock = RunnableClock::start();
+        let started = clock.mark();
+        while !predicate() {
+            if clock.expired(started, Duration::from_secs(3)) {
+                return Some(clock.describe(started));
+            }
+            asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+        }
+        None
     }
 
     #[derive(Default)]
@@ -1567,6 +1578,38 @@ mod tests {
             until(&cx, || io.response(63).is_some()).await;
             assert!(io.response(63).unwrap().error.is_none());
             assert_eq!(gate.entered.load(Ordering::Acquire), 3);
+            io.eof();
+            serving.join(&cx).await.unwrap().unwrap();
+        });
+    }
+
+    /// The test above with its three calls never fed: the server has nothing
+    /// to make progress on, so the same wait must still expire its budget.
+    #[test]
+    fn async_stdio_test_budget_expires_when_the_server_makes_no_progress() {
+        run(|cx| async move {
+            let gate = Arc::new(Gate::default());
+            let io = Arc::new(IoProbe::default());
+            io.allow(usize::MAX);
+            let service = server(&gate);
+            let stream = Arc::clone(&io);
+            let mut serving = cx
+                .spawn(move |server_cx| async move {
+                    service
+                        .serve_stdio_io(
+                            &server_cx,
+                            ProbeReader(Arc::clone(&stream)),
+                            ProbeWriter(stream),
+                        )
+                        .await
+                })
+                .unwrap();
+            let waited = budget_expiry(&cx, || io.response(62).is_some())
+                .await
+                .expect("no response arrives when no call was fed");
+            assert!(waited.contains("runnable"), "{waited}");
+            assert!(io.response(62).is_none(), "{}", io.observed());
+            assert_eq!(gate.entered.load(Ordering::Acquire), 0);
             io.eof();
             serving.join(&cx).await.unwrap().unwrap();
         });

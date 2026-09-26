@@ -4,7 +4,7 @@
 
 use fastmcp_protocol::{
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, MAX_JSONRPC_STRING_ID_ENCODED_BYTES,
-    RequestId, admit_raw_jsonrpc_document,
+    RawJsonAdmissionError, RawJsonRpcEnvelopeMember, RequestId, admit_raw_jsonrpc_envelope,
 };
 use std::collections::BTreeSet;
 
@@ -38,7 +38,7 @@ const MAX_AGGREGATE_JSON_NUMBER_BYTES: usize = 256 * 1024;
 /// Maximum absolute JSON decimal exponent admitted before typed decoding.
 const MAX_ABSOLUTE_JSON_EXPONENT: usize = 10_000;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct RawEnvelopeShape {
     root_is_object: bool,
     has_method: bool,
@@ -52,6 +52,20 @@ struct RawEnvelopeShape {
 }
 
 impl RawEnvelopeShape {
+    /// The shape of a root object the protocol admission accepted. Accepted
+    /// members are unique, so no duplicate is ever noted.
+    fn admitted(members: &[RawJsonRpcEnvelopeMember]) -> Self {
+        let mut envelope = Self {
+            root_is_object: true,
+            ..Self::default()
+        };
+        for member in members {
+            envelope.note_member(&member.name);
+            envelope.note_value_span(&member.name, member.value.start, member.value.end);
+        }
+        envelope
+    }
+
     fn note_member(&mut self, name: &str) {
         match name {
             "jsonrpc" => {}
@@ -592,6 +606,57 @@ fn decode_raw_request_id(
     serde_json::from_slice(token).map(Some)
 }
 
+/// Applies the envelope rules to a structurally admitted frame's top-level
+/// shape and decodes its request id.
+fn classify_envelope(
+    frame: &[u8],
+    envelope: RawEnvelopeShape,
+    forced_kind: Option<InvalidMessageKind>,
+) -> Result<EnvelopeAdmission, CodecError> {
+    let kind = envelope.complete_kind();
+    let decoded_id =
+        decode_raw_request_id(frame, envelope).map_err(|source| CodecError::InvalidMessage {
+            kind,
+            request_id: None,
+            source,
+        })?;
+    let request_id = match kind {
+        InvalidMessageKind::Request => decoded_id,
+        InvalidMessageKind::Response => None,
+    };
+
+    if !envelope.root_is_object {
+        return Err(invalid_message_codec_error(
+            forced_kind.unwrap_or(InvalidMessageKind::Request),
+            None,
+            "JSON-RPC top-level value must be an object",
+        ));
+    }
+    if envelope.has_unknown_member {
+        return Err(invalid_message_codec_error(
+            kind,
+            request_id,
+            "unknown JSON-RPC top-level envelope member",
+        ));
+    }
+    if kind == InvalidMessageKind::Response && (envelope.has_method || envelope.has_params) {
+        return Err(invalid_message_codec_error(
+            InvalidMessageKind::Response,
+            None,
+            "conflicting JSON-RPC request and response envelope members",
+        ));
+    }
+    if forced_kind == Some(InvalidMessageKind::Request) && kind == InvalidMessageKind::Response {
+        return Err(invalid_message_codec_error(
+            InvalidMessageKind::Response,
+            None,
+            "expected a JSON-RPC request, received a response envelope",
+        ));
+    }
+
+    Ok(EnvelopeAdmission { kind, request_id })
+}
+
 #[derive(Debug)]
 struct EnvelopeAdmission {
     kind: InvalidMessageKind,
@@ -767,12 +832,35 @@ impl Codec {
         if frame.len() > self.max_message_size {
             return Err(CodecError::MessageTooLarge(frame.len()));
         }
-        let text = std::str::from_utf8(frame)
-            .map_err(|_| json_admission_codec_error(JsonAdmissionError::InvalidUtf8))?;
+        // The protocol-owned admission is authoritative and runs first. Its
+        // grammar and limits equal the local scanner's, and it adds the BOM and
+        // top-level-object rules, so every frame it admits the local scanner
+        // would admit with the same top-level members. An admitted frame is
+        // classified from the members that single pass recorded; only a refused
+        // frame is scanned again, so its diagnostic stays direction-safe.
+        match admit_raw_jsonrpc_envelope(frame, self.max_message_size) {
+            Ok(members) => {
+                classify_envelope(frame, RawEnvelopeShape::admitted(&members), forced_kind)
+            }
+            Err(refusal) => Err(self.refused_frame_error(frame, forced_kind, refusal)),
+        }
+    }
+
+    /// Diagnoses a frame the protocol admission refused, with the envelope
+    /// classification the local scanner can still recover from it.
+    fn refused_frame_error(
+        &self,
+        frame: &[u8],
+        forced_kind: Option<InvalidMessageKind>,
+        refusal: RawJsonAdmissionError,
+    ) -> CodecError {
+        let Ok(text) = std::str::from_utf8(frame) else {
+            return json_admission_codec_error(JsonAdmissionError::InvalidUtf8);
+        };
         let envelope = match JsonAdmission::new(text, self.max_message_size).admit() {
             Ok(envelope) => envelope,
             Err(failure) if failure.error == JsonAdmissionError::InvalidSyntax => {
-                return Err(json_admission_codec_error(failure.error));
+                return json_admission_codec_error(failure.error);
             }
             Err(failure) => {
                 let kind = failure.envelope.partial_kind(forced_kind);
@@ -782,65 +870,15 @@ impl Codec {
                         .flatten(),
                     InvalidMessageKind::Response => None,
                 };
-                return Err(invalid_message_codec_error(kind, request_id, failure.error));
+                return invalid_message_codec_error(kind, request_id, failure.error);
             }
         };
-
-        let kind = envelope.complete_kind();
-        let decoded_id = decode_raw_request_id(frame, envelope).map_err(|source| {
-            CodecError::InvalidMessage {
-                kind,
-                request_id: None,
-                source,
-            }
-        })?;
-        let request_id = match kind {
-            InvalidMessageKind::Request => decoded_id,
-            InvalidMessageKind::Response => None,
-        };
-
-        if !envelope.root_is_object {
-            return Err(invalid_message_codec_error(
-                forced_kind.unwrap_or(InvalidMessageKind::Request),
-                None,
-                "JSON-RPC top-level value must be an object",
-            ));
+        match classify_envelope(frame, envelope, forced_kind) {
+            Err(error) => error,
+            Ok(_) => CodecError::Json(<serde_json::Error as serde::de::Error>::custom(
+                refusal.to_string(),
+            )),
         }
-        if envelope.has_unknown_member {
-            return Err(invalid_message_codec_error(
-                kind,
-                request_id,
-                "unknown JSON-RPC top-level envelope member",
-            ));
-        }
-        if kind == InvalidMessageKind::Response && (envelope.has_method || envelope.has_params) {
-            return Err(invalid_message_codec_error(
-                InvalidMessageKind::Response,
-                None,
-                "conflicting JSON-RPC request and response envelope members",
-            ));
-        }
-        if forced_kind == Some(InvalidMessageKind::Request) && kind == InvalidMessageKind::Response
-        {
-            return Err(invalid_message_codec_error(
-                InvalidMessageKind::Response,
-                None,
-                "expected a JSON-RPC request, received a response envelope",
-            ));
-        }
-
-        // Keep the protocol-owned raw admission primitive in the production
-        // decode path. The local scanner above retains envelope classification
-        // for direction-safe codec diagnostics; this call makes the shared
-        // strict UTF-8/BOM/duplicate/limit contract authoritative before any
-        // `serde_json` typed envelope is constructed.
-        admit_raw_jsonrpc_document(frame, self.max_message_size).map_err(|error| {
-            CodecError::Json(<serde_json::Error as serde::de::Error>::custom(
-                error.to_string(),
-            ))
-        })?;
-
-        Ok(EnvelopeAdmission { kind, request_id })
     }
 
     /// Decodes bytes into a message, returning any complete messages.
@@ -1849,5 +1887,44 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn admitted_frames_classify_from_recorded_members_as_the_local_scan_would() {
+        let limit = Codec::new().max_message_size;
+        let admitted: [&[u8]; 5] = [
+            br#"{"jsonrpc":"2.0","method":"tools/list","id":"req-1"}"#,
+            br#" { "jsonrpc" : "2.0" , "id" : 7 , "result" : {"id":[1,2]} } "#,
+            b"{\"jsonrpc\":\"2.0\",\"\\u0069d\":\"a\\u0062\",\"method\":\"m\",\"params\":{\"error\":1},\"x\":true}",
+            br#"{"jsonrpc":"2.0","method":"tools/list","result":null,"id":1}"#,
+            b"{}",
+        ];
+        for frame in admitted {
+            let members = admit_raw_jsonrpc_envelope(frame, limit).expect("protocol admits");
+            let local = JsonAdmission::new(std::str::from_utf8(frame).unwrap(), limit)
+                .admit()
+                .expect("local scan admits");
+            assert_eq!(
+                RawEnvelopeShape::admitted(&members),
+                local,
+                "{}",
+                String::from_utf8_lossy(frame)
+            );
+        }
+
+        // The first frame with a byte-order mark inside its id: the local scan
+        // still admits it, so only the authoritative pass can refuse it.
+        let planted = "{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":\"req-\u{feff}\"}";
+        assert!(JsonAdmission::new(planted, limit).admit().is_ok());
+        let error = Codec::new()
+            .decode_complete_message(planted.as_bytes())
+            .unwrap_err();
+        assert!(matches!(error, CodecError::Json(_)), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains(&RawJsonAdmissionError::ByteOrderMark.to_string()),
+            "{error}"
+        );
     }
 }

@@ -196,6 +196,35 @@ pub fn admit_raw_jsonrpc_document(
         .map_err(RawJsonAdmissionFailure::into)
 }
 
+/// One top-level member of an admitted JSON-RPC envelope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RawJsonRpcEnvelopeMember {
+    /// The member name after JSON string unescaping.
+    pub name: String,
+    /// The byte span of the member's value token in the admitted document,
+    /// excluding the whitespace around it.
+    pub value: std::ops::Range<usize>,
+}
+
+/// Admits a raw JSON-RPC document exactly as [`admit_raw_jsonrpc_document`]
+/// does and returns its top-level members in document order.
+///
+/// Recording the envelope during the one authoritative pass lets a caller
+/// classify the message without scanning the document a second time.
+pub fn admit_raw_jsonrpc_envelope(
+    bytes: &[u8],
+    document_byte_limit: usize,
+) -> Result<Vec<RawJsonRpcEnvelopeMember>, RawJsonAdmissionError> {
+    scan_raw_json_document(
+        bytes,
+        document_byte_limit,
+        RawJsonTopLevel::JsonRpcObject,
+        Some(Vec::new()),
+    )
+    .map(Option::unwrap_or_default)
+    .map_err(RawJsonAdmissionFailure::into)
+}
+
 /// Whether the UTF-8 byte-order mark occurs anywhere in `bytes`. This is the
 /// predicate of comparing every three-byte window, found by seeking the mark's
 /// lead byte; the windowed comparison cost more than the admission scan itself.
@@ -232,6 +261,18 @@ pub fn admit_raw_json_document(
     document_byte_limit: usize,
     top_level: RawJsonTopLevel,
 ) -> Result<(), RawJsonAdmissionFailure> {
+    scan_raw_json_document(bytes, document_byte_limit, top_level, None)?;
+    Ok(())
+}
+
+/// The admission pass itself. When `top_level_members` is present, the root
+/// object's members are appended to it as they are admitted.
+fn scan_raw_json_document(
+    bytes: &[u8],
+    document_byte_limit: usize,
+    top_level: RawJsonTopLevel,
+    top_level_members: Option<Vec<RawJsonRpcEnvelopeMember>>,
+) -> Result<Option<Vec<RawJsonRpcEnvelopeMember>>, RawJsonAdmissionFailure> {
     if bytes.len() > document_byte_limit {
         return Err(RawJsonAdmissionFailure::at_root(
             RawJsonAdmissionError::DocumentTooLarge,
@@ -248,6 +289,7 @@ pub fn admit_raw_json_document(
         ));
     };
     let mut scanner = RawJsonScanner::new(input, document_byte_limit);
+    scanner.top_level_members = top_level_members;
     scanner.skip_whitespace();
     let scanned = match (scanner.peek(), top_level) {
         (Some(b'{'), _) => scanner.parse_object(0),
@@ -277,7 +319,7 @@ pub fn admit_raw_json_document(
             RawJsonAdmissionError::InvalidSyntax,
         ));
     }
-    Ok(())
+    Ok(scanner.top_level_members)
 }
 
 /// Decode a complete JSON-RPC message only after raw-document admission.
@@ -427,6 +469,7 @@ struct RawJsonScanner<'a> {
     decoded_string_bytes: usize,
     decoded_string_byte_limit: usize,
     path: Vec<RawJsonPathSegment>,
+    top_level_members: Option<Vec<RawJsonRpcEnvelopeMember>>,
 }
 
 impl<'a> RawJsonScanner<'a> {
@@ -440,6 +483,7 @@ impl<'a> RawJsonScanner<'a> {
             decoded_string_bytes: 0,
             decoded_string_byte_limit,
             path: Vec::new(),
+            top_level_members: None,
         }
     }
 
@@ -493,8 +537,18 @@ impl<'a> RawJsonScanner<'a> {
                 return Err(RawJsonAdmissionError::InvalidSyntax);
             }
             self.skip_whitespace();
+            let value_start = self.position;
             self.parse_value(nested_depth)?;
-            self.path.pop();
+            let member = self.path.pop();
+            if depth == 0
+                && let (Some(members), Some(RawJsonPathSegment::Member(name))) =
+                    (self.top_level_members.as_mut(), member)
+            {
+                members.push(RawJsonRpcEnvelopeMember {
+                    name,
+                    value: value_start..self.position,
+                });
+            }
             self.skip_whitespace();
             if self.consume(b'}') {
                 return Ok(());
@@ -1828,6 +1882,56 @@ mod tests {
         );
         admit_frame(&mut state, near_miss.as_bytes())
             .expect("changing only the mark's last byte leaves an admissible code point");
+    }
+
+    #[test]
+    fn envelope_admission_records_only_the_root_members_with_exact_value_spans() {
+        // The second member's name is `id` and its value `ab`, both spelled
+        // with a unicode escape.
+        let document =
+            b" { \"jsonrpc\" : \"2.0\" , \"\\u0069d\" : \"a\\u0062\" , \"params\" : {\"id\":[1,{\"method\":2}]} } ";
+        let span_of = |token: &str| {
+            let start = document
+                .windows(token.len())
+                .position(|window| window == token.as_bytes())
+                .expect("token is present");
+            start..start + token.len()
+        };
+
+        let members = admit_raw_jsonrpc_envelope(document, 1024).expect("document is admissible");
+
+        assert_eq!(
+            members,
+            [
+                RawJsonRpcEnvelopeMember {
+                    name: "jsonrpc".to_owned(),
+                    value: span_of(r#""2.0""#),
+                },
+                RawJsonRpcEnvelopeMember {
+                    name: "id".to_owned(),
+                    value: span_of("\"a\\u0062\""),
+                },
+                RawJsonRpcEnvelopeMember {
+                    name: "params".to_owned(),
+                    value: span_of(r#"{"id":[1,{"method":2}]}"#),
+                },
+            ],
+            "names are unescaped, spans exclude whitespace, and nested members are not recorded"
+        );
+        assert_eq!(admit_raw_jsonrpc_document(document, 1024), Ok(()));
+
+        // The same document with the escaped `id` spelled as a second `params`
+        // is refused exactly as the unrecorded admission refuses it.
+        let duplicate =
+            b" { \"jsonrpc\" : \"2.0\" , \"p\\u0061rams\" : \"a\\u0062\" , \"params\" : {\"id\":[1,{\"method\":2}]} } ";
+        assert_eq!(
+            admit_raw_jsonrpc_envelope(duplicate, 1024),
+            Err(RawJsonAdmissionError::DuplicateObjectMember)
+        );
+        assert_eq!(
+            admit_raw_jsonrpc_document(duplicate, 1024),
+            Err(RawJsonAdmissionError::DuplicateObjectMember)
+        );
     }
 
     #[test]
