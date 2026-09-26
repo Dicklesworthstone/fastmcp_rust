@@ -29626,29 +29626,21 @@ mod lib_unit_tests {
 
     // ── ActiveRequestGuard ──────────────────────────────────────────
 
-    // Exact-2024 era: legacy active-request reservation.
-    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn active_request_pending_activation_preserves_parent_and_sibling() {
         active_request_pending_case(None);
     }
 
-    // Exact-2024 era: legacy active-request reservation.
-    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn active_request_pending_cancel_before_activation_preserves_parent_and_sibling() {
         active_request_pending_case(Some(true));
     }
 
-    // Exact-2024 era: legacy active-request reservation.
-    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn active_request_pending_cancel_after_activation_preserves_parent_and_sibling() {
         active_request_pending_case(Some(false));
     }
 
-    // Exact-2024 era: legacy active-request reservation.
-    #[cfg(feature = "legacy-2024-11-05")]
     fn active_request_pending_case(cancel_before_activation: Option<bool>) {
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -35343,8 +35335,6 @@ mod lib_unit_tests {
         assert!(!failure.load(Ordering::Acquire));
     }
 
-    // Exact-2024 era: drives the dual-era returning loop directly.
-    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn reality_check_regression_returning_loop_preserves_notification_failure() {
         let failure = Arc::new(AtomicBool::new(false));
@@ -35375,8 +35365,6 @@ mod lib_unit_tests {
         );
     }
 
-    // Exact-2024 era: drives the dual-era returning loop directly.
-    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn reality_check_regression_notification_failure_wins_cancelled_response_send() {
         let failure = Arc::new(AtomicBool::new(false));
@@ -35416,8 +35404,6 @@ mod lib_unit_tests {
         );
     }
 
-    // Exact-2024 era: drives the dual-era returning loop directly.
-    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn reality_check_regression_parse_error_send_preserves_notification_failure() {
         let failure = Arc::new(AtomicBool::new(false));
@@ -48646,36 +48632,26 @@ mod lib_unit_tests {
         returning_subscription_cleanup_case(true, true);
     }
 
-    // Exact-2024 era: drives the dual-era returning loop directly.
-    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn returning_subscription_background_response_write_succeeds() {
         returning_subscription_background_write_case(false);
     }
 
-    // Exact-2024 era: drives the dual-era returning loop directly.
-    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn returning_subscription_background_response_write_failure_survives_eof() {
         returning_subscription_background_write_case(true);
     }
 
-    // Exact-2024 era: drives the dual-era returning loop directly.
-    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn returning_subscription_matching_peer_cancel_retires_only_its_owner() {
         returning_subscription_peer_cancel_case(true);
     }
 
-    // Exact-2024 era: drives the dual-era returning loop directly.
-    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn returning_subscription_unrelated_peer_cancel_preserves_owner_until_eof() {
         returning_subscription_peer_cancel_case(false);
     }
 
-    // Exact-2024 era: drives the dual-era returning loop directly.
-    #[cfg(feature = "legacy-2024-11-05")]
     fn returning_subscription_peer_cancel_case(matching: bool) {
         let runtime = RuntimeBuilder::current_thread()
             .with_reactor(create_reactor().expect("peer cancellation reactor"))
@@ -48683,8 +48659,8 @@ mod lib_unit_tests {
             .build()
             .expect("peer cancellation runtime");
         let server = Server::new("returning-peer-cancellation", "1.0.0")
-            .protocol_policy(ProtocolPolicy::Auto)
-            .expect("Auto is available in this test profile")
+            .protocol_policy(build_default_protocol_policy())
+            .expect("the build's default policy must be available")
             .build();
         let active = Arc::clone(&server.active_requests);
         let active_for_recv = Arc::clone(&active);
@@ -48788,8 +48764,6 @@ mod lib_unit_tests {
         }
     }
 
-    // Exact-2024 era: drives the dual-era returning loop directly.
-    #[cfg(feature = "legacy-2024-11-05")]
     fn returning_subscription_background_write_case(fail_write: bool) {
         struct RejectListen;
 
@@ -48816,8 +48790,8 @@ mod lib_unit_tests {
         let shutdown_calls = Arc::new(AtomicUsize::new(0));
         let shutdown_calls_for_hook = Arc::clone(&shutdown_calls);
         let server = Server::new("background-response-write", "1.0.0")
-            .protocol_policy(ProtocolPolicy::Auto)
-            .expect("Auto is available in this test profile")
+            .protocol_policy(build_default_protocol_policy())
+            .expect("the build's default policy must be available")
             .middleware(RejectListen)
             .on_shutdown(move || {
                 shutdown_calls_for_hook.fetch_add(1, Ordering::AcqRel);
@@ -49161,15 +49135,11 @@ mod lib_unit_tests {
     // connection. bd-8bcfq fixed it by queueing such output until `recv`
     // returns.
 
-    // Exact-2024 era: drives the dual-era returning loop directly.
-    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn forced_subscription_ack_order_pump_first_keeps_graceful_completion() {
         forced_subscription_shutdown_order_case(true);
     }
 
-    // Exact-2024 era: drives the dual-era returning loop directly.
-    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn forced_subscription_ack_order_active_first_keeps_graceful_completion() {
         forced_subscription_shutdown_order_case(false);
@@ -49238,8 +49208,6 @@ mod lib_unit_tests {
     /// until the opener has published `Active`, and shutdown elects the
     /// graceful completion directly. Either order must deliver exactly one
     /// graceful completion.
-    // Exact-2024 era: drives the dual-era returning loop directly.
-    #[cfg(feature = "legacy-2024-11-05")]
     fn forced_subscription_shutdown_order_case(pump_first: bool) {
         let runtime = RuntimeBuilder::current_thread()
             .with_reactor(create_reactor().expect("forced shutdown-order reactor"))
@@ -49247,8 +49215,8 @@ mod lib_unit_tests {
             .build()
             .expect("forced shutdown-order runtime");
         let server = Server::new("forced-subscription-shutdown-order", "1.0.0")
-            .protocol_policy(ProtocolPolicy::Auto)
-            .expect("Auto is available in this test profile")
+            .protocol_policy(build_default_protocol_policy())
+            .expect("the build's default policy must be available")
             .build();
         let active = Arc::clone(&server.active_requests);
         let active_for_callback = Arc::clone(&active);
