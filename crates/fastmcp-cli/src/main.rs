@@ -848,6 +848,23 @@ impl Commands {
             Self::Tasks { .. } => Some(CliProtocolPolicy::ModernOnly),
         }
     }
+
+    /// The command a machine-readable failure document names, when this
+    /// invocation selected a single-document JSON output mode.
+    const fn machine_output(&self) -> Option<&'static str> {
+        match self {
+            Self::Inspect {
+                format: InspectFormat::Json,
+                ..
+            } => Some("inspect"),
+            Self::Test { json: true, .. } => Some("test"),
+            Self::List {
+                format: ListFormat::Json,
+                ..
+            } => Some("list"),
+            _ => None,
+        }
+    }
 }
 
 /// Tasks never fall back to a legacy custom task protocol.
@@ -967,15 +984,20 @@ impl CliProtocolPolicyRefusal {
             ),
         }
     }
+
+    fn error(self) -> fastmcp_core::McpError {
+        fastmcp_core::McpError::invalid_params(self.diagnostic())
+    }
+}
+
+/// The typed refusal for a policy this build cannot construct, if any.
+fn cli_protocol_policy_refusal(policy: CliProtocolPolicy) -> Option<CliProtocolPolicyRefusal> {
+    (!LEGACY_PROTOCOL_POLICY_ENABLED && !matches!(policy, CliProtocolPolicy::ModernOnly))
+        .then_some(CliProtocolPolicyRefusal::LegacyFeatureUnavailable { policy })
 }
 
 fn validate_cli_protocol_policy(policy: CliProtocolPolicy) -> McpResult<()> {
-    if LEGACY_PROTOCOL_POLICY_ENABLED || matches!(policy, CliProtocolPolicy::ModernOnly) {
-        return Ok(());
-    }
-
-    let refusal = CliProtocolPolicyRefusal::LegacyFeatureUnavailable { policy };
-    Err(fastmcp_core::McpError::invalid_params(refusal.diagnostic()))
+    cli_protocol_policy_refusal(policy).map_or(Ok(()), |refusal| Err(refusal.error()))
 }
 
 /// The immutable policy selected by the CLI and the exact protocol revision
@@ -1117,14 +1139,27 @@ fn main() -> ExitCode {
         }
         Err(error) => error.exit(),
     };
+    let machine_output = cli.command.machine_output();
+    // An unavailable policy is refused before the runtime, reactor, child,
+    // listener, credential read, or protocol byte exists.
+    if let Some(refusal) = cli
+        .command
+        .protocol_policy()
+        .and_then(cli_protocol_policy_refusal)
+    {
+        return report_cli_failure(
+            machine_output,
+            CliFailureCategory::FeatureUnavailable(refusal),
+            &refusal.error(),
+        );
+    }
     // FND-01: no eager crates.io update checks (CLI-NO-UREQ / CLI-NO-SEMVER).
     let forwards_child_exit = matches!(&cli.command, Commands::Run { .. } | Commands::Dev { .. });
 
     let runtime = match build_cli_runtime() {
         Ok(runtime) => runtime,
         Err(error) => {
-            write_cli_error(&error);
-            return ExitCode::FAILURE;
+            return report_cli_failure(machine_output, CliFailureCategory::CommandFailed, &error);
         }
     };
     let result = runtime.block_on(async move {
@@ -1148,8 +1183,7 @@ fn main() -> ExitCode {
                 return code;
             }
 
-            write_cli_error(&e);
-            ExitCode::FAILURE
+            report_cli_failure(machine_output, CliFailureCategory::CommandFailed, &e)
         }
     }
 }
@@ -1316,6 +1350,80 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
 fn write_cli_error(error: &fastmcp_core::McpError) {
     let rendered = sanitize_peer_text(&error.to_string(), PEER_DETAIL_LIMIT);
     write_cli_stderr_line("Error", &rendered);
+}
+
+/// Exit status of every CLI failure that is not a forwarded child status or a
+/// command-line usage error (clap reports those with status 2).
+const CLI_FAILURE_EXIT_CODE: u8 = 1;
+
+/// Schema of the machine-readable failure document.
+const CLI_ERROR_DOCUMENT_SCHEMA: &str = "fastmcp.cli.error/v1";
+
+/// Set once this process has started writing to stdout. A machine output mode
+/// keeps stdout to exactly one JSON document, so a failure after a command
+/// began its own report adds no second document.
+static STDOUT_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Why a command failed, chosen only from locally typed facts. A peer's error
+/// code or data never selects a category.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CliFailureCategory {
+    FeatureUnavailable(CliProtocolPolicyRefusal),
+    CommandFailed,
+}
+
+/// Reports a failure on stderr and, in a machine output mode whose stdout is
+/// still empty, as one JSON document on stdout.
+fn report_cli_failure(
+    machine_output: Option<&'static str>,
+    category: CliFailureCategory,
+    error: &fastmcp_core::McpError,
+) -> ExitCode {
+    write_cli_error(error);
+    if let Some(command) = machine_output {
+        if !STDOUT_STARTED.load(std::sync::atomic::Ordering::Acquire) {
+            let document = cli_error_document(command, category, error);
+            // Best effort: the stderr diagnostic above already reports the
+            // failure if stdout itself is unwritable.
+            if let Ok(text) = serde_json::to_string_pretty(&document) {
+                let _ = write_stdout(&text, "CLI error document", true);
+            }
+        }
+    }
+    ExitCode::from(CLI_FAILURE_EXIT_CODE)
+}
+
+fn cli_error_document(
+    command: &str,
+    category: CliFailureCategory,
+    error: &fastmcp_core::McpError,
+) -> serde_json::Value {
+    let (message, mutation) = sanitize_peer_text_with_metadata(&error.message, PEER_DETAIL_LIMIT);
+    let mut failure = serde_json::Map::new();
+    match category {
+        CliFailureCategory::FeatureUnavailable(
+            CliProtocolPolicyRefusal::LegacyFeatureUnavailable { policy },
+        ) => {
+            failure.insert("category".to_owned(), "featureUnavailable".into());
+            failure.insert("feature".to_owned(), LEGACY_PROTOCOL_POLICY_FEATURE.into());
+            failure.insert("policy".to_owned(), policy.server_launch_value().into());
+        }
+        CliFailureCategory::CommandFailed => {
+            failure.insert("category".to_owned(), "commandFailed".into());
+        }
+    }
+    failure.insert("code".to_owned(), i32::from(error.code).into());
+    failure.insert("message".to_owned(), message.into());
+    serde_json::json!({
+        "schema": CLI_ERROR_DOCUMENT_SCHEMA,
+        "command": command,
+        "success": false,
+        "exitCode": CLI_FAILURE_EXIT_CODE,
+        "error": failure,
+        "redacted": mutation.redacted,
+        "sanitized": mutation.sanitized,
+        "truncated": mutation.truncated,
+    })
 }
 
 fn write_cli_warning(message: &str) {
@@ -1788,6 +1896,7 @@ fn write_stdout_output(
 }
 
 fn write_stdout(output: &str, context: &str, append_newline: bool) -> McpResult<()> {
+    STDOUT_STARTED.store(true, std::sync::atomic::Ordering::Release);
     let stdout = io::stdout();
     write_stdout_output(&mut stdout.lock(), output, context, append_newline)
 }
@@ -7980,6 +8089,7 @@ fn write_inspect_output(writer: &mut impl Write, output: &str) -> McpResult<()> 
 }
 
 fn write_inspect_stdout(output: &str) -> McpResult<()> {
+    STDOUT_STARTED.store(true, std::sync::atomic::Ordering::Release);
     let stdout = io::stdout();
     write_inspect_output(&mut stdout.lock(), output)
 }
