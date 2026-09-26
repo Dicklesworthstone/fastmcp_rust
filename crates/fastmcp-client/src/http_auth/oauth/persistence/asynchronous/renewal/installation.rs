@@ -61,16 +61,21 @@ impl<A, P> OAuthRefreshRenewal<A, P> {
         let OAuthRefreshRenewalCustody::Complete { credentials, .. } = &self.custody else {
             return Err(OAuthAccessRotationError::NotComplete);
         };
+        // Clone only lifetime handles, not grant/store custody. The reservation
+        // then borrows no part of self while the final ownership election runs.
+        let origin = self.origin.clone();
+        let cancellation = self.cancellation.clone();
+        let deadline = self.deadline;
         let observer_deadline = observer.now().saturating_add_nanos(
-            self.deadline.as_nanos().saturating_sub(self.origin.now().as_nanos()),
+            deadline.as_nanos().saturating_sub(origin.now().as_nanos()),
         );
         // Acquisition is the ONLY asynchronous phase. Keep the candidate in
         // Complete until all wait guards have returned, so a post-poll timeout
         // cannot hide a completed installation or discard a usable candidate.
         let reservation = within(observer, observer_deadline, async {
-            Ok(within(&self.origin, self.deadline, async {
+            Ok(within(&origin, deadline, async {
                 Ok(session.reserve_access_rotation(
-                    observer, &self.cancellation, expected_generation, credentials,
+                    observer, &cancellation, expected_generation, credentials,
                 ).await)
             }).await)
         }).await.map_err(OAuthAccessRotationError::Context)?

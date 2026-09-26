@@ -226,3 +226,5 @@ fn acquisition_deadline_is_not_reset_before_the_commit() {
         assert_eq!(session.credential(&cx).await.unwrap().generation(), 1);
     });
 }
+
+mod live;
