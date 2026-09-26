@@ -4839,6 +4839,221 @@ fn spawn_modern_task_http_server() -> HttpServerFixture {
     }
 }
 
+/// A live `bind_http` Tasks server whose Task service, when `hosted`, comes
+/// from the one-call `task_supervisor` hook. The two variants differ only in
+/// that one builder call.
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn spawn_task_supervisor_http_server(hosted: bool) -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("task_supervisor HTTP server control receiver went away".to_owned());
+            }
+            let builder = modern::ServerBuilder::new("facade-http-task-supervisor", "1.0.0")
+                .tool(PublicHttpTaskTool);
+            let builder = if hosted {
+                builder.task_supervisor(Arc::new(PublicHttpHoldingTaskSupervisor))
+            } else {
+                builder
+            };
+            let bound = match builder.build().bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("task_supervisor HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message = format!("task_supervisor HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("task_supervisor HTTP server startup receiver went away".to_owned());
+            }
+            bound
+                .serve(&cx)
+                .await
+                .map_err(|error| format!("task_supervisor HTTP server stopped: {error}"))
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("task_supervisor HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("task_supervisor HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("task_supervisor HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn task_supervisor_http_client(cx: &Cx, server: &HttpServerFixture) -> modern::HttpClient {
+    runtime_block_on_bounded(
+        cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-task-supervisor", "1.0.0")
+            .connect_http_with_cx(cx, public_http_target(server.address(), "/mcp")),
+    )
+    .expect("the public facade connects to the live task_supervisor HTTP server")
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_task_supervisor_creates_reads_and_resumes_a_task() {
+    let cx = Cx::for_request();
+    let server = spawn_task_supervisor_http_server(true);
+    let mut client = task_supervisor_http_client(&cx, &server);
+
+    let created = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_outcome(
+            &cx,
+            RequestId::Number(2),
+            PUBLIC_HTTP_TASK_TOOL_NAME,
+            json!({}),
+            1 << 20,
+        ),
+    )
+    .expect("a task_supervisor server must create a Task over live bind_http");
+    let FinalToolCallOutcome::Task(created) = created else {
+        panic!("tools/call must return the official Task branch: {created:?}");
+    };
+    let task_id = created.task.base().task_id.clone();
+
+    let mut next_id = 3_i64;
+    let get = |client: &mut modern::HttpClient, next_id: &mut i64| {
+        let observed = runtime_block_on_bounded(
+            &cx,
+            client.get_task(&cx, RequestId::Number(*next_id), task_id.clone(), 1 << 20),
+        )
+        .expect("tasks/get must read the created Task");
+        *next_id += 1;
+        observed
+    };
+    let deadline = Instant::now() + HTTP_OPERATION_BOUND;
+    let awaiting = loop {
+        let observed = get(&mut client, &mut next_id);
+        assert_eq!(
+            observed.task.base().task_id,
+            task_id,
+            "tasks/get returns the same id"
+        );
+        if matches!(observed.task, FinalTask::InputRequired { .. }) {
+            break observed;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the hosted service must reach input_required: {observed:?}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    };
+
+    let responses: FinalTaskInputResponses =
+        serde_json::from_value(json!({"roots": {"roots": []}}))
+            .expect("the public final roots response is typed");
+    runtime_block_on_bounded(
+        &cx,
+        client.update_task(
+            &cx,
+            RequestId::Number(next_id),
+            &awaiting.task,
+            responses,
+            1 << 20,
+        ),
+    )
+    .expect("tasks/update must resume the input_required Task");
+    next_id += 1;
+    let deadline = Instant::now() + HTTP_OPERATION_BOUND;
+    loop {
+        let observed = get(&mut client, &mut next_id);
+        if matches!(observed.task, FinalTask::Working(_)) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "tasks/update must resume the Task: {observed:?}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    drop(client);
+    server.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_without_task_supervisor_refuses_task_creation() {
+    let cx = Cx::for_request();
+    let server = spawn_task_supervisor_http_server(false);
+    let mut client = task_supervisor_http_client(&cx, &server);
+
+    let refused = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_outcome(
+            &cx,
+            RequestId::Number(2),
+            PUBLIC_HTTP_TASK_TOOL_NAME,
+            json!({}),
+            1 << 20,
+        ),
+    )
+    .expect_err("only task_supervisor differs, so Task creation must be refused");
+    assert!(
+        format!("{refused:?} {refused}")
+            .contains("Final task creation requires an installed ready task service"),
+        "the refusal must be the existing no-service error: {refused:?}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
 #[cfg(all(
     unix,
     feature = "proxy",
@@ -35998,6 +36213,7 @@ fn spawn_legacy_as_proxy_http_gateway_configured_with_auth(
             .map_err(|error| format!("legacy as_proxy HTTP plan failed: {error}"))?;
             let (proxy, catalog) =
                 Box::pin(ProxyClient::connect_legacy_http_with_protocol_plan_and_catalog(
+                    cx.clone(),
                     1,
                     plan,
                     ClientInfo {
@@ -36012,7 +36228,6 @@ fn spawn_legacy_as_proxy_http_gateway_configured_with_auth(
                         }),
                         ..Default::default()
                     },
-                    cx.clone(),
                 ))
                 .await
                 .map_err(|error| format!("live exact-2024 HTTP proxy upstream connect failed: {error}"))?;

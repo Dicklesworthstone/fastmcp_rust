@@ -3799,14 +3799,17 @@ impl CoreRequest {
             PROMPTS_GET => PROMPTS_GET,
             _ => unreachable!("the final MRTR raw-params guard selected a known method"),
         };
-        crate::result::parse_exact_json(raw_params).map_err(|_| {
+        let exact = crate::result::parse_exact_json(raw_params).map_err(|_| {
             CoreDispatchError::InvalidParams {
                 era,
                 method: method_literal,
             }
         })?;
-        let raw_value: Value =
-            serde_json::from_str(raw_params).map_err(|_| CoreDispatchError::InvalidParams {
+        // The exact parse already holds this source's value; converting it
+        // (numbers through serde_json's own number parser) equals decoding the
+        // source again, without a second pass over its bytes.
+        let raw_value =
+            exact_json_to_serde(&exact).map_err(|_| CoreDispatchError::InvalidParams {
                 era,
                 method: method_literal,
             })?;
@@ -7695,6 +7698,37 @@ mod tests {
                 "changing only one raw {method} value cannot attach another frame's source"
             );
         }
+    }
+
+    #[test]
+    fn final_core_raw_params_compare_numbers_as_serde_decodes_them() {
+        // The raw source is checked against the materialized params through
+        // its exact parse. serde_json respells 4.2e1 as 4.2e+1 when it
+        // materializes, so the check must compare numbers as serde decodes
+        // them, not by source spelling.
+        let raw = r#"{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"name":"weather","arguments":{"n":4.2e1,"d":-0.50E-3}}"#;
+        let materialized: Value =
+            serde_json::from_str(raw).expect("raw call parameters materialize");
+        CoreRequest::decode_with_raw_params(
+            ProtocolEra::Modern2026,
+            TOOLS_CALL,
+            Some(&materialized),
+            Some(raw),
+        )
+        .expect("a source whose numbers decode to the materialized value is attached");
+        let other_number = raw.replacen("4.2e1", "4.3e1", 1);
+        assert!(
+            matches!(
+                CoreRequest::decode_with_raw_params(
+                    ProtocolEra::Modern2026,
+                    TOOLS_CALL,
+                    Some(&materialized),
+                    Some(&other_number),
+                ),
+                Err(CoreDispatchError::InvalidParams { .. })
+            ),
+            "changing one digit of one raw number cannot attach that source"
+        );
     }
 
     #[test]
