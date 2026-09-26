@@ -37313,7 +37313,7 @@ mod lib_unit_tests {
         let cx = Cx::for_testing();
         let calls = Arc::new(AtomicUsize::new(0));
         let endpoint = extension_registry_test_server(Arc::clone(&calls))
-            .into_http_endpoint("http://legacy.test")
+            .test_http_endpoint("http://legacy.test")
             .expect("extension server must construct the configured HTTP endpoint");
         let mut session = endpoint
             .open_session(&cx)
@@ -37335,7 +37335,8 @@ mod lib_unit_tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    #[cfg(feature = "tasks")]
+    // Exact-2024 era: drives the dual-era internal HTTP dispatcher.
+    #[cfg(all(feature = "tasks", feature = "legacy-2024-11-05"))]
     #[test]
     fn builder_http_endpoint_rejects_one_variable_wrong_extension_version() {
         let cx = Cx::for_testing();
