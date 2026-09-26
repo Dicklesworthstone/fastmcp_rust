@@ -129,7 +129,7 @@ impl Peer {
     }
     async fn login(&self, cx: &Cx) -> ManagedOAuthSession {
         let target = format!("https://{}", self.listener.local_addr().unwrap());
-        let root = Certificate::from_pem(ROOT).unwrap();
+        let root = Certificate::from_pem(ROOT).unwrap().remove(0);
         let configuration = OAuthClientConfiguration::from_trusted_endpoints("https://issuer.example",
             url("https://issuer.example/authorize"), url(&format!("{target}/token")),
             url(&format!("{target}/mcp")), "completion-client", vec!["tools:read".to_owned()]).unwrap()

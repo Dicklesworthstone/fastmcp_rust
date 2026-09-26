@@ -53,7 +53,7 @@ async fn peer(listener: &TcpListener, body: &str, ending: Ending) {
             if matches!(ending, Ending::Chunked) { socket.write_all(b"0\r\n\r\n").await.unwrap(); }
         }
     }
-    socket.shutdown().await.unwrap();
+    AsyncWriteExt::shutdown(&mut socket).await.unwrap();
 }
 
 fn limits() -> SseLimits { SseLimits::new(4096, 65536, 64).unwrap() }
