@@ -91,7 +91,7 @@ impl<A, P> OAuthRefreshRenewal<A, P> {
         match reservation.commit(credentials) {
             Ok(session_generation) => Ok((store, OAuthAccessInstallation { session_generation, stored_revision: revision })),
             Err((error, credentials)) => {
-                self.custody = OAuthRefreshRenewalCustody::Complete { store, credentials, revision };
+                self.custody = OAuthRefreshRenewalCustody::Complete { store, credentials: *credentials, revision };
                 Err(error)
             }
         }

@@ -1795,7 +1795,7 @@ impl ModernHttpRequestExecution {
                 }
             }
             match &event {
-                Ok(Some(ModernHttpFinalCoreEvent::Terminal(_))) | Ok(None) => {
+                Ok(Some(ModernHttpFinalCoreEvent::Terminal(_)) | None) => {
                     state.terminal_reason = Some(ExecutionTerminalReason::FinalResponse);
                 }
                 Ok(Some(_)) => state.listener = listener,

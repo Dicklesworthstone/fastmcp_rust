@@ -135,7 +135,7 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
         })();
         let deadline = match admitted {
             Ok(deadline) => deadline,
-            Err(cause) => return Err(OAuthRefreshSubmissionFailure { cause, retained: Some((self, ())) }),
+            Err(cause) => return Err(OAuthRefreshSubmissionFailure { cause, retained: Some(Box::new((self, ()))) }),
         };
         Ok(OAuthRefreshRenewal {
             origin: cx.clone(), cancellation: cancellation.clone(), deadline,
