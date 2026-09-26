@@ -10,7 +10,6 @@ use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
-use std::time::Duration;
 
 use asupersync::Cx;
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
@@ -315,6 +314,7 @@ fn managed_public_completion_wait_is_cancel_correct_and_does_not_poison_the_sess
 #[cfg(feature = "tasks")]
 mod tasks {
     use super::*;
+    use std::time::Duration;
     use fastmcp_client::http_auth::managed::tasks::{ManagedTaskEvent, ManagedTaskRequest, ManagedTaskRequestIds, ManagedTasksClient, ManagedTasksError, ManagedTasksLimits};
     use fastmcp_protocol::tasks_extension::{TASKS_EXTENSION, TaskId};
 
