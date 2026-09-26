@@ -105,7 +105,7 @@ impl Peer {
             launches.fetch_add(1, Ordering::SeqCst);
             browser(authorization)
         });
-        let (_, result) = native::pair(self.token("authorization_code", body), login).await;
+        let ((), result) = native::pair(self.token("authorization_code", body), login).await;
         assert_eq!(launches.load(Ordering::SeqCst), 1);
         quiet(&self.issuer);
         result.unwrap()
@@ -166,7 +166,7 @@ fn native_login_capture_reopen_renew_install_and_mcp_reuse_the_original_session(
         // two independent acceptors inspecting the same listener.
         renewal.advance(&cx).await.unwrap(); renewal.advance(&cx).await.unwrap();
         assert_eq!(f.writes(), 4);
-        let (_, renewed) = native::pair(peer.token("refresh_token", NEXT), renewal.run(&cx)).await;
+        let ((), renewed) = native::pair(peer.token("refresh_token", NEXT), renewal.run(&cx)).await;
         renewed.unwrap(); quiet(&peer.issuer);
         let (store, receipt) = renewal.install_managed_access(&cx, &session, 1).await.unwrap();
         assert_eq!(receipt.session_generation(), 2); assert_eq!(receipt.stored_revision().generation(), 3);
@@ -183,7 +183,7 @@ fn native_login_capture_reopen_renew_install_and_mcp_reuse_the_original_session(
             assert_eq!(result["content"][0]["text"], "capture-journey");
             assert!(call.next_event(&cx).await.unwrap().is_none());
         };
-        native::pair(peer.mcp(&params, &f), application).await;
+        Box::pin(native::pair(peer.mcp(&params, &f), application)).await;
         quiet(&peer.resource); quiet(&peer.issuer);
         session.close(); assert!(active.credential().authorization_for_target(session.resource()).is_none());
         assert!(snapshot.credential().authorization_for_target(session.resource()).is_none());

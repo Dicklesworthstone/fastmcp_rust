@@ -359,7 +359,7 @@ fn managed_capture_competing_stores_cannot_copy_one_refresh_lineage() {
         let mut first = one.begin(&cx, &session, one.open(&cx, &client).await);
         let mut second = two.begin(&cx, &session, two.open(&cx, &client).await);
         ready_to_transfer(&mut first, &cx).await; ready_to_transfer(&mut second, &cx).await;
-        let (a, b) = native::pair(first.run(&cx), second.run(&cx)).await;
+        let (a, b) = Box::pin(native::pair(first.run(&cx), second.run(&cx))).await;
         assert_ne!(a.is_ok(), b.is_ok());
         assert_eq!(one.seals() + two.seals(), 1); assert_eq!(one.writes() + two.writes(), 2);
         for mut capture in [first, second] {
