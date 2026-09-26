@@ -5,6 +5,9 @@
 //! still decides transfer, tombstone, quarantine and commit disposition. There
 //! is no split load/decrypt/take sequence between separately admitted workers.
 
+/// Explicit consume/exchange/persist renewal with retained interruption custody.
+pub mod renewal;
+
 use std::fmt;
 use std::fs::File;
 
