@@ -32,6 +32,7 @@ use asupersync::{Cx, channel::oneshot, runtime::TaskHandle, sync::Notify, time::
 use fastmcp_core::runtime::{ProcessBoundToken, ProcessGenerationGuard};
 use fastmcp_core::{McpContext, McpError, McpOutcome, McpResult, Outcome};
 use fastmcp_protocol::common_types::{OpenMetadata, RawIcon};
+use fastmcp_protocol::http_headers::NonSensitiveHeaderExposure;
 use fastmcp_protocol::{CompleteResult, Content, FinalCallToolResult, FinalTool, Icon, Tool, ToolAnnotations};
 use serde_json::Value;
 
@@ -450,6 +451,9 @@ impl<H: ToolHandler + 'static> ToolHandler for BlockingTool<H> {
     fn final_icons(&self) -> Option<&[RawIcon]> { self.handler.final_icons() }
     fn final_metadata(&self) -> Option<&OpenMetadata> { self.handler.final_metadata() }
     fn final_definition(&self) -> Option<FinalTool> { self.handler.final_definition() }
+    fn header_exposure_reviews(&self) -> Vec<NonSensitiveHeaderExposure> {
+        self.handler.header_exposure_reviews()
+    }
     fn final_tool_error_structured_content(&self, kind: ToolErrorKind) -> Option<Value> {
         self.handler.final_tool_error_structured_content(kind)
     }

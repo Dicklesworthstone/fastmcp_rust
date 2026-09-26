@@ -24,6 +24,7 @@ use fastmcp_protocol::common_types::ExactNonNegativeJsonNumber;
 use fastmcp_protocol::common_types::{
     AbsoluteUri, Annotations, ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
 };
+use fastmcp_protocol::http_headers::NonSensitiveHeaderExposure;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
     AdmittedFinalFormSchema, CacheScope, CacheTtl, CompleteResult, CompletionValues, Content,
@@ -1577,6 +1578,17 @@ pub trait ToolHandler: Send + Sync {
     /// Returns final open metadata for this tool's catalog entry.
     fn final_metadata(&self) -> Option<&OpenMetadata> {
         None
+    }
+
+    /// Returns the registration-time reviews that let this tool's
+    /// `x-mcp-header` properties be mirrored into `Mcp-Param-*` fields.
+    ///
+    /// Local registration refuses an annotated property unless a review names
+    /// this tool, the exact input-schema revision and that property's path; it
+    /// always refuses a `writeOnly` or password-formatted one. Read once during
+    /// admission. Default: no reviews, so annotated local tools are refused.
+    fn header_exposure_reviews(&self) -> Vec<NonSensitiveHeaderExposure> {
+        Vec::new()
     }
 
     /// Returns an exact final catalog definition when this handler owns one.

@@ -3169,6 +3169,9 @@ mod tests {
     use fastmcp_protocol::common_types::{ContentBlock, Implementation};
     #[cfg(feature = "apps")]
     use fastmcp_protocol::extensions::ExtensionNegotiationError;
+    use fastmcp_protocol::http_headers::{
+        HeaderExposureError, NonSensitiveHeaderExposure, ToolSchemaRevision,
+    };
     use fastmcp_protocol::protocol_policy::ProtocolPolicy;
     #[cfg(feature = "proxy")]
     use fastmcp_protocol::protocol_policy::{ProtocolEra, StdioOpeningFrame};
@@ -4784,7 +4787,7 @@ mod tests {
         );
     }
 
-    struct AnnotatedTool(serde_json::Value);
+    struct AnnotatedTool(serde_json::Value, Vec<NonSensitiveHeaderExposure>);
     impl crate::ToolHandler for AnnotatedTool {
         fn definition(&self) -> Tool {
             Tool {
@@ -4798,6 +4801,9 @@ mod tests {
                 annotations: None,
             }
         }
+        fn header_exposure_reviews(&self) -> Vec<NonSensitiveHeaderExposure> {
+            self.1.clone()
+        }
         fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
             Ok(vec![Content::text("ok")])
         }
@@ -4810,10 +4816,24 @@ mod tests {
         }})
     }
 
+    /// Reviews `region` for this exact schema revision.
+    fn region_review(schema: &serde_json::Value) -> NonSensitiveHeaderExposure {
+        NonSensitiveHeaderExposure::new(
+            "lookup",
+            ToolSchemaRevision::of(schema).expect("bounded schema"),
+            ["region"],
+        )
+    }
+
+    fn reviewed(schema: serde_json::Value) -> AnnotatedTool {
+        let review = region_review(&schema);
+        AnnotatedTool(schema, vec![review])
+    }
+
     #[test]
     fn builder_admits_a_valid_annotated_tool_into_the_catalog() {
         let server = ServerBuilder::new("srv", "1.0")
-            .tool(AnnotatedTool(region_schema(serde_json::json!("string"))))
+            .tool(reviewed(region_schema(serde_json::json!("string"))))
             .try_build()
             .expect("a valid annotated tool must build");
         let tools = server.tools();
@@ -4828,7 +4848,7 @@ mod tests {
     #[test]
     fn builder_refuses_an_invalid_annotation_naming_the_tool_and_reason() {
         // Identical to the positive except the annotated type is nullable.
-        let refused = refused_registrations(ServerBuilder::new("srv", "1.0").tool(AnnotatedTool(
+        let refused = refused_registrations(ServerBuilder::new("srv", "1.0").tool(reviewed(
             region_schema(serde_json::json!(["string", "null"])),
         )));
         assert_eq!(refused.len(), 1);
@@ -4846,10 +4866,95 @@ mod tests {
     #[should_panic(expected = "tool \"lookup\": tool declares an invalid final input schema")]
     fn builder_build_panics_instead_of_dropping_a_refused_tool() {
         let _ = ServerBuilder::new("srv", "1.0")
-            .tool(AnnotatedTool(region_schema(serde_json::json!([
+            .tool(reviewed(region_schema(serde_json::json!([
                 "string", "null"
             ]))))
             .build();
+    }
+
+    #[test]
+    fn builder_refuses_each_unreviewed_header_exposure_without_building() {
+        // Each case differs from the reviewed positive above in one dimension.
+        let schema = region_schema(serde_json::json!("string"));
+        let revision = ToolSchemaRevision::of(&schema).expect("bounded schema");
+        let path = vec!["region".to_owned()];
+        let mut earlier = schema.clone();
+        earlier["properties"]["region"]["description"] = serde_json::json!("reviewed earlier");
+        let secret = |keyword: &str, value: serde_json::Value| {
+            let mut secret = schema.clone();
+            secret["properties"]["region"][keyword] = value;
+            secret
+        };
+        let cases = [
+            (
+                AnnotatedTool(schema.clone(), vec![]),
+                HeaderExposureError::Unreviewed {
+                    path: path.clone(),
+                    revision,
+                },
+            ),
+            (
+                AnnotatedTool(schema.clone(), vec![region_review(&earlier)]),
+                HeaderExposureError::StaleReview {
+                    path: path.clone(),
+                    revision,
+                },
+            ),
+            (
+                AnnotatedTool(
+                    schema.clone(),
+                    vec![NonSensitiveHeaderExposure::new(
+                        "lookup",
+                        revision,
+                        ["note"],
+                    )],
+                ),
+                HeaderExposureError::Unreviewed {
+                    path: path.clone(),
+                    revision,
+                },
+            ),
+            (
+                reviewed(secret("writeOnly", serde_json::json!(true))),
+                HeaderExposureError::SecretField { path: path.clone() },
+            ),
+            (
+                reviewed(secret("format", serde_json::json!("password"))),
+                HeaderExposureError::SecretField { path: path.clone() },
+            ),
+        ];
+        for (tool, expected) in cases {
+            let refused = refused_registrations(ServerBuilder::new("srv", "1.0").tool(tool));
+            assert_eq!(refused.len(), 1);
+            assert_eq!(
+                (
+                    refused[0].kind,
+                    refused[0].name.as_str(),
+                    refused[0].reason.as_str()
+                ),
+                (
+                    RegistrationKind::Tool,
+                    "lookup",
+                    expected.to_string().as_str()
+                )
+            );
+        }
+        let mut untokened = schema.clone();
+        untokened["properties"]["region"]["x-mcp-header"] = serde_json::json!("Re gion");
+        let refused =
+            refused_registrations(ServerBuilder::new("srv", "1.0").tool(reviewed(untokened)));
+        assert_eq!(
+            (
+                refused[0].kind,
+                refused[0].name.as_str(),
+                refused[0].reason.as_str()
+            ),
+            (
+                RegistrationKind::Tool,
+                "lookup",
+                "tool declares an invalid final input schema"
+            )
+        );
     }
 
     // ── Mount ──────────────────────────────────────────────────────
