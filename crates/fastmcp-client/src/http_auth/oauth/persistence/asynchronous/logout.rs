@@ -275,7 +275,11 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
         );
         let result = {
             let work = async {
-                let mut step = std::pin::pin!(self.advance_inner(&origin));
+                // Boxed, not stack-pinned: this block is passed by value into
+                // two nested `within` timeouts, and each one keeps its argument
+                // twice (the parameter and the pinned local). Inline, the step
+                // multiplied `advance` to ~49 KB; boxed, it adds one pointer.
+                let mut step = Box::pin(self.advance_inner(&origin));
                 let mut cancelled = std::pin::pin!(cancellation.cancelled());
                 poll_fn(|task| {
                     if cancelled.as_mut().poll(task).is_ready() {
