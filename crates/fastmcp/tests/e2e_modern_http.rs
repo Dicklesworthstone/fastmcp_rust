@@ -23827,15 +23827,16 @@ fn http_05_a_run(reviewed: bool) {
     });
 }
 
-/// Re-runs `name` in a child whose only trust root is the TEST ONLY CA.
+/// Re-runs `name` in a child whose only trust root is the TEST ONLY CA; only
+/// the child calls `case`.
 #[cfg(feature = "native-tls-roots")]
-fn http_05_a_isolated(name: &str, reviewed: bool) {
+fn http_05_a_isolated(name: &str, case: impl FnOnce()) {
     if let Ok(selected) = std::env::var(HTTP_05_A_CHILD) {
         assert_eq!(
             selected, name,
             "the child must run exactly the selected case"
         );
-        http_05_a_run(reviewed);
+        case();
         return;
     }
     let roots = std::env::temp_dir().join(format!("fastmcp-e2e-{name}-ca.pem"));
@@ -23868,14 +23869,22 @@ fn http_05_a_isolated(name: &str, reviewed: bool) {
 
 #[cfg(feature = "native-tls-roots")]
 #[test]
-fn http_05_a_positive() {
-    http_05_a_isolated("http_05_a_positive", true);
+fn http_05_a_executor_reviewed_header_reaches_the_peer() {
+    http_05_a_isolated(
+        "http_05_a_executor_reviewed_header_reaches_the_peer",
+        || {
+            http_05_a_run(true);
+        },
+    );
 }
 
 #[cfg(feature = "native-tls-roots")]
 #[test]
-fn http_05_a_planted_negative() {
-    http_05_a_isolated("http_05_a_planted_negative", false);
+fn http_05_a_executor_unreviewed_annotation_discloses_nothing() {
+    http_05_a_isolated(
+        "http_05_a_executor_unreviewed_annotation_discloses_nothing",
+        || http_05_a_run(false),
+    );
 }
 
 // HTTP-05 B: a live `bind_http` server compares each recognized
@@ -24237,13 +24246,15 @@ fn http_05_b_rewrite_head(head: &str, strip_parameters: bool, host: Option<&str>
 }
 
 /// Terminates TLS for one request per connection and forwards it to the
-/// plain `bind_http` backend.
+/// plain `bind_http` backend, appending each request head as received to
+/// `observed` when given.
 #[cfg(feature = "native-tls-roots")]
 async fn http_05_b_relay(
     listener: asupersync::net::TcpListener,
     acceptor: asupersync::tls::TlsAcceptor,
     backend: SocketAddr,
     strip_parameters: bool,
+    observed: Option<Arc<std::sync::Mutex<Vec<String>>>>,
 ) {
     use asupersync::io::AsyncWriteExt;
     let backend_host = backend.to_string();
@@ -24257,6 +24268,12 @@ async fn http_05_b_relay(
         let Some((head, body)) = http_05_b_read_message(&mut client).await else {
             continue;
         };
+        if let Some(observed) = &observed {
+            observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(head.clone());
+        }
         let Ok(mut upstream) = asupersync::net::TcpStream::connect(backend).await else {
             continue;
         };
@@ -24359,7 +24376,7 @@ fn http_05_b_retry_run(case: Http05BRetryCase) {
         };
         // The relay is polled beside the client, never spawned, so it ends
         // when the client finishes instead of outliving the runtime.
-        let mut relay = std::pin::pin!(http_05_b_relay(listener, acceptor, backend, strip));
+        let mut relay = std::pin::pin!(http_05_b_relay(listener, acceptor, backend, strip, None));
         let mut application = std::pin::pin!(application);
         let mut relay_done = false;
         std::future::poll_fn(|task| {
@@ -24487,6 +24504,352 @@ fn http_05_b_retry_handler_error_is_not_retried() {
     http_05_b_retry_isolated(
         "http_05_b_retry_handler_error_is_not_retried",
         Http05BRetryCase::HandlerError,
+    );
+}
+
+// HTTP-05 A through the public `modern::HttpClient`: the client projects each
+// present non-null annotated argument of the exact outgoing body into one
+// `Mcp-Param-*` field, and a value it cannot project exactly sends nothing.
+// The backend is a live `bind_http` server behind the TLS relay, so its own
+// header validation also checks every field the client sent.
+#[cfg(feature = "native-tls-roots")]
+const HTTP_05_A_CLIENT_TOOL: &str = "public-http-e2e-projection";
+#[cfg(feature = "native-tls-roots")]
+const HTTP_05_A_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+
+/// One annotated property of each primitive kind, an optional annotated
+/// `zone`, and a body-only `note`.
+#[cfg(feature = "native-tls-roots")]
+fn http_05_a_client_schema() -> serde_json::Value {
+    json!({"type": "object", "properties": {
+        "region": {"type": "string", "x-mcp-header": "Region"},
+        "verbose": {"type": "boolean", "x-mcp-header": "Verbose"},
+        "limit": {"type": "integer", "x-mcp-header": "Limit"},
+        "zone": {"type": "string", "x-mcp-header": "Zone"},
+        "note": {"type": "string"}
+    }})
+}
+
+/// `zone` is absent; `region` needs the sentinel encoding.
+#[cfg(feature = "native-tls-roots")]
+fn http_05_a_client_arguments(limit: i64) -> serde_json::Value {
+    json!({"region": "Hello, 世界", "verbose": true, "limit": limit, "note": "body-only"})
+}
+
+/// Records the exact arguments of every handler run.
+#[cfg(feature = "native-tls-roots")]
+struct Http05AProjectionTool {
+    received: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
+
+#[cfg(feature = "native-tls-roots")]
+impl ToolHandler for Http05AProjectionTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: HTTP_05_A_CLIENT_TOOL.to_owned(),
+            description: Some("Proves HTTP-05 A client parameter-header projection".to_owned()),
+            input_schema: http_05_a_client_schema(),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        self.received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(arguments);
+        Ok(vec![Content::text("projection-complete")])
+    }
+}
+
+/// What one public call left behind: its outcome, every request head the
+/// relay forwarded, the backend's `tools/call` count before routing, and the
+/// arguments of every handler run.
+#[cfg(feature = "native-tls-roots")]
+struct Http05AClientObservation {
+    outcome: Result<FinalCoreResult, modern::HttpClientError>,
+    heads: Vec<String>,
+    calls: usize,
+    received: Vec<serde_json::Value>,
+}
+
+/// Connects the public client through the relay and makes one
+/// `call_tool_with_parameter_headers` with every annotation approved.
+#[cfg(feature = "native-tls-roots")]
+fn http_05_a_client_run(arguments: serde_json::Value) -> Http05AClientObservation {
+    use fastmcp_rust::http_executor::parameter_headers::ReviewedToolHeaders;
+    let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (tool_received, counted_calls) = (Arc::clone(&received), Arc::clone(&calls));
+    let server = spawn_legacy_http_server("modern parameter-header projection", move || {
+        ServerBuilder::new("facade-http-param-header-projection", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly is available")
+            .middleware(Http05BRequestCounter {
+                calls: counted_calls,
+                lists: Arc::new(AtomicUsize::new(0)),
+            })
+            .tool(Http05AProjectionTool {
+                received: tool_received,
+            })
+            .build()
+    });
+    let backend = server.address();
+    let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let relay_heads = Arc::clone(&heads);
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .with_reactor(
+            asupersync::runtime::reactor::create_reactor().expect("relay reactor initializes"),
+        )
+        .build()
+        .expect("relay runtime builds");
+    let outcome = runtime.block_on(async move {
+        let cx = Cx::current().expect("the runtime installs an ambient context");
+        let listener = asupersync::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the TLS relay");
+        let acceptor = asupersync::tls::TlsAcceptorBuilder::new(
+            asupersync::tls::CertificateChain::from_pem(HTTP_05_A_LEAF).expect("TEST ONLY leaf"),
+            asupersync::tls::PrivateKey::from_pem(HTTP_05_A_KEY).expect("TEST ONLY key"),
+        )
+        .alpn_protocols(vec![b"http/1.1".to_vec()])
+        .build()
+        .expect("relay TLS acceptor builds");
+        let target = format!(
+            "https://{}/mcp",
+            listener.local_addr().expect("relay address")
+        );
+        let application = async {
+            let endpoint = CanonicalHttpUrl::parse(&target).expect("the relay target is canonical");
+            let mut client = Box::pin(
+                modern::ClientBuilder::new()
+                    .client_info("e2e-http-05-a-projection", "1.0.0")
+                    .connect_http_with_cx(&cx, endpoint.clone()),
+            )
+            .await
+            .expect("the client connects through the TLS relay");
+            let policy = |binding: &fastmcp_protocol::http_headers::ParameterHeaderBinding| {
+                matches!(
+                    binding.header_name(),
+                    "Mcp-Param-Region" | "Mcp-Param-Verbose" | "Mcp-Param-Limit" | "Mcp-Param-Zone"
+                )
+            };
+            let reviewed = ReviewedToolHeaders::new(
+                endpoint,
+                HTTP_05_A_CLIENT_TOOL,
+                http_05_a_client_schema(),
+                policy,
+            )
+            .expect("the host approves every annotated binding");
+            client
+                .call_tool_with_parameter_headers(
+                    &cx,
+                    HTTP_05_A_CLIENT_TOOL,
+                    arguments,
+                    &reviewed,
+                    &policy,
+                )
+                .await
+        };
+        // Polled beside the client, never spawned, as in the B retry cases.
+        let mut relay = std::pin::pin!(http_05_b_relay(
+            listener,
+            acceptor,
+            backend,
+            false,
+            Some(relay_heads)
+        ));
+        let mut application = std::pin::pin!(application);
+        let mut relay_done = false;
+        std::future::poll_fn(|task| {
+            if let std::task::Poll::Ready(outcome) = application.as_mut().poll(task) {
+                return std::task::Poll::Ready(outcome);
+            }
+            if !relay_done {
+                relay_done = relay.as_mut().poll(task).is_ready();
+            }
+            std::task::Poll::Pending
+        })
+        .await
+    });
+    server.shutdown();
+    let heads = heads
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let received = received
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    Http05AClientObservation {
+        outcome,
+        heads,
+        calls: calls.load(Ordering::SeqCst),
+        received,
+    }
+}
+
+/// The `Mcp-Param-*` fields of each forwarded `tools/call` head, names
+/// lowercased and sorted, values verbatim.
+#[cfg(feature = "native-tls-roots")]
+fn http_05_a_tools_call_parameters(heads: &[String]) -> Vec<Vec<(String, String)>> {
+    heads
+        .iter()
+        .filter(|head| {
+            head.to_ascii_lowercase()
+                .contains("\r\nmcp-method: tools/call\r\n")
+        })
+        .map(|head| {
+            let mut fields: Vec<(String, String)> = head
+                .split("\r\n")
+                .skip(1)
+                .filter_map(|line| line.split_once(':'))
+                .filter(|(name, _)| name.to_ascii_lowercase().starts_with("mcp-param-"))
+                .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+                .collect();
+            fields.sort();
+            fields
+        })
+        .collect()
+}
+
+/// A value the client cannot project exactly is refused locally: no
+/// `tools/call` reaches the relay or the backend and no handler runs.
+#[cfg(feature = "native-tls-roots")]
+fn assert_http_05_a_refused_before_send(observed: &Http05AClientObservation) {
+    assert!(
+        matches!(
+            observed.outcome,
+            Err(modern::HttpClientError::Connection(
+                fastmcp_rust::ClientHttpConnectionError::Modern(
+                    fastmcp_rust::ModernHttpClientError::ParameterHeaders(
+                        fastmcp_rust::http_executor::parameter_headers::ToolHeaderDispatchError::Projection(
+                            fastmcp_protocol::http_headers::McpHeaderError::InvalidParameter
+                        )
+                    )
+                )
+            ))
+        ),
+        "the typed local projection refusal: {:?}",
+        observed.outcome
+    );
+    assert_eq!(
+        http_05_a_tools_call_parameters(&observed.heads),
+        Vec::<Vec<(String, String)>>::new(),
+        "no tools/call may leave the client: {:?}",
+        observed.heads
+    );
+    assert_eq!(observed.calls, 0, "the backend saw no tools/call");
+    assert!(
+        observed.received.is_empty(),
+        "no handler ran: {:?}",
+        observed.received
+    );
+}
+
+#[cfg(feature = "native-tls-roots")]
+#[test]
+fn http_05_a_positive() {
+    http_05_a_isolated("http_05_a_positive", || {
+        let arguments = http_05_a_client_arguments(HTTP_05_A_MAX_SAFE_INTEGER);
+        let observed = http_05_a_client_run(arguments.clone());
+        let Ok(FinalCoreResult::ToolsCall { result, .. }) = &observed.outcome else {
+            panic!("the projected call must complete: {:?}", observed.outcome);
+        };
+        assert!(!result.payload.is_error, "{:?}", observed.outcome);
+        assert_eq!(
+            http_05_a_tools_call_parameters(&observed.heads),
+            vec![vec![
+                ("mcp-param-limit".to_owned(), "9007199254740991".to_owned()),
+                (
+                    "mcp-param-region".to_owned(),
+                    "=?base64?SGVsbG8sIOS4lueVjA==?=".to_owned()
+                ),
+                ("mcp-param-verbose".to_owned(), "true".to_owned()),
+            ]],
+            "one exact field per present annotated value; absent zone and body-only note have none"
+        );
+        assert_eq!(
+            observed.calls, 1,
+            "exactly one tools/call reached the backend"
+        );
+        assert_eq!(
+            observed.received,
+            vec![arguments],
+            "the handler receives the body arguments unchanged"
+        );
+    });
+}
+
+#[cfg(feature = "native-tls-roots")]
+#[test]
+fn http_05_a_planted_negative() {
+    http_05_a_isolated("http_05_a_planted_negative", || {
+        // Identical to the positive except that `limit` is one past the
+        // largest JavaScript-safe integer.
+        let observed =
+            http_05_a_client_run(http_05_a_client_arguments(HTTP_05_A_MAX_SAFE_INTEGER + 1));
+        assert_http_05_a_refused_before_send(&observed);
+    });
+}
+
+#[cfg(feature = "native-tls-roots")]
+#[test]
+fn http_05_a_wrong_primitive_kind_sends_no_request() {
+    http_05_a_isolated("http_05_a_wrong_primitive_kind_sends_no_request", || {
+        // Identical to the positive except that the boolean `verbose` is the
+        // string "true".
+        let mut arguments = http_05_a_client_arguments(HTTP_05_A_MAX_SAFE_INTEGER);
+        arguments["verbose"] = json!("true");
+        assert_http_05_a_refused_before_send(&http_05_a_client_run(arguments));
+    });
+}
+
+#[cfg(feature = "native-tls-roots")]
+#[test]
+fn http_05_a_null_annotated_value_is_sent_without_its_header() {
+    http_05_a_isolated(
+        "http_05_a_null_annotated_value_is_sent_without_its_header",
+        || {
+            // sep-2243-client-omit-null: the annotated boolean `verbose` is
+            // null. The client still sends the call, without its field; the
+            // server's schema validation then refuses the null as a tool error.
+            let mut arguments = http_05_a_client_arguments(HTTP_05_A_MAX_SAFE_INTEGER);
+            arguments["verbose"] = serde_json::Value::Null;
+            let observed = http_05_a_client_run(arguments);
+            let Ok(FinalCoreResult::ToolsCall { result, .. }) = &observed.outcome else {
+                panic!(
+                    "a null annotated value must not stop the call: {:?}",
+                    observed.outcome
+                );
+            };
+            assert!(
+                result.payload.is_error,
+                "the non-nullable schema refuses the null as a tool error: {:?}",
+                observed.outcome
+            );
+            assert_eq!(
+                http_05_a_tools_call_parameters(&observed.heads),
+                vec![vec![
+                    ("mcp-param-limit".to_owned(), "9007199254740991".to_owned()),
+                    (
+                        "mcp-param-region".to_owned(),
+                        "=?base64?SGVsbG8sIOS4lueVjA==?=".to_owned()
+                    ),
+                ]],
+                "the null verbose has no field; the other present values keep theirs"
+            );
+            assert_eq!(observed.calls, 1, "the call reached the backend once");
+            assert!(
+                observed.received.is_empty(),
+                "schema refusal must not reach the handler: {:?}",
+                observed.received
+            );
+        },
     );
 }
 
