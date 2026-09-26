@@ -480,7 +480,17 @@ mod modern_http_only {
             Ok(())
         }
         pub fn close(&mut self) {
+            if self.closed {
+                return;
+            }
             self.closed = true;
+            self.transport.terminate();
+        }
+    }
+
+    impl Drop for DualEraHttpSession {
+        fn drop(&mut self) {
+            self.close();
         }
     }
 }
