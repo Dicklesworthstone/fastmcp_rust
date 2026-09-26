@@ -5,6 +5,9 @@
 //! consumed before the single issuer exchange, and the replacement is durably
 //! stored before completion. No failure automatically repeats an exchange.
 
+/// Install a completed persistent renewal into an existing shared access owner.
+pub mod installation;
+
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::task::Poll;

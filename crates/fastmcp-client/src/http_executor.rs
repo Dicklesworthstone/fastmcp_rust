@@ -1237,6 +1237,22 @@ impl ModernHttpSubscriptionListener {
         self.accepted_filter.as_ref()
     }
 
+    /// Cancels this listener by releasing its owned HTTP response immediately.
+    ///
+    /// No peer event or response is awaited, and no JSON-RPC cancellation
+    /// notification or replacement request is sent. Buffered events are
+    /// discarded. The caller's context and other HTTP exchanges remain live.
+    /// Later reads report that the SSE stream is closed rather than yielding
+    /// a synthetic terminal result.
+    ///
+    /// Returns `true` only when a live response was released by this call.
+    /// Calling it again, or after terminal delivery, returns `false`.
+    pub fn cancel(&mut self) -> bool {
+        let was_live = self.stream.response.is_some() && !self.terminal_received;
+        self.stream.close();
+        was_live
+    }
+
     /// Reads and validates one record from this live listener.
     ///
     /// `None` is returned only after the terminal record was already yielded.

@@ -1560,13 +1560,17 @@ pub trait FinalTaskStore: Send + Sync {
     /// application work that must begin from its initial `working` state.
     ///
     /// The task must not be advertised until all three values are durable.
-    /// Older stores fail closed rather than creating unexecutable work.
+    /// Capture the returned snapshot from the actual retained record in that
+    /// same atomic write, before another worker can advance it, and return
+    /// only after commit has succeeded. Reopening the live record after the
+    /// write is not sufficient: the service may already have completed it.
+    /// Stores without this boundary fail closed before creating work.
     fn create_task_with_work(
         &self,
         _task: FinalTask,
         _notification: FinalTaskStatusNotification,
         _work_descriptor: FinalTaskWorkDescriptor,
-    ) -> McpResult<()> {
+    ) -> McpResult<FinalTaskSnapshot> {
         Err(McpError::internal_error(
             "Final task store does not implement atomic task-work creation",
         ))
@@ -1577,13 +1581,15 @@ pub trait FinalTaskStore: Send + Sync {
     /// lifetime, and must survive every snapshot, transition, and recovery.
     /// It is never part of the wire task or application work descriptor.
     /// Stores without this capability must reject before writing anything.
+    /// The returned snapshot obeys the atomic committed-record contract of
+    /// [`Self::create_task_with_work`], including the retained principal.
     fn create_task_with_authenticated_work(
         &self,
         _task: FinalTask,
         _notification: FinalTaskStatusNotification,
         _work_descriptor: FinalTaskWorkDescriptor,
         _principal: Sha256Digest,
-    ) -> McpResult<()> {
+    ) -> McpResult<FinalTaskSnapshot> {
         Err(McpError::internal_error(
             "Final task store does not implement atomic authenticated task creation",
         ))
@@ -1619,7 +1625,9 @@ pub trait FinalTaskStore: Send + Sync {
     /// Atomically compares the current generation, replaces the task and its
     /// notification, and appends validated input to the private worker
     /// handoff. No task, notification, generation, or handoff state may change
-    /// when the comparison fails.
+    /// when the comparison fails. Return `None` on that loss; after a winning
+    /// commit return the actual snapshot captured inside the same transaction,
+    /// before any subsequent worker transition can change the live record.
     ///
     /// Stores written before this operation was added fail closed by default;
     /// accepting an update while discarding its input is never a valid
@@ -1630,7 +1638,7 @@ pub trait FinalTaskStore: Send + Sync {
         _task: FinalTask,
         _notification: FinalTaskStatusNotification,
         _input_responses: FinalTaskInputResponses,
-    ) -> McpResult<bool> {
+    ) -> McpResult<Option<FinalTaskSnapshot>> {
         Err(McpError::internal_error(
             "Final task store does not implement atomic task-input append",
         ))
@@ -1640,12 +1648,14 @@ pub trait FinalTaskStore: Send + Sync {
     /// notification, and clears every unconsumed input from an earlier input
     /// cycle. This operation is required when entering `input_required` and
     /// when committing a terminal state.
+    /// Return `None` without mutation on a lost comparison, or the actual
+    /// committed snapshot captured inside the same atomic write on success.
     fn replace_task_and_clear_input_if_current(
         &self,
         _expected: &FinalTaskSnapshot,
         _task: FinalTask,
         _notification: FinalTaskStatusNotification,
-    ) -> McpResult<bool> {
+    ) -> McpResult<Option<FinalTaskSnapshot>> {
         Err(McpError::internal_error(
             "Final task store does not implement atomic task-input clearing",
         ))
@@ -1660,6 +1670,10 @@ pub trait FinalTaskStore: Send + Sync {
     /// terminal transition requires that cancellation intent has won. The
     /// check and replacement share one durable linearization point, so a
     /// former worker cannot mutate a task after its lease is reclaimed.
+    /// Return `None` on a lost election, or the actual committed snapshot
+    /// captured inside the same atomic write. Do not reread the live record
+    /// after releasing the transaction: an input response may already have
+    /// advanced a newly committed `input_required` task.
     fn replace_task_and_clear_input_for_handoff_if_current(
         &self,
         _expected: &FinalTaskSnapshot,
@@ -1668,7 +1682,7 @@ pub trait FinalTaskStore: Send + Sync {
         _cancellation_required: bool,
         _task: FinalTask,
         _notification: FinalTaskStatusNotification,
-    ) -> McpResult<bool> {
+    ) -> McpResult<Option<FinalTaskSnapshot>> {
         Err(McpError::internal_error(
             "Final task store does not implement fenced handoff transitions",
         ))
@@ -2672,7 +2686,7 @@ impl InMemoryFinalTaskStore {
         notification: FinalTaskStatusNotification,
         work_descriptor: FinalTaskWorkDescriptor,
         principal: Option<Sha256Digest>,
-    ) -> McpResult<()> {
+    ) -> McpResult<FinalTaskSnapshot> {
         let task_id = task.base().task_id.clone();
         validate_final_task_storage_shape(&task)?;
         ensure_final_task_notification_matches_task(&task, &notification)?;
@@ -2725,9 +2739,9 @@ impl InMemoryFinalTaskStore {
                 .insert(task_id.clone(), principal);
         }
         if let Some(expires_at) = expires_at {
-            state.expires_at.insert(task_id, expires_at);
+            state.expires_at.insert(task_id.clone(), expires_at);
         }
-        Ok(())
+        committed_in_memory_final_task_snapshot(&state, &task_id)
     }
 }
 
@@ -2796,7 +2810,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         task: FinalTask,
         notification: FinalTaskStatusNotification,
         work_descriptor: FinalTaskWorkDescriptor,
-    ) -> McpResult<()> {
+    ) -> McpResult<FinalTaskSnapshot> {
         self.persist_task_with_work(task, notification, work_descriptor, None)
     }
 
@@ -2806,7 +2820,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         notification: FinalTaskStatusNotification,
         work_descriptor: FinalTaskWorkDescriptor,
         principal: Sha256Digest,
-    ) -> McpResult<()> {
+    ) -> McpResult<FinalTaskSnapshot> {
         self.persist_task_with_work(task, notification, work_descriptor, Some(principal))
     }
 
@@ -2908,7 +2922,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         task: FinalTask,
         notification: FinalTaskStatusNotification,
         input_responses: FinalTaskInputResponses,
-    ) -> McpResult<bool> {
+    ) -> McpResult<Option<FinalTaskSnapshot>> {
         let task_id = task.base().task_id.clone();
         if expected.task().base().task_id != task_id {
             return Err(McpError::invalid_params(
@@ -2922,12 +2936,12 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.generations.get(&task_id) != Some(&expected.generation()) {
-            return Ok(false);
+            return Ok(None);
         }
         let now = (self.clock)();
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(&task_id) != Some(&expected.generation()) {
-            return Ok(false);
+            return Ok(None);
         }
         replace_in_memory_final_task(
             &mut state,
@@ -2936,7 +2950,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             now,
             InMemoryFinalTaskInputMutation::Append(input_responses),
         )?;
-        Ok(true)
+        committed_in_memory_final_task_snapshot(&state, &task_id).map(Some)
     }
 
     fn replace_task_and_clear_input_if_current(
@@ -2944,7 +2958,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         expected: &FinalTaskSnapshot,
         task: FinalTask,
         notification: FinalTaskStatusNotification,
-    ) -> McpResult<bool> {
+    ) -> McpResult<Option<FinalTaskSnapshot>> {
         let task_id = task.base().task_id.clone();
         if expected.task().base().task_id != task_id {
             return Err(McpError::invalid_params(
@@ -2958,12 +2972,12 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.generations.get(&task_id) != Some(&expected.generation()) {
-            return Ok(false);
+            return Ok(None);
         }
         let now = (self.clock)();
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(&task_id) != Some(&expected.generation()) {
-            return Ok(false);
+            return Ok(None);
         }
         replace_in_memory_final_task(
             &mut state,
@@ -2972,7 +2986,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             now,
             InMemoryFinalTaskInputMutation::Clear,
         )?;
-        Ok(true)
+        committed_in_memory_final_task_snapshot(&state, &task_id).map(Some)
     }
 
     fn replace_task_and_clear_input_for_handoff_if_current(
@@ -2983,7 +2997,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         cancellation_required: bool,
         task: FinalTask,
         notification: FinalTaskStatusNotification,
-    ) -> McpResult<bool> {
+    ) -> McpResult<Option<FinalTaskSnapshot>> {
         if owner_id.is_empty() {
             return Err(McpError::invalid_params(
                 "Final task handoff owner must be non-empty",
@@ -3021,7 +3035,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             || !owns_exact_dispatch
             || state.cancellation_requests.contains(&task_id) != cancellation_required
         {
-            return Ok(false);
+            return Ok(None);
         }
         replace_in_memory_final_task(
             &mut state,
@@ -3030,7 +3044,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             now,
             InMemoryFinalTaskInputMutation::Clear,
         )?;
-        Ok(true)
+        committed_in_memory_final_task_snapshot(&state, &task_id).map(Some)
     }
 
     fn take_input_if_current(
@@ -3730,6 +3744,22 @@ fn ensure_final_task_notification_matches_task(
         ));
     }
     Ok(())
+}
+
+/// Captures the actual committed record while the caller still owns the
+/// mutation lock. A subsequent service transition cannot change this receipt.
+fn committed_in_memory_final_task_snapshot(
+    state: &InMemoryFinalTaskState,
+    task_id: &FinalTaskId,
+) -> McpResult<FinalTaskSnapshot> {
+    let task = state.tasks.get(task_id).cloned().ok_or_else(|| {
+        McpError::internal_error("In-memory final task store lost a committed task")
+    })?;
+    let generation = state.generations.get(task_id).copied().ok_or_else(|| {
+        McpError::internal_error("In-memory final task store lost a committed task generation")
+    })?;
+    Ok(FinalTaskSnapshot::new(task, generation)
+        .with_authenticated_principal(state.authenticated_principals.get(task_id).copied()))
 }
 
 /// Compares complete durable task values without relying on handwritten
@@ -5654,8 +5684,10 @@ impl FinalTaskRuntime {
 
     /// Ensures cancellation's store result is either the unchanged exact
     /// elected snapshot or the exact terminal cancellation proposed by this
-    /// runtime. A permissive backend must not substitute another active or
-    /// terminal task after winning the cancellation compare-and-swap.
+    /// runtime. The elected worker may already have consumed cancellation
+    /// intent and committed its own terminal cancellation before readback.
+    /// Only that monotonic successor may replace the returned active snapshot;
+    /// an unrelated transition or substituted store result still fails closed.
     fn validate_cancellation_store_result(
         &self,
         expected: &FinalTaskSnapshot,
@@ -5674,7 +5706,7 @@ impl FinalTaskRuntime {
                         "Final task store returned an invalid terminal cancellation transition",
                     )
                 })?;
-                if returned.generation() == expected.generation()
+                if returned.generation() <= expected.generation()
                     || !final_tasks_match_exactly(returned.task(), cancelled_task)?
                 {
                     return Err(McpError::internal_error(
@@ -5686,9 +5718,6 @@ impl FinalTaskRuntime {
             FinalTask::Working(_) => {
                 if returned.generation() != expected.generation()
                     || !final_tasks_match_exactly(returned.task(), expected.task())?
-                    || !self
-                        .store
-                        .is_cancellation_requested(&expected.task().base().task_id)?
                 {
                     return Err(McpError::internal_error(
                         "Final task store returned a substituted active cancellation snapshot",
@@ -5702,16 +5731,46 @@ impl FinalTaskRuntime {
                 ));
             }
         };
-        let committed = self.load_task_snapshot(&expected.task().base().task_id)?;
-        if committed.generation() != returned.generation()
-            || committed.authenticated_principal() != returned.authenticated_principal()
-            || !final_tasks_match_exactly(committed.task(), returned.task())?
+        let task_id = &expected.task().base().task_id;
+        // Read intent before the snapshot. A worker can consume intent only by
+        // leaving a terminal cancellation, so a false intent observation must
+        // be followed by a read that can observe that newer terminal state.
+        // Reversing these reads can pair a stale Working snapshot with the
+        // already-consumed intent and reject a successfully committed cancel.
+        let cancellation_requested =
+            !terminal && self.store.is_cancellation_requested(task_id)?;
+        let committed = self.load_task_snapshot(task_id)?;
+        if committed.authenticated_principal() != returned.authenticated_principal() {
+            return Err(McpError::internal_error(
+                "Final task store changed the task principal",
+            ));
+        }
+        if committed.generation() == returned.generation()
+            && final_tasks_match_exactly(committed.task(), returned.task())?
+        {
+            if !terminal && !cancellation_requested {
+                return Err(McpError::internal_error(
+                    "Final task store did not retain the active cancellation intent",
+                ));
+            }
+            return Ok(terminal);
+        }
+        if terminal
+            || committed.generation() <= returned.generation()
+            || !matches!(committed.task(), FinalTask::Cancelled(_))
         {
             return Err(McpError::internal_error(
                 "Final task store returned cancellation data that is not durably retained",
             ));
         }
-        Ok(terminal)
+        validate_final_task_transition(returned.task(), committed.task()).map_err(|_| {
+            McpError::internal_error(
+                "Final task store returned an invalid cooperative cancellation transition",
+            )
+        })?;
+        // The worker owns this terminal transition and its notification. The
+        // request only acknowledges its already committed cancellation intent.
+        Ok(false)
     }
 
     /// Returns durable cancellation intent for a caller-owned task worker.
@@ -5952,20 +6011,23 @@ impl FinalTaskRuntime {
         Ok(())
     }
 
-    /// Checks the store's post-commit value before observers can treat a
-    /// successful compare-and-swap as an application-visible transition.
+    /// Validates the actual snapshot captured by the store's atomic write.
+    /// The live record may already have advanced by the time this runs; only
+    /// the committed receipt establishes the outcome of this exact operation.
     fn validate_committed_transition(
         &self,
         expected: &FinalTaskSnapshot,
         intended: &FinalTask,
-    ) -> McpResult<()> {
-        let committed = self.load_task_snapshot(&intended.base().task_id)?;
+        committed: FinalTaskSnapshot,
+    ) -> McpResult<FinalTaskSnapshot> {
+        let committed =
+            self.validate_loaded_task_snapshot(committed, Some(&intended.base().task_id))?;
         validate_final_task_transition(expected.task(), committed.task()).map_err(|_| {
             McpError::internal_error(
                 "Final task store committed an invalid durable task transition",
             )
         })?;
-        if committed.generation() == expected.generation()
+        if committed.generation() <= expected.generation()
             || committed.authenticated_principal() != expected.authenticated_principal()
             || !final_tasks_match_exactly(committed.task(), intended)?
         {
@@ -5973,19 +6035,30 @@ impl FinalTaskRuntime {
                 "Final task store substituted a durable task transition",
             ));
         }
-        Ok(())
+        Ok(committed)
     }
 
     /// Checks the store's create-before-reply value before publishing a task
     /// handle or observer notification.
-    fn validate_committed_new_task(&self, intended: &FinalTask) -> McpResult<()> {
-        let committed = self.load_task_snapshot(&intended.base().task_id)?;
+    fn validate_committed_new_task(
+        &self,
+        intended: &FinalTask,
+        principal: Option<Sha256Digest>,
+        committed: FinalTaskSnapshot,
+    ) -> McpResult<FinalTaskSnapshot> {
+        let committed =
+            self.validate_loaded_task_snapshot(committed, Some(&intended.base().task_id))?;
         if !final_tasks_match_exactly(committed.task(), intended)? {
             return Err(McpError::internal_error(
                 "Final task store substituted a newly created durable task",
             ));
         }
-        Ok(())
+        if committed.authenticated_principal() != principal {
+            return Err(McpError::internal_error(
+                "Final task store substituted the task principal at creation",
+            ));
+        }
+        Ok(committed)
     }
 
     /// Validates a new task immediately before its durable create boundary.
@@ -6020,13 +6093,14 @@ impl FinalTaskRuntime {
         let notification = final_task_notification(&task);
         self.validate_new_task_write(&task, &notification)?;
         validate_final_task_work_descriptor(&work_descriptor)?;
-        self.store
+        let committed = self
+            .store
             .create_task_with_work(task.clone(), notification.clone(), work_descriptor)?;
-        self.validate_committed_new_task(&task)?;
+        let committed = self.validate_committed_new_task(&task, None, committed)?;
         // Creation has crossed the durable create-before-reply boundary. A
         // post-commit observer failure must never erase the client handle by
         // turning this accepted operation into an RPC error.
-        self.emit(notification, None);
+        self.emit_committed(notification, &committed);
         self.signal_task_service(task_id);
         Ok(())
     }
@@ -6050,7 +6124,7 @@ impl FinalTaskRuntime {
         let notification = final_task_notification(&task);
         self.validate_new_task_write(&task, &notification)?;
         validate_final_task_work_descriptor(&work_descriptor)?;
-        {
+        let committed = {
             let signal = self
                 .service_signal
                 .lock()
@@ -6066,24 +6140,19 @@ impl FinalTaskRuntime {
                     notification.clone(),
                     work_descriptor,
                     principal,
-                )?;
+                )?
             } else {
                 self.store.create_task_with_work(
                     task.clone(),
                     notification.clone(),
                     work_descriptor,
-                )?;
+                )?
             }
-        }
-        self.validate_committed_new_task(&task)?;
-        if self.load_task_snapshot(&task_id)?.authenticated_principal() != principal {
-            return Err(McpError::internal_error(
-                "Final task store substituted the task principal at creation",
-            ));
-        }
+        };
+        let committed = self.validate_committed_new_task(&task, principal, committed)?;
         // The durable commit above is the acceptance point. Observer failures
         // cannot revoke the returned task handle.
-        self.emit(notification, principal);
+        self.emit_committed(notification, &committed);
         self.signal_task_service(task_id);
         Ok(())
     }
@@ -6100,18 +6169,18 @@ impl FinalTaskRuntime {
         };
         let notification = final_task_notification(&task);
         self.validate_task_transition_write(expected, &task, &notification)?;
-        if !self.store.replace_task_and_append_input_if_current(
+        let Some(committed) = self.store.replace_task_and_append_input_if_current(
             expected,
             task.clone(),
             notification.clone(),
             input_responses,
-        )? {
+        )? else {
             return Err(McpError::invalid_params(
                 "Task state changed before the transition could be recorded",
             ));
-        }
-        self.validate_committed_transition(expected, &task)?;
-        self.emit(notification, expected.authenticated_principal());
+        };
+        let committed = self.validate_committed_transition(expected, &task, committed)?;
+        self.emit_committed(notification, &committed);
         if let Some(task_id) = wakeup_task_id {
             self.signal_task_service(task_id);
         }
@@ -6126,17 +6195,17 @@ impl FinalTaskRuntime {
     ) -> McpResult<()> {
         let notification = final_task_notification(&task);
         self.validate_task_transition_write(expected, &task, &notification)?;
-        if !self.store.replace_task_and_clear_input_if_current(
+        let Some(committed) = self.store.replace_task_and_clear_input_if_current(
             expected,
             task.clone(),
             notification.clone(),
-        )? {
+        )? else {
             return Err(McpError::invalid_params(
                 "Task state changed before the transition could be recorded",
             ));
-        }
-        self.validate_committed_transition(expected, &task)?;
-        self.emit(notification, expected.authenticated_principal());
+        };
+        let committed = self.validate_committed_transition(expected, &task, committed)?;
+        self.emit_committed(notification, &committed);
         Ok(())
     }
 
@@ -6150,7 +6219,7 @@ impl FinalTaskRuntime {
     ) -> McpResult<()> {
         let notification = final_task_notification(&task);
         self.validate_task_transition_write(expected, &task, &notification)?;
-        if !self
+        let Some(committed) = self
             .store
             .replace_task_and_clear_input_for_handoff_if_current(
                 expected,
@@ -6160,12 +6229,32 @@ impl FinalTaskRuntime {
                 task.clone(),
                 notification.clone(),
             )?
-        {
+        else {
             return Err(stale_final_task_handoff_error());
-        }
-        self.validate_committed_transition(expected, &task)?;
-        self.emit(notification, expected.authenticated_principal());
+        };
+        let committed = self.validate_committed_transition(expected, &task, committed)?;
+        self.emit_committed(notification, &committed);
         Ok(())
+    }
+
+    /// Suppresses a notification already superseded when publication starts.
+    /// This read is best effort and cannot revoke an accepted durable write.
+    /// Concurrent writers can still overtake the callback after this probe;
+    /// this is not a cross-runtime ordered notification stream. No application
+    /// callback runs while a backend transaction or record lock is retained.
+    fn emit_committed(
+        &self,
+        notification: FinalTaskStatusNotification,
+        committed: &FinalTaskSnapshot,
+    ) {
+        let current = self.load_task_snapshot(&committed.task().base().task_id);
+        if current.is_ok_and(|current| {
+            current.generation() == committed.generation()
+                && current.authenticated_principal() == committed.authenticated_principal()
+                && final_tasks_match_exactly(current.task(), committed.task()).unwrap_or(false)
+        }) {
+            self.emit(notification, committed.authenticated_principal());
+        }
     }
 
     /// Delivers a durable notification to every observer after the store
@@ -8174,7 +8263,7 @@ mod tests {
             task: FinalTask,
             notification: FinalTaskStatusNotification,
             work_descriptor: FinalTaskWorkDescriptor,
-        ) -> McpResult<()> {
+        ) -> McpResult<FinalTaskSnapshot> {
             let service_signal = self
                 .service_signal
                 .lock()
@@ -8302,7 +8391,7 @@ mod tests {
             task: FinalTask,
             notification: FinalTaskStatusNotification,
             input_responses: FinalTaskInputResponses,
-        ) -> McpResult<bool> {
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
             self.inner.replace_task_and_append_input_if_current(
                 expected,
                 task,
@@ -8316,7 +8405,7 @@ mod tests {
             expected: &FinalTaskSnapshot,
             task: FinalTask,
             notification: FinalTaskStatusNotification,
-        ) -> McpResult<bool> {
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
             self.inner
                 .replace_task_and_clear_input_if_current(expected, task, notification)
         }
@@ -9607,13 +9696,14 @@ mod tests {
             task: FinalTask,
             _notification: FinalTaskStatusNotification,
             work_descriptor: FinalTaskWorkDescriptor,
-        ) -> McpResult<()> {
-            self.replace_snapshot_for_read(task);
+        ) -> McpResult<FinalTaskSnapshot> {
+            let mut snapshot = self.snapshot.lock().unwrap();
+            *snapshot = FinalTaskSnapshot::new(task, snapshot.generation());
             *self
                 .work_descriptor
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(work_descriptor);
-            Ok(())
+            Ok(snapshot.clone())
         }
 
         fn get_task(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTask>> {
@@ -9675,11 +9765,29 @@ mod tests {
             &self,
             expected: &FinalTaskSnapshot,
             task: FinalTask,
-            notification: FinalTaskStatusNotification,
-        ) -> McpResult<bool> {
+            _notification: FinalTaskStatusNotification,
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
             self.transition_write_calls
                 .fetch_add(1, AtomicOrdering::SeqCst);
-            self.replace_task_if_current(expected, task, notification)
+            if self.force_false_cas.load(AtomicOrdering::SeqCst) {
+                return Ok(None);
+            }
+            let mut snapshot = self.snapshot.lock().unwrap();
+            if snapshot.generation() != expected.generation() {
+                return Ok(None);
+            }
+            let generation = snapshot
+                .generation()
+                .checked_add(1)
+                .ok_or_else(|| McpError::internal_error("probe generation exhausted"))?;
+            let committed_task = self
+                .transition_result_override
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or(task);
+            *snapshot = FinalTaskSnapshot::new(committed_task, generation);
+            Ok(Some(snapshot.clone()))
         }
 
         fn next_initial_work_snapshot_after(
@@ -10185,6 +10293,747 @@ mod tests {
         assert_eq!(after.generation(), baseline.generation());
     }
 
+    type CommittedSnapshotProbe = Box<dyn FnOnce(FinalTaskSnapshot) -> FinalTaskSnapshot + Send>;
+
+    /// Runs one independent worker transition after the real atomic commit
+    /// and before its captured snapshot reaches the requesting runtime.
+    struct CommittedSnapshotProbeStore {
+        inner: Arc<InMemoryFinalTaskStore>,
+        after_commit: Mutex<Option<CommittedSnapshotProbe>>,
+        fail_observation: AtomicBool,
+    }
+
+    impl CommittedSnapshotProbeStore {
+        fn committed(&self, snapshot: FinalTaskSnapshot) -> FinalTaskSnapshot {
+            let probe = self.after_commit.lock().unwrap().take();
+            match probe {
+                Some(probe) => probe(snapshot),
+                None => snapshot,
+            }
+        }
+    }
+
+    impl FinalTaskStore for CommittedSnapshotProbeStore {
+        fn create_task(
+            &self,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+        ) -> McpResult<()> {
+            self.inner.create_task(task, notification)
+        }
+
+        fn create_task_with_work(
+            &self,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+            work_descriptor: FinalTaskWorkDescriptor,
+        ) -> McpResult<FinalTaskSnapshot> {
+            self.inner
+                .create_task_with_work(task, notification, work_descriptor)
+                .map(|snapshot| self.committed(snapshot))
+        }
+
+        fn create_task_with_authenticated_work(
+            &self,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+            work_descriptor: FinalTaskWorkDescriptor,
+            principal: Sha256Digest,
+        ) -> McpResult<FinalTaskSnapshot> {
+            self.inner
+                .create_task_with_authenticated_work(task, notification, work_descriptor, principal)
+                .map(|snapshot| self.committed(snapshot))
+        }
+
+        fn get_task(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTask>> {
+            self.inner.get_task(task_id)
+        }
+
+        fn get_task_snapshot(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTaskSnapshot>> {
+            if self.fail_observation.load(AtomicOrdering::SeqCst) {
+                return Err(McpError::internal_error(
+                    "planted post-commit observation failure",
+                ));
+            }
+            self.inner.get_task_snapshot(task_id)
+        }
+
+        fn replace_task(
+            &self,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+        ) -> McpResult<()> {
+            self.inner.replace_task(task, notification)
+        }
+
+        fn replace_task_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+        ) -> McpResult<bool> {
+            self.inner
+                .replace_task_if_current(expected, task, notification)
+        }
+
+        fn replace_task_and_append_input_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+            input_responses: FinalTaskInputResponses,
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner
+                .replace_task_and_append_input_if_current(expected, task, notification, input_responses)
+                .map(|snapshot| snapshot.map(|snapshot| self.committed(snapshot)))
+        }
+
+        fn replace_task_and_clear_input_for_handoff_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            owner_id: &str,
+            dispatch_fence: u64,
+            cancellation_required: bool,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner
+                .replace_task_and_clear_input_for_handoff_if_current(
+                    expected,
+                    owner_id,
+                    dispatch_fence,
+                    cancellation_required,
+                    task,
+                    notification,
+                )
+                .map(|snapshot| snapshot.map(|snapshot| self.committed(snapshot)))
+        }
+
+        fn next_initial_work_snapshot_after(
+            &self,
+            after: Option<&FinalTaskId>,
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner.next_initial_work_snapshot_after(after)
+        }
+
+        fn next_accepted_input_snapshot_after(
+            &self,
+            after: Option<&FinalTaskId>,
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner.next_accepted_input_snapshot_after(after)
+        }
+
+        fn request_cancellation(&self, task_id: &FinalTaskId) -> McpResult<()> {
+            self.inner.request_cancellation(task_id)
+        }
+
+        fn request_cancellation_if_current(&self, expected: &FinalTaskSnapshot) -> McpResult<bool> {
+            self.inner.request_cancellation_if_current(expected)
+        }
+
+        fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool> {
+            self.inner.is_cancellation_requested(task_id)
+        }
+
+        fn retention_clock_now(&self) -> Instant {
+            self.inner.retention_clock_now()
+        }
+
+        fn task_retention_deadline_if_current(
+            &self,
+            task_id: &FinalTaskId,
+            generation: u64,
+        ) -> McpResult<Option<FinalTaskRetentionDeadline>> {
+            self.inner
+                .task_retention_deadline_if_current(task_id, generation)
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum AtomicTaskCommitPhase {
+        Create,
+        Update,
+        RequireInput,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum AtomicTaskReceiptMutation {
+        Identity,
+        Payload,
+        Principal,
+        Generation,
+        OlderGeneration,
+    }
+
+    fn assert_atomic_task_receipt(
+        phase: AtomicTaskCommitPhase,
+        authenticated: bool,
+        mutation: Option<AtomicTaskReceiptMutation>,
+    ) {
+        const OWNER: &str = "atomic-receipt-worker";
+        let inner = Arc::new(InMemoryFinalTaskStore::default());
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let worker_notifications = notifications.clone();
+        let worker = FinalTaskRuntime::new(
+            inner.clone(),
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000)).unwrap(),
+            Arc::new(move |notification| worker_notifications.lock().unwrap().push(notification)),
+        );
+        let probe = Arc::new(CommittedSnapshotProbeStore {
+            inner: inner.clone(),
+            after_commit: Mutex::new(None),
+            fail_observation: AtomicBool::new(false),
+        });
+        let request_notifications = notifications.clone();
+        let runtime = FinalTaskRuntime::new(
+            probe.clone(),
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000)).unwrap(),
+            Arc::new(move |notification| request_notifications.lock().unwrap().push(notification)),
+        );
+        let mut ctx = McpContext::new(Cx::for_testing(), 1);
+        if authenticated {
+            ctx = ctx.with_auth(fastmcp_core::AuthContext::with_subject("atomic-owner"));
+        }
+        let principal = task_request_principal(&ctx).unwrap();
+        let retained_after_worker = Arc::new(Mutex::new(None));
+        let after_worker = retained_after_worker.clone();
+        let worker_inner = inner.clone();
+        let worker_for_probe = worker.clone();
+        let predecessor_generation = Arc::new(AtomicU64::new(0));
+        let generation_for_probe = predecessor_generation.clone();
+        let hook: CommittedSnapshotProbe = Box::new(move |mut committed| {
+            let task_id = committed.task().base().task_id.clone();
+            match phase {
+                AtomicTaskCommitPhase::Create | AtomicTaskCommitPhase::Update => {
+                    let claimed = match phase {
+                        AtomicTaskCommitPhase::Create => worker_inner
+                            .take_initial_work_handoff_for_owner_if_current(&committed, OWNER)
+                            .unwrap().is_some(),
+                        AtomicTaskCommitPhase::Update => worker_inner
+                            .take_input_handoff_for_owner_if_current(&committed, OWNER)
+                            .unwrap().is_some(),
+                        AtomicTaskCommitPhase::RequireInput => unreachable!(),
+                    };
+                    assert!(claimed, "the real store provides the exact committed handoff");
+                    let fence = worker_inner.begin_handoff_dispatch_for_owner_if_current(
+                        &task_id, committed.generation(), OWNER,
+                    ).unwrap().unwrap();
+                    let successor = match phase {
+                        AtomicTaskCommitPhase::Create => FinalTask::InputRequired {
+                            base: transition_final_task_base(committed.task().base().clone(), FinalTaskStatus::InputRequired, None).unwrap(),
+                            input_requests: final_roots_request(),
+                        },
+                        AtomicTaskCommitPhase::Update => FinalTask::Completed {
+                            base: transition_terminal_final_task_base(committed.task().base().clone(), FinalTaskStatus::Completed, None).unwrap(),
+                            result: serde_json::from_value(serde_json::json!({"content": [{"type": "text", "text": "completed by worker"}]})).unwrap(),
+                        },
+                        AtomicTaskCommitPhase::RequireInput => unreachable!(),
+                    };
+                    worker_for_probe.persist_fenced_handoff_transition_clearing_input(
+                        &committed, OWNER, fence, false, successor,
+                    ).unwrap();
+                }
+                AtomicTaskCommitPhase::RequireInput => {
+                    worker_for_probe.update_task(&task_id, &serde_json::from_value(
+                        serde_json::json!({"roots": {"roots": []}}),
+                    ).unwrap()).unwrap();
+                }
+            }
+            *after_worker.lock().unwrap() = Some((task_id.clone(), input_key_store_snapshot(&worker_inner, &task_id)));
+            if let Some(mutation) = mutation {
+                match mutation {
+                    AtomicTaskReceiptMutation::Principal => {
+                        committed.authenticated_principal = Some(Sha256Digest::from_bytes([83; 32]));
+                    }
+                    AtomicTaskReceiptMutation::Generation => {
+                        committed.generation = generation_for_probe.load(AtomicOrdering::SeqCst);
+                    }
+                    AtomicTaskReceiptMutation::OlderGeneration => {
+                        let expected = generation_for_probe.load(AtomicOrdering::SeqCst);
+                        assert!(expected > 1, "rollback uses a valid earlier generation");
+                        committed.generation = expected - 1;
+                    }
+                    AtomicTaskReceiptMutation::Identity => match &mut committed.task {
+                        FinalTask::Working(base) | FinalTask::InputRequired { base, .. } => {
+                            base.task_id = FinalTaskId::parse("substituted-receipt").unwrap();
+                        }
+                        _ => unreachable!(),
+                    },
+                    AtomicTaskReceiptMutation::Payload => match &mut committed.task {
+                        FinalTask::Working(base) => base.status_message = Some("substituted receipt".to_owned()),
+                        FinalTask::InputRequired { input_requests, .. } => {
+                            let roots = input_requests.remove("roots").unwrap();
+                            input_requests.insert("substituted-input-key".to_owned(), roots);
+                        }
+                        _ => unreachable!(),
+                    },
+                }
+            }
+            committed
+        });
+        let runner = runtime.install_task_service(1, Arc::new(FailingFinalTaskSupervisor)).unwrap();
+        let service_cx = Cx::for_testing();
+        let _running_service = enter_task_service_runner(runner, &service_cx);
+        let result = match phase {
+            AtomicTaskCommitPhase::Create => {
+                *probe.after_commit.lock().unwrap() = Some(hook);
+                runtime.create_task_for_request(&ctx, final_test_work_descriptor(), None).map(|_| ())
+            }
+            AtomicTaskCommitPhase::Update | AtomicTaskCommitPhase::RequireInput => {
+                let initial = final_working_task_with_ttl("atomic-commit-existing", 60_000);
+                let task_id = initial.base().task_id.clone();
+                let notification = final_task_notification(&initial);
+                let initial = if let Some(principal) = principal {
+                    inner.create_task_with_authenticated_work(initial, notification, final_test_work_descriptor(), principal).unwrap()
+                } else {
+                    inner.create_task_with_work(initial, notification, final_test_work_descriptor()).unwrap()
+                };
+                match phase {
+                    AtomicTaskCommitPhase::Update => {
+                        worker.require_input(&task_id, final_roots_request(), None).unwrap();
+                        predecessor_generation.store(inner.get_task_snapshot(&task_id).unwrap().unwrap().generation(), AtomicOrdering::SeqCst);
+                        notifications.lock().unwrap().clear();
+                        *probe.after_commit.lock().unwrap() = Some(hook);
+                        let mut parameters = final_task_method_parameters(&task_id);
+                        parameters["inputResponses"] = serde_json::json!({"roots": {"roots": []}});
+                        dispatch_final_tasks_update(&runtime, &ctx, parameters).map(|_| ())
+                    }
+                    AtomicTaskCommitPhase::RequireInput => {
+                        assert!(inner.take_initial_work_handoff_for_owner_if_current(&initial, OWNER).unwrap().is_some());
+                        let fence = inner.begin_handoff_dispatch_for_owner_if_current(&task_id, initial.generation(), OWNER).unwrap().unwrap();
+                        predecessor_generation.store(initial.generation(), AtomicOrdering::SeqCst);
+                        *probe.after_commit.lock().unwrap() = Some(hook);
+                        let awaiting = FinalTask::InputRequired {
+                            base: transition_final_task_base(initial.task().base().clone(), FinalTaskStatus::InputRequired, None).unwrap(),
+                            input_requests: final_roots_request(),
+                        };
+                        runtime.persist_fenced_handoff_transition_clearing_input(&initial, OWNER, fence, false, awaiting)
+                    }
+                    AtomicTaskCommitPhase::Create => unreachable!(),
+                }
+            }
+        };
+        if mutation.is_some() {
+            assert_eq!(result.expect_err("a changed receipt cannot authorize acknowledgement").code, fastmcp_core::McpErrorCode::InternalError);
+        } else {
+            result.expect("a committed operation succeeds even after a worker advances its task");
+        }
+        let (task_id, snapshot) = retained_after_worker.lock().unwrap().clone().expect("independent worker ran");
+        assert_eq!(input_key_store_snapshot(&inner, &task_id), snapshot, "the request never rewrites its worker's later durable state");
+        assert_eq!(inner.get_task_snapshot(&task_id).unwrap().unwrap().authenticated_principal(), principal);
+        let notifications = notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1, "the already-obsolete predecessor notification is not emitted");
+        assert!(final_tasks_match_exactly(&notifications[0].params.task, &inner.get_task(&task_id).unwrap().unwrap()).unwrap());
+    }
+
+    #[test]
+    fn task_03_atomic_create_receipt_survives_immediate_worker_progress() {
+        for authenticated in [false, true] {
+            assert_atomic_task_receipt(AtomicTaskCommitPhase::Create, authenticated, None);
+        }
+    }
+
+    #[test]
+    fn task_03_atomic_update_receipt_survives_immediate_worker_completion() {
+        for authenticated in [false, true] {
+            assert_atomic_task_receipt(AtomicTaskCommitPhase::Update, authenticated, None);
+        }
+    }
+
+    #[test]
+    fn task_03_atomic_input_required_receipt_survives_immediate_response() {
+        for authenticated in [false, true] {
+            assert_atomic_task_receipt(AtomicTaskCommitPhase::RequireInput, authenticated, None);
+        }
+    }
+
+    #[test]
+    fn task_03_atomic_receipts_reject_substitution_without_rewriting_successors() {
+        for phase in [
+            AtomicTaskCommitPhase::Create,
+            AtomicTaskCommitPhase::Update,
+            AtomicTaskCommitPhase::RequireInput,
+        ] {
+            for mutation in [
+                AtomicTaskReceiptMutation::Identity,
+                AtomicTaskReceiptMutation::Payload,
+                AtomicTaskReceiptMutation::Principal,
+            ] {
+                assert_atomic_task_receipt(phase, true, Some(mutation));
+            }
+            if !matches!(phase, AtomicTaskCommitPhase::Create) {
+                assert_atomic_task_receipt(phase, true, Some(AtomicTaskReceiptMutation::Generation));
+            }
+            if matches!(phase, AtomicTaskCommitPhase::Update) {
+                assert_atomic_task_receipt(phase, true, Some(AtomicTaskReceiptMutation::OlderGeneration));
+            }
+        }
+    }
+
+    #[test]
+    fn task_03_atomic_commit_survives_notification_observation_failure() {
+        for fail_observation in [false, true] {
+            let inner = Arc::new(InMemoryFinalTaskStore::default());
+            let notifications = Arc::new(AtomicUsize::new(0));
+            let observed = notifications.clone();
+            let probe = Arc::new(CommittedSnapshotProbeStore {
+                inner: inner.clone(),
+                after_commit: Mutex::new(None),
+                fail_observation: AtomicBool::new(fail_observation),
+            });
+            let runtime = FinalTaskRuntime::new(probe, FinalTaskRuntimeConfig::new(60_000, None).unwrap(), Arc::new(move |_| {
+                observed.fetch_add(1, AtomicOrdering::SeqCst);
+            }));
+            let runner = runtime.install_task_service(1, Arc::new(FailingFinalTaskSupervisor)).unwrap();
+            let cx = Cx::for_testing();
+            let _service = enter_task_service_runner(runner, &cx);
+            let created = runtime.create_task_with_work(final_test_work_descriptor(), None)
+                .expect("notification observation cannot revoke the successfully committed task");
+            assert!(inner.get_task(&created.task.base().task_id).unwrap().is_some());
+            assert_eq!(notifications.load(AtomicOrdering::SeqCst), usize::from(!fail_observation));
+        }
+    }
+
+    /// Keeps the real store's cancellation and dispatch fencing, while
+    /// deterministically scheduling worker retirement around the intent read.
+    struct CancellationReadbackProbeStore {
+        inner: Arc<InMemoryFinalTaskStore>,
+        retire_after_intent_read: bool,
+        retirement: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl FinalTaskStore for CancellationReadbackProbeStore {
+        fn create_task(
+            &self,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+        ) -> McpResult<()> {
+            self.inner.create_task(task, notification)
+        }
+
+        fn get_task(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTask>> {
+            self.inner.get_task(task_id)
+        }
+
+        fn get_task_snapshot(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner.get_task_snapshot(task_id)
+        }
+
+        fn replace_task(
+            &self,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+        ) -> McpResult<()> {
+            self.inner.replace_task(task, notification)
+        }
+
+        fn replace_task_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+        ) -> McpResult<bool> {
+            self.inner
+                .replace_task_if_current(expected, task, notification)
+        }
+
+        fn request_cancellation_and_clear_input_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            cancelled_task: FinalTask,
+            cancelled_notification: FinalTaskStatusNotification,
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner.request_cancellation_and_clear_input_if_current(
+                expected,
+                cancelled_task,
+                cancelled_notification,
+            )
+        }
+
+        fn request_cancellation(&self, task_id: &FinalTaskId) -> McpResult<()> {
+            self.inner.request_cancellation(task_id)
+        }
+
+        fn request_cancellation_if_current(&self, expected: &FinalTaskSnapshot) -> McpResult<bool> {
+            self.inner.request_cancellation_if_current(expected)
+        }
+
+        fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool> {
+            let retirement = self.retirement.lock().unwrap().take();
+            if self.retire_after_intent_read {
+                let requested = self.inner.is_cancellation_requested(task_id)?;
+                if let Some(retire) = retirement {
+                    retire();
+                }
+                Ok(requested)
+            } else {
+                if let Some(retire) = retirement {
+                    retire();
+                }
+                self.inner.is_cancellation_requested(task_id)
+            }
+        }
+
+        fn retention_clock_now(&self) -> Instant {
+            self.inner.retention_clock_now()
+        }
+
+        fn task_retention_deadline_if_current(
+            &self,
+            task_id: &FinalTaskId,
+            generation: u64,
+        ) -> McpResult<Option<FinalTaskRetentionDeadline>> {
+            self.inner
+                .task_retention_deadline_if_current(task_id, generation)
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum CancellationReadbackMutation {
+        Principal,
+        Identity,
+        CreatedAt,
+        Retention,
+        PollInterval,
+        SameGeneration,
+        OlderGeneration,
+        Completed,
+        WorkingWithoutIntent,
+    }
+
+    fn assert_cancellation_retirement_readback(
+        retire_after_intent_read: bool,
+        mutation: Option<CancellationReadbackMutation>,
+    ) {
+        const OWNER: &str = "cancellation-readback-owner";
+        let inner = Arc::new(InMemoryFinalTaskStore::default());
+        let worker_runtime = final_task_runtime(inner.clone(), Arc::new(AtomicBool::new(false)));
+        let responses = serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
+            .expect("typed roots response");
+        let task_id = create_accepted_final_input(&worker_runtime, responses);
+        let expected = inner.get_task_snapshot(&task_id).unwrap().unwrap();
+        assert!(
+            inner
+                .take_input_handoff_for_owner_if_current(&expected, OWNER)
+                .unwrap()
+                .is_some()
+        );
+        let fence = inner
+            .begin_handoff_dispatch_for_owner_if_current(&task_id, expected.generation(), OWNER)
+            .unwrap()
+            .expect("the resumed supervisor owns the dispatch fence");
+        let retained_after_retirement = Arc::new(Mutex::new(None));
+        let retained_for_worker = retained_after_retirement.clone();
+        let inner_for_worker = inner.clone();
+        let expected_for_worker = expected.clone();
+        let task_for_worker = task_id.clone();
+        let retirement = Box::new(move || {
+            let cancelled = FinalTask::Cancelled(
+                transition_terminal_final_task_base(
+                    expected_for_worker.task().base().clone(),
+                    FinalTaskStatus::Cancelled,
+                    Some("retired by the elected supervisor".to_owned()),
+                )
+                .unwrap(),
+            );
+            worker_runtime
+                .persist_fenced_handoff_transition_clearing_input(
+                    &expected_for_worker,
+                    OWNER,
+                    fence,
+                    true,
+                    cancelled.clone(),
+                )
+                .expect("the cancellation winner lets its exact elected worker retire");
+            if let Some(mutation) = mutation {
+                // Change only the forbidden readback fact after the real
+                // fenced retirement. This models a substituting backend;
+                // production mutation APIs correctly refuse these writes.
+                let mut state = inner_for_worker.state.lock().unwrap();
+                let mut base = cancelled.base().clone();
+                match mutation {
+                    CancellationReadbackMutation::Principal => {
+                        state.authenticated_principals.insert(
+                            task_for_worker.clone(),
+                            Sha256Digest::from_bytes([17; 32]),
+                        );
+                    }
+                    CancellationReadbackMutation::Identity => {
+                        base.task_id = FinalTaskId::parse("substituted-task").unwrap();
+                    }
+                    CancellationReadbackMutation::CreatedAt => {
+                        base.created_at = FinalTaskTimestamp::parse("2026-07-28T12:00:00Z").unwrap();
+                    }
+                    CancellationReadbackMutation::Retention => {
+                        base.ttl_ms = None;
+                    }
+                    CancellationReadbackMutation::PollInterval => {
+                        base.poll_interval_ms = Some(final_task_duration(9_999).unwrap());
+                    }
+                    CancellationReadbackMutation::SameGeneration => {
+                        state.generations.insert(
+                            task_for_worker.clone(),
+                            expected_for_worker.generation(),
+                        );
+                    }
+                    CancellationReadbackMutation::OlderGeneration => {
+                        state.generations.insert(
+                            task_for_worker.clone(),
+                            expected_for_worker.generation() - 1,
+                        );
+                    }
+                    CancellationReadbackMutation::Completed => {
+                        base.status = FinalTaskStatus::Completed;
+                    }
+                    CancellationReadbackMutation::WorkingWithoutIntent => {
+                        base = expected_for_worker.task().base().clone();
+                        state.generations.insert(
+                            task_for_worker.clone(),
+                            expected_for_worker.generation(),
+                        );
+                    }
+                }
+                let replacement = match mutation {
+                    CancellationReadbackMutation::Completed => FinalTask::Completed {
+                        base,
+                        result: serde_json::from_value(serde_json::json!({"content": []})).unwrap(),
+                    },
+                    CancellationReadbackMutation::WorkingWithoutIntent => FinalTask::Working(base),
+                    _ => FinalTask::Cancelled(base),
+                };
+                state.tasks.insert(task_for_worker.clone(), replacement);
+            }
+            *retained_for_worker.lock().unwrap() = Some(input_key_store_snapshot(
+                &inner_for_worker,
+                &task_for_worker,
+            ));
+        });
+        let store = Arc::new(CancellationReadbackProbeStore {
+            inner: inner.clone(),
+            retire_after_intent_read,
+            retirement: Mutex::new(Some(retirement)),
+        });
+        let request_notifications = Arc::new(AtomicUsize::new(0));
+        let notifications_for_runtime = request_notifications.clone();
+        let runtime = FinalTaskRuntime::new(
+            store,
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000)).unwrap(),
+            Arc::new(move |_| {
+                notifications_for_runtime.fetch_add(1, AtomicOrdering::SeqCst);
+            }),
+        );
+        let result = dispatch_final_tasks_cancel(
+            &runtime,
+            &McpContext::new(Cx::for_testing(), 1),
+            final_task_method_parameters(&task_id),
+        );
+        if let Some(mutation) = mutation {
+            let error = result.expect_err("a substituted cancellation successor must fail closed");
+            assert_eq!(
+                error.code,
+                fastmcp_core::McpErrorCode::InternalError,
+                "{mutation:?}"
+            );
+        } else {
+            assert_eq!(
+                result.expect("successful cancellation survives prompt worker retirement"),
+                serde_json::json!({"resultType": "complete"})
+            );
+            let current = inner.get_task_snapshot(&task_id).unwrap().unwrap();
+            assert!(matches!(current.task(), FinalTask::Cancelled(_)));
+            assert!(current.generation() > expected.generation());
+            assert!(!inner.is_cancellation_requested(&task_id).unwrap());
+            assert_eq!(
+                current.task().base().status_message.as_deref(),
+                Some("retired by the elected supervisor")
+            );
+        }
+        assert_eq!(
+            input_key_store_snapshot(&inner, &task_id),
+            retained_after_retirement
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("worker retirement ran"),
+            "acknowledgement or rejection leaves the worker's durable state unchanged"
+        );
+        assert_eq!(
+            request_notifications.load(AtomicOrdering::SeqCst),
+            0,
+            "only the worker emits its terminal notification"
+        );
+    }
+
+    #[test]
+    fn task_03_cancellation_ack_survives_retirement_before_intent_read() {
+        assert_cancellation_retirement_readback(false, None);
+    }
+
+    #[test]
+    fn task_03_cancellation_ack_survives_retirement_between_intent_and_snapshot_reads() {
+        assert_cancellation_retirement_readback(true, None);
+    }
+
+    #[test]
+    fn task_03_cancellation_readback_rejects_substituted_successors_without_mutation() {
+        for mutation in [
+            CancellationReadbackMutation::Principal,
+            CancellationReadbackMutation::Identity,
+            CancellationReadbackMutation::CreatedAt,
+            CancellationReadbackMutation::Retention,
+            CancellationReadbackMutation::PollInterval,
+            CancellationReadbackMutation::SameGeneration,
+            CancellationReadbackMutation::OlderGeneration,
+            CancellationReadbackMutation::Completed,
+            CancellationReadbackMutation::WorkingWithoutIntent,
+        ] {
+            assert_cancellation_retirement_readback(false, Some(mutation));
+        }
+    }
+
+    #[test]
+    fn task_03_cancellation_rejects_terminal_generation_rollback_without_mutation() {
+        for advances in [true, false] {
+            let working = final_working_task_without_ttl("terminal-cancellation-generation");
+            let store = Arc::new(RuntimeBoundaryProbeFinalTaskStore::new(working));
+            let expected = store.snapshot();
+            let cancelled = FinalTask::Cancelled(
+                transition_terminal_final_task_base(
+                    expected.task().base().clone(),
+                    FinalTaskStatus::Cancelled,
+                    None,
+                )
+                .unwrap(),
+            );
+            let generation = if advances {
+                expected.generation() + 1
+            } else {
+                expected.generation() - 1
+            };
+            let returned = FinalTaskSnapshot::new(cancelled.clone(), generation);
+            *store.snapshot.lock().unwrap() = returned.clone();
+            let runtime = FinalTaskRuntime::new(
+                store.clone(),
+                FinalTaskRuntimeConfig::new(60_000, Some(5_000)).unwrap(),
+                Arc::new(|_| {}),
+            );
+            let result =
+                runtime.validate_cancellation_store_result(&expected, &cancelled, returned);
+            if advances {
+                assert!(result.expect("an exact retained terminal cancellation advances generation"));
+            } else {
+                let error = result.expect_err(
+                    "changing only the committed generation to an older value must be rejected",
+                );
+                assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
+            }
+            let retained = store.snapshot();
+            assert_eq!(retained.generation(), generation);
+            assert!(final_tasks_match_exactly(retained.task(), &cancelled).unwrap());
+            assert_eq!(store.transition_write_calls.load(AtomicOrdering::SeqCst), 0);
+        }
+    }
+
     #[test]
     fn task_03_runtime_rejects_custom_store_cancellation_substitution_and_false_cas_unchanged() {
         let initial = final_working_task_without_ttl("task-runtime-custom-cancel");
@@ -10344,24 +11193,26 @@ mod tests {
             serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
                 .expect("typed empty roots response");
         assert!(
-            !store
+            store
                 .replace_task_and_append_input_if_current(
                     &stale,
                     task.clone(),
                     final_task_notification(&task),
                     empty_roots,
                 )
-                .expect("stale append compare-and-swap returns false"),
+                .expect("stale append compare-and-swap returns no committed snapshot")
+                .is_none(),
             "stale append compare-and-swap must preserve retained task state"
         );
         assert!(
-            !store
+            store
                 .replace_task_and_clear_input_if_current(
                     &stale,
                     task.clone(),
                     final_task_notification(&task),
                 )
-                .expect("stale clear compare-and-swap returns false"),
+                .expect("stale clear compare-and-swap returns no committed snapshot")
+                .is_none(),
             "stale clear compare-and-swap must preserve retained task state"
         );
         let state = store
@@ -10659,6 +11510,7 @@ mod tests {
                 } else {
                     assert!(
                         result.expect("exact terminal member is committed by its fenced owner")
+                            .is_some()
                     );
                     assert!(store.retained_payload_bytes() >= 2 * MAX_FINAL_TASK_RESULT_BYTES);
                     assert_final_task_payload_accounting(&store);
@@ -10915,7 +11767,7 @@ mod tests {
                 assert!(store.replace_task_and_clear_input_for_handoff_if_current(
                     &snapshot, "cancel-owner", fence, true,
                     cancelled.clone(), final_task_notification(&cancelled),
-                ).unwrap());
+                ).unwrap().is_some());
             }
             assert!(matches!(store.get_task(&task_id).unwrap(), Some(FinalTask::Cancelled(_))));
             let sibling_after = store.get_task_snapshot(&sibling_id).unwrap().unwrap();
@@ -11416,6 +12268,7 @@ mod tests {
                         final_task_notification(&completed),
                     )
                     .expect("successor completes under its own fence")
+                    .is_some()
             );
             let terminal = final_task_restoration_snapshot(&store, &task_id);
             assert!(
@@ -11539,6 +12392,7 @@ mod tests {
                         final_task_notification(&completed),
                     )
                     .expect("successor completes with its resumed fence")
+                    .is_some()
             );
             let terminal = final_task_restoration_snapshot(&store, &task_id);
             assert!(
@@ -11607,7 +12461,7 @@ mod tests {
                 result,
             };
             assert!(
-                !store
+                store
                     .replace_task_and_clear_input_for_handoff_if_current(
                         &snapshot,
                         "stale-owner",
@@ -11617,6 +12471,7 @@ mod tests {
                         final_task_notification(&replacement),
                     )
                     .expect("expired replacement refusal is readable")
+                    .is_none()
             );
             let state = store
                 .state
@@ -11921,7 +12776,7 @@ mod tests {
                 result,
             };
             assert!(
-                !store
+                store
                     .replace_task_and_clear_input_for_handoff_if_current(
                         &snapshot,
                         "stale-owner",
@@ -11931,6 +12786,7 @@ mod tests {
                         final_task_notification(&replacement),
                     )
                     .expect("expired replacement refusal is readable")
+                    .is_none()
             );
             let state = store
                 .state
@@ -12631,7 +13487,7 @@ mod tests {
             task: FinalTask,
             notification: FinalTaskStatusNotification,
             work_descriptor: FinalTaskWorkDescriptor,
-        ) -> McpResult<()> {
+        ) -> McpResult<FinalTaskSnapshot> {
             self.inner
                 .create_task_with_work(task, notification, work_descriptor)
         }
@@ -12728,7 +13584,7 @@ mod tests {
             task: FinalTask,
             notification: FinalTaskStatusNotification,
             input_responses: FinalTaskInputResponses,
-        ) -> McpResult<bool> {
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
             self.inner.replace_task_and_append_input_if_current(
                 expected,
                 task,
@@ -12741,7 +13597,7 @@ mod tests {
             expected: &FinalTaskSnapshot,
             task: FinalTask,
             notification: FinalTaskStatusNotification,
-        ) -> McpResult<bool> {
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
             self.inner
                 .replace_task_and_clear_input_if_current(expected, task, notification)
         }
@@ -13325,7 +14181,7 @@ mod tests {
             task: FinalTask,
             notification: FinalTaskStatusNotification,
             work_descriptor: FinalTaskWorkDescriptor,
-        ) -> McpResult<()> {
+        ) -> McpResult<FinalTaskSnapshot> {
             self.inner
                 .create_task_with_work(task, notification, work_descriptor)
         }
@@ -13435,7 +14291,7 @@ mod tests {
             task: FinalTask,
             notification: FinalTaskStatusNotification,
             input_responses: FinalTaskInputResponses,
-        ) -> McpResult<bool> {
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
             self.inner.replace_task_and_append_input_if_current(
                 expected,
                 task,
@@ -13448,7 +14304,7 @@ mod tests {
             expected: &FinalTaskSnapshot,
             task: FinalTask,
             notification: FinalTaskStatusNotification,
-        ) -> McpResult<bool> {
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
             self.inner
                 .replace_task_and_clear_input_if_current(expected, task, notification)
         }
@@ -14112,9 +14968,10 @@ mod tests {
                         BTreeMap::new(),
                     )
                     .expect("the identical descriptor can retry under the same generation")
+                    .is_some()
             );
         } else {
-            assert!(result.expect("an identical outstanding descriptor remains valid"));
+            assert!(result.expect("an identical outstanding descriptor remains valid").is_some());
         }
         let after = store.get_task_snapshot(&task_id).unwrap().unwrap();
         assert_ne!(after.generation(), current.generation());
@@ -15143,14 +16000,16 @@ mod tests {
                     replacement_notification,
                     append_input_responses.clone(),
                 )
-                .expect("live append replacement CAS is readable"),
+                .expect("live append replacement CAS is readable")
+                .is_some(),
                 2 => FinalTaskStore::replace_task_and_clear_input_if_current(
                     &*store,
                     &target_snapshot,
                     replacement,
                     replacement_notification,
                 )
-                .expect("live clear replacement CAS is readable"),
+                .expect("live clear replacement CAS is readable")
+                .is_some(),
                 _ => unreachable!("all replacement variants are covered"),
             };
             assert!(committed, "an unexpired replacement CAS commits");
@@ -15303,7 +16162,7 @@ mod tests {
                             "roots": {"roots": []}
                         }))
                         .expect("expired replacement input is valid");
-                    !FinalTaskStore::replace_task_and_append_input_if_current(
+                    FinalTaskStore::replace_task_and_append_input_if_current(
                         &*store,
                         &target_snapshot,
                         replacement,
@@ -15311,14 +16170,16 @@ mod tests {
                         input_responses,
                     )
                     .expect("expired append replacement CAS is readable")
+                    .is_none()
                 }
-                2 => !FinalTaskStore::replace_task_and_clear_input_if_current(
+                2 => FinalTaskStore::replace_task_and_clear_input_if_current(
                     &*store,
                     &target_snapshot,
                     replacement,
                     replacement_notification,
                 )
-                .expect("expired clear replacement CAS is readable"),
+                .expect("expired clear replacement CAS is readable")
+                .is_none(),
                 _ => unreachable!("all replacement variants are covered"),
             };
             assert!(rejected, "retention expiry fences every replacement CAS");
