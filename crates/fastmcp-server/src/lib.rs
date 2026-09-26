@@ -24918,7 +24918,7 @@ mod lib_unit_tests {
             task: fastmcp_protocol::Task,
             notification: fastmcp_protocol::TaskStatusNotification,
             work_descriptor: FinalTaskWorkDescriptor,
-        ) -> McpResult<()> {
+        ) -> McpResult<FinalTaskSnapshot> {
             let task_id = task.base().task_id.clone();
             let ttl_ms = validate_server_final_task_durations(&task)?;
             ensure_server_final_task_notification_matches_task(&task, &notification)?;
@@ -24945,10 +24945,11 @@ mod lib_unit_tests {
                 .insert(task_id.clone(), work_descriptor.clone());
             state.initial_work.insert(task_id.clone(), work_descriptor);
             state.notifications.push(notification);
+            let committed = FinalTaskSnapshot::new(state.tasks[&task_id].clone(), generation);
             if let Some(expires_at) = expires_at {
                 state.expires_at.insert(task_id, expires_at);
             }
-            Ok(())
+            Ok(committed)
         }
 
         fn get_task(
@@ -25063,7 +25064,7 @@ mod lib_unit_tests {
             task: fastmcp_protocol::Task,
             notification: fastmcp_protocol::TaskStatusNotification,
             input_responses: fastmcp_protocol::TaskInputResponses,
-        ) -> McpResult<bool> {
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
             let task_id = task.base().task_id.clone();
             if expected.task().base().task_id != task_id {
                 return Err(McpError::invalid_params(
@@ -25078,13 +25079,14 @@ mod lib_unit_tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             reclaim_expired_server_final_task_handoffs(&mut state, self.now());
             if state.generations.get(&task_id) != Some(&expected.generation()) {
-                return Ok(false);
+                return Ok(None);
             }
             let generation = next_server_final_task_generation(&mut state)?;
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
             state.handoff_leases.remove(&task_id);
             state.initial_work.remove(&task_id);
+            let committed = FinalTaskSnapshot::new(state.tasks[&task_id].clone(), generation);
             if !input_responses.is_empty() {
                 state
                     .accepted_inputs
@@ -25093,7 +25095,7 @@ mod lib_unit_tests {
                     .extend(input_responses);
             }
             state.notifications.push(notification);
-            Ok(true)
+            Ok(Some(committed))
         }
 
         fn replace_task_and_clear_input_if_current(
@@ -25101,7 +25103,7 @@ mod lib_unit_tests {
             expected: &FinalTaskSnapshot,
             task: fastmcp_protocol::Task,
             notification: fastmcp_protocol::TaskStatusNotification,
-        ) -> McpResult<bool> {
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
             let task_id = task.base().task_id.clone();
             if expected.task().base().task_id != task_id {
                 return Err(McpError::invalid_params(
@@ -25116,7 +25118,7 @@ mod lib_unit_tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             reclaim_expired_server_final_task_handoffs(&mut state, self.now());
             if state.generations.get(&task_id) != Some(&expected.generation()) {
-                return Ok(false);
+                return Ok(None);
             }
             let generation = next_server_final_task_generation(&mut state)?;
             let terminal = matches!(
@@ -25134,7 +25136,10 @@ mod lib_unit_tests {
             if terminal {
                 state.cancellation_requests.remove(&task_id);
             }
-            Ok(true)
+            Ok(Some(FinalTaskSnapshot::new(
+                state.tasks[&task_id].clone(),
+                generation,
+            )))
         }
 
         fn replace_task_and_clear_input_for_handoff_if_current(
@@ -25145,7 +25150,7 @@ mod lib_unit_tests {
             cancellation_required: bool,
             task: fastmcp_protocol::Task,
             notification: fastmcp_protocol::TaskStatusNotification,
-        ) -> McpResult<bool> {
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
             if owner_id.is_empty() {
                 return Err(McpError::invalid_params(
                     "Final task handoff owner must be non-empty",
@@ -25178,7 +25183,7 @@ mod lib_unit_tests {
                 || !owns_exact_dispatch
                 || state.cancellation_requests.contains(&task_id) != cancellation_required
             {
-                return Ok(false);
+                return Ok(None);
             }
             let generation = next_server_final_task_generation(&mut state)?;
             let terminal = matches!(
@@ -25196,7 +25201,10 @@ mod lib_unit_tests {
             if terminal {
                 state.cancellation_requests.remove(&task_id);
             }
-            Ok(true)
+            Ok(Some(FinalTaskSnapshot::new(
+                state.tasks[&task_id].clone(),
+                generation,
+            )))
         }
 
         fn take_input_if_current(
