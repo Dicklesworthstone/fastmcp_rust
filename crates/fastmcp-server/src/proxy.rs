@@ -10069,17 +10069,34 @@ impl ProxyClient {
         self.admit_upstream_result("tools/call", result)
     }
 
-    /// Yielding counterpart of [`Self::call_tool_typed`].
+    /// Calls a tool while retaining its selected protocol-era result and
+    /// yielding native HTTP or stdio I/O to the caller's runtime.
     ///
-    /// When the HTTP backend returns a detached `ProxyLegacyHttpRequest`,
-    /// wait on the inbound request Cx instead of a nested `block_on` runtime.
-    async fn call_tool_typed_async(
+    /// Native requests release the route mutex while waiting and observe the
+    /// request's cancellation and deadline. Modern complete and input-required
+    /// outcomes retain their exact typed result and progress notifications;
+    /// this API does not negotiate creation of upstream Tasks.
+    /// Custom [`ProxyBackend`] implementations without native request hooks
+    /// retain their synchronous backend behavior and must not block an async
+    /// runtime worker.
+    pub async fn call_tool_typed_async(
         &self,
         ctx: &McpContext,
         name: &str,
         arguments: serde_json::Value,
     ) -> McpResult<CoreResult> {
         ctx.checkpoint()?;
+        if let Some(result) = self
+            .try_final_mrtr_request(
+                ctx,
+                fastmcp_protocol::methods::TOOLS_CALL,
+                serde_json::json!({"name": name, "arguments": arguments.clone()}),
+            )
+            .await?
+        {
+            self.relay_resource_updated_notifications(ctx)?;
+            return Ok(result);
+        }
         #[cfg(feature = "legacy-2024-11-05")]
         self.start_legacy_receive_pump()?;
         #[cfg(feature = "legacy-2024-11-05")]
@@ -10767,8 +10784,16 @@ impl ProxyClient {
         self.admit_upstream_result("resources/read", result)
     }
 
-    /// Yielding counterpart of [`Self::read_resource_typed`].
-    async fn read_resource_typed_async(
+    /// Reads a resource while retaining its selected protocol-era result and
+    /// yielding native HTTP or stdio I/O to the caller's runtime.
+    ///
+    /// Native requests release the route mutex while waiting, observe request
+    /// cancellation and deadlines, and retain complete or input-required
+    /// results, cache hints, and exact final progress notifications.
+    /// Custom [`ProxyBackend`] implementations without native request hooks
+    /// retain their synchronous backend behavior and must not block an async
+    /// runtime worker.
+    pub async fn read_resource_typed_async(
         &self,
         ctx: &McpContext,
         uri: &str,
@@ -10874,8 +10899,16 @@ impl ProxyClient {
         self.admit_upstream_result("prompts/get", result)
     }
 
-    /// Yielding counterpart of [`Self::get_prompt_typed`].
-    async fn get_prompt_typed_async(
+    /// Gets a prompt while retaining its selected protocol-era result and
+    /// yielding native HTTP or stdio I/O to the caller's runtime.
+    ///
+    /// Native requests release the route mutex while waiting, observe request
+    /// cancellation and deadlines, and retain complete or input-required
+    /// results and exact final progress notifications.
+    /// Custom [`ProxyBackend`] implementations without native request hooks
+    /// retain their synchronous backend behavior and must not block an async
+    /// runtime worker.
+    pub async fn get_prompt_typed_async(
         &self,
         ctx: &McpContext,
         name: &str,
@@ -13173,6 +13206,335 @@ IFS= read -r end
     #[test]
     fn proxy_task_tool_caller_runtime_planted_negative() {
         proxy_task_tool_caller_runtime_probe(true);
+    }
+
+    async fn invoke_public_typed_proxy_request(
+        proxy: &ProxyClient,
+        ctx: &McpContext,
+        method: &str,
+        target: &str,
+        subject: &str,
+    ) -> fastmcp_core::McpResult<CoreResult> {
+        match method {
+            "tools/call" => {
+                proxy
+                    .call_tool_typed_async(ctx, target, serde_json::json!({"subject": subject}))
+                    .await
+            }
+            "resources/read" => proxy.read_resource_typed_async(ctx, target).await,
+            "prompts/get" => {
+                proxy
+                    .get_prompt_typed_async(
+                        ctx,
+                        target,
+                        HashMap::from([("subject".to_owned(), subject.to_owned())]),
+                    )
+                    .await
+            }
+            _ => panic!("unexpected public typed request method"),
+        }
+    }
+
+    fn proxy_public_typed_http_caller_runtime_probe(cancel: bool) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build()
+            .expect("caller runtime with native reactor");
+        for method in ["tools/call", "resources/read", "prompts/get"] {
+            for input_required in [false, true] {
+                for sse in [false, true] {
+                    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                    listener.set_nonblocking(true).unwrap();
+                    let address = listener.local_addr().unwrap();
+                    let subject = format!("public-typed-{}", address.port());
+                    let target = if method == "resources/read" {
+                        format!("db://{subject}")
+                    } else {
+                        subject.clone()
+                    };
+                    let complete = match method {
+                        "tools/call" => serde_json::json!({
+                            "resultType": "complete",
+                            "content": [{"type": "text", "text": subject}],
+                            "structuredContent": {"subject": subject},
+                            "peerExtra": {"preserved": true},
+                        }),
+                        "resources/read" => serde_json::json!({
+                            "resultType": "complete",
+                            "contents": [{"uri": target, "text": subject}],
+                            "ttlMs": 123, "cacheScope": "private",
+                            "peerExtra": {"preserved": true},
+                        }),
+                        "prompts/get" => serde_json::json!({
+                            "resultType": "complete", "description": subject,
+                            "messages": [{"role": "user", "content": {"type": "text", "text": subject}}],
+                            "peerExtra": {"preserved": true},
+                        }),
+                        _ => unreachable!(),
+                    };
+                    let initial = if input_required {
+                        serde_json::json!({
+                            "resultType": "input_required",
+                            "requestState": format!("state-{subject}"),
+                            "inputRequests": {"roots": {"method": "roots/list"}},
+                            "peerExtra": {"preserved": true},
+                        })
+                    } else {
+                        complete.clone()
+                    };
+                    let peer_initial = initial.clone();
+                    let peer_complete = complete.clone();
+                    let peer_subject = subject.clone();
+                    let peer_target = target.clone();
+                    let received = Arc::new(AtomicBool::new(false));
+                    let peer_received = Arc::clone(&received);
+                    let (release, replies) = std::sync::mpsc::sync_channel::<()>(1);
+                    let peer = thread::spawn(move || {
+                        let accept = || {
+                            let deadline = Instant::now() + Duration::from_secs(10);
+                            loop {
+                                match listener.accept() {
+                                    Ok((stream, _)) => {
+                                        stream
+                                            .set_read_timeout(Some(Duration::from_secs(10)))
+                                            .unwrap();
+                                        stream
+                                            .set_write_timeout(Some(Duration::from_secs(10)))
+                                            .unwrap();
+                                        return stream;
+                                    }
+                                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                        assert!(
+                                            Instant::now() < deadline,
+                                            "public typed peer accept is bounded"
+                                        );
+                                        thread::sleep(Duration::from_millis(1));
+                                    }
+                                    Err(error) => panic!("public typed peer accept: {error}"),
+                                }
+                            }
+                        };
+                        let mut discovery = accept();
+                        let opening: serde_json::Value =
+                            serde_json::from_slice(&read_http_request(&mut discovery).body).unwrap();
+                        assert_eq!(opening["method"], "server/discover");
+                        write_http_discovery_response(
+                            &mut discovery,
+                            &serde_json::to_vec(&serde_json::json!({
+                                "jsonrpc": "2.0", "id": opening["id"], "result": {
+                                    "supportedVersions": ["2026-07-28"],
+                                    "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
+                                    "ttlMs": 0, "cacheScope": "private"
+                                }
+                            }))
+                            .unwrap(),
+                        );
+                        drop(discovery);
+                        let mut requests = Vec::new();
+                        for round in 0..2 {
+                            let mut stream = accept();
+                            let request: serde_json::Value =
+                                serde_json::from_slice(&read_http_request(&mut stream).body).unwrap();
+                            assert_eq!(request["method"], method);
+                            let params = &request["params"];
+                            assert_eq!(
+                                params[if method == "resources/read" {
+                                    "uri"
+                                } else {
+                                    "name"
+                                }],
+                                peer_target
+                            );
+                            if method != "resources/read" {
+                                assert_eq!(params["arguments"]["subject"], peer_subject);
+                            }
+                            assert_eq!(params["_meta"]["progressToken"], peer_subject);
+                            assert_eq!(
+                                params["_meta"]["io.modelcontextprotocol/protocolVersion"],
+                                "2026-07-28"
+                            );
+                            assert!(
+                                params["_meta"]
+                                    [fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]
+                                    ["extensions"]
+                                    .get("io.modelcontextprotocol/tasks")
+                                    .is_none()
+                            );
+                            if round == 0 {
+                                peer_received.store(true, Ordering::Release);
+                                replies
+                                    .recv_timeout(Duration::from_secs(10))
+                                    .expect("caller sibling releases the withheld response");
+                            }
+                            let response = serde_json::json!({
+                                "jsonrpc": "2.0", "id": request["id"],
+                                "result": if round == 0 { &peer_initial } else { &peer_complete },
+                            });
+                            let body = if sse {
+                                let marker = serde_json::to_string(&peer_subject).unwrap();
+                                format!(
+                                    "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progressToken\":{marker},\"progress\":1.20e+4,\"total\":12000.0,\"message\":\"relayed\"}}}}\n\nevent: message\ndata: {response}\n\n"
+                                )
+                                .into_bytes()
+                            } else {
+                                serde_json::to_vec(&response).unwrap()
+                            };
+                            let content_type = if sse {
+                                "text/event-stream"
+                            } else {
+                                "application/json"
+                            };
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let written = stream
+                                .write_all(head.as_bytes())
+                                .and_then(|()| stream.write_all(&body))
+                                .is_ok();
+                            assert!(written || (cancel && round == 0));
+                            requests.push(request);
+                        }
+                        requests
+                    });
+                    let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+                    let cancellation = McpRequestCancellation::new();
+                    let capture = Arc::new(ExactProgressCapture::default());
+                    runtime.block_on(async {
+                        let plan = ClientProtocolPlan::http(
+                            ProtocolPolicy::ModernOnly,
+                            Some(CanonicalHttpUrl::parse(&format!("http://{address}/mcp")).unwrap()),
+                            None,
+                            None,
+                            subject.clone(),
+                            subject.clone(),
+                            subject.clone(),
+                            1,
+                            1,
+                            0,
+                        )
+                        .unwrap();
+                        let mut bindings = ProxyClient::upstream_binding_registry();
+                        let proxy = bindings
+                            .connect_http_with_protocol_plan(
+                                &cx,
+                                &subject,
+                                &subject,
+                                1,
+                                plan,
+                                proxy_http_client_info(),
+                                ClientCapabilities::default(),
+                            )
+                            .await
+                            .expect("public proxy establishment");
+                        let context = |request_id| {
+                            McpContext::with_progress(
+                                cx.clone(),
+                                request_id,
+                                ProgressReporter::with_marker(
+                                    serde_json::json!(subject),
+                                    Arc::clone(&capture) as Arc<dyn NotificationSender>,
+                                ),
+                            )
+                            .with_client_capabilities(
+                                fastmcp_core::ClientCapabilityInfo::new().with_roots(false),
+                            )
+                        };
+                        let ctx = context(1201).with_request_cancellation(cancellation.clone());
+                        let sibling_received = Arc::clone(&received);
+                        let sibling_cancel = cancellation.clone();
+                        let sibling_release = release.clone();
+                        let sibling_proxy = proxy.clone();
+                        let mut sibling = cx
+                            .spawn(move |sibling_cx| async move {
+                                let deadline = sibling_cx.now().saturating_add_nanos(8_000_000_000);
+                                while !sibling_received.load(Ordering::Acquire) {
+                                    assert!(sibling_cx.now() < deadline, "public request reaches peer");
+                                    asupersync::time::sleep(
+                                        sibling_cx.now(),
+                                        Duration::from_millis(1),
+                                    )
+                                    .await;
+                                }
+                                assert!(
+                                    sibling_proxy.inner.try_lock().is_ok(),
+                                    "HTTP wait releases route mutex"
+                                );
+                                if cancel {
+                                    assert!(sibling_cancel.cancel());
+                                } else {
+                                    sibling_release.send(()).unwrap();
+                                }
+                            })
+                            .unwrap();
+                        let result = asupersync::time::timeout_at(
+                            cx.now().saturating_add_nanos(9_000_000_000),
+                            invoke_public_typed_proxy_request(&proxy, &ctx, method, &target, &subject),
+                        )
+                        .await
+                        .expect("public typed request has a finite caller-owned wait");
+                        sibling.join(&cx).await.expect("caller sibling completes");
+                        assert!(received.load(Ordering::Acquire));
+                        if cancel {
+                            assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+                            release.send(()).unwrap();
+                        } else {
+                            let result = result.unwrap();
+                            let observed: serde_json::Value =
+                                serde_json::from_str(&result.encode().unwrap()).unwrap();
+                            assert_eq!(observed, initial, "typed results retain every upstream member");
+                        }
+                        let sibling_ctx = context(1202);
+                        let reused = asupersync::time::timeout_at(
+                            cx.now().saturating_add_nanos(9_000_000_000),
+                            invoke_public_typed_proxy_request(
+                                &proxy,
+                                &sibling_ctx,
+                                method,
+                                &target,
+                                &subject,
+                            ),
+                        )
+                        .await
+                        .expect("subsequent request remains live")
+                        .unwrap();
+                        let observed: serde_json::Value =
+                            serde_json::from_str(&reused.encode().unwrap()).unwrap();
+                        assert_eq!(observed, complete);
+                        sibling_ctx.ensure_live().unwrap();
+                        assert!(!cx.is_cancel_requested());
+                    });
+                    let requests = peer.join().expect("public typed peer retires");
+                    assert_eq!(requests.len(), 2);
+                    assert_ne!(requests[0]["id"], requests[1]["id"]);
+                    let progress = capture.values.lock().unwrap();
+                    assert_eq!(progress.len(), if sse { 2 - usize::from(cancel) } else { 0 });
+                    for update in progress.iter() {
+                        assert_eq!(
+                            update,
+                            &(
+                                "1.20e+4".to_owned(),
+                                Some("12000.0".to_owned()),
+                                Some("relayed".to_owned())
+                            )
+                        );
+                    }
+                }
+            }
+        }
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn proxy_public_typed_http_caller_runtime_positive() {
+        proxy_public_typed_http_caller_runtime_probe(false);
+    }
+
+    #[test]
+    fn proxy_public_typed_http_caller_runtime_planted_negative() {
+        proxy_public_typed_http_caller_runtime_probe(true);
     }
 
     fn proxy_tool_resume_caller_runtime_probe(cancel: bool, context_deadline: bool) {
