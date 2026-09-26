@@ -517,6 +517,38 @@ mod tests {
         }
     }
 
+    /// `inherited` stands in for the copy a concurrently spawned child holds
+    /// between fork and exec: a duplicate of the same open file description.
+    #[test]
+    fn a_dropped_handle_releases_its_lock_despite_an_inherited_duplicate() {
+        let cx = Cx::for_testing();
+        let directory = PrivateDirectory::new();
+        let store = directory.open(&cx);
+        let inherited = store.lock.try_clone().unwrap();
+        drop(store);
+        let reopened =
+            SecureAtomicFile::open(&cx, File::open(&directory.0).unwrap(), "credential", 4096);
+        assert!(
+            reopened.is_ok(),
+            "a dropped handle's slot must reopen while a duplicate lives"
+        );
+        drop(inherited);
+    }
+
+    /// The same duplicate beside a live handle: the lock is still enforced.
+    #[test]
+    fn a_live_handle_still_refuses_a_second_opener_beside_an_inherited_duplicate() {
+        let cx = Cx::for_testing();
+        let directory = PrivateDirectory::new();
+        let store = directory.open(&cx);
+        let inherited = store.lock.try_clone().unwrap();
+        let second =
+            SecureAtomicFile::open(&cx, File::open(&directory.0).unwrap(), "credential", 4096);
+        assert!(matches!(second, Err(AtomicFileError::Busy)));
+        drop(store);
+        drop(inherited);
+    }
+
     /// A directory fsync that fails after the store has validated the directory.
     pub(super) fn failing_directory_sync(_: &File) -> std::io::Result<()> {
         Err(std::io::Error::other("injected directory fsync failure"))
