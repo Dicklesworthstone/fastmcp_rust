@@ -7,6 +7,10 @@
 //! One caller-bounded deadline covers acquisition and remote revocation together.
 //! Already-sent requests and headers cannot be recalled.
 
+// Access replacement must serialize with the same grant owner as logout.
+#[cfg(target_os = "linux")]
+pub(crate) mod rotation;
+
 use std::future::{Future, poll_fn};
 use std::pin::pin;
 use std::sync::Arc;
