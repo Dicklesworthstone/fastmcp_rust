@@ -7972,6 +7972,7 @@ async fn await_proxy_final_tool_body_or_cancellation(
 /// full [`McpContext`] can be moved into the operation. This is used by the
 /// final Tasks listener, whose upstream SSE read must wake even when it is
 /// otherwise silent.
+#[cfg(feature = "tasks")]
 async fn await_proxy_operation_or_cancellation<T>(
     cx: &Cx,
     request_cancellation: &fastmcp_core::McpRequestCancellation,
