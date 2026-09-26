@@ -172,18 +172,23 @@ fn sse_commit_frame<W: Write>(
     }
 }
 
+/// Maximum decoded JSON-RPC message carried by one SSE event.
+///
+/// LIMIT-01's guarded default for a decoded SSE JSON message: 8 MiB.
+const MAX_SSE_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
+
+/// Bytes a peer may add around one data line: `data: ` plus a CRLF
+/// terminator, the longest line ending an event stream admits.
+const SSE_DATA_LINE_CRLF_OVERHEAD: usize = b"data: \r\n".len();
+
 /// Maximum wire-line size for SSE events.
 ///
-/// LIMIT-01's guarded default for one SSE line: 8 MiB of data plus the
-/// `data: ` prefix and line terminator. A JSON-RPC message is one `data:`
-/// line, so this is also the largest message any SSE lane can carry.
-const MAX_SSE_LINE_SIZE: usize = 8 * 1024 * 1024 + 8;
+/// LIMIT-01's guarded default for one SSE line: 8 MiB + 8 B, which is one
+/// maximal message on a single `data:` line ending in CRLF.
+const MAX_SSE_LINE_SIZE: usize = MAX_SSE_MESSAGE_SIZE + SSE_DATA_LINE_CRLF_OVERHEAD;
 
-/// Bytes added around one serialized data line: `data: ` plus LF.
+/// Bytes this writer adds around one serialized data line: `data: ` plus LF.
 const SSE_DATA_LINE_WIRE_OVERHEAD: usize = b"data: \n".len();
-
-/// Effective JSON-RPC message ceiling for this SSE implementation.
-const MAX_SSE_MESSAGE_SIZE: usize = MAX_SSE_LINE_SIZE - SSE_DATA_LINE_WIRE_OVERHEAD;
 
 /// Explicit bounds for a modern request-scoped SSE response body.
 ///
@@ -2313,8 +2318,12 @@ event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"valid\",\"id\":2}\n\n";
 
         assert_eq!(reader.codec.max_message_size(), MAX_SSE_MESSAGE_SIZE);
         assert_eq!(writer.codec.max_message_size(), MAX_SSE_MESSAGE_SIZE);
+        // LIMIT-01: an 8 MiB decoded message, on a line of 8 MiB + 8 B, which
+        // is that message after `data: ` and before a CRLF terminator.
+        assert_eq!(MAX_SSE_MESSAGE_SIZE, 8 * 1024 * 1024);
+        assert_eq!(MAX_SSE_LINE_SIZE, 8 * 1024 * 1024 + 8);
         assert_eq!(
-            MAX_SSE_MESSAGE_SIZE + SSE_DATA_LINE_WIRE_OVERHEAD,
+            MAX_SSE_MESSAGE_SIZE + b"data: \r\n".len(),
             MAX_SSE_LINE_SIZE
         );
     }
@@ -2361,6 +2370,127 @@ event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"valid\",\"id\":2}\n\n";
         ));
         assert_eq!(writer.inner().len(), 0);
         assert_eq!(writer.event_counter, 0);
+    }
+
+    /// One event whose single `data:` line carries `size` payload bytes and
+    /// ends, like the blank line after it, with `terminator`.
+    fn one_data_line_event(size: usize, terminator: &str) -> Vec<u8> {
+        let mut wire = b"data: ".to_vec();
+        wire.resize(wire.len() + size, b'x');
+        wire.extend_from_slice(terminator.as_bytes());
+        wire.extend_from_slice(terminator.as_bytes());
+        wire
+    }
+
+    /// LIMIT-01's decoded SSE JSON message, written out rather than read from
+    /// the constant under test.
+    const LIMIT_01_SSE_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
+    #[test]
+    fn sse_reader_admits_a_limit_01_message_and_refuses_one_more_byte_on_lf_and_crlf_lines() {
+        let cx = Cx::for_testing();
+        let refusal =
+            format!("SSE event data exceeds maximum size of {LIMIT_01_SSE_MESSAGE_BYTES} bytes");
+        for terminator in ["\n", "\r\n"] {
+            let at_bound = one_data_line_event(LIMIT_01_SSE_MESSAGE_BYTES, terminator);
+            if terminator == "\r\n" {
+                // The maximal message on a CRLF line fills the line bound.
+                assert_eq!(at_bound.len() - terminator.len(), MAX_SSE_LINE_SIZE);
+            }
+            let event = SseReader::new(Cursor::new(at_bound))
+                .read_event(&cx)
+                .expect("an 8 MiB message is admitted")
+                .expect("its event dispatches");
+            assert_eq!(
+                event.data.len(),
+                LIMIT_01_SSE_MESSAGE_BYTES,
+                "{terminator:?}"
+            );
+
+            let error = SseReader::new(Cursor::new(one_data_line_event(
+                LIMIT_01_SSE_MESSAGE_BYTES + 1,
+                terminator,
+            )))
+            .read_event(&cx)
+            .expect_err("one byte more is refused");
+            assert!(
+                matches!(&error, TransportError::Io(io)
+                    if io.kind() == std::io::ErrorKind::InvalidData
+                        && io.to_string() == refusal),
+                "{terminator:?}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sse_reader_admits_a_limit_01_lf_line_and_refuses_one_more_byte() {
+        let cx = Cx::for_testing();
+        // A comment line of `line_bytes` including its LF, then one event.
+        let comment_then_event = |line_bytes: usize| {
+            let mut wire = b": ".to_vec();
+            wire.resize(line_bytes - 1, b'x');
+            wire.extend_from_slice(b"\ndata: ok\n\n");
+            wire
+        };
+
+        let event = SseReader::new(Cursor::new(comment_then_event(MAX_SSE_LINE_SIZE)))
+            .read_event(&cx)
+            .expect("a line of exactly the bound is admitted")
+            .expect("the following event dispatches");
+        assert_eq!(event.data, "ok");
+
+        let error = SseReader::new(Cursor::new(comment_then_event(MAX_SSE_LINE_SIZE + 1)))
+            .read_event(&cx)
+            .expect_err("one byte more is refused");
+        assert!(
+            matches!(&error, TransportError::Io(io)
+                if io.to_string() == format!("SSE line exceeds maximum size of {MAX_SSE_LINE_SIZE} bytes")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn sse_writer_admits_a_limit_01_message_and_refuses_one_more_byte_for_lf_and_crlf_data() {
+        let cx = Cx::for_testing();
+        for crlf in [false, true] {
+            // One data line, or the same size split by a CRLF that the writer
+            // normalizes into two LF-terminated data lines.
+            let data = |size: usize| {
+                if crlf {
+                    format!("a\r\n{}", "x".repeat(size - 3))
+                } else {
+                    "x".repeat(size)
+                }
+            };
+
+            let mut writer = SseWriter::new(Vec::new());
+            writer
+                .write_event(&cx, &SseEvent::message(data(LIMIT_01_SSE_MESSAGE_BYTES)))
+                .expect("an 8 MiB message is written");
+            let echoed = SseReader::new(Cursor::new(writer.into_inner()))
+                .read_event(&cx)
+                .expect("the written event is admitted by the reader")
+                .expect("its event dispatches");
+            assert_eq!(
+                echoed.data,
+                data(LIMIT_01_SSE_MESSAGE_BYTES).replace("\r\n", "\n"),
+                "crlf={crlf}"
+            );
+
+            let mut refused = SseWriter::new(Vec::new());
+            let error = refused
+                .write_event(
+                    &cx,
+                    &SseEvent::message(data(LIMIT_01_SSE_MESSAGE_BYTES + 1)),
+                )
+                .expect_err("one byte more is refused");
+            assert!(
+                matches!(error, TransportError::Codec(CodecError::MessageTooLarge(size))
+                    if size == LIMIT_01_SSE_MESSAGE_BYTES + 1),
+                "crlf={crlf}: {error:?}"
+            );
+            assert!(refused.inner().is_empty(), "crlf={crlf}");
+        }
     }
 
     #[test]
