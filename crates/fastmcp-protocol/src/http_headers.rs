@@ -137,8 +137,8 @@ impl ToolSchemaRevision {
             _ => None,
         };
         let mut bytes = [0_u8; 32];
-        for (index, pair) in hex.chunks_exact(2).enumerate() {
-            bytes[index] = digit(pair[0])? << 4 | digit(pair[1])?;
+        for (index, [high, low]) in hex.as_chunks::<2>().0.iter().enumerate() {
+            bytes[index] = digit(*high)? << 4 | digit(*low)?;
         }
         Some(Self(Sha256Digest::from_bytes(bytes)))
     }
@@ -195,9 +195,14 @@ pub enum HeaderExposureError {
 }
 impl fmt::Display for HeaderExposureError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let pointer = |path: &[String]| path.iter()
-            .map(|key| format!("/{}", key.replace('~', "~0").replace('/', "~1")))
-            .collect::<String>();
+        let pointer = |path: &[String]| {
+            let mut pointer = String::new();
+            for key in path {
+                pointer.push('/');
+                pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
+            }
+            pointer
+        };
         match self {
             Self::Annotation(error) => write!(f, "tool declares invalid x-mcp-header annotations: {error}"),
             Self::SecretField { path } => write!(f,
