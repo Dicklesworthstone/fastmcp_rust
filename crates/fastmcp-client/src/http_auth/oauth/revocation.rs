@@ -25,7 +25,7 @@ use super::{
 };
 use crate::http_auth::CanonicalHttpUrl;
 
-const REVOCATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(super) const REVOCATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_REVOCATION_RESPONSE_BYTES: usize = 4096;
 
 /// Outcome of exactly one token's single remote revocation attempt.
@@ -156,7 +156,9 @@ impl OAuthClient {
         Ok(OAuthRevocationReport { refresh_token, access_token })
     }
 
-    async fn revoke_one(
+    // Shared only within native OAuth, including an exclusively consumed
+    // persistent refresh grant. No public raw-token revocation escape hatch.
+    pub(super) async fn revoke_one(
         &self,
         cx: &Cx,
         deadline: Time,
@@ -206,7 +208,7 @@ impl OAuthClient {
     }
 }
 
-fn map_preflight(error: OAuthError) -> OAuthRevocationError {
+pub(super) fn map_preflight(error: OAuthError) -> OAuthRevocationError {
     match error {
         OAuthError::Cancelled => OAuthRevocationError::Cancelled,
         OAuthError::TimedOut => OAuthRevocationError::TimedOut,

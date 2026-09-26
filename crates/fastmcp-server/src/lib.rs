@@ -480,7 +480,17 @@ mod modern_http_only {
             Ok(())
         }
         pub fn close(&mut self) {
+            if self.closed {
+                return;
+            }
             self.closed = true;
+            self.transport.terminate();
+        }
+    }
+
+    impl Drop for DualEraHttpSession {
+        fn drop(&mut self) {
+            self.close();
         }
     }
 }
@@ -4788,6 +4798,15 @@ impl FinalSubscriptionElection {
 /// unregisters the listener from the server.
 pub struct SubscriptionListenHandle {
     _lease: FinalSubscriptionLease,
+}
+
+#[cfg(test)]
+impl SubscriptionListenHandle {
+    /// The registration this handle keeps alive, for tests that inspect it.
+    fn lease(&self) -> &FinalSubscriptionLease {
+        let Self { _lease: lease } = self;
+        lease
+    }
 }
 
 /// Removes one subscription entry when its request exits for any reason.
@@ -51514,7 +51533,7 @@ mod lib_unit_tests {
                 serde_json::json!(730)
             );
         }
-        let queue = held.handle._lease.election.opening_events.lock().unwrap();
+        let queue = held.handle.lease().election.opening_events.lock().unwrap();
         assert_eq!((queue.retained_events, queue.retained_bytes), (0, 0));
     }
 
@@ -51553,7 +51572,7 @@ mod lib_unit_tests {
             );
         }
         {
-            let queue = held.handle._lease.election.opening_events.lock().unwrap();
+            let queue = held.handle.lease().election.opening_events.lock().unwrap();
             assert_eq!(queue.retained_events, MAX_FINAL_SUBSCRIPTION_QUEUED_EVENTS);
             assert!(queue.retained_bytes > 0);
         }
@@ -51565,7 +51584,7 @@ mod lib_unit_tests {
             "one extra event must retire only the listener at its bound"
         );
         {
-            let queue = held.handle._lease.election.opening_events.lock().unwrap();
+            let queue = held.handle.lease().election.opening_events.lock().unwrap();
             assert_eq!(
                 (
                     queue.retained_events,
@@ -51582,7 +51601,7 @@ mod lib_unit_tests {
                 .lock()
                 .unwrap()
                 .entries
-                .contains_key(&held.handle._lease.key),
+                .contains_key(&held.handle.lease().key),
             "capacity must be released while the failed callback and public handle remain live"
         );
         assert_eq!(
@@ -51627,7 +51646,7 @@ mod lib_unit_tests {
                 .expect("first event must enter");
             let first_bytes = held
                 .handle
-                ._lease
+                .lease()
                 .election
                 .opening_events
                 .lock()
@@ -51654,7 +51673,7 @@ mod lib_unit_tests {
                 .publish_subscription_notification(event(payload))
                 .unwrap();
             {
-                let queue = held.handle._lease.election.opening_events.lock().unwrap();
+                let queue = held.handle.lease().election.opening_events.lock().unwrap();
                 if excess == 0 {
                     assert_eq!(
                         (admitted, queue.retained_events, queue.retained_bytes),
@@ -51672,7 +51691,7 @@ mod lib_unit_tests {
                             .lock()
                             .unwrap()
                             .entries
-                            .contains_key(&held.handle._lease.key)
+                            .contains_key(&held.handle.lease().key)
                     );
                 }
             }
@@ -51688,7 +51707,7 @@ mod lib_unit_tests {
                 held.frames.lock().unwrap().len(),
                 if excess == 0 { 3 } else { 2 }
             );
-            let queue = held.handle._lease.election.opening_events.lock().unwrap();
+            let queue = held.handle.lease().election.opening_events.lock().unwrap();
             assert_eq!((queue.retained_events, queue.retained_bytes), (0, 0));
         }
 
@@ -51733,9 +51752,9 @@ mod lib_unit_tests {
                 .lock()
                 .unwrap()
                 .entries
-                .contains_key(&handle._lease.key)
+                .contains_key(&handle.lease().key)
         );
-        let queue = handle._lease.election.opening_events.lock().unwrap();
+        let queue = handle.lease().election.opening_events.lock().unwrap();
         assert_eq!((queue.retained_events, queue.retained_bytes), (0, 0));
         drop(queue);
         assert_eq!(
@@ -51827,7 +51846,7 @@ mod lib_unit_tests {
                     .collect::<Vec<_>>(),
                 expected
             );
-            assert_eq!(handle._lease.has_graceful_completion(), terminate);
+            assert_eq!(handle.lease().has_graceful_completion(), terminate);
             if panic_after_enqueue {
                 assert!(
                     server
@@ -51839,7 +51858,7 @@ mod lib_unit_tests {
                         .is_empty()
                 );
             }
-            let queue = handle._lease.election.opening_events.lock().unwrap();
+            let queue = handle.lease().election.opening_events.lock().unwrap();
             assert_eq!((queue.retained_events, queue.retained_bytes), (0, 0));
         }
     }
