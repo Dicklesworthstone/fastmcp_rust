@@ -24111,6 +24111,9 @@ enum Http05BRetryCase {
     RelayStripsHeaders,
     /// A current review; the handler returns a tool error.
     HandlerError,
+    /// Same as `StaleReview`, but the host's policy refuses the refreshed
+    /// annotation, so no retry may be sent.
+    RefreshDenied,
 }
 
 /// Counts `tools/call` and `tools/list` before routing, so a request refused
@@ -24358,8 +24361,9 @@ fn http_05_b_retry_run(case: Http05BRetryCase) {
             } else {
                 json!({"type": "object", "properties": {"region": {"type": "string"}}})
             };
-            let policy = |binding: &fastmcp_protocol::http_headers::ParameterHeaderBinding| {
-                binding.header_name() == "Mcp-Param-Region"
+            let deny = matches!(case, Http05BRetryCase::RefreshDenied);
+            let policy = move |binding: &fastmcp_protocol::http_headers::ParameterHeaderBinding| {
+                !deny && binding.header_name() == "Mcp-Param-Region"
             };
             let reviewed =
                 ReviewedToolHeaders::new(endpoint, HTTP_05_B_RETRY_TOOL, initial_schema, policy)
@@ -24439,6 +24443,30 @@ fn http_05_b_retry_run(case: Http05BRetryCase) {
                 (calls, lists, handled),
                 (1, 0, 1),
                 "a response the handler produced is never retried"
+            );
+        }
+        Http05BRetryCase::RefreshDenied => {
+            assert!(
+                matches!(
+                    outcome,
+                    Err(modern::HttpClientError::Connection(
+                        fastmcp_rust::ClientHttpConnectionError::Modern(
+                            fastmcp_rust::ModernHttpClientError::ParameterHeaders(
+                                fastmcp_rust::http_executor::parameter_headers::ToolHeaderDispatchError::DisclosureDenied
+                            )
+                        )
+                    ))
+                ),
+                "a denied refreshed annotation suppresses the whole retry: {outcome:?}"
+            );
+            assert_eq!(
+                (calls, lists, handled),
+                (1, 1, 0),
+                "the refused POST and the refresh only; no retry and no handler run"
+            );
+            assert!(
+                !format!("{outcome:?}").contains("eu-west"),
+                "the denied value never reaches client diagnostics: {outcome:?}"
             );
         }
     }
@@ -24773,6 +24801,11 @@ fn http_05_a_positive() {
             ]],
             "one exact field per present annotated value; absent zone and body-only note have none"
         );
+        let diagnostics = format!("{:?}", observed.outcome);
+        assert!(
+            !diagnostics.contains("Hello, 世界") && !diagnostics.contains("SGVsbG8sIOS4lueVjA"),
+            "a projected value never reaches client diagnostics: {diagnostics}"
+        );
         assert_eq!(
             observed.calls, 1,
             "exactly one tools/call reached the backend"
@@ -24794,6 +24827,13 @@ fn http_05_a_planted_negative() {
         let observed =
             http_05_a_client_run(http_05_a_client_arguments(HTTP_05_A_MAX_SAFE_INTEGER + 1));
         assert_http_05_a_refused_before_send(&observed);
+        let Err(error) = &observed.outcome else {
+            unreachable!("the refusal was asserted above");
+        };
+        assert!(
+            !format!("{error:?} {error}").contains("9007199254740992"),
+            "the refused value never reaches the error's diagnostics: {error:?}"
+        );
     });
 }
 
@@ -24850,6 +24890,17 @@ fn http_05_a_null_annotated_value_is_sent_without_its_header() {
                 observed.received
             );
         },
+    );
+}
+
+#[cfg(feature = "native-tls-roots")]
+#[test]
+fn http_05_a_policy_denial_of_a_refreshed_annotation_sends_no_retry() {
+    // Near-identical to http_05_b_retry_positive: only the host policy's
+    // verdict on the refreshed annotation differs.
+    http_05_b_retry_isolated(
+        "http_05_a_policy_denial_of_a_refreshed_annotation_sends_no_retry",
+        Http05BRetryCase::RefreshDenied,
     );
 }
 

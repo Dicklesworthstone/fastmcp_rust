@@ -50,10 +50,13 @@ const TOOL: &str = "revalidation_probe";
 const INTERVAL: Duration = Duration::from_millis(100);
 const WAIT: Duration = Duration::from_millis(150);
 
+/// `provider` is built once, so every clone derives the same token owner, as
+/// the one provider installed in a server does.
 #[derive(Clone)]
 struct Probe {
     tokens: [String; 2],
     verifier: StaticTokenVerifier,
+    provider: TokenAuthProvider,
     checks: Arc<AtomicUsize>,
     change: Arc<AtomicUsize>,
 }
@@ -70,14 +73,20 @@ impl Probe {
         let verifier = StaticTokenVerifier::new([
             (tokens[0].clone(), facts(0)), (tokens[1].clone(), facts(1)),
         ]).unwrap();
-        Self { tokens, verifier, checks:Arc::new(AtomicUsize::new(0)), change:Arc::new(AtomicUsize::new(0)) }
+        let provider = TokenAuthProvider::new(verifier.clone());
+        Self { tokens, verifier, provider, checks:Arc::new(AtomicUsize::new(0)), change:Arc::new(AtomicUsize::new(0)) }
     }
     fn calls(&self) -> usize { self.checks.load(Ordering::SeqCst) }
 }
 impl AuthProvider for Probe {
     fn authenticate(&self, ctx: &McpContext, request: AuthRequest<'_>) -> McpResult<AuthContext> {
         self.checks.fetch_add(1, Ordering::SeqCst);
-        let mut facts = TokenAuthProvider::new(self.verifier.clone()).authenticate(ctx, request)?;
+        // Change 4 verifies the same credential through an independently
+        // constructed provider, whose owner namespace is a different principal.
+        let mut facts = match self.change.load(Ordering::SeqCst) {
+            4 => TokenAuthProvider::new(self.verifier.clone()).authenticate(ctx, request)?,
+            _ => self.provider.authenticate(ctx, request)?,
+        };
         match self.change.load(Ordering::SeqCst) {
             1 => facts.scopes.push("write".to_owned()),
             2 => facts.claims = Some(json!({"tenant":"changed"})),
@@ -304,6 +313,27 @@ fn revalidated_public_sse_delivers_the_real_catalog_without_raw_body_access() {
         assert!(event.contains("\"resultType\":\"complete\""));
         assert!(probe.calls()>before,"a current provider verdict is required");
         assert!(next(&cx,&mut stream).await.unwrap().is_none());
+        stream.close(&cx).await;
+        assert!(cx.checkpoint().is_ok());
+    });
+}
+
+#[test]
+fn revalidation_under_another_providers_owner_is_a_changed_principal() {
+    // Identical to the real-catalog case above except that revalidation
+    // derives the same credential's owner in a different provider namespace.
+    run(|cx| async move {
+        let probe = Probe::new();
+        let endpoint = endpoint(&probe);
+        let mut stream = open(&cx,&endpoint,&policy(64),request(&probe,0,false)).await;
+        assert!(stream.stream().is_none(),"guarded body cannot be extracted");
+        let before = probe.calls();
+        probe.change.store(4,Ordering::SeqCst);
+        asupersync::time::sleep(cx.now(),WAIT).await;
+        assert!(matches!(next(&cx,&mut stream).await,
+            Err(SecuredHttpEndpointError::Revalidation(SseAuthorizationError::FactsChanged))));
+        assert!(probe.calls()>before,"the refusal is a current provider verdict");
+        assert!(matches!(next(&cx,&mut stream).await,Err(SecuredHttpEndpointError::BodyClosed)));
         stream.close(&cx).await;
         assert!(cx.checkpoint().is_ok());
     });
