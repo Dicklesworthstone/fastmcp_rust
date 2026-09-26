@@ -109,6 +109,8 @@ pub enum OAuthSessionError {
     LoginRequired,
     TargetMismatch,
     GenerationExhausted,
+    /// HTTP ended after the native SSE parser discarded an incomplete record.
+    IncompleteSseResponse,
     AuthorizationRejected { status: u16 },
     OAuth(OAuthError),
     Http(ModernHttpExecutorError),
@@ -127,6 +129,7 @@ impl fmt::Display for OAuthSessionError {
             Self::LoginRequired => f.write_str("managed OAuth requires a new explicit login"),
             Self::TargetMismatch => f.write_str("request target differs from the OAuth resource"),
             Self::GenerationExhausted => f.write_str("managed OAuth generation exhausted"),
+            Self::IncompleteSseResponse => f.write_str("managed OAuth SSE response ended with incomplete framing"),
             Self::AuthorizationRejected { status } => {
                 write!(f, "MCP authorization rejected with HTTP {status}; request not retried")
             }
@@ -605,6 +608,11 @@ impl ManagedOAuthSseStream {
     /// Delivers one event while preserving the native parser's bounds and
     /// idle/absolute deadlines. Abandoning a polled read closes the stream:
     /// partially consumed framing cannot later be replayed as a fresh read.
+    /// Only a clean native EOF returns `None`. Unlike a general EventSource,
+    /// this MCP response cannot silently discard an unfinished event or line:
+    /// finite core/Tasks consumers rely on EOF before publishing their result.
+    /// Earlier delivered events cannot be recalled; an incomplete tail ends
+    /// this owner with `IncompleteSseResponse`, never a reconnect or retry.
     pub async fn next_event(&mut self, cx: &Cx) -> Result<Option<String>, OAuthSessionError> {
         if self.finished {
             return Ok(None);
@@ -618,7 +626,18 @@ impl ManagedOAuthSseStream {
         let deadline = cx.budget().deadline.unwrap_or(Time::from_nanos(u64::MAX));
         let result = self.session.await_active(
             cx, &self.cancellation, deadline, Some(self.expires_at), async {
-                stream.next_event(cx).await.map_err(OAuthSessionError::Http)
+                let event = stream.next_event(cx).await.map_err(OAuthSessionError::Http)?;
+                if event.is_none() {
+                    // The native WHATWG parser intentionally reports discarded
+                    // EOF fragments separately from data events. Inspect that
+                    // report while the stream and authorization guard are still
+                    // owned here, before classifying this call as finished.
+                    let end = stream.end_of_stream().ok_or(OAuthSessionError::IncompleteSseResponse)?;
+                    if end.discarded_pending_event || end.discarded_partial_line {
+                        return Err(OAuthSessionError::IncompleteSseResponse);
+                    }
+                }
+                Ok(event)
             },
         ).await;
         match &result {
@@ -710,6 +729,8 @@ impl Drop for SessionGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod sse_completion;
 
     #[test]
     fn renewal_leeway_never_consumes_more_than_half_a_new_tokens_lifetime() {
