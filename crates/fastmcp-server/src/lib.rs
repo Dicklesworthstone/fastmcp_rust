@@ -1937,17 +1937,16 @@ fn admitted_final_client_implementation(
 /// A raw parameter sidecar is usable only while authentication and admission
 /// have left the materialized parameter value untouched.  In particular,
 /// stripping a recognized credential must sever the raw source before router
-/// MRTR decoding can observe it.
+/// MRTR decoding can observe it.  The sidecar was admitted as the source of
+/// `admitted`, so comparing that value with the current one replaces decoding
+/// the source again; final core decoding still verifies the source against
+/// the value it receives.
 fn retained_raw_params<'a>(
     raw_params: Option<&'a str>,
-    request: &JsonRpcRequest,
+    admitted: Option<&serde_json::Value>,
+    current: Option<&serde_json::Value>,
 ) -> Option<&'a str> {
-    raw_params.filter(|source| {
-        serde_json::from_str::<serde_json::Value>(source)
-            .ok()
-            .as_ref()
-            == request.params.as_ref()
-    })
+    raw_params.filter(|_| admitted == current)
 }
 
 /// Re-admits a middleware-produced final core response through the request's
@@ -8991,7 +8990,6 @@ impl ServerHttpSession {
             .flatten()
             .map(|sender| {
                 TransportRootsProvider::new(
-                    sender,
                     McpContext::new(
                         self.legacy_request_cx
                             .lock()
@@ -8999,6 +8997,7 @@ impl ServerHttpSession {
                             .clone(),
                         0,
                     ),
+                    sender,
                 )
             })
     }
@@ -13039,11 +13038,11 @@ impl Server {
         runtime
             .handlers
             .invoke(
+                request_ctx,
                 negotiated,
                 ProtocolEra::Modern2026,
                 extension_id,
                 &request,
-                request_ctx,
             )
             .map_err(|error| match error {
                 ExtensionHandlerInvocationError::Handler(error) => error,
@@ -13444,6 +13443,9 @@ impl Server {
             ));
         };
 
+        // The value the raw sidecar was admitted with; `request` is shadowed
+        // below by a metadata-stripped copy.
+        let admitted_params = request.params.as_ref();
         let mut admission_request = request.clone();
         if let Err(error) = self.authenticate_modern_request(
             &request_ctx,
@@ -13540,7 +13542,11 @@ impl Server {
                     .dispatch_stateless_with_continuation_cancellation_and_raw_params(
                         &request_ctx,
                         &admission_request,
-                        retained_raw_params(raw_params, &admission_request),
+                        retained_raw_params(
+                            raw_params,
+                            admitted_params,
+                            admission_request.params.as_ref(),
+                        ),
                         &continuation_cancellation,
                     )
                     .await
@@ -13659,6 +13665,9 @@ impl Server {
         terminal_delivery: Option<Arc<FinalSubscriptionTerminalDelivery>>,
         notification_sender: NotificationSender,
     ) -> Option<JsonRpcResponse> {
+        // The value the raw sidecar was admitted with, before authentication
+        // may strip credentials from this request.
+        let admitted_params = raw_params.as_ref().and_then(|_| request.params.clone());
         let method = request.method.clone();
         let response_id = request.id.clone();
         let is_notification = response_id.is_none();
@@ -13860,7 +13869,12 @@ impl Server {
                     .dispatch_stateless_owned_with_continuation_cancellation_and_raw_params(
                         request_ctx.clone(),
                         request.clone(),
-                        retained_raw_params(raw_params.as_deref(), &request).map(Arc::<str>::from),
+                        retained_raw_params(
+                            raw_params.as_deref(),
+                            admitted_params.as_ref(),
+                            request.params.as_ref(),
+                        )
+                        .map(Arc::<str>::from),
                         inbound.mrtr_continuation_cancellation().unwrap_or_default(),
                     )
                     .await
@@ -19397,8 +19411,8 @@ impl Server {
         if supports_sampling {
             let sampling_sender: Arc<dyn fastmcp_core::SamplingSender> =
                 Arc::new(bidirectional::TransportSamplingSender::new(
-                    request_sender.clone(),
                     request_context.clone(),
+                    request_sender.clone(),
                 ));
             senders = senders.with_sampling(sampling_sender);
         }
@@ -19406,15 +19420,15 @@ impl Server {
         if supports_elicitation {
             let elicitation_sender: Arc<dyn fastmcp_core::ElicitationSender> =
                 Arc::new(bidirectional::TransportElicitationSender::new(
-                    request_sender.clone(),
                     request_context.clone(),
+                    request_sender.clone(),
                 ));
             senders = senders.with_elicitation(elicitation_sender);
         }
 
         if supports_roots {
             let roots_provider: Arc<dyn fastmcp_core::RootsProvider> = Arc::new(
-                bidirectional::TransportRootsProvider::new(request_sender, request_context.clone()),
+                bidirectional::TransportRootsProvider::new(request_context.clone(), request_sender),
             );
             senders = senders.with_roots(roots_provider);
         }
@@ -31628,11 +31642,54 @@ mod lib_unit_tests {
         response
     }
 
-    fn auth_00_mrtr_server(stable_owner: bool, calls: &Arc<AtomicUsize>) -> Server {
-        Server::new("auth-00-mrtr-owner", "1.0.0")
+    /// How the MRTR test server's provider supplies the session owner.
+    #[derive(Clone, Copy)]
+    enum Auth00Owner {
+        /// The verifier configures an explicit provider-scoped owner.
+        Configured,
+        /// A subject-only verified context. `TokenAuthProvider` derives its
+        /// owner in a process-local namespace (756719c3).
+        Derived,
+        /// The same verified subject-only context, with no owner at all.
+        Absent,
+    }
+
+    /// Verifies the same credentials through `TokenAuthProvider`, then
+    /// rebuilds the admitted context without the owner that provider
+    /// derives. Owner admission therefore sees a verified subject that
+    /// really has no stable owner.
+    struct OwnerlessAuthProvider(TokenAuthProvider);
+
+    impl AuthProvider for OwnerlessAuthProvider {
+        fn authenticate(
+            &self,
+            ctx: &McpContext,
+            request: AuthRequest<'_>,
+        ) -> McpResult<AuthContext> {
+            let admitted = self.0.authenticate(ctx, request)?;
+            let subject = admitted
+                .subject
+                .clone()
+                .ok_or_else(|| McpError::internal_error("admitted context has no subject"))?;
+            let mut ownerless = AuthContext::with_subject(subject);
+            ownerless.scopes = admitted.scopes;
+            ownerless.claims = admitted.claims;
+            Ok(ownerless)
+        }
+    }
+
+    fn auth_00_mrtr_server(owner: Auth00Owner, calls: &Arc<AtomicUsize>) -> Server {
+        let builder = Server::new("auth-00-mrtr-owner", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
-            .expect("modern policy")
-            .auth_provider(auth_00_mrtr_provider(stable_owner))
+            .expect("modern policy");
+        let builder = match owner {
+            Auth00Owner::Configured => builder.auth_provider(auth_00_mrtr_provider(true)),
+            Auth00Owner::Derived => builder.auth_provider(auth_00_mrtr_provider(false)),
+            Auth00Owner::Absent => {
+                builder.auth_provider(OwnerlessAuthProvider(auth_00_mrtr_provider(false)))
+            }
+        };
+        builder
             .tool(LiveHttpMrtrTool {
                 name: "live_http_mrtr",
                 calls: Arc::clone(calls),
@@ -31652,9 +31709,21 @@ mod lib_unit_tests {
 
     #[test]
     fn auth_00_http_mrtr_stable_owner_completes_two_rounds() {
-        run_live_http_test(|cx| async move {
+        assert_auth_00_http_mrtr_completes_two_rounds(Auth00Owner::Configured);
+    }
+
+    /// Pins 756719c3: `TokenAuthProvider` derives an owner for a subject-only
+    /// verified context, so the same two rounds complete without a
+    /// verifier-configured owner.
+    #[test]
+    fn auth_00_http_mrtr_derived_owner_completes_two_rounds() {
+        assert_auth_00_http_mrtr_completes_two_rounds(Auth00Owner::Derived);
+    }
+
+    fn assert_auth_00_http_mrtr_completes_two_rounds(owner: Auth00Owner) {
+        run_live_http_test(move |cx| async move {
             let calls = Arc::new(AtomicUsize::new(0));
-            let endpoint = auth_00_mrtr_server(true, &calls)
+            let endpoint = auth_00_mrtr_server(owner, &calls)
                 .into_http_endpoint("http://auth-owner.test")
                 .unwrap();
             let initial = auth_00_mrtr_http_call(&cx, &endpoint, None, 981).await;
@@ -31681,7 +31750,7 @@ mod lib_unit_tests {
             let calls = Arc::new(AtomicUsize::new(0));
             // Same valid credential, subject, request and handler as the
             // positive; only the provider's stable owner is absent.
-            let endpoint = auth_00_mrtr_server(false, &calls)
+            let endpoint = auth_00_mrtr_server(Auth00Owner::Absent, &calls)
                 .into_http_endpoint("http://auth-owner.test")
                 .unwrap();
             let response = auth_00_mrtr_http_call(&cx, &endpoint, None, 981).await;
@@ -31698,8 +31767,8 @@ mod lib_unit_tests {
     fn auth_00_http_mrtr_ownerless_leaked_handle_preserves_owner_state() {
         run_live_http_test(|cx| async move {
             let calls = Arc::new(AtomicUsize::new(0));
-            let owner_server = auth_00_mrtr_server(true, &calls);
-            let mut ownerless_server = auth_00_mrtr_server(false, &calls);
+            let owner_server = auth_00_mrtr_server(Auth00Owner::Configured, &calls);
+            let mut ownerless_server = auth_00_mrtr_server(Auth00Owner::Absent, &calls);
             // Both public endpoints use the same real exchange registry.
             // Independent registries would reject even without owner checks.
             ownerless_server.router = Arc::clone(&owner_server.router);
@@ -31801,7 +31870,7 @@ mod lib_unit_tests {
         run_live_http_test(move |cx| async move {
             for state_only in [false, true] {
                 let calls = Arc::new(AtomicUsize::new(0));
-                let endpoint = auth_00_mrtr_server(true, &calls)
+                let endpoint = auth_00_mrtr_server(Auth00Owner::Configured, &calls)
                     .into_http_endpoint("http://auth-owner.test")
                     .unwrap();
                 let mut issuer = endpoint.open_session(&cx).unwrap();
@@ -39296,14 +39365,28 @@ mod lib_unit_tests {
                     .unwrap()
                     .as_nanos()
             );
-            let mut refreshed = AuthContext::with_subject(subject.clone());
+            // TokenAuthProvider derives a fallback owner per credential, so a
+            // rotated credential changes it (756719c3). Continuity across the
+            // refresh therefore needs the verifier's own owner, as auth.rs
+            // documents; the foreign caller has a distinct one.
+            let verified_owner = |subject: &str| {
+                sha256_bounded(subject.as_bytes(), 256).expect("bounded test owner subject")
+            };
+            let owner = verified_owner(&subject);
+            let mut refreshed =
+                AuthContext::with_subject(subject.clone()).with_session_owner(owner);
             refreshed.scopes = vec!["tasks".to_owned()];
+            let foreign_subject = format!("foreign-{subject}");
             let verifier = StaticTokenVerifier::new([
-                ("owner-first", AuthContext::with_subject(subject.clone())),
+                (
+                    "owner-first",
+                    AuthContext::with_subject(subject.clone()).with_session_owner(owner),
+                ),
                 ("owner-refreshed", refreshed),
                 (
                     "foreign-valid",
-                    AuthContext::with_subject(format!("foreign-{subject}")),
+                    AuthContext::with_subject(foreign_subject.clone())
+                        .with_session_owner(verified_owner(&foreign_subject)),
                 ),
             ])
             .map_err(|error| error.to_string())?;
@@ -39943,18 +40026,25 @@ mod lib_unit_tests {
     #[test]
     fn admitted_raw_params_are_withheld_after_sanitation_changes_the_request() {
         // RH-5 neighbor of the retained-source positive: a byte-exact raw
-        // sidecar is legal only while it still decodes to the request that
-        // admission handed downstream.  Credential stripping changes that
-        // request, so continuation routing must receive no stale source.
+        // sidecar is legal only while the request still carries the value it
+        // was admitted with.  Credential stripping changes that request, so
+        // continuation routing must receive no stale source.
         let raw = r#"{"authorization":"Bearer never-forward","requestState":"state"}"#;
         let mut request = JsonRpcRequest::new(
             "tools/call",
             Some(serde_json::from_str(raw).expect("raw sidecar fixture must decode")),
             937_i64,
         );
-        assert_eq!(retained_raw_params(Some(raw), &request), Some(raw));
+        let admitted = request.params.clone();
+        assert_eq!(
+            retained_raw_params(Some(raw), admitted.as_ref(), request.params.as_ref()),
+            Some(raw)
+        );
         auth::strip_recognized_access_credentials(&mut request.params);
-        assert_eq!(retained_raw_params(Some(raw), &request), None);
+        assert_eq!(
+            retained_raw_params(Some(raw), admitted.as_ref(), request.params.as_ref()),
+            None
+        );
         assert_eq!(
             request.params,
             Some(serde_json::json!({"requestState": "state"})),
@@ -45350,13 +45440,31 @@ mod lib_unit_tests {
         .expect("valid verifier configuration")
         .with_allowed_schemes(["Bearer"])
         .expect("valid scheme configuration");
-        let alice = crate::auth::principal_fingerprint(Some(&AuthContext::with_subject("alice")))
-            .expect("alice fingerprint");
-        let bob = crate::auth::principal_fingerprint(Some(&AuthContext::with_subject("bob")))
-            .expect("bob fingerprint");
+        // The session binds the context the installed provider admits. For
+        // these subject-only contexts that includes the owner the provider
+        // derives (756719c3), in a namespace its clones share. So derive each
+        // expected fingerprint by admitting the credential through it.
+        let provider = TokenAuthProvider::new(verifier);
+        let admitted_fingerprint = |token: &str| {
+            let authorization = format!("Bearer {token}");
+            let admitted = provider
+                .authenticate(
+                    &McpContext::new(cx.clone(), 0),
+                    AuthRequest {
+                        method: "initialize",
+                        params: None,
+                        transport_authorization: Some(&authorization),
+                        request_id: 0,
+                    },
+                )
+                .expect("the installed provider admits its own credential");
+            crate::auth::principal_fingerprint(Some(&admitted)).expect("admitted fingerprint")
+        };
+        let alice = admitted_fingerprint("alpha");
+        let bob = admitted_fingerprint("beta");
         let endpoint = Server::new("legacy-sse-owner", "1.0.0")
             .tool(LiveRuntimeListedTool)
-            .auth_provider(TokenAuthProvider::new(verifier))
+            .auth_provider(provider.clone())
             .build_http_endpoint("http://legacy.test")
             .expect("dual-era endpoint must build");
         let mut session = endpoint
@@ -54546,6 +54654,101 @@ mod lib_unit_tests {
                     "peer-close path emitted an event instead of closing without completion"
                         .to_owned(),
                 );
+            }
+            Ok(())
+        });
+    }
+
+    #[cfg(feature = "tasks")]
+    struct IdleHostedTaskSupervisor;
+
+    #[cfg(feature = "tasks")]
+    impl ApplicationTaskSupervisor for IdleHostedTaskSupervisor {
+        fn resume<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Serves `bound` until `runtime` reports a ready Task service or a bound
+    /// passes, then cancels the serve. Returns whether the service was ready.
+    #[cfg(feature = "tasks")]
+    async fn serve_until_task_service_ready(
+        cx: &Cx,
+        bound: BoundHttpServer,
+        runtime: FinalTaskRuntime,
+    ) -> Result<bool, String> {
+        let caller_cx = cx.clone();
+        let mut observer = cx
+            .spawn(move |observer_cx| async move {
+                let mut ready = false;
+                for _ in 0..2_000 {
+                    if runtime.is_task_service_ready() {
+                        ready = true;
+                        break;
+                    }
+                    asupersync::time::sleep(observer_cx.now(), Duration::from_millis(1)).await;
+                }
+                caller_cx.cancel_with(CancelKind::User, Some("hosted Task service observed"));
+                ready
+            })
+            .map_err(|error| format!("observer admission failed: {error}"))?;
+        let serve = bound.serve(cx).await;
+        let ready = observer
+            .join(cx)
+            .await
+            .map_err(|error| format!("observer failed: {error:?}"))?;
+        let shutdown = serve.map_err(|error| format!("hosted Tasks serve failed: {error}"))?;
+        require_quiescent_http_shutdown(shutdown, "hosted Tasks serve").await?;
+        Ok(ready)
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn live_http_hosts_a_ready_task_service_and_settles_it_when_serve_is_cancelled() {
+        run_live_http_test(|cx| async move {
+            let server = Server::new("live-hosted-tasks", "1.0.0")
+                .task_supervisor(Arc::new(IdleHostedTaskSupervisor))
+                .build();
+            let runtime = server
+                .final_task_runtime()
+                .cloned()
+                .ok_or_else(|| "the default Tasks runtime is installed".to_owned())?;
+            if runtime.is_task_service_ready() {
+                return Err("building must not start the Task service".to_owned());
+            }
+            let bound = server
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("hosted Tasks bind failed: {error}"))?;
+            if !serve_until_task_service_ready(&cx, bound, runtime.clone()).await? {
+                return Err("the serve must host a ready Task service".to_owned());
+            }
+            if runtime.is_task_service_ready() {
+                return Err("no Task service runner may still run after serve returns".to_owned());
+            }
+            Ok(())
+        });
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn live_http_without_a_task_supervisor_hosts_no_task_service() {
+        run_live_http_test(|cx| async move {
+            let server = Server::new("live-unhosted-tasks", "1.0.0").build();
+            let runtime = server
+                .final_task_runtime()
+                .cloned()
+                .ok_or_else(|| "the default Tasks runtime is installed".to_owned())?;
+            let bound = server
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("unhosted Tasks bind failed: {error}"))?;
+            if serve_until_task_service_ready(&cx, bound, runtime).await? {
+                return Err("a server without task_supervisor must host no Task service".to_owned());
             }
             Ok(())
         });
