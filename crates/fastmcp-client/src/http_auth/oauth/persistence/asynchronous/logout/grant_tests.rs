@@ -76,7 +76,7 @@ fn refresh_revocation_precancellation_never_starts_an_exchange() {
         Err(OAuthRevocationError::Cancelled));
 }
 
-async fn peer_request(
+pub(super) async fn peer_request(
     listener: &TcpListener,
 ) -> asupersync::tls::TlsStream<asupersync::net::TcpStream> {
     let (socket, _) = listener.accept().await.unwrap();
@@ -92,7 +92,7 @@ async fn peer_request(
     tls
 }
 
-async fn fixture() -> (TcpListener, OAuthClientConfiguration) {
+pub(super) async fn fixture() -> (TcpListener, OAuthClientConfiguration) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut config = configuration().with_extra_root_certificate(native::test_root()).unwrap();
     config.revocation_endpoint = Some(CanonicalHttpUrl::parse(
@@ -101,7 +101,7 @@ async fn fixture() -> (TcpListener, OAuthClientConfiguration) {
     (listener, config)
 }
 
-fn no_more_requests(listener: &TcpListener) {
+pub(super) fn no_more_requests(listener: &TcpListener) {
     assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending(),
         "revocation cannot renew, send an access token, follow redirects, or retry");
 }
