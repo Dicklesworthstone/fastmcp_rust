@@ -11,6 +11,8 @@ use crate::http_auth::oauth::persistence::{OAuthGrantBinding, OAuthGrantEncoding
 use crate::http_auth::secure_file::slot::coordinator::{CredentialAnchorBinding, CredentialAnchorError, CredentialAnchorSnapshot, CredentialAnchorState};
 use crate::http_auth::secure_file::slot::coordinator::asynchronous::{CredentialIoLane, CredentialIoLimits};
 
+mod live;
+
 // Real files, locks, transaction coordinator and runtime. The opaque-service
 // provider and independently modeled anchor are IN-MEMORY TEST DOUBLES, not
 // production cryptography, independent durability or process-restart evidence.
