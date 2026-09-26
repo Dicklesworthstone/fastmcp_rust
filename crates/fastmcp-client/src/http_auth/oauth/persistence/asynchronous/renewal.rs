@@ -22,6 +22,7 @@ use super::{
     PartitionAuthorization, SlotRevision,
 };
 use crate::http_auth::oauth::{OAuthError, operation_deadline, within};
+use crate::http_auth::managed::{ManagedOAuthSession, OAuthSessionError, OAuthSessionPolicy};
 
 /// Non-secret progress. ReadyToPersist never means the replacement is durable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,7 +60,9 @@ pub enum OAuthRefreshRenewalError {
     Submission(AsyncOAuthRefreshError),
     Completion(CredentialIoError),
     Storage(OAuthRefreshStoreError),
+    Session(OAuthSessionError),
     NoStoredGrant,
+    NotComplete,
     Stopped,
 }
 impl fmt::Display for OAuthRefreshRenewalError {
@@ -69,7 +72,9 @@ impl fmt::Display for OAuthRefreshRenewalError {
             Self::Submission(error) => error.fmt(f),
             Self::Completion(error) => error.fmt(f),
             Self::Storage(error) => error.fmt(f),
+            Self::Session(error) => error.fmt(f),
             Self::NoStoredGrant => f.write_str("no stored OAuth refresh grant; explicit login required"),
+            Self::NotComplete => f.write_str("persistent OAuth renewal is not complete"),
             Self::Stopped => f.write_str("persistent OAuth renewal stopped; no exchange retry is authorized"),
         }
     }
@@ -159,6 +164,34 @@ impl<A, P> OAuthRefreshRenewal<A, P> {
     /// renewing them later requires another explicit persistent renewal.
     pub fn into_custody(self) -> OAuthRefreshRenewalCustody<A, P> { self.custody }
 
+    /// Hands a completed renewal to the ordinary managed client exactly once.
+    /// The returned store retains the persistent refresh lineage; the session
+    /// owns access only and will not silently switch to in-memory renewal.
+    /// Session generation starts at one and is NOT the persisted file revision.
+    /// A premature/cancelled call preserves custody. If native session admission
+    /// fails after extraction, the store remains in Stopped for explicit cleanup.
+    pub fn take_managed_session(
+        &mut self, observer: &Cx, policy: OAuthSessionPolicy,
+    ) -> Result<(ManagedOAuthSession, AsyncOAuthRefreshStore<A, P>, SlotRevision), OAuthRefreshRenewalError> {
+        if self.cancellation.is_cancel_requested() || self.origin.checkpoint().is_err() || observer.checkpoint().is_err() {
+            return Err(OAuthRefreshRenewalError::Context(OAuthError::Cancelled));
+        }
+        if self.origin.now() >= self.deadline || observer.budget().deadline.is_some_and(|deadline| observer.now() >= deadline) {
+            return Err(OAuthRefreshRenewalError::Context(OAuthError::TimedOut));
+        }
+        if self.stage() != OAuthRefreshRenewalStage::Complete { return Err(OAuthRefreshRenewalError::NotComplete); }
+        let OAuthRefreshRenewalCustody::Complete { store, credentials, revision } = std::mem::replace(
+            &mut self.custody, OAuthRefreshRenewalCustody::Stopped { store: None, credentials: None },
+        ) else { return Err(OAuthRefreshRenewalError::NotComplete); };
+        match ManagedOAuthSession::from_credentials(observer, self.client.clone(), policy, credentials) {
+            Ok(session) => Ok((session, store, revision)),
+            Err(error) => {
+                self.custody = OAuthRefreshRenewalCustody::Stopped { store: Some(store), credentials: None };
+                Err(OAuthRefreshRenewalError::Session(error))
+            }
+        }
+    }
+
     /// Cancels this run and requests cancellation of its current storage worker.
     /// It neither revokes issuer tokens nor invalidates stored custody. Keep the
     /// task via into_custody to observe a potentially committed transaction.
@@ -194,6 +227,12 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
         let origin = self.origin.clone();
         let cancellation = self.cancellation.clone();
         let deadline = self.deadline;
+        // A fresh observer can have a different runtime clock origin. Only
+        // the original clock defines the operation end; translate its remaining
+        // duration for the observer, while still guarding the original deadline.
+        let observer_deadline = observer.now().saturating_add_nanos(
+            deadline.as_nanos().saturating_sub(origin.now().as_nanos()),
+        );
         let result = {
             let work = async {
                 let mut step = std::pin::pin!(self.advance_inner(&origin));
@@ -210,7 +249,7 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
             };
             // Both contexts register cancellation wakes; changing an observer
             // never replaces the original operation's lifetime or authority.
-            within(observer, deadline, async {
+            within(observer, observer_deadline, async {
                 Ok(within(&origin, deadline, async { Ok(work.await) }).await)
             }).await
                 .map_err(OAuthRefreshRenewalError::Context)

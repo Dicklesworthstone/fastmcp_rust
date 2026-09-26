@@ -275,11 +275,49 @@ impl ManagedOAuthSession {
         F: Future<Output = Result<(), OAuthError>>,
     {
         let credentials = client.authorize(cx, launch_browser).await.map_err(OAuthSessionError::OAuth)?;
+        Ok(Self::from_admitted_credentials(client, policy, credentials))
+    }
+
+    /// Adopts an exclusively owned, native-admitted OAuth grant without another
+    /// browser login or token exchange. This Linux persistence integration
+    /// checks the exact immutable client configuration, revocation and original
+    /// access expiry; it never deserializes tokens or reconstructs an Instant.
+    ///
+    /// An access-only grant from persistent renewal remains access-only: this
+    /// session returns LoginRequired at its original expiry. The host must use
+    /// the separately retained store for another explicit persistent renewal.
+    /// A grant retaining its refresh token instead uses normal single-flight
+    /// in-memory renewal. Neither case establishes persistence by itself.
+    /// Existing credential clones created before adoption remain caller-owned;
+    /// only snapshots issued through this session acquire its closure signal.
+    #[cfg(target_os = "linux")]
+    pub fn from_credentials(
+        cx: &Cx,
+        client: OAuthClient,
+        policy: OAuthSessionPolicy,
+        credentials: OAuthCredentials,
+    ) -> Result<Self, OAuthSessionError> {
+        if cx.checkpoint().is_err() { return Err(OAuthSessionError::Cancelled); }
+        if cx.budget().deadline.is_some_and(|deadline| cx.now() >= deadline) {
+            return Err(OAuthSessionError::TimedOut);
+        }
+        if !client.accepts_credentials(&credentials) {
+            return Err(OAuthSessionError::OAuth(OAuthError::CredentialBindingMismatch));
+        }
+        if credentials.bearer_credential().is_revoked() || Instant::now() >= credentials.expires_at() {
+            return Err(OAuthSessionError::LoginRequired);
+        }
+        Ok(Self::from_admitted_credentials(client, policy, credentials))
+    }
+
+    fn from_admitted_credentials(
+        client: OAuthClient, policy: OAuthSessionPolicy, credentials: OAuthCredentials,
+    ) -> Self {
         let resource = credentials.bearer_credential().resource().clone();
         let renew_after = renewal_time(
             Instant::now(), credentials.expires_at(), credentials.has_refresh_token(), policy.refresh_leeway,
         );
-        Ok(Self {
+        Self {
             inner: Arc::new(SessionInner {
                 client,
                 resource,
@@ -291,7 +329,7 @@ impl ManagedOAuthSession {
                 logout_handoff: AtomicBool::new(false),
                 pending: AtomicUsize::new(0),
             }),
-        })
+        }
     }
 
     pub fn resource(&self) -> &CanonicalHttpUrl {

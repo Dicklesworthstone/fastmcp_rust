@@ -2,7 +2,7 @@ use super::*;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::os::unix::fs::DirBuilderExt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, atomic::{AtomicBool, Ordering}};
 use std::time::Instant;
 
 use asupersync::io::AsyncWriteExt;
@@ -23,7 +23,25 @@ struct State {
     writes: usize,
     refuse_seal: bool,
     uncertain_settlement: bool,
+    open_gate: Option<Arc<OpenGate>>,
 }
+struct OpenGate { entered: AtomicBool, released: Mutex<bool>, wake: Condvar }
+impl OpenGate {
+    fn new() -> Arc<Self> { Arc::new(Self { entered: AtomicBool::new(false), released: Mutex::new(false), wake: Condvar::new() }) }
+    fn block(&self) {
+        self.entered.store(true, Ordering::Release);
+        let (released, _) = self.wake.wait_timeout_while(self.released.lock().unwrap(), Duration::from_secs(5), |value| !*value).unwrap();
+        assert!(*released, "test provider must be released within its bound");
+    }
+    fn release(&self) { *self.released.lock().unwrap() = true; self.wake.notify_all(); }
+    async fn entered(&self, cx: &Cx) {
+        asupersync::time::timeout_at(cx.now().saturating_add_nanos(2_000_000_000), async {
+            while !self.entered.load(Ordering::Acquire) { asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await; }
+        }).await.unwrap();
+    }
+}
+struct ReleaseOpen(Arc<OpenGate>);
+impl Drop for ReleaseOpen { fn drop(&mut self) { self.0.release(); } }
 #[derive(Clone)]
 struct Provider(Arc<Mutex<State>>);
 impl CredentialCommitAnchor for Provider {
@@ -58,11 +76,15 @@ impl OAuthGrantProtector for Provider {
     }
     fn open(&mut self, cx: &Cx, binding: &OAuthGrantBinding, envelope: &[u8]) -> Result<Vec<u8>, OAuthGrantProtectionError> {
         cx.checkpoint().map_err(|_| OAuthGrantProtectionError::Cancelled)?;
-        let mut state = self.0.lock().unwrap();
-        state.opens += 1;
-        let (expected, bytes) = state.records.get(envelope).ok_or(OAuthGrantProtectionError::InvalidEnvelope)?;
-        if expected != binding { return Err(OAuthGrantProtectionError::InvalidEnvelope); }
-        Ok(bytes.clone())
+        let (bytes, gate) = {
+            let mut state = self.0.lock().unwrap();
+            state.opens += 1;
+            let (expected, bytes) = state.records.get(envelope).ok_or(OAuthGrantProtectionError::InvalidEnvelope)?;
+            if expected != binding { return Err(OAuthGrantProtectionError::InvalidEnvelope); }
+            (bytes.clone(), state.open_gate.take())
+        };
+        if let Some(gate) = gate { gate.block(); }
+        Ok(bytes)
     }
 }
 struct Fixture {
@@ -78,7 +100,7 @@ impl Fixture {
         let key = CredentialStoreKey::derive(&descriptor, "store", "refresh", "renewal").unwrap();
         let auth = PartitionAuthorization::current(&descriptor, &DurableOwnerKey::derive(&descriptor, 1).unwrap());
         let binding = CredentialAnchorBinding::for_store("renewal", &key, &auth).unwrap();
-        let provider = Provider(Arc::new(Mutex::new(State { snapshot: CredentialAnchorSnapshot::new(binding, 0, CredentialAnchorState::Stable(None)), records: BTreeMap::new(), seals: 0, opens: 0, writes: 0, refuse_seal: false, uncertain_settlement: false })));
+        let provider = Provider(Arc::new(Mutex::new(State { snapshot: CredentialAnchorSnapshot::new(binding, 0, CredentialAnchorState::Stable(None)), records: BTreeMap::new(), seals: 0, opens: 0, writes: 0, refuse_seal: false, uncertain_settlement: false, open_gate: None })));
         let nonce = fastmcp_core::draw_security_identifier().unwrap();
         let directory = std::env::temp_dir().join(format!("fastmcp-renewal-{}-{}", std::process::id(), crate::http_auth::oauth::hex(nonce.as_bytes())));
         std::fs::DirBuilder::new().mode(0o700).create(&directory).unwrap();
@@ -337,3 +359,5 @@ fn renewal_wait_errors_distinguish_terminal_mailbox_failures_from_interruption()
     for error in [CredentialIoError::WorkerStopped, CredentialIoError::WorkerPanicked, CredentialIoError::AlreadyReceived] { assert!(terminal_completion(error)); }
     for error in [CredentialIoError::WaitCancelled, CredentialIoError::WaitTimedOut, CredentialIoError::CapabilityUnavailable, CredentialIoError::ProcessChanged] { assert!(!terminal_completion(error)); }
 }
+
+mod managed;
