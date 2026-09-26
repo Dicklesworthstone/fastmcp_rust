@@ -31,7 +31,8 @@ use crate::result::{
     CompleteResult, CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonObject, ExactJsonValue,
     FinalResultMetadataRole, InputRequiredResult, ResultDecodeError, ResultPeerDiagnostic,
     UnknownResultMembers, decode_peer_result_for_era_with_metadata_role, deserialize_exact_object,
-    encode_complete_result, encode_result, exact_json_to_serde, has_final_only_metadata,
+    deserialize_exact_value, encode_complete_result, encode_result, exact_json_to_serde,
+    has_final_only_metadata,
 };
 use crate::types::{
     ClientCapabilities, ClientInfo, LegacyContent, LegacyMetadata, LegacyPromptMessage,
@@ -3820,31 +3821,22 @@ impl CoreRequest {
             });
         }
 
+        // The typed decode reads the exact value, which keeps member order and
+        // number lexemes, rather than scanning the source a third time.
+        let invalid_params = |_: ResultDecodeError| CoreDispatchError::InvalidParams {
+            era,
+            method: method_literal,
+        };
         let request = match method {
-            TOOLS_CALL => {
-                FinalCoreRequest::ToolsCall(serde_json::from_str(raw_params).map_err(|_| {
-                    CoreDispatchError::InvalidParams {
-                        era,
-                        method: TOOLS_CALL,
-                    }
-                })?)
-            }
-            RESOURCES_READ => {
-                FinalCoreRequest::ResourcesRead(serde_json::from_str(raw_params).map_err(|_| {
-                    CoreDispatchError::InvalidParams {
-                        era,
-                        method: RESOURCES_READ,
-                    }
-                })?)
-            }
-            PROMPTS_GET => {
-                FinalCoreRequest::PromptsGet(serde_json::from_str(raw_params).map_err(|_| {
-                    CoreDispatchError::InvalidParams {
-                        era,
-                        method: PROMPTS_GET,
-                    }
-                })?)
-            }
+            TOOLS_CALL => FinalCoreRequest::ToolsCall(
+                deserialize_exact_value(&exact).map_err(invalid_params)?,
+            ),
+            RESOURCES_READ => FinalCoreRequest::ResourcesRead(
+                deserialize_exact_value(&exact).map_err(invalid_params)?,
+            ),
+            PROMPTS_GET => FinalCoreRequest::PromptsGet(
+                deserialize_exact_value(&exact).map_err(invalid_params)?,
+            ),
             _ => unreachable!("the final MRTR raw-params guard selected a known method"),
         };
         request.validate_metadata()?;
@@ -7728,6 +7720,56 @@ mod tests {
                 Err(CoreDispatchError::InvalidParams { .. })
             ),
             "changing one digit of one raw number cannot attach that source"
+        );
+    }
+
+    #[test]
+    fn final_core_raw_params_decode_the_exact_value_whatever_its_source_spelling() {
+        let compact = r#"{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"name":"weather","arguments":{"n":4.2e1},"inputResponses":{"second":{"roots":[]},"first":{"roots":[]}}}"#;
+        // The same value with insignificant whitespace and two unicode escapes.
+        let spelled = r#" {  "_meta" : {"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}} , "name" : "weather" , "arguments" : { "n" : 4.2e1 } , "inputResponses" : { "second" : {"roots":[]} , "first" : {"roots":[]} } } "#
+            .replacen("\"name\"", "\"n\\u0061me\"", 1)
+            .replacen("\"weather\"", "\"we\\u0061ther\"", 1);
+        let decode = |raw: &str| {
+            let materialized: Value =
+                serde_json::from_str(raw).expect("raw parameters materialize");
+            CoreRequest::decode_with_raw_params(
+                ProtocolEra::Modern2026,
+                TOOLS_CALL,
+                Some(&materialized),
+                Some(raw),
+            )
+        };
+        let typed = |raw: &str| {
+            let Ok(CoreRequest::Final(FinalCoreRequest::ToolsCall(call))) = decode(raw) else {
+                panic!("raw tools/call parameters decode: {raw}");
+            };
+            serde_json::to_string(&call).expect("typed call parameters encode")
+        };
+
+        assert!(spelled.contains("\"n\\u0061me\" : \"we\\u0061ther\""));
+        assert_eq!(
+            typed(&spelled),
+            typed(compact),
+            "whitespace and escape spellings do not reach the typed parameters"
+        );
+        assert!(
+            typed(compact).contains(r#""second":{"roots":[]},"first""#),
+            "input response order survives the exact value: {}",
+            typed(compact)
+        );
+
+        // The same spelled source with one member the schema does not declare.
+        let undeclared = spelled.replacen(r#""arguments""#, r#""argumentz""#, 1);
+        assert!(
+            matches!(
+                decode(&undeclared),
+                Err(CoreDispatchError::InvalidParams {
+                    era: ProtocolEra::Modern2026,
+                    method: TOOLS_CALL,
+                })
+            ),
+            "the typed schema still refuses an undeclared member"
         );
     }
 
