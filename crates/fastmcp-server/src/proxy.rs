@@ -47,8 +47,10 @@ use fastmcp_client::{StdioFinalTaskExecution, StdioTaskSubscriptionEvent};
 use fastmcp_core::runtime::poll_on_cx;
 use fastmcp_core::{
     CanonicalHttpUrl, McpContext, McpError, McpErrorCode, McpLogLevel, McpOutcome, McpResult,
-    Outcome, SamplingRequest, SamplingRequestMessage, SamplingRole,
+    Outcome,
 };
+#[cfg(feature = "legacy-2024-11-05")]
+use fastmcp_core::{SamplingRequest, SamplingRequestMessage, SamplingRole};
 use fastmcp_protocol::common_types::{AbsoluteUri, Implementation, LoggingLevel, RawIcon};
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::extensions::{
@@ -63,7 +65,7 @@ use fastmcp_protocol::protocol_policy::{
 };
 use fastmcp_protocol::{
     CacheScope, CacheTtl, CallToolResult, ClientCapabilities, ClientInfo, CompleteResult,
-    CompletionValues, Content, CoreRequest, CoreResult, CreateMessageParams, ElicitationCapability,
+    CompletionValues, Content, CoreRequest, CoreResult, ElicitationCapability,
     FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY, FINAL_LOG_LEVEL_META_KEY,
     FinalCallToolResult, FinalCompletionParams, FinalCompletionValues, FinalCoreResult,
     FinalGetPromptResult, FinalLogMessageParams, FinalProgressNotificationParams,
@@ -72,9 +74,8 @@ use fastmcp_protocol::{
     LegacyCompletionReference, LegacyContent, LegacyCoreResult, LegacyPromptMessage,
     LegacyResourceContent, ProgressParams, Prompt, PromptMessage, ReadResourceResult, RequestId,
     Resource, ResourceContent, ResourceTemplate, RootsCapability, SamplingCapability,
-    SamplingContent, ServerDiscoverResult, ServerNotification, SubscriptionFilter, Tool,
-    ToolAnnotations, UrlElicitationCapability, decode_strict_jsonrpc_message,
-    decode_strict_jsonrpc_response,
+    ServerDiscoverResult, ServerNotification, SubscriptionFilter, Tool, ToolAnnotations,
+    UrlElicitationCapability, decode_strict_jsonrpc_message, decode_strict_jsonrpc_response,
 };
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::{
@@ -86,7 +87,8 @@ use fastmcp_protocol::{
 };
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_protocol::{
-    CreateMessageResult, InitializeParams, InitializeResult, ListRootsResult, Root,
+    CreateMessageParams, CreateMessageResult, InitializeParams, InitializeResult, ListRootsResult,
+    Root, SamplingContent,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -1947,6 +1949,7 @@ impl Drop for ProxyInboundLegacyReverseGuard<'_> {
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 fn sampling_request_from_create_message_params(
     params: CreateMessageParams,
 ) -> McpResult<SamplingRequest> {
@@ -5596,6 +5599,7 @@ pub struct ProxyHttpClient {
     client_info: ClientInfo,
     client_capabilities: ClientCapabilities,
     next_request_id: i64,
+    #[cfg(feature = "legacy-2024-11-05")]
     legacy_initialized: bool,
     /// Upstream initialize advertised `capabilities.completions`.
     legacy_completion_supported: bool,
@@ -5690,6 +5694,7 @@ impl ProxyHttpClient {
             client_info,
             client_capabilities,
             next_request_id,
+            #[cfg(feature = "legacy-2024-11-05")]
             legacy_initialized: false,
             legacy_completion_supported: false,
             instructions,
@@ -7691,6 +7696,7 @@ fn legacy_progress_matches_marker(
 /// queue. Drain them before consuming the terminal response; consuming the
 /// response deliberately retires the execution and makes its stream
 /// unavailable.
+#[cfg(feature = "legacy-2024-11-05")]
 fn relay_request_owned_legacy_progress(
     ctx: &McpContext,
     notifications: impl IntoIterator<Item = JsonRpcRequest>,
