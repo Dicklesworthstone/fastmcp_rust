@@ -4749,25 +4749,7 @@ impl StreamableHttpResponseStream {
 
     fn terminate(&self) {
         close_streamable_admissions(&self.admissions_open, &self.active_admissions);
-
-        let request_states = {
-            let mut request_states = self
-                .request_states
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            std::mem::take(&mut *request_states)
-        };
-        for state in request_states.into_values() {
-            StreamableHttpRequestCancellation { state }.cancel();
-        }
-
-        let mut mailbox = self
-            .mailbox
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        mailbox.queue.clear();
-        mailbox.retained_bytes = 0;
-        self.pending_count.store(0, Ordering::Release);
+        terminate_streamable_responses(&self.request_states, &self.mailbox, &self.pending_count);
     }
 
     /// Returns whether the owner or shared response producer has closed.
@@ -5141,6 +5123,31 @@ impl StreamableHttpRequestResponseSender {
         self.responses
             .send_response_for_request(cx, &self.cancellation, response)
     }
+}
+
+/// Cancels every response owner and releases queued output after the caller
+/// has sealed response admission and settled admissions already in progress.
+fn terminate_streamable_responses(
+    request_states: &Mutex<HashMap<RequestId, Arc<StreamableHttpRequestCancellationState>>>,
+    mailbox: &Mutex<StreamableResponseMailbox>,
+    pending_count: &AtomicUsize,
+) {
+    let request_states = {
+        let mut request_states = request_states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *request_states)
+    };
+    for state in request_states.into_values() {
+        StreamableHttpRequestCancellation { state }.cancel();
+    }
+
+    let mut mailbox = mailbox
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    mailbox.queue.clear();
+    mailbox.retained_bytes = 0;
+    pending_count.store(0, Ordering::Release);
 }
 
 fn try_pop_streamable_message(
@@ -5859,6 +5866,27 @@ impl StreamableHttpTransport {
 
     fn release_request_bytes(&self, serialized_bytes: usize) {
         release_streamable_bytes(&self.request_retained_bytes, serialized_bytes);
+    }
+
+    /// Terminates this HTTP owner and every response body admitted through it.
+    ///
+    /// Request and response admission are sealed, live request cancellation
+    /// domains are revoked, and all queued messages are discarded. Retained
+    /// body and sender handles cannot publish or drain output afterward.
+    /// Other transports and their response bodies remain independent.
+    ///
+    /// This synchronous, idempotent teardown needs no caller context and is
+    /// suitable for an HTTP session's destructor after peer disconnect. Use
+    /// [`Transport::close`] when already-queued responses should remain
+    /// drainable instead. Neither method joins application tasks; their owner
+    /// must settle those tasks through its caller-owned runtime.
+    pub fn terminate(&mut self) {
+        self.close_queues();
+        terminate_streamable_responses(
+            &self.request_response_states,
+            &self.response_mailbox,
+            &self.response_pending_count,
+        );
     }
 
     fn close_queues(&mut self) {
@@ -7174,16 +7202,7 @@ impl DualEraHttpSession {
             return;
         }
         self.closed = true;
-        self.modern_ingress.close();
-        self.modern_responses.terminate();
-        // `Transport::close` now takes the caller's `&Cx`, and this method is
-        // reachable from `Drop for DualEraHttpSession` (below), where no `Cx`
-        // exists and none can be conjured. The trait method was never needed
-        // here: `StreamableHttpTransport::close` is exactly `close_queues()`
-        // plus `Ok(())`, and that type's own `Drop` already calls
-        // `close_queues()`. Calling it directly keeps the destructor path
-        // synchronous and loses no behaviour.
-        self.modern_transport.close_queues();
+        self.modern_transport.terminate();
         let _lifecycle_guard = self
             .legacy_post_lifecycle_guard
             .lock()
