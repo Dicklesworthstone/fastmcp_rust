@@ -176,7 +176,7 @@ async fn renew(cx: &Cx, fixture: &Fixture, client: &OAuthClient, issuer: &TcpLis
             "refresh_token":new_refresh,"scope":"read"}).to_string();
         json_reply(&mut tls, &body).await;
     };
-    let (_, outcome) = native::pair(server, renewal.run(cx)).await; outcome.unwrap();
+    let ((), outcome) = native::pair(server, renewal.run(cx)).await; outcome.unwrap();
     assert_eq!(fixture.revision(), tombstone + 1);
     assert_eq!(renewal.stage(), OAuthRefreshRenewalStage::Complete);
     renewal
@@ -241,8 +241,8 @@ fn two_persisted_rotations_keep_existing_clones_on_the_same_managed_session() {
             assert_eq!(receipt.session_generation(), 2 + index); assert_eq!(receipt.stored_revision().generation(), 3 + 2 * index);
             assert_eq!(fixture.bytes(), bytes, "installation performs no storage write");
             assert!(matches!(renewal.install_managed_access(&cx, &session, 2 + index).await, Err(OAuthAccessRotationError::NotComplete)));
-            native::pair(mcp_peer(&resource, &fixture, access, 100 + index as i64, 3 + 2 * index),
-                call(&cx, &existing, 100 + index as i64, 2 + index, access)).await;
+            Box::pin(native::pair(mcp_peer(&resource, &fixture, access, 100 + index as i64, 3 + 2 * index),
+                call(&cx, &existing, 100 + index as i64, 2 + index, access))).await;
         }
         assert_eq!(old.generation(), 1); assert_eq!(old.expires_at(), old_expiry);
         session.close(); assert!(old.credential().authorization_for_target(&client.configuration.resource).is_none());
@@ -300,7 +300,7 @@ fn cancellation_during_install_wait_preserves_completed_store_for_cleanup() {
         let held = session.reserve_access_rotation(&cx, &held_cancel, 1, &candidate).await.unwrap();
         let cancel = renewal.cancellation.clone(); let mut waiting = Box::pin(renewal.install_managed_access(&cx, &session, 1));
         pending(waiting.as_mut()).await; cancel.cancel();
-        assert!(matches!(waiting.await, Err(OAuthAccessRotationError::Session(OAuthSessionError::Cancelled)) | Err(OAuthAccessRotationError::Context(OAuthError::Cancelled))));
+        assert!(matches!(waiting.await, Err(OAuthAccessRotationError::Session(OAuthSessionError::Cancelled) | OAuthAccessRotationError::Context(OAuthError::Cancelled))));
         drop(held); assert_eq!(session.credential(&cx).await.unwrap().generation(), 1);
         assert_eq!(renewal.stage(), OAuthRefreshRenewalStage::Complete);
         close(&cx, take_complete(renewal)).await; quiet(&issuer); quiet(&resource);
@@ -373,6 +373,6 @@ fn an_in_flight_response_keeps_old_expiry_after_persisted_access_installation() 
             call(&cx, &existing, 91, 2, "rotated").await;
             close(&cx, store).await;
         };
-        native::pair(server, application).await; quiet(&issuer); quiet(&resource);
+        Box::pin(native::pair(server, application)).await; quiet(&issuer); quiet(&resource);
     });
 }

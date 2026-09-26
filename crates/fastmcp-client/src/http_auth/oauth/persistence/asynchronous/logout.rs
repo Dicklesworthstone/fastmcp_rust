@@ -115,7 +115,9 @@ pub type OAuthRefreshRetirementCompletion<A, P> = OAuthRefreshCompletion<
 pub enum OAuthRefreshLogoutCustody<A, P> {
     ReadyToRetire(AsyncOAuthRefreshStore<A, P>),
     Retiring(CredentialSlotTask<OAuthRefreshRetirementCompletion<A, P>>),
-    ReadyToRevoke { store: AsyncOAuthRefreshStore<A, P>, grant: OAuthRefreshGrant },
+    // The grant is boxed so this variant is no larger than the store-only
+    // ones (bd-19tqe); its secret already lives in a heap String.
+    ReadyToRevoke { store: AsyncOAuthRefreshStore<A, P>, grant: Box<OAuthRefreshGrant> },
     Complete(AsyncOAuthRefreshStore<A, P>),
     Stopped(Option<AsyncOAuthRefreshStore<A, P>>),
 }
@@ -205,7 +207,7 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
         })();
         let deadline = match admitted {
             Ok(deadline) => deadline,
-            Err(cause) => return Err(OAuthRefreshSubmissionFailure { cause, retained: Some((self, ())) }),
+            Err(cause) => return Err(OAuthRefreshSubmissionFailure { cause, retained: Some(Box::new((self, ()))) }),
         };
         if let Some(session) = session { session.close(); }
         Ok(OAuthRefreshLogout {
@@ -275,7 +277,9 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
         );
         let result = {
             let work = async {
-                let mut step = std::pin::pin!(self.advance_inner(&origin));
+                // Boxed at its source (bd-19tqe): the logout step holds the
+                // network revocation and would push every caller past 16 KiB.
+                let mut step = Box::pin(self.advance_inner(&origin));
                 let mut cancelled = std::pin::pin!(cancellation.cancelled());
                 poll_fn(|task| {
                     if cancelled.as_mut().poll(task).is_ready() {
@@ -317,7 +321,10 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
                     self.report.retired_revision = Some(retired.revision);
                     self.report.remote = retired.remote;
                     self.custody = match retired.grant {
-                        Some(grant) => C::ReadyToRevoke { store, grant },
+                        Some(grant) => C::ReadyToRevoke {
+                            store,
+                            grant: Box::new(grant),
+                        },
                         None => C::Complete(store),
                     };
                 }
@@ -354,7 +361,7 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
                 // timeout nor dropping this advance can restore the token.
                 self.custody = C::Stopped(Some(store));
                 self.report.remote = OAuthPersistentRevocation::Uncertain;
-                let outcome = self.client.revoke_refresh_grant(cx, grant).await;
+                let outcome = self.client.revoke_refresh_grant(cx, *grant).await;
                 self.report.remote = match outcome {
                     Ok(outcome) => OAuthPersistentRevocation::Outcome(outcome),
                     Err(error) => OAuthPersistentRevocation::PreflightRefused(error),

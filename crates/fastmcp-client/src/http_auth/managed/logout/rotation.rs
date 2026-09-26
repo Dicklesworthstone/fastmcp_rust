@@ -115,15 +115,16 @@ impl AccessRotation<'_> {
     /// Every refusal returns the original candidate without changing state.
     /// No await, callback, serialization, or further fallible step follows the
     /// ownership election. Existing response/snapshot lifetimes are untouched.
+    /// The returned candidate is boxed so this Result stays small (bd-19tqe).
     pub(crate) fn commit(mut self, candidate: OAuthCredentials)
-        -> Result<u64, (OAuthAccessRotationError, OAuthCredentials)>
+        -> Result<u64, (OAuthAccessRotationError, Box<OAuthCredentials>)>
     {
         let generation = match self.admit(&candidate) {
             Ok(generation) => generation,
-            Err(error) => return Err((error, candidate)),
+            Err(error) => return Err((error, Box::new(candidate))),
         };
         let Some(state) = self.guard.as_mut() else {
-            return Err((OAuthSessionError::Closed.into(), candidate));
+            return Err((OAuthSessionError::Closed.into(), Box::new(candidate)));
         };
         state.renew_after = candidate.expires_at();
         state.credentials = candidate;

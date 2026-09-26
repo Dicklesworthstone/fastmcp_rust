@@ -151,7 +151,7 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
         })();
         let deadline = match admitted {
             Ok(deadline) => deadline,
-            Err(cause) => return Err(OAuthRefreshSubmissionFailure { cause, retained: Some((self, ())) }),
+            Err(cause) => return Err(OAuthRefreshSubmissionFailure { cause, retained: Some(Box::new((self, ()))) }),
         };
         let client = OAuthClient::new(self.store.configuration.clone());
         Ok(OAuthRefreshCapture {
@@ -223,7 +223,9 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
         );
         let result = {
             let work = async {
-                let mut step = std::pin::pin!(self.advance_inner(&origin));
+                // Boxed at its source (bd-19tqe): the capture step's state is
+                // large enough to push every enclosing future past 16 KiB.
+                let mut step = Box::pin(self.advance_inner(&origin));
                 let mut cancelled = std::pin::pin!(cancellation.cancelled());
                 poll_fn(|task| {
                     if cancelled.as_mut().poll(task).is_ready() {

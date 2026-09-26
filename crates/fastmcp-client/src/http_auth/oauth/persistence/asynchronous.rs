@@ -73,12 +73,14 @@ impl From<OAuthRefreshStoreError> for AsyncOAuthRefreshError {
 /// and requires reopening persisted custody rather than recreating its input.
 pub struct OAuthRefreshSubmissionFailure<A, P, I> {
     cause: AsyncOAuthRefreshError,
-    retained: Option<(AsyncOAuthRefreshStore<A, P>, I)>,
+    // Boxed so every submission Result stays small (bd-19tqe): the store is
+    // over a kilobyte and only a refused admission pays the allocation.
+    retained: Option<Box<(AsyncOAuthRefreshStore<A, P>, I)>>,
 }
 impl<A, P, I> OAuthRefreshSubmissionFailure<A, P, I> {
     pub fn cause(&self) -> &AsyncOAuthRefreshError { &self.cause }
     pub fn into_parts(self) -> (AsyncOAuthRefreshError, Option<(AsyncOAuthRefreshStore<A, P>, I)>) {
-        (self.cause, self.retained)
+        (self.cause, self.retained.map(|retained| *retained))
     }
 }
 impl<A, P, I> fmt::Debug for OAuthRefreshSubmissionFailure<A, P, I> {
@@ -200,7 +202,7 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
         expected: Option<SlotRevision>, mut credentials: OAuthCredentials,
     ) -> Result<CredentialSlotTask<OAuthRefreshWrite<A, P>>, OAuthRefreshSubmissionFailure<A, P, OAuthCredentials>> {
         if let Err(error) = configuration_digest(&credentials.configuration) {
-            return Err(OAuthRefreshSubmissionFailure { cause: error.into(), retained: Some((self, credentials)) });
+            return Err(OAuthRefreshSubmissionFailure { cause: error.into(), retained: Some(Box::new((self, credentials))) });
         }
         // Credentials are native admitted values, but discard spare capacities
         // before queueing their secret/map buffers under a fixed reservation.
@@ -262,7 +264,7 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
             OAuthRefreshCompletion { owner, outcome }
         }).map_err(|(error, retained)| OAuthRefreshSubmissionFailure {
             cause: error.into(),
-            retained: retained.map(|(io, (store, input))| (Self { store, io }, input)),
+            retained: retained.map(|(io, (store, input))| Box::new((Self { store, io }, input))),
         })
     }
 

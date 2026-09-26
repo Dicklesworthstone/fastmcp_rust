@@ -169,7 +169,7 @@ fn persisted_renewal_adopts_into_typed_authenticated_mcp_without_browser_login()
             assert_eq!(outcome.unwrap().unwrap().refresh_token, "refresh-two");
             close(&cx, store).await;
         };
-        native::pair(server, application).await;
+        Box::pin(native::pair(server, application)).await;
         quiet(&issuer); quiet(&resource);
     });
 }
@@ -181,7 +181,7 @@ fn cancelled_session_handoff_leaves_the_completed_store_available_for_cleanup() 
         let fixture = Fixture::new();
         let store = fixture.seed(&cx, &client).await;
         let mut renewal = fixture.begin(&cx, &client, store);
-        let (_, result) = native::pair(token_reply(&listener, Some(ROTATED)), renewal.run(&cx)).await;
+        let ((), result) = native::pair(token_reply(&listener, Some(ROTATED)), renewal.run(&cx)).await;
         result.unwrap();
         renewal.cancel();
         assert!(matches!(renewal.take_managed_session(&cx, OAuthSessionPolicy::default()), Err(OAuthRefreshRenewalError::Context(OAuthError::Cancelled))));
@@ -201,7 +201,7 @@ fn rejected_access_adoption_retains_the_completed_store_without_reexchanging() {
         let fixture = Fixture::new();
         let store = fixture.seed(&cx, &client).await;
         let mut renewal = fixture.begin(&cx, &client, store);
-        let (_, result) = native::pair(token_reply(&listener, Some(ROTATED)), renewal.run(&cx)).await;
+        let ((), result) = native::pair(token_reply(&listener, Some(ROTATED)), renewal.run(&cx)).await;
         result.unwrap();
         let OAuthRefreshRenewalCustody::Complete { credentials, .. } = &renewal.custody else { panic!("completed"); };
         credentials.bearer_credential().revoke();
@@ -251,7 +251,7 @@ fn abandoned_or_cancelled_refresh_exchange_never_restores_issuer_replay_authorit
                 assert_eq!(store.revision().unwrap().generation(), 2);
                 close(&cx, store).await;
             };
-            native::pair(server, application).await;
+            Box::pin(native::pair(server, application)).await;
             quiet(&listener);
         }
     });

@@ -212,7 +212,7 @@ fn persistent_logout_closes_session_then_retires_before_one_native_issuer_attemp
                     tls.shutdown().await.unwrap();
                 }
             };
-            let (_, report) = Box::pin(native::pair(server, logout.run(&cx))).await;
+            let ((), report) = Box::pin(native::pair(server, logout.run(&cx))).await;
             let report = report.unwrap(); assert_eq!(report.retired_revision().unwrap().generation(), 2);
             assert_eq!(report.remote(), OAuthPersistentRevocation::Outcome(match status {
                 Some(200) => OAuthTokenRevocationOutcome::Succeeded,
@@ -440,7 +440,7 @@ fn persistent_logout_saturation_retains_the_unexecuted_command_for_explicit_admi
         settled(&cx, &lane).await; done(&cx, &lane, other_store.close(&cx)).await;
         let server = async { let mut tls = peer_request(&listener).await;
             tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap(); tls.shutdown().await.unwrap(); };
-        let (_, result) = Box::pin(native::pair(server, logout.run(&cx))).await;
+        let ((), result) = Box::pin(native::pair(server, logout.run(&cx))).await;
         assert!(result.unwrap().retired_revision().is_some()); assert_eq!(f.counts().0, 1); assert_eq!(f.counts().2, 4);
         no_more_requests(&listener); let store = take_store(logout); settled(&cx, &lane).await; done(&cx, &lane, store.close(&cx)).await;
     });
