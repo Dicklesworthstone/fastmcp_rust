@@ -20924,4 +20924,85 @@ mod tests {
         assert!(runtime.has_installed_task_service());
         assert!(TaskServiceHost::install(&runtime, Arc::new(IdleSupervisor)).is_err());
     }
+
+    /// Holds its handoff in a cooperative checkpoint loop, as a long-running
+    /// application operation does until its service is cancelled.
+    struct HoldingSupervisor {
+        entered: Arc<AtomicBool>,
+    }
+
+    impl ApplicationTaskSupervisor for HoldingSupervisor {
+        fn resume<'a>(
+            &'a self,
+            cx: &'a Cx,
+            _handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            let entered = Arc::clone(&self.entered);
+            Box::pin(async move {
+                entered.store(true, AtomicOrdering::SeqCst);
+                loop {
+                    cx.checkpoint()
+                        .map_err(|error| McpError::internal_error(error.to_string()))?;
+                    asupersync::time::sleep(cx.now(), StdDuration::from_millis(1)).await;
+                }
+            })
+        }
+    }
+
+    /// Hosts a `HoldingSupervisor` with one created Task in flight, then
+    /// settles; `cancel_first` cancels the serve context before settling, as
+    /// every serve path does when it exits.
+    fn settle_held_supervisor(cancel_first: bool) {
+        let runtime = FinalTaskRuntime::in_memory(
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000)).expect("valid timing policy"),
+            Arc::new(|_| {}),
+        );
+        let entered = Arc::new(AtomicBool::new(false));
+        let host = TaskServiceHost::install(
+            &runtime,
+            Arc::new(HoldingSupervisor {
+                entered: Arc::clone(&entered),
+            }),
+        )
+        .expect("install host");
+        hosting_runtime().block_on(async {
+            let cx = Cx::current().expect("caller execution context");
+            let hosted = host.start_ready(&cx).await.expect("hosted service ready");
+            runtime
+                .create_task_with_work(final_test_work_descriptor(), None)
+                .expect("a hosted ready service admits creation");
+            for _ in 0..2_000 {
+                if entered.load(AtomicOrdering::SeqCst) {
+                    break;
+                }
+                asupersync::time::sleep(cx.now(), StdDuration::from_millis(1)).await;
+            }
+            assert!(
+                entered.load(AtomicOrdering::SeqCst),
+                "the supervisor holds the handoff"
+            );
+            if cancel_first {
+                cx.cancel_with(CancelKind::User, Some("serve ended"));
+            }
+            let started = std::time::Instant::now();
+            hosted
+                .settle(&cx)
+                .await
+                .expect("settling ends the held supervisor within its bound");
+            assert!(started.elapsed() < HOSTED_TASK_SERVICE_SETTLEMENT_BOUND);
+            assert!(!runtime.is_task_service_ready());
+        });
+    }
+
+    #[test]
+    fn settling_ends_supervisor_work_in_flight_within_its_bound() {
+        settle_held_supervisor(false);
+    }
+
+    /// Near-identical to the test above; only the serve context is cancelled
+    /// first, under which an asupersync timer completes at once.
+    #[test]
+    fn settling_under_a_cancelled_serve_context_waits_for_the_runner() {
+        settle_held_supervisor(true);
+    }
 }
