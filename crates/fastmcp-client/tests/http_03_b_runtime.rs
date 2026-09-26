@@ -4405,3 +4405,430 @@ os.link('ready.pending', 'ready')
 server.serve_forever()
 ";
 }
+
+mod owned_execution {
+    use super::*;
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+
+    use fastmcp_client::ExecutionTerminalReason;
+    use fastmcp_client::http_executor::{ModernHttpRequestControl, ModernHttpRequestExecution};
+    use fastmcp_protocol::CoreResult;
+
+    fn limits() -> SseLimits {
+        SseLimits::new(4_096, 65_536, 8).expect("bounded execution SSE limits")
+    }
+
+    async fn connect(cx: &Cx, target: &str) -> ModernHttpClient {
+        ModernHttpClient::connect(
+            cx,
+            plan(target, "http://127.0.0.1:9/sse", "http://127.0.0.1:9/message", ProtocolPolicy::ModernOnly),
+            client_info(),
+            ClientCapabilities::default(),
+        ).await.expect("modern discovery succeeds").into_modern().expect("modern selected")
+    }
+
+    fn prepare(client: &ModernHttpClient, cx: &Cx, id: i64) -> ModernHttpRequestExecution {
+        client.execute_core(
+            cx, "tools/call",
+            serde_json::json!({"name":"owned-tool", "arguments":{}, "_meta":{"progressToken":"owned-progress"}}),
+            RequestId::Number(id), limits(), RequestTimeoutPolicy::default(),
+        ).expect("prepare an owned ordinary execution")
+    }
+
+    fn progress() -> serde_json::Value {
+        progress_event(&ProgressMarker::String("owned-progress".to_owned()), 1)
+    }
+
+    fn assert_cancelled_once(control: &ModernHttpRequestControl, reason: ExecutionTerminalReason) {
+        let event = control.take_cancellation_event().expect("one local cancellation indication");
+        assert_eq!(event.request_id, *control.request_id());
+        assert_eq!(event.reason, reason);
+        assert!(control.take_cancellation_event().is_none());
+        assert!(!control.cancel(), "a retired execution cannot cancel twice");
+        assert!(control.take_cancellation_event().is_none());
+    }
+
+    #[test]
+    fn http_owned_execution_json_and_sse_preserve_typed_results() {
+        for sse in [false, true] {
+            for input_required in [false, true] {
+                for wrong_id in [false, true] {
+                    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                    let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+                    let server = thread::spawn(move || {
+                        respond_probe_ok(&mut accept_bounded_stream(&listener));
+                        let mut stream = accept_bounded_stream(&listener);
+                        let request = read_request(&mut stream);
+                        assert_final_metadata(&request, "tools/call");
+                        let wire: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                        assert!(wire["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
+                            ["extensions"]["io.modelcontextprotocol/tasks"].is_null());
+                        let result = if input_required {
+                            r#"{"resultType":"input_required","inputRequests":{"sample":{"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"continue"}}],"maxTokens":8}}},"requestState":"opaque-continuation","vendorExact":9007199254740993,"vendorExponent":1.2300e+42}"#
+                        } else {
+                            r#"{"resultType":"complete","content":[{"type":"text","text":"owned-result"}],"vendorExact":9007199254740993,"vendorExponent":1.2300e+42}"#
+                        };
+                        let id = if wrong_id { 3 } else { 2 };
+                        let body = format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{result}}}"#);
+                        if sse {
+                            begin_sse_response(&mut stream);
+                            write_sse_event(&mut stream, &progress()).unwrap();
+                            write_sse_chunk(&mut stream, format!("data: {body}\n\n").as_bytes()).unwrap();
+                            end_sse_response(&mut stream).unwrap();
+                        } else {
+                            write_response(&mut stream, 200, "application/json", body.as_bytes());
+                        }
+                    });
+                    runtime_block_on(async {
+                        let cx = Cx::current().unwrap();
+                        let client = connect(&cx, &target).await;
+                        let mut execution = prepare(&client, &cx, 2);
+                        let control = execution.control();
+                        if sse {
+                            assert!(matches!(execution.next_event(&cx).await.unwrap(),
+                                Some(ModernHttpFinalCoreEvent::Progress(_))));
+                        }
+                        let result = execution.next_event(&cx).await;
+                        if wrong_id {
+                            assert!(matches!(result, Err(ModernHttpFinalCoreListenError::ResponseIdMismatch { .. })));
+                            assert_eq!(control.terminal_reason(), Some(ExecutionTerminalReason::PeerProtocol));
+                        } else {
+                            let Some(ModernHttpFinalCoreEvent::Terminal(result)) = result.unwrap() else {
+                                panic!("expected the single typed terminal result");
+                            };
+                            let encoded = CoreResult::Final(result).encode().unwrap();
+                            assert!(encoded.contains("9007199254740993"));
+                            assert!(encoded.contains("1.2300e+42"));
+                            assert!(encoded.contains(if input_required { "opaque-continuation" } else { "owned-result" }));
+                            assert_eq!(control.terminal_reason(), Some(ExecutionTerminalReason::FinalResponse));
+                        }
+                        assert!(execution.next_event(&cx).await.unwrap().is_none());
+                        assert!(!control.cancel());
+                        assert!(control.take_cancellation_event().is_none());
+                    });
+                    server.join().unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn http_owned_execution_cancel_before_poll_sends_nothing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            respond_probe_ok(&mut accept_bounded_stream(&listener));
+            let mut stream = accept_bounded_stream(&listener);
+            let request = read_request(&mut stream);
+            let wire: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(wire["id"], 3, "the cancelled owner must never create a POST");
+            write_response(&mut stream, 200, "application/json", &serde_json::to_vec(&terminal_event(3, "sibling")).unwrap());
+            listener
+        });
+        runtime_block_on(async {
+            let cx = Cx::current().unwrap();
+            let client = connect(&cx, &target).await;
+            let mut execution = prepare(&client, &cx, 2);
+            let control = execution.control();
+            assert!(control.cancel());
+            assert!(matches!(execution.next_event(&cx).await,
+                Err(ModernHttpFinalCoreListenError::CallerCancelled { .. })));
+            assert!(execution.next_event(&cx).await.unwrap().is_none());
+            assert_cancelled_once(&control, ExecutionTerminalReason::CallerCancelled);
+            let mut sibling = prepare(&client, &cx, 3);
+            assert!(matches!(sibling.next_event(&cx).await.unwrap(), Some(ModernHttpFinalCoreEvent::Terminal(_))));
+            assert!(cx.checkpoint().is_ok());
+        });
+        let listener = server.join().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn http_owned_execution_cancel_pending_headers_preserves_sibling() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (received_tx, received_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            respond_probe_ok(&mut accept_bounded_stream(&listener));
+            let mut stalled = accept_bounded_stream(&listener);
+            assert_final_metadata(&read_request(&mut stalled), "tools/call");
+            received_tx.send(()).unwrap();
+            assert_connection_closed_by_client(&mut stalled);
+            let mut sibling = accept_bounded_stream(&listener);
+            let request: serde_json::Value = serde_json::from_slice(&read_request(&mut sibling).body).unwrap();
+            assert_eq!(request["id"], 3);
+            write_response(&mut sibling, 200, "application/json", &serde_json::to_vec(&terminal_event(3, "sibling")).unwrap());
+        });
+        runtime_block_on(async {
+            let cx = Cx::current().unwrap();
+            let client = connect(&cx, &target).await;
+            let mut execution = prepare(&client, &cx, 2);
+            let control = execution.control();
+            let canceller = control.clone();
+            let controller = thread::spawn(move || {
+                received_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert!(canceller.cancel());
+            });
+            assert!(matches!(execution.next_event(&cx).await,
+                Err(ModernHttpFinalCoreListenError::CallerCancelled { .. })));
+            assert_cancelled_once(&control, ExecutionTerminalReason::CallerCancelled);
+            let mut sibling = prepare(&client, &cx, 3);
+            assert!(matches!(sibling.next_event(&cx).await.unwrap(), Some(ModernHttpFinalCoreEvent::Terminal(_))));
+            assert!(cx.checkpoint().is_ok());
+            controller.join().unwrap();
+        });
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn http_owned_execution_cancel_pending_body_discards_buffered_events() {
+        for buffered in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                respond_probe_ok(&mut accept_bounded_stream(&listener));
+                let mut stream = accept_bounded_stream(&listener);
+                read_request(&mut stream);
+                begin_sse_response(&mut stream);
+                let mut payload = format!("data: {}\n\n", progress());
+                if buffered { payload.push_str(&format!("data: {}\n\n", terminal_event(2, "must be discarded"))); }
+                write_sse_chunk(&mut stream, payload.as_bytes()).unwrap();
+                assert_connection_closed_by_client(&mut stream);
+            });
+            runtime_block_on(async {
+                let cx = Cx::current().unwrap();
+                let client = connect(&cx, &target).await;
+                let mut execution = prepare(&client, &cx, 2);
+                let control = execution.control();
+                assert!(matches!(execution.next_event(&cx).await.unwrap(), Some(ModernHttpFinalCoreEvent::Progress(_))));
+                if buffered {
+                    assert!(control.cancel(), "unconsumed terminal bytes have not won admission");
+                } else {
+                    let mut next = Box::pin(execution.next_event(&cx));
+                    poll_fn(|task_cx| {
+                        assert!(next.as_mut().poll(task_cx).is_pending());
+                        Poll::Ready(())
+                    }).await;
+                    assert!(control.cancel(), "cancellation must wake a pending body poll");
+                    assert!(matches!(next.await, Err(ModernHttpFinalCoreListenError::CallerCancelled { .. })));
+                }
+                if buffered {
+                    assert!(matches!(execution.next_event(&cx).await, Err(ModernHttpFinalCoreListenError::CallerCancelled { .. })));
+                }
+                assert!(execution.next_event(&cx).await.unwrap().is_none());
+                assert_cancelled_once(&control, ExecutionTerminalReason::CallerCancelled);
+                assert!(cx.checkpoint().is_ok());
+            });
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn http_owned_execution_resumes_abandoned_poll_without_reposting() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            respond_probe_ok(&mut accept_bounded_stream(&listener));
+            let mut stream = accept_bounded_stream(&listener);
+            read_request(&mut stream);
+            begin_sse_response(&mut stream);
+            write_sse_event(&mut stream, &progress()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            write_sse_event(&mut stream, &terminal_event(2, "same POST")).unwrap();
+            end_sse_response(&mut stream).unwrap();
+            listener
+        });
+        runtime_block_on(async {
+            let cx = Cx::current().unwrap();
+            let client = connect(&cx, &target).await;
+            let mut execution = prepare(&client, &cx, 2);
+            assert!(matches!(execution.next_event(&cx).await.unwrap(), Some(ModernHttpFinalCoreEvent::Progress(_))));
+            {
+                let mut next = Box::pin(execution.next_event(&cx));
+                poll_fn(|task_cx| {
+                    assert!(next.as_mut().poll(task_cx).is_pending());
+                    Poll::Ready(())
+                }).await;
+            }
+            release_tx.send(()).unwrap();
+            let Some(ModernHttpFinalCoreEvent::Terminal(result)) = execution.next_event(&cx).await.unwrap() else {
+                panic!("resumed body must produce the original request's terminal");
+            };
+            assert!(CoreResult::Final(result).encode().unwrap().contains("same POST"));
+            assert!(execution.control().take_cancellation_event().is_none());
+        });
+        let listener = server.join().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn http_owned_execution_terminal_wins_over_late_cancel() {
+        for sse in [false, true] {
+            for remote_error in [false, true] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+                let server = thread::spawn(move || {
+                    respond_probe_ok(&mut accept_bounded_stream(&listener));
+                    let mut stream = accept_bounded_stream(&listener);
+                    read_request(&mut stream);
+                    let body = if remote_error {
+                        serde_json::json!({"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"declined"}})
+                    } else { terminal_event(2, "final won") };
+                    if sse {
+                        begin_sse_response(&mut stream);
+                        write_sse_event(&mut stream, &body).unwrap();
+                        end_sse_response(&mut stream).unwrap();
+                    } else { write_response(&mut stream, 200, "application/json", &serde_json::to_vec(&body).unwrap()); }
+                });
+                runtime_block_on(async {
+                    let cx = Cx::current().unwrap();
+                    let client = connect(&cx, &target).await;
+                    let mut execution = prepare(&client, &cx, 2);
+                    let control = execution.control();
+                    let outcome = execution.next_event(&cx).await;
+                    if remote_error {
+                        assert!(matches!(outcome, Err(ModernHttpFinalCoreListenError::RemoteError { .. })));
+                    } else { assert!(matches!(outcome.unwrap(), Some(ModernHttpFinalCoreEvent::Terminal(_)))); }
+                    assert_eq!(control.terminal_reason(), Some(ExecutionTerminalReason::FinalResponse));
+                    assert!(!control.cancel());
+                    drop(execution);
+                    assert!(control.take_cancellation_event().is_none());
+                });
+                server.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn http_owned_execution_timeout_emits_one_local_indication() {
+        for absolute in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                respond_probe_ok(&mut accept_bounded_stream(&listener));
+                let mut stream = accept_bounded_stream(&listener);
+                read_request(&mut stream);
+                assert_connection_closed_by_client(&mut stream);
+            });
+            runtime_block_on(async {
+                let cx = Cx::current().unwrap();
+                let client = connect(&cx, &target).await;
+                let policy = RequestTimeoutPolicy::new(
+                    if absolute { Duration::from_secs(1) } else { Duration::from_millis(40) },
+                    if absolute { Duration::from_millis(40) } else { Duration::from_secs(1) },
+                ).unwrap();
+                let mut execution = client.execute_core(&cx, "tools/call",
+                    serde_json::json!({"name":"owned-tool", "arguments":{}}),
+                    RequestId::Number(2), limits(), policy).unwrap();
+                let control = execution.control();
+                let error = execution.next_event(&cx).await.unwrap_err();
+                let expected = if absolute { RequestTimeoutSource::Absolute } else { RequestTimeoutSource::Idle };
+                assert!(matches!(error, ModernHttpFinalCoreListenError::Executor(ModernHttpExecutorError::Timeout(source)) if source == expected));
+                assert!(execution.next_event(&cx).await.unwrap().is_none());
+                assert_cancelled_once(&control, if absolute { ExecutionTerminalReason::AbsoluteTimeout } else { ExecutionTerminalReason::IdleTimeout });
+                assert!(cx.checkpoint().is_ok());
+            });
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn http_owned_execution_rejects_progress_owned_by_another_request() {
+        for malformed in [0, 1, 2] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                respond_probe_ok(&mut accept_bounded_stream(&listener));
+                let mut stream = accept_bounded_stream(&listener);
+                read_request(&mut stream);
+                begin_sse_response(&mut stream);
+                let mut second = progress();
+                second["params"]["progress"] = serde_json::json!(if malformed == 2 { 1 } else { 2 });
+                if malformed == 1 { second["params"]["progressToken"] = serde_json::json!("sibling-progress"); }
+                let payload = format!("data: {}\n\ndata: {second}\n\ndata: {}\n\n", progress(), terminal_event(2, "complete"));
+                write_sse_chunk(&mut stream, payload.as_bytes()).unwrap();
+                assert_connection_closed_by_client(&mut stream);
+            });
+            runtime_block_on(async {
+                let cx = Cx::current().unwrap();
+                let client = connect(&cx, &target).await;
+                let mut execution = prepare(&client, &cx, 2);
+                assert!(matches!(execution.next_event(&cx).await.unwrap(), Some(ModernHttpFinalCoreEvent::Progress(_))));
+                let second = execution.next_event(&cx).await;
+                if malformed == 0 {
+                    assert!(matches!(second.unwrap(), Some(ModernHttpFinalCoreEvent::Progress(_))));
+                    assert!(matches!(execution.next_event(&cx).await.unwrap(), Some(ModernHttpFinalCoreEvent::Terminal(_))));
+                } else {
+                    assert!(matches!(second, Err(ModernHttpFinalCoreListenError::NotificationAdmission(_))));
+                    assert_eq!(execution.control().terminal_reason(), Some(ExecutionTerminalReason::PeerProtocol));
+                }
+                assert!(execution.next_event(&cx).await.unwrap().is_none());
+                assert!(execution.control().take_cancellation_event().is_none());
+                assert!(cx.checkpoint().is_ok());
+            });
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn http_owned_execution_preserves_http_failure_status_without_retry() {
+        for status in [202, 429, 503] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                respond_probe_ok(&mut accept_bounded_stream(&listener));
+                let mut stream = accept_bounded_stream(&listener);
+                read_request(&mut stream);
+                if status == 202 {
+                    stream.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    stream.flush().unwrap();
+                } else {
+                    write_response(&mut stream, status, "text/plain", b"peer diagnostic is not a protocol result");
+                }
+                listener
+            });
+            runtime_block_on(async {
+                let cx = Cx::current().unwrap();
+                let client = connect(&cx, &target).await;
+                let mut execution = prepare(&client, &cx, 2);
+                assert!(matches!(execution.next_event(&cx).await,
+                    Err(ModernHttpFinalCoreListenError::UnexpectedHttpStatus { status: actual }) if actual == status));
+                assert!(execution.next_event(&cx).await.unwrap().is_none());
+                assert!(!execution.control().cancel());
+                assert!(execution.control().take_cancellation_event().is_none());
+            });
+            let listener = server.join().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        }
+    }
+
+    #[test]
+    fn http_owned_execution_drop_closes_unpolled_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            respond_probe_ok(&mut accept_bounded_stream(&listener));
+            let mut stream = accept_bounded_stream(&listener);
+            read_request(&mut stream);
+            begin_sse_response(&mut stream);
+            write_sse_event(&mut stream, &progress()).unwrap();
+            assert_connection_closed_by_client(&mut stream);
+        });
+        runtime_block_on(async {
+            let cx = Cx::current().unwrap();
+            let client = connect(&cx, &target).await;
+            let mut execution = prepare(&client, &cx, 2);
+            let control = execution.control();
+            assert!(matches!(execution.next_event(&cx).await.unwrap(), Some(ModernHttpFinalCoreEvent::Progress(_))));
+            drop(execution);
+            assert_cancelled_once(&control, ExecutionTerminalReason::CallerDropped);
+            assert!(cx.checkpoint().is_ok());
+        });
+        server.join().unwrap();
+    }
+}
