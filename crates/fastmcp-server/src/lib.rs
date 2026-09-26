@@ -7316,10 +7316,11 @@ static NEXT_WEBSOCKET_AUTH_CONNECTION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// A bound, caller-owned WebSocket listener.
 ///
-/// Each accepted connection completes HTTP Upgrade before it enters a bounded
-/// bridge to the same split dual-era dispatcher used by stdio. Consequently
-/// its protocol-era decision, session, active-request registry, cancellation
-/// routing, and server-to-client requests are all connection scoped.
+/// Each accepted connection completes HTTP Upgrade before dispatch. A
+/// ModernOnly listener drives independently owned native read/write halves
+/// and request child regions without a blocking worker. Auto and LegacyOnly
+/// retain the split dual-era dispatcher used by synchronous stdio. Protocol
+/// binding, cancellation, and authentication remain connection scoped.
 #[cfg(feature = "websocket")]
 pub struct BoundWebSocketServer {
     listener: AsyncTcpListener,
@@ -7812,6 +7813,17 @@ async fn serve_websocket_connection(
         prefix: trailing,
         stream,
     });
+    if server.protocol_policy == ProtocolPolicy::ModernOnly {
+        return server
+            .serve_modern_websocket(
+                cx,
+                transport,
+                transport_authorization,
+                auth_custody,
+                connection_generation,
+            )
+            .await;
+    }
     run_websocket_dispatch_bridge(
         cx,
         server,

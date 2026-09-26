@@ -71,7 +71,9 @@ use fastmcp_protocol::{
 
 #[cfg(feature = "tasks")]
 use crate::FinalToolCallOutcome;
-use crate::execution::{MrtrDriver, MrtrDriverLimits};
+use crate::execution::{
+    CancellationRequested, ExecutionTerminalReason, MrtrDriver, MrtrDriverLimits,
+};
 use crate::session::{ClientExtensionRuntime, mcp_apps_activation_receipt};
 use crate::sse::{BoundedSseParser, SseEndOfStream, SseLimits, SseParseError, SsePushError};
 use crate::{
@@ -1578,6 +1580,291 @@ pub struct ModernHttpFinalCoreCollector {
     pub terminal: FinalCoreResult,
 }
 
+type ModernHttpExecutionStep = (
+    Option<ModernHttpFinalCoreListener>,
+    Result<Option<ModernHttpFinalCoreEvent>, ModernHttpFinalCoreListenError>,
+);
+type ModernHttpExecutionFuture =
+    Pin<Box<dyn Future<Output = ModernHttpExecutionStep> + Send + 'static>>;
+
+struct ModernHttpExecutionState {
+    operation: Option<ModernHttpExecutionFuture>,
+    listener: Option<ModernHttpFinalCoreListener>,
+    terminal_reason: Option<ExecutionTerminalReason>,
+    cancellation_event: Option<CancellationRequested>,
+    terminal_error: Option<ModernHttpFinalCoreListenError>,
+    waker: Option<Waker>,
+    progress_marker: Option<fastmcp_protocol::ProgressMarker>,
+    last_progress: Option<fastmcp_protocol::common_types::ExactNonNegativeJsonNumber>,
+}
+
+/// Independent cancellation and observation for one ordinary modern HTTP POST.
+///
+/// This control never cancels the caller's `Cx`. Cancellation synchronously
+/// releases the owned exchange, including a response that nobody is polling,
+/// and wakes a pending [`ModernHttpRequestExecution::next_event`] call. Only
+/// the first terminal transition wins; a completed response cannot subsequently
+/// produce a cancellation indication.
+#[derive(Clone)]
+pub struct ModernHttpRequestControl {
+    request_id: RequestId,
+    state: Arc<std::sync::Mutex<ModernHttpExecutionState>>,
+}
+
+impl fmt::Debug for ModernHttpRequestControl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ModernHttpRequestControl")
+            .field("request_id", &self.request_id)
+            .field("terminal_reason", &self.terminal_reason())
+            .finish()
+    }
+}
+
+impl ModernHttpRequestControl {
+    /// Returns the exact JSON-RPC identity of this execution.
+    #[must_use]
+    pub const fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    /// Cancels only this exchange. Returns false if a terminal outcome already won.
+    pub fn cancel(&self) -> bool {
+        self.retire(ExecutionTerminalReason::CallerCancelled)
+    }
+
+    /// Takes the sole local cancellation indication, without waiting for an observer.
+    ///
+    /// Its reason is a local classifier. Peer reason text and log payloads are
+    /// never copied into this capacity-one slot. All control clones share it.
+    pub fn take_cancellation_event(&self) -> Option<CancellationRequested> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancellation_event
+            .take()
+    }
+
+    /// Returns the first terminal cause, if this execution has retired.
+    #[must_use]
+    pub fn terminal_reason(&self) -> Option<ExecutionTerminalReason> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .terminal_reason
+    }
+
+    fn retire(&self, reason: ExecutionTerminalReason) -> bool {
+        let (operation, listener, waker) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.terminal_reason.is_some() {
+                return false;
+            }
+            state.terminal_reason = Some(reason);
+            state.progress_marker = None;
+            state.last_progress = None;
+            state.cancellation_event = Some(CancellationRequested {
+                request_id: self.request_id.clone(),
+                reason,
+            });
+            state.terminal_error = Some(ModernHttpFinalCoreListenError::CallerCancelled {
+                request_id: self.request_id.clone(),
+            });
+            (state.operation.take(), state.listener.take(), state.waker.take())
+        };
+        // Dropping a native future/socket may run its own wake or cleanup code.
+        // Never execute that code while holding the terminal election lock.
+        drop(operation);
+        drop(listener);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        true
+    }
+}
+
+/// An ordinary core request owning one modern HTTP exchange from before send.
+///
+/// [`ModernHttpClient::execute_core`] prepares this handle without opening a
+/// socket. Polling [`Self::next_event`] drives the single POST on the caller's
+/// runtime and yields exact typed notifications followed by at most one typed
+/// final result, whether the peer selects JSON or SSE. Dropping a pending
+/// `next_event` future leaves that same operation inside the handle, so resuming
+/// never sends a replacement POST. No receive loop or timer worker is detached.
+///
+/// Dropping the handle closes its owned exchange immediately. Control clones
+/// retain only the bounded terminal observation after retirement. Subscriptions
+/// and Tasks use their separate, explicitly negotiated execution surfaces.
+pub struct ModernHttpRequestExecution {
+    cx: Cx,
+    control: ModernHttpRequestControl,
+}
+
+impl fmt::Debug for ModernHttpRequestExecution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ModernHttpRequestExecution")
+            .field("control", &self.control)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ModernHttpRequestExecution {
+    /// Returns the exact JSON-RPC identity of the prepared request.
+    #[must_use]
+    pub const fn request_id(&self) -> &RequestId {
+        self.control.request_id()
+    }
+
+    /// Clones this request's independent cancellation and observation control.
+    #[must_use]
+    pub fn control(&self) -> ModernHttpRequestControl {
+        self.control.clone()
+    }
+
+    /// Drives the next typed event while honoring both the execution's original
+    /// context and this call's cancellation/deadline. A selected error is returned
+    /// once; subsequent calls return `None`. No buffered event survives cancellation.
+    pub async fn next_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<ModernHttpFinalCoreEvent>, ModernHttpFinalCoreListenError> {
+        let (_cancellation_guard, mut cancellation_signal) = oneshot::channel::<()>();
+        let mut cancelled = std::pin::pin!(cancellation_signal.recv(cx));
+        let mut caller_deadline = cx.budget().deadline.map(Sleep::new);
+        poll_fn(|task_cx| {
+            let mut state = self
+                .control
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.terminal_reason.is_some() {
+                return Poll::Ready(state.terminal_error.take().map_or(Ok(None), Err));
+            }
+            state.waker = Some(task_cx.waker().clone());
+            let caller_error = modern_http_execution_caller_error(cx).or_else(|| {
+                if cancelled.as_mut().poll(task_cx).is_ready() {
+                    Some(check_modern_http_context(cx).err()
+                        .unwrap_or(ModernHttpExecutorError::Cancelled))
+                } else if caller_deadline.as_mut().is_some_and(|sleep| {
+                    let _caller = Cx::set_current(Some(cx.clone()));
+                    Pin::new(sleep).poll(task_cx).is_ready()
+                }) {
+                    Some(ModernHttpExecutorError::Transport(ClientError::DeadlineExceeded))
+                } else {
+                    None
+                }
+            });
+            let result = if let Some(error) = caller_error {
+                Poll::Ready((None, Err(ModernHttpFinalCoreListenError::Executor(error))))
+            } else {
+                if state.operation.is_none() {
+                    let Some(mut listener) = state.listener.take() else {
+                        return Poll::Ready(Ok(None));
+                    };
+                    let owner_cx = self.cx.clone();
+                    state.operation = Some(Box::pin(async move {
+                        let event = listener.next_event(&owner_cx).await;
+                        (Some(listener), event)
+                    }));
+                }
+                state.operation.as_mut().expect("execution owns its pending operation")
+                    .as_mut().poll(task_cx)
+            };
+            let Poll::Ready((listener, mut event)) = result else {
+                return Poll::Pending;
+            };
+            if let Some(error) = modern_http_execution_caller_error(cx) {
+                event = Err(ModernHttpFinalCoreListenError::Executor(error));
+            }
+            let operation = state.operation.take();
+            let previous_listener = state.listener.take();
+            state.waker = None;
+            if let Ok(Some(ModernHttpFinalCoreEvent::Progress(progress))) = &event {
+                if state.progress_marker.as_ref() != Some(&progress.progress_token)
+                    || state.last_progress.as_ref().is_some_and(|last| progress.progress.cmp(last).is_le())
+                {
+                    event = Err(ModernHttpFinalCoreListenError::NotificationAdmission(
+                        FinalNotificationError::InvalidParams { method: NOTIFICATIONS_PROGRESS },
+                    ));
+                } else {
+                    state.last_progress = Some(progress.progress.clone());
+                }
+            }
+            match &event {
+                Ok(Some(ModernHttpFinalCoreEvent::Terminal(_))) | Ok(None) => {
+                    state.terminal_reason = Some(ExecutionTerminalReason::FinalResponse);
+                }
+                Ok(Some(_)) => state.listener = listener,
+                Err(error) => {
+                    let reason = modern_http_execution_error_reason(error);
+                    state.terminal_reason = Some(reason);
+                    if matches!(reason, ExecutionTerminalReason::CallerCancelled
+                        | ExecutionTerminalReason::IdleTimeout
+                        | ExecutionTerminalReason::AbsoluteTimeout)
+                    {
+                        state.cancellation_event = Some(CancellationRequested {
+                            request_id: self.control.request_id.clone(),
+                            reason,
+                        });
+                    }
+                }
+            }
+            if state.terminal_reason.is_some() {
+                state.progress_marker = None;
+                state.last_progress = None;
+            }
+            drop(state);
+            drop(operation);
+            drop(previous_listener);
+            Poll::Ready(event)
+        }).await
+    }
+}
+
+impl Drop for ModernHttpRequestExecution {
+    fn drop(&mut self) {
+        self.control.retire(ExecutionTerminalReason::CallerDropped);
+    }
+}
+
+fn modern_http_execution_caller_error(cx: &Cx) -> Option<ModernHttpExecutorError> {
+    check_modern_http_context(cx).err().or_else(|| {
+        cx.budget().deadline.filter(|deadline| cx.now() >= *deadline)
+            .map(|_| ModernHttpExecutorError::Transport(ClientError::DeadlineExceeded))
+    })
+}
+
+fn modern_http_execution_error_reason(error: &ModernHttpFinalCoreListenError) -> ExecutionTerminalReason {
+    let executor_error = match error {
+        ModernHttpFinalCoreListenError::RemoteError { .. }
+        | ModernHttpFinalCoreListenError::UnexpectedHttpStatus { .. } => {
+            return ExecutionTerminalReason::FinalResponse;
+        }
+        ModernHttpFinalCoreListenError::EndOfStream { .. } => {
+            return ExecutionTerminalReason::ConnectionLost;
+        }
+        ModernHttpFinalCoreListenError::CallerCancelled { .. } => {
+            return ExecutionTerminalReason::CallerCancelled;
+        }
+        ModernHttpFinalCoreListenError::Executor(error)
+        | ModernHttpFinalCoreListenError::Request(ModernHttpClientError::Executor(error)) => error,
+        _ => return ExecutionTerminalReason::PeerProtocol,
+    };
+    match executor_error {
+        ModernHttpExecutorError::Cancelled => ExecutionTerminalReason::CallerCancelled,
+        ModernHttpExecutorError::Timeout(RequestTimeoutSource::Idle) => ExecutionTerminalReason::IdleTimeout,
+        ModernHttpExecutorError::Timeout(RequestTimeoutSource::Absolute)
+        | ModernHttpExecutorError::Transport(ClientError::DeadlineExceeded) => ExecutionTerminalReason::AbsoluteTimeout,
+        ModernHttpExecutorError::Transport(_) | ModernHttpExecutorError::DispatchUncertain(_)
+        | ModernHttpExecutorError::ResponseBodyReadFailed => ExecutionTerminalReason::ConnectionLost,
+        _ => ExecutionTerminalReason::PeerProtocol,
+    }
+}
+
 /// A live, request-owned final core HTTP response stream.
 ///
 /// This listener is intentionally final-only. It never projects a notification
@@ -1768,6 +2055,9 @@ pub enum ModernHttpFinalCoreListenError {
     Request(ModernHttpClientError),
     /// The response did not use the required SSE body lane or could not be read.
     Executor(ModernHttpExecutorError),
+    /// The POST returned an HTTP failure or a notification-only acknowledgement.
+    /// No body payload is promoted to a protocol result and no retry is attempted.
+    UnexpectedHttpStatus { status: u16 },
     /// An SSE event was not one strictly admitted JSON-RPC object.
     JsonRpcAdmission(JsonRpcAdmissionError),
     /// A server request was not one exact final server notification.
@@ -1813,6 +2103,10 @@ impl fmt::Display for ModernHttpFinalCoreListenError {
             }
             Self::Request(error) => error.fmt(formatter),
             Self::Executor(error) => error.fmt(formatter),
+            Self::UnexpectedHttpStatus { status } => write!(
+                formatter,
+                "final core request received HTTP status {status} without a result response"
+            ),
             Self::JsonRpcAdmission(error) => write!(
                 formatter,
                 "final core SSE event failed strict JSON-RPC admission: {error}"
@@ -1863,6 +2157,7 @@ impl std::error::Error for ModernHttpFinalCoreListenError {
             Self::NotificationAdmission(error) => Some(error),
             Self::TerminalResult(error) => Some(error),
             Self::InvalidRequestId
+            | Self::UnexpectedHttpStatus { .. }
             | Self::NonFinalCoreRequest
             | Self::ResponseIdMismatch { .. }
             | Self::RemoteError { .. }
@@ -6605,6 +6900,113 @@ impl ModernHttpClient {
     ) -> Result<ModernHttpResponseStream, ModernHttpClientError> {
         self.request_with_client_extensions(cx, method.as_ref(), parameters, request_id, None, None)
             .await
+    }
+
+    /// Prepares one owned ordinary core execution without starting network I/O.
+    ///
+    /// The first [`ModernHttpRequestExecution::next_event`] poll sends one POST.
+    /// JSON complete/input-required results and SSE notifications/finals use the
+    /// same exact request decoder, including its bounded open result members.
+    /// Each handle owns cancellation and backpressure independently of this
+    /// client and all sibling handles; dropping a poll future never reissues it.
+    ///
+    /// `timeout_policy` must satisfy the ordinary bounded policy even if it was
+    /// constructed through the application-timeout escape hatch. Its idle and
+    /// absolute durations are capped by the client's configured durations and
+    /// the original caller budget. Response timers begin at committed send,
+    /// never at handle construction. `limits.max_event_bytes()` also bounds a
+    /// JSON response. No subscription or Tasks operation is admitted here.
+    pub fn execute_core(
+        &self,
+        cx: &Cx,
+        method: impl AsRef<str>,
+        parameters: serde_json::Value,
+        request_id: RequestId,
+        limits: SseLimits,
+        timeout_policy: RequestTimeoutPolicy,
+    ) -> Result<ModernHttpRequestExecution, ModernHttpFinalCoreListenError> {
+        check_modern_http_context(cx).map_err(ModernHttpFinalCoreListenError::Executor)?;
+        if request_id.validate().is_err() {
+            return Err(ModernHttpFinalCoreListenError::InvalidRequestId);
+        }
+        let method = method.as_ref();
+        if method == SUBSCRIPTIONS_LISTEN {
+            return Err(ModernHttpFinalCoreListenError::Request(
+                ModernHttpClientError::UnsupportedFinalMethod { method: method.to_owned() },
+            ));
+        }
+        let bounded_policy = RequestTimeoutPolicy::new(
+            timeout_policy.idle_timeout(), timeout_policy.absolute_timeout(),
+        ).map_err(|_| ModernHttpFinalCoreListenError::Executor(
+            ModernHttpExecutorError::InvalidTimeoutPolicy,
+        ))?;
+        let effective_policy = RequestTimeoutPolicy::new(
+            bounded_policy.idle_timeout().min(self.executor.request_timeout_policy.idle_timeout()),
+            bounded_policy.absolute_timeout().min(self.executor.request_timeout_policy.absolute_timeout()),
+        ).map_err(|_| ModernHttpFinalCoreListenError::Executor(
+            ModernHttpExecutorError::InvalidTimeoutPolicy,
+        ))?.reset_idle_on_matching_progress(timeout_policy.resets_idle_on_matching_progress()
+            && self.executor.request_timeout_policy.resets_idle_on_matching_progress());
+        let request = self.build_post_discovery_request(
+            cx, method, parameters, Some(request_id.clone()), None, true,
+        ).map_err(ModernHttpFinalCoreListenError::Request)?;
+        let wire: JsonRpcRequest = serde_json::from_slice(&request.body).map_err(|_| {
+            ModernHttpFinalCoreListenError::Request(ModernHttpClientError::RequestEncodingFailed)
+        })?;
+        let core_request = CoreRequest::decode(ProtocolEra::Modern2026, method, wire.params.as_ref())
+            .map_err(ModernHttpFinalCoreListenError::TerminalResult)?;
+        let progress_marker = wire.params.as_ref()
+            .and_then(|params| params.pointer("/_meta/progressToken"))
+            .and_then(|marker| serde_json::from_value(marker.clone()).ok());
+        let executor = self.executor.clone().with_timeout_policy(effective_policy);
+        let owner_cx = cx.clone();
+        let expected_id = request_id.clone();
+        let operation = Box::pin(async move {
+            let result: Result<ModernHttpExecutionStep, ModernHttpFinalCoreListenError> = async {
+                let response = executor.execute(&owner_cx, &request).await
+                    .map_err(ModernHttpFinalCoreListenError::Executor)?;
+                if matches!(response.metadata().kind(), ModernHttpResponseKind::HttpFailure
+                    | ModernHttpResponseKind::EmptyAcknowledgement)
+                {
+                    return Err(ModernHttpFinalCoreListenError::UnexpectedHttpStatus {
+                        status: response.metadata().status(),
+                    });
+                }
+                if matches!(response.metadata().kind(), ModernHttpResponseKind::Json) {
+                    let maximum_bytes = limits.max_event_bytes();
+                    let body = response.read_to_end(&owner_cx, maximum_bytes).await
+                        .map_err(ModernHttpFinalCoreListenError::Executor)?;
+                    let admission = decode_strict_jsonrpc_response(&body, maximum_bytes)
+                        .map_err(ModernHttpFinalCoreListenError::JsonRpcAdmission)?;
+                    let (response, raw_result) = admission.into_parts();
+                    let terminal = decode_final_core_terminal(
+                        &core_request, response, raw_result.as_deref(), expected_id, false,
+                    )?;
+                    Ok((None, Ok(Some(ModernHttpFinalCoreEvent::Terminal(terminal)))))
+                } else {
+                    let mut listener = response.into_final_core_listener(expected_id, core_request, limits)?;
+                    let event = listener.next_event(&owner_cx).await;
+                    Ok((Some(listener), event))
+                }
+            }.await;
+            result.unwrap_or_else(|error| (None, Err(error)))
+        });
+        Ok(ModernHttpRequestExecution {
+            cx: cx.clone(),
+            control: ModernHttpRequestControl {
+                request_id,
+                state: Arc::new(std::sync::Mutex::new(ModernHttpExecutionState {
+                    operation: Some(operation),
+                    listener: None,
+                    terminal_reason: None,
+                    cancellation_event: None,
+                    terminal_error: None,
+                    waker: None,
+                    progress_marker,
+                    last_progress: None,
+                })),
+            },
+        })
     }
 
     /// Starts one catalog page and returns the decoder for the exact stamped

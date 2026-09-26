@@ -14,7 +14,7 @@ use asupersync::types::Time;
 use fastmcp_core::McpRequestCancellation;
 
 use super::super::{ManagedOAuthSession, OAuthSessionError, PendingPermit, SessionGuard, deadline_after};
-use crate::http_auth::oauth::{OAuthCredentials, OAuthError};
+use crate::http_auth::oauth::{OAuthClient, OAuthCredentials, OAuthError};
 
 /// A local access-installation refusal. It does not undo a completed durable
 /// renewal, and contains no token, grant, file path or peer response.
@@ -145,4 +145,99 @@ fn admit_candidate(session: &ManagedOAuthSession, candidate: &OAuthCredentials)
         return Err(OAuthSessionError::LoginRequired.into());
     }
     Ok(())
+}
+
+/// Refusal before moving a managed session's refresh lineage to storage.
+/// No token, principal, store path or provider diagnostic is retained.
+#[derive(Debug)]
+pub enum OAuthRefreshTransferError {
+    Session(OAuthSessionError),
+    GenerationMismatch,
+}
+impl fmt::Display for OAuthRefreshTransferError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Session(error) => fmt::Display::fmt(error, f),
+            Self::GenerationMismatch => f.write_str("managed OAuth generation changed before refresh transfer"),
+        }
+    }
+}
+impl std::error::Error for OAuthRefreshTransferError {}
+impl From<OAuthSessionError> for OAuthRefreshTransferError {
+    fn from(error: OAuthSessionError) -> Self { Self::Session(error) }
+}
+
+pub(crate) struct RefreshTransfer<'a> {
+    session: &'a ManagedOAuthSession,
+    guard: SessionGuard<'a>,
+    _permit: PendingPermit<'a>,
+    cx: &'a Cx,
+    cancellation: &'a McpRequestCancellation,
+    client: &'a OAuthClient,
+    deadline: Time,
+    expected_generation: u64,
+}
+
+impl ManagedOAuthSession {
+    pub(crate) async fn reserve_refresh_transfer<'a>(
+        &'a self, cx: &'a Cx, cancellation: &'a McpRequestCancellation,
+        expected_generation: u64, client: &'a OAuthClient,
+    ) -> Result<RefreshTransfer<'a>, OAuthRefreshTransferError> {
+        self.check(cx, cancellation)?;
+        let deadline = deadline_after(cx, self.inner.policy.acquisition_timeout)?;
+        let permit = PendingPermit::acquire(&self.inner.pending, self.inner.policy.max_pending_acquisitions)?;
+        // Serialize with renewal/rotation/logout, but NEVER renew in order to
+        // capture. Even an expired access token can own a valid refresh grant.
+        let guard = self.await_active(cx, cancellation, deadline, None, async {
+            let guard = OwnedMutexGuard::lock(Arc::clone(&self.inner.state), cx)
+                .await.map_err(|_| OAuthSessionError::StateUnavailable)?;
+            Ok(SessionGuard {
+                guard,
+                closed: &self.inner.closed,
+                logout_handoff: &self.inner.logout_handoff,
+            })
+        }).await?;
+        let reserved = RefreshTransfer {
+            session: self, guard, _permit: permit, cx, cancellation,
+            client, deadline, expected_generation,
+        };
+        reserved.admit()?;
+        Ok(reserved)
+    }
+}
+
+impl RefreshTransfer<'_> {
+    fn admit(&self) -> Result<(), OAuthRefreshTransferError> {
+        self.session.check(self.cx, self.cancellation)?;
+        if self.cx.now() >= self.deadline { return Err(OAuthSessionError::TimedOut.into()); }
+        let state = self.guard.as_ref().ok_or(OAuthSessionError::Closed)?;
+        if state.generation != self.expected_generation {
+            return Err(OAuthRefreshTransferError::GenerationMismatch);
+        }
+        if !self.client.accepts_credentials(&state.credentials) {
+            return Err(OAuthSessionError::OAuth(OAuthError::CredentialBindingMismatch).into());
+        }
+        if state.renewal_failed || state.credentials.bearer_credential().is_revoked() {
+            return Err(OAuthSessionError::LoginRequired.into());
+        }
+        if !state.credentials.has_refresh_token() {
+            return Err(OAuthSessionError::OAuth(OAuthError::RefreshUnavailable).into());
+        }
+        Ok(())
+    }
+
+    /// A synchronous election after the cancel-aware lock wait. No provider,
+    /// await or further fallible step follows the refresh-token move. Access
+    /// snapshots keep their original token, generation, expiry and revocation.
+    pub(crate) fn commit(mut self) -> Result<OAuthCredentials, OAuthRefreshTransferError> {
+        self.admit()?;
+        let state = self.guard.as_mut().ok_or(OAuthSessionError::Closed)?;
+        let credentials = state.credentials.take_persistence_credentials(&self.session.inner.closed)
+            .map_err(OAuthSessionError::OAuth)?;
+        // The access token did not change, so its generation must not change.
+        // In-memory acquisition can now use access until expiry, not attempt
+        // a renewal at the previous early-refresh threshold.
+        state.renew_after = state.credentials.expires_at();
+        Ok(credentials)
+    }
 }
