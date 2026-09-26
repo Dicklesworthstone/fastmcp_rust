@@ -478,7 +478,17 @@ mod modern_http_only {
             Ok(())
         }
         pub fn close(&mut self) {
+            if self.closed {
+                return;
+            }
             self.closed = true;
+            self.transport.terminate();
+        }
+    }
+
+    impl Drop for DualEraHttpSession {
+        fn drop(&mut self) {
+            self.close();
         }
     }
 }
@@ -503,7 +513,6 @@ use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener as AsyncTcpListener, TcpStream as AsyncTcpStream};
 use asupersync::stream::StreamExt;
 use asupersync::{Budget, CancelKind, Cx, RegionId, channel::oneshot};
-#[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_console::RequestResponseRenderer;
 use fastmcp_console::banner::StartupBanner;
 use fastmcp_console::console::FastMcpConsole;
@@ -3448,7 +3457,6 @@ fn transport_run_error(stage: &'static str, error: &TransportError) -> McpError 
     )
 }
 
-#[cfg(feature = "legacy-2024-11-05")]
 fn returning_send_result(error: &TransportError) -> McpResult<()> {
     if error.is_cancelled() {
         Ok(())
@@ -3468,7 +3476,6 @@ fn server_run_error(stage: &'static str, kind: &'static str, message: &'static s
     )
 }
 
-#[cfg(feature = "legacy-2024-11-05")]
 fn returning_send_result_with_connection_failure(
     error: &TransportError,
     connection_failure: &Option<Arc<AtomicBool>>,
@@ -3500,7 +3507,6 @@ fn combined_run_and_close_error(run_error: McpError, close_error: McpError) -> M
     )
 }
 
-#[cfg(feature = "legacy-2024-11-05")]
 fn combined_operation_and_cleanup_error(
     operation_error: McpError,
     cleanup: ShutdownCleanupOutcome,
@@ -3520,7 +3526,6 @@ fn combined_operation_and_cleanup_error(
     )
 }
 
-#[cfg(feature = "legacy-2024-11-05")]
 fn send_uncorrelated_parse_error<S>(send: &Arc<Mutex<S>>, cx: &Cx) -> Result<(), TransportError>
 where
     S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError>,
@@ -3528,7 +3533,6 @@ where
     send_jsonrpc_error(send, cx, None, McpErrorCode::ParseError, "Parse error")
 }
 
-#[cfg(feature = "legacy-2024-11-05")]
 fn send_invalid_request<S>(
     send: &Arc<Mutex<S>>,
     cx: &Cx,
@@ -3546,7 +3550,6 @@ where
     )
 }
 
-#[cfg(feature = "legacy-2024-11-05")]
 fn send_jsonrpc_error<S>(
     send: &Arc<Mutex<S>>,
     cx: &Cx,
@@ -4792,6 +4795,15 @@ impl FinalSubscriptionElection {
 /// unregisters the listener from the server.
 pub struct SubscriptionListenHandle {
     _lease: FinalSubscriptionLease,
+}
+
+#[cfg(test)]
+impl SubscriptionListenHandle {
+    /// The registration this handle keeps alive, for tests that inspect it.
+    fn lease(&self) -> &FinalSubscriptionLease {
+        let Self { _lease: lease } = self;
+        lease
+    }
 }
 
 /// Removes one subscription entry when its request exits for any reason.
@@ -8994,7 +9006,6 @@ impl ServerHttpSession {
             .flatten()
             .map(|sender| {
                 TransportRootsProvider::new(
-                    sender,
                     McpContext::new(
                         self.legacy_request_cx
                             .lock()
@@ -9002,6 +9013,7 @@ impl ServerHttpSession {
                             .clone(),
                         0,
                     ),
+                    sender,
                 )
             })
     }
@@ -13044,11 +13056,11 @@ impl Server {
         runtime
             .handlers
             .invoke(
+                request_ctx,
                 negotiated,
                 ProtocolEra::Modern2026,
                 extension_id,
                 &request,
-                request_ctx,
             )
             .map_err(|error| match error {
                 ExtensionHandlerInvocationError::Handler(error) => error,
@@ -13262,7 +13274,6 @@ impl Server {
         renderer.render_panel(&snapshot, &self.console);
     }
 
-    #[cfg(feature = "legacy-2024-11-05")]
     fn configured_traffic_renderer(&self) -> Option<RequestResponseRenderer> {
         let show_bodies = match self.console_config.traffic_verbosity {
             TrafficVerbosity::None => return None,
@@ -14451,6 +14462,10 @@ impl Server {
     /// Runs one modern stdio request. `subscriptions/listen` runs in a
     /// caller-owned blocking task so the receive pump can keep accepting
     /// requests while shutdown retains the subscription's active ownership.
+    /// On an unsplit transport, output queued while `recv` owns the I/O
+    /// handle flushes when that receive returns. Waiting for a blocked
+    /// middleware callback here would also block the input that releases it;
+    /// callers needing independent output must use the split transport API.
     ///
     /// `cx` is the RECEIVE PUMP's context and owns transport I/O. `dispatch_cx`
     /// is the caller runtime's context and owns the request future: when the
@@ -14460,7 +14475,6 @@ impl Server {
     /// answers `server/discover` and then silently stops responding
     /// (GitHub #65). Callers whose pump and runtime are the same context pass
     /// the same `Cx` twice.
-    #[cfg(feature = "legacy-2024-11-05")]
     fn dispatch_or_schedule_stdio_modern_request<S>(
         server: Arc<Self>,
         cx: &Cx,
@@ -14473,11 +14487,11 @@ impl Server {
         notification_sender: NotificationSender,
         send: Arc<Mutex<S>>,
         background_send_failure: Arc<Mutex<Option<McpError>>>,
+        queue: Arc<DispatchQueueState>,
     ) -> Option<JsonRpcResponse>
     where
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + 'static,
     {
-        let request_cancellation = McpRequestCancellation::new();
         let policy = server.protocol_policy;
         if request.id.is_none() && request.method == "notifications/cancelled" {
             let mut request = request;
@@ -14496,6 +14510,38 @@ impl Server {
             }
             return None;
         }
+        // Reserve count and retained bytes before authentication or task
+        // submission. The owner moves into the task, including while it is
+        // queued or still blocked in application middleware.
+        let reservation = match queue.admit_modern_request(&request, Arc::new(AtomicBool::new(false))) {
+            Ok(reservation) => reservation,
+            Err(error) => return request.id.map(|id| JsonRpcResponse::error(Some(id), error)),
+        };
+        let request_cancellation = reservation.cancellation();
+        // Establish the connection principal before receiving another frame.
+        // A cancellation of this opening request must work even if its child
+        // has not started. The private receipt prevents a second provider call.
+        let auth_receipt = match server.admit_modern_pump_authentication(
+            &inbound,
+            &request,
+            auth_receipt.as_ref(),
+            auth_custody_generation,
+        ) {
+            Ok(receipt) => Some(receipt),
+            Err(error) => {
+                let error = mask_peer_error(error, server.mask_error_details);
+                return request.id.map(|id| {
+                    JsonRpcResponse::error(
+                        Some(id),
+                        JsonRpcError {
+                            code: error.code.into(),
+                            message: error.message,
+                            data: error.data,
+                        },
+                    )
+                });
+            }
+        };
         if request.method == SUBSCRIPTIONS_LISTEN {
             // `inbound`/`request` move into the worker closure below;
             // `InboundRequestContext` is deliberately non-Clone, so a failed
@@ -14548,6 +14594,7 @@ impl Server {
                 let notification_sender = Arc::clone(&notification_sender);
                 let request_cancellation = request_cancellation.clone();
                 move |request_cx| {
+                    let _reservation = reservation;
                     let active_guard = active_request;
                     if active_guard
                         .as_ref()
@@ -15386,7 +15433,7 @@ impl Server {
         let shared_recv = shared.clone();
         let shared_send = shared.clone();
         #[cfg(feature = "legacy-2024-11-05")]
-        let run_result = self.run_loop_returning_legacy(
+        let run_result = self.run_loop_returning(
             cx,
             move |cx| shared_recv.recv(cx),
             move |cx, message| shared_send.send(cx, message),
@@ -15501,8 +15548,7 @@ impl Server {
 
         let shared_recv = shared.clone();
         let shared_send = shared.clone();
-        #[cfg(feature = "legacy-2024-11-05")]
-        let run_result = self.run_loop_returning_legacy(
+        let run_result = self.run_loop_returning(
             cx,
             move |cx| shared_recv.recv(cx),
             move |cx, message| shared_send.send(cx, message),
@@ -15510,30 +15556,6 @@ impl Server {
             Some(notification_failure),
             "custom",
         );
-        #[cfg(not(feature = "legacy-2024-11-05"))]
-        let run_result = match Arc::new(self).run_loop_pump_with_policy(
-            cx,
-            cx,
-            move |cx, _worker_failed| shared_recv.recv(cx),
-            move |cx, message| shared_send.send(cx, message),
-            notification_sender,
-            "custom",
-            false,
-            Some(notification_failure),
-            true,
-            true,
-            None,
-            None,
-            None,
-            PumpIoMode::Unsplit,
-        ) {
-            0 => Ok(()),
-            _ => Err(server_run_error(
-                "transport",
-                "pump_failure",
-                "Server transport loop failed",
-            )),
-        };
         let close_result = shared
             .close(cx)
             .map_err(|error| transport_run_error("close", &error));
@@ -17856,8 +17878,7 @@ impl Server {
     /// entrypoints use `std::process::exit` on shutdown for subprocess use-cases. Clean EOF and
     /// cancellation return success; startup, protocol, and fatal transport failures return errors.
     #[allow(clippy::too_many_lines)]
-    #[cfg(feature = "legacy-2024-11-05")]
-    fn run_loop_returning_legacy<R, S>(
+    fn run_loop_returning<R, S>(
         self,
         cx: &Cx,
         mut recv: R,
@@ -17871,10 +17892,21 @@ impl Server {
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
         let server = Arc::new(self);
+        #[cfg(feature = "legacy-2024-11-05")]
         let mut session = Session::new(server.info.clone(), server.capabilities.clone());
+        #[cfg(feature = "legacy-2024-11-05")]
+        let connection_id = session.id();
+        // This returning API consumes its Server and owns exactly one
+        // connection. Its active-request registry is already isolated from
+        // other Server values; no legacy Session is needed for that key.
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        let connection_id = 0;
+        #[cfg(feature = "legacy-2024-11-05")]
         let legacy_binding = runtime_legacy_binding(session.id());
+        #[cfg(feature = "legacy-2024-11-05")]
         let mut legacy_adapter: Option<Legacy2024ServerAdapter<LiveLegacy2024RuntimeHandler<'_>>> =
             None;
+        #[cfg(feature = "legacy-2024-11-05")]
         let legacy_active_request = Arc::new(Mutex::new(None));
         let mut era_classifier =
             StdioEraClassifier::new(runtime_stdio_policy(server.protocol_policy));
@@ -17883,7 +17915,10 @@ impl Server {
         // Keep response output and inbound pending-response routing connection-scoped.
         let send = Arc::new(Mutex::new(send));
         let background_send_failure = Arc::new(Mutex::new(None));
+        let modern_queue = Arc::new(DispatchQueueState::default());
+        #[cfg(feature = "legacy-2024-11-05")]
         let pending_requests = server.new_pending_requests_for_connection();
+        #[cfg(feature = "legacy-2024-11-05")]
         let legacy_runtime = LiveLegacy2024ConnectionRuntime::new(
             SessionState::new(),
             Arc::clone(&notification_sender),
@@ -18053,6 +18088,7 @@ impl Server {
                             {
                                 ProtocolEra::Modern2026
                             }
+                            #[cfg(feature = "legacy-2024-11-05")]
                             Some(ProtocolEra::Legacy2024)
                                 if modern_protocol_version(&request).is_none() =>
                             {
@@ -18088,6 +18124,7 @@ impl Server {
                                         negotiated_era = Some(ProtocolEra::Modern2026);
                                         ProtocolEra::Modern2026
                                     }
+                                    #[cfg(feature = "legacy-2024-11-05")]
                                     StdioEraDecision::Selected {
                                         era: ProtocolEra::Legacy2024,
                                         modern_version: None,
@@ -18122,18 +18159,19 @@ impl Server {
                         if matches!(era, ProtocolEra::Modern2026) {
                             // Stdio is a local trusted pipe with no transport-layer
                             // authorization; dispatch carries no auth custody for it.
-                            let inbound = InboundRequestContext::with_modern_connection_and_transport_authorization(
-                            cx.clone(),
-                            request_id_to_u64(request.id.as_ref()),
-                            InboundRequestTransport::Stdio,
-                            &modern_connection,
-                            TransportAuthorization::default(),
-                        );
-                            Self::dispatch_or_schedule_stdio_modern_request(
+                            let inbound =
+                                InboundRequestContext::with_modern_connection_and_transport_authorization(
+                                    cx.clone(),
+                                    request_id_to_u64(request.id.as_ref()),
+                                    InboundRequestTransport::Stdio,
+                                    &modern_connection,
+                                    TransportAuthorization::default(),
+                                );
+                            let response = Self::dispatch_or_schedule_stdio_modern_request(
                                 Arc::clone(&server),
                                 cx,
                                 cx,
-                                session.id(),
+                                connection_id,
                                 inbound,
                                 request,
                                 None,
@@ -18141,66 +18179,78 @@ impl Server {
                                 Arc::clone(&notification_sender),
                                 Arc::clone(&send),
                                 Arc::clone(&background_send_failure),
-                            )
-                            .map(HandledRequest::untracked)
+                                Arc::clone(&modern_queue),
+                            );
+                            #[cfg(feature = "legacy-2024-11-05")]
+                            let response = response.map(HandledRequest::untracked);
+                            response
                         } else {
-                            let adapter = match legacy_adapter.as_mut() {
-                                Some(adapter) => adapter,
-                                None => {
-                                    let adapter = server.install_legacy_2024_adapter(
-                                        legacy_binding,
-                                        LiveLegacy2024RuntimeHandler {
-                                            server: server.as_ref(),
-                                            cx: cx.clone(),
-                                            session_id: legacy_binding.generation(),
-                                            session_principal: session.principal_binding(),
-                                            runtime: legacy_runtime.clone(),
-                                            queue_state: None,
-                                            active_request: Arc::clone(&legacy_active_request),
-                                            connection_auth: None,
-                                        },
-                                    );
-                                    let Ok(adapter) = adapter else {
+                            #[cfg(not(feature = "legacy-2024-11-05"))]
+                            return Err(server_run_error(
+                                "protocol",
+                                "era_admission",
+                                "Request does not match the negotiated MCP protocol era",
+                            ));
+                            #[cfg(feature = "legacy-2024-11-05")]
+                            {
+                                let adapter = match legacy_adapter.as_mut() {
+                                    Some(adapter) => adapter,
+                                    None => {
+                                        let adapter = server.install_legacy_2024_adapter(
+                                            legacy_binding,
+                                            LiveLegacy2024RuntimeHandler {
+                                                server: server.as_ref(),
+                                                cx: cx.clone(),
+                                                session_id: legacy_binding.generation(),
+                                                session_principal: session.principal_binding(),
+                                                runtime: legacy_runtime.clone(),
+                                                queue_state: None,
+                                                active_request: Arc::clone(&legacy_active_request),
+                                                connection_auth: None,
+                                            },
+                                        );
+                                        let Ok(adapter) = adapter else {
+                                            return Err(server_run_error(
+                                                "protocol",
+                                                "legacy_adapter_install",
+                                                "Legacy MCP 2024-11-05 adapter could not be installed",
+                                            ));
+                                        };
+                                        legacy_adapter.insert(adapter)
+                                    }
+                                };
+                                let legacy_response = poll_on_cx(
+                                    cx,
+                                    legacy_adapter_response_async(adapter, legacy_binding, &request),
+                                );
+                                sync_live_legacy_runtime_from_adapter(&legacy_runtime, adapter);
+                                let active_request =
+                                    take_live_legacy_active_request(&legacy_active_request);
+                                match legacy_response {
+                                    Ok(response) => response.map(|response| {
+                                        legacy_handled_response(response, active_request, cx)
+                                    }),
+                                    // A peer-fault rejection of an id-less frame has no
+                                    // response channel; JSON-RPC drops it without
+                                    // advancing lifecycle, and one malformed peer
+                                    // notification must not terminate the connection.
+                                    Err(error)
+                                        if matches!(error.code().as_i32(), Some(-32602..=-32600)) =>
+                                    {
+                                        debug!(
+                                            target: targets::SESSION,
+                                            "Dropped invalid exact-2024 notification; code={}",
+                                            error.code()
+                                        );
+                                        None
+                                    }
+                                    Err(_) => {
                                         return Err(server_run_error(
                                             "protocol",
-                                            "legacy_adapter_install",
-                                            "Legacy MCP 2024-11-05 adapter could not be installed",
+                                            "legacy_adapter",
+                                            "Legacy MCP 2024-11-05 adapter rejected a notification",
                                         ));
-                                    };
-                                    legacy_adapter.insert(adapter)
-                                }
-                            };
-                            let legacy_response = poll_on_cx(
-                                cx,
-                                legacy_adapter_response_async(adapter, legacy_binding, &request),
-                            );
-                            sync_live_legacy_runtime_from_adapter(&legacy_runtime, adapter);
-                            let active_request =
-                                take_live_legacy_active_request(&legacy_active_request);
-                            match legacy_response {
-                                Ok(response) => response.map(|response| {
-                                    legacy_handled_response(response, active_request, cx)
-                                }),
-                                // A peer-fault rejection of an id-less frame has no
-                                // response channel; JSON-RPC drops it without
-                                // advancing lifecycle, and one malformed peer
-                                // notification must not terminate the connection.
-                                Err(error)
-                                    if matches!(error.code().as_i32(), Some(-32602..=-32600)) =>
-                                {
-                                    debug!(
-                                        target: targets::SESSION,
-                                        "Dropped invalid exact-2024 notification; code={}",
-                                        error.code()
-                                    );
-                                    None
-                                }
-                                Err(_) => {
-                                    return Err(server_run_error(
-                                        "protocol",
-                                        "legacy_adapter",
-                                        "Legacy MCP 2024-11-05 adapter rejected a notification",
-                                    ));
+                                    }
                                 }
                             }
                         }
@@ -18213,39 +18263,57 @@ impl Server {
                                 "Received invalid JSON-RPC response",
                             ));
                         }
-                        // Preserve generic pending responses first; otherwise an
-                        // exact-2024 response completes the adapter-owned reverse
-                        // request for this one selected legacy connection.
-                        let disposition =
-                            pending_requests.route_response_with_disposition(&response);
-                        if matches!(
-                            disposition,
-                            bidirectional::PendingResponseDisposition::Delivered
-                        ) {
-                            debug!(target: targets::SERVER, "Routed response to pending request");
-                        } else if matches!(
-                            disposition,
-                            bidirectional::PendingResponseDisposition::Unmatched
-                        ) && matches!(negotiated_era, Some(ProtocolEra::Legacy2024))
+                        #[cfg(feature = "legacy-2024-11-05")]
                         {
-                            let Some(adapter) = legacy_adapter.as_mut() else {
-                                return Err(server_run_error(
-                                    "protocol",
-                                    "legacy_adapter",
-                                    "Legacy MCP 2024-11-05 adapter is unavailable for a client response",
-                                ));
-                            };
-                            if !legacy_adapter_accept_response(adapter, legacy_binding, &response) {
-                                return Err(server_run_error(
-                                    "protocol",
-                                    "legacy_adapter",
-                                    "Legacy MCP 2024-11-05 adapter rejected a client response",
-                                ));
+                            // Preserve generic pending responses first; otherwise an
+                            // exact-2024 response completes the adapter-owned reverse
+                            // request for this one selected legacy connection.
+                            let disposition =
+                                pending_requests.route_response_with_disposition(&response);
+                            if matches!(
+                                disposition,
+                                bidirectional::PendingResponseDisposition::Delivered
+                            ) {
+                                debug!(target: targets::SERVER, "Routed response to pending request");
+                            } else if matches!(
+                                disposition,
+                                bidirectional::PendingResponseDisposition::Unmatched
+                            ) && matches!(negotiated_era, Some(ProtocolEra::Legacy2024))
+                            {
+                                let Some(adapter) = legacy_adapter.as_mut() else {
+                                    return Err(server_run_error(
+                                        "protocol",
+                                        "legacy_adapter",
+                                        "Legacy MCP 2024-11-05 adapter is unavailable for a client response",
+                                    ));
+                                };
+                                if !legacy_adapter_accept_response(adapter, legacy_binding, &response)
+                                {
+                                    return Err(server_run_error(
+                                        "protocol",
+                                        "legacy_adapter",
+                                        "Legacy MCP 2024-11-05 adapter rejected a client response",
+                                    ));
+                                }
+                            } else if matches!(
+                                disposition,
+                                bidirectional::PendingResponseDisposition::Unmatched
+                            ) {
+                                let request_key = response.id.as_ref().map(request_id_log_key);
+                                debug!(
+                                    target: targets::SERVER,
+                                    "Received unexpected response (id_present={}, request_key={:016x})",
+                                    response.id.is_some(),
+                                    request_key.unwrap_or_default()
+                                );
                             }
-                        } else if matches!(
-                            disposition,
-                            bidirectional::PendingResponseDisposition::Unmatched
-                        ) {
+                        }
+                        #[cfg(not(feature = "legacy-2024-11-05"))]
+                        {
+                            // Modern requests do not create reverse JSON-RPC
+                            // requests. A well-formed unmatched response has
+                            // no recipient, but invalid responses above must
+                            // still terminate the transport before more input.
                             let request_key = response.id.as_ref().map(request_id_log_key);
                             debug!(
                                 target: targets::SERVER,
@@ -18282,9 +18350,13 @@ impl Server {
                             poisoned.into_inner()
                         }
                     };
+                    #[cfg(feature = "legacy-2024-11-05")]
                     let send_result = response.send_with(&mut session, |response| {
                         guard(cx, &JsonRpcMessage::Response(response.clone()))
                     });
+                    #[cfg(not(feature = "legacy-2024-11-05"))]
+                    let send_result = guard(cx, &JsonRpcMessage::Response(response.clone()))
+                        .map(|()| Some(response));
                     drop(guard);
                     if let Ok(Some(response)) = &send_result {
                         if let Some(renderer) = &traffic_renderer {
@@ -19421,8 +19493,8 @@ impl Server {
         if supports_sampling {
             let sampling_sender: Arc<dyn fastmcp_core::SamplingSender> =
                 Arc::new(bidirectional::TransportSamplingSender::new(
-                    request_sender.clone(),
                     request_context.clone(),
+                    request_sender.clone(),
                 ));
             senders = senders.with_sampling(sampling_sender);
         }
@@ -19430,15 +19502,15 @@ impl Server {
         if supports_elicitation {
             let elicitation_sender: Arc<dyn fastmcp_core::ElicitationSender> =
                 Arc::new(bidirectional::TransportElicitationSender::new(
-                    request_sender.clone(),
                     request_context.clone(),
+                    request_sender.clone(),
                 ));
             senders = senders.with_elicitation(elicitation_sender);
         }
 
         if supports_roots {
             let roots_provider: Arc<dyn fastmcp_core::RootsProvider> = Arc::new(
-                bidirectional::TransportRootsProvider::new(request_sender, request_context.clone()),
+                bidirectional::TransportRootsProvider::new(request_context.clone(), request_sender),
             );
             senders = senders.with_roots(roots_provider);
         }
@@ -19808,7 +19880,6 @@ impl Server {
         }
     }
 
-    #[cfg(feature = "legacy-2024-11-05")]
     fn handle_cancellation_wire_notification(
         &self,
         session_id: u64,
@@ -20290,7 +20361,6 @@ enum ShutdownCleanupOutcome {
     TimedOut { remaining: usize },
 }
 
-#[cfg(feature = "legacy-2024-11-05")]
 impl ShutdownCleanupOutcome {
     fn into_error(self) -> Option<McpError> {
         match self {
@@ -20426,7 +20496,6 @@ impl ActiveRequest {
 struct ActiveRequestGuard {
     map: Arc<Mutex<HashMap<ActiveRequestKey, ActiveRequest>>>,
     key: ActiveRequestKey,
-    #[cfg(feature = "legacy-2024-11-05")]
     cx: Arc<OnceLock<Cx>>,
     cancellation: McpRequestCancellation,
     completion: Arc<RequestCompletion>,
@@ -20455,7 +20524,6 @@ impl ActiveRequestGuard {
         Self::try_insert(map, session_id, id, entry)
     }
 
-    #[cfg(feature = "legacy-2024-11-05")]
     fn try_reserve(
         map: Arc<Mutex<HashMap<ActiveRequestKey, ActiveRequest>>>,
         session_id: u64,
@@ -20483,7 +20551,6 @@ impl ActiveRequestGuard {
         entry: ActiveRequest,
     ) -> Result<Self, RequestId> {
         let key = ActiveRequestKey::new(session_id, &id).map_err(|_| id.clone())?;
-        #[cfg(feature = "legacy-2024-11-05")]
         let cx = Arc::clone(&entry.cx);
         let completion = Arc::clone(&entry.completion);
         let cancellation = entry.cancellation.clone();
@@ -20503,14 +20570,12 @@ impl ActiveRequestGuard {
         Ok(Self {
             map,
             key,
-            #[cfg(feature = "legacy-2024-11-05")]
             cx,
             cancellation,
             completion,
         })
     }
 
-    #[cfg(feature = "legacy-2024-11-05")]
     fn activate(&self, cx: Cx) -> bool {
         // Publish before checking the token. Shutdown cancels the token before
         // reading this same cell, so either it sees the child or activation
@@ -31809,11 +31874,54 @@ mod lib_unit_tests {
         response
     }
 
-    fn auth_00_mrtr_server(stable_owner: bool, calls: &Arc<AtomicUsize>) -> Server {
-        Server::new("auth-00-mrtr-owner", "1.0.0")
+    /// How the MRTR test server's provider supplies the session owner.
+    #[derive(Clone, Copy)]
+    enum Auth00Owner {
+        /// The verifier configures an explicit provider-scoped owner.
+        Configured,
+        /// A subject-only verified context. `TokenAuthProvider` derives its
+        /// owner in a process-local namespace (756719c3).
+        Derived,
+        /// The same verified subject-only context, with no owner at all.
+        Absent,
+    }
+
+    /// Verifies the same credentials through `TokenAuthProvider`, then
+    /// rebuilds the admitted context without the owner that provider
+    /// derives. Owner admission therefore sees a verified subject that
+    /// really has no stable owner.
+    struct OwnerlessAuthProvider(TokenAuthProvider);
+
+    impl AuthProvider for OwnerlessAuthProvider {
+        fn authenticate(
+            &self,
+            ctx: &McpContext,
+            request: AuthRequest<'_>,
+        ) -> McpResult<AuthContext> {
+            let admitted = self.0.authenticate(ctx, request)?;
+            let subject = admitted
+                .subject
+                .clone()
+                .ok_or_else(|| McpError::internal_error("admitted context has no subject"))?;
+            let mut ownerless = AuthContext::with_subject(subject);
+            ownerless.scopes = admitted.scopes;
+            ownerless.claims = admitted.claims;
+            Ok(ownerless)
+        }
+    }
+
+    fn auth_00_mrtr_server(owner: Auth00Owner, calls: &Arc<AtomicUsize>) -> Server {
+        let builder = Server::new("auth-00-mrtr-owner", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
-            .expect("modern policy")
-            .auth_provider(auth_00_mrtr_provider(stable_owner))
+            .expect("modern policy");
+        let builder = match owner {
+            Auth00Owner::Configured => builder.auth_provider(auth_00_mrtr_provider(true)),
+            Auth00Owner::Derived => builder.auth_provider(auth_00_mrtr_provider(false)),
+            Auth00Owner::Absent => {
+                builder.auth_provider(OwnerlessAuthProvider(auth_00_mrtr_provider(false)))
+            }
+        };
+        builder
             .tool(LiveHttpMrtrTool {
                 name: "live_http_mrtr",
                 calls: Arc::clone(calls),
@@ -31833,9 +31941,21 @@ mod lib_unit_tests {
 
     #[test]
     fn auth_00_http_mrtr_stable_owner_completes_two_rounds() {
-        run_live_http_test(|cx| async move {
+        assert_auth_00_http_mrtr_completes_two_rounds(Auth00Owner::Configured);
+    }
+
+    /// Pins 756719c3: `TokenAuthProvider` derives an owner for a subject-only
+    /// verified context, so the same two rounds complete without a
+    /// verifier-configured owner.
+    #[test]
+    fn auth_00_http_mrtr_derived_owner_completes_two_rounds() {
+        assert_auth_00_http_mrtr_completes_two_rounds(Auth00Owner::Derived);
+    }
+
+    fn assert_auth_00_http_mrtr_completes_two_rounds(owner: Auth00Owner) {
+        run_live_http_test(move |cx| async move {
             let calls = Arc::new(AtomicUsize::new(0));
-            let endpoint = auth_00_mrtr_server(true, &calls)
+            let endpoint = auth_00_mrtr_server(owner, &calls)
                 .test_http_endpoint("http://auth-owner.test")
                 .unwrap();
             let initial = auth_00_mrtr_http_call(&cx, &endpoint, None, 981).await;
@@ -31862,7 +31982,7 @@ mod lib_unit_tests {
             let calls = Arc::new(AtomicUsize::new(0));
             // Same valid credential, subject, request and handler as the
             // positive; only the provider's stable owner is absent.
-            let endpoint = auth_00_mrtr_server(false, &calls)
+            let endpoint = auth_00_mrtr_server(Auth00Owner::Absent, &calls)
                 .test_http_endpoint("http://auth-owner.test")
                 .unwrap();
             let response = auth_00_mrtr_http_call(&cx, &endpoint, None, 981).await;
@@ -31879,8 +31999,8 @@ mod lib_unit_tests {
     fn auth_00_http_mrtr_ownerless_leaked_handle_preserves_owner_state() {
         run_live_http_test(|cx| async move {
             let calls = Arc::new(AtomicUsize::new(0));
-            let owner_server = auth_00_mrtr_server(true, &calls);
-            let mut ownerless_server = auth_00_mrtr_server(false, &calls);
+            let owner_server = auth_00_mrtr_server(Auth00Owner::Configured, &calls);
+            let mut ownerless_server = auth_00_mrtr_server(Auth00Owner::Absent, &calls);
             // Both public endpoints use the same real exchange registry.
             // Independent registries would reject even without owner checks.
             ownerless_server.router = Arc::clone(&owner_server.router);
@@ -31982,7 +32102,7 @@ mod lib_unit_tests {
         run_live_http_test(move |cx| async move {
             for state_only in [false, true] {
                 let calls = Arc::new(AtomicUsize::new(0));
-                let endpoint = auth_00_mrtr_server(true, &calls)
+                let endpoint = auth_00_mrtr_server(Auth00Owner::Configured, &calls)
                     .test_http_endpoint("http://auth-owner.test")
                     .unwrap();
                 let mut issuer = endpoint.open_session(&cx).unwrap();
@@ -35231,7 +35351,7 @@ mod lib_unit_tests {
         let failure_from_receive = Arc::clone(&failure);
         let error = Server::new("returning-notification-failure-test", "1.0.0")
             .build()
-            .run_loop_returning_legacy(
+            .run_loop_returning(
                 &Cx::for_testing(),
                 move |_receive_cx| {
                     failure_from_receive.store(true, Ordering::Release);
@@ -35265,7 +35385,7 @@ mod lib_unit_tests {
         let emitted_from_receive = Arc::clone(&emitted);
         let error = Server::new("returning-notification-send-race-test", "1.0.0")
             .build()
-            .run_loop_returning_legacy(
+            .run_loop_returning(
                 &Cx::for_testing(),
                 move |_receive_cx| {
                     if emitted_from_receive.swap(true, Ordering::AcqRel) {
@@ -35304,7 +35424,7 @@ mod lib_unit_tests {
         let failure_from_send = Arc::clone(&failure);
         let error = Server::new("returning-notification-parse-error-race-test", "1.0.0")
             .build()
-            .run_loop_returning_legacy(
+            .run_loop_returning(
                 &Cx::for_testing(),
                 move |_receive_cx| {
                     Err(TransportError::Codec(fastmcp_transport::CodecError::Json(
@@ -39715,14 +39835,28 @@ mod lib_unit_tests {
                     .unwrap()
                     .as_nanos()
             );
-            let mut refreshed = AuthContext::with_subject(subject.clone());
+            // TokenAuthProvider derives a fallback owner per credential, so a
+            // rotated credential changes it (756719c3). Continuity across the
+            // refresh therefore needs the verifier's own owner, as auth.rs
+            // documents; the foreign caller has a distinct one.
+            let verified_owner = |subject: &str| {
+                sha256_bounded(subject.as_bytes(), 256).expect("bounded test owner subject")
+            };
+            let owner = verified_owner(&subject);
+            let mut refreshed =
+                AuthContext::with_subject(subject.clone()).with_session_owner(owner);
             refreshed.scopes = vec!["tasks".to_owned()];
+            let foreign_subject = format!("foreign-{subject}");
             let verifier = StaticTokenVerifier::new([
-                ("owner-first", AuthContext::with_subject(subject.clone())),
+                (
+                    "owner-first",
+                    AuthContext::with_subject(subject.clone()).with_session_owner(owner),
+                ),
                 ("owner-refreshed", refreshed),
                 (
                     "foreign-valid",
-                    AuthContext::with_subject(format!("foreign-{subject}")),
+                    AuthContext::with_subject(foreign_subject.clone())
+                        .with_session_owner(verified_owner(&foreign_subject)),
                 ),
             ])
             .map_err(|error| error.to_string())?;
@@ -45854,13 +45988,31 @@ mod lib_unit_tests {
         .expect("valid verifier configuration")
         .with_allowed_schemes(["Bearer"])
         .expect("valid scheme configuration");
-        let alice = crate::auth::principal_fingerprint(Some(&AuthContext::with_subject("alice")))
-            .expect("alice fingerprint");
-        let bob = crate::auth::principal_fingerprint(Some(&AuthContext::with_subject("bob")))
-            .expect("bob fingerprint");
+        // The session binds the context the installed provider admits. For
+        // these subject-only contexts that includes the owner the provider
+        // derives (756719c3), in a namespace its clones share. So derive each
+        // expected fingerprint by admitting the credential through it.
+        let provider = TokenAuthProvider::new(verifier);
+        let admitted_fingerprint = |token: &str| {
+            let authorization = format!("Bearer {token}");
+            let admitted = provider
+                .authenticate(
+                    &McpContext::new(cx.clone(), 0),
+                    AuthRequest {
+                        method: "initialize",
+                        params: None,
+                        transport_authorization: Some(&authorization),
+                        request_id: 0,
+                    },
+                )
+                .expect("the installed provider admits its own credential");
+            crate::auth::principal_fingerprint(Some(&admitted)).expect("admitted fingerprint")
+        };
+        let alice = admitted_fingerprint("alpha");
+        let bob = admitted_fingerprint("beta");
         let endpoint = Server::new("legacy-sse-owner", "1.0.0")
             .tool(LiveRuntimeListedTool)
-            .auth_provider(TokenAuthProvider::new(verifier))
+            .auth_provider(provider.clone())
             .build_http_endpoint("http://legacy.test")
             .expect("dual-era endpoint must build");
         let mut session = endpoint
@@ -48545,7 +48697,7 @@ mod lib_unit_tests {
                 let mut pump = cx
                     .spawn_blocking(move |pump_cx| {
                         let mut phase = 0;
-                        server.run_loop_returning_legacy(
+                        server.run_loop_returning(
                             &pump_cx,
                             move |_| {
                                 let current = phase;
@@ -48681,7 +48833,7 @@ mod lib_unit_tests {
                         modern_discovery_opening_request(),
                         modern_subscriptions_listen_request(906),
                     ]);
-                    server.run_loop_returning_legacy(
+                    server.run_loop_returning(
                         &pump_cx,
                         move |_| {
                             if let Some(request) = incoming.pop_front() {
@@ -49116,7 +49268,7 @@ mod lib_unit_tests {
                 let mut pump = cx
                     .spawn_blocking(move |pump_cx| {
                         let mut phase = 0;
-                        server.run_loop_returning_legacy(
+                        server.run_loop_returning(
                             &pump_cx,
                             move |_| {
                                 let current = phase;
@@ -49490,6 +49642,377 @@ mod lib_unit_tests {
         );
         let wire = serde_json::to_value(response).expect("parse error response must serialize");
         assert!(wire.get("id").is_none());
+    }
+
+    struct ModernReturningScriptTransport {
+        steps: std::collections::VecDeque<Result<JsonRpcMessage, TransportError>>,
+        received: Arc<AtomicUsize>,
+        sent: Arc<Mutex<Vec<JsonRpcMessage>>>,
+        closed: Arc<AtomicUsize>,
+    }
+
+    impl Transport for ModernReturningScriptTransport {
+        fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+            self.received.fetch_add(1, Ordering::AcqRel);
+            self.steps.pop_front().unwrap_or(Err(TransportError::Closed))
+        }
+
+        fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+            self.sent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(message.clone());
+            Ok(())
+        }
+
+        fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+            self.closed.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+    }
+
+    struct ModernReturningCallbackTransport<R> {
+        receive: R,
+        sent: Arc<Mutex<Vec<JsonRpcMessage>>>,
+    }
+
+    impl<R> Transport for ModernReturningCallbackTransport<R>
+    where
+        R: FnMut(&Cx) -> Result<JsonRpcMessage, TransportError>,
+    {
+        fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+            (self.receive)(cx)
+        }
+
+        fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+            self.sent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(message.clone());
+            Ok(())
+        }
+
+        fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    struct ReleaseModernReturningBlocker(Arc<NonQuiescentLegacyControl>);
+
+    impl Drop for ReleaseModernReturningBlocker {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    #[test]
+    fn modern_returning_loop_queued_subscription_below_capacity_allows_request() {
+        modern_returning_loop_queued_capacity_case(false);
+    }
+
+    #[test]
+    fn modern_returning_loop_queued_subscription_at_capacity_rejects_request() {
+        modern_returning_loop_queued_capacity_case(true);
+    }
+
+    fn modern_returning_loop_queued_capacity_case(at_capacity: bool) {
+        // The receive loop is synchronous; a second async worker must keep
+        // polling the caller-owned spawn wrappers while this one receives.
+        let runtime = RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .blocking_threads(1, 1)
+            .build()
+            .expect("queued admission runtime");
+        runtime.block_on(async move {
+            let cx = Cx::current().expect("caller runtime context");
+            let blocker_control = Arc::new(NonQuiescentLegacyControl::default());
+            let _release = ReleaseModernReturningBlocker(Arc::clone(&blocker_control));
+            let blocker_wait = Arc::clone(&blocker_control);
+            let mut blocker = cx
+                .spawn_blocking(move |_| blocker_wait.wait_until_released())
+                .expect("the only blocking worker is admitted");
+            assert!(blocker_control.wait_for_started(Duration::from_secs(2)));
+            let server = Server::new("modern-returning-queued-capacity", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("modern policy")
+                .build();
+            let active = Arc::clone(&server.active_requests);
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let sent_for_receive = Arc::clone(&sent);
+            let queued = MAX_DISPATCH_QUEUE_DEPTH - usize::from(!at_capacity);
+            let mut phase = 0;
+            server
+                .run_transport_returning_with_cx(
+                    &cx,
+                    ModernReturningCallbackTransport {
+                        receive: move |_: &Cx| {
+                            let current = phase;
+                            phase += 1;
+                            if current < queued {
+                                return Ok(modern_subscriptions_listen_request(
+                                    10_000 + current as i64,
+                                ));
+                            }
+                            if current == queued {
+                                return Ok(modern_discovery_request(11_000));
+                            }
+                            let owners = active
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            assert_eq!(owners.len(), queued);
+                            let messages = sent_for_receive
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let [JsonRpcMessage::Response(response)] = messages.as_slice() else {
+                                panic!("queued listens must not execute before the worker is free");
+                            };
+                            assert_eq!(response.id, Some(11_000_i64.into()));
+                            if at_capacity {
+                                assert_eq!(
+                                    response.error.as_ref().unwrap().code.as_i32(),
+                                    Some(RESOURCE_EXHAUSTED_ERROR_CODE)
+                                );
+                            } else {
+                                assert!(response.error.is_none());
+                            }
+                            for owner in owners.values() {
+                                owner.cancellation.cancel();
+                            }
+                            drop(owners);
+                            blocker_control.release();
+                            Err(TransportError::Closed)
+                        },
+                        sent,
+                    },
+                )
+                .expect("queued owners retire after their blocker is released");
+            blocker.join(&cx).await.expect("blocker retires");
+        });
+    }
+
+    #[test]
+    fn modern_returning_loop_opening_listen_accepts_queued_peer_cancellation() {
+        modern_returning_loop_queued_cancellation_case(true);
+    }
+
+    #[test]
+    fn modern_returning_loop_opening_listen_ignores_unrelated_queued_cancellation() {
+        modern_returning_loop_queued_cancellation_case(false);
+    }
+
+    fn modern_returning_loop_queued_cancellation_case(matching: bool) {
+        struct ObserveSubscriptionStart(Arc<BoundedTestSignal>);
+
+        impl Middleware for ObserveSubscriptionStart {
+            fn on_request(
+                &self,
+                _ctx: &McpContext,
+                request: &JsonRpcRequest,
+            ) -> McpResult<MiddlewareDecision> {
+                if request.method == SUBSCRIPTIONS_LISTEN {
+                    self.0.raise();
+                }
+                Ok(MiddlewareDecision::Continue)
+            }
+        }
+
+        let runtime = RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .blocking_threads(1, 1)
+            .build()
+            .expect("queued cancellation runtime");
+        runtime.block_on(async move {
+            let cx = Cx::current().expect("caller runtime context");
+            let blocker_control = Arc::new(NonQuiescentLegacyControl::default());
+            let _release = ReleaseModernReturningBlocker(Arc::clone(&blocker_control));
+            let blocker_wait = Arc::clone(&blocker_control);
+            let mut blocker = cx
+                .spawn_blocking(move |_| blocker_wait.wait_until_released())
+                .expect("the only blocking worker is admitted");
+            assert!(blocker_control.wait_for_started(Duration::from_secs(2)));
+            let started = Arc::new(BoundedTestSignal::default());
+            let started_for_receive = Arc::clone(&started);
+            let server = Server::new("modern-returning-opening-listen-cancellation", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("modern policy")
+                .middleware(ObserveSubscriptionStart(Arc::clone(&started)))
+                .build();
+            let active = Arc::clone(&server.active_requests);
+            let active_for_receive = Arc::clone(&active);
+            let mut phase = 0;
+            server
+                .run_transport_returning_with_cx(
+                    &cx,
+                    ModernReturningCallbackTransport {
+                        receive: move |_: &Cx| {
+                            let current = phase;
+                            phase += 1;
+                            match current {
+                                0 => Ok(modern_subscriptions_listen_request(12_000)),
+                                1 => Ok(modern_cancelled_notification(if matching {
+                                    12_000
+                                } else {
+                                    12_001
+                                })),
+                                _ => {
+                                    let owners = active_for_receive
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    assert_eq!(owners.len(), 1);
+                                    let owner = owners.values().next().unwrap();
+                                    assert_eq!(
+                                        owner.cancellation.is_cancel_requested(),
+                                        matching,
+                                        "the opening listen must bind its principal before spawn"
+                                    );
+                                    let completion = Arc::clone(&owner.completion);
+                                    drop(owners);
+                                    blocker_control.release();
+                                    if matching {
+                                        assert!(completion.wait_timeout(Duration::from_secs(2)));
+                                    } else {
+                                        assert!(started_for_receive.wait(Duration::from_secs(2)));
+                                    }
+                                    Err(TransportError::Closed)
+                                }
+                            }
+                        },
+                        sent: Arc::new(Mutex::new(Vec::new())),
+                    },
+                )
+                .expect("queued cancellation must preserve a clean shutdown");
+            blocker.join(&cx).await.expect("blocker retires");
+            assert_eq!(started.wait(Duration::ZERO), !matching);
+            assert!(active.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn modern_returning_loop_valid_peer_response_preserves_next_request() {
+        modern_returning_loop_peer_response_case(false);
+    }
+
+    #[test]
+    fn modern_returning_loop_invalid_peer_response_stops_before_next_request() {
+        modern_returning_loop_peer_response_case(true);
+    }
+
+    fn modern_returning_loop_peer_response_case(invalid_version: bool) {
+        let mut response = JsonRpcResponse::success(9900_i64.into(), serde_json::json!({}));
+        if invalid_version {
+            response.jsonrpc = "1.0".to_owned();
+        }
+        let received = Arc::new(AtomicUsize::new(0));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let closed = Arc::new(AtomicUsize::new(0));
+        let result = Server::new("modern-returning-response-validation", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("the modern profile must be available")
+            .build()
+            .run_transport_returning_with_cx(
+                &Cx::for_testing(),
+                ModernReturningScriptTransport {
+                    steps: std::collections::VecDeque::from([
+                        Ok(modern_discovery_request(9901)),
+                        Ok(JsonRpcMessage::Response(response)),
+                        Ok(modern_discovery_request(9902)),
+                        Err(TransportError::Closed),
+                    ]),
+                    received: Arc::clone(&received),
+                    sent: Arc::clone(&sent),
+                    closed: Arc::clone(&closed),
+                },
+            );
+        let messages = sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(closed.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            messages.first(),
+            Some(JsonRpcMessage::Response(response))
+                if response.id == Some(9901_i64.into()) && response.error.is_none()
+        ));
+        if invalid_version {
+            let error = result.expect_err("an invalid peer response must terminate ingress");
+            assert_eq!(error.data.as_ref().unwrap()["stage"], "receive");
+            assert_eq!(error.data.as_ref().unwrap()["kind"], "invalid_response");
+            assert_eq!(received.load(Ordering::Acquire), 2);
+            assert_eq!(messages.len(), 1, "no later request may be dispatched");
+        } else {
+            result.expect("a valid unmatched response must not poison the connection");
+            assert_eq!(received.load(Ordering::Acquire), 4);
+            assert_eq!(messages.len(), 2);
+            assert!(matches!(
+                messages.last(),
+                Some(JsonRpcMessage::Response(response))
+                    if response.id == Some(9902_i64.into()) && response.error.is_none()
+            ));
+        }
+    }
+
+    #[test]
+    fn modern_returning_loop_complete_json_error_replies_and_continues() {
+        modern_returning_loop_codec_boundary_case(false);
+    }
+
+    #[test]
+    fn modern_returning_loop_unbounded_frame_error_stops_without_reply() {
+        modern_returning_loop_codec_boundary_case(true);
+    }
+
+    fn modern_returning_loop_codec_boundary_case(lost_frame_boundary: bool) {
+        let codec_error = if lost_frame_boundary {
+            fastmcp_transport::CodecError::MessageTooLarge(1)
+        } else {
+            fastmcp_transport::CodecError::Json(
+                serde_json::from_str::<serde_json::Value>("{")
+                    .expect_err("the complete frame contains malformed JSON"),
+            )
+        };
+        let received = Arc::new(AtomicUsize::new(0));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let closed = Arc::new(AtomicUsize::new(0));
+        let result = Server::new("modern-returning-codec-boundary", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("the modern profile must be available")
+            .build()
+            .run_transport_returning_with_cx(
+                &Cx::for_testing(),
+                ModernReturningScriptTransport {
+                    steps: std::collections::VecDeque::from([
+                        Err(TransportError::Codec(codec_error)),
+                        Ok(modern_discovery_request(9911)),
+                        Err(TransportError::Closed),
+                    ]),
+                    received: Arc::clone(&received),
+                    sent: Arc::clone(&sent),
+                    closed: Arc::clone(&closed),
+                },
+            );
+        let messages = sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(closed.load(Ordering::Acquire), 1);
+        if lost_frame_boundary {
+            let error = result.expect_err("a lost framing boundary must terminate ingress");
+            assert_eq!(error.data.as_ref().unwrap()["stage"], "receive");
+            assert_eq!(error.data.as_ref().unwrap()["kind"], "codec");
+            assert_eq!(received.load(Ordering::Acquire), 1);
+            assert!(messages.is_empty(), "an unbounded frame must receive no reply");
+        } else {
+            result.expect("a complete malformed JSON frame must permit the next request");
+            assert_eq!(received.load(Ordering::Acquire), 3);
+            let [JsonRpcMessage::Response(parse_error), JsonRpcMessage::Response(discovery)] =
+                messages.as_slice()
+            else {
+                panic!("expected one parse error followed by one discovery response");
+            };
+            assert!(parse_error.id.is_none());
+            assert_eq!(parse_error.error.as_ref().unwrap().code.as_i32(), Some(-32700));
+            assert!(parse_error.error.as_ref().unwrap().data.is_none());
+            assert_eq!(discovery.id, Some(9911_i64.into()));
+            assert!(discovery.error.is_none());
+        }
     }
 
     // Exact-2024 era: negotiates the connection with a legacy initialize.
@@ -51984,7 +52507,7 @@ mod lib_unit_tests {
                 serde_json::json!(730)
             );
         }
-        let queue = held.handle._lease.election.opening_events.lock().unwrap();
+        let queue = held.handle.lease().election.opening_events.lock().unwrap();
         assert_eq!((queue.retained_events, queue.retained_bytes), (0, 0));
     }
 
@@ -52023,7 +52546,7 @@ mod lib_unit_tests {
             );
         }
         {
-            let queue = held.handle._lease.election.opening_events.lock().unwrap();
+            let queue = held.handle.lease().election.opening_events.lock().unwrap();
             assert_eq!(queue.retained_events, MAX_FINAL_SUBSCRIPTION_QUEUED_EVENTS);
             assert!(queue.retained_bytes > 0);
         }
@@ -52035,7 +52558,7 @@ mod lib_unit_tests {
             "one extra event must retire only the listener at its bound"
         );
         {
-            let queue = held.handle._lease.election.opening_events.lock().unwrap();
+            let queue = held.handle.lease().election.opening_events.lock().unwrap();
             assert_eq!(
                 (
                     queue.retained_events,
@@ -52052,7 +52575,7 @@ mod lib_unit_tests {
                 .lock()
                 .unwrap()
                 .entries
-                .contains_key(&held.handle._lease.key),
+                .contains_key(&held.handle.lease().key),
             "capacity must be released while the failed callback and public handle remain live"
         );
         assert_eq!(
@@ -52097,7 +52620,7 @@ mod lib_unit_tests {
                 .expect("first event must enter");
             let first_bytes = held
                 .handle
-                ._lease
+                .lease()
                 .election
                 .opening_events
                 .lock()
@@ -52124,7 +52647,7 @@ mod lib_unit_tests {
                 .publish_subscription_notification(event(payload))
                 .unwrap();
             {
-                let queue = held.handle._lease.election.opening_events.lock().unwrap();
+                let queue = held.handle.lease().election.opening_events.lock().unwrap();
                 if excess == 0 {
                     assert_eq!(
                         (admitted, queue.retained_events, queue.retained_bytes),
@@ -52142,7 +52665,7 @@ mod lib_unit_tests {
                             .lock()
                             .unwrap()
                             .entries
-                            .contains_key(&held.handle._lease.key)
+                            .contains_key(&held.handle.lease().key)
                     );
                 }
             }
@@ -52158,7 +52681,7 @@ mod lib_unit_tests {
                 held.frames.lock().unwrap().len(),
                 if excess == 0 { 3 } else { 2 }
             );
-            let queue = held.handle._lease.election.opening_events.lock().unwrap();
+            let queue = held.handle.lease().election.opening_events.lock().unwrap();
             assert_eq!((queue.retained_events, queue.retained_bytes), (0, 0));
         }
 
@@ -52203,9 +52726,9 @@ mod lib_unit_tests {
                 .lock()
                 .unwrap()
                 .entries
-                .contains_key(&handle._lease.key)
+                .contains_key(&handle.lease().key)
         );
-        let queue = handle._lease.election.opening_events.lock().unwrap();
+        let queue = handle.lease().election.opening_events.lock().unwrap();
         assert_eq!((queue.retained_events, queue.retained_bytes), (0, 0));
         drop(queue);
         assert_eq!(
@@ -52297,7 +52820,7 @@ mod lib_unit_tests {
                     .collect::<Vec<_>>(),
                 expected
             );
-            assert_eq!(handle._lease.has_graceful_completion(), terminate);
+            assert_eq!(handle.lease().has_graceful_completion(), terminate);
             if panic_after_enqueue {
                 assert!(
                     server
@@ -52309,7 +52832,7 @@ mod lib_unit_tests {
                         .is_empty()
                 );
             }
-            let queue = handle._lease.election.opening_events.lock().unwrap();
+            let queue = handle.lease().election.opening_events.lock().unwrap();
             assert_eq!((queue.retained_events, queue.retained_bytes), (0, 0));
         }
     }
@@ -55124,6 +55647,101 @@ mod lib_unit_tests {
                     "peer-close path emitted an event instead of closing without completion"
                         .to_owned(),
                 );
+            }
+            Ok(())
+        });
+    }
+
+    #[cfg(feature = "tasks")]
+    struct IdleHostedTaskSupervisor;
+
+    #[cfg(feature = "tasks")]
+    impl ApplicationTaskSupervisor for IdleHostedTaskSupervisor {
+        fn resume<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Serves `bound` until `runtime` reports a ready Task service or a bound
+    /// passes, then cancels the serve. Returns whether the service was ready.
+    #[cfg(feature = "tasks")]
+    async fn serve_until_task_service_ready(
+        cx: &Cx,
+        bound: BoundHttpServer,
+        runtime: FinalTaskRuntime,
+    ) -> Result<bool, String> {
+        let caller_cx = cx.clone();
+        let mut observer = cx
+            .spawn(move |observer_cx| async move {
+                let mut ready = false;
+                for _ in 0..2_000 {
+                    if runtime.is_task_service_ready() {
+                        ready = true;
+                        break;
+                    }
+                    asupersync::time::sleep(observer_cx.now(), Duration::from_millis(1)).await;
+                }
+                caller_cx.cancel_with(CancelKind::User, Some("hosted Task service observed"));
+                ready
+            })
+            .map_err(|error| format!("observer admission failed: {error}"))?;
+        let serve = bound.serve(cx).await;
+        let ready = observer
+            .join(cx)
+            .await
+            .map_err(|error| format!("observer failed: {error:?}"))?;
+        let shutdown = serve.map_err(|error| format!("hosted Tasks serve failed: {error}"))?;
+        require_quiescent_http_shutdown(shutdown, "hosted Tasks serve").await?;
+        Ok(ready)
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn live_http_hosts_a_ready_task_service_and_settles_it_when_serve_is_cancelled() {
+        run_live_http_test(|cx| async move {
+            let server = Server::new("live-hosted-tasks", "1.0.0")
+                .task_supervisor(Arc::new(IdleHostedTaskSupervisor))
+                .build();
+            let runtime = server
+                .final_task_runtime()
+                .cloned()
+                .ok_or_else(|| "the default Tasks runtime is installed".to_owned())?;
+            if runtime.is_task_service_ready() {
+                return Err("building must not start the Task service".to_owned());
+            }
+            let bound = server
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("hosted Tasks bind failed: {error}"))?;
+            if !serve_until_task_service_ready(&cx, bound, runtime.clone()).await? {
+                return Err("the serve must host a ready Task service".to_owned());
+            }
+            if runtime.is_task_service_ready() {
+                return Err("no Task service runner may still run after serve returns".to_owned());
+            }
+            Ok(())
+        });
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn live_http_without_a_task_supervisor_hosts_no_task_service() {
+        run_live_http_test(|cx| async move {
+            let server = Server::new("live-unhosted-tasks", "1.0.0").build();
+            let runtime = server
+                .final_task_runtime()
+                .cloned()
+                .ok_or_else(|| "the default Tasks runtime is installed".to_owned())?;
+            let bound = server
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("unhosted Tasks bind failed: {error}"))?;
+            if serve_until_task_service_ready(&cx, bound, runtime).await? {
+                return Err("a server without task_supervisor must host no Task service".to_owned());
             }
             Ok(())
         });

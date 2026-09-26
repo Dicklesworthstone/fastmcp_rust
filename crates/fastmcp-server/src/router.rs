@@ -520,7 +520,7 @@ struct FinalCatalogCursor {
 }
 
 const MODERN_CATALOG_CURSOR_PREFIX: &str = "fc1.";
-const MODERN_CATALOG_CURSOR_LIFETIME: Duration = Duration::from_secs(5 * 60);
+const MODERN_CATALOG_CURSOR_LIFETIME: Duration = Duration::from_mins(5);
 const MAX_CATALOG_BINDING_BYTES: usize = 64 * 1024;
 const INVALID_MODERN_CATALOG_CURSOR: &str = "Invalid catalog cursor";
 

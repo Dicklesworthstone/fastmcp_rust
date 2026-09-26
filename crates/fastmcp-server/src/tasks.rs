@@ -5654,8 +5654,10 @@ impl FinalTaskRuntime {
 
     /// Ensures cancellation's store result is either the unchanged exact
     /// elected snapshot or the exact terminal cancellation proposed by this
-    /// runtime. A permissive backend must not substitute another active or
-    /// terminal task after winning the cancellation compare-and-swap.
+    /// runtime. The elected worker may already have consumed cancellation
+    /// intent and committed its own terminal cancellation before readback.
+    /// Only that monotonic successor may replace the returned active snapshot;
+    /// an unrelated transition or substituted store result still fails closed.
     fn validate_cancellation_store_result(
         &self,
         expected: &FinalTaskSnapshot,
@@ -5674,7 +5676,7 @@ impl FinalTaskRuntime {
                         "Final task store returned an invalid terminal cancellation transition",
                     )
                 })?;
-                if returned.generation() == expected.generation()
+                if returned.generation() <= expected.generation()
                     || !final_tasks_match_exactly(returned.task(), cancelled_task)?
                 {
                     return Err(McpError::internal_error(
@@ -5686,9 +5688,6 @@ impl FinalTaskRuntime {
             FinalTask::Working(_) => {
                 if returned.generation() != expected.generation()
                     || !final_tasks_match_exactly(returned.task(), expected.task())?
-                    || !self
-                        .store
-                        .is_cancellation_requested(&expected.task().base().task_id)?
                 {
                     return Err(McpError::internal_error(
                         "Final task store returned a substituted active cancellation snapshot",
@@ -5702,16 +5701,46 @@ impl FinalTaskRuntime {
                 ));
             }
         };
-        let committed = self.load_task_snapshot(&expected.task().base().task_id)?;
-        if committed.generation() != returned.generation()
-            || committed.authenticated_principal() != returned.authenticated_principal()
-            || !final_tasks_match_exactly(committed.task(), returned.task())?
+        let task_id = &expected.task().base().task_id;
+        // Read intent before the snapshot. A worker can consume intent only by
+        // leaving a terminal cancellation, so a false intent observation must
+        // be followed by a read that can observe that newer terminal state.
+        // Reversing these reads can pair a stale Working snapshot with the
+        // already-consumed intent and reject a successfully committed cancel.
+        let cancellation_requested =
+            !terminal && self.store.is_cancellation_requested(task_id)?;
+        let committed = self.load_task_snapshot(task_id)?;
+        if committed.authenticated_principal() != returned.authenticated_principal() {
+            return Err(McpError::internal_error(
+                "Final task store changed the task principal",
+            ));
+        }
+        if committed.generation() == returned.generation()
+            && final_tasks_match_exactly(committed.task(), returned.task())?
+        {
+            if !terminal && !cancellation_requested {
+                return Err(McpError::internal_error(
+                    "Final task store did not retain the active cancellation intent",
+                ));
+            }
+            return Ok(terminal);
+        }
+        if terminal
+            || committed.generation() <= returned.generation()
+            || !matches!(committed.task(), FinalTask::Cancelled(_))
         {
             return Err(McpError::internal_error(
                 "Final task store returned cancellation data that is not durably retained",
             ));
         }
-        Ok(terminal)
+        validate_final_task_transition(returned.task(), committed.task()).map_err(|_| {
+            McpError::internal_error(
+                "Final task store returned an invalid cooperative cancellation transition",
+            )
+        })?;
+        // The worker owns this terminal transition and its notification. The
+        // request only acknowledges its already committed cancellation intent.
+        Ok(false)
     }
 
     /// Returns durable cancellation intent for a caller-owned task worker.
@@ -10183,6 +10212,346 @@ mod tests {
             "rejected recovery claims never rewrite the retained task"
         );
         assert_eq!(after.generation(), baseline.generation());
+    }
+
+    /// Keeps the real store's cancellation and dispatch fencing, while
+    /// deterministically scheduling worker retirement around the intent read.
+    struct CancellationReadbackProbeStore {
+        inner: Arc<InMemoryFinalTaskStore>,
+        retire_after_intent_read: bool,
+        retirement: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl FinalTaskStore for CancellationReadbackProbeStore {
+        fn create_task(
+            &self,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+        ) -> McpResult<()> {
+            self.inner.create_task(task, notification)
+        }
+
+        fn get_task(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTask>> {
+            self.inner.get_task(task_id)
+        }
+
+        fn get_task_snapshot(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner.get_task_snapshot(task_id)
+        }
+
+        fn replace_task(
+            &self,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+        ) -> McpResult<()> {
+            self.inner.replace_task(task, notification)
+        }
+
+        fn replace_task_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+        ) -> McpResult<bool> {
+            self.inner
+                .replace_task_if_current(expected, task, notification)
+        }
+
+        fn request_cancellation_and_clear_input_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            cancelled_task: FinalTask,
+            cancelled_notification: FinalTaskStatusNotification,
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner.request_cancellation_and_clear_input_if_current(
+                expected,
+                cancelled_task,
+                cancelled_notification,
+            )
+        }
+
+        fn request_cancellation(&self, task_id: &FinalTaskId) -> McpResult<()> {
+            self.inner.request_cancellation(task_id)
+        }
+
+        fn request_cancellation_if_current(&self, expected: &FinalTaskSnapshot) -> McpResult<bool> {
+            self.inner.request_cancellation_if_current(expected)
+        }
+
+        fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool> {
+            let retirement = self.retirement.lock().unwrap().take();
+            if self.retire_after_intent_read {
+                let requested = self.inner.is_cancellation_requested(task_id)?;
+                if let Some(retire) = retirement {
+                    retire();
+                }
+                Ok(requested)
+            } else {
+                if let Some(retire) = retirement {
+                    retire();
+                }
+                self.inner.is_cancellation_requested(task_id)
+            }
+        }
+
+        fn retention_clock_now(&self) -> Instant {
+            self.inner.retention_clock_now()
+        }
+
+        fn task_retention_deadline_if_current(
+            &self,
+            task_id: &FinalTaskId,
+            generation: u64,
+        ) -> McpResult<Option<FinalTaskRetentionDeadline>> {
+            self.inner
+                .task_retention_deadline_if_current(task_id, generation)
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum CancellationReadbackMutation {
+        Principal,
+        Identity,
+        CreatedAt,
+        Retention,
+        PollInterval,
+        SameGeneration,
+        OlderGeneration,
+        Completed,
+        WorkingWithoutIntent,
+    }
+
+    fn assert_cancellation_retirement_readback(
+        retire_after_intent_read: bool,
+        mutation: Option<CancellationReadbackMutation>,
+    ) {
+        const OWNER: &str = "cancellation-readback-owner";
+        let inner = Arc::new(InMemoryFinalTaskStore::default());
+        let worker_runtime = final_task_runtime(inner.clone(), Arc::new(AtomicBool::new(false)));
+        let responses = serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
+            .expect("typed roots response");
+        let task_id = create_accepted_final_input(&worker_runtime, responses);
+        let expected = inner.get_task_snapshot(&task_id).unwrap().unwrap();
+        assert!(
+            inner
+                .take_input_handoff_for_owner_if_current(&expected, OWNER)
+                .unwrap()
+                .is_some()
+        );
+        let fence = inner
+            .begin_handoff_dispatch_for_owner_if_current(&task_id, expected.generation(), OWNER)
+            .unwrap()
+            .expect("the resumed supervisor owns the dispatch fence");
+        let retained_after_retirement = Arc::new(Mutex::new(None));
+        let retained_for_worker = retained_after_retirement.clone();
+        let inner_for_worker = inner.clone();
+        let expected_for_worker = expected.clone();
+        let task_for_worker = task_id.clone();
+        let retirement = Box::new(move || {
+            let cancelled = FinalTask::Cancelled(
+                transition_terminal_final_task_base(
+                    expected_for_worker.task().base().clone(),
+                    FinalTaskStatus::Cancelled,
+                    Some("retired by the elected supervisor".to_owned()),
+                )
+                .unwrap(),
+            );
+            worker_runtime
+                .persist_fenced_handoff_transition_clearing_input(
+                    &expected_for_worker,
+                    OWNER,
+                    fence,
+                    true,
+                    cancelled.clone(),
+                )
+                .expect("the cancellation winner lets its exact elected worker retire");
+            if let Some(mutation) = mutation {
+                // Change only the forbidden readback fact after the real
+                // fenced retirement. This models a substituting backend;
+                // production mutation APIs correctly refuse these writes.
+                let mut state = inner_for_worker.state.lock().unwrap();
+                let mut base = cancelled.base().clone();
+                match mutation {
+                    CancellationReadbackMutation::Principal => {
+                        state.authenticated_principals.insert(
+                            task_for_worker.clone(),
+                            Sha256Digest::from_bytes([17; 32]),
+                        );
+                    }
+                    CancellationReadbackMutation::Identity => {
+                        base.task_id = FinalTaskId::parse("substituted-task").unwrap();
+                    }
+                    CancellationReadbackMutation::CreatedAt => {
+                        base.created_at = FinalTaskTimestamp::parse("2026-07-28T12:00:00Z").unwrap();
+                    }
+                    CancellationReadbackMutation::Retention => {
+                        base.ttl_ms = None;
+                    }
+                    CancellationReadbackMutation::PollInterval => {
+                        base.poll_interval_ms = Some(final_task_duration(9_999).unwrap());
+                    }
+                    CancellationReadbackMutation::SameGeneration => {
+                        state.generations.insert(
+                            task_for_worker.clone(),
+                            expected_for_worker.generation(),
+                        );
+                    }
+                    CancellationReadbackMutation::OlderGeneration => {
+                        state.generations.insert(
+                            task_for_worker.clone(),
+                            expected_for_worker.generation() - 1,
+                        );
+                    }
+                    CancellationReadbackMutation::Completed => {
+                        base.status = FinalTaskStatus::Completed;
+                    }
+                    CancellationReadbackMutation::WorkingWithoutIntent => {
+                        base = expected_for_worker.task().base().clone();
+                        state.generations.insert(
+                            task_for_worker.clone(),
+                            expected_for_worker.generation(),
+                        );
+                    }
+                }
+                let replacement = match mutation {
+                    CancellationReadbackMutation::Completed => FinalTask::Completed {
+                        base,
+                        result: serde_json::from_value(serde_json::json!({"content": []})).unwrap(),
+                    },
+                    CancellationReadbackMutation::WorkingWithoutIntent => FinalTask::Working(base),
+                    _ => FinalTask::Cancelled(base),
+                };
+                state.tasks.insert(task_for_worker.clone(), replacement);
+            }
+            *retained_for_worker.lock().unwrap() = Some(input_key_store_snapshot(
+                &inner_for_worker,
+                &task_for_worker,
+            ));
+        });
+        let store = Arc::new(CancellationReadbackProbeStore {
+            inner: inner.clone(),
+            retire_after_intent_read,
+            retirement: Mutex::new(Some(retirement)),
+        });
+        let request_notifications = Arc::new(AtomicUsize::new(0));
+        let notifications_for_runtime = request_notifications.clone();
+        let runtime = FinalTaskRuntime::new(
+            store,
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000)).unwrap(),
+            Arc::new(move |_| {
+                notifications_for_runtime.fetch_add(1, AtomicOrdering::SeqCst);
+            }),
+        );
+        let result = dispatch_final_tasks_cancel(
+            &runtime,
+            &McpContext::new(Cx::for_testing(), 1),
+            final_task_method_parameters(&task_id),
+        );
+        if let Some(mutation) = mutation {
+            let error = result.expect_err("a substituted cancellation successor must fail closed");
+            assert_eq!(
+                error.code,
+                fastmcp_core::McpErrorCode::InternalError,
+                "{mutation:?}"
+            );
+        } else {
+            assert_eq!(
+                result.expect("successful cancellation survives prompt worker retirement"),
+                serde_json::json!({"resultType": "complete"})
+            );
+            let current = inner.get_task_snapshot(&task_id).unwrap().unwrap();
+            assert!(matches!(current.task(), FinalTask::Cancelled(_)));
+            assert!(current.generation() > expected.generation());
+            assert!(!inner.is_cancellation_requested(&task_id).unwrap());
+            assert_eq!(
+                current.task().base().status_message.as_deref(),
+                Some("retired by the elected supervisor")
+            );
+        }
+        assert_eq!(
+            input_key_store_snapshot(&inner, &task_id),
+            retained_after_retirement
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("worker retirement ran"),
+            "acknowledgement or rejection leaves the worker's durable state unchanged"
+        );
+        assert_eq!(
+            request_notifications.load(AtomicOrdering::SeqCst),
+            0,
+            "only the worker emits its terminal notification"
+        );
+    }
+
+    #[test]
+    fn task_03_cancellation_ack_survives_retirement_before_intent_read() {
+        assert_cancellation_retirement_readback(false, None);
+    }
+
+    #[test]
+    fn task_03_cancellation_ack_survives_retirement_between_intent_and_snapshot_reads() {
+        assert_cancellation_retirement_readback(true, None);
+    }
+
+    #[test]
+    fn task_03_cancellation_readback_rejects_substituted_successors_without_mutation() {
+        for mutation in [
+            CancellationReadbackMutation::Principal,
+            CancellationReadbackMutation::Identity,
+            CancellationReadbackMutation::CreatedAt,
+            CancellationReadbackMutation::Retention,
+            CancellationReadbackMutation::PollInterval,
+            CancellationReadbackMutation::SameGeneration,
+            CancellationReadbackMutation::OlderGeneration,
+            CancellationReadbackMutation::Completed,
+            CancellationReadbackMutation::WorkingWithoutIntent,
+        ] {
+            assert_cancellation_retirement_readback(false, Some(mutation));
+        }
+    }
+
+    #[test]
+    fn task_03_cancellation_rejects_terminal_generation_rollback_without_mutation() {
+        for advances in [true, false] {
+            let working = final_working_task_without_ttl("terminal-cancellation-generation");
+            let store = Arc::new(RuntimeBoundaryProbeFinalTaskStore::new(working));
+            let expected = store.snapshot();
+            let cancelled = FinalTask::Cancelled(
+                transition_terminal_final_task_base(
+                    expected.task().base().clone(),
+                    FinalTaskStatus::Cancelled,
+                    None,
+                )
+                .unwrap(),
+            );
+            let generation = if advances {
+                expected.generation() + 1
+            } else {
+                expected.generation() - 1
+            };
+            let returned = FinalTaskSnapshot::new(cancelled.clone(), generation);
+            *store.snapshot.lock().unwrap() = returned.clone();
+            let runtime = FinalTaskRuntime::new(
+                store.clone(),
+                FinalTaskRuntimeConfig::new(60_000, Some(5_000)).unwrap(),
+                Arc::new(|_| {}),
+            );
+            let result =
+                runtime.validate_cancellation_store_result(&expected, &cancelled, returned);
+            if advances {
+                assert!(result.expect("an exact retained terminal cancellation advances generation"));
+            } else {
+                let error = result.expect_err(
+                    "changing only the committed generation to an older value must be rejected",
+                );
+                assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
+            }
+            let retained = store.snapshot();
+            assert_eq!(retained.generation(), generation);
+            assert!(final_tasks_match_exactly(retained.task(), &cancelled).unwrap());
+            assert_eq!(store.transition_write_calls.load(AtomicOrdering::SeqCst), 0);
+        }
     }
 
     #[test]
@@ -20923,5 +21292,86 @@ mod tests {
             .expect("caller installs its own service");
         assert!(runtime.has_installed_task_service());
         assert!(TaskServiceHost::install(&runtime, Arc::new(IdleSupervisor)).is_err());
+    }
+
+    /// Holds its handoff in a cooperative checkpoint loop, as a long-running
+    /// application operation does until its service is cancelled.
+    struct HoldingSupervisor {
+        entered: Arc<AtomicBool>,
+    }
+
+    impl ApplicationTaskSupervisor for HoldingSupervisor {
+        fn resume<'a>(
+            &'a self,
+            cx: &'a Cx,
+            _handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            let entered = Arc::clone(&self.entered);
+            Box::pin(async move {
+                entered.store(true, AtomicOrdering::SeqCst);
+                loop {
+                    cx.checkpoint()
+                        .map_err(|error| McpError::internal_error(error.to_string()))?;
+                    asupersync::time::sleep(cx.now(), StdDuration::from_millis(1)).await;
+                }
+            })
+        }
+    }
+
+    /// Hosts a `HoldingSupervisor` with one created Task in flight, then
+    /// settles; `cancel_first` cancels the serve context before settling, as
+    /// every serve path does when it exits.
+    fn settle_held_supervisor(cancel_first: bool) {
+        let runtime = FinalTaskRuntime::in_memory(
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000)).expect("valid timing policy"),
+            Arc::new(|_| {}),
+        );
+        let entered = Arc::new(AtomicBool::new(false));
+        let host = TaskServiceHost::install(
+            &runtime,
+            Arc::new(HoldingSupervisor {
+                entered: Arc::clone(&entered),
+            }),
+        )
+        .expect("install host");
+        hosting_runtime().block_on(async {
+            let cx = Cx::current().expect("caller execution context");
+            let hosted = host.start_ready(&cx).await.expect("hosted service ready");
+            runtime
+                .create_task_with_work(final_test_work_descriptor(), None)
+                .expect("a hosted ready service admits creation");
+            for _ in 0..2_000 {
+                if entered.load(AtomicOrdering::SeqCst) {
+                    break;
+                }
+                asupersync::time::sleep(cx.now(), StdDuration::from_millis(1)).await;
+            }
+            assert!(
+                entered.load(AtomicOrdering::SeqCst),
+                "the supervisor holds the handoff"
+            );
+            if cancel_first {
+                cx.cancel_with(CancelKind::User, Some("serve ended"));
+            }
+            let started = std::time::Instant::now();
+            hosted
+                .settle(&cx)
+                .await
+                .expect("settling ends the held supervisor within its bound");
+            assert!(started.elapsed() < HOSTED_TASK_SERVICE_SETTLEMENT_BOUND);
+            assert!(!runtime.is_task_service_ready());
+        });
+    }
+
+    #[test]
+    fn settling_ends_supervisor_work_in_flight_within_its_bound() {
+        settle_held_supervisor(false);
+    }
+
+    /// Near-identical to the test above; only the serve context is cancelled
+    /// first, under which an asupersync timer completes at once.
+    #[test]
+    fn settling_under_a_cancelled_serve_context_waits_for_the_runner() {
+        settle_held_supervisor(true);
     }
 }

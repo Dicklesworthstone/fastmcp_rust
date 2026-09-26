@@ -1,11 +1,11 @@
 use asupersync::Cx;
 use fastmcp_protocol::protocol_version::{HeaderMismatchReason, RequestAdmissionError};
-use fastmcp_protocol::{JsonRpcRequest, JsonRpcResponse, RequestId};
+use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
 use fastmcp_transport::{
-    TransportError,
+    Transport, TransportError,
     http::{
         HttpError, HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler,
-        HttpResponseRepresentation, StreamableHttpTransport,
+        HttpResponseRepresentation, StreamableHttpRequestResponseMessage, StreamableHttpTransport,
     },
 };
 
@@ -368,6 +368,179 @@ fn http_02_b_positive() {
         0
     );
     assert_eq!(responses.pending_responses(), 0);
+}
+
+fn assert_http_01_owner_teardown(terminate: bool) {
+    let cx = Cx::for_testing();
+    let mut transport = StreamableHttpTransport::new();
+    let (ingress, responses) = transport.split_handles().expect("externalize the HTTP owner");
+    let request_id = RequestId::Number(811);
+    let body = responses
+        .for_request(request_id.clone())
+        .expect("register the active subscription body");
+    let cancellation = body.cancellation();
+    let sender = body.sender();
+    let acknowledgement = JsonRpcRequest::notification(
+        "notifications/subscriptions/acknowledged",
+        Some(serde_json::json!({
+            "_meta": {"io.modelcontextprotocol/subscriptionId": 811},
+            "notifications": {"toolsListChanged": true},
+        })),
+    );
+    sender
+        .send_notification(&cx, acknowledgement)
+        .expect("acknowledge the subscription before teardown");
+    assert!(matches!(
+        body.pop_message(),
+        Ok(Some(StreamableHttpRequestResponseMessage::Notification(notification)))
+            if notification.method == "notifications/subscriptions/acknowledged"
+                && notification.params.as_ref().and_then(|params| {
+                    params.pointer("/_meta/io.modelcontextprotocol~1subscriptionId")
+                }) == Some(&serde_json::json!(811))
+    ));
+
+    let changed = JsonRpcRequest::notification(
+        "notifications/tools/list_changed",
+        Some(serde_json::json!({
+            "_meta": {"io.modelcontextprotocol/subscriptionId": 811},
+        })),
+    );
+    sender
+        .send_notification(&cx, changed.clone())
+        .expect("retain an event that the peer has not consumed");
+    let final_id = RequestId::Number(812);
+    let final_body = responses
+        .for_request(final_id.clone())
+        .expect("register an independent final-response body on this owner");
+    let final_cancellation = final_body.cancellation();
+    final_body
+        .sender()
+        .send_response(
+            &cx,
+            JsonRpcResponse::success(final_id.clone(), serde_json::json!({"done": true})),
+        )
+        .expect("retain a committed final response before teardown");
+    let json_id = RequestId::Number(813);
+    transport
+        .send(
+            &cx,
+            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                json_id.clone(),
+                serde_json::json!({"json": true}),
+            )),
+        )
+        .expect("retain an unowned JSON response before teardown");
+    ingress
+        .push_request(&cx, JsonRpcRequest::new("tools/list", None, 814_i64))
+        .expect("queue a request that has not been dispatched");
+    assert_eq!(responses.pending_responses(), 3);
+    assert_eq!(responses.live_request_bodies().unwrap(), 2);
+    assert_eq!(transport.pending_requests(), 1);
+
+    let mut sibling = StreamableHttpTransport::new();
+    let sibling_responses = sibling
+        .response_stream()
+        .expect("externalize a sibling owner");
+    let sibling_body = sibling_responses
+        .for_request(request_id.clone())
+        .expect("the same request ID is independent on another HTTP owner");
+
+    if terminate {
+        transport.terminate();
+        transport.terminate();
+    } else {
+        // The sole control mutation is a graceful close in place of owner
+        // termination. It seals admissions but deliberately preserves output.
+        Transport::close(&mut transport, &cx).expect("graceful close succeeds");
+        Transport::close(&mut transport, &cx).expect("graceful close is idempotent");
+    }
+    assert!(ingress.is_closed());
+    assert!(responses.is_closed());
+    assert_eq!(transport.pending_requests(), 0);
+    assert!(matches!(transport.recv(&cx), Err(TransportError::Closed)));
+    assert!(matches!(
+        ingress.push_request(&cx, JsonRpcRequest::new("tools/list", None, 815_i64)),
+        Err(TransportError::Closed)
+    ));
+    assert!(matches!(
+        responses.for_request(RequestId::Number(816)),
+        Err(TransportError::Closed)
+    ));
+
+    if terminate {
+        assert!(cancellation.is_cancelled());
+        assert!(cancellation.request_cancellation().is_cancel_requested());
+        assert!(final_cancellation.is_cancelled());
+        assert_eq!(responses.live_request_bodies().unwrap(), 0);
+        assert_eq!(responses.pending_responses(), 0);
+        assert!(matches!(body.pop_message(), Err(TransportError::Cancelled)));
+        assert!(matches!(
+            final_body.pop_response(),
+            Err(TransportError::Cancelled)
+        ));
+        assert!(matches!(
+            responses.pop_response(Some(&json_id)),
+            Err(TransportError::Closed)
+        ));
+        assert!(matches!(
+            sender.send_notification(&cx, changed.clone()),
+            Err(TransportError::Cancelled)
+        ));
+        assert!(matches!(
+            sender.send_response(
+                &cx,
+                JsonRpcResponse::success(request_id, serde_json::json!({"late": true})),
+            ),
+            Err(TransportError::Cancelled)
+        ));
+        assert_eq!(responses.pending_responses(), 0);
+    } else {
+        assert!(!cancellation.is_cancelled());
+        assert!(!cancellation.request_cancellation().is_cancel_requested());
+        assert!(!final_cancellation.is_cancelled());
+        assert_eq!(responses.live_request_bodies().unwrap(), 2);
+        assert_eq!(responses.pending_responses(), 3);
+        assert!(matches!(
+            body.pop_message(),
+            Ok(Some(StreamableHttpRequestResponseMessage::Notification(notification)))
+                if notification.method == changed.method && notification.params == changed.params
+        ));
+        assert_eq!(final_body.pop_response().unwrap().unwrap().id, Some(final_id));
+        assert_eq!(
+            responses.pop_response(Some(&json_id)).unwrap().unwrap().id,
+            Some(json_id)
+        );
+        assert!(matches!(
+            sender.send_notification(&cx, changed.clone()),
+            Err(TransportError::Closed)
+        ));
+        assert_eq!(responses.pending_responses(), 0);
+    }
+
+    assert!(
+        !cx.is_cancel_requested(),
+        "HTTP teardown preserves the caller context"
+    );
+    assert!(!sibling_body.cancellation().is_cancelled());
+    sibling_body
+        .sender()
+        .send_notification(&cx, changed.clone())
+        .expect("the other HTTP owner continues publishing after teardown");
+    assert!(matches!(
+        sibling_body.pop_message(),
+        Ok(Some(StreamableHttpRequestResponseMessage::Notification(notification)))
+            if notification.method == changed.method && notification.params == changed.params
+    ));
+}
+
+#[test]
+fn http_01_terminate_cancels_live_bodies_and_discards_queued_messages() {
+    assert_http_01_owner_teardown(true);
+}
+
+#[test]
+fn http_01_graceful_close_preserves_live_bodies_and_queued_messages() {
+    assert_http_01_owner_teardown(false);
 }
 
 #[test]

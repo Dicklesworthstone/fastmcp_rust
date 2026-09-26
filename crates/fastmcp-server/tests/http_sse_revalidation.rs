@@ -154,6 +154,143 @@ where F: FnOnce(Cx)->Fut+Send+'static, Fut: Future<Output=()>+Send+'static {
 }
 
 #[test]
+fn modern_http_peer_session_drop_closes_acknowledged_listen_without_completion() {
+    run(|cx| async move {
+        let server = Server::new("peer-session-teardown", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly is available in every feature profile")
+            .build();
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        let endpoint = server.into_http_endpoint();
+        #[cfg(feature = "legacy-2024-11-05")]
+        let endpoint = server.into_http_endpoint("http://peer.example");
+        let endpoint = endpoint.expect("the shipped HTTP endpoint opens");
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("open the first HTTP session");
+        let mut sibling_session = endpoint
+            .open_session(&cx)
+            .expect("open an independent HTTP session");
+        let request = HttpRequest::new(HttpMethod::Post, "/mcp")
+            .with_header("content-type", "application/json")
+            .with_header("accept", "text/event-stream")
+            .with_header("mcp-protocol-version", FINAL_PROTOCOL_VERSION)
+            .with_header("mcp-method", "subscriptions/listen")
+            .with_body(
+                serde_json::to_vec(&json!({
+                    "jsonrpc": "2.0",
+                    "id": 889,
+                    "method": "subscriptions/listen",
+                    "params": {
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                        "notifications": {"toolsListChanged": true},
+                    },
+                }))
+                .unwrap(),
+            );
+        let response = Box::pin(session.handle_async(&cx, request.clone()))
+            .await
+            .expect("the first listen request opens its response stream");
+        let sibling_response = Box::pin(sibling_session.handle_async(&cx, request))
+            .await
+            .expect("the same request ID is independent in a sibling session");
+        let fastmcp_server::ServerHttpEndpointResponse::ModernSse(body) = response else {
+            panic!("the first listen request must select SSE");
+        };
+        let fastmcp_server::ServerHttpEndpointResponse::ModernSse(sibling_body) = sibling_response
+        else {
+            panic!("the sibling listen request must select SSE");
+        };
+        for stream in [&body, &sibling_body] {
+            let acknowledgement = asupersync::time::timeout(
+                cx.now(),
+                Duration::from_secs(3),
+                async {
+                    loop {
+                        match stream
+                            .pop_event()
+                            .expect("listen remains open before acknowledgement")
+                        {
+                            Some(event) => break event,
+                            None => {
+                                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                            }
+                        }
+                    }
+                },
+            )
+            .await
+            .expect("each public listen is acknowledged within its bound");
+            let acknowledgement: Value = serde_json::from_str(&acknowledgement.data).unwrap();
+            assert_eq!(
+                acknowledgement["method"],
+                "notifications/subscriptions/acknowledged"
+            );
+            assert_eq!(
+                acknowledgement["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+                889
+            );
+            assert!(stream.cancellation().checkpoint(&cx).is_ok());
+        }
+
+        let changed = fastmcp_protocol::JsonRpcRequest::notification(
+            "notifications/tools/list_changed",
+            Some(json!({"_meta": {"io.modelcontextprotocol/subscriptionId": 889}})),
+        );
+        let sender = body.sender();
+        sender.send_notification(&cx, changed.clone()).unwrap();
+        sibling_body
+            .sender()
+            .send_notification(&cx, changed.clone())
+            .unwrap();
+        let cancellation = body.cancellation();
+
+        // Both sessions have the same acknowledged request and queued event.
+        // Only the first session loses its owner before the body is drained.
+        drop(session);
+        assert!(cancellation.checkpoint(&cx).is_err());
+        assert!(
+            matches!(
+                body.pop_event(),
+                Err(fastmcp_server::ServerHttpEndpointError::Closed)
+            ),
+            "peer close must discard queued events and emit no terminal completion"
+        );
+        assert!(
+            matches!(
+                sender.send_notification(&cx, changed),
+                Err(fastmcp_transport::TransportError::Cancelled)
+            ),
+            "a retained producer cannot write after peer teardown"
+        );
+
+        assert!(sibling_body.cancellation().checkpoint(&cx).is_ok());
+        let event = sibling_body
+            .pop_event()
+            .unwrap()
+            .expect("the sibling retains its queued event");
+        let event: Value = serde_json::from_str(&event.data).unwrap();
+        assert_eq!(event["method"], "notifications/tools/list_changed");
+        assert_eq!(
+            event["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+            889
+        );
+        sibling_session.close(&cx).await;
+        assert!(matches!(
+            sibling_body.pop_event(),
+            Err(fastmcp_server::ServerHttpEndpointError::Closed)
+        ));
+        assert!(
+            cx.checkpoint().is_ok(),
+            "neither session teardown cancels the caller context"
+        );
+    });
+}
+
+#[test]
 fn revalidated_public_sse_delivers_the_real_catalog_without_raw_body_access() {
     run(|cx| async move {
         let probe = Probe::new();

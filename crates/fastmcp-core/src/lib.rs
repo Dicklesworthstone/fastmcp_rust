@@ -1572,10 +1572,10 @@ pub mod limits {
     impl LogicalExchangeBudget {
         /// Captures `limits` and the caller context's time, deadline, and cancellation domain.
         pub fn new(
-            limits: ProtocolLimits,
             context: &McpContext,
+            limits: ProtocolLimits,
         ) -> Result<Self, LogicalExchangeBudgetError> {
-            Self::with_external_deadline(limits, context, None)
+            Self::with_external_deadline(context, limits, None)
         }
 
         /// Captures `limits` and meets its deadline with the caller context and `external_deadline`.
@@ -1584,8 +1584,8 @@ pub mod limits {
         /// the caller context's budget deadline and `external_deadline` is
         /// retained. The deadline can never be extended after construction.
         pub fn with_external_deadline(
-            limits: ProtocolLimits,
             context: &McpContext,
+            limits: ProtocolLimits,
             external_deadline: Option<Time>,
         ) -> Result<Self, LogicalExchangeBudgetError> {
             context
@@ -1940,7 +1940,7 @@ pub mod limits {
         #[test]
         fn logical_exchange_budget_cumulatively_charges_valid_rounds_inputs_and_bytes() {
             let context = McpContext::new(Cx::for_testing(), 1);
-            let budget = LogicalExchangeBudget::new(small_limits(), &context).unwrap();
+            let budget = LogicalExchangeBudget::new(&context, small_limits()).unwrap();
 
             budget.try_start_round().unwrap();
             budget.try_reserve_input(3).unwrap();
@@ -1958,7 +1958,7 @@ pub mod limits {
         #[test]
         fn logical_exchange_budget_rejects_overages_without_mutating_accounting() {
             let context = McpContext::new(Cx::for_testing(), 1);
-            let budget = LogicalExchangeBudget::new(small_limits(), &context).unwrap();
+            let budget = LogicalExchangeBudget::new(&context, small_limits()).unwrap();
 
             assert_eq!(
                 budget.try_reserve_input(1),
@@ -2012,7 +2012,7 @@ pub mod limits {
                 .logical_exchange_max_wall_clock(HARD_LOGICAL_EXCHANGE_MAX_WALL_CLOCK)
                 .build()
                 .unwrap();
-            let budget = LogicalExchangeBudget::new(limits, &context).unwrap();
+            let budget = LogicalExchangeBudget::new(&context, limits).unwrap();
             budget.try_start_round().unwrap();
 
             let barrier = Arc::new(Barrier::new(3));
@@ -2045,7 +2045,7 @@ pub mod limits {
         #[test]
         fn logical_exchange_budget_equality_handles_self_and_shared_clones() {
             let context = McpContext::new(Cx::for_testing(), 1);
-            let budget = LogicalExchangeBudget::new(small_limits(), &context).unwrap();
+            let budget = LogicalExchangeBudget::new(&context, small_limits()).unwrap();
             let clone = budget.clone();
 
             assert!(Arc::ptr_eq(&budget.counters, &clone.counters));
@@ -2066,14 +2066,14 @@ pub mod limits {
             // reaches the ordered counter locking under test.
             let shared_deadline = Some(Time::from_nanos(1_000_000));
             let first_budget = LogicalExchangeBudget::with_external_deadline(
-                small_limits(),
                 &context,
+                small_limits(),
                 shared_deadline,
             )
             .unwrap();
             let second_budget = LogicalExchangeBudget::with_external_deadline(
-                small_limits(),
                 &context,
+                small_limits(),
                 shared_deadline,
             )
             .unwrap();
@@ -2106,7 +2106,7 @@ pub mod limits {
             let request_cancellation = McpRequestCancellation::new();
             let context = McpContext::new(Cx::for_testing(), 1)
                 .with_request_cancellation(request_cancellation.clone());
-            let budget = LogicalExchangeBudget::new(small_limits(), &context).unwrap();
+            let budget = LogicalExchangeBudget::new(&context, small_limits()).unwrap();
 
             assert!(request_cancellation.cancel());
             assert_eq!(
@@ -2117,7 +2117,7 @@ pub mod limits {
 
             let cx = Cx::for_testing();
             let context = McpContext::new(cx.clone(), 2);
-            let budget = LogicalExchangeBudget::new(small_limits(), &context).unwrap();
+            let budget = LogicalExchangeBudget::new(&context, small_limits()).unwrap();
             cx.set_cancel_requested(true);
             assert_eq!(
                 budget.try_start_round(),
@@ -2131,7 +2131,7 @@ pub mod limits {
             let request_cancellation = McpRequestCancellation::new();
             let context = McpContext::new(Cx::for_testing(), 1)
                 .with_request_cancellation(request_cancellation.clone());
-            let budget = LogicalExchangeBudget::new(small_limits(), &context).unwrap();
+            let budget = LogicalExchangeBudget::new(&context, small_limits()).unwrap();
 
             let held_counters = budget.counters();
             let before_counter_lock = Arc::new(Barrier::new(2));
@@ -2159,8 +2159,8 @@ pub mod limits {
         fn logical_exchange_budget_uses_context_time_without_a_caller_supplied_instant() {
             let context = McpContext::new(Cx::for_testing(), 1);
             let budget = LogicalExchangeBudget::with_external_deadline(
-                small_limits(),
                 &context,
+                small_limits(),
                 Some(Time::ZERO),
             )
             .unwrap();
@@ -2183,7 +2183,7 @@ pub mod limits {
                 .build()
                 .unwrap();
 
-            let budget = LogicalExchangeBudget::new(limits, &context).unwrap();
+            let budget = LogicalExchangeBudget::new(&context, limits).unwrap();
 
             assert_eq!(budget.deadline(), context_deadline);
         }
