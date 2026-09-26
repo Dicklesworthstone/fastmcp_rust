@@ -7,6 +7,8 @@
 
 /// Explicit consume/exchange/persist renewal with retained interruption custody.
 pub mod renewal;
+/// Explicit revocation of stored refresh grants and persistent logout custody.
+pub mod logout;
 
 use std::fmt;
 use std::fs::File;
