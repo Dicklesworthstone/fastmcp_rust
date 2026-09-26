@@ -18,11 +18,10 @@
 //!   through diagnostics. Binding uses the same bounded `token68` grammar
 //!   as HTTP credential admission, before retaining or emitting a token.
 //! - Local revocation is shared by every clone. It stops subsequent header
-//!   construction without changing another independently bound credential.
+//!   construction and wakes managed response readers without changing another
+//!   independently bound credential.
 
 use core::fmt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use fastmcp_core::{AccessToken, McpRequestCancellation};
@@ -85,7 +84,7 @@ pub struct BoundBearerCredential {
     resource: CanonicalHttpUrl,
     token: String,
     expires_at: Option<Instant>,
-    revoked: Arc<AtomicBool>,
+    revoked: McpRequestCancellation,
     owner_cancellation: Option<McpRequestCancellation>,
 }
 
@@ -134,7 +133,7 @@ impl BoundBearerCredential {
             resource,
             token,
             expires_at: None,
-            revoked: Arc::new(AtomicBool::new(false)),
+            revoked: McpRequestCancellation::new(),
             owner_cancellation: None,
         })
     }
@@ -186,20 +185,22 @@ impl BoundBearerCredential {
 
     /// Irreversibly withholds this credential from subsequent header
     /// construction through this value and all existing or future clones.
+    /// Active managed response readers are woken to discard their owned read;
+    /// unpolled responses release their socket on the next poll or drop.
     ///
     /// This is local capability revocation, not an OAuth revocation-endpoint
     /// request. Already-created header strings, requests that captured such
     /// strings, and bytes already sent cannot be recalled. A header operation
     /// concurrent with revocation may have completed its admission first.
     pub fn revoke(&self) {
-        self.revoked.store(true, Ordering::Release);
+        self.revoked.cancel();
     }
 
     /// Returns whether this credential lineage has been locally revoked or
     /// its owner has cancelled. Expiry remains a separate condition.
     #[must_use]
     pub fn is_revoked(&self) -> bool {
-        self.revoked.load(Ordering::Acquire)
+        self.revoked.is_cancel_requested()
             || self.owner_cancellation.as_ref().is_some_and(
                 McpRequestCancellation::is_cancel_requested,
             )

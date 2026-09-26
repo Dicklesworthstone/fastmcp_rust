@@ -35,6 +35,9 @@ use crate::sse::SseLimits;
 #[cfg(test)]
 use crate::http_executor::ModernHttpExecutor;
 
+// Shared dispatch/body guard for the original token's local revocation.
+mod credential_lifetime;
+
 /// Explicit logout with remote issuer revocation and local session closure.
 pub mod logout;
 /// Typed core subscriptions retaining managed cancellation and token lifetime.
@@ -424,9 +427,9 @@ impl ManagedOAuthSession {
     /// The native executor retains explicitly configured resource CA trust,
     /// TLS verification and response admission. Private token-issuer CA settings
     /// do not implicitly authorize a private MCP-resource CA. The response retains local session
-    /// closure, request cancellation and the original access-token expiry for
-    /// JSON/SSE reads. It does not perform issuer introspection or continuous
-    /// policy revalidation and is not a full authorization lease.
+    /// closure, token-local revocation, request cancellation and the original
+    /// access-token expiry for JSON/SSE reads. It does not perform issuer
+    /// introspection or continuous policy revalidation and is not a full authorization lease.
     pub async fn execute(
         &self,
         cx: &Cx,
@@ -447,20 +450,18 @@ impl ManagedOAuthSession {
         let request = snapshot.authorize_request(request)?;
         let deadline = deadline_after(cx, self.inner.policy.response_head_timeout)?;
         let executor = self.inner.client.resource_http_executor();
-        let response = self.await_active(cx, cancellation, deadline, Some(snapshot.expires_at), async {
-            executor.execute_with_cancellation(cx, cancellation, &request)
-                .await.map_err(OAuthSessionError::Http)
-        }).await?;
+        let response = self.await_credential(cx, cancellation, deadline, snapshot.expires_at,
+            &snapshot.credential.revoked, async {
+                executor.execute_with_cancellation(cx, cancellation, &request)
+                    .await.map_err(OAuthSessionError::Http)
+            },
+        ).await?;
         if matches!(response.metadata().status(), 401 | 403) {
             return Err(OAuthSessionError::AuthorizationRejected { status: response.metadata().status() });
         }
-        Ok(ManagedOAuthResponse {
-            response,
-            session: self.clone(),
-            cancellation: cancellation.clone(),
-            expires_at: snapshot.expires_at,
-            generation: snapshot.generation,
-        })
+        Ok(ManagedOAuthResponse::from_snapshot(
+            response, self.clone(), cancellation.clone(), &snapshot,
+        ))
     }
 
     fn check(&self, cx: &Cx, cancellation: &McpRequestCancellation) -> Result<(), OAuthSessionError> {
@@ -533,7 +534,7 @@ impl ManagedOAuthSession {
 
 /// One HTTP response tied to the credential generation used for its POST.
 /// Reading or dropping the response owns socket cleanup. There is no raw-body
-/// extraction that would silently remove the session/expiry boundary.
+/// extraction that would silently remove the session/expiry/revocation boundary.
 /// Renewing the session cannot extend this response's original token lifetime.
 pub struct ManagedOAuthResponse {
     response: ModernHttpResponseStream,
@@ -541,6 +542,7 @@ pub struct ManagedOAuthResponse {
     cancellation: McpRequestCancellation,
     expires_at: Instant,
     generation: u64,
+    revocation: McpRequestCancellation,
 }
 
 impl ManagedOAuthResponse {
@@ -556,13 +558,13 @@ impl ManagedOAuthResponse {
     /// domain and the supplied caller's budget. Dropping this future discards
     /// the owned response, including partially read bytes and the socket.
     pub async fn read_to_end(self, cx: &Cx, maximum_bytes: usize) -> Result<Vec<u8>, OAuthSessionError> {
-        let Self { response, session, cancellation, expires_at, .. } = self;
+        let Self { response, session, cancellation, expires_at, revocation, .. } = self;
         session.check(cx, &cancellation)?;
         // await_active alone translates token expiry to runtime time. Sampling
         // it twice could misclassify nanosecond clock skew as a caller timeout.
         // The native body still owns its idle/absolute response deadlines.
         let deadline = cx.budget().deadline.unwrap_or(Time::from_nanos(u64::MAX));
-        session.await_active(cx, &cancellation, deadline, Some(expires_at), async {
+        session.await_credential(cx, &cancellation, deadline, expires_at, &revocation, async {
             response.read_to_end_with_cancellation(cx, &cancellation, maximum_bytes)
                 .await.map_err(OAuthSessionError::Http)
         }).await
@@ -577,14 +579,15 @@ impl ManagedOAuthResponse {
             cancellation: self.cancellation,
             expires_at: self.expires_at,
             generation: self.generation,
+            revocation: self.revocation,
             finished: false,
         })
     }
 }
 
 /// Caller-owned SSE response whose authorization lifetime cannot be renewed
-/// in place. Session close or request cancellation wakes an active read;
-/// credential expiry is a terminal read failure, never a reconnect trigger.
+/// in place. Session close, token revocation or request cancellation wakes an
+/// active read; credential expiry is a terminal failure, never a reconnect trigger.
 /// An unpolled stream retains its socket until its next poll, explicit close
 /// or drop. Already-delivered events cannot be recalled.
 pub struct ManagedOAuthSseStream {
@@ -593,6 +596,7 @@ pub struct ManagedOAuthSseStream {
     cancellation: McpRequestCancellation,
     expires_at: Instant,
     generation: u64,
+    revocation: McpRequestCancellation,
     finished: bool,
 }
 
@@ -624,8 +628,8 @@ impl ManagedOAuthSseStream {
         ))?;
         self.session.check(cx, &self.cancellation)?;
         let deadline = cx.budget().deadline.unwrap_or(Time::from_nanos(u64::MAX));
-        let result = self.session.await_active(
-            cx, &self.cancellation, deadline, Some(self.expires_at), async {
+        let result = self.session.await_credential(
+            cx, &self.cancellation, deadline, self.expires_at, &self.revocation, async {
                 let event = stream.next_event(cx).await.map_err(OAuthSessionError::Http)?;
                 if event.is_none() {
                     // The native WHATWG parser intentionally reports discarded
@@ -898,6 +902,7 @@ mod tests {
         ManagedOAuthResponse {
             response, session: session.clone(), cancellation: cancellation.clone(),
             expires_at: Instant::now() + lifetime, generation: 7,
+            revocation: McpRequestCancellation::new(),
         }
     }
 
