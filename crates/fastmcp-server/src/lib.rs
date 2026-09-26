@@ -1937,17 +1937,16 @@ fn admitted_final_client_implementation(
 /// A raw parameter sidecar is usable only while authentication and admission
 /// have left the materialized parameter value untouched.  In particular,
 /// stripping a recognized credential must sever the raw source before router
-/// MRTR decoding can observe it.
+/// MRTR decoding can observe it.  The sidecar was admitted as the source of
+/// `admitted`, so comparing that value with the current one replaces decoding
+/// the source again; final core decoding still verifies the source against
+/// the value it receives.
 fn retained_raw_params<'a>(
     raw_params: Option<&'a str>,
-    request: &JsonRpcRequest,
+    admitted: Option<&serde_json::Value>,
+    current: Option<&serde_json::Value>,
 ) -> Option<&'a str> {
-    raw_params.filter(|source| {
-        serde_json::from_str::<serde_json::Value>(source)
-            .ok()
-            .as_ref()
-            == request.params.as_ref()
-    })
+    raw_params.filter(|_| admitted == current)
 }
 
 /// Re-admits a middleware-produced final core response through the request's
@@ -13444,6 +13443,9 @@ impl Server {
             ));
         };
 
+        // The value the raw sidecar was admitted with; `request` is shadowed
+        // below by a metadata-stripped copy.
+        let admitted_params = request.params.as_ref();
         let mut admission_request = request.clone();
         if let Err(error) = self.authenticate_modern_request(
             &request_ctx,
@@ -13540,7 +13542,11 @@ impl Server {
                     .dispatch_stateless_with_continuation_cancellation_and_raw_params(
                         &request_ctx,
                         &admission_request,
-                        retained_raw_params(raw_params, &admission_request),
+                        retained_raw_params(
+                            raw_params,
+                            admitted_params,
+                            admission_request.params.as_ref(),
+                        ),
                         &continuation_cancellation,
                     )
                     .await
@@ -13659,6 +13665,9 @@ impl Server {
         terminal_delivery: Option<Arc<FinalSubscriptionTerminalDelivery>>,
         notification_sender: NotificationSender,
     ) -> Option<JsonRpcResponse> {
+        // The value the raw sidecar was admitted with, before authentication
+        // may strip credentials from this request.
+        let admitted_params = raw_params.as_ref().and_then(|_| request.params.clone());
         let method = request.method.clone();
         let response_id = request.id.clone();
         let is_notification = response_id.is_none();
@@ -13860,7 +13869,12 @@ impl Server {
                     .dispatch_stateless_owned_with_continuation_cancellation_and_raw_params(
                         request_ctx.clone(),
                         request.clone(),
-                        retained_raw_params(raw_params.as_deref(), &request).map(Arc::<str>::from),
+                        retained_raw_params(
+                            raw_params.as_deref(),
+                            admitted_params.as_ref(),
+                            request.params.as_ref(),
+                        )
+                        .map(Arc::<str>::from),
                         inbound.mrtr_continuation_cancellation().unwrap_or_default(),
                     )
                     .await
@@ -39943,18 +39957,25 @@ mod lib_unit_tests {
     #[test]
     fn admitted_raw_params_are_withheld_after_sanitation_changes_the_request() {
         // RH-5 neighbor of the retained-source positive: a byte-exact raw
-        // sidecar is legal only while it still decodes to the request that
-        // admission handed downstream.  Credential stripping changes that
-        // request, so continuation routing must receive no stale source.
+        // sidecar is legal only while the request still carries the value it
+        // was admitted with.  Credential stripping changes that request, so
+        // continuation routing must receive no stale source.
         let raw = r#"{"authorization":"Bearer never-forward","requestState":"state"}"#;
         let mut request = JsonRpcRequest::new(
             "tools/call",
             Some(serde_json::from_str(raw).expect("raw sidecar fixture must decode")),
             937_i64,
         );
-        assert_eq!(retained_raw_params(Some(raw), &request), Some(raw));
+        let admitted = request.params.clone();
+        assert_eq!(
+            retained_raw_params(Some(raw), admitted.as_ref(), request.params.as_ref()),
+            Some(raw)
+        );
         auth::strip_recognized_access_credentials(&mut request.params);
-        assert_eq!(retained_raw_params(Some(raw), &request), None);
+        assert_eq!(
+            retained_raw_params(Some(raw), admitted.as_ref(), request.params.as_ref()),
+            None
+        );
         assert_eq!(
             request.params,
             Some(serde_json::json!({"requestState": "state"})),

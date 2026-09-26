@@ -17,6 +17,9 @@
 //! blocking-I/O lane. `OAuthClient::refresh_grant` is separately asynchronous,
 //! uses the caller's Cx, and performs no file I/O or automatic exchange retry.
 
+/// Protected refresh custody on the caller's bounded blocking-I/O lane.
+pub mod asynchronous;
+
 use std::fmt;
 use std::io::Write;
 use std::time::Instant;
