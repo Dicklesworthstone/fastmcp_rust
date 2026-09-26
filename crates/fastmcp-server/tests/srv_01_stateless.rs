@@ -2036,3 +2036,220 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
         "the latest notification must retain the exact completed task"
     );
 }
+
+// Additional public schema-capacity regressions; the frozen SRV-01 tests above
+// retain their original acceptance surfaces and assertions.
+const SCHEMA_CAPACITY_PAYLOAD_BYTES: usize = 256 * 1024;
+
+struct SchemaCapacityTool {
+    input_minimum: usize,
+    shorten_output: bool,
+    calls: Arc<AtomicUsize>,
+}
+
+impl ToolHandler for SchemaCapacityTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "schema-capacity-echo".to_owned(),
+            description: Some("Echoes a large schema-validated payload".to_owned()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "payload": {"type": "string", "minLength": self.input_minimum}
+                },
+                "required": ["payload"],
+                "additionalProperties": false,
+            }),
+            output_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "payload": {
+                        "type": "string",
+                        "minLength": SCHEMA_CAPACITY_PAYLOAD_BYTES
+                    },
+                    "error": {"enum": ["input-validation", "handler"]}
+                },
+                "anyOf": [
+                    {"required": ["payload"]},
+                    {"required": ["error"]}
+                ],
+                "additionalProperties": false,
+            })),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        Err(McpError::internal_error(
+            "schema-capacity tool requires the final result hook",
+        ))
+    }
+
+    fn final_tool_error_structured_content(
+        &self,
+        kind: fastmcp_server::ToolErrorKind,
+    ) -> Option<serde_json::Value> {
+        Some(match kind {
+            fastmcp_server::ToolErrorKind::InputValidation => {
+                serde_json::json!({"error": "input-validation"})
+            }
+            fastmcp_server::ToolErrorKind::Handler => serde_json::json!({"error": "handler"}),
+        })
+    }
+
+    fn call_final_outcome(
+        &self,
+        ctx: &McpContext,
+        arguments: serde_json::Value,
+    ) -> McpResult<FinalToolOutcome> {
+        use fastmcp_protocol::common_types::ContentBlock;
+        use fastmcp_protocol::{CompleteResult, FinalCallToolResult, ResultMeta};
+
+        ctx.checkpoint()?;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mut payload = arguments
+            .get("payload")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| McpError::invalid_params("payload must be a string"))?
+            .to_owned();
+        if self.shorten_output {
+            let _ = payload.pop();
+        }
+        Ok(FinalToolOutcome::Complete(CompleteResult::new(
+            FinalCallToolResult {
+                content: vec![ContentBlock::text("large payload echoed")],
+                is_error: false,
+                structured_content: Some(serde_json::json!({"payload": payload})),
+            },
+            ResultMeta::empty(),
+        )))
+    }
+}
+
+async fn dispatch_schema_capacity_tool(
+    input_minimum: usize,
+    shorten_output: bool,
+) -> (JsonRpcResponse, usize, String) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let server = Server::new("stateless-schema-capacity", "1.0.0")
+        .tool(SchemaCapacityTool {
+            input_minimum,
+            shorten_output,
+            calls: Arc::clone(&calls),
+        })
+        .build();
+    assert_eq!(
+        server.tools().len(),
+        1,
+        "schema admission must publish the tool"
+    );
+    let catalog_before = stateless_public_catalog_snapshot(&server);
+    let payload = "x".repeat(SCHEMA_CAPACITY_PAYLOAD_BYTES);
+    let mut request = stateless_tool_call("schema-capacity-echo", 301_i64);
+    request.params.as_mut().expect("tool call has params")["arguments"] =
+        serde_json::json!({"payload": payload});
+    let inbound = InboundRequestContext::new(caller_cx(), 301, InboundRequestTransport::Memory);
+
+    let response = server
+        .dispatch_stateless(&inbound, &request)
+        .await
+        .expect("schema-capacity tool call receives a response");
+
+    assert_eq!(response.id, request.id);
+    assert_eq!(
+        stateless_public_catalog_snapshot(&server),
+        catalog_before,
+        "schema validation must not mutate the published catalog"
+    );
+    (response, calls.load(Ordering::SeqCst), payload)
+}
+
+#[test]
+fn schema_capacity_stateless_accepts_large_arguments_and_structured_output() {
+    on_caller_runtime(async {
+        let (response, calls, payload) =
+            dispatch_schema_capacity_tool(SCHEMA_CAPACITY_PAYLOAD_BYTES, false).await;
+
+        assert!(
+            response.error.is_none(),
+            "large valid output must be emitted; framework error: {:?}",
+            response.error.as_ref().map(|error| (
+                &error.code,
+                error.message.chars().take(256).collect::<String>()
+            ))
+        );
+        assert_eq!(calls, 1, "large valid arguments must reach the handler");
+        let result = response.result.expect("successful tool call has a result");
+        assert_eq!(result["resultType"], "complete");
+        assert!(result.get("isError").is_none());
+        assert_eq!(result["content"][0]["text"], "large payload echoed");
+        assert_eq!(
+            result["structuredContent"]["payload"].as_str(),
+            Some(payload.as_str()),
+            "the entire 256 KiB string must survive input and output validation"
+        );
+    });
+}
+
+#[test]
+fn schema_capacity_stateless_rejects_large_arguments_before_handler() {
+    on_caller_runtime(async {
+        // Only the input minimum changes from the accepted case; the same
+        // 256 KiB argument must now fail the schema before any handler effect.
+        let (response, calls, _) =
+            dispatch_schema_capacity_tool(SCHEMA_CAPACITY_PAYLOAD_BYTES + 1, false).await;
+
+        assert!(
+            response.error.is_none(),
+            "invalid arguments are a tool error; framework error: {:?}",
+            response.error.as_ref().map(|error| (
+                &error.code,
+                error.message.chars().take(256).collect::<String>()
+            ))
+        );
+        assert_eq!(calls, 0, "input refusal must precede handler effects");
+        let result = response.result.expect("input refusal has a tool result");
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["structuredContent"],
+            serde_json::json!({"error": "input-validation"})
+        );
+        assert_eq!(
+            result["content"][0]["text"],
+            "Tool arguments do not match the declared input schema."
+        );
+    });
+}
+
+#[test]
+fn schema_capacity_stateless_rejects_invalid_large_structured_output() {
+    on_caller_runtime(async {
+        // Input and both schemas are identical to the accepted case. Only the
+        // handler output loses one character, violating output minLength.
+        let (response, calls, _) =
+            dispatch_schema_capacity_tool(SCHEMA_CAPACITY_PAYLOAD_BYTES, true).await;
+
+        assert_eq!(
+            calls,
+            1,
+            "output refusal occurs after the handler executes; framework error: {:?}",
+            response.error.as_ref().map(|error| (
+                &error.code,
+                error.message.chars().take(256).collect::<String>()
+            ))
+        );
+        assert!(
+            response.result.is_none(),
+            "invalid output must not reach the peer"
+        );
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code.clone()),
+            Some(McpErrorCode::InternalError.into()),
+            "a handler output-schema mismatch remains a framework error"
+        );
+    });
+}
