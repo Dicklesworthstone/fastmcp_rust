@@ -8990,7 +8990,6 @@ impl ServerHttpSession {
             .flatten()
             .map(|sender| {
                 TransportRootsProvider::new(
-                    sender,
                     McpContext::new(
                         self.legacy_request_cx
                             .lock()
@@ -8998,6 +8997,7 @@ impl ServerHttpSession {
                             .clone(),
                         0,
                     ),
+                    sender,
                 )
             })
     }
@@ -13038,11 +13038,11 @@ impl Server {
         runtime
             .handlers
             .invoke(
+                request_ctx,
                 negotiated,
                 ProtocolEra::Modern2026,
                 extension_id,
                 &request,
-                request_ctx,
             )
             .map_err(|error| match error {
                 ExtensionHandlerInvocationError::Handler(error) => error,
@@ -19411,8 +19411,8 @@ impl Server {
         if supports_sampling {
             let sampling_sender: Arc<dyn fastmcp_core::SamplingSender> =
                 Arc::new(bidirectional::TransportSamplingSender::new(
-                    request_sender.clone(),
                     request_context.clone(),
+                    request_sender.clone(),
                 ));
             senders = senders.with_sampling(sampling_sender);
         }
@@ -19420,15 +19420,15 @@ impl Server {
         if supports_elicitation {
             let elicitation_sender: Arc<dyn fastmcp_core::ElicitationSender> =
                 Arc::new(bidirectional::TransportElicitationSender::new(
-                    request_sender.clone(),
                     request_context.clone(),
+                    request_sender.clone(),
                 ));
             senders = senders.with_elicitation(elicitation_sender);
         }
 
         if supports_roots {
             let roots_provider: Arc<dyn fastmcp_core::RootsProvider> = Arc::new(
-                bidirectional::TransportRootsProvider::new(request_sender, request_context.clone()),
+                bidirectional::TransportRootsProvider::new(request_context.clone(), request_sender),
             );
             senders = senders.with_roots(roots_provider);
         }

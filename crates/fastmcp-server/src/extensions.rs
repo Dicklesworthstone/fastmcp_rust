@@ -732,11 +732,11 @@ impl ExtensionHandlerRegistry {
     /// generically before its parameters can reach stateful extension code.
     pub fn invoke(
         &self,
+        context: &McpContext,
         negotiated: &NegotiatedExtensionSet,
         protocol_era: ProtocolEra,
         extension_id: &ExtensionId,
         request: &JsonRpcRequest,
-        context: &McpContext,
     ) -> Result<Value, ExtensionHandlerInvocationError> {
         let handler = self.admitted_handler(negotiated, protocol_era, extension_id, request)?;
         handler
@@ -931,7 +931,7 @@ mod tests {
         request.id = Some(1_i64.into());
         let before = calls.load(Ordering::SeqCst);
         assert!(matches!(handlers.invoke(
-            &negotiated, ProtocolEra::Modern2026, &id, &request, &context,
+            &context, &negotiated, ProtocolEra::Modern2026, &id, &request,
         ), Err(ExtensionHandlerInvocationError::Handler(error))
             if error.code == McpErrorCode::InvalidRequest));
         assert_eq!(
@@ -1263,11 +1263,11 @@ mod tests {
         assert_eq!(
             handlers
                 .invoke(
+                    &context,
                     &negotiated,
                     ProtocolEra::Modern2026,
                     &id,
                     &JsonRpcRequest::new("tasks/get", Some(json!({"value": 41})), 1_i64),
-                    &context,
                 )
                 .expect("negotiated protocol admission invokes the typed get handler"),
             json!({"next": 42})
@@ -1275,11 +1275,11 @@ mod tests {
         assert_eq!(
             handlers
                 .invoke(
+                    &context,
                     &negotiated,
                     ProtocolEra::Modern2026,
                     &id,
                     &JsonRpcRequest::new("tasks/update", Some(json!({"title": "review"})), 2_i64),
-                    &context,
                 )
                 .expect("the same registry invokes the differently typed update handler"),
             json!({"updated_title": "REVIEW"})
@@ -1288,11 +1288,11 @@ mod tests {
 
         let error = handlers
             .invoke(
+                &context,
                 &negotiated,
                 ProtocolEra::Modern2026,
                 &id,
                 &JsonRpcRequest::new("tasks/get", Some(json!({"unexpected": true})), 3_i64),
-                &context,
             )
             .expect_err("one malformed request field shape must reject before the handler runs");
         let ExtensionHandlerInvocationError::Handler(error) = error else {
@@ -1330,11 +1330,11 @@ mod tests {
         assert_eq!(
             handlers
                 .invoke(
+                    &context,
                     &negotiated,
                     ProtocolEra::Modern2026,
                     &id,
                     &JsonRpcRequest::new("tasks/update", Some(parameters.clone()), 4_i64),
-                    &context,
                 )
                 .expect("the request-shaped extension frame is admitted"),
             json!({"resultType": "complete"})
@@ -1343,11 +1343,11 @@ mod tests {
 
         let error = handlers
             .invoke(
+                &context,
                 &negotiated,
                 ProtocolEra::Modern2026,
                 &id,
                 &JsonRpcRequest::notification("tasks/update", Some(parameters)),
-                &context,
             )
             .expect_err("removing only the request id must reject before handler invocation");
         assert!(matches!(
