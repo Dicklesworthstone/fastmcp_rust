@@ -6179,7 +6179,10 @@ where
         // Cancellation notification delivery is the short commit-critical
         // boundary after tombstone installation. Mask only its individual
         // polls so a caller that reused the connection Cx for its operation
-        // cannot suppress the required control frame.
+        // cannot suppress the required control frame. Poll the send and its
+        // bound under the connection Cx as well: when the caller's own task
+        // is the one cancelled, an ambient cancelled task would otherwise
+        // end the bound's timer at once and misreport the send as timed out.
         let cancellation_send = {
             let mut send = Box::pin(send_websocket_callback_message(
                 &sender,
@@ -6189,12 +6192,16 @@ where
             let masked_send = std::future::poll_fn(|task_cx| {
                 connection_cx.masked(|| send.as_mut().poll(task_cx))
             });
-            asupersync::time::timeout_at(
+            let mut bounded = std::pin::pin!(asupersync::time::timeout_at(
                 connection_cx
                     .now()
                     .saturating_add_nanos(WEBSOCKET_CANCELLATION_CONTROL_SEND_TIMEOUT_NANOS),
                 masked_send,
-            )
+            ));
+            std::future::poll_fn(|task_cx| {
+                let _connection = Cx::set_current(Some(connection_cx.clone()));
+                bounded.as_mut().poll(task_cx)
+            })
             .await
         };
         commitment.committed = matches!(cancellation_send, Ok(Ok(())));
@@ -24272,6 +24279,27 @@ mod tests {
         });
     }
 
+    /// Returns a value through `slot` when the task future holding it is
+    /// dropped. A region-cancelled task's join may discard the task's output,
+    /// so a listener waiter placed in that region hands the client back here.
+    #[cfg(feature = "websocket-experimental")]
+    struct ReturnOnDrop<T> {
+        value: Option<T>,
+        slot: Arc<Mutex<Option<T>>>,
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    impl<T> Drop for ReturnOnDrop<T> {
+        fn drop(&mut self) {
+            if let Some(value) = self.value.take() {
+                *self
+                    .slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(value);
+            }
+        }
+    }
+
     #[cfg(feature = "websocket-experimental")]
     #[test]
     fn websocket_async_catalog_listener_cancel_interrupts_silent_receive_and_keeps_client() {
@@ -24318,7 +24346,68 @@ mod tests {
                         Ok(StdioSubscriptionEvent::Acknowledged(_))
                     ));
                 }
-                {
+                if cancel_context {
+                    // Region cancellation reaches the region's tasks, never its
+                    // principal Cx (asupersync 0.5.0 child_region.rs:204-210),
+                    // so this waiter runs as a task spawned into the region.
+                    // Its join may report the region's cancellation instead of
+                    // its output, so it hands back the client and its result.
+                    let returned = Arc::new(Mutex::new(None));
+                    let delivered = Arc::new(Mutex::new(None));
+                    let holder = ReturnOnDrop {
+                        value: Some(client),
+                        slot: Arc::clone(&returned),
+                    };
+                    let waiter_delivered = Arc::clone(&delivered);
+                    let waiter_cancellation = cancellation.clone();
+                    let mut waiting = request_cx
+                        .spawn(move |task_cx| async move {
+                            let mut holder = holder;
+                            let event = holder
+                                .value
+                                .as_mut()
+                                .expect("the waiter holds the client")
+                                .next_subscription_event(&task_cx, &waiter_cancellation)
+                                .await;
+                            drop(holder);
+                            *waiter_delivered
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(event);
+                        })
+                        .expect("the listener waiter is admitted into the request region");
+                    // Let the admitted waiter park on its silent receive.
+                    asupersync::runtime::yield_now().await;
+                    assert!(
+                        std::future::poll_fn(|task_cx| Poll::Ready(waiting.poll_join(task_cx)))
+                            .await
+                            .is_pending(),
+                        "the peer is silent after listen commitment"
+                    );
+                    request_region
+                        .cancel(asupersync::types::CancelReason::user(
+                            "cancel only the listener waiter",
+                        ))
+                        .unwrap();
+                    let _joined = asupersync::time::timeout(
+                        cx.now(),
+                        Duration::from_millis(500),
+                        std::future::poll_fn(|task_cx| waiting.poll_join(task_cx)),
+                    )
+                    .await
+                    .expect("request-local cancellation wakes the parked reader");
+                    client = returned
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                        .expect("the listener waiter returns its client");
+                    let error = delivered
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                        .expect("the listener waiter delivers its result")
+                        .expect_err("a cancelled listener cannot deliver an event");
+                    assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                } else {
                     let mut waiting =
                         Box::pin(client.next_subscription_event(request_cx, &cancellation));
                     assert!(
@@ -24327,15 +24416,7 @@ mod tests {
                             .is_pending(),
                         "the peer is silent after listen commitment"
                     );
-                    if cancel_context {
-                        request_region
-                            .cancel(asupersync::types::CancelReason::user(
-                                "cancel only the listener waiter",
-                            ))
-                            .unwrap();
-                    } else {
-                        assert!(cancellation.cancel());
-                    }
+                    assert!(cancellation.cancel());
                     let error = asupersync::time::timeout(
                         cx.now(),
                         Duration::from_millis(500),
@@ -24413,6 +24494,105 @@ mod tests {
                     Err(TransportError::Closed)
                 ));
             }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_catalog_listener_region_waiter_stays_live_without_cancellation() {
+        // Near-identical negative of the region cases above: the same waiter
+        // placement as a task in the request region, but nothing cancels it.
+        // The parked reader stays parked until the peer's next frame arrives.
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = async_websocket_pair();
+            write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("client discovers before opening the listener");
+            client
+                .open_subscriptions_listener(
+                    &cx,
+                    SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        ..SubscriptionFilter::default()
+                    },
+                )
+                .await
+                .expect("listener request commits");
+            let cancellation = McpRequestCancellation::new();
+            let request_region = cx
+                .open_child_region(asupersync::cx::child_region::ChildRegionSpec::inherit())
+                .await
+                .expect("listener waiter derives an independent caller region");
+            let returned = Arc::new(Mutex::new(None));
+            let delivered = Arc::new(Mutex::new(None));
+            let holder = ReturnOnDrop {
+                value: Some(client),
+                slot: Arc::clone(&returned),
+            };
+            let waiter_delivered = Arc::clone(&delivered);
+            let waiter_cancellation = cancellation.clone();
+            let mut waiting = request_region
+                .cx()
+                .spawn(move |task_cx| async move {
+                    let mut holder = holder;
+                    let event = holder
+                        .value
+                        .as_mut()
+                        .expect("the waiter holds the client")
+                        .next_subscription_event(&task_cx, &waiter_cancellation)
+                        .await;
+                    drop(holder);
+                    *waiter_delivered
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(event);
+                })
+                .expect("the listener waiter is admitted into the request region");
+            asupersync::runtime::yield_now().await;
+            assert!(
+                std::future::poll_fn(|task_cx| Poll::Ready(waiting.poll_join(task_cx)))
+                    .await
+                    .is_pending(),
+                "the peer is silent after listen commitment"
+            );
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2},"notifications":{"toolsListChanged":true}}}"#,
+            )
+            .await;
+            asupersync::time::timeout(
+                cx.now(),
+                Duration::from_millis(500),
+                std::future::poll_fn(|task_cx| waiting.poll_join(task_cx)),
+            )
+            .await
+            .expect("the peer's frame wakes the parked reader")
+            .expect("an uncancelled waiter completes normally");
+            let mut client = returned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .expect("the listener waiter returns its client");
+            let event = delivered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .expect("the listener waiter delivers its result");
+            assert!(
+                matches!(event, Ok(StdioSubscriptionEvent::Acknowledged(_))),
+                "an uncancelled waiter delivers the peer's event, not a cancellation"
+            );
+            assert!(!client.closed);
+            assert!(client.live_catalog_subscription.is_some());
+            request_region.close().await.unwrap();
+            client.close(&cx).await.unwrap();
         });
     }
 
