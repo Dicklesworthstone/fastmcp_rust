@@ -49868,7 +49868,7 @@ mod lib_unit_tests {
     fn modern_returning_loop_peer_response_case(invalid_version: bool) {
         let mut response = JsonRpcResponse::success(9900_i64.into(), serde_json::json!({}));
         if invalid_version {
-            response.jsonrpc = "1.0".to_owned();
+            response.jsonrpc = "1.0".into();
         }
         let received = Arc::new(AtomicUsize::new(0));
         let sent = Arc::new(Mutex::new(Vec::new()));
