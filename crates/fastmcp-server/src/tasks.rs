@@ -10799,6 +10799,7 @@ mod tests {
         OlderGeneration,
         Completed,
         WorkingWithoutIntent,
+        ActiveSuccessor,
     }
 
     fn assert_cancellation_retirement_readback(
@@ -10892,13 +10893,20 @@ mod tests {
                             expected_for_worker.generation(),
                         );
                     }
+                    CancellationReadbackMutation::ActiveSuccessor => {
+                        // A newer non-terminal task has not consumed the
+                        // request, so the intent stays recorded beside it.
+                        base.status = FinalTaskStatus::Working;
+                        state.cancellation_requests.insert(task_for_worker.clone());
+                    }
                 }
                 let replacement = match mutation {
                     CancellationReadbackMutation::Completed => FinalTask::Completed {
                         base,
                         result: serde_json::from_value(serde_json::json!({"content": []})).unwrap(),
                     },
-                    CancellationReadbackMutation::WorkingWithoutIntent => FinalTask::Working(base),
+                    CancellationReadbackMutation::WorkingWithoutIntent
+                    | CancellationReadbackMutation::ActiveSuccessor => FinalTask::Working(base),
                     _ => FinalTask::Cancelled(base),
                 };
                 state.tasks.insert(task_for_worker.clone(), replacement);
@@ -10986,6 +10994,7 @@ mod tests {
             CancellationReadbackMutation::OlderGeneration,
             CancellationReadbackMutation::Completed,
             CancellationReadbackMutation::WorkingWithoutIntent,
+            CancellationReadbackMutation::ActiveSuccessor,
         ] {
             assert_cancellation_retirement_readback(false, Some(mutation));
         }
