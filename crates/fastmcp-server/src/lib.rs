@@ -50098,7 +50098,14 @@ mod lib_unit_tests {
                     })
                     .expect("returning bounded cleanup pump must be admitted");
                 let started = Instant::now();
-                let deadline = cx.now().saturating_add_nanos(8_000_000_000);
+                // Same anti-hang watchdog as the sibling returning-pump helpers, and for
+                // the same reason. 8 s stood here, but the branch below deliberately waits
+                // `>= SHUTDOWN_CLEANUP_TIMEOUT` (5 s), which left only ~3 s of headroom for
+                // pump scheduling on a host running the other 2307 tests concurrently. That
+                // is the same upper-bound-on-wall-time mistake the comment further down
+                // records for the removed `started.elapsed() < SHUTDOWN_CLEANUP_TIMEOUT`
+                // assertion, which flaked 1926/0 then 1925/1 on identical source.
+                let deadline = cx.now().saturating_add_nanos(RETURNING_PUMP_WATCHDOG_NANOS);
                 let result = loop {
                     match result_receiver.try_recv() {
                         Ok(result) => break result,
