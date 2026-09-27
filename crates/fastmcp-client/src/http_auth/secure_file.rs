@@ -610,4 +610,59 @@ mod tests {
         assert!(!store.recovery_required);
         assert_eq!(store.load(&cx).unwrap().unwrap().version(), attempted);
     }
+
+    /// A process whose stdin shares `store`'s lock open file description, as
+    /// a child forked by any other thread does until it execs.
+    fn process_sharing_the_lock_description(store: &SecureAtomicFile) -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("60")
+            .stdin(std::process::Stdio::from(store.lock.try_clone().unwrap()))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn open_contender(
+        cx: &Cx,
+        directory: &PrivateDirectory,
+    ) -> Result<SecureAtomicFile, AtomicFileError> {
+        SecureAtomicFile::open(cx, File::open(&directory.0).unwrap(), "credential", 4096)
+    }
+
+    #[test]
+    fn a_dropped_handle_is_not_kept_busy_by_another_process_sharing_its_lock() {
+        let cx = Cx::for_testing();
+        let directory = PrivateDirectory::new();
+        let mut store = directory.open(&cx);
+        let committed = store.replace(&cx, None, b"committed").unwrap();
+        let mut sharer = process_sharing_the_lock_description(&store);
+        drop(store);
+
+        let reopened = open_contender(&cx, &directory);
+        let _ = sharer.kill();
+        let _ = sharer.wait();
+        let reopened = reopened.expect("dropping the only handle must release its lock");
+        assert_eq!(reopened.load(&cx).unwrap().unwrap().version(), committed);
+    }
+
+    /// Planted negative: identical except the owning handle is still live, so
+    /// the contender is refused and the owner's state is untouched.
+    #[test]
+    fn a_live_handle_keeps_a_contender_busy_while_another_process_shares_its_lock() {
+        let cx = Cx::for_testing();
+        let directory = PrivateDirectory::new();
+        let mut store = directory.open(&cx);
+        let committed = store.replace(&cx, None, b"committed").unwrap();
+        let mut sharer = process_sharing_the_lock_description(&store);
+
+        let contender = open_contender(&cx, &directory);
+        let _ = sharer.kill();
+        let _ = sharer.wait();
+        assert!(matches!(contender, Err(AtomicFileError::Busy)));
+        assert!(!store.recovery_required);
+        assert_eq!(store.load(&cx).unwrap().unwrap().version(), committed);
+        let next = version(b"next").unwrap();
+        assert_eq!(store.replace(&cx, Some(committed), b"next"), Ok(next));
+    }
 }
