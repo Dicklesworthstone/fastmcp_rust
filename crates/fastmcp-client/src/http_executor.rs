@@ -323,6 +323,27 @@ const MAX_LEGACY_SSE_DATA_LINES_PER_EVENT: usize = 4096;
 #[cfg(feature = "legacy-2024-11-05")]
 const MAX_LEGACY_SSE_RECONNECT_ATTEMPTS: u32 = 8;
 
+/// Default absolute lifetime of one legacy SSE stream generation, which is
+/// one outbound connection (LIMIT-01 guarded outbound HTTP absolute
+/// connection lifetime: 15 min default).
+#[cfg(feature = "legacy-2024-11-05")]
+const DEFAULT_LEGACY_SSE_STREAM_LIFETIME: std::time::Duration = std::time::Duration::from_mins(15);
+
+/// Hard ceiling for a configured legacy SSE stream lifetime (LIMIT-01: 2 h).
+#[cfg(feature = "legacy-2024-11-05")]
+const MAX_LEGACY_SSE_STREAM_LIFETIME: std::time::Duration = std::time::Duration::from_hours(2);
+
+/// Default guarded idle lifetime of a legacy SSE stream: how long it may
+/// deliver no bytes while a request awaits its response (LIMIT-01 guarded
+/// HTTP idle lifetime, 60 s default, per the LEG-HTTP-01 B ruling that it
+/// runs only while a request is outstanding).
+#[cfg(feature = "legacy-2024-11-05")]
+const DEFAULT_LEGACY_SSE_IDLE_LIFETIME: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// Hard ceiling for a configured legacy SSE idle lifetime (LIMIT-01: 10 min).
+#[cfg(feature = "legacy-2024-11-05")]
+const MAX_LEGACY_SSE_IDLE_LIFETIME: std::time::Duration = std::time::Duration::from_mins(10);
+
 /// Maximum JSON-RPC bytes accepted from one legacy `message` SSE event
 /// (LIMIT-01 guarded default for one decoded SSE JSON message: 8 MiB).
 #[cfg(feature = "legacy-2024-11-05")]
@@ -4933,6 +4954,7 @@ impl ClientHttpConnection {
                     }
                     return Err(ClientHttpConnectionError::Legacy(error));
                 }
+                client.note_request_sent(cx.now());
                 let mut interleaved_control_frames = 0_usize;
                 loop {
                     let message = client
@@ -8172,6 +8194,7 @@ pub struct LegacySseHttpClient {
     stream_generation: u32,
     reconnect_attempts: u32,
     closed: bool,
+    lifetimes: LegacySseStreamLifetimes,
 }
 
 /// Cloneable POST half of an admitted exact-2024 SSE connection.
@@ -9136,7 +9159,8 @@ impl LegacySseHttpClient {
             return Err(LegacySseHttpClientError::Cancelled);
         }
         let (stream, advertised_message_post_target) =
-            open_legacy_sse_generation(cx, &protocol_plan).await?;
+            open_legacy_sse_generation(cx, &protocol_plan, LegacySseStreamLifetimes::DEFAULT)
+                .await?;
         let configured_message_post_target = protocol_plan
             .legacy_message_post_target()
             .ok_or(LegacySseHttpClientError::MissingMessagePostTarget)?
@@ -9152,6 +9176,7 @@ impl LegacySseHttpClient {
             stream_generation: 1,
             reconnect_attempts: 0,
             closed: false,
+            lifetimes: LegacySseStreamLifetimes::DEFAULT,
         })
     }
 
@@ -9194,6 +9219,70 @@ impl LegacySseHttpClient {
         self.closed
     }
 
+    /// Returns the absolute lifetime applied to each stream generation.
+    #[must_use]
+    pub const fn stream_lifetime(&self) -> std::time::Duration {
+        self.lifetimes.absolute
+    }
+
+    /// Returns the guarded idle lifetime applied to each stream generation.
+    #[must_use]
+    pub const fn idle_lifetime(&self) -> std::time::Duration {
+        self.lifetimes.idle
+    }
+
+    /// Sets the guarded idle lifetime of the current and every later stream
+    /// generation. The default is 60 seconds.
+    ///
+    /// The idle clock runs only while a request sent with [`Self::send`]
+    /// awaits its response, and any bytes from the peer restart it. A quiet
+    /// stream with nothing pending is never cut. When it expires, the next
+    /// read returns [`LegacySseHttpClientError::SseIdleLifetimeExceeded`] and
+    /// the generation's POST target is invalidated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LegacySseHttpClientError::InvalidIdleLifetime`] for zero or
+    /// for more than ten minutes, leaving the lifetime unchanged.
+    pub fn set_idle_lifetime(
+        &mut self,
+        lifetime: std::time::Duration,
+    ) -> Result<(), LegacySseHttpClientError> {
+        if lifetime.is_zero() || lifetime > MAX_LEGACY_SSE_IDLE_LIFETIME {
+            return Err(LegacySseHttpClientError::InvalidIdleLifetime);
+        }
+        self.lifetimes.idle = lifetime;
+        if let Some(stream) = self.stream.as_mut() {
+            stream.set_idle_lifetime(lifetime);
+        }
+        Ok(())
+    }
+
+    /// Sets the absolute lifetime of the current and every later stream
+    /// generation, measured from when each generation was opened. The default
+    /// is 15 minutes. When it ends, the next read that would wait for more
+    /// bytes returns [`LegacySseHttpClientError::SseStreamLifetimeExpired`]
+    /// and the generation's POST target is invalidated; [`Self::reconnect`]
+    /// may open a new one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LegacySseHttpClientError::InvalidStreamLifetime`] for zero
+    /// or for more than two hours, leaving the lifetime unchanged.
+    pub fn set_stream_lifetime(
+        &mut self,
+        lifetime: std::time::Duration,
+    ) -> Result<(), LegacySseHttpClientError> {
+        if lifetime.is_zero() || lifetime > MAX_LEGACY_SSE_STREAM_LIFETIME {
+            return Err(LegacySseHttpClientError::InvalidStreamLifetime);
+        }
+        self.lifetimes.absolute = lifetime;
+        if let Some(stream) = self.stream.as_mut() {
+            stream.set_lifetime(lifetime);
+        }
+        Ok(())
+    }
+
     /// Opens a new SSE stream generation in place of the current one.
     ///
     /// Exact `2024-11-05` has no replay or resumption: a reconnect is a fresh
@@ -9226,7 +9315,7 @@ impl LegacySseHttpClient {
         }
         self.reconnect_attempts += 1;
         let (stream, advertised_message_post_target) =
-            open_legacy_sse_generation(cx, &self.protocol_plan).await?;
+            open_legacy_sse_generation(cx, &self.protocol_plan, self.lifetimes).await?;
         self.stream = Some(stream);
         self.advertised_message_post_target = advertised_message_post_target;
         self.notifications.clear();
@@ -9263,7 +9352,9 @@ impl LegacySseHttpClient {
 async fn open_legacy_sse_generation(
     cx: &Cx,
     protocol_plan: &ClientProtocolPlan,
+    lifetimes: LegacySseStreamLifetimes,
 ) -> Result<(LegacySseResponseStream, String), LegacySseHttpClientError> {
+    let opened_at = cx.now();
     let sse_target = protocol_plan
         .legacy_sse_target()
         .ok_or(LegacySseHttpClientError::MissingSseTarget)?
@@ -9304,7 +9395,7 @@ async fn open_legacy_sse_generation(
         .map_err(LegacySseHttpClientError::Executor)?;
     validate_legacy_sse_response_head(response.head.status, &response.head.headers)?;
 
-    let mut stream = LegacySseResponseStream::new(response);
+    let mut stream = LegacySseResponseStream::new(response, opened_at, lifetimes);
     let advertised_message_post_target = match stream.next_event(cx).await? {
         Some(LegacySseEvent::Endpoint(target)) if !target.is_empty() => target,
         Some(LegacySseEvent::Endpoint(_)) => {
@@ -9321,6 +9412,12 @@ async fn open_legacy_sse_generation(
         &advertised_message_post_target,
     )?;
     Ok((stream, advertised_message_post_target))
+}
+
+/// The end of a stream generation's absolute lifetime.
+#[cfg(feature = "legacy-2024-11-05")]
+fn legacy_sse_stream_deadline(opened_at: Time, lifetime: std::time::Duration) -> Time {
+    opened_at.saturating_add_nanos(u64::try_from(lifetime.as_nanos()).unwrap_or(u64::MAX))
 }
 
 #[cfg(feature = "legacy-2024-11-05")]
@@ -9357,7 +9454,7 @@ impl LegacySseHttpClient {
     /// Closing or ending the SSE stream invalidates its advertised POST
     /// target, so both refuse the send before any request is made.
     pub async fn send(
-        &self,
+        &mut self,
         cx: &Cx,
         message: &JsonRpcMessage,
     ) -> Result<(), LegacySseHttpClientError> {
@@ -9377,7 +9474,21 @@ impl LegacySseHttpClient {
         self.outbound()
             .send(cx, message)
             .await
-            .map_err(|error| error.error)
+            .map_err(|error| error.error)?;
+        if let JsonRpcMessage::Request(request) = message
+            && !request.is_notification()
+        {
+            self.note_request_sent(cx.now());
+        }
+        Ok(())
+    }
+
+    /// Starts the current generation's guarded idle clock for one request
+    /// that now awaits its response.
+    pub(crate) fn note_request_sent(&mut self, now: Time) {
+        if let Some(stream) = self.stream.as_mut() {
+            stream.request_sent(now);
+        }
     }
 
     /// Waits for the next legacy SSE `message` JSON-RPC envelope.
@@ -9395,7 +9506,11 @@ impl LegacySseHttpClient {
             .stream
             .as_mut()
             .ok_or(LegacySseHttpClientError::ReceiverOwnedByReadyClient)?;
-        next_legacy_sse_message(stream, cx).await
+        let message = next_legacy_sse_message(stream, cx).await?;
+        if matches!(message, Some(JsonRpcMessage::Response(_))) {
+            stream.response_received();
+        }
+        Ok(message)
     }
 }
 
@@ -9572,6 +9687,15 @@ pub enum LegacySseHttpClientError {
     StreamGenerationEnded,
     /// The client has spent its reconnect bound.
     ReconnectLimitExceeded { maximum_attempts: u32 },
+    /// The current stream generation reached its absolute lifetime.
+    SseStreamLifetimeExpired,
+    /// A configured stream lifetime was zero or above its hard ceiling.
+    InvalidStreamLifetime,
+    /// The stream delivered no bytes for its guarded idle lifetime while at
+    /// least one request was outstanding.
+    SseIdleLifetimeExceeded,
+    /// A configured idle lifetime was zero or above its hard ceiling.
+    InvalidIdleLifetime,
 }
 
 impl fmt::Display for LegacySseHttpClientError {
@@ -9671,6 +9795,15 @@ impl fmt::Display for LegacySseHttpClientError {
                 formatter,
                 "legacy SSE client spent its {maximum_attempts} reconnect attempts"
             ),
+            Self::SseStreamLifetimeExpired => {
+                formatter.write_str("legacy SSE stream generation reached its absolute lifetime")
+            }
+            Self::InvalidStreamLifetime => formatter
+                .write_str("legacy SSE stream lifetime must be above zero and at most two hours"),
+            Self::SseIdleLifetimeExceeded => formatter
+                .write_str("legacy SSE stream delivered no bytes within its guarded idle lifetime"),
+            Self::InvalidIdleLifetime => formatter
+                .write_str("legacy SSE idle lifetime must be above zero and at most ten minutes"),
         }
     }
 }
@@ -9707,7 +9840,11 @@ impl std::error::Error for LegacySseHttpClientError {
             | Self::SseEventTooManyDataLines { .. }
             | Self::Closed
             | Self::StreamGenerationEnded
-            | Self::ReconnectLimitExceeded { .. } => None,
+            | Self::ReconnectLimitExceeded { .. }
+            | Self::SseStreamLifetimeExpired
+            | Self::InvalidStreamLifetime
+            | Self::SseIdleLifetimeExceeded
+            | Self::InvalidIdleLifetime => None,
         }
     }
 }
@@ -9734,16 +9871,100 @@ struct LegacySseResponseStream {
     parser: LegacySseParser,
     pending_events: VecDeque<LegacySseEvent>,
     pending_event_bytes: usize,
+    /// When this stream generation was opened.
+    opened_at: Time,
+    /// When its absolute lifetime ends.
+    deadline: Time,
+    /// How long it may deliver no bytes while a request awaits a response.
+    idle_lifetime: std::time::Duration,
+    /// Requests sent on this generation whose responses have not been read.
+    awaiting_responses: usize,
+    /// When the guarded idle clock last started: the first outstanding
+    /// request, or the latest bytes received since.
+    idle_since: Time,
+}
+
+/// The two lifetimes applied to each legacy SSE stream generation.
+#[cfg(feature = "legacy-2024-11-05")]
+#[derive(Clone, Copy)]
+struct LegacySseStreamLifetimes {
+    absolute: std::time::Duration,
+    idle: std::time::Duration,
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl LegacySseStreamLifetimes {
+    const DEFAULT: Self = Self {
+        absolute: DEFAULT_LEGACY_SSE_STREAM_LIFETIME,
+        idle: DEFAULT_LEGACY_SSE_IDLE_LIFETIME,
+    };
+}
+
+/// Why a legacy SSE read stopped waiting for the next body frame.
+#[cfg(feature = "legacy-2024-11-05")]
+enum LegacySseWaitInterrupt {
+    Cancelled,
+    DeadlineReached,
 }
 
 #[cfg(feature = "legacy-2024-11-05")]
 impl LegacySseResponseStream {
-    fn new(response: ClientStreamingResponse<ClientIo>) -> Self {
+    fn new(
+        response: ClientStreamingResponse<ClientIo>,
+        opened_at: Time,
+        lifetimes: LegacySseStreamLifetimes,
+    ) -> Self {
         Self {
             response: Some(response),
             parser: LegacySseParser::default(),
             pending_events: VecDeque::new(),
             pending_event_bytes: 0,
+            opened_at,
+            deadline: legacy_sse_stream_deadline(opened_at, lifetimes.absolute),
+            idle_lifetime: lifetimes.idle,
+            awaiting_responses: 0,
+            idle_since: opened_at,
+        }
+    }
+
+    /// Moves this generation's deadline to `lifetime` after it was opened.
+    fn set_lifetime(&mut self, lifetime: std::time::Duration) {
+        self.deadline = legacy_sse_stream_deadline(self.opened_at, lifetime);
+    }
+
+    fn set_idle_lifetime(&mut self, lifetime: std::time::Duration) {
+        self.idle_lifetime = lifetime;
+    }
+
+    /// Records a request POSTed on this generation. The first outstanding
+    /// request starts the guarded idle clock.
+    fn request_sent(&mut self, now: Time) {
+        if self.awaiting_responses == 0 {
+            self.idle_since = now;
+        }
+        self.awaiting_responses = self.awaiting_responses.saturating_add(1);
+    }
+
+    /// Records a response read from this generation.
+    const fn response_received(&mut self) {
+        self.awaiting_responses = self.awaiting_responses.saturating_sub(1);
+    }
+
+    /// When the guarded idle clock expires, or `None` while nothing awaits a
+    /// response, so a quiet stream with nothing pending is never cut.
+    fn idle_deadline(&self) -> Option<Time> {
+        (self.awaiting_responses > 0)
+            .then(|| legacy_sse_stream_deadline(self.idle_since, self.idle_lifetime))
+    }
+
+    /// The lifetime refusal due at `now`, if any.
+    fn expired_lifetime(&self, now: Time) -> Option<LegacySseHttpClientError> {
+        if now >= self.deadline {
+            Some(LegacySseHttpClientError::SseStreamLifetimeExpired)
+        } else if self.idle_deadline().is_some_and(|deadline| now >= deadline) {
+            Some(LegacySseHttpClientError::SseIdleLifetimeExceeded)
+        } else {
+            None
         }
     }
 
@@ -9817,27 +10038,46 @@ impl LegacySseResponseStream {
                 self.pending_event_bytes = self.pending_event_bytes.saturating_sub(event.len());
                 return Ok(Some(event));
             }
+            if self.response.is_none() {
+                return Ok(None);
+            }
+            // Events admitted before a deadline are delivered above; no new
+            // bytes are read once either lifetime has ended.
+            if let Some(refusal) = self.expired_lifetime(cx.now()) {
+                self.close_for_cancellation();
+                return Err(refusal);
+            }
+            let wake_at = self
+                .idle_deadline()
+                .map_or(self.deadline, |idle| idle.min(self.deadline));
             let Some(response) = self.response.as_mut() else {
                 return Ok(None);
             };
             let (_cancellation_guard, mut cancellation_signal) = oneshot::channel::<()>();
             let mut cancellation = std::pin::pin!(cancellation_signal.recv(cx));
+            let mut expiry = std::pin::pin!(asupersync::time::sleep_until(wake_at));
             let frame = poll_fn(|task_cx| {
                 if cancellation.as_mut().poll(task_cx).is_ready() {
-                    return Poll::Ready(Err(()));
+                    return Poll::Ready(Err(LegacySseWaitInterrupt::Cancelled));
                 }
-                match Pin::new(&mut response.body).poll_frame(task_cx) {
-                    Poll::Ready(frame) => Poll::Ready(Ok(frame)),
-                    Poll::Pending => Poll::Pending,
+                if let Poll::Ready(frame) = Pin::new(&mut response.body).poll_frame(task_cx) {
+                    return Poll::Ready(Ok(frame));
                 }
+                let _caller = Cx::set_current(Some(cx.clone()));
+                if expiry.as_mut().poll(task_cx).is_ready() {
+                    return Poll::Ready(Err(LegacySseWaitInterrupt::DeadlineReached));
+                }
+                Poll::Pending
             })
             .await;
             let frame = match frame {
                 Ok(frame) => frame,
-                Err(()) => {
+                Err(LegacySseWaitInterrupt::Cancelled) => {
                     self.close_for_cancellation();
                     return Err(LegacySseHttpClientError::Cancelled);
                 }
+                // The check at the top of the loop names the lifetime that ended.
+                Err(LegacySseWaitInterrupt::DeadlineReached) => continue,
             };
             let frame = match reject_body_frame_after_cancellation(cx, frame) {
                 Ok(frame) => frame,
@@ -9864,6 +10104,8 @@ impl LegacySseResponseStream {
             let Some(mut data) = frame.into_data() else {
                 continue;
             };
+            // Any bytes from the peer restart the guarded idle clock.
+            self.idle_since = cx.now();
             while data.has_remaining() {
                 let chunk = data.chunk();
                 let mut parser = std::mem::take(&mut self.parser);
