@@ -1975,6 +1975,7 @@ async fn run_handler_in_request<'a, T>(
     request_cx: &'a Cx,
     budget: Budget,
     handler_class: &'static str,
+    handler_admission: Option<&crate::FinalHandlerAdmission>,
     make_future: impl FnOnce(&'a Cx) -> BoxFuture<'a, McpOutcome<T>>,
 ) -> McpResult<McpOutcome<T>> {
     if request_cx_cancellation_is_visible(request_cx) {
@@ -1982,6 +1983,17 @@ async fn run_handler_in_request<'a, T>(
     }
     if let Some(error) = handler_budget_error(ctx, budget) {
         return Err(error);
+    }
+    if let Some(admit) = handler_admission {
+        admit();
+        // Flushing an admitted transport frame may observe peer closure.
+        // Do not enter application code after that flush cancels this request.
+        if request_cx_cancellation_is_visible(request_cx) {
+            return Err(cancellation_error(ctx));
+        }
+        if let Some(error) = handler_budget_error(ctx, budget) {
+            return Err(error);
+        }
     }
 
     let future = crate::catch_extension_unwind(|| make_future(request_cx))
@@ -2531,7 +2543,7 @@ impl Router {
             .expect("final catalog revision cannot overflow");
     }
 
-/// Sets the application cache policy for final catalog and resource-read
+    /// Sets the application cache policy for final catalog and resource-read
     /// responses. The default is a five-minute private catalog TTL and a
     /// one-hour private resource-read TTL. Catalog responses additionally
     /// respect any upstream proxy's remaining lifetime and private scope.
@@ -2548,7 +2560,7 @@ impl Router {
         };
     }
 
-/// Returns the configured application cache policy as
+    /// Returns the configured application cache policy as
     /// `(&list_ttl_ms, &resource_read_ttl_ms, scope)`.
     #[must_use]
     pub fn final_cache_hint_policy(&self) -> (&CacheTtl, &CacheTtl, CacheScope) {
@@ -4199,6 +4211,7 @@ impl Router {
             request_cx,
             effective_budget,
             "completion",
+            None,
             |child_cx| handler.complete_legacy_async_in_request(&handler_ctx, child_cx, params),
         )
         .await?;
@@ -4236,6 +4249,7 @@ impl Router {
         request_ctx: &McpContext,
         request_cx: &Cx,
         params: FinalCompletionParams,
+        handler_admission: Option<&crate::FinalHandlerAdmission>,
     ) -> McpResult<FinalCompletionResult> {
         let dispatch_started_at = request_ctx.cx().now();
         if request_cx_cancellation_is_visible(request_cx) {
@@ -4345,6 +4359,7 @@ impl Router {
             request_cx,
             effective_budget,
             "completion",
+            handler_admission,
             |child_cx| handler.complete_final_async_in_request(&handler_ctx, child_cx, params),
         )
         .await?;
@@ -4455,6 +4470,7 @@ impl Router {
             request,
             raw_params,
             continuation_cancellation,
+            None,
         )
         .await
     }
@@ -4505,12 +4521,34 @@ impl Router {
     /// Dispatches an owned modern request with its retained raw-parameter
     /// sidecar. The sidecar is owned because a request child may outlive the
     /// transport frame reader that admitted it.
+    #[cfg(test)]
     pub(crate) async fn dispatch_stateless_owned_with_continuation_cancellation_and_raw_params(
         self: Arc<Self>,
         request_ctx: McpContext,
         request: JsonRpcRequest,
         raw_params: Option<Arc<str>>,
         continuation_cancellation: fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<serde_json::Value> {
+        self.dispatch_stateless_owned_with_handler_admission(
+            request_ctx,
+            request,
+            raw_params,
+            continuation_cancellation,
+            None,
+        )
+        .await
+    }
+
+    /// Carries a transport-owned admission signal to the actual final handler
+    /// boundary. Middleware, raw decoding, target and capability admission
+    /// remain ahead of any incremental response representation.
+    pub(crate) async fn dispatch_stateless_owned_with_handler_admission(
+        self: Arc<Self>,
+        request_ctx: McpContext,
+        request: JsonRpcRequest,
+        raw_params: Option<Arc<str>>,
+        continuation_cancellation: fastmcp_core::McpRequestCancellation,
+        handler_admission: Option<crate::FinalHandlerAdmission>,
     ) -> McpResult<serde_json::Value> {
         if let Some(error) = budget_error(&request_ctx) {
             return Err(error);
@@ -4524,6 +4562,7 @@ impl Router {
                     &request,
                     raw_params.as_deref(),
                     &continuation_cancellation,
+                    handler_admission.as_ref(),
                 )
                 .await;
         };
@@ -4552,6 +4591,7 @@ impl Router {
                             &request,
                             raw_params.as_deref(),
                             &continuation_cancellation,
+                            handler_admission.as_ref(),
                         ),
                     )
                 })
@@ -4563,6 +4603,7 @@ impl Router {
                 &request,
                 raw_params.as_deref(),
                 &continuation_cancellation,
+                handler_admission.as_ref(),
             )
             .await
         });
@@ -4628,6 +4669,7 @@ impl Router {
         request: &JsonRpcRequest,
         raw_params: Option<&str>,
         continuation_cancellation: &fastmcp_core::McpRequestCancellation,
+        handler_admission: Option<&crate::FinalHandlerAdmission>,
     ) -> McpResult<serde_json::Value> {
         if request_cx_cancellation_is_visible(request_cx) {
             return Err(McpError::request_cancelled());
@@ -4652,7 +4694,7 @@ impl Router {
                     ));
                 };
                 encode_stateless_handler_result(
-                    self.handle_completion_final_in_request(request_ctx, request_cx, params)
+                    self.handle_completion_final_in_request(request_ctx, request_cx, params, handler_admission)
                         .await,
                 )?
             }
@@ -4706,6 +4748,7 @@ impl Router {
                             binding,
                             None,
                             continuation_cancellation,
+                            handler_admission,
                         )
                         .await?
                     }
@@ -4717,6 +4760,7 @@ impl Router {
                             binding,
                             Some(resume_inputs),
                             continuation_cancellation,
+                            handler_admission,
                         )
                         .await?
                     }
@@ -4794,6 +4838,7 @@ impl Router {
                             binding,
                             None,
                             continuation_cancellation,
+                            handler_admission,
                         )
                         .await?
                     }
@@ -4805,6 +4850,7 @@ impl Router {
                             binding,
                             Some(resume_inputs),
                             continuation_cancellation,
+                            handler_admission,
                         )
                         .await?
                     }
@@ -4860,6 +4906,7 @@ impl Router {
                             binding,
                             None,
                             continuation_cancellation,
+                            handler_admission,
                         )
                         .await?
                     }
@@ -4871,6 +4918,7 @@ impl Router {
                             binding,
                             Some(resume_inputs),
                             continuation_cancellation,
+                            handler_admission,
                         )
                         .await?
                     }
@@ -5000,6 +5048,7 @@ impl Router {
         binding: Option<MrtrExchangeBinding>,
         resume_inputs: Option<MrtrCompletedInputs>,
         continuation_cancellation: &fastmcp_core::McpRequestCancellation,
+        handler_admission: Option<&crate::FinalHandlerAdmission>,
     ) -> McpResult<serde_json::Value> {
         #[cfg(feature = "tasks")]
         let request_metadata = params.meta.clone();
@@ -5016,6 +5065,7 @@ impl Router {
                 None,
                 None,
                 resume_inputs.as_ref(),
+                handler_admission,
             )
             .await?;
         match outcome {
@@ -5074,6 +5124,7 @@ impl Router {
         binding: Option<MrtrExchangeBinding>,
         resume_inputs: Option<MrtrCompletedInputs>,
         continuation_cancellation: &fastmcp_core::McpRequestCancellation,
+        handler_admission: Option<&crate::FinalHandlerAdmission>,
     ) -> McpResult<serde_json::Value> {
         let session_state = request_ctx
             .session_state()
@@ -5088,6 +5139,7 @@ impl Router {
                 None,
                 None,
                 resume_inputs.as_ref(),
+                handler_admission,
             )
             .await?
         {
@@ -5116,6 +5168,7 @@ impl Router {
         binding: Option<MrtrExchangeBinding>,
         resume_inputs: Option<MrtrCompletedInputs>,
         continuation_cancellation: &fastmcp_core::McpRequestCancellation,
+        handler_admission: Option<&crate::FinalHandlerAdmission>,
     ) -> McpResult<serde_json::Value> {
         let session_state = request_ctx
             .session_state()
@@ -5130,6 +5183,7 @@ impl Router {
                 None,
                 None,
                 resume_inputs.as_ref(),
+                handler_admission,
             )
             .await?
         {
@@ -5532,11 +5586,17 @@ impl Router {
             dispatch_started_at,
         );
         let ctx = ctx.with_operation_deadline(effective_budget.deadline);
-        let outcome =
-            run_handler_in_request(&ctx, request_cx, effective_budget, "tool", |child_cx| {
+        let outcome = run_handler_in_request(
+            &ctx,
+            request_cx,
+            effective_budget,
+            "tool",
+            None,
+            |child_cx| {
                 handler.call_async_in_request(&ctx, child_cx, arguments)
-            })
-            .await?;
+            },
+        )
+        .await?;
 
         match outcome {
             Outcome::Ok(content) => Ok(ApplicationToolResult {
@@ -5575,6 +5635,7 @@ impl Router {
         notification_sender: Option<&NotificationSender>,
         bidirectional_senders: Option<&BidirectionalSenders>,
         resume_inputs: Option<&MrtrCompletedInputs>,
+        handler_admission: Option<&crate::FinalHandlerAdmission>,
     ) -> McpResult<FinalToolOutcome> {
         debug!(
             target: targets::HANDLER,
@@ -5625,6 +5686,13 @@ impl Router {
         // point, so `arguments` is here always Absent or a typed value.
         #[cfg(feature = "tasks")]
         let declares_final_tasks = final_registration.declares_final_tasks;
+        // A declared task-capable handler may still complete normally without
+        // client Tasks support. Keep its frames deferred until its outcome is
+        // known whenever CreateTask could produce a canonical HTTP 400.
+        #[cfg(feature = "tasks")]
+        let handler_admission = handler_admission.filter(|_| {
+            !declares_final_tasks || require_final_tasks_capability(&params.meta).is_ok()
+        });
         let arguments = params
             .arguments
             .into_value()
@@ -5690,8 +5758,13 @@ impl Router {
             dispatch_started_at,
         );
         let ctx = ctx.with_operation_deadline(effective_budget.deadline);
-        let outcome =
-            run_handler_in_request(&ctx, request_cx, effective_budget, "tool", |child_cx| {
+        let outcome = run_handler_in_request(
+            &ctx,
+            request_cx,
+            effective_budget,
+            "tool",
+            handler_admission,
+            |child_cx| {
                 // MRTR-aware handlers receive every call through the resuming
                 // hook: None marks the initial invocation, Some the admitted
                 // retry. The default resuming hook forwards to the plain
@@ -5702,8 +5775,9 @@ impl Router {
                     arguments,
                     resume_inputs,
                 )
-            })
-            .await?;
+            },
+        )
+        .await?;
 
         match outcome {
             Outcome::Ok(result) => {
@@ -5940,16 +6014,22 @@ impl Router {
             dispatch_started_at,
         );
         let ctx = ctx.with_operation_deadline(effective_budget.deadline);
-        let outcome =
-            run_handler_in_request(&ctx, request_cx, effective_budget, "resource", |child_cx| {
+        let outcome = run_handler_in_request(
+            &ctx,
+            request_cx,
+            effective_budget,
+            "resource",
+            None,
+            |child_cx| {
                 resolved.handler.read_async_with_uri_in_request(
                     &ctx,
                     child_cx,
                     &params.uri,
                     &resolved.params,
                 )
-            })
-            .await?;
+            },
+        )
+        .await?;
 
         let contents = match outcome {
             Outcome::Ok(contents) => contents,
@@ -5984,6 +6064,7 @@ impl Router {
         notification_sender: Option<&NotificationSender>,
         bidirectional_senders: Option<&BidirectionalSenders>,
         resume_inputs: Option<&MrtrCompletedInputs>,
+        handler_admission: Option<&crate::FinalHandlerAdmission>,
     ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
         let progress_marker = final_progress_marker(&params.meta)?;
         let uri = params.uri.as_str();
@@ -6058,8 +6139,13 @@ impl Router {
             dispatch_started_at,
         );
         let ctx = ctx.with_operation_deadline(effective_budget.deadline);
-        let outcome =
-            run_handler_in_request(&ctx, request_cx, effective_budget, "resource", |child_cx| {
+        let outcome = run_handler_in_request(
+            &ctx,
+            request_cx,
+            effective_budget,
+            "resource",
+            handler_admission,
+            |child_cx| {
                 if let Some(resume_inputs) = resume_inputs {
                     resolved
                         .handler
@@ -6080,8 +6166,9 @@ impl Router {
                             &resolved.params,
                         )
                 }
-            })
-            .await?;
+            },
+        )
+        .await?;
 
         match outcome {
             Outcome::Ok(mut result) => {
@@ -6248,11 +6335,17 @@ impl Router {
         );
         let ctx = ctx.with_operation_deadline(effective_budget.deadline);
         let arguments = params.arguments.unwrap_or_default();
-        let outcome =
-            run_handler_in_request(&ctx, request_cx, effective_budget, "prompt", |child_cx| {
+        let outcome = run_handler_in_request(
+            &ctx,
+            request_cx,
+            effective_budget,
+            "prompt",
+            None,
+            |child_cx| {
                 handler.get_async_in_request(&ctx, child_cx, arguments)
-            })
-            .await?;
+            },
+        )
+        .await?;
 
         let messages = match outcome {
             Outcome::Ok(messages) => messages,
@@ -6288,6 +6381,7 @@ impl Router {
         notification_sender: Option<&NotificationSender>,
         bidirectional_senders: Option<&BidirectionalSenders>,
         resume_inputs: Option<&MrtrCompletedInputs>,
+        handler_admission: Option<&crate::FinalHandlerAdmission>,
     ) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
         debug!(
             target: targets::HANDLER,
@@ -6356,8 +6450,13 @@ impl Router {
         );
         let ctx = ctx.with_operation_deadline(effective_budget.deadline);
         let arguments = arguments.into_iter().collect();
-        let outcome =
-            run_handler_in_request(&ctx, request_cx, effective_budget, "prompt", |child_cx| {
+        let outcome = run_handler_in_request(
+            &ctx,
+            request_cx,
+            effective_budget,
+            "prompt",
+            handler_admission,
+            |child_cx| {
                 if let Some(resume_inputs) = resume_inputs {
                     handler.get_final_outcome_async_resuming_in_request(
                         &ctx,
@@ -6368,8 +6467,9 @@ impl Router {
                 } else {
                     handler.get_final_outcome_async_in_request(&ctx, child_cx, arguments)
                 }
-            })
-            .await?;
+            },
+        )
+        .await?;
 
         match outcome {
             Outcome::Ok(result) => {
@@ -8358,6 +8458,7 @@ impl RouterResourceReader {
             parent_ctx.cx(),
             effective_budget,
             "resource",
+            None,
             |request_cx| {
                 resolved.handler.read_async_with_uri_in_request(
                     &child_ctx,
@@ -8464,6 +8565,7 @@ impl RouterResourceReader {
             parent_ctx.cx(),
             effective_budget,
             "resource",
+            None,
             |request_cx| {
                 resolved
                     .handler
@@ -8676,6 +8778,7 @@ impl RouterToolCaller {
             parent_ctx.cx(),
             effective_budget,
             "tool",
+            None,
             |request_cx| handler.call_async_in_request(&child_ctx, request_cx, args),
         )
         .await?;
@@ -8786,6 +8889,7 @@ impl RouterToolCaller {
             parent_ctx.cx(),
             effective_budget,
             "tool",
+            None,
             |request_cx| {
                 handler.call_final_outcome_async_resuming_in_request(
                     &child_ctx, request_cx, args, None,
@@ -9063,6 +9167,7 @@ impl RouterPromptCaller {
             parent_ctx.cx(),
             effective_budget,
             "prompt",
+            None,
             |request_cx| handler.get_async_in_request(&child_ctx, request_cx, arguments),
         )
         .await?;
@@ -9154,6 +9259,7 @@ impl RouterPromptCaller {
             parent_ctx.cx(),
             effective_budget,
             "prompt",
+            None,
             |request_cx| {
                 handler.get_final_outcome_async_in_request(&child_ctx, request_cx, arguments)
             },
@@ -10307,6 +10413,7 @@ mod router_tests {
             Some(&notification_sender),
             None,
             None,
+            None,
         ))
         .expect("ordinary final router dispatch completes");
         assert!(matches!(outcome, FinalToolOutcome::Complete(_)));
@@ -10332,6 +10439,7 @@ mod router_tests {
             planted,
             state,
             Some(&notification_sender),
+            None,
             None,
             None,
         ))
@@ -10396,6 +10504,7 @@ mod router_tests {
             params,
             state,
             Some(&notification_sender),
+            None,
             None,
             None,
         ))
@@ -17380,6 +17489,7 @@ mod router_tests {
             request_cx,
             Budget::INFINITE,
             "tool",
+            None,
             |_| Box::pin(async { Outcome::Ok(()) }),
         ))
     }

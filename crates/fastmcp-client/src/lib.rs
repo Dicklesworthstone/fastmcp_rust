@@ -150,7 +150,8 @@ use fastmcp_protocol::{
 };
 pub use http_executor::{
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse, ModernHttpClient,
-    ModernHttpClientError, ModernHttpResponseStream, ModernHttpSubscriptionListenCollector,
+    ModernHttpClientError, ModernHttpRequestControl, ModernHttpRequestExecution,
+    ModernHttpResponseStream, ModernHttpSubscriptionListenCollector,
     ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener,
 };
 #[cfg(feature = "legacy-2024-11-05")]
@@ -11098,6 +11099,221 @@ fn invoke_tool_progress_callback(
     .map_err(|_| McpError::internal_error(PROGRESS_CALLBACK_PANIC_ERROR))
 }
 
+/// Maximum simultaneously owned ordinary executions on one [`HttpClient`].
+pub const MAX_HTTP_IN_FLIGHT_EXECUTIONS: usize = execution::DEFAULT_MAX_IN_FLIGHT_EXECUTIONS;
+/// Maximum conservatively accounted encoded bytes in one owned HTTP request.
+pub const MAX_HTTP_EXECUTION_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum encoded request bytes retained or reserved by one HTTP client.
+pub const MAX_HTTP_RETAINED_EXECUTION_BYTES: usize = 64 * 1024 * 1024;
+const MAX_HTTP_EXECUTION_METADATA_BYTES: usize = 64 * 1024;
+
+struct HttpClientExecutionEntry {
+    control: ModernHttpRequestControl,
+    request_bytes: usize,
+}
+
+#[derive(Default)]
+struct HttpClientExecutionRegistry {
+    state: Mutex<HttpClientExecutionRegistryState>,
+}
+
+#[derive(Default)]
+struct HttpClientExecutionRegistryState {
+    controls: Vec<HttpClientExecutionEntry>,
+    reserved: usize,
+    retiring: usize,
+    request_bytes: usize,
+    cancellation_generation: u64,
+    generation_exhausted: bool,
+}
+
+struct HttpClientExecutionAdmission<'a> {
+    registry: &'a HttpClientExecutionRegistry,
+    cancellation_generation: u64,
+    request_bytes: usize,
+    reserved: bool,
+}
+
+struct HttpClientExecutionRetirement<'a> {
+    registry: &'a HttpClientExecutionRegistry,
+    count: usize,
+    request_bytes: usize,
+}
+
+impl Drop for HttpClientExecutionRetirement<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .registry
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.retiring -= self.count;
+        state.request_bytes -= self.request_bytes;
+    }
+}
+
+impl HttpClientExecutionRegistry {
+    fn reserve(
+        &self,
+        request_bytes: usize,
+    ) -> Result<HttpClientExecutionAdmission<'_>, HttpClientError> {
+        let mut retired = Vec::new();
+        let result = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut index = 0;
+            while index < state.controls.len() {
+                // A request may be polling while its waker starts a sibling.
+                // Never wait for that request's terminal lock while holding
+                // the registry lock, or run its final destructor here.
+                if state.controls[index].control.is_terminal_nonblocking() {
+                    let entry = state.controls.swap_remove(index);
+                    state.request_bytes -= entry.request_bytes;
+                    retired.push(entry);
+                } else {
+                    index += 1;
+                }
+            }
+            if state.generation_exhausted {
+                Err(HttpClientError::CoreResult(McpError::internal_error(
+                    "HTTP execution cancellation generations are exhausted",
+                )))
+            } else if state.controls.len() + state.reserved + state.retiring
+                >= MAX_HTTP_IN_FLIGHT_EXECUTIONS
+            {
+                Err(HttpClientError::CoreResult(McpError::internal_error(
+                    "HTTP client has reached its owned execution limit",
+                )))
+            } else if request_bytes > MAX_HTTP_EXECUTION_REQUEST_BYTES
+                || request_bytes
+                    > MAX_HTTP_RETAINED_EXECUTION_BYTES.saturating_sub(state.request_bytes)
+            {
+                Err(HttpClientError::CoreResult(McpError::invalid_params(
+                    "HTTP client owned execution request byte limit exceeded",
+                )))
+            } else {
+                state.reserved += 1;
+                state.request_bytes += request_bytes;
+                Ok(HttpClientExecutionAdmission {
+                    registry: self,
+                    cancellation_generation: state.cancellation_generation,
+                    request_bytes,
+                    reserved: true,
+                })
+            }
+        };
+        drop(retired);
+        result
+    }
+
+    fn cancel_pending(&self) -> usize {
+        let (controls, mut retirement) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match state.cancellation_generation.checked_add(1) {
+                Some(generation) => state.cancellation_generation = generation,
+                None => state.generation_exhausted = true,
+            }
+            let controls = std::mem::take(&mut state.controls);
+            let retirement = HttpClientExecutionRetirement {
+                registry: self,
+                count: controls.len(),
+                request_bytes: controls.iter().map(|entry| entry.request_bytes).sum(),
+            };
+            state.retiring += controls.len();
+            (controls, retirement)
+        };
+        // Cancellation can synchronously drop native I/O and invoke a caller
+        // waker. Keep its admission charged until all retirement completes,
+        // without holding the registry lock across either action.
+        let mut cancelled = 0;
+        let mut panic = None;
+        let mut still_polling = Vec::new();
+        for entry in controls {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| entry.control.cancel()))
+            {
+                Ok(won) => cancelled += usize::from(won),
+                Err(payload) if panic.is_none() => panic = Some(payload),
+                Err(_) => {}
+            }
+            if !entry.control.is_terminal_nonblocking() {
+                still_polling.push(entry);
+            }
+        }
+        if !still_polling.is_empty() {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for entry in still_polling {
+                state.retiring -= 1;
+                retirement.count -= 1;
+                retirement.request_bytes -= entry.request_bytes;
+                state.controls.push(entry);
+            }
+        }
+        drop(retirement);
+        if let Some(payload) = panic {
+            if !std::thread::panicking() {
+                std::panic::resume_unwind(payload);
+            }
+        }
+        cancelled
+    }
+}
+
+impl Drop for HttpClientExecutionRegistry {
+    fn drop(&mut self) {
+        self.cancel_pending();
+    }
+}
+
+impl HttpClientExecutionAdmission<'_> {
+    fn commit(mut self, control: ModernHttpRequestControl) -> bool {
+        let mut state = self
+            .registry
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let admitted = !state.generation_exhausted
+            && state.cancellation_generation == self.cancellation_generation;
+        if admitted {
+            state.reserved -= 1;
+            self.reserved = false;
+            state.controls.push(HttpClientExecutionEntry {
+                control,
+                request_bytes: self.request_bytes,
+            });
+        } else {
+            // A concurrent cancel-all retired this reserved generation while
+            // the request was being prepared. Keep its reservation until its
+            // operation has been dropped outside the registry lock.
+            drop(state);
+            control.cancel();
+            drop(control);
+        }
+        admitted
+    }
+}
+
+impl Drop for HttpClientExecutionAdmission<'_> {
+    fn drop(&mut self) {
+        if self.reserved {
+            let mut state = self
+                .registry
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.reserved -= 1;
+            state.request_bytes -= self.request_bytes;
+        }
+    }
+}
+
 /// A ready dual-era HTTP MCP client.
 ///
 /// This composes the policy-bound HTTP connection with the legacy lifecycle
@@ -11115,6 +11331,8 @@ pub struct HttpClient {
     /// initialize. `None` means the peer did not advertise instructions.
     instructions: Option<String>,
     next_id: AtomicU64,
+    request_timeout_policy: RequestTimeoutPolicy,
+    owned_executions: HttpClientExecutionRegistry,
     final_result_cache: FinalResultCache,
     final_cache_ttl_diagnostics: VecDeque<FinalCacheTtlDiagnostic>,
     mcp_apps_settings: Option<McpAppsClientSettings>,
@@ -11560,6 +11778,7 @@ impl HttpClient {
         reverse_request_handlers: ReverseRequestHandlers,
     ) -> Result<Self, HttpClientError> {
         let mcp_apps_settings = settings.mcp_apps.clone();
+        let request_timeout_policy = settings.request_timeout_policy;
         let mut connection = ClientHttpConnection::connect_with_settings(
             cx,
             protocol_plan,
@@ -11686,6 +11905,8 @@ impl HttpClient {
             legacy_server_capabilities,
             instructions,
             next_id: AtomicU64::new(2),
+            request_timeout_policy,
+            owned_executions: HttpClientExecutionRegistry::default(),
             final_result_cache: FinalResultCache::default(),
             final_cache_ttl_diagnostics: VecDeque::new(),
             mcp_apps_settings,
@@ -11965,7 +12186,153 @@ impl HttpClient {
         }
     }
 
+    /// Prepares an independent ordinary modern HTTP request without sending it.
+    ///
+    /// The returned handle owns its POST, response events, and cancellation,
+    /// so several handles can be driven concurrently without borrowing this
+    /// client. The first `next_event` poll starts its sole POST. Request IDs
+    /// come from this client's allocator, and every request carries its local
+    /// identity, capabilities, and configured log level. The configured request
+    /// timeout policy applies; use [`Self::execute_core_with_timeout_policy`]
+    /// to choose a stricter policy for one execution.
+    ///
+    /// JSON and SSE yield the same typed result, including `input_required`
+    /// and bounded open result fields. The caller consumes notifications and
+    /// decides whether to continue MRTR; these events do not populate the
+    /// client's shared notification queues or result cache. Tasks, extension
+    /// methods, and subscriptions use their separate execution APIs.
+    ///
+    /// At most [`MAX_HTTP_IN_FLIGHT_EXECUTIONS`] handles remain active. Encoded
+    /// request admission additionally enforces [`MAX_HTTP_EXECUTION_REQUEST_BYTES`]
+    /// per handle and [`MAX_HTTP_RETAINED_EXECUTION_BYTES`] across this client,
+    /// including bounded configured metadata and envelope overhead. These are
+    /// encoded-byte bounds, not a claim about Rust allocation sizes.
+    /// `limits` bounds response JSON/SSE decoding. Dropping this client or
+    /// converting it with [`Self::into_connection`] cancels its live handles.
+    pub fn execute_core(
+        &self,
+        cx: &Cx,
+        method: impl AsRef<str>,
+        parameters: serde_json::Value,
+        limits: sse::SseLimits,
+    ) -> Result<ModernHttpRequestExecution, HttpClientError> {
+        self.execute_core_with_timeout_policy(
+            cx,
+            method,
+            parameters,
+            limits,
+            self.request_timeout_policy,
+        )
+    }
+
+    /// Prepares an owned request with bounded per-execution response timeouts.
+    ///
+    /// The idle and absolute limits cannot exceed this client's configured
+    /// limits or the caller's earlier deadline. Progress can reset only the
+    /// idle deadline when both policies permit it. Validation, count and byte
+    /// admission precede request-ID allocation and network I/O. Exact-2024
+    /// connections are refused without changing their lifecycle.
+    pub fn execute_core_with_timeout_policy(
+        &self,
+        cx: &Cx,
+        method: impl AsRef<str>,
+        parameters: serde_json::Value,
+        limits: sse::SseLimits,
+        timeout_policy: RequestTimeoutPolicy,
+    ) -> Result<ModernHttpRequestExecution, HttpClientError> {
+        let client = match &self.connection {
+            ClientHttpConnection::Modern(client) => client,
+            #[cfg(feature = "legacy-2024-11-05")]
+            ClientHttpConnection::LegacySse(_) => {
+                return Err(HttpClientError::Connection(
+                    ClientHttpConnectionError::FinalCoreListenRequiresModern,
+                ));
+            }
+        };
+        cx.checkpoint()
+            .map_err(|_| HttpClientError::CoreResult(McpError::request_cancelled()))?;
+        RequestTimeoutPolicy::new(
+            timeout_policy.idle_timeout(),
+            timeout_policy.absolute_timeout(),
+        )
+        .map_err(HttpClientError::CoreResult)?;
+        let method = method.as_ref();
+        if method == "subscriptions/listen" {
+            return Err(HttpClientError::CoreResult(McpError::invalid_params(
+                "Owned ordinary HTTP execution cannot open a subscription",
+            )));
+        }
+        if parameters
+            .get("_meta")
+            .is_some_and(|metadata| !metadata.is_object())
+        {
+            return Err(HttpClientError::CoreResult(McpError::invalid_params(
+                "HTTP modern core request metadata must be an object",
+            )));
+        }
+        let parameter_bytes =
+            measure_serialized_bytes(&parameters, MAX_HTTP_EXECUTION_REQUEST_BYTES).map_err(
+                |_| {
+                    HttpClientError::CoreResult(McpError::invalid_params(
+                        "HTTP owned execution request byte limit exceeded",
+                    ))
+                },
+            )?;
+        let metadata_bytes =
+            client.owned_core_metadata_bytes(cx, MAX_HTTP_EXECUTION_METADATA_BYTES)?;
+        let request_bytes = parameter_bytes
+            .checked_add(metadata_bytes)
+            .filter(|bytes| *bytes <= MAX_HTTP_EXECUTION_REQUEST_BYTES)
+            .ok_or_else(|| {
+                HttpClientError::CoreResult(McpError::invalid_params(
+                    "HTTP owned execution request byte limit exceeded",
+                ))
+            })?;
+        let admission = self.owned_executions.reserve(request_bytes)?;
+        let mut parameters = self.core_request_parameters(&parameters)?;
+        if let Some(metadata) = parameters
+            .get_mut("_meta")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            // The raw gateway seam accepts an explicit downstream identity.
+            // High-level executions always stamp the configured local one.
+            metadata.remove(fastmcp_protocol::FINAL_CLIENT_INFO_META_KEY);
+            metadata.remove("clientInfo");
+        }
+        CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&parameters)).map_err(|_| {
+            HttpClientError::CoreResult(McpError::invalid_params(
+                "Invalid ordinary modern HTTP core request",
+            ))
+        })?;
+        let request_id = self.next_request_id()?;
+        let execution = client
+            .execute_core(cx, method, parameters, request_id, limits, timeout_policy)
+            .map_err(|error| {
+                HttpClientError::Connection(ClientHttpConnectionError::FinalCoreListen(error))
+            })?;
+        if !admission.commit(execution.control()) {
+            execution.control().cancel();
+            return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
+        }
+        Ok(execution)
+    }
+
+    /// Cancels every pending owned ordinary execution and returns the number
+    /// whose cancellation won. Already terminal handles are unchanged.
+    ///
+    /// Native requests and response bodies are released without waiting for
+    /// peer traffic. Cancellation wakes individual waiters after registry
+    /// locks are released. Reservations already in progress are also retired;
+    /// later executions may use this client normally. Catalog/Tasks listeners
+    /// keep their independent lifetime and cancellation APIs.
+    pub fn cancel_pending_executions(&self) -> usize {
+        self.owned_executions.cancel_pending()
+    }
+
     /// Consumes the high-level wrapper and returns its transport.
+    ///
+    /// Any ordinary executions created through this wrapper are cancelled
+    /// before ownership of the selected transport is transferred.
     #[must_use]
     pub fn into_connection(self) -> ClientHttpConnection {
         self.connection
@@ -28866,6 +29233,434 @@ mod tests {
             0,
         )
         .expect("modern-only HTTP cache plan is complete")
+    }
+
+    #[cfg(unix)]
+    fn http_owned_execution_fixture() -> (HttpClient, TcpListener) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind owned HTTP test peer");
+        let target = format!(
+            "http://{}/mcp",
+            listener.local_addr().expect("peer address")
+        );
+        let discovery_listener = listener.try_clone().expect("clone discovery listener");
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = discovery_listener.accept().expect("accept discovery");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("bound discovery read");
+            let request = read_http_cache_test_request(&mut stream);
+            assert_eq!(request["method"], "server/discover");
+            let body = modern_discovery_response("owned-http-peer", &[MODERN_PROTOCOL_VERSION]);
+            write_http_cache_test_response(&mut stream, "application/json", body.as_bytes());
+        });
+        let policy = RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(3))
+            .expect("bounded configured timeout")
+            .reset_idle_on_matching_progress(false);
+        let client = http_test_runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(http_cache_test_plan(&target))
+                .client_info("owned-http-client", "1.2.3")
+                .request_timeout_policy(policy)
+                .connect_http_client_with_cx(&Cx::for_request()),
+        )
+        .expect("connect owned HTTP client");
+        peer.join().expect("discovery peer joins");
+        assert_eq!(client.request_timeout_policy, policy);
+        listener
+            .set_nonblocking(true)
+            .expect("observe unexpected contact");
+        (client, listener)
+    }
+
+    #[cfg(unix)]
+    fn http_owned_execution_limits() -> sse::SseLimits {
+        sse::SseLimits::with_data_lines(64 * 1024, 1024 * 1024, 64, 4096)
+            .expect("bounded owned HTTP response limits")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn http_owned_execution_admission_is_bounded_reusable_and_does_not_send() {
+        let (client, listener) = http_owned_execution_fixture();
+        let cx = Cx::for_request();
+        let first_id = client.next_id.load(Ordering::Relaxed);
+        let mut executions = Vec::new();
+        for offset in 0..MAX_HTTP_IN_FLIGHT_EXECUTIONS {
+            let execution = client
+                .execute_core(
+                    &cx,
+                    "tools/list",
+                    serde_json::json!({}),
+                    http_owned_execution_limits(),
+                )
+                .expect("admit the complete configured capacity");
+            assert_eq!(
+                execution.request_id(),
+                &RequestId::Number((first_id + offset as u64) as i64)
+            );
+            executions.push(execution);
+        }
+        let next_id = client.next_id.load(Ordering::Relaxed);
+        assert!(
+            client
+                .execute_core(
+                    &cx,
+                    "tools/list",
+                    serde_json::json!({}),
+                    http_owned_execution_limits(),
+                )
+                .is_err(),
+            "one beyond capacity must be refused"
+        );
+        assert_eq!(client.next_id.load(Ordering::Relaxed), next_id);
+        let dropped = executions.pop().expect("one admitted execution");
+        let dropped_control = dropped.control();
+        drop(dropped);
+        assert_eq!(
+            dropped_control.terminal_reason(),
+            Some(execution::ExecutionTerminalReason::CallerDropped)
+        );
+        let replacement = client
+            .execute_core(
+                &cx,
+                "tools/list",
+                serde_json::json!({}),
+                http_owned_execution_limits(),
+            )
+            .expect("dropping one execution immediately makes capacity reusable");
+        let replacement_control = replacement.control();
+        assert_eq!(replacement.request_id(), &RequestId::Number(next_id as i64));
+        assert_eq!(
+            client.cancel_pending_executions(),
+            MAX_HTTP_IN_FLIGHT_EXECUTIONS
+        );
+        assert_eq!(client.cancel_pending_executions(), 0);
+        assert_eq!(
+            replacement_control.terminal_reason(),
+            Some(execution::ExecutionTerminalReason::CallerCancelled)
+        );
+        for execution in &executions {
+            assert_eq!(
+                execution.control().terminal_reason(),
+                Some(execution::ExecutionTerminalReason::CallerCancelled)
+            );
+        }
+        let state = client
+            .owned_executions
+            .state
+            .lock()
+            .expect("registry available");
+        assert_eq!(state.request_bytes, 0);
+        assert_eq!(state.reserved + state.retiring + state.controls.len(), 0);
+        drop(state);
+        let reused = client
+            .execute_core(
+                &cx,
+                "tools/list",
+                serde_json::json!({}),
+                http_owned_execution_limits(),
+            )
+            .expect("client remains reusable after cancelling its pending set");
+        assert!(reused.control().terminal_reason().is_none());
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn http_owned_execution_aggregate_bytes_reserve_atomically_and_release() {
+        let registry = HttpClientExecutionRegistry::default();
+        let reservations: Vec<_> = (0..MAX_HTTP_RETAINED_EXECUTION_BYTES
+            / MAX_HTTP_EXECUTION_REQUEST_BYTES)
+            .map(|_| {
+                registry
+                    .reserve(MAX_HTTP_EXECUTION_REQUEST_BYTES)
+                    .expect("admit exact byte capacity")
+            })
+            .collect();
+        assert_eq!(
+            registry.state.lock().expect("registry").request_bytes,
+            MAX_HTTP_RETAINED_EXECUTION_BYTES
+        );
+        assert!(
+            registry.reserve(1).is_err(),
+            "one extra encoded byte exceeds aggregate capacity"
+        );
+        assert_eq!(
+            registry.cancel_pending(),
+            0,
+            "preparations are not live controls yet"
+        );
+        assert!(
+            registry.reserve(1).is_err(),
+            "cancel-all cannot free a preparation still holding bytes"
+        );
+        drop(reservations);
+        assert_eq!(registry.state.lock().expect("registry").request_bytes, 0);
+        assert!(
+            registry
+                .reserve(MAX_HTTP_EXECUTION_REQUEST_BYTES + 1)
+                .is_err()
+        );
+        let admitted = registry
+            .reserve(MAX_HTTP_EXECUTION_REQUEST_BYTES)
+            .expect("capacity is reusable");
+        drop(admitted);
+        assert_eq!(registry.state.lock().expect("registry").reserved, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn http_owned_execution_request_byte_boundary_precedes_id_and_contact() {
+        let (client, listener) = http_owned_execution_fixture();
+        let cx = Cx::for_request();
+        let metadata_bytes = match &client.connection {
+            ClientHttpConnection::Modern(modern) => modern
+                .owned_core_metadata_bytes(&cx, MAX_HTTP_EXECUTION_METADATA_BYTES)
+                .expect("metadata fits"),
+            #[cfg(feature = "legacy-2024-11-05")]
+            ClientHttpConnection::LegacySse(_) => panic!("fixture selected modern"),
+        };
+        let base = serde_json::json!({"name":"upload", "arguments":{"payload":""}});
+        let base_bytes = measure_serialized_bytes(&base, MAX_HTTP_EXECUTION_REQUEST_BYTES)
+            .expect("measure base");
+        let payload_bytes = MAX_HTTP_EXECUTION_REQUEST_BYTES - metadata_bytes - base_bytes;
+        let mut exact = base.clone();
+        exact["arguments"]["payload"] = serde_json::Value::String("x".repeat(payload_bytes));
+        let execution = client
+            .execute_core(&cx, "tools/call", exact, http_owned_execution_limits())
+            .expect("exact configured encoded byte capacity is useful and accepted");
+        assert_eq!(
+            client
+                .owned_executions
+                .state
+                .lock()
+                .expect("registry")
+                .request_bytes,
+            MAX_HTTP_EXECUTION_REQUEST_BYTES
+        );
+        let next_id = client.next_id.load(Ordering::Relaxed);
+        let mut oversized = base;
+        oversized["arguments"]["payload"] =
+            serde_json::Value::String("x".repeat(payload_bytes + 1));
+        assert!(
+            client
+                .execute_core(&cx, "tools/call", oversized, http_owned_execution_limits())
+                .is_err()
+        );
+        assert_eq!(client.next_id.load(Ordering::Relaxed), next_id);
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        drop(execution);
+        assert_eq!(client.cancel_pending_executions(), 0);
+        assert_eq!(
+            client
+                .owned_executions
+                .state
+                .lock()
+                .expect("registry")
+                .request_bytes,
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn http_owned_execution_validation_drop_and_transfer_close_owners() {
+        let (client, listener) = http_owned_execution_fixture();
+        let cx = Cx::for_request();
+        let next_id = client.next_id.load(Ordering::Relaxed);
+        for (method, parameters) in [
+            ("subscriptions/listen", serde_json::json!({})),
+            ("tasks/get", serde_json::json!({"taskId":"other"})),
+            ("tools/call", serde_json::json!({})),
+            ("tools/list", serde_json::json!([])),
+            ("tools/list", serde_json::json!({"_meta":false})),
+        ] {
+            assert!(
+                client
+                    .execute_core(&cx, method, parameters, http_owned_execution_limits())
+                    .is_err()
+            );
+        }
+        let cancelled = Cx::for_request();
+        cancelled.set_cancel_requested(true);
+        assert!(
+            client
+                .execute_core(
+                    &cancelled,
+                    "tools/list",
+                    serde_json::json!({}),
+                    http_owned_execution_limits()
+                )
+                .is_err()
+        );
+        let excessive_timeout = RequestTimeoutPolicy::from_application_timeout_ms(900_001)
+            .expect("trusted timeout escape hatch");
+        assert!(
+            client
+                .execute_core_with_timeout_policy(
+                    &cx,
+                    "tools/list",
+                    serde_json::json!({}),
+                    http_owned_execution_limits(),
+                    excessive_timeout,
+                )
+                .is_err()
+        );
+        assert_eq!(client.next_id.load(Ordering::Relaxed), next_id);
+        assert_eq!(
+            client
+                .owned_executions
+                .state
+                .lock()
+                .expect("registry")
+                .request_bytes,
+            0
+        );
+        let execution = client
+            .execute_core(
+                &cx,
+                "tools/list",
+                serde_json::json!({}),
+                http_owned_execution_limits(),
+            )
+            .expect("valid request");
+        let control = execution.control();
+        drop(client);
+        assert_eq!(
+            control.terminal_reason(),
+            Some(execution::ExecutionTerminalReason::CallerCancelled)
+        );
+        assert!(control.take_cancellation_event().is_some());
+        assert!(control.take_cancellation_event().is_none());
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+
+        let (client, listener) = http_owned_execution_fixture();
+        let execution = client
+            .execute_core(
+                &cx,
+                "tools/list",
+                serde_json::json!({}),
+                http_owned_execution_limits(),
+            )
+            .expect("valid request before transfer");
+        let control = execution.control();
+        let _connection = client.into_connection();
+        assert_eq!(
+            control.terminal_reason(),
+            Some(execution::ExecutionTerminalReason::CallerCancelled)
+        );
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn http_owned_execution_large_json_preserves_local_metadata_and_open_result() {
+        let (mut client, listener) = http_owned_execution_fixture();
+        client
+            .set_log_level_typed(LoggingLevel::Warning)
+            .expect("configure local log level");
+        let cx = Cx::for_request();
+        let mut execution = client
+            .execute_core(
+                &cx,
+                "tools/call",
+                serde_json::json!({
+                    "name":"upload", "arguments":{"payload":"x".repeat(256 * 1024)},
+                    "_meta": {
+                        "io.modelcontextprotocol/clientInfo":{"name":"spoofed", "version":"9"},
+                        "clientInfo":{"name":"legacy-spoof", "version":"9"},
+                        "io.modelcontextprotocol/clientCapabilities":{"sampling":{}},
+                        "io.modelcontextprotocol/logLevel":"debug",
+                        "vendor/trace":"retained"
+                    }
+                }),
+                http_owned_execution_limits(),
+            )
+            .expect("prepare useful large payload");
+        assert_eq!(execution.request_id(), &RequestId::Number(2));
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        listener
+            .set_nonblocking(false)
+            .expect("serve one actual request");
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept sole owned POST");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("bound request read");
+            let request = read_http_cache_test_request(&mut stream);
+            assert_eq!(request["method"], "tools/call");
+            assert_eq!(request["id"], 2);
+            assert_eq!(
+                request["params"]["arguments"]["payload"]
+                    .as_str()
+                    .expect("string payload")
+                    .len(),
+                256 * 1024
+            );
+            let metadata = &request["params"]["_meta"];
+            assert_eq!(
+                metadata[FINAL_CLIENT_INFO_META_KEY]["name"],
+                "owned-http-client"
+            );
+            assert_eq!(metadata[FINAL_CLIENT_INFO_META_KEY]["version"], "1.2.3");
+            assert!(metadata.get("clientInfo").is_none());
+            assert!(
+                metadata[FINAL_CLIENT_CAPABILITIES_META_KEY]
+                    .get("sampling")
+                    .is_none()
+            );
+            assert_eq!(metadata[FINAL_LOG_LEVEL_META_KEY], "warning");
+            assert_eq!(metadata["vendor/trace"], "retained");
+            write_http_cache_test_response(&mut stream, "application/json", br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"uploaded"}],"vendorReceipt":{"bytes":262144}}}"#);
+            listener
+                .set_nonblocking(true)
+                .expect("detect duplicate POST");
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            );
+        });
+        let event = http_test_runtime_block_on(execution.next_event(&cx))
+            .expect("owned JSON request succeeds")
+            .expect("one final result");
+        let http_executor::ModernHttpFinalCoreEvent::Terminal(
+            result @ FinalCoreResult::ToolsCall { .. },
+        ) = event
+        else {
+            panic!("owned tools/call yields its typed terminal result");
+        };
+        let encoded = CoreResult::Final(result)
+            .encode()
+            .expect("round-trip final open result");
+        assert!(encoded.contains(r#""vendorReceipt":{"bytes":262144}"#));
+        let result: serde_json::Value =
+            serde_json::from_str(&encoded).expect("encoded final result is JSON");
+        assert_eq!(result["content"][0]["text"], "uploaded");
+        assert_eq!(result["vendorReceipt"]["bytes"], 262144);
+        assert!(
+            http_test_runtime_block_on(execution.next_event(&cx))
+                .expect("terminal owner stays closed")
+                .is_none()
+        );
+        assert_eq!(client.cancel_pending_executions(), 0);
+        assert_eq!(
+            client
+                .owned_executions
+                .state
+                .lock()
+                .expect("registry")
+                .request_bytes,
+            0
+        );
+        peer.join().expect("owned JSON peer joins");
     }
 
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]

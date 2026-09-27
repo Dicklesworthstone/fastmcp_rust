@@ -10833,14 +10833,141 @@ enum ModernSseDispatchElection {
     Failed,
 }
 
-enum ModernSseNotificationDelivery {
-    Pending(Vec<JsonRpcRequest>),
+enum ModernSseNotificationDelivery {    Pending(Vec<JsonRpcRequest>),
+    Admitted,
     Streaming,
 }
 
-enum ModernSseOutcomeGateState {
-    AwaitingElection(oneshot::Sender<ModernSseDispatchElection>),
-    Elected,
+/// A transport-owned signal invoked only after final router handler admission.
+/// Application contexts cannot construct or invoke this HTTP representation gate.
+pub(crate) type FinalHandlerAdmission = Arc<dyn Fn() + Send + Sync>;
+
+struct ModernSseNotificationGate {
+    delivery: Mutex<ModernSseNotificationDelivery>,
+    subscription_request: bool,
+    outcome_gate: Option<Arc<ModernSseOutcomeGate>>,
+    terminal_delivery: Arc<FinalSubscriptionTerminalDelivery>,
+    committed_sender: NotificationSender,
+    commit_failed: Arc<AtomicBool>,
+    stream_admitted: Arc<AtomicBool>,
+}
+
+impl ModernSseNotificationGate {
+    fn publish(&self, notification: JsonRpcRequest) {
+        if final_subscription_terminal_notification(&notification) {
+            self.terminal_delivery.mark_control_not_required();
+            return;
+        }
+        if self.commit_failed.load(Ordering::Acquire) {
+            return;
+        }
+        let mut delivery = self
+            .delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &mut *delivery {
+            ModernSseNotificationDelivery::Streaming => {
+                drop(delivery);
+                (self.committed_sender)(notification);
+                return;
+            }
+            ModernSseNotificationDelivery::Admitted => {
+                (self.committed_sender)(notification);
+            }
+            ModernSseNotificationDelivery::Pending(pending) => {
+                let acknowledgement = self.subscription_request
+                    && final_subscription_acknowledgement_notification(&notification);
+                if !acknowledgement {
+                    pending.push(notification);
+                    return;
+                }
+                let deferred = std::mem::take(pending);
+                // Keep concurrent publishers behind the acknowledgement and
+                // the frames already waiting for that subscription boundary.
+                (self.committed_sender)(notification);
+                if !self.finish_stream_admission(&mut delivery) {
+                    return;
+                }
+                for notification in deferred {
+                    (self.committed_sender)(notification);
+                }
+                return;
+            }
+        }
+        self.finish_stream_admission(&mut delivery);
+    }
+
+    fn admit_handler(&self) {
+        if self.subscription_request || self.commit_failed.load(Ordering::Acquire) {
+            return;
+        }
+        let mut delivery = self
+            .delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ModernSseNotificationDelivery::Pending(pending) = &mut *delivery else {
+            return;
+        };
+        if pending.is_empty() {
+            // Admission alone does not commit an HTTP representation. A
+            // canonical error can still elect JSON 400 until a frame exists.
+            *delivery = ModernSseNotificationDelivery::Admitted;
+            return;
+        }
+        let mut deferred = std::mem::take(pending).into_iter();
+        if let Some(notification) = deferred.next() {
+            (self.committed_sender)(notification);
+        }
+        // The writer must be able to drain its bounded queue before the
+        // remainder is committed. Admission still follows one real frame.
+        if !self.finish_stream_admission(&mut delivery) {
+            return;
+        }
+        for notification in deferred {
+            (self.committed_sender)(notification);
+        }
+    }
+
+    fn finish_stream_admission(&self, delivery: &mut ModernSseNotificationDelivery) -> bool {
+        if self.commit_failed.load(Ordering::Acquire) {
+            self.terminal_delivery.mark_failed();
+            if let Some(outcome_gate) = &self.outcome_gate {
+                outcome_gate.elect(ModernSseDispatchElection::Failed);
+            }
+            return false;
+        }
+        *delivery = ModernSseNotificationDelivery::Streaming;
+        let elected = self
+            .outcome_gate
+            .as_ref()
+            .is_none_or(|gate| gate.elect(ModernSseDispatchElection::Stream));
+        if elected {
+            // HTTP has no in-band cancellation control. Once the body starts,
+            // its one terminal response owns the remaining settlement.
+            if self.outcome_gate.is_some() {
+                self.terminal_delivery.mark_control_not_required();
+            }
+            self.stream_admitted.store(true, Ordering::Release);
+        }
+        elected
+    }
+
+    fn take_pending(&self) -> Vec<JsonRpcRequest> {
+        match &mut *self
+            .delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            ModernSseNotificationDelivery::Pending(pending) => std::mem::take(pending),
+            ModernSseNotificationDelivery::Admitted | ModernSseNotificationDelivery::Streaming => {
+                Vec::new()
+            }
+        }
+    }
+}
+
+enum ModernSseOutcomeGateState {    AwaitingElection(oneshot::Sender<ModernSseDispatchElection>),
+    Elected { stream: bool },
 }
 
 /// A one-time dispatch-to-writer handoff for one live modern SSE request.
@@ -10875,8 +11002,12 @@ impl ModernSseOutcomeGate {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if matches!(&*state, ModernSseOutcomeGateState::Elected { .. }) {
+                return false;
+            }
+            let stream = matches!(&election, ModernSseDispatchElection::Stream);
             let ModernSseOutcomeGateState::AwaitingElection(sender) =
-                std::mem::replace(&mut *state, ModernSseOutcomeGateState::Elected)
+                std::mem::replace(&mut *state, ModernSseOutcomeGateState::Elected { stream })
             else {
                 return false;
             };
@@ -10884,6 +11015,16 @@ impl ModernSseOutcomeGate {
         };
         let _ = sender.send_blocking(election);
         true
+    }
+
+    fn stream_admitted(&self) -> bool {
+        matches!(
+            &*self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ModernSseOutcomeGateState::Elected { stream: true }
+        )
     }
 }
 
@@ -10990,101 +11131,45 @@ fn spawn_modern_sse_dispatch(
                 notification_cancellation.cancel();
             }
         });
-        // A subscription acknowledgement must lead every public SSE body,
-        // including the typed in-process endpoint surface that has no live
-        // HTTP outcome gate. Live request-scoped SSE additionally buffers all
-        // notifications until its representation election.
-        let deferred_notifications = (subscription_request || outcome_gate.is_some()).then(|| {
-            Arc::new(Mutex::new(ModernSseNotificationDelivery::Pending(
-                Vec::new(),
-            )))
-        });
         // `Stream` is the live writer's linearized admission point. A later
         // canonical -32021 may replace the terminal response only after this
         // point; before it, the same error still elects an HTTP JSON 400.
         let stream_admitted = Arc::new(AtomicBool::new(false));
+        // Subscriptions admit at their acknowledgement. Ordinary live HTTP
+        // requests admit at the router's handler boundary, keeping middleware
+        // and parameter-header rejections ahead of the first SSE frame.
+        let deferred_notifications = (subscription_request || outcome_gate.is_some()).then(|| {
+            Arc::new(ModernSseNotificationGate {
+                delivery: Mutex::new(ModernSseNotificationDelivery::Pending(Vec::new())),
+                subscription_request,
+                outcome_gate: outcome_gate.clone(),
+                terminal_delivery: Arc::clone(&terminal_delivery),
+                committed_sender: Arc::clone(&committed_notification_sender),
+                commit_failed: Arc::clone(&notification_commit_failed),
+                stream_admitted: Arc::clone(&stream_admitted),
+            })
+        });
         let notification_sender: NotificationSender = match &deferred_notifications {
             Some(deferred_notifications) => {
                 let deferred_notifications = Arc::clone(deferred_notifications);
-                let terminal_delivery = Arc::clone(&terminal_delivery);
-                let committed_notification_sender = Arc::clone(&committed_notification_sender);
-                let notification_commit_failed = Arc::clone(&notification_commit_failed);
-                let outcome_gate = outcome_gate.clone();
-                let stream_admitted = Arc::clone(&stream_admitted);
                 Arc::new(move |notification| {
-                    if final_subscription_terminal_notification(&notification) {
-                        terminal_delivery.mark_control_not_required();
-                        return;
-                    }
-                    if notification_commit_failed.load(Ordering::Acquire) {
-                        return;
-                    }
-                    let mut delivery = deferred_notifications
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    match &mut *delivery {
-                        ModernSseNotificationDelivery::Streaming => {
-                            drop(delivery);
-                            committed_notification_sender(notification);
-                        }
-                        ModernSseNotificationDelivery::Pending(pending) => {
-                            let admission_acknowledgement = subscription_request
-                                && final_subscription_acknowledgement_notification(&notification);
-                            if !admission_acknowledgement {
-                                pending.push(notification);
-                                return;
-                            }
-                            let deferred = std::mem::take(pending);
-                            // Retain this delivery mutex while committing the
-                            // acknowledgement and deferred frames. A
-                            // concurrent publisher cannot overtake the
-                            // acknowledgement, which is always the first
-                            // subscription frame on this body.
-                            committed_notification_sender(notification);
-                            if notification_commit_failed.load(Ordering::Acquire) {
-                                terminal_delivery.mark_failed();
-                                if let Some(outcome_gate) = &outcome_gate {
-                                    outcome_gate.elect(ModernSseDispatchElection::Failed);
-                                }
-                                return;
-                            }
-                            for notification in deferred {
-                                committed_notification_sender(notification);
-                            }
-                            if notification_commit_failed.load(Ordering::Acquire) {
-                                terminal_delivery.mark_failed();
-                                if let Some(outcome_gate) = &outcome_gate {
-                                    outcome_gate.elect(ModernSseDispatchElection::Failed);
-                                }
-                                return;
-                            }
-                            *delivery = ModernSseNotificationDelivery::Streaming;
-                            if let Some(outcome_gate) = &outcome_gate {
-                                if outcome_gate.elect(ModernSseDispatchElection::Stream) {
-                                    // Modern HTTP has no in-band cancellation
-                                    // control. From the admitted SSE boundary
-                                    // onward only its one terminal response is
-                                    // required for settlement.
-                                    terminal_delivery.mark_control_not_required();
-                                    stream_admitted.store(true, Ordering::Release);
-                                }
-                            } else {
-                                // The public in-process SSE body has no H1
-                                // election, but its acknowledgement still
-                                // establishes the same frame-order boundary.
-                                stream_admitted.store(true, Ordering::Release);
-                            }
-                        }
-                    }
+                    deferred_notifications.publish(notification);
                 })
             }
             None => Arc::clone(&committed_notification_sender),
         };
+        let handler_admission = deferred_notifications
+            .as_ref()
+            .filter(|_| outcome_gate.is_some() && !subscription_request)
+            .map(|gate| {
+                let gate = Arc::clone(gate);
+                Arc::new(move || gate.admit_handler()) as FinalHandlerAdmission
+            });
         let response = match duplicate_response {
             Some(response) => Some(response),
             None => {
                 Arc::clone(&server)
-                    .dispatch_with_protocol_policy_owned(
+                    .dispatch_with_protocol_policy_owned_and_handler_admission(
                         policy,
                         &inbound,
                         request,
@@ -11095,6 +11180,7 @@ fn spawn_modern_sse_dispatch(
                         cancellation.clone(),
                         Some(Arc::clone(&terminal_delivery)),
                         notification_sender,
+                        handler_admission,
                     )
                     .await
             }
@@ -11109,7 +11195,7 @@ fn spawn_modern_sse_dispatch(
             if outcome_gate.elect(ModernSseDispatchElection::Immediate(rejection)) {
                 return;
             }
-            if stream_admitted.load(Ordering::Acquire) {
+            if outcome_gate.stream_admitted() {
                 canonical_after_stream_admission = true;
             } else {
                 // An earlier failed election cannot safely commit a response
@@ -11130,16 +11216,7 @@ fn spawn_modern_sse_dispatch(
             canonical_after_stream_admission = true;
         }
         if let Some(deferred_notifications) = deferred_notifications {
-            let deferred_notifications = match &mut *deferred_notifications
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-            {
-                ModernSseNotificationDelivery::Pending(notifications) => {
-                    std::mem::take(notifications)
-                }
-                ModernSseNotificationDelivery::Streaming => Vec::new(),
-            };
-            for notification in deferred_notifications {
+            for notification in deferred_notifications.take_pending() {
                 committed_notification_sender(notification);
             }
         }
@@ -11238,12 +11315,13 @@ async fn send_modern_sse_stream(
     response: DualEraHttpSseResponse,
 ) -> Result<(), ()> {
     let sender = response.sender();
+    let ordinary_request = request.method != SUBSCRIPTIONS_LISTEN;
     let request_cancellation = sender.request_cancellation();
     let terminal_delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
     // Every modern SSE representation waits for this request-owned election.
     // A durable subscription elects `Stream` only after its dynamic middleware
     // and admission acknowledgement succeed; ordinary requests elect after
-    // their final response has been committed to the request response queue.
+    // handler admission commits a notification or their final response is queued.
     let (outcome_gate, mut outcome_receiver) = ModernSseOutcomeGate::new();
     // H1 request input is complete before this request-owned response starts.
     // A clean peer write-half EOF is therefore ordinary request completion,
@@ -11296,6 +11374,7 @@ async fn send_modern_sse_stream(
         let response_head = sse_response_head(response.response())?;
         writer.write_all(&response_head).await.map_err(|_| ())?;
         writer.flush().await.map_err(|_| ())?;
+        let mut last_frame_write = cx.now();
         loop {
             // A failed request-scoped progress/log/terminal commit retires
             // this body even when response finalization had already claimed
@@ -11313,6 +11392,7 @@ async fn send_modern_sse_stream(
                     writer.write_all(&bytes).await.map_err(|_| ())?;
                     writer.write_all(b"\r\n").await.map_err(|_| ())?;
                     writer.flush().await.map_err(|_| ())?;
+                    last_frame_write = cx.now();
                     if terminal_control {
                         terminal_delivery.mark_drained();
                     }
@@ -11351,6 +11431,23 @@ async fn send_modern_sse_stream(
                         }
                         asupersync::runtime::yield_now().await;
                     } else {
+                        if ordinary_request
+                            && cx.now().duration_since(last_frame_write) >= 2_000_000_000
+                        {
+                            // A quiet handler still needs an output write to
+                            // observe a peer that has closed its response body.
+                            // One inert comment line every two idle seconds
+                            // detects that closure without treating a legal
+                            // request write-half EOF as cancellation. No blank
+                            // line is added: this consumes one caller keepalive
+                            // line and cannot create an MCP event or reset an
+                            // ordinary response's progress-based idle deadline.
+                            // Subscriptions retain their separate long-lived
+                            // activity and keepalive policies.
+                            writer.write_all(b"2\r\n:\n\r\n").await.map_err(|_| ())?;
+                            writer.flush().await.map_err(|_| ())?;
+                            last_frame_write = cx.now();
+                        }
                         asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
                     }
                 }
@@ -13693,6 +13790,7 @@ impl Server {
         request_cancellation: McpRequestCancellation,
         terminal_delivery: Option<Arc<FinalSubscriptionTerminalDelivery>>,
         notification_sender: NotificationSender,
+        handler_admission: Option<FinalHandlerAdmission>,
     ) -> Option<JsonRpcResponse> {
         // The value the raw sidecar was admitted with, before authentication
         // may strip credentials from this request.
@@ -13895,7 +13993,7 @@ impl Server {
                     .await
                 }
                 None => match Arc::clone(&self.router)
-                    .dispatch_stateless_owned_with_continuation_cancellation_and_raw_params(
+                    .dispatch_stateless_owned_with_handler_admission(
                         request_ctx.clone(),
                         request.clone(),
                         retained_raw_params(
@@ -13905,6 +14003,7 @@ impl Server {
                         )
                         .map(Arc::<str>::from),
                         inbound.mrtr_continuation_cancellation().unwrap_or_default(),
+                        handler_admission,
                     )
                     .await
                 {
@@ -14689,6 +14788,36 @@ impl Server {
         terminal_delivery: Option<Arc<FinalSubscriptionTerminalDelivery>>,
         notification_sender: NotificationSender,
     ) -> Option<JsonRpcResponse> {
+        self.dispatch_with_protocol_policy_owned_and_handler_admission(
+            policy,
+            inbound,
+            request,
+            raw_params,
+            auth_receipt,
+            websocket_connection_generation,
+            modern_http_owner,
+            request_cancellation,
+            terminal_delivery,
+            notification_sender,
+            None,
+        )
+        .await
+    }
+
+    async fn dispatch_with_protocol_policy_owned_and_handler_admission(
+        self: Arc<Self>,
+        policy: ProtocolPolicy,
+        inbound: &InboundRequestContext,
+        request: JsonRpcRequest,
+        raw_params: Option<Arc<str>>,
+        auth_receipt: Option<AuthDispatchCustody>,
+        websocket_connection_generation: Option<u64>,
+        modern_http_owner: Option<u64>,
+        request_cancellation: McpRequestCancellation,
+        terminal_delivery: Option<Arc<FinalSubscriptionTerminalDelivery>>,
+        notification_sender: NotificationSender,
+        handler_admission: Option<FinalHandlerAdmission>,
+    ) -> Option<JsonRpcResponse> {
         if matches!(policy, ProtocolPolicy::ModernOnly)
             && request.method == "initialize"
             && request.validate().is_ok()
@@ -14715,6 +14844,7 @@ impl Server {
             request_cancellation,
             terminal_delivery,
             notification_sender,
+            handler_admission,
         )
         .await
     }
@@ -26841,6 +26971,105 @@ mod lib_unit_tests {
             }
             Ok(response)
         }
+    }
+
+    #[test]
+    fn modern_sse_elected_representation_survives_losing_elections() {
+        let (stream, _receiver) = ModernSseOutcomeGate::new();
+        assert!(!stream.stream_admitted());
+        assert!(stream.elect(ModernSseDispatchElection::Stream));
+        assert!(stream.stream_admitted());
+        assert!(
+            !stream.elect(ModernSseDispatchElection::Immediate(HttpResponse::new(
+                HttpStatus::BAD_REQUEST
+            ),))
+        );
+        assert!(!stream.elect(ModernSseDispatchElection::Failed));
+        assert!(
+            stream.stream_admitted(),
+            "the elected stream owns its terminal response"
+        );
+
+        let (immediate, _receiver) = ModernSseOutcomeGate::new();
+        assert!(
+            immediate.elect(ModernSseDispatchElection::Immediate(HttpResponse::new(
+                HttpStatus::BAD_REQUEST
+            ),))
+        );
+        assert!(!immediate.elect(ModernSseDispatchElection::Stream));
+        assert!(
+            !immediate.stream_admitted(),
+            "a losing Stream cannot authorize SSE output"
+        );
+    }
+
+    #[test]
+    fn modern_sse_admission_elects_before_draining_bounded_pending_notifications() {
+        let (outcome_gate, _receiver) = ModernSseOutcomeGate::new();
+        let failed = Arc::new(AtomicBool::new(false));
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let committed_sender: NotificationSender = {
+            let outcome_gate = Arc::clone(&outcome_gate);
+            let failed = Arc::clone(&failed);
+            let delivered = Arc::clone(&delivered);
+            let receiver = Arc::clone(&receiver);
+            Arc::new(move |notification| {
+                // Model a capacity-one body whose writer can drain only once
+                // it receives the real Stream election.
+                if outcome_gate.stream_admitted()
+                    && let Ok(previous) = receiver.lock().unwrap().try_recv()
+                {
+                    delivered.lock().unwrap().push(previous);
+                }
+                if sender.try_send(notification).is_err() {
+                    failed.store(true, Ordering::Release);
+                }
+            })
+        };
+        let gate = ModernSseNotificationGate {
+            delivery: Mutex::new(ModernSseNotificationDelivery::Pending(Vec::new())),
+            subscription_request: false,
+            outcome_gate: Some(Arc::clone(&outcome_gate)),
+            terminal_delivery: Arc::new(FinalSubscriptionTerminalDelivery::default()),
+            committed_sender,
+            commit_failed: Arc::clone(&failed),
+            stream_admitted: Arc::new(AtomicBool::new(false)),
+        };
+        let first = JsonRpcRequest::notification(
+            "notifications/progress",
+            Some(serde_json::json!({
+                "progressToken": "bounded-gate", "progress": 1
+            })),
+        );
+        let second = JsonRpcRequest::notification(
+            "notifications/progress",
+            Some(serde_json::json!({
+                "progressToken": "bounded-gate", "progress": 2
+            })),
+        );
+        gate.publish(first.clone());
+        gate.publish(second.clone());
+        assert!(receiver.lock().unwrap().try_recv().is_err());
+        assert!(
+            !outcome_gate.stream_admitted(),
+            "middleware cannot open the body"
+        );
+        gate.admit_handler();
+        assert!(outcome_gate.stream_admitted());
+        assert!(
+            !failed.load(Ordering::Acquire),
+            "the admitted writer must drain before the second commit"
+        );
+        delivered
+            .lock()
+            .unwrap()
+            .push(receiver.lock().unwrap().try_recv().unwrap());
+        assert_eq!(
+            serde_json::to_string(&*delivered.lock().unwrap()).unwrap(),
+            serde_json::to_string(&[first, second]).unwrap(),
+        );
     }
 
     #[test]
@@ -41883,6 +42112,179 @@ mod lib_unit_tests {
             }
             if calls.load(Ordering::Acquire) != 1 {
                 return Err("live modern SSE handler did not execute exactly once".to_owned());
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn live_http_sse_handler_admission_preserves_parameter_header_rejection() {
+        #[derive(Clone)]
+        struct HeaderAdmissionProbe {
+            middleware_calls: Arc<AtomicUsize>,
+            handler_calls: Arc<AtomicUsize>,
+        }
+
+        impl Middleware for HeaderAdmissionProbe {
+            fn on_request(
+                &self,
+                ctx: &McpContext,
+                _request: &JsonRpcRequest,
+            ) -> McpResult<MiddlewareDecision> {
+                self.middleware_calls.fetch_add(1, Ordering::AcqRel);
+                ctx.report_progress(0.25, Some("before parameter-header admission"));
+                Ok(MiddlewareDecision::Continue)
+            }
+        }
+
+        impl ToolHandler for HeaderAdmissionProbe {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "http_header_admission_probe".to_owned(),
+                    description: None,
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "region": {"type": "string", "x-mcp-header": "Region"}
+                        },
+                        "required": ["region"]
+                    }),
+                    output_schema: None,
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                    annotations: None,
+                }
+            }
+
+            fn call(
+                &self,
+                _ctx: &McpContext,
+                _arguments: serde_json::Value,
+            ) -> McpResult<Vec<Content>> {
+                self.handler_calls.fetch_add(1, Ordering::AcqRel);
+                Ok(vec![Content::text("admitted header")])
+            }
+        }
+
+        run_live_http_test(|cx| async move {
+            let probe = HeaderAdmissionProbe {
+                middleware_calls: Arc::new(AtomicUsize::new(0)),
+                handler_calls: Arc::new(AtomicUsize::new(0)),
+            };
+            let bound = Server::new("live-http-handler-admission", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
+                .middleware(probe.clone())
+                .tool(probe.clone())
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("handler admission bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("handler admission address failed: {error}"))?;
+            let request = JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "http_header_admission_probe",
+                    "arguments": {"region": "west"},
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                        "progressToken": "header-admission-progress",
+                    },
+                })),
+                839_i64,
+            );
+            let body = serde_json::to_vec(&request)
+                .map_err(|error| format!("handler admission request failed: {error}"))?;
+            let caller_cx = cx.clone();
+            let mut client = cx
+                .spawn(move |_client_cx| async move {
+                    let result = async {
+                        let mut responses = Vec::new();
+                        for region in ["west", "east"] {
+                            responses.push(
+                                live_http_exchange(
+                                    address,
+                                    live_http_post(
+                                        "/mcp",
+                                        &body,
+                                        &[
+                                            ("Accept", "text/event-stream"),
+                                            ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                            ("Mcp-Method", "tools/call"),
+                                            ("Mcp-Name", "http_header_admission_probe"),
+                                            ("Mcp-Param-Region", region),
+                                        ],
+                                    ),
+                                )
+                                .await?,
+                            );
+                        }
+                        Ok::<_, String>(responses)
+                    }
+                    .await;
+                    caller_cx
+                        .cancel_with(CancelKind::User, Some("handler admission proof complete"));
+                    result
+                })
+                .map_err(|error| format!("handler admission client spawn failed: {error}"))?;
+            let serve = bound.serve(&cx).await;
+            let responses = client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("handler admission client failed: {error:?}"))??;
+            let shutdown =
+                serve.map_err(|error| format!("handler admission server failed: {error}"))?;
+            require_quiescent_http_shutdown(shutdown, "handler admission").await?;
+            let [accepted, rejected] = responses.as_slice() else {
+                return Err("the paired handler admission responses are missing".to_owned());
+            };
+            if !accepted.starts_with(b"HTTP/1.1 200")
+                || live_http_response_header(accepted, "content-type")? != "text/event-stream"
+            {
+                return Err("matching parameter header did not admit SSE".to_owned());
+            }
+            let messages = live_http_chunked_sse_messages(accepted)?;
+            if !messages.iter().any(|message| matches!(message,
+                JsonRpcMessage::Request(notification) if notification.method == "notifications/progress"))
+                || !messages.iter().any(|message| matches!(message,
+                    JsonRpcMessage::Response(response) if response.id == Some(839_i64.into()) && response.error.is_none()))
+            {
+                return Err("admitted tool lost middleware progress or its terminal result".to_owned());
+            }
+            if !rejected.starts_with(b"HTTP/1.1 400")
+                || live_http_response_header(rejected, "content-type")? != "application/json"
+                || rejected
+                    .windows(b"event: message".len())
+                    .any(|window| window == b"event: message")
+            {
+                return Err(
+                    "mismatched parameter header committed SSE before canonical JSON400".to_owned(),
+                );
+            }
+            let rejected: JsonRpcResponse =
+                serde_json::from_slice(live_http_response_body(rejected)?)
+                    .map_err(|error| format!("header rejection was not JSON-RPC: {error}"))?;
+            if rejected.id != Some(839_i64.into())
+                || rejected
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.code.as_i32())
+                    != Some(fastmcp_protocol::HEADER_MISMATCH_ERROR_CODE)
+                || rejected
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.data.as_ref())
+                    .is_some()
+                || probe.middleware_calls.load(Ordering::Acquire) != 2
+                || probe.handler_calls.load(Ordering::Acquire) != 1
+            {
+                return Err(
+                    "header mismatch changed its canonical error or reached the handler".to_owned(),
+                );
             }
             Ok(())
         });

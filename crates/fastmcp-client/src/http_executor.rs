@@ -1601,6 +1601,8 @@ type ModernHttpExecutionFuture =
 struct ModernHttpExecutionState {
     operation: Option<ModernHttpExecutionFuture>,
     listener: Option<ModernHttpFinalCoreListener>,
+    // At most one exclusive `next_event` poll and one winning retirement.
+    active_cleanup_owners: u8,
     terminal_reason: Option<ExecutionTerminalReason>,
     cancellation_event: Option<CancellationRequested>,
     terminal_error: Option<ModernHttpFinalCoreListenError>,
@@ -1609,11 +1611,53 @@ struct ModernHttpExecutionState {
     last_progress: Option<fastmcp_protocol::common_types::ExactNonNegativeJsonNumber>,
 }
 
+/// Owns the native operation while a single `next_event` poll runs without the
+/// terminal mutex. Unwinding must retire the owner instead of leaving an empty
+/// live state that could subsequently lose its exchange or start another one.
+struct ModernHttpExecutionPollGuard {
+    control: ModernHttpRequestControl,
+    operation: Option<ModernHttpExecutionFuture>,
+    listener: Option<ModernHttpFinalCoreListener>,
+    armed: bool,
+}
+
+struct ModernHttpExecutionPollRelease<'a>(&'a ModernHttpRequestControl);
+
+impl Drop for ModernHttpExecutionPollRelease<'_> {
+    fn drop(&mut self) {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_cleanup_owners -= 1;
+    }
+}
+
+impl Drop for ModernHttpExecutionPollGuard {
+    fn drop(&mut self) {
+        // Declared before the resources so unwinding drops them before the
+        // release marker, including when native cleanup itself panics.
+        let _release = ModernHttpExecutionPollRelease(&self.control);
+        let operation = self.operation.take();
+        let listener = self.listener.take();
+        if self.armed {
+            // The poll itself is unwinding, so there is no pending caller to
+            // wake. In particular, do not invoke another arbitrary wake hook
+            // while propagating a panic from native polling or waker cleanup.
+            self.control
+                .retire_with_wake(ExecutionTerminalReason::CallerDropped, false);
+        }
+        drop(operation);
+        drop(listener);
+    }
+}
+
 /// Independent cancellation and observation for one ordinary modern HTTP POST.
 ///
 /// This control never cancels the caller's `Cx`. Cancellation synchronously
-/// releases the owned exchange, including a response that nobody is polling,
-/// and wakes a pending [`ModernHttpRequestExecution::next_event`] call. Only
+/// releases an idle owned exchange, including a response nobody is polling,
+/// and wakes a pending [`ModernHttpRequestExecution::next_event`] call. An
+/// active native poll releases its exchange as soon as that poll returns. Only
 /// the first terminal transition wins; a completed response cannot subsequently
 /// produce a cancellation indication.
 #[derive(Clone)]
@@ -1665,7 +1709,29 @@ impl ModernHttpRequestControl {
             .terminal_reason
     }
 
+    /// Registry pruning must not wait for a request that may be polling a
+    /// caller waker which itself admits another request on the same client.
+    /// Retirement is reclaimable only after an active poll drops its exchange.
+    pub(crate) fn is_terminal_nonblocking(&self) -> bool {
+        match self.state.try_lock() {
+            Ok(state) => state.terminal_reason.is_some() && state.active_cleanup_owners == 0,
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                let state = error.into_inner();
+                state.terminal_reason.is_some() && state.active_cleanup_owners == 0
+            }
+            Err(std::sync::TryLockError::WouldBlock) => false,
+        }
+    }
+
     fn retire(&self, reason: ExecutionTerminalReason) -> bool {
+        self.retire_with_wake(reason, true)
+    }
+
+    fn retire_with_wake(&self, reason: ExecutionTerminalReason, wake: bool) -> bool {
+        // Retirement owns a distinct cleanup charge: a pending poll may have
+        // restored its operation just before cancellation takes it, and that
+        // poll's guard can finish while this native cleanup is still running.
+        let mut _release = None;
         let (operation, listener, waker) = {
             let mut state = self
                 .state
@@ -1674,6 +1740,8 @@ impl ModernHttpRequestControl {
             if state.terminal_reason.is_some() {
                 return false;
             }
+            state.active_cleanup_owners += 1;
+            _release = Some(ModernHttpExecutionPollRelease(self));
             state.terminal_reason = Some(reason);
             state.progress_marker = None;
             state.last_progress = None;
@@ -1690,7 +1758,7 @@ impl ModernHttpRequestControl {
         // Never execute that code while holding the terminal election lock.
         drop(operation);
         drop(listener);
-        if let Some(waker) = waker {
+        if wake && let Some(waker) = waker {
             waker.wake();
         }
         true
@@ -1747,15 +1815,25 @@ impl ModernHttpRequestExecution {
         let mut cancelled = std::pin::pin!(cancellation_signal.recv(cx));
         let mut caller_deadline = cx.budget().deadline.map(Sleep::new);
         poll_fn(|task_cx| {
-            let mut state = self
-                .control
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.terminal_reason.is_some() {
-                return Poll::Ready(state.terminal_error.take().map_or(Ok(None), Err));
-            }
-            state.waker = Some(task_cx.waker().clone());
+            // Waker clone/drop/wake and native Future::poll may all reenter a
+            // request control. None may run while its terminal mutex is held.
+            let waker = task_cx.waker().clone();
+            let (mut active, previous_waker) = {
+                let mut state = self.control.state.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.terminal_reason.is_some() {
+                    return Poll::Ready(state.terminal_error.take().map_or(Ok(None), Err));
+                }
+                let previous_waker = state.waker.replace(waker);
+                state.active_cleanup_owners += 1;
+                (ModernHttpExecutionPollGuard {
+                    control: self.control.clone(),
+                    operation: state.operation.take(),
+                    listener: state.listener.take(),
+                    armed: true,
+                }, previous_waker)
+            };
+            drop(previous_waker);
             let caller_error = modern_http_execution_caller_error(cx).or_else(|| {
                 if cancelled.as_mut().poll(task_cx).is_ready() {
                     Some(check_modern_http_context(cx).err()
@@ -1769,31 +1847,49 @@ impl ModernHttpRequestExecution {
                     None
                 }
             });
+            // Replacing a prior waker or polling the caller's cancellation
+            // machinery can itself cancel this execution before native I/O.
+            {
+                let mut state = self.control.state.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.terminal_reason.is_some() {
+                    active.armed = false;
+                    return Poll::Ready(state.terminal_error.take().map_or(Ok(None), Err));
+                }
+            }
             let result = if let Some(error) = caller_error {
                 Poll::Ready((None, Err(ModernHttpFinalCoreListenError::Executor(error))))
             } else {
-                if state.operation.is_none() {
-                    let Some(mut listener) = state.listener.take() else {
-                        return Poll::Ready(Ok(None));
-                    };
+                if active.operation.is_none() && let Some(mut listener) = active.listener.take() {
                     let owner_cx = self.cx.clone();
-                    state.operation = Some(Box::pin(async move {
+                    active.operation = Some(Box::pin(async move {
                         let event = listener.next_event(&owner_cx).await;
                         (Some(listener), event)
                     }));
                 }
-                state.operation.as_mut().expect("execution owns its pending operation")
-                    .as_mut().poll(task_cx)
+                active.operation.as_mut().map_or(Poll::Ready((None, Ok(None))), |operation| {
+                    operation.as_mut().poll(task_cx)
+                })
             };
-            let Poll::Ready((listener, mut event)) = result else {
+            let caller_error = modern_http_execution_caller_error(cx);
+            let mut state = self.control.state.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.terminal_reason.is_some() {
+                // A reentrant or concurrent cancellation won while polling.
+                // Discard every event and native resource outside this lock.
+                active.armed = false;
+                return Poll::Ready(state.terminal_error.take().map_or(Ok(None), Err));
+            }
+            let Poll::Ready((mut listener, mut event)) = result else {
+                state.operation = active.operation.take();
+                state.listener = active.listener.take();
+                active.armed = false;
                 return Poll::Pending;
             };
-            if let Some(error) = modern_http_execution_caller_error(cx) {
+            if let Some(error) = caller_error {
                 event = Err(ModernHttpFinalCoreListenError::Executor(error));
             }
-            let operation = state.operation.take();
-            let previous_listener = state.listener.take();
-            state.waker = None;
+            let waker = state.waker.take();
             if let Ok(Some(ModernHttpFinalCoreEvent::Progress(progress))) = &event {
                 if state.progress_marker.as_ref() != Some(&progress.progress_token)
                     || state.last_progress.as_ref().is_some_and(|last| progress.progress.cmp(last).is_le())
@@ -1809,7 +1905,7 @@ impl ModernHttpRequestExecution {
                 Ok(Some(ModernHttpFinalCoreEvent::Terminal(_)) | None) => {
                     state.terminal_reason = Some(ExecutionTerminalReason::FinalResponse);
                 }
-                Ok(Some(_)) => state.listener = listener,
+                Ok(Some(_)) => state.listener = listener.take(),
                 Err(error) => {
                     let reason = modern_http_execution_error_reason(error);
                     state.terminal_reason = Some(reason);
@@ -1824,13 +1920,26 @@ impl ModernHttpRequestExecution {
                     }
                 }
             }
-            if state.terminal_reason.is_some() {
+            let selected_terminal = state.terminal_reason.is_some();
+            if selected_terminal {
                 state.progress_marker = None;
                 state.last_progress = None;
             }
             drop(state);
-            drop(operation);
-            drop(previous_listener);
+            drop(active.operation.take());
+            drop(active.listener.take());
+            drop(listener);
+            drop(waker);
+            if !selected_terminal {
+                // Native/waker destructors may cancel after a notification was
+                // decoded. Such an undelivered event must not escape retirement.
+                let mut state = self.control.state.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.terminal_reason.is_some() {
+                    event = state.terminal_error.take().map_or(Ok(None), Err);
+                }
+            }
+            active.armed = false;
             Poll::Ready(event)
         }).await
     }
@@ -1873,6 +1982,401 @@ fn modern_http_execution_error_reason(error: &ModernHttpFinalCoreListenError) ->
         ModernHttpExecutorError::Transport(_) | ModernHttpExecutorError::DispatchUncertain(_)
         | ModernHttpExecutorError::ResponseBodyReadFailed => ExecutionTerminalReason::ConnectionLost,
         _ => ExecutionTerminalReason::PeerProtocol,
+    }
+}
+
+#[cfg(test)]
+mod owned_execution_reentrancy_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::task::Wake;
+
+    struct ProbeOperation {
+        polls: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+        ready: Arc<AtomicBool>,
+        wake: bool,
+        panic: bool,
+    }
+
+    impl Future for ProbeOperation {
+        type Output = ModernHttpExecutionStep;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            if self.wake {
+                cx.waker().wake_by_ref();
+            }
+            assert!(!self.panic, "injected native HTTP poll panic");
+            if self.ready.load(Ordering::SeqCst) {
+                Poll::Ready((None, Ok(None)))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    impl Drop for ProbeOperation {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ReentrantWake {
+        control: ModernHttpRequestControl,
+        locked: Arc<AtomicBool>,
+        observations: Arc<AtomicUsize>,
+        on_drop: bool,
+        require_active: bool,
+    }
+
+    impl ReentrantWake {
+        fn observe_and_cancel(&self) {
+            // Detect the planted lock regression without letting the test
+            // itself deadlock. On the admitted path, call the real public
+            // blocking observation and cancellation APIs, including reentry.
+            match self.control.state.try_lock() {
+                Ok(state) => drop(state),
+                Err(std::sync::TryLockError::Poisoned(error)) => drop(error.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    self.locked.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+            self.observations.fetch_add(1, Ordering::SeqCst);
+            if self.control.terminal_reason().is_none() {
+                self.control.cancel();
+            }
+            if self.require_active {
+                assert!(
+                    !self.control.is_terminal_nonblocking(),
+                    "retired native work remains charged until its active poll releases it"
+                );
+            }
+        }
+    }
+
+    impl Wake for ReentrantWake {
+        fn wake(self: Arc<Self>) {
+            self.observe_and_cancel();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.observe_and_cancel();
+        }
+    }
+
+    impl Drop for ReentrantWake {
+        fn drop(&mut self) {
+            if self.on_drop {
+                self.observe_and_cancel();
+            }
+        }
+    }
+
+    fn execution(cx: &Cx, operation: ProbeOperation) -> ModernHttpRequestExecution {
+        ModernHttpRequestExecution {
+            cx: cx.clone(),
+            control: ModernHttpRequestControl {
+                request_id: RequestId::Number(41),
+                state: Arc::new(std::sync::Mutex::new(ModernHttpExecutionState {
+                    operation: Some(Box::pin(operation)),
+                    listener: None,
+                    active_cleanup_owners: 0,
+                    terminal_reason: None,
+                    cancellation_event: None,
+                    terminal_error: None,
+                    waker: None,
+                    progress_marker: None,
+                    last_progress: None,
+                })),
+            },
+        }
+    }
+
+    fn poll_once(
+        execution: &mut ModernHttpRequestExecution,
+        cx: &Cx,
+        waker: &Waker,
+    ) -> Poll<Result<Option<ModernHttpFinalCoreEvent>, ModernHttpFinalCoreListenError>> {
+        let mut next = std::pin::pin!(execution.next_event(cx));
+        next.as_mut().poll(&mut Context::from_waker(waker))
+    }
+
+    #[test]
+    fn owned_execution_reentrant_wake_cancels_pending_and_ready_native_polls() {
+        for ready in [false, true] {
+            let cx = Cx::for_testing();
+            let polls = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let mut execution = execution(
+                &cx,
+                ProbeOperation {
+                    polls: polls.clone(),
+                    drops: drops.clone(),
+                    ready: Arc::new(AtomicBool::new(ready)),
+                    wake: true,
+                    panic: false,
+                },
+            );
+            let control = execution.control();
+            let locked = Arc::new(AtomicBool::new(false));
+            let observations = Arc::new(AtomicUsize::new(0));
+            let waker = Waker::from(Arc::new(ReentrantWake {
+                control: control.clone(),
+                locked: locked.clone(),
+                observations: observations.clone(),
+                on_drop: false,
+                require_active: true,
+            }));
+            assert!(matches!(
+                poll_once(&mut execution, &cx, &waker),
+                Poll::Ready(Err(ModernHttpFinalCoreListenError::CallerCancelled { .. }))
+            ));
+            assert!(!locked.load(Ordering::SeqCst));
+            assert!(observations.load(Ordering::SeqCst) >= 1);
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                control.terminal_reason(),
+                Some(ExecutionTerminalReason::CallerCancelled)
+            );
+            assert!(control.is_terminal_nonblocking());
+            assert!(control.take_cancellation_event().is_some());
+            assert!(control.take_cancellation_event().is_none());
+            assert!(!control.cancel());
+            assert!(matches!(
+                poll_once(&mut execution, &cx, Waker::noop()),
+                Poll::Ready(Ok(None))
+            ));
+        }
+    }
+
+    #[test]
+    fn owned_execution_reentrancy_probe_detects_planted_locked_poll() {
+        let cx = Cx::for_testing();
+        let execution = execution(
+            &cx,
+            ProbeOperation {
+                polls: Arc::new(AtomicUsize::new(0)),
+                drops: Arc::new(AtomicUsize::new(0)),
+                ready: Arc::new(AtomicBool::new(false)),
+                wake: false,
+                panic: false,
+            },
+        );
+        let control = execution.control();
+        let locked = Arc::new(AtomicBool::new(false));
+        let observations = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(ReentrantWake {
+            control: control.clone(),
+            locked: locked.clone(),
+            observations: observations.clone(),
+            on_drop: false,
+            require_active: false,
+        }));
+        {
+            let _planted_lock = control.state.lock().unwrap();
+            waker.wake_by_ref();
+        }
+        assert!(locked.load(Ordering::SeqCst));
+        assert_eq!(observations.load(Ordering::SeqCst), 0);
+        assert!(control.terminal_reason().is_none());
+        locked.store(false, Ordering::SeqCst);
+        waker.wake_by_ref();
+        assert!(!locked.load(Ordering::SeqCst));
+        assert_eq!(observations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            control.terminal_reason(),
+            Some(ExecutionTerminalReason::CallerCancelled)
+        );
+    }
+
+    #[test]
+    fn owned_execution_reentrant_waker_drop_cancels_before_repoll() {
+        let cx = Cx::for_testing();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut execution = execution(
+            &cx,
+            ProbeOperation {
+                polls: polls.clone(),
+                drops: drops.clone(),
+                ready: Arc::new(AtomicBool::new(false)),
+                wake: false,
+                panic: false,
+            },
+        );
+        let locked = Arc::new(AtomicBool::new(false));
+        let observations = Arc::new(AtomicUsize::new(0));
+        {
+            let waker = Waker::from(Arc::new(ReentrantWake {
+                control: execution.control(),
+                locked: locked.clone(),
+                observations: observations.clone(),
+                on_drop: true,
+                require_active: true,
+            }));
+            assert!(poll_once(&mut execution, &cx, &waker).is_pending());
+        }
+        assert_eq!(
+            observations.load(Ordering::SeqCst),
+            0,
+            "the execution retains its waker"
+        );
+        assert!(matches!(
+            poll_once(&mut execution, &cx, Waker::noop()),
+            Poll::Ready(Err(ModernHttpFinalCoreListenError::CallerCancelled { .. }))
+        ));
+        assert!(!locked.load(Ordering::SeqCst));
+        assert_eq!(observations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            1,
+            "cancellation prevents another native poll"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn owned_execution_dropped_poll_preserves_the_same_native_operation() {
+        let cx = Cx::for_testing();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(AtomicBool::new(false));
+        let mut execution = execution(
+            &cx,
+            ProbeOperation {
+                polls: polls.clone(),
+                drops: drops.clone(),
+                ready: ready.clone(),
+                wake: false,
+                panic: false,
+            },
+        );
+        assert!(poll_once(&mut execution, &cx, Waker::noop()).is_pending());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        ready.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            poll_once(&mut execution, &cx, Waker::noop()),
+            Poll::Ready(Ok(None))
+        ));
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            execution.control().terminal_reason(),
+            Some(ExecutionTerminalReason::FinalResponse)
+        );
+        assert!(!execution.control().cancel());
+        assert!(execution.control().take_cancellation_event().is_none());
+    }
+
+    #[test]
+    fn owned_execution_panicking_poll_retires_and_releases_native_operation() {
+        let cx = Cx::for_testing();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut execution = execution(
+            &cx,
+            ProbeOperation {
+                polls: polls.clone(),
+                drops: drops.clone(),
+                ready: Arc::new(AtomicBool::new(false)),
+                wake: false,
+                panic: true,
+            },
+        );
+        let control = execution.control();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = poll_once(&mut execution, &cx, Waker::noop());
+        }));
+        assert!(panic.is_err());
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            control.terminal_reason(),
+            Some(ExecutionTerminalReason::CallerDropped)
+        );
+        assert!(control.is_terminal_nonblocking());
+        assert!(control.take_cancellation_event().is_some());
+        assert!(control.take_cancellation_event().is_none());
+        assert!(matches!(
+            poll_once(&mut execution, &cx, Waker::noop()),
+            Poll::Ready(Err(ModernHttpFinalCoreListenError::CallerCancelled { .. }))
+        ));
+        assert!(matches!(
+            poll_once(&mut execution, &cx, Waker::noop()),
+            Poll::Ready(Ok(None))
+        ));
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            1,
+            "a panic cannot reissue the operation"
+        );
+    }
+
+    #[test]
+    fn owned_execution_overlapping_poll_and_retirement_keep_cleanup_charged() {
+        struct RetiringOperation {
+            finishing_poll: Option<ModernHttpExecutionPollGuard>,
+            control: ModernHttpRequestControl,
+            reclaimed_during_drop: Arc<AtomicBool>,
+        }
+
+        impl Future for RetiringOperation {
+            type Output = ModernHttpExecutionStep;
+
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Pending
+            }
+        }
+
+        impl Drop for RetiringOperation {
+            fn drop(&mut self) {
+                // The returning poll finishes while cancellation still owns
+                // the operation it took from the restored pending state.
+                drop(self.finishing_poll.take());
+                self.reclaimed_during_drop
+                    .store(self.control.is_terminal_nonblocking(), Ordering::SeqCst);
+            }
+        }
+
+        let cx = Cx::for_testing();
+        let execution = execution(
+            &cx,
+            ProbeOperation {
+                polls: Arc::new(AtomicUsize::new(0)),
+                drops: Arc::new(AtomicUsize::new(0)),
+                ready: Arc::new(AtomicBool::new(false)),
+                wake: false,
+                panic: false,
+            },
+        );
+        let control = execution.control();
+        let reclaimed_during_drop = Arc::new(AtomicBool::new(false));
+        let previous = {
+            let mut state = control.state.lock().unwrap();
+            // Reproduce the narrow interval after a Pending poll has restored
+            // its operation and unlocked, before its guard has returned.
+            state.active_cleanup_owners = 1;
+            state.operation.replace(Box::pin(RetiringOperation {
+                finishing_poll: Some(ModernHttpExecutionPollGuard {
+                    control: control.clone(),
+                    operation: None,
+                    listener: None,
+                    armed: false,
+                }),
+                control: control.clone(),
+                reclaimed_during_drop: reclaimed_during_drop.clone(),
+            }))
+        };
+        drop(previous);
+        assert!(control.cancel());
+        assert!(
+            !reclaimed_during_drop.load(Ordering::SeqCst),
+            "finishing the poll cannot release the concurrent retirement's quota"
+        );
+        assert!(control.is_terminal_nonblocking());
     }
 }
 
@@ -6913,6 +7417,45 @@ impl ModernHttpClient {
             .await
     }
 
+    /// Measures the configured metadata and JSON-RPC envelope independently
+    /// of caller parameters before a high-level execution reserves its bytes.
+    pub(crate) fn owned_core_metadata_bytes(&self, cx: &Cx, maximum: usize) -> McpResult<usize> {
+        crate::measure_serialized_bytes(
+            &(
+                &self.client_info,
+                &self.client_implementation,
+                &self.client_capabilities,
+            ),
+            maximum,
+        )
+        .map_err(|_| {
+            McpError::invalid_params("HTTP owned execution metadata byte limit exceeded")
+        })?;
+        let request = self
+            .build_post_discovery_request(
+                cx,
+                PING,
+                serde_json::json!({}),
+                Some(RequestId::Number(i64::MAX)),
+                None,
+                true,
+            )
+            .map_err(|_| {
+                McpError::invalid_params("HTTP owned execution metadata could not be encoded")
+            })?;
+        // All admitted core method names are shorter than this additional
+        // allowance; the maximal numeric ID above already bounds ID encoding.
+        let bytes = request.body.len().checked_add(64).ok_or_else(|| {
+            McpError::invalid_params("HTTP owned execution metadata byte limit exceeded")
+        })?;
+        if bytes > maximum {
+            return Err(McpError::invalid_params(
+                "HTTP owned execution metadata byte limit exceeded",
+            ));
+        }
+        Ok(bytes)
+    }
+
     /// Prepares one owned ordinary core execution without starting network I/O.
     ///
     /// The first [`ModernHttpRequestExecution::next_event`] poll sends one POST.
@@ -7009,6 +7552,7 @@ impl ModernHttpClient {
                 state: Arc::new(std::sync::Mutex::new(ModernHttpExecutionState {
                     operation: Some(operation),
                     listener: None,
+                    active_cleanup_owners: 0,
                     terminal_reason: None,
                     cancellation_event: None,
                     terminal_error: None,

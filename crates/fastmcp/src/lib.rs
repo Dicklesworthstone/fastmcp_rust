@@ -241,12 +241,13 @@ pub mod client {
         HttpEndpointConfigError, MAX_MODERN_HTTP_PROBE_BODY_BYTES, MODERN_MCP_ACCEPT,
         MODERN_MCP_ACCEPT_ENCODING, MODERN_MCP_CONTENT_TYPE, McpConfig, ModernHttpClient,
         ModernHttpClientError, ModernHttpConnectOutcome, ModernHttpExecutor,
-        ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind,
-        ModernHttpResponseMetadata, ModernHttpResponseStream, ModernHttpSseResponseStream,
-        ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
-        ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener, ServerConfig,
-        SseEndOfStream, SseLimits, SseParseError, claude_desktop_config_path, default_config_paths,
-        validate_response_head,
+        ModernHttpExecutorError, ModernHttpFinalCoreEvent, ModernHttpFinalCoreListenError,
+        ModernHttpRequest, ModernHttpRequestControl, ModernHttpRequestExecution,
+        ModernHttpResponseKind, ModernHttpResponseMetadata, ModernHttpResponseStream,
+        ModernHttpSseResponseStream, ModernHttpSubscriptionListenCollector,
+        ModernHttpSubscriptionListenError, ModernHttpSubscriptionListenEvent,
+        ModernHttpSubscriptionListener, ServerConfig, SseEndOfStream, SseLimits, SseParseError,
+        claude_desktop_config_path, default_config_paths, validate_response_head,
     };
     pub use crate::{
         BoundedListPage, CachePartitionKey, CancellationRequested, Client, ClientBuilder,
@@ -259,10 +260,11 @@ pub mod client {
         FinalCacheLookup, FinalCacheMiss, FinalCacheResultSet, FinalCacheStats,
         FinalCacheTtlDiagnostic, FinalResultCache, HttpClient, HttpClientError,
         HttpSubscriptionListener, ListPageLimits, MAX_FINAL_CACHE_CAPACITY,
-        MAX_FINAL_CACHE_MAX_BYTES, OpaquePagination, PaginationBounds, PendingRequestRecord,
-        ProgressCallback, Request, RequestExecution, RequestExecutor, RequestTimeoutPolicy,
-        RequestTimeoutSource, ReverseRequest, ReverseRequestCancellation, StdioRequestExecution,
-        StdioRequestExecutor, StdioSubscriptionEvent, SubscriptionFilter,
+        MAX_FINAL_CACHE_MAX_BYTES, MAX_HTTP_EXECUTION_REQUEST_BYTES, MAX_HTTP_IN_FLIGHT_EXECUTIONS,
+        MAX_HTTP_RETAINED_EXECUTION_BYTES, OpaquePagination, PaginationBounds,
+        PendingRequestRecord, ProgressCallback, Request, RequestExecution, RequestExecutor,
+        RequestTimeoutPolicy, RequestTimeoutSource, ReverseRequest, ReverseRequestCancellation,
+        StdioRequestExecution, StdioRequestExecutor, StdioSubscriptionEvent, SubscriptionFilter,
         SubscriptionListenCollector, SubscriptionTimeoutPolicy,
     };
     /// Tasks client APIs are available only with the official Tasks extension.
@@ -280,14 +282,14 @@ pub mod client {
     /// MCP Apps client APIs are available only with the Apps extension.
     #[cfg(feature = "apps")]
     pub use crate::{
-        McpAppsHostRequestOutcome, McpAppsViewCallToolResult, McpAppsViewTool,
-        McpAppsViewToolsPage, McpAppsWireHostResponse,
         McpAppsBridgeTransport, McpAppsClientWirePolicy, McpAppsHost, McpAppsHostConfiguration,
-        McpAppsHostError, McpAppsHostPolicy, McpAppsHttpClientWirePolicy,
-        McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport,
+        McpAppsHostError, McpAppsHostPolicy, McpAppsHostRequestOutcome,
+        McpAppsHttpClientWirePolicy, McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport,
         McpAppsInMemoryWireHostTransport, McpAppsInMemoryWireViewTransport,
+        McpAppsViewCallToolResult, McpAppsViewTool, McpAppsViewToolsPage,
         McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostConfiguration,
-        McpAppsWireHostPolicy, mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
+        McpAppsWireHostPolicy, McpAppsWireHostResponse, mcp_apps_in_memory_pair,
+        mcp_apps_in_memory_wire_pair,
     };
     #[cfg(feature = "apps")]
     pub use fastmcp_client::mcp_apps;
@@ -871,10 +873,11 @@ pub use fastmcp_client::{
     FinalCacheLookup, FinalCacheMiss, FinalCacheResultSet, FinalCacheStats,
     FinalCacheTtlDiagnostic, FinalResultCache, HttpClient, HttpClientError,
     HttpSubscriptionListener, ListPageLimits, MAX_FINAL_CACHE_CAPACITY, MAX_FINAL_CACHE_MAX_BYTES,
-    OpaquePagination, PaginationBounds, PendingRequestRecord, ProgressCallback, Request,
-    RequestExecution, RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource, ReverseRequest,
-    ReverseRequestCancellation, StdioRequestExecution, StdioRequestExecutor,
-    StdioSubscriptionEvent, SubscriptionFilter, SubscriptionListenCollector,
+    MAX_HTTP_EXECUTION_REQUEST_BYTES, MAX_HTTP_IN_FLIGHT_EXECUTIONS,
+    MAX_HTTP_RETAINED_EXECUTION_BYTES, OpaquePagination, PaginationBounds, PendingRequestRecord,
+    ProgressCallback, Request, RequestExecution, RequestExecutor, RequestTimeoutPolicy,
+    RequestTimeoutSource, ReverseRequest, ReverseRequestCancellation, StdioRequestExecution,
+    StdioRequestExecutor, StdioSubscriptionEvent, SubscriptionFilter, SubscriptionListenCollector,
     SubscriptionTimeoutPolicy,
 };
 #[cfg(feature = "websocket-experimental")]
@@ -912,10 +915,12 @@ pub use fastmcp_client::http_executor::{LegacySseHttpClient, LegacySseHttpClient
 pub use fastmcp_client::http_executor::{
     MAX_MODERN_HTTP_PROBE_BODY_BYTES, MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING,
     MODERN_MCP_CONTENT_TYPE, ModernHttpClient, ModernHttpClientError, ModernHttpConnectOutcome,
-    ModernHttpExecutor, ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind,
-    ModernHttpResponseMetadata, ModernHttpResponseStream, ModernHttpSseResponseStream,
-    ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
-    ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener, validate_response_head,
+    ModernHttpExecutor, ModernHttpExecutorError, ModernHttpFinalCoreEvent,
+    ModernHttpFinalCoreListenError, ModernHttpRequest, ModernHttpRequestControl,
+    ModernHttpRequestExecution, ModernHttpResponseKind, ModernHttpResponseMetadata,
+    ModernHttpResponseStream, ModernHttpSseResponseStream, ModernHttpSubscriptionListenCollector,
+    ModernHttpSubscriptionListenError, ModernHttpSubscriptionListenEvent,
+    ModernHttpSubscriptionListener, validate_response_head,
 };
 pub use fastmcp_client::mcp_config::{
     ConfigError, ConfigLoader, HttpEndpointConfig, HttpEndpointConfigError, McpConfig,
@@ -942,8 +947,10 @@ pub mod auto {
     #[cfg(feature = "tasks")]
     pub use fastmcp_client::StdioTaskSubscriptionEvent;
     pub use fastmcp_client::http_executor::{
-        ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
-        ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener,
+        ModernHttpFinalCoreEvent, ModernHttpFinalCoreListenError, ModernHttpRequestControl,
+        ModernHttpRequestExecution, ModernHttpSubscriptionListenCollector,
+        ModernHttpSubscriptionListenError, ModernHttpSubscriptionListenEvent,
+        ModernHttpSubscriptionListener,
     };
     pub use fastmcp_client::sse::{SseEndOfStream, SseLimits, SseParseError};
     pub use fastmcp_client::{
@@ -951,9 +958,10 @@ pub mod auto {
         ClientHttpNegotiationDecision, ClientHttpNegotiationError, ClientHttpNegotiationState,
         ClientHttpResponse, ClientProtocolPlan, ClientProtocolPlanError, ClientSession,
         CompletionContext, CompletionParams, CompletionReference, HttpClient, HttpClientError,
-        HttpSubscriptionListener, MrtrInputResponses, Request, RequestExecution, RequestExecutor,
-        ReverseRequest, ReverseRequestCancellation, ReverseRequestHandlers, StdioRequestExecution,
-        StdioRequestExecutor, StdioSubscriptionEvent, SubscriptionFilter,
+        HttpSubscriptionListener, MAX_HTTP_EXECUTION_REQUEST_BYTES, MAX_HTTP_IN_FLIGHT_EXECUTIONS,
+        MAX_HTTP_RETAINED_EXECUTION_BYTES, MrtrInputResponses, Request, RequestExecution,
+        RequestExecutor, ReverseRequest, ReverseRequestCancellation, ReverseRequestHandlers,
+        StdioRequestExecution, StdioRequestExecutor, StdioSubscriptionEvent, SubscriptionFilter,
         SubscriptionListenCollector,
     };
     pub use fastmcp_core::{CanonicalHttpUrl, Cx, McpError, McpResult};
@@ -2630,9 +2638,10 @@ pub mod modern {
     pub use fastmcp_client::StdioTaskSubscriptionEvent;
     pub use fastmcp_client::http_executor::{
         MAX_MODERN_HTTP_PROBE_BODY_BYTES, MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING,
-        MODERN_MCP_CONTENT_TYPE, ModernHttpClientError, ModernHttpSubscriptionListenCollector,
-        ModernHttpSubscriptionListenError, ModernHttpSubscriptionListenEvent,
-        ModernHttpSubscriptionListener,
+        MODERN_MCP_CONTENT_TYPE, ModernHttpClientError, ModernHttpFinalCoreEvent,
+        ModernHttpFinalCoreListenError, ModernHttpRequestControl, ModernHttpRequestExecution,
+        ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
+        ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener,
     };
     pub use fastmcp_client::sse::SseLimits;
     pub use fastmcp_client::{
@@ -2642,7 +2651,8 @@ pub mod modern {
         FinalCacheGeneration, FinalCacheInsert, FinalCacheKey, FinalCacheLookup, FinalCacheMiss,
         FinalCacheResultSet, FinalCacheStats, FinalCacheTtlDiagnostic, FinalResultCache,
         HttpClientError, HttpSubscriptionListener, ListPageLimits, MAX_FINAL_CACHE_CAPACITY,
-        MAX_FINAL_CACHE_MAX_BYTES, MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_INPUT_RESPONSES,
+        MAX_FINAL_CACHE_MAX_BYTES, MAX_HTTP_EXECUTION_REQUEST_BYTES, MAX_HTTP_IN_FLIGHT_EXECUTIONS,
+        MAX_HTTP_RETAINED_EXECUTION_BYTES, MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_INPUT_RESPONSES,
         MAX_MRTR_TOTAL_INPUT_RESPONSES, MrtrInputResponses, OpaquePagination, PaginationBounds,
         PendingRequestRecord, ProgressCallback, RequestTimeoutPolicy, RequestTimeoutSource,
         ReverseRequestHandlers, StdioSubscriptionEvent, SubscriptionFilter,
@@ -5159,6 +5169,60 @@ pub mod modern {
             self.inner.server_discovery().expect(
                 "the modern facade only retains an HTTP client admitted by final server/discover",
             )
+        }
+
+        /// Prepares one independently owned core HTTP request without sending it.
+        ///
+        /// Each returned handle uses this client's request-ID allocator,
+        /// negotiated capabilities, identity, logging policy, and timeout bounds.
+        /// Driving [`ModernHttpRequestExecution::next_event`] sends its single POST
+        /// and yields typed progress, notifications, and the terminal result.
+        /// Several handles can be driven concurrently without borrowing the client;
+        /// cancelling one leaves its siblings and the caller's context untouched.
+        /// Dropping this client retires every outstanding handle.
+        ///
+        /// The caller owns event consumption and any `input_required` continuation.
+        /// These streaming requests do not populate the client's result cache or
+        /// invoke its automatic MRTR resolvers. Subscriptions and official Tasks
+        /// retain their dedicated APIs.
+        pub fn execute_core(
+            &self,
+            cx: &Cx,
+            method: impl AsRef<str>,
+            parameters: serde_json::Value,
+            limits: SseLimits,
+        ) -> Result<ModernHttpRequestExecution, HttpClientError> {
+            self.inner.execute_core(cx, method, parameters, limits)
+        }
+
+        /// Prepares an owned core request with per-execution response deadlines.
+        ///
+        /// Idle and absolute deadlines remain capped by the client configuration
+        /// and the original caller budget. Dropping a pending event future does
+        /// not restart the request or reset its response deadline.
+        pub fn execute_core_with_timeout_policy(
+            &self,
+            cx: &Cx,
+            method: impl AsRef<str>,
+            parameters: serde_json::Value,
+            limits: SseLimits,
+            timeout_policy: RequestTimeoutPolicy,
+        ) -> Result<ModernHttpRequestExecution, HttpClientError> {
+            self.inner.execute_core_with_timeout_policy(
+                cx,
+                method,
+                parameters,
+                limits,
+                timeout_policy,
+            )
+        }
+
+        /// Retires all outstanding owned requests and returns the number cancelled.
+        ///
+        /// This also retires prepared requests that have never been polled. It
+        /// leaves the client available for new requests and does not cancel `Cx`.
+        pub fn cancel_pending_executions(&self) -> usize {
+            self.inner.cancel_pending_executions()
         }
 
         /// Returns whether final discovery activated the official MCP Apps extension.
@@ -10633,7 +10697,11 @@ pub mod prelude {
         ModernHttpConnectOutcome,
         ModernHttpExecutor,
         ModernHttpExecutorError,
+        ModernHttpFinalCoreEvent,
+        ModernHttpFinalCoreListenError,
         ModernHttpRequest,
+        ModernHttpRequestControl,
+        ModernHttpRequestExecution,
         ModernHttpResponseKind,
         ModernHttpResponseMetadata,
         ModernHttpResponseStream,
@@ -10765,10 +10833,11 @@ pub mod prelude {
     };
     #[cfg(feature = "proxy")]
     pub use crate::{
-        FinalProgressCallback, ProxyAsyncRequest, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint,
-        ProxyClient, ProxyFinalCatalog, ProxyProgressCallback, ProxyPromptCatalog, ProxyResourceCatalog,
-        ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog, ProxyUpstreamAdapter,
-        ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
+        FinalProgressCallback, ProxyAsyncRequest, ProxyBackend, ProxyCatalog,
+        ProxyCatalogCacheHint, ProxyClient, ProxyFinalCatalog, ProxyProgressCallback,
+        ProxyPromptCatalog, ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog,
+        ProxyTypedCatalog, ProxyUpstreamAdapter, ProxyUpstreamBinding,
+        ProxyUpstreamBindingRegistry,
     };
     #[cfg(feature = "apps")]
     pub use crate::{

@@ -11173,6 +11173,483 @@ fn e2e_public_http_progress_marker_is_retained_from_request_sse() {
     server.shutdown();
 }
 
+const PUBLIC_HTTP_OWNED_EXECUTION_TOOL: &str = "public-http-e2e-owned-execution";
+
+#[derive(Default)]
+struct PublicHttpOwnedExecutionGate {
+    released: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    waiters: std::sync::Mutex<BTreeMap<String, std::task::Waker>>,
+}
+
+impl PublicHttpOwnedExecutionGate {
+    fn release(&self, value: &str) {
+        self.released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(value.to_owned());
+        let waker = self
+            .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(value);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    async fn wait(&self, value: &str, ctx: &McpContext, request_cx: &Cx) -> McpResult<()> {
+        let (_cancellation_owner, mut cancellation_signal) =
+            asupersync::channel::oneshot::channel::<()>();
+        let mut cancelled = std::pin::pin!(cancellation_signal.recv(request_cx));
+        std::future::poll_fn(|task_context| {
+            if ctx.checkpoint().is_err()
+                || request_cx.checkpoint().is_err()
+                || std::future::Future::poll(cancelled.as_mut(), task_context).is_ready()
+            {
+                return std::task::Poll::Ready(Err(McpError::request_cancelled()));
+            }
+            let mut waiters = self
+                .waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(value)
+            {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            waiters.insert(value.to_owned(), task_context.waker().clone());
+            std::task::Poll::Pending
+        })
+        .await
+    }
+}
+
+#[derive(Default)]
+struct PublicHttpOwnedExecutionCounters {
+    started: AtomicUsize,
+    completed: AtomicUsize,
+    active: AtomicUsize,
+    dropped: AtomicUsize,
+}
+
+struct PublicHttpOwnedExecutionGuard {
+    value: String,
+    gate: Arc<PublicHttpOwnedExecutionGate>,
+    counters: Arc<PublicHttpOwnedExecutionCounters>,
+    drops: mpsc::Sender<String>,
+}
+
+impl Drop for PublicHttpOwnedExecutionGuard {
+    fn drop(&mut self) {
+        self.gate
+            .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.value);
+        self.counters.active.fetch_sub(1, Ordering::SeqCst);
+        self.counters.dropped.fetch_add(1, Ordering::SeqCst);
+        let _ = self.drops.send(self.value.clone());
+    }
+}
+
+/// Emits request-scoped progress before optionally waiting on an observable
+/// application gate, so a sibling can finish while this invocation remains live.
+struct PublicHttpOwnedExecutionTool {
+    gate: Arc<PublicHttpOwnedExecutionGate>,
+    counters: Arc<PublicHttpOwnedExecutionCounters>,
+    drops: mpsc::Sender<String>,
+}
+
+impl ToolHandler for PublicHttpOwnedExecutionTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PUBLIC_HTTP_OWNED_EXECUTION_TOOL.to_owned(),
+            description: Some(
+                "Reports progress and echoes independently owned HTTP work".to_owned(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "value": {"type": "string"},
+                    "hold": {"type": "boolean"}
+                },
+                "required": ["value", "hold"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let value = arguments
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| McpError::invalid_params("value must be a string"))?;
+        Ok(vec![Content::text(value)])
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Async
+    }
+
+    fn call_final_outcome_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+        Box::pin(async move {
+            let Some(value) = arguments.get("value").and_then(serde_json::Value::as_str) else {
+                return Outcome::Err(McpError::invalid_params("value must be a string"));
+            };
+            self.counters.started.fetch_add(1, Ordering::SeqCst);
+            self.counters.active.fetch_add(1, Ordering::SeqCst);
+            let _guard = PublicHttpOwnedExecutionGuard {
+                value: value.to_owned(),
+                gate: Arc::clone(&self.gate),
+                counters: Arc::clone(&self.counters),
+                drops: self.drops.clone(),
+            };
+            ctx.report_progress(0.5, Some(value));
+            if arguments.get("hold").and_then(serde_json::Value::as_bool) == Some(true)
+                && let Err(error) = self.gate.wait(value, ctx, request_cx).await
+            {
+                return Outcome::Err(error);
+            }
+            self.counters.completed.fetch_add(1, Ordering::SeqCst);
+            Outcome::Ok(FinalToolOutcome::Complete(CompleteResult::new(
+                FinalCallToolResult {
+                    content: vec![ContentBlock::text(value)],
+                    is_error: false,
+                    structured_content: None,
+                },
+                ResultMeta::empty(),
+            )))
+        })
+    }
+}
+
+fn spawn_owned_execution_http_server(
+    gate: Arc<PublicHttpOwnedExecutionGate>,
+    counters: Arc<PublicHttpOwnedExecutionCounters>,
+    drops: mpsc::Sender<String>,
+) -> HttpServerFixture {
+    spawn_legacy_http_server("modern owned executions", move || {
+        ServerBuilder::new("facade-http-owned-executions", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly is available")
+            .tool(PublicHttpOwnedExecutionTool {
+                gate,
+                counters,
+                drops,
+            })
+            .build()
+    })
+}
+
+fn public_http_owned_execution(
+    client: &modern::HttpClient,
+    cx: &Cx,
+    value: &str,
+    hold: bool,
+) -> fastmcp_rust::ModernHttpRequestExecution {
+    client
+        .execute_core(
+            cx,
+            "tools/call",
+            json!({
+                "name": PUBLIC_HTTP_OWNED_EXECUTION_TOOL,
+                "arguments": {"value": value, "hold": hold},
+                "_meta": {"progressToken": value}
+            }),
+            SseLimits::new(64 * 1024, 1 << 20, 128)
+                .expect("owned execution SSE limits are bounded"),
+        )
+        .expect("the public facade prepares an execution without borrowing the client")
+}
+
+fn assert_public_http_owned_execution_progress(
+    cx: &Cx,
+    execution: &mut fastmcp_rust::ModernHttpRequestExecution,
+    value: &str,
+) {
+    let event = runtime_block_on_bounded_named(
+        cx,
+        &format!("owned HTTP {value}: progress before handler release"),
+        execution.next_event(cx),
+    )
+    .expect("the request-owned response yields progress before its terminal result")
+    .expect("the first event is retained");
+    assert!(
+        matches!(
+            event,
+            fastmcp_rust::ModernHttpFinalCoreEvent::Progress(progress)
+                if progress.progress_token == modern::ProgressMarker::from(value)
+                    && progress.message.as_deref() == Some(value)
+        ),
+        "progress stays on the exact owning execution and marker"
+    );
+}
+
+fn assert_public_http_owned_execution_terminal(
+    cx: &Cx,
+    execution: &mut fastmcp_rust::ModernHttpRequestExecution,
+    value: &str,
+) {
+    let event = runtime_block_on_bounded_named(
+        cx,
+        &format!("owned HTTP {value}: terminal after handler release"),
+        execution.next_event(cx),
+    )
+    .expect("the request-owned response yields a successful terminal result")
+    .expect("the terminal event is retained");
+    let fastmcp_rust::ModernHttpFinalCoreEvent::Terminal(FinalCoreResult::ToolsCall {
+        result, ..
+    }) = event
+    else {
+        panic!("the owned tools/call must yield its typed terminal result: {event:?}");
+    };
+    assert!(!result.payload.is_error);
+    assert!(matches!(
+        result.payload.content.as_slice(),
+        [ContentBlock::Text { text, .. }] if text == value
+    ));
+    assert!(
+        runtime_block_on_bounded_named(
+            cx,
+            &format!("owned HTTP {value}: terminal finality"),
+            execution.next_event(cx),
+        )
+        .expect("a terminal execution stays retired")
+        .is_none()
+    );
+    assert_eq!(
+        execution.control().terminal_reason(),
+        Some(fastmcp_rust::ExecutionTerminalReason::FinalResponse)
+    );
+    assert!(!execution.control().cancel());
+    assert!(execution.control().take_cancellation_event().is_none());
+}
+
+fn assert_public_http_owned_execution_cancelled(
+    cx: &Cx,
+    execution: &mut fastmcp_rust::ModernHttpRequestExecution,
+) {
+    let control = execution.control();
+    let cancellation = control
+        .take_cancellation_event()
+        .expect("cancellation publishes exactly one local indication");
+    assert_eq!(&cancellation.request_id, execution.request_id());
+    assert_eq!(
+        cancellation.reason,
+        fastmcp_rust::ExecutionTerminalReason::CallerCancelled
+    );
+    assert!(control.take_cancellation_event().is_none());
+    let error = runtime_block_on_bounded_named(
+        cx,
+        "owned HTTP: cancellation error after control retirement",
+        execution.next_event(cx),
+    )
+    .expect_err("the cancelled response must never deliver a terminal result");
+    assert!(matches!(
+        error,
+        fastmcp_rust::ModernHttpFinalCoreListenError::CallerCancelled { request_id }
+            if &request_id == execution.request_id()
+    ));
+    assert!(
+        runtime_block_on_bounded_named(
+            cx,
+            "owned HTTP: cancellation finality",
+            execution.next_event(cx),
+        )
+        .expect("the cancellation error is delivered only once")
+        .is_none()
+    );
+    assert!(!control.cancel());
+    assert!(
+        cx.checkpoint().is_ok(),
+        "request cancellation leaves the caller context live"
+    );
+}
+
+fn assert_public_http_owned_execution_client_reuse(cx: &Cx, client: &mut modern::HttpClient) {
+    let result = runtime_block_on_bounded(
+        cx,
+        client.call_tool(
+            cx,
+            PUBLIC_HTTP_OWNED_EXECUTION_TOOL,
+            json!({"value": "reuse", "hold": false}),
+        ),
+    )
+    .expect("the same public client retains its typed API after owned executions retire");
+    assert!(!result.is_error);
+    assert!(matches!(
+        result.content.as_slice(),
+        [ContentBlock::Text { text, .. }] if text == "reuse"
+    ));
+    assert!(
+        client.take_progress_notifications().is_empty(),
+        "owned progress must not leak into the client's sequential notification queue"
+    );
+}
+
+fn public_http_owned_execution_round(cancel_first: bool) {
+    let cx = Cx::for_request();
+    let gate = Arc::new(PublicHttpOwnedExecutionGate::default());
+    let counters = Arc::new(PublicHttpOwnedExecutionCounters::default());
+    let (drops_tx, drops_rx) = mpsc::channel();
+    let server =
+        spawn_owned_execution_http_server(Arc::clone(&gate), Arc::clone(&counters), drops_tx);
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-owned-executions", "1.0.0")
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
+    )
+    .expect("the public modern client connects to the owned-execution HTTP server");
+    let mut first = public_http_owned_execution(&client, &cx, "first", true);
+    let mut sibling = public_http_owned_execution(&client, &cx, "sibling", true);
+    assert_ne!(first.request_id(), sibling.request_id());
+    assert_eq!(counters.started.load(Ordering::SeqCst), 0);
+
+    assert_public_http_owned_execution_progress(&cx, &mut first, "first");
+    assert_eq!(counters.active.load(Ordering::SeqCst), 1);
+    assert_public_http_owned_execution_progress(&cx, &mut sibling, "sibling");
+    assert_eq!(counters.active.load(Ordering::SeqCst), 2);
+    assert_eq!(counters.completed.load(Ordering::SeqCst), 0);
+    if cancel_first {
+        assert!(first.control().cancel());
+        assert_public_http_owned_execution_cancelled(&cx, &mut first);
+        assert_eq!(
+            drops_rx
+                .recv_timeout(HTTP_OPERATION_BOUND)
+                .expect("the cancelled handler drops"),
+            "first"
+        );
+        assert_eq!(counters.active.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.completed.load(Ordering::SeqCst), 0);
+    }
+    assert_eq!(sibling.control().terminal_reason(), None);
+    gate.release("sibling");
+    assert_public_http_owned_execution_terminal(&cx, &mut sibling, "sibling");
+    assert_eq!(
+        drops_rx
+            .recv_timeout(HTTP_OPERATION_BOUND)
+            .expect("the sibling handler drops"),
+        "sibling"
+    );
+    assert_eq!(counters.completed.load(Ordering::SeqCst), 1);
+    if !cancel_first {
+        assert_eq!(first.control().terminal_reason(), None);
+        assert_eq!(counters.active.load(Ordering::SeqCst), 1);
+        gate.release("first");
+        assert_public_http_owned_execution_terminal(&cx, &mut first, "first");
+        assert_eq!(
+            drops_rx
+                .recv_timeout(HTTP_OPERATION_BOUND)
+                .expect("the held handler drops"),
+            "first"
+        );
+    }
+    assert_eq!(counters.active.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        counters.completed.load(Ordering::SeqCst),
+        if cancel_first { 1 } else { 2 }
+    );
+    assert_public_http_owned_execution_client_reuse(&cx, &mut client);
+    assert_eq!(
+        drops_rx
+            .recv_timeout(HTTP_OPERATION_BOUND)
+            .expect("the reused handler drops"),
+        "reuse"
+    );
+    assert_eq!(counters.started.load(Ordering::SeqCst), 3);
+    assert_eq!(counters.dropped.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        counters.completed.load(Ordering::SeqCst),
+        if cancel_first { 2 } else { 3 }
+    );
+    drop((first, sibling, client));
+    server.shutdown();
+    assert_eq!(counters.active.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn e2e_public_http_owned_executions_complete_out_of_order_with_isolated_progress() {
+    public_http_owned_execution_round(false);
+}
+
+#[test]
+fn e2e_public_http_owned_execution_cancellation_preserves_sibling_and_client_reuse() {
+    public_http_owned_execution_round(true);
+}
+
+#[test]
+fn e2e_public_http_cancel_pending_executions_retires_polled_and_unpolled_requests() {
+    let cx = Cx::for_request();
+    let gate = Arc::new(PublicHttpOwnedExecutionGate::default());
+    let counters = Arc::new(PublicHttpOwnedExecutionCounters::default());
+    let (drops_tx, drops_rx) = mpsc::channel();
+    let server = spawn_owned_execution_http_server(gate, Arc::clone(&counters), drops_tx);
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-owned-shutdown", "1.0.0")
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
+    )
+    .expect("the public modern client connects before owned execution shutdown");
+    let mut first = public_http_owned_execution(&client, &cx, "first", true);
+    let mut sibling = public_http_owned_execution(&client, &cx, "sibling", true);
+    let mut unsent = public_http_owned_execution(&client, &cx, "unsent", true);
+    assert_ne!(first.request_id(), sibling.request_id());
+    assert_ne!(first.request_id(), unsent.request_id());
+    assert_ne!(sibling.request_id(), unsent.request_id());
+    assert_public_http_owned_execution_progress(&cx, &mut first, "first");
+    assert_public_http_owned_execution_progress(&cx, &mut sibling, "sibling");
+    assert_eq!(counters.started.load(Ordering::SeqCst), 2);
+    assert_eq!(counters.active.load(Ordering::SeqCst), 2);
+    assert_eq!(client.cancel_pending_executions(), 3);
+    assert_eq!(client.cancel_pending_executions(), 0);
+    for execution in [&mut first, &mut sibling, &mut unsent] {
+        assert_public_http_owned_execution_cancelled(&cx, execution);
+    }
+    let dropped: std::collections::BTreeSet<String> = (0..2)
+        .map(|_| {
+            drops_rx
+                .recv_timeout(HTTP_OPERATION_BOUND)
+                .expect("both polled handlers drop after their response streams close")
+        })
+        .collect();
+    assert_eq!(
+        dropped,
+        std::collections::BTreeSet::from(["first".to_owned(), "sibling".to_owned()])
+    );
+    assert_eq!(counters.started.load(Ordering::SeqCst), 2);
+    assert_eq!(counters.completed.load(Ordering::SeqCst), 0);
+    assert_eq!(counters.active.load(Ordering::SeqCst), 0);
+    assert_eq!(counters.dropped.load(Ordering::SeqCst), 2);
+    assert_public_http_owned_execution_client_reuse(&cx, &mut client);
+    assert_eq!(
+        drops_rx
+            .recv_timeout(HTTP_OPERATION_BOUND)
+            .expect("the reused handler drops"),
+        "reuse"
+    );
+    assert_eq!(counters.started.load(Ordering::SeqCst), 3);
+    assert_eq!(counters.completed.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.dropped.load(Ordering::SeqCst), 3);
+    drop((first, sibling, unsent, client));
+    server.shutdown();
+    assert_eq!(counters.active.load(Ordering::SeqCst), 0);
+}
+
 const PUBLIC_HTTP_TEMPLATE: &str = "test://public-http-e2e/item/{id}";
 const PUBLIC_HTTP_TEMPLATE_NAME: &str = "public-http-e2e-item";
 const PUBLIC_HTTP_TEMPLATE_MATCHED_URI: &str = "test://public-http-e2e/item/alpha";
