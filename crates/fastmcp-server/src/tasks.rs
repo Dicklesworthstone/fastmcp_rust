@@ -4359,6 +4359,7 @@ struct FinalTaskHandoffAuthority {
     generation: u64,
     owner_id: String,
     dispatch_fence: u64,
+    transition_committed: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for FinalTaskHandoffAuthority {
@@ -4380,14 +4381,17 @@ impl FinalTaskHandoffAuthority {
         input_requests: FinalTaskInputRequests,
         status_message: Option<String>,
     ) -> McpResult<FinalTask> {
-        self.runtime.fenced_require_input(
+        let task = self.runtime.fenced_require_input(
             &self.task_id,
             self.generation,
             &self.owner_id,
             self.dispatch_fence,
             input_requests,
             status_message,
-        )
+        )?;
+        self.transition_committed
+            .store(true, TaskServiceOrdering::Release);
+        Ok(task)
     }
 
     fn complete_task(
@@ -4395,14 +4399,17 @@ impl FinalTaskHandoffAuthority {
         result: FinalTaskCallToolResult,
         status_message: Option<String>,
     ) -> McpResult<FinalTask> {
-        self.runtime.fenced_complete_task(
+        let task = self.runtime.fenced_complete_task(
             &self.task_id,
             self.generation,
             &self.owner_id,
             self.dispatch_fence,
             result,
             status_message,
-        )
+        )?;
+        self.transition_committed
+            .store(true, TaskServiceOrdering::Release);
+        Ok(task)
     }
 
     fn fail_task(
@@ -4410,24 +4417,30 @@ impl FinalTaskHandoffAuthority {
         error: FinalTaskError,
         status_message: Option<String>,
     ) -> McpResult<FinalTask> {
-        self.runtime.fenced_fail_task(
+        let task = self.runtime.fenced_fail_task(
             &self.task_id,
             self.generation,
             &self.owner_id,
             self.dispatch_fence,
             error,
             status_message,
-        )
+        )?;
+        self.transition_committed
+            .store(true, TaskServiceOrdering::Release);
+        Ok(task)
     }
 
     fn honor_cancellation(&self, status_message: Option<String>) -> McpResult<FinalTask> {
-        self.runtime.fenced_honor_cancellation(
+        let task = self.runtime.fenced_honor_cancellation(
             &self.task_id,
             self.generation,
             &self.owner_id,
             self.dispatch_fence,
             status_message,
-        )
+        )?;
+        self.transition_committed
+            .store(true, TaskServiceOrdering::Release);
+        Ok(task)
     }
 
     fn is_cancellation_requested(&self) -> McpResult<bool> {
@@ -4760,7 +4773,10 @@ pub type FinalTaskSupervisorFuture<'a> = Pin<Box<dyn Future<Output = McpResult<(
 /// or bypass the durable handoff. Once `tasks/cancel` wins for an elected
 /// handoff, the runner wakes it and records terminal cancellation under the
 /// same fence. A supervisor can record a custom cancellation status only if
-/// it observes and honours that winner before the runner's next poll boundary.
+/// it observes and honours that winner before the runner's next poll boundary
+/// while the exact elected dispatch lease remains valid. A backend that refuses
+/// renewal stops further application polling immediately, including this final
+/// cancellation window; the framework still attempts fenced retirement.
 pub trait ApplicationTaskSupervisor: Send + Sync {
     /// Begins or resumes one operation after its durable handoff is claimed.
     fn resume<'a>(
@@ -7121,6 +7137,10 @@ impl FinalTaskHandoffExecutor {
         guard: &mut FinalTaskExecutionGuard,
         cancellation_wake: &FinalTaskCancellationWakeRegistration,
     ) -> McpResult<()> {
+        // A stalled service may lose its claim even before the application
+        // constructs its future. Revalidate the exact owner fence at every
+        // application entry, rather than relying on a timer being polled first.
+        guard.ensure_live_dispatch_for_application()?;
         let mut supervisor = self.supervisor.resume(cx, handoff);
         loop {
             // The application callback is allowed to be pending for longer
@@ -7138,9 +7158,10 @@ impl FinalTaskHandoffExecutor {
             }
             let heartbeat_interval = guard.bounded_heartbeat_interval()?;
             let mut heartbeat = Box::pin(asupersync::time::sleep(cx.now(), heartbeat_interval));
-            // The supervisor is promised one poll boundary in which to observe
-            // and honour a cancellation winner. Electing the winner on the
-            // same turn the request first becomes visible makes that window
+            // While its exact dispatch lease remains live, the supervisor is
+            // promised one poll boundary to observe and honour cancellation.
+            // Electing the winner on the same turn it first becomes visible
+            // makes that window
             // unsatisfiable, so the first observation arms this flag, wakes
             // this future, and yields; the next turn elects the winner if the
             // supervisor still has not finished. Exactly one extra boundary is
@@ -7158,6 +7179,9 @@ impl FinalTaskHandoffExecutor {
                 // application poll boundary.
                 if guard.is_authoritatively_expired() {
                     return std::task::Poll::Ready(None);
+                }
+                if let Err(error) = guard.ensure_live_dispatch_for_application() {
+                    return std::task::Poll::Ready(Some(Err(error)));
                 }
                 cancellation_wake.register_waker(task_context.waker());
                 // Poll the supervisor before electing the cancellation winner.
@@ -7560,6 +7584,7 @@ struct FinalTaskExecutionGuard {
     generation: u64,
     owner_id: String,
     dispatch_fence: Option<u64>,
+    transition_committed: Arc<AtomicBool>,
     retention_deadline: Option<FinalTaskRetentionDeadline>,
     restoration: Option<FinalTaskHandoffRestoration>,
 }
@@ -7588,6 +7613,7 @@ impl FinalTaskExecutionGuard {
             generation,
             owner_id: owner_id.to_owned(),
             dispatch_fence: None,
+            transition_committed: Arc::new(AtomicBool::new(false)),
             retention_deadline: None,
             restoration: Some(restoration),
         }
@@ -7669,6 +7695,13 @@ impl FinalTaskExecutionGuard {
     }
 
     fn renew(&self) -> McpResult<bool> {
+        // A successful fenced transition consumes the dispatch lease. The
+        // same future may still need to finish asynchronous cleanup before a
+        // successor handoff starts. Only this private commit receipt permits
+        // that cleanup; observing a newer store generation alone does not.
+        if self.transition_committed.load(TaskServiceOrdering::Acquire) {
+            return Ok(true);
+        }
         let Some(dispatch_fence) = self.dispatch_fence else {
             return Ok(false);
         };
@@ -7678,6 +7711,16 @@ impl FinalTaskExecutionGuard {
             &self.owner_id,
             dispatch_fence,
         )
+    }
+
+    fn ensure_live_dispatch_for_application(&self) -> McpResult<()> {
+        if self.renew()? {
+            Ok(())
+        } else {
+            Err(McpError::internal_error(
+                "Final task dispatch lease was lost while application work was running",
+            ))
+        }
     }
 
     fn heartbeat_interval(&self) -> McpResult<StdDuration> {
@@ -7731,6 +7774,7 @@ impl FinalTaskExecutionGuard {
             generation: self.generation,
             owner_id: self.owner_id.clone(),
             dispatch_fence,
+            transition_committed: Arc::clone(&self.transition_committed),
         })
     }
 
@@ -14199,6 +14243,241 @@ mod tests {
         check_retention_before_supervisor_repoll(false);
     }
 
+    fn check_dispatch_lease_before_supervisor_repoll(expired: bool, resumed: bool) {
+        let (store, clock) = in_memory_store_with_test_clock(1);
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let inputs: FinalTaskInputResponses =
+            serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
+        let task_id = if resumed {
+            create_accepted_final_input(&runtime, inputs.clone())
+        } else {
+            create_final_task_state_fixture(&runtime, None)
+                .task
+                .base()
+                .task_id
+                .clone()
+        };
+        let handoff = if resumed {
+            FinalTaskSupervisorHandoff::Resumed(
+                runtime.take_accepted_input(&task_id).unwrap().unwrap(),
+            )
+        } else {
+            FinalTaskSupervisorHandoff::Initial(runtime.recover_initial_work().unwrap().unwrap())
+        };
+        let polls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let runner = runtime
+            .install_task_service(
+                1,
+                Arc::new(RetentionPollSupervisor {
+                    polls: Arc::clone(&polls),
+                    dropped: Arc::clone(&dropped),
+                }),
+            )
+            .unwrap();
+        let cx = Cx::for_testing();
+        let mut running = runner.resume_handoff(&cx, handoff);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(running.as_mut().poll(&mut context).is_pending());
+        assert_eq!(polls.load(AtomicOrdering::SeqCst), 1);
+        let before = store.get_task_snapshot(&task_id).unwrap().unwrap();
+
+        // Only backend time moves: this models a stalled application scheduler
+        // whose heartbeat timer has not yet been polled. Retention remains live
+        // in both cases; the paired scenarios cross only the dispatch lease.
+        *clock.lock().unwrap() += if expired {
+            IN_MEMORY_FINAL_TASK_HANDOFF_LEASE
+        } else {
+            IN_MEMORY_FINAL_TASK_HANDOFF_LEASE - StdDuration::from_millis(1)
+        };
+        let outcome = running.as_mut().poll(&mut context);
+        if expired {
+            assert!(matches!(outcome, std::task::Poll::Ready(Err(_))));
+            assert_eq!(
+                polls.load(AtomicOrdering::SeqCst),
+                1,
+                "an expired dispatch owner cannot poll application work again"
+            );
+            assert!(dropped.load(AtomicOrdering::SeqCst));
+            let recovered = store.get_task_snapshot(&task_id).unwrap().unwrap();
+            assert!(recovered.generation() > before.generation());
+            assert_eq!(
+                serde_json::to_value(recovered.task()).unwrap(),
+                serde_json::to_value(before.task()).unwrap(),
+                "lease loss retains the working task and its retention contract"
+            );
+            if resumed {
+                let claim = store
+                    .take_input_handoff_for_owner_if_current(&recovered, "successor")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(claim.input_responses, inputs);
+                assert_eq!(claim.work_descriptor, final_test_work_descriptor());
+            } else {
+                let claim = store
+                    .take_initial_work_handoff_for_owner_if_current(&recovered, "successor")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(claim.work_descriptor, final_test_work_descriptor());
+            }
+            let successor_fence = store
+                .begin_handoff_dispatch_for_owner_if_current(
+                    &task_id,
+                    recovered.generation(),
+                    "successor",
+                )
+                .unwrap()
+                .unwrap();
+            drop(running);
+            let state = store.state.lock().unwrap();
+            let lease = state.handoff_leases.get(&task_id).unwrap();
+            assert_eq!(lease.owner_id, "successor");
+            assert_eq!(lease.dispatch_fence, Some(successor_fence));
+        } else {
+            assert!(outcome.is_pending());
+            assert_eq!(polls.load(AtomicOrdering::SeqCst), 2);
+            assert!(!dropped.load(AtomicOrdering::SeqCst));
+            let current = store.get_task_snapshot(&task_id).unwrap().unwrap();
+            assert_eq!(current.generation(), before.generation());
+            assert_eq!(
+                serde_json::to_value(current.task()).unwrap(),
+                serde_json::to_value(before.task()).unwrap()
+            );
+            drop(running);
+            assert!(dropped.load(AtomicOrdering::SeqCst));
+            assert!(
+                !store
+                    .state
+                    .lock()
+                    .unwrap()
+                    .handoff_leases
+                    .contains_key(&task_id)
+            );
+        }
+        assert_eq!(store.task_count(), 1);
+    }
+
+    #[test]
+    fn task_02_expired_initial_dispatch_lease_stops_before_application_repoll() {
+        check_dispatch_lease_before_supervisor_repoll(true, false);
+    }
+
+    #[test]
+    fn task_02_live_initial_dispatch_lease_allows_application_repoll() {
+        check_dispatch_lease_before_supervisor_repoll(false, false);
+    }
+
+    #[test]
+    fn task_02_expired_resumed_dispatch_lease_stops_before_application_repoll() {
+        check_dispatch_lease_before_supervisor_repoll(true, true);
+    }
+
+    #[test]
+    fn task_02_live_resumed_dispatch_lease_allows_application_repoll() {
+        check_dispatch_lease_before_supervisor_repoll(false, true);
+    }
+
+    struct DispatchTransitionCleanupSupervisor {
+        owns_transition: bool,
+        polls: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl ApplicationTaskSupervisor for DispatchTransitionCleanupSupervisor {
+        fn resume<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            Box::pin(async move {
+                let _lifetime = RetentionExpiryDropFlag(Arc::clone(&self.dropped));
+                let FinalTaskSupervisorHandoff::Initial(initial) = handoff else {
+                    panic!("the cleanup fixture requires an initial handoff");
+                };
+                if self.owns_transition {
+                    initial.require_input(final_roots_request(), None)?;
+                }
+                std::future::poll_fn(|_| {
+                    self.polls.fetch_add(1, AtomicOrdering::SeqCst);
+                    std::task::Poll::Pending::<McpResult<()>>
+                })
+                .await
+            })
+        }
+    }
+
+    fn check_cleanup_after_dispatch_transition(owns_transition: bool) {
+        let (store, clock) = in_memory_store_with_test_clock(1);
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let task_id = create_final_task_state_fixture(&runtime, None)
+            .task
+            .base()
+            .task_id
+            .clone();
+        let handoff = FinalTaskSupervisorHandoff::Initial(
+            runtime.recover_initial_work().unwrap().unwrap(),
+        );
+        let polls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let runner = runtime
+            .install_task_service(
+                1,
+                Arc::new(DispatchTransitionCleanupSupervisor {
+                    owns_transition,
+                    polls: Arc::clone(&polls),
+                    dropped: Arc::clone(&dropped),
+                }),
+            )
+            .unwrap();
+        let cx = Cx::for_testing();
+        let mut running = runner.resume_handoff(&cx, handoff);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(running.as_mut().poll(&mut context).is_pending());
+        assert_eq!(polls.load(AtomicOrdering::SeqCst), 1);
+        if !owns_transition {
+            runtime
+                .require_input(&task_id, final_roots_request(), None)
+                .unwrap();
+        }
+        let before = final_task_restoration_snapshot(&store, &task_id);
+        assert!(matches!(
+            store.get_task(&task_id).unwrap(),
+            Some(FinalTask::InputRequired { .. })
+        ));
+        assert!(
+            !store
+                .state
+                .lock()
+                .unwrap()
+                .handoff_leases
+                .contains_key(&task_id)
+        );
+        *clock.lock().unwrap() += IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
+        let outcome = running.as_mut().poll(&mut context);
+        if owns_transition {
+            assert!(outcome.is_pending());
+            assert_eq!(polls.load(AtomicOrdering::SeqCst), 2);
+            assert!(!dropped.load(AtomicOrdering::SeqCst));
+        } else {
+            assert!(matches!(outcome, std::task::Poll::Ready(Err(_))));
+            assert_eq!(polls.load(AtomicOrdering::SeqCst), 1);
+            assert!(dropped.load(AtomicOrdering::SeqCst));
+        }
+        drop(running);
+        assert!(dropped.load(AtomicOrdering::SeqCst));
+        assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
+    }
+
+    #[test]
+    fn task_02_committed_handoff_transition_keeps_cleanup_pollable() {
+        check_cleanup_after_dispatch_transition(true);
+    }
+
+    #[test]
+    fn task_02_foreign_transition_does_not_authorize_stale_cleanup() {
+        check_cleanup_after_dispatch_transition(false);
+    }
+
     struct ExpiryThenCompletingSupervisor {
         runtime: FinalTaskRuntime,
         clock: Arc<Mutex<Instant>>,
@@ -14332,6 +14611,7 @@ mod tests {
     struct FastHeartbeatProbeStore {
         inner: Arc<InMemoryFinalTaskStore>,
         heartbeat: StdDuration,
+        reject_cancelled_renewal: bool,
     }
 
     impl FinalTaskStore for FastHeartbeatProbeStore {
@@ -14468,6 +14748,25 @@ mod tests {
             self.inner
                 .replace_task_and_clear_input_if_current(expected, task, notification)
         }
+        fn replace_task_and_clear_input_for_handoff_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            owner_id: &str,
+            dispatch_fence: u64,
+            cancellation_required: bool,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner.replace_task_and_clear_input_for_handoff_if_current(
+                expected,
+                owner_id,
+                dispatch_fence,
+                cancellation_required,
+                task,
+                notification,
+            )
+        }
+
         fn begin_handoff_dispatch_if_current(
             &self,
             task_id: &FinalTaskId,
@@ -14492,6 +14791,9 @@ mod tests {
             owner_id: &str,
             dispatch_fence: u64,
         ) -> McpResult<bool> {
+            if self.reject_cancelled_renewal && self.inner.is_cancellation_requested(task_id)? {
+                return Ok(false);
+            }
             self.inner.renew_handoff_dispatch_if_current(
                 task_id,
                 generation,
@@ -14547,6 +14849,84 @@ mod tests {
             self.inner
                 .task_retention_deadline_if_current(task_id, generation)
         }
+    }
+
+    fn check_cancellation_after_dispatch_renewal(reject_cancelled_renewal: bool) {
+        let (inner, _clock) = in_memory_store_with_test_clock(1);
+        let store = Arc::new(FastHeartbeatProbeStore {
+            inner: Arc::clone(&inner),
+            heartbeat: IN_MEMORY_FINAL_TASK_HANDOFF_HEARTBEAT,
+            reject_cancelled_renewal,
+        });
+        let runtime = FinalTaskRuntime::new(
+            store,
+            FinalTaskRuntimeConfig::new(60_000, None).unwrap(),
+            Arc::new(|_| {}),
+        );
+        let task_id = create_final_task_state_fixture(&runtime, None)
+            .task
+            .base()
+            .task_id
+            .clone();
+        let handoff = FinalTaskSupervisorHandoff::Initial(
+            runtime.recover_initial_work().unwrap().unwrap(),
+        );
+        let polls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let runner = runtime
+            .install_task_service(
+                1,
+                Arc::new(RetentionPollSupervisor {
+                    polls: Arc::clone(&polls),
+                    dropped: Arc::clone(&dropped),
+                }),
+            )
+            .unwrap();
+        let cx = Cx::for_testing();
+        let mut running = runner.resume_handoff(&cx, handoff);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(running.as_mut().poll(&mut context).is_pending());
+        assert_eq!(polls.load(AtomicOrdering::SeqCst), 1);
+        runtime.cancel_task(&task_id).unwrap();
+        assert!(inner.is_cancellation_requested(&task_id).unwrap());
+
+        let outcome = running.as_mut().poll(&mut context);
+        if reject_cancelled_renewal {
+            assert!(matches!(outcome, std::task::Poll::Ready(Ok(()))));
+            assert_eq!(
+                polls.load(AtomicOrdering::SeqCst),
+                1,
+                "a refused renewal cannot grant the final cancellation poll"
+            );
+        } else {
+            assert!(outcome.is_pending());
+            assert!(polls.load(AtomicOrdering::SeqCst) > 1);
+            assert!(matches!(
+                running.as_mut().poll(&mut context),
+                std::task::Poll::Ready(Ok(()))
+            ));
+        }
+        assert!(dropped.load(AtomicOrdering::SeqCst));
+        drop(running);
+        assert!(matches!(
+            inner.get_task(&task_id).unwrap(),
+            Some(FinalTask::Cancelled(_))
+        ));
+        assert!(!inner.is_cancellation_requested(&task_id).unwrap());
+        let state = inner.state.lock().unwrap();
+        assert!(!state.handoff_leases.contains_key(&task_id));
+        assert!(!state.initial_work.contains_key(&task_id));
+        assert!(!state.accepted_inputs.contains_key(&task_id));
+    }
+
+    #[test]
+    fn task_02_refused_cancelled_renewal_retires_without_application_repoll() {
+        check_cancellation_after_dispatch_renewal(true);
+    }
+
+    #[test]
+    fn task_02_live_cancelled_lease_preserves_application_cancellation_window() {
+        check_cancellation_after_dispatch_renewal(false);
     }
 
     fn assert_queued_wakeup_progress(elapsed_ms: u64, first_should_execute: bool) {
@@ -14947,6 +15327,7 @@ mod tests {
         let store = Arc::new(FastHeartbeatProbeStore {
             inner: Arc::clone(&inner_store),
             heartbeat: StdDuration::from_millis(1),
+            reject_cancelled_renewal: false,
         });
         let runtime = FinalTaskRuntime::new(
             store.clone(),
@@ -15447,6 +15828,7 @@ mod tests {
             generation: stale_generation,
             owner_id: "test-owner".to_owned(),
             dispatch_fence: None,
+            transition_committed: Arc::new(AtomicBool::new(false)),
             retention_deadline: None,
             restoration: None,
         };
@@ -15473,6 +15855,7 @@ mod tests {
             generation: retained.generation(),
             owner_id: "test-owner".to_owned(),
             dispatch_fence: None,
+            transition_committed: Arc::new(AtomicBool::new(false)),
             retention_deadline: None,
             restoration: None,
         };
