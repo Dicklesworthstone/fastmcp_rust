@@ -254,7 +254,8 @@ pub mod client {
         ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
         ClientHttpNegotiationDecision, ClientHttpNegotiationError, ClientHttpNegotiationState,
         ClientHttpResponse, ClientProtocolPlan, ClientProtocolPlanError, ClientSession,
-        CompletionContext, CompletionParams, CompletionReference, DEFAULT_FINAL_CACHE_CAPACITY,
+        CollectedHttpCatalog, CompletionContext, CompletionParams, CompletionReference,
+        DEFAULT_FINAL_CACHE_CAPACITY,
         DEFAULT_FINAL_CACHE_MAX_BYTES, ExecutionTerminalReason, ExecutionTerminalRecord,
         ExecutionTerminalState, FinalCacheGeneration, FinalCacheInsert, FinalCacheKey,
         FinalCacheLookup, FinalCacheMiss, FinalCacheResultSet, FinalCacheStats,
@@ -282,7 +283,8 @@ pub mod client {
     /// MCP Apps client APIs are available only with the Apps extension.
     #[cfg(feature = "apps")]
     pub use crate::{
-        McpAppsBridgeTransport, McpAppsClientWirePolicy, McpAppsHost, McpAppsHostConfiguration,
+        McpAppsBridgeTransport, McpAppsCatalogBinding, McpAppsClientWirePolicy,
+        McpAppsHost, McpAppsHostConfiguration,
         McpAppsHostError, McpAppsHostPolicy, McpAppsHostRequestOutcome,
         McpAppsHttpClientWirePolicy, McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport,
         McpAppsInMemoryWireHostTransport, McpAppsInMemoryWireViewTransport,
@@ -867,7 +869,8 @@ pub use fastmcp_client::{
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
     ClientHttpNegotiationDecision, ClientHttpNegotiationError, ClientHttpNegotiationState,
     ClientHttpResponse, ClientProtocolPlan, ClientProtocolPlanError, ClientSession,
-    CompletionContext, CompletionParams, CompletionReference, DEFAULT_FINAL_CACHE_CAPACITY,
+    CollectedHttpCatalog, CompletionContext, CompletionParams, CompletionReference,
+    DEFAULT_FINAL_CACHE_CAPACITY,
     DEFAULT_FINAL_CACHE_MAX_BYTES, ExecutionTerminalReason, ExecutionTerminalRecord,
     ExecutionTerminalState, FinalCacheGeneration, FinalCacheInsert, FinalCacheKey,
     FinalCacheLookup, FinalCacheMiss, FinalCacheResultSet, FinalCacheStats,
@@ -894,7 +897,8 @@ pub use fastmcp_client::{
 pub use fastmcp_client::{
     McpAppsHostRequestOutcome, McpAppsViewCallToolResult, McpAppsViewTool,
     McpAppsViewToolsPage, McpAppsWireHostResponse,
-    McpAppsBridgeTransport, McpAppsClientWirePolicy, McpAppsHost, McpAppsHostConfiguration,
+    McpAppsBridgeTransport, McpAppsCatalogBinding, McpAppsClientWirePolicy,
+    McpAppsHost, McpAppsHostConfiguration,
     McpAppsHostError, McpAppsHostPolicy, McpAppsHttpClientWirePolicy, McpAppsInMemoryHostTransport,
     McpAppsInMemoryViewTransport, McpAppsInMemoryWireHostTransport,
     McpAppsInMemoryWireViewTransport, McpAppsWireBridgeTransport, McpAppsWireHost,
@@ -957,7 +961,8 @@ pub mod auto {
         Client, ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
         ClientHttpNegotiationDecision, ClientHttpNegotiationError, ClientHttpNegotiationState,
         ClientHttpResponse, ClientProtocolPlan, ClientProtocolPlanError, ClientSession,
-        CompletionContext, CompletionParams, CompletionReference, HttpClient, HttpClientError,
+        CollectedHttpCatalog, CompletionContext, CompletionParams, CompletionReference,
+        HttpClient, HttpClientError,
         HttpSubscriptionListener, MAX_HTTP_EXECUTION_REQUEST_BYTES, MAX_HTTP_IN_FLIGHT_EXECUTIONS,
         MAX_HTTP_RETAINED_EXECUTION_BYTES, MrtrInputResponses, Request, RequestExecution,
         RequestExecutor, ReverseRequest, ReverseRequestCancellation, ReverseRequestHandlers,
@@ -992,7 +997,8 @@ pub mod auto {
     };
     #[cfg(feature = "apps")]
     pub use fastmcp_client::{
-        McpAppsClientWirePolicy, McpAppsHostError, McpAppsInMemoryWireHostTransport,
+        McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHostError,
+        McpAppsInMemoryWireHostTransport,
         McpAppsInMemoryWireViewTransport, McpAppsWireBridgeTransport, McpAppsWireHost,
         McpAppsWireHostConfiguration, McpAppsWireHostEffects, McpAppsWireHostPolicy,
         McpAppsWireHostWithEffects, mcp_apps_in_memory_wire_pair,
@@ -2880,7 +2886,8 @@ pub mod modern {
 
     #[cfg(feature = "apps")]
     pub use fastmcp_client::{
-        McpAppsBridgeTransport, McpAppsClientWirePolicy, McpAppsHost, McpAppsHostConfiguration,
+        McpAppsBridgeTransport, McpAppsCatalogBinding, McpAppsClientWirePolicy,
+        McpAppsHost, McpAppsHostConfiguration,
         McpAppsHostError, McpAppsHostPolicy, McpAppsHttpClientWirePolicy,
         McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport,
         McpAppsInMemoryWireHostTransport, McpAppsInMemoryWireViewTransport,
@@ -10603,6 +10610,7 @@ pub mod prelude {
         ClientRoot,
         ClientSession,
         ClientTransportRecvHalf,
+        CollectedHttpCatalog,
         CompleteResult,
         CompletionContext,
         CompletionHandler,

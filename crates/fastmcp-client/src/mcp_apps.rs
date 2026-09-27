@@ -42,6 +42,25 @@ pub const MAX_MCP_APPS_VIEW_TOOL_STATE_BYTES: usize = 1024 * 1024;
 /// Maximum tools in one complete, isolated View catalog.
 pub const MAX_MCP_APPS_VIEW_TOOLS: usize = 1_024;
 
+/// Trusted Host identity for one same-server catalog authorization. These
+/// values come from the embedder's admitted View and authenticated MCP client,
+/// never from an Apps request. They are retained privately and never emitted.
+#[derive(Clone, PartialEq, Eq)]
+pub struct McpAppsCatalogBinding {
+    pub view_id: String,
+    pub resource_uri: String,
+    pub origin: String,
+    pub principal_id: String,
+    pub server_id: String,
+    pub revision: String,
+}
+
+impl fmt::Debug for McpAppsCatalogBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("McpAppsCatalogBinding([redacted])")
+    }
+}
+
 /// One admitted tool owned by exactly one Apps View. The descriptor remains
 /// untrusted display/policy input and is never added to an MCP server catalog.
 #[derive(Clone, Debug)]
@@ -900,6 +919,11 @@ pub trait McpAppsWireHostPolicy {
         false
     }
 
+    /// Dispatches an admitted request against the same server and security
+    /// partition installed by `bind_server_catalogs`. Catalog cursors here
+    /// have already been unwrapped from this Host's private continuation map.
+    /// Return the complete selected-era payload, including final cache fields;
+    /// the Host validates, substitutes and projects list results before send.
     async fn dispatch_reused_request(
         &mut self,
         cx: &Cx,
@@ -1128,7 +1152,56 @@ pub struct McpAppsWireHost<T, P> {
     view_tools: BTreeMap<String, Arc<McpAppsViewTool>>,
     staged_view_tools: Option<StagedViewTools>,
     teardown_request: Option<(McpAppsJsonRpcRequestId, WireHostDeadline)>,
+    server_catalogs: WireServerCatalogs,
     disconnected: bool,
+}
+
+const MAX_APPS_CATALOG_CURSORS: usize = 64;
+const MAX_APPS_CATALOG_CURSOR_BYTES: usize = 4 * 1024;
+const MAX_APPS_CATALOG_PAGES: usize = 64;
+
+#[derive(Default)]
+struct WireServerCatalogs {
+    binding: Option<McpAppsCatalogBinding>,
+    allow_prompts: bool,
+    cursors: BTreeMap<String, WireCatalogCursor>,
+    invalidated_requests: BTreeSet<McpAppsJsonRpcRequestId>,
+    omitted_sizes: u64,
+}
+
+#[derive(Clone)]
+struct WireCatalogCursor {
+    method: McpAppsRoutedMethod,
+    upstream: String,
+    deadline: WireHostDeadline,
+    pages: usize,
+}
+
+struct WireCatalogRequest {
+    params: Value,
+    previous: Option<String>,
+    deadline: WireHostDeadline,
+    pages: usize,
+}
+
+struct WirePreparedCatalogPage {
+    result: Value,
+    cursor: Option<(String, WireCatalogCursor)>,
+    omitted_sizes: u64,
+}
+
+/// A carrier may commit bytes before its send future is cancelled. Such a
+/// send must fence the View rather than leave a remotely visible handle with
+/// no corresponding committed local owner.
+struct WireCatalogSendGuard<'a> {
+    disconnected: &'a mut bool,
+    committed: bool,
+}
+
+impl Drop for WireCatalogSendGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed { *self.disconnected = true; }
+    }
 }
 
 struct WireHostRequest {
@@ -1345,6 +1418,195 @@ fn admit_view_numbers(value: &Value) -> Result<(), McpAppsHostError> {
     visit(value, 0, &mut 0).then_some(()).ok_or_else(invalid_view_result)
 }
 
+fn is_server_catalog(method: McpAppsRoutedMethod) -> bool {
+    matches!(method, McpAppsRoutedMethod::ResourcesList
+        | McpAppsRoutedMethod::ResourceTemplatesList | McpAppsRoutedMethod::PromptsList)
+}
+
+impl WireServerCatalogs {
+    fn retained_bytes(&self) -> usize {
+        self.cursors.iter().map(|(token, cursor)| token.len() + cursor.upstream.len()).sum::<usize>()
+            + self.binding.as_ref().map_or(0, |binding| binding.view_id.len() + binding.resource_uri.len()
+                + binding.origin.len() + binding.principal_id.len() + binding.server_id.len() + binding.revision.len())
+    }
+
+    fn prepare_request(
+        &mut self,
+        cx: &Cx,
+        method: McpAppsRoutedMethod,
+        params: Option<&Value>,
+    ) -> Result<WireCatalogRequest, McpAppsHostError> {
+        self.cursors.retain(|_, cursor| !cursor.deadline.expired());
+        if self.binding.is_none()
+            || (method == McpAppsRoutedMethod::PromptsList && !self.allow_prompts)
+        {
+            return Err(wire_policy_denied());
+        }
+        let previous = params.and_then(|params| params.get("cursor"))
+            .map(|cursor| cursor.as_str().ok_or_else(invalid_view_result))
+            .transpose()?;
+        match previous {
+            Some(token) => {
+                let cursor = self.cursors.get(token)
+                    .filter(|cursor| cursor.method == method && cursor.pages < MAX_APPS_CATALOG_PAGES)
+                    .ok_or_else(wire_policy_denied)?;
+                if cursor.deadline.owner.checkpoint().is_err() {
+                    return Err(McpAppsHostError::Core(McpError::request_cancelled()));
+                }
+                Ok(WireCatalogRequest {
+                    params: json!({"cursor": cursor.upstream}),
+                    previous: Some(token.to_owned()),
+                    deadline: cursor.deadline.clone(),
+                    pages: cursor.pages,
+                })
+            }
+            None => Ok(WireCatalogRequest {
+                params: json!({}), previous: None, deadline: WireHostDeadline::new(cx), pages: 0,
+            }),
+        }
+    }
+
+    fn prepare_page(
+        &self,
+        cx: &Cx,
+        method: McpAppsRoutedMethod,
+        request: &WireCatalogRequest,
+        mut result: Value,
+        retained_bytes: usize,
+    ) -> Result<WirePreparedCatalogPage, McpAppsHostError> {
+        // Admission precedes substitution; a malformed final page cannot
+        // manufacture a continuation even when its cursor happens to parse.
+        validate_final_catalog_payload(method, &result)?;
+        let upstream = result.get("nextCursor").map(|value| {
+            value.as_str().filter(|cursor| cursor.len() <= MAX_APPS_CATALOG_CURSOR_BYTES)
+                .map(ToOwned::to_owned).ok_or_else(invalid_view_result)
+        }).transpose()?;
+        let cursor = if let Some(upstream) = upstream {
+            if request.pages + 1 >= MAX_APPS_CATALOG_PAGES
+                || self.cursors.len() - usize::from(request.previous.is_some()) >= MAX_APPS_CATALOG_CURSORS
+                || !cx.capabilities().entropy
+            {
+                return Err(wire_policy_denied());
+            }
+            let identifier = fastmcp_core::crypto::draw_security_identifier()
+                .map_err(|_| wire_policy_denied())?;
+            let token = identifier.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+            if self.cursors.contains_key(&token)
+                || retained_bytes.saturating_add(token.len()).saturating_add(upstream.len())
+                    > MAX_MCP_APPS_VIEW_TOOL_STATE_BYTES
+            {
+                return Err(McpAppsHostError::Bridge(McpAppsBridgeError::TooManyInFlight));
+            }
+            result["nextCursor"] = Value::String(token.clone());
+            Some((token, WireCatalogCursor {
+                method, upstream, deadline: request.deadline.clone(), pages: request.pages + 1,
+            }))
+        } else { None };
+        // This is the only outward projection, after HostCursorSubstitution.
+        // Keep the exact internal page and upstream cursor out of View state.
+        let omitted_sizes = project_apps_catalog(method, &mut result)?;
+        Ok(WirePreparedCatalogPage { result, cursor, omitted_sizes })
+    }
+}
+
+fn validate_final_catalog_payload(
+    method: McpAppsRoutedMethod,
+    value: &Value,
+) -> Result<(), McpAppsHostError> {
+    fn exact<T: serde::de::DeserializeOwned + Serialize>(value: &Value) -> Result<(), McpAppsHostError> {
+        let typed: T = serde_json::from_value(value.clone()).map_err(|_| invalid_view_result())?;
+        let encoded = serde_json::to_value(typed).map_err(|_| invalid_view_result())?;
+        (encoded == *value).then_some(()).ok_or_else(invalid_view_result)
+    }
+    match method {
+        McpAppsRoutedMethod::ResourcesList => exact::<fastmcp_protocol::FinalListResourcesResult>(value),
+        McpAppsRoutedMethod::ResourceTemplatesList => exact::<fastmcp_protocol::FinalListResourceTemplatesResult>(value),
+        McpAppsRoutedMethod::PromptsList => exact::<fastmcp_protocol::FinalListPromptsResult>(value),
+        _ => Err(invalid_view_result()),
+    }
+}
+
+/// SDK 1.29's three list roots retain result members, but nested descriptor
+/// objects strip unknown members. Reject any such loss rather than returning
+/// a page that the View interprets differently. The sole omission here is the
+/// plan's optional advisory Resource.size outside JavaScript's safe range.
+fn project_apps_catalog(method: McpAppsRoutedMethod, page: &mut Value) -> Result<u64, McpAppsHostError> {
+    fn closed(value: &Value, fields: &[&str]) -> Result<(), McpAppsHostError> {
+        value.as_object().filter(|object| object.keys().all(|key| fields.contains(&key.as_str())))
+            .map(|_| ()).ok_or_else(invalid_view_result)
+    }
+    let key = match method {
+        McpAppsRoutedMethod::ResourcesList => "resources",
+        McpAppsRoutedMethod::ResourceTemplatesList => "resourceTemplates",
+        McpAppsRoutedMethod::PromptsList => "prompts",
+        _ => return Err(invalid_view_result()),
+    };
+    let items = page.get_mut(key).and_then(Value::as_array_mut).ok_or_else(invalid_view_result)?;
+    let mut omitted = 0;
+    for item in items {
+        closed(item, match method {
+            McpAppsRoutedMethod::ResourcesList => &["uri", "name", "title", "description", "icons", "mimeType", "size", "annotations", "_meta"],
+            McpAppsRoutedMethod::ResourceTemplatesList => &["uriTemplate", "name", "title", "description", "icons", "mimeType", "annotations", "_meta"],
+            McpAppsRoutedMethod::PromptsList => &["name", "title", "description", "icons", "arguments", "_meta"],
+            _ => return Err(invalid_view_result()),
+        })?;
+        if method == McpAppsRoutedMethod::ResourcesList
+            && item.get("size").is_some_and(|size| admit_view_numbers(size).is_err())
+        {
+            item.as_object_mut().ok_or_else(invalid_view_result)?.remove("size");
+            omitted += 1;
+        }
+        if let Some(icons) = item.get("icons").and_then(Value::as_array) {
+            for icon in icons { closed(icon, &["src", "mimeType", "sizes", "theme"])?; }
+        }
+        if let Some(annotations) = item.get("annotations") {
+            closed(annotations, &["audience", "priority", "lastModified"])?;
+            if let Some(stamp) = annotations.get("lastModified") {
+                if !stamp.as_str().is_some_and(apps_sdk29_datetime) { return Err(invalid_view_result()); }
+            }
+        }
+        if let Some(arguments) = item.get("arguments").and_then(Value::as_array) {
+            for argument in arguments { closed(argument, &["name", "description", "required"])?; }
+        }
+    }
+    admit_view_numbers(page)?;
+    Ok(omitted)
+}
+
+fn apps_sdk29_datetime(value: &str) -> bool {
+    fn number(value: &str) -> Option<u32> {
+        value.bytes().all(|byte| byte.is_ascii_digit()).then(|| value.parse().ok()).flatten()
+    }
+    if !value.is_ascii() || value.len() < 17 { return false; }
+    let bytes = value.as_bytes();
+    if bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' { return false; }
+    let (Some(year), Some(month), Some(day)) = (number(&value[..4]), number(&value[5..7]), number(&value[8..10])) else { return false; };
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) { 29 } else { 28 },
+        _ => return false,
+    };
+    if !(1..=days).contains(&day) { return false; }
+    let clock = &value[11..];
+    let clock = if let Some(clock) = clock.strip_suffix('Z') { clock } else {
+        if clock.len() < 11 { return false; }
+        let offset = &clock[clock.len() - 6..];
+        if !matches!(offset.as_bytes()[0], b'+' | b'-') || offset.as_bytes()[3] != b':'
+            || number(&offset[1..3]).is_none_or(|hour| hour > 23)
+            || number(&offset[4..]).is_none_or(|minute| minute > 59) { return false; }
+        &clock[..clock.len() - 6]
+    };
+    if clock.len() < 5 || clock.as_bytes()[2] != b':'
+        || number(&clock[..2]).is_none_or(|hour| hour > 23)
+        || number(&clock[3..5]).is_none_or(|minute| minute > 59) { return false; }
+    if clock.len() == 5 { return true; }
+    if clock.len() < 8 || clock.as_bytes()[5] != b':'
+        || number(&clock[6..8]).is_none_or(|second| second > 59) { return false; }
+    clock.len() == 8 || (clock.as_bytes()[8] == b'.' && clock.len() > 9
+        && clock[9..].bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 fn expire_wire_host_requests(
     admission: &mut McpAppsBridgeAdmission,
     requests: &mut BTreeMap<McpAppsJsonRpcRequestId, WireHostRequest>,
@@ -1541,6 +1803,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             view_tools: BTreeMap::new(),
             staged_view_tools: None,
             teardown_request: None,
+            server_catalogs: WireServerCatalogs::default(),
             disconnected: false,
         }
     }
@@ -1582,8 +1845,76 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             view_tools: self.view_tools,
             staged_view_tools: self.staged_view_tools,
             teardown_request: self.teardown_request,
+            server_catalogs: self.server_catalogs,
             disconnected: self.disconnected,
         }
+    }
+
+    /// Authorizes catalog forwarding for this exact admitted View and MCP
+    /// security partition. List bridges are disabled until this is installed.
+    /// The carrier must already enforce the bound resource/origin; these Host
+    /// values describe that decision and do not authenticate browser messages.
+    ///
+    /// `allow_prompts` additionally asserts that the installed forwarding
+    /// policy discovered and authorized this same server's prompts capability.
+    /// Apps defines no `serverPrompts` capability, so none is advertised.
+    ///
+    /// Rebinding, even to identical strings, invalidates every old continuation.
+    /// The embedder must rebind or revoke before changing origin, principal,
+    /// server, authorization, connection generation, or catalog revision. The
+    /// built-in forwarding policies hold an exclusive borrow of their client.
+    /// This method does not discover identity or detect external policy changes.
+    pub fn bind_server_catalogs(
+        &mut self,
+        binding: McpAppsCatalogBinding,
+        allow_prompts: bool,
+    ) -> Result<(), McpAppsHostError> {
+        if self.disconnected || matches!(self.lifecycle(), McpAppsBridgeLifecycle::Closing | McpAppsBridgeLifecycle::Closed) {
+            return Err(McpAppsHostError::Bridge(McpAppsBridgeError::InvalidLifecycle));
+        }
+        if [&binding.view_id, &binding.resource_uri, &binding.origin, &binding.principal_id,
+            &binding.server_id, &binding.revision].iter()
+            .any(|value| value.is_empty() || value.len() > MAX_APPS_CATALOG_CURSOR_BYTES)
+            || fastmcp_protocol::common_types::AbsoluteUri::parse(binding.resource_uri.clone()).is_err()
+        {
+            return Err(invalid_view_result());
+        }
+        let replacement = WireServerCatalogs {
+            binding: Some(binding), allow_prompts, ..WireServerCatalogs::default()
+        };
+        if self.retained_tool_bytes().saturating_sub(self.server_catalogs.retained_bytes())
+            .saturating_add(replacement.retained_bytes()) > MAX_MCP_APPS_VIEW_TOOL_STATE_BYTES
+        {
+            return Err(McpAppsHostError::Bridge(McpAppsBridgeError::TooManyInFlight));
+        }
+        self.server_catalogs = replacement;
+        self.invalidate_deferred_catalog_requests();
+        Ok(())
+    }
+
+    /// Withdraws same-server catalog authorization and invalidates all its
+    /// outstanding continuation handles. It does not change View-owned tools.
+    pub fn revoke_server_catalogs(&mut self) {
+        self.server_catalogs = WireServerCatalogs::default();
+        self.invalidate_deferred_catalog_requests();
+    }
+
+    fn invalidate_deferred_catalog_requests(&mut self) {
+        self.server_catalogs.invalidated_requests.retain(|id| self.deferred_view_requests.contains(id));
+        for frame in &self.deferred_view_frames {
+            if let Ok(McpAppsJsonRpcEnvelope::Request { id, method, .. }) =
+                McpAppsJsonRpcEnvelope::decode(McpAppsBridgeDirection::ViewToHost, frame)
+            {
+                if is_server_catalog(method) { self.server_catalogs.invalidated_requests.insert(id); }
+            }
+        }
+    }
+
+    /// Bounded diagnostic count of optional unsafe resource-size hints omitted
+    /// from successfully delivered catalog pages in the current binding.
+    #[must_use]
+    pub fn omitted_catalog_size_hints(&self) -> u64 {
+        if self.disconnected { 0 } else { self.server_catalogs.omitted_sizes }
     }
 
     #[must_use]
@@ -1664,6 +1995,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             self.disconnect_view();
             return Err(McpAppsHostError::Transport("MCP Apps View is disconnected".to_owned()));
         }
+        self.server_catalogs.invalidated_requests.retain(|id| self.deferred_view_requests.contains(id));
         if self.lifecycle() != McpAppsBridgeLifecycle::Active {
             self.deferred_view_frames.clear();
             for id in std::mem::take(&mut self.deferred_view_requests) {
@@ -1756,6 +2088,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             + self.staged_view_tools.as_ref().map_or(0, staged_view_tool_bytes)
             + self.host_requests.values().map(|entry| entry.retained_bytes).sum::<usize>()
             + self.deferred_view_frames.iter().map(String::len).sum::<usize>()
+            + self.server_catalogs.retained_bytes()
     }
 
     fn disconnect_view(&mut self) {
@@ -1765,6 +2098,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
         self.deferred_view_frames.clear();
         self.deferred_view_requests.clear();
         self.state = McpAppsWireHostState::default();
+        self.revoke_server_catalogs();
         for (id, entry) in &mut self.host_requests {
             if !matches!(entry.state, WireHostRequestState::Complete(_)) {
                 let _ = self.admission.complete_error(McpAppsBridgeDirection::HostToView, id);
@@ -1797,6 +2131,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             self.view_tools.clear();
             self.staged_view_tools = None;
             self.state.model_context = None;
+            self.revoke_server_catalogs();
             for entry in self.host_requests.values_mut() {
                 if !matches!(entry.state, WireHostRequestState::Complete(_)) {
                     entry.state = WireHostRequestState::Complete(McpAppsHostRequestOutcome::ViewClosed);
@@ -1936,16 +2271,28 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
         method: McpAppsRoutedMethod,
         params: Option<Value>,
     ) -> Result<(), McpAppsHostError> {
+        let catalog = if is_server_catalog(method) {
+            let prepared = if self.server_catalogs.invalidated_requests.remove(&id) {
+                Err(wire_policy_denied())
+            } else {
+                self.server_catalogs.prepare_request(cx, method, params.as_ref())
+            };
+            match prepared {
+                Ok(prepared) => Some(prepared),
+                Err(error) => return self.finish_view_request(cx, id, method, params.as_ref(), None, Err(error)).await,
+            }
+        } else { None };
         let cancellation = McpRequestCancellation::new();
-        let mut execution = Box::pin(Self::dispatch_view_request(
-            &mut self.policy,
-            &self.configuration,
-            &mut self.state,
-            cx,
-            &cancellation,
-            method,
-            params.as_ref(),
-        ));
+        let mut execution = Box::pin(async {
+            let operation = Self::dispatch_view_request(
+                &mut self.policy, &self.configuration, &mut self.state, cx, &cancellation,
+                method, catalog.as_ref().map_or(params.as_ref(), |request| Some(&request.params)),
+            );
+            match &catalog {
+                Some(request) => await_wire_operation(cx, &request.deadline, operation).await,
+                None => operation.await,
+            }
+        });
         let mut deferred_error = None;
         loop {
             expire_wire_host_requests(
@@ -1964,7 +2311,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                     drop(incoming);
                     drop(execution);
                     let completion = self
-                        .finish_view_request(cx, id, method, params.as_ref(), result)
+                        .finish_view_request(cx, id, method, params.as_ref(), catalog, result)
                         .await;
                     return match (completion, deferred_error) {
                         (Err(error), _) => Err(error),
@@ -2015,7 +2362,8 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                             let retained = self.deferred_view_frames.iter().map(String::len).sum::<usize>()
                                 + view_catalog_bytes(&self.view_tools)
                                 + self.staged_view_tools.as_ref().map_or(0, staged_view_tool_bytes)
-                                + self.host_requests.values().map(|entry| entry.retained_bytes).sum::<usize>();
+                                + self.host_requests.values().map(|entry| entry.retained_bytes).sum::<usize>()
+                                + self.server_catalogs.retained_bytes();
                             if self.deferred_view_frames.len() >= MAX_MCP_APPS_BRIDGE_IN_FLIGHT
                                 || retained + frame.len() > MAX_MCP_APPS_VIEW_TOOL_STATE_BYTES
                             {
@@ -2056,11 +2404,23 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
         id: McpAppsJsonRpcRequestId,
         method: McpAppsRoutedMethod,
         params: Option<&Value>,
+        catalog: Option<WireCatalogRequest>,
         result: Result<Value, McpAppsHostError>,
     ) -> Result<(), McpAppsHostError> {
+        let mut prepared_catalog = None;
         let result = result.and_then(|result| {
+            let result = if let Some(request) = &catalog {
+                let prepared = self.server_catalogs.prepare_page(cx, method, request, result, self.retained_tool_bytes())?;
+                let result = prepared.result.clone();
+                prepared_catalog = Some(prepared);
+                result
+            } else { result };
             McpAppsJsonRpcEnvelope::validate_response_for(method, &result)
                 .map_err(McpAppsHostError::Bridge)?;
+            if catalog.is_some() {
+                McpAppsJsonRpcEnvelope::Response { id: id.clone(), result: result.clone() }
+                    .encode(McpAppsBridgeDirection::HostToView).map_err(McpAppsHostError::Bridge)?;
+            }
             Ok(result)
         });
         match result {
@@ -2080,6 +2440,24 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                     id: id.clone(),
                     result: result.clone(),
                 };
+                if let (Some(request), Some(prepared)) = (catalog, prepared_catalog) {
+                    // Preflight every fallible encode, quota and correlation
+                    // step before entering the carrier. A dropped/failed send
+                    // fences the Host; success has one synchronous commit.
+                    let frame = response.encode(McpAppsBridgeDirection::HostToView)
+                        .map_err(McpAppsHostError::Bridge)?;
+                    let mut admission = self.admission.clone();
+                    admission.complete_response(McpAppsBridgeDirection::ViewToHost, &id, &result)
+                        .map_err(McpAppsHostError::Bridge)?;
+                    let mut guard = WireCatalogSendGuard { disconnected: &mut self.disconnected, committed: false };
+                    await_wire_operation(cx, &request.deadline, self.transport.send_to_view(cx, frame)).await?;
+                    if let Some(previous) = request.previous { self.server_catalogs.cursors.remove(&previous); }
+                    if let Some((token, cursor)) = prepared.cursor { self.server_catalogs.cursors.insert(token, cursor); }
+                    self.server_catalogs.omitted_sizes = self.server_catalogs.omitted_sizes.saturating_add(prepared.omitted_sizes);
+                    self.admission = admission;
+                    guard.committed = true;
+                    return Ok(());
+                }
                 self.send_envelope(cx, response).await?;
                 if method == McpAppsRoutedMethod::Initialize {
                     self.admission
@@ -2456,6 +2834,12 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             ));
         }
         let (method, params) = wire_host_notification_parts(notification)?;
+        if matches!(method, McpAppsRoutedMethod::ResourcesListChanged | McpAppsRoutedMethod::PromptsListChanged) {
+            // The producer has observed a new catalog revision even if the
+            // subsequent notification send fails. Old handles cannot select it.
+            self.server_catalogs.cursors.clear();
+            self.invalidate_deferred_catalog_requests();
+        }
         let merged_context = if method == McpAppsRoutedMethod::HostContextChanged {
             let mut merged = serde_json::to_value(&self.state.host_context)
                 .map_err(|_| McpAppsHostError::Bridge(McpAppsBridgeError::InvalidParams))?;
@@ -2549,6 +2933,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                 .map_err(McpAppsHostError::Bridge)?;
         } else {
             self.state.model_context = None;
+            self.revoke_server_catalogs();
             self.deferred_view_frames.clear();
             for request_id in std::mem::take(&mut self.deferred_view_requests) {
                 self.admission.complete_error(McpAppsBridgeDirection::ViewToHost, &request_id)
@@ -2845,6 +3230,434 @@ mod tests {
         McpAppsViewCapabilities,
     };
     use serde_json::json;
+
+    fn catalog_binding() -> McpAppsCatalogBinding {
+        McpAppsCatalogBinding {
+            view_id: "catalog-view".into(), resource_uri: "ui://catalog/view".into(),
+            origin: "https://view.example".into(), principal_id: "principal-7".into(),
+            server_id: "server-9".into(), revision: "revision-1".into(),
+        }
+    }
+
+    fn catalog_page(method: McpAppsRoutedMethod, cursor: Option<&str>) -> Value {
+        let (key, item) = match method {
+            McpAppsRoutedMethod::ResourcesList => ("resources", json!({"name":"entry", "uri":"test://entry"})),
+            McpAppsRoutedMethod::ResourceTemplatesList => ("resourceTemplates", json!({"name":"entry", "uriTemplate":"test://{entry}"})),
+            McpAppsRoutedMethod::PromptsList => ("prompts", json!({"name":"entry"})),
+            _ => panic!("catalog fixture requires a list method"),
+        };
+        let mut page = json!({"ttlMs":1000,"cacheScope":"private"});
+        page[key] = json!([item]);
+        if let Some(cursor) = cursor { page["nextCursor"] = json!(cursor); }
+        page
+    }
+
+    struct CatalogPolicy {
+        observed: Vec<(McpAppsRoutedMethod, Value)>,
+        responses: VecDeque<Result<Value, McpAppsHostError>>,
+        pending: bool,
+    }
+
+    impl McpAppsWireHostPolicy for CatalogPolicy {
+        async fn dispatch_reused_request(
+            &mut self, _cx: &Cx, _cancellation: &McpRequestCancellation,
+            method: McpAppsRoutedMethod, params: Option<Value>,
+        ) -> Result<Value, McpAppsHostError> {
+            self.observed.push((method, params.unwrap_or_else(|| json!({}))));
+            if self.pending { std::future::pending().await } else {
+                self.responses.pop_front().expect("unexpected downstream catalog request")
+            }
+        }
+    }
+
+    async fn catalog_host(cx: &Cx) -> (
+        McpAppsWireHost<McpAppsInMemoryWireHostTransport, CatalogPolicy>,
+        McpAppsInMemoryWireViewTransport,
+    ) {
+        let (transport, mut view) = mcp_apps_in_memory_wire_pair(128);
+        let mut host = McpAppsWireHost::new_negotiated(transport, wire_configuration(), CatalogPolicy {
+            observed: Vec::new(), responses: VecDeque::new(), pending: false,
+        }, activation_proof());
+        host.bind_server_catalogs(catalog_binding(), true).unwrap();
+        activate_stateful_wire_host(&mut host, &mut view, cx, None).await;
+        (host, view)
+    }
+
+    #[test]
+    fn catalog_cursor_public_round_trip_all_methods() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (mut host, mut view) = catalog_host(&cx).await;
+            for (method, name, upstream) in [
+                (McpAppsRoutedMethod::ResourcesList, "resources/list", " private upstream / + "),
+                (McpAppsRoutedMethod::ResourceTemplatesList, "resources/templates/list", ""),
+                (McpAppsRoutedMethod::PromptsList, "prompts/list", "opaque-prompt-cursor"),
+            ] {
+                let first = catalog_page(method, Some(upstream));
+                host.policy.responses.push_back(Ok(first.clone()));
+                let response = stateful_wire_request(&mut host, &mut view, &cx, "page-one", name, json!({})).await;
+                assert_eq!(response["id"], "page-one");
+                let token = response["result"]["nextCursor"].as_str().expect("Host issued continuation").to_owned();
+                assert_eq!(token.len(), 64);
+                assert_ne!(token, upstream);
+                let mut expected = first;
+                expected["nextCursor"] = json!(token);
+                assert_eq!(response["result"], expected, "all non-cursor cache/result fields survive");
+                host.policy.responses.push_back(Ok(catalog_page(method, None)));
+                let response = stateful_wire_request(&mut host, &mut view, &cx, "page-two", name, json!({"cursor":token})).await;
+                assert_eq!(response["result"], catalog_page(method, None));
+                assert_eq!(host.policy.observed.last().unwrap(), &(method, json!({"cursor":upstream})));
+                assert!(host.server_catalogs.cursors.is_empty());
+            }
+            assert_eq!(host.policy.observed.len(), 6);
+        });
+    }
+
+    #[test]
+    fn catalog_cursor_wrong_owner_method_and_replay_reject_before_forwarding() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (mut host, mut view) = catalog_host(&cx).await;
+            let (mut other, mut other_view) = catalog_host(&cx).await;
+            host.policy.responses.push_back(Ok(catalog_page(McpAppsRoutedMethod::ResourcesList, Some("upstream-secret"))));
+            let page = stateful_wire_request(&mut host, &mut view, &cx, "first", "resources/list", json!({})).await;
+            let token = page["result"]["nextCursor"].as_str().unwrap().to_owned();
+            for (name, candidate) in [("prompts/list", token.clone()), ("resources/list", "upstream-secret".into()),
+                ("resources/list", format!("{token}0"))] {
+                let response = stateful_wire_request(&mut host, &mut view, &cx, "wrong", name, json!({"cursor":candidate})).await;
+                assert!(response.get("error").is_some());
+                assert_eq!(host.policy.observed.len(), 1);
+                assert!(host.server_catalogs.cursors.contains_key(&token));
+            }
+            let response = stateful_wire_request(&mut other, &mut other_view, &cx, "foreign", "resources/list", json!({"cursor":token})).await;
+            assert!(response.get("error").is_some());
+            assert!(other.policy.observed.is_empty(), "identical binding strings do not share a Host owner");
+            host.policy.responses.push_back(Ok(catalog_page(McpAppsRoutedMethod::ResourcesList, None)));
+            let response = stateful_wire_request(&mut host, &mut view, &cx, "next", "resources/list", json!({"cursor":token})).await;
+            assert!(response.get("result").is_some());
+            let response = stateful_wire_request(&mut host, &mut view, &cx, "replay", "resources/list", json!({"cursor":token})).await;
+            assert!(response.get("error").is_some());
+            assert_eq!(host.policy.observed.len(), 2);
+            other.revoke_server_catalogs();
+            let response = stateful_wire_request(&mut other, &mut other_view, &cx, "unbound", "resources/list", json!({})).await;
+            assert!(response.get("error").is_some());
+            assert!(other.policy.observed.is_empty());
+            other.bind_server_catalogs(catalog_binding(), false).unwrap();
+            let response = stateful_wire_request(&mut other, &mut other_view, &cx, "unapproved-prompts", "prompts/list", json!({})).await;
+            assert!(response.get("error").is_some());
+            assert!(other.policy.observed.is_empty());
+        });
+    }
+
+    #[test]
+    fn catalog_cursor_rebind_expiry_and_change_invalidate() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            for changed in ["same", "view", "resource", "origin", "principal", "server", "revision", "expiry", "notification"] {
+                let (mut host, mut view) = catalog_host(&cx).await;
+                host.policy.responses.push_back(Ok(catalog_page(McpAppsRoutedMethod::ResourcesList, Some("private"))));
+                let response = stateful_wire_request(&mut host, &mut view, &cx, "first", "resources/list", json!({})).await;
+                let token = response["result"]["nextCursor"].as_str().unwrap().to_owned();
+                let mut binding = catalog_binding();
+                match changed {
+                    "view" => binding.view_id.push('2'),
+                    "resource" => binding.resource_uri.push('2'),
+                    "origin" => binding.origin.push('2'),
+                    "principal" => binding.principal_id.push('2'),
+                    "server" => binding.server_id.push('2'),
+                    "revision" => binding.revision.push('2'),
+                    "expiry" => host.server_catalogs.cursors.get_mut(&token).unwrap().deadline.absolute = Time::ZERO,
+                    "notification" => {
+                        host.send_notification(&cx, McpAppsHostNotification::ResourcesListChanged).await.unwrap();
+                        let _ = view.receive_from_host(&cx).await.unwrap();
+                    }
+                    _ => {}
+                }
+                if !matches!(changed, "expiry" | "notification") { host.bind_server_catalogs(binding, true).unwrap(); }
+                let response = stateful_wire_request(&mut host, &mut view, &cx, "stale", "resources/list", json!({"cursor":token})).await;
+                assert!(response.get("error").is_some(), "{changed}");
+                assert_eq!(host.policy.observed.len(), 1, "{changed}");
+            }
+        });
+    }
+
+    #[test]
+    fn catalog_cursor_rebind_fences_deferred_page_requests() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (mut host, mut view) = catalog_host(&cx).await;
+            let ping = host.send_host_request(&cx,
+                McpAppsHostRequest::Ping(fastmcp_protocol::McpAppsPingParams::default()), None).await.unwrap();
+            let _ = view.receive_from_host(&cx).await.unwrap();
+            view.send_to_host(&cx, json!({"jsonrpc":"2.0","id":"old-page","method":"resources/list","params":{}}).to_string()).await.unwrap();
+            host.process_next(&cx).await.unwrap();
+            assert_eq!(host.deferred_view_requests.len(), 1);
+            host.bind_server_catalogs(catalog_binding(), true).unwrap();
+            view.send_to_host(&cx, json!({"jsonrpc":"2.0","id":ping,"result":{}}).to_string()).await.unwrap();
+            host.process_next(&cx).await.unwrap();
+            host.process_next(&cx).await.unwrap();
+            let response: Value = serde_json::from_str(&view.receive_from_host(&cx).await.unwrap()).unwrap();
+            assert_eq!(response["id"], "old-page");
+            assert!(response.get("error").is_some());
+            assert!(host.policy.observed.is_empty(), "a request admitted before rebind cannot borrow the new authority");
+            assert!(host.server_catalogs.invalidated_requests.is_empty());
+            host.policy.responses.push_back(Ok(catalog_page(McpAppsRoutedMethod::ResourcesList, None)));
+            let response = stateful_wire_request(&mut host, &mut view, &cx, "new-page", "resources/list", json!({})).await;
+            assert!(response.get("result").is_some());
+            assert_eq!(host.policy.observed.len(), 1);
+        });
+    }
+
+    #[test]
+    fn catalog_cursor_failed_page_and_cancellation_preserve_continuation() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let (mut host, mut view) = catalog_host(&cx).await;
+            host.policy.responses.push_back(Ok(catalog_page(McpAppsRoutedMethod::ResourcesList, Some("private"))));
+            let response = stateful_wire_request(&mut host, &mut view, &cx, "first", "resources/list", json!({})).await;
+            let token = response["result"]["nextCursor"].as_str().unwrap().to_owned();
+            host.policy.responses.push_back(Err(wire_policy_denied()));
+            let response = stateful_wire_request(&mut host, &mut view, &cx, "failure", "resources/list", json!({"cursor":token})).await;
+            assert!(response.get("error").is_some());
+            assert!(host.server_catalogs.cursors.contains_key(&token));
+            host.policy.pending = true;
+            view.send_to_host(&cx, json!({"jsonrpc":"2.0","id":"cancelled-page","method":"resources/list","params":{"cursor":token}}).to_string()).await.unwrap();
+            view.send_to_host(&cx, json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"cancelled-page"}}).to_string()).await.unwrap();
+            host.process_next(&cx).await.unwrap();
+            assert!(host.server_catalogs.cursors.contains_key(&token));
+            assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+            host.policy.pending = false;
+            host.policy.responses.push_back(Ok(catalog_page(McpAppsRoutedMethod::ResourcesList, None)));
+            let response = stateful_wire_request(&mut host, &mut view, &cx, "retry", "resources/list", json!({"cursor":token})).await;
+            assert_eq!(response["id"], "retry", "cancelled request emitted no stray response");
+            assert_eq!(response["result"], catalog_page(McpAppsRoutedMethod::ResourcesList, None));
+            assert!(host.server_catalogs.cursors.is_empty());
+        });
+    }
+
+    #[test]
+    fn catalog_cursor_projection_and_capacity_abort_without_exposure() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (mut host, mut view) = catalog_host(&cx).await;
+            let mut page = catalog_page(McpAppsRoutedMethod::ResourcesList, Some("private"));
+            page["resources"][0]["size"] = json!(9_007_199_254_740_992_u64);
+            host.policy.responses.push_back(Ok(page));
+            let response = stateful_wire_request(&mut host, &mut view, &cx, "size", "resources/list", json!({})).await;
+            assert!(response["result"]["resources"][0].get("size").is_none());
+            assert_eq!(host.omitted_catalog_size_hints(), 1);
+            let token = response["result"]["nextCursor"].as_str().unwrap().to_owned();
+            for invalid in ["number", "prompt-title", "annotation", "timestamp"] {
+                let method = if invalid == "prompt-title" { McpAppsRoutedMethod::PromptsList } else { McpAppsRoutedMethod::ResourcesList };
+                let mut page = catalog_page(method, Some("never-exposed"));
+                match invalid {
+                    "number" => page["resources"][0]["_meta"] = json!({"unsafe":9_007_199_254_740_992_u64}),
+                    "prompt-title" => page["prompts"][0]["arguments"] = json!([{"name":"argument","title":"SDK would strip"}]),
+                    "annotation" => page["resources"][0]["annotations"] = json!({"example.com/custom":true}),
+                    _ => page["resources"][0]["annotations"] = json!({"lastModified":"2026-02-29T12:34Z"}),
+                }
+                host.policy.responses.push_back(Ok(page));
+                let name = if invalid == "prompt-title" { "prompts/list" } else { "resources/list" };
+                let response = stateful_wire_request(&mut host, &mut view, &cx, "invalid", name, json!({})).await;
+                assert!(response.get("error").is_some(), "{invalid}");
+                assert!(!response.to_string().contains("never-exposed"));
+                assert_eq!(host.server_catalogs.cursors.len(), 1);
+                assert!(host.server_catalogs.cursors.contains_key(&token));
+            }
+            for timestamp in ["0000-02-29T00:00Z", "2024-02-29T23:59:59.123+23:59", "2026-01-01T12:34-00:00"] {
+                let mut page = catalog_page(McpAppsRoutedMethod::ResourcesList, None);
+                page["resources"][0]["annotations"] = json!({"lastModified":timestamp});
+                host.policy.responses.push_back(Ok(page.clone()));
+                let response = stateful_wire_request(&mut host, &mut view, &cx, "timestamp", "resources/list", json!({})).await;
+                assert_eq!(response["result"], page);
+            }
+            for index in 1..MAX_APPS_CATALOG_CURSORS {
+                host.policy.responses.push_back(Ok(catalog_page(McpAppsRoutedMethod::ResourcesList, Some("private"))));
+                let response = stateful_wire_request(&mut host, &mut view, &cx, &format!("capacity-{index}"), "resources/list", json!({})).await;
+                assert!(response.get("result").is_some());
+            }
+            host.policy.responses.push_back(Ok(catalog_page(McpAppsRoutedMethod::ResourcesList, Some("private"))));
+            let response = stateful_wire_request(&mut host, &mut view, &cx, "overflow", "resources/list", json!({})).await;
+            assert!(response.get("error").is_some());
+            assert_eq!(host.server_catalogs.cursors.len(), MAX_APPS_CATALOG_CURSORS);
+            host.deferred_view_frames.push_back("x".repeat(MAX_MCP_APPS_VIEW_TOOL_STATE_BYTES));
+            let binding = host.server_catalogs.binding.clone();
+            assert!(host.bind_server_catalogs(catalog_binding(), true).is_err());
+            assert_eq!(host.server_catalogs.binding, binding);
+            assert!(host.server_catalogs.cursors.contains_key(&token));
+        });
+    }
+
+    #[test]
+    fn catalog_cursor_failed_send_fences_host() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+            let mut host = McpAppsWireHost::new_negotiated(FailableWireTransport { inner: transport, fail: false },
+                wire_configuration(), CatalogPolicy { observed: Vec::new(), responses: VecDeque::new(), pending: false }, activation_proof());
+            host.bind_server_catalogs(catalog_binding(), true).unwrap();
+            activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+            host.policy.responses.push_back(Ok(catalog_page(McpAppsRoutedMethod::ResourcesList, Some("private"))));
+            host.transport.fail = true;
+            view.send_to_host(&cx, json!({"jsonrpc":"2.0","id":"page","method":"resources/list","params":{}}).to_string()).await.unwrap();
+            assert!(host.process_next(&cx).await.is_err());
+            assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Closed);
+            assert!(host.server_catalogs.cursors.is_empty());
+            assert!(host.bind_server_catalogs(catalog_binding(), true).is_err());
+            assert!(host.process_next(&cx).await.is_err());
+            assert_eq!(host.policy.observed.len(), 1);
+        });
+    }
+
+    async fn public_catalog_pages<P: McpAppsWireHostPolicy>(
+        cx: &Cx,
+        host: &mut McpAppsWireHost<McpAppsInMemoryWireHostTransport, P>,
+        view: &mut McpAppsInMemoryWireViewTransport,
+    ) {
+        host.bind_server_catalogs(catalog_binding(), true).unwrap();
+        activate_stateful_wire_host(host, view, cx, None).await;
+        for (method, name) in [
+            (McpAppsRoutedMethod::ResourcesList, "resources/list"),
+            (McpAppsRoutedMethod::ResourceTemplatesList, "resources/templates/list"),
+            (McpAppsRoutedMethod::PromptsList, "prompts/list"),
+        ] {
+            let first = stateful_wire_request(host, view, cx, "view-first", name, json!({})).await;
+            let token = first["result"]["nextCursor"].as_str().expect("real server page issues Host continuation").to_owned();
+            assert_ne!(token, "upstream-cursor");
+            assert!(!first.to_string().contains("upstream-cursor"));
+            let wrong = stateful_wire_request(host, view, cx, "view-tampered", name, json!({"cursor":format!("{token}x")})).await;
+            assert!(wrong.get("error").is_some(), "tampering must not create a real server request");
+            let second = stateful_wire_request(host, view, cx, "view-second", name, json!({"cursor":token})).await;
+            assert_eq!(second["id"], "view-second");
+            assert_eq!(second["result"], catalog_page(method, None));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_cursor_public_stdio_round_trip() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let script = r#"
+IFS= read -r discovery || exit 91
+case "$discovery" in *server/discover*io.modelcontextprotocol/ui*) ;; *) exit 92 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"resources":{},"prompts":{},"extensions":{"io.modelcontextprotocol/ui":{}}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"catalog-peer","version":"1"}}}}'
+id=2
+for method in resources/list resources/templates/list prompts/list; do
+    case "$method" in
+        resources/list) members='"resources":[{"name":"entry","uri":"test://entry"}]' ;;
+        resources/templates/list) members='"resourceTemplates":[{"name":"entry","uriTemplate":"test://{entry}"}]' ;;
+        prompts/list) members='"prompts":[{"name":"entry"}]' ;;
+    esac
+    for page in first second; do
+        IFS= read -r request || exit 93
+        case "$request" in *"\"method\":\"$method\""*) ;; *) exit 94 ;; esac
+        case "$request" in *"\"id\":$id"*) ;; *) exit 95 ;; esac
+        case "$request" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) ;; *) exit 96 ;; esac
+        case "$request" in *view-first*|*view-second*|*view-tampered*) exit 97 ;; esac
+        if [ "$page" = first ]; then
+            case "$request" in *'"cursor"'*) exit 98 ;; esac
+            cursor=',"nextCursor":"upstream-cursor"'
+        else
+            case "$request" in *'"cursor":"upstream-cursor"'*) ;; *) exit 99 ;; esac
+            cursor=''
+        fi
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete",%s,"ttlMs":1000,"cacheScope":"private"%s}}\n' "$id" "$members" "$cursor"
+        id=$((id + 1))
+    done
+done
+IFS= read -r ping || exit 100
+case "$ping" in *'"method":"ping"'*'"id":8'*|*'"id":8'*'"method":"ping"'*) ;; *) exit 101 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":8,"result":{}}'
+exec sleep 10
+"#;
+            let mut client = crate::ClientBuilder::new()
+                .protocol_plan(crate::ClientProtocolPlan::stdio(fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly))
+                .mcp_apps(fastmcp_protocol::extensions::McpAppsClientSettings::new(vec![fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE.into()]).unwrap())
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script]).await.unwrap();
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let mut host = client.mcp_apps_wire_host(transport, wire_configuration()).unwrap();
+            public_catalog_pages(&cx, &mut host, &mut view).await;
+            drop(host);
+            client.ping_with_cx(&cx, &McpRequestCancellation::new()).await.unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_cursor_public_http_round_trip() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for index in 0..7 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let header_end = loop {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") { break end + 4; }
+                };
+                let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
+                let length = headers.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
+                }).unwrap();
+                while bytes.len() < header_end + length {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                let request: Value = serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                assert_eq!(request["id"], index + 1);
+                let result = if index == 0 {
+                    assert_eq!(request["method"], "server/discover");
+                    json!({"resultType":"complete","supportedVersions":["2026-07-28"],
+                        "capabilities":{"resources":{},"prompts":{},"extensions":{"io.modelcontextprotocol/ui":{}}},
+                        "ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"http-catalog-peer","version":"1"}}})
+                } else {
+                    let (method, name) = match (index - 1) / 2 {
+                        0 => (McpAppsRoutedMethod::ResourcesList, "resources/list"),
+                        1 => (McpAppsRoutedMethod::ResourceTemplatesList, "resources/templates/list"),
+                        _ => (McpAppsRoutedMethod::PromptsList, "prompts/list"),
+                    };
+                    assert_eq!(request["method"], name);
+                    assert_eq!(request["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"], "2026-07-28");
+                    let first = index % 2 == 1;
+                    if first { assert!(request["params"].get("cursor").is_none()); }
+                    else { assert_eq!(request["params"]["cursor"], "upstream-cursor"); }
+                    assert!(!request.to_string().contains("view-"));
+                    let mut page = catalog_page(method, first.then_some("upstream-cursor"));
+                    page["resultType"] = json!("complete");
+                    page
+                };
+                let body = json!({"jsonrpc":"2.0","id":index + 1,"result":result}).to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let plan = crate::ClientProtocolPlan::http(
+                fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly,
+                Some(crate::CanonicalHttpUrl::parse(&format!("http://{address}/mcp")).unwrap()),
+                None, None, "credential".into(), "security".into(), "transport".into(), 1, 1, 0,
+            ).unwrap();
+            let mut client = crate::ClientBuilder::new().protocol_plan(plan)
+                .mcp_apps(fastmcp_protocol::extensions::McpAppsClientSettings::new(vec![fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE.into()]).unwrap())
+                .connect_http_client_with_cx(&cx).await.unwrap();
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let mut host = client.mcp_apps_wire_host(transport, wire_configuration()).unwrap();
+            public_catalog_pages(&cx, &mut host, &mut view).await;
+        });
+        server.join().unwrap();
+    }
 
     struct ComposedEffects {
         allow: bool,
@@ -4280,10 +5093,10 @@ exec sleep 10
             &mut self,
             _cx: &Cx,
             _cancellation: &McpRequestCancellation,
-            _method: McpAppsRoutedMethod,
+            method: McpAppsRoutedMethod,
             _params: Option<Value>,
         ) -> Result<Value, McpAppsHostError> {
-            Ok(json!({"forwarded": true}))
+            Ok(if is_server_catalog(method) { catalog_page(method, None) } else { json!({"forwarded": true}) })
         }
     }
 
@@ -4514,12 +5327,12 @@ exec sleep 10
             &mut self,
             _cx: &Cx,
             _cancellation: &McpRequestCancellation,
-            _method: McpAppsRoutedMethod,
+            method: McpAppsRoutedMethod,
             params: Option<Value>,
         ) -> Result<Value, McpAppsHostError> {
             self.entries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.changes.lock().unwrap().push(json!({"forwarded": params}));
-            Ok(json!({"forwarded": true}))
+            Ok(if is_server_catalog(method) { catalog_page(method, None) } else { json!({"forwarded": true}) })
         }
     }
 
@@ -4835,6 +5648,7 @@ exec sleep 10
                     let mut policy = state_recording_policy();
                     policy.advertised = Some(serde_json::from_value(advertised).unwrap());
                     let mut host = McpAppsWireHost::new_negotiated(transport, configuration, policy, activation_proof());
+                    host.bind_server_catalogs(catalog_binding(), true).unwrap();
                     activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
                     let response = stateful_wire_request(&mut host, &mut view, &cx, "operation", method, params.clone()).await;
                     assert_eq!(response.get("result").is_some(), permitted, "{method}: {response}");
@@ -4856,6 +5670,7 @@ exec sleep 10
                 WirePolicy,
                 activation_proof(),
             );
+            host.bind_server_catalogs(catalog_binding(), true).unwrap();
             view.send_to_host(
                 &cx,
                 json!({
@@ -4907,7 +5722,8 @@ exec sleep 10
                 .unwrap();
                 host.process_next(&cx).await.unwrap();
                 let response = view.receive_from_host(&cx).await.unwrap();
-                assert!(response.contains("forwarded"));
+                let response: Value = serde_json::from_str(&response).unwrap();
+                assert_eq!(response["result"], catalog_page(McpAppsRoutedMethod::ResourcesList, None));
             }
 
             host.begin_teardown(&cx).await.unwrap();

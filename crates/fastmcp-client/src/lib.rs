@@ -168,7 +168,7 @@ pub mod websocket_experimental {
 }
 #[cfg(feature = "apps")]
 pub use mcp_apps::{
-    McpAppsHostRequestOutcome, McpAppsViewCallToolResult, McpAppsViewTool,
+    McpAppsCatalogBinding, McpAppsHostRequestOutcome, McpAppsViewCallToolResult, McpAppsViewTool,
     McpAppsViewToolsPage, McpAppsWireHostResponse,
     McpAppsBridgeTransport, McpAppsClientWirePolicy, McpAppsHost, McpAppsHostConfiguration,
     McpAppsHostError, McpAppsHostPolicy, McpAppsHttpClientWirePolicy, McpAppsInMemoryHostTransport,
