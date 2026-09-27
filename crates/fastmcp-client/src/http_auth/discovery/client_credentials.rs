@@ -25,6 +25,8 @@ pub mod tasks;
 #[cfg(all(not(target_arch = "wasm32"), feature = "builtin-auth-server"))]
 pub mod private_key_jwt;
 
+// One caller owns each grant; joined callers share its success or failure.
+mod acquisition;
 // Observe token-local revocation during both dispatch and replacement grants.
 mod lifetime;
 use lifetime::unless_revoked;
@@ -38,8 +40,8 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
-use asupersync::http::h1::{HttpClient, Method, RedirectPolicy, Request, RetryPolicy};
-use asupersync::sync::{Mutex, OwnedMutexGuard};
+use asupersync::http::h1::{HttpClient, RedirectPolicy, Request, RetryPolicy};
+use asupersync::sync::Mutex;
 use asupersync::tls::Certificate;
 use asupersync::types::Time;
 use fastmcp_core::{AccessToken, CanonicalHttpUrl, McpRequestCancellation};
@@ -54,7 +56,7 @@ use serde_json::{Value, json};
 use super::{
     OAuthDiscoveryError, OAuthDiscoveryPlan, TrustedOAuthIssuer, admit_root,
     admit_scopes, check_context, decode_metadata, discovery_deadline, has,
-    present, validate_array, validate_headers, validate_optional_array, within,
+    present, validate_array, validate_optional_array, within,
 };
 use crate::http_auth::BoundBearerCredential;
 use crate::http_executor::{
@@ -96,6 +98,10 @@ pub enum ClientCredentialsError {
     Saturated,
     StateUnavailable,
     GenerationExhausted,
+    /// The grant this caller joined failed or its owning caller abandoned it.
+    /// The leader receives its specific failure. Joined callers never take over
+    /// or resubmit the grant; this marker is not evidence of zero remote effect.
+    ConcurrentAcquisitionFailed,
     UnsupportedAuthentication,
     InvalidToken,
     ExpandedScope,
@@ -126,6 +132,7 @@ impl fmt::Display for ClientCredentialsError {
             Self::Saturated => "client-credentials acquisition capacity exhausted",
             Self::StateUnavailable => "client-credentials state unavailable",
             Self::GenerationExhausted => "client-credentials generation exhausted",
+            Self::ConcurrentAcquisitionFailed => "the joined client-credentials acquisition failed or was abandoned",
             Self::UnsupportedAuthentication => "issuer does not admit the selected client-credentials authentication",
             Self::InvalidToken => "client-credentials token response rejected",
             Self::ExpandedScope => "client-credentials token exceeds requested scopes",
@@ -424,7 +431,11 @@ impl Drop for ClientInner {
     fn drop(&mut self) { self.closed.cancel(); }
 }
 #[derive(Default)]
-struct TokenState { current: Option<ServiceToken>, generation: u64 }
+struct TokenState {
+    current: Option<ServiceToken>,
+    generation: u64,
+    flight: Option<Arc<acquisition::GrantFlight>>,
+}
 struct ServiceToken {
     bearer: BoundBearerCredential,
     scopes: Vec<String>,
@@ -434,8 +445,10 @@ struct ServiceToken {
 
 /// Clones share single-flight token acquisition. Expiry causes a new
 /// client_credentials grant, never refresh_token. No background task is used.
-/// After failure another caller may explicitly request a new acquisition; the
-/// failing call itself does not retry or overwrite the previously admitted token.
+/// A caller joining an active grant shares that flight's terminal outcome;
+/// failure or leader abandonment never makes a follower submit another grant.
+/// After a flight ends, a new explicit call may start a new acquisition without
+/// overwriting the previously admitted token unless its replacement is valid.
 #[derive(Clone)]
 pub struct ClientCredentialsClient { inner: Arc<ClientInner> }
 impl fmt::Debug for ClientCredentialsClient {
@@ -478,73 +491,25 @@ impl ClientCredentialsClient {
     /// snapshots withhold new headers. Already-sent bytes cannot be recalled.
     pub fn close(&self) {
         self.inner.closed.cancel();
-        if let Ok(mut state) = self.inner.state.try_lock_owned() { state.current = None; }
+        if let Ok(mut state) = self.inner.state.try_lock_owned() {
+            state.current = None;
+            state.flight = None;
+        }
     }
     pub async fn credential(&self, cx: &Cx) -> Result<ClientCredentialsSnapshot, ClientCredentialsError> {
         self.credential_with_cancellation(cx, &McpRequestCancellation::new()).await
     }
+
+    /// Acquire or join one bounded grant. Cancelling a joined caller removes
+    /// only that caller's wait. The first caller owns signer/network work; its
+    /// failure or abandonment wakes followers with ConcurrentAcquisitionFailed.
+    /// Local closure, cancellation and token revocation retain their precedence.
+    /// A successful follower receives the flight's original generation/expiry,
+    /// even if another caller subsequently installs a newer credential.
     pub async fn credential_with_cancellation(
         &self, cx: &Cx, cancellation: &McpRequestCancellation,
     ) -> Result<ClientCredentialsSnapshot, ClientCredentialsError> {
-        let deadline = discovery_deadline(cx, self.inner.timeout)?;
-        let _permit = AcquisitionPermit::new(&self.inner.pending)?;
-        active(cx, deadline, &self.inner.closed, cancellation, None, async {
-            self.inner.authentication.check()?;
-            let mut state = OwnedMutexGuard::lock(Arc::clone(&self.inner.state), cx).await
-                .map_err(|_| ClientCredentialsError::StateUnavailable)?;
-            self.inner.authentication.check()?;
-            if state.current.as_ref().is_some_and(|token| token.bearer.is_revoked()) {
-                return Err(ClientCredentialsError::Expired);
-            }
-            if state.current.as_ref().is_none_or(|token| Instant::now() >= token.renew_after) {
-                let generation = state.generation.checked_add(1).ok_or(ClientCredentialsError::GenerationExhausted)?;
-                // Renewal may outlive the OLD access token, but must not outlive
-                // its explicit revocation. Observe only that signal, without
-                // extending any in-flight response or copying the bearer text.
-                let revocation = state.current.as_ref().map(|old| old.bearer.revoked.clone());
-                let token = unless_revoked(revocation.as_ref(), async {
-                    let started = Instant::now();
-                    let grant = self.inner.authentication.prepare(
-                        cx, deadline, &self.inner.client_id, self.resource(), &self.inner.scopes,
-                    ).await?;
-                    let mut headers = vec![
-                        ("Content-Type".to_owned(), "application/x-www-form-urlencoded".to_owned()),
-                        ("Accept".to_owned(), "application/json".to_owned()),
-                        ("Accept-Encoding".to_owned(), "identity".to_owned()),
-                        ("Connection".to_owned(), "close".to_owned()),
-                    ];
-                    if let Some(authorization) = grant.authorization {
-                        headers.push(("Authorization".to_owned(), authorization));
-                    }
-                    let transport = token_transport(&self.inner.issuer_roots);
-                    let response = active(cx, grant.deadline, &self.inner.closed, cancellation, None, async {
-                        transport.request(cx, Method::Post, self.inner.token_endpoint.as_str(), headers, grant.body)
-                            .await.map_err(|_| ClientCredentialsError::Transport)
-                    }).await?;
-                    if response.status != 200 { return Err(ClientCredentialsError::TokenEndpointRejected); }
-                    validate_headers(&response.headers)?;
-                    if !response.trailers.is_empty() { return Err(ClientCredentialsError::InvalidToken); }
-                    self.inner.authentication.check()?;
-                    admit_token(&self.inner, &response.body, started)
-                }).await?;
-                check_context(cx, deadline)?;
-                if self.inner.closed.is_cancel_requested() { return Err(ClientCredentialsError::Closed); }
-                if cancellation.is_cancel_requested() { return Err(OAuthDiscoveryError::Cancelled.into()); }
-                // Revocation while renewal was pending must not be reversed by
-                // installing a fresh token after the revocation decision.
-                if state.current.as_ref().is_some_and(|old| old.bearer.is_revoked()) {
-                    return Err(ClientCredentialsError::Expired);
-                }
-                state.current = Some(token);
-                state.generation = generation;
-            }
-            let token = state.current.as_ref().ok_or(ClientCredentialsError::StateUnavailable)?;
-            check_token(&token.bearer, token.expires_at)?;
-            Ok(ClientCredentialsSnapshot {
-                bearer: token.bearer.clone(), scopes: token.scopes.clone(),
-                expires_at: token.expires_at, generation: state.generation,
-            })
-        }).await
+        acquisition::credential(self, cx, cancellation).await
     }
 
     /// Executes one core operation after fresh same-token extension discovery.
