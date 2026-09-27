@@ -42157,6 +42157,27 @@ mod lib_unit_tests {
                 }
             }
 
+            // The annotated `region` is what this test exists to exercise, so
+            // the projection must be admitted rather than dropped. Derive the
+            // review from this handler's own schema: a revision hard-coded
+            // here would go stale the next time the schema is touched.
+            fn header_exposure_reviews(
+                &self,
+            ) -> Vec<fastmcp_protocol::http_headers::NonSensitiveHeaderExposure> {
+                let definition = self.definition();
+                let revision = fastmcp_protocol::http_headers::ToolSchemaRevision::of(
+                    &definition.input_schema,
+                )
+                .expect("the probe's bounded input schema has a revision");
+                vec![
+                    fastmcp_protocol::http_headers::NonSensitiveHeaderExposure::new(
+                        definition.name,
+                        revision,
+                        ["region"],
+                    ),
+                ]
+            }
+
             fn call(
                 &self,
                 _ctx: &McpContext,
