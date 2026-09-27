@@ -403,6 +403,19 @@ struct Temporary<'a> {
     renamed: bool,
 }
 
+impl Drop for SecureAtomicFile {
+    /// Releases the writer lock explicitly, not by closing the descriptor. A
+    /// `flock` belongs to the open file description, and a child that another
+    /// thread is spawning holds a duplicate of every descriptor until its exec
+    /// closes it: close-on-exec acts at exec, not at fork. Relying on close
+    /// would leave the slot locked, and a prompt reopen `Busy`, for as long as
+    /// such a child sits between fork and exec. An unlock through any
+    /// duplicate releases the description's lock.
+    fn drop(&mut self) {
+        let _ = flock(&self.lock, FlockOperation::Unlock);
+    }
+}
+
 impl Drop for Temporary<'_> {
     fn drop(&mut self) {
         if !self.renamed {
@@ -515,6 +528,38 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// `inherited` stands in for the copy a concurrently spawned child holds
+    /// between fork and exec: a duplicate of the same open file description.
+    #[test]
+    fn a_dropped_handle_releases_its_lock_despite_an_inherited_duplicate() {
+        let cx = Cx::for_testing();
+        let directory = PrivateDirectory::new();
+        let store = directory.open(&cx);
+        let inherited = store.lock.try_clone().unwrap();
+        drop(store);
+        let reopened =
+            SecureAtomicFile::open(&cx, File::open(&directory.0).unwrap(), "credential", 4096);
+        assert!(
+            reopened.is_ok(),
+            "a dropped handle's slot must reopen while a duplicate lives"
+        );
+        drop(inherited);
+    }
+
+    /// The same duplicate beside a live handle: the lock is still enforced.
+    #[test]
+    fn a_live_handle_still_refuses_a_second_opener_beside_an_inherited_duplicate() {
+        let cx = Cx::for_testing();
+        let directory = PrivateDirectory::new();
+        let store = directory.open(&cx);
+        let inherited = store.lock.try_clone().unwrap();
+        let second =
+            SecureAtomicFile::open(&cx, File::open(&directory.0).unwrap(), "credential", 4096);
+        assert!(matches!(second, Err(AtomicFileError::Busy)));
+        drop(store);
+        drop(inherited);
     }
 
     /// A directory fsync that fails after the store has validated the directory.
