@@ -21,6 +21,12 @@
 //!   either, a task-creating request is refused with "Final task creation
 //!   requires an installed ready task service".
 //!
+//! The backend owns finite execution limits independently of result retention.
+//! The in-memory defaults allow one hour per claim, 24 hours from creation,
+//! and eight claims across retries and input resumptions. Input waiting consumes
+//! the original total lifetime. Deadline failure retains the task result through
+//! its existing TTL and releases the application handoff so other work can run.
+//!
 //! The legacy `TaskManager` (Docket/SEP-1686) in this file is compiled only for
 //! tests and is not part of the shipped API.
 
@@ -1549,6 +1555,56 @@ fn validate_json_rpc_error(error: &serde_json::Value) -> McpResult<()> {
 /// dispatch-lease state. This history survives recovery and terminal
 /// transitions and is removed only when the task is reclaimed.
 pub trait FinalTaskStore: Send + Sync {
+    /// Attests finite, immutable execution limits for newly admitted tasks.
+    /// Creation must stamp the total deadline atomically using backend time.
+    /// Every claim spends one attempt and stamps a deadline no later than the
+    /// original total deadline. Renewal, restoration and input waiting must
+    /// never extend either deadline or reset the attempt count.
+    ///
+    /// A store lacking this contract is refused before public task creation.
+    fn execution_limits(&self) -> McpResult<FinalTaskExecutionLimits> {
+        Err(McpError::internal_error(
+            "Final task store does not implement bounded execution",
+        ))
+    }
+
+    /// Reads execution accounting for the exact current generation. Instants
+    /// share the authoritative clock domain of [`Self::retention_clock_now`].
+    /// All task writes and dispatch claims must independently reject an
+    /// exhausted execution budget within their atomic mutation boundary.
+    fn task_execution_budget_if_current(
+        &self,
+        _expected: &FinalTaskSnapshot,
+    ) -> McpResult<Option<FinalTaskExecutionBudget>> {
+        Err(McpError::internal_error(
+            "Final task store does not implement execution budget lookup",
+        ))
+    }
+
+    /// Atomically retires an exhausted live task as `failed`, retaining its
+    /// deterministic error and matching notification through its original
+    /// retention deadline. Returns the committed snapshot only when this
+    /// exact generation won retirement. A live budget or lost comparison
+    /// returns `None` without mutation. Mandatory retirement capacity must be
+    /// reserved at admission; a late completion cannot consume that capacity.
+    fn expire_task_execution_if_current(
+        &self,
+        _expected: &FinalTaskSnapshot,
+    ) -> McpResult<Option<FinalTaskSnapshot>> {
+        Err(McpError::internal_error(
+            "Final task store does not implement execution expiry",
+        ))
+    }
+
+    /// Returns one exhausted task, including queued work and `input_required`
+    /// tasks without a worker claim. The service calls this independently of
+    /// work recovery so input waiting cannot suspend total execution time.
+    fn next_expired_execution_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
+        Err(McpError::internal_error(
+            "Final task store does not implement execution expiry recovery",
+        ))
+    }
+
     /// Durably records a newly created task and its status notification.
     fn create_task(
         &self,
@@ -1772,6 +1828,8 @@ pub trait FinalTaskStore: Send + Sync {
 
     /// Cursor-based initial-work recovery. Implementations must continue
     /// after `after_task_id` and wrap to the beginning when necessary.
+    /// Execution-exhausted records must be excluded; they are retired by the
+    /// independent execution-expiry scan and must not starve live work.
     fn next_initial_work_snapshot_after(
         &self,
         _after_task_id: Option<&FinalTaskId>,
@@ -1886,6 +1944,8 @@ pub trait FinalTaskStore: Send + Sync {
 
     /// Cursor-based accepted-input recovery. Implementations must continue
     /// after `after_task_id` and wrap to the beginning when necessary.
+    /// Exclude execution-exhausted records just as initial-work recovery does;
+    /// the separate expiry scan owns their deterministic terminal transition.
     fn next_accepted_input_snapshot_after(
         &self,
         _after_task_id: Option<&FinalTaskId>,
@@ -2086,6 +2146,104 @@ pub enum FinalTaskRetentionDeadline {
     Unlimited,
 }
 
+/// Finite backend-owned execution policy, independent of result retention.
+/// Defaults are one hour per attempt, 24 hours total and eight claims. Hard
+/// ceilings are 24 hours per attempt, 30 days total and 64 claims. A retry or
+/// resumed input cycle spends another claim; a failed compare-and-swap does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FinalTaskExecutionLimits {
+    total_runtime: StdDuration,
+    attempt_runtime: StdDuration,
+    max_attempts: u32,
+}
+
+impl FinalTaskExecutionLimits {
+    /// Validates finite positive limits against the library's hard ceilings.
+    pub fn new(
+        total_runtime: StdDuration,
+        attempt_runtime: StdDuration,
+        max_attempts: u32,
+    ) -> McpResult<Self> {
+        if total_runtime.is_zero()
+            || total_runtime > StdDuration::from_secs(30 * 24 * 60 * 60)
+            || attempt_runtime.is_zero()
+            || attempt_runtime > StdDuration::from_secs(24 * 60 * 60)
+            || !(1..=64).contains(&max_attempts)
+        {
+            return Err(McpError::invalid_params(
+                "Task execution limits require positive total <= 30 days, attempt <= 24 hours, and attempts <= 64",
+            ));
+        }
+        Ok(Self { total_runtime, attempt_runtime, max_attempts })
+    }
+
+    /// Total lifetime from the backend's atomic creation boundary.
+    #[must_use]
+    pub const fn total_runtime(self) -> StdDuration { self.total_runtime }
+
+    /// Maximum time from each successful claim, including dispatch scheduling.
+    #[must_use]
+    pub const fn attempt_runtime(self) -> StdDuration { self.attempt_runtime }
+
+    /// Maximum number of successfully admitted initial and resumed claims.
+    #[must_use]
+    pub const fn max_attempts(self) -> u32 { self.max_attempts }
+}
+
+impl Default for FinalTaskExecutionLimits {
+    fn default() -> Self {
+        Self {
+            total_runtime: StdDuration::from_secs(24 * 60 * 60),
+            attempt_runtime: StdDuration::from_secs(60 * 60),
+            max_attempts: 8,
+        }
+    }
+}
+
+/// Backend execution accounting for one task generation. This is private
+/// service metadata and is never added to the MCP Task wire representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FinalTaskExecutionBudget {
+    total_deadline: Instant,
+    attempt_deadline: Option<Instant>,
+    attempts: u32,
+    limits: FinalTaskExecutionLimits,
+}
+
+impl FinalTaskExecutionBudget {
+    /// Builds an attestation in the backend's authoritative monotonic domain.
+    pub fn new(
+        total_deadline: Instant,
+        attempt_deadline: Option<Instant>,
+        attempts: u32,
+        limits: FinalTaskExecutionLimits,
+    ) -> McpResult<Self> {
+        if attempts > limits.max_attempts
+            || attempt_deadline.is_some_and(|deadline| deadline > total_deadline)
+            || (attempts == 0 && attempt_deadline.is_some())
+        {
+            return Err(McpError::internal_error("Invalid final task execution accounting"));
+        }
+        Ok(Self { total_deadline, attempt_deadline, attempts, limits })
+    }
+
+    /// Original creation-time deadline, unchanged across every input cycle.
+    #[must_use]
+    pub const fn total_deadline(self) -> Instant { self.total_deadline }
+
+    /// Active claim deadline, absent while queued or waiting for input.
+    #[must_use]
+    pub const fn attempt_deadline(self) -> Option<Instant> { self.attempt_deadline }
+
+    /// Claims already spent, including abandoned or restored attempts.
+    #[must_use]
+    pub const fn attempts(self) -> u32 { self.attempts }
+
+    /// The immutable limits retained at task creation.
+    #[must_use]
+    pub const fn limits(self) -> FinalTaskExecutionLimits { self.limits }
+}
+
 /// One final task plus the opaque monotonic generation assigned by its store.
 ///
 /// A generation changes on every accepted task-state or cancellation-intent
@@ -2176,9 +2334,10 @@ const MAX_FINAL_TASK_APPLICATION_BYTES: usize = 10 * 1_024 * 1_024;
 // A final timestamp has 20..=35 ASCII bytes. Cancelling `working` adds two
 // status bytes and may grow lastUpdatedAt by fifteen; reserve both task and
 // notification copies so mandatory cancellation never competes with new work.
+// Each copy also reserves 256 bytes for a fixed execution-limit error envelope.
 const FINAL_TASK_CANCELLATION_METADATA_RESERVE_BYTES: usize = 2 + 15;
 const FINAL_TASK_CANCELLATION_RESERVE_BYTES: usize =
-    2 * FINAL_TASK_CANCELLATION_METADATA_RESERVE_BYTES;
+    2 * (FINAL_TASK_CANCELLATION_METADATA_RESERVE_BYTES + 256);
 
 /// Bounded process-local [`FinalTaskStore`] for embeddings and development.
 ///
@@ -2199,14 +2358,16 @@ const FINAL_TASK_CANCELLATION_RESERVE_BYTES: usize =
 /// admit at most 256 KiB of descriptor, 1 MiB of combined outstanding and
 /// accepted input, 8 MiB of result/error, and 1 MiB of task metadata; the task,
 /// permanent descriptor, and accepted input together must fit 10 MiB.
-/// Each live task also reserves 34 bytes within that capacity for mandatory
-/// cancellation retirement; unrelated writes cannot consume this reserve.
+/// Each live task also reserves 546 bytes within that capacity for mandatory
+/// cancellation or execution-limit retirement; unrelated writes cannot consume
+/// this reserve. Fixed execution errors fit within the reserved space.
 /// Live task metadata leaves 17 bytes unused within its 1 MiB member ceiling
 /// for the same status/timestamp transition.
 /// These are encoded payload bounds, not decoded heap, active application
 /// memory, framework-wide memory, or persistent-storage guarantees.
 pub struct InMemoryFinalTaskStore {
     max_tasks: usize,
+    execution_limits: FinalTaskExecutionLimits,
     clock: Arc<dyn Fn() -> Instant + Send + Sync>,
     state: Mutex<InMemoryFinalTaskState>,
 }
@@ -2226,6 +2387,7 @@ struct InMemoryFinalTaskState {
     cancellation_requests: BTreeSet<FinalTaskId>,
     latest_notifications: BTreeMap<FinalTaskId, FinalTaskStatusNotification>,
     expires_at: BTreeMap<FinalTaskId, Instant>,
+    execution_budgets: BTreeMap<FinalTaskId, FinalTaskExecutionBudget>,
     payload_accounting: InMemoryFinalTaskPayloadAccounting,
 }
 
@@ -2579,7 +2741,7 @@ impl InMemoryFinalTaskStore {
     /// Creates a store with explicit task-count and encoded-payload capacities.
     /// Payload capacity must be positive and at most 512 MiB. A smaller value
     /// does not evict retained tasks; it rejects expanding writes atomically.
-    /// The capacity includes 34 bytes of cancellation headroom per live task.
+    /// The capacity includes mandatory terminal-transition headroom per live task.
     pub fn with_payload_capacity(max_tasks: usize, max_payload_bytes: usize) -> McpResult<Self> {
         Self::with_clock_and_payload_capacity(max_tasks, max_payload_bytes, Arc::new(Instant::now))
     }
@@ -2601,6 +2763,36 @@ impl InMemoryFinalTaskStore {
         max_payload_bytes: usize,
         clock: Arc<dyn Fn() -> Instant + Send + Sync>,
     ) -> McpResult<Self> {
+        Self::with_clock_payload_and_execution_limits(
+            max_tasks,
+            max_payload_bytes,
+            FinalTaskExecutionLimits::default(),
+            clock,
+        )
+    }
+
+    /// Creates a store with an immutable finite execution policy.
+    pub fn with_execution_limits(
+        max_tasks: usize,
+        execution_limits: FinalTaskExecutionLimits,
+    ) -> McpResult<Self> {
+        Self::with_clock_payload_and_execution_limits(
+            max_tasks,
+            Self::DEFAULT_MAX_PAYLOAD_BYTES,
+            execution_limits,
+            Arc::new(Instant::now),
+        )
+    }
+
+    /// Creates a store with explicit payload capacity, execution limits and
+    /// backend monotonic clock. The bounded, non-reentrant clock is sampled
+    /// under the state lock; timestamps never determine execution authority.
+    pub fn with_clock_payload_and_execution_limits(
+        max_tasks: usize,
+        max_payload_bytes: usize,
+        execution_limits: FinalTaskExecutionLimits,
+        clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+    ) -> McpResult<Self> {
         if max_tasks == 0 {
             return Err(McpError::invalid_params(
                 "In-memory final task store capacity must be positive",
@@ -2613,6 +2805,7 @@ impl InMemoryFinalTaskStore {
         }
         Ok(Self {
             max_tasks,
+            execution_limits,
             clock,
             state: Mutex::new(InMemoryFinalTaskState {
                 payload_accounting: InMemoryFinalTaskPayloadAccounting {
@@ -2695,13 +2888,14 @@ impl InMemoryFinalTaskStore {
                 "Initial application work requires a working final task",
             ));
         }
-        let now = (self.clock)();
         validate_final_task_runtime_durations(&task)?;
-        let expires_at = in_memory_final_task_expiry(&task, now)?;
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = (self.clock)();
+        let expires_at = in_memory_final_task_expiry(&task, now)?;
+        let execution_budget = new_in_memory_final_task_execution_budget(self.execution_limits, now)?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.tasks.contains_key(&task_id) {
             return Err(McpError::invalid_params("Task already exists"));
@@ -2729,6 +2923,7 @@ impl InMemoryFinalTaskStore {
             .insert(task_id.clone(), notification);
         state.tasks.insert(task_id.clone(), task);
         state.generations.insert(task_id.clone(), generation);
+        state.execution_budgets.insert(task_id.clone(), execution_budget);
         state
             .work_descriptors
             .insert(task_id.clone(), work_descriptor.clone());
@@ -2753,6 +2948,70 @@ impl Default for InMemoryFinalTaskStore {
 }
 
 impl FinalTaskStore for InMemoryFinalTaskStore {
+    fn execution_limits(&self) -> McpResult<FinalTaskExecutionLimits> {
+        Ok(self.execution_limits)
+    }
+
+    fn task_execution_budget_if_current(
+        &self,
+        expected: &FinalTaskSnapshot,
+    ) -> McpResult<Option<FinalTaskExecutionBudget>> {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        reclaim_expired_in_memory_final_tasks(&mut state, (self.clock)());
+        let task_id = &expected.task().base().task_id;
+        if state.generations.get(task_id) != Some(&expected.generation()) {
+            return Ok(None);
+        }
+        state.execution_budgets.get(task_id).copied().map(Some).ok_or_else(|| {
+            McpError::internal_error("In-memory final task is missing execution accounting")
+        })
+    }
+
+    fn expire_task_execution_if_current(
+        &self,
+        expected: &FinalTaskSnapshot,
+    ) -> McpResult<Option<FinalTaskSnapshot>> {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = (self.clock)();
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
+        let task_id = &expected.task().base().task_id;
+        if state.generations.get(task_id) != Some(&expected.generation()) {
+            return Ok(None);
+        }
+        let Some(reason) = in_memory_final_task_execution_exhaustion(&state, task_id, now) else {
+            return Ok(None);
+        };
+        let retained = state.tasks.get(task_id).ok_or_else(|| {
+            McpError::internal_error("In-memory final task is missing its retained task")
+        })?;
+        let task = FinalTask::Failed {
+            base: transition_terminal_final_task_base(
+                retained.base().clone(), FinalTaskStatus::Failed, None,
+            )?,
+            error: FinalTaskError {
+                code: (-32000).into(),
+                message: reason.to_owned(),
+                data: None,
+                additional: BTreeMap::new(),
+            },
+        };
+        replace_in_memory_final_task(
+            &mut state, task.clone(), final_task_notification(&task), now,
+            InMemoryFinalTaskInputMutation::ExecutionExpiry,
+        )?;
+        committed_in_memory_final_task_snapshot(&state, task_id).map(Some)
+    }
+
+    fn next_expired_execution_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = (self.clock)();
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
+        let Some(task_id) = state.tasks.keys().find(|task_id| {
+            in_memory_final_task_execution_exhaustion(&state, task_id, now).is_some()
+        }) else { return Ok(None); };
+        committed_in_memory_final_task_snapshot(&state, task_id).map(Some)
+    }
+
     fn create_task(
         &self,
         task: FinalTask,
@@ -2761,13 +3020,14 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         let task_id = task.base().task_id.clone();
         validate_final_task_storage_shape(&task)?;
         ensure_final_task_notification_matches_task(&task, &notification)?;
-        let now = (self.clock)();
         validate_final_task_runtime_durations(&task)?;
-        let expires_at = in_memory_final_task_expiry(&task, now)?;
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = (self.clock)();
+        let expires_at = in_memory_final_task_expiry(&task, now)?;
+        let execution_budget = new_in_memory_final_task_execution_budget(self.execution_limits, now)?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.tasks.contains_key(&task_id) {
             return Err(McpError::invalid_params("Task already exists"));
@@ -2799,6 +3059,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .insert(task_id.clone(), notification);
         state.tasks.insert(task_id.clone(), task);
         state.generations.insert(task_id.clone(), generation);
+        state.execution_budgets.insert(task_id.clone(), execution_budget);
         if let Some(expires_at) = expires_at {
             state.expires_at.insert(task_id, expires_at);
         }
@@ -3090,6 +3351,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
                 .is_some_and(|task| matches!(task, FinalTask::Working(_)))
             || state.cancellation_requests.contains(task_id)
             || state.handoff_leases.contains_key(task_id)
+            || in_memory_final_task_execution_exhaustion(&state, task_id, now).is_some()
         {
             return Ok(None);
         }
@@ -3171,6 +3433,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
                 matches!(state.tasks.get(task_id), Some(FinalTask::Working(_)))
                     && !state.cancellation_requests.contains(task_id)
                     && !state.handoff_leases.contains_key(task_id)
+                    && in_memory_final_task_execution_exhaustion(&state, task_id, now).is_none()
             },
         ) else {
             return Ok(None);
@@ -3239,6 +3502,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
                 .is_some_and(|task| matches!(task, FinalTask::Working(_)))
             || state.cancellation_requests.contains(task_id)
             || state.handoff_leases.contains_key(task_id)
+            || in_memory_final_task_execution_exhaustion(&state, task_id, now).is_some()
         {
             return Ok(None);
         }
@@ -3295,7 +3559,9 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
                     .recovery_expires_at
                     .is_some_and(|expires_at| expires_at > now)
         });
-        if !owns_matching_lease {
+        if !owns_matching_lease
+            || in_memory_final_task_execution_exhaustion(&state, task_id, now).is_some()
+        {
             return Ok(false);
         }
         // Preserve the elected fence for the runner's automatic cancellation
@@ -3315,6 +3581,9 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         // the retained payload before releasing it: a rejected substitution
         // must not let another runner start the still-owned operation.
         state.handoff_leases.remove(task_id);
+        if let Some(budget) = state.execution_budgets.get_mut(task_id) {
+            budget.attempt_deadline = None;
+        }
         Ok(true)
     }
 
@@ -3336,6 +3605,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
                 matches!(state.tasks.get(task_id), Some(FinalTask::Working(_)))
                     && !state.cancellation_requests.contains(task_id)
                     && !state.handoff_leases.contains_key(task_id)
+                    && in_memory_final_task_execution_exhaustion(&state, task_id, now).is_none()
             },
         ) else {
             return Ok(None);
@@ -3398,7 +3668,9 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
                     .recovery_expires_at
                     .is_some_and(|expires_at| expires_at > now)
         });
-        if !owns_matching_lease {
+        if !owns_matching_lease
+            || in_memory_final_task_execution_exhaustion(&state, task_id, now).is_some()
+        {
             return Ok(false);
         }
         // See the initial-work restoration path above. A cancellation winner
@@ -3418,6 +3690,9 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         // post-release result. A mismatched response leaves the owner and its
         // dispatch fence live for a matching retry or terminal transition.
         state.handoff_leases.remove(task_id);
+        if let Some(budget) = state.execution_budgets.get_mut(task_id) {
+            budget.attempt_deadline = None;
+        }
         Ok(true)
     }
 
@@ -3454,6 +3729,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
                 .get(task_id)
                 .is_some_and(|task| matches!(task, FinalTask::Working(_)))
             || state.cancellation_requests.contains(task_id)
+            || in_memory_final_task_execution_exhaustion(&state, task_id, now).is_some()
             || !state.handoff_leases.get(task_id).is_some_and(|lease| {
                 lease.generation == generation
                     && !lease.dispatch_elected
@@ -3492,6 +3768,9 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = (self.clock)();
         reclaim_expired_in_memory_final_tasks(&mut state, now);
+        if in_memory_final_task_execution_exhaustion(&state, task_id, now).is_some() {
+            return Ok(false);
+        }
         let renewed_expires_at = in_memory_final_task_handoff_lease_expiry(now)?;
         let Some(lease) = state.handoff_leases.get(task_id) else {
             return Ok(false);
@@ -3545,6 +3824,9 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = (self.clock)();
         reclaim_expired_in_memory_final_tasks(&mut state, now);
+        if in_memory_final_task_execution_exhaustion(&state, task_id, now).is_some() {
+            return Ok(false);
+        }
         let Some(lease) = state.handoff_leases.get(task_id) else {
             return Ok(false);
         };
@@ -3573,6 +3855,9 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             && !state.cancellation_requests.contains(task_id);
         let kind = lease.kind;
         state.handoff_leases.remove(task_id);
+        if let Some(budget) = state.execution_budgets.get_mut(task_id) {
+            budget.attempt_deadline = None;
+        }
         if still_dispatchable {
             match kind {
                 InMemoryFinalTaskHandoffKind::Initial => {
@@ -3598,6 +3883,9 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         if !state.tasks.contains_key(task_id) {
             return Err(McpError::invalid_params("Task not found"));
         }
+        if let Some(reason) = in_memory_final_task_execution_exhaustion(&state, task_id, now) {
+            return Err(McpError::invalid_params(reason));
+        }
         record_in_memory_final_task_cancellation(&mut state, task_id)?;
         Ok(())
     }
@@ -3611,6 +3899,9 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         let now = (self.clock)();
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(task_id) != Some(&expected.generation()) {
+            return Ok(false);
+        }
+        if in_memory_final_task_execution_exhaustion(&state, task_id, now).is_some() {
             return Ok(false);
         }
         record_in_memory_final_task_cancellation(&mut state, task_id)?;
@@ -3644,6 +3935,9 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         let now = (self.clock)();
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(task_id) != Some(&expected.generation()) {
+            return Ok(None);
+        }
+        if in_memory_final_task_execution_exhaustion(&state, task_id, now).is_some() {
             return Ok(None);
         }
         let dispatch_elected = state.handoff_leases.get(task_id).is_some_and(|lease| {
@@ -4009,6 +4303,7 @@ fn record_in_memory_final_task_cancellation(
 
 enum InMemoryFinalTaskInputMutation {
     Clear,
+    ExecutionExpiry,
     Append(FinalTaskInputResponses),
 }
 
@@ -4016,10 +4311,15 @@ fn replace_in_memory_final_task(
     state: &mut InMemoryFinalTaskState,
     task: FinalTask,
     notification: FinalTaskStatusNotification,
-    _now: Instant,
+    now: Instant,
     input_mutation: InMemoryFinalTaskInputMutation,
 ) -> McpResult<()> {
     let task_id = task.base().task_id.clone();
+    if !matches!(input_mutation, InMemoryFinalTaskInputMutation::ExecutionExpiry)
+        && let Some(reason) = in_memory_final_task_execution_exhaustion(state, &task_id, now)
+    {
+        return Err(McpError::invalid_params(reason));
+    }
     let current = state
         .tasks
         .get(&task_id)
@@ -4031,7 +4331,7 @@ fn replace_in_memory_final_task(
         &task,
     )?;
     let accepted_input_bytes = match &input_mutation {
-        InMemoryFinalTaskInputMutation::Clear => 0,
+        InMemoryFinalTaskInputMutation::Clear | InMemoryFinalTaskInputMutation::ExecutionExpiry => 0,
         InMemoryFinalTaskInputMutation::Append(input_responses) => {
             let current_inputs = state.accepted_inputs.get(&task_id);
             if input_responses.is_empty() && current_inputs.is_none() {
@@ -4077,11 +4377,14 @@ fn replace_in_memory_final_task(
     state.tasks.insert(task_id.clone(), task);
     state.generations.insert(task_id.clone(), generation);
     state.handoff_leases.remove(&task_id);
+    if let Some(budget) = state.execution_budgets.get_mut(&task_id) {
+        budget.attempt_deadline = None;
+    }
     if !working {
         state.initial_work.remove(&task_id);
     }
     match input_mutation {
-        InMemoryFinalTaskInputMutation::Clear => {
+        InMemoryFinalTaskInputMutation::Clear | InMemoryFinalTaskInputMutation::ExecutionExpiry => {
             state.accepted_inputs.remove(&task_id);
         }
         InMemoryFinalTaskInputMutation::Append(input_responses) => {
@@ -4116,6 +4419,12 @@ fn reclaim_expired_in_memory_final_tasks(state: &mut InMemoryFinalTaskState, now
         .map(|(task_id, _)| task_id.clone())
         .collect::<Vec<_>>();
     for task_id in expired_handoff_task_ids {
+        // An execution timeout is a terminal outcome, not a retryable lease
+        // loss. Preserve its generation until explicit expiry reconciliation
+        // commits the failure and can publish that exact notification.
+        if in_memory_final_task_execution_exhaustion(state, &task_id, now).is_some() {
+            continue;
+        }
         let Some(lease_generation) = state
             .handoff_leases
             .get(&task_id)
@@ -4148,6 +4457,9 @@ fn reclaim_expired_in_memory_final_tasks(state: &mut InMemoryFinalTaskState, now
             // drop from the old worker could release a newer worker's lease.
             if let Ok(generation) = next_in_memory_final_task_generation(state) {
                 state.handoff_leases.remove(&task_id);
+                if let Some(budget) = state.execution_budgets.get_mut(&task_id) {
+                    budget.attempt_deadline = None;
+                }
                 state.generations.insert(task_id, generation);
             }
         } else {
@@ -4163,6 +4475,7 @@ fn reclaim_expired_in_memory_final_tasks(state: &mut InMemoryFinalTaskState, now
     for task_id in expired_task_ids {
         state.payload_accounting.release_task(&task_id);
         state.expires_at.remove(&task_id);
+        state.execution_budgets.remove(&task_id);
         state.tasks.remove(&task_id);
         state.authenticated_principals.remove(&task_id);
         state.generations.remove(&task_id);
@@ -4213,7 +4526,31 @@ fn insert_in_memory_final_task_handoff_lease(
     owner_id: &str,
     now: Instant,
 ) -> McpResult<()> {
+    if let Some(reason) = in_memory_final_task_execution_exhaustion(state, &task_id, now) {
+        return Err(McpError::invalid_params(reason));
+    }
     let expires_at = in_memory_final_task_handoff_lease_expiry(now)?;
+    let budget = state.execution_budgets.get(&task_id).ok_or_else(|| {
+        McpError::internal_error("In-memory final task is missing execution accounting")
+    })?;
+    let attempts = budget.attempts.checked_add(1).filter(|attempts| {
+        *attempts <= budget.limits.max_attempts
+    }).ok_or_else(|| McpError::invalid_params(FINAL_TASK_ATTEMPTS_EXHAUSTED))?;
+    let attempt_deadline = now.checked_add(budget.limits.attempt_runtime)
+        .ok_or_else(|| McpError::internal_error("Task attempt exceeds process-local clock range"))?
+        .min(budget.total_deadline);
+    if state.handoff_leases.contains_key(&task_id) {
+        return Err(McpError::internal_error(
+            "In-memory final task store overwrote a live handoff lease",
+        ));
+    }
+    // Every checked admission above precedes both the attempt charge and the
+    // claim write, so a refused claim spends neither an attempt nor authority.
+    let budget = state.execution_budgets.get_mut(&task_id).ok_or_else(|| {
+        McpError::internal_error("In-memory final task is missing execution accounting")
+    })?;
+    budget.attempts = attempts;
+    budget.attempt_deadline = Some(attempt_deadline);
     if state
         .handoff_leases
         .insert(
@@ -4234,6 +4571,46 @@ fn insert_in_memory_final_task_handoff_lease(
         ));
     }
     Ok(())
+}
+
+const FINAL_TASK_TOTAL_DEADLINE_EXCEEDED: &str = "Task total execution deadline exceeded";
+const FINAL_TASK_ATTEMPT_DEADLINE_EXCEEDED: &str = "Task attempt execution deadline exceeded";
+const FINAL_TASK_ATTEMPTS_EXHAUSTED: &str = "Task execution attempt limit exceeded";
+
+fn new_in_memory_final_task_execution_budget(
+    limits: FinalTaskExecutionLimits,
+    now: Instant,
+) -> McpResult<FinalTaskExecutionBudget> {
+    let total_deadline = now.checked_add(limits.total_runtime).ok_or_else(|| {
+        McpError::internal_error("Task total execution exceeds process-local clock range")
+    })?;
+    FinalTaskExecutionBudget::new(total_deadline, None, 0, limits)
+}
+
+fn in_memory_final_task_execution_exhaustion(
+    state: &InMemoryFinalTaskState,
+    task_id: &FinalTaskId,
+    now: Instant,
+) -> Option<&'static str> {
+    let task = state.tasks.get(task_id)?;
+    if !matches!(task, FinalTask::Working(_) | FinalTask::InputRequired { .. }) {
+        return None;
+    }
+    let budget = state.execution_budgets.get(task_id)?;
+    if now >= budget.total_deadline {
+        return Some(FINAL_TASK_TOTAL_DEADLINE_EXCEEDED);
+    }
+    if budget.attempt_deadline.is_some_and(|deadline| now >= deadline) {
+        return Some(FINAL_TASK_ATTEMPT_DEADLINE_EXCEEDED);
+    }
+    if budget.attempts == budget.limits.max_attempts
+        && !state.handoff_leases.contains_key(task_id)
+        && matches!(task, FinalTask::Working(_))
+        && (state.initial_work.contains_key(task_id) || state.accepted_inputs.contains_key(task_id))
+    {
+        return Some(FINAL_TASK_ATTEMPTS_EXHAUSTED);
+    }
+    None
 }
 
 fn in_memory_final_task_handoff_lease_expiry(now: Instant) -> McpResult<Instant> {
@@ -4360,6 +4737,7 @@ struct FinalTaskHandoffAuthority {
     owner_id: String,
     dispatch_fence: u64,
     transition_committed: Arc<AtomicBool>,
+    execution_budget: FinalTaskExecutionBudget,
 }
 
 impl std::fmt::Debug for FinalTaskHandoffAuthority {
@@ -4675,6 +5053,19 @@ pub enum FinalTaskSupervisorHandoff {
 }
 
 impl FinalTaskSupervisorHandoff {
+    /// Returns the store-issued execution accounting for this exact attempt.
+    /// The claim number is stable for this invocation and increases across
+    /// retries and input resumptions. The total deadline never restarts.
+    /// These instants belong to the backend's monotonic clock domain; they
+    /// are not wall timestamps or a replacement for the supplied `Cx` clock.
+    pub fn execution_budget(&self) -> McpResult<FinalTaskExecutionBudget> {
+        let authority = match self {
+            Self::Initial(initial) => initial.authority()?,
+            Self::Resumed(accepted) => accepted.authority()?,
+        };
+        Ok(authority.execution_budget)
+    }
+
     fn attach_authority(&mut self, authority: FinalTaskHandoffAuthority) {
         match self {
             Self::Initial(initial) => initial.attach_authority(authority),
@@ -4696,7 +5087,8 @@ pub trait FinalTaskRetentionAuthority: Send + Sync {
     fn authorize_unlimited_retention(&self) -> McpResult<()>;
 }
 
-/// Immutable final Tasks timing policy supplied with the durable store.
+/// Immutable final Tasks retention and polling policy. Execution limits are
+/// owned separately by the backend and cannot be widened by rebinding a runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FinalTaskRuntimeConfig {
     ttl_ms: Option<u64>,
@@ -5208,22 +5600,40 @@ impl FinalTaskRuntime {
 
     /// Service-only accepted-input recovery with a cancellation checkpoint
     /// directly before every durable handoff claim.
-    fn recover_accepted_input_with_checkpoints(
+    fn recover_accepted_input_excluding(
         &self,
         cx: &Cx,
         owner_id: &str,
-        after_task_id: Option<&FinalTaskId>,
+        recovery_cursor: &mut Option<FinalTaskId>,
+        excluded_task_ids: &BTreeSet<FinalTaskId>,
     ) -> McpResult<Option<FinalTaskAcceptedInput>> {
-        for _ in 0..MAX_FINAL_TASK_RECOVERY_CAS_RETRIES {
+        let mut skipped = BTreeSet::new();
+        let mut lost_comparisons = 0;
+        let mut work_steps = 0;
+        for _ in 0..MAX_FINAL_TASK_RECOVERY_CAS_RETRIES + excluded_task_ids.len() {
             cx.checkpoint()
                 .map_err(|error| McpError::internal_error(error.to_string()))?;
             let Some(candidate) = self
                 .store
-                .next_accepted_input_snapshot_after(after_task_id)?
+                .next_accepted_input_snapshot_after(recovery_cursor.as_ref())?
             else {
                 return Ok(None);
             };
             let candidate = self.validate_loaded_task_snapshot(candidate, None)?;
+            let task_id = candidate.task().base().task_id.clone();
+            if excluded_task_ids.contains(&task_id) {
+                if !skipped.insert(task_id.clone()) {
+                    return Ok(None);
+                }
+                *recovery_cursor = Some(task_id);
+                continue;
+            }
+            work_steps += 1;
+            if self.expire_execution_snapshot(&candidate)?.is_some() {
+                *recovery_cursor = Some(task_id);
+                if work_steps == MAX_FINAL_TASK_RECOVERY_CAS_RETRIES { break; }
+                continue;
+            }
             if !matches!(candidate.task(), FinalTask::Working(_)) {
                 return Err(McpError::internal_error(
                     "Final task store returned a non-working accepted-input recovery candidate",
@@ -5235,11 +5645,19 @@ impl FinalTaskRuntime {
                 .store
                 .take_input_handoff_for_owner_if_current(&candidate, owner_id)?
             else {
+                lost_comparisons += 1;
+                if work_steps == MAX_FINAL_TASK_RECOVERY_CAS_RETRIES { break; }
                 continue;
             };
             return self
                 .validate_accepted_input_claim(&candidate, owner_id, claim)
                 .map(Some);
+        }
+        if lost_comparisons < MAX_FINAL_TASK_RECOVERY_CAS_RETRIES {
+            if let Some(task_id) = recovery_cursor.as_ref() {
+                self.signal_task_service(task_id.clone());
+            }
+            return Ok(None);
         }
         Err(McpError::internal_error(
             "Accepted-input recovery exceeded bounded lost-CAS retries",
@@ -5280,20 +5698,38 @@ impl FinalTaskRuntime {
 
     /// Service-only initial-work recovery with a cancellation checkpoint
     /// directly before every durable work claim.
-    fn recover_initial_work_with_checkpoints(
+    fn recover_initial_work_excluding(
         &self,
         cx: &Cx,
         owner_id: &str,
-        after_task_id: Option<&FinalTaskId>,
+        recovery_cursor: &mut Option<FinalTaskId>,
+        excluded_task_ids: &BTreeSet<FinalTaskId>,
     ) -> McpResult<Option<FinalTaskInitialWork>> {
-        for _ in 0..MAX_FINAL_TASK_RECOVERY_CAS_RETRIES {
+        let mut skipped = BTreeSet::new();
+        let mut lost_comparisons = 0;
+        let mut work_steps = 0;
+        for _ in 0..MAX_FINAL_TASK_RECOVERY_CAS_RETRIES + excluded_task_ids.len() {
             cx.checkpoint()
                 .map_err(|error| McpError::internal_error(error.to_string()))?;
-            let Some(candidate) = self.store.next_initial_work_snapshot_after(after_task_id)?
+            let Some(candidate) = self.store.next_initial_work_snapshot_after(recovery_cursor.as_ref())?
             else {
                 return Ok(None);
             };
             let candidate = self.validate_loaded_task_snapshot(candidate, None)?;
+            let task_id = candidate.task().base().task_id.clone();
+            if excluded_task_ids.contains(&task_id) {
+                if !skipped.insert(task_id.clone()) {
+                    return Ok(None);
+                }
+                *recovery_cursor = Some(task_id);
+                continue;
+            }
+            work_steps += 1;
+            if self.expire_execution_snapshot(&candidate)?.is_some() {
+                *recovery_cursor = Some(task_id);
+                if work_steps == MAX_FINAL_TASK_RECOVERY_CAS_RETRIES { break; }
+                continue;
+            }
             if !matches!(candidate.task(), FinalTask::Working(_)) {
                 return Err(McpError::internal_error(
                     "Final task store returned a non-working initial-work recovery candidate",
@@ -5305,15 +5741,32 @@ impl FinalTaskRuntime {
                 .store
                 .take_initial_work_handoff_for_owner_if_current(&candidate, owner_id)?
             else {
+                lost_comparisons += 1;
+                if work_steps == MAX_FINAL_TASK_RECOVERY_CAS_RETRIES { break; }
                 continue;
             };
             return self
                 .validate_initial_work_claim(&candidate, owner_id, claim)
                 .map(Some);
         }
+        if lost_comparisons < MAX_FINAL_TASK_RECOVERY_CAS_RETRIES {
+            if let Some(task_id) = recovery_cursor.as_ref() {
+                self.signal_task_service(task_id.clone());
+            }
+            return Ok(None);
+        }
         Err(McpError::internal_error(
             "Initial-work recovery exceeded bounded lost-CAS retries",
         ))
+    }
+
+    #[cfg(test)]
+    fn recover_initial_work_with_checkpoints(
+        &self, cx: &Cx, owner_id: &str, after_task_id: Option<&FinalTaskId>,
+    ) -> McpResult<Option<FinalTaskInitialWork>> {
+        self.recover_initial_work_excluding(
+            cx, owner_id, &mut after_task_id.cloned(), &BTreeSet::new(),
+        )
     }
 
     fn take_initial_work_with_checkpoint(
@@ -5924,8 +6377,51 @@ impl FinalTaskRuntime {
         let Some(snapshot) = self.store.get_task_snapshot(task_id)? else {
             return Ok(None);
         };
-        self.validate_loaded_task_snapshot(snapshot, Some(task_id))
-            .map(Some)
+        let snapshot = self.validate_loaded_task_snapshot(snapshot, Some(task_id))?;
+        Ok(Some(self.expire_execution_snapshot(&snapshot)?.unwrap_or(snapshot)))
+    }
+
+    fn expire_execution_snapshot(
+        &self,
+        expected: &FinalTaskSnapshot,
+    ) -> McpResult<Option<FinalTaskSnapshot>> {
+        if !matches!(expected.task(), FinalTask::Working(_) | FinalTask::InputRequired { .. }) {
+            return Ok(None);
+        }
+        let Some(committed) = self.store.expire_task_execution_if_current(expected)? else {
+            return Ok(None);
+        };
+        let committed = self.validate_loaded_task_snapshot(
+            committed, Some(&expected.task().base().task_id),
+        )?;
+        if !matches!(committed.task(), FinalTask::Failed { .. })
+            || committed.generation() <= expected.generation()
+            || committed.authenticated_principal() != expected.authenticated_principal()
+        {
+            return Err(McpError::internal_error(
+                "Final task store returned an invalid execution-expiry commit",
+            ));
+        }
+        validate_final_task_transition(expected.task(), committed.task())?;
+        self.emit_committed(final_task_notification(committed.task()), &committed);
+        Ok(Some(committed))
+    }
+
+    fn expire_pending_execution(&self, cx: &Cx) -> McpResult<()> {
+        for turn in 0..MAX_FINAL_TASK_RECOVERY_HANDOFFS_PER_SCAN {
+            cx.checkpoint().map_err(|error| McpError::internal_error(error.to_string()))?;
+            let Some(candidate) = self.store.next_expired_execution_snapshot()? else {
+                break;
+            };
+            let candidate = self.validate_loaded_task_snapshot(candidate, None)?;
+            self.expire_execution_snapshot(&candidate)?;
+            if turn + 1 == MAX_FINAL_TASK_RECOVERY_HANDOFFS_PER_SCAN {
+                // Finish large expiry backlogs in subsequent bounded service
+                // turns. Queued wakeups are hints; the scan remains authoritative.
+                self.signal_task_service(candidate.task().base().task_id.clone());
+            }
+        }
+        Ok(())
     }
 
     fn load_task_snapshot(&self, task_id: &FinalTaskId) -> McpResult<FinalTaskSnapshot> {
@@ -5940,13 +6436,15 @@ impl FinalTaskRuntime {
     ) -> McpResult<FinalTaskSnapshot> {
         ctx.ensure_live()?;
         let principal = task_request_principal(ctx)?;
-        let snapshot = self.load_task_snapshot(task_id)?;
+        let snapshot = self.store.get_task_snapshot(task_id)?
+            .ok_or_else(|| McpError::invalid_params("Task not found"))?;
+        let snapshot = self.validate_loaded_task_snapshot(snapshot, Some(task_id))?;
         if snapshot.authenticated_principal() != principal {
             // A foreign task and a missing task have the same public error.
             // Never inspect its state or input ledger before this comparison.
             return Err(McpError::invalid_params("Task not found"));
         }
-        Ok(snapshot)
+        Ok(self.expire_execution_snapshot(&snapshot)?.unwrap_or(snapshot))
     }
 
     pub(crate) fn notification_matches_task_owner(
@@ -6057,7 +6555,13 @@ impl FinalTaskRuntime {
     /// claim implementation cannot pass work to the application after its
     /// expected active generation has changed.
     fn validate_claim_snapshot_still_current(&self, expected: &FinalTaskSnapshot) -> McpResult<()> {
-        let current = self.load_task_snapshot(&expected.task().base().task_id)?;
+        // This read checks the claim attestation only. Deadline retirement is
+        // performed by dispatch election, where it is a normal completed
+        // handoff rather than a malformed-backend error that stops the service.
+        let task_id = &expected.task().base().task_id;
+        let current = self.store.get_task_snapshot(task_id)?
+            .ok_or_else(|| McpError::invalid_params("Task not found"))?;
+        let current = self.validate_loaded_task_snapshot(current, Some(task_id))?;
         if current.generation() != expected.generation()
             || current.authenticated_principal() != expected.authenticated_principal()
             || !final_tasks_match_exactly(current.task(), expected.task())?
@@ -6182,6 +6686,9 @@ impl FinalTaskRuntime {
         let notification = final_task_notification(&task);
         self.validate_new_task_write(&task, &notification)?;
         validate_final_task_work_descriptor(&work_descriptor)?;
+        // Check the capability before any durable creation. Existing custom
+        // stores must implement finite accounting before admitting new work.
+        self.store.execution_limits()?;
         let committed = {
             let signal = self
                 .service_signal
@@ -6227,12 +6734,16 @@ impl FinalTaskRuntime {
         };
         let notification = final_task_notification(&task);
         self.validate_task_transition_write(expected, &task, &notification)?;
-        let Some(committed) = self.store.replace_task_and_append_input_if_current(
+        let result = self.store.replace_task_and_append_input_if_current(
             expected,
             task.clone(),
             notification.clone(),
             input_responses,
-        )? else {
+        );
+        if !matches!(&result, Ok(Some(_))) {
+            self.expire_execution_snapshot(expected)?;
+        }
+        let Some(committed) = result? else {
             return Err(McpError::invalid_params(
                 "Task state changed before the transition could be recorded",
             ));
@@ -6277,7 +6788,7 @@ impl FinalTaskRuntime {
     ) -> McpResult<()> {
         let notification = final_task_notification(&task);
         self.validate_task_transition_write(expected, &task, &notification)?;
-        let Some(committed) = self
+        let result = self
             .store
             .replace_task_and_clear_input_for_handoff_if_current(
                 expected,
@@ -6286,8 +6797,14 @@ impl FinalTaskRuntime {
                 cancellation_required,
                 task.clone(),
                 notification.clone(),
-            )?
-        else {
+            );
+        // Backend time may advance inside a single application poll. The
+        // atomic store write refuses a late commit; publish the deterministic
+        // deadline failure immediately rather than waiting for another poll.
+        if !matches!(&result, Ok(Some(_))) {
+            self.expire_execution_snapshot(expected)?;
+        }
+        let Some(committed) = result? else {
             return Err(stale_final_task_handoff_error());
         };
         let committed = self.validate_committed_transition(expected, &task, committed)?;
@@ -6678,6 +7195,7 @@ impl AuthorizedTaskServiceRunner {
     pub async fn run_service(&mut self, cx: &Cx) -> McpResult<()> {
         cx.checkpoint()
             .map_err(|error| McpError::internal_error(error.to_string()))?;
+        self.runtime.store.execution_limits()?;
         // A pre-cancelled runner must never publish readiness, even briefly.
         // The returned lease remains alive across every await in this run and
         // revokes its exact generation on normal exit, cancellation, or drop.
@@ -6757,12 +7275,13 @@ impl AuthorizedTaskServiceRunner {
             if cx.checkpoint().is_err() {
                 return Ok(());
             }
+            self.runtime.expire_pending_execution(cx)?;
             let mut scanned = 0;
-            let mut deferred = BTreeSet::new();
             while active.len() < self.max_concurrent_handoffs
                 && scanned < MAX_FINAL_TASK_RECOVERY_HANDOFFS_PER_SCAN
             {
-                let (kind, handoff) = match self.next_recovery_handoff(cx) {
+                let excluded_task_ids = active.iter().map(|handoff| handoff.task_id.clone()).collect();
+                let (kind, handoff) = match self.next_recovery_handoff_excluding(cx, &excluded_task_ids) {
                     Ok(Some(recovered)) => recovered,
                     Ok(None) => break,
                     Err(_) if cx.checkpoint().is_err() => return Ok(()),
@@ -6770,21 +7289,6 @@ impl AuthorizedTaskServiceRunner {
                 };
                 scanned += 1;
                 let task_id = final_task_handoff_task_id(&handoff).clone();
-                if active.iter().any(|active| active.task_id == task_id) {
-                    // A supervisor may have committed input_required while
-                    // still finishing its asynchronous cleanup. Defer a
-                    // successor generation until that prior future settles.
-                    // Restoration keeps its accepted inputs authoritative.
-                    drop(FinalTaskExecutionGuard::new(
-                        &self.runtime,
-                        &self.dispatch_owner,
-                        &handoff,
-                    ));
-                    if !deferred.insert((kind, task_id)) {
-                        break;
-                    }
-                    continue;
-                }
                 // Construct the restoration guard before the future enters
                 // the queue, so even an unpolled claimed handoff is restored
                 // if a sibling fails or the service future is dropped.
@@ -6799,7 +7303,6 @@ impl AuthorizedTaskServiceRunner {
                 });
             }
             let scan_has_more_capacity = scanned == MAX_FINAL_TASK_RECOVERY_HANDOFFS_PER_SCAN
-                && deferred.is_empty()
                 && active.len() < self.max_concurrent_handoffs;
             let has_capacity = active.len() < self.max_concurrent_handoffs;
             let turn = {
@@ -6906,12 +7409,25 @@ impl AuthorizedTaskServiceRunner {
         &mut self,
         cx: &Cx,
     ) -> McpResult<Option<(FinalTaskRecoveryKind, FinalTaskSupervisorHandoff)>> {
+        self.next_recovery_handoff_excluding(cx, &BTreeSet::new())
+    }
+
+    fn next_recovery_handoff_excluding(
+        &mut self,
+        cx: &Cx,
+        excluded_task_ids: &BTreeSet<FinalTaskId>,
+    ) -> McpResult<Option<(FinalTaskRecoveryKind, FinalTaskSupervisorHandoff)>> {
+        self.runtime.expire_pending_execution(cx)?;
+        // These are admission scan cursors, distinct from the concurrent
+        // runner's last-polled checkpoints. Skipping cleanup-owned tasks
+        // cannot spend an attempt or advance application execution progress.
         let recovered = match self.next_recovery_kind {
             FinalTaskRecoveryKind::Initial => {
-                if let Some(handoff) = self.runtime.recover_initial_work_with_checkpoints(
+                if let Some(handoff) = self.runtime.recover_initial_work_excluding(
                     cx,
                     &self.dispatch_owner,
-                    self.initial_recovery_cursor.as_ref(),
+                    &mut self.initial_recovery_cursor,
+                    excluded_task_ids,
                 )? {
                     Some((
                         FinalTaskRecoveryKind::Initial,
@@ -6919,10 +7435,11 @@ impl AuthorizedTaskServiceRunner {
                     ))
                 } else {
                     self.runtime
-                        .recover_accepted_input_with_checkpoints(
+                        .recover_accepted_input_excluding(
                             cx,
                             &self.dispatch_owner,
-                            self.accepted_recovery_cursor.as_ref(),
+                            &mut self.accepted_recovery_cursor,
+                            excluded_task_ids,
                         )?
                         .map(|handoff| {
                             (
@@ -6933,10 +7450,11 @@ impl AuthorizedTaskServiceRunner {
                 }
             }
             FinalTaskRecoveryKind::Resumed => {
-                if let Some(handoff) = self.runtime.recover_accepted_input_with_checkpoints(
+                if let Some(handoff) = self.runtime.recover_accepted_input_excluding(
                     cx,
                     &self.dispatch_owner,
-                    self.accepted_recovery_cursor.as_ref(),
+                    &mut self.accepted_recovery_cursor,
+                    excluded_task_ids,
                 )? {
                     Some((
                         FinalTaskRecoveryKind::Resumed,
@@ -6944,10 +7462,11 @@ impl AuthorizedTaskServiceRunner {
                     ))
                 } else {
                     self.runtime
-                        .recover_initial_work_with_checkpoints(
+                        .recover_initial_work_excluding(
                             cx,
                             &self.dispatch_owner,
-                            self.initial_recovery_cursor.as_ref(),
+                            &mut self.initial_recovery_cursor,
+                            excluded_task_ids,
                         )?
                         .map(|handoff| {
                             (
@@ -7066,6 +7585,9 @@ impl FinalTaskHandoffExecutor {
             guard.disarm();
             return Ok(());
         }
+        if guard.retire_if_execution_expired()? {
+            return Ok(());
+        }
         let cancellation_wake = self
             .runtime
             .register_task_cancellation_wake(self.service_id, guard.task_id())?;
@@ -7082,6 +7604,9 @@ impl FinalTaskHandoffExecutor {
             .await
         {
             Ok(()) => {
+                if guard.retire_if_execution_expired()? {
+                    return Ok(());
+                }
                 if guard.is_authoritatively_expired() {
                     guard.disarm();
                     return Ok(());
@@ -7111,6 +7636,9 @@ impl FinalTaskHandoffExecutor {
                 Ok(())
             }
             Err(error) => {
+                if guard.retire_if_execution_expired()? {
+                    return Ok(());
+                }
                 // Returned errors restore synchronously so a recovery runner
                 // sees the exact pre-await payload. Cancellation, dropped
                 // futures, and unwinding use the same lease in `Drop`.
@@ -7140,6 +7668,9 @@ impl FinalTaskHandoffExecutor {
         // A stalled service may lose its claim even before the application
         // constructs its future. Revalidate the exact owner fence at every
         // application entry, rather than relying on a timer being polled first.
+        if guard.retire_if_execution_expired()? {
+            return Ok(());
+        }
         guard.ensure_live_dispatch_for_application()?;
         let mut supervisor = self.supervisor.resume(cx, handoff);
         loop {
@@ -7149,6 +7680,10 @@ impl FinalTaskHandoffExecutor {
             // application work and before renewing durable ownership.
             cx.checkpoint()
                 .map_err(|error| McpError::internal_error(error.to_string()))?;
+            self.runtime.expire_pending_execution(cx)?;
+            if guard.retire_if_execution_expired()? {
+                return Ok(());
+            }
             if guard.is_authoritatively_expired() {
                 guard.disarm();
                 return Ok(());
@@ -7173,6 +7708,11 @@ impl FinalTaskHandoffExecutor {
                         error.to_string(),
                     ))));
                 }
+                match guard.retire_if_execution_expired() {
+                    Ok(true) => return std::task::Poll::Ready(Some(Ok(()))),
+                    Ok(false) => {}
+                    Err(error) => return std::task::Poll::Ready(Some(Err(error))),
+                }
                 // A wake may arrive after retention elapsed while application
                 // work was pending. Retire it before giving it another poll;
                 // unlike cooperative cancellation, expiry grants no final
@@ -7193,12 +7733,22 @@ impl FinalTaskHandoffExecutor {
                 // `retire_if_cancellation_requested` below still records
                 // terminal cancellation when the supervisor declines.
                 if let std::task::Poll::Ready(result) = supervisor.as_mut().poll(task_context) {
+                    match guard.retire_if_execution_expired() {
+                        Ok(true) => return std::task::Poll::Ready(Some(Ok(()))),
+                        Ok(false) => {}
+                        Err(error) => return std::task::Poll::Ready(Some(Err(error))),
+                    }
                     // A completed application result is authoritative. The
                     // sanctioned wind-down idiom cancels the service region
                     // and then returns success; observing that cancellation
                     // here would overwrite the success and restore a durable
                     // handoff the application already consumed.
                     return std::task::Poll::Ready(Some(result));
+                }
+                match guard.retire_if_execution_expired() {
+                    Ok(true) => return std::task::Poll::Ready(Some(Ok(()))),
+                    Ok(false) => {}
+                    Err(error) => return std::task::Poll::Ready(Some(Err(error))),
                 }
                 if guard.is_authoritatively_expired() {
                     return std::task::Poll::Ready(None);
@@ -7227,6 +7777,9 @@ impl FinalTaskHandoffExecutor {
             })
             .await;
             let Some(result) = completed else {
+                if guard.retire_if_execution_expired()? {
+                    return Ok(());
+                }
                 cx.checkpoint()
                     .map_err(|error| McpError::internal_error(error.to_string()))?;
                 if guard.is_authoritatively_expired() {
@@ -7237,6 +7790,9 @@ impl FinalTaskHandoffExecutor {
                     return Ok(());
                 }
                 if !guard.renew()? {
+                    if guard.retire_if_execution_expired()? {
+                        return Ok(());
+                    }
                     if guard.is_authoritatively_expired() {
                         guard.disarm();
                         return Ok(());
@@ -7586,6 +8142,7 @@ struct FinalTaskExecutionGuard {
     dispatch_fence: Option<u64>,
     transition_committed: Arc<AtomicBool>,
     retention_deadline: Option<FinalTaskRetentionDeadline>,
+    execution_budget: Option<FinalTaskExecutionBudget>,
     restoration: Option<FinalTaskHandoffRestoration>,
 }
 
@@ -7615,11 +8172,27 @@ impl FinalTaskExecutionGuard {
             dispatch_fence: None,
             transition_committed: Arc::new(AtomicBool::new(false)),
             retention_deadline: None,
+            execution_budget: None,
             restoration: Some(restoration),
         }
     }
 
     fn elect(&mut self) -> McpResult<bool> {
+        let Some(current) = self.runtime.load_optional_task_snapshot(&self.task_id)? else {
+            return Ok(false);
+        };
+        if current.generation() != self.generation {
+            return Ok(false);
+        }
+        let Some(budget) = self.runtime.store.task_execution_budget_if_current(&current)? else {
+            return Ok(false);
+        };
+        if budget.attempt_deadline.is_none() || budget.attempts == 0 {
+            return Err(McpError::internal_error(
+                "Final task store did not bound the claimed execution attempt",
+            ));
+        }
+        self.execution_budget = Some(budget);
         let Some(deadline) = self
             .runtime
             .task_retention_deadline(&self.task_id, self.generation)?
@@ -7639,6 +8212,22 @@ impl FinalTaskExecutionGuard {
 
     fn task_id(&self) -> &FinalTaskId {
         &self.task_id
+    }
+
+    /// An attempt's finite bound also limits asynchronous cleanup after its
+    /// own committed transition. Only the current store generation may be
+    /// failed; a cached old attempt never authorizes overwriting a successor.
+    fn retire_if_execution_expired(&mut self) -> McpResult<bool> {
+        let Some(budget) = self.execution_budget else { return Ok(false); };
+        let deadline = budget.attempt_deadline.unwrap_or(budget.total_deadline);
+        if self.runtime.retention_clock_now() < deadline {
+            return Ok(false);
+        }
+        // Loading reconciles the current record under the backend's own
+        // generation/deadline predicates. Completed outcomes remain retained.
+        let _ = self.runtime.load_optional_task_snapshot(&self.task_id)?;
+        self.disarm();
+        Ok(true)
     }
 
     fn is_authoritatively_expired(&self) -> bool {
@@ -7728,7 +8317,13 @@ impl FinalTaskExecutionGuard {
     }
 
     fn bounded_heartbeat_interval(&self) -> McpResult<StdDuration> {
-        let base_interval = self.heartbeat_interval()?;
+        let mut base_interval = self.heartbeat_interval()?.min(FINAL_TASK_RECOVERY_WAKE_INTERVAL);
+        if let Some(budget) = self.execution_budget {
+            let deadline = budget.attempt_deadline.unwrap_or(budget.total_deadline);
+            base_interval = base_interval.min(
+                deadline.saturating_duration_since(self.runtime.retention_clock_now()),
+            );
+        }
         if let Some(FinalTaskRetentionDeadline::Finite(deadline)) = self.retention_deadline {
             let store_now = self.runtime.retention_clock_now();
             if store_now >= deadline {
@@ -7775,6 +8370,9 @@ impl FinalTaskExecutionGuard {
             owner_id: self.owner_id.clone(),
             dispatch_fence,
             transition_committed: Arc::clone(&self.transition_committed),
+            execution_budget: self.execution_budget.ok_or_else(|| {
+                McpError::internal_error("Final task handoff has no execution budget")
+            })?,
         })
     }
 
@@ -7831,6 +8429,9 @@ impl FinalTaskExecutionGuard {
 
 impl Drop for FinalTaskExecutionGuard {
     fn drop(&mut self) {
+        if self.retire_if_execution_expired().unwrap_or(false) {
+            return;
+        }
         // A Rust future can be dropped during cancellation or unwinding, when
         // there is no result channel for a restoration failure. The durable
         // store operation is still attempted synchronously and is generation
@@ -8071,6 +8672,30 @@ pub type SharedTaskManager = Arc<TaskManager>;
 
 #[cfg(test)]
 mod tests {
+    // Probe wrappers keep the same real backend execution policy; none may
+    // silently replace finite deadlines with an unlimited fixture fallback.
+    macro_rules! delegate_final_execution_policy {
+        () => {
+            fn execution_limits(&self) -> McpResult<FinalTaskExecutionLimits> {
+                self.inner.execution_limits()
+            }
+            fn task_execution_budget_if_current(
+                &self,
+                expected: &FinalTaskSnapshot,
+            ) -> McpResult<Option<FinalTaskExecutionBudget>> {
+                self.inner.task_execution_budget_if_current(expected)
+            }
+            fn expire_task_execution_if_current(
+                &self,
+                expected: &FinalTaskSnapshot,
+            ) -> McpResult<Option<FinalTaskSnapshot>> {
+                self.inner.expire_task_execution_if_current(expected)
+            }
+            fn next_expired_execution_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
+                self.inner.next_expired_execution_snapshot()
+            }
+        };
+    }
     use super::*;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -8632,6 +9257,12 @@ mod tests {
             Box::pin(async move {
                 match handoff {
                     FinalTaskSupervisorHandoff::Initial(initial) => {
+                        if initial.work_descriptor().as_value().get("finish") == Some(&serde_json::Value::Bool(true)) {
+                            initial.complete_task(
+                                serde_json::from_value(serde_json::json!({"content": []})).unwrap(), None,
+                            )?;
+                            return Ok(());
+                        }
                         initial.require_input(final_roots_request(), None)?;
                         std::future::poll_fn(|task_context| {
                             *self.cleanup_waker.lock().unwrap() =
@@ -8715,6 +9346,56 @@ mod tests {
         assert!(runtime.is_task_service_ready());
         drop(service);
         assert!(!runtime.is_task_service_ready());
+    }
+
+    #[test]
+    fn task_02_parallel_cleanup_deferral_does_not_spend_successor_attempts() {
+        let (store, _clock) = execution_test_store(10_000, 5_000, 2);
+        let runtime = final_task_runtime(store.clone(), Arc::new(AtomicBool::new(false)));
+        let probe = Arc::new(TaskTransitionCleanupProbe::default());
+        let mut runner = runtime.install_task_service(2, probe.clone()).unwrap()
+            .with_max_concurrent_handoffs(2).unwrap();
+        RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut service = Box::pin(runner.run_service(&cx));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(service.as_mut().poll(&mut context).is_pending());
+            let task = runtime.create_task_with_work(final_test_work_descriptor(), None).unwrap().task;
+            let task_id = task.base().task_id.clone();
+            assert!(service.as_mut().poll(&mut context).is_pending());
+            let inputs = serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
+            runtime.update_task(&task_id, &inputs).unwrap();
+            let successor = store.get_task_snapshot(&task_id).unwrap().unwrap();
+            let budget = store.task_execution_budget_if_current(&successor).unwrap().unwrap();
+            assert_eq!(budget.attempts(), 1);
+            assert!(budget.attempt_deadline().is_none());
+            // Wake recovery more times than the entire configured attempt
+            // allowance while the predecessor is still cleaning up.
+            for _ in 0..12 {
+                runtime.signal_task_service(task_id.clone());
+                assert!(service.as_mut().poll(&mut context).is_pending());
+                assert_eq!(store.task_execution_budget_if_current(&successor).unwrap(), Some(budget));
+                assert_eq!(probe.resumed.load(AtomicOrdering::SeqCst), 0);
+            }
+            let healthy = runtime.create_task_with_work(
+                FinalTaskWorkDescriptor::new(serde_json::json!({"finish": true})).unwrap(), None,
+            ).unwrap().task;
+            assert!(service.as_mut().poll(&mut context).is_pending());
+            assert!(matches!(store.get_task(&healthy.base().task_id).unwrap(), Some(FinalTask::Completed { .. })),
+                "skipping a cleanup-owned successor must not hide healthy siblings");
+            assert_eq!(store.task_execution_budget_if_current(&successor).unwrap(), Some(budget));
+            probe.cleanup_ready.store(true, AtomicOrdering::SeqCst);
+            probe.cleanup_waker.lock().unwrap().take().unwrap().wake();
+            assert!(service.as_mut().poll(&mut context).is_pending());
+            assert_eq!(probe.resumed.load(AtomicOrdering::SeqCst), 1);
+            let completed = store.get_task_snapshot(&task_id).unwrap().unwrap();
+            assert!(matches!(completed.task(), FinalTask::Completed { .. }));
+            let final_budget = store.task_execution_budget_if_current(&completed).unwrap().unwrap();
+            assert_eq!(final_budget.attempts(), 2);
+            assert_eq!(final_budget.total_deadline(), budget.total_deadline());
+            assert!(runtime.is_task_service_ready());
+            drop(service);
+        });
     }
 
     #[test]
@@ -9152,6 +9833,7 @@ mod tests {
     }
 
     impl FinalTaskStore for ReadinessLeaseProbeFinalTaskStore {
+        delegate_final_execution_policy!();
         fn create_task(
             &self,
             task: FinalTask,
@@ -9479,6 +10161,7 @@ mod tests {
     }
 
     impl FinalTaskStore for LoseFirstAcceptedRecoveryCandidateStore {
+        delegate_final_execution_policy!();
         fn create_task(
             &self,
             task: FinalTask,
@@ -9628,6 +10311,7 @@ mod tests {
     }
 
     impl FinalTaskStore for CancelBeforeFinalTaskDispatchStore {
+        delegate_final_execution_policy!();
         fn create_task(
             &self,
             task: FinalTask,
@@ -10535,6 +11219,7 @@ mod tests {
     /// durable read and write boundaries.
     struct RuntimeBoundaryProbeFinalTaskStore {
         snapshot: Mutex<FinalTaskSnapshot>,
+        execution_budget: Mutex<FinalTaskExecutionBudget>,
         transition_write_calls: AtomicUsize,
         transition_result_override: Mutex<Option<FinalTask>>,
         work_descriptor: Mutex<Option<FinalTaskWorkDescriptor>>,
@@ -10549,6 +11234,9 @@ mod tests {
         fn new(task: FinalTask) -> Self {
             Self {
                 snapshot: Mutex::new(FinalTaskSnapshot::new(task, 1)),
+                execution_budget: Mutex::new(new_in_memory_final_task_execution_budget(
+                    FinalTaskExecutionLimits::default(), Instant::now(),
+                ).expect("default probe deadline fits the process clock")),
                 transition_write_calls: AtomicUsize::new(0),
                 transition_result_override: Mutex::new(None),
                 work_descriptor: Mutex::new(Some(final_test_work_descriptor())),
@@ -10584,6 +11272,55 @@ mod tests {
     }
 
     impl FinalTaskStore for RuntimeBoundaryProbeFinalTaskStore {
+        fn execution_limits(&self) -> McpResult<FinalTaskExecutionLimits> {
+            Ok(FinalTaskExecutionLimits::default())
+        }
+
+        fn task_execution_budget_if_current(
+            &self, expected: &FinalTaskSnapshot,
+        ) -> McpResult<Option<FinalTaskExecutionBudget>> {
+            let snapshot = self.snapshot.lock().unwrap();
+            if snapshot.generation() != expected.generation()
+                || snapshot.task().base().task_id != expected.task().base().task_id
+            {
+                return Ok(None);
+            }
+            Ok(Some(*self.execution_budget.lock().unwrap()))
+        }
+
+        fn expire_task_execution_if_current(
+            &self, expected: &FinalTaskSnapshot,
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
+            let mut snapshot = self.snapshot.lock().unwrap();
+            if snapshot.generation() != expected.generation()
+                || snapshot.task().base().task_id != expected.task().base().task_id
+                || !matches!(snapshot.task(), FinalTask::Working(_) | FinalTask::InputRequired { .. })
+                || Instant::now() < self.execution_budget.lock().unwrap().total_deadline()
+            {
+                return Ok(None);
+            }
+            let task = FinalTask::Failed {
+                base: transition_terminal_final_task_base(
+                    snapshot.task().base().clone(), FinalTaskStatus::Failed, None,
+                )?,
+                error: FinalTaskError {
+                    code: (-32000).into(),
+                    message: FINAL_TASK_TOTAL_DEADLINE_EXCEEDED.to_owned(),
+                    data: None,
+                    additional: BTreeMap::new(),
+                },
+            };
+            *snapshot = FinalTaskSnapshot::new(task, snapshot.generation() + 1);
+            Ok(Some(snapshot.clone()))
+        }
+
+        fn next_expired_execution_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
+            let snapshot = self.snapshot();
+            Ok((matches!(snapshot.task(), FinalTask::Working(_) | FinalTask::InputRequired { .. })
+                && Instant::now() >= self.execution_budget.lock().unwrap().total_deadline())
+                .then_some(snapshot))
+        }
+
         fn create_task(
             &self,
             task: FinalTask,
@@ -10600,7 +11337,11 @@ mod tests {
             work_descriptor: FinalTaskWorkDescriptor,
         ) -> McpResult<FinalTaskSnapshot> {
             let mut snapshot = self.snapshot.lock().unwrap();
+            let budget = new_in_memory_final_task_execution_budget(
+                FinalTaskExecutionLimits::default(), Instant::now(),
+            )?;
             *snapshot = FinalTaskSnapshot::new(task, snapshot.generation());
+            *self.execution_budget.lock().unwrap() = budget;
             *self
                 .work_descriptor
                 .lock()
@@ -11216,6 +11957,7 @@ mod tests {
     }
 
     impl FinalTaskStore for CommittedSnapshotProbeStore {
+        delegate_final_execution_policy!();
         fn create_task(
             &self,
             task: FinalTask,
@@ -11605,6 +12347,7 @@ mod tests {
     }
 
     impl FinalTaskStore for CancellationReadbackProbeStore {
+        delegate_final_execution_policy!();
         fn create_task(
             &self,
             task: FinalTask,
@@ -14126,6 +14869,561 @@ mod tests {
         }
     }
 
+    fn execution_test_store(
+        total_ms: u64, attempt_ms: u64, max_attempts: u32,
+    ) -> (Arc<InMemoryFinalTaskStore>, Arc<Mutex<Instant>>) {
+        let clock = Arc::new(Mutex::new(Instant::now()));
+        let clock_reader = Arc::clone(&clock);
+        let limits = FinalTaskExecutionLimits::new(
+            StdDuration::from_millis(total_ms), StdDuration::from_millis(attempt_ms), max_attempts,
+        ).unwrap();
+        let store = InMemoryFinalTaskStore::with_clock_payload_and_execution_limits(
+            4, InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES, limits,
+            Arc::new(move || *clock_reader.lock().unwrap()),
+        ).unwrap();
+        (Arc::new(store), clock)
+    }
+
+    #[derive(Default)]
+    struct ExecutionPollingSupervisor {
+        require_initial_input: bool,
+        polls: AtomicUsize,
+        dropped: Arc<AtomicBool>,
+        budgets: Mutex<Vec<FinalTaskExecutionBudget>>,
+    }
+
+    impl ApplicationTaskSupervisor for ExecutionPollingSupervisor {
+        fn resume<'a>(
+            &'a self, _cx: &'a Cx, handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            Box::pin(async move {
+                self.budgets.lock().unwrap().push(handoff.execution_budget()?);
+                let finishes = match &handoff {
+                    FinalTaskSupervisorHandoff::Initial(initial) => initial.work_descriptor(),
+                    FinalTaskSupervisorHandoff::Resumed(accepted) => accepted.work_descriptor(),
+                }.as_value().get("finish").and_then(serde_json::Value::as_bool) == Some(true);
+                if finishes {
+                    let result = serde_json::from_value(serde_json::json!({"content": []})).unwrap();
+                    match handoff {
+                        FinalTaskSupervisorHandoff::Initial(initial) => { initial.complete_task(result, None)?; }
+                        FinalTaskSupervisorHandoff::Resumed(accepted) => { accepted.complete_task(result, None)?; }
+                    }
+                    return Ok(());
+                }
+                if self.require_initial_input
+                    && let FinalTaskSupervisorHandoff::Initial(initial) = &handoff
+                {
+                    initial.require_input(final_roots_request(), None)?;
+                    return Ok(());
+                }
+                let _lifetime = RetentionExpiryDropFlag(Arc::clone(&self.dropped));
+                let _handoff = handoff;
+                std::future::poll_fn(|_| {
+                    self.polls.fetch_add(1, AtomicOrdering::SeqCst);
+                    std::task::Poll::Pending::<McpResult<()>>
+                }).await
+            })
+        }
+    }
+
+    fn check_execution_before_application_repoll(expired: bool, total: bool) {
+        for resumed in [false, true] {
+            let (store, clock) = execution_test_store(
+                if total { 100 } else { 1_000 }, if total { 200 } else { 100 }, 8,
+            );
+            let runtime = final_task_runtime(store.clone(), Arc::new(AtomicBool::new(false)));
+            let supervisor = Arc::new(ExecutionPollingSupervisor {
+                require_initial_input: resumed, ..ExecutionPollingSupervisor::default()
+            });
+            let mut runner = runtime.install_task_service(2, supervisor.clone()).unwrap();
+            let application = RuntimeBuilder::current_thread().build().unwrap();
+            application.block_on(async {
+                let cx = Cx::current().unwrap();
+                let service_budget = cx.budget();
+                let mut running = Box::pin(runner.run_service(&cx));
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(running.as_mut().poll(&mut context).is_pending());
+                let created = runtime.create_task_with_work(final_test_work_descriptor(), None).unwrap();
+                let task_id = created.task.base().task_id.clone();
+                assert!(running.as_mut().poll(&mut context).is_pending());
+                let first = supervisor.budgets.lock().unwrap()[0];
+                if resumed {
+                    assert!(matches!(store.get_task(&task_id).unwrap(), Some(FinalTask::InputRequired { .. })));
+                    *clock.lock().unwrap() += StdDuration::from_millis(10);
+                    let inputs = serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
+                    runtime.update_task(&task_id, &inputs).unwrap();
+                    assert!(running.as_mut().poll(&mut context).is_pending());
+                }
+                let budget = *supervisor.budgets.lock().unwrap().last().unwrap();
+                assert_eq!(budget.total_deadline(), first.total_deadline());
+                assert_eq!(budget.attempts(), if resumed { 2 } else { 1 });
+                assert_eq!(supervisor.polls.load(AtomicOrdering::SeqCst), 1);
+                let deadline = budget.attempt_deadline().unwrap();
+                *clock.lock().unwrap() = if expired { deadline } else {
+                    deadline - StdDuration::from_millis(1)
+                };
+                assert!(running.as_mut().poll(&mut context).is_pending(), "expiry must not fail the service");
+                let task = store.get_task(&task_id).unwrap().unwrap();
+                if expired {
+                    assert_eq!(supervisor.polls.load(AtomicOrdering::SeqCst), 1);
+                    assert!(supervisor.dropped.load(AtomicOrdering::SeqCst));
+                    let FinalTask::Failed { error, .. } = &task else { panic!("expired execution must retain failure"); };
+                    assert_eq!(error.message, if total {
+                        FINAL_TASK_TOTAL_DEADLINE_EXCEEDED
+                    } else { FINAL_TASK_ATTEMPT_DEADLINE_EXCEEDED });
+                    assert!(store.state.lock().unwrap().handoff_leases.is_empty());
+                    assert_eq!(serde_json::to_value(&task).unwrap(), serde_json::to_value(
+                        store.latest_notification(&task_id).unwrap().params.task,
+                    ).unwrap());
+                } else {
+                    assert_eq!(supervisor.polls.load(AtomicOrdering::SeqCst), 2);
+                    assert!(!supervisor.dropped.load(AtomicOrdering::SeqCst));
+                    assert!(matches!(task, FinalTask::Working(_)));
+                }
+                assert!(runtime.is_task_service_ready());
+                assert_eq!(cx.budget().deadline, service_budget.deadline);
+                assert_eq!(store.task_count(), 1, "execution expiry must preserve retained result");
+                assert_final_task_payload_accounting(&store);
+                if expired {
+                    let sibling = runtime.create_task_with_work(
+                        FinalTaskWorkDescriptor::new(serde_json::json!({"finish": true})).unwrap(), None,
+                    ).unwrap();
+                    assert!(running.as_mut().poll(&mut context).is_pending());
+                    assert!(matches!(store.get_task(&sibling.task.base().task_id).unwrap(),
+                        Some(FinalTask::Completed { .. })), "a deadline failure must leave the service usable by healthy work");
+                }
+                drop(running);
+            });
+        }
+    }
+
+    #[test]
+    fn task_02_total_execution_deadline_stops_initial_and_resumed_work() {
+        check_execution_before_application_repoll(true, true);
+    }
+
+    #[test]
+    fn task_02_live_total_execution_budget_allows_initial_and_resumed_work() {
+        check_execution_before_application_repoll(false, true);
+    }
+
+    #[test]
+    fn task_02_attempt_execution_deadline_stops_initial_and_resumed_work() {
+        check_execution_before_application_repoll(true, false);
+    }
+
+    #[test]
+    fn task_02_live_attempt_execution_budget_allows_initial_and_resumed_work() {
+        check_execution_before_application_repoll(false, false);
+    }
+
+    #[test]
+    fn task_02_execution_limits_validate_defaults_and_hard_ceilings() {
+        let defaults = FinalTaskExecutionLimits::default();
+        assert_eq!(defaults.total_runtime(), StdDuration::from_secs(86_400));
+        assert_eq!(defaults.attempt_runtime(), StdDuration::from_secs(3_600));
+        assert_eq!(defaults.max_attempts(), 8);
+        assert!(FinalTaskExecutionLimits::new(
+            StdDuration::from_secs(30 * 86_400), StdDuration::from_secs(86_400), 64,
+        ).is_ok());
+        for (total, attempt, claims) in [
+            (0, 1, 1), (1, 0, 1), (1, 1, 0), (30 * 86_400 + 1, 1, 1),
+            (1, 86_401, 1), (1, 1, 65),
+        ] {
+            assert!(FinalTaskExecutionLimits::new(
+                StdDuration::from_secs(total), StdDuration::from_secs(attempt), claims,
+            ).is_err());
+        }
+    }
+
+    fn check_input_wait_execution_recovery(expired: bool) {
+        let (store, clock) = execution_test_store(100, 40, 8);
+        let runtime = final_task_runtime(store.clone(), Arc::new(AtomicBool::new(false)));
+        let supervisor = Arc::new(ExecutionPollingSupervisor {
+            require_initial_input: true, ..ExecutionPollingSupervisor::default()
+        });
+        let mut runner = runtime.install_task_service(2, supervisor.clone()).unwrap();
+        RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            let mut running = Box::pin(runner.run_service(&cx));
+            assert!(running.as_mut().poll(&mut context).is_pending());
+            let task = runtime.create_task_with_work(final_test_work_descriptor(), None).unwrap().task;
+            let task_id = task.base().task_id.clone();
+            assert!(running.as_mut().poll(&mut context).is_pending());
+            let waiting = store.get_task_snapshot(&task_id).unwrap().unwrap();
+            assert!(matches!(waiting.task(), FinalTask::InputRequired { .. }));
+            let original = store.task_execution_budget_if_current(&waiting).unwrap().unwrap();
+            assert_eq!(original.attempts(), 1);
+            assert!(original.attempt_deadline().is_none(), "waiting input has no active attempt");
+            drop(running);
+            drop(runner);
+            *clock.lock().unwrap() = original.total_deadline() - if expired {
+                StdDuration::ZERO
+            } else { StdDuration::from_millis(1) };
+            // A replacement runtime has a different retention policy. It must
+            // use the original task's execution deadline and retention record.
+            let recovered = FinalTaskRuntime::new(
+                store.clone(), FinalTaskRuntimeConfig::new(5_000, None).unwrap(), Arc::new(|_| {}),
+            );
+            let mut successor = recovered.install_task_service(2, supervisor.clone()).unwrap();
+            let mut recovering = Box::pin(successor.run_service(&cx));
+            assert!(recovering.as_mut().poll(&mut context).is_pending());
+            let current = store.get_task_snapshot(&task_id).unwrap().unwrap();
+            let current_budget = store.task_execution_budget_if_current(&current).unwrap().unwrap();
+            assert_eq!(current_budget.total_deadline(), original.total_deadline());
+            assert_eq!(current.task().base().ttl_ms, task.base().ttl_ms);
+            let inputs = serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
+            recovered.update_task(&task_id, &inputs).unwrap();
+            assert!(recovering.as_mut().poll(&mut context).is_pending());
+            if expired {
+                let FinalTask::Failed { error, .. } = current.task() else { panic!("recovery must expire input wait"); };
+                assert_eq!(error.message, FINAL_TASK_TOTAL_DEADLINE_EXCEEDED);
+                assert_eq!(supervisor.budgets.lock().unwrap().len(), 1);
+                assert!(store.state.lock().unwrap().accepted_inputs.is_empty());
+            } else {
+                assert!(matches!(current.task(), FinalTask::InputRequired { .. }));
+                let budget = *supervisor.budgets.lock().unwrap().last().unwrap();
+                assert_eq!(budget.attempts(), 2);
+                assert_eq!(budget.attempt_deadline(), Some(original.total_deadline()));
+                assert_eq!(supervisor.polls.load(AtomicOrdering::SeqCst), 1);
+            }
+            assert!(recovered.is_task_service_ready());
+            drop(recovering);
+        });
+    }
+
+    #[test]
+    fn task_02_input_wait_total_deadline_survives_runtime_recovery() {
+        check_input_wait_execution_recovery(true);
+    }
+
+    #[test]
+    fn task_02_live_input_wait_resumes_with_original_total_deadline() {
+        check_input_wait_execution_recovery(false);
+    }
+
+    #[test]
+    fn task_02_renewal_and_restoration_preserve_execution_accounting() {
+        let (store, clock) = execution_test_store(1_000, 100, 2);
+        let task = final_working_task_with_ttl("task-execution-recovery", 60_000);
+        let task_id = task.base().task_id.clone();
+        let descriptor = final_test_work_descriptor();
+        let original = store.create_task_with_work(task.clone(), final_task_notification(&task), descriptor.clone()).unwrap();
+        let created_budget = store.task_execution_budget_if_current(&original).unwrap().unwrap();
+        let start = *clock.lock().unwrap();
+        store.take_initial_work_handoff_for_owner_if_current(&original, "first").unwrap().unwrap();
+        let first = store.task_execution_budget_if_current(&original).unwrap().unwrap();
+        let fence = store.begin_handoff_dispatch_for_owner_if_current(&task_id, original.generation(), "first").unwrap().unwrap();
+        *clock.lock().unwrap() = start + StdDuration::from_millis(50);
+        assert!(store.renew_handoff_dispatch_if_current(&task_id, original.generation(), "first", fence).unwrap());
+        assert_eq!(store.task_execution_budget_if_current(&original).unwrap().unwrap(), first);
+        assert!(store.take_initial_work_handoff_for_owner_if_current(&original, "competitor").unwrap().is_none());
+        assert_eq!(store.task_execution_budget_if_current(&original).unwrap().unwrap().attempts(), 1);
+        assert!(store.restore_initial_work_for_owner_if_current(
+            &task_id, original.generation(), "first", Some(fence), descriptor.clone(),
+        ).unwrap());
+        let restored = store.task_execution_budget_if_current(&original).unwrap().unwrap();
+        assert_eq!(restored.total_deadline(), created_budget.total_deadline());
+        assert_eq!(restored.attempts(), 1);
+        assert!(restored.attempt_deadline().is_none());
+        store.take_initial_work_handoff_for_owner_if_current(&original, "second").unwrap().unwrap();
+        let second = store.task_execution_budget_if_current(&original).unwrap().unwrap();
+        assert_eq!(second.attempts(), 2);
+        assert_eq!(second.total_deadline(), created_budget.total_deadline());
+        assert_eq!(second.attempt_deadline(), Some(start + StdDuration::from_millis(150)));
+        assert!(store.expire_task_execution_if_current(&original).unwrap().is_none(), "last allowed live attempt remains authorized");
+        assert!(!store.renew_handoff_dispatch_if_current(&task_id, original.generation(), "first", fence).unwrap());
+        assert!(store.restore_initial_work_for_owner_if_current(
+            &task_id, original.generation(), "second", None, descriptor,
+        ).unwrap());
+        let terminal = store.expire_task_execution_if_current(&original).unwrap().unwrap();
+        let FinalTask::Failed { error, .. } = terminal.task() else { panic!("exhausted claims fail deterministically"); };
+        assert_eq!(error.message, FINAL_TASK_ATTEMPTS_EXHAUSTED);
+        assert!(store.take_initial_work_handoff_for_owner_if_current(&terminal, "third").unwrap().is_none());
+        assert_final_task_payload_accounting(&store);
+    }
+
+    #[test]
+    fn task_02_execution_failure_uses_reserved_capacity_and_retained_identity() {
+        let task = final_working_task_with_ttl("task-full-execution-expiry", 60_000);
+        let task_id = task.base().task_id.clone();
+        let payload = encoded_final_task_test_bytes(&task)
+            + encoded_final_task_test_bytes(&final_task_notification(&task));
+        let clock = Arc::new(Mutex::new(Instant::now()));
+        let reader = clock.clone();
+        let store = InMemoryFinalTaskStore::with_clock_payload_and_execution_limits(
+            2, payload + FINAL_TASK_CANCELLATION_RESERVE_BYTES,
+            FinalTaskExecutionLimits::new(StdDuration::from_millis(100), StdDuration::from_millis(100), 1).unwrap(),
+            Arc::new(move || *reader.lock().unwrap()),
+        ).unwrap();
+        store.create_task(task.clone(), final_task_notification(&task)).unwrap();
+        let snapshot = store.get_task_snapshot(&task_id).unwrap().unwrap();
+        let before = final_task_restoration_snapshot(&store, &task_id);
+        let sibling = final_working_task_with_ttl("capacity-competitor", 60_000);
+        assert!(store.create_task(sibling.clone(), final_task_notification(&sibling)).is_err());
+        assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
+        assert!(store.expire_task_execution_if_current(&snapshot).unwrap().is_none());
+        *clock.lock().unwrap() += StdDuration::from_millis(100);
+        let mut forged_task = task.clone();
+        if let FinalTask::Working(base) = &mut forged_task {
+            base.ttl_ms = Some(final_task_duration(9_999).unwrap());
+            base.created_at = FinalTaskTimestamp::parse("2000-01-01T00:00:00Z").unwrap();
+        }
+        let forged = FinalTaskSnapshot::new(forged_task, snapshot.generation());
+        let expired = store.expire_task_execution_if_current(&forged).unwrap().unwrap();
+        assert_eq!(expired.task().base().created_at, task.base().created_at);
+        assert_eq!(expired.task().base().ttl_ms, task.base().ttl_ms);
+        assert!(matches!(expired.task(), FinalTask::Failed { .. }));
+        assert!(store.retained_payload_bytes() <= store.max_payload_bytes());
+        assert_eq!(store.task_count(), 1);
+        assert_final_task_payload_accounting(&store);
+    }
+
+    #[test]
+    fn task_02_backend_fenced_completion_checks_exact_execution_deadline() {
+        for total in [false, true] {
+            for expired in [false, true] {
+                let (store, clock) = execution_test_store(
+                    if total { 100 } else { 1_000 }, if total { 200 } else { 100 }, 8,
+                );
+                let task = final_working_task_with_ttl("task-atomic-execution-boundary", 60_000);
+                let task_id = task.base().task_id.clone();
+                let expected = store.create_task_with_work(
+                    task.clone(), final_task_notification(&task), final_test_work_descriptor(),
+                ).unwrap();
+                store.take_initial_work_handoff_for_owner_if_current(&expected, "owner").unwrap().unwrap();
+                let fence = store.begin_handoff_dispatch_for_owner_if_current(
+                    &task_id, expected.generation(), "owner",
+                ).unwrap().unwrap();
+                let budget = store.task_execution_budget_if_current(&expected).unwrap().unwrap();
+                *clock.lock().unwrap() = budget.attempt_deadline().unwrap()
+                    - if expired { StdDuration::ZERO } else { StdDuration::from_millis(1) };
+                let before = final_task_restoration_snapshot(&store, &task_id);
+                let completed = FinalTask::Completed {
+                    base: transition_terminal_final_task_base(task.base().clone(), FinalTaskStatus::Completed, None).unwrap(),
+                    result: serde_json::from_value(serde_json::json!({"content": []})).unwrap(),
+                };
+                let write = store.replace_task_and_clear_input_for_handoff_if_current(
+                    &expected, "owner", fence, false, completed.clone(), final_task_notification(&completed),
+                );
+                if expired {
+                    assert!(write.is_err(), "the atomic backend must refuse late completion without relying on a runner poll");
+                    assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
+                    assert_eq!(store.task_execution_budget_if_current(&expected).unwrap().unwrap(), budget);
+                    let terminal = store.expire_task_execution_if_current(&expected).unwrap().unwrap();
+                    let FinalTask::Failed { error, .. } = terminal.task() else { panic!("deadline retirement must win"); };
+                    assert_eq!(error.message, if total { FINAL_TASK_TOTAL_DEADLINE_EXCEEDED } else { FINAL_TASK_ATTEMPT_DEADLINE_EXCEEDED });
+                    assert!(!store.finish_handoff_dispatch_for_owner_if_current(
+                        &task_id, expected.generation(), "owner", fence,
+                    ).unwrap());
+                } else {
+                    assert!(write.unwrap().is_some());
+                    assert!(matches!(store.get_task(&task_id).unwrap(), Some(FinalTask::Completed { .. })));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn task_02_lease_reclaim_spends_attempt_without_resetting_total_deadline() {
+        let (store, clock) = execution_test_store(120_000, 60_000, 8);
+        let task = final_working_task_with_ttl("task-budget-lease-reclaim", 180_000);
+        let task_id = task.base().task_id.clone();
+        let first = store.create_task_with_work(
+            task.clone(), final_task_notification(&task), final_test_work_descriptor(),
+        ).unwrap();
+        store.take_initial_work_handoff_for_owner_if_current(&first, "old").unwrap().unwrap();
+        let original = store.task_execution_budget_if_current(&first).unwrap().unwrap();
+        *clock.lock().unwrap() += IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
+        let recovered = store.get_task_snapshot(&task_id).unwrap().unwrap();
+        assert!(recovered.generation() > first.generation());
+        let awaiting = store.task_execution_budget_if_current(&recovered).unwrap().unwrap();
+        assert_eq!(awaiting.total_deadline(), original.total_deadline());
+        assert_eq!(awaiting.attempts(), 1);
+        assert!(awaiting.attempt_deadline().is_none());
+        store.take_initial_work_handoff_for_owner_if_current(&recovered, "new").unwrap().unwrap();
+        let retry = store.task_execution_budget_if_current(&recovered).unwrap().unwrap();
+        assert_eq!(retry.attempts(), 2);
+        assert_eq!(retry.total_deadline(), original.total_deadline());
+        assert_eq!(retry.attempt_deadline(), Some(*clock.lock().unwrap() + StdDuration::from_secs(60)));
+        assert!(store.take_initial_work_handoff_for_owner_if_current(&first, "old").unwrap().is_none());
+    }
+
+    #[test]
+    fn task_02_queued_execution_expires_before_application_entry() {
+        for expired in [false, true] {
+            let (store, clock) = execution_test_store(100, 100, 8);
+            let runtime = final_task_runtime(store.clone(), Arc::new(AtomicBool::new(false)));
+            let supervisor = Arc::new(ExecutionPollingSupervisor::default());
+            let mut runner = runtime.install_task_service(1, supervisor.clone()).unwrap();
+            RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+                let cx = Cx::current().unwrap();
+                let mut running = Box::pin(runner.run_service(&cx));
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(running.as_mut().poll(&mut context).is_pending());
+                let task = runtime.create_task_with_work(final_test_work_descriptor(), None).unwrap().task;
+                *clock.lock().unwrap() += StdDuration::from_millis(if expired { 100 } else { 99 });
+                assert!(running.as_mut().poll(&mut context).is_pending());
+                let current = store.get_task(&task.base().task_id).unwrap().unwrap();
+                if expired {
+                    assert!(matches!(current, FinalTask::Failed { .. }));
+                    assert_eq!(supervisor.polls.load(AtomicOrdering::SeqCst), 0);
+                    assert!(supervisor.budgets.lock().unwrap().is_empty());
+                } else {
+                    assert!(matches!(current, FinalTask::Working(_)));
+                    assert_eq!(supervisor.polls.load(AtomicOrdering::SeqCst), 1);
+                }
+                assert!(runtime.is_task_service_ready());
+                drop(running);
+            });
+        }
+    }
+
+    #[test]
+    fn task_02_execution_expiry_backlog_does_not_starve_live_initial_or_resumed_work() {
+        for resumed in [false, true] {
+            let expired_count = 2 * MAX_FINAL_TASK_RECOVERY_HANDOFFS_PER_SCAN + 2;
+            let clock = Arc::new(Mutex::new(Instant::now()));
+            let reader = clock.clone();
+            let store = Arc::new(InMemoryFinalTaskStore::with_clock_payload_and_execution_limits(
+                expired_count + 1, InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES,
+                FinalTaskExecutionLimits::new(StdDuration::from_millis(100), StdDuration::from_millis(100), 8).unwrap(),
+                Arc::new(move || *reader.lock().unwrap()),
+            ).unwrap());
+            let runtime = final_task_runtime(store.clone(), Arc::new(AtomicBool::new(false)));
+            let inputs = serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
+            let descriptor = FinalTaskWorkDescriptor::new(serde_json::json!({"finish": true})).unwrap();
+            for index in 0..=expired_count {
+                if index == expired_count {
+                    *clock.lock().unwrap() += StdDuration::from_millis(100);
+                }
+                let task = final_working_task_with_ttl(&format!("task-expiry-backlog-{index:04}"), 60_000);
+                store.create_task_with_work(task.clone(), final_task_notification(&task), descriptor.clone()).unwrap();
+                if resumed {
+                    runtime.require_input(&task.base().task_id, final_roots_request(), None).unwrap();
+                    runtime.update_task(&task.base().task_id, &inputs).unwrap();
+                }
+            }
+            let live_id = FinalTaskId::parse(format!("task-expiry-backlog-{expired_count:04}")).unwrap();
+            let supervisor = Arc::new(ExecutionPollingSupervisor::default());
+            let mut runner = runtime.install_task_service(4, supervisor.clone()).unwrap();
+            RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+                let cx = Cx::current().unwrap();
+                let mut running = Box::pin(runner.run_service(&cx));
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(running.as_mut().poll(&mut context).is_pending(),
+                    "large expired backlog must not exhaust work-recovery CAS retries");
+                assert!(runtime.is_task_service_ready());
+                assert!(matches!(store.get_task(&live_id).unwrap(), Some(FinalTask::Completed { .. })));
+                assert_eq!(supervisor.budgets.lock().unwrap().len(), 1,
+                    "only the healthy record may enter application work");
+                assert!(store.next_expired_execution_snapshot().unwrap().is_none(),
+                    "bounded self-wake turns eventually retire the entire expired backlog");
+                assert_eq!(store.task_count(), expired_count + 1);
+                assert_final_task_payload_accounting(&store);
+                drop(running);
+            });
+        }
+    }
+
+    struct ExecutionCompletionSupervisor {
+        clock: Arc<Mutex<Instant>>,
+        complete_at_deadline: Option<bool>,
+        cleanup_polls: AtomicUsize,
+        rejected: AtomicBool,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl ApplicationTaskSupervisor for ExecutionCompletionSupervisor {
+        fn resume<'a>(
+            &'a self, _cx: &'a Cx, handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            Box::pin(async move {
+                let _lifetime = RetentionExpiryDropFlag(self.dropped.clone());
+                let budget = handoff.execution_budget()?;
+                if let Some(expired) = self.complete_at_deadline {
+                    *self.clock.lock().unwrap() = budget.attempt_deadline().unwrap()
+                        - if expired { StdDuration::ZERO } else { StdDuration::from_millis(1) };
+                }
+                let result = serde_json::from_value(serde_json::json!({"content": []})).unwrap();
+                let committed = match &handoff {
+                    FinalTaskSupervisorHandoff::Initial(initial) => initial.complete_task(result, None),
+                    FinalTaskSupervisorHandoff::Resumed(accepted) => accepted.complete_task(result, None),
+                };
+                self.rejected.store(committed.is_err(), AtomicOrdering::SeqCst);
+                committed?;
+                if self.complete_at_deadline.is_some() {
+                    return Ok(());
+                }
+                std::future::poll_fn(|_| {
+                    self.cleanup_polls.fetch_add(1, AtomicOrdering::SeqCst);
+                    std::task::Poll::Pending::<McpResult<()>>
+                }).await
+            })
+        }
+    }
+
+    fn check_execution_completion_boundary(expired: bool, cleanup: bool) {
+        let (store, clock) = execution_test_store(1_000, 100, 8);
+        let runtime = final_task_runtime(store.clone(), Arc::new(AtomicBool::new(false)));
+        let supervisor = Arc::new(ExecutionCompletionSupervisor {
+            clock: clock.clone(), complete_at_deadline: (!cleanup).then_some(expired),
+            cleanup_polls: AtomicUsize::new(0), rejected: AtomicBool::new(false),
+            dropped: Arc::new(AtomicBool::new(false)),
+        });
+        let mut runner = runtime.install_task_service(2, supervisor.clone()).unwrap();
+        RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut running = Box::pin(runner.run_service(&cx));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(running.as_mut().poll(&mut context).is_pending());
+            let start = *clock.lock().unwrap();
+            let task = runtime.create_task_with_work(final_test_work_descriptor(), None).unwrap().task;
+            let task_id = task.base().task_id.clone();
+            assert!(running.as_mut().poll(&mut context).is_pending());
+            if cleanup {
+                assert_eq!(supervisor.cleanup_polls.load(AtomicOrdering::SeqCst), 1);
+                *clock.lock().unwrap() = start + StdDuration::from_millis(if expired { 100 } else { 99 });
+                assert!(running.as_mut().poll(&mut context).is_pending());
+                assert_eq!(supervisor.cleanup_polls.load(AtomicOrdering::SeqCst), if expired { 1 } else { 2 });
+                assert_eq!(supervisor.dropped.load(AtomicOrdering::SeqCst), expired);
+                assert!(matches!(store.get_task(&task_id).unwrap(), Some(FinalTask::Completed { .. })),
+                    "bounded cleanup must preserve the already committed success");
+            } else {
+                assert_eq!(supervisor.rejected.load(AtomicOrdering::SeqCst), expired);
+                let current = store.get_task(&task_id).unwrap().unwrap();
+                if expired {
+                    let FinalTask::Failed { error, .. } = current else { panic!("late completion must fail"); };
+                    assert_eq!(error.message, FINAL_TASK_ATTEMPT_DEADLINE_EXCEEDED);
+                } else { assert!(matches!(current, FinalTask::Completed { .. })); }
+            }
+            assert!(runtime.is_task_service_ready());
+            assert_final_task_payload_accounting(&store);
+            drop(running);
+        });
+    }
+
+    #[test]
+    fn task_02_deadline_inside_application_poll_rejects_late_completion() {
+        check_execution_completion_boundary(true, false);
+    }
+
+    #[test]
+    fn task_02_live_deadline_inside_application_poll_accepts_completion() {
+        check_execution_completion_boundary(false, false);
+    }
+
+    #[test]
+    fn task_02_committed_success_cleanup_stops_at_attempt_deadline() {
+        check_execution_completion_boundary(true, true);
+    }
+
+    #[test]
+    fn task_02_committed_success_cleanup_remains_live_before_deadline() {
+        check_execution_completion_boundary(false, true);
+    }
+
     struct RetentionExpiryDropFlag(Arc<AtomicBool>);
     impl Drop for RetentionExpiryDropFlag {
         fn drop(&mut self) {
@@ -14615,6 +15913,7 @@ mod tests {
     }
 
     impl FinalTaskStore for FastHeartbeatProbeStore {
+        delegate_final_execution_policy!();
         fn next_accepted_input_snapshot_after(
             &self,
             after_task_id: Option<&FinalTaskId>,
@@ -15410,6 +16709,7 @@ mod tests {
     }
 
     impl FinalTaskStore for FailingSnapshotProbeStore {
+        delegate_final_execution_policy!();
         fn next_accepted_input_snapshot_after(
             &self,
             after_task_id: Option<&FinalTaskId>,
@@ -15830,6 +17130,7 @@ mod tests {
             dispatch_fence: None,
             transition_committed: Arc::new(AtomicBool::new(false)),
             retention_deadline: None,
+            execution_budget: None,
             restoration: None,
         };
 
@@ -15857,6 +17158,7 @@ mod tests {
             dispatch_fence: None,
             transition_committed: Arc::new(AtomicBool::new(false)),
             retention_deadline: None,
+            execution_budget: None,
             restoration: None,
         };
         assert!(
@@ -19596,7 +20898,9 @@ mod tests {
     #[test]
     fn task_03_final_uncancelled_elected_handoff_error_requeues_under_unlimited_retention() {
         const ELAPSED_MS: u64 = 86_400_000;
-        let (store, now) = in_memory_store_with_test_clock(1);
+        // This is a retention/requeue control. Its finite execution policy
+        // deliberately remains live after the full-day retention interval.
+        let (store, now) = execution_test_store(2 * ELAPSED_MS, 3_600_000, 8);
         let runtime = FinalTaskRuntime::new(
             store.clone(),
             FinalTaskRuntimeConfig::with_unlimited_ttl(&AllowUnlimitedFinalTaskRetention, None)

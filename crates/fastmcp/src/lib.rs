@@ -415,7 +415,8 @@ pub mod server {
     #[cfg(feature = "tasks")]
     pub use fastmcp_server::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
-        FinalTaskAcceptedInput, FinalTaskInitialWork, FinalTaskNotificationEmitter,
+        FinalTaskAcceptedInput, FinalTaskExecutionBudget, FinalTaskExecutionLimits,
+        FinalTaskInitialWork, FinalTaskNotificationEmitter,
         FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
         FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
         FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
@@ -808,7 +809,8 @@ pub use fastmcp_server::{
 #[cfg(feature = "tasks")]
 pub use fastmcp_server::{
     ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
-    FinalTaskAcceptedInput, FinalTaskInitialWork, FinalTaskNotificationEmitter,
+    FinalTaskAcceptedInput, FinalTaskExecutionBudget, FinalTaskExecutionLimits,
+    FinalTaskInitialWork, FinalTaskNotificationEmitter,
     FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
     FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
     FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
@@ -2878,7 +2880,8 @@ pub mod modern {
     #[cfg(feature = "tasks")]
     pub use fastmcp_server::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
-        FinalTaskAcceptedInput, FinalTaskInitialWork, FinalTaskNotificationEmitter,
+        FinalTaskAcceptedInput, FinalTaskExecutionBudget, FinalTaskExecutionLimits,
+        FinalTaskInitialWork, FinalTaskNotificationEmitter,
         FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
         FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
         FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
@@ -10801,7 +10804,8 @@ pub mod prelude {
     #[cfg(feature = "tasks")]
     pub use crate::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
-        FinalTask, FinalTaskAcceptedInput, FinalTaskCallToolResult, FinalTaskHandle, FinalTaskId,
+        FinalTask, FinalTaskAcceptedInput, FinalTaskCallToolResult, FinalTaskExecutionBudget,
+        FinalTaskExecutionLimits, FinalTaskHandle, FinalTaskId,
         FinalTaskInitialWork, FinalTaskInputResponses, FinalTaskNotificationEmitter,
         FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
         FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStatusNotification, FinalTaskStore,
