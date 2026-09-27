@@ -10321,6 +10321,72 @@ pub struct BoundedListPage<T> {
     pub peer_has_more: bool,
 }
 
+/// A complete HTTP catalog traversal, retaining each exact typed result page.
+///
+/// Pages preserve their individual TTL, cache scope and unknown result members;
+/// no merged result or synthetic TTL is created. The collection uses one local
+/// invalidation generation and cache scope, but does not promise an atomic
+/// snapshot of a changing server catalog. A failed traversal returns no partial
+/// collection.
+#[derive(Debug, Clone)]
+pub struct CollectedHttpCatalog {
+    method: &'static str,
+    pages: Vec<CoreResult>,
+    item_count: usize,
+}
+
+impl CollectedHttpCatalog {
+    /// Returns the catalog method used for every page.
+    #[must_use]
+    pub const fn method(&self) -> &'static str {
+        self.method
+    }
+
+    /// Borrows the admitted pages in traversal order.
+    #[must_use]
+    pub fn pages(&self) -> &[CoreResult] {
+        &self.pages
+    }
+
+    /// Consumes the collection without projecting away modern result fields.
+    #[must_use]
+    pub fn into_pages(self) -> Vec<CoreResult> {
+        self.pages
+    }
+
+    /// Returns the number of catalog entries across the retained pages.
+    #[must_use]
+    pub const fn item_count(&self) -> usize {
+        self.item_count
+    }
+}
+
+fn http_catalog_page(
+    method: &str,
+    result: &CoreResult,
+) -> McpResult<(usize, Option<String>)> {
+    let (items, cursor) = match (method, result) {
+        ("tools/list", CoreResult::Legacy(LegacyCoreResult::ToolsList(result))) =>
+            (result.tools.len(), &result.next_cursor),
+        ("tools/list", CoreResult::Final(FinalCoreResult::ToolsList { result, .. })) =>
+            (result.payload.tools.len(), &result.payload.next_cursor),
+        ("resources/list", CoreResult::Legacy(LegacyCoreResult::ResourcesList(result))) =>
+            (result.resources.len(), &result.next_cursor),
+        ("resources/list", CoreResult::Final(FinalCoreResult::ResourcesList { result, .. })) =>
+            (result.payload.resources.len(), &result.payload.next_cursor),
+        ("resources/templates/list", CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(result))) =>
+            (result.resource_templates.len(), &result.next_cursor),
+        ("resources/templates/list", CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, .. })) =>
+            (result.payload.resource_templates.len(), &result.payload.next_cursor),
+        ("prompts/list", CoreResult::Legacy(LegacyCoreResult::PromptsList(result))) =>
+            (result.prompts.len(), &result.next_cursor),
+        ("prompts/list", CoreResult::Final(FinalCoreResult::PromptsList { result, .. })) =>
+            (result.payload.prompts.len(), &result.payload.next_cursor),
+        _ => return Err(unexpected_convenience_result(method)),
+    };
+    Ok((items, cursor.clone()))
+}
+
 impl PaginationBudget {
     fn new() -> Self {
         Self::with_limits(PaginationLimits::DEFAULT)
@@ -10407,6 +10473,30 @@ impl PaginationBudget {
 
         self.check_deadline()?;
         self.items = item_count;
+        self.serialized_bytes = serialized_bytes;
+        Ok(())
+    }
+
+    fn account_core_page(&mut self, result: &CoreResult, page_items: usize) -> McpResult<()> {
+        self.check_deadline()?;
+        let items = self
+            .items
+            .checked_add(page_items)
+            .filter(|items| *items <= self.limits.items)
+            .ok_or_else(|| McpError::internal_error(PAGINATION_ITEM_LIMIT_ERROR))?;
+        // Retained CoreResult pages include open result siblings, so charging
+        // only their item arrays would leave substantial unbounded state.
+        let page_bytes = result
+            .encode()
+            .map_err(|_| McpError::internal_error(PAGINATION_MEASUREMENT_ERROR))?
+            .len();
+        let serialized_bytes = self
+            .serialized_bytes
+            .checked_add(page_bytes)
+            .filter(|bytes| *bytes <= self.limits.serialized_bytes)
+            .ok_or_else(|| McpError::internal_error(PAGINATION_BYTE_LIMIT_ERROR))?;
+        self.check_deadline()?;
+        self.items = items;
         self.serialized_bytes = serialized_bytes;
         Ok(())
     }
@@ -12479,6 +12569,27 @@ impl HttpClient {
         parameters: serde_json::Value,
         parameter_headers: Option<&http_executor::parameter_headers::ReviewedToolHeaders>,
     ) -> Result<CoreResult, HttpClientError> {
+        self.request_final_core_with_cache_policy(
+            cx,
+            cancellation,
+            method,
+            parameters,
+            parameter_headers,
+            true,
+        )
+        .await
+        .map(|(result, _)| result)
+    }
+
+    async fn request_final_core_with_cache_policy(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        method: &str,
+        parameters: serde_json::Value,
+        parameter_headers: Option<&http_executor::parameter_headers::ReviewedToolHeaders>,
+        read_cache: bool,
+    ) -> Result<(CoreResult, Option<FinalCachePageState>), HttpClientError> {
         if cx.checkpoint().is_err()
             || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
         {
@@ -12504,15 +12615,27 @@ impl HttpClient {
             None
         };
 
-        if let Some(key) = key.as_ref()
-            && let FinalCacheLookup::Fresh(result) = self.final_result_cache.lookup(key)
-        {
-            if cx.checkpoint().is_err()
-                || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
-            {
-                return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
+        let mut miss = None;
+        if read_cache && let Some(key) = key.as_ref() {
+            match self.final_result_cache.lookup_page_at(key, Instant::now()) {
+                FinalCachePageLookup::Fresh(page) => {
+                    if cx.checkpoint().is_err()
+                        || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+                    {
+                        return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
+                    }
+                    let state = FinalCachePageState {
+                        generation: page.generation,
+                        scope: page.scope,
+                        miss: None,
+                    };
+                    return Ok((page.result, Some(state)));
+                }
+                FinalCachePageLookup::Miss(reason) => miss = Some(reason),
             }
-            return Ok(result);
+        } else {
+            // A bypass is a fresh network page, never a cached prefix.
+            miss = Some(FinalCacheMiss::Disabled);
         }
 
         let generation = key
@@ -12573,7 +12696,17 @@ impl HttpClient {
         .map_err(HttpClientError::Connection)?;
         let (mut response, result_source, receipt, _, _) = response;
         if let Some(error) = response.error.take() {
-            return Err(HttpClientError::CoreResult(json_rpc_error_to_mcp(error)));
+            let error = json_rpc_error_to_mcp(error);
+            if error.code == McpErrorCode::InvalidParams
+                && parameters.get("cursor").and_then(serde_json::Value::as_str).is_some()
+                && let Some(result_set @ (FinalCacheResultSet::Tools
+                    | FinalCacheResultSet::Resources
+                    | FinalCacheResultSet::ResourceTemplates
+                    | FinalCacheResultSet::Prompts)) = result_set.as_ref()
+            {
+                self.final_result_cache.invalidate_result_set(result_set);
+            }
+            return Err(HttpClientError::CoreResult(error));
         }
         let raw_result = response.result.take().ok_or_else(|| {
             HttpClientError::CoreResult(McpError::invalid_request("HTTP response has no result"))
@@ -12590,15 +12723,26 @@ impl HttpClient {
             }
             self.final_cache_ttl_diagnostics.push_back(diagnostic);
         }
+        let mut page_state = None;
         if let (Some(key), Some(generation)) = (key, generation) {
+            let scope = final_cache_hints(&result).map(|(_, scope)| scope);
+            let page_result_set = key.result_set().clone();
             let _ = self.final_result_cache.insert_if_current_at(
                 key,
                 generation,
                 result.clone(),
                 receipt,
             );
+            if generation != self.final_result_cache.begin_fetch(&page_result_set) {
+                miss = Some(FinalCacheMiss::Invalidated);
+            }
+            page_state = scope.map(|scope| FinalCachePageState {
+                generation,
+                scope,
+                miss,
+            });
         }
-        Ok(result)
+        Ok((result, page_state))
     }
 
     /// Completes one prompt or resource-template argument in the selected era.
@@ -12734,6 +12878,222 @@ impl HttpClient {
             ),
         )
         .await
+    }
+
+    /// Collects every tools page while preserving exact typed result members.
+    ///
+    /// `params.cursor` must be absent. Include/exclude filters survive every
+    /// page and the one permitted cursorless rebuild. Empty and repeated peer
+    /// cursors require another HTTP request; only an absent cursor finishes.
+    ///
+    /// The entire operation, including discarded rebuild pages, is limited to
+    /// 1,024 requests/pages, 100,000 entries, 64 MiB of encoded results, 4 KiB
+    /// cursors, and the earliest of five minutes, the configured absolute
+    /// request timeout, or the caller deadline. Cancellation returns an error.
+    ///
+    /// A cached terminal first page may satisfy the collection. A cached
+    /// prefix, rejected continuation cursor, or observed generation/scope
+    /// change discards the whole traversal and permits one fresh rebuild.
+    /// Network pages with zero TTL remain valid for this traversal. This local
+    /// consistency policy does not establish a server snapshot.
+    pub async fn list_all_tools(
+        &mut self,
+        cx: &Cx,
+        params: ListToolsParams,
+    ) -> Result<CollectedHttpCatalog, HttpClientError> {
+        self.collect_http_catalog_with_budget(
+            cx,
+            "tools/list",
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
+            FinalCacheResultSet::Tools,
+            PaginationBudget::for_request(self.request_timeout_policy),
+        )
+        .await
+    }
+
+    /// Collects all resource pages with the bounds and consistency policy of
+    /// [`Self::list_all_tools`]. The initial cursor must be absent.
+    pub async fn list_all_resources(
+        &mut self,
+        cx: &Cx,
+        params: ListResourcesParams,
+    ) -> Result<CollectedHttpCatalog, HttpClientError> {
+        self.collect_http_catalog_with_budget(
+            cx,
+            "resources/list",
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
+            FinalCacheResultSet::Resources,
+            PaginationBudget::for_request(self.request_timeout_policy),
+        )
+        .await
+    }
+
+    /// Collects all resource-template pages with the bounds and consistency
+    /// policy of [`Self::list_all_tools`]. The initial cursor must be absent.
+    pub async fn list_all_resource_templates(
+        &mut self,
+        cx: &Cx,
+        params: ListResourceTemplatesParams,
+    ) -> Result<CollectedHttpCatalog, HttpClientError> {
+        self.collect_http_catalog_with_budget(
+            cx,
+            "resources/templates/list",
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
+            FinalCacheResultSet::ResourceTemplates,
+            PaginationBudget::for_request(self.request_timeout_policy),
+        )
+        .await
+    }
+
+    /// Collects all prompt pages with the bounds and consistency policy of
+    /// [`Self::list_all_tools`]. The initial cursor must be absent.
+    pub async fn list_all_prompts(
+        &mut self,
+        cx: &Cx,
+        params: ListPromptsParams,
+    ) -> Result<CollectedHttpCatalog, HttpClientError> {
+        self.collect_http_catalog_with_budget(
+            cx,
+            "prompts/list",
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
+            FinalCacheResultSet::Prompts,
+            PaginationBudget::for_request(self.request_timeout_policy),
+        )
+        .await
+    }
+
+    async fn collect_http_catalog_with_budget(
+        &mut self,
+        cx: &Cx,
+        method: &'static str,
+        parameters: serde_json::Value,
+        result_set: FinalCacheResultSet,
+        mut budget: PaginationBudget,
+    ) -> Result<CollectedHttpCatalog, HttpClientError> {
+        if parameters.get("cursor").is_some() {
+            return Err(McpError::invalid_params(
+                "Complete HTTP catalog collection requires an absent initial cursor",
+            ).into());
+        }
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled().into());
+        }
+        budget.check_deadline()?;
+        let runtime_now = cx.now();
+        let wall_now = Instant::now();
+        let remaining = budget.deadline.saturating_duration_since(wall_now);
+        let remaining = cx.budget().deadline.map_or(remaining, |deadline| {
+            remaining.min(Duration::from_nanos(deadline.duration_since(runtime_now)))
+        });
+        budget.deadline = budget.deadline.min(wall_now + remaining);
+        let deadline = runtime_now.saturating_add_nanos(
+            u64::try_from(remaining.as_nanos()).unwrap_or(u64::MAX),
+        );
+        // Bound the outstanding HTTP await as well as work between pages.
+        // Dropping this one request future preserves its existing cancellation
+        // cleanup; it never cancels the shared client or sibling executions.
+        match asupersync::time::timeout_at(
+            deadline,
+            self.collect_http_catalog_pages(cx, method, parameters, result_set, &mut budget),
+        ).await {
+            Ok(result) => result,
+            Err(_) if cx.checkpoint().is_err() => Err(McpError::request_cancelled().into()),
+            Err(_) => Err(McpError::with_data(
+                McpErrorCode::InternalError,
+                PAGINATION_DEADLINE_ERROR,
+                serde_json::json!({"timeoutSource": "absolute"}),
+            ).into()),
+        }
+    }
+
+    async fn collect_http_catalog_pages(
+        &mut self,
+        cx: &Cx,
+        method: &'static str,
+        parameters: serde_json::Value,
+        result_set: FinalCacheResultSet,
+        budget: &mut PaginationBudget,
+    ) -> Result<CollectedHttpCatalog, HttpClientError> {
+        let mut rebuilds = 0;
+        'rebuild: loop {
+            let mut pages = Vec::new();
+            let mut item_count = 0;
+            let mut cursor = None;
+            let mut baseline = None;
+            loop {
+                if cx.checkpoint().is_err() {
+                    return Err(McpError::request_cancelled().into());
+                }
+                budget.begin_page()?;
+                let mut page_parameters = parameters.clone();
+                if let Some(cursor) = cursor.as_ref() {
+                    page_parameters["cursor"] = serde_json::Value::String(cursor.clone());
+                }
+                let page = self.request_final_core_with_cache_policy(
+                    cx, None, method, page_parameters, None, budget.pages == 1,
+                ).await;
+                if cx.checkpoint().is_err() {
+                    return Err(McpError::request_cancelled().into());
+                }
+                let (result, state) = match page {
+                    Err(HttpClientError::CoreResult(error))
+                        if cursor.is_some() && error.code == McpErrorCode::InvalidParams
+                            && rebuilds == 0 =>
+                    {
+                        rebuilds += 1;
+                        continue 'rebuild;
+                    }
+                    other => other?,
+                };
+                let (page_items, next_cursor) = http_catalog_page(method, &result)?;
+                budget.account_core_page(&result, page_items)?;
+                let next_cursor = budget.admit_next_cursor(next_cursor)?;
+                // Check even terminal pages and disabled caches: a list-change
+                // notification may have arrived inside this page's SSE body.
+                let restart = state.is_some_and(|state| {
+                    let current = self.final_result_cache.begin_fetch(&result_set);
+                    let identity = (state.generation, state.scope);
+                    let changed = state.generation != current
+                        || state.miss == Some(FinalCacheMiss::Invalidated)
+                        || baseline.is_some_and(|previous| previous != identity);
+                    baseline.get_or_insert(identity);
+                    changed || (state.miss.is_none() && next_cursor.is_some())
+                });
+                if restart {
+                    self.final_result_cache.invalidate_result_set(&result_set);
+                    if rebuilds != 0 {
+                        return Err(McpError::invalid_request(
+                            FINAL_CACHE_LIST_RESTART_LIMIT_ERROR,
+                        ).into());
+                    }
+                    rebuilds += 1;
+                    continue 'rebuild;
+                }
+                item_count += page_items;
+                pages.push(result);
+                cursor = next_cursor;
+                budget.check_deadline()?;
+                if cursor.is_none() {
+                    return Ok(CollectedHttpCatalog { method, pages, item_count });
+                }
+            }
+        }
     }
 
     /// Sends `ping` through the negotiated HTTP era.
@@ -31955,6 +32315,441 @@ mod tests {
             expected_snapshot
         );
         assert_eq!(next_id, 4);
+    }
+
+    #[cfg(unix)]
+    fn accept_http_catalog_test_request(listener: &TcpListener) -> TcpStream {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                    return stream;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "catalog request was not sent");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("catalog peer accept failed: {error}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn http_catalog_test_server(
+        listener: TcpListener,
+        count: usize,
+        mut reply: impl FnMut(usize, &serde_json::Value) -> (&'static str, String) + Send + 'static,
+    ) -> std::thread::JoinHandle<Vec<serde_json::Value>> {
+        std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for index in 0..count {
+                let mut stream = accept_http_catalog_test_request(&listener);
+                let request = read_http_cache_test_request(&mut stream);
+                let (content_type, body) = reply(index, &request);
+                write_http_cache_test_response(&mut stream, content_type, body.as_bytes());
+                requests.push(request);
+            }
+            requests
+        })
+    }
+
+    #[cfg(unix)]
+    fn http_catalog_test_result(
+        method: &str,
+        name: &str,
+        cursor: Option<&str>,
+        ttl_ms: u64,
+        scope: &str,
+    ) -> serde_json::Value {
+        let (field, item) = match method {
+            "tools/list" => ("tools", serde_json::json!({
+                "name": name, "inputSchema": {"type": "object"}
+            })),
+            "resources/list" => ("resources", serde_json::json!({
+                "name": name, "uri": format!("file:///{name}")
+            })),
+            "resources/templates/list" => ("resourceTemplates", serde_json::json!({
+                "name": name, "uriTemplate": "file:///{name}"
+            })),
+            "prompts/list" => ("prompts", serde_json::json!({"name": name})),
+            _ => panic!("unknown test catalog"),
+        };
+        let mut result = serde_json::json!({
+            "resultType": "complete", "ttlMs": ttl_ms, "cacheScope": scope
+        });
+        result[field] = serde_json::json!([item]);
+        if let Some(cursor) = cursor {
+            result["nextCursor"] = serde_json::json!(cursor);
+        }
+        result
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_http_full_catalogs_preserve_opaque_cursors_filters_and_exact_pages() {
+        for method in ["tools/list", "resources/list", "resources/templates/list", "prompts/list"] {
+            let (mut client, listener) = http_owned_execution_fixture();
+            let server = http_catalog_test_server(listener, 3, move |index, request| {
+                assert_eq!(request["method"], method);
+                assert_eq!(request["params"]["includeTags"], serde_json::json!(["visible"]));
+                assert_eq!(request["params"]["excludeTags"], serde_json::json!(["hidden"]));
+                assert_eq!(request["params"].get("cursor").and_then(serde_json::Value::as_str),
+                    if index == 0 { None } else { Some("") });
+                let mut result = http_catalog_test_result(
+                    method, &format!("page-{index}"), (index < 2).then_some(""), 0, "private",
+                ).to_string();
+                result.pop();
+                result.push_str(",\"vendorExact\":922337203685477580812345678901234567890}");
+                ("application/json", format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{result}}}", request["id"],
+                ))
+            });
+            let cx = Cx::for_request();
+            let include_tags = Some(vec!["visible".to_owned()]);
+            let exclude_tags = Some(vec!["hidden".to_owned()]);
+            let collection = http_test_runtime_block_on(async {
+                match method {
+                    "tools/list" => client.list_all_tools(&cx, ListToolsParams {
+                        cursor: None, include_tags, exclude_tags,
+                    }).await,
+                    "resources/list" => client.list_all_resources(&cx, ListResourcesParams {
+                        cursor: None, include_tags, exclude_tags,
+                    }).await,
+                    "resources/templates/list" => client.list_all_resource_templates(&cx, ListResourceTemplatesParams {
+                        cursor: None, include_tags, exclude_tags,
+                    }).await,
+                    "prompts/list" => client.list_all_prompts(&cx, ListPromptsParams {
+                        cursor: None, include_tags, exclude_tags,
+                    }).await,
+                    _ => unreachable!(),
+                }
+            }).expect("all four public helpers traverse zero-TTL pages");
+            assert_eq!(collection.method(), method);
+            assert_eq!(collection.item_count(), 3);
+            assert_eq!(collection.pages().len(), 3);
+            for (index, page) in collection.into_pages().into_iter().enumerate() {
+                let encoded = page.encode().unwrap();
+                assert!(encoded.contains(&format!("page-{index}")));
+                assert!(encoded.contains("\"vendorExact\":922337203685477580812345678901234567890"));
+            }
+            assert_eq!(server.join().unwrap().len(), 3);
+            assert_eq!(client.next_id.load(Ordering::Relaxed), 5);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_http_full_catalog_rebuilds_rejected_cursor_once_with_original_filters() {
+        for reject_rebuild in [false, true] {
+            let (mut client, listener) = http_owned_execution_fixture();
+            let server = http_catalog_test_server(listener, 4, move |index, request| {
+                assert_eq!(request["params"]["includeTags"], serde_json::json!(["visible"]));
+                assert_eq!(request["params"]["excludeTags"], serde_json::json!([]));
+                let expected = match index { 0 | 2 => None, 1 => Some("stale"), _ => Some("fresh") };
+                assert_eq!(request["params"].get("cursor").and_then(serde_json::Value::as_str), expected);
+                let response = if index == 1 || (index == 3 && reject_rebuild) {
+                    serde_json::json!({"jsonrpc":"2.0", "id":request["id"],
+                        "error":{"code":-32602,"message":"invalid cursor"}})
+                } else {
+                    let (name, cursor) = match index {
+                        0 => ("discarded", Some("stale")),
+                        2 => ("new-first", Some("fresh")),
+                        _ => ("new-last", None),
+                    };
+                    serde_json::json!({"jsonrpc":"2.0", "id":request["id"],
+                        "result":http_catalog_test_result("tools/list", name, cursor, 60_000, "private")})
+                };
+                ("application/json", response.to_string())
+            });
+            let result = http_test_runtime_block_on(client.list_all_tools(&Cx::for_request(), ListToolsParams {
+                cursor: None, include_tags: Some(vec!["visible".to_owned()]), exclude_tags: Some(vec![]),
+            }));
+            if reject_rebuild {
+                assert!(matches!(result, Err(HttpClientError::CoreResult(error)) if error.code == McpErrorCode::InvalidParams));
+            } else {
+                let collection = result.expect("one rejected cursor permits a fresh whole traversal");
+                assert_eq!(collection.item_count(), 2);
+                assert_eq!(collection.pages().len(), 2);
+                assert!(collection.pages()[0].encode().unwrap().contains("new-first"));
+                assert!(collection.pages()[1].encode().unwrap().contains("new-last"));
+            }
+            assert_eq!(server.join().unwrap().len(), 4);
+            assert_eq!(client.next_id.load(Ordering::Relaxed), 6);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_http_single_page_cursor_rejection_flushes_cached_first_page() {
+        let (mut client, listener) = http_owned_execution_fixture();
+        let server = http_catalog_test_server(listener, 3, |index, request| {
+            let response = if index == 1 {
+                assert_eq!(request["params"]["cursor"], "stale");
+                serde_json::json!({"jsonrpc":"2.0", "id":request["id"],
+                    "error":{"code":-32602,"message":"invalid cursor"}})
+            } else {
+                assert!(request["params"].get("cursor").is_none());
+                serde_json::json!({"jsonrpc":"2.0", "id":request["id"],
+                    "result":http_catalog_test_result("tools/list", if index == 0 { "old" } else { "new" },
+                        (index == 0).then_some("stale"), 60_000, "private")})
+            };
+            ("application/json", response.to_string())
+        });
+        let cx = Cx::for_request();
+        http_test_runtime_block_on(client.list_tools(&cx, None)).unwrap();
+        assert!(matches!(http_test_runtime_block_on(client.list_tools(&cx, Some("stale"))),
+            Err(HttpClientError::CoreResult(error)) if error.code == McpErrorCode::InvalidParams));
+        let collection = http_test_runtime_block_on(client.list_all_tools(&cx, ListToolsParams::default())).unwrap();
+        assert!(collection.pages()[0].encode().unwrap().contains("\"name\":\"new\""));
+        assert_eq!(server.join().unwrap().len(), 3);
+        let next_id = client.next_id.load(Ordering::Relaxed);
+        let cached = http_test_runtime_block_on(client.list_all_tools(&cx, ListToolsParams::default())).unwrap();
+        assert_eq!(cached.item_count(), 1);
+        assert_eq!(client.next_id.load(Ordering::Relaxed), next_id, "a fresh cached terminal page satisfies a catalog");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_http_full_catalog_discards_cached_prefix_before_network_continuation() {
+        let (mut client, listener) = http_owned_execution_fixture();
+        let server = http_catalog_test_server(listener, 3, |index, request| {
+            assert_eq!(request["params"].get("cursor").and_then(serde_json::Value::as_str),
+                if index < 2 { None } else { Some("fresh-tail") });
+            let (name, cursor) = match index {
+                0 => ("cached-old", Some("old-tail")),
+                1 => ("fresh-first", Some("fresh-tail")),
+                _ => ("fresh-last", None),
+            };
+            ("application/json", serde_json::json!({"jsonrpc":"2.0", "id":request["id"],
+                "result":http_catalog_test_result("tools/list", name, cursor, 60_000, "private")}).to_string())
+        });
+        let cx = Cx::for_request();
+        http_test_runtime_block_on(client.list_tools(&cx, None)).unwrap();
+        let collection = http_test_runtime_block_on(client.list_all_tools(&cx, ListToolsParams::default())).unwrap();
+        assert_eq!(collection.item_count(), 2);
+        assert!(collection.pages().iter().all(|page| !page.encode().unwrap().contains("cached-old")));
+        assert_eq!(server.join().unwrap().len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_http_full_catalog_rechecks_terminal_generation_and_scope_with_cache_disabled() {
+        for cache_enabled in [false, true] {
+            for notify in [false, true] {
+                let (mut client, listener) = http_owned_execution_fixture();
+                client.set_final_result_cache_enabled(cache_enabled);
+                let server = http_catalog_test_server(listener, 3, move |index, request| {
+                    assert_eq!(request["params"].get("cursor").and_then(serde_json::Value::as_str),
+                        if index == 1 { Some("tail") } else { None });
+                    let response = serde_json::json!({"jsonrpc":"2.0", "id":request["id"],
+                        "result":http_catalog_test_result("tools/list", if index == 2 { "fresh" } else { "discarded" },
+                            (index == 0).then_some("tail"), 0, if index == 1 && !notify { "public" } else { "private" })});
+                    if index == 1 && notify {
+                        ("text/event-stream", format!(
+                            "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}\n\ndata: {response}\n\n"
+                        ))
+                    } else {
+                        ("application/json", response.to_string())
+                    }
+                });
+                let collection = http_test_runtime_block_on(client.list_all_tools(&Cx::for_request(), ListToolsParams::default()))
+                    .expect("terminal generation/scope drift gets one whole-list rebuild");
+                assert_eq!(collection.pages().len(), 1);
+                assert_eq!(collection.item_count(), 1);
+                assert!(collection.pages()[0].encode().unwrap().contains("\"name\":\"fresh\""));
+                assert_eq!(server.join().unwrap().len(), 3);
+                assert_eq!(client.take_final_server_notifications().len(), usize::from(notify));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_http_full_catalog_bounds_stop_before_another_post_and_charge_discarded_pages() {
+        for bound in ["pages", "items", "bytes", "cursor", "discarded"] {
+            let (mut client, listener) = http_owned_execution_fixture();
+            let (requests, expected) = match bound {
+                "pages" => (2, PAGINATION_PAGE_LIMIT_ERROR),
+                "items" | "discarded" => (2, PAGINATION_ITEM_LIMIT_ERROR),
+                "bytes" => (1, PAGINATION_BYTE_LIMIT_ERROR),
+                "cursor" => (1, PAGINATION_CURSOR_LIMIT_ERROR),
+                _ => unreachable!(),
+            };
+            let server = http_catalog_test_server(listener, requests, move |index, request| {
+                let cursor = if bound == "cursor" { "oversized" } else { "" };
+                let mut result = http_catalog_test_result("tools/list", "bounded", Some(cursor), 0, "private");
+                if bound == "bytes" {
+                    result["vendorLarge"] = serde_json::json!("x".repeat(1_024));
+                }
+                let response = serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result":result});
+                if bound == "discarded" && index == 0 {
+                    ("text/event-stream", format!(
+                        "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}\n\ndata: {response}\n\n"
+                    ))
+                } else {
+                    ("application/json", response.to_string())
+                }
+            });
+            let mut limits = PaginationLimits::DEFAULT;
+            match bound {
+                "pages" => limits.pages = 2,
+                "items" | "discarded" => limits.items = 1,
+                "bytes" => limits.serialized_bytes = 512,
+                "cursor" => limits.cursor_bytes = 4,
+                _ => unreachable!(),
+            }
+            let error = http_test_runtime_block_on(client.collect_http_catalog_with_budget(
+                &Cx::for_request(), "tools/list", serde_json::json!({}), FinalCacheResultSet::Tools,
+                PaginationBudget::with_limits(limits),
+            )).expect_err("limits reject the entire collection");
+            assert!(matches!(error, HttpClientError::CoreResult(error) if error.message == expected), "{bound} limit");
+            let observed = server.join().unwrap();
+            assert_eq!(observed.len(), requests);
+            if bound == "discarded" {
+                assert!(observed[1]["params"].get("cursor").is_none(), "discarded page triggers cursorless rebuild");
+            }
+            assert_eq!(client.next_id.load(Ordering::Relaxed), 2 + requests as u64,
+                "limit rejection must not allocate or send another request");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_http_full_catalog_rejects_starting_cursor_and_stopped_caller_before_io() {
+        let (mut client, listener) = http_owned_execution_fixture();
+        let cx = Cx::for_testing();
+        for cursor in ["", "opaque"] {
+            let result = http_test_runtime_block_on(client.list_all_tools(&cx, ListToolsParams {
+                cursor: Some(cursor.to_owned()), ..ListToolsParams::default()
+            }));
+            assert!(matches!(result, Err(HttpClientError::CoreResult(error)) if error.code == McpErrorCode::InvalidParams));
+        }
+        cx.set_cancel_requested(true);
+        let result = http_test_runtime_block_on(client.list_all_tools(&cx, ListToolsParams::default()));
+        assert!(matches!(result, Err(HttpClientError::CoreResult(error)) if error.code == McpErrorCode::RequestCancelled));
+        assert_eq!(client.next_id.load(Ordering::Relaxed), 2);
+        assert!(matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_http_full_catalog_original_deadline_drops_pending_page_and_client_remains_usable() {
+        for caller_deadline in [false, true] {
+            let (mut client, listener) = http_owned_execution_fixture();
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            let healthy = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let limited = runtime.request_cx_with_budget(asupersync::Budget::INFINITE.with_deadline(
+                healthy.now() + Duration::from_millis(500),
+            ));
+            let server = std::thread::spawn(move || {
+                let mut first = accept_http_catalog_test_request(&listener);
+                let request = read_http_cache_test_request(&mut first);
+                assert!(request["params"].get("cursor").is_none());
+                // The same absolute budget must cover the first page and the
+                // indefinitely withheld second response headers.
+                std::thread::sleep(Duration::from_millis(30));
+                let response = serde_json::json!({"jsonrpc":"2.0", "id":request["id"],
+                    "result":http_catalog_test_result("tools/list", "first", Some("pending"), 0, "private")});
+                write_http_cache_test_response(&mut first, "application/json", response.to_string().as_bytes());
+                let mut pending = accept_http_catalog_test_request(&listener);
+                let request = read_http_cache_test_request(&mut pending);
+                assert_eq!(request["params"]["cursor"], "pending");
+                let mut probe = [0_u8; 1];
+                assert_eq!(pending.read(&mut probe).unwrap(), 0, "deadline drops this request's socket");
+                let mut healthy = accept_http_catalog_test_request(&listener);
+                let request = read_http_cache_test_request(&mut healthy);
+                assert!(request["params"].get("cursor").is_none());
+                let response = serde_json::json!({"jsonrpc":"2.0", "id":request["id"],
+                    "result":http_catalog_test_result("tools/list", "reused", None, 0, "private")});
+                write_http_cache_test_response(&mut healthy, "application/json", response.to_string().as_bytes());
+            });
+            let mut budget = PaginationBudget::with_limits(PaginationLimits::DEFAULT);
+            if !caller_deadline {
+                budget.deadline = Instant::now() + Duration::from_millis(500);
+            }
+            let started = Instant::now();
+            let error = runtime.block_on(client.collect_http_catalog_with_budget(
+                if caller_deadline { &limited } else { &healthy }, "tools/list", serde_json::json!({}),
+                FinalCacheResultSet::Tools, budget,
+            )).expect_err("a stalled continuation cannot return the first page as a complete catalog");
+            if caller_deadline {
+                assert!(matches!(error, HttpClientError::CoreResult(error) if error.code == McpErrorCode::RequestCancelled));
+            } else {
+                assert!(matches!(error, HttpClientError::CoreResult(error) if error.message == PAGINATION_DEADLINE_ERROR));
+            }
+            assert!(started.elapsed() < Duration::from_secs(2), "the original traversal deadline bounds in-flight HTTP");
+            let collection = runtime.block_on(client.list_all_tools(&healthy, ListToolsParams::default()))
+                .expect("deadline preserves the reusable HTTP client");
+            assert_eq!(collection.item_count(), 1);
+            assert!(collection.pages()[0].encode().unwrap().contains("reused"));
+            assert_eq!(client.next_id.load(Ordering::Relaxed), 5);
+            server.join().unwrap();
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn clt_01_http_full_catalog_preserves_the_selected_legacy_era_across_pages() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message");
+        let advertised = message_target.clone();
+        let server = std::thread::spawn(move || {
+            let mut sse = accept_http_catalog_test_request(&listener);
+            let mut head = [0_u8; 1_024];
+            let read = sse.read(&mut head).unwrap();
+            assert!(std::str::from_utf8(&head[..read]).unwrap().starts_with("GET /legacy-sse "));
+            let endpoint = format!("event: endpoint\ndata: {advertised}\n\n");
+            write!(sse,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n{:X}\r\n{}\r\n",
+                endpoint.len(), endpoint,
+            ).unwrap();
+            sse.flush().unwrap();
+            let mut initialize = accept_http_catalog_test_request(&listener);
+            let request = read_http_cache_test_request(&mut initialize);
+            assert_eq!(request["method"], "initialize");
+            write_legacy_http_accepted_response(&mut initialize);
+            write_legacy_http_sse_message(&mut sse,
+                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"legacy-catalog","version":"1.0.0"}}}"#,
+            );
+            let mut initialized = accept_http_catalog_test_request(&listener);
+            let request = read_http_cache_test_request(&mut initialized);
+            assert_eq!(request["method"], "notifications/initialized");
+            write_legacy_http_accepted_response(&mut initialized);
+            for index in 0..2 {
+                let mut page = accept_http_catalog_test_request(&listener);
+                let request = read_http_cache_test_request(&mut page);
+                assert_eq!(request["method"], "tools/list");
+                assert_eq!(request["params"].get("cursor").and_then(serde_json::Value::as_str),
+                    if index == 0 { None } else { Some("") });
+                assert!(request["params"].get("_meta").is_none());
+                write_legacy_http_accepted_response(&mut page);
+                let mut result = serde_json::json!({"tools":[{
+                    "name":format!("legacy-{index}"), "inputSchema":{"type":"object"}
+                }]});
+                if index == 0 { result["nextCursor"] = serde_json::json!(""); }
+                write_legacy_http_sse_message(&mut sse, &serde_json::json!({
+                    "jsonrpc":"2.0", "id":request["id"], "result":result
+                }).to_string());
+            }
+        });
+        let cx = Cx::for_request();
+        let collection = http_test_runtime_block_on(async {
+            let mut client = HttpClient::connect(&cx,
+                legacy_completion_http_plan(&sse_target, &message_target),
+                ClientInfo { name: "legacy-catalog-client".to_owned(), version: "1.0.0".to_owned() },
+                ClientCapabilities::default(),
+            ).await.unwrap();
+            client.list_all_tools(&cx, ListToolsParams::default()).await.unwrap()
+        });
+        assert_eq!(collection.item_count(), 2);
+        assert_eq!(collection.pages().len(), 2);
+        assert!(collection.pages().iter().all(|page| matches!(page, CoreResult::Legacy(LegacyCoreResult::ToolsList(_)))));
+        server.join().unwrap();
     }
 
     #[cfg(unix)]
