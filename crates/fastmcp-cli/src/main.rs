@@ -13112,10 +13112,87 @@ mod tests {
         );
     }
 
+    /// Diagnostic snapshot of the host and one fixture directory.
+    #[cfg(unix)]
+    fn cli_core_diagnostics(directory: &Path) -> String {
+        let run = |program: &str, args: &[&str]| -> String {
+            std::process::Command::new(program)
+                .args(args)
+                .output()
+                .map(|output| {
+                    format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                })
+                .unwrap_or_else(|error| format!("<{program} failed: {error}>\n"))
+        };
+        let dir = directory.to_str().unwrap();
+        format!(
+            "now={:?}\nloadavg={}df -k:\n{}df -i:\n{}ls:\n{}log:\n{}ready={:?} release={:?}\nps:\n{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap(),
+            std::fs::read_to_string("/proc/loadavg").unwrap_or_default(),
+            run("df", &["-k", dir]),
+            run("df", &["-i", dir]),
+            run("ls", &["-la", dir]),
+            std::fs::read_to_string(directory.join("log")).unwrap_or_default(),
+            std::fs::read_to_string(directory.join("ready")).ok(),
+            std::fs::read_to_string(directory.join("release")).ok(),
+            {
+                // The script and its cat/sleep/date children, with their
+                // scheduler state: D names an uninterruptible I/O wait.
+                let table = run(
+                    "ps",
+                    &["-e", "-o", "pid=,ppid=,stat=,wchan:32=,etime=,comm="],
+                );
+                let mut family = vec![std::process::id().to_string()];
+                let mut lines = Vec::new();
+                for _ in 0..3 {
+                    for line in table.lines() {
+                        let fields: Vec<&str> = line.split_whitespace().collect();
+                        if fields.len() >= 2
+                            && family.iter().any(|pid| pid == fields[1])
+                            && !family.iter().any(|pid| pid == fields[0])
+                        {
+                            family.push(fields[0].to_owned());
+                            lines.push(line.to_owned());
+                        }
+                    }
+                }
+                lines.join("\n")
+            }
+        )
+    }
+
     #[cfg(unix)]
     fn assert_stdio_catalog_commands_caller_runtime(cancel: bool) {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        // The sibling's observation bound is the ONLY bound here that names the
+        // property under test: the command must yield at every request. Every
+        // other budget in this fixture must therefore outlast it, or a slow
+        // host trips a shorter bound first and the failure reports a client
+        // timeout or a broken pipe instead of naming the property. Keep this
+        // ordering whenever any of the three is retuned.
+        const SIBLING_OBSERVATION_BOUND: Duration = Duration::from_secs(15);
+        // Each poll forks `cat` and `sleep 0.01`, so this is at least 30s of
+        // wall time and grows with load, staying above the bound above.
+        const CHILD_RELEASE_POLLS: u32 = 3_000;
+        // Per-request idle and absolute client budgets. These bound one
+        // request's own wait, not the whole fixture handshake, and they are not
+        // an assertion about how fast this scripted child answers.
+        const COMMAND_REQUEST_TIMEOUT_SECS: u64 = 30;
+        // Fails this test outright if the ordering above is ever inverted, so a
+        // retune cannot quietly send the fixture back to reporting a client
+        // timeout in place of the property.
+        assert!(
+            COMMAND_REQUEST_TIMEOUT_SECS > SIBLING_OBSERVATION_BOUND.as_secs(),
+            "the client budget must outlast the sibling's observation bound",
+        );
 
         for policy in [CliProtocolPolicy::ModernOnly, CliProtocolPolicy::LegacyOnly] {
             if policy == CliProtocolPolicy::LegacyOnly && !LEGACY_PROTOCOL_POLICY_ENABLED {
@@ -13227,25 +13304,33 @@ mod tests {
                     script.push_str(&format!(
                         r#"
 IFS= read -r request || fail 92 request-eof
+printf 'read {id} %s\n' "$(date +%s.%N)" >> {log}
 case "$request" in
     *'"method":"notifications/cancelled"'*) fail 0 "$request" ;;
     *'"method":"{wire_method}"'*'"id":{id}'*) ;;
     *) fail 93 "$request" ;;
 esac
 printf '%s' '{id}' > {ready} || fail 95 ready-write
-remaining=1000
+[ "$(cat {ready})" = '{id}' ] || fail 96 ready-verify
+printf 'ready {id} %s\n' "$(date +%s.%N)" >> {log}
+remaining={polls}
 while [ "$(cat {release})" != '{id}' ]; do
     remaining=$((remaining - 1))
     [ "$remaining" -gt 0 ] || fail 94 release-timeout
     sleep 0.01
 done
+printf 'released {id} %s remaining=%s\n' "$(date +%s.%N)" "$remaining" >> {log}
 printf '%s\n' '{{"jsonrpc":"2.0","id":{id},"result":{result}}}'
 "#,
                         ready = quote(&ready),
-                        release = quote(&release)
+                        release = quote(&release),
+                        log = quote(&directory.join("log")),
+                        polls = CHILD_RELEASE_POLLS
                     ));
                 }
                 script.push_str("IFS= read -r end\n");
+                let sibling_diag_dir = directory.clone();
+                let outcome_diag_dir = directory.clone();
                 let runtime = RuntimeBuilder::current_thread()
                     .blocking_threads(0, 0)
                     .build()
@@ -13262,10 +13347,22 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":{id},"result":{result}}}'
                             assert_eq!(std::thread::current().id(), worker);
                             for id in 2..=5 {
                                 let expected = id.to_string();
-                                let deadline = Instant::now() + Duration::from_secs(15);
+                                let started = Instant::now();
+                                let deadline = Instant::now() + SIBLING_OBSERVATION_BOUND;
                                 let mut polls = 0_u64;
-                                while std::fs::read_to_string(&ready).unwrap() != expected {
+                                loop {
+                                    let read_at = Instant::now();
+                                    let observed = std::fs::read_to_string(&ready).unwrap();
+                                    if read_at.elapsed() > Duration::from_millis(100) {
+                                        eprintln!("CLI_CORE_FS_STALL read id={id} elapsed={:?}", read_at.elapsed());
+                                    }
+                                    if observed == expected {
+                                        break;
+                                    }
                                     polls += 1;
+                                    if Instant::now() >= deadline {
+                                        eprintln!("CLI_CORE_DIAG sibling id={id}\n{}", cli_core_diagnostics(&sibling_diag_dir));
+                                    }
                                     assert!(Instant::now() < deadline,
                                         "catalog command must yield at every request: id={id}, sibling_polls={polls}, ready={:?}",
                                         std::fs::read_to_string(&ready).unwrap());
@@ -13275,8 +13372,17 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":{id},"result":{result}}}'
                                         eprintln!("CLI_CORE_RUNTIME_DELAY id={id} elapsed={:?}", yielded_at.elapsed());
                                     }
                                 }
+                                eprintln!(
+                                    "CLI_CORE_ID_OBSERVED id={id} polls={polls} waited_ms={} at={:?}",
+                                    started.elapsed().as_millis(),
+                                    SystemTime::now().duration_since(UNIX_EPOCH).unwrap()
+                                );
                                 if cancel { command_cx.set_cancel_requested(true); }
+                                let write_at = Instant::now();
                                 std::fs::write(&release, expected).unwrap();
+                                if write_at.elapsed() > Duration::from_millis(100) {
+                                    eprintln!("CLI_CORE_FS_STALL write id={id} elapsed={:?}", write_at.elapsed());
+                                }
                                 if cancel { return 1; }
                             }
                             4
@@ -13285,7 +13391,17 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":{id},"result":{result}}}'
                         let outcome = if inspect {
                             Box::pin(cmd_inspect(&cx, "sh", &args, InspectFormat::Json, None, policy)).await
                         } else {
-                            Box::pin(cmd_test(&cx, "sh", &args, policy, 5, 5, false, true)).await
+                            Box::pin(cmd_test(
+                                &cx,
+                                "sh",
+                                &args,
+                                policy,
+                                COMMAND_REQUEST_TIMEOUT_SECS,
+                                COMMAND_REQUEST_TIMEOUT_SECS,
+                                false,
+                                true,
+                            ))
+                            .await
                         };
                         if cancel {
                             let error = outcome.unwrap_err();
@@ -13305,6 +13421,9 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":{id},"result":{result}}}'
                         } else {
                             // The same command without cancellation must finish
                             // every request and its cleanup.
+                            if outcome.is_err() {
+                                eprintln!("CLI_CORE_DIAG outcome\n{}", cli_core_diagnostics(&outcome_diag_dir));
+                            }
                             outcome.expect("an uncancelled run must complete with cleanup verified");
                         }
                         sibling_root.checkpoint().unwrap();
