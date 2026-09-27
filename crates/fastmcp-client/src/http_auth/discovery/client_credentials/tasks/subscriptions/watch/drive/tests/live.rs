@@ -38,7 +38,40 @@ fn isolated(name: &str, case: Case) {
     isolated_run(name, || run(case));
 }
 
+// The parent's own root-authority file, keyed by the whole scenario path.
+// Sibling modules deliberately run the same leaf scenario name, so the final
+// path segment is not a unique key; `-` cannot occur in a Rust identifier, so
+// substituting it for `::` stays injective over these paths.
+fn root_authority_file(scenario: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("fastmcp-machine-watch-{}-{}.pem", std::process::id(), scenario.replace("::", "-")))
+}
+
+#[test]
+fn sibling_scenarios_sharing_a_leaf_name_get_distinct_root_authority_files() {
+    // Each leaf below is run twice, once under `recovery::input_driver` and
+    // once under `recovery::input`. Keyed by the final segment alone the two
+    // named one file, so whichever child exited first had its `Root` remove
+    // the authority the other child was still presenting; that handshake then
+    // failed as Authentication(Transport) with no deadline involved.
+    for leaf in ["tls_input_recovery_cannot_extend_the_original_deadline",
+        "tls_input_recovery_rejects_changed_unanswered_descriptors"]
+    {
+        let (driver, input) = (format!("recovery::input_driver::{leaf}"), format!("recovery::input::{leaf}"));
+        // The retired key is equal for this very pair, so the inequality below
+        // is a property of the new key and not of the chosen names.
+        assert_eq!(driver.rsplit("::").next(), input.rsplit("::").next());
+        assert_ne!(root_authority_file(&driver), root_authority_file(&input));
+        for scenario in [&driver, &input] {
+            let file = root_authority_file(scenario);
+            let file = file.file_name().unwrap().to_str().unwrap();
+            assert!(file.len() < 255, "root authority file name must stay legal: {file}");
+            assert!(file.ends_with(&format!("{leaf}.pem")), "the leaf stays greppable: {file}");
+        }
+    }
+}
+
 fn isolated_run(name: &str, scenario: impl FnOnce()) {
+    let authority = root_authority_file(name);
     let name = format!("{}::{name}", module_path!().split_once("::").unwrap().1);
     if let Ok(selected) = std::env::var(CHILD) {
         assert_eq!(selected, name);
@@ -49,7 +82,7 @@ fn isolated_run(name: &str, scenario: impl FnOnce()) {
     impl Drop for Root { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); } }
     struct Child(std::process::Child);
     impl Drop for Child { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
-    let root = Root(std::env::temp_dir().join(format!("fastmcp-machine-watch-{}-{}.pem", std::process::id(), name.rsplit("::").next().unwrap())));
+    let root = Root(authority);
     std::fs::write(&root.0, ROOT).unwrap();
     let mut child = Child(Command::new(std::env::current_exe().unwrap())
         .args(["--exact", &name, "--nocapture", "--test-threads=1"])

@@ -527,6 +527,7 @@ mod tests {
                 state: Arc::new(asupersync::sync::Mutex::new(machine::TokenState {
                     current: Some(machine::ServiceToken { bearer, scopes: vec![], expires_at, renew_after: expires_at }),
                     generation: 1,
+                    ..machine::TokenState::default()
                 })),
             }),
         };

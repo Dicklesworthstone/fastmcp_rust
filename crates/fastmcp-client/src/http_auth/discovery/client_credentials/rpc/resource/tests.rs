@@ -48,7 +48,7 @@ pub(super) fn consumer(limits: ClientCredentialsResourceLimits) -> ClientCredent
         issuer_roots: vec![], resource_tls: None, timeout: Duration::from_secs(5),
         maximum_lifetime: Duration::from_secs(600), leeway: Duration::from_secs(30),
         closed, pending: AtomicUsize::new(0),
-        state: Arc::new(asupersync::sync::Mutex::new(TokenState { current: Some(token), generation: 1 })),
+        state: Arc::new(asupersync::sync::Mutex::new(TokenState { current: Some(token), generation: 1, ..TokenState::default() })),
     }) };
     ClientCredentialsResourceClient::new(client, limits).with_cache_limits(8, 64 * 1024).unwrap()
 }
