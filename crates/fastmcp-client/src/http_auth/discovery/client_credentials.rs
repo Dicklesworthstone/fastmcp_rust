@@ -633,8 +633,32 @@ struct TokenDocument {
     resource: Option<String>,
     #[serde(default, deserialize_with = "present")]
     error: Option<String>,
+    // These are known authority-bearing members of incompatible responses,
+    // not ignorable extensions. Presence is forbidden even when null, empty
+    // or malformed. Unit fields retain no extra credential or peer diagnostic.
+    #[serde(default, rename = "refresh_token", deserialize_with = "reject_token_member")]
+    _refresh_token: (),
+    #[serde(default, rename = "id_token", deserialize_with = "reject_token_member")]
+    _id_token: (),
+    #[serde(default, rename = "cnf", deserialize_with = "reject_token_member")]
+    _confirmation: (),
+    #[serde(default, rename = "issued_token_type", deserialize_with = "reject_token_member")]
+    _issued_token_type: (),
+    #[serde(default, rename = "error_description", deserialize_with = "reject_token_member")]
+    _error_description: (),
+    #[serde(default, rename = "error_uri", deserialize_with = "reject_token_member")]
+    _error_uri: (),
 }
+
+fn reject_token_member<'de, D: serde::Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+    Err(serde::de::Error::custom("unsupported machine token response member"))
+}
+
 fn admit_token(inner: &ClientInner, bytes: &[u8], started: Instant) -> Result<ServiceToken, ClientCredentialsError> {
+    if bytes.len() > MAX_TOKEN_BYTES { return Err(ClientCredentialsError::InvalidToken); }
+    // The shared raw decoder rejects duplicate members and non-object input
+    // before serde can erase their presence. Unknown members remain bounded
+    // and ignored; they cannot override the recognized grant/security fields.
     let token: TokenDocument = decode_metadata(bytes).map_err(|_| ClientCredentialsError::InvalidToken)?;
     if !token.token_type.eq_ignore_ascii_case("Bearer") || token.access_token.len() > 16 * 1024
         || !AccessToken::is_valid_token68(&token.access_token) || token.error.is_some()
@@ -653,8 +677,10 @@ fn admit_token(inner: &ClientInner, bytes: &[u8], started: Instant) -> Result<Se
         .for_owner(&inner.closed).ok_or(ClientCredentialsError::StateUnavailable)?;
     let remaining = expires_at.saturating_duration_since(Instant::now());
     let renew_after = expires_at.checked_sub(inner.leeway.min(remaining / 2)).ok_or(ClientCredentialsError::InvalidToken)?;
-    // Refresh tokens and registration URLs remain ignored, never persisted or
-    // used to change this issuer-bound preregistered acquisition method.
+    // The complete document is admitted before a token can reach the cache.
+    // No refresh/identity grant, sender constraint or token-exchange response
+    // can be silently downgraded to this bearer-only machine profile. Unknown
+    // metadata cannot reconfigure registration, trust or the token endpoint.
     Ok(ServiceToken { bearer, scopes, expires_at, renew_after })
 }
 
@@ -904,7 +930,7 @@ mod tests {
     #[test]
     fn token_admission_bounds_expiry_scopes_and_resource_without_refresh_authority() {
         let inner=inner(); let now=Instant::now();
-        let token=admit_token(&inner, br#"{"access_token":"access","token_type":"Bearer","expires_in":600,"scope":"read","refresh_token":"ignored"}"#,now).unwrap();
+        let token=admit_token(&inner, br#"{"access_token":"access","token_type":"Bearer","expires_in":600,"scope":"read"}"#,now).unwrap();
         assert_eq!(token.expires_at,now+Duration::from_secs(60));
         assert_eq!(token.scopes,["read"]);
         assert!(token.bearer.authorization_for_target(&inner.resource).is_some());
@@ -924,7 +950,7 @@ mod tests {
         assert_eq!(body["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"],json!({CLIENT_CREDENTIALS_EXTENSION:{}}));
         assert!(!wire.headers().iter().any(|(name,_)| name.eq_ignore_ascii_case("authorization")));
         let mut params=core().encode_params().unwrap().unwrap();
-        params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]=json!({"io.modelcontextprotocol/tasks":{}});
+        params["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]=json!({"io.modelcontextprotocol/tasks":{}});
         let other=CoreRequest::decode(ProtocolEra::Modern2026,"tools/list",Some(&params)).unwrap();
         assert!(prepare(&url("https://resource.example/mcp"),&other,&RequestId::Number(7)).is_err());
     }
@@ -1062,5 +1088,129 @@ mod tests {
         }
         assert!(admit_machine_issuer(&post.discovery, &post.discovery.issuers[0],
             &serde_json::to_vec(&valid).unwrap(), &post.authentication).is_ok());
+    }
+
+    fn valid_machine_token() -> Value {
+        json!({"access_token":"access-secret-canary", "token_type":"Bearer",
+            "expires_in":60, "scope":"read"})
+    }
+
+    #[test]
+    fn machine_token_forbidden_members_reject_presence_not_just_values() {
+        let inner = inner();
+        let valid = valid_machine_token();
+        for key in ["refresh_token", "id_token", "cnf", "issued_token_type", "error_description", "error_uri"] {
+            for value in [Value::Null, json!(""), json!("peer-secret-canary"), json!(false),
+                json!(7), json!([]), json!({})]
+            {
+                assert!(admit_token(&inner, &serde_json::to_vec(&valid).unwrap(), Instant::now()).is_ok());
+                let mut changed = valid.clone();
+                changed[key] = value;
+                let error = admit_token(&inner, &serde_json::to_vec(&changed).unwrap(), Instant::now()).err().unwrap();
+                assert!(matches!(error, ClientCredentialsError::InvalidToken));
+                let diagnostic = format!("{error:?} {error}");
+                assert!(!diagnostic.contains("peer-secret-canary"));
+                assert!(!diagnostic.contains("access-secret-canary"));
+            }
+        }
+    }
+
+    #[test]
+    fn machine_token_cannot_downgrade_sender_constraints_or_exchange_grants() {
+        let inner = inner();
+        for (key, value) in [
+            ("token_type", json!("DPoP")),
+            ("cnf", json!({"jkt":"proof-key"})),
+            ("cnf", json!({"x5t#S256":"client-certificate"})),
+            ("issued_token_type", json!("urn:ietf:params:oauth:token-type:access_token")),
+        ] {
+            let mut document = valid_machine_token();
+            document[key] = value;
+            assert!(matches!(admit_token(&inner, &serde_json::to_vec(&document).unwrap(), Instant::now()),
+                Err(ClientCredentialsError::InvalidToken)));
+        }
+        for spelling in ["Bearer", "bearer", "bEaReR"] {
+            let mut document = valid_machine_token();
+            document["token_type"] = json!(spelling);
+            assert!(admit_token(&inner, &serde_json::to_vec(&document).unwrap(), Instant::now()).is_ok());
+        }
+    }
+
+    #[test]
+    fn machine_token_error_fields_never_coexist_with_success() {
+        let inner = inner();
+        for key in ["error", "error_description", "error_uri"] {
+            for value in [Value::Null, json!(""), json!("invalid_client"), json!({})] {
+                let mut document = valid_machine_token();
+                document[key] = value;
+                assert!(matches!(admit_token(&inner, &serde_json::to_vec(&document).unwrap(), Instant::now()),
+                    Err(ClientCredentialsError::InvalidToken)));
+            }
+        }
+        assert!(admit_token(&inner, br#"{"error":"invalid_client","error_description":"peer-secret"}"#,
+            Instant::now()).is_err());
+    }
+
+    #[test]
+    fn machine_token_ignores_unknown_metadata_without_promoting_nested_authority() {
+        let inner = inner();
+        let started = Instant::now();
+        let mut document = valid_machine_token();
+        document["x-extension"] = json!({"refresh_token":"ignored-nested", "id_token":null,
+            "cnf":{"jkt":"nested"}, "error":"nested", "scope":"admin"});
+        document["registration_client_uri"] = json!("https://untrusted.example/registration");
+        document["token_endpoint"] = json!("https://untrusted.example/token");
+        let admitted = admit_token(&inner, &serde_json::to_vec(&document).unwrap(), started).unwrap();
+        assert_eq!(admitted.scopes, ["read"]);
+        assert_eq!(admitted.expires_at, started + Duration::from_secs(60));
+        assert_eq!(admitted.bearer.resource(), &inner.resource);
+        document.as_object_mut().unwrap().remove("access_token");
+        document["x-extension"]["access_token"] = json!("nested-not-a-grant");
+        assert!(admit_token(&inner, &serde_json::to_vec(&document).unwrap(), started).is_err());
+    }
+
+    #[test]
+    fn machine_token_escaped_names_and_duplicates_cannot_hide_forbidden_members() {
+        let inner = inner();
+        for field in [r#""refresh\u005ftoken":null"#, r#""id\u005ftoken":"secret""#,
+            r#""c\u006ef":{}"#, r#""error\u005furi":"secret""#,
+            r#""refresh_token":null,"refresh_token":"secret""#]
+        {
+            let source = format!(r#"{{"access_token":"access","token_type":"Bearer",{field}}}"#);
+            assert!(matches!(admit_token(&inner, source.as_bytes(), Instant::now()),
+                Err(ClientCredentialsError::InvalidToken)));
+        }
+        assert!(admit_token(&inner,
+            br#"{"access_token":"one","access_token":"two","token_type":"Bearer"}"#,
+            Instant::now()).is_err());
+    }
+
+    #[test]
+    fn machine_token_byte_limit_includes_ignored_members_and_trailing_space() {
+        let inner = inner();
+        let mut exact = serde_json::to_vec(&valid_machine_token()).unwrap();
+        exact.resize(MAX_TOKEN_BYTES, b' ');
+        assert!(admit_token(&inner, &exact, Instant::now()).is_ok());
+        exact.push(b' ');
+        assert!(matches!(admit_token(&inner, &exact, Instant::now()), Err(ClientCredentialsError::InvalidToken)));
+        let mut oversized = valid_machine_token();
+        oversized["x-extension"] = json!("x".repeat(MAX_TOKEN_BYTES));
+        assert!(matches!(admit_token(&inner, &serde_json::to_vec(&oversized).unwrap(), Instant::now()),
+            Err(ClientCredentialsError::InvalidToken)));
+    }
+
+    #[test]
+    fn machine_token_opaque_jwt_text_never_supplies_scope_or_expiration() {
+        let mut inner = inner();
+        inner.maximum_lifetime = Duration::from_secs(17);
+        let started = Instant::now();
+        // Payload spells {"exp":0}; the bearer is deliberately NOT a verified
+        // JWT. Neither its shape nor unknown top-level claims define authority.
+        let document = br#"{"access_token":"e30.eyJleHAiOjB9.signature","token_type":"Bearer","exp":0,"scp":["admin"]}"#;
+        let admitted = admit_token(&inner, document, started).unwrap();
+        assert_eq!(admitted.scopes, inner.scopes);
+        assert_eq!(admitted.expires_at, started + Duration::from_secs(17));
+        assert_eq!(admitted.bearer.authorization_for_target(&inner.resource).unwrap(),
+            "Bearer e30.eyJleHAiOjB9.signature");
     }
 }

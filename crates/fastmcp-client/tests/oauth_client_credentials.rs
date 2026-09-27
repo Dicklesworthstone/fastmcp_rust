@@ -10,6 +10,9 @@ mod tasks;
 #[path = "oauth_client_credentials/private_key_jwt.rs"]
 mod private_key_jwt;
 
+#[path = "oauth_client_credentials/token_admission.rs"]
+mod token_admission;
+
 use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
 use std::io::Write;
@@ -252,8 +255,10 @@ impl Peer {
     }
     async fn grant(&self, token: &str, seconds: u64) {
         let mut tls = self.token_request().await;
-        json_reply(&mut tls,&json!({"access_token":token,"token_type":"Bearer","expires_in":seconds,"scope":"read",
-            "refresh_token":"MUST-NOT-BE-USED"}).to_string()).await;
+        // A client-credentials success cannot carry a refresh grant. Dedicated
+        // token-admission negatives cover its presence instead of relying on
+        // silently ignored credentials in every positive workflow fixture.
+        json_reply(&mut tls,&json!({"access_token":token,"token_type":"Bearer","expires_in":seconds,"scope":"read"}).to_string()).await;
     }
     async fn rpc(&self, id: i64, method: &str, token: &str) -> TlsStream<TcpStream> {
         let (tls,start,headers,body) = self.request().await;
@@ -656,7 +661,7 @@ async fn post_token_request(peer: &Peer, id: &str, secret: &str) -> TlsStream<Tc
 async fn post_grant(peer: &Peer, id: &str, secret: &str, token: &str, seconds: u64) {
     let mut tls = post_token_request(peer, id, secret).await;
     json_reply(&mut tls, &json!({"access_token":token,"token_type":"Bearer",
-        "expires_in":seconds,"scope":"read","refresh_token":"NEVER-USE-THIS"}).to_string()).await;
+        "expires_in":seconds,"scope":"read"}).to_string()).await;
 }
 
 fn run_post(case: PostCase) {
