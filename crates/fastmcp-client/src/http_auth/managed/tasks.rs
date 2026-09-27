@@ -245,14 +245,15 @@ impl ManagedTasksClient {
         let wire = credential.authorize_request(wire)?;
         let head_deadline = deadline.min(deadline_after(cx, self.session.inner.policy.response_head_timeout)?);
         let executor = self.session.inner.client.resource_http_executor();
-        let response = self.session.await_active(cx, cancellation, head_deadline, Some(credential.expires_at), async {
-            executor.execute_with_cancellation(cx, cancellation, &wire).await.map_err(OAuthSessionError::Http)
-        }).await?;
+        let response = self.session.await_credential(cx, cancellation, head_deadline,
+            credential.expires_at, &credential.credential.revoked, async {
+                executor.execute_with_cancellation(cx, cancellation, &wire).await.map_err(OAuthSessionError::Http)
+            },
+        ).await?;
         if response.metadata().status() != 200 { return Err(ManagedTasksError::HttpStatus { status: response.metadata().status() }); }
-        Ok(ManagedOAuthResponse {
-            response, session: self.session.clone(), cancellation: cancellation.clone(),
-            expires_at: credential.expires_at, generation: credential.generation,
-        })
+        Ok(ManagedOAuthResponse::from_snapshot(
+            response, self.session.clone(), cancellation.clone(), credential,
+        ))
     }
 }
 
@@ -280,6 +281,7 @@ pub struct ManagedTaskCall {
     deadline: Time,
     expires_at: Instant,
     generation: u64,
+    revocation: McpRequestCancellation,
     limits: ManagedTasksLimits,
     records: usize,
     finished: bool,
@@ -291,6 +293,7 @@ impl ManagedTaskCall {
         let cancellation = response.cancellation.clone();
         let expires_at = response.expires_at;
         let generation = response.generation;
+        let revocation = response.revocation.clone();
         let body = match response.metadata().kind() {
             ModernHttpResponseKind::Json => TaskBody::Json(Box::new(response)),
             ModernHttpResponseKind::Sse => {
@@ -303,7 +306,7 @@ impl ManagedTaskCall {
         Ok(Self {
             body: Some(body), decoder: prepared.decoder, session, cancellation, request_id,
             progress: prepared.progress, last_progress: None, deadline, expires_at, generation,
-            limits, records: 0, finished: false,
+            revocation, limits, records: 0, finished: false,
         })
     }
 
@@ -320,6 +323,7 @@ impl ManagedTaskCall {
         if self.finished { return Ok(None); }
         let body = self.body.take().ok_or(ManagedTasksError::Closed)?;
         self.session.check(cx, &self.cancellation)?;
+        if self.revocation.is_cancel_requested() { return Err(OAuthSessionError::LoginRequired.into()); }
         if self.records >= self.limits.records { return Err(ManagedTasksError::RecordLimit); }
         let (event, remaining) = match body {
             TaskBody::Json(response) => {
@@ -340,6 +344,7 @@ impl ManagedTaskCall {
             }
         };
         self.session.check(cx, &self.cancellation)?;
+        if self.revocation.is_cancel_requested() { return Err(OAuthSessionError::LoginRequired.into()); }
         if Instant::now() >= self.expires_at { return Err(OAuthSessionError::LoginRequired.into()); }
         if cx.now() >= self.deadline { return Err(OAuthSessionError::TimedOut.into()); }
         let event = if matches!(&event, ManagedTaskEvent::Notification(_)) {
@@ -370,11 +375,12 @@ impl ManagedTaskCall {
         event: ManagedTaskEvent,
         next: impl std::future::Future<Output = Result<Option<String>, OAuthSessionError>>,
     ) -> Result<ManagedTaskEvent, ManagedTasksError> {
-        let trailing = self.session.await_active(
-            cx, &self.cancellation, self.deadline, Some(self.expires_at), next,
+        let trailing = self.session.await_credential(
+            cx, &self.cancellation, self.deadline, self.expires_at, &self.revocation, next,
         ).await?;
         if trailing.is_some() { return Err(ManagedTasksError::InvalidResponse); }
         self.session.check(cx, &self.cancellation)?;
+        if self.revocation.is_cancel_requested() { return Err(OAuthSessionError::LoginRequired.into()); }
         if Instant::now() >= self.expires_at { return Err(OAuthSessionError::LoginRequired.into()); }
         if cx.now() >= self.deadline { return Err(OAuthSessionError::TimedOut.into()); }
         Ok(event)
@@ -803,6 +809,7 @@ mod tests {
             cancellation: McpRequestCancellation::new(), request_id: RequestId::Number(2),
             progress: None, last_progress: None, deadline: Time::from_nanos(u64::MAX),
             expires_at: Instant::now() + Duration::from_secs(60), generation: 1,
+            revocation: McpRequestCancellation::new(),
             limits: ManagedTasksLimits::default(), records: 0, finished: false,
         }
     }

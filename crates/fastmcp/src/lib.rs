@@ -2168,6 +2168,19 @@ pub mod auto {
             }
         }
 
+        /// Bounds concurrent application handoffs in the hosted Tasks service.
+        ///
+        /// Defaults to 32. Values from 1 through 256 are accepted; 1 requests
+        /// sequential execution. Invalid values are rejected when building.
+        /// Applies to [`Self::task_supervisor`] in either builder-call order.
+        #[cfg(feature = "tasks")]
+        #[must_use]
+        pub fn task_concurrency(self, max_concurrent_handoffs: usize) -> Self {
+            Self {
+                inner: self.inner.task_concurrency(max_concurrent_handoffs),
+            }
+        }
+
         /// Registers an ordinary component available after either successful
         /// Auto-era admission.
         #[must_use]
@@ -6774,6 +6787,19 @@ pub mod modern {
         ) -> Self {
             Self {
                 inner: self.inner.task_supervisor(supervisor),
+            }
+        }
+
+        /// Bounds concurrent application handoffs in the hosted Tasks service.
+        ///
+        /// Defaults to 32. Values from 1 through 256 are accepted; 1 requests
+        /// sequential execution. Invalid values are rejected when building.
+        /// Applies to [`Self::task_supervisor`] in either builder-call order.
+        #[cfg(feature = "tasks")]
+        #[must_use]
+        pub fn task_concurrency(self, max_concurrent_handoffs: usize) -> Self {
+            Self {
+                inner: self.inner.task_concurrency(max_concurrent_handoffs),
             }
         }
 

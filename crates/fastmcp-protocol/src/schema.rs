@@ -62,12 +62,31 @@ pub const MAX_SCHEMA_INSTANCE_NODES: usize = 4_096;
 /// Maximum JSON instance nesting depth accepted by one validation call.
 pub const MAX_SCHEMA_INSTANCE_DEPTH: usize = 64;
 
-/// Maximum UTF-8 bytes in one instance string or object member name.
-pub const MAX_SCHEMA_INSTANCE_STRING_BYTES: usize = 64 * 1024;
+/// Maximum encoded JSON bytes in one validation instance, including escaping,
+/// member names, and container punctuation. Matches the LIMIT-01 default.
+pub const MAX_SCHEMA_INSTANCE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Maximum UTF-8 bytes in one instance string. The complete instance must also
+/// fit [`MAX_SCHEMA_INSTANCE_BYTES`] after JSON encoding.
+pub const MAX_SCHEMA_INSTANCE_STRING_BYTES: usize = MAX_SCHEMA_INSTANCE_BYTES;
+
+/// Maximum UTF-8 bytes in an instance object member name. Names remain bounded
+/// independently because validation paths and evaluated-property sets retain them.
+pub const MAX_SCHEMA_INSTANCE_KEY_BYTES: usize = 64 * 1024;
+
+/// Maximum UTF-8 bytes in an instance string examined by any regex pattern.
+/// Unconstrained strings do not inherit this LIMIT-01 pattern-input bound.
+pub const MAX_SCHEMA_PATTERN_INPUT_BYTES: usize = 1024 * 1024;
+
+// A work unit covers at most the former per-string admission ceiling. Larger
+// strings consume proportionally more fuel without changing small-instance,
+// node, reference, or composition accounting.
+const SCHEMA_STRING_WORK_UNIT_BYTES: usize = 64 * 1024;
 
 /// Maximum work units performed by one validation call, including schema
 /// applications, local-resource traversal, branch probes, regular-expression
-/// compilation and matching, and object-property annotation bookkeeping.
+/// compilation and matching, object-property annotation bookkeeping, and
+/// additional 64 KiB chunks of large-string traversal or comparison.
 pub const MAX_SCHEMA_VALIDATION_WORK: usize = 4_096;
 
 /// Maximum local `$ref` hops on a single validation path.
@@ -450,6 +469,17 @@ fn measure_generated_schema(
         }
         Ok(())
     }
+    let mut nodes = 0;
+    count(schema, 0, &mut nodes, limits)?;
+    let bytes = bounded_schema_json_bytes(schema, limits.max_bytes)
+        .ok_or(SchemaGenerationError::ByteLimit)?;
+    Ok((nodes, bytes))
+}
+
+// The caller bounds depth and node count before serialization. A counting
+// writer accounts for JSON escaping without allocating another document, and
+// stops as soon as the encoded document exceeds its byte budget.
+fn bounded_schema_json_bytes(value: &Value, maximum: usize) -> Option<usize> {
     struct ByteCounter {
         remaining: usize,
     }
@@ -465,13 +495,9 @@ fn measure_generated_schema(
             Ok(())
         }
     }
-    let mut nodes = 0;
-    count(schema, 0, &mut nodes, limits)?;
-    let mut counter = ByteCounter {
-        remaining: limits.max_bytes,
-    };
-    serde_json::to_writer(&mut counter, schema).map_err(|_| SchemaGenerationError::ByteLimit)?;
-    Ok((nodes, limits.max_bytes - counter.remaining))
+    let mut counter = ByteCounter { remaining: maximum };
+    serde_json::to_writer(&mut counter, value).ok()?;
+    Some(maximum - counter.remaining)
 }
 
 fn generated_schema_contains_resource(schema: &Value) -> bool {
@@ -2296,12 +2322,28 @@ fn validate_with_schema_features(
     let mut errors = Vec::new();
     let mut context = ValidationContext::new(schema, enforce_unevaluated_properties);
     let mut instance_nodes = 0;
-    if !validate_instance_bounds(value, "root", 0, &mut instance_nodes, &mut errors) {
+    let mut instance_string_work = 0;
+    if !validate_instance_bounds(
+        value,
+        "root",
+        0,
+        &mut instance_nodes,
+        &mut instance_string_work,
+        &mut errors,
+    ) {
         return Err(errors);
     }
-    if enforce_unevaluated_properties
-        && !consume_instance_preflight_work(&mut context, instance_nodes, "root", &mut errors)
-    {
+    if bounded_schema_json_bytes(value, MAX_SCHEMA_INSTANCE_BYTES).is_none() {
+        push_error(&mut errors, "root", "instance document byte limit exceeded");
+        return Err(errors);
+    }
+    let preflight_work = instance_string_work
+        + if enforce_unevaluated_properties {
+            instance_nodes
+        } else {
+            0
+        };
+    if !consume_required_work_units(&mut context, preflight_work, "root", &mut errors) {
         return Err(errors);
     }
     validate_internal(schema, value, "root", &mut errors, &mut context);
@@ -2311,6 +2353,13 @@ fn validate_with_schema_features(
             .any(|error| error.message == "schema validation work limit exceeded")
     {
         push_error(&mut errors, "root", "schema validation work limit exceeded");
+    }
+    if context.pattern_input_exceeded
+        && !errors
+            .iter()
+            .any(|error| error.message == "pattern input byte limit exceeded")
+    {
+        push_error(&mut errors, "root", "pattern input byte limit exceeded");
     }
 
     if errors.is_empty() {
@@ -2438,6 +2487,7 @@ struct ValidationContext<'a> {
     dynamic_anchors: Vec<(String, Value)>,
     remaining_work: usize,
     work_exhausted: bool,
+    pattern_input_exceeded: bool,
     enforce_unevaluated_properties: bool,
 }
 
@@ -2450,6 +2500,7 @@ impl<'a> ValidationContext<'a> {
             dynamic_anchors: Vec::new(),
             remaining_work: MAX_SCHEMA_VALIDATION_WORK,
             work_exhausted: false,
+            pattern_input_exceeded: false,
             enforce_unevaluated_properties,
         }
     }
@@ -2504,13 +2555,15 @@ impl<'a> ValidationContext<'a> {
     }
 }
 
-fn consume_instance_preflight_work(
+// Raw validation retains its historical small-instance work allowances, but
+// new large-string byte charges always debit the same finite validation fuel.
+fn consume_required_work_units(
     context: &mut ValidationContext<'_>,
-    nodes: usize,
+    units: usize,
     path: &str,
     errors: &mut Vec<ValidationError>,
 ) -> bool {
-    for _ in 0..nodes {
+    for _ in 0..units {
         if !context.consume_work() {
             push_error(errors, path, "schema validation work limit exceeded");
             return false;
@@ -2542,7 +2595,26 @@ fn charged_regex_is_match(
     errors: &mut Vec<ValidationError>,
     context: &mut ValidationContext<'_>,
 ) -> Option<bool> {
-    consume_validation_work(context, path, errors).then(|| pattern.is_match(candidate))
+    if candidate.len() > MAX_SCHEMA_PATTERN_INPUT_BYTES {
+        // Branch probes intentionally discard ordinary mismatch diagnostics.
+        // Keep resource failure sticky so `not`, `if`, and fallback branches
+        // cannot reinterpret an unexamined string as a non-match.
+        context.pattern_input_exceeded = true;
+        push_error(errors, path, "pattern input byte limit exceeded");
+        return None;
+    }
+    (consume_validation_work(context, path, errors)
+        && consume_required_work_units(
+            context,
+            additional_string_work(candidate.len()),
+            path,
+            errors,
+        ))
+    .then(|| pattern.is_match(candidate))
+}
+
+fn additional_string_work(bytes: usize) -> usize {
+    bytes.saturating_sub(1) / SCHEMA_STRING_WORK_UNIT_BYTES
 }
 
 fn validate_instance_bounds(
@@ -2550,6 +2622,7 @@ fn validate_instance_bounds(
     path: &str,
     depth: usize,
     node_count: &mut usize,
+    string_work: &mut usize,
     errors: &mut Vec<ValidationError>,
 ) -> bool {
     if depth >= MAX_SCHEMA_INSTANCE_DEPTH {
@@ -2568,6 +2641,7 @@ fn validate_instance_bounds(
                 push_error(errors, path, "instance string byte limit exceeded");
                 return false;
             }
+            *string_work += additional_string_work(string.len());
         }
         Value::Array(items) => {
             for (index, item) in items.iter().enumerate() {
@@ -2576,6 +2650,7 @@ fn validate_instance_bounds(
                     &format!("{path}[{index}]"),
                     depth + 1,
                     node_count,
+                    string_work,
                     errors,
                 ) {
                     return false;
@@ -2584,7 +2659,7 @@ fn validate_instance_bounds(
         }
         Value::Object(members) => {
             for (name, member) in members {
-                if name.len() > MAX_SCHEMA_INSTANCE_STRING_BYTES {
+                if name.len() > MAX_SCHEMA_INSTANCE_KEY_BYTES {
                     push_error(
                         errors,
                         path,
@@ -2597,6 +2672,7 @@ fn validate_instance_bounds(
                     &format!("{path}.{name}"),
                     depth + 1,
                     node_count,
+                    string_work,
                     errors,
                 ) {
                     return false;
@@ -2690,22 +2766,17 @@ fn validate_internal(
     // Check enum constraint
     if let Some(enum_val) = schema_obj.get("enum") {
         if let Some(enum_arr) = enum_val.as_array() {
-            let matches = if context.enforce_unevaluated_properties {
-                let mut matches = false;
-                for candidate in enum_arr {
-                    match json_schema_equal_with_work(candidate, value, path, errors, context) {
-                        Some(true) => {
-                            matches = true;
-                            break;
-                        }
-                        Some(false) => {}
-                        None => break,
+            let mut matches = false;
+            for candidate in enum_arr {
+                match json_schema_equal_with_work(candidate, value, path, errors, context) {
+                    Some(true) => {
+                        matches = true;
+                        break;
                     }
+                    Some(false) => {}
+                    None => break,
                 }
-                matches
-            } else {
-                enum_arr.contains(value)
-            };
+            }
             if !matches && !context.work_exhausted {
                 push_error(errors, path, format!("value must be one of: {enum_arr:?}"));
             }
@@ -2714,11 +2785,7 @@ fn validate_internal(
 
     // Check const constraint
     if let Some(const_val) = schema_obj.get("const") {
-        let matches = if context.enforce_unevaluated_properties {
-            json_schema_equal_with_work(value, const_val, path, errors, context)
-        } else {
-            Some(value == const_val)
-        };
+        let matches = json_schema_equal_with_work(value, const_val, path, errors, context);
         if matches == Some(false) {
             push_error(errors, path, format!("value must equal {const_val}"));
         }
@@ -4201,6 +4268,9 @@ fn validate_array(
             // Preserve the historical raw-validator representation equality.
             let mut seen = std::collections::HashSet::with_capacity(arr.len());
             for (index, item) in arr.iter().enumerate() {
+                if !charge_large_string_tree(item, path, errors, context) {
+                    return;
+                }
                 let key = serde_json::to_string(item).unwrap_or_default();
                 if !seen.insert(key) {
                     push_error(
@@ -4499,28 +4569,41 @@ fn validate_string(
     errors: &mut Vec<ValidationError>,
     context: &mut ValidationContext<'_>,
 ) {
-    // Admitted final schemas preserve arbitrary-width count bounds; raw
-    // validation retains its historical u64-only behavior.
-    let len = s.chars().count();
-    if let Some(min) = schema.get("minLength")
-        && count_compare_to_schema_bound(len, min, context.enforce_unevaluated_properties)
-            == Some(Ordering::Less)
-    {
-        push_error(
-            errors,
+    // Count Unicode scalar values only when a length assertion needs them.
+    // The schema application already paid one work unit; charge the remaining
+    // byte chunks before a potentially multi-megabyte scan.
+    if schema.contains_key("minLength") || schema.contains_key("maxLength") {
+        if !consume_required_work_units(
+            context,
+            additional_string_work(s.len()),
             path,
-            format!("string must be at least {min} characters"),
-        );
-    }
-    if let Some(max) = schema.get("maxLength")
-        && count_compare_to_schema_bound(len, max, context.enforce_unevaluated_properties)
-            == Some(Ordering::Greater)
-    {
-        push_error(
             errors,
-            path,
-            format!("string must be at most {max} characters"),
-        );
+        ) {
+            return;
+        }
+        // Admitted final schemas preserve arbitrary-width count bounds; raw
+        // validation retains its historical u64-only behavior.
+        let len = s.chars().count();
+        if let Some(min) = schema.get("minLength")
+            && count_compare_to_schema_bound(len, min, context.enforce_unevaluated_properties)
+                == Some(Ordering::Less)
+        {
+            push_error(
+                errors,
+                path,
+                format!("string must be at least {min} characters"),
+            );
+        }
+        if let Some(max) = schema.get("maxLength")
+            && count_compare_to_schema_bound(len, max, context.enforce_unevaluated_properties)
+                == Some(Ordering::Greater)
+        {
+            push_error(
+                errors,
+                path,
+                format!("string must be at most {max} characters"),
+            );
+        }
     }
 
     // Check pattern (JSON Schema semantics: pattern matches if any substring matches).
@@ -4842,7 +4925,9 @@ fn trim_decimal_integer(value: &mut String) {
     }
 }
 
-/// Compares final-schema values while charging every recursive equality step.
+/// Compares schema values while charging large strings in both validation
+/// modes. Admitted final schemas additionally charge each recursive step and
+/// compare numbers mathematically; raw schemas retain representation equality.
 fn json_schema_equal_with_work(
     left: &Value,
     right: &Value,
@@ -4854,11 +4939,23 @@ fn json_schema_equal_with_work(
         return None;
     }
     match (left, right) {
-        (Value::Number(left), Value::Number(right)) => Some(
+        (Value::Number(left), Value::Number(right)) if context.enforce_unevaluated_properties => Some(
             ExactDecimal::from_number(left)
                 .zip(ExactDecimal::from_number(right))
                 .is_some_and(|(left, right)| left.compare(&right) == Ordering::Equal),
         ),
+        (Value::String(left), Value::String(right)) => {
+            if left.len() != right.len() {
+                return Some(false);
+            }
+            consume_required_work_units(
+                context,
+                additional_string_work(left.len()),
+                path,
+                errors,
+            )
+            .then(|| left == right)
+        }
         (Value::Array(left), Value::Array(right)) => {
             if left.len() != right.len() {
                 return Some(false);
@@ -4885,6 +4982,29 @@ fn json_schema_equal_with_work(
             Some(true)
         }
         _ => Some(left == right),
+    }
+}
+
+// Raw uniqueItems preserves its historical serialized-representation equality.
+// Charge the newly admitted large strings before serializing and hashing each
+// item, including strings inside nested arrays and objects.
+fn charge_large_string_tree(
+    value: &Value,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+    context: &mut ValidationContext<'_>,
+) -> bool {
+    match value {
+        Value::String(value) => {
+            consume_required_work_units(context, additional_string_work(value.len()), path, errors)
+        }
+        Value::Array(values) => values
+            .iter()
+            .all(|value| charge_large_string_tree(value, path, errors, context)),
+        Value::Object(values) => values
+            .values()
+            .all(|value| charge_large_string_tree(value, path, errors, context)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => true,
     }
 }
 
@@ -7534,6 +7654,337 @@ mod tests {
             accepted.as_array().unwrap().len(),
             MAX_SCHEMA_INSTANCE_NODES - 1
         );
+    }
+
+    fn schema_instance_byte_fixture(kind: usize) -> Value {
+        let mut value = match kind {
+            0 => json!("\u{0001}".repeat(MAX_SCHEMA_INSTANCE_BYTES / 12)),
+            1 => json!(["x".repeat(MAX_SCHEMA_INSTANCE_BYTES / 2), ""]),
+            _ => json!({
+                "escaped\"\\\nkey": [true, false, null, 12.5, "é🦀"],
+                "payload": "\u{0001}".repeat(MAX_SCHEMA_INSTANCE_BYTES / 12)
+            }),
+        };
+        let padding = MAX_SCHEMA_INSTANCE_BYTES - serde_json::to_vec(&value).unwrap().len();
+        let target = schema_instance_fixture_string(&mut value);
+        target.extend(std::iter::repeat_n('x', padding));
+        value
+    }
+
+    fn schema_instance_fixture_string(value: &mut Value) -> &mut String {
+        let target = match value {
+            Value::Array(items) => &mut items[1],
+            Value::Object(members) => members.get_mut("payload").unwrap(),
+            value => value,
+        };
+        let Value::String(target) = target else {
+            panic!("byte fixture payload must be a string");
+        };
+        target
+    }
+
+    #[test]
+    fn schema_instance_bytes_positive() {
+        let schema = admit_final_schema(Value::Bool(true)).unwrap();
+        for kind in 0..3 {
+            let instance = schema_instance_byte_fixture(kind);
+            assert_eq!(
+                serde_json::to_vec(&instance).unwrap().len(),
+                8 * 1024 * 1024
+            );
+            schema.validate(&instance).expect(
+                "root strings, aggregate arrays, and escaped object documents admit at 8 MiB",
+            );
+            validate(&Value::Bool(true), &instance)
+                .expect("raw validation shares the aggregate byte admission boundary");
+        }
+        let names = json!({("x".repeat(MAX_SCHEMA_INSTANCE_KEY_BYTES)): null});
+        schema
+            .validate(&names)
+            .expect("the existing member-name boundary remains admitted");
+    }
+
+    #[test]
+    fn schema_instance_bytes_planted_negative() {
+        let schema = admit_final_schema(Value::Bool(true)).unwrap();
+        for kind in 0..3 {
+            let accepted = schema_instance_byte_fixture(kind);
+            let mut planted = accepted.clone();
+            schema_instance_fixture_string(&mut planted).push('x');
+            assert_eq!(
+                serde_json::to_vec(&planted).unwrap().len(),
+                8 * 1024 * 1024 + 1
+            );
+            let errors = schema
+                .validate(&planted)
+                .expect_err("one additional encoded byte must fail before schema evaluation");
+            assert_eq!(errors[0].path, "root");
+            assert_eq!(errors[0].message, "instance document byte limit exceeded");
+            assert!(validate(&Value::Bool(true), &planted).is_err());
+            assert_eq!(
+                serde_json::to_vec(&accepted).unwrap().len(),
+                MAX_SCHEMA_INSTANCE_BYTES
+            );
+        }
+        let names = json!({("x".repeat(MAX_SCHEMA_INSTANCE_KEY_BYTES + 1)): null});
+        let errors = schema
+            .validate(&names)
+            .expect_err("increasing payload capacity must not increase retained name capacity");
+        assert_eq!(
+            errors[0].message,
+            "instance object member-name byte limit exceeded"
+        );
+        let string = json!("x".repeat(MAX_SCHEMA_INSTANCE_STRING_BYTES + 1));
+        let errors = schema
+            .validate(&string)
+            .expect_err("one scalar must remain bounded before escaped-size traversal");
+        assert_eq!(errors[0].message, "instance string byte limit exceeded");
+        assert_eq!(schema.schema(), &Value::Bool(true));
+    }
+
+    fn schema_large_result_fixture_schema() -> AdmittedSchema {
+        admit_final_schema(json!({
+            "type": "object",
+            "required": ["resultType", "content"],
+            "properties": {
+                "resultType": {"const": "complete"},
+                "content": {"type": "array", "items": {"type": "object",
+                    "required": ["type", "data", "mimeType"],
+                    "properties": {"data": {"type": "string"}}
+                }}
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn schema_large_output_semantics_positive() {
+        let instance = json!("🦀".repeat(1024 * 1024));
+        assert_eq!(instance.as_str().unwrap().len(), 4 * 1024 * 1024);
+        let schema = admit_final_schema(json!({
+            "type": "string", "minLength": 1024 * 1024, "maxLength": 1024 * 1024
+        }))
+        .unwrap();
+        schema
+            .validate(&instance)
+            .expect("multi-megabyte structured output retains Unicode length semantics");
+
+        let result = json!({
+            "resultType": "complete",
+            "content": [{"type": "image", "data": "AAAA".repeat(1024 * 1024), "mimeType": "image/png"}]
+        });
+        let result_schema = schema_large_result_fixture_schema();
+        validate_final_core_result(&result_schema, &result, FinalCoreResultType::Complete)
+            .expect("full-result schema validation admits a 3 MiB decoded binary block");
+    }
+
+    #[test]
+    fn schema_large_output_semantics_planted_negative() {
+        let instance = json!("🦀".repeat(1024 * 1024));
+        let schema = admit_final_schema(json!({
+            "type": "string", "minLength": 1024 * 1024, "maxLength": 1024 * 1024 - 1
+        }))
+        .unwrap();
+        let errors = schema
+            .validate(&instance)
+            .expect_err("one less allowed Unicode character must reject the same large output");
+        assert_eq!(
+            errors[0].message,
+            "string must be at most 1048575 characters"
+        );
+        assert_eq!(instance.as_str().unwrap().len(), 4 * 1024 * 1024);
+
+        let result = json!({
+            "resultType": "task",
+            "content": [{"type": "image", "data": "AAAA".repeat(1024 * 1024), "mimeType": "image/png"}]
+        });
+        let result_schema = schema_large_result_fixture_schema();
+        let errors =
+            validate_final_core_result(&result_schema, &result, FinalCoreResultType::Complete)
+                .expect_err(
+                    "a changed discriminator cannot bypass full-result validation at large sizes",
+                );
+        assert_eq!(errors[0].path, "root.resultType");
+        assert_eq!(
+            errors[0].message,
+            "resultType does not match the selected final core result branch"
+        );
+    }
+
+    fn schema_pattern_input_fixtures() -> Vec<Value> {
+        vec![
+            json!({"type": "string", "pattern": "^x+$"}),
+            json!({"anyOf": [{"pattern": "^y+$"}, {"type": "string"}]}),
+            json!({"not": {"pattern": "^y+$"}}),
+            json!({"if": {"pattern": "^y+$"}, "then": false, "else": true}),
+            json!({"allOf": [{"pattern": "^x+$"}]}),
+        ]
+    }
+
+    #[test]
+    fn schema_pattern_input_bytes_positive() {
+        let instance = json!("x".repeat(MAX_SCHEMA_PATTERN_INPUT_BYTES));
+        for source in schema_pattern_input_fixtures() {
+            let schema = admit_final_schema(source.clone()).unwrap();
+            schema
+                .validate(&instance)
+                .expect("matching and non-matching 1 MiB probes retain ordinary branch semantics");
+            validate(&source, &instance)
+                .expect("raw validation admits the same pattern-input boundary");
+        }
+    }
+
+    #[test]
+    fn schema_pattern_input_bytes_planted_negative() {
+        let instance = json!("x".repeat(MAX_SCHEMA_PATTERN_INPUT_BYTES + 1));
+        for source in schema_pattern_input_fixtures() {
+            let schema = admit_final_schema(source.clone()).unwrap();
+            let errors = schema.validate(&instance).expect_err(
+                "one excess pattern-input byte cannot become an ordinary branch mismatch",
+            );
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.message == "pattern input byte limit exceeded")
+            );
+            assert!(validate(&source, &instance).is_err());
+            assert_eq!(schema.schema(), &source);
+        }
+        assert_eq!(
+            instance.as_str().unwrap().len(),
+            MAX_SCHEMA_PATTERN_INPUT_BYTES + 1
+        );
+    }
+
+    fn schema_large_string_work_fixtures(excess: usize) -> Vec<(Value, Value)> {
+        let unique = Value::Array(
+            (0..7)
+                .map(|index| json!(format!("{}{index}", "x".repeat(1024 * 1024 - 1))))
+                .collect(),
+        );
+        let pattern_unit = json!({"allOf": vec![json!({"pattern": "^x+$"}); 64]});
+        vec![
+            (
+                json!({"allOf": vec![json!({"minLength": 1}); 62 + excess]}),
+                json!("x".repeat(4 * 1024 * 1024)),
+            ),
+            (
+                json!({"allOf": vec![json!({"uniqueItems": true}); 11 + excess]}),
+                unique,
+            ),
+            (
+                json!({"allOf": vec![pattern_unit; 3 + excess]}),
+                json!("x".repeat(1024 * 1024)),
+            ),
+        ]
+    }
+
+    #[test]
+    fn schema_large_string_work_positive() {
+        for (source, instance) in schema_large_string_work_fixtures(0) {
+            admit_final_schema(source)
+                .unwrap()
+                .validate(&instance)
+                .expect("bounded large-string length, equality, and regex scans fit shared fuel");
+        }
+    }
+
+    #[test]
+    fn schema_large_string_work_planted_negative() {
+        for (source, instance) in schema_large_string_work_fixtures(1) {
+            let schema = admit_final_schema(source.clone()).unwrap();
+            let errors = schema
+                .validate(&instance)
+                .expect_err("one additional repeated large-string unit exhausts shared fuel");
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.message == "schema validation work limit exceeded")
+            );
+            assert_eq!(schema.schema(), &source);
+        }
+    }
+
+    fn schema_raw_large_string_work_fixtures(excess: usize) -> Vec<(Value, Value)> {
+        let mut fixtures = schema_large_string_work_fixtures(excess);
+        // Raw mode historically omits per-node preflight, regex compilation,
+        // and equality-step charges. Preserve those allowances for small data
+        // while exercising its distinct thresholds for large byte scans.
+        fixtures[0].0 = json!({"allOf": vec![json!({"minLength": 1}); 63 + excess]});
+        fixtures[1].0 = json!({"allOf": vec![json!({"uniqueItems": true}); 37 + excess]});
+        for keyword in ["const", "enum"] {
+            let instance = json!("x".repeat(4 * 1024 * 1024));
+            let assertion = if keyword == "enum" {
+                json!([instance.clone()])
+            } else {
+                instance.clone()
+            };
+            // Raw schemas retain their existing local-reference and literal
+            // representation semantics. Refer to one large assertion rather
+            // than constructing dozens of separately retained copies.
+            let source = json!({
+                "$defs": {"large": {keyword: assertion}},
+                "allOf": vec![json!({"$ref": "#/$defs/large"}); 62 + excess]
+            });
+            fixtures.push((source, instance));
+        }
+        fixtures
+    }
+
+    #[test]
+    fn schema_raw_large_string_work_positive() {
+        for (source, instance) in schema_raw_large_string_work_fixtures(0) {
+            validate(&source, &instance).expect(
+                "raw length, regex, uniqueItems, const, and enum byte work remains bounded",
+            );
+            validate_strict(&source, &instance)
+                .expect("strict input validation uses the same bounded raw evaluation");
+        }
+        for keyword in ["const", "enum"] {
+            let candidate = json!({"value": 1.0});
+            let assertion = if keyword == "enum" {
+                json!([candidate.clone()])
+            } else {
+                candidate.clone()
+            };
+            validate(&json!({keyword: assertion}), &candidate)
+                .expect("raw nested numeric equality retains the same representation");
+        }
+        validate(&json!({"uniqueItems": true}), &json!([1, 1.0]))
+            .expect("raw uniqueItems still distinguishes distinct numeric representations");
+    }
+
+    #[test]
+    fn schema_raw_large_string_work_planted_negative() {
+        for (source, instance) in schema_raw_large_string_work_fixtures(1) {
+            for result in [
+                validate(&source, &instance),
+                validate_strict(&source, &instance),
+            ] {
+                let errors =
+                    result.expect_err("one additional raw large-string unit exhausts shared fuel");
+                assert!(
+                    errors
+                        .iter()
+                        .any(|error| { error.message == "schema validation work limit exceeded" })
+                );
+            }
+        }
+        for keyword in ["const", "enum"] {
+            let candidate = json!({"value": 1.0});
+            let assertion = if keyword == "enum" {
+                json!([candidate])
+            } else {
+                candidate
+            };
+            let source = json!({keyword: assertion});
+            let instance = json!({"value": 1});
+            assert!(validate(&source, &instance).is_err());
+            admit_final_schema(source)
+                .unwrap()
+                .validate(&instance)
+                .expect("only admitted-final equality treats distinct numeric spellings equally");
+        }
     }
 
     #[test]
