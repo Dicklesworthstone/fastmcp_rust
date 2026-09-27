@@ -9,7 +9,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
@@ -652,7 +652,18 @@ impl ReverseRequestCancellation {
 pub struct ReverseRequest {
     request: JsonRpcRequest,
     cancellation: ReverseRequestCancellation,
-    owner: Arc<()>,
+    owner: Arc<ReverseRequestOwner>,
+}
+
+#[derive(Debug)]
+struct ReverseRequestOwner {
+    cancellation: ReverseRequestCancellation,
+}
+
+impl Drop for ReverseRequestOwner {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
 }
 
 impl ReverseRequest {
@@ -682,7 +693,7 @@ impl ReverseRequest {
 struct ActiveReverseRequest {
     request_id: RequestId,
     cancellation: ReverseRequestCancellation,
-    owner: Arc<()>,
+    owner: Weak<ReverseRequestOwner>,
 }
 
 /// Immutable receipt for the terminal CAS of one execution.
@@ -1149,7 +1160,7 @@ struct ExecutorState<T> {
     terminal_records: HashMap<(RequestId, u64), ExecutionTerminalRecord>,
     terminal_expirations: HashMap<(RequestId, u64), Instant>,
     cancellation_events: VecDeque<CancellationRequested>,
-    deferred_drop_cancellations: VecDeque<PendingCancellationControl>,
+    deferred_cancellations: VecDeque<PendingCancellationControl>,
     #[cfg(feature = "tasks")]
     task_subscriptions: HashMap<(RequestId, u64), TaskSubscription>,
     next_generation: u64,
@@ -1191,6 +1202,7 @@ impl<T> ExecutorState<T> {
     }
 
     fn retain_reverse_request(&mut self, request: JsonRpcRequest) -> McpResult<()> {
+        self.prune_abandoned_reverse_requests();
         let request_id = request.id.clone().ok_or_else(|| {
             McpError::invalid_request("Client reverse request omitted a JSON-RPC request ID")
         })?;
@@ -1202,19 +1214,21 @@ impl<T> ExecutorState<T> {
                 "Client reverse request ID is already active",
             ));
         }
-        if self.reverse_requests.len() >= MAX_RETAINED_PEER_ACTIVITY {
+        if self.pending_reverse_requests.len() >= MAX_RETAINED_PEER_ACTIVITY {
             return Err(McpError::internal_error(
-                "Client reverse-request queue is full",
+                "Client reverse-request capacity is full",
             ));
         }
         let cancellation = ReverseRequestCancellation::new();
-        let owner = Arc::new(());
+        let owner = Arc::new(ReverseRequestOwner {
+            cancellation: cancellation.clone(),
+        });
         self.pending_reverse_requests.insert(
             key,
             ActiveReverseRequest {
                 request_id: request_id.clone(),
                 cancellation: cancellation.clone(),
-                owner: Arc::clone(&owner),
+                owner: Arc::downgrade(&owner),
             },
         );
         self.reverse_requests.push_back(ReverseRequest {
@@ -1222,6 +1236,21 @@ impl<T> ExecutorState<T> {
             cancellation,
             owner,
         });
+        Ok(())
+    }
+
+    fn prune_abandoned_reverse_requests(&mut self) {
+        self.pending_reverse_requests
+            .retain(|_, request| request.owner.strong_count() > 0);
+    }
+
+    fn defer_cancellation(&mut self, cancellation: PendingCancellationControl) -> McpResult<()> {
+        if self.deferred_cancellations.len() >= DEFAULT_MAX_IN_FLIGHT_EXECUTIONS {
+            let error = McpError::internal_error("Client cancellation control queue is full");
+            self.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
+            return Err(error);
+        }
+        self.deferred_cancellations.push_back(cancellation);
         Ok(())
     }
 
@@ -1280,7 +1309,7 @@ impl<T> ExecutorState<T> {
         self.cancel_reverse_requests();
         #[cfg(feature = "tasks")]
         self.task_subscriptions.clear();
-        self.deferred_drop_cancellations.clear();
+        self.deferred_cancellations.clear();
         let pending = std::mem::take(&mut self.pending);
         for (_, pending) in pending {
             let request_id = pending.record.request_id.clone();
@@ -1394,7 +1423,7 @@ where
                 terminal_records: HashMap::new(),
                 terminal_expirations: HashMap::new(),
                 cancellation_events: VecDeque::new(),
-                deferred_drop_cancellations: VecDeque::new(),
+                deferred_cancellations: VecDeque::new(),
                 #[cfg(feature = "tasks")]
                 task_subscriptions: HashMap::new(),
                 next_generation: 0,
@@ -1569,6 +1598,12 @@ where
 
         let mut state = self.state.borrow_mut();
         self.drain_abandoned_locked(cx, &mut state)?;
+        // Servicing a deferred control can exhaust this caller's remaining
+        // budget. Do not admit another application write after that local
+        // stop, even when a custom transport omits its own checkpoint.
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
         state.prune_tombstones(Instant::now());
         state.prune_retained_terminals(Instant::now());
         if state.shutdown {
@@ -1597,7 +1632,19 @@ where
                 "Tombstoned request ID cannot be reused",
             ));
         }
-        if state.pending.len() >= self.max_in_flight {
+        if state.deferred_cancellations.iter().any(|cancellation| {
+            cancellation.request_id.correlates_with(&request_id)
+        }) {
+            return Err(McpError::invalid_request(
+                "Request ID still owns a queued cancellation control",
+            ));
+        }
+        if state
+            .pending
+            .len()
+            .saturating_add(state.deferred_cancellations.len())
+            >= self.max_in_flight
+        {
             return Err(McpError::internal_error(
                 "Client in-flight execution limit reached",
             ));
@@ -1843,6 +1890,19 @@ where
             // Expiry may have just elected this waiter's outcome while a
             // sibling remains live. No further peer read belongs to this wait.
             return Ok(());
+        }
+        // Maintenance may consume the last poll while deferring a control.
+        // A stopped caller cannot read past it or poison unrelated waiters.
+        if cx.checkpoint().is_err() {
+            if let Some((request_id, _)) = waiting_owner {
+                self.cancel_pending_locked(
+                    cx,
+                    &mut state,
+                    request_id,
+                    ExecutionTerminalReason::CallerCancelled,
+                )?;
+            }
+            return Err(McpError::request_cancelled());
         }
         let (received, source) = match state.receive_frame {
             Some(receive_frame) => match receive_frame(&mut state.transport, cx) {
@@ -2412,7 +2472,10 @@ where
     /// Each returned request retains its own response capability and
     /// cancellation handle. Pass the same value to
     /// [`Self::respond_to_reverse_request`] so an old callback cannot respond
-    /// to a later peer request that reuses its JSON-RPC ID.
+    /// to a later peer request that reuses its JSON-RPC ID. Outstanding handles
+    /// remain charged against the reverse-request capacity after dequeue.
+    /// Dropping the last clone cancels its local ownership; the next executor
+    /// turn reclaims the abandoned slot without sending a fabricated result.
     pub fn take_reverse_requests(&self) -> Vec<ReverseRequest> {
         self.state.borrow_mut().reverse_requests.drain(..).collect()
     }
@@ -2444,7 +2507,7 @@ where
                 "Client reverse response does not own a live peer request ID",
             ));
         };
-        if !Arc::ptr_eq(&active.owner, &request.owner)
+        if !Weak::ptr_eq(&active.owner, &Arc::downgrade(&request.owner))
             || !active
                 .cancellation
                 .belongs_to_same_request(&request.cancellation)
@@ -2493,6 +2556,17 @@ where
     }
 
     /// Selects explicit caller cancellation for one live execution.
+    ///
+    /// If `cx` has stopped, the local terminal is selected immediately and its
+    /// bounded control frame is queued without attempting I/O through that
+    /// context. The connection owner must service the executor with its live
+    /// context through [`Self::poll_timeouts_at`], [`Self::drive`], another
+    /// execution, or [`Self::shutdown`]. That turn sends the control before any
+    /// new application frame or peer read. Cancellation never creates or masks
+    /// a context, starts a worker, or silently retries a failed transport write.
+    /// Once a transport write is attempted, any error remains terminal to the
+    /// connection: the generic transport contract cannot prove whether a
+    /// cancellation racing that write left partial bytes on the wire.
     pub fn cancel(&self, cx: &Cx, execution: &mut RequestExecution<T>) -> McpResult<()> {
         execution.ensure_owner(&self.state)?;
         let mut state = self.state.borrow_mut();
@@ -2538,6 +2612,10 @@ where
     }
 
     /// Expires committed request deadlines at a runtime-supplied monotonic instant.
+    ///
+    /// The connection owner may also use this non-reading service turn with a
+    /// live context to flush controls queued by dropped or cancelled request
+    /// owners. A stopped context preserves those controls for later service.
     pub fn poll_timeouts_at(&self, cx: &Cx, observed_at: Instant) -> McpResult<()> {
         let mut state = self.state.borrow_mut();
         self.drain_abandoned_locked(cx, &mut state)?;
@@ -2583,7 +2661,7 @@ where
             return Ok(());
         }
         let mut cleanup_error = self
-            .flush_deferred_drop_cancellations_locked(cx, &mut state)
+            .flush_deferred_cancellations_locked(cx, &mut state)
             .err();
         state.shutdown = true;
         let request_ids = state
@@ -2803,9 +2881,10 @@ where
 
     fn drain_abandoned_locked(&self, cx: &Cx, state: &mut ExecutorState<T>) -> McpResult<()> {
         let now = Instant::now();
+        state.prune_abandoned_reverse_requests();
         state.prune_tombstones(now);
         state.prune_retained_terminals(now);
-        self.flush_deferred_drop_cancellations_locked(cx, state)?;
+        self.flush_deferred_cancellations_locked(cx, state)?;
         let abandoned = state
             .pending
             .values()
@@ -2832,12 +2911,19 @@ where
         Ok(())
     }
 
-    fn flush_deferred_drop_cancellations_locked(
+    fn flush_deferred_cancellations_locked(
         &self,
         cx: &Cx,
         state: &mut ExecutorState<T>,
     ) -> McpResult<()> {
-        while let Some(cancellation) = state.deferred_drop_cancellations.pop_front() {
+        while !state.deferred_cancellations.is_empty() {
+            if cx.checkpoint().is_err() {
+                break;
+            }
+            let cancellation = state
+                .deferred_cancellations
+                .pop_front()
+                .expect("a deferred cancellation remains queued under the executor lock");
             self.send_cancellation_control_locked(cx, state, cancellation)?;
         }
         Ok(())
@@ -2849,6 +2935,9 @@ where
         state: &mut ExecutorState<T>,
         cancellation: PendingCancellationControl,
     ) -> McpResult<()> {
+        if cx.checkpoint().is_err() {
+            return state.defer_cancellation(cancellation);
+        }
         if let Some(record) = state
             .terminal_records
             .get_mut(&(cancellation.request_id, cancellation.generation))
@@ -3019,9 +3108,9 @@ where
                     .and_then(|key| state.pending_reverse_requests.remove(key))
                 {
                     active.cancellation.cancel();
-                    state
-                        .reverse_requests
-                        .retain(|request| !Arc::ptr_eq(&request.owner, &active.owner));
+                    state.reverse_requests.retain(|request| {
+                        !Weak::ptr_eq(&Arc::downgrade(&request.owner), &active.owner)
+                    });
                 }
             }
             CancellationWireMessage::Modern2026 { params, .. } => {
@@ -3866,13 +3955,11 @@ impl<T> Drop for RequestExecution<T> {
             reason: ExecutionTerminalReason::CallerDropped,
         });
         if let Some(message) = cancellation {
-            state
-                .deferred_drop_cancellations
-                .push_back(PendingCancellationControl {
-                    request_id: self.request_id.clone(),
-                    generation: self.generation,
-                    message,
-                });
+            let _ = state.defer_cancellation(PendingCancellationControl {
+                request_id: self.request_id.clone(),
+                generation: self.generation,
+                message,
+            });
         }
         state.release_terminal(&key);
     }
@@ -4256,6 +4343,115 @@ mod tests {
         };
         assert_eq!(response.id, Some(RequestId::Number(700)));
         assert_eq!(response.result, Some(serde_json::json!({"ok": true})));
+    }
+
+    #[test]
+    fn reverse_request_capacity_includes_dequeued_live_owners() {
+        for release_one in [true, false] {
+            let cx = Cx::for_testing();
+            let executor = RequestExecutor::new(ScriptedTransport::new(
+                (0..=MAX_RETAINED_PEER_ACTIVITY)
+                    .map(|index| Ok(legacy_reverse_request(i64::try_from(index).unwrap()))),
+            ));
+            let mut owners = Vec::new();
+            for _ in 0..MAX_RETAINED_PEER_ACTIVITY {
+                executor.drive(&cx).expect("the admitted live owner fits");
+                owners.extend(executor.take_reverse_requests());
+            }
+            {
+                let state = executor.state.borrow();
+                assert!(state.reverse_requests.is_empty());
+                assert_eq!(
+                    state.pending_reverse_requests.len(),
+                    MAX_RETAINED_PEER_ACTIVITY
+                );
+            }
+            if release_one {
+                executor
+                    .respond_to_reverse_request(&cx, &owners[0], serde_json::json!({"ok": true}))
+                    .expect("responding releases one active slot");
+                executor
+                    .drive(&cx)
+                    .expect("exactly one replacement owner fits");
+                let replacement = executor.take_reverse_requests();
+                assert_eq!(replacement.len(), 1);
+                assert_eq!(
+                    executor.state.borrow().pending_reverse_requests.len(),
+                    MAX_RETAINED_PEER_ACTIVITY
+                );
+                assert!(!owners[1].cancellation().is_cancel_requested());
+            } else {
+                let error = executor
+                    .drive(&cx)
+                    .expect_err("dequeue alone must not permit another active reverse request");
+                assert_eq!(error.message, "Client reverse-request capacity is full");
+                let state = executor.state.borrow();
+                assert!(state.pending_reverse_requests.is_empty());
+                assert!(state.reverse_requests.is_empty());
+                assert!(state.transport.sent.is_empty());
+                assert!(
+                    owners
+                        .iter()
+                        .all(|owner| owner.cancellation().is_cancel_requested())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reverse_request_drop_reclaims_capacity_and_cancels_only_the_last_clone() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::new(ScriptedTransport::new(
+            (0..=MAX_RETAINED_PEER_ACTIVITY).map(|_| Ok(legacy_reverse_request(700))),
+        ));
+        for _ in 0..=MAX_RETAINED_PEER_ACTIVITY {
+            executor
+                .drive(&cx)
+                .expect("abandoned prior ownership is reclaimed");
+            let mut owners = executor.take_reverse_requests();
+            let owner = owners.pop().expect("one reverse owner was admitted");
+            let clone = owner.clone();
+            let cancellation = owner.cancellation().clone();
+            drop(owner);
+            assert!(!cancellation.is_cancel_requested());
+            executor
+                .poll_timeouts_at(&cx, Instant::now())
+                .expect("live clone remains owned during maintenance");
+            assert_eq!(executor.state.borrow().pending_reverse_requests.len(), 1);
+            drop(clone);
+            assert!(cancellation.is_cancel_requested());
+            executor
+                .poll_timeouts_at(&cx, Instant::now())
+                .expect("maintenance releases abandoned ownership");
+            assert!(executor.state.borrow().pending_reverse_requests.is_empty());
+        }
+        assert!(executor.state.borrow().transport.sent.is_empty());
+    }
+
+    #[test]
+    fn reverse_request_live_clone_prevents_same_id_replacement() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::new(ScriptedTransport::new([
+            Ok(legacy_reverse_request(700)),
+            Ok(legacy_reverse_request(700)),
+        ]));
+        executor.drive(&cx).unwrap();
+        let mut owners = executor.take_reverse_requests();
+        let owner = owners.pop().unwrap();
+        let clone = owner.clone();
+        drop(owner);
+        let error = executor
+            .drive(&cx)
+            .expect_err("one surviving clone still owns the first request incarnation");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(clone.cancellation().is_cancel_requested());
+        assert!(executor.state.borrow().transport.sent.is_empty());
+        assert!(
+            executor
+                .respond_to_reverse_request(&cx, &clone, serde_json::json!({"late": true}))
+                .is_err()
+        );
+        assert!(executor.state.borrow().transport.sent.is_empty());
     }
 
     #[test]
@@ -4718,6 +4914,7 @@ mod tests {
     fn executor_wait_preserves_selected_timeout_when_control_send_fails() {
         for caller_cancelled in [false, true] {
             let cx = Cx::for_testing();
+            let connection_cx = Cx::for_testing();
             let executor = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
             let mut execution = executor.execute(&cx, request(41)).unwrap();
             let mut sibling = executor.execute(&cx, request(42)).unwrap();
@@ -4746,9 +4943,15 @@ mod tests {
                 );
             }
             assert_eq!(executor.take_cancellation_events().len(), 1);
+            if caller_cancelled {
+                assert_eq!(executor.pending_records().len(), 1);
+                executor
+                    .poll_timeouts_at(&connection_cx, Instant::now())
+                    .expect_err("the deferred control still exposes a real broken pipe");
+            }
             assert_eq!(
                 executor
-                    .wait(&cx, &mut sibling)
+                    .wait(&connection_cx, &mut sibling)
                     .expect_err("the sibling receives connection loss")
                     .code,
                 McpErrorCode::InternalError,
@@ -4756,6 +4959,234 @@ mod tests {
             assert!(executor.pending_records().is_empty());
             assert!(executor.terminal_records().is_empty());
         }
+    }
+
+    #[test]
+    fn stopped_caller_cancellation_preserves_memory_transport_siblings() {
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        for stopped in [
+            cancelled,
+            Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(0)),
+            Cx::for_testing_with_budget(asupersync::Budget::new().with_cost_quota(0)),
+            Cx::for_testing_with_budget(
+                asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+            ),
+        ] {
+            let connection_cx = Cx::for_testing();
+            let (transport, mut peer) =
+                fastmcp_transport::memory::create_memory_transport_pair_with_capacity(8);
+            let executor = RequestExecutor::new(transport);
+            let mut cancelled = executor.execute(&connection_cx, request(41)).unwrap();
+            let mut sibling = executor.execute(&connection_cx, request(42)).unwrap();
+            for expected in [41, 42] {
+                let JsonRpcMessage::Request(received) = peer.recv(&connection_cx).unwrap() else {
+                    panic!("the two application requests reach the real peer");
+                };
+                assert_eq!(received.id, Some(RequestId::Number(expected)));
+            }
+            let error = executor.wait(&stopped, &mut cancelled).unwrap_err();
+            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            assert_eq!(executor.pending_records().len(), 1);
+            assert!(executor.state.borrow().terminal_error.is_none());
+            assert_eq!(executor.state.borrow().deferred_cancellations.len(), 1);
+            executor
+                .poll_timeouts_at(&stopped, Instant::now())
+                .expect("a stopped service turn leaves cancellation queued");
+            assert_eq!(executor.state.borrow().deferred_cancellations.len(), 1);
+            assert!(executor.state.borrow().terminal_error.is_none());
+
+            peer.send(
+                &connection_cx,
+                &response(41, serde_json::json!({"late": true})),
+            )
+            .unwrap();
+            peer.send(
+                &connection_cx,
+                &response(42, serde_json::json!({"sibling": true})),
+            )
+            .unwrap();
+            let received = executor
+                .wait(&connection_cx, &mut sibling)
+                .expect("live connection service flushes control and retains the sibling result");
+            assert_eq!(received.id, Some(RequestId::Number(42)));
+            assert!(executor.take_uncorrelated_responses().is_empty());
+            assert!(executor.state.borrow().deferred_cancellations.is_empty());
+            let next = executor.execute(&connection_cx, request(43)).unwrap();
+            let JsonRpcMessage::Request(control) = peer.recv(&connection_cx).unwrap() else {
+                panic!("the deferred cancellation reaches the peer exactly once");
+            };
+            assert!(control.is_notification());
+            assert_eq!(control.method, "notifications/cancelled");
+            assert_eq!(control.params.as_ref().unwrap()["requestId"], 41);
+            let JsonRpcMessage::Request(application) = peer.recv(&connection_cx).unwrap() else {
+                panic!("the next application request follows the single cancellation");
+            };
+            assert_eq!(application.id, Some(RequestId::Number(43)));
+            assert_eq!(executor.take_cancellation_events().len(), 1);
+            assert!(stopped.checkpoint().is_err());
+            drop(next);
+        }
+    }
+
+    #[test]
+    fn deferred_control_maintenance_exhaustion_preserves_sibling_ownership() {
+        for driver in ["execute", "drive", "wait"] {
+            let connection_cx = Cx::for_testing();
+            let executor = RequestExecutor::new(ScriptedTransport::new([Ok(response(
+                42,
+                serde_json::json!({"sibling": true}),
+            ))]));
+            let dropped = executor.execute(&connection_cx, request(41)).unwrap();
+            let mut sibling = executor.execute(&connection_cx, request(42)).unwrap();
+            let mut waiting = (driver == "wait")
+                .then(|| executor.execute(&connection_cx, request(43)).unwrap());
+            drop(dropped);
+            let limited =
+                Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(1));
+            let result = match driver {
+                "execute" => executor.execute(&limited, request(43)).map(drop),
+                "drive" => executor.drive(&limited),
+                "wait" => executor
+                    .wait(&limited, waiting.as_mut().unwrap())
+                    .map(|_| ()),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                result.expect_err("control maintenance exhausts the local caller").code,
+                McpErrorCode::RequestCancelled
+            );
+            let expected_controls = if driver == "wait" { 2 } else { 1 };
+            let committed_requests = if driver == "wait" { 3 } else { 2 };
+            {
+                let state = executor.state.borrow();
+                assert!(state.terminal_error.is_none());
+                assert_eq!(state.transport.sent.len(), committed_requests);
+                assert_eq!(state.transport.received.len(), 1);
+                assert_eq!(state.pending.len(), 1);
+                assert_eq!(state.deferred_cancellations.len(), expected_controls);
+                assert!(state.pending.contains_key(
+                    &RequestId::Number(42).correlation_key().unwrap()
+                ));
+            }
+
+            assert_eq!(
+                executor
+                    .wait(&connection_cx, &mut sibling)
+                    .expect("live connection service still completes the untouched sibling")
+                    .id,
+                Some(RequestId::Number(42))
+            );
+            let state = executor.state.borrow();
+            assert!(state.terminal_error.is_none());
+            assert!(state.pending.is_empty());
+            assert!(state.deferred_cancellations.is_empty());
+            assert_eq!(
+                state.transport.sent.len(),
+                committed_requests + expected_controls
+            );
+            assert!(state.transport.received.is_empty());
+        }
+    }
+
+    #[test]
+    fn deferred_cancellation_is_flushed_before_expired_id_reuse() {
+        let connection_cx = Cx::for_testing();
+        let stopped = Cx::for_testing();
+        stopped.set_cancel_requested(true);
+        let mut executor = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
+        executor.tombstone_retention = Duration::ZERO;
+        let mut old = executor.execute(&connection_cx, request(41)).unwrap();
+        executor.cancel(&stopped, &mut old).unwrap();
+        executor
+            .poll_timeouts_at(&stopped, Instant::now())
+            .unwrap();
+        {
+            let state = executor.state.borrow();
+            assert!(state.tombstones.is_empty());
+            assert_eq!(state.deferred_cancellations.len(), 1);
+            assert_eq!(state.transport.sent.len(), 1);
+        }
+        let replacement = executor
+            .execute(
+                &connection_cx,
+                JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({"replacement": true})),
+                    RequestId::Integer("41e0".to_owned()),
+                ),
+            )
+            .expect("live service flushes the old control before reusing its canonical ID");
+        executor
+            .poll_timeouts_at(&connection_cx, Instant::now())
+            .unwrap();
+        let state = executor.state.borrow();
+        assert!(state.deferred_cancellations.is_empty());
+        assert_eq!(state.transport.sent.len(), 3);
+        let JsonRpcMessage::Request(control) = &state.transport.sent[1] else {
+            panic!("old control precedes replacement commit");
+        };
+        assert_eq!(control.method, "notifications/cancelled");
+        assert_eq!(control.params.as_ref().unwrap()["requestId"], 41);
+        let JsonRpcMessage::Request(application) = &state.transport.sent[2] else {
+            panic!("replacement commits only after the old control");
+        };
+        assert_eq!(application.id.as_ref(), Some(replacement.request_id()));
+        assert!(state.terminal_error.is_none());
+    }
+
+    #[test]
+    fn cancellation_racing_transport_send_remains_terminal_without_retry() {
+        struct CancellingTransport {
+            sent: Vec<JsonRpcMessage>,
+            control_attempts: usize,
+        }
+
+        impl Transport for CancellingTransport {
+            fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+                if matches!(message, JsonRpcMessage::Request(request)
+                    if request.method == "notifications/cancelled")
+                {
+                    self.control_attempts += 1;
+                    cx.set_cancel_requested(true);
+                    return Err(TransportError::Cancelled);
+                }
+                self.sent.push(message.clone());
+                Ok(())
+            }
+
+            fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+                panic!("ambiguous cancellation-write failure must prevent further reads");
+            }
+
+            fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::new(CancellingTransport {
+            sent: Vec::new(),
+            control_attempts: 0,
+        });
+        let mut cancelled = executor.execute(&cx, request(41)).unwrap();
+        let mut sibling = executor.execute(&cx, request(42)).unwrap();
+        executor
+            .cancel(&cx, &mut cancelled)
+            .expect_err("a generic transport error cannot prove that no control bytes committed");
+        let live = Cx::for_testing();
+        assert_eq!(
+            executor.wait(&live, &mut cancelled).unwrap_err().code,
+            McpErrorCode::RequestCancelled
+        );
+        assert!(executor.wait(&live, &mut sibling).is_err());
+        executor.poll_timeouts_at(&live, Instant::now()).unwrap();
+        let state = executor.state.borrow();
+        assert_eq!(state.transport.control_attempts, 1);
+        assert_eq!(state.transport.sent.len(), 2);
+        assert!(state.deferred_cancellations.is_empty());
+        assert!(state.pending.is_empty());
+        assert!(state.terminal_error.is_some());
     }
 
     #[test]
@@ -5768,7 +6199,7 @@ mod tests {
         let state = executor.state.borrow();
         assert!(state.shutdown);
         assert!(state.terminal_error.is_some());
-        assert!(state.deferred_drop_cancellations.is_empty());
+        assert!(state.deferred_cancellations.is_empty());
         assert!(state.pending.is_empty());
     }
 
