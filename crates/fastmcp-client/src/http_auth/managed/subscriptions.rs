@@ -2,8 +2,8 @@
 //!
 //! SUB-03/TASK-03 consume the existing native subscription validator: there is
 //! no second acknowledgement, filter, JSON-RPC or terminal-result parser here.
-//! The managed owner adds token expiry, session closure, caller cancellation
-//! and finite whole-listen bounds around that same production validator.
+//! The managed owner adds token expiry, token-local revocation, session closure,
+//! caller cancellation and finite whole-listen bounds around that validator.
 //!
 //! `subscribe_core` never activates extensions. With the Tasks feature,
 //! `subscribe_tasks` first negotiates official Tasks through live discovery
@@ -285,19 +285,20 @@ impl ManagedOAuthSession {
         let wire = credential.authorize_request(wire)?;
         let head_deadline = deadline.min(deadline_after(cx, self.inner.policy.response_head_timeout)?);
         let executor = self.inner.client.resource_http_executor();
-        let response = self.await_active(cx, cancellation, head_deadline, Some(credential.expires_at), async {
-            executor.execute_with_cancellation(cx, cancellation, &wire).await.map_err(OAuthSessionError::Http)
-        }).await?;
+        let response = self.await_credential(cx, cancellation, head_deadline,
+            credential.expires_at, &credential.credential.revoked, async {
+                executor.execute_with_cancellation(cx, cancellation, &wire).await.map_err(OAuthSessionError::Http)
+            },
+        ).await?;
         if matches!(response.metadata().status(), 401 | 403) {
             return Err(OAuthSessionError::AuthorizationRejected { status: response.metadata().status() }.into());
         }
         if response.metadata().status() != 200 {
             return Err(ManagedSubscriptionError::InvalidResponse);
         }
-        Ok(ManagedOAuthResponse {
-            response, session: self.clone(), cancellation: cancellation.clone(),
-            expires_at: credential.expires_at, generation: credential.generation,
-        })
+        Ok(ManagedOAuthResponse::from_snapshot(
+            response, self.clone(), cancellation.clone(), credential,
+        ))
     }
 }
 
@@ -315,6 +316,7 @@ pub struct ManagedSubscription {
     profile: SubscriptionProfile,
     expires_at: Instant,
     generation: u64,
+    revocation: McpRequestCancellation,
     deadline: Time,
     limits: ManagedSubscriptionLimits,
     records: usize,
@@ -333,14 +335,14 @@ impl ManagedSubscription {
         if response.metadata().status() != 200 || response.metadata().kind() != ModernHttpResponseKind::Sse {
             return Err(ManagedSubscriptionError::InvalidResponse);
         }
-        let ManagedOAuthResponse { response, session, cancellation, expires_at, generation } = response;
+        let ManagedOAuthResponse { response, session, cancellation, expires_at, generation, revocation } = response;
         let framing = SseLimits::new(limits.frame_bytes, limits.frame_bytes, 64)
             .ok_or(ManagedSubscriptionError::InvalidLimits)?;
         let listener = response.into_final_subscriptions_listener(request_id.clone(), requested, framing)
             .map_err(admission_error)?;
         Ok(Self {
             listener: Some(Box::new(listener)), session, cancellation, request_id,
-            accepted_filter: None, profile, expires_at, generation, deadline, limits,
+            accepted_filter: None, profile, expires_at, generation, revocation, deadline, limits,
             records: 0, finished: false,
         })
     }
@@ -368,8 +370,8 @@ impl ManagedSubscription {
         if self.records >= self.limits.records {
             return Err(ManagedSubscriptionError::RecordLimit);
         }
-        let record = self.session.await_active(
-            cx, &self.cancellation, self.deadline, Some(self.expires_at), async {
+        let record = self.session.await_credential(
+            cx, &self.cancellation, self.deadline, self.expires_at, &self.revocation, async {
                 // Keep protocol failures distinct without exposing their raw
                 // peer diagnostics through OAuthSessionError.
                 Ok(listener.next_event(cx).await)
@@ -377,6 +379,7 @@ impl ManagedSubscription {
         ).await?.map_err(admission_error)?.ok_or(ManagedSubscriptionError::MissingTerminal)?;
         let record = select_record(record, self.profile)?;
         self.session.check(cx, &self.cancellation)?;
+        if self.revocation.is_cancel_requested() { return Err(OAuthSessionError::LoginRequired.into()); }
         if Instant::now() >= self.expires_at {
             return Err(OAuthSessionError::LoginRequired.into());
         }

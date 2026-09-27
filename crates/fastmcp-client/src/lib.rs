@@ -36333,8 +36333,11 @@ exec sleep 30
             ("resources/templates/list", "resourceTemplates"),
             ("prompts/list", "prompts"),
         ] {
-            let delay = if late_second_page { "0.35" } else { "0.005" };
-            let cancellation_read = if late_second_page {
+            // Ordering is event-gated, never paced by wall-clock sleeps. The late
+            // peer withholds the second page until the client's own deadline
+            // has cancelled request 3, and only then writes that page as late
+            // output. The timely peer answers each page as soon as it is asked.
+            let stall_until_cancelled = if late_second_page {
                 r#"IFS= read -r control || exit 1
                    case "$control" in *'"method":"notifications/cancelled"'*) ;; *) exit 1 ;; esac
                    case "$control" in *'"requestId":3'*) ;; *) exit 1 ;; esac"#
@@ -36344,13 +36347,11 @@ exec sleep 30
             let script = format!(r#"
                 IFS= read -r request || exit 1
                 case "$request" in *'"method":"{method}"'*) ;; *) exit 1 ;; esac
-                sleep 0.35
                 printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"resultType":"complete","{field}":[],"nextCursor":"","ttlMs":0,"cacheScope":"private"}}}}'
                 IFS= read -r request || exit 1
                 case "$request" in *'"cursor":""'*) ;; *) exit 1 ;; esac
-                sleep {delay}
+                {stall_until_cancelled}
                 printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"resultType":"complete","{field}":[],"ttlMs":0,"cacheScope":"private"}}}}'
-                {cancellation_read}
                 IFS= read -r request || exit 1
                 case "$request" in *'"method":"ping"'*) ;; *) exit 1 ;; esac
                 printf '%s\n' '{{"jsonrpc":"2.0","id":4,"result":{{"resultType":"complete"}}}}'
@@ -36385,6 +36386,78 @@ exec sleep 30
     #[test]
     fn automatic_catalog_lists_accept_the_same_second_page_before_the_deadline() {
         assert_automatic_catalog_deadline(false);
+    }
+
+    /// The traversal deadline caps a later page's in-flight wait; the page does
+    /// not get a fresh request budget. Only the traversal deadline is short
+    /// here, and the request policy is 20 s. A stalled second page must
+    /// therefore expire far sooner than a fresh budget could.
+    #[cfg(unix)]
+    #[test]
+    fn automatic_catalog_second_page_wait_is_capped_by_the_traversal_deadline() {
+        let script = r#"
+            IFS= read -r request || exit 1
+            case "$request" in *'"method":"tools/list"'*) ;; *) exit 1 ;; esac
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"nextCursor":"","ttlMs":0,"cacheScope":"private"}}'
+            IFS= read -r request || exit 1
+            case "$request" in *'"cursor":""'*) ;; *) exit 1 ;; esac
+            IFS= read -r control || exit 1
+            case "$control" in *'"method":"notifications/cancelled"'*) ;; *) exit 1 ;; esac
+            case "$control" in *'"requestId":3'*) ;; *) exit 1 ;; esac
+            printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}'
+            IFS= read -r request || exit 1
+            case "$request" in *'"method":"ping"'*) ;; *) exit 1 ;; esac
+            printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete"}}'
+            exec sleep 2
+        "#;
+        let mut client = make_shell_scripted_initialized_client_for_version(
+            script,
+            Duration::from_secs(20),
+            MODERN_PROTOCOL_VERSION,
+        );
+        let mut budget = PaginationBudget::for_request(client.timeout_policy);
+        budget.begin_page().unwrap();
+        let first = client
+            .request_paginated_catalog_page(FinalCacheResultSet::Tools, None, None, None, &budget)
+            .expect("the first page arrives at once");
+        let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = first else {
+            panic!("the selected core list result is retained");
+        };
+        let cursor = budget
+            .admit_next_cursor(result.payload.next_cursor)
+            .unwrap();
+        budget.deadline = Instant::now() + Duration::from_millis(200);
+        budget.begin_page().unwrap();
+        let started = Instant::now();
+        let error = client
+            .request_paginated_catalog_page(
+                FinalCacheResultSet::Tools,
+                cursor.as_deref(),
+                None,
+                None,
+                &budget,
+            )
+            .expect_err("the stalled second page is capped by the traversal deadline");
+        let waited = started.elapsed();
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({"timeoutSource": "absolute"}))
+        );
+        // A fresh request budget would wait the full 20 s; the cap is 200 ms.
+        assert!(
+            waited < Duration::from_secs(10),
+            "second page waited {waited:?}"
+        );
+        assert_eq!(
+            client.next_id.load(Ordering::SeqCst),
+            4,
+            "no retry or third list request"
+        );
+        assert_eq!(client.responses.pending_len(), 0);
+        client
+            .ping()
+            .expect("the late second page is discarded, not delivered to the next request");
+        client.close().expect("capped second page peer cleanup");
     }
 
     #[test]
