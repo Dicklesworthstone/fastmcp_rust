@@ -1380,6 +1380,20 @@ fn b35_third_party_backend_conformance() {
 
     let third_party = MinimalBackend::default();
     assert_required_surface_conformance(&third_party, "MinimalBackend");
+    assert!(third_party.execution_limits().is_err(),
+        "an older backend must explicitly implement finite execution before admission");
+    let bounded = shipped.execution_limits().expect("shipped finite execution policy");
+    assert_eq!(bounded.total_runtime(), Duration::from_secs(24 * 60 * 60));
+    assert_eq!(bounded.attempt_runtime(), Duration::from_secs(60 * 60));
+    assert_eq!(bounded.max_attempts(), 8);
+    let old_snapshot = third_party.get_task_snapshot(
+        &conformance_task("conformance-fail-closed").0.base().task_id,
+    ).unwrap();
+    assert!(old_snapshot.is_none());
+    let unsupported_snapshot = FinalTaskSnapshot::new(conformance_task("conformance-fail-closed").0, 1);
+    assert!(third_party.task_execution_budget_if_current(&unsupported_snapshot).is_err());
+    assert!(third_party.expire_task_execution_if_current(&unsupported_snapshot).is_err());
+    assert!(third_party.next_expired_execution_snapshot().is_err());
 
     // The optional surface FAILS CLOSED on a backend that declined it. The
     // trait's defaults return an error rather than a false or a None, so a

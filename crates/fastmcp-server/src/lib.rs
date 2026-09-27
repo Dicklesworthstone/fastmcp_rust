@@ -168,7 +168,8 @@ use session::{
 #[cfg(feature = "tasks")]
 pub use tasks::{
     ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
-    FinalTaskAcceptedInput, FinalTaskInitialWork, FinalTaskNotificationEmitter,
+    FinalTaskAcceptedInput, FinalTaskExecutionBudget, FinalTaskExecutionLimits, FinalTaskInitialWork,
+    FinalTaskNotificationEmitter,
     FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
     FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
     FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
@@ -24832,6 +24833,10 @@ mod lib_unit_tests {
         cancellation_requests: std::collections::BTreeSet<fastmcp_protocol::FinalTaskId>,
         notifications: Vec<fastmcp_protocol::TaskStatusNotification>,
         expires_at: std::collections::BTreeMap<fastmcp_protocol::FinalTaskId, Instant>,
+        execution_budgets: std::collections::BTreeMap<
+            fastmcp_protocol::FinalTaskId,
+            crate::tasks::FinalTaskExecutionBudget,
+        >,
     }
 
     #[cfg(feature = "tasks")]
@@ -24858,6 +24863,7 @@ mod lib_unit_tests {
     #[cfg(feature = "tasks")]
     struct ServerFinalTaskStore {
         clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+        execution_limits: crate::tasks::FinalTaskExecutionLimits,
         state: Mutex<ServerFinalTaskState>,
     }
 
@@ -24873,6 +24879,7 @@ mod lib_unit_tests {
         fn with_clock(clock: Arc<dyn Fn() -> Instant + Send + Sync>) -> Self {
             Self {
                 clock,
+                execution_limits: crate::tasks::FinalTaskExecutionLimits::default(),
                 state: Mutex::new(ServerFinalTaskState::default()),
             }
         }
@@ -24956,6 +24963,83 @@ mod lib_unit_tests {
     }
 
     #[cfg(feature = "tasks")]
+    fn new_server_final_task_execution_budget(
+        limits: crate::tasks::FinalTaskExecutionLimits,
+        now: Instant,
+    ) -> McpResult<crate::tasks::FinalTaskExecutionBudget> {
+        let total_deadline = now.checked_add(limits.total_runtime()).ok_or_else(|| {
+            McpError::internal_error("Server final task execution exceeds clock range")
+        })?;
+        crate::tasks::FinalTaskExecutionBudget::new(total_deadline, None, 0, limits)
+    }
+
+    #[cfg(feature = "tasks")]
+    fn server_final_task_execution_exhaustion(
+        state: &ServerFinalTaskState,
+        task_id: &fastmcp_protocol::FinalTaskId,
+        now: Instant,
+    ) -> McpResult<Option<&'static str>> {
+        let Some(task) = state.tasks.get(task_id) else {
+            return Ok(None);
+        };
+        if !matches!(
+            task,
+            fastmcp_protocol::Task::Working(_) | fastmcp_protocol::Task::InputRequired { .. }
+        ) {
+            return Ok(None);
+        }
+        let budget = state.execution_budgets.get(task_id).ok_or_else(|| {
+            McpError::internal_error("Server final task is missing execution accounting")
+        })?;
+        if now >= budget.total_deadline() {
+            return Ok(Some("Task total execution deadline exceeded"));
+        }
+        if budget
+            .attempt_deadline()
+            .is_some_and(|deadline| now >= deadline)
+        {
+            return Ok(Some("Task attempt execution deadline exceeded"));
+        }
+        if budget.attempts() == budget.limits().max_attempts()
+            && !state.handoff_leases.contains_key(task_id)
+            && matches!(task, fastmcp_protocol::Task::Working(_))
+            && (state.initial_work.contains_key(task_id)
+                || state.accepted_inputs.contains_key(task_id))
+        {
+            return Ok(Some("Task execution attempt limit exceeded"));
+        }
+        Ok(None)
+    }
+
+    #[cfg(feature = "tasks")]
+    fn released_server_final_task_execution_budget(
+        state: &ServerFinalTaskState,
+        task_id: &fastmcp_protocol::FinalTaskId,
+    ) -> McpResult<crate::tasks::FinalTaskExecutionBudget> {
+        let budget = state.execution_budgets.get(task_id).ok_or_else(|| {
+            McpError::internal_error("Server final task is missing execution accounting")
+        })?;
+        crate::tasks::FinalTaskExecutionBudget::new(
+            budget.total_deadline(),
+            None,
+            budget.attempts(),
+            budget.limits(),
+        )
+    }
+
+    #[cfg(feature = "tasks")]
+    fn prepare_server_final_task_execution_release(
+        state: &ServerFinalTaskState,
+        task_id: &fastmcp_protocol::FinalTaskId,
+        now: Instant,
+    ) -> McpResult<crate::tasks::FinalTaskExecutionBudget> {
+        if let Some(reason) = server_final_task_execution_exhaustion(state, task_id, now)? {
+            return Err(McpError::invalid_params(reason));
+        }
+        released_server_final_task_execution_budget(state, task_id)
+    }
+
+    #[cfg(feature = "tasks")]
     fn server_final_task_is_working(
         state: &ServerFinalTaskState,
         task_id: &fastmcp_protocol::FinalTaskId,
@@ -24990,9 +25074,11 @@ mod lib_unit_tests {
                 None,
             )?);
         let notification = crate::tasks::final_task_notification(&task);
+        let execution_budget = released_server_final_task_execution_budget(state, task_id)?;
         let generation = next_server_final_task_generation(state)?;
         state.tasks.insert(task_id.clone(), task);
         state.generations.insert(task_id.clone(), generation);
+        state.execution_budgets.insert(task_id.clone(), execution_budget);
         state.accepted_inputs.remove(task_id);
         state.initial_work.remove(task_id);
         state.handoff_leases.remove(task_id);
@@ -25010,6 +25096,14 @@ mod lib_unit_tests {
             .map(|(task_id, _)| task_id.clone())
             .collect::<Vec<_>>();
         for task_id in expired {
+            // Expired execution retains its exact fence until the explicit
+            // expiry operation commits a failure and matching notification.
+            if !matches!(
+                server_final_task_execution_exhaustion(state, &task_id, now),
+                Ok(None)
+            ) {
+                continue;
+            }
             let Some(lease_generation) = state
                 .handoff_leases
                 .get(&task_id)
@@ -25031,8 +25125,14 @@ mod lib_unit_tests {
             }
             let recoverable = server_final_task_is_working(state, &task_id, lease_generation);
             if recoverable {
+                let Ok(execution_budget) =
+                    released_server_final_task_execution_budget(state, &task_id)
+                else {
+                    continue;
+                };
                 if let Ok(generation) = next_server_final_task_generation(state) {
                     state.handoff_leases.remove(&task_id);
+                    state.execution_budgets.insert(task_id.clone(), execution_budget);
                     state.generations.insert(task_id, generation);
                 }
             } else {
@@ -25048,6 +25148,7 @@ mod lib_unit_tests {
             .collect::<Vec<_>>();
         for task_id in expired_task_ids {
             state.expires_at.remove(&task_id);
+            state.execution_budgets.remove(&task_id);
             state.tasks.remove(&task_id);
             state.generations.remove(&task_id);
             state.work_descriptors.remove(&task_id);
@@ -25070,25 +25171,46 @@ mod lib_unit_tests {
         owner_id: &str,
         now: Instant,
     ) -> McpResult<()> {
+        if let Some(reason) = server_final_task_execution_exhaustion(state, &task_id, now)? {
+            return Err(McpError::invalid_params(reason));
+        }
         let expires_at = server_final_task_handoff_expiry(now)?;
-        if state
-            .handoff_leases
-            .insert(
-                task_id,
-                ServerFinalTaskHandoffLease {
-                    generation,
-                    kind,
-                    owner_id: owner_id.to_owned(),
-                    dispatch_fence: None,
-                    expires_at,
-                },
-            )
-            .is_some()
-        {
+        if state.handoff_leases.contains_key(&task_id) {
             return Err(McpError::internal_error(
                 "Server final task test-store overwrote a live handoff lease",
             ));
         }
+        let budget = state.execution_budgets.get(&task_id).ok_or_else(|| {
+            McpError::internal_error("Server final task is missing execution accounting")
+        })?;
+        let attempts = budget
+            .attempts()
+            .checked_add(1)
+            .filter(|attempts| *attempts <= budget.limits().max_attempts())
+            .ok_or_else(|| McpError::invalid_params("Task execution attempt limit exceeded"))?;
+        let attempt_deadline = now
+            .checked_add(budget.limits().attempt_runtime())
+            .ok_or_else(|| {
+                McpError::internal_error("Server final task attempt exceeds clock range")
+            })?
+            .min(budget.total_deadline());
+        let execution_budget = crate::tasks::FinalTaskExecutionBudget::new(
+            budget.total_deadline(),
+            Some(attempt_deadline),
+            attempts,
+            budget.limits(),
+        )?;
+        state.execution_budgets.insert(task_id.clone(), execution_budget);
+        state.handoff_leases.insert(
+            task_id,
+            ServerFinalTaskHandoffLease {
+                generation,
+                kind,
+                owner_id: owner_id.to_owned(),
+                dispatch_fence: None,
+                expires_at,
+            },
+        );
         Ok(())
     }
 
@@ -25096,22 +25218,29 @@ mod lib_unit_tests {
     fn next_server_final_task_recovery_id<'a>(
         task_ids: impl Iterator<Item = &'a fastmcp_protocol::FinalTaskId>,
         after_task_id: Option<&fastmcp_protocol::FinalTaskId>,
-        mut eligible: impl FnMut(&fastmcp_protocol::FinalTaskId) -> bool,
-    ) -> Option<fastmcp_protocol::FinalTaskId> {
+        mut eligible: impl FnMut(&fastmcp_protocol::FinalTaskId) -> McpResult<bool>,
+    ) -> McpResult<Option<fastmcp_protocol::FinalTaskId>> {
         let task_ids = task_ids.collect::<Vec<_>>();
-        task_ids
-            .iter()
-            .copied()
-            .find(|task_id| after_task_id.is_none_or(|after| *task_id > after) && eligible(task_id))
-            .or_else(|| task_ids.into_iter().find(|task_id| eligible(task_id)))
-            .cloned()
+        for task_id in task_ids.iter().copied() {
+            if after_task_id.is_none_or(|after| task_id > after) && eligible(task_id)? {
+                return Ok(Some(task_id.clone()));
+            }
+        }
+        for task_id in task_ids {
+            if after_task_id.is_some_and(|after| task_id <= after) && eligible(task_id)? {
+                return Ok(Some(task_id.clone()));
+            }
+        }
+        Ok(None)
     }
 
     #[cfg(feature = "tasks")]
     fn record_server_final_task_cancellation(
         state: &mut ServerFinalTaskState,
         task_id: &fastmcp_protocol::FinalTaskId,
+        now: Instant,
     ) -> McpResult<()> {
+        let execution_budget = prepare_server_final_task_execution_release(state, task_id, now)?;
         let generation = state.generations.get(task_id).copied().ok_or_else(|| {
             McpError::internal_error("Server final task test-store is missing a task generation")
         })?;
@@ -25126,6 +25255,7 @@ mod lib_unit_tests {
         state.initial_work.remove(task_id);
         if !dispatch_elected {
             state.handoff_leases.remove(task_id);
+            state.execution_budgets.insert(task_id.clone(), execution_budget);
         }
         state.cancellation_requests.insert(task_id.clone());
         if let Some(next_generation) = next_generation {
@@ -25159,6 +25289,98 @@ mod lib_unit_tests {
 
     #[cfg(feature = "tasks")]
     impl FinalTaskStore for ServerFinalTaskStore {
+        fn execution_limits(&self) -> McpResult<crate::tasks::FinalTaskExecutionLimits> {
+            Ok(self.execution_limits)
+        }
+
+        fn task_execution_budget_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+        ) -> McpResult<Option<crate::tasks::FinalTaskExecutionBudget>> {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
+            let task_id = &expected.task().base().task_id;
+            if state.generations.get(task_id) != Some(&expected.generation()) {
+                return Ok(None);
+            }
+            state
+                .execution_budgets
+                .get(task_id)
+                .copied()
+                .map(Some)
+                .ok_or_else(|| {
+                    McpError::internal_error("Server final task is missing execution accounting")
+                })
+        }
+
+        fn expire_task_execution_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = self.now();
+            reclaim_expired_server_final_task_handoffs(&mut state, now);
+            let task_id = &expected.task().base().task_id;
+            if state.generations.get(task_id) != Some(&expected.generation()) {
+                return Ok(None);
+            }
+            let Some(reason) = server_final_task_execution_exhaustion(&state, task_id, now)? else {
+                return Ok(None);
+            };
+            let retained = state.tasks.get(task_id).ok_or_else(|| {
+                McpError::internal_error("Server final task expiry lost its retained task")
+            })?;
+            let task = fastmcp_protocol::Task::Failed {
+                base: crate::tasks::transition_terminal_final_task_base(
+                    retained.base().clone(),
+                    fastmcp_protocol::FinalTaskStatus::Failed,
+                    None,
+                )?,
+                error: fastmcp_protocol::FinalTaskError {
+                    code: (-32000).into(),
+                    message: reason.to_owned(),
+                    data: None,
+                    additional: BTreeMap::new(),
+                },
+            };
+            let notification = crate::tasks::final_task_notification(&task);
+            let execution_budget = released_server_final_task_execution_budget(&state, task_id)?;
+            let generation = next_server_final_task_generation(&mut state)?;
+            state.tasks.insert(task_id.clone(), task.clone());
+            state.generations.insert(task_id.clone(), generation);
+            state.execution_budgets.insert(task_id.clone(), execution_budget);
+            state.initial_work.remove(task_id);
+            state.accepted_inputs.remove(task_id);
+            state.handoff_leases.remove(task_id);
+            state.cancellation_requests.remove(task_id);
+            state.notifications.push(notification);
+            Ok(Some(FinalTaskSnapshot::new(task, generation)))
+        }
+
+        fn next_expired_execution_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = self.now();
+            reclaim_expired_server_final_task_handoffs(&mut state, now);
+            for (task_id, task) in &state.tasks {
+                if server_final_task_execution_exhaustion(&state, task_id, now)?.is_some() {
+                    let generation = state.generations.get(task_id).copied().ok_or_else(|| {
+                        McpError::internal_error("Server final task expiry lost its generation")
+                    })?;
+                    return Ok(Some(FinalTaskSnapshot::new(task.clone(), generation)));
+                }
+            }
+            Ok(None)
+        }
+
         fn create_task(
             &self,
             task: fastmcp_protocol::Task,
@@ -25167,12 +25389,14 @@ mod lib_unit_tests {
             let task_id = task.base().task_id.clone();
             let ttl_ms = validate_server_final_task_durations(&task)?;
             ensure_server_final_task_notification_matches_task(&task, &notification)?;
-            let now = self.now();
-            let expires_at = server_final_task_expiry(ttl_ms, now)?;
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = self.now();
+            let expires_at = server_final_task_expiry(ttl_ms, now)?;
+            let execution_budget =
+                new_server_final_task_execution_budget(self.execution_limits, now)?;
             reclaim_expired_server_final_task_handoffs(&mut state, now);
             if state.tasks.contains_key(&task_id) {
                 return Err(McpError::invalid_params("Task already exists"));
@@ -25180,6 +25404,7 @@ mod lib_unit_tests {
             let generation = next_server_final_task_generation(&mut state)?;
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
+            state.execution_budgets.insert(task_id.clone(), execution_budget);
             state.notifications.push(notification);
             if let Some(expires_at) = expires_at {
                 state.expires_at.insert(task_id, expires_at);
@@ -25207,6 +25432,8 @@ mod lib_unit_tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let now = self.now();
             let expires_at = server_final_task_expiry(ttl_ms, now)?;
+            let execution_budget =
+                new_server_final_task_execution_budget(self.execution_limits, now)?;
             reclaim_expired_server_final_task_handoffs(&mut state, now);
             if state.tasks.contains_key(&task_id) {
                 return Err(McpError::invalid_params("Task already exists"));
@@ -25214,6 +25441,7 @@ mod lib_unit_tests {
             let generation = next_server_final_task_generation(&mut state)?;
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
+            state.execution_budgets.insert(task_id.clone(), execution_budget);
             state
                 .work_descriptors
                 .insert(task_id.clone(), work_descriptor.clone());
@@ -25268,10 +25496,13 @@ mod lib_unit_tests {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
+            let now = self.now();
+            reclaim_expired_server_final_task_handoffs(&mut state, now);
             if !state.tasks.contains_key(&task_id) {
                 return Err(McpError::invalid_params("Task not found"));
             }
+            let execution_budget =
+                prepare_server_final_task_execution_release(&state, &task_id, now)?;
             let generation = next_server_final_task_generation(&mut state)?;
             let terminal = matches!(
                 &task,
@@ -25281,6 +25512,7 @@ mod lib_unit_tests {
             );
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
+            state.execution_budgets.insert(task_id.clone(), execution_budget);
             state.accepted_inputs.remove(&task_id);
             state.handoff_leases.remove(&task_id);
             state.initial_work.remove(&task_id);
@@ -25309,10 +25541,13 @@ mod lib_unit_tests {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
+            let now = self.now();
+            reclaim_expired_server_final_task_handoffs(&mut state, now);
             if state.generations.get(&task_id) != Some(&expected.generation()) {
                 return Ok(false);
             }
+            let execution_budget =
+                prepare_server_final_task_execution_release(&state, &task_id, now)?;
             let generation = next_server_final_task_generation(&mut state)?;
             let terminal = matches!(
                 &task,
@@ -25322,6 +25557,7 @@ mod lib_unit_tests {
             );
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
+            state.execution_budgets.insert(task_id.clone(), execution_budget);
             state.accepted_inputs.remove(&task_id);
             state.handoff_leases.remove(&task_id);
             state.initial_work.remove(&task_id);
@@ -25351,13 +25587,17 @@ mod lib_unit_tests {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
+            let now = self.now();
+            reclaim_expired_server_final_task_handoffs(&mut state, now);
             if state.generations.get(&task_id) != Some(&expected.generation()) {
                 return Ok(None);
             }
+            let execution_budget =
+                prepare_server_final_task_execution_release(&state, &task_id, now)?;
             let generation = next_server_final_task_generation(&mut state)?;
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
+            state.execution_budgets.insert(task_id.clone(), execution_budget);
             state.handoff_leases.remove(&task_id);
             state.initial_work.remove(&task_id);
             let committed = FinalTaskSnapshot::new(state.tasks[&task_id].clone(), generation);
@@ -25390,10 +25630,13 @@ mod lib_unit_tests {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
+            let now = self.now();
+            reclaim_expired_server_final_task_handoffs(&mut state, now);
             if state.generations.get(&task_id) != Some(&expected.generation()) {
                 return Ok(None);
             }
+            let execution_budget =
+                prepare_server_final_task_execution_release(&state, &task_id, now)?;
             let generation = next_server_final_task_generation(&mut state)?;
             let terminal = matches!(
                 &task,
@@ -25403,6 +25646,7 @@ mod lib_unit_tests {
             );
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
+            state.execution_budgets.insert(task_id.clone(), execution_budget);
             state.accepted_inputs.remove(&task_id);
             state.handoff_leases.remove(&task_id);
             state.initial_work.remove(&task_id);
@@ -25447,7 +25691,8 @@ mod lib_unit_tests {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
+            let now = self.now();
+            reclaim_expired_server_final_task_handoffs(&mut state, now);
             let owns_exact_dispatch = state.handoff_leases.get(&task_id).is_some_and(|lease| {
                 lease.generation == expected.generation()
                     && lease.owner_id == owner_id
@@ -25459,6 +25704,8 @@ mod lib_unit_tests {
             {
                 return Ok(None);
             }
+            let execution_budget =
+                prepare_server_final_task_execution_release(&state, &task_id, now)?;
             let generation = next_server_final_task_generation(&mut state)?;
             let terminal = matches!(
                 &task,
@@ -25468,6 +25715,7 @@ mod lib_unit_tests {
             );
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
+            state.execution_budgets.insert(task_id.clone(), execution_budget);
             state.accepted_inputs.remove(&task_id);
             state.handoff_leases.remove(&task_id);
             state.initial_work.remove(&task_id);
@@ -25509,6 +25757,7 @@ mod lib_unit_tests {
             reclaim_expired_server_final_task_handoffs(&mut state, now);
             if !server_final_task_is_working(&state, task_id, expected.generation())
                 || state.handoff_leases.contains_key(task_id)
+                || server_final_task_execution_exhaustion(&state, task_id, now)?.is_some()
             {
                 return Ok(None);
             }
@@ -25559,16 +25808,18 @@ mod lib_unit_tests {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
+            let now = self.now();
+            reclaim_expired_server_final_task_handoffs(&mut state, now);
             let Some(task_id) = next_server_final_task_recovery_id(
                 state.initial_work.keys(),
                 after_task_id,
                 |task_id| {
-                    state.generations.get(task_id).is_some_and(|generation| {
+                    Ok(state.generations.get(task_id).is_some_and(|generation| {
                         server_final_task_is_working(&state, task_id, *generation)
                     }) && !state.handoff_leases.contains_key(task_id)
+                        && server_final_task_execution_exhaustion(&state, task_id, now)?.is_none())
                 },
-            ) else {
+            )? else {
                 return Ok(None);
             };
             let task = state.tasks.get(&task_id).cloned().ok_or_else(|| {
@@ -25607,6 +25858,7 @@ mod lib_unit_tests {
             reclaim_expired_server_final_task_handoffs(&mut state, now);
             if !server_final_task_is_working(&state, task_id, expected.generation())
                 || state.handoff_leases.contains_key(task_id)
+                || server_final_task_execution_exhaustion(&state, task_id, now)?.is_some()
             {
                 return Ok(None);
             }
@@ -25636,7 +25888,8 @@ mod lib_unit_tests {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
+            let now = self.now();
+            reclaim_expired_server_final_task_handoffs(&mut state, now);
             let owns_lease = state.handoff_leases.get(task_id).is_some_and(|lease| {
                 lease.generation == generation
                     && lease.kind == ServerFinalTaskHandoffKind::Initial
@@ -25650,12 +25903,17 @@ mod lib_unit_tests {
             // concurrent cancellation request into the terminal task state.
             // Removing it here would strand a working task with cancellation
             // intent after a supervisor error or dropped future.
-            if state.cancellation_requests.contains(task_id) {
+            if state.cancellation_requests.contains(task_id)
+                || server_final_task_execution_exhaustion(&state, task_id, now)?.is_some()
+                || !server_final_task_is_working(&state, task_id, generation)
+                || state.initial_work.get(task_id) != Some(&work_descriptor)
+            {
                 return Ok(false);
             }
+            let execution_budget = released_server_final_task_execution_budget(&state, task_id)?;
             state.handoff_leases.remove(task_id);
-            Ok(server_final_task_is_working(&state, task_id, generation)
-                && state.initial_work.get(task_id) == Some(&work_descriptor))
+            state.execution_budgets.insert(task_id.clone(), execution_budget);
+            Ok(true)
         }
 
         fn next_accepted_input_snapshot_after(
@@ -25666,16 +25924,18 @@ mod lib_unit_tests {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
+            let now = self.now();
+            reclaim_expired_server_final_task_handoffs(&mut state, now);
             let Some(task_id) = next_server_final_task_recovery_id(
                 state.accepted_inputs.keys(),
                 after_task_id,
                 |task_id| {
-                    state.generations.get(task_id).is_some_and(|generation| {
+                    Ok(state.generations.get(task_id).is_some_and(|generation| {
                         server_final_task_is_working(&state, task_id, *generation)
                     }) && !state.handoff_leases.contains_key(task_id)
+                        && server_final_task_execution_exhaustion(&state, task_id, now)?.is_none())
                 },
-            ) else {
+            )? else {
                 return Ok(None);
             };
             let task = state.tasks.get(&task_id).cloned().ok_or_else(|| {
@@ -25712,7 +25972,8 @@ mod lib_unit_tests {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
+            let now = self.now();
+            reclaim_expired_server_final_task_handoffs(&mut state, now);
             let owns_lease = state.handoff_leases.get(task_id).is_some_and(|lease| {
                 lease.generation == generation
                     && lease.kind == ServerFinalTaskHandoffKind::Resumed
@@ -25724,12 +25985,17 @@ mod lib_unit_tests {
             }
             // See initial-work restoration: cancellation must retain the
             // elected fence until the runner records terminal cancellation.
-            if state.cancellation_requests.contains(task_id) {
+            if state.cancellation_requests.contains(task_id)
+                || server_final_task_execution_exhaustion(&state, task_id, now)?.is_some()
+                || !server_final_task_is_working(&state, task_id, generation)
+                || state.accepted_inputs.get(task_id) != Some(&input_responses)
+            {
                 return Ok(false);
             }
+            let execution_budget = released_server_final_task_execution_budget(&state, task_id)?;
             state.handoff_leases.remove(task_id);
-            Ok(server_final_task_is_working(&state, task_id, generation)
-                && state.accepted_inputs.get(task_id) == Some(&input_responses))
+            state.execution_budgets.insert(task_id.clone(), execution_budget);
+            Ok(true)
         }
 
         fn begin_handoff_dispatch_for_owner_if_current(
@@ -25750,6 +26016,7 @@ mod lib_unit_tests {
             let now = self.now();
             reclaim_expired_server_final_task_handoffs(&mut state, now);
             if !server_final_task_is_working(&state, task_id, generation)
+                || server_final_task_execution_exhaustion(&state, task_id, now)?.is_some()
                 || !state.handoff_leases.get(task_id).is_some_and(|lease| {
                     lease.generation == generation
                         && lease.owner_id == owner_id
@@ -25783,6 +26050,7 @@ mod lib_unit_tests {
             let now = self.now();
             reclaim_expired_server_final_task_handoffs(&mut state, now);
             if !server_final_task_is_working(&state, task_id, generation)
+                || server_final_task_execution_exhaustion(&state, task_id, now)?.is_some()
                 || !state.handoff_leases.get(task_id).is_some_and(|lease| {
                     lease.generation == generation
                         && lease.owner_id == owner_id
@@ -25814,7 +26082,8 @@ mod lib_unit_tests {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
+            let now = self.now();
+            reclaim_expired_server_final_task_handoffs(&mut state, now);
             let Some(lease) = state.handoff_leases.get(task_id) else {
                 return Ok(false);
             };
@@ -25826,12 +26095,16 @@ mod lib_unit_tests {
             }
             // A cancellation race after the supervisor returns must preserve
             // this elected fence for fenced terminal retirement.
-            if state.cancellation_requests.contains(task_id) {
+            if state.cancellation_requests.contains(task_id)
+                || server_final_task_execution_exhaustion(&state, task_id, now)?.is_some()
+            {
                 return Ok(false);
             }
             let kind = lease.kind;
             let still_dispatchable = server_final_task_is_working(&state, task_id, generation);
+            let execution_budget = released_server_final_task_execution_budget(&state, task_id)?;
             state.handoff_leases.remove(task_id);
+            state.execution_budgets.insert(task_id.clone(), execution_budget);
             if still_dispatchable {
                 match kind {
                     ServerFinalTaskHandoffKind::Initial => {
@@ -25850,11 +26123,12 @@ mod lib_unit_tests {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
+            let now = self.now();
+            reclaim_expired_server_final_task_handoffs(&mut state, now);
             if !state.tasks.contains_key(task_id) {
                 return Err(McpError::invalid_params("Task not found"));
             }
-            record_server_final_task_cancellation(&mut state, task_id)
+            record_server_final_task_cancellation(&mut state, task_id, now)
         }
 
         fn request_cancellation_if_current(&self, expected: &FinalTaskSnapshot) -> McpResult<bool> {
@@ -25863,11 +26137,12 @@ mod lib_unit_tests {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
+            let now = self.now();
+            reclaim_expired_server_final_task_handoffs(&mut state, now);
             if state.generations.get(task_id) != Some(&expected.generation()) {
                 return Ok(false);
             }
-            record_server_final_task_cancellation(&mut state, task_id)?;
+            record_server_final_task_cancellation(&mut state, task_id, now)?;
             Ok(true)
         }
 
@@ -25897,15 +26172,18 @@ mod lib_unit_tests {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            reclaim_expired_server_final_task_handoffs(&mut state, self.now());
+            let now = self.now();
+            reclaim_expired_server_final_task_handoffs(&mut state, now);
             if state.generations.get(task_id) != Some(&expected.generation()) {
                 return Ok(None);
             }
+            let execution_budget =
+                prepare_server_final_task_execution_release(&state, task_id, now)?;
             let dispatch_elected = state.handoff_leases.get(task_id).is_some_and(|lease| {
                 lease.generation == expected.generation() && lease.dispatch_fence.is_some()
             });
             if dispatch_elected {
-                record_server_final_task_cancellation(&mut state, task_id)?;
+                record_server_final_task_cancellation(&mut state, task_id, now)?;
                 let task = state.tasks.get(task_id).cloned().ok_or_else(|| {
                     McpError::internal_error(
                         "Server final task test store lost an elected task during cancellation",
@@ -25921,6 +26199,7 @@ mod lib_unit_tests {
             let generation = next_server_final_task_generation(&mut state)?;
             state.tasks.insert(task_id.clone(), cancelled_task.clone());
             state.generations.insert(task_id.clone(), generation);
+            state.execution_budgets.insert(task_id.clone(), execution_budget);
             state.accepted_inputs.remove(task_id);
             state.initial_work.remove(task_id);
             state.handoff_leases.remove(task_id);
@@ -25968,6 +26247,363 @@ mod lib_unit_tests {
                 Ok(None)
             }
         }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn server_final_task_store_execution_budget_survives_renewal_and_reclaim() {
+        let start = Instant::now();
+        let clock_now = Arc::new(Mutex::new(start));
+        let clock = {
+            let clock_now = Arc::clone(&clock_now);
+            Arc::new(move || {
+                *clock_now
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            })
+        };
+        let mut backend = ServerFinalTaskStore::with_clock(clock);
+        backend.execution_limits = crate::tasks::FinalTaskExecutionLimits::new(
+            Duration::from_secs(120),
+            Duration::from_secs(60),
+            2,
+        )
+        .expect("finite backend execution policy");
+        let store = Arc::new(backend);
+        let runtime = server_final_task_store_runtime(Arc::clone(&store));
+        let mut service = start_final_tasks_test_service(&runtime);
+
+        let healthy = runtime
+            .create_task_with_work(final_tasks_test_work_descriptor(), None)
+            .expect("public admission accepts a bounded backend");
+        let mut poll_cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(Future::poll(service.as_mut(), &mut poll_cx).is_pending());
+        assert!(matches!(
+            runtime
+                .get_task(&healthy.task.base().task_id)
+                .expect("read service completion")
+                .task,
+            fastmcp_protocol::Task::Completed { .. }
+        ));
+
+        let created = runtime
+            .create_task_with_work(final_tasks_test_work_descriptor(), None)
+            .expect("public admission stamps execution accounting");
+        let task_id = created.task.base().task_id.clone();
+        let snapshot = store.get_task_snapshot(&task_id).unwrap().unwrap();
+        let original = store
+            .task_execution_budget_if_current(&snapshot)
+            .unwrap()
+            .unwrap();
+        assert_eq!(original.total_deadline(), start + Duration::from_secs(120));
+        assert_eq!(original.attempt_deadline(), None);
+        assert_eq!(original.attempts(), 0);
+
+        let work = store
+            .take_initial_work_for_owner_if_current(&snapshot, "first-owner")
+            .unwrap()
+            .unwrap();
+        let claimed = store
+            .task_execution_budget_if_current(&snapshot)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.attempts(), 1);
+        assert_eq!(
+            claimed.attempt_deadline(),
+            Some(start + Duration::from_secs(60))
+        );
+        assert!(
+            store
+                .take_initial_work_for_owner_if_current(&snapshot, "other-owner")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.task_execution_budget_if_current(&snapshot).unwrap(),
+            Some(claimed)
+        );
+        let fence = store
+            .begin_handoff_dispatch_for_owner_if_current(
+                &task_id,
+                snapshot.generation(),
+                "first-owner",
+            )
+            .unwrap()
+            .unwrap();
+
+        *clock_now
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = start + Duration::from_secs(10);
+        assert!(
+            store
+                .renew_handoff_dispatch_if_current(
+                    &task_id,
+                    snapshot.generation(),
+                    "first-owner",
+                    fence,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store.task_execution_budget_if_current(&snapshot).unwrap(),
+            Some(claimed)
+        );
+
+        *clock_now
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = start + Duration::from_secs(40);
+        let recovered = store.get_task_snapshot(&task_id).unwrap().unwrap();
+        assert!(recovered.generation() > snapshot.generation());
+        assert!(
+            store
+                .task_execution_budget_if_current(&snapshot)
+                .unwrap()
+                .is_none()
+        );
+        let released = store
+            .task_execution_budget_if_current(&recovered)
+            .unwrap()
+            .unwrap();
+        assert_eq!(released.total_deadline(), original.total_deadline());
+        assert_eq!(released.attempt_deadline(), None);
+        assert_eq!(released.attempts(), 1);
+        assert!(
+            !store
+                .restore_initial_work_for_owner_if_current(
+                    &task_id,
+                    snapshot.generation(),
+                    "first-owner",
+                    Some(fence),
+                    work.clone(),
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store.task_execution_budget_if_current(&recovered).unwrap(),
+            Some(released)
+        );
+
+        assert!(
+            store
+                .take_initial_work_for_owner_if_current(&recovered, "second-owner")
+                .unwrap()
+                .is_some()
+        );
+        let retried = store
+            .task_execution_budget_if_current(&recovered)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.total_deadline(), original.total_deadline());
+        assert_eq!(
+            retried.attempt_deadline(),
+            Some(start + Duration::from_secs(100))
+        );
+        assert_eq!(retried.attempts(), 2);
+        assert!(
+            store
+                .restore_initial_work_for_owner_if_current(
+                    &task_id,
+                    recovered.generation(),
+                    "second-owner",
+                    None,
+                    work,
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .take_initial_work_for_owner_if_current(&recovered, "third-owner")
+                .unwrap()
+                .is_none()
+        );
+        let fastmcp_protocol::Task::Failed { error, .. } = runtime
+            .get_task(&task_id)
+            .expect("public read retires exhausted claims")
+            .task
+        else {
+            panic!("claim exhaustion must retain a failed task");
+        };
+        assert_eq!(error.message, "Task execution attempt limit exceeded");
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn server_final_task_store_execution_expiry_fences_completion_and_retains_identity() {
+        let start = Instant::now();
+        let clock_now = Arc::new(Mutex::new(start));
+        let clock = {
+            let clock_now = Arc::clone(&clock_now);
+            Arc::new(move || {
+                *clock_now
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            })
+        };
+        let mut backend = ServerFinalTaskStore::with_clock(clock);
+        backend.execution_limits = crate::tasks::FinalTaskExecutionLimits::new(
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+            2,
+        )
+        .expect("finite backend execution policy");
+        let store = Arc::new(backend);
+        let runtime = server_final_task_store_runtime(Arc::clone(&store));
+        let _service = start_final_tasks_test_service(&runtime);
+        let created = runtime
+            .create_task_with_work(final_tasks_test_work_descriptor(), None)
+            .unwrap();
+        let sibling = runtime
+            .create_task_with_work(final_tasks_test_work_descriptor(), None)
+            .unwrap();
+        let task_id = created.task.base().task_id.clone();
+        let snapshot = store.get_task_snapshot(&task_id).unwrap().unwrap();
+        let sibling_snapshot = store
+            .get_task_snapshot(&sibling.task.base().task_id)
+            .unwrap()
+            .unwrap();
+        store
+            .take_initial_work_for_owner_if_current(&snapshot, "owner")
+            .unwrap()
+            .unwrap();
+        let fence = store
+            .begin_handoff_dispatch_for_owner_if_current(&task_id, snapshot.generation(), "owner")
+            .unwrap()
+            .unwrap();
+        let claimed = store
+            .task_execution_budget_if_current(&snapshot)
+            .unwrap()
+            .unwrap();
+        let retained_ttl = snapshot.task().base().ttl_ms.clone();
+        let retained_created_at = snapshot.task().base().created_at.clone();
+        assert!(
+            store
+                .expire_task_execution_if_current(&snapshot)
+                .unwrap()
+                .is_none()
+        );
+
+        *clock_now
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = start + Duration::from_millis(10);
+        assert!(
+            !store
+                .renew_handoff_dispatch_if_current(&task_id, snapshot.generation(), "owner", fence)
+                .unwrap()
+        );
+        let completed = fastmcp_protocol::Task::Completed {
+            base: crate::tasks::transition_terminal_final_task_base(
+                snapshot.task().base().clone(),
+                fastmcp_protocol::FinalTaskStatus::Completed,
+                None,
+            )
+            .unwrap(),
+            result: serde_json::from_value(serde_json::json!({"content": []})).unwrap(),
+        };
+        let error = store
+            .replace_task_and_clear_input_for_handoff_if_current(
+                &snapshot,
+                "owner",
+                fence,
+                false,
+                completed.clone(),
+                crate::tasks::final_task_notification(&completed),
+            )
+            .expect_err("late fenced completion cannot replace the pending timeout");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            store.get_task_snapshot(&task_id).unwrap().unwrap().generation(),
+            snapshot.generation()
+        );
+        assert_eq!(
+            store.task_execution_budget_if_current(&snapshot).unwrap(),
+            Some(claimed)
+        );
+        {
+            let state = store
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(state.notifications.len(), 2);
+            assert_eq!(state.handoff_leases[&task_id].dispatch_fence, Some(fence));
+        }
+        assert_eq!(
+            store
+                .next_expired_execution_snapshot()
+                .unwrap()
+                .unwrap()
+                .task()
+                .base()
+                .task_id,
+            task_id
+        );
+
+        let mut forged_base = snapshot.task().base().clone();
+        forged_base.ttl_ms = None;
+        let forged = FinalTaskSnapshot::new(
+            fastmcp_protocol::Task::Working(forged_base),
+            snapshot.generation(),
+        );
+        let expired = store
+            .expire_task_execution_if_current(&forged)
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.task().base().ttl_ms, retained_ttl);
+        assert_eq!(expired.task().base().created_at, retained_created_at);
+        assert!(expired.generation() > snapshot.generation());
+        let fastmcp_protocol::Task::Failed { error, .. } = expired.task() else {
+            panic!("attempt timeout must commit a typed failure");
+        };
+        assert_eq!(error.code, (-32000).into());
+        assert_eq!(error.message, "Task attempt execution deadline exceeded");
+        assert!(
+            store
+                .expire_task_execution_if_current(&snapshot)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            runtime.get_task(&task_id).unwrap().task,
+            fastmcp_protocol::Task::Failed { .. }
+        ));
+        assert_eq!(
+            store
+                .get_task_snapshot(&sibling.task.base().task_id)
+                .unwrap()
+                .unwrap()
+                .generation(),
+            sibling_snapshot.generation()
+        );
+        {
+            let state = store
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(state.notifications.len(), 3);
+            assert!(!state.handoff_leases.contains_key(&task_id));
+            assert!(!state.initial_work.contains_key(&task_id));
+            assert_eq!(state.execution_budgets[&task_id].attempt_deadline(), None);
+            assert_eq!(state.execution_budgets[&task_id].attempts(), 1);
+        }
+
+        *clock_now
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = start + Duration::from_millis(100);
+        assert!(store.next_initial_work_snapshot().unwrap().is_none());
+        let fastmcp_protocol::Task::Failed { error, .. } =
+            runtime.get_task(&sibling.task.base().task_id).unwrap().task
+        else {
+            panic!("queued work must expire without first acquiring a worker");
+        };
+        assert_eq!(error.message, "Task total execution deadline exceeded");
+        let state = store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            state.execution_budgets[&sibling.task.base().task_id].attempts(),
+            0
+        );
+        assert_eq!(state.notifications.len(), 4);
     }
 
     #[cfg(feature = "tasks")]
