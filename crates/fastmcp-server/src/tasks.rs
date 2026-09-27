@@ -4773,6 +4773,8 @@ pub trait ApplicationTaskSupervisor: Send + Sync {
 const MAX_FINAL_TASK_RECOVERY_HANDOFFS_PER_SCAN: usize = 64;
 const MAX_FINAL_TASK_RECOVERY_CAS_RETRIES: usize = 64;
 const FINAL_TASK_RECOVERY_WAKE_INTERVAL: StdDuration = StdDuration::from_secs(1);
+pub(crate) const DEFAULT_CONCURRENT_TASK_HANDOFFS: usize = 32;
+pub(crate) const MAX_CONCURRENT_TASK_HANDOFFS: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum FinalTaskRecoveryKind {
@@ -4801,7 +4803,7 @@ struct FinalTaskServiceSignal {
     /// owns the live readiness lease. `None` means installation has not yet
     /// entered a runnable service, or that service has exited.
     ready_generation: Option<u64>,
-    /// A direct wake path for the one supervisor handoff currently running in
+    /// A direct wake path for the bounded supervisor handoffs running in
     /// this service generation. The durable store remains the cancellation
     /// authority; this merely makes a newly-recorded cancellation observable
     /// without waiting for the dispatch-lease heartbeat.
@@ -4810,10 +4812,9 @@ struct FinalTaskServiceSignal {
 
 /// Per-runner wake registration for an elected application handoff.
 ///
-/// There is only one non-cloneable runner per service generation, so it can
-/// execute only one supervisor handoff at once. Keeping the task ID and last
-/// task waker together prevents a cancellation for another durable task from
-/// spuriously polling the active supervisor. The durable cancellation record
+/// Keeping each task ID and its last task waker together prevents a
+/// cancellation for another durable task from spuriously polling an active
+/// supervisor. The durable cancellation record
 /// remains the source of truth and closes the registration-vs-cancel race.
 #[derive(Default)]
 struct FinalTaskCancellationWake {
@@ -4822,8 +4823,7 @@ struct FinalTaskCancellationWake {
 
 #[derive(Default)]
 struct FinalTaskCancellationWakeState {
-    active_task_id: Option<FinalTaskId>,
-    waker: Option<std::task::Waker>,
+    active: BTreeMap<FinalTaskId, Option<std::task::Waker>>,
 }
 
 /// RAII registration that makes an elected handoff immediately wakeable by
@@ -4843,13 +4843,17 @@ impl FinalTaskCancellationWake {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.active_task_id.is_some() {
+        if state.active.contains_key(task_id) {
             return Err(McpError::internal_error(
-                "Task service attempted to execute concurrent supervisor handoffs",
+                "Task service attempted to execute duplicate supervisor handoffs",
             ));
         }
-        state.active_task_id = Some(task_id.clone());
-        state.waker = None;
+        if state.active.len() >= MAX_CONCURRENT_TASK_HANDOFFS {
+            return Err(McpError::internal_error(
+                "Task service cancellation registration capacity is exhausted",
+            ));
+        }
+        state.active.insert(task_id.clone(), None);
         Ok(FinalTaskCancellationWakeRegistration {
             wake: Arc::clone(self),
             task_id: task_id.clone(),
@@ -4861,8 +4865,8 @@ impl FinalTaskCancellationWake {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.active_task_id.as_ref() == Some(task_id) {
-            state.waker = Some(waker.clone());
+        if let Some(registered) = state.active.get_mut(task_id) {
+            *registered = Some(waker.clone());
         }
     }
 
@@ -4872,9 +4876,7 @@ impl FinalTaskCancellationWake {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (state.active_task_id.as_ref() == Some(task_id))
-                .then(|| state.waker.clone())
-                .flatten()
+            state.active.get(task_id).cloned().flatten()
         };
         if let Some(waker) = waker {
             waker.wake();
@@ -4895,10 +4897,7 @@ impl Drop for FinalTaskCancellationWakeRegistration {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.active_task_id.as_ref() == Some(&self.task_id) {
-            state.active_task_id = None;
-            state.waker = None;
-        }
+        state.active.remove(&self.task_id);
     }
 }
 
@@ -4931,6 +4930,48 @@ pub struct AuthorizedTaskServiceRunner {
     next_recovery_kind: FinalTaskRecoveryKind,
     initial_recovery_cursor: Option<FinalTaskId>,
     accepted_recovery_cursor: Option<FinalTaskId>,
+    max_concurrent_handoffs: usize,
+}
+
+/// Execution authority shared by the bounded futures owned by one service.
+#[derive(Clone)]
+struct FinalTaskHandoffExecutor {
+    runtime: FinalTaskRuntime,
+    service_id: u64,
+    dispatch_owner: String,
+    supervisor: Arc<dyn ApplicationTaskSupervisor>,
+}
+
+struct FinalTaskConcurrentHandoff<'a> {
+    kind: FinalTaskRecoveryKind,
+    task_id: FinalTaskId,
+    future: FinalTaskSupervisorFuture<'a>,
+    wake: Arc<FinalTaskHandoffWake>,
+}
+
+/// Only the handoff that was woken is polled on a service turn. In particular,
+/// cancelling one task must not give a pending sibling an application poll.
+struct FinalTaskHandoffWake {
+    ready: AtomicBool,
+    parent: Mutex<Option<std::task::Waker>>,
+}
+
+impl std::task::Wake for FinalTaskHandoffWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.ready.store(true, TaskServiceOrdering::Release);
+        let parent = self
+            .parent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(parent) = parent {
+            parent.wake();
+        }
+    }
 }
 
 /// Final Tasks state machine backed by an application-supplied durable store.
@@ -5081,6 +5122,7 @@ impl FinalTaskRuntime {
             next_recovery_kind: FinalTaskRecoveryKind::Initial,
             initial_recovery_cursor: None,
             accepted_recovery_cursor: None,
+            max_concurrent_handoffs: 1,
         })
     }
 
@@ -6532,6 +6574,39 @@ impl FinalTaskRuntime {
 }
 
 impl AuthorizedTaskServiceRunner {
+    /// Sets the maximum number of live application handoffs owned by one
+    /// service invocation. The limit must be between 1 and 256 inclusive.
+    ///
+    /// The explicit installation API defaults to one worker. Larger limits
+    /// let a pending application task coexist with other initial or resumed
+    /// work. Every future remains owned by `run_service`: cancellation,
+    /// failure, or dropping that future restores all uncompleted handoffs
+    /// under their existing durable fences before the service is released.
+    pub fn with_max_concurrent_handoffs(mut self, maximum: usize) -> McpResult<Self> {
+        if !(1..=MAX_CONCURRENT_TASK_HANDOFFS).contains(&maximum) {
+            return Err(McpError::invalid_params(
+                "Task service concurrency must be between 1 and 256",
+            ));
+        }
+        self.max_concurrent_handoffs = maximum;
+        Ok(self)
+    }
+
+    /// Returns the service's immutable bound on concurrent handoff futures.
+    #[must_use]
+    pub const fn max_concurrent_handoffs(&self) -> usize {
+        self.max_concurrent_handoffs
+    }
+
+    fn handoff_executor(&self) -> FinalTaskHandoffExecutor {
+        FinalTaskHandoffExecutor {
+            runtime: self.runtime.clone(),
+            service_id: self.service_id,
+            dispatch_owner: self.dispatch_owner.clone(),
+            supervisor: Arc::clone(&self.supervisor),
+        }
+    }
+
     /// Runs the service once, consuming this one-shot runner.
     ///
     /// New embeddings that supervise stdio or HTTP alongside Tasks should use
@@ -6591,6 +6666,9 @@ impl AuthorizedTaskServiceRunner {
         // The returned lease remains alive across every await in this run and
         // revokes its exact generation on normal exit, cancellation, or drop.
         let _readiness_lease = self.runtime.mark_task_service_ready(self.service_id)?;
+        if self.max_concurrent_handoffs > 1 {
+            return self.run_concurrent_service(cx).await;
+        }
         if let Err(error) = self.recover_pending(cx).await {
             if cx.checkpoint().is_err() {
                 return Ok(());
@@ -6645,76 +6723,245 @@ impl AuthorizedTaskServiceRunner {
         }
     }
 
+    async fn run_concurrent_service(&mut self, cx: &Cx) -> McpResult<()> {
+        enum Turn {
+            Completed(usize, McpResult<()>),
+            Recover,
+            Cancelled,
+            ReceiveFailed(String),
+        }
+
+        let executor = self.handoff_executor();
+        let mut active: Vec<FinalTaskConcurrentHandoff<'_>> =
+            Vec::with_capacity(self.max_concurrent_handoffs);
+        let mut ready_turns = 0;
+        let mut attempted_initial_cursor = self.initial_recovery_cursor.clone();
+        let mut attempted_accepted_cursor = self.accepted_recovery_cursor.clone();
+        loop {
+            if cx.checkpoint().is_err() {
+                return Ok(());
+            }
+            let mut scanned = 0;
+            let mut deferred = BTreeSet::new();
+            while active.len() < self.max_concurrent_handoffs
+                && scanned < MAX_FINAL_TASK_RECOVERY_HANDOFFS_PER_SCAN
+            {
+                let (kind, handoff) = match self.next_recovery_handoff(cx) {
+                    Ok(Some(recovered)) => recovered,
+                    Ok(None) => break,
+                    Err(_) if cx.checkpoint().is_err() => return Ok(()),
+                    Err(error) => return Err(error),
+                };
+                scanned += 1;
+                let task_id = final_task_handoff_task_id(&handoff).clone();
+                if active.iter().any(|active| active.task_id == task_id) {
+                    // A supervisor may have committed input_required while
+                    // still finishing its asynchronous cleanup. Defer a
+                    // successor generation until that prior future settles.
+                    // Restoration keeps its accepted inputs authoritative.
+                    drop(FinalTaskExecutionGuard::new(
+                        &self.runtime,
+                        &self.dispatch_owner,
+                        &handoff,
+                    ));
+                    if !deferred.insert((kind, task_id)) {
+                        break;
+                    }
+                    continue;
+                }
+                // Construct the restoration guard before the future enters
+                // the queue, so even an unpolled claimed handoff is restored
+                // if a sibling fails or the service future is dropped.
+                active.push(FinalTaskConcurrentHandoff {
+                    kind,
+                    task_id,
+                    future: executor.resume_handoff(cx, handoff),
+                    wake: Arc::new(FinalTaskHandoffWake {
+                        ready: AtomicBool::new(true),
+                        parent: Mutex::new(None),
+                    }),
+                });
+            }
+            let scan_has_more_capacity = scanned == MAX_FINAL_TASK_RECOVERY_HANDOFFS_PER_SCAN
+                && deferred.is_empty()
+                && active.len() < self.max_concurrent_handoffs;
+            let has_capacity = active.len() < self.max_concurrent_handoffs;
+            let turn = {
+                let mut receiver = std::pin::pin!(self.receiver.recv(cx));
+                let mut recovery_wake = std::pin::pin!(asupersync::time::sleep(
+                    cx.now(),
+                    FINAL_TASK_RECOVERY_WAKE_INTERVAL,
+                ));
+                std::future::poll_fn(|task_context| {
+                    if cx.checkpoint().is_err() {
+                        return std::task::Poll::Ready(Turn::Cancelled);
+                    }
+                    for (index, handoff) in active.iter_mut().enumerate() {
+                        *handoff
+                            .wake
+                            .parent
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(task_context.waker().clone());
+                        if !handoff.wake.ready.swap(false, TaskServiceOrdering::AcqRel) {
+                            continue;
+                        }
+                        let waker = std::task::Waker::from(Arc::clone(&handoff.wake));
+                        let mut handoff_context = std::task::Context::from_waker(&waker);
+                        match handoff.kind {
+                            FinalTaskRecoveryKind::Initial => {
+                                attempted_initial_cursor = Some(handoff.task_id.clone());
+                            }
+                            FinalTaskRecoveryKind::Resumed => {
+                                attempted_accepted_cursor = Some(handoff.task_id.clone());
+                            }
+                        }
+                        if let std::task::Poll::Ready(result) =
+                            handoff.future.as_mut().poll(&mut handoff_context)
+                        {
+                            return std::task::Poll::Ready(Turn::Completed(index, result));
+                        }
+                        // One supervisor can cancel the enclosing service.
+                        // Never start a sibling after that cancellation.
+                        if cx.checkpoint().is_err() {
+                            return std::task::Poll::Ready(Turn::Cancelled);
+                        }
+                    }
+                    if scan_has_more_capacity {
+                        return std::task::Poll::Ready(Turn::Recover);
+                    }
+                    if has_capacity {
+                        if let std::task::Poll::Ready(result) = receiver.as_mut().poll(task_context)
+                        {
+                            return std::task::Poll::Ready(match result {
+                                Ok(_) => Turn::Recover,
+                                Err(_) if cx.checkpoint().is_err() => Turn::Cancelled,
+                                Err(error) => Turn::ReceiveFailed(error.to_string()),
+                            });
+                        }
+                    }
+                    if recovery_wake.as_mut().poll(task_context).is_ready() {
+                        return std::task::Poll::Ready(Turn::Recover);
+                    }
+                    std::task::Poll::Pending
+                })
+                .await
+            };
+            match turn {
+                Turn::Completed(index, result) => {
+                    // Dropping the completed future retires its task-local
+                    // wake registration before the next slot is admitted.
+                    let completed = active.remove(index);
+                    if let Err(error) = result {
+                        if cx.checkpoint().is_err() {
+                            return Ok(());
+                        }
+                        // Admission may have scanned past unpolled futures
+                        // of either recovery kind. Restore both execution
+                        // checkpoints: keeping the other kind's speculative
+                        // cursor can alternate failures forever around an
+                        // unpolled sibling when initial and resumed work mix.
+                        self.initial_recovery_cursor = attempted_initial_cursor;
+                        self.accepted_recovery_cursor = attempted_accepted_cursor;
+                        self.next_recovery_kind = completed.kind.other();
+                        return Err(error);
+                    }
+                    drop(completed);
+                }
+                Turn::Recover => {}
+                Turn::Cancelled => return Ok(()),
+                Turn::ReceiveFailed(error) => {
+                    return Err(McpError::internal_error(format!(
+                        "Task service wakeup receive failed: {error}"
+                    )));
+                }
+            }
+            ready_turns += 1;
+            if ready_turns == MAX_FINAL_TASK_RECOVERY_HANDOFFS_PER_SCAN {
+                // Immediate completions or a perpetually full signal queue
+                // must not turn one service poll into an unbounded drain.
+                asupersync::runtime::yield_now().await;
+                ready_turns = 0;
+            }
+        }
+    }
+
+    fn next_recovery_handoff(
+        &mut self,
+        cx: &Cx,
+    ) -> McpResult<Option<(FinalTaskRecoveryKind, FinalTaskSupervisorHandoff)>> {
+        let recovered = match self.next_recovery_kind {
+            FinalTaskRecoveryKind::Initial => {
+                if let Some(handoff) = self.runtime.recover_initial_work_with_checkpoints(
+                    cx,
+                    &self.dispatch_owner,
+                    self.initial_recovery_cursor.as_ref(),
+                )? {
+                    Some((
+                        FinalTaskRecoveryKind::Initial,
+                        FinalTaskSupervisorHandoff::Initial(handoff),
+                    ))
+                } else {
+                    self.runtime
+                        .recover_accepted_input_with_checkpoints(
+                            cx,
+                            &self.dispatch_owner,
+                            self.accepted_recovery_cursor.as_ref(),
+                        )?
+                        .map(|handoff| {
+                            (
+                                FinalTaskRecoveryKind::Resumed,
+                                FinalTaskSupervisorHandoff::Resumed(handoff),
+                            )
+                        })
+                }
+            }
+            FinalTaskRecoveryKind::Resumed => {
+                if let Some(handoff) = self.runtime.recover_accepted_input_with_checkpoints(
+                    cx,
+                    &self.dispatch_owner,
+                    self.accepted_recovery_cursor.as_ref(),
+                )? {
+                    Some((
+                        FinalTaskRecoveryKind::Resumed,
+                        FinalTaskSupervisorHandoff::Resumed(handoff),
+                    ))
+                } else {
+                    self.runtime
+                        .recover_initial_work_with_checkpoints(
+                            cx,
+                            &self.dispatch_owner,
+                            self.initial_recovery_cursor.as_ref(),
+                        )?
+                        .map(|handoff| {
+                            (
+                                FinalTaskRecoveryKind::Initial,
+                                FinalTaskSupervisorHandoff::Initial(handoff),
+                            )
+                        })
+                }
+            }
+        };
+        if let Some((kind, handoff)) = &recovered {
+            let task_id = final_task_handoff_task_id(handoff).clone();
+            match kind {
+                FinalTaskRecoveryKind::Initial => self.initial_recovery_cursor = Some(task_id),
+                FinalTaskRecoveryKind::Resumed => self.accepted_recovery_cursor = Some(task_id),
+            }
+            self.next_recovery_kind = kind.other();
+        }
+        Ok(recovered)
+    }
+
     async fn recover_pending(&mut self, cx: &Cx) -> McpResult<()> {
         let mut last_recovered_task_id = None;
         let mut first_retryable_error = None;
         let mut retried_handoffs = BTreeSet::new();
         for _ in 0..MAX_FINAL_TASK_RECOVERY_HANDOFFS_PER_SCAN {
-            let recovered = match self.next_recovery_kind {
-                FinalTaskRecoveryKind::Initial => {
-                    if let Some(handoff) = self.runtime.recover_initial_work_with_checkpoints(
-                        cx,
-                        &self.dispatch_owner,
-                        self.initial_recovery_cursor.as_ref(),
-                    )? {
-                        Some((
-                            FinalTaskRecoveryKind::Initial,
-                            FinalTaskSupervisorHandoff::Initial(handoff),
-                        ))
-                    } else {
-                        self.runtime
-                            .recover_accepted_input_with_checkpoints(
-                                cx,
-                                &self.dispatch_owner,
-                                self.accepted_recovery_cursor.as_ref(),
-                            )?
-                            .map(|handoff| {
-                                (
-                                    FinalTaskRecoveryKind::Resumed,
-                                    FinalTaskSupervisorHandoff::Resumed(handoff),
-                                )
-                            })
-                    }
-                }
-                FinalTaskRecoveryKind::Resumed => {
-                    if let Some(handoff) = self.runtime.recover_accepted_input_with_checkpoints(
-                        cx,
-                        &self.dispatch_owner,
-                        self.accepted_recovery_cursor.as_ref(),
-                    )? {
-                        Some((
-                            FinalTaskRecoveryKind::Resumed,
-                            FinalTaskSupervisorHandoff::Resumed(handoff),
-                        ))
-                    } else {
-                        self.runtime
-                            .recover_initial_work_with_checkpoints(
-                                cx,
-                                &self.dispatch_owner,
-                                self.initial_recovery_cursor.as_ref(),
-                            )?
-                            .map(|handoff| {
-                                (
-                                    FinalTaskRecoveryKind::Initial,
-                                    FinalTaskSupervisorHandoff::Initial(handoff),
-                                )
-                            })
-                    }
-                }
-            };
-            let Some((kind, handoff)) = recovered else {
+            let Some((kind, handoff)) = self.next_recovery_handoff(cx)? else {
                 break;
             };
             let task_id = final_task_handoff_task_id(&handoff).clone();
-            match kind {
-                FinalTaskRecoveryKind::Initial => {
-                    self.initial_recovery_cursor = Some(task_id.clone());
-                }
-                FinalTaskRecoveryKind::Resumed => {
-                    self.accepted_recovery_cursor = Some(task_id.clone());
-                }
-            }
-            self.next_recovery_kind = kind.other();
             let retry_key = (kind, task_id.clone());
             last_recovered_task_id = Some(task_id);
             if let Err(error) = self.resume_handoff(cx, handoff).await {
@@ -6768,12 +7015,32 @@ impl AuthorizedTaskServiceRunner {
         Ok(())
     }
 
-    async fn resume_handoff(
+    fn resume_handoff<'a>(
+        &self,
+        cx: &'a Cx,
+        handoff: FinalTaskSupervisorHandoff,
+    ) -> FinalTaskSupervisorFuture<'a> {
+        self.handoff_executor().resume_handoff(cx, handoff)
+    }
+}
+
+impl FinalTaskHandoffExecutor {
+    fn resume_handoff<'a>(
+        &self,
+        cx: &'a Cx,
+        handoff: FinalTaskSupervisorHandoff,
+    ) -> FinalTaskSupervisorFuture<'a> {
+        let executor = self.clone();
+        let guard = FinalTaskExecutionGuard::new(&self.runtime, &self.dispatch_owner, &handoff);
+        Box::pin(async move { executor.execute_handoff(cx, handoff, guard).await })
+    }
+
+    async fn execute_handoff(
         &self,
         cx: &Cx,
         mut handoff: FinalTaskSupervisorHandoff,
+        mut guard: FinalTaskExecutionGuard,
     ) -> McpResult<()> {
-        let mut guard = FinalTaskExecutionGuard::new(&self.runtime, &self.dispatch_owner, &handoff);
         cx.checkpoint()
             .map_err(|error| McpError::internal_error(error.to_string()))?;
         if !guard.elect()? {
@@ -7043,9 +7310,16 @@ impl TaskServiceHost {
     pub(crate) fn install(
         runtime: &FinalTaskRuntime,
         supervisor: Arc<dyn ApplicationTaskSupervisor>,
+        max_concurrent_handoffs: usize,
     ) -> McpResult<Self> {
-        let runner =
-            runtime.install_task_service(HOSTED_TASK_SERVICE_QUEUE_CAPACITY, supervisor)?;
+        if !(1..=MAX_CONCURRENT_TASK_HANDOFFS).contains(&max_concurrent_handoffs) {
+            return Err(McpError::invalid_params(
+                "Task service concurrency must be between 1 and 256",
+            ));
+        }
+        let runner = runtime
+            .install_task_service(HOSTED_TASK_SERVICE_QUEUE_CAPACITY, supervisor)?
+            .with_max_concurrent_handoffs(max_concurrent_handoffs)?;
         Ok(Self {
             runtime: runtime.clone(),
             slot: Arc::new(Mutex::new(Some(runner))),
@@ -7828,6 +8102,590 @@ mod tests {
                 }
             }),
         )
+    }
+
+    #[derive(Default)]
+    struct ConcurrentTaskProbeState {
+        started: Vec<FinalTaskId>,
+        live: BTreeSet<FinalTaskId>,
+        peak_live: usize,
+        polls: BTreeMap<FinalTaskId, usize>,
+        actions: BTreeMap<FinalTaskId, bool>,
+        wakers: BTreeMap<FinalTaskId, std::task::Waker>,
+    }
+
+    #[derive(Default)]
+    struct ConcurrentTaskProbe {
+        state: Mutex<ConcurrentTaskProbeState>,
+    }
+
+    impl ConcurrentTaskProbe {
+        fn release(&self, task_id: &FinalTaskId, fail: bool) {
+            let waker = {
+                let mut state = self.state.lock().unwrap();
+                state.actions.insert(task_id.clone(), fail);
+                state.wakers.get(task_id).cloned()
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+    }
+
+    struct ConcurrentTaskProbeLease<'a> {
+        probe: &'a ConcurrentTaskProbe,
+        task_id: FinalTaskId,
+    }
+
+    impl Drop for ConcurrentTaskProbeLease<'_> {
+        fn drop(&mut self) {
+            let mut state = self.probe.state.lock().unwrap();
+            assert!(state.live.remove(&self.task_id));
+            state.wakers.remove(&self.task_id);
+        }
+    }
+
+    impl ApplicationTaskSupervisor for ConcurrentTaskProbe {
+        fn resume<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            Box::pin(async move {
+                let task_id = final_task_handoff_task_id(&handoff).clone();
+                {
+                    let mut state = self.state.lock().unwrap();
+                    assert!(state.live.insert(task_id.clone()));
+                    state.started.push(task_id.clone());
+                    state.peak_live = state.peak_live.max(state.live.len());
+                }
+                let _lease = ConcurrentTaskProbeLease {
+                    probe: self,
+                    task_id: task_id.clone(),
+                };
+                let fail = std::future::poll_fn(|task_context| {
+                    let mut state = self.state.lock().unwrap();
+                    *state.polls.entry(task_id.clone()).or_default() += 1;
+                    state
+                        .wakers
+                        .insert(task_id.clone(), task_context.waker().clone());
+                    state
+                        .actions
+                        .get(&task_id)
+                        .copied()
+                        .map_or(std::task::Poll::Pending, std::task::Poll::Ready)
+                })
+                .await;
+                if fail {
+                    return Err(McpError::internal_error("concurrent supervisor failed"));
+                }
+                let result = serde_json::from_value(serde_json::json!({"content": []}))
+                    .expect("bounded terminal result");
+                match handoff {
+                    FinalTaskSupervisorHandoff::Initial(initial) => {
+                        initial.complete_task(result, None)?;
+                    }
+                    FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                        accepted.complete_task(result, None)?;
+                    }
+                }
+                Ok(())
+            })
+        }
+    }
+
+    struct ConcurrentTaskFixture {
+        runtime: FinalTaskRuntime,
+        store: Arc<InMemoryFinalTaskStore>,
+        runner: AuthorizedTaskServiceRunner,
+        probe: Arc<ConcurrentTaskProbe>,
+        task_ids: Vec<FinalTaskId>,
+    }
+
+    fn concurrent_task_fixture(concurrency: usize, tasks: usize) -> ConcurrentTaskFixture {
+        let store = Arc::new(InMemoryFinalTaskStore::new(tasks).unwrap());
+        let task_ids = (0..tasks)
+            .map(|index| {
+                let task =
+                    final_working_task_with_ttl(&format!("concurrent-task-{index:04}"), 60_000);
+                let task_id = task.base().task_id.clone();
+                store
+                    .create_task_with_work(
+                        task.clone(),
+                        final_task_notification(&task),
+                        final_test_work_descriptor(),
+                    )
+                    .unwrap();
+                task_id
+            })
+            .collect();
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let probe = Arc::new(ConcurrentTaskProbe::default());
+        let supervisor: Arc<dyn ApplicationTaskSupervisor> = probe.clone();
+        let runner = runtime
+            .install_task_service(1, supervisor)
+            .unwrap()
+            .with_max_concurrent_handoffs(concurrency)
+            .unwrap();
+        ConcurrentTaskFixture {
+            runtime,
+            store,
+            runner,
+            probe,
+            task_ids,
+        }
+    }
+
+    fn check_concurrent_task_start(concurrency: usize) {
+        let mut fixture = concurrent_task_fixture(concurrency, 2);
+        let before = fixture.store.get_task(&fixture.task_ids[1]).unwrap();
+        let cx = Cx::for_testing();
+        let mut service = Box::pin(fixture.runner.run_service(&cx));
+        let mut task_context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(service.as_mut().poll(&mut task_context).is_pending());
+        assert!(fixture.runtime.is_task_service_ready());
+        let state = fixture.probe.state.lock().unwrap();
+        assert_eq!(state.started.len(), concurrency);
+        assert_eq!(state.live.len(), concurrency);
+        assert_eq!(state.peak_live, concurrency);
+        assert_eq!(
+            serde_json::to_value(fixture.store.get_task(&fixture.task_ids[1]).unwrap()).unwrap(),
+            serde_json::to_value(before).unwrap(),
+            "starting or queuing a sibling does not invent a public task transition"
+        );
+        if concurrency == 1 {
+            assert!(
+                !fixture
+                    .store
+                    .state
+                    .lock()
+                    .unwrap()
+                    .handoff_leases
+                    .contains_key(&fixture.task_ids[1])
+            );
+        }
+        drop(state);
+        drop(service);
+        assert!(!fixture.runtime.is_task_service_ready());
+        assert!(fixture.probe.state.lock().unwrap().live.is_empty());
+        assert!(
+            fixture
+                .store
+                .state
+                .lock()
+                .unwrap()
+                .handoff_leases
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn task_service_bounded_concurrency_starts_sibling_while_first_is_pending() {
+        check_concurrent_task_start(2);
+    }
+
+    #[test]
+    fn task_service_single_worker_keeps_sibling_queued() {
+        // Identical durable work and supervisor; only the worker limit changes.
+        check_concurrent_task_start(1);
+    }
+
+    #[test]
+    fn task_service_concurrency_never_exceeds_limit_and_refills_released_slot() {
+        let mut fixture = concurrent_task_fixture(2, 3);
+        let cx = Cx::for_testing();
+        let mut service = Box::pin(fixture.runner.run_service(&cx));
+        let mut task_context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(service.as_mut().poll(&mut task_context).is_pending());
+        assert_eq!(fixture.probe.state.lock().unwrap().started.len(), 2);
+        assert!(
+            !fixture
+                .store
+                .state
+                .lock()
+                .unwrap()
+                .handoff_leases
+                .contains_key(&fixture.task_ids[2])
+        );
+        fixture.probe.release(&fixture.task_ids[0], false);
+        assert!(service.as_mut().poll(&mut task_context).is_pending());
+        {
+            let state = fixture.probe.state.lock().unwrap();
+            assert_eq!(state.started, fixture.task_ids);
+            assert_eq!(state.live.len(), 2);
+            assert_eq!(state.peak_live, 2);
+        }
+        assert!(matches!(
+            fixture.store.get_task(&fixture.task_ids[0]).unwrap(),
+            Some(FinalTask::Completed { .. })
+        ));
+        for task_id in &fixture.task_ids[1..] {
+            fixture.probe.release(task_id, false);
+        }
+        assert!(service.as_mut().poll(&mut task_context).is_pending());
+        assert!(fixture.probe.state.lock().unwrap().live.is_empty());
+        for task_id in &fixture.task_ids {
+            assert!(matches!(
+                fixture.store.get_task(task_id).unwrap(),
+                Some(FinalTask::Completed { .. })
+            ));
+        }
+        drop(service);
+        assert!(!fixture.runtime.is_task_service_ready());
+    }
+
+    #[test]
+    fn task_service_parallel_cancellation_leaves_sibling_running() {
+        let mut fixture = concurrent_task_fixture(2, 2);
+        let cx = Cx::for_testing();
+        let mut service = Box::pin(fixture.runner.run_service(&cx));
+        let mut task_context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(service.as_mut().poll(&mut task_context).is_pending());
+        let sibling_before = fixture.store.get_task(&fixture.task_ids[1]).unwrap();
+        let sibling_polls = fixture.probe.state.lock().unwrap().polls[&fixture.task_ids[1]];
+        fixture.runtime.cancel_task(&fixture.task_ids[0]).unwrap();
+        for _ in 0..3 {
+            assert!(service.as_mut().poll(&mut task_context).is_pending());
+        }
+        assert!(matches!(
+            fixture.store.get_task(&fixture.task_ids[0]).unwrap(),
+            Some(FinalTask::Cancelled(_))
+        ));
+        {
+            let state = fixture.probe.state.lock().unwrap();
+            assert_eq!(state.live.len(), 1);
+            assert!(state.live.contains(&fixture.task_ids[1]));
+            assert_eq!(
+                state.polls[&fixture.task_ids[1]], sibling_polls,
+                "a task-local cancellation does not repoll its sibling"
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(fixture.store.get_task(&fixture.task_ids[1]).unwrap()).unwrap(),
+            serde_json::to_value(sibling_before).unwrap()
+        );
+        assert!(fixture.runtime.is_task_service_ready());
+        fixture.probe.release(&fixture.task_ids[1], false);
+        assert!(service.as_mut().poll(&mut task_context).is_pending());
+        assert!(matches!(
+            fixture.store.get_task(&fixture.task_ids[1]).unwrap(),
+            Some(FinalTask::Completed { .. })
+        ));
+        assert!(fixture.probe.state.lock().unwrap().live.is_empty());
+        drop(service);
+        assert!(!fixture.runtime.is_task_service_ready());
+    }
+
+    #[test]
+    fn task_service_parallel_drop_restores_all_claimed_handoffs() {
+        let mut fixture = concurrent_task_fixture(2, 3);
+        let cx = Cx::for_testing();
+        let before = fixture
+            .task_ids
+            .iter()
+            .map(|id| serde_json::to_value(fixture.store.get_task(id).unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        let mut task_context = std::task::Context::from_waker(std::task::Waker::noop());
+        for invocation in 0..2 {
+            let mut service = Box::pin(fixture.runner.run_service(&cx));
+            assert!(service.as_mut().poll(&mut task_context).is_pending());
+            assert_eq!(fixture.probe.state.lock().unwrap().live.len(), 2);
+            drop(service);
+            assert!(!fixture.runtime.is_task_service_ready());
+            assert!(fixture.probe.state.lock().unwrap().live.is_empty());
+            let state = fixture.store.state.lock().unwrap();
+            assert!(state.handoff_leases.is_empty());
+            assert_eq!(
+                state.initial_work.len(),
+                3,
+                "all payloads survive invocation {invocation}"
+            );
+            drop(state);
+            assert!(
+                fixture
+                    .runtime
+                    .service_signal
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .cancellation_wake
+                    .state
+                    .lock()
+                    .unwrap()
+                    .active
+                    .is_empty()
+            );
+            let after = fixture
+                .task_ids
+                .iter()
+                .map(|id| serde_json::to_value(fixture.store.get_task(id).unwrap()).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                after, before,
+                "dropping the service preserves every public snapshot"
+            );
+        }
+    }
+
+    #[test]
+    fn task_service_parallel_supervisor_error_restores_siblings() {
+        for fail_before_first_poll in [false, true] {
+            let mut fixture = concurrent_task_fixture(2, 2);
+            let cx = Cx::for_testing();
+            let mut service = Box::pin(fixture.runner.run_service(&cx));
+            let mut task_context = std::task::Context::from_waker(std::task::Waker::noop());
+            if !fail_before_first_poll {
+                assert!(service.as_mut().poll(&mut task_context).is_pending());
+                assert_eq!(fixture.probe.state.lock().unwrap().live.len(), 2);
+            }
+            fixture.probe.release(&fixture.task_ids[0], true);
+            let std::task::Poll::Ready(Err(error)) = service.as_mut().poll(&mut task_context)
+            else {
+                panic!("a supervisor error terminates the bounded service");
+            };
+            assert_eq!(error.message, "concurrent supervisor failed");
+            assert!(!fixture.runtime.is_task_service_ready());
+            assert!(fixture.probe.state.lock().unwrap().live.is_empty());
+            let state = fixture.store.state.lock().unwrap();
+            assert!(state.handoff_leases.is_empty());
+            assert_eq!(
+                state.initial_work.len(),
+                2,
+                "even a claimed sibling that was never polled retains its payload"
+            );
+            assert!(
+                state
+                    .tasks
+                    .values()
+                    .all(|task| matches!(task, FinalTask::Working(_)))
+            );
+            drop(state);
+            assert!(
+                fixture
+                    .runtime
+                    .service_signal
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .cancellation_wake
+                    .state
+                    .lock()
+                    .unwrap()
+                    .active
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn task_service_parallel_retryable_low_id_failure_does_not_starve_sibling_on_restart() {
+        let mut fixture = concurrent_task_fixture(2, 2);
+        fixture.probe.release(&fixture.task_ids[0], true);
+        fixture.probe.release(&fixture.task_ids[1], false);
+        let cx = Cx::for_testing();
+        let mut task_context = std::task::Context::from_waker(std::task::Waker::noop());
+        for _ in 0..2 {
+            let mut service = Box::pin(fixture.runner.run_service(&cx));
+            assert!(matches!(
+                service.as_mut().poll(&mut task_context),
+                std::task::Poll::Ready(Err(_))
+            ));
+        }
+        assert!(matches!(
+            fixture.store.get_task(&fixture.task_ids[0]).unwrap(),
+            Some(FinalTask::Working(_))
+        ));
+        assert!(
+            matches!(
+                fixture.store.get_task(&fixture.task_ids[1]).unwrap(),
+                Some(FinalTask::Completed { .. })
+            ),
+            "the first failed admission batch cannot pin recovery before the same failing task forever"
+        );
+        assert_eq!(
+            fixture.probe.state.lock().unwrap().started,
+            vec![
+                fixture.task_ids[0].clone(),
+                fixture.task_ids[1].clone(),
+                fixture.task_ids[0].clone()
+            ]
+        );
+        assert!(!fixture.runtime.is_task_service_ready());
+    }
+
+    #[test]
+    fn task_service_parallel_mixed_recovery_kinds_do_not_starve_unpolled_sibling() {
+        let mut fixture = concurrent_task_fixture(2, 3);
+        let inputs: FinalTaskInputResponses =
+            serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
+        for task_id in &fixture.task_ids[1..] {
+            fixture
+                .runtime
+                .require_input(task_id, final_roots_request(), None)
+                .unwrap();
+            fixture.runtime.update_task(task_id, &inputs).unwrap();
+        }
+        // The initial task and higher-ID resumed task fail. The lower-ID
+        // resumed task must run even when it was claimed but never polled in
+        // the first batch. Speculative cursors for both kinds used to skip it.
+        fixture.probe.release(&fixture.task_ids[0], true);
+        fixture.probe.release(&fixture.task_ids[1], false);
+        fixture.probe.release(&fixture.task_ids[2], true);
+        let cx = Cx::for_testing();
+        let mut task_context = std::task::Context::from_waker(std::task::Waker::noop());
+        for _ in 0..2 {
+            let mut service = Box::pin(fixture.runner.run_service(&cx));
+            assert!(matches!(
+                service.as_mut().poll(&mut task_context),
+                std::task::Poll::Ready(Err(_))
+            ));
+        }
+        assert!(matches!(
+            fixture.store.get_task(&fixture.task_ids[1]).unwrap(),
+            Some(FinalTask::Completed { .. })
+        ));
+        for task_id in [&fixture.task_ids[0], &fixture.task_ids[2]] {
+            assert!(matches!(
+                fixture.store.get_task(task_id).unwrap(),
+                Some(FinalTask::Working(_))
+            ));
+        }
+        assert_eq!(
+            fixture.probe.state.lock().unwrap().started,
+            vec![
+                fixture.task_ids[0].clone(),
+                fixture.task_ids[1].clone(),
+                fixture.task_ids[0].clone(),
+            ]
+        );
+        assert!(!fixture.runtime.is_task_service_ready());
+        assert!(
+            fixture
+                .store
+                .state
+                .lock()
+                .unwrap()
+                .handoff_leases
+                .is_empty()
+        );
+    }
+
+    #[derive(Default)]
+    struct TaskTransitionCleanupProbe {
+        cleanup_ready: AtomicBool,
+        cleanup_waker: Mutex<Option<std::task::Waker>>,
+        resumed: AtomicUsize,
+    }
+
+    impl ApplicationTaskSupervisor for TaskTransitionCleanupProbe {
+        fn resume<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            Box::pin(async move {
+                match handoff {
+                    FinalTaskSupervisorHandoff::Initial(initial) => {
+                        initial.require_input(final_roots_request(), None)?;
+                        std::future::poll_fn(|task_context| {
+                            *self.cleanup_waker.lock().unwrap() =
+                                Some(task_context.waker().clone());
+                            if self.cleanup_ready.load(AtomicOrdering::SeqCst) {
+                                std::task::Poll::Ready(())
+                            } else {
+                                std::task::Poll::Pending
+                            }
+                        })
+                        .await;
+                    }
+                    FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                        assert!(
+                            self.cleanup_ready.load(AtomicOrdering::SeqCst),
+                            "successor application work cannot overlap predecessor cleanup"
+                        );
+                        self.resumed.fetch_add(1, AtomicOrdering::SeqCst);
+                        let result =
+                            serde_json::from_value(serde_json::json!({"content": []})).unwrap();
+                        accepted.complete_task(result, None)?;
+                    }
+                }
+                Ok(())
+            })
+        }
+    }
+
+    #[test]
+    fn task_service_parallel_successor_waits_for_predecessor_cleanup() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let task = final_working_task_with_ttl("concurrent-transition", 60_000);
+        let task_id = task.base().task_id.clone();
+        store
+            .create_task_with_work(
+                task.clone(),
+                final_task_notification(&task),
+                final_test_work_descriptor(),
+            )
+            .unwrap();
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let probe = Arc::new(TaskTransitionCleanupProbe::default());
+        let supervisor: Arc<dyn ApplicationTaskSupervisor> = probe.clone();
+        let mut runner = runtime
+            .install_task_service(1, supervisor)
+            .unwrap()
+            .with_max_concurrent_handoffs(2)
+            .unwrap();
+        let cx = Cx::for_testing();
+        let mut service = Box::pin(runner.run_service(&cx));
+        let mut task_context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(service.as_mut().poll(&mut task_context).is_pending());
+        assert!(matches!(
+            store.get_task(&task_id).unwrap(),
+            Some(FinalTask::InputRequired { .. })
+        ));
+        let inputs = serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
+        runtime.update_task(&task_id, &inputs).unwrap();
+        let after_update = serde_json::to_value(store.get_task(&task_id).unwrap()).unwrap();
+        assert!(
+            service.as_mut().poll(&mut task_context).is_pending(),
+            "a successor generation must not fail duplicate cancellation registration"
+        );
+        assert_eq!(probe.resumed.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(
+            serde_json::to_value(store.get_task(&task_id).unwrap()).unwrap(),
+            after_update
+        );
+        assert!(
+            test_next_accepted_input(&store).unwrap().is_some(),
+            "deferred successor input is restored for authoritative recovery"
+        );
+        probe.cleanup_ready.store(true, AtomicOrdering::SeqCst);
+        probe.cleanup_waker.lock().unwrap().take().unwrap().wake();
+        assert!(service.as_mut().poll(&mut task_context).is_pending());
+        assert_eq!(probe.resumed.load(AtomicOrdering::SeqCst), 1);
+        assert!(matches!(
+            store.get_task(&task_id).unwrap(),
+            Some(FinalTask::Completed { .. })
+        ));
+        assert!(runtime.is_task_service_ready());
+        drop(service);
+        assert!(!runtime.is_task_service_ready());
+    }
+
+    #[test]
+    fn task_service_concurrency_rejects_zero_and_over_limit() {
+        for limit in [1, MAX_CONCURRENT_TASK_HANDOFFS] {
+            let fixture = concurrent_task_fixture(limit, 1);
+            assert_eq!(fixture.runner.max_concurrent_handoffs(), limit);
+        }
+        for limit in [0, MAX_CONCURRENT_TASK_HANDOFFS + 1, usize::MAX] {
+            let fixture = concurrent_task_fixture(1, 1);
+            assert!(fixture.runner.with_max_concurrent_handoffs(limit).is_err());
+            assert!(!fixture.runtime.has_installed_task_service());
+            assert!(fixture.probe.state.lock().unwrap().started.is_empty());
+            assert_eq!(fixture.store.state.lock().unwrap().initial_work.len(), 1);
+        }
     }
 
     struct RecordingFinalTaskSupervisor {
@@ -21716,8 +22574,12 @@ mod tests {
             FinalTaskRuntimeConfig::new(60_000, Some(5_000)).expect("valid timing policy"),
             Arc::new(|_| {}),
         );
-        let host =
-            TaskServiceHost::install(&runtime, Arc::new(IdleSupervisor)).expect("install host");
+        let host = TaskServiceHost::install(
+            &runtime,
+            Arc::new(IdleSupervisor),
+            DEFAULT_CONCURRENT_TASK_HANDOFFS,
+        )
+        .expect("install host");
         (runtime, host)
     }
 
@@ -21792,7 +22654,14 @@ mod tests {
             .install_task_service(1, Arc::new(IdleSupervisor))
             .expect("caller installs its own service");
         assert!(runtime.has_installed_task_service());
-        assert!(TaskServiceHost::install(&runtime, Arc::new(IdleSupervisor)).is_err());
+        assert!(
+            TaskServiceHost::install(
+                &runtime,
+                Arc::new(IdleSupervisor),
+                DEFAULT_CONCURRENT_TASK_HANDOFFS,
+            )
+            .is_err()
+        );
     }
 
     /// Holds its handoff in a cooperative checkpoint loop, as a long-running
@@ -21833,6 +22702,7 @@ mod tests {
             Arc::new(HoldingSupervisor {
                 entered: Arc::clone(&entered),
             }),
+            DEFAULT_CONCURRENT_TASK_HANDOFFS,
         )
         .expect("install host");
         hosting_runtime().block_on(async {
