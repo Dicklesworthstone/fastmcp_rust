@@ -549,7 +549,7 @@ pub use fastmcp_protocol::{
     UriTemplateExpansionLimits, UriTemplateExpression, UriTemplateModifier, UriTemplateOperator,
     UriTemplatePart,
 };
-pub use fastmcp_protocol::{common_types, methods, protocol_policy};
+pub use fastmcp_protocol::{common_types, http_headers, methods, protocol_policy};
 pub use modern::extensions;
 // Final common wire vocabulary. `FinalAbsoluteUri` avoids colliding with the
 // established core URI type; `modern::AbsoluteUri` retains the exact name.

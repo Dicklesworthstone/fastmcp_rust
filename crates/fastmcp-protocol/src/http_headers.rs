@@ -15,6 +15,7 @@
 use std::fmt;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use fastmcp_core::{Sha256Digest, sha256_bounded};
 use serde_json::Value;
 
 use crate::schema::{AdmittedSchema, ValidationResult, MAX_SCHEMA_ADMISSION_NODES, MAX_SCHEMA_VALIDATION_DEPTH};
@@ -110,6 +111,148 @@ pub fn admit_final_tool_input_schema(source: Value) -> Result<AdmittedSchema, Mc
     } else {
         crate::schema::admit_final_schema(source).map_err(|_| McpHeaderError::InvalidSchema)
     }
+}
+
+/// Exact revision of one tool input schema: SHA-256 of its serialized JSON.
+/// Any schema edit, including one to an unannotated property, is a new
+/// revision that needs its own exposure review. Displays as lowercase hex so a
+/// review can pin the revision it covered.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ToolSchemaRevision(Sha256Digest);
+impl ToolSchemaRevision {
+    pub fn of(schema: &Value) -> Result<Self, McpHeaderError> {
+        let bytes = serde_json::to_vec(schema).map_err(|_| McpHeaderError::InvalidSchema)?;
+        sha256_bounded(&bytes, MAX_TOOL_HEADER_SCHEMA_BYTES)
+            .map(Self)
+            .map_err(|_| McpHeaderError::LimitExceeded)
+    }
+
+    /// Parses the 64 lowercase hex digits this revision displays as.
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        let hex = hex.as_bytes();
+        if hex.len() != 64 { return None; }
+        let digit = |byte: u8| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        };
+        let mut bytes = [0_u8; 32];
+        for (index, [high, low]) in hex.as_chunks::<2>().0.iter().enumerate() {
+            bytes[index] = digit(*high)? << 4 | digit(*low)?;
+        }
+        Some(Self(Sha256Digest::from_bytes(bytes)))
+    }
+}
+impl fmt::Display for ToolSchemaRevision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.as_bytes().iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+}
+impl fmt::Debug for ToolSchemaRevision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ToolSchemaRevision({self})")
+    }
+}
+
+/// Registration-time evidence that one `x-mcp-header` property of one exact
+/// local tool schema revision may be mirrored into its `Mcp-Param-*` field.
+/// It supports the dated developer SHOULD; it is not a claim that runtime
+/// values cannot contain personal data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NonSensitiveHeaderExposure {
+    tool: String,
+    revision: ToolSchemaRevision,
+    path: Vec<String>,
+}
+impl NonSensitiveHeaderExposure {
+    /// `path` is the exact property path of the annotated property: object
+    /// member names from the schema root, as in [`ParameterHeaderBinding`].
+    pub fn new<P: Into<String>>(
+        tool: impl Into<String>,
+        revision: ToolSchemaRevision,
+        path: impl IntoIterator<Item = P>,
+    ) -> Self {
+        Self { tool: tool.into(), revision, path: path.into_iter().map(Into::into).collect() }
+    }
+    pub fn tool(&self) -> &str { &self.tool }
+    pub fn revision(&self) -> ToolSchemaRevision { self.revision }
+    pub fn property_path(&self) -> &[String] { &self.path }
+}
+
+/// Why local registration refused a tool's parameter-header annotations.
+/// Paths are schema structure, never argument values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeaderExposureError {
+    /// The annotations themselves are malformed, e.g. a header name that is
+    /// not an RFC 9110 token, or a non-exact primitive type.
+    Annotation(McpHeaderError),
+    /// The property is `writeOnly` or password-formatted; no review applies.
+    SecretField { path: Vec<String> },
+    /// No review names this tool and property path.
+    Unreviewed { path: Vec<String>, revision: ToolSchemaRevision },
+    /// This tool and path were reviewed, but for another schema revision.
+    StaleReview { path: Vec<String>, revision: ToolSchemaRevision },
+}
+impl fmt::Display for HeaderExposureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let pointer = |path: &[String]| {
+            let mut pointer = String::new();
+            for key in path {
+                pointer.push('/');
+                pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
+            }
+            pointer
+        };
+        match self {
+            Self::Annotation(error) => write!(f, "tool declares invalid x-mcp-header annotations: {error}"),
+            Self::SecretField { path } => write!(f,
+                "x-mcp-header at {} marks a writeOnly or password field, which is never exposed",
+                pointer(path)),
+            Self::Unreviewed { path, revision } => write!(f,
+                "x-mcp-header at {} needs a NonSensitiveHeaderExposure review of schema revision {revision}",
+                pointer(path)),
+            Self::StaleReview { path, revision } => write!(f,
+                "x-mcp-header at {} was reviewed for another schema revision; the current revision is {revision}",
+                pointer(path)),
+        }
+    }
+}
+impl std::error::Error for HeaderExposureError {}
+
+/// Admits a locally registered tool's input schema like
+/// [`admit_final_tool_input_schema`], and additionally requires every
+/// `x-mcp-header` annotation to be reviewed for this exact tool, schema
+/// revision and property path. A `writeOnly` or password-formatted property is
+/// refused even when reviewed. Remote descriptors are not admitted here; a
+/// client applies its own invocation policy to them.
+pub fn admit_local_tool_input_schema(
+    tool: &str,
+    source: Value,
+    reviews: &[NonSensitiveHeaderExposure],
+) -> Result<AdmittedSchema, HeaderExposureError> {
+    crate::schema::bound_schema_document(&source)
+        .map_err(|_| HeaderExposureError::Annotation(McpHeaderError::LimitExceeded))?;
+    if !has_header_annotations(&source) {
+        return admit_final_tool_input_schema(source).map_err(HeaderExposureError::Annotation);
+    }
+    let revision = ToolSchemaRevision::of(&source).map_err(HeaderExposureError::Annotation)?;
+    let admitted = AdmittedToolHeaderSchema::admit(source).map_err(HeaderExposureError::Annotation)?;
+    for binding in admitted.header_plan().bindings() {
+        let path = binding.property_path();
+        if binding.marks_secret_field() {
+            return Err(HeaderExposureError::SecretField { path: path.to_vec() });
+        }
+        let mut reviewed = reviews.iter()
+            .filter(|review| review.tool == tool && review.path == path)
+            .peekable();
+        if reviewed.peek().is_none() {
+            return Err(HeaderExposureError::Unreviewed { path: path.to_vec(), revision });
+        }
+        if !reviewed.any(|review| review.revision == revision) {
+            return Err(HeaderExposureError::StaleReview { path: path.to_vec(), revision });
+        }
+    }
+    Ok(admitted.validation)
 }
 
 // Only schema-valued locations grant annotation meaning. The complete tree was
@@ -269,11 +412,15 @@ pub struct ParameterHeaderBinding {
     path: Vec<String>,
     name: String,
     kind: ParameterHeaderType,
+    secret: bool,
 }
 impl ParameterHeaderBinding {
     pub fn property_path(&self) -> &[String] { &self.path }
     pub fn header_name(&self) -> &str { &self.name }
     pub fn parameter_type(&self) -> ParameterHeaderType { self.kind }
+    /// Whether the annotated property marks itself `writeOnly` or
+    /// password-formatted, which no exposure review can override.
+    pub fn marks_secret_field(&self) -> bool { self.secret }
 }
 impl fmt::Debug for ParameterHeaderBinding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -424,7 +571,10 @@ impl Compiler {
             self.path_bytes = path.iter().try_fold(self.path_bytes, |n, key| n.checked_add(key.len()))
                 .ok_or(McpHeaderError::LimitExceeded)?;
             if self.path_bytes > MAX_PARAMETER_HEADER_PATH_BYTES { return Err(McpHeaderError::LimitExceeded); }
-            self.bindings.push(ParameterHeaderBinding { path: path.clone(), name, kind });
+            let secret = schema.get("writeOnly") == Some(&Value::Bool(true))
+                || schema.get("format").and_then(Value::as_str)
+                    .is_some_and(|format| format.eq_ignore_ascii_case("password"));
+            self.bindings.push(ParameterHeaderBinding { path: path.clone(), name, kind, secret });
         }
         // Walk schema locations, not literal example/default/enum/const data.
         // Even unused definitions must be checked: an annotation there is not
@@ -828,5 +978,72 @@ mod tests {
         let mut custom = source;
         custom["properties"]["value"]["x-other"] = json!(true);
         assert!(admit_final_tool_input_schema(custom).is_err());
+    }
+
+    fn reviewed_schema() -> Value {
+        json!({"type":"object","properties":{
+            "region":{"type":"string","x-mcp-header":"Region"},
+            "note":{"type":"string"}
+        }})
+    }
+
+    fn region_review(schema: &Value) -> NonSensitiveHeaderExposure {
+        NonSensitiveHeaderExposure::new("lookup", ToolSchemaRevision::of(schema).unwrap(), ["region"])
+    }
+
+    #[test]
+    fn local_admission_accepts_a_review_of_the_exact_tool_revision_and_path() {
+        let schema = reviewed_schema();
+        let admitted = admit_local_tool_input_schema("lookup", schema.clone(), &[region_review(&schema)])
+            .expect("the reviewed annotation admits");
+        assert!(admitted.validate(&json!({"region":"eu-west"})).is_ok());
+        assert!(admitted.validate(&json!({"region":7})).is_err());
+        // Unannotated schemas need no review, exactly as before.
+        let plain = json!({"type":"object","properties":{"note":{"type":"string"}}});
+        assert!(admit_local_tool_input_schema("lookup", plain, &[]).is_ok());
+    }
+
+    #[test]
+    fn local_admission_refuses_each_unreviewed_dimension() {
+        let schema = reviewed_schema();
+        let revision = ToolSchemaRevision::of(&schema).unwrap();
+        let path = vec!["region".to_owned()];
+        let refuse = |schema: Value, reviews: &[NonSensitiveHeaderExposure]| {
+            admit_local_tool_input_schema("lookup", schema, reviews).expect_err("refused")
+        };
+        assert_eq!(refuse(schema.clone(), &[]),
+            HeaderExposureError::Unreviewed { path: path.clone(), revision });
+        let mut earlier = schema.clone();
+        earlier["properties"]["note"]["maxLength"] = json!(64);
+        assert_eq!(refuse(schema.clone(), &[region_review(&earlier)]),
+            HeaderExposureError::StaleReview { path: path.clone(), revision });
+        assert_eq!(refuse(schema.clone(), &[NonSensitiveHeaderExposure::new("lookup", revision, ["note"])]),
+            HeaderExposureError::Unreviewed { path: path.clone(), revision });
+        assert_eq!(refuse(schema.clone(), &[NonSensitiveHeaderExposure::new("other", revision, ["region"])]),
+            HeaderExposureError::Unreviewed { path: path.clone(), revision });
+        for (keyword, value) in [("writeOnly", json!(true)), ("format", json!("password"))] {
+            let mut secret = schema.clone();
+            secret["properties"]["region"][keyword] = value;
+            assert_eq!(refuse(secret.clone(), &[region_review(&secret)]),
+                HeaderExposureError::SecretField { path: path.clone() });
+        }
+        let mut untokened = schema.clone();
+        untokened["properties"]["region"]["x-mcp-header"] = json!("Re gion");
+        assert_eq!(refuse(untokened.clone(), &[region_review(&untokened)]),
+            HeaderExposureError::Annotation(McpHeaderError::InvalidAnnotation));
+    }
+
+    #[test]
+    fn schema_revisions_round_trip_through_hex_and_change_with_any_edit() {
+        let schema = reviewed_schema();
+        let revision = ToolSchemaRevision::of(&schema).unwrap();
+        let hex = revision.to_string();
+        assert_eq!(hex.len(), 64);
+        assert_eq!(ToolSchemaRevision::from_hex(&hex), Some(revision));
+        assert_eq!(ToolSchemaRevision::from_hex(&hex.to_uppercase()), None);
+        assert_eq!(ToolSchemaRevision::from_hex(&hex[..63]), None);
+        let mut edited = schema;
+        edited["properties"]["note"]["description"] = json!("unannotated edit");
+        assert_ne!(ToolSchemaRevision::of(&edited).unwrap(), revision);
     }
 }

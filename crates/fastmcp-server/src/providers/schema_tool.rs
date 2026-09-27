@@ -14,6 +14,7 @@ use std::time::Duration;
 use asupersync::Cx;
 use fastmcp_core::{McpContext, McpOutcome, McpResult};
 use fastmcp_protocol::common_types::{OpenMetadata, RawIcon};
+use fastmcp_protocol::http_headers::NonSensitiveHeaderExposure;
 use fastmcp_protocol::{
     CompleteResult, Content, FinalCallToolResult, FinalTool, Icon,
     SchemaRegistryError, SchemaResourceRegistry, Tool, ToolAnnotations, admit_final_schema,
@@ -133,6 +134,11 @@ impl<H: ToolHandler> ToolHandler for RegisteredSchemaTool<H> {
     fn final_icons(&self) -> Option<&[RawIcon]> { self.definition.icons.as_deref() }
     fn final_metadata(&self) -> Option<&OpenMetadata> { self.definition.meta.as_ref() }
     fn final_definition(&self) -> Option<FinalTool> { Some(self.definition.clone()) }
+    // Reviews bind an exact schema revision, so one made for the handler's
+    // own schema cannot cover a registered schema that differs from it.
+    fn header_exposure_reviews(&self) -> Vec<NonSensitiveHeaderExposure> {
+        self.handler.header_exposure_reviews()
+    }
     // Deliberately keep ToolHandler's LOCAL authority defaults. A sealed proxy
     // registration cannot be carried across a locally replaced schema.
     fn final_tool_error_structured_content(&self, kind: ToolErrorKind) -> Option<Value> {

@@ -36,6 +36,9 @@ use std::time::{Duration, Instant};
     feature = "native-tls-roots"
 ))]
 use fastmcp_rust::FinalTaskWatchEvent;
+use fastmcp_rust::http_headers::{
+    HeaderExposureError, NonSensitiveHeaderExposure, ToolSchemaRevision,
+};
 use fastmcp_rust::server::{BoxFuture, FinalMethodOutcome};
 use fastmcp_rust::{
     AccessToken, AuthContext, AuthRequest, CacheScope, CacheTtl, CanonicalHttpUrl,
@@ -24245,6 +24248,17 @@ fn e2e_public_http_as_proxy_refused_roots_yield_no_final_resource_or_prompt() {
 // ingress headers), and since 7a0af503 the upstream refuses a missing mirror.
 const PXY_04_TOOL_NAME: &str = "public-http-pxy04-param-header";
 
+/// The registration-time reviews a local tool needs before its server may
+/// publish `Mcp-Param-*` mirrors for `paths` of its exact input schema.
+fn reviewed_header_exposure(tool: &Tool, paths: &[&str]) -> Vec<NonSensitiveHeaderExposure> {
+    let revision = ToolSchemaRevision::of(&tool.input_schema)
+        .expect("a bounded tool input schema has a revision");
+    paths
+        .iter()
+        .map(|path| NonSensitiveHeaderExposure::new(tool.name.clone(), revision, [*path]))
+        .collect()
+}
+
 /// Upstream tool whose `region` is annotated. Each call records the
 /// `Mcp-Param-*` fields its request arrived with.
 struct Pxy04ParamHeaderTool {
@@ -24266,6 +24280,10 @@ impl ToolHandler for Pxy04ParamHeaderTool {
             tags: Vec::new(),
             annotations: None,
         }
+    }
+
+    fn header_exposure_reviews(&self) -> Vec<NonSensitiveHeaderExposure> {
+        reviewed_header_exposure(&self.definition(), &["region"])
     }
 
     fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
@@ -24733,6 +24751,10 @@ impl ToolHandler for Http05BParamHeaderTool {
         }
     }
 
+    fn header_exposure_reviews(&self) -> Vec<NonSensitiveHeaderExposure> {
+        reviewed_header_exposure(&self.definition(), &["region"])
+    }
+
     fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let region = arguments["region"].as_str().unwrap_or_default();
@@ -24978,6 +25000,10 @@ impl ToolHandler for Http05BRetryTool {
             tags: Vec::new(),
             annotations: None,
         }
+    }
+
+    fn header_exposure_reviews(&self) -> Vec<NonSensitiveHeaderExposure> {
+        reviewed_header_exposure(&self.definition(), &["region"])
     }
 
     fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
@@ -25402,6 +25428,10 @@ impl ToolHandler for Http05AProjectionTool {
         }
     }
 
+    fn header_exposure_reviews(&self) -> Vec<NonSensitiveHeaderExposure> {
+        reviewed_header_exposure(&self.definition(), &["region", "verbose", "limit", "zone"])
+    }
+
     fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         self.received
             .lock()
@@ -25707,6 +25737,84 @@ fn http_05_a_null_annotated_value_is_sent_without_its_header() {
                 observed.received
             );
         },
+    );
+}
+
+/// A local tool annotating `region`, with exactly the given reviews.
+struct Http05AReviewTool(Vec<NonSensitiveHeaderExposure>);
+
+impl ToolHandler for Http05AReviewTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "public-http-e2e-reviewed-lookup".to_owned(),
+            description: None,
+            input_schema: json!({"type": "object", "properties": {
+                "region": {"type": "string", "x-mcp-header": "Region"},
+                "note": {"type": "string"}
+            }}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn header_exposure_reviews(&self) -> Vec<NonSensitiveHeaderExposure> {
+        self.0.clone()
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        Ok(vec![Content::text("reviewed")])
+    }
+}
+
+fn http_05_a_build_review_tool(
+    reviews: Vec<NonSensitiveHeaderExposure>,
+) -> Result<fastmcp_server::Server, fastmcp_server::ServerBuildError> {
+    ServerBuilder::new("facade-http-header-review", "1.0.0")
+        .protocol_policy(ProtocolPolicy::ModernOnly)
+        .expect("ModernOnly is available")
+        .tool(Http05AReviewTool(reviews))
+        .try_build()
+}
+
+#[test]
+fn http_05_a_reviewed_local_annotation_is_published() {
+    let definition = Http05AReviewTool(Vec::new()).definition();
+    let server = http_05_a_build_review_tool(reviewed_header_exposure(&definition, &["region"]))
+        .expect("the reviewed local annotation registers");
+    let tools = server.tools();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(
+        tools[0].input_schema["properties"]["region"]["x-mcp-header"], "Region",
+        "the reviewed projection is published"
+    );
+}
+
+#[test]
+fn http_05_a_unreviewed_local_annotation_is_refused_at_registration() {
+    // Identical to the reviewed case except that no review is supplied.
+    let definition = Http05AReviewTool(Vec::new()).definition();
+    let revision = ToolSchemaRevision::of(&definition.input_schema)
+        .expect("a bounded tool input schema has a revision");
+    let Err(fastmcp_server::ServerBuildError::InvalidConfiguration(refused)) =
+        http_05_a_build_review_tool(Vec::new())
+    else {
+        panic!("an unreviewed local annotation must not build a server");
+    };
+    assert_eq!(
+        refused,
+        vec![fastmcp_server::RefusedRegistration {
+            kind: fastmcp_server::RegistrationKind::Tool,
+            name: definition.name,
+            reason: HeaderExposureError::Unreviewed {
+                path: vec!["region".to_owned()],
+                revision,
+            }
+            .to_string(),
+        }],
+        "the one refusal names the tool and the typed exposure error"
     );
 }
 

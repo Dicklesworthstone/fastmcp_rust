@@ -937,6 +937,7 @@ fn admit_final_tool_error_structured_content<H: ToolHandler + ?Sized>(
 
 fn admit_final_tool_schemas<H: ToolHandler + ?Sized>(
     upstream_schema_registered: bool,
+    tool_name: &str,
     input_schema: &serde_json::Value,
     output_schema: Option<&serde_json::Value>,
     handler: &H,
@@ -962,10 +963,24 @@ fn admit_final_tool_schemas<H: ToolHandler + ?Sized>(
             "tool declares a final input schema without type object",
         ));
     }
-    let input = fastmcp_protocol::http_headers::admit_final_tool_input_schema(input_schema.clone())
-        .map_err(|_error| {
+    // A local descriptor may publish `x-mcp-header` projections only under a
+    // review of this exact tool, schema revision and property path.
+    let reviews = crate::catch_extension_unwind(|| handler.header_exposure_reviews()).map_err(
+        |_payload| {
+            McpError::internal_error("tool header exposure review hook panicked during admission")
+        },
+    )?;
+    let input = fastmcp_protocol::http_headers::admit_local_tool_input_schema(
+        tool_name,
+        input_schema.clone(),
+        &reviews,
+    )
+    .map_err(|error| match error {
+        fastmcp_protocol::http_headers::HeaderExposureError::Annotation(_) => {
             McpError::internal_error("tool declares an invalid final input schema")
-        })?;
+        }
+        error => McpError::internal_error(error.to_string()),
+    })?;
     let output = output_schema
         .cloned()
         .map(|schema| {
@@ -1093,6 +1108,7 @@ impl AdmittedToolRegistration {
         }
         let schemas = admit_final_tool_schemas(
             upstream_schema_registered,
+            &final_definition.name,
             &final_definition.input_schema,
             final_definition.output_schema.as_ref(),
             &handler,

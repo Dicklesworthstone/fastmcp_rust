@@ -5,7 +5,9 @@
 
 use super::*;
 use fastmcp_core::McpErrorCode;
-use fastmcp_protocol::http_headers::decode_mcp_header_value;
+use fastmcp_protocol::http_headers::{
+    NonSensitiveHeaderExposure, ToolSchemaRevision, decode_mcp_header_value,
+};
 use fastmcp_server::providers::managed_oauth::ManagedOAuthProvider;
 use fastmcp_server::providers::managed_oauth::interaction::{
     ManagedOAuthInputCapabilities, ManagedOAuthInputHandler, ManagedOAuthInputPolicy,
@@ -49,15 +51,23 @@ impl AnnotatedProbe {
     }
 }
 
+fn annotated_schema() -> Value {
+    json!({"type":"object","properties":{
+        "quantity":{"type":"integer","x-mcp-header":"Quantity"},
+        "region":{"type":"string","x-mcp-header":"Region"},
+        "private":{"type":"string"}
+    },"required":["quantity","region"]})
+}
+
 impl ToolHandler for AnnotatedProbe {
     fn definition(&self) -> Tool {
         let mut definition = self.probe.definition();
-        definition.input_schema = json!({"type":"object","properties":{
-            "quantity":{"type":"integer","x-mcp-header":"Quantity"},
-            "region":{"type":"string","x-mcp-header":"Region"},
-            "private":{"type":"string"}
-        },"required":["quantity","region"]});
+        definition.input_schema = annotated_schema();
         definition
+    }
+    fn header_exposure_reviews(&self) -> Vec<NonSensitiveHeaderExposure> {
+        let (tool, revision) = (self.probe.definition().name, ToolSchemaRevision::of(&annotated_schema()).unwrap());
+        ["quantity", "region"].map(|path| NonSensitiveHeaderExposure::new(tool.clone(), revision, [path])).into()
     }
     fn execution_mode(&self) -> ToolExecutionMode { ToolExecutionMode::Async }
     fn declares_final_mrtr(&self) -> bool { self.interactive }
