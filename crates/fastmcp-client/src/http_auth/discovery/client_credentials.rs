@@ -9,8 +9,9 @@
 //! registration, browser login or persistent custody is installed.
 //!
 //! Trusted resource/issuer discovery is shared with the native OAuth path.
-//! Every protected operation additionally verifies the official extension by
-//! fresh authenticated MCP discovery using the SAME token as the operation.
+//! Every protected operation performs fresh authenticated MCP discovery using
+//! the SAME token as the operation. The client declaration is required on each
+//! request; the server advertisement is optional but, when present, must be {}.
 //! No failed POST is automatically retried. All work uses the caller's runtime.
 
 /// Typed incremental core calls over the same machine authentication owner.
@@ -132,7 +133,7 @@ impl fmt::Display for ClientCredentialsError {
             Self::Transport => "client-credentials transport failed",
             Self::InvalidRequest => "invalid client-credentials MCP request",
             Self::RequestTooLarge => "client-credentials MCP request exceeds its byte bound",
-            Self::Negotiation => "resource did not admit the client-credentials extension",
+            Self::Negotiation => "client-credentials discovery or extension declaration rejected",
             Self::UnexpectedResponse => "client-credentials response rejected",
             Self::Redirect { .. } => "resource answered the client-credentials request with a redirect, which MCP does not follow",
             Self::Discovery(_) => "client-credentials discovery or operation lifetime failed",
@@ -765,19 +766,36 @@ fn decoded_result(request: &CoreRequest, id: &RequestId, bytes: &[u8], maximum: 
         .map_err(|_| ClientCredentialsError::UnexpectedResponse)
 }
 fn admit_resource(request: &CoreRequest, id: &RequestId, bytes: &[u8]) -> Result<(), ClientCredentialsError> {
+    // Optional server advertisement is not implicit client activation. Require
+    // the exact declaration on THIS discovery request, including Tasks callers.
+    let params = request.encode_params().map_err(|_| ClientCredentialsError::Negotiation)?
+        .ok_or(ClientCredentialsError::Negotiation)?;
+    if request.era() != ProtocolEra::Modern2026 || request.method() != "server/discover"
+        || !params.get("_meta").and_then(|meta| meta.get(FINAL_CLIENT_CAPABILITIES_META_KEY))
+            .and_then(|caps| caps.get("extensions")).and_then(|ext| ext.get(CLIENT_CREDENTIALS_EXTENSION))
+            .is_some_and(|settings| settings.as_object().is_some_and(serde_json::Map::is_empty))
+    { return Err(ClientCredentialsError::Negotiation); }
     let result = decoded_result(request, id, bytes, MAX_TOKEN_BYTES).map_err(|_| ClientCredentialsError::Negotiation)?;
     let CoreResult::Final(FinalCoreResult::Discover(discovery)) = &result else { return Err(ClientCredentialsError::Negotiation) };
     if !discovery.supported_versions().iter().any(|version| version == FINAL_PROTOCOL_VERSION) {
         return Err(ClientCredentialsError::Negotiation);
     }
-    // Inspect the method-admitted typed result, not an unknown sibling or an
-    // unvalidated raw Value whose duplicate security fields could be collapsed.
-    let document: Value = serde_json::from_str(&result.encode().map_err(|_| ClientCredentialsError::Negotiation)?)
-        .map_err(|_| ClientCredentialsError::Negotiation)?;
-    if !document.get("capabilities").and_then(|value| value.get("extensions"))
-        .and_then(|value| value.get(CLIENT_CREDENTIALS_EXTENSION))
-        .is_some_and(|settings| settings.as_object().is_some_and(serde_json::Map::is_empty))
-    { return Err(ClientCredentialsError::Negotiation); }
+    // First admit the whole bounded response with its strict method/ID codec.
+    // Then inspect its admitted wire presence, not a typed re-serialization:
+    // Option fields can otherwise turn a present null into an absent member.
+    let document: Value = serde_json::from_slice(bytes).map_err(|_| ClientCredentialsError::Negotiation)?;
+    let capabilities = document.get("result").and_then(|result| result.get("capabilities"))
+        .and_then(Value::as_object).ok_or(ClientCredentialsError::Negotiation)?;
+    if let Some(extensions) = capabilities.get("extensions") {
+        let extensions = extensions.as_object().ok_or(ClientCredentialsError::Negotiation)?;
+        if extensions.get(CLIENT_CREDENTIALS_EXTENSION)
+            .is_some_and(|settings| !settings.as_object().is_some_and(serde_json::Map::is_empty))
+        { return Err(ClientCredentialsError::Negotiation); }
+    }
+    // This authorization profile does not require a server-side implementation
+    // advertisement. Unselected server extensions neither activate another
+    // profile nor substitute for the required current client declaration.
+    // Tasks still perform their independent, mandatory negotiation afterward.
     Ok(())
 }
 fn check_token(token: &BoundBearerCredential, expiry: Instant) -> Result<(), ClientCredentialsError> {
@@ -1212,5 +1230,105 @@ mod tests {
         assert_eq!(admitted.expires_at, started + Duration::from_secs(17));
         assert_eq!(admitted.bearer.authorization_for_target(&inner.resource).unwrap(),
             "Bearer e30.eyJleHAiOjB9.signature");
+    }
+
+    fn declared_discovery() -> CoreRequest {
+        let (_, declared) = prepare(&url("https://resource.example/mcp"), &core(), &RequestId::Number(7)).unwrap();
+        let params = declared.encode_params().unwrap().unwrap();
+        CoreRequest::decode(ProtocolEra::Modern2026, "server/discover", Some(&json!({"_meta":params["_meta"]}))).unwrap()
+    }
+    fn discovery_reply(capabilities: Value) -> Vec<u8> {
+        serde_json::to_vec(&json!({"jsonrpc":"2.0","id":7,"result":{
+            "resultType":"complete","supportedVersions":[FINAL_PROTOCOL_VERSION],
+            "capabilities":capabilities,"ttlMs":0,"cacheScope":"private"
+        }})).unwrap()
+    }
+
+    #[test]
+    fn machine_discovery_accepts_absent_or_exact_advertisement_without_changing_the_request() {
+        let request = declared_discovery();
+        let before = request.encode_params().unwrap();
+        for caps in [json!({}), json!({"extensions":{}}),
+            json!({"extensions":{CLIENT_CREDENTIALS_EXTENSION:{}}}),
+            json!({"extensions":{"com.example/independent":{}}})]
+        {
+            assert!(admit_resource(&request, &RequestId::Number(7), &discovery_reply(caps)).is_ok());
+            assert_eq!(request.encode_params().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn machine_discovery_never_treats_present_null_or_malformed_settings_as_absence() {
+        let request = declared_discovery();
+        for settings in [Value::Null, json!(false), json!(7), json!(""), json!([]), json!({"enabled":true})] {
+            let bytes = discovery_reply(json!({"extensions":{CLIENT_CREDENTIALS_EXTENSION:settings}}));
+            assert!(matches!(admit_resource(&request, &RequestId::Number(7), &bytes), Err(ClientCredentialsError::Negotiation)));
+        }
+        for extensions in [Value::Null, json!(false), json!(7), json!(""), json!([])] {
+            let bytes = discovery_reply(json!({"extensions":extensions}));
+            assert!(matches!(admit_resource(&request, &RequestId::Number(7), &bytes), Err(ClientCredentialsError::Negotiation)));
+        }
+        assert!(admit_resource(&request, &RequestId::Number(7), &discovery_reply(json!({}))).is_ok());
+    }
+
+    #[test]
+    fn machine_discovery_requires_this_requests_client_declaration_even_when_server_advertises() {
+        let declared = declared_discovery();
+        let base = declared.encode_params().unwrap().unwrap();
+        let response = discovery_reply(json!({"extensions":{CLIENT_CREDENTIALS_EXTENSION:{}}}));
+        for caps in [json!({}), json!({"extensions":{}}),
+            json!({"extensions":{"com.example/independent":{}}}),
+            json!({"experimental":{CLIENT_CREDENTIALS_EXTENSION:{}}})]
+        {
+            let mut params = base.clone();
+            params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY] = caps;
+            let request = CoreRequest::decode(ProtocolEra::Modern2026, "server/discover", Some(&params)).unwrap();
+            assert!(matches!(admit_resource(&request, &RequestId::Number(7), &response), Err(ClientCredentialsError::Negotiation)));
+        }
+        assert!(admit_resource(&declared, &RequestId::Number(7), &response).is_ok());
+    }
+
+    #[test]
+    fn optional_advertisement_does_not_bypass_version_correlation_or_document_bounds() {
+        let request = declared_discovery();
+        let valid = discovery_reply(json!({}));
+        assert!(admit_resource(&request, &RequestId::Number(7), &valid).is_ok());
+        for id in [RequestId::Number(8), RequestId::String("7".to_owned())] {
+            assert!(admit_resource(&request, &id, &valid).is_err());
+        }
+        let mut wrong: Value = serde_json::from_slice(&valid).unwrap();
+        wrong["result"]["supportedVersions"] = json!(["2024-11-05"]);
+        assert!(admit_resource(&request, &RequestId::Number(7), &serde_json::to_vec(&wrong).unwrap()).is_err());
+        let array = serde_json::to_vec(&json!([serde_json::from_slice::<Value>(&valid).unwrap()])).unwrap();
+        assert!(admit_resource(&request, &RequestId::Number(7), &array).is_err());
+        let mut oversized = valid;
+        oversized.resize(MAX_TOKEN_BYTES + 1, b' ');
+        assert!(admit_resource(&request, &RequestId::Number(7), &oversized).is_err());
+    }
+
+    #[test]
+    fn optional_advertisement_keeps_raw_duplicate_and_escaped_member_checks() {
+        let request = declared_discovery();
+        for members in [
+            r#""extensions":{"io.modelcontextprotocol/oauth-client-credentials":{},"io.modelcontextprotocol/oauth-client-credentials":null}"#,
+            r#""extensions":{"io.modelcontextprotocol/oauth-client-credentials":{}},"extensions":{}"#,
+            r#""extens\u0069ons":null"#,
+            r#""extensions":{"io.modelcontextprotocol/oauth-client-credent\u0069als":null}"#,
+        ] {
+            let source = format!(r#"{{"jsonrpc":"2.0","id":7,"result":{{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{{{members}}},"ttlMs":0,"cacheScope":"private"}}}}"#);
+            assert!(matches!(admit_resource(&request, &RequestId::Number(7), source.as_bytes()), Err(ClientCredentialsError::Negotiation)));
+        }
+    }
+
+    #[test]
+    fn machine_advertisement_is_revalidated_instead_of_cached_between_requests() {
+        let request = declared_discovery();
+        let valid = discovery_reply(json!({"extensions":{CLIENT_CREDENTIALS_EXTENSION:{}}}));
+        let malformed = discovery_reply(json!({"extensions":{CLIENT_CREDENTIALS_EXTENSION:{"unexpected":true}}}));
+        let absent = discovery_reply(json!({}));
+        assert!(admit_resource(&request, &RequestId::Number(7), &valid).is_ok());
+        assert!(admit_resource(&request, &RequestId::Number(7), &malformed).is_err());
+        assert!(admit_resource(&request, &RequestId::Number(7), &absent).is_ok());
+        assert!(admit_resource(&request, &RequestId::Number(7), &malformed).is_err());
     }
 }

@@ -16,7 +16,7 @@ const TASK_CHILD: &str = "FASTMCP_TEST_MACHINE_TASKS_CASE";
 const PROGRESS: &str = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"work","progress":1}}"#;
 #[derive(Clone, Copy)]
 enum TaskCase {
-    Lifecycle, MissingTasks, MissingAuth, WrongResponse, WrongTask, InvalidProgress,
+    Lifecycle, MissingTasks, MalformedAuth, WrongResponse, WrongTask, InvalidProgress,
     Truncated, Cancel, Close, Abandon, Expiry, Deadline, RecordLimit,
     Denied, Redirect, LostMutation, Preflight, Renewal,
 }
@@ -146,18 +146,23 @@ fn run_tasks(case: TaskCase) {
                     assert_eq!(peer.grants.load(Ordering::SeqCst),1);
                     assert_eq!(peer.rpcs.load(Ordering::SeqCst),12);
                 }
-                TaskCase::MissingTasks | TaskCase::MissingAuth => {
+                TaskCase::MissingTasks | TaskCase::MalformedAuth => {
                     acquire(&peer,&cx,&client,"access-one",300).await;
                     let mut missing=discovery();
-                    let key=if matches!(case,TaskCase::MissingTasks) { TASKS_EXTENSION } else { CLIENT_CREDENTIALS_EXTENSION };
-                    missing["capabilities"]["extensions"].as_object_mut().unwrap().remove(key);
+                    if matches!(case,TaskCase::MissingTasks) {
+                        missing["capabilities"]["extensions"].as_object_mut().unwrap().remove(TASKS_EXTENSION);
+                    } else {
+                        // Absence of the auth advertisement is legal. A present
+                        // null is not, and must still block the mutation.
+                        missing["capabilities"]["extensions"][CLIENT_CREDENTIALS_EXTENSION] = Value::Null;
+                    }
                     let ((), rejected)=Box::pin(pair(discover(&peer,1,"access-one",&missing),
                         tasks.request(&cx,RequestId::Number(1),RequestId::Number(2),ManagedTaskRequest::Cancel(task_id())))).await;
                     match case {
                         TaskCase::MissingTasks => assert!(matches!(rejected,Err(TaskError::Protocol(ManagedTasksError::Negotiation)))),
                         _ => assert!(matches!(rejected,Err(TaskError::Authentication(Error::Negotiation)))),
                     }
-                    assert_eq!(peer.rpcs.load(Ordering::SeqCst),1,"no mutation on partial negotiation");
+                    assert_eq!(peer.rpcs.load(Ordering::SeqCst),1,"no mutation on rejected negotiation");
                     peer.quiet();
                     let good=task("working","complete");
                     let (_, snapshot)=Box::pin(pair(operation(&peer,3,"tasks/get","access-one",&good),
@@ -302,7 +307,7 @@ fn machine_tasks_complete_the_create_input_update_cancel_lifecycle() { isolated_
 #[test]
 fn missing_tasks_advertisement_prevents_mutation_and_preserves_the_client() { isolated_task("tasks::missing_tasks_advertisement_prevents_mutation_and_preserves_the_client",TaskCase::MissingTasks); }
 #[test]
-fn missing_machine_auth_advertisement_prevents_mutation_and_preserves_the_client() { isolated_task("tasks::missing_machine_auth_advertisement_prevents_mutation_and_preserves_the_client",TaskCase::MissingAuth); }
+fn malformed_machine_auth_advertisement_prevents_mutation_and_preserves_the_client() { isolated_task("tasks::malformed_machine_auth_advertisement_prevents_mutation_and_preserves_the_client",TaskCase::MalformedAuth); }
 #[test]
 fn wrong_response_identity_closes_only_its_task_call() { isolated_task("tasks::wrong_response_identity_closes_only_its_task_call",TaskCase::WrongResponse); }
 #[test]

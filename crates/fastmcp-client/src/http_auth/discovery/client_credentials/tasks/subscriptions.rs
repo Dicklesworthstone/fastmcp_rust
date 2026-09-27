@@ -1,10 +1,11 @@
 //! One authenticated Tasks subscription, optionally composed with core filters.
 //!
-//! Both official extensions are admitted by fresh discovery using the exact
-//! credential that opens the listen POST. The existing native subscription
-//! decoder owns ACK ordering, filter narrowing, event ownership and terminal
-//! correlation. This layer adds machine-credential lifetime and finite budgets;
-//! it never reconnects, replays missed events or cancels a remote task.
+//! Fresh discovery checks the required Tasks advertisement and the optional
+//! machine-auth advertisement using the exact credential for the listen POST.
+//! The existing native subscription decoder owns ACK ordering, filter narrowing,
+//! event ownership and terminal correlation. This layer adds machine-credential
+//! lifetime and finite budgets; it never reconnects, replays missed events or
+//! cancels a remote task.
 
 /// Notification-driven snapshots for an explicitly acknowledged Task selection.
 pub mod watch;
@@ -321,7 +322,7 @@ fn admit_subscription_discovery(
     bytes: &[u8],
     maximum: usize,
 ) -> Result<(), ClientCredentialsTasksError> {
-    // This validates the auth extension and the supported protocol version.
+    // This validates the auth declaration, optional advertisement and version.
     admit_resource(discovery, id, bytes)?;
     let (response, source) = response_source(bytes, id, maximum)?;
     let CoreResult::Final(FinalCoreResult::Discover(result)) =
@@ -420,16 +421,20 @@ mod tests {
     }
 
     #[test]
-    fn subscription_requires_both_advertisements_and_the_exact_discovery_owner() {
+    fn subscription_requires_tasks_and_validates_optional_auth_and_discovery_owner() {
         let prepared = prepare(filter(json!({"taskIds":["one"]}))).unwrap();
         let valid = discovery_result();
         assert!(admit_subscription_discovery(&prepared.discovery, &RequestId::Number(1),
             &serde_json::to_vec(&valid).unwrap(), 4096).is_ok());
+        let mut absent = valid.clone();
+        absent["result"]["capabilities"]["extensions"].as_object_mut().unwrap().remove(CLIENT_CREDENTIALS_EXTENSION);
+        assert!(admit_subscription_discovery(&prepared.discovery, &RequestId::Number(1),
+            &serde_json::to_vec(&absent).unwrap(), 4096).is_ok());
         for dimension in 0..6 {
             let mut changed = valid.clone();
             match dimension {
                 0 => { changed["result"]["capabilities"]["extensions"].as_object_mut().unwrap().remove(TASKS_EXTENSION); }
-                1 => { changed["result"]["capabilities"]["extensions"].as_object_mut().unwrap().remove(CLIENT_CREDENTIALS_EXTENSION); }
+                1 => changed["result"]["capabilities"]["extensions"][CLIENT_CREDENTIALS_EXTENSION] = Value::Null,
                 2 => changed["result"]["capabilities"]["extensions"][TASKS_EXTENSION] = json!({"invented":true}),
                 3 => changed["result"]["capabilities"]["extensions"][CLIENT_CREDENTIALS_EXTENSION] = json!({"invented":true}),
                 4 => changed["result"]["supportedVersions"] = json!(["2024-11-05"]),

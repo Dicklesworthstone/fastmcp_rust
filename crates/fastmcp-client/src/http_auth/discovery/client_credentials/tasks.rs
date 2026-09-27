@@ -1,9 +1,10 @@
 //! Explicit composition of machine OAuth and the official Tasks extension.
 //!
 //! Reuses the browser-managed client's public command/event vocabulary and the
-//! protocol crate's authoritative Tasks codecs. Each operation negotiates BOTH
-//! extensions using the exact token that authenticates its operation POST. No
-//! failed discovery, grant, tool call, update or cancel is automatically retried.
+//! protocol crate's authoritative Tasks codecs. Each operation checks the required
+//! Tasks advertisement and any present machine-auth advertisement using the exact
+//! token for its POST. Both client declarations remain explicit on every request.
+//! No failed discovery, grant, tool call, update or cancel is automatically retried.
 //! This is process-local client orchestration, not durable task storage.
 
 /// Authenticated Tasks subscriptions, optionally composed with core filters.
@@ -549,7 +550,7 @@ mod tests {
         }
     }
     #[test]
-    fn discovery_requires_both_extensions_and_the_same_response_owner() {
+    fn discovery_requires_tasks_and_validates_optional_auth_and_response_owner() {
         let discovery = CoreRequest::decode(fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026,
             "server/discover", Some(&json!({"_meta":metadata()}))).unwrap();
         let base = json!({"resultType":"complete", "supportedVersions":[FINAL_PROTOCOL_VERSION], "ttlMs":0, "cacheScope":"private",
@@ -558,7 +559,11 @@ mod tests {
         for key in [TASKS_EXTENSION, CLIENT_CREDENTIALS_EXTENSION] {
             let mut changed = base.clone();
             changed["capabilities"]["extensions"].as_object_mut().unwrap().remove(key);
-            assert!(admit_composition(&discovery, &RequestId::Number(2), &envelope(changed), &Decoder::Get(id()), 65536).is_err());
+            let admitted = admit_composition(&discovery, &RequestId::Number(2), &envelope(changed), &Decoder::Get(id()), 65536);
+            assert_eq!(admitted.is_ok(), key == CLIENT_CREDENTIALS_EXTENSION);
+            let mut malformed = base.clone();
+            malformed["capabilities"]["extensions"][key] = Value::Null;
+            assert!(admit_composition(&discovery, &RequestId::Number(2), &envelope(malformed), &Decoder::Get(id()), 65536).is_err());
         }
         assert!(admit_composition(&discovery, &RequestId::Number(3), &envelope(base), &Decoder::Get(id()), 65536).is_err());
     }

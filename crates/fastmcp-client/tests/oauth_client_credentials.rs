@@ -12,6 +12,8 @@ mod private_key_jwt;
 
 #[path = "oauth_client_credentials/token_admission.rs"]
 mod token_admission;
+#[path = "oauth_client_credentials/advertisement.rs"]
+mod advertisement;
 
 use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
@@ -398,7 +400,7 @@ fn run(case: Case) {
                 Case::Negotiation => {
                     acquire(&peer,&cx,&client,"access-one",300).await;
                     for (index,(from,to)) in [
-                        ("\"io.modelcontextprotocol/oauth-client-credentials\":{}","\"com.example/other\":{}"),
+                        ("\"io.modelcontextprotocol/oauth-client-credentials\":{}","\"io.modelcontextprotocol/oauth-client-credentials\":null"),
                         ("\"io.modelcontextprotocol/oauth-client-credentials\":{}","\"io.modelcontextprotocol/oauth-client-credentials\":{\"invented\":true}"),
                         ("2026-07-28","2024-11-05"),
                     ].into_iter().enumerate() {

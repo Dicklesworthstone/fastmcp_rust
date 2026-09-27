@@ -14,7 +14,7 @@ const SUB_CHILD: &str = "FASTMCP_TEST_MACHINE_TASK_SUBSCRIPTION_CASE";
 
 #[derive(Clone, Copy)]
 enum SubCase {
-    Live, MissingTasks, MissingAuth, WrongAck, WidenedAck, BeforeAck,
+    Live, MissingTasks, MalformedAuth, WrongAck, WidenedAck, BeforeAck,
     WrongTask, WrongSubscription, WrongResource, DuplicateAck, Truncated,
     RemoteError, Cancel, Close, Abandon, Expiry, Deadline, RecordLimit,
     Renewal, Preflight, Denied, Redirect, LostListen, NarrowedAck,
@@ -176,10 +176,15 @@ fn run_subscription(case: SubCase) {
                         Box::pin(pair(server, application)).await;
                         assert_eq!(peer.rpcs.load(Ordering::SeqCst), 2, "events cause no polling or mutation");
                     }
-                    SubCase::MissingTasks | SubCase::MissingAuth => {
+                    SubCase::MissingTasks | SubCase::MalformedAuth => {
                         let mut document = discovery();
-                        let key = if matches!(case, SubCase::MissingTasks) { TASKS_EXTENSION } else { CLIENT_CREDENTIALS_EXTENSION };
-                        document["capabilities"]["extensions"].as_object_mut().unwrap().remove(key);
+                        if matches!(case, SubCase::MissingTasks) {
+                            document["capabilities"]["extensions"].as_object_mut().unwrap().remove(TASKS_EXTENSION);
+                        } else {
+                            // Omission is valid; explicit null is malformed and
+                            // cannot become permission to open the listen.
+                            document["capabilities"]["extensions"][CLIENT_CREDENTIALS_EXTENSION] = Value::Null;
+                        }
                         let ((), rejected) = Box::pin(pair(discover(&peer, 1, "access-one", &document),
                             tasks.subscribe(&cx, RequestId::Number(1), RequestId::Number(2), selected(),
                                 ClientCredentialsSubscriptionLimits::default()))).await;
@@ -187,7 +192,7 @@ fn run_subscription(case: SubCase) {
                             SubCase::MissingTasks => assert!(matches!(rejected, Err(TaskError::Protocol(ManagedTasksError::Negotiation)))),
                             _ => assert!(matches!(rejected, Err(TaskError::Authentication(Error::Negotiation)))),
                         }
-                        assert_eq!(peer.rpcs.load(Ordering::SeqCst), 1, "no listen after partial negotiation");
+                        assert_eq!(peer.rpcs.load(Ordering::SeqCst), 1, "no listen after rejected negotiation");
                         peer.quiet();
                         healthy_listen(&peer, &tasks, &cx, 3, "access-one", 1).await;
                     }
@@ -374,7 +379,7 @@ fn machine_subscriptions_deliver_live_task_catalog_and_resource_events() { isola
 #[test]
 fn missing_tasks_advertisement_prevents_the_listen_post() { isolated_subscription("tasks::subscriptions::missing_tasks_advertisement_prevents_the_listen_post", SubCase::MissingTasks); }
 #[test]
-fn missing_auth_advertisement_prevents_the_listen_post() { isolated_subscription("tasks::subscriptions::missing_auth_advertisement_prevents_the_listen_post", SubCase::MissingAuth); }
+fn malformed_auth_advertisement_prevents_the_listen_post() { isolated_subscription("tasks::subscriptions::malformed_auth_advertisement_prevents_the_listen_post", SubCase::MalformedAuth); }
 #[test]
 fn foreign_ack_identity_does_not_publish_filter_state() { isolated_subscription("tasks::subscriptions::foreign_ack_identity_does_not_publish_filter_state", SubCase::WrongAck); }
 #[test]
