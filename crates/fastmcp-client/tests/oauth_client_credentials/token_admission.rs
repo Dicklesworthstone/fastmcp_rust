@@ -5,6 +5,8 @@
 
 use super::*;
 
+mod singleflight;
+
 fn run_admission<F, Fut>(scenario: F)
 where
     F: FnOnce(Cx) -> Fut,
