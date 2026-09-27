@@ -312,6 +312,17 @@ const MAX_LEGACY_SSE_LINE_BYTES: usize = 8 * 1024 * 1024 + 8;
 #[cfg(feature = "legacy-2024-11-05")]
 const MAX_LEGACY_SSE_KEEPALIVE_LINES: usize = 64;
 
+/// Maximum `data:` lines in one legacy SSE event (LIMIT-01 guarded default
+/// for SSE data lines per event: 4,096).
+#[cfg(feature = "legacy-2024-11-05")]
+const MAX_LEGACY_SSE_DATA_LINES_PER_EVENT: usize = 4096;
+
+/// Maximum reconnect attempts, successful or refused, over one legacy client's
+/// life. No LIMIT-01 row sets this bound; it keeps a peer that keeps ending
+/// its stream from driving an unbounded sequence of GETs.
+#[cfg(feature = "legacy-2024-11-05")]
+const MAX_LEGACY_SSE_RECONNECT_ATTEMPTS: u32 = 8;
+
 /// Maximum JSON-RPC bytes accepted from one legacy `message` SSE event
 /// (LIMIT-01 guarded default for one decoded SSE JSON message: 8 MiB).
 #[cfg(feature = "legacy-2024-11-05")]
@@ -8158,6 +8169,9 @@ pub struct LegacySseHttpClient {
     post_client: HttpClient,
     stream: Option<LegacySseResponseStream>,
     notifications: VecDeque<JsonRpcRequest>,
+    stream_generation: u32,
+    reconnect_attempts: u32,
+    closed: bool,
 }
 
 /// Cloneable POST half of an admitted exact-2024 SSE connection.
@@ -9112,13 +9126,7 @@ impl LegacySseHttpClient {
         Self::connect_inner(cx, protocol_plan).await
     }
 
-    /// Opens the configured SSE GET endpoint and admits its first `endpoint`
-    /// event only when it names the immutable configured POST resource: the
-    /// advertised target must equal the configured one exactly, or differ
-    /// from a query-free configured target solely by an appended query
-    /// component (the exact 2024-11-05 lane advertises a session-scoped
-    /// message endpoint). Any scheme, authority, or path divergence remains
-    /// a hard mismatch.
+    /// Opens the first SSE stream generation; see [`open_legacy_sse_generation`].
     #[cfg(feature = "legacy-2024-11-05")]
     async fn connect_inner(
         cx: &Cx,
@@ -9127,62 +9135,12 @@ impl LegacySseHttpClient {
         if cx.checkpoint().is_err() {
             return Err(LegacySseHttpClientError::Cancelled);
         }
-        let sse_target = protocol_plan
-            .legacy_sse_target()
-            .ok_or(LegacySseHttpClientError::MissingSseTarget)?
-            .to_owned();
+        let (stream, advertised_message_post_target) =
+            open_legacy_sse_generation(cx, &protocol_plan).await?;
         let configured_message_post_target = protocol_plan
             .legacy_message_post_target()
             .ok_or(LegacySseHttpClientError::MissingMessagePostTarget)?
             .to_owned();
-        let sse_url = fastmcp_core::CanonicalHttpUrl::parse(&sse_target)
-            .map_err(|_| LegacySseHttpClientError::InvalidEndpointConfiguration)?;
-        let message_url = fastmcp_core::CanonicalHttpUrl::parse(&configured_message_post_target)
-            .map_err(|_| LegacySseHttpClientError::InvalidEndpointConfiguration)?;
-        if [&sse_url, &message_url].iter().any(|target| {
-            target.has_syntax_violation() || target.has_userinfo() || target.fragment().is_some()
-        }) || sse_url.scheme() != message_url.scheme()
-            || sse_url.host() != message_url.host()
-            || sse_url.effective_port() != message_url.effective_port()
-        {
-            return Err(LegacySseHttpClientError::InvalidEndpointConfiguration);
-        }
-
-        let response = native_http_client()
-            .request_streaming(
-                cx,
-                Method::Get,
-                &sse_target,
-                vec![
-                    ("Accept".to_owned(), "text/event-stream".to_owned()),
-                    (
-                        "Accept-Encoding".to_owned(),
-                        MODERN_MCP_ACCEPT_ENCODING.to_owned(),
-                    ),
-                ],
-                Vec::new(),
-            )
-            .await
-            .map_err(map_transport_error)
-            .map_err(LegacySseHttpClientError::Executor)?;
-        validate_legacy_sse_response_head(response.head.status, &response.head.headers)?;
-
-        let mut stream = LegacySseResponseStream::new(response);
-        let advertised_message_post_target = match stream.next_event(cx).await? {
-            Some(LegacySseEvent::Endpoint(target)) if !target.is_empty() => target,
-            Some(LegacySseEvent::Endpoint(_)) => {
-                return Err(LegacySseHttpClientError::EmptyAdvertisedMessagePostTarget);
-            }
-            Some(LegacySseEvent::Message(_)) => {
-                return Err(LegacySseHttpClientError::FirstEventWasNotEndpoint);
-            }
-            None => return Err(LegacySseHttpClientError::SseEndedBeforeEndpoint),
-        };
-        let advertised_message_post_target = resolve_legacy_message_post_target(
-            &sse_url,
-            &configured_message_post_target,
-            &advertised_message_post_target,
-        )?;
 
         Ok(Self {
             protocol_plan,
@@ -9191,6 +9149,9 @@ impl LegacySseHttpClient {
             post_client: native_http_client(),
             stream: Some(stream),
             notifications: VecDeque::new(),
+            stream_generation: 1,
+            reconnect_attempts: 0,
+            closed: false,
         })
     }
 
@@ -9206,12 +9167,164 @@ impl LegacySseHttpClient {
         &self.configured_message_post_target
     }
 
-    /// Returns the validated endpoint advertised by the first SSE event.
+    /// Returns the validated endpoint advertised by the first SSE event of
+    /// the current stream generation.
     #[must_use]
     pub fn advertised_message_post_target(&self) -> &str {
         &self.advertised_message_post_target
     }
 
+    /// Returns the current SSE stream generation: 1 after connect, plus one
+    /// for each successful [`Self::reconnect`].
+    #[must_use]
+    pub const fn stream_generation(&self) -> u32 {
+        self.stream_generation
+    }
+
+    /// Returns the reconnect attempts made so far, successful or not. They
+    /// count against the client's fixed reconnect bound.
+    #[must_use]
+    pub const fn reconnect_attempts(&self) -> u32 {
+        self.reconnect_attempts
+    }
+
+    /// Returns whether [`Self::close`] has closed this client.
+    #[must_use]
+    pub const fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Opens a new SSE stream generation in place of the current one.
+    ///
+    /// Exact `2024-11-05` has no replay or resumption: a reconnect is a fresh
+    /// GET whose first event must again be `endpoint`, resolving to the
+    /// configured POST resource. Nothing from the prior generation carries
+    /// over; queued notifications are dropped and no event ID is sent. The
+    /// peer usually starts a new session, so the caller must initialize again.
+    ///
+    /// The prior generation is replaced only when the new one is admitted. A
+    /// refused attempt leaves the current stream, advertised target, and
+    /// generation unchanged, but still counts against the attempt bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LegacySseHttpClientError::Closed`] after [`Self::close`],
+    /// [`LegacySseHttpClientError::ReconnectLimitExceeded`] once the bound is
+    /// spent (without any request), and otherwise the same typed refusals as
+    /// [`Self::connect`].
+    pub async fn reconnect(&mut self, cx: &Cx) -> Result<(), LegacySseHttpClientError> {
+        if self.closed {
+            return Err(LegacySseHttpClientError::Closed);
+        }
+        if self.stream.is_none() {
+            return Err(LegacySseHttpClientError::ReceiverOwnedByReadyClient);
+        }
+        if self.reconnect_attempts >= MAX_LEGACY_SSE_RECONNECT_ATTEMPTS {
+            return Err(LegacySseHttpClientError::ReconnectLimitExceeded {
+                maximum_attempts: MAX_LEGACY_SSE_RECONNECT_ATTEMPTS,
+            });
+        }
+        self.reconnect_attempts += 1;
+        let (stream, advertised_message_post_target) =
+            open_legacy_sse_generation(cx, &self.protocol_plan).await?;
+        self.stream = Some(stream);
+        self.advertised_message_post_target = advertised_message_post_target;
+        self.notifications.clear();
+        self.stream_generation += 1;
+        Ok(())
+    }
+
+    /// Closes the SSE stream and invalidates its advertised POST target.
+    ///
+    /// Returns `true` for the call that closed the client and `false` for
+    /// every later call. After it, sends, reads, and reconnects are refused
+    /// with [`LegacySseHttpClientError::Closed`] and perform no I/O.
+    pub fn close(&mut self) -> bool {
+        if self.closed {
+            return false;
+        }
+        self.closed = true;
+        if let Some(stream) = self.stream.as_mut() {
+            stream.close_for_cancellation();
+        }
+        self.notifications.clear();
+        true
+    }
+}
+
+/// Opens one exact-2024 SSE stream generation and admits its first
+/// `endpoint` event against the plan's immutable configured POST resource.
+///
+/// The advertised target must equal the configured one exactly, or differ
+/// from a query-free configured target solely by an appended query component
+/// (the exact 2024-11-05 lane advertises a session-scoped message endpoint).
+/// Any scheme, authority, or path divergence remains a hard mismatch.
+#[cfg(feature = "legacy-2024-11-05")]
+async fn open_legacy_sse_generation(
+    cx: &Cx,
+    protocol_plan: &ClientProtocolPlan,
+) -> Result<(LegacySseResponseStream, String), LegacySseHttpClientError> {
+    let sse_target = protocol_plan
+        .legacy_sse_target()
+        .ok_or(LegacySseHttpClientError::MissingSseTarget)?
+        .to_owned();
+    let configured_message_post_target = protocol_plan
+        .legacy_message_post_target()
+        .ok_or(LegacySseHttpClientError::MissingMessagePostTarget)?
+        .to_owned();
+    let sse_url = fastmcp_core::CanonicalHttpUrl::parse(&sse_target)
+        .map_err(|_| LegacySseHttpClientError::InvalidEndpointConfiguration)?;
+    let message_url = fastmcp_core::CanonicalHttpUrl::parse(&configured_message_post_target)
+        .map_err(|_| LegacySseHttpClientError::InvalidEndpointConfiguration)?;
+    if [&sse_url, &message_url].iter().any(|target| {
+        target.has_syntax_violation() || target.has_userinfo() || target.fragment().is_some()
+    }) || sse_url.scheme() != message_url.scheme()
+        || sse_url.host() != message_url.host()
+        || sse_url.effective_port() != message_url.effective_port()
+    {
+        return Err(LegacySseHttpClientError::InvalidEndpointConfiguration);
+    }
+
+    let response = native_http_client()
+        .request_streaming(
+            cx,
+            Method::Get,
+            &sse_target,
+            vec![
+                ("Accept".to_owned(), "text/event-stream".to_owned()),
+                (
+                    "Accept-Encoding".to_owned(),
+                    MODERN_MCP_ACCEPT_ENCODING.to_owned(),
+                ),
+            ],
+            Vec::new(),
+        )
+        .await
+        .map_err(map_transport_error)
+        .map_err(LegacySseHttpClientError::Executor)?;
+    validate_legacy_sse_response_head(response.head.status, &response.head.headers)?;
+
+    let mut stream = LegacySseResponseStream::new(response);
+    let advertised_message_post_target = match stream.next_event(cx).await? {
+        Some(LegacySseEvent::Endpoint(target)) if !target.is_empty() => target,
+        Some(LegacySseEvent::Endpoint(_)) => {
+            return Err(LegacySseHttpClientError::EmptyAdvertisedMessagePostTarget);
+        }
+        Some(LegacySseEvent::Message(_)) => {
+            return Err(LegacySseHttpClientError::FirstEventWasNotEndpoint);
+        }
+        None => return Err(LegacySseHttpClientError::SseEndedBeforeEndpoint),
+    };
+    let advertised_message_post_target = resolve_legacy_message_post_target(
+        &sse_url,
+        &configured_message_post_target,
+        &advertised_message_post_target,
+    )?;
+    Ok((stream, advertised_message_post_target))
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl LegacySseHttpClient {
     /// Pops the oldest notification received while an owning request awaited
     /// its correlated response.
     #[must_use]
@@ -9241,6 +9354,8 @@ impl LegacySseHttpClient {
     /// Sends one legacy JSON-RPC envelope to the validated advertised POST URL.
     ///
     /// The legacy request intentionally carries no final-MCP metadata headers.
+    /// Closing or ending the SSE stream invalidates its advertised POST
+    /// target, so both refuse the send before any request is made.
     pub async fn send(
         &self,
         cx: &Cx,
@@ -9248,6 +9363,16 @@ impl LegacySseHttpClient {
     ) -> Result<(), LegacySseHttpClientError> {
         if cx.checkpoint().is_err() {
             return Err(LegacySseHttpClientError::Cancelled);
+        }
+        if self.closed {
+            return Err(LegacySseHttpClientError::Closed);
+        }
+        if self
+            .stream
+            .as_ref()
+            .is_some_and(LegacySseResponseStream::has_ended)
+        {
+            return Err(LegacySseHttpClientError::StreamGenerationEnded);
         }
         self.outbound()
             .send(cx, message)
@@ -9263,6 +9388,9 @@ impl LegacySseHttpClient {
         &mut self,
         cx: &Cx,
     ) -> Result<Option<JsonRpcMessage>, LegacySseHttpClientError> {
+        if self.closed {
+            return Err(LegacySseHttpClientError::Closed);
+        }
         let stream = self
             .stream
             .as_mut()
@@ -9435,6 +9563,15 @@ pub enum LegacySseHttpClientError {
     PendingSseEventCountExceeded { maximum_events: usize },
     /// Complete legacy events waiting for delivery exceeded their byte bound.
     PendingSseEventBytesExceeded { maximum_bytes: usize },
+    /// One legacy SSE event carried more `data:` lines than its bound.
+    SseEventTooManyDataLines { maximum_lines: usize },
+    /// The client was closed; its stream and POST target are no longer usable.
+    Closed,
+    /// The current SSE stream generation ended, which invalidates its
+    /// advertised POST target until a reconnect admits a new one.
+    StreamGenerationEnded,
+    /// The client has spent its reconnect bound.
+    ReconnectLimitExceeded { maximum_attempts: u32 },
 }
 
 impl fmt::Display for LegacySseHttpClientError {
@@ -9522,6 +9659,18 @@ impl fmt::Display for LegacySseHttpClientError {
                 formatter,
                 "legacy SSE retained more than {maximum_bytes} event bytes before delivery"
             ),
+            Self::SseEventTooManyDataLines { maximum_lines } => write!(
+                formatter,
+                "legacy SSE event carried more than {maximum_lines} data lines"
+            ),
+            Self::Closed => formatter.write_str("legacy SSE HTTP client is closed"),
+            Self::StreamGenerationEnded => formatter.write_str(
+                "legacy SSE stream ended, invalidating its advertised POST target until reconnect",
+            ),
+            Self::ReconnectLimitExceeded { maximum_attempts } => write!(
+                formatter,
+                "legacy SSE client spent its {maximum_attempts} reconnect attempts"
+            ),
         }
     }
 }
@@ -9554,7 +9703,11 @@ impl std::error::Error for LegacySseHttpClientError {
             | Self::MessageDecodeFailed
             | Self::ReceiverOwnedByReadyClient
             | Self::PendingSseEventCountExceeded { .. }
-            | Self::PendingSseEventBytesExceeded { .. } => None,
+            | Self::PendingSseEventBytesExceeded { .. }
+            | Self::SseEventTooManyDataLines { .. }
+            | Self::Closed
+            | Self::StreamGenerationEnded
+            | Self::ReconnectLimitExceeded { .. } => None,
         }
     }
 }
@@ -9599,6 +9752,13 @@ impl LegacySseResponseStream {
         self.parser.finish();
         self.pending_events.clear();
         self.pending_event_bytes = 0;
+    }
+
+    /// Whether the peer ended this stream or it was closed after a refusal.
+    /// Events already retained stay readable, but the stream's session, and
+    /// with it the advertised POST target, is gone.
+    const fn has_ended(&self) -> bool {
+        self.response.is_none()
     }
 
     /// Retains one completed legacy SSE event after aggregate admission.
@@ -9728,6 +9888,7 @@ struct LegacySseParser {
     event_type: Option<LegacySseEventType>,
     data: String,
     has_data: bool,
+    data_lines: usize,
     event_bytes: usize,
     ignored_keepalives: usize,
 }
@@ -9792,6 +9953,7 @@ impl LegacySseParser {
                 let mut data = std::mem::take(&mut self.data);
                 data.pop();
                 self.has_data = false;
+                self.data_lines = 0;
                 self.event_type = None;
                 self.event_bytes = 0;
                 match event_type {
@@ -9831,6 +9993,12 @@ impl LegacySseParser {
                 });
             }
             "data" => {
+                self.data_lines = self.data_lines.saturating_add(1);
+                if self.data_lines > MAX_LEGACY_SSE_DATA_LINES_PER_EVENT {
+                    return Err(LegacySseHttpClientError::SseEventTooManyDataLines {
+                        maximum_lines: MAX_LEGACY_SSE_DATA_LINES_PER_EVENT,
+                    });
+                }
                 // The bound applies to the decoded message: the `data:`
                 // values joined by newlines. The retained buffer already ends
                 // each value with the newline that joins it to this one, and
@@ -9853,6 +10021,7 @@ impl LegacySseParser {
         self.event_type = None;
         self.data.clear();
         self.has_data = false;
+        self.data_lines = 0;
         self.event_bytes = 0;
     }
 }

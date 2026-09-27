@@ -24,6 +24,10 @@ pub mod tasks;
 #[cfg(all(not(target_arch = "wasm32"), feature = "builtin-auth-server"))]
 pub mod private_key_jwt;
 
+// Observe token-local revocation during both dispatch and replacement grants.
+mod lifetime;
+use lifetime::unless_revoked;
+
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::io::{self, Write};
@@ -493,29 +497,35 @@ impl ClientCredentialsClient {
             }
             if state.current.as_ref().is_none_or(|token| Instant::now() >= token.renew_after) {
                 let generation = state.generation.checked_add(1).ok_or(ClientCredentialsError::GenerationExhausted)?;
-                let started = Instant::now();
-                let grant = self.inner.authentication.prepare(
-                    cx, deadline, &self.inner.client_id, self.resource(), &self.inner.scopes,
-                ).await?;
-                let mut headers = vec![
-                    ("Content-Type".to_owned(), "application/x-www-form-urlencoded".to_owned()),
-                    ("Accept".to_owned(), "application/json".to_owned()),
-                    ("Accept-Encoding".to_owned(), "identity".to_owned()),
-                    ("Connection".to_owned(), "close".to_owned()),
-                ];
-                if let Some(authorization) = grant.authorization {
-                    headers.push(("Authorization".to_owned(), authorization));
-                }
-                let transport = token_transport(&self.inner.issuer_roots);
-                let response = active(cx, grant.deadline, &self.inner.closed, cancellation, None, async {
-                    transport.request(cx, Method::Post, self.inner.token_endpoint.as_str(), headers, grant.body)
-                        .await.map_err(|_| ClientCredentialsError::Transport)
+                // Renewal may outlive the OLD access token, but must not outlive
+                // its explicit revocation. Observe only that signal, without
+                // extending any in-flight response or copying the bearer text.
+                let revocation = state.current.as_ref().map(|old| old.bearer.revoked.clone());
+                let token = unless_revoked(revocation.as_ref(), async {
+                    let started = Instant::now();
+                    let grant = self.inner.authentication.prepare(
+                        cx, deadline, &self.inner.client_id, self.resource(), &self.inner.scopes,
+                    ).await?;
+                    let mut headers = vec![
+                        ("Content-Type".to_owned(), "application/x-www-form-urlencoded".to_owned()),
+                        ("Accept".to_owned(), "application/json".to_owned()),
+                        ("Accept-Encoding".to_owned(), "identity".to_owned()),
+                        ("Connection".to_owned(), "close".to_owned()),
+                    ];
+                    if let Some(authorization) = grant.authorization {
+                        headers.push(("Authorization".to_owned(), authorization));
+                    }
+                    let transport = token_transport(&self.inner.issuer_roots);
+                    let response = active(cx, grant.deadline, &self.inner.closed, cancellation, None, async {
+                        transport.request(cx, Method::Post, self.inner.token_endpoint.as_str(), headers, grant.body)
+                            .await.map_err(|_| ClientCredentialsError::Transport)
+                    }).await?;
+                    if response.status != 200 { return Err(ClientCredentialsError::TokenEndpointRejected); }
+                    validate_headers(&response.headers)?;
+                    if !response.trailers.is_empty() { return Err(ClientCredentialsError::InvalidToken); }
+                    self.inner.authentication.check()?;
+                    admit_token(&self.inner, &response.body, started)
                 }).await?;
-                if response.status != 200 { return Err(ClientCredentialsError::TokenEndpointRejected); }
-                validate_headers(&response.headers)?;
-                if !response.trailers.is_empty() { return Err(ClientCredentialsError::InvalidToken); }
-                self.inner.authentication.check()?;
-                let token = admit_token(&self.inner, &response.body, started)?;
                 check_context(cx, deadline)?;
                 if self.inner.closed.is_cancel_requested() { return Err(ClientCredentialsError::Closed); }
                 if cancellation.is_cancel_requested() { return Err(OAuthDiscoveryError::Cancelled.into()); }
@@ -759,7 +769,10 @@ async fn active<T>(
     let deadline = expiry_deadline.map_or(deadline, |expiry| deadline.min(expiry));
     let mut stopped = std::pin::pin!(owner.cancelled());
     let mut cancelled = std::pin::pin!(cancellation.cancelled());
-    let mut future = std::pin::pin!(future);
+    // Poll-time checks alone cannot wake a silent socket or host callback.
+    // Keep the exact snapshot's revocation registration inside the original
+    // lifetime guard; a newer generation cannot replace this signal.
+    let mut future = std::pin::pin!(unless_revoked(token.map(|snapshot| &snapshot.bearer.revoked), future));
     within(cx, deadline, async {
         Ok(poll_fn(|task| {
             if owner.is_cancel_requested() || stopped.as_mut().poll(task).is_ready() { return Poll::Ready(Err(ClientCredentialsError::Closed)); }

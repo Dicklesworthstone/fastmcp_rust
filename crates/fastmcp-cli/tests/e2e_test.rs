@@ -2424,23 +2424,18 @@ fn e2e_cli_inspect_http_bundle_rejects_mismatched_legacy_message_endpoint() {
     let sse_address = sse_listener
         .local_addr()
         .expect("read mismatch SSE fixture address");
-    let configured_listener =
-        TcpListener::bind("127.0.0.1:0").expect("bind configured message observer");
-    let configured_address = configured_listener
-        .local_addr()
-        .expect("read configured message observer address");
+    // The configured message route shares the SSE origin, as a valid legacy
+    // bundle must. Any request to it after the GET would queue on this same
+    // listener, where the observer below counts it.
+    let configured_route = sse_listener
+        .try_clone()
+        .expect("clone the SSE listener to observe the configured route");
     let advertised_listener =
         TcpListener::bind("127.0.0.1:0").expect("bind advertised message observer");
     let advertised_address = advertised_listener
         .local_addr()
         .expect("read advertised message observer address");
-    let configured_contacts = Arc::new(AtomicUsize::new(0));
     let advertised_contacts = Arc::new(AtomicUsize::new(0));
-    let configured_observer = spawn_forbidden_http_contact_observer(
-        configured_listener,
-        Arc::clone(&configured_contacts),
-        "configured message",
-    );
     let advertised_observer = spawn_forbidden_http_contact_observer(
         advertised_listener,
         Arc::clone(&advertised_contacts),
@@ -2460,7 +2455,7 @@ fn e2e_cli_inspect_http_bundle_rejects_mismatched_legacy_message_endpoint() {
     });
     let modern_url = format!("http://{sse_address}/mcp");
     let legacy_sse_url = format!("http://{sse_address}/legacy-sse");
-    let configured_message_url = format!("http://{configured_address}/legacy-message");
+    let configured_message_url = format!("http://{sse_address}/legacy-message");
 
     let output = inspect_http_bundle(
         "legacy-only",
@@ -2472,7 +2467,18 @@ fn e2e_cli_inspect_http_bundle_rejects_mismatched_legacy_message_endpoint() {
         !output.status.success(),
         "changing only the SSE-advertised message target must reject the bundle"
     );
+    let stderr = stderr_str(&output);
+    assert!(
+        stderr.contains("differs from configured target"),
+        "the refusal must be the advertised-target mismatch after the endpoint event: {stderr}"
+    );
     wait_for_loopback_fixture(fixture, "mismatch legacy SSE fixture");
+    let configured_contacts = Arc::new(AtomicUsize::new(0));
+    let configured_observer = spawn_forbidden_http_contact_observer(
+        configured_route,
+        Arc::clone(&configured_contacts),
+        "configured message",
+    );
     stop_forbidden_http_contact_observer(configured_observer, "configured message");
     stop_forbidden_http_contact_observer(advertised_observer, "advertised message");
     assert_eq!(
@@ -2484,6 +2490,63 @@ fn e2e_cli_inspect_http_bundle_rejects_mismatched_legacy_message_endpoint() {
         advertised_contacts.load(Ordering::SeqCst),
         0,
         "a mismatched legacy endpoint must not contact the advertised foreign route"
+    );
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[test]
+fn e2e_cli_inspect_http_bundle_refuses_cross_origin_legacy_configuration_before_contact() {
+    // The test above with one variable changed: the configured message URL
+    // names a different port from the SSE URL. The client refuses such a
+    // bundle before any request, so neither route is ever contacted.
+    let sse_listener = TcpListener::bind("127.0.0.1:0").expect("bind legacy SSE observer");
+    let sse_address = sse_listener
+        .local_addr()
+        .expect("read legacy SSE observer address");
+    let configured_listener =
+        TcpListener::bind("127.0.0.1:0").expect("bind configured message observer");
+    let configured_address = configured_listener
+        .local_addr()
+        .expect("read configured message observer address");
+    let sse_contacts = Arc::new(AtomicUsize::new(0));
+    let configured_contacts = Arc::new(AtomicUsize::new(0));
+    let sse_observer = spawn_forbidden_http_contact_observer(
+        sse_listener,
+        Arc::clone(&sse_contacts),
+        "legacy SSE",
+    );
+    let configured_observer = spawn_forbidden_http_contact_observer(
+        configured_listener,
+        Arc::clone(&configured_contacts),
+        "configured message",
+    );
+
+    let output = inspect_http_bundle(
+        "legacy-only",
+        &format!("http://{sse_address}/mcp"),
+        &format!("http://{sse_address}/legacy-sse"),
+        &format!("http://{configured_address}/legacy-message"),
+    );
+    assert!(
+        !output.status.success(),
+        "a cross-origin legacy message URL must reject the bundle"
+    );
+    let stderr = stderr_str(&output);
+    assert!(
+        stderr.contains("must be safe resources on the same origin"),
+        "the refusal must be the configuration check, before contact: {stderr}"
+    );
+    stop_forbidden_http_contact_observer(sse_observer, "legacy SSE");
+    stop_forbidden_http_contact_observer(configured_observer, "configured message");
+    assert_eq!(
+        sse_contacts.load(Ordering::SeqCst),
+        0,
+        "a cross-origin configuration must not open the legacy SSE GET"
+    );
+    assert_eq!(
+        configured_contacts.load(Ordering::SeqCst),
+        0,
+        "a cross-origin configuration must not contact the configured message route"
     );
 }
 
