@@ -12,7 +12,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
-#[cfg(feature = "tasks")]
 use std::time::Instant;
 
 use asupersync::Cx;
@@ -853,22 +852,82 @@ const RELAYED_TASK_RESULT_MEMBER: &str = "io.fastmcp.proxy.relayed-task-result";
 /// belong to their individual upstream responses. Retaining one record per
 /// page keeps both the arbitrary-width TTL token and the selected sharing
 /// scope available to callers without inventing a synthetic aggregate policy.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ProxyCatalogCacheHint {
     /// Exact upstream final cache lifetime.
     pub ttl_ms: CacheTtl,
     /// Exact upstream final cache sharing scope.
     pub cache_scope: CacheScope,
+    /// Monotonic acquisition time; cloning a catalog must not renew its age.
+    observed_at: Instant,
 }
 
 impl ProxyCatalogCacheHint {
-    fn new(ttl_ms: CacheTtl, cache_scope: CacheScope) -> Self {
+    /// Records a cache policy when its upstream page is acquired.
+    ///
+    /// The exact wire lifetime remains available in [`Self::ttl_ms`]. Gateway
+    /// publication separately accounts for the elapsed lifetime of this
+    /// snapshot instead of issuing a fresh lifetime whenever it is listed.
+    #[must_use]
+    pub fn new(ttl_ms: CacheTtl, cache_scope: CacheScope) -> Self {
         Self {
             ttl_ms,
             cache_scope,
+            observed_at: Instant::now(),
         }
     }
+
+    /// Returns the still-valid local cache lifetime, rounded down to whole
+    /// milliseconds. Unrepresentable lifetimes cannot authorize caching.
+    pub(crate) fn remaining_ttl_ms(&self, now: Instant) -> u64 {
+        let Ok(ttl_ms) = self.ttl_ms.try_as_millis() else {
+            return 0;
+        };
+        let Some(elapsed) = now.checked_duration_since(self.observed_at) else {
+            return 0;
+        };
+        let elapsed_ms = elapsed.as_nanos().div_ceil(1_000_000);
+        ttl_ms.saturating_sub(u64::try_from(elapsed_ms).unwrap_or(u64::MAX))
+    }
+
+    /// Combines page policies without increasing any page's remaining lifetime
+    /// or widening private scope. The resulting bound occupies constant space
+    /// and keeps its acquisition time when merged into another catalog later.
+    pub(crate) fn conservative_merge<'a>(
+        hints: impl IntoIterator<Item = &'a Self>,
+    ) -> Option<Self> {
+        Self::conservative_merge_at(hints, Instant::now())
+    }
+
+    fn conservative_merge_at<'a>(
+        hints: impl IntoIterator<Item = &'a Self>,
+        now: Instant,
+    ) -> Option<Self> {
+        let mut hints = hints.into_iter();
+        let first = hints.next()?;
+        let mut ttl_ms = first.remaining_ttl_ms(now);
+        let mut cache_scope = first.cache_scope;
+        for hint in hints {
+            ttl_ms = ttl_ms.min(hint.remaining_ttl_ms(now));
+            if hint.cache_scope == CacheScope::Private {
+                cache_scope = CacheScope::Private;
+            }
+        }
+        Some(Self {
+            ttl_ms: CacheTtl::milliseconds(ttl_ms),
+            cache_scope,
+            observed_at: now,
+        })
+    }
 }
+
+impl PartialEq for ProxyCatalogCacheHint {
+    fn eq(&self, other: &Self) -> bool {
+        self.ttl_ms == other.ttl_ms && self.cache_scope == other.cache_scope
+    }
+}
+
+impl Eq for ProxyCatalogCacheHint {}
 
 /// Materialized final catalog entries plus each upstream page's cache policy.
 #[derive(Debug, Clone)]
@@ -22136,6 +22195,181 @@ IFS= read -r end
             retained_tool_wire,
             "the failed replacement cannot expose the first partial modern page"
         );
+    }
+
+    #[test]
+    fn proxy_catalog_cache_hint_remaining_ttl_ages_without_renewal() {
+        let observed_at = Instant::now();
+        let hint = ProxyCatalogCacheHint {
+            ttl_ms: CacheTtl::milliseconds(100),
+            cache_scope: CacheScope::Public,
+            observed_at,
+        };
+        for (elapsed, expected) in [
+            (Duration::ZERO, 100),
+            (Duration::from_nanos(1), 99),
+            (Duration::from_millis(1), 99),
+            (Duration::from_nanos(1_000_001), 98),
+            (Duration::from_millis(99), 1),
+            (Duration::from_millis(100), 0),
+            (Duration::from_secs(1), 0),
+        ] {
+            assert_eq!(hint.remaining_ttl_ms(observed_at + elapsed), expected);
+            assert_eq!(
+                hint.clone().remaining_ttl_ms(observed_at + elapsed),
+                expected,
+                "cloning a retained catalog cannot refresh its lifetime"
+            );
+        }
+        assert_eq!(hint.ttl_ms.as_str(), "100");
+
+        let future_hint = ProxyCatalogCacheHint {
+            observed_at: observed_at + Duration::from_millis(1),
+            ..hint
+        };
+        assert_eq!(
+            future_hint.remaining_ttl_ms(observed_at),
+            0,
+            "an invalid observation order cannot grant additional freshness"
+        );
+    }
+
+    #[test]
+    fn proxy_catalog_cache_hint_unrepresentable_ttl_is_not_cacheable() {
+        let observed_at = Instant::now();
+        for wire_ttl in [
+            "0",
+            "-0",
+            "0e10000",
+            "922337203685477580812345678901234567890",
+            "1e10000",
+        ] {
+            let ttl_ms = serde_json::from_str(wire_ttl)
+                .expect("the exact nonnegative integer is a valid final wire TTL");
+            let hint = ProxyCatalogCacheHint {
+                ttl_ms,
+                cache_scope: CacheScope::Public,
+                observed_at,
+            };
+            assert_eq!(hint.remaining_ttl_ms(observed_at), 0);
+            assert_eq!(hint.ttl_ms.as_str(), wire_ttl);
+            let merged = ProxyCatalogCacheHint::conservative_merge_at([&hint], observed_at)
+                .expect("one page contributes a cache bound");
+            assert_eq!(merged.remaining_ttl_ms(observed_at), 0);
+        }
+
+        let representable = ProxyCatalogCacheHint {
+            ttl_ms: serde_json::from_str("1e3").expect("exponent TTL is a valid integer"),
+            cache_scope: CacheScope::Public,
+            observed_at,
+        };
+        assert_eq!(representable.remaining_ttl_ms(observed_at), 1_000);
+        assert_eq!(representable.ttl_ms.as_str(), "1e3");
+    }
+
+    #[test]
+    fn proxy_catalog_cache_hint_merge_keeps_minimum_and_private_scope() {
+        let observed_at = Instant::now();
+        let public = ProxyCatalogCacheHint {
+            ttl_ms: CacheTtl::milliseconds(50),
+            cache_scope: CacheScope::Public,
+            observed_at,
+        };
+        let private = ProxyCatalogCacheHint {
+            ttl_ms: CacheTtl::milliseconds(100),
+            cache_scope: CacheScope::Private,
+            observed_at,
+        };
+        assert!(ProxyCatalogCacheHint::conservative_merge_at([], observed_at).is_none());
+        for hints in [[&public, &private], [&private, &public]] {
+            let merged = ProxyCatalogCacheHint::conservative_merge_at(hints, observed_at)
+                .expect("both pages contribute to the merged catalog");
+            assert_eq!(merged.remaining_ttl_ms(observed_at), 50);
+            assert_eq!(merged.cache_scope, CacheScope::Private);
+        }
+
+        let also_public = ProxyCatalogCacheHint {
+            cache_scope: CacheScope::Public,
+            ..private.clone()
+        };
+        let merged =
+            ProxyCatalogCacheHint::conservative_merge_at([&public, &also_public], observed_at)
+                .expect("two public pages admit a public ceiling");
+        assert_eq!(merged.remaining_ttl_ms(observed_at), 50);
+        assert_eq!(merged.cache_scope, CacheScope::Public);
+
+        let no_cache = ProxyCatalogCacheHint {
+            ttl_ms: CacheTtl::milliseconds(0),
+            ..public.clone()
+        };
+        let merged = ProxyCatalogCacheHint::conservative_merge_at(
+            [&public, &private, &no_cache],
+            observed_at,
+        )
+        .expect("the no-cache page remains a contributing policy");
+        assert_eq!(merged.remaining_ttl_ms(observed_at), 0);
+        assert_eq!(merged.cache_scope, CacheScope::Private);
+    }
+
+    #[test]
+    fn proxy_catalog_cache_hint_merge_preserves_existing_age() {
+        let observed_at = Instant::now();
+        let original = ProxyCatalogCacheHint {
+            ttl_ms: CacheTtl::milliseconds(100),
+            cache_scope: CacheScope::Private,
+            observed_at,
+        };
+        let first_merge_at = observed_at + Duration::from_millis(20);
+        let first = ProxyCatalogCacheHint::conservative_merge_at([&original], first_merge_at)
+            .expect("first upstream snapshot contributes a lifetime");
+        assert_eq!(first.remaining_ttl_ms(first_merge_at), 80);
+
+        let second_merge_at = observed_at + Duration::from_millis(70);
+        let later = ProxyCatalogCacheHint {
+            ttl_ms: CacheTtl::milliseconds(1_000),
+            cache_scope: CacheScope::Public,
+            observed_at: second_merge_at,
+        };
+        let second =
+            ProxyCatalogCacheHint::conservative_merge_at([&first, &later], second_merge_at)
+                .expect("a later upstream does not renew the first catalog");
+        assert_eq!(second.remaining_ttl_ms(second_merge_at), 30);
+        assert_eq!(second.cache_scope, CacheScope::Private);
+        assert_eq!(
+            second.remaining_ttl_ms(observed_at + Duration::from_millis(100)),
+            0,
+            "the merged catalog expires at its earliest source expiry"
+        );
+
+        let expired_at = observed_at + Duration::from_millis(101);
+        let third = ProxyCatalogCacheHint::conservative_merge_at([&second, &later], expired_at)
+            .expect("an expired source remains a no-cache constraint");
+        assert_eq!(third.remaining_ttl_ms(expired_at), 0);
+    }
+
+    #[test]
+    fn proxy_catalog_cache_hint_equality_retains_wire_semantics() {
+        let original = ProxyCatalogCacheHint::new(CacheTtl::milliseconds(100), CacheScope::Public);
+        let later = ProxyCatalogCacheHint {
+            observed_at: original.observed_at + Duration::from_millis(10),
+            ..original.clone()
+        };
+        assert_eq!(original, later);
+        assert_ne!(
+            original.remaining_ttl_ms(later.observed_at),
+            later.remaining_ttl_ms(later.observed_at),
+            "wire equality does not erase an independently observed age"
+        );
+        let private = ProxyCatalogCacheHint {
+            cache_scope: CacheScope::Private,
+            ..original.clone()
+        };
+        assert_ne!(original, private);
+        let longer = ProxyCatalogCacheHint {
+            ttl_ms: CacheTtl::milliseconds(101),
+            ..original.clone()
+        };
+        assert_ne!(original, longer);
     }
 
     #[test]

@@ -24,6 +24,8 @@ use crate::handler::{
     BoxedCompletionHandler, BoxedPromptHandler, BoxedResourceHandler, BoxedToolHandler,
     CompletionHandler, PromptHandler, ResourceHandler, ToolErrorKind, ToolHandler,
 };
+#[cfg(feature = "proxy")]
+use crate::proxy::ProxyCatalogCacheHint;
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 use crate::proxy::ProxyFinalTaskRelay;
 use crate::session::SessionPrincipalBinding;
@@ -2147,6 +2149,10 @@ pub struct Router {
     final_catalog_protector: std::sync::Mutex<Option<EphemeralEnvelopeProtector>>,
     /// Cache policy emitted on exact modern catalog and resource-read results.
     final_cache_hints: FinalCacheHintPolicy,
+    /// Independent upstream freshness and sharing ceilings for tools, resources,
+    /// resource templates, and prompts. Local policy can only narrow them.
+    #[cfg(feature = "proxy")]
+    proxy_catalog_cache_hints: [Option<ProxyCatalogCacheHint>; 4],
     /// Application-owned durable final Tasks runtime used only after the
     /// request metadata has admitted the official extension.
     #[cfg(feature = "tasks")]
@@ -2190,6 +2196,8 @@ impl Router {
             final_catalog_revision: 0,
             final_catalog_protector: std::sync::Mutex::new(None),
             final_cache_hints: FinalCacheHintPolicy::default(),
+            #[cfg(feature = "proxy")]
+            proxy_catalog_cache_hints: std::array::from_fn(|_| None),
             #[cfg(feature = "tasks")]
             final_task_runtime: None,
             #[cfg(all(feature = "proxy", feature = "tasks"))]
@@ -2424,8 +2432,31 @@ impl Router {
         Ok((items[offset..end].to_vec(), next_cursor))
     }
 
-    fn final_catalog_cache_hints(&self) -> FinalCacheHintPolicy {
+    fn final_catalog_cache_hints(&self, catalog: FinalCatalogKind) -> FinalCacheHintPolicy {
         let mut hints = self.final_cache_hints.clone();
+        #[cfg(feature = "proxy")]
+        {
+            let index = match catalog {
+                FinalCatalogKind::Tools => 0,
+                FinalCatalogKind::Resources => 1,
+                FinalCatalogKind::ResourceTemplates => 2,
+                FinalCatalogKind::Prompts => 3,
+            };
+            if let Some(upstream) = &self.proxy_catalog_cache_hints[index] {
+                // An upstream snapshot does not become fresh again when a
+                // downstream client lists it. Intersect its remaining age-
+                // adjusted lifetime with the current application policy.
+                let local_ttl = hints.list_ttl_ms.try_as_millis().unwrap_or(0);
+                hints.list_ttl_ms = CacheTtl::milliseconds(
+                    local_ttl.min(upstream.remaining_ttl_ms(std::time::Instant::now())),
+                );
+                if upstream.cache_scope == CacheScope::Private {
+                    hints.scope = CacheScope::Private;
+                }
+            }
+        }
+        #[cfg(not(feature = "proxy"))]
+        let _ = catalog;
         if self.list_page_size.is_some() {
             // A cached copy cannot renew an expiring cursor's lifetime. Until
             // every cache propagates exact age/remaining validity, return the
@@ -2438,6 +2469,61 @@ impl Router {
         hints
     }
 
+    /// Retains bounded per-family upstream ceilings after catalog admission.
+    /// This is separate from application policy so later policy changes cannot
+    /// renew an upstream snapshot or broaden its sharing scope.
+    #[cfg(feature = "proxy")]
+    pub(crate) fn constrain_final_proxy_catalog_cache_hints(
+        &mut self,
+        tools: &[ProxyCatalogCacheHint],
+        resources: &[ProxyCatalogCacheHint],
+        resource_templates: &[ProxyCatalogCacheHint],
+        prompts: &[ProxyCatalogCacheHint],
+    ) {
+        let families = [tools, resources, resource_templates, prompts];
+        if families.iter().all(|hints| hints.is_empty()) {
+            return;
+        }
+        for (retained, incoming) in self.proxy_catalog_cache_hints.iter_mut().zip(families) {
+            if !incoming.is_empty() {
+                *retained = ProxyCatalogCacheHint::conservative_merge(
+                    retained.iter().chain(incoming.iter()),
+                );
+            }
+        }
+        // Empty upstream pages can still tighten the response policy without
+        // adding a handler, and existing cursors must bind that policy change.
+        self.advance_final_catalog_revision();
+    }
+
+    #[cfg(feature = "proxy")]
+    fn constrain_mounted_proxy_catalog_cache_hints(
+        &mut self,
+        source: &Self,
+        selection: MountSelection,
+        preserve_final_resources: bool,
+    ) {
+        let source = &source.proxy_catalog_cache_hints;
+        let tools = if matches!(selection, MountSelection::All | MountSelection::Tools) {
+            source[0].as_slice()
+        } else {
+            &[]
+        };
+        let (resources, templates) = if preserve_final_resources
+            && matches!(selection, MountSelection::All | MountSelection::Resources)
+        {
+            (source[1].as_slice(), source[2].as_slice())
+        } else {
+            (&[][..], &[][..])
+        };
+        let prompts = if matches!(selection, MountSelection::All | MountSelection::Prompts) {
+            source[3].as_slice()
+        } else {
+            &[]
+        };
+        self.constrain_final_proxy_catalog_cache_hints(tools, resources, templates, prompts);
+    }
+
     fn advance_final_catalog_revision(&mut self) {
         self.final_catalog_revision = self
             .final_catalog_revision
@@ -2445,9 +2531,10 @@ impl Router {
             .expect("final catalog revision cannot overflow");
     }
 
-    /// Sets the cache hints emitted by final catalog and resource-read
+/// Sets the application cache policy for final catalog and resource-read
     /// responses. The default is a five-minute private catalog TTL and a
-    /// one-hour private resource-read TTL.
+    /// one-hour private resource-read TTL. Catalog responses additionally
+    /// respect any upstream proxy's remaining lifetime and private scope.
     pub fn set_final_cache_hint_policy(
         &mut self,
         list_ttl_ms: CacheTtl,
@@ -2461,7 +2548,7 @@ impl Router {
         };
     }
 
-    /// Returns the active final cache-hint policy as
+/// Returns the configured application cache policy as
     /// `(&list_ttl_ms, &resource_read_ttl_ms, scope)`.
     #[must_use]
     pub fn final_cache_hint_policy(&self) -> (&CacheTtl, &CacheTtl, CacheScope) {
@@ -5149,7 +5236,11 @@ impl Router {
             &query,
         )?;
         let result = ListToolsResult { tools, next_cursor };
-        self.project_final_tools_list(request_ctx, result, self.final_catalog_cache_hints())
+        self.project_final_tools_list(
+            request_ctx,
+            result,
+            self.final_catalog_cache_hints(FinalCatalogKind::Tools),
+        )
     }
 
     fn project_final_tools_list(
@@ -5219,7 +5310,7 @@ impl Router {
             FinalCatalogKind::Resources,
             &query,
         )?;
-        let hints = self.final_catalog_cache_hints();
+        let hints = self.final_catalog_cache_hints(FinalCatalogKind::Resources);
         Ok(FinalListResourcesResult {
             resources,
             next_cursor,
@@ -5263,7 +5354,7 @@ impl Router {
             FinalCatalogKind::ResourceTemplates,
             &query,
         )?;
-        let hints = self.final_catalog_cache_hints();
+        let hints = self.final_catalog_cache_hints(FinalCatalogKind::ResourceTemplates);
         Ok(FinalListResourceTemplatesResult {
             resource_templates,
             next_cursor,
@@ -5302,7 +5393,7 @@ impl Router {
             FinalCatalogKind::Prompts,
             &query,
         )?;
-        let hints = self.final_catalog_cache_hints();
+        let hints = self.final_catalog_cache_hints(FinalCatalogKind::Prompts);
         Ok(FinalListPromptsResult {
             prompts,
             next_cursor,
@@ -6901,6 +6992,13 @@ impl Router {
             return preflight;
         }
 
+        #[cfg(feature = "proxy")]
+        self.constrain_mounted_proxy_catalog_cache_hints(
+            &other,
+            MountSelection::All,
+            Self::prefix_preserves_keys(prefix),
+        );
+
         let mut result = preflight;
         let preexisting_prompts = self.completion_prompt_keys();
         let preexisting_templates = self
@@ -7012,6 +7110,9 @@ impl Router {
             return preflight;
         }
 
+        #[cfg(feature = "proxy")]
+        self.constrain_mounted_proxy_catalog_cache_hints(&other, MountSelection::All, true);
+
         let mut result = preflight;
         let preexisting_prompts = self.completion_prompt_keys();
         let preexisting_templates = self
@@ -7111,6 +7212,8 @@ impl Router {
         if !preflight.is_success() {
             return preflight;
         }
+        #[cfg(feature = "proxy")]
+        self.constrain_mounted_proxy_catalog_cache_hints(&other, MountSelection::Tools, false);
         let result = self.mount_tools_from(other.tools, other.tool_order, prefix, behavior);
         if result.has_components() {
             self.advance_final_catalog_revision();
@@ -7205,6 +7308,13 @@ impl Router {
         if !preflight.is_success() {
             return preflight;
         }
+
+        #[cfg(feature = "proxy")]
+        self.constrain_mounted_proxy_catalog_cache_hints(
+            &other,
+            MountSelection::Resources,
+            Self::prefix_preserves_keys(prefix),
+        );
 
         let preexisting_templates = self
             .resource_templates
@@ -7625,6 +7735,8 @@ impl Router {
         if !preflight.is_success() {
             return preflight;
         }
+        #[cfg(feature = "proxy")]
+        self.constrain_mounted_proxy_catalog_cache_hints(&other, MountSelection::Prompts, false);
         let preexisting_prompts = self.completion_prompt_keys();
         let Router {
             prompts,

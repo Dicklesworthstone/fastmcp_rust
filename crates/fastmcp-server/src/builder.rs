@@ -1626,6 +1626,13 @@ impl ServerBuilder {
             }
         }
 
+        self.router.constrain_final_proxy_catalog_cache_hints(
+            &catalog.final_tool_cache_hints,
+            &catalog.final_resource_cache_hints,
+            &catalog.final_resource_template_cache_hints,
+            &catalog.final_prompt_cache_hints,
+        );
+
         if has_tools {
             self.advertise_legacy_tools_list_changed();
         }
@@ -1915,7 +1922,7 @@ impl ServerBuilder {
                     resource_templates.len(),
                     prompts.len(),
                 );
-                for tool in tools {
+                for tool in tools.entries {
                     #[cfg(feature = "tasks")]
                     let handler = match task_relay.as_ref() {
                         Some(task_relay) => ProxyToolHandler::with_prefix_final_with_task_relay(
@@ -1943,7 +1950,7 @@ impl ServerBuilder {
                         Self::absorb_prefixed_proxy_duplicate(error)?;
                     }
                 }
-                for resource in resources {
+                for resource in resources.entries {
                     if let Err(error) = self.router.add_final_resource_with_behavior(
                         FinalProxyResourceHandler::new(resource, proxy_client.clone()),
                         self.on_duplicate,
@@ -1956,7 +1963,7 @@ impl ServerBuilder {
                         Self::absorb_prefixed_proxy_duplicate(error)?;
                     }
                 }
-                for template in resource_templates {
+                for template in resource_templates.entries {
                     let downstream_uri = template.uri_template.clone();
                     let completion_target_admitted =
                         self.proxy_resource_template_wins_admission(&downstream_uri);
@@ -1986,7 +1993,7 @@ impl ServerBuilder {
                         }
                     }
                 }
-                for prompt in prompts {
+                for prompt in prompts.entries {
                     let upstream_name = prompt.name.clone();
                     let downstream_name = format!("{prefix}/{upstream_name}");
                     let completion_target_admitted =
@@ -2017,6 +2024,12 @@ impl ServerBuilder {
                         }
                     }
                 }
+                self.router.constrain_final_proxy_catalog_cache_hints(
+                    &tools.cache_hints,
+                    &resources.cache_hints,
+                    &resource_templates.cache_hints,
+                    &prompts.cache_hints,
+                );
                 counts
             }
             _ => {
@@ -2227,7 +2240,7 @@ impl ServerBuilder {
                 let has_tools = !tools.is_empty();
                 let has_resources = !resources.is_empty() || !resource_templates.is_empty();
                 let has_prompts = !prompts.is_empty();
-                for tool in tools {
+                for tool in tools.entries {
                     // Complete-only registration: a live echo/tool catalog must
                     // not require the official Tasks client extension merely
                     // because the upstream server advertises Tasks. The route
@@ -2236,13 +2249,13 @@ impl ServerBuilder {
                     self.router
                         .add_final_tool_with_behavior(handler, self.on_duplicate)?;
                 }
-                for resource in resources {
+                for resource in resources.entries {
                     self.router.add_final_resource_with_behavior(
                         FinalProxyResourceHandler::new(resource, proxy_client.clone()),
                         self.on_duplicate,
                     )?;
                 }
-                for template in resource_templates {
+                for template in resource_templates.entries {
                     let downstream_uri = template.uri_template.clone();
                     let completion_target_admitted =
                         self.proxy_resource_template_wins_admission(&downstream_uri);
@@ -2262,7 +2275,7 @@ impl ServerBuilder {
                         self.advertise_completions();
                     }
                 }
-                for prompt in prompts {
+                for prompt in prompts.entries {
                     let downstream_name = prompt.name.clone();
                     let completion_target_admitted =
                         self.proxy_prompt_wins_admission(&downstream_name);
@@ -2282,6 +2295,12 @@ impl ServerBuilder {
                         self.advertise_completions();
                     }
                 }
+                self.router.constrain_final_proxy_catalog_cache_hints(
+                    &tools.cache_hints,
+                    &resources.cache_hints,
+                    &resource_templates.cache_hints,
+                    &prompts.cache_hints,
+                );
                 if has_tools {
                     self.advertise_legacy_tools_list_changed();
                 }
@@ -5287,6 +5306,8 @@ mod tests {
     #[cfg(feature = "proxy")]
     mod proxy_registration_tests {
         use super::*;
+        use crate::proxy::ProxyCatalogCacheHint;
+        use fastmcp_protocol::{CacheScope, CacheTtl};
 
         // ── Proxy registration ─────────────────────────────────────────
 
@@ -7483,6 +7504,452 @@ mod tests {
                 legacy_prompt.code,
                 fastmcp_core::McpErrorCode::PromptNotFound
             );
+        }
+
+        fn cache_policy_proxy_catalog(
+            policies: [Vec<ProxyCatalogCacheHint>; 4],
+        ) -> ProxyTypedCatalog {
+            let [tools, resources, resource_templates, prompts] = policies;
+            ProxyTypedCatalog {
+                tools: ProxyToolCatalog::Final(ProxyFinalCatalog {
+                    entries: final_proxy_catalog().final_tools,
+                    cache_hints: tools,
+                }),
+                resources: ProxyResourceCatalog::Final(ProxyFinalCatalog {
+                    entries: vec![
+                        serde_json::from_value(serde_json::json!({
+                            "uri": "mcp://cache-policy/resource",
+                            "name": "cached-resource",
+                            "size": 4096,
+                            "_meta": {"com.example/cache": {"retained": true}}
+                        }))
+                        .expect("the final resource fixture is valid"),
+                    ],
+                    cache_hints: resources,
+                }),
+                resource_templates: ProxyResourceTemplateCatalog::Final(ProxyFinalCatalog {
+                    entries: vec![
+                        serde_json::from_value(serde_json::json!({
+                            "uriTemplate": "mcp://cache-policy/templates/{name}",
+                            "name": "cached-template",
+                            "_meta": {"com.example/cache": {"retained": true}}
+                        }))
+                        .expect("the final resource-template fixture is valid"),
+                    ],
+                    cache_hints: resource_templates,
+                }),
+                prompts: ProxyPromptCatalog::Final(ProxyFinalCatalog {
+                    entries: vec![
+                        serde_json::from_value(serde_json::json!({
+                            "name": "cached-prompt",
+                            "arguments": [{"name": "region", "title": "Region"}],
+                            "_meta": {"com.example/cache": {"retained": true}}
+                        }))
+                        .expect("the final prompt fixture is valid"),
+                    ],
+                    cache_hints: prompts,
+                }),
+            }
+        }
+
+        fn cached_proxy_list(server: &crate::Server, method: &str) -> serde_json::Value {
+            let inbound = crate::InboundRequestContext::new(
+                Cx::for_testing(),
+                720,
+                crate::InboundRequestTransport::Memory,
+            );
+            let response = fastmcp_core::block_on(server.dispatch_stateless(
+                &inbound,
+                &JsonRpcRequest::new(
+                    method,
+                    Some(serde_json::json!({
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                    })),
+                    720_i64,
+                ),
+            ))
+            .expect("the public final catalog dispatch succeeds");
+            assert!(
+                response.error.is_none(),
+                "catalog error: {:?}",
+                response.error
+            );
+            response.result.expect("the final catalog has a result")
+        }
+
+        fn set_proxy_test_cache_policy(builder: &mut ServerBuilder, ttl: u64, scope: CacheScope) {
+            builder.router.set_final_cache_hint_policy(
+                CacheTtl::milliseconds(ttl),
+                CacheTtl::milliseconds(3_600_000),
+                scope,
+            );
+        }
+
+        #[test]
+        fn public_proxy_registration_preserves_catalog_cache_families() {
+            // Change only the upstream page policy between the positive and
+            // planted cases, exercising all three public registration paths.
+            for registration in ["prefixed", "typed", "catalog"] {
+                for restricted in [false, true] {
+                    let policies = [
+                        (if restricted { 0 } else { 60_000 }, CacheScope::Public),
+                        (
+                            120_000,
+                            if restricted {
+                                CacheScope::Private
+                            } else {
+                                CacheScope::Public
+                            },
+                        ),
+                        (180_000, CacheScope::Public),
+                        (240_000, CacheScope::Public),
+                    ];
+                    let typed = cache_policy_proxy_catalog(policies.map(|(ttl, scope)| {
+                        vec![ProxyCatalogCacheHint::new(
+                            CacheTtl::milliseconds(ttl),
+                            scope,
+                        )]
+                    }));
+                    let client =
+                        bound_proxy_client(DuplicatePolicyProxyBackend, ProtocolEra::Modern2026);
+                    let builder = ServerBuilder::new("cache-policy-gateway", "1.0");
+                    let mut builder = match registration {
+                        "prefixed" => builder.as_proxy_typed("upstream", client, typed),
+                        "typed" => builder.proxy_typed(client, typed),
+                        "catalog" => {
+                            let ProxyTypedCatalog {
+                                tools: ProxyToolCatalog::Final(tools),
+                                resources: ProxyResourceCatalog::Final(resources),
+                                resource_templates: ProxyResourceTemplateCatalog::Final(templates),
+                                prompts: ProxyPromptCatalog::Final(prompts),
+                            } = typed
+                            else {
+                                panic!("the cache fixture is exact final");
+                            };
+                            builder.proxy(
+                                client,
+                                ProxyCatalog {
+                                    tool_catalog_era: Some(ProtocolEra::Modern2026),
+                                    final_tools: tools.entries,
+                                    final_tool_cache_hints: tools.cache_hints,
+                                    final_resources: resources.entries,
+                                    final_resource_cache_hints: resources.cache_hints,
+                                    final_resource_templates: templates.entries,
+                                    final_resource_template_cache_hints: templates.cache_hints,
+                                    final_prompts: prompts.entries,
+                                    final_prompt_cache_hints: prompts.cache_hints,
+                                    ..ProxyCatalog::default()
+                                },
+                            )
+                        }
+                        _ => unreachable!("the registration paths are fixed"),
+                    }
+                    .expect("the public proxy registration succeeds");
+                    // An application setter after registration must not erase
+                    // the independently retained upstream bounds.
+                    set_proxy_test_cache_policy(&mut builder, 600_000, CacheScope::Public);
+                    let server = builder.build();
+                    for ((method, member), (ttl, scope)) in [
+                        ("tools/list", "tools"),
+                        ("resources/list", "resources"),
+                        ("resources/templates/list", "resourceTemplates"),
+                        ("prompts/list", "prompts"),
+                    ]
+                    .into_iter()
+                    .zip(policies)
+                    {
+                        let result = cached_proxy_list(&server, method);
+                        let actual_ttl = result["ttlMs"].as_u64().expect("bounded numeric TTL");
+                        assert!(
+                            actual_ttl <= ttl,
+                            "{registration} {method} widened its upstream TTL"
+                        );
+                        if ttl > 0 {
+                            assert!(
+                                actual_ttl > 0,
+                                "fresh public or private catalogs remain cacheable"
+                            );
+                        }
+                        assert_eq!(
+                            result["cacheScope"],
+                            match scope {
+                                CacheScope::Public => "public",
+                                CacheScope::Private => "private",
+                            }
+                        );
+                        assert_eq!(result[member].as_array().map(Vec::len), Some(1));
+                        if member != "tools" {
+                            assert_eq!(
+                                result[member][0]["_meta"]["com.example/cache"]["retained"],
+                                true
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn public_as_proxy_typed_combines_page_and_route_cache_ceilings() {
+            for reverse in [false, true] {
+                let first = cache_policy_proxy_catalog([
+                    vec![
+                        ProxyCatalogCacheHint::new(
+                            CacheTtl::milliseconds(120_000),
+                            CacheScope::Public,
+                        ),
+                        ProxyCatalogCacheHint::new(
+                            CacheTtl::milliseconds(90_000),
+                            CacheScope::Public,
+                        ),
+                    ],
+                    vec![ProxyCatalogCacheHint::new(
+                        CacheTtl::milliseconds(120_000),
+                        CacheScope::Public,
+                    )],
+                    vec![ProxyCatalogCacheHint::new(
+                        CacheTtl::milliseconds(180_000),
+                        CacheScope::Public,
+                    )],
+                    vec![ProxyCatalogCacheHint::new(
+                        CacheTtl::milliseconds(240_000),
+                        CacheScope::Public,
+                    )],
+                ]);
+                let mut second = cache_policy_proxy_catalog([
+                    vec![ProxyCatalogCacheHint::new(
+                        CacheTtl::milliseconds(60_000),
+                        CacheScope::Private,
+                    )],
+                    vec![ProxyCatalogCacheHint::new(
+                        CacheTtl::milliseconds(0),
+                        CacheScope::Private,
+                    )],
+                    Vec::new(),
+                    Vec::new(),
+                ]);
+                let ProxyResourceCatalog::Final(resources) = &mut second.resources else {
+                    panic!("the fixture selects exact final resources");
+                };
+                resources.entries.clear();
+                let ProxyResourceTemplateCatalog::Final(templates) = &mut second.resource_templates
+                else {
+                    panic!("the fixture selects exact final templates");
+                };
+                templates.entries.clear();
+                let ProxyPromptCatalog::Final(prompts) = &mut second.prompts else {
+                    panic!("the fixture selects exact final prompts");
+                };
+                prompts.entries.clear();
+                let routes = if reverse {
+                    [("second", second), ("first", first)]
+                } else {
+                    [("first", first), ("second", second)]
+                };
+                let mut builder = ServerBuilder::new("cache-policy-union", "1.0");
+                set_proxy_test_cache_policy(&mut builder, 600_000, CacheScope::Public);
+                for (prefix, catalog) in routes {
+                    builder = builder
+                        .as_proxy_typed(
+                            prefix,
+                            bound_proxy_client(
+                                DuplicatePolicyProxyBackend,
+                                ProtocolEra::Modern2026,
+                            ),
+                            catalog,
+                        )
+                        .expect("each admitted upstream joins the gateway");
+                }
+                let server = builder.build();
+                let tools = cached_proxy_list(&server, "tools/list");
+                assert_eq!(tools["tools"].as_array().map(Vec::len), Some(2));
+                assert_eq!(tools["cacheScope"], "private");
+                assert!((1..=60_000).contains(&tools["ttlMs"].as_u64().unwrap()));
+                let resources = cached_proxy_list(&server, "resources/list");
+                assert_eq!(resources["resources"].as_array().map(Vec::len), Some(1));
+                assert_eq!(
+                    resources["ttlMs"], 0,
+                    "an empty upstream page still constrains freshness"
+                );
+                assert_eq!(resources["cacheScope"], "private");
+                for (method, ttl) in [
+                    ("resources/templates/list", 180_000),
+                    ("prompts/list", 240_000),
+                ] {
+                    let result = cached_proxy_list(&server, method);
+                    assert_eq!(
+                        result["cacheScope"], "public",
+                        "other catalog families retain their own sharing scope"
+                    );
+                    assert!((1..=ttl).contains(&result["ttlMs"].as_u64().unwrap()));
+                }
+            }
+        }
+
+        #[test]
+        fn public_as_proxy_typed_respects_local_cache_policy_in_either_order() {
+            for configure_after in [false, true] {
+                for local_ttl in [0, 30_000] {
+                    let catalog = cache_policy_proxy_catalog(std::array::from_fn(|_| {
+                        vec![ProxyCatalogCacheHint::new(
+                            CacheTtl::milliseconds(120_000),
+                            CacheScope::Public,
+                        )]
+                    }));
+                    let mut builder = ServerBuilder::new("cache-policy-local", "1.0");
+                    if !configure_after {
+                        set_proxy_test_cache_policy(&mut builder, local_ttl, CacheScope::Private);
+                    }
+                    builder = builder
+                        .as_proxy_typed(
+                            "upstream",
+                            bound_proxy_client(
+                                DuplicatePolicyProxyBackend,
+                                ProtocolEra::Modern2026,
+                            ),
+                            catalog,
+                        )
+                        .expect("the final proxy catalog registers");
+                    if configure_after {
+                        set_proxy_test_cache_policy(&mut builder, local_ttl, CacheScope::Private);
+                    }
+                    let server = builder.build();
+                    for method in [
+                        "tools/list",
+                        "resources/list",
+                        "resources/templates/list",
+                        "prompts/list",
+                    ] {
+                        let result = cached_proxy_list(&server, method);
+                        assert_eq!(result["ttlMs"], local_ttl);
+                        assert_eq!(result["cacheScope"], "private");
+                    }
+                    let router = server.into_router();
+                    assert_eq!(router.final_cache_hint_policy().1.as_str(), "3600000");
+                }
+            }
+        }
+
+        #[test]
+        fn public_proxy_catalog_without_upstream_hints_keeps_local_policy() {
+            let catalog = cache_policy_proxy_catalog(std::array::from_fn(|_| Vec::new()));
+            let mut builder = ServerBuilder::new("local-catalog-policy", "1.0")
+                .as_proxy_typed(
+                    "upstream",
+                    bound_proxy_client(DuplicatePolicyProxyBackend, ProtocolEra::Modern2026),
+                    catalog,
+                )
+                .expect("a locally supplied final catalog remains supported");
+            let wide_ttl: CacheTtl = serde_json::from_str("184467440737095516160000000")
+                .expect("the wire model permits an arbitrary-width cache lifetime");
+            builder.router.set_final_cache_hint_policy(
+                wide_ttl.clone(),
+                CacheTtl::milliseconds(1),
+                CacheScope::Public,
+            );
+            let server = builder.build();
+            for method in [
+                "tools/list",
+                "resources/list",
+                "resources/templates/list",
+                "prompts/list",
+            ] {
+                let result = cached_proxy_list(&server, method);
+                assert_eq!(result["ttlMs"].to_string(), wide_ttl.as_str());
+                assert_eq!(result["cacheScope"], "public");
+            }
+        }
+
+        #[test]
+        fn public_mounted_proxy_retains_only_selected_catalog_cache_ceilings() {
+            for selection in [
+                "all",
+                "prefixed_all",
+                "namespaced",
+                "tools",
+                "resources",
+                "prefixed_resources",
+                "prompts",
+            ] {
+                let policies = [
+                    (0, CacheScope::Private),
+                    (120_000, CacheScope::Public),
+                    (180_000, CacheScope::Private),
+                    (240_000, CacheScope::Public),
+                ];
+                let catalog = cache_policy_proxy_catalog(policies.map(|(ttl, scope)| {
+                    vec![ProxyCatalogCacheHint::new(
+                        CacheTtl::milliseconds(ttl),
+                        scope,
+                    )]
+                }));
+                let child = ServerBuilder::new("proxy-child", "1.0")
+                    .as_proxy_typed(
+                        "upstream",
+                        bound_proxy_client(DuplicatePolicyProxyBackend, ProtocolEra::Modern2026),
+                        catalog,
+                    )
+                    .expect("the source proxy installs")
+                    .build();
+                let parent = ServerBuilder::new("mounted-proxy-gateway", "1.0");
+                let mut parent = match selection {
+                    "all" => parent.mount(child, None),
+                    "prefixed_all" => parent.mount(child, Some("mounted")),
+                    "namespaced" => parent.mount_preserving_resource_uris(child, Some("mounted")),
+                    "tools" => parent.mount_tools(child, Some("mounted")),
+                    "resources" => parent.mount_resources(child, None),
+                    "prefixed_resources" => parent.mount_resources(child, Some("mounted")),
+                    "prompts" => parent.mount_prompts(child, Some("mounted")),
+                    _ => unreachable!("the mount variants are fixed"),
+                };
+                set_proxy_test_cache_policy(&mut parent, 600_000, CacheScope::Public);
+                let server = parent.build();
+                for ((method, member, family), (ttl, scope)) in [
+                    ("tools/list", "tools", "tools"),
+                    ("resources/list", "resources", "resources"),
+                    ("resources/templates/list", "resourceTemplates", "resources"),
+                    ("prompts/list", "prompts", "prompts"),
+                ]
+                .into_iter()
+                .zip(policies)
+                {
+                    let selected = match selection {
+                        "all" | "namespaced" => true,
+                        "prefixed_all" => family != "resources",
+                        "prefixed_resources" => false,
+                        _ => selection == family,
+                    };
+                    let result = cached_proxy_list(&server, method);
+                    if selected {
+                        assert_eq!(result[member].as_array().map(Vec::len), Some(1));
+                        let actual_ttl = result["ttlMs"].as_u64().unwrap();
+                        assert!(
+                            actual_ttl <= ttl,
+                            "{selection} renewed an upstream lifetime"
+                        );
+                        if ttl > 0 {
+                            assert!(actual_ttl > 0, "a fresh mounted catalog remains cacheable");
+                        }
+                        assert_eq!(
+                            result["cacheScope"],
+                            match scope {
+                                CacheScope::Public => "public",
+                                CacheScope::Private => "private",
+                            }
+                        );
+                    } else {
+                        assert_eq!(result[member].as_array().map(Vec::len), Some(0));
+                        assert_eq!(
+                            result["ttlMs"], 600_000,
+                            "unmounted catalog families keep the parent policy"
+                        );
+                        assert_eq!(result["cacheScope"], "public");
+                    }
+                }
+            }
         }
 
         #[test]
