@@ -909,6 +909,207 @@ pub trait McpAppsWireHostPolicy {
     ) -> Result<Value, McpAppsHostError>;
 }
 
+/// Embedder effects for a Host that already owns its MCP forwarding policy.
+///
+/// Attach these callbacks with [`McpAppsWireHost::with_effects`] to combine
+/// renderer or consent decisions with the ready client's fresh core requests.
+/// The bridge still checks lifecycle, capabilities, content and correlations
+/// before invoking a callback. No callback receives the MCP client or its
+/// credentials. Defaults authorize no external effect.
+///
+/// Callbacks have the same cancellation-correctness requirements as
+/// [`McpAppsWireHostPolicy`]: pending work is dropped when its matching request
+/// is cancelled, and an error must leave embedder state unchanged.
+#[allow(async_fn_in_trait)]
+pub trait McpAppsWireHostEffects {
+    /// Performs an admitted open-link, download or message operation.
+    /// A declined operation returns the pinned `isError` result.
+    async fn operation(
+        &mut self,
+        _method: McpAppsRoutedMethod,
+        _params: Option<&Value>,
+    ) -> Result<Value, McpAppsHostError> {
+        Ok(json!({ "isError": true }))
+    }
+
+    /// Authorizes one schema-validated Host invocation of a View-owned tool.
+    /// Success grants only this invocation and must not invoke the tool itself.
+    async fn approve_view_tool_call(
+        &mut self,
+        _cx: &Cx,
+        _tool: &McpAppsViewTool,
+        _params: &fastmcp_protocol::McpAppsToolCallParams,
+    ) -> Result<(), McpAppsHostError> {
+        Err(wire_policy_denied())
+    }
+
+    /// Atomically accepts one complete model-context replacement, including
+    /// an empty replacement that clears the previous context.
+    async fn update_model_context(
+        &mut self,
+        _cx: &Cx,
+        _cancellation: &McpRequestCancellation,
+        _params: &McpAppsUpdateModelContextParams,
+    ) -> Result<(), McpAppsHostError> {
+        Err(wire_policy_denied())
+    }
+
+    /// Changes the renderer mode and reports its actual resulting mode.
+    /// The default keeps the current mode or refuses when none is known.
+    async fn request_display_mode(
+        &mut self,
+        _cx: &Cx,
+        _cancellation: &McpRequestCancellation,
+        _params: McpAppsDisplayModeParams,
+        current: Option<McpAppsDisplayMode>,
+    ) -> Result<McpAppsDisplayModeParams, McpAppsHostError> {
+        current
+            .map(|mode| McpAppsDisplayModeParams { mode })
+            .ok_or_else(wire_policy_denied)
+    }
+
+    /// Observes an admitted notification for this View.
+    async fn notification(
+        &mut self,
+        _method: McpAppsRoutedMethod,
+        _params: Option<&Value>,
+    ) -> Result<(), McpAppsHostError> {
+        Ok(())
+    }
+
+    /// Observes progress already bound to one exact Host request.
+    async fn progress(
+        &mut self,
+        _request_id: &McpAppsJsonRpcRequestId,
+        _params: &McpAppsProgressControlParams,
+    ) -> Result<(), McpAppsHostError> {
+        Ok(())
+    }
+
+    /// Observes matching View cancellation after the original forwarding
+    /// policy has serviced its core cancellation. Only immediate, bounded
+    /// bookkeeping is permitted here; absent-ID controls never reach the hook.
+    fn cancelled(
+        &mut self,
+        _cx: &Cx,
+        _request_id: &McpAppsJsonRpcRequestId,
+        _params: &McpAppsCancelledControlParams,
+    ) -> Result<(), McpAppsHostError> {
+        Ok(())
+    }
+
+    /// Accepts a View request to begin the existing graceful teardown flow.
+    async fn approve_view_teardown(&mut self) -> bool {
+        false
+    }
+}
+
+impl McpAppsWireHostEffects for () {}
+
+/// Composition of an existing forwarding policy and embedder-owned effects.
+///
+/// Created by [`McpAppsWireHost::with_effects`]. Initialization and all reused
+/// core methods retain the original policy. Effect hooks use the embedder,
+/// while cancellation always services the original policy first.
+pub struct McpAppsWireHostWithEffects<P, E> {
+    forwarding: P,
+    effects: E,
+}
+
+impl<P: McpAppsWireHostPolicy, E: McpAppsWireHostEffects> McpAppsWireHostPolicy
+    for McpAppsWireHostWithEffects<P, E>
+{
+    async fn initialize(
+        &mut self,
+        params: &McpAppsPinnedInitializeParams,
+        configuration: &McpAppsWireHostConfiguration,
+    ) -> McpAppsPinnedInitializeResult {
+        self.forwarding.initialize(params, configuration).await
+    }
+
+    async fn operation(
+        &mut self,
+        method: McpAppsRoutedMethod,
+        params: Option<&Value>,
+    ) -> Result<Value, McpAppsHostError> {
+        self.effects.operation(method, params).await
+    }
+
+    async fn approve_view_tool_call(
+        &mut self,
+        cx: &Cx,
+        tool: &McpAppsViewTool,
+        params: &fastmcp_protocol::McpAppsToolCallParams,
+    ) -> Result<(), McpAppsHostError> {
+        self.effects.approve_view_tool_call(cx, tool, params).await
+    }
+
+    async fn update_model_context(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: &McpAppsUpdateModelContextParams,
+    ) -> Result<(), McpAppsHostError> {
+        self.effects
+            .update_model_context(cx, cancellation, params)
+            .await
+    }
+
+    async fn request_display_mode(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: McpAppsDisplayModeParams,
+        current: Option<McpAppsDisplayMode>,
+    ) -> Result<McpAppsDisplayModeParams, McpAppsHostError> {
+        self.effects
+            .request_display_mode(cx, cancellation, params, current)
+            .await
+    }
+
+    async fn notification(
+        &mut self,
+        method: McpAppsRoutedMethod,
+        params: Option<&Value>,
+    ) -> Result<(), McpAppsHostError> {
+        self.effects.notification(method, params).await
+    }
+
+    async fn progress(
+        &mut self,
+        request_id: &McpAppsJsonRpcRequestId,
+        params: &McpAppsProgressControlParams,
+    ) -> Result<(), McpAppsHostError> {
+        self.effects.progress(request_id, params).await
+    }
+
+    fn cancelled(
+        &mut self,
+        cx: &Cx,
+        request_id: &McpAppsJsonRpcRequestId,
+        params: &McpAppsCancelledControlParams,
+    ) -> Result<(), McpAppsHostError> {
+        self.forwarding.cancelled(cx, request_id, params)?;
+        self.effects.cancelled(cx, request_id, params)
+    }
+
+    async fn approve_view_teardown(&mut self) -> bool {
+        self.effects.approve_view_teardown().await
+    }
+
+    async fn dispatch_reused_request(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: McpAppsRoutedMethod,
+        params: Option<Value>,
+    ) -> Result<Value, McpAppsHostError> {
+        self.forwarding
+            .dispatch_reused_request(cx, cancellation, method, params)
+            .await
+    }
+}
+
 /// A negotiated closed-wire Apps Host. It never sends Apps frames through the
 /// MCP server transport; standard-reused methods are delegated to its policy.
 pub struct McpAppsWireHost<T, P> {
@@ -1341,6 +1542,47 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             staged_view_tools: None,
             teardown_request: None,
             disconnected: false,
+        }
+    }
+
+    /// Attaches embedder effects while retaining this Host's MCP forwarding.
+    ///
+    /// Use after [`crate::Client::mcp_apps_wire_host`] or
+    /// [`crate::HttpClient::mcp_apps_wire_host`] to supply consent, model
+    /// context and renderer hooks without reimplementing core requests. The
+    /// original initialization policy, fresh core IDs, cancellation cleanup
+    /// and selected-era result validation remain in force.
+    ///
+    /// This consumes and preserves the same Host, including its activation,
+    /// lifecycle, capabilities, pending requests and catalog. It never
+    /// reinitializes a View or revives a disconnected one. New callbacks apply
+    /// to future effects; already accepted host state remains unchanged.
+    /// When composed repeatedly, ordinary effects use the latest callbacks,
+    /// while cancellation retains every prior cleanup and observer in order
+    /// before invoking the new observer.
+    #[must_use]
+    pub fn with_effects<E: McpAppsWireHostEffects>(
+        self,
+        effects: E,
+    ) -> McpAppsWireHost<T, McpAppsWireHostWithEffects<P, E>> {
+        McpAppsWireHost {
+            transport: self.transport,
+            _activation_proof: self._activation_proof,
+            admission: self.admission,
+            next_host_id: self.next_host_id,
+            configuration: self.configuration,
+            policy: McpAppsWireHostWithEffects {
+                forwarding: self.policy,
+                effects,
+            },
+            state: self.state,
+            deferred_view_frames: self.deferred_view_frames,
+            deferred_view_requests: self.deferred_view_requests,
+            host_requests: self.host_requests,
+            view_tools: self.view_tools,
+            staged_view_tools: self.staged_view_tools,
+            teardown_request: self.teardown_request,
+            disconnected: self.disconnected,
         }
     }
 
@@ -2603,6 +2845,418 @@ mod tests {
         McpAppsViewCapabilities,
     };
     use serde_json::json;
+
+    struct ComposedEffects {
+        allow: bool,
+        events: Arc<Mutex<Vec<Value>>>,
+    }
+
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "embedder decisions commit synchronously through async effect hooks"
+    )]
+    impl McpAppsWireHostEffects for ComposedEffects {
+        async fn update_model_context(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: &McpAppsUpdateModelContextParams,
+        ) -> Result<(), McpAppsHostError> {
+            wire_policy_checkpoint(cx, cancellation)?;
+            if !self.allow {
+                return Err(wire_policy_denied());
+            }
+            self.events.lock().unwrap().push(json!({"context": params}));
+            Ok(())
+        }
+
+        async fn approve_view_tool_call(
+            &mut self,
+            _cx: &Cx,
+            tool: &McpAppsViewTool,
+            params: &McpAppsToolCallParams,
+        ) -> Result<(), McpAppsHostError> {
+            if !self.allow {
+                return Err(wire_policy_denied());
+            }
+            assert_eq!(tool.descriptor().name, params.name);
+            self.events
+                .lock()
+                .unwrap()
+                .push(json!({"approved": params.name}));
+            Ok(())
+        }
+
+        fn cancelled(
+            &mut self,
+            _cx: &Cx,
+            request_id: &McpAppsJsonRpcRequestId,
+            params: &McpAppsCancelledControlParams,
+        ) -> Result<(), McpAppsHostError> {
+            assert_eq!(params.request_id.as_ref(), Some(request_id));
+            self.events
+                .lock()
+                .unwrap()
+                .push(json!({"cancelled": request_id}));
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    async fn initialize_composed_view<P: McpAppsWireHostPolicy>(
+        cx: &Cx,
+        host: &mut McpAppsWireHost<McpAppsInMemoryWireHostTransport, P>,
+        view: &mut McpAppsInMemoryWireViewTransport,
+    ) {
+        view.send_to_host(
+            cx,
+            json!({
+                "jsonrpc": "2.0", "id": "initialize", "method": "ui/initialize",
+                "params": {
+                    "appInfo": {"name": "composed-effects-view", "version": "1"},
+                    "appCapabilities": {},
+                    "protocolVersion": MCP_APPS_HOST_VIEW_PROTOCOL_VERSION
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        host.process_next(cx).await.unwrap();
+        let initialized: Value =
+            serde_json::from_str(&view.receive_from_host(cx).await.unwrap()).unwrap();
+        assert_eq!(initialized["id"], "initialize");
+        assert_eq!(
+            initialized["result"]["hostCapabilities"]["serverTools"],
+            json!({})
+        );
+        view.send_to_host(
+            cx,
+            json!({
+                "jsonrpc": "2.0", "method": "ui/notifications/initialized"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        host.process_next(cx).await.unwrap();
+        assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+    }
+
+    #[cfg(unix)]
+    async fn composed_effects_stdio_client(cx: &Cx, cancel_tool: bool) -> crate::Client {
+        let opening = r#"
+IFS= read -r discovery || exit 91
+case "$discovery" in *server/discover*io.modelcontextprotocol/ui*) ;; *) exit 92 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"extensions":{"io.modelcontextprotocol/ui":{}}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"composed-effects-peer","version":"1"}}}}'
+IFS= read -r tool || exit 93
+case "$tool" in *'"method":"tools/call"'*) ;; *) exit 94 ;; esac
+case "$tool" in *'"id":2'*) ;; *) exit 95 ;; esac
+case "$tool" in *'"name":"server_echo"'*) ;; *) exit 96 ;; esac
+case "$tool" in *'"arguments":{"value":7}'*) ;; *) exit 97 ;; esac
+case "$tool" in *view-call*|*ui/update-model-context*) exit 98 ;; esac
+"#;
+        let execution = if cancel_tool {
+            r#"
+IFS= read -r cancelled || exit 101
+case "$cancelled" in *'"method":"notifications/cancelled"'*) ;; *) exit 102 ;; esac
+case "$cancelled" in *'"requestId":2'*) ;; *) exit 103 ;; esac
+"#
+        } else {
+            r#"
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"real core result"}]}}'
+"#
+        };
+        let ending = r#"
+IFS= read -r ping || exit 104
+case "$ping" in *'"method":"ping"'*) ;; *) exit 105 ;; esac
+case "$ping" in *'"id":3'*) ;; *) exit 106 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+exec sleep 10
+"#;
+        let script = format!("{opening}\n{execution}\n{ending}");
+        let client = crate::ClientBuilder::new()
+            .protocol_plan(crate::ClientProtocolPlan::stdio(
+                fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly,
+            ))
+            .mcp_apps(
+                fastmcp_protocol::extensions::McpAppsClientSettings::new(vec![
+                    fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE.to_owned(),
+                ])
+                .unwrap(),
+            )
+            .request_timeout_policy(
+                crate::RequestTimeoutPolicy::new(
+                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_secs(5),
+                )
+                .unwrap(),
+            )
+            .connect_stdio_with_cx(cx, "sh", &["-c", &script])
+            .await
+            .expect("public discovery must negotiate Apps with the real subprocess");
+        assert!(client.mcp_apps_active());
+        client
+    }
+
+    #[cfg(unix)]
+    async fn composed_effects_context_and_core_case(cx: &Cx, allow: bool) {
+        let mut client = composed_effects_stdio_client(cx, false).await;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+        let mut configuration = wire_configuration();
+        configuration.host_capabilities.update_model_context =
+            Some(serde_json::from_value(json!({"text": {}})).unwrap());
+        let mut host = client
+            .mcp_apps_wire_host(transport, configuration)
+            .unwrap()
+            .with_effects(ComposedEffects {
+                allow,
+                events: Arc::clone(&events),
+            });
+        initialize_composed_view(cx, &mut host, &mut view).await;
+        let replacement = json!({"content": [{"type": "text", "text": "selected row"}]});
+        view.send_to_host(
+            cx,
+            json!({
+                "jsonrpc": "2.0", "id": "context", "method": "ui/update-model-context",
+                "params": replacement
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        host.process_next(cx).await.unwrap();
+        let response: Value =
+            serde_json::from_str(&view.receive_from_host(cx).await.unwrap()).unwrap();
+        assert_eq!(response["id"], "context");
+        if allow {
+            assert_eq!(response["result"], json!({}));
+            assert_eq!(
+                serde_json::to_value(host.model_context().unwrap()).unwrap(),
+                replacement
+            );
+            assert_eq!(
+                *events.lock().unwrap(),
+                vec![json!({"context": replacement})]
+            );
+        } else {
+            assert!(response["error"].is_object());
+            assert!(host.model_context().is_none());
+            assert!(
+                events.lock().unwrap().is_empty(),
+                "denied context must have no embedder effect"
+            );
+        }
+        view.send_to_host(
+            cx,
+            json!({
+                "jsonrpc": "2.0", "id": "view-call", "method": "tools/call",
+                "params": {"name": "server_echo", "arguments": {"value": 7}}
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        host.process_next(cx).await.unwrap();
+        let response: Value =
+            serde_json::from_str(&view.receive_from_host(cx).await.unwrap()).unwrap();
+        assert_eq!(
+            response,
+            json!({
+                "jsonrpc": "2.0", "id": "view-call",
+                "result": {"content": [{"type": "text", "text": "real core result"}]}
+            })
+        );
+        assert_eq!(host.model_context().is_some(), allow);
+        assert_eq!(events.lock().unwrap().len(), usize::from(allow));
+        drop(host);
+        client
+            .ping_with_cx(cx, &McpRequestCancellation::default())
+            .await
+            .expect(
+                "the core client must remain usable after both effect and forwarding operations",
+            );
+        client.close_with_cx(cx).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn composed_wire_effects_context_and_real_core_forwarding_positive() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            composed_effects_context_and_core_case(&cx, true).await;
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn composed_wire_effects_context_and_real_core_forwarding_planted_negative() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            composed_effects_context_and_core_case(&cx, false).await;
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn composed_wire_effects_cancellation_preserves_core_cleanup() {
+        struct CancellationObserver(Arc<Mutex<Vec<Value>>>);
+        impl McpAppsWireHostEffects for CancellationObserver {
+            fn cancelled(
+                &mut self,
+                _cx: &Cx,
+                request_id: &McpAppsJsonRpcRequestId,
+                _params: &McpAppsCancelledControlParams,
+            ) -> Result<(), McpAppsHostError> {
+                self.0.lock().unwrap().push(json!({"observed": request_id}));
+                Ok(())
+            }
+        }
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut client = composed_effects_stdio_client(&cx, true).await;
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let mut host = client
+                .mcp_apps_wire_host(transport, wire_configuration())
+                .unwrap()
+                .with_effects(ComposedEffects {
+                    allow: true,
+                    events: Arc::clone(&events),
+                })
+                .with_effects(CancellationObserver(Arc::clone(&events)));
+            initialize_composed_view(&cx, &mut host, &mut view).await;
+            view.send_to_host(
+                &cx,
+                json!({
+                    "jsonrpc": "2.0", "id": "view-call", "method": "tools/call",
+                    "params": {"name": "server_echo", "arguments": {"value": 7}}
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+            view.send_to_host(
+                &cx,
+                json!({
+                    "jsonrpc": "2.0", "method": "notifications/cancelled",
+                    "params": {"requestId": "view-call"}
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+            host.process_next(&cx).await.unwrap();
+            assert_eq!(
+                *events.lock().unwrap(),
+                vec![
+                    json!({"cancelled": "view-call"}),
+                    json!({"observed": "view-call"}),
+                ]
+            );
+            assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+            drop(host);
+            client
+                .ping_with_cx(&cx, &McpRequestCancellation::default())
+                .await
+                .expect(
+                    "the subprocess must observe exact core cancellation before its next request",
+                );
+            client.close_with_cx(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn composed_wire_effects_preserve_pending_host_request_and_lifecycle() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (mut host, mut view) = tool_wire_host(&cx, false).await;
+            install_view_tool_catalog(&mut host, &mut view, &cx).await;
+            let pending = host
+                .send_host_request(
+                    &cx,
+                    McpAppsHostRequest::Ping(fastmcp_protocol::McpAppsPingParams::default()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let _ = view.receive_from_host(&cx).await.unwrap();
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut host = host.with_effects(ComposedEffects {
+                allow: true,
+                events: Arc::clone(&events),
+            });
+            assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+            assert_eq!(host.view_tools().count(), 1);
+            assert!(host.take_host_response(&pending).is_none());
+            assert!(matches!(
+                tool_wire_reply(&mut host, &mut view, &cx, &pending, json!({})).await,
+                McpAppsHostRequestOutcome::Ping
+            ));
+            let called = host
+                .send_host_request(&cx, view_tool_call(json!(3)), None)
+                .await
+                .unwrap();
+            assert_ne!(
+                pending, called,
+                "composing effects must not reset the Host ID allocator"
+            );
+            let _ = view.receive_from_host(&cx).await.unwrap();
+            assert!(matches!(
+                tool_wire_reply(
+                    &mut host,
+                    &mut view,
+                    &cx,
+                    &called,
+                    json!({"content": [], "structuredContent": {"accepted": 3}})
+                )
+                .await,
+                McpAppsHostRequestOutcome::ToolCall(_)
+            ));
+            assert_eq!(
+                *events.lock().unwrap(),
+                vec![json!({"approved": "view_counter"})]
+            );
+            host.begin_teardown(&cx).await.unwrap();
+            let teardown: Value =
+                serde_json::from_str(&view.receive_from_host(&cx).await.unwrap()).unwrap();
+            let mut host = host.with_effects(());
+            assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Closing);
+            assert_eq!(host.view_tools().count(), 0);
+            view.send_to_host(
+                &cx,
+                json!({
+                    "jsonrpc": "2.0", "id": teardown["id"], "result": {}
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+            host.process_next(&cx).await.unwrap();
+            assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Closed);
+            let mut host = host.with_effects(ComposedEffects {
+                allow: true,
+                events,
+            });
+            assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Closed);
+            assert!(
+                host.send_host_request(&cx, view_tool_call(json!(3)), None)
+                    .await
+                    .is_err()
+            );
+        });
+    }
 
     struct AcceptTeardown(bool);
     impl McpAppsHostPolicy for AcceptTeardown {

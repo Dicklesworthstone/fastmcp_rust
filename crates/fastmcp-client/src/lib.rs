@@ -174,8 +174,8 @@ pub use mcp_apps::{
     McpAppsHostError, McpAppsHostPolicy, McpAppsHttpClientWirePolicy, McpAppsInMemoryHostTransport,
     McpAppsInMemoryViewTransport, McpAppsInMemoryWireHostTransport,
     McpAppsInMemoryWireViewTransport, McpAppsWireBridgeTransport, McpAppsWireHost,
-    McpAppsWireHostConfiguration, McpAppsWireHostPolicy, mcp_apps_in_memory_pair,
-    mcp_apps_in_memory_wire_pair,
+    McpAppsWireHostConfiguration, McpAppsWireHostEffects, McpAppsWireHostPolicy,
+    McpAppsWireHostWithEffects, mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
 };
 pub use leg_http_01::{
     FrozenLimit, LEG_HTTP_01_B_EVALUATOR_MANIFEST_V1, LimitConflict, ObservedLimit, frozen_limits,

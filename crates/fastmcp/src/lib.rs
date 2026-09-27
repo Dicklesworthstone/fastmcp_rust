@@ -288,8 +288,8 @@ pub mod client {
         McpAppsInMemoryWireHostTransport, McpAppsInMemoryWireViewTransport,
         McpAppsViewCallToolResult, McpAppsViewTool, McpAppsViewToolsPage,
         McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostConfiguration,
-        McpAppsWireHostPolicy, McpAppsWireHostResponse, mcp_apps_in_memory_pair,
-        mcp_apps_in_memory_wire_pair,
+        McpAppsWireHostEffects, McpAppsWireHostPolicy, McpAppsWireHostResponse,
+        McpAppsWireHostWithEffects, mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
     };
     #[cfg(feature = "apps")]
     pub use fastmcp_client::mcp_apps;
@@ -898,8 +898,8 @@ pub use fastmcp_client::{
     McpAppsHostError, McpAppsHostPolicy, McpAppsHttpClientWirePolicy, McpAppsInMemoryHostTransport,
     McpAppsInMemoryViewTransport, McpAppsInMemoryWireHostTransport,
     McpAppsInMemoryWireViewTransport, McpAppsWireBridgeTransport, McpAppsWireHost,
-    McpAppsWireHostConfiguration, McpAppsWireHostPolicy, mcp_apps_in_memory_pair,
-    mcp_apps_in_memory_wire_pair,
+    McpAppsWireHostConfiguration, McpAppsWireHostEffects, McpAppsWireHostPolicy,
+    McpAppsWireHostWithEffects, mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
 };
 
 /// Exact-2024 HTTP request staging is available only with its adapter profile.
@@ -994,7 +994,8 @@ pub mod auto {
     pub use fastmcp_client::{
         McpAppsClientWirePolicy, McpAppsHostError, McpAppsInMemoryWireHostTransport,
         McpAppsInMemoryWireViewTransport, McpAppsWireBridgeTransport, McpAppsWireHost,
-        McpAppsWireHostConfiguration, McpAppsWireHostPolicy, mcp_apps_in_memory_wire_pair,
+        McpAppsWireHostConfiguration, McpAppsWireHostEffects, McpAppsWireHostPolicy,
+        McpAppsWireHostWithEffects, mcp_apps_in_memory_wire_pair,
     };
     #[cfg(feature = "apps")]
     pub use fastmcp_protocol::extensions::McpAppsClientSettings;
@@ -2884,7 +2885,8 @@ pub mod modern {
         McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport,
         McpAppsInMemoryWireHostTransport, McpAppsInMemoryWireViewTransport,
         McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostConfiguration,
-        McpAppsWireHostPolicy, mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
+        McpAppsWireHostEffects, McpAppsWireHostPolicy, McpAppsWireHostWithEffects,
+        mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
     };
     #[cfg(feature = "apps")]
     pub use fastmcp_client::{
