@@ -408,6 +408,75 @@ mod tests {
     }
 
     #[test]
+    fn definitions_registered_schemas_validate_input_and_output_on_owned_dispatch() {
+        let mut registry = SchemaResourceRegistry::default();
+        let input = json!({
+            "type": "object",
+            "definitions": {"value": {"type": "integer", "minimum": 1}},
+            "properties": {"value": {"$ref": "#/definitions/value"}},
+            "required": ["value"], "additionalProperties": false
+        });
+        let output = json!({
+            "type": "object",
+            "definitions": {
+                "value": {"type": "integer", "minimum": 1},
+                "error": {"enum": ["invalid_input", "handler_error"]}
+            },
+            "oneOf": [
+                {"properties": {"value": {"$ref": "#/definitions/value"}},
+                    "required": ["value"], "additionalProperties": false},
+                {"properties": {"error": {"$ref": "#/definitions/error"}},
+                    "required": ["error"], "additionalProperties": false}
+            ]
+        });
+        registry.insert(INPUT, input.clone()).unwrap();
+        registry.insert(OUTPUT, output.clone()).unwrap();
+
+        let valid_handler = handler(json!({"value": 2}));
+        let effects = valid_handler.effects.clone();
+        let owned = valid_handler.owned_calls.clone();
+        let tool = RegisteredSchemaTool::from_handler(
+            valid_handler, &registry, INPUT, Some(OUTPUT),
+        ).unwrap();
+        assert_eq!(tool.compiled_definition().input_schema["definitions"], input["definitions"]);
+        assert_eq!(
+            tool.compiled_definition().output_schema.as_ref().unwrap()["definitions"],
+            output["definitions"]
+        );
+        let mut router = Router::new();
+        router.add_tool(tool).unwrap();
+        runtime().block_on(async {
+            let router = Arc::new(router);
+            let valid = call(router.clone(), 1, json!({"value": 2})).await.unwrap();
+            assert_eq!(valid["resultType"], "complete");
+            assert_eq!(valid["structuredContent"], json!({"value": 2}));
+            assert_eq!(effects.load(Ordering::SeqCst), 1);
+            assert_eq!(owned.load(Ordering::SeqCst), 1);
+            let invalid = call(router, 2, json!({"value": 0})).await.unwrap();
+            assert_eq!(invalid["isError"], true);
+            assert_eq!(invalid["structuredContent"], json!({"error": "invalid_input"}));
+            assert_eq!(effects.load(Ordering::SeqCst), 1);
+            assert_eq!(owned.load(Ordering::SeqCst), 1);
+        });
+
+        let invalid_handler = handler(json!({"value": 0}));
+        let effects = invalid_handler.effects.clone();
+        let owned = invalid_handler.owned_calls.clone();
+        let tool = RegisteredSchemaTool::from_handler(
+            invalid_handler, &registry, INPUT, Some(OUTPUT),
+        ).unwrap();
+        let mut router = Router::new();
+        router.add_tool(tool).unwrap();
+        runtime().block_on(async {
+            let error = call(Arc::new(router), 1, json!({"value": 2})).await.unwrap_err();
+            assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
+            assert_eq!(error.message, "tool output does not match the declared output schema");
+            assert_eq!(effects.load(Ordering::SeqCst), 1);
+            assert_eq!(owned.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
     fn router_refuses_invalid_structured_output_after_one_effect() {
         let handler = handler(json!({"value":0}));
         let effects = handler.effects.clone();

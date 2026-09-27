@@ -9,7 +9,7 @@
 //! - Property, pattern-property, dependency, property-name, and
 //!   unevaluated-property validation
 //! - Items, tuple, contains, and unevaluated-items validation for arrays
-//! - Local `$id` resources, `$defs`/`$ref`/anchor/dynamic-reference
+//! - Local `$id` resources, `$defs`/`definitions`/`$ref`/anchor/dynamic-reference
 //!   resolution, composition, and conditional applicators
 //! - Declared Draft 2020-12 vocabularies and bounded content annotations
 //!
@@ -529,6 +529,7 @@ fn handwritten_schema_has_unscoped_reference(schema: &Value) -> bool {
         "properties",
         "patternProperties",
         "$defs",
+        "definitions",
         "dependentSchemas",
     ] {
         if object
@@ -631,6 +632,7 @@ fn check_generated_reference_resources(
         "properties",
         "patternProperties",
         "$defs",
+        "definitions",
         "dependentSchemas",
     ] {
         if let Some(children) = object.get(keyword).and_then(Value::as_object) {
@@ -949,6 +951,7 @@ fn validate_final_form_schema(schema: &Value) -> Result<(), SchemaAdmissionError
         "$ref",
         "$dynamicRef",
         "$defs",
+        "definitions",
         "items",
         "prefixItems",
         "contains",
@@ -1039,6 +1042,7 @@ fn validate_final_form_property_schema(
         "$ref",
         "$dynamicRef",
         "$defs",
+        "definitions",
         "properties",
         "items",
         "prefixItems",
@@ -1220,6 +1224,7 @@ fn validate_final_schema_node(
         "properties",
         "patternProperties",
         "$defs",
+        "definitions",
         "dependentSchemas",
     ] {
         if let Some(subschemas) = object.get(keyword) {
@@ -1394,11 +1399,14 @@ fn validate_supported_schema_keywords(
         // Draft 2020-12 Core sections 4.3.1 and 6.5 define unknown
         // keywords as annotations. Their contents were bounded above and
         // remain opaque to reference, resource, and schema traversal.
-        // The canonical meta-schema reserves these deprecated keywords and
-        // constrains their values. They are not arbitrary extension data;
-        // preserve their existing refusal until that vocabulary is implemented.
+        // Validation Appendix A specifies that `definitions` behaves like
+        // `$defs` under the default meta-schema. Its entries are admitted and
+        // traversed as schemas below; it is deliberately absent from SUPPORTED
+        // so custom dialects retain their existing closed keyword contract.
+        // The other reserved deprecated keywords still require their own
+        // semantics and must not become unchecked extension annotations.
         let unsupported_reserved = matches!(keyword.as_str(),
-            "definitions" | "dependencies" | "$recursiveAnchor" | "$recursiveRef"
+            "dependencies" | "$recursiveAnchor" | "$recursiveRef"
         );
         if unsupported_reserved || (!unknown_annotations && !SUPPORTED.contains(&keyword.as_str())) {
             return Err(SchemaAdmissionError::new(
@@ -1660,6 +1668,7 @@ fn is_admitted_schema_node(schema: &Value, target: &Value) -> bool {
         "properties",
         "patternProperties",
         "$defs",
+        "definitions",
         "dependentSchemas",
     ] {
         if object
@@ -1774,6 +1783,7 @@ fn validate_unique_local_anchors(
         "properties",
         "patternProperties",
         "$defs",
+        "definitions",
         "dependentSchemas",
     ] {
         if let Some(subschemas) = object.get(keyword).and_then(Value::as_object) {
@@ -1881,6 +1891,7 @@ fn validate_unique_local_resource_ids(
         "properties",
         "patternProperties",
         "$defs",
+        "definitions",
         "dependentSchemas",
     ] {
         if let Some(subschemas) = object.get(keyword).and_then(Value::as_object) {
@@ -2435,6 +2446,7 @@ fn make_strict_schema(schema: &Value) -> Value {
                 "patternProperties",
                 "dependentSchemas",
                 "$defs",
+                "definitions",
             ] {
                 if let Some(Value::Object(subschemas)) = obj.get(keyword) {
                     let strict_subschemas: serde_json::Map<String, Value> = subschemas
@@ -3063,6 +3075,7 @@ fn find_schema_child_scope<'a>(
         "properties",
         "patternProperties",
         "$defs",
+        "definitions",
         "dependentSchemas",
     ] {
         if let Some(subschemas) = object.get(keyword).and_then(Value::as_object) {
@@ -3178,6 +3191,7 @@ fn find_local_schema_resource_child<'a>(
         "properties",
         "patternProperties",
         "$defs",
+        "definitions",
         "dependentSchemas",
     ] {
         if let Some(subschemas) = object.get(keyword).and_then(Value::as_object) {
@@ -3490,6 +3504,7 @@ fn find_resource_anchor_inner<'a>(
         "properties",
         "patternProperties",
         "$defs",
+        "definitions",
         "dependentSchemas",
     ] {
         if let Some(subschemas) = object.get(keyword).and_then(Value::as_object) {
@@ -6527,6 +6542,256 @@ mod tests {
             source[keyword] = json!(17);
             assert!(admit_final_schema(source).is_err());
         }
+    }
+
+    #[test]
+    fn admitted_definitions_preserve_spelling_and_enforce_referenced_tool_arguments() {
+        // Draft 2020-12 Validation Appendix A gives `definitions` the same
+        // behavior as `$defs` under the default meta-schema:
+        // https://json-schema.org/draft/2020-12/json-schema-validation#appendix-A
+        let source = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "type": "object",
+            "definitions": {
+                "id/~value": {"type": "integer", "minimum": 3},
+                "unused": false
+            },
+            "$defs": {"id/~value": {"type": "string", "minLength": 2}},
+            "properties": {
+                "id": {"$ref": "#/definitions/id~1~0value"},
+                "label": {"$ref": "#/$defs/id~1~0value"}
+            },
+            "required": ["id", "label"],
+            "additionalProperties": false
+        });
+        let admitted = admit_final_schema(source.clone()).expect("both definition maps admit");
+        assert_eq!(admitted.schema(), &source);
+        assert!(admitted.validate(&json!({"id": 3, "label": "ok"})).is_ok());
+        for invalid in [
+            json!({"id": 2, "label": "ok"}),
+            json!({"id": "3", "label": "ok"}),
+            json!({"id": 3, "label": "x"}),
+            json!({"id": 3, "label": 3}),
+        ] {
+            assert!(admitted.validate(&invalid).is_err());
+        }
+        assert_eq!(admitted.schema(), &source);
+
+        let mut default_dialect = source;
+        default_dialect.as_object_mut().unwrap().remove("$schema");
+        assert!(admit_final_schema(default_dialect)
+            .unwrap()
+            .validate(&json!({"id": 3, "label": "ok"}))
+            .is_ok());
+    }
+
+    #[test]
+    fn admitted_definitions_are_reserved_schemas_without_implicit_application() {
+        let source = json!({"definitions": {"accept": true, "reject": false}});
+        let admitted = admit_final_schema(source.clone()).unwrap();
+        assert!(admitted.validate(&Value::Null).is_ok());
+        for (target, valid) in [("accept", true), ("reject", false)] {
+            let mut referenced = source.clone();
+            referenced["$ref"] = json!(format!("#/definitions/{target}"));
+            let admitted = admit_final_schema(referenced).unwrap();
+            assert_eq!(admitted.validate(&Value::Null).is_ok(), valid);
+        }
+        let mut annotation = source;
+        annotation["default"] = json!({"definitions": {"hidden": true}});
+        annotation["$ref"] = json!("#/default/definitions/hidden");
+        assert_eq!(
+            admit_final_schema(annotation).unwrap_err().reason(),
+            "local schema reference target is not an admitted schema node"
+        );
+    }
+
+    #[test]
+    fn admitted_definitions_preserve_nested_resource_and_anchor_resolution() {
+        let source = json!({
+            "$id": "https://schemas.example/root",
+            "$ref": "nested/",
+            "definitions": {"outer": {
+                "$id": "nested/",
+                "$ref": "child#value",
+                "definitions": {"child": {
+                    "$id": "child",
+                    "definitions": {"value": {
+                        "$anchor": "value", "type": "integer", "minimum": 3
+                    }}
+                }}
+            }}
+        });
+        let admitted = admit_final_schema(source.clone()).unwrap();
+        assert!(admitted.validate(&json!(3)).is_ok());
+        assert!(admitted.validate(&json!(2)).is_err());
+        let mut wrong_scope = source;
+        wrong_scope["definitions"]["outer"]["$ref"] = json!("#value");
+        assert_eq!(
+            admit_final_schema(wrong_scope).unwrap_err().reason(),
+            "unresolved local schema reference"
+        );
+
+        let dynamic = admit_final_schema(json!({
+            "$dynamicRef": "#value",
+            "definitions": {"value": {"$dynamicAnchor": "value", "type": "boolean"}}
+        })).unwrap();
+        assert!(dynamic.validate(&json!(true)).is_ok());
+        assert!(dynamic.validate(&json!("true")).is_err());
+    }
+
+    #[test]
+    fn admitted_definitions_reject_malformed_children_and_duplicate_authorities() {
+        for definitions in [Value::Null, json!([]), json!(true), json!({"value": 17})] {
+            assert!(admit_final_schema(json!({"definitions": definitions})).is_err());
+        }
+        let source = json!({"definitions": {"value": {"type": "integer"}}});
+        assert!(admit_final_schema(source.clone()).is_ok());
+        let mut malformed = source;
+        malformed["definitions"]["value"]["type"] = json!(17);
+        assert_eq!(admit_final_schema(malformed).unwrap_err().path(), "$.definitions.value.type");
+        for keyword in ["$ref", "$dynamicRef"] {
+            let unresolved = json!({"definitions": {"value": {
+                keyword: "https://unregistered.example/schema"
+            }}});
+            assert_eq!(
+                admit_final_schema(unresolved).unwrap_err().reason(),
+                "external schema reference is not allowed"
+            );
+        }
+
+        for keyword in ["$anchor", "$dynamicAnchor", "$id"] {
+            let (first, second) = if keyword == "$id" {
+                ("https://schemas.example/first", "https://schemas.example/second")
+            } else {
+                ("first", "second")
+            };
+            let source = json!({
+                "$defs": {"modern": {keyword: first}},
+                "definitions": {"older": {keyword: second}}
+            });
+            assert!(admit_final_schema(source.clone()).is_ok());
+            let mut duplicate = source;
+            duplicate["definitions"]["older"][keyword] = json!(first);
+            let error = admit_final_schema(duplicate).unwrap_err();
+            assert_eq!(error.path(), format!("$.definitions.older.{keyword}"));
+            assert!(error.reason().starts_with("duplicate local schema"));
+        }
+    }
+
+    #[test]
+    fn admitted_definitions_obey_custom_dialect_and_form_boundaries() {
+        let source = json!({
+            "$id": "https://schemas.example/root",
+            "$schema": "https://schemas.example/meta",
+            "$defs": {"meta": {
+                "$id": "https://schemas.example/meta",
+                "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                "$vocabulary": {CORE_VOCABULARY_URI: true, VALIDATION_VOCABULARY_URI: true}
+            }},
+            "type": "object",
+            "properties": {"value": {
+                "$id": "child",
+                "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                "definitions": {"integer": {"type": "integer"}},
+                "$ref": "#/definitions/integer"
+            }}
+        });
+        let admitted = admit_final_schema(source.clone()).unwrap();
+        assert!(admitted.validate(&json!({"value": 3})).is_ok());
+        assert!(admitted.validate(&json!({"value": "3"})).is_err());
+        let mut inherited = source;
+        inherited["properties"]["value"].as_object_mut().unwrap().remove("$schema");
+        assert_eq!(
+            admit_final_schema(inherited).unwrap_err().path(),
+            "$.properties.value.definitions"
+        );
+
+        let form = json!({"type": "object", "properties": {"value": {"type": "integer"}}});
+        assert!(admit_final_form_schema(form.clone()).is_ok());
+        for at_root in [true, false] {
+            let mut nested = form.clone();
+            let target = if at_root { &mut nested } else { &mut nested["properties"]["value"] };
+            target["definitions"] = json!({"value": {"type": "integer"}});
+            assert!(admit_final_schema(nested.clone()).is_ok());
+            assert!(admit_final_form_schema(nested).is_err());
+        }
+    }
+
+    #[test]
+    fn admitted_definitions_share_schema_node_and_reference_work_bounds() {
+        let entries: serde_json::Map<String, Value> = (0..MAX_SCHEMA_ADMISSION_NODES - 1)
+            .map(|index| (format!("value_{index:04}"), Value::Bool(true)))
+            .collect();
+        for keyword in ["$defs", "definitions"] {
+            let source = json!({keyword: entries});
+            assert!(admit_final_schema(source.clone()).is_ok());
+            let mut excessive = source;
+            excessive[keyword]["extra"] = Value::Bool(true);
+            assert_eq!(
+                admit_final_schema(excessive).unwrap_err().reason(),
+                "schema admission node limit exceeded"
+            );
+        }
+        let mut nested = Value::Bool(true);
+        for _ in 0..(MAX_SCHEMA_VALIDATION_DEPTH - 1) / 2 {
+            nested = json!({"definitions": {"child": nested}});
+        }
+        assert!(admit_final_schema(nested.clone()).is_ok());
+        assert_eq!(
+            admit_final_schema(json!({"definitions": {"child": nested}})).unwrap_err().reason(),
+            "schema document nesting limit exceeded"
+        );
+
+        // Charge one unit each for instance preflight, root evaluation,
+        // source-scope lookup, anchor-root visit, target visit and evaluation.
+        // Every unused definition inspected while finding the anchor is also
+        // charged, so one extra sibling crosses the same validation budget.
+        let mut entries: serde_json::Map<String, Value> = (0..MAX_SCHEMA_VALIDATION_WORK - 6)
+            .map(|index| (format!("unused_{index:04}"), Value::Bool(false)))
+            .collect();
+        entries.insert("zz_target".to_owned(), json!({"$anchor": "target", "type": "boolean"}));
+        let source = json!({"definitions": entries, "$ref": "#target"});
+        let admitted = admit_final_schema(source.clone()).unwrap();
+        assert!(admitted.validate(&json!(true)).is_ok());
+        let mut excessive = source.clone();
+        excessive["definitions"]["unused_extra"] = Value::Bool(false);
+        let errors = admit_final_schema(excessive).unwrap().validate(&json!(true)).unwrap_err();
+        assert!(errors.iter().any(|error| error.message == "schema validation work limit exceeded"));
+        assert_eq!(admitted.schema(), &source);
+    }
+
+    #[test]
+    fn definitions_remain_safe_in_handwritten_generation_and_strict_validation() {
+        let source = json!({
+            "$id": "https://schemas.example/handwritten",
+            "definitions": {"record": {
+                "type": "object", "properties": {"value": {"type": "integer"}},
+                "required": ["value"]
+            }},
+            "$ref": "#/definitions/record"
+        });
+        assert_eq!(SchemaGenerator::new().finish(source.clone()).unwrap(), source);
+        assert!(validate_strict(&source, &json!({"value": 3})).is_ok());
+        assert!(validate_strict(&source, &json!({"value": 3, "extra": true})).is_err());
+
+        let mut unscoped = source;
+        unscoped.as_object_mut().unwrap().remove("$id");
+        unscoped.as_object_mut().unwrap().remove("$ref");
+        unscoped["definitions"]["alias"] = json!({"$ref": "#/definitions/record"});
+        let mut generator = SchemaGenerator::new();
+        assert_eq!(generator.inline_schema(unscoped), Value::Bool(false));
+        assert_eq!(generator.finish(json!({})), Err(SchemaGenerationError::ReferenceResourceBoundary));
+
+        let mut generator = SchemaGenerator::new();
+        let first = generator.subschema_for::<GeneratedText>();
+        let reused = generator.subschema_for::<GeneratedText>();
+        let root = json!({
+            "type": "object", "properties": {"first": first},
+            "definitions": {"nested": {
+                "$id": "https://schemas.example/nested", "allOf": [reused]
+            }}
+        });
+        assert_eq!(generator.finish(root), Err(SchemaGenerationError::ReferenceResourceBoundary));
     }
 
     #[test]
