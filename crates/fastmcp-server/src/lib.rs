@@ -587,6 +587,27 @@ const REDACTED_EXTENSION_PANIC_INCIDENT: &[u8] =
 const RESOURCE_EXHAUSTED_ERROR_CODE: i32 = -32006;
 const RESOURCE_SUBSCRIPTION_CAPACITY_MESSAGE: &str = "Resource subscription capacity exhausted";
 const MAX_DISPATCH_QUEUE_DEPTH: usize = 64;
+/// Anti-hang watchdog for the test helpers that drive a whole returning
+/// transport lifecycle on a blocking thread and wait for its result.
+///
+/// This is NOT a latency assertion. Nothing about the protocol or the server
+/// promises to finish inside it, and no test asserts on it; its only job is to
+/// fail loudly instead of hanging the suite when a pump never produces a
+/// result. Each per-test assertion on the returned value is unaffected.
+///
+/// It must therefore be far larger than any legitimate completion, because the
+/// bound starts before the pump has been scheduled. `cargo test -p
+/// fastmcp-server --lib` discovers 2307 tests and, at default parallelism,
+/// leaves hundreds of threads competing for CPU, so a pump can sit runnable
+/// while the clock runs. The previous 2-second bound measured that contention
+/// rather than the server: it produced a rotating set of ~12 failures across
+/// `legacy_application_content_*`, `live_runtime_*` and
+/// `public_stdio_legacy_progress_*`, all reporting the same
+/// "legacy returning test timed out", while the identical tests passed under
+/// `--test-threads=1`. A genuine stall still trips this bound and is still
+/// reported as a failure.
+#[cfg(test)]
+const RETURNING_PUMP_WATCHDOG_NANOS: u64 = 30_000_000_000;
 const MAX_DISPATCH_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 const DISPATCH_QUEUE_CAPACITY_MESSAGE: &str = "Server request queue capacity exhausted";
 const DISCOVERY_CACHE_MAX_AGE_SECONDS: u32 = 60;
@@ -48813,7 +48834,7 @@ mod lib_unit_tests {
                     let _ = result_sender.send(result);
                 })
                 .map_err(|error| McpError::internal_error(error.to_string()))?;
-            let deadline = cx.now().saturating_add_nanos(2_000_000_000);
+            let deadline = cx.now().saturating_add_nanos(RETURNING_PUMP_WATCHDOG_NANOS);
             loop {
                 match result_receiver.try_recv() {
                     Ok(result) => {

@@ -94,7 +94,9 @@ where
                 let _ = result_sender.send(result);
             })
             .map_err(|error| McpError::internal_error(error.to_string()))?;
-        let deadline = caller_cx.now().saturating_add_nanos(5_000_000_000);
+        let deadline = caller_cx
+            .now()
+            .saturating_add_nanos(crate::RETURNING_PUMP_WATCHDOG_NANOS);
         loop {
             match result_receiver.try_recv() {
                 Ok(result) => {
