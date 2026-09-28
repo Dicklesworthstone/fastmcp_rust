@@ -203,7 +203,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172
         with:
           tool: cargo-llvm-cov@0.8.7
           checksum: true
@@ -250,7 +250,7 @@ jobs:
           toolchain: nightly-2026-08-25
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172
         with:
           tool: cargo-audit@0.22.2
           checksum: true
