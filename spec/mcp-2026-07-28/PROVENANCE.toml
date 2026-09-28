@@ -1,0 +1,61 @@
+schema_version = 1
+purpose = "Vendored, digest-pinned copy of the official MCP 2026-07-28 schema and its official example corpus, so that this repository can measure its own wire output against the specification instead of against its own reading of it."
+
+# WHY THIS EXISTS
+#
+# Plan section 2.6 permits an MCP 2026-07-28 support claim only when "the
+# official conformance harness passes in both client and server modes" with
+# "the conformance expected-failure baseline empty", and section 2.1 requires
+# that "core protocol types round-trip against the final dated composed
+# oracle". Until this directory existed, no artifact in the repository
+# described the specification: every correctness claim rested on ~11,000
+# self-authored tests, which encode the authors' reading of the spec and
+# therefore cannot detect a misreading. An oracle has to come from outside.
+
+[source]
+repository = "https://github.com/modelcontextprotocol/modelcontextprotocol"
+schema_path = "schema/2026-07-28"
+upstream_commit = "ab3a39c13bd23be691c2760e1c6c5c15a64582e1"
+upstream_commit_date_utc = "2026-09-24T01:39:54Z"
+retrieved_at_utc = "2026-09-28T05:10:00Z"
+retrieved_by = "WildMountain"
+retrieval_user_agent = "OpenAI File Downloader, XaiImageApiFetch/1.0"
+operator_authorization = "Jeff, 2026-09-28, instructing that the conformance gap be closed rather than escalated again. The vendoring question had been raised and left open on the preceding turn; this is the answer to it."
+
+[schema]
+file = "schema.json"
+sha256 = "ef70b61f99b6d2e5e3b46863822eab08dff6a45bedc7a08914e0e5b133f40203"
+bytes = 181474
+dialect = "https://json-schema.org/draft/2020-12/schema"
+definition_count = 155
+# The digest was obtained twice by independent paths and agreed: a direct
+# raw.githubusercontent.com download of schema.json, and extraction of the
+# repository tarball at the pinned commit. A single fetch would not have
+# distinguished a correct download from a truncated one.
+digest_independently_confirmed = true
+
+[typescript_source]
+file = "schema.ts"
+note = "Retained because section 2.6 makes schema.ts the authoritative source where the raw JSON Schema and the TypeScript disagree: a permitted raw-schema mismatch 'must pass the authoritative schema.ts-derived corrected rule there'. Any parity exception therefore needs this file to adjudicate it."
+
+[examples]
+directory = "examples"
+json_files = 129
+type_directories = 88
+note = "Official per-type example instances, several per type covering distinct scenarios (for example CallToolResult carries result-with-structured-content, result-with-array-structured-content, result-with-unstructured-text and invalid-tool-input-error). These are the oracle SUBJECTS: instances the specification itself declares valid, which this repository's types must accept and round-trip."
+
+[license]
+upstream_file = "LICENSE.upstream"
+terms = "The upstream project states that new specification contributions are licensed under Apache-2.0, that documentation contributions excluding specifications are CC-BY-4.0, and that contributions whose authors have not consented to relicensing remain under the MIT License. The schema and example corpus are specification material, hence Apache-2.0."
+obligations = "Attribution and retention of the upstream license text, both satisfied by this file and LICENSE.upstream. Nothing here is relicensed, and no workspace crate's own license-file is altered by vendoring it."
+
+[integrity]
+frozen = true
+# This directory is an EXTERNAL AUTHORITY, not project-authored evidence. The
+# distinction matters and is the one FND-01 draws repeatedly: a project-authored
+# record may be re-measured and re-frozen when the thing it measures changes,
+# whereas editing a vendored spec to agree with this implementation would
+# destroy the only independent check in the repository. If a conformance test
+# fails against these bytes, the implementation is what moves.
+amendment_rule = "Replace wholesale by re-fetching at a newer upstream commit and updating every field above in one change. Never edit schema.json, schema.ts or any example in place."
+retirement_condition = "Superseded when this repository targets a later dated MCP specification, at which point a sibling spec/mcp-<date>/ directory is vendored the same way and this one is retained as history."
