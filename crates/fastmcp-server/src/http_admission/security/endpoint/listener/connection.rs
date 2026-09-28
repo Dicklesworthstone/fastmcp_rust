@@ -353,7 +353,8 @@ async fn json(
         }
     };
     // The connection owns this read directly. No sibling peer-reader task can
-    // survive abandonment, and a reset stops the wait even for a slow handler.
+    // survive abandonment, and EOF/reset stops even a synchronous handler's
+    // result wait through the same request-local token installed in dispatch.
     let mut byte = [0_u8; 1];
     let response = monitor_response_peer(&cancellation, reader.read(&mut byte), async {
         let response = receiver.recv(cx).await;
@@ -494,12 +495,17 @@ async fn sse(
 /// Poll the one outstanding peer read before a JSON or SSE response, without a
 /// spawned task or repeatedly cancelling/recreating a partially completed write.
 ///
-/// Read EOF only disables this monitor: HTTP permits a client to half-close its
-/// request and continue reading the response. That case still relies on native
-/// response deadlines/write errors to discover a later loss of the receiver.
-/// Any received byte is unsupported pipelining; read errors retire the request.
-/// The existing caller performs dispatch settlement and marks failed terminal
-/// delivery. In particular, a reset never becomes a successful terminal drain.
+/// EOF retires the outstanding request just like a reset. TCP cannot distinguish
+/// a peer dropping its socket from a deliberate write-half-close, so this native
+/// one-request listener requires the client to keep its write side open until
+/// the response completes. Ignoring EOF would leave blocking handlers running
+/// for an absent caller until their deadline, even though they poll cancellation.
+/// Any received byte is unsupported pipelining and also retires the request.
+///
+/// Only the existing request-local cancellation domain is signalled; the ambient
+/// Cx and sibling requests are untouched. Its atomic terminal election preserves
+/// a finalization that won first, but that cannot turn a failed socket delivery
+/// into a successful terminal drain. The caller retains dispatch settlement.
 async fn monitor_response_peer<P, F, T>(
     cancellation: &McpRequestCancellation,
     peer: P,
@@ -515,17 +521,10 @@ where
     };
     let mut peer = std::pin::pin!(peer);
     let mut response = std::pin::pin!(response);
-    let mut half_closed = false;
     let result = poll_fn(|task| {
-        if !half_closed {
-            match peer.as_mut().poll(task) {
-                Poll::Ready(Ok(0)) => half_closed = true,
-                Poll::Ready(Ok(_) | Err(_)) => {
-                    cancellation.cancel();
-                    return Poll::Ready(Err(()));
-                }
-                Poll::Pending => {},
-            }
+        if peer.as_mut().poll(task).is_ready() {
+            cancellation.cancel();
+            return Poll::Ready(Err(()));
         }
         // Do not reject solely because the request token was cancelled: a
         // committed graceful terminal may still need to drain on this socket.
@@ -748,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn secured_json_ready_result_channel_preserves_half_close_and_reset_priority() {
+    fn secured_json_disconnect_wins_over_a_queued_result() {
         asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
             .build().unwrap().block_on(async {
@@ -768,14 +767,10 @@ mod tests {
                     let result = monitor_response_peer(&cancellation, ready(peer), async {
                         receiver.recv(&cx).await.map_err(|_| ())
                     }).await;
-                    if reset {
-                        assert!(result.is_err());
-                        assert_eq!(receiver.try_recv().unwrap().status.0, 201, "reset must not consume the queued result");
-                    } else {
-                        assert_eq!(result.unwrap().status.0, 201);
-                    }
+                    assert!(result.is_err());
+                    assert_eq!(receiver.try_recv().unwrap().status.0, 201, "EOF/reset must not consume the queued result");
                     drop(owner);
-                    assert_eq!(cancellation.is_cancel_requested(), reset);
+                    assert!(cancellation.is_cancel_requested());
                     assert!(registry.retired_dispatches.lock().unwrap().is_empty());
                 }
             });
@@ -812,36 +807,88 @@ mod tests {
     }
 
     #[test]
-    fn secured_sse_half_close_allows_the_ready_terminal_response() {
+    fn secured_peer_eof_cancels_only_its_request_context() {
+        let cx = Cx::for_testing();
         let cancellation = McpRequestCancellation::new();
+        let context = fastmcp_core::McpContext::new(cx.clone(), 7)
+            .with_request_cancellation(cancellation.clone());
+        let sibling = fastmcp_core::McpContext::new(cx.clone(), 7);
         let mut work = Box::pin(monitor_response_peer(
-            &cancellation, ready(Ok(0)), ready(Ok::<_, ()>(7)),
+            &cancellation, ready(Ok(0)), pending::<Result<(), ()>>(),
         ));
         let mut task = Context::from_waker(Waker::noop());
-        assert_eq!(work.as_mut().poll(&mut task), Poll::Ready(Ok(7)));
+        assert_eq!(work.as_mut().poll(&mut task), Poll::Ready(Err(())));
         drop(work);
-        assert!(!cancellation.is_cancel_requested());
+        assert!(context.is_cancelled());
+        assert!(cancellation.is_cancel_requested());
+        assert!(!cancellation.begin_finalization(), "disconnect won the terminal race");
+        assert!(!sibling.is_cancelled(), "even the same request ID has independent ownership");
+        assert!(cx.checkpoint().is_ok());
     }
 
     #[test]
-    fn secured_sse_half_closed_read_is_never_polled_after_completion() {
+    fn secured_peer_eof_drops_the_response_without_polling_it() {
         let cancellation = McpRequestCancellation::new();
         let peer = Tracked::new(ready(Ok(0)));
         let reads = Arc::clone(&peer.polls);
-        let calls = Arc::new(AtomicUsize::new(0));
-        let observed = Arc::clone(&calls);
-        let response = poll_fn(move |_| {
-            if observed.fetch_add(1, Ordering::SeqCst) == 0 { Poll::Pending }
-            else { Poll::Ready(Ok::<_, ()>(7)) }
-        });
+        let peer_drops = Arc::clone(&peer.drops);
+        let response = Tracked::new(ready(Ok::<_, ()>(7)));
+        let calls = Arc::clone(&response.polls);
+        let response_drops = Arc::clone(&response.drops);
         let mut work = Box::pin(monitor_response_peer(&cancellation, peer, response));
         let mut task = Context::from_waker(Waker::noop());
-        assert!(work.as_mut().poll(&mut task).is_pending());
-        assert_eq!(work.as_mut().poll(&mut task), Poll::Ready(Ok(7)));
+        assert_eq!(work.as_mut().poll(&mut task), Poll::Ready(Err(())));
         drop(work);
         assert_eq!(reads.load(Ordering::SeqCst), 1);
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert!(!cancellation.is_cancel_requested());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(peer_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(response_drops.load(Ordering::SeqCst), 1);
+        assert!(cancellation.is_cancel_requested());
+    }
+
+    #[test]
+    fn secured_peer_disconnect_does_not_reverse_finalization_or_claim_delivery() {
+        for reset in [false, true] {
+            let cancellation = McpRequestCancellation::new();
+            assert!(cancellation.begin_finalization());
+            let peer = if reset { Err(io::Error::from(io::ErrorKind::ConnectionReset)) } else { Ok(0) };
+            let mut work = Box::pin(monitor_response_peer(
+                &cancellation, ready(peer), ready(Ok::<_, ()>(7)),
+            ));
+            let mut task = Context::from_waker(Waker::noop());
+            assert_eq!(work.as_mut().poll(&mut task), Poll::Ready(Err(())));
+            drop(work);
+            assert!(cancellation.is_finalizing());
+            assert!(!cancellation.is_cancel_requested());
+            assert!(!cancellation.cancel());
+        }
+    }
+
+    #[test]
+    fn secured_peer_eof_racing_finalization_has_one_terminal_owner() {
+        for _ in 0..64 {
+            let cancellation = McpRequestCancellation::new();
+            let start = std::sync::Barrier::new(2);
+            let finalized = std::thread::scope(|scope| {
+                let finalizer = scope.spawn(|| {
+                    start.wait();
+                    cancellation.begin_finalization()
+                });
+                let mut work = Box::pin(monitor_response_peer(
+                    &cancellation, ready(Ok(0)), ready(Ok::<_, ()>(7)),
+                ));
+                let mut task = Context::from_waker(Waker::noop());
+                start.wait();
+                assert_eq!(work.as_mut().poll(&mut task), Poll::Ready(Err(())));
+                drop(work);
+                finalizer.join().unwrap()
+            });
+            assert!(cancellation.is_terminal());
+            assert_eq!(cancellation.is_finalizing(), finalized);
+            assert_eq!(cancellation.is_cancel_requested(), !finalized);
+            assert_eq!(cancellation.begin_finalization(), finalized);
+            assert!(!cancellation.cancel(), "the terminal winner cannot change");
+        }
     }
 
     #[test]
