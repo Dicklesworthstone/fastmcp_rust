@@ -13034,7 +13034,12 @@ impl HttpClient {
         'rebuild: loop {
             let mut pages = Vec::new();
             let mut item_count = 0;
-            let mut cursor = None;
+            // Annotated because the first use is `cursor.as_ref()` followed by `.clone()`:
+            // on an unresolved `&T` that call is ambiguous between `Clone for &T` and
+            // `T: Clone`, and method resolution runs before the later `cursor =
+            // next_cursor` assignment can supply the type. `admit_next_cursor` fixes it
+            // at `Option<String>`.
+            let mut cursor: Option<String> = None;
             let mut baseline = None;
             loop {
                 if cx.checkpoint().is_err() {
