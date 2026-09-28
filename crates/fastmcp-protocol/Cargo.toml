@@ -30,5 +30,13 @@ regex.workspace = true
 ring = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
 
+[dev-dependencies]
+# Integration tests link only against this crate plus its dev-dependencies, so
+# the conformance oracle in tests/spec_2026_07_28_oracle.rs needs its own
+# handle on serde_json to read the vendored official example corpus. Already a
+# normal dependency of this crate, so the dependency graph and lockfile are
+# unchanged by declaring it here.
+serde_json = { workspace = true }
+
 [lints]
 workspace = true
