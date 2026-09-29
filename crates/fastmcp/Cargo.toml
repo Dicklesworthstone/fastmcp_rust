@@ -205,6 +205,17 @@ test = false
 bench = false
 doc = false
 
+# Conformance adapter for the official @modelcontextprotocol/conformance suite.
+# It serves the upstream fixture contract over modern HTTP so the harness that
+# plan section 2.6 requires can be pointed at this codebase at all. Declared
+# explicitly because this crate sets `autoexamples = false`.
+[[bin]]
+name = "conformance_server"
+path = "examples/conformance_server.rs"
+test = false
+bench = false
+doc = false
+
 [[test]]
 name = "readme_examples"
 path = "tests/readme_examples.rs"
