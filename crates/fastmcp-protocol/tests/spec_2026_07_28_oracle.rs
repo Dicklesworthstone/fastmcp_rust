@@ -213,8 +213,10 @@ fn official_modern_envelopes_are_admitted_and_round_trip() {
         let request: JsonRpcRequest = match serde_json::from_value(value.clone()) {
             Ok(request) => request,
             Err(error) => {
-                admission_failures
-                    .insert(name, format!("official envelope is not a JsonRpcRequest: {error}"));
+                admission_failures.insert(
+                    name,
+                    format!("official envelope is not a JsonRpcRequest: {error}"),
+                );
                 continue;
             }
         };
@@ -297,6 +299,124 @@ fn official_modern_envelopes_are_admitted_and_round_trip() {
     );
 }
 
+/// Result example directories paired with the official request that selects
+/// them. `decode_result` is a method ON a request, because in this protocol the
+/// request chooses the result vocabulary, so a result cannot be decoded in
+/// isolation. Both sides of every pair come from the specification.
+///
+/// `InputRequiredResult` is paired with `CallToolRequest` because
+/// `input_required` is a result *type* any of tools/call, resources/read or
+/// prompts/get may return rather than a method of its own; tools/call is the
+/// case the official example is written against.
+const RESULT_PAIRINGS: &[(&str, &str)] = &[
+    ("CallToolResult", "CallToolRequest"),
+    ("CompleteResult", "CompleteRequest"),
+    ("DiscoverResult", "DiscoverRequest"),
+    ("GetPromptResult", "GetPromptRequest"),
+    ("InputRequiredResult", "CallToolRequest"),
+    ("ListPromptsResult", "ListPromptsRequest"),
+    (
+        "ListResourceTemplatesResult",
+        "ListResourceTemplatesRequest",
+    ),
+    ("ListResourcesResult", "ListResourcesRequest"),
+    ("ListToolsResult", "ListToolsRequest"),
+    ("ReadResourceResult", "ReadResourceRequest"),
+    ("SubscriptionsListenResult", "SubscriptionsListenRequest"),
+];
+
+/// Official result instances decoded through the official request that selects
+/// them. This is the result-side half of section 2.1: every successful modern
+/// result must carry a valid `resultType`, and the two `InputRequiredResult`
+/// instances are official examples of the `input_required` shape that 13 of the
+/// 37 scored server scenarios exercise.
+#[test]
+fn official_modern_results_decode_through_their_selecting_request() {
+    let mut failures: BTreeMap<String, String> = BTreeMap::new();
+    let mut decoded: Vec<String> = Vec::new();
+    let mut examined = 0usize;
+
+    for (result_dir, request_dir) in RESULT_PAIRINGS {
+        // Build the selecting request from its own official envelope.
+        let request_files = {
+            let dir = spec_root().join("examples").join(request_dir);
+            let mut files: Vec<PathBuf> = fs::read_dir(&dir)
+                .unwrap_or_else(|error| panic!("{}: {error}", dir.display()))
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+                .collect();
+            files.sort();
+            files
+        };
+        let request_path = request_files
+            .first()
+            .unwrap_or_else(|| panic!("{request_dir} must carry an official request example"));
+        let request_value: Value = serde_json::from_slice(
+            &fs::read(request_path).unwrap_or_else(|error| panic!("{request_dir}: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("{request_dir}: not JSON: {error}"));
+        let method = request_value
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("{request_dir} example must carry a method"));
+        let request =
+            match CoreRequest::decode(ProtocolEra::Modern2026, method, request_value.get("params"))
+            {
+                Ok(request) => request,
+                Err(error) => {
+                    failures.insert(
+                        (*request_dir).to_owned(),
+                        format!("selecting request {method} was itself refused: {error:?}"),
+                    );
+                    continue;
+                }
+            };
+
+        let result_dir_path = spec_root().join("examples").join(result_dir);
+        let mut result_files: Vec<PathBuf> = fs::read_dir(&result_dir_path)
+            .unwrap_or_else(|error| panic!("{}: {error}", result_dir_path.display()))
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        result_files.sort();
+        for result_path in &result_files {
+            examined += 1;
+            let raw = fs::read_to_string(result_path)
+                .unwrap_or_else(|error| panic!("{}: {error}", relative(result_path)));
+            match request.decode_result(&raw) {
+                Ok(_) => decoded.push(relative(result_path)),
+                Err(error) => {
+                    failures.insert(relative(result_path), format!("via {method}: {error:?}"));
+                }
+            }
+        }
+    }
+
+    assert!(
+        examined >= 16,
+        "the pinned corpus carried 16 official result instances; examined only {examined}. \
+         A shrinking corpus must fail rather than quietly narrow this oracle."
+    );
+
+    let mut report = String::new();
+    if !failures.is_empty() {
+        report.push_str(&format!(
+            "\n{} official MCP 2026-07-28 result instance(s) NOT decoded by this implementation:\n",
+            failures.len()
+        ));
+        for (file, detail) in &failures {
+            report.push_str(&format!("  - {file}\n     {detail}\n"));
+        }
+    }
+    assert!(
+        report.is_empty(),
+        "{report}\ndecoded cleanly: {} of {examined}",
+        decoded.len()
+    );
+}
+
 /// Planted negatives (RH-5). Without these, "the implementation admitted all 21
 /// official envelopes" would be equally consistent with an implementation that
 /// admits anything at all. Each mutation differs from an admitted instance in
@@ -335,8 +455,7 @@ fn near_identical_mutations_of_an_official_envelope_are_refused() {
         .and_then(Value::as_object_mut)
         .expect("params object")
         .remove("_meta");
-    let no_meta =
-        CoreRequest::decode(ProtocolEra::Modern2026, &method, stripped.get("params"));
+    let no_meta = CoreRequest::decode(ProtocolEra::Modern2026, &method, stripped.get("params"));
     assert!(
         no_meta.is_err(),
         "plan section 2.1 requires that every modern request carry protocol-version and \
@@ -347,8 +466,7 @@ fn near_identical_mutations_of_an_official_envelope_are_refused() {
     let mut cross_era = official.clone();
     cross_era["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
         Value::String("2024-11-05".to_owned());
-    let wrong_era =
-        CoreRequest::decode(ProtocolEra::Modern2026, &method, cross_era.get("params"));
+    let wrong_era = CoreRequest::decode(ProtocolEra::Modern2026, &method, cross_era.get("params"));
     assert!(
         wrong_era.is_err(),
         "a modern request declaring the 2024-11-05 protocol version must be refused; the two \
