@@ -197,14 +197,23 @@ impl Drop for RegisteredResponseBody {
 
 async fn buffered<T: asupersync::io::AsyncWrite + Unpin>(
     cx: &Cx, shutdown: &HttpListenerShutdown, framed: &mut Framed<T, NativeHttp1Codec>,
-    mut response: HttpResponse, cors: Option<&CorsResponseHeaders>, io: SecuredHttpIoLimits,
+    response: HttpResponse, cors: Option<&CorsResponseHeaders>, io: SecuredHttpIoLimits,
 ) {
+    // Admission refusals own no dispatch. Their only remaining action is to
+    // close this one-request connection, whether delivery succeeds or fails.
+    let _ = write_buffered(cx, shutdown, framed, response, cors, io).await;
+}
+
+async fn write_buffered<T: asupersync::io::AsyncWrite + Unpin>(
+    cx: &Cx, shutdown: &HttpListenerShutdown, framed: &mut Framed<T, NativeHttp1Codec>,
+    mut response: HttpResponse, cors: Option<&CorsResponseHeaders>, io: SecuredHttpIoLimits,
+) -> Result<(), ()> {
     if response.status.0 >= 400 {
         response = response.with_header("cache-control", "no-store");
     }
     if let Some(cors) = cors { cors.apply_to(&mut response); }
-    let _ = asupersync::time::timeout(cx.now(), io.write_timeout,
-        send_h1_response(cx, shutdown, framed, response)).await;
+    asupersync::time::timeout(cx.now(), io.write_timeout,
+        send_h1_response(cx, shutdown, framed, response)).await.map_err(|_| ())?.map_err(|_| ())
 }
 
 #[derive(Default)]
@@ -276,7 +285,7 @@ async fn issuer(
     };
     let cancellation = McpRequestCancellation::new();
     let worker_cancellation = cancellation.clone();
-    let (sender, mut receiver) = asupersync::channel::oneshot::channel::<HttpResponse>();
+    let (sender, receiver) = asupersync::channel::oneshot::channel::<HttpResponse>();
     let task = cx.spawn(move |worker_cx| async move {
         let (result_sender, mut result_receiver) = asupersync::channel::oneshot::channel();
         let completion = Arc::new(IssuerCompletion::default());
@@ -295,7 +304,7 @@ async fn issuer(
             let _ = sender.send_blocking(response.with_header("cache-control", "no-store"));
         }
     });
-    let mut dispatch = match task {
+    let dispatch = match task {
         Ok(task) => OwnedJsonDispatch { task: Some(task), sessions, cancellation: cancellation.clone() },
         Err(_) => {
             let mut framed = Framed::new(stream, native_http1_codec(&endpoint));
@@ -305,17 +314,11 @@ async fn issuer(
     };
     let (mut reader, writer) = stream.into_split();
     let mut byte = [0_u8; 1];
-    let response = monitor_response_peer(&cancellation, reader.read(&mut byte), async {
-        let response = receiver.recv(cx).await;
-        if cx.checkpoint().is_err() { return Err(()); }
-        Ok(response.unwrap_or_else(|_| unavailable()))
-    }).await;
-    let Ok(mut response) = response else { return; };
-    if !dispatch.finish(cx).await { response = unavailable(); }
-    drop(dispatch);
-    drop(reader);
     let mut framed = Framed::new(writer, native_http1_codec(&endpoint));
-    buffered(cx, &shutdown, &mut framed, response, Some(&cors), io).await;
+    let _ = deliver_buffered_response(
+        cx, dispatch, receiver, reader.read(&mut byte), unavailable(),
+        |response| write_buffered(cx, &shutdown, &mut framed, response, Some(&cors), io),
+    ).await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -330,7 +333,7 @@ async fn json(
     let dispatch_endpoint = Arc::clone(&endpoint);
     let dispatch_sessions = Arc::clone(&sessions);
     let dispatch_cancellation = cancellation.clone();
-    let (sender, mut receiver) = asupersync::channel::oneshot::channel::<HttpResponse>();
+    let (sender, receiver) = asupersync::channel::oneshot::channel::<HttpResponse>();
     let task = cx.spawn(move |request_cx| async move {
         let response = match scopes {
             Some(scopes) => Box::pin(scope::dispatch_socket_json(
@@ -343,7 +346,7 @@ async fn json(
         };
         let _ = sender.send_blocking(response);
     });
-    let mut dispatch = match task {
+    let dispatch = match task {
         Ok(task) => OwnedJsonDispatch { task: Some(task), sessions, cancellation: cancellation.clone() },
         Err(_) => {
             cancellation.cancel();
@@ -352,25 +355,48 @@ async fn json(
             return;
         }
     };
-    // The connection owns this read directly. No sibling peer-reader task can
-    // survive abandonment, and EOF/reset stops even a synchronous handler's
-    // result wait through the same request-local token installed in dispatch.
     let mut byte = [0_u8; 1];
-    let response = monitor_response_peer(&cancellation, reader.read(&mut byte), async {
+    let mut framed = Framed::new(writer, native_http1_codec(&endpoint));
+    let _ = deliver_buffered_response(
+        cx, dispatch, receiver, reader.read(&mut byte), HttpResponse::internal_error(),
+        |response| write_buffered(cx, &shutdown, &mut framed, response, Some(&cors), io),
+    ).await;
+}
+
+/// Own one peer read across result retrieval, child settlement and final write.
+/// A queued result is not proof that its producer has quiesced or that any
+/// bytes reached the peer. Neither the join nor the bounded write may escape
+/// disconnect monitoring, including for issuer responses without MCP terminals.
+/// On abandonment the dispatch guard transfers any unfinished child to the
+/// listener; after settlement the peer guard still owns request cancellation.
+async fn deliver_buffered_response<P, W, F>(
+    cx: &Cx,
+    mut dispatch: OwnedJsonDispatch,
+    mut receiver: asupersync::channel::oneshot::Receiver<HttpResponse>,
+    peer: P,
+    failure: HttpResponse,
+    write: W,
+) -> Result<(), ()>
+where
+    P: Future<Output = std::io::Result<usize>>,
+    W: FnOnce(HttpResponse) -> F,
+    F: Future<Output = Result<(), ()>>,
+{
+    let cancellation = dispatch.cancellation.clone();
+    monitor_response_peer(&cancellation, peer, async move {
         let response = receiver.recv(cx).await;
         if cx.checkpoint().is_err() { return Err(()); }
-        Ok(response.unwrap_or_else(|_| HttpResponse::internal_error()))
-    }).await;
-    let Ok(mut response) = response else { return; };
-    drop(reader);
-    if !dispatch.finish(cx).await {
-        if cx.checkpoint().is_err() { return; }
-        response = HttpResponse::internal_error();
-    }
-    // Transfer any failed/unsettled child before attempting a socket write.
-    drop(dispatch);
-    let mut framed = Framed::new(writer, native_http1_codec(&endpoint));
-    buffered(cx, &shutdown, &mut framed, response, Some(&cors), io).await;
+        let mut response = response.unwrap_or_else(|_| failure.clone());
+        if !dispatch.finish(cx).await {
+            if cx.checkpoint().is_err() { return Err(()); }
+            response = failure;
+        }
+        // Transfer failed/unsettled custody before writing, but leave the peer
+        // monitor armed. In particular, a write error must not count as success
+        // merely because the task handle has already been joined and released.
+        drop(dispatch);
+        write(response).await
+    }).await
 }
 
 /// Keep a JSON request's child handle even if its result wait or join is dropped.
@@ -945,6 +971,229 @@ mod tests {
         let mut task = Context::from_waker(Waker::noop());
         assert_eq!(work.as_mut().poll(&mut task), Poll::Ready(Ok(7)));
         assert!(cancellation.is_cancel_requested(), "success never reverses cancellation");
+    }
+
+    #[test]
+    fn buffered_delivery_raw_tcp_disconnect_interrupts_post_result_join() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build().unwrap().block_on(async {
+                let cx = Cx::current().unwrap();
+                let bound = Server::new("buffered-join-peer", "1")
+                    .protocol_policy(fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly).unwrap()
+                    .build().bind_http(&cx, "127.0.0.1:0").await.unwrap();
+                let peer = std::net::TcpStream::connect_timeout(
+                    &bound.local_addr().unwrap(), Duration::from_secs(2),
+                ).unwrap();
+                let (stream, _) = bound.listener.accept().await.unwrap();
+                let (mut reader, writer) = ConnectionIo::Plain(stream).into_split();
+                let registry = Arc::clone(&bound.modern_sessions);
+                let cancellation = McpRequestCancellation::new();
+                let sibling = fastmcp_core::McpContext::new(cx.clone(), 7);
+                let (sender, receiver) = asupersync::channel::oneshot::channel();
+                let (queued, mut queue_ready) = asupersync::channel::oneshot::channel();
+                let (release, mut cleanup) = asupersync::channel::oneshot::channel::<()>();
+                let child = cx.spawn(move |child_cx| async move {
+                    let _ = sender.send_blocking(HttpResponse::new(HttpStatus(201)));
+                    let _ = queued.send_blocking(());
+                    // Producing a value is deliberately distinct from retiring
+                    // the child's remaining cleanup and captured resources.
+                    let _ = cleanup.recv(&child_cx).await;
+                }).unwrap();
+                let dispatch = OwnedJsonDispatch {
+                    task: Some(child), sessions: Arc::clone(&registry), cancellation: cancellation.clone(),
+                };
+                queue_ready.recv(&cx).await.unwrap();
+                let writes = AtomicUsize::new(0);
+                let shutdown = HttpListenerShutdown::new(&cx);
+                let mut framed = Framed::new(writer, native_http1_codec(&bound.endpoint));
+                let mut byte = [0_u8; 1];
+                let mut delivery = Box::pin(deliver_buffered_response(
+                    &cx, dispatch, receiver, reader.read(&mut byte), HttpResponse::internal_error(),
+                    |response| {
+                        writes.fetch_add(1, Ordering::SeqCst);
+                        write_buffered(&cx, &shutdown, &mut framed, response, None, SecuredHttpIoLimits::default())
+                    },
+                ));
+                poll_fn(|task| {
+                    assert!(delivery.as_mut().poll(task).is_pending(), "queued response must still join its child");
+                    Poll::Ready(())
+                }).await;
+                assert_eq!(writes.load(Ordering::SeqCst), 0);
+                assert!(!cancellation.is_cancel_requested());
+                drop(peer); // Real FIN, not a fabricated read result or Cx abort.
+                let result = asupersync::time::timeout(
+                    cx.now(), Duration::from_secs(2), delivery.as_mut(),
+                ).await;
+                drop(delivery);
+                let _ = release.send_blocking(());
+                let mut retired = registry.take_retired_dispatches();
+                assert_eq!(retired.len(), 1, "disconnect retains the unfinished child for settlement");
+                let _ = asupersync::time::timeout(
+                    cx.now(), Duration::from_secs(2), retired[0].join(&cx),
+                ).await.expect("retired child settles after release");
+                assert_eq!(result.expect("peer monitoring must remain active during join"), Err(()));
+                assert_eq!(writes.load(Ordering::SeqCst), 0, "no buffered response starts after EOF");
+                assert!(cancellation.is_cancel_requested());
+                assert!(!sibling.is_cancelled());
+                assert!(cx.checkpoint().is_ok());
+            });
+    }
+
+    #[test]
+    fn buffered_delivery_owns_pending_write_after_child_settlement() {
+        for finalized in [false, true] {
+            for abandon in [false, true] {
+                let cx = Cx::for_testing();
+                let cancellation = McpRequestCancellation::new();
+                if finalized { assert!(cancellation.begin_finalization()); }
+                let registry = Arc::new(crate::LiveModernHttpSessionRegistryState::new());
+                // The producer has already joined; its guard can no longer be
+                // relied on to signal loss of response ownership.
+                let dispatch = OwnedJsonDispatch {
+                    task: None, sessions: Arc::clone(&registry), cancellation: cancellation.clone(),
+                };
+                let (sender, receiver) = asupersync::channel::oneshot::channel();
+                sender.send_blocking(HttpResponse::new(HttpStatus(201))).unwrap();
+                let disconnected = AtomicBool::new(false);
+                let peer = Tracked::new(poll_fn(|_| {
+                    if disconnected.load(Ordering::SeqCst) { Poll::Ready(Ok(0)) }
+                    else { Poll::Pending }
+                }));
+                let peer_drops = Arc::clone(&peer.drops);
+                let write = Tracked::new(pending::<Result<(), ()>>());
+                let write_polls = Arc::clone(&write.polls);
+                let write_drops = Arc::clone(&write.drops);
+                let starts = AtomicUsize::new(0);
+                let mut delivery = Box::pin(deliver_buffered_response(
+                    &cx, dispatch, receiver, peer, HttpResponse::internal_error(),
+                    |response| {
+                        assert_eq!(response.status.0, 201);
+                        starts.fetch_add(1, Ordering::SeqCst);
+                        write
+                    },
+                ));
+                let mut task = Context::from_waker(Waker::noop());
+                assert!(delivery.as_mut().poll(&mut task).is_pending());
+                assert!(delivery.as_mut().poll(&mut task).is_pending());
+                assert_eq!(starts.load(Ordering::SeqCst), 1, "never recreate a partially completed write");
+                assert_eq!(write_polls.load(Ordering::SeqCst), 2);
+                assert!(!cancellation.is_cancel_requested());
+                if !abandon {
+                    disconnected.store(true, Ordering::SeqCst);
+                    assert_eq!(delivery.as_mut().poll(&mut task), Poll::Ready(Err(())));
+                }
+                drop(delivery);
+                assert_eq!(write_polls.load(Ordering::SeqCst), 2, "no further write poll after observed EOF");
+                assert_eq!(write_drops.load(Ordering::SeqCst), 1);
+                assert_eq!(peer_drops.load(Ordering::SeqCst), 1);
+                assert_eq!(cancellation.is_cancel_requested(), !finalized);
+                assert_eq!(cancellation.is_finalizing(), finalized);
+                assert!(registry.retired_dispatches.lock().unwrap().is_empty());
+                assert!(cx.checkpoint().is_ok());
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum BufferedWriteMode { Complete, Fail, Stall }
+
+    struct BufferedTestWriter {
+        mode: BufferedWriteMode,
+        bytes: Vec<u8>,
+    }
+
+    impl asupersync::io::AsyncWrite for BufferedTestWriter {
+        fn poll_write(mut self: Pin<&mut Self>, _: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+            if !self.bytes.is_empty() {
+                match self.mode {
+                    BufferedWriteMode::Fail => return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+                    BufferedWriteMode::Stall => return Poll::Pending,
+                    BufferedWriteMode::Complete => {},
+                }
+            }
+            let count = bytes.len().min(3);
+            self.bytes.extend_from_slice(&bytes[..count]);
+            Poll::Ready(Ok(count))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> { Poll::Ready(Ok(())) }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> { Poll::Ready(Ok(())) }
+    }
+
+    #[test]
+    fn buffered_delivery_checks_real_partial_writes_errors_and_timeouts() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build().unwrap().block_on(async {
+                let cx = Cx::current().unwrap();
+                let bound = Server::new("buffered-write-result", "1")
+                    .protocol_policy(fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly).unwrap()
+                    .build().bind_http(&cx, "127.0.0.1:0").await.unwrap();
+                for finalized in [false, true] {
+                    for mode in [BufferedWriteMode::Complete, BufferedWriteMode::Fail, BufferedWriteMode::Stall] {
+                        let cancellation = McpRequestCancellation::new();
+                        if finalized { assert!(cancellation.begin_finalization()); }
+                        let registry = Arc::clone(&bound.modern_sessions);
+                        let child = cx.spawn(|_| async {}).unwrap();
+                        let mut dispatch = OwnedJsonDispatch {
+                            task: Some(child), sessions: Arc::clone(&registry), cancellation: cancellation.clone(),
+                        };
+                        assert!(dispatch.finish(&cx).await);
+                        let (sender, receiver) = asupersync::channel::oneshot::channel();
+                        sender.send_blocking(HttpResponse::new(HttpStatus(201))).unwrap();
+                        let writer = BufferedTestWriter { mode, bytes: Vec::new() };
+                        let mut framed = Framed::new(writer, native_http1_codec(&bound.endpoint));
+                        let shutdown = HttpListenerShutdown::new(&cx);
+                        let io = SecuredHttpIoLimits::new(Duration::from_secs(1), Duration::from_millis(20)).unwrap();
+                        let result = asupersync::time::timeout(cx.now(), Duration::from_secs(2),
+                            deliver_buffered_response(
+                                &cx, dispatch, receiver, pending::<io::Result<usize>>(), HttpResponse::internal_error(),
+                                |response| write_buffered(&cx, &shutdown, &mut framed, response, None, io),
+                            ),
+                        ).await.expect("bounded final response write");
+                        let complete = matches!(mode, BufferedWriteMode::Complete);
+                        assert_eq!(result.is_ok(), complete, "a partial/failed response is not successful delivery");
+                        let bytes = framed.into_inner().bytes;
+                        if complete {
+                            assert!(bytes.starts_with(b"HTTP/1.1 201"));
+                            assert!(bytes.ends_with(b"\r\n\r\n"));
+                        } else {
+                            assert_eq!(bytes, b"HTT", "a failed short write is not restarted or replaced with a 500");
+                        }
+                        assert_eq!(cancellation.is_cancel_requested(), !complete && !finalized);
+                        assert_eq!(cancellation.is_finalizing(), finalized);
+                        assert!(registry.retired_dispatches.lock().unwrap().is_empty());
+                        assert!(cx.checkpoint().is_ok());
+                    }
+                }
+            });
+    }
+
+    #[test]
+    fn buffered_delivery_preserves_fallback_response_when_producer_closes_without_a_value() {
+        let cx = Cx::for_testing();
+        for status in [500, 503] {
+            let cancellation = McpRequestCancellation::new();
+            let dispatch = OwnedJsonDispatch {
+                task: None, sessions: Arc::new(crate::LiveModernHttpSessionRegistryState::new()),
+                cancellation: cancellation.clone(),
+            };
+            let (sender, receiver) = asupersync::channel::oneshot::channel::<HttpResponse>();
+            drop(sender);
+            let mut delivery = Box::pin(deliver_buffered_response(
+                &cx, dispatch, receiver, pending::<io::Result<usize>>(),
+                HttpResponse::new(HttpStatus(status)).with_header("cache-control", "no-store"),
+                |response| {
+                    assert_eq!(response.status.0, status);
+                    assert_eq!(response.headers.get("cache-control").map(String::as_str), Some("no-store"));
+                    ready(Ok(()))
+                },
+            ));
+            let mut task = Context::from_waker(Waker::noop());
+            assert_eq!(delivery.as_mut().poll(&mut task), Poll::Ready(Ok(())));
+            drop(delivery);
+            assert!(!cancellation.is_cancel_requested());
+        }
     }
 
     #[test]
