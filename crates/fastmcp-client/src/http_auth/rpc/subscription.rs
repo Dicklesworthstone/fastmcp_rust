@@ -41,6 +41,8 @@ impl ManagedOAuthSession {
     /// The notification limit includes the acknowledgement. The timeout covers
     /// credential acquisition, all reads, and caller time between reads; events
     /// and keepalives never reset it. There is no automatic reconnection.
+    /// A finite JSON error response exposes its correlated JSON-RPC error code;
+    /// it never opens a subscription or retains the peer's message or data.
     pub async fn listen_core(
         &self,
         cx: &Cx,
@@ -82,6 +84,19 @@ impl ManagedOAuthSession {
                 status: response.metadata().status(),
             });
         }
+        // A peer can refuse a listen with a finite application/json response
+        // instead of opening SSE. Preserve a strictly admitted, correlated error
+        // without accepting a JSON success as a subscription acknowledgement.
+        // This read retains the original deadline, cancellation and native body
+        // policy; it does not renew credentials or retry the refused request.
+        if matches!(response.metadata().kind(), ModernHttpResponseKind::Json) {
+            let frame = bounded_wait(cx, cancellation, deadline, async {
+                response.read_to_end(cx, limits.frame_bytes.min(limits.total_bytes))
+                    .await.map_err(ManagedCoreError::from)
+            }).await?;
+            check_call(cx, cancellation, deadline)?;
+            return Err(json_subscription_error(&frame, &decoder.request_id, limits));
+        }
         // A successful listen is an incremental SSE response, never a JSON
         // collector pretending that a terminal-only response opened a stream.
         if !matches!(response.metadata().kind(), ModernHttpResponseKind::Sse) {
@@ -105,6 +120,30 @@ impl ManagedOAuthSession {
             generation,
             finished: false,
         })
+    }
+}
+
+// Shared with other managed subscription facades. A JSON body can communicate
+// refusal, never stream establishment. Validate the entire envelope before
+// correlation or error publication, retaining only the numeric remote code.
+pub(crate) fn json_subscription_error(
+    frame: &[u8],
+    request_id: &RequestId,
+    limits: ManagedCoreLimits,
+) -> ManagedCoreError {
+    if frame.len() > limits.frame_bytes || frame.len() > limits.total_bytes {
+        return ManagedCoreError::ResponseByteLimit;
+    }
+    let response = match decode_strict_jsonrpc_response(frame, limits.frame_bytes) {
+        Ok(decoded) => decoded.into_parts().0,
+        Err(_) => return ManagedCoreError::InvalidResponse,
+    };
+    if !response.id.as_ref().is_some_and(|id| id.correlates_with(request_id)) {
+        return ManagedCoreError::ResponseIdMismatch;
+    }
+    match response.error {
+        Some(error) => ManagedCoreError::Remote { code: error.code },
+        None => ManagedCoreError::InvalidResponse,
     }
 }
 
@@ -363,3 +402,86 @@ impl SubscriptionDecoder {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod json_error_tests {
+    use super::*;
+
+    fn admit(frame: &[u8]) -> ManagedCoreError {
+        json_subscription_error(frame, &RequestId::Number(7), ManagedCoreLimits::default())
+    }
+
+    #[test]
+    fn finite_json_refusal_preserves_only_the_correlated_remote_code() {
+        let frame = br#"{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"private-message-canary","data":{"secret":"private-data-canary"}}}"#;
+        let error = admit(frame);
+        assert!(matches!(&error, ManagedCoreError::Remote { code } if code.to_string() == "-32601"));
+        let diagnostic = format!("{error} {error:?}");
+        assert!(!diagnostic.contains("private-message-canary"));
+        assert!(!diagnostic.contains("private-data-canary"));
+    }
+
+    #[test]
+    fn finite_json_refusal_cannot_borrow_another_requests_id() {
+        for id in [serde_json::json!(8), serde_json::json!("7"), Value::Null] {
+            let frame = serde_json::to_vec(&serde_json::json!({
+                "jsonrpc":"2.0", "id":id,
+                "error":{"code":-32602,"message":"refused"},
+            })).unwrap();
+            assert!(matches!(admit(&frame), ManagedCoreError::ResponseIdMismatch));
+        }
+    }
+
+    #[test]
+    fn string_request_ids_remain_distinct_and_correlate_exactly() {
+        let frame = br#"{"jsonrpc":"2.0","id":"owned","error":{"code":-32602,"message":"refused"}}"#;
+        assert!(matches!(json_subscription_error(
+            frame, &RequestId::String("owned".to_owned()), ManagedCoreLimits::default(),
+        ), ManagedCoreError::Remote { .. }));
+        assert!(matches!(json_subscription_error(
+            frame, &RequestId::String("other".to_owned()), ManagedCoreLimits::default(),
+        ), ManagedCoreError::ResponseIdMismatch));
+    }
+
+    #[test]
+    fn finite_json_success_or_notification_cannot_open_a_subscription() {
+        for frame in [
+            br#"{"jsonrpc":"2.0","id":7,"result":{"resultType":"complete"}}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"notifications":{}}}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":7,"method":"roots/list"}"#.as_slice(),
+        ] {
+            assert!(matches!(admit(frame), ManagedCoreError::InvalidResponse));
+        }
+    }
+
+    #[test]
+    fn finite_json_refusals_require_one_strict_complete_envelope() {
+        for frame in [
+            br#"{"jsonrpc":"2.0","id":7,"id":7,"error":{"code":-32601,"message":"refused"}}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":7,"result":{},"error":{"code":-32601,"message":"refused"}}"#.as_slice(),
+            br#"[{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"refused"}}]"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"refused"}} {}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":7,"error":{"code":-32601}}"#.as_slice(),
+            &[0xff],
+        ] {
+            assert!(matches!(admit(frame), ManagedCoreError::InvalidResponse));
+        }
+    }
+
+    #[test]
+    fn finite_json_refusals_obey_frame_and_total_byte_boundaries() {
+        let frame = br#"{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"refused"}}"#;
+        let mut limits = ManagedCoreLimits::default();
+        limits.frame_bytes = frame.len();
+        limits.total_bytes = frame.len();
+        assert!(matches!(json_subscription_error(frame, &RequestId::Number(7), limits),
+            ManagedCoreError::Remote { .. }));
+        limits.frame_bytes -= 1;
+        assert!(matches!(json_subscription_error(frame, &RequestId::Number(7), limits),
+            ManagedCoreError::ResponseByteLimit));
+        limits.frame_bytes = frame.len();
+        limits.total_bytes -= 1;
+        assert!(matches!(json_subscription_error(frame, &RequestId::Number(7), limits),
+            ManagedCoreError::ResponseByteLimit));
+    }
+}
