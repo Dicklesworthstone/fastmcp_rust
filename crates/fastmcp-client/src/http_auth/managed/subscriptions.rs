@@ -24,6 +24,7 @@ use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
     CompleteResult, CoreRequest, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION,
     FinalSubscriptionsListenResult, JsonInteger, RequestId, ServerNotification, SubscriptionFilter,
+    decode_strict_jsonrpc_response,
 };
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::tasks_extension::{
@@ -31,7 +32,7 @@ use fastmcp_protocol::tasks_extension::{
     TaskStatusNotification, task_subscription_ids,
 };
 #[cfg(feature = "tasks")]
-use fastmcp_protocol::{CoreResult, ExtensionDirection, FinalCoreResult, decode_strict_jsonrpc_response};
+use fastmcp_protocol::{CoreResult, ExtensionDirection, FinalCoreResult};
 
 use super::{ManagedOAuthResponse, ManagedOAuthSession, OAuthSessionError, deadline_after};
 #[cfg(feature = "tasks")]
@@ -162,6 +163,8 @@ impl ManagedOAuthSession {
     /// The caller supplies a typed request with final per-request metadata.
     /// Request/profile/size checks finish before any renewal or network contact.
     /// This does not add a legacy session or perform implicit discovery.
+    /// Finite JSON refusals retain only their correlated JSON-RPC error code;
+    /// successful stream establishment still requires an SSE acknowledgement.
     pub async fn subscribe_core(
         &self,
         cx: &Cx,
@@ -191,7 +194,7 @@ impl ManagedOAuthSession {
         let response = self.await_active(cx, cancellation, deadline, None, async {
             self.execute_with_cancellation(cx, cancellation, &wire).await
         }).await?;
-        ManagedSubscription::from_response(response, request_id, requested, limits, deadline, SubscriptionProfile::Core)
+        ManagedSubscription::open_response(cx, response, request_id, requested, limits, deadline, SubscriptionProfile::Core).await
     }
 
     /// Opens an official Tasks listen, optionally composed with core filters.
@@ -265,7 +268,7 @@ impl ManagedOAuthSession {
         let response = self.execute_subscription_snapshot(
             cx, cancellation, deadline, &credential, &wire,
         ).await?;
-        ManagedSubscription::from_response(response, request_id, requested, limits, deadline, SubscriptionProfile::Tasks)
+        ManagedSubscription::open_response(cx, response, request_id, requested, limits, deadline, SubscriptionProfile::Tasks).await
     }
 
     #[cfg(feature = "tasks")]
@@ -324,6 +327,43 @@ pub struct ManagedSubscription {
 }
 
 impl ManagedSubscription {
+    async fn open_response(
+        cx: &Cx,
+        response: ManagedOAuthResponse,
+        request_id: RequestId,
+        requested: SubscriptionFilter,
+        limits: ManagedSubscriptionLimits,
+        deadline: Time,
+        profile: SubscriptionProfile,
+    ) -> Result<Self, ManagedSubscriptionError> {
+        if response.metadata().status() != 200 {
+            return Err(ManagedSubscriptionError::InvalidResponse);
+        }
+        if response.metadata().kind() == ModernHttpResponseKind::Json {
+            // A refused listen need not establish an SSE stream. Consume one
+            // bounded finite body under the original credential and deadline;
+            // never perform a token lookup, negotiation, retry or downgrade.
+            let session = response.session.clone();
+            let cancellation = response.cancellation.clone();
+            let revocation = response.revocation.clone();
+            let expires_at = response.expires_at;
+            let bytes = session.await_credential(
+                cx, &cancellation, deadline, expires_at, &revocation, async {
+                    response.read_to_end(cx, limits.frame_bytes).await
+                },
+            ).await?;
+            session.check(cx, &cancellation)?;
+            if revocation.is_cancel_requested() || Instant::now() >= expires_at {
+                return Err(OAuthSessionError::LoginRequired.into());
+            }
+            if cx.now() >= deadline {
+                return Err(OAuthSessionError::TimedOut.into());
+            }
+            return Err(json_refusal(&bytes, &request_id, limits.frame_bytes));
+        }
+        Self::from_response(response, request_id, requested, limits, deadline, profile)
+    }
+
     fn from_response(
         response: ManagedOAuthResponse,
         request_id: RequestId,
@@ -398,6 +438,23 @@ impl ManagedSubscription {
             self.listener = Some(listener);
         }
         Ok(Some(record))
+    }
+}
+
+// A finite JSON refusal uses the same strict protocol codec as discovery and
+// the native stream. A success, foreign ID or malformed envelope cannot open
+// a subscription or surface an unowned remote error. No peer text is retained.
+fn json_refusal(bytes: &[u8], request_id: &RequestId, maximum: usize) -> ManagedSubscriptionError {
+    let response = match decode_strict_jsonrpc_response(bytes, maximum) {
+        Ok(decoded) => decoded.into_parts().0,
+        Err(_) => return ManagedSubscriptionError::InvalidResponse,
+    };
+    if !response.id.as_ref().is_some_and(|id| id.correlates_with(request_id)) {
+        return ManagedSubscriptionError::InvalidResponse;
+    }
+    match response.error {
+        Some(error) => ManagedSubscriptionError::Remote { code: error.code },
+        None => ManagedSubscriptionError::InvalidResponse,
     }
 }
 
@@ -630,6 +687,61 @@ mod tests {
             code: JsonInteger::from(-32603_i64), message: "peer-secret-canary".to_owned(),
         });
         assert!(!format!("{error:?} {error}").contains("peer-secret-canary"));
+    }
+
+    #[test]
+    fn json_subscription_refusal_preserves_code_without_peer_diagnostics() {
+        let frame = br#"{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"message-canary","data":{"token":"data-canary"}}}"#;
+        let error = json_refusal(frame, &RequestId::Number(7), 4096);
+        assert!(matches!(&error, ManagedSubscriptionError::Remote { code } if code == &JsonInteger::from(-32602_i64)));
+        let diagnostic = format!("{error:?} {error}");
+        assert!(!diagnostic.contains("message-canary"));
+        assert!(!diagnostic.contains("data-canary"));
+    }
+
+    #[test]
+    fn json_subscription_refusals_must_correlate_with_the_listen_not_discovery() {
+        for id in [json!(1), json!("7"), serde_json::Value::Null] {
+            let frame = serde_json::to_vec(&json!({
+                "jsonrpc":"2.0", "id":id, "error":{"code":-32601,"message":"refused"},
+            })).unwrap();
+            assert!(matches!(json_refusal(&frame, &RequestId::Number(7), 4096),
+                ManagedSubscriptionError::InvalidResponse));
+        }
+        let frame = br#"{"jsonrpc":"2.0","id":"listen","error":{"code":-32601,"message":"refused"}}"#;
+        assert!(matches!(json_refusal(frame, &RequestId::String("listen".to_owned()), 4096),
+            ManagedSubscriptionError::Remote { .. }));
+    }
+
+    #[test]
+    fn json_subscription_success_notifications_and_reverse_calls_never_open_streams() {
+        for frame in [
+            br#"{"jsonrpc":"2.0","id":7,"result":{"resultType":"complete"}}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"notifications":{}}}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":7,"method":"roots/list"}"#.as_slice(),
+        ] {
+            assert!(matches!(json_refusal(frame, &RequestId::Number(7), 4096),
+                ManagedSubscriptionError::InvalidResponse));
+        }
+    }
+
+    #[test]
+    fn json_subscription_refusals_enforce_strict_envelopes_and_the_document_cap() {
+        let frame = br#"{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"refused"}}"#;
+        assert!(matches!(json_refusal(frame, &RequestId::Number(7), frame.len()),
+            ManagedSubscriptionError::Remote { .. }));
+        assert!(matches!(json_refusal(frame, &RequestId::Number(7), frame.len() - 1),
+            ManagedSubscriptionError::InvalidResponse));
+        for malformed in [
+            br#"{"jsonrpc":"2.0","id":7,"id":7,"error":{"code":-32601,"message":"refused"}}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":7,"result":{},"error":{"code":-32601,"message":"refused"}}"#.as_slice(),
+            br#"[{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"refused"}}]"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"refused"}} {}"#.as_slice(),
+            &[0xff],
+        ] {
+            assert!(matches!(json_refusal(malformed, &RequestId::Number(7), 4096),
+                ManagedSubscriptionError::InvalidResponse));
+        }
     }
 
     #[cfg(feature = "tasks")]
