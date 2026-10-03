@@ -136,13 +136,32 @@ impl McpError {
         Self::new(McpErrorCode::InvalidParams, message)
     }
 
-    /// Creates an internal error.
+    /// Creates an internal error, which is **opaque and terminal**.
+    ///
+    /// Returned from a tool handler, this is reported to the peer as a
+    /// JSON-RPC *protocol* error carrying a fixed message and an incident
+    /// id, never as a tool result: the handler's own message is redacted
+    /// before it leaves the process. The framework raises the same code for
+    /// its own terminal conditions (the nested-call depth limit, for
+    /// example), and an intermediate handler cannot convert one into a
+    /// successful or in-band result.
+    ///
+    /// A tool whose *execution* failed in a way the model should see wants
+    /// [`Self::tool_error`] instead. Choosing this constructor for an
+    /// ordinary execution failure hides the reason from the model and fails
+    /// the official `tools-call-error` conformance check.
     #[must_use]
     pub fn internal_error(message: impl Into<String>) -> Self {
         Self::new(McpErrorCode::InternalError, message)
     }
 
-    /// Creates a tool execution error.
+    /// Creates a tool execution error, which is reported **in band**.
+    ///
+    /// This is the constructor for a tool that ran and failed. Both MCP eras
+    /// report tool execution failures inside the tool result (`isError:
+    /// true`) so the model can read the reason and retry, rather than as a
+    /// JSON-RPC protocol error. Prefer it over [`Self::internal_error`] for
+    /// anything the caller is meant to understand.
     #[must_use]
     pub fn tool_error(message: impl Into<String>) -> Self {
         Self::new(McpErrorCode::ToolExecutionError, message)
