@@ -1,12 +1,13 @@
 //! The README "TL;DR / The Solution" server, compiled from the block's exact
 //! text below the allow line. tests/readme_examples.rs fails if the two differ
-//! and drives this binary over stdio with the modern facade client.
+//! and drives this binary over stdio with the modern facade client and with an
+//! exact 2024-11-05 `initialize` handshake.
 // A user's crate does not enable clippy::pedantic, and the README shows the
 // async handler form without awaiting anything.
 #![allow(clippy::unused_async)]
 
 use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
-use fastmcp_rust::{modern::ServerBuilder, prelude::*};
+use fastmcp_rust::{auto::ServerBuilder, prelude::*};
 
 #[tool]
 async fn greet(ctx: &McpContext, name: String) -> McpResult<String> {

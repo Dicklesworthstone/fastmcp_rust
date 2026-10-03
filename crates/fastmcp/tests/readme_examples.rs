@@ -185,6 +185,155 @@ mod live {
             .close()
             .expect("the README Quick Start client closes cleanly");
     }
+
+    /// A README server spoken to over raw stdio JSON lines, the way a pre-2026
+    /// host (the MCP Inspector, desktop clients) speaks to it.
+    struct RawStdioPeer {
+        child: std::process::Child,
+        stdin: Option<std::process::ChildStdin>,
+        lines: std::sync::mpsc::Receiver<String>,
+    }
+
+    impl RawStdioPeer {
+        fn spawn(binary: &str) -> Self {
+            let mut child = std::process::Command::new(binary)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap_or_else(|error| panic!("{binary} spawns: {error}"));
+            let stdin = child.stdin.take();
+            let stdout = child.stdout.take().expect("stdout is piped");
+            let (sender, lines) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let reader = std::io::BufReader::new(stdout);
+                for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
+                    if sender.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+            Self {
+                child,
+                stdin,
+                lines,
+            }
+        }
+
+        fn send(&mut self, message: &serde_json::Value) {
+            let stdin = self.stdin.as_mut().expect("stdin is open");
+            std::io::Write::write_all(stdin, format!("{message}\n").as_bytes())
+                .expect("the server reads stdin");
+            std::io::Write::flush(stdin).expect("stdin flushes");
+        }
+
+        /// The response carrying `id`; every stdout line must be JSON-RPC.
+        fn response(&self, id: &str) -> serde_json::Value {
+            loop {
+                let line = self
+                    .lines
+                    .recv_timeout(Duration::from_secs(30))
+                    .unwrap_or_else(|error| panic!("no response to {id}: {error}"));
+                let frame: serde_json::Value =
+                    serde_json::from_str(&line).unwrap_or_else(|error| {
+                        panic!("stdout carries only JSON-RPC: {line:?}: {error}")
+                    });
+                if frame["id"] == id {
+                    return frame;
+                }
+            }
+        }
+
+        /// Closes stdin and requires a clean exit, as a host closing the pipe.
+        fn finish(mut self) {
+            drop(self.stdin.take());
+            for _ in 0..300 {
+                if let Some(status) = self.child.try_wait().expect("the child is waitable") {
+                    assert!(status.success(), "clean stdin EOF exits 0: {status}");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            panic!("the server did not exit within 30s of stdin EOF");
+        }
+    }
+
+    impl Drop for RawStdioPeer {
+        fn drop(&mut self) {
+            if self.child.try_wait().ok().flatten().is_none() {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    /// README step 5 points the MCP Inspector at the Quick Start server. The
+    /// Inspector, like today's desktop hosts, opens with a pre-2026
+    /// `initialize`; the Auto builder negotiates it to exact 2024-11-05 and
+    /// serves the same tool on that connection.
+    #[test]
+    fn readme_quick_start_server_answers_an_inspector_style_initialize() {
+        let mut peer = RawStdioPeer::spawn(env!("CARGO_BIN_EXE_readme_quick_start"));
+        peer.send(&json!({
+            "jsonrpc": "2.0",
+            "id": "init",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "inspector-shaped-host", "version": "0.0.0"},
+            },
+        }));
+        let initialized = peer.response("init");
+        let result = &initialized["result"];
+        assert_eq!(
+            result["protocolVersion"],
+            json!("2024-11-05"),
+            "{initialized}"
+        );
+        assert_eq!(
+            result["serverInfo"]["name"],
+            json!("echo-server"),
+            "{initialized}"
+        );
+        assert_eq!(
+            result["instructions"],
+            json!("A simple echo server for testing"),
+            "{initialized}"
+        );
+        peer.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+
+        peer.send(&json!({"jsonrpc": "2.0", "id": "list", "method": "tools/list"}));
+        let listed = peer.response("list");
+        assert_eq!(
+            listed["result"]["tools"][0]["name"],
+            json!("echo"),
+            "{listed}"
+        );
+
+        let call = |id: &str, message: serde_json::Value| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": "echo", "arguments": {"message": message}},
+            })
+        };
+        peer.send(&call("call", json!("hello from the Inspector")));
+        let called = peer.response("call");
+        assert_eq!(
+            called["result"]["content"],
+            json!([{"type": "text", "text": "hello from the Inspector"}]),
+            "{called}"
+        );
+        // Near-identical negative: the same call with a non-string message is
+        // refused by the exact-2024 input validation, never echoed.
+        peer.send(&call("bad", json!(7)));
+        let refused = peer.response("bad");
+        assert_eq!(refused["error"]["code"], json!(-32602), "{refused}");
+        assert!(refused.get("result").is_none(), "{refused}");
+        peer.finish();
+    }
 }
 
 /// The README "Troubleshooting" and "Limitations" tables, as behaviour: every

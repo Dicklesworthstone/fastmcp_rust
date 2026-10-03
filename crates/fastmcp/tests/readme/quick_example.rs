@@ -6,7 +6,7 @@
 #![allow(clippy::unused_async)]
 
 use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
-use fastmcp_rust::{modern::ServerBuilder, prelude::*};
+use fastmcp_rust::{auto::ServerBuilder, prelude::*};
 
 // Define a tool with automatic JSON schema generation
 #[tool(description = "Calculate the sum of two numbers")]

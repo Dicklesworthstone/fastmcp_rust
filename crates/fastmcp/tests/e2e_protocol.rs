@@ -1721,15 +1721,22 @@ fn assert_public_auto_stdio_multiplexes(server_policy: &str, expected_era: Proto
         .expect("the selected public stdio session installs its shared executor");
     assert_eq!(executor.selected_protocol_era(), expected_era);
     let cx = Cx::for_request();
+    // Each era's no-argument liveness request: MCP 2026-07-28 removed `ping`
+    // (a modern server answers it with Method not found), so the modern
+    // session uses the stateless `server/discover` round-trip.
+    let liveness = match expected_era {
+        ProtocolEra::Modern2026 => "server/discover",
+        ProtocolEra::Legacy2024 => "ping",
+    };
     // Both sends occur before either wait. The real subprocess therefore sees
     // two committed request owners on the selected final child, rather than a
     // tautological sequence of one request followed by one response.
     let mut first = client
-        .start_multiplexed_request(&cx, "ping", Some(json!({})))
-        .expect("first selected-era ping commits");
+        .start_multiplexed_request(&cx, liveness, Some(json!({})))
+        .expect("first selected-era liveness request commits");
     let mut second = client
-        .start_multiplexed_request(&cx, "ping", Some(json!({})))
-        .expect("second selected-era ping commits before the first wait");
+        .start_multiplexed_request(&cx, liveness, Some(json!({})))
+        .expect("second selected-era liveness request commits before the first wait");
     assert_ne!(first.request_id(), second.request_id());
 
     // The sequential adapter must drive this same ingress/correlation path.

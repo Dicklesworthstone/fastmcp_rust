@@ -10190,39 +10190,57 @@ fn e2e_public_http_result_verbs_return_live_input_required() {
     server.shutdown();
 }
 
+/// MCP 2026-07-28 MRTR over stateless HTTP: the elicitation answer travels in
+/// the retry's `inputResponses` on a second POST and resumes the operation,
+/// exactly like sampling or roots input (official conformance
+/// `input-required-result-basic-elicitation`).
 #[test]
-fn e2e_public_http_typed_verbs_cannot_resume_stateless_elicitation_request_state() {
+fn e2e_public_http_typed_verbs_resume_stateless_elicitation_with_the_clients_answer() {
     let cx = Cx::for_request();
     let server = spawn_modern_sampling_http_server();
-    let mut capabilities = ClientCapabilities::default();
-    capabilities.elicitation = serde_json::from_value(json!({"form": {}, "url": {}}))
-        .expect("form and url elicitation capabilities are valid");
-    let mut client = runtime_block_on_bounded(
-        &cx,
-        modern::ClientBuilder::new()
-            .client_info("e2e-public-http-elicit-stateless", "1.0.0")
-            .capabilities(capabilities)
-            .modern_reverse_request_handlers(public_modern_elicitation_follow_handlers())
-            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
-    )
-    .expect("the ModernOnly public facade installs an elicitation handler before discovery");
-
-    let retry = runtime_block_on_bounded(
-        &cx,
-        client.call_tool(&cx, PUBLIC_HTTP_URL_ELICITATION_TOOL_NAME, json!({})),
-    );
-    let retry = match retry {
-        Ok(result) => {
-            panic!("stateless HTTP must not complete elicitation across a second POST: {result:?}")
-        }
-        Err(error) => format!("{error:?}"),
+    let call_with = |handlers: modern::ReverseRequestHandlers, label: &str| {
+        let mut capabilities = ClientCapabilities::default();
+        capabilities.elicitation = serde_json::from_value(json!({"form": {}, "url": {}}))
+            .expect("form and url elicitation capabilities are valid");
+        let mut client = runtime_block_on_bounded(
+            &cx,
+            modern::ClientBuilder::new()
+                .client_info(label, "1.0.0")
+                .capabilities(capabilities)
+                .modern_reverse_request_handlers(handlers)
+                .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
+        )
+        .expect("the ModernOnly public facade installs an elicitation handler before discovery");
+        let result = runtime_block_on_bounded(
+            &cx,
+            client.call_tool(&cx, PUBLIC_HTTP_URL_ELICITATION_TOOL_NAME, json!({})),
+        )
+        .unwrap_or_else(|error| {
+            panic!("{label}: stateless HTTP elicitation must resume on the retry POST: {error:?}")
+        });
+        serde_json::to_value(&result.content).expect("tool content serializes")
     };
-    assert!(
-        retry.contains("RequestCancelled")
-            || retry.contains("requestState")
-            || retry.contains("InvalidRequest")
-            || retry.contains("session"),
-        "a second HTTP POST must not resume the first POST's elicitation requestState: {retry}"
+
+    let accepted = call_with(
+        public_modern_elicitation_follow_handlers(),
+        "e2e-public-http-elicit-accept",
+    );
+    assert_eq!(
+        accepted,
+        json!([{"type": "text", "text": "url-elicit:accept"}])
+    );
+
+    // Planted negative (RH-5): only the client's answer differs, so the
+    // completed result must change with it; a hard-coded success could not.
+    let declining = modern::ReverseRequestHandlers::new().with_modern_elicitation_create(
+        |_cx, _cancellation, _params| {
+            Box::pin(async move { Ok(fastmcp_protocol::ElicitResult::decline()) })
+        },
+    );
+    let declined = call_with(declining, "e2e-public-http-elicit-decline");
+    assert_eq!(
+        declined,
+        json!([{"type": "text", "text": "url-elicit:decline"}])
     );
     server.shutdown();
 }

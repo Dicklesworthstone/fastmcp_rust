@@ -1,13 +1,14 @@
 //! The README "Quick Start" server, compiled from the block's exact text below
 //! the allow line. tests/readme_examples.rs fails if the two differ and drives
-//! this binary over stdio with the modern facade client.
+//! this binary over stdio with the modern facade client and with the exact
+//! `initialize` handshake the MCP Inspector (README step 5) opens with.
 // A user's crate does not enable clippy::pedantic, and the README shows the
 // async handler form without awaiting anything.
 #![allow(clippy::unused_async)]
 
 // src/main.rs
 use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
-use fastmcp_rust::{modern::ServerBuilder, prelude::*};
+use fastmcp_rust::{auto::ServerBuilder, prelude::*};
 
 #[tool(description = "Echo the input message")]
 async fn echo(ctx: &McpContext, message: String) -> McpResult<String> {

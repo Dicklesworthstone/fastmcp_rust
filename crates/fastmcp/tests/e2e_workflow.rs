@@ -808,6 +808,13 @@ impl LifecycleThreadHarness {
             .expect("lifecycle peer must remain owned")
     }
 
+    /// Closes the peer first (EOF), then waits for the server's bounded
+    /// outcome. Use when the server is expected to still be serving.
+    fn close_peer_and_settle(mut self, owner: &str) -> McpResult<()> {
+        self.peer.take();
+        self.settle(owner)
+    }
+
     fn settle(mut self, owner: &str) -> McpResult<()> {
         let outcome = self
             .outcome
@@ -929,24 +936,54 @@ fn assert_live_facade_era_admission<F>(
         .error
         .as_ref()
         .expect("opposite-era request must receive a JSON-RPC refusal");
-    assert_eq!(
-        error.code.as_i32(),
-        Some(McpErrorCode::InvalidRequest.into())
-    );
-    assert_eq!(
-        error.message,
-        "Request does not match the connection's negotiated MCP protocol era"
-    );
+    if opening_is_modern {
+        // MCP 2026-07-28 admits every request on its own `_meta` (SEP-2575):
+        // a request missing the required protocol version is invalid params,
+        // answered statelessly, and never ends the connection.
+        assert_eq!(
+            error.code.as_i32(),
+            Some(McpErrorCode::InvalidParams.into()),
+            "{facade}: a modern connection answers a request without `_meta` with -32602"
+        );
+    } else {
+        assert_eq!(
+            error.code.as_i32(),
+            Some(McpErrorCode::InvalidRequest.into())
+        );
+        assert_eq!(
+            error.message,
+            "Request does not match the connection's negotiated MCP protocol era"
+        );
+    }
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
         "{facade}: opposite-era refusal must not mutate the handler"
     );
-    let outcome = harness.settle("caller-owned facade era refusal");
-    assert!(
-        outcome.is_err(),
-        "{facade}: opposite-era refusal must terminate the mismatched connection"
-    );
+    if opening_is_modern {
+        // The same connection still serves the next era-correct request.
+        harness
+            .peer_mut()
+            .send(&cx, &lifecycle_tool_request(3, true))
+            .unwrap_or_else(|error| panic!("{facade}: send post-refusal tool request: {error}"));
+        let resumed = lifecycle_response(harness.peer_mut(), &cx, 3, "post-refusal tool response");
+        assert!(
+            resumed.error.is_none(),
+            "{facade}: a refused modern request must not end the connection: {resumed:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        harness
+            .close_peer_and_settle("caller-owned facade modern refusal")
+            .unwrap_or_else(|error| {
+                panic!("{facade}: modern connection must settle cleanly at EOF: {error:?}")
+            });
+    } else {
+        let outcome = harness.settle("caller-owned facade era refusal");
+        assert!(
+            outcome.is_err(),
+            "{facade}: opposite-era refusal must terminate the exact-2024 connection"
+        );
+    }
 }
 
 fn assert_live_facade_cancellation<F>(
