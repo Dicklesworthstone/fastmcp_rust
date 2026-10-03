@@ -213,8 +213,10 @@ doc = false
 [[bin]]
 name = "conformance_server"
 path = "examples/conformance_server.rs"
-# Serves the Tasks-extension fixtures too.
-required-features = ["tasks"]
+# Serves the Tasks-extension fixtures too, and answers exact-2024 completion
+# requests through `fastmcp_rust::legacy_2024`, so the ModernOnly
+# (--no-default-features) facade profile must not try to build it.
+required-features = ["tasks", "legacy-2024-11-05"]
 test = false
 bench = false
 doc = false
