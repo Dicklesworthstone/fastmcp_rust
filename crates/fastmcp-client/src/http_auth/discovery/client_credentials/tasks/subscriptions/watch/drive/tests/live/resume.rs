@@ -4,28 +4,54 @@
 //! cryptographic storage providers, or process-crash persistence.
 
 use super::*;
-use std::sync::atomic::AtomicBool;
-use fastmcp_core::partition::{DurableOwnerKey, PartitionDescriptor};
-use crate::http_auth::discovery::client_credentials::{ClientCredentialsError, OAuthDiscoveryError};
-use crate::http_auth::discovery::client_credentials::tasks::{ClientCredentialsTasksError, ManagedTasksError};
 use crate::http_auth::discovery::client_credentials::tasks::subscriptions::watch::resume::{
-    ClientCredentialsTaskResumeError as ResumeError,
-    ClientCredentialsTaskResumeReconciliation as Reconciliation,
     ClientCredentialsTaskRestartOutcome as RestartOutcome,
     ClientCredentialsTaskRestartPolicy as RestartPolicy,
-    TaskResumeBinding, TaskResumeError, TaskResumeRecord,
+    ClientCredentialsTaskResumeError as ResumeError,
+    ClientCredentialsTaskResumeReconciliation as Reconciliation, TaskResumeBinding,
+    TaskResumeError, TaskResumeRecord,
 };
+use crate::http_auth::discovery::client_credentials::tasks::{
+    ClientCredentialsTasksError, ManagedTasksError,
+};
+use crate::http_auth::discovery::client_credentials::{
+    ClientCredentialsError, OAuthDiscoveryError,
+};
+use fastmcp_core::partition::{DurableOwnerKey, PartitionDescriptor};
+use std::sync::atomic::AtomicBool;
 
 #[derive(Clone, Copy)]
 enum ResumeCase {
-    Mixed, WrongTask, WrongResponse, Creation, Ttl, Stale, SameTime,
-    Malformed, LostBody, ForbiddenDiscovery, ServerError,
-    DropRead, CancelRead, CloseOwner, Revoke, Expiry, Deadline, CallerPause,
+    Mixed,
+    WrongTask,
+    WrongResponse,
+    Creation,
+    Ttl,
+    Stale,
+    SameTime,
+    Malformed,
+    LostBody,
+    ForbiddenDiscovery,
+    ServerError,
+    DropRead,
+    CancelRead,
+    CloseOwner,
+    Revoke,
+    Expiry,
+    Deadline,
+    CallerPause,
 }
 impl ResumeCase {
     fn held_read(self) -> bool {
-        matches!(self, Self::DropRead | Self::CancelRead | Self::CloseOwner
-            | Self::Revoke | Self::Expiry | Self::Deadline)
+        matches!(
+            self,
+            Self::DropRead
+                | Self::CancelRead
+                | Self::CloseOwner
+                | Self::Revoke
+                | Self::Expiry
+                | Self::Deadline
+        )
     }
 }
 fn isolated_resume(name: &str, case: ResumeCase) {
@@ -33,12 +59,29 @@ fn isolated_resume(name: &str, case: ResumeCase) {
 }
 fn resume_binding(client: &ClientCredentialsTasksClient) -> TaskResumeBinding {
     let resource = client.client.resource();
-    let facts = PartitionDescriptor::from_verified_facts("fixture", 1, "https://issuer.example",
-        resource.as_str(), "tenant", "machine-owner", "watch-fixture", 1, 1,
-        &[b"bound-resource".as_slice()]).unwrap();
+    let facts = PartitionDescriptor::from_verified_facts(
+        "fixture",
+        1,
+        "https://issuer.example",
+        resource.as_str(),
+        "tenant",
+        "machine-owner",
+        "watch-fixture",
+        1,
+        1,
+        &[b"bound-resource".as_slice()],
+    )
+    .unwrap();
     let owner = DurableOwnerKey::derive(&facts, 1).unwrap();
-    TaskResumeBinding::from_verified_owner(resource.clone(), "machine-resume", &owner,
-        [1; 32], [2; 32], [3; 32]).unwrap()
+    TaskResumeBinding::from_verified_owner(
+        resource.clone(),
+        "machine-resume",
+        &owner,
+        [1; 32],
+        [2; 32],
+        [3; 32],
+    )
+    .unwrap()
 }
 fn resume_task(id: &str, status: &str, second: u8) -> serde_json::Value {
     let mut value = json!({"taskId":id, "status":status,
@@ -46,10 +89,14 @@ fn resume_task(id: &str, status: &str, second: u8) -> serde_json::Value {
         "lastUpdatedAt":format!("2020-01-01T00:00:{second:02}Z"),
         "ttlMs":null, "statusMessage":"PRIVATE-STATUS"});
     match status {
-        "input_required" => value["inputRequests"] = json!({"PRIVATE-INPUT":{"method":"roots/list"}}),
-        "completed" => value["result"] = json!({"content":[{"type":"text","text":"PRIVATE-RESULT"}]}),
+        "input_required" => {
+            value["inputRequests"] = json!({"PRIVATE-INPUT":{"method":"roots/list"}})
+        }
+        "completed" => {
+            value["result"] = json!({"content":[{"type":"text","text":"PRIVATE-RESULT"}]})
+        }
         "failed" => value["error"] = json!({"code":-32603,"message":"PRIVATE-ERROR"}),
-        _ => {},
+        _ => {}
     }
     value
 }
@@ -72,8 +119,9 @@ async fn resume_rpc(peer: &Peer, method: &str) -> (TlsStream<TcpStream>, serde_j
 }
 async fn resume_discover(peer: &Peer, refuse: bool) {
     let (mut socket, request) = resume_rpc(peer, "server/discover").await;
-    if refuse { status_reply(&mut socket, 403).await; }
-    else {
+    if refuse {
+        status_reply(&mut socket, 403).await;
+    } else {
         reply(&mut socket, json!({"jsonrpc":"2.0","id":request["id"],"result":{
             "resultType":"complete","supportedVersions":["2026-07-28"],"ttlMs":0,"cacheScope":"private",
             "capabilities":{"extensions":{TASKS_EXTENSION:{},CLIENT_CREDENTIALS_EXTENSION:{}}}
@@ -81,22 +129,45 @@ async fn resume_discover(peer: &Peer, refuse: bool) {
     }
 }
 async fn status_reply(socket: &mut TlsStream<TcpStream>, status: u16) {
-    socket.write_all(format!("HTTP/1.1 {status} Refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-        .as_bytes()).await.unwrap();
+    socket
+        .write_all(
+            format!("HTTP/1.1 {status} Refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
     socket.shutdown().await.unwrap();
 }
-async fn resume_reply(socket: &mut TlsStream<TcpStream>, request: &serde_json::Value, mut task: serde_json::Value) {
+async fn resume_reply(
+    socket: &mut TlsStream<TcpStream>,
+    request: &serde_json::Value,
+    mut task: serde_json::Value,
+) {
     task["resultType"] = json!("complete");
-    reply(socket, json!({"jsonrpc":"2.0","id":request["id"],"result":task})).await;
+    reply(
+        socket,
+        json!({"jsonrpc":"2.0","id":request["id"],"result":task}),
+    )
+    .await;
 }
 fn mixed_status(id: &str) -> &str {
     match id {
-        "work" => "working", "input/é" => "input_required", "complete" => "completed",
-        "failed" => "failed", "cancelled" => "cancelled", _ => "working",
+        "work" => "working",
+        "input/é" => "input_required",
+        "complete" => "completed",
+        "failed" => "failed",
+        "cancelled" => "cancelled",
+        _ => "working",
     }
 }
 fn assert_no_payload(record: &TaskResumeRecord) {
-    assert!(!record.encode().unwrap().windows(7).any(|part| part == b"PRIVATE"));
+    assert!(
+        !record
+            .encode()
+            .unwrap()
+            .windows(7)
+            .any(|part| part == b"PRIVATE")
+    );
 }
 
 fn run_resume(case: ResumeCase) {
@@ -324,38 +395,125 @@ fn run_resume(case: ResumeCase) {
 }
 
 #[test]
-fn tls_machine_restart_reconciles_mixed_records_without_mutation_or_subscription() { isolated_resume("tls_machine_restart_reconciles_mixed_records_without_mutation_or_subscription", ResumeCase::Mixed); }
+fn tls_machine_restart_reconciles_mixed_records_without_mutation_or_subscription() {
+    isolated_resume(
+        "tls_machine_restart_reconciles_mixed_records_without_mutation_or_subscription",
+        ResumeCase::Mixed,
+    );
+}
 #[test]
-fn tls_machine_restart_rejects_a_foreign_task() { isolated_resume("tls_machine_restart_rejects_a_foreign_task", ResumeCase::WrongTask); }
+fn tls_machine_restart_rejects_a_foreign_task() {
+    isolated_resume(
+        "tls_machine_restart_rejects_a_foreign_task",
+        ResumeCase::WrongTask,
+    );
+}
 #[test]
-fn tls_machine_restart_rejects_a_foreign_response_id() { isolated_resume("tls_machine_restart_rejects_a_foreign_response_id", ResumeCase::WrongResponse); }
+fn tls_machine_restart_rejects_a_foreign_response_id() {
+    isolated_resume(
+        "tls_machine_restart_rejects_a_foreign_response_id",
+        ResumeCase::WrongResponse,
+    );
+}
 #[test]
-fn tls_machine_restart_rejects_reused_task_creation_identity() { isolated_resume("tls_machine_restart_rejects_reused_task_creation_identity", ResumeCase::Creation); }
+fn tls_machine_restart_rejects_reused_task_creation_identity() {
+    isolated_resume(
+        "tls_machine_restart_rejects_reused_task_creation_identity",
+        ResumeCase::Creation,
+    );
+}
 #[test]
-fn tls_machine_restart_rejects_changed_ttl() { isolated_resume("tls_machine_restart_rejects_changed_ttl", ResumeCase::Ttl); }
+fn tls_machine_restart_rejects_changed_ttl() {
+    isolated_resume("tls_machine_restart_rejects_changed_ttl", ResumeCase::Ttl);
+}
 #[test]
-fn tls_machine_restart_rejects_regressed_snapshots() { isolated_resume("tls_machine_restart_rejects_regressed_snapshots", ResumeCase::Stale); }
+fn tls_machine_restart_rejects_regressed_snapshots() {
+    isolated_resume(
+        "tls_machine_restart_rejects_regressed_snapshots",
+        ResumeCase::Stale,
+    );
+}
 #[test]
-fn tls_machine_restart_rejects_conflicting_same_time_status() { isolated_resume("tls_machine_restart_rejects_conflicting_same_time_status", ResumeCase::SameTime); }
+fn tls_machine_restart_rejects_conflicting_same_time_status() {
+    isolated_resume(
+        "tls_machine_restart_rejects_conflicting_same_time_status",
+        ResumeCase::SameTime,
+    );
+}
 #[test]
-fn tls_machine_restart_preserves_complete_malformed_response_failure() { isolated_resume("tls_machine_restart_preserves_complete_malformed_response_failure", ResumeCase::Malformed); }
+fn tls_machine_restart_preserves_complete_malformed_response_failure() {
+    isolated_resume(
+        "tls_machine_restart_preserves_complete_malformed_response_failure",
+        ResumeCase::Malformed,
+    );
+}
 #[test]
-fn tls_machine_restart_retains_lost_read_without_retrying() { isolated_resume("tls_machine_restart_retains_lost_read_without_retrying", ResumeCase::LostBody); }
+fn tls_machine_restart_retains_lost_read_without_retrying() {
+    isolated_resume(
+        "tls_machine_restart_retains_lost_read_without_retrying",
+        ResumeCase::LostBody,
+    );
+}
 #[test]
-fn tls_machine_restart_can_continue_after_explicit_unavailable_discovery() { isolated_resume("tls_machine_restart_can_continue_after_explicit_unavailable_discovery", ResumeCase::ForbiddenDiscovery); }
+fn tls_machine_restart_can_continue_after_explicit_unavailable_discovery() {
+    isolated_resume(
+        "tls_machine_restart_can_continue_after_explicit_unavailable_discovery",
+        ResumeCase::ForbiddenDiscovery,
+    );
+}
 #[test]
-fn tls_machine_restart_server_failure_cannot_skip_to_the_next_record() { isolated_resume("tls_machine_restart_server_failure_cannot_skip_to_the_next_record", ResumeCase::ServerError); }
+fn tls_machine_restart_server_failure_cannot_skip_to_the_next_record() {
+    isolated_resume(
+        "tls_machine_restart_server_failure_cannot_skip_to_the_next_record",
+        ResumeCase::ServerError,
+    );
+}
 #[test]
-fn tls_machine_restart_abandoned_response_keeps_pending_and_unvisited_records() { isolated_resume("tls_machine_restart_abandoned_response_keeps_pending_and_unvisited_records", ResumeCase::DropRead); }
+fn tls_machine_restart_abandoned_response_keeps_pending_and_unvisited_records() {
+    isolated_resume(
+        "tls_machine_restart_abandoned_response_keeps_pending_and_unvisited_records",
+        ResumeCase::DropRead,
+    );
+}
 #[test]
-fn tls_machine_restart_local_cancel_releases_only_its_read() { isolated_resume("tls_machine_restart_local_cancel_releases_only_its_read", ResumeCase::CancelRead); }
+fn tls_machine_restart_local_cancel_releases_only_its_read() {
+    isolated_resume(
+        "tls_machine_restart_local_cancel_releases_only_its_read",
+        ResumeCase::CancelRead,
+    );
+}
 #[test]
-fn tls_machine_restart_owner_close_ends_pending_response() { isolated_resume("tls_machine_restart_owner_close_ends_pending_response", ResumeCase::CloseOwner); }
+fn tls_machine_restart_owner_close_ends_pending_response() {
+    isolated_resume(
+        "tls_machine_restart_owner_close_ends_pending_response",
+        ResumeCase::CloseOwner,
+    );
+}
 #[test]
-fn tls_machine_restart_revocation_cannot_become_unavailable_or_retry() { isolated_resume("tls_machine_restart_revocation_cannot_become_unavailable_or_retry", ResumeCase::Revoke); }
+fn tls_machine_restart_revocation_cannot_become_unavailable_or_retry() {
+    isolated_resume(
+        "tls_machine_restart_revocation_cannot_become_unavailable_or_retry",
+        ResumeCase::Revoke,
+    );
+}
 #[test]
-fn tls_machine_restart_credential_expiry_stops_the_original_read() { isolated_resume("tls_machine_restart_credential_expiry_stops_the_original_read", ResumeCase::Expiry); }
+fn tls_machine_restart_credential_expiry_stops_the_original_read() {
+    isolated_resume(
+        "tls_machine_restart_credential_expiry_stops_the_original_read",
+        ResumeCase::Expiry,
+    );
+}
 #[test]
-fn tls_machine_restart_deadline_drops_pending_response_without_skipping() { isolated_resume("tls_machine_restart_deadline_drops_pending_response_without_skipping", ResumeCase::Deadline); }
+fn tls_machine_restart_deadline_drops_pending_response_without_skipping() {
+    isolated_resume(
+        "tls_machine_restart_deadline_drops_pending_response_without_skipping",
+        ResumeCase::Deadline,
+    );
+}
 #[test]
-fn tls_machine_restart_caller_pause_does_not_reset_the_deadline() { isolated_resume("tls_machine_restart_caller_pause_does_not_reset_the_deadline", ResumeCase::CallerPause); }
+fn tls_machine_restart_caller_pause_does_not_reset_the_deadline() {
+    isolated_resume(
+        "tls_machine_restart_caller_pause_does_not_reset_the_deadline",
+        ResumeCase::CallerPause,
+    );
+}

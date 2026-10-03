@@ -183,13 +183,16 @@ impl AuthorityRevisions {
             Diagnostic::new(Code::SchemaInvalid, subject, "toml", error.to_string())
         })?;
 
-        let mut known: BTreeSet<String> =
-            document.artifacts.into_iter().map(|a| a.id).collect();
+        let mut known: BTreeSet<String> = document.artifacts.into_iter().map(|a| a.id).collect();
         if let Some(sets) = document.required_sets {
             known.extend(sets.core_authorization_drafts);
         }
 
-        for required in [OAUTH_GENERAL_REVISION, OAUTH_REFRESH_TOKEN_REVISION, CIMD_REVISION] {
+        for required in [
+            OAUTH_GENERAL_REVISION,
+            OAUTH_REFRESH_TOKEN_REVISION,
+            CIMD_REVISION,
+        ] {
             if !known.contains(required) {
                 return Err(Diagnostic::new(
                     Code::SchemaInvalid,
@@ -220,7 +223,10 @@ impl AuthorityRevisions {
 ///
 /// `oauth-2.1` names a moving draft series; `oauth-2.1-13` names bytes.
 fn is_floating(revision: &str) -> bool {
-    matches!(revision, "oauth-2.1" | "oauth2.1" | "OAuth 2.1" | "cimd" | "CIMD")
+    matches!(
+        revision,
+        "oauth-2.1" | "oauth2.1" | "OAuth 2.1" | "cimd" | "CIMD"
+    )
 }
 
 /// The authorization source prefix a row must carry to be checked here.
@@ -245,7 +251,9 @@ pub fn check_auth_revisions(revisions: &AuthorityRevisions, table: &TraceTable) 
                 Code::AuthRevisionFloating,
                 &row.clause_key,
                 "source_revision",
-                format!("{cited:?} is a floating citation; an exact immutable revision is required"),
+                format!(
+                    "{cited:?} is a floating citation; an exact immutable revision is required"
+                ),
             ));
             continue;
         }
@@ -294,8 +302,8 @@ pub fn check_auth_revisions(revisions: &AuthorityRevisions, table: &TraceTable) 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::trace::{TRACE_TABLE_SCHEMA, TraceRow, TraceTable};
+    use super::*;
 
     const CONFORMANCE: &str = "\
 [[conformance_scenarios]]
@@ -337,7 +345,10 @@ id = \"rfc-9207\"
     }
 
     fn table(rows: Vec<TraceRow>) -> TraceTable {
-        TraceTable { schema: TRACE_TABLE_SCHEMA.to_owned(), rows }
+        TraceTable {
+            schema: TRACE_TABLE_SCHEMA.to_owned(),
+            rows,
+        }
     }
 
     #[test]
@@ -345,8 +356,14 @@ id = \"rfc-9207\"
         let inventory = ConformanceInventory::parse(CONFORMANCE, "c").expect("parses");
         assert_eq!(inventory.scenario_count(), 2);
         assert_eq!(inventory.pair_count(), 3);
-        assert!(inventory.declares("auth/client-credentials-jwt", "client-credentials-grant-type"));
-        assert!(!inventory.declares("auth/client-credentials-basic", "client-credentials-jwt-iss"));
+        assert!(inventory.declares(
+            "auth/client-credentials-jwt",
+            "client-credentials-grant-type"
+        ));
+        assert!(!inventory.declares(
+            "auth/client-credentials-basic",
+            "client-credentials-jwt-iss"
+        ));
     }
 
     #[test]
@@ -415,7 +432,11 @@ id = \"rfc-9207\"
     #[test]
     fn an_exact_general_revision_passes() {
         let revisions = AuthorityRevisions::parse(AUTHORITY, "a").unwrap();
-        let rows = table(vec![row("auth/general-security", NONE_SENTINEL, "auth:oauth-2.1-13")]);
+        let rows = table(vec![row(
+            "auth/general-security",
+            NONE_SENTINEL,
+            "auth:oauth-2.1-13",
+        )]);
         assert!(check_auth_revisions(&revisions, &rows).is_clean());
     }
 
@@ -425,7 +446,11 @@ id = \"rfc-9207\"
         for floating in ["auth:oauth-2.1", "auth:cimd", "auth:OAuth 2.1"] {
             let rows = table(vec![row("auth/general-security", NONE_SENTINEL, floating)]);
             let report = check_auth_revisions(&revisions, &rows);
-            assert_eq!(report.codes(), vec![Code::AuthRevisionFloating], "{floating}");
+            assert_eq!(
+                report.codes(),
+                vec![Code::AuthRevisionFloating],
+                "{floating}"
+            );
         }
     }
 
@@ -448,21 +473,33 @@ id = \"rfc-9207\"
     #[test]
     fn a_general_clause_may_not_borrow_the_refresh_token_revision() {
         let revisions = AuthorityRevisions::parse(AUTHORITY, "a").unwrap();
-        let rows = table(vec![row("auth/general-security", NONE_SENTINEL, "auth:oauth-2.1-14")]);
+        let rows = table(vec![row(
+            "auth/general-security",
+            NONE_SENTINEL,
+            "auth:oauth-2.1-14",
+        )]);
         assert!(check_auth_revisions(&revisions, &rows).has(Code::AuthRevisionWrong));
     }
 
     #[test]
     fn an_unknown_exact_revision_is_rejected() {
         let revisions = AuthorityRevisions::parse(AUTHORITY, "a").unwrap();
-        let rows = table(vec![row("auth/general-security", NONE_SENTINEL, "auth:oauth-2.1-99")]);
+        let rows = table(vec![row(
+            "auth/general-security",
+            NONE_SENTINEL,
+            "auth:oauth-2.1-99",
+        )]);
         assert!(check_auth_revisions(&revisions, &rows).has(Code::AuthRevisionWrong));
     }
 
     #[test]
     fn a_non_auth_row_is_not_subject_to_the_auth_rule() {
         let revisions = AuthorityRevisions::parse(AUTHORITY, "a").unwrap();
-        let rows = table(vec![row("core/lifecycle", NONE_SENTINEL, "core_2026_git:5f5440bb")]);
+        let rows = table(vec![row(
+            "core/lifecycle",
+            NONE_SENTINEL,
+            "core_2026_git:5f5440bb",
+        )]);
         assert!(check_auth_revisions(&revisions, &rows).is_clean());
     }
 }

@@ -24,9 +24,7 @@ use crate::{HTTP_ACCEPT_CANCEL_POLL, HttpListenerShutdown};
 /// Validate the actual immutable TLS configuration before binding a socket.
 pub(super) fn validate_acceptor(acceptor: &TlsAcceptor) -> McpResult<()> {
     let config = acceptor.config();
-    if config.alpn_protocols.len() != 1
-        || config.alpn_protocols[0].as_slice() != b"http/1.1"
-    {
+    if config.alpn_protocols.len() != 1 || config.alpn_protocols[0].as_slice() != b"http/1.1" {
         return Err(McpError::invalid_request(
             "secured HTTPS requires an HTTP/1.1-only TLS acceptor",
         ));
@@ -51,7 +49,10 @@ pub(super) async fn accept(
     }
     let nanos = u64::try_from(timeout.as_nanos()).ok()?;
     let local_deadline = Time::from_nanos(cx.now().as_nanos().checked_add(nanos)?);
-    let deadline = cx.budget().deadline.map_or(local_deadline, |caller| caller.min(local_deadline));
+    let deadline = cx
+        .budget()
+        .deadline
+        .map_or(local_deadline, |caller| caller.min(local_deadline));
     let mut handshake = std::pin::pin!(acceptor.accept(stream));
     loop {
         let now = cx.now();
@@ -60,14 +61,22 @@ pub(super) async fn accept(
         }
         let remaining = Duration::from_nanos(deadline.as_nanos() - now.as_nanos());
         match asupersync::time::timeout(
-            now, remaining.min(HTTP_ACCEPT_CANCEL_POLL), handshake.as_mut(),
-        ).await {
+            now,
+            remaining.min(HTTP_ACCEPT_CANCEL_POLL),
+            handshake.as_mut(),
+        )
+        .await
+        {
             Ok(Ok(stream)) => {
                 // Do not admit a success that raced cancellation or its deadline.
                 // Absence of ALPN retains HTTP/1.1's ordinary TLS default. An
                 // acceptor requiring ALPN has already rejected that case itself.
-                if shutdown.is_requested() || cx.checkpoint().is_err() || cx.now() >= deadline
-                    || stream.alpn_protocol().is_some_and(|protocol| protocol != b"http/1.1")
+                if shutdown.is_requested()
+                    || cx.checkpoint().is_err()
+                    || cx.now() >= deadline
+                    || stream
+                        .alpn_protocol()
+                        .is_some_and(|protocol| protocol != b"http/1.1")
                 {
                     return None;
                 }
@@ -94,7 +103,10 @@ impl ConnectionIo {
         match self {
             Self::Plain(stream) => {
                 let (reader, writer) = stream.into_split();
-                (ConnectionRead::Plain(reader), ConnectionWrite::Plain(writer))
+                (
+                    ConnectionRead::Plain(reader),
+                    ConnectionWrite::Plain(writer),
+                )
             }
             Self::Tls(stream) => (
                 ConnectionRead::Tls(Arc::clone(&stream)),
@@ -141,7 +153,9 @@ fn poll_tls<T>(
 
 impl AsyncRead for ConnectionIo {
     fn poll_read(
-        self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>,
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
@@ -152,7 +166,9 @@ impl AsyncRead for ConnectionIo {
 
 impl AsyncRead for ConnectionRead {
     fn poll_read(
-        self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>,
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
@@ -163,7 +179,9 @@ impl AsyncRead for ConnectionRead {
 
 impl AsyncWrite for ConnectionIo {
     fn poll_write(
-        self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8],
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
@@ -188,7 +206,9 @@ impl AsyncWrite for ConnectionIo {
 
 impl AsyncWrite for ConnectionWrite {
     fn poll_write(
-        self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8],
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
@@ -223,15 +243,21 @@ mod tests {
 
     fn acceptor(protocols: Vec<Vec<u8>>) -> TlsAcceptor {
         TlsAcceptorBuilder::new(
-            CertificateChain::from_pem(LEAF).unwrap(), PrivateKey::from_pem(KEY).unwrap(),
-        ).alpn_protocols(protocols).build().unwrap()
+            CertificateChain::from_pem(LEAF).unwrap(),
+            PrivateKey::from_pem(KEY).unwrap(),
+        )
+        .alpn_protocols(protocols)
+        .build()
+        .unwrap()
     }
 
     #[test]
     fn secured_https_requires_http11_only_before_listening() {
         assert!(validate_acceptor(&acceptor(vec![b"http/1.1".to_vec()])).is_ok());
         for protocols in [
-            vec![], vec![b"h2".to_vec()], vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            vec![],
+            vec![b"h2".to_vec()],
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
             vec![b"http/1.1".to_vec(), b"http/1.1".to_vec()],
         ] {
             assert!(validate_acceptor(&acceptor(protocols)).is_err());

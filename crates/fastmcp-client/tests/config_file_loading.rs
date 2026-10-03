@@ -96,13 +96,19 @@ fn assert_server(path: &Path, expected: &str) {
 #[test]
 fn explicit_file_loader_supports_toml_and_jsonc_without_json_fallback() {
     let mut scratch = Scratch::new();
-    let toml = scratch.write("config.toml", b"[mcp_servers.local]\ncommand = \"server\"\n");
+    let toml = scratch.write(
+        "config.toml",
+        b"[mcp_servers.local]\ncommand = \"server\"\n",
+    );
     assert_server(&toml, "server");
     let jsonc = br#"{/* comment */"servers":{"local":{"command":"server",},},}"#;
     let explicit = scratch.write("config.jsonc", jsonc);
     assert_server(&explicit, "server");
     let strict = scratch.write("config.json", jsonc);
-    assert!(matches!(McpConfig::from_file(strict), Err(ConfigError::ParseError(_))));
+    assert!(matches!(
+        McpConfig::from_file(strict),
+        Err(ConfigError::ParseError(_))
+    ));
 }
 
 #[test]
@@ -148,7 +154,9 @@ fn default_bound_applies_to_discovery_as_well_as_explicit_reads() {
     let path = scratch.write("large.json", &vec![b' '; DEFAULT_MAX_CONFIG_FILE_BYTES + 1]);
     assert!(matches!(
         McpConfig::from_file(&path),
-        Err(ConfigError::FileTooLarge { limit_bytes: DEFAULT_MAX_CONFIG_FILE_BYTES })
+        Err(ConfigError::FileTooLarge {
+            limit_bytes: DEFAULT_MAX_CONFIG_FILE_BYTES
+        })
     ));
     assert!(matches!(
         ConfigLoader::from_path(path).load(),
@@ -180,23 +188,48 @@ fn invalid_utf8_stays_a_read_error() {
 #[test]
 fn discovery_skips_missing_files_but_not_malformed_files() {
     let mut scratch = Scratch::new();
-    let valid = scratch.write("valid.json", br#"{"mcpServers":{"local":{"command":"server"}}}"#);
+    let valid = scratch.write(
+        "valid.json",
+        br#"{"mcpServers":{"local":{"command":"server"}}}"#,
+    );
     let missing_first = ConfigLoader::from_path(scratch.path("missing.json")).with_path(&valid);
-    assert_eq!(missing_first.load().unwrap().get_server("local").unwrap().command, "server");
+    assert_eq!(
+        missing_first
+            .load()
+            .unwrap()
+            .get_server("local")
+            .unwrap()
+            .command,
+        "server"
+    );
     let invalid = scratch.write("invalid.json", b"{");
     let malformed_first = ConfigLoader::from_path(invalid).with_path(valid);
-    assert!(matches!(malformed_first.load(), Err(ConfigError::ParseError(_))));
+    assert!(matches!(
+        malformed_first.load(),
+        Err(ConfigError::ParseError(_))
+    ));
 }
 
 #[test]
 fn load_all_keeps_documented_override_order_and_rejects_any_bad_input() {
     let mut scratch = Scratch::new();
-    let first = scratch.write("first.json", br#"{"mcpServers":{"local":{"command":"first"}}}"#);
+    let first = scratch.write(
+        "first.json",
+        br#"{"mcpServers":{"local":{"command":"first"}}}"#,
+    );
     let last = scratch.write("last.toml", b"[mcp_servers.local]\ncommand = \"last\"\n");
     let loader = ConfigLoader::from_path(first)
         .with_path(scratch.path("missing.json"))
         .with_path(last);
-    assert_eq!(loader.load_all().unwrap().get_server("local").unwrap().command, "last");
+    assert_eq!(
+        loader
+            .load_all()
+            .unwrap()
+            .get_server("local")
+            .unwrap()
+            .command,
+        "last"
+    );
     let invalid = scratch.write("invalid.json", b"{");
     assert!(matches!(
         loader.with_path(invalid).load_all(),
@@ -211,7 +244,10 @@ fn a_filesystem_error_cannot_silently_select_a_lower_priority_config() {
     let loop_path = scratch.path("loop.json");
     std::os::unix::fs::symlink(&loop_path, &loop_path).expect("self-referential test symlink");
     scratch.files.push(loop_path.clone());
-    let valid = scratch.write("valid.json", br#"{"mcpServers":{"local":{"command":"fallback"}}}"#);
+    let valid = scratch.write(
+        "valid.json",
+        br#"{"mcpServers":{"local":{"command":"fallback"}}}"#,
+    );
     // Path::exists() reports false for the loop. Discovery must attempt the
     // open and preserve ELOOP instead of skipping to the fallback config.
     assert!(!loop_path.exists());

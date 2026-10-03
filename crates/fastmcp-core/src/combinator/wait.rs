@@ -129,9 +129,9 @@ mod tests {
                 Kind::Race => race(cx, futures).await?,
                 Kind::TimedRace => race_timeout(cx, Duration::MAX, futures).await?,
                 Kind::Quorum => Ok(quorum(cx, 1, futures).await?.successes[0]),
-                Kind::TimedQuorum => {
-                    Ok(quorum_timeout(cx, 1, Duration::MAX, futures).await?.successes[0])
-                }
+                Kind::TimedQuorum => Ok(quorum_timeout(cx, 1, Duration::MAX, futures)
+                    .await?
+                    .successes[0]),
                 Kind::FirstOk => first_ok(cx, futures).await,
             }
         })

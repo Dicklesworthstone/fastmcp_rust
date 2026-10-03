@@ -48,12 +48,14 @@ pub mod managed_oauth;
 #[cfg(feature = "proxy")]
 pub use managed_oauth::dynamic::ClientCredentialsProvider;
 
+pub use blocking::{
+    BlockingCompletion, BlockingHandlerLane, BlockingPrompt, BlockingResource, BlockingTool,
+};
+pub use fastmcp_protocol::{SchemaRegistryError, SchemaRegistryLimits, SchemaResourceRegistry};
 pub use filesystem::{FilesystemProvider, FilesystemProviderError, FilesystemResourceHandler};
-pub use blocking::{BlockingCompletion, BlockingHandlerLane, BlockingPrompt, BlockingResource, BlockingTool};
 #[cfg(feature = "apps")]
 pub use mcp_apps::{McpAppsUiResource, McpAppsUiResourceError};
 pub use schema_tool::{RegisteredSchemaTool, RegisteredSchemaToolError};
-pub use fastmcp_protocol::{SchemaRegistryError, SchemaRegistryLimits, SchemaResourceRegistry};
 
 /// Enumeration guard over the `host_cancelled` conversion family.
 ///

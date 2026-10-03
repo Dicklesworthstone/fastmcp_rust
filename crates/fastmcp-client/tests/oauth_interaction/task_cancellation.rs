@@ -4,17 +4,17 @@
 //! terminal snapshot, and a lost ACK never becomes permission to send again.
 use super::*;
 use fastmcp_client::http_auth::managed::OAuthSessionError;
-use fastmcp_client::http_auth::managed::tasks::{
-    ManagedTaskEvent, ManagedTaskRequest, ManagedTaskRequestIds, ManagedTasksClient,
-    ManagedTasksError, ManagedTasksLimits,
-};
 use fastmcp_client::http_auth::managed::tasks::watch::ManagedTaskWatchPolicy;
 use fastmcp_client::http_auth::managed::tasks::watch::cancellation::{
     CancellableTaskWatchError, TaskCancellationError, TaskCancellationState,
 };
 use fastmcp_client::http_auth::managed::tasks::watch::recovery::ManagedTaskRecoveryPolicy;
-use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta, FINAL_SUBSCRIPTION_ID_META_KEY};
+use fastmcp_client::http_auth::managed::tasks::{
+    ManagedTaskEvent, ManagedTaskRequest, ManagedTaskRequestIds, ManagedTasksClient,
+    ManagedTasksError, ManagedTasksLimits,
+};
 use fastmcp_protocol::tasks_extension::{Task, TaskId};
+use fastmcp_protocol::{ClientCapabilities, FINAL_SUBSCRIPTION_ID_META_KEY, FinalRequestMeta};
 
 const CASE_ENV: &str = "FASTMCP_TEST_TASK_REMOTE_CANCELLATION";
 const TASK_ID: &str = "opaque task / cancellation";
@@ -25,9 +25,20 @@ const DISCOVER: &str = r#"{"resultType":"complete","supportedVersions":["2026-07
 
 #[derive(Clone, Copy)]
 enum Case {
-    IdleAck, GetAck, BackoffAck, WrongAck, LostAck, Refused,
-    DropAttempt, CancelAttempt, CloseOwner, DropRead, Terminal,
-    PreCancelled, Unpolled, Deadline,
+    IdleAck,
+    GetAck,
+    BackoffAck,
+    WrongAck,
+    LostAck,
+    Refused,
+    DropAttempt,
+    CancelAttempt,
+    CloseOwner,
+    DropRead,
+    Terminal,
+    PreCancelled,
+    Unpolled,
+    Deadline,
 }
 
 fn isolated(name: &str, case: Case) {
@@ -40,19 +51,33 @@ fn isolated(name: &str, case: Case) {
     let roots = RootFile::create();
     struct Child(std::process::Child);
     impl Drop for Child {
-        fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
-    let mut child = Child(Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
-        .env(CASE_ENV, &exact).env("SSL_CERT_FILE", &roots.0).env_remove("SSL_CERT_DIR")
-        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap());
+    let mut child = Child(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
+            .env(CASE_ENV, &exact)
+            .env("SSL_CERT_FILE", &roots.0)
+            .env_remove("SSL_CERT_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             assert!(status.success(), "Task cancellation HTTPS case failed");
             return;
         }
-        assert!(Instant::now() < deadline, "Task cancellation child exceeded its bound");
+        assert!(
+            Instant::now() < deadline,
+            "Task cancellation child exceeded its bound"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -64,7 +89,9 @@ fn task(status: &str) -> Value {
     let mut value = json!({"taskId":TASK_ID, "status":status,
         "createdAt":"2020-01-01T00:00:00Z", "lastUpdatedAt":"2020-01-01T00:00:01Z",
         "ttlMs":null, "pollIntervalMs":10});
-    if status == "completed" { value["result"] = json!({"content":[]}); }
+    if status == "completed" {
+        value["result"] = json!({"content":[]});
+    }
     value
 }
 async fn request(peer: &Peer, id: &str, method: &str) -> (TlsStream<TcpStream>, Value) {
@@ -72,9 +99,14 @@ async fn request(peer: &Peer, id: &str, method: &str) -> (TlsStream<TcpStream>, 
     let value: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["id"], id);
     assert_eq!(value["method"], method);
-    assert!(matches!(method, "server/discover" | "subscriptions/listen" | "tasks/get" | "tasks/cancel"));
-    assert_eq!(value["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"],
-        json!({"io.modelcontextprotocol/tasks":{}}));
+    assert!(matches!(
+        method,
+        "server/discover" | "subscriptions/listen" | "tasks/get" | "tasks/cancel"
+    ));
+    assert_eq!(
+        value["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"],
+        json!({"io.modelcontextprotocol/tasks":{}})
+    );
     assert!(value["params"].get("requestState").is_none());
     assert!(value["params"].get("inputResponses").is_none());
     // Peer::request checks exact bearer and routing headers on every TLS POST.
@@ -82,18 +114,27 @@ async fn request(peer: &Peer, id: &str, method: &str) -> (TlsStream<TcpStream>, 
 }
 async fn discover(peer: &Peer, id: &str) -> Value {
     let (mut tls, value) = request(peer, id, "server/discover").await;
-    json_reply(&mut tls, &result(id, serde_json::from_str(DISCOVER).unwrap())).await;
+    json_reply(
+        &mut tls,
+        &result(id, serde_json::from_str(DISCOVER).unwrap()),
+    )
+    .await;
     value
 }
 async fn listen(peer: &Peer, ended: bool) -> TlsStream<TcpStream> {
     let discovery = discover(peer, "cancelwatch:0").await;
     let (mut tls, value) = request(peer, "cancelwatch:1", "subscriptions/listen").await;
     assert_eq!(value["params"]["_meta"], discovery["params"]["_meta"]);
-    assert_eq!(value["params"]["notifications"], json!({"taskIds":[TASK_ID]}));
+    assert_eq!(
+        value["params"]["notifications"],
+        json!({"taskIds":[TASK_ID]})
+    );
     sse_head(&mut tls).await;
-    let acknowledgement = json!({"jsonrpc":"2.0", "method":"notifications/subscriptions/acknowledged",
+    let acknowledgement =
+        json!({"jsonrpc":"2.0", "method":"notifications/subscriptions/acknowledged",
         "params":{"_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):"cancelwatch:1"},
-            "notifications":{"taskIds":[TASK_ID]}}}).to_string();
+            "notifications":{"taskIds":[TASK_ID]}}})
+        .to_string();
     event(&mut tls, &acknowledgement, ended).await;
     tls
 }
@@ -115,23 +156,36 @@ async fn cancel_head(peer: &Peer) -> TlsStream<TcpStream> {
     let (tls, value) = request(peer, CANCEL_OPERATION, "tasks/cancel").await;
     assert_eq!(value["params"]["_meta"], discovery["params"]["_meta"]);
     assert_eq!(value["params"]["taskId"], TASK_ID);
-    assert_eq!(value["params"].as_object().unwrap().len(), 2, "only taskId and request metadata");
+    assert_eq!(
+        value["params"].as_object().unwrap().len(),
+        2,
+        "only taskId and request metadata"
+    );
     tls
 }
 async fn ack(tls: &mut TlsStream<TcpStream>) {
-    json_reply(tls, &result(CANCEL_OPERATION, json!({"resultType":"complete"}))).await;
+    json_reply(
+        tls,
+        &result(CANCEL_OPERATION, json!({"resultType":"complete"})),
+    )
+    .await;
 }
 async fn require_close(mut tls: TlsStream<TcpStream>) {
     let mut byte = [0; 1];
     match tls.read(&mut byte).await {
-        Ok(0) | Err(_) => {},
+        Ok(0) | Err(_) => {}
         Ok(_) => panic!("client must close its owned response, not replay a request"),
     }
 }
 async fn notify(tls: &mut TlsStream<TcpStream>) {
     let mut params = task("working");
     params["_meta"] = json!({(FINAL_SUBSCRIPTION_ID_META_KEY):"cancelwatch:1"});
-    event(tls, &json!({"jsonrpc":"2.0", "method":"notifications/tasks", "params":params}).to_string(), false).await;
+    event(
+        tls,
+        &json!({"jsonrpc":"2.0", "method":"notifications/tasks", "params":params}).to_string(),
+        false,
+    )
+    .await;
 }
 
 fn run(case: Case) {
@@ -334,59 +388,101 @@ fn run(case: Case) {
 
 #[test]
 fn acknowledged_cancel_stops_idle_observation_without_fabricating_terminal() {
-    isolated("acknowledged_cancel_stops_idle_observation_without_fabricating_terminal", Case::IdleAck);
+    isolated(
+        "acknowledged_cancel_stops_idle_observation_without_fabricating_terminal",
+        Case::IdleAck,
+    );
 }
 #[test]
 fn acknowledged_cancel_closes_an_inflight_snapshot_read() {
-    isolated("acknowledged_cancel_closes_an_inflight_snapshot_read", Case::GetAck);
+    isolated(
+        "acknowledged_cancel_closes_an_inflight_snapshot_read",
+        Case::GetAck,
+    );
 }
 #[test]
 fn acknowledged_cancel_interrupts_recovery_backoff_without_reconnect() {
-    isolated("acknowledged_cancel_interrupts_recovery_backoff_without_reconnect", Case::BackoffAck);
+    isolated(
+        "acknowledged_cancel_interrupts_recovery_backoff_without_reconnect",
+        Case::BackoffAck,
+    );
 }
 #[test]
 fn wrong_cancel_ack_identity_leaves_original_observation_usable() {
-    isolated("wrong_cancel_ack_identity_leaves_original_observation_usable", Case::WrongAck);
+    isolated(
+        "wrong_cancel_ack_identity_leaves_original_observation_usable",
+        Case::WrongAck,
+    );
 }
 #[test]
 fn lost_cancel_reply_is_not_replayed_and_does_not_end_observation() {
-    isolated("lost_cancel_reply_is_not_replayed_and_does_not_end_observation", Case::LostAck);
+    isolated(
+        "lost_cancel_reply_is_not_replayed_and_does_not_end_observation",
+        Case::LostAck,
+    );
 }
 #[test]
 fn current_authorization_refusal_sends_no_remote_cancel() {
-    isolated("current_authorization_refusal_sends_no_remote_cancel", Case::Refused);
+    isolated(
+        "current_authorization_refusal_sends_no_remote_cancel",
+        Case::Refused,
+    );
 }
 #[test]
 fn dropped_cancel_attempt_retains_uncertainty_across_handle_clones() {
-    isolated("dropped_cancel_attempt_retains_uncertainty_across_handle_clones", Case::DropAttempt);
+    isolated(
+        "dropped_cancel_attempt_retains_uncertainty_across_handle_clones",
+        Case::DropAttempt,
+    );
 }
 #[test]
 fn local_attempt_cancellation_does_not_cancel_observation() {
-    isolated("local_attempt_cancellation_does_not_cancel_observation", Case::CancelAttempt);
+    isolated(
+        "local_attempt_cancellation_does_not_cancel_observation",
+        Case::CancelAttempt,
+    );
 }
 #[test]
 fn closing_watch_wakes_and_releases_an_outstanding_cancel_request() {
-    isolated("closing_watch_wakes_and_releases_an_outstanding_cancel_request", Case::CloseOwner);
+    isolated(
+        "closing_watch_wakes_and_releases_an_outstanding_cancel_request",
+        Case::CloseOwner,
+    );
 }
 #[test]
 fn abandoning_observation_retires_future_remote_cancel_admission() {
-    isolated("abandoning_observation_retires_future_remote_cancel_admission", Case::DropRead);
+    isolated(
+        "abandoning_observation_retires_future_remote_cancel_admission",
+        Case::DropRead,
+    );
 }
 #[test]
 fn delivered_terminal_prevents_a_later_cancel_attempt() {
-    isolated("delivered_terminal_prevents_a_later_cancel_attempt", Case::Terminal);
+    isolated(
+        "delivered_terminal_prevents_a_later_cancel_attempt",
+        Case::Terminal,
+    );
 }
 #[test]
 fn pre_cancelled_attempt_preserves_the_unused_cancel_opportunity() {
-    isolated("pre_cancelled_attempt_preserves_the_unused_cancel_opportunity", Case::PreCancelled);
+    isolated(
+        "pre_cancelled_attempt_preserves_the_unused_cancel_opportunity",
+        Case::PreCancelled,
+    );
 }
 #[test]
 fn unpolled_cancel_has_no_effect_on_observation_or_attempt_budget() {
-    isolated("unpolled_cancel_has_no_effect_on_observation_or_attempt_budget", Case::Unpolled);
+    isolated(
+        "unpolled_cancel_has_no_effect_on_observation_or_attempt_budget",
+        Case::Unpolled,
+    );
 }
 #[test]
 fn remote_cancel_cannot_extend_the_original_watch_deadline() {
-    isolated("remote_cancel_cannot_extend_the_original_watch_deadline", Case::Deadline);
+    isolated(
+        "remote_cancel_cannot_extend_the_original_watch_deadline",
+        Case::Deadline,
+    );
 }
 
 // The original observation-only helpers and tests above remain unchanged.
@@ -394,66 +490,117 @@ fn remote_cancel_cannot_extend_the_original_watch_deadline() {
 // no-input request allowlist. All tests use the shipped owned driver over TLS.
 mod input_driver {
     use super::*;
-    use std::cell::Cell;
     use fastmcp_client::http_auth::managed::tasks::watch::ManagedTaskWatchError;
     use fastmcp_client::http_auth::managed::tasks::watch::drive::{
         ManagedTaskInputAction, ManagedTaskRunOutcome, ManagedTaskWatchDriveError,
         ManagedTaskWatchDrivePolicy, TaskInputUpdateState,
     };
     use fastmcp_protocol::tasks_extension::{TaskInputRequests, TaskInputResponses};
+    use std::cell::Cell;
 
     const INPUT_ENV: &str = "FASTMCP_TEST_TASK_INPUT_CANCELLATION";
     #[derive(Clone, Copy)]
     enum InputCase {
-        BeforeFirst, Resolver, ReadyResolver, Update, GetAfterUpdate, Backoff,
-        WrongAck, LostAck, Refused, DropResolver, DropUpdate, Terminal, Return,
-        LocalCancel, Deadline, ExpiredCredential,
+        BeforeFirst,
+        Resolver,
+        ReadyResolver,
+        Update,
+        GetAfterUpdate,
+        Backoff,
+        WrongAck,
+        LostAck,
+        Refused,
+        DropResolver,
+        DropUpdate,
+        Terminal,
+        Return,
+        LocalCancel,
+        Deadline,
+        ExpiredCredential,
     }
 
     fn isolated_input(name: &str, case: InputCase) {
         let exact = format!("driver::task_cancellation::input_driver::{name}");
         if let Ok(selected) = std::env::var(INPUT_ENV) {
             assert_eq!(selected, exact);
-            RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(Box::pin(async {
-                let cx = Cx::current().unwrap();
-                let peer = Peer::new().await;
-                Box::pin(asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), scenario(&peer, &cx, case)))
-                    .await.expect("owned input cancellation must settle within its bound");
-            }));
+            RuntimeBuilder::current_thread()
+                .with_reactor(create_reactor().unwrap())
+                .build()
+                .unwrap()
+                .block_on(Box::pin(async {
+                    let cx = Cx::current().unwrap();
+                    let peer = Peer::new().await;
+                    Box::pin(asupersync::time::timeout_at(
+                        cx.now().saturating_add_nanos(20_000_000_000),
+                        scenario(&peer, &cx, case),
+                    ))
+                    .await
+                    .expect("owned input cancellation must settle within its bound");
+                }));
             return;
         }
         let roots = RootFile::create();
         struct Child(std::process::Child);
         impl Drop for Child {
-            fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
         }
-        let mut child = Child(Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
-            .env(INPUT_ENV, &exact).env("SSL_CERT_FILE", &roots.0).env_remove("SSL_CERT_DIR")
-            .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap());
+        let mut child = Child(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
+                .env(INPUT_ENV, &exact)
+                .env("SSL_CERT_FILE", &roots.0)
+                .env_remove("SSL_CERT_DIR")
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
         let end = Instant::now() + Duration::from_secs(30);
         loop {
             if let Some(status) = child.0.try_wait().unwrap() {
-                assert!(status.success(), "owned input cancellation HTTPS case failed");
+                assert!(
+                    status.success(),
+                    "owned input cancellation HTTPS case failed"
+                );
                 return;
             }
-            assert!(Instant::now() < end, "owned input cancellation child exceeded its bound");
+            assert!(
+                Instant::now() < end,
+                "owned input cancellation child exceeded its bound"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
 
-    fn no_resolver(_: TaskInputRequests) -> std::future::Ready<Result<ManagedTaskInputAction, ManagedTaskWatchDriveError>> {
+    fn no_resolver(
+        _: TaskInputRequests,
+    ) -> std::future::Ready<Result<ManagedTaskInputAction, ManagedTaskWatchDriveError>> {
         panic!("closed or terminal driver must not invoke a resolver")
     }
     fn no_observer(_: &Task) -> Result<(), ManagedTaskWatchDriveError> {
         panic!("closed driver must not publish a snapshot")
     }
     fn resolver_waits(case: InputCase) -> bool {
-        matches!(case, InputCase::Resolver | InputCase::WrongAck | InputCase::LostAck
-            | InputCase::Refused | InputCase::DropResolver | InputCase::LocalCancel | InputCase::Deadline)
+        matches!(
+            case,
+            InputCase::Resolver
+                | InputCase::WrongAck
+                | InputCase::LostAck
+                | InputCase::Refused
+                | InputCase::DropResolver
+                | InputCase::LocalCancel
+                | InputCase::Deadline
+        )
     }
     fn failed_cancel(case: InputCase) -> bool {
-        matches!(case, InputCase::WrongAck | InputCase::LostAck | InputCase::Refused)
+        matches!(
+            case,
+            InputCase::WrongAck | InputCase::LostAck | InputCase::Refused
+        )
     }
 
     async fn input_get(peer: &Peer) {
@@ -471,13 +618,20 @@ mod input_driver {
         assert_eq!(update["method"], "tasks/update");
         assert_eq!(update["params"]["_meta"], discovery["params"]["_meta"]);
         assert_eq!(update["params"]["taskId"], TASK_ID);
-        assert_eq!(update["params"]["inputResponses"], json!({"ask":{"roots":[]}}));
+        assert_eq!(
+            update["params"]["inputResponses"],
+            json!({"ask":{"roots":[]}})
+        );
         assert_eq!(update["params"].as_object().unwrap().len(), 3);
         assert!(update["params"].get("requestState").is_none());
         tls
     }
     async fn update_ack(tls: &mut TlsStream<TcpStream>) {
-        json_reply(tls, &result("cancelwatch:5", json!({"resultType":"complete"}))).await;
+        json_reply(
+            tls,
+            &result("cancelwatch:5", json!({"resultType":"complete"})),
+        )
+        .await;
     }
     async fn lose_reply(mut tls: TlsStream<TcpStream>) {
         tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 128\r\nConnection: close\r\n\r\n{\"jsonrpc\":").await.unwrap();
@@ -491,55 +645,116 @@ mod input_driver {
                 // Renewable credentials make a hidden re-acquisition observable:
                 // the peer admits NO refresh exchange after original expiry.
                 json_reply(&mut tls, r#"{"access_token":"interaction-access","token_type":"Bearer","expires_in":5,"refresh_token":"interaction-refresh"}"#).await;
-            } else { peer.login().await; }
+            } else {
+                peer.login().await;
+            }
         });
-        let ((), login) = pair(issuer, Box::pin(ManagedOAuthSession::authorize(
-            cx, peer.client(), OAuthSessionPolicy::default(), browser,
-        ))).await;
+        let ((), login) = pair(
+            issuer,
+            Box::pin(ManagedOAuthSession::authorize(
+                cx,
+                peer.client(),
+                OAuthSessionPolicy::default(),
+                browser,
+            )),
+        )
+        .await;
         let session = login.unwrap();
         let expiry = session.credential(cx).await.unwrap().expires_at();
         let caps: ClientCapabilities = serde_json::from_value(json!({"roots":{}})).unwrap();
-        let client = ManagedTasksClient::new(session.clone(), FinalRequestMeta::new(caps),
-            ManagedTasksLimits::new(65536, 65536, 32, Duration::from_secs(15)).unwrap()).unwrap();
+        let client = ManagedTasksClient::new(
+            session.clone(),
+            FinalRequestMeta::new(caps),
+            ManagedTasksLimits::new(65536, 65536, 32, Duration::from_secs(15)).unwrap(),
+        )
+        .unwrap();
         let shared = McpRequestCancellation::new();
-        let timeout = if matches!(case, InputCase::Deadline) { Duration::from_secs(3) } else { Duration::from_secs(15) };
+        let timeout = if matches!(case, InputCase::Deadline) {
+            Duration::from_secs(3)
+        } else {
+            Duration::from_secs(15)
+        };
         let mut policy = ManagedTaskWatchDrivePolicy::new(
-            ManagedTaskWatchPolicy::new(timeout, 16, 60).unwrap(), 4, 8, 65536,
-        ).unwrap();
+            ManagedTaskWatchPolicy::new(timeout, 16, 60).unwrap(),
+            4,
+            8,
+            65536,
+        )
+        .unwrap();
         if matches!(case, InputCase::Backoff) {
-            policy = policy.with_recovery(ManagedTaskRecoveryPolicy::new(
-                2, Duration::from_secs(60), Duration::from_secs(60),
-            ).unwrap()).unwrap();
+            policy = policy
+                .with_recovery(
+                    ManagedTaskRecoveryPolicy::new(
+                        2,
+                        Duration::from_secs(60),
+                        Duration::from_secs(60),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
         }
-        let (stream, admitted) = pair(Box::pin(listen(peer, matches!(case, InputCase::Backoff))),
-            Box::pin(client.watch_task_inputs_with_cancellation(cx, &shared,
-                TaskId::parse(TASK_ID).unwrap(), PREFIX.to_owned(), policy))).await;
+        let (stream, admitted) = pair(
+            Box::pin(listen(peer, matches!(case, InputCase::Backoff))),
+            Box::pin(client.watch_task_inputs_with_cancellation(
+                cx,
+                &shared,
+                TaskId::parse(TASK_ID).unwrap(),
+                PREFIX.to_owned(),
+                policy,
+            )),
+        )
+        .await;
         let mut driver = admitted.unwrap();
         let handle = driver.cancel_handle();
         drop(Box::pin(driver.drive(cx, no_resolver, no_observer)));
-        assert_eq!(peer.posts.load(Ordering::SeqCst), 2, "unpolled drive cannot read or mutate");
+        assert_eq!(
+            peer.posts.load(Ordering::SeqCst),
+            2,
+            "unpolled drive cannot read or mutate"
+        );
         assert_eq!(driver.update_state(), TaskInputUpdateState::NotAttempted);
         assert_eq!(handle.state(), TaskCancellationState::Ready);
         assert!(!format!("{driver:?} {handle:?}").contains(TASK_ID));
 
         if matches!(case, InputCase::BeforeFirst) {
-            let server = Box::pin(async { let mut tls = cancel_head(peer).await; ack(&mut tls).await; });
+            let server = Box::pin(async {
+                let mut tls = cancel_head(peer).await;
+                ack(&mut tls).await;
+            });
             let ((), accepted) = pair(server, Box::pin(handle.request_cancel(cx))).await;
             accepted.unwrap();
-            assert!(matches!(driver.drive(cx, no_resolver, no_observer).await,
-                Err(ManagedTaskWatchDriveError::CancellationRequested)));
+            assert!(matches!(
+                driver.drive(cx, no_resolver, no_observer).await,
+                Err(ManagedTaskWatchDriveError::CancellationRequested)
+            ));
             assert_eq!(driver.acknowledged_updates(), 0);
             assert_eq!(driver.update_state(), TaskInputUpdateState::NotAttempted);
             assert_eq!(peer.posts.load(Ordering::SeqCst), 4);
         } else if matches!(case, InputCase::ExpiredCredential) {
             let wait = expiry.saturating_duration_since(Instant::now()) + Duration::from_millis(20);
-            Sleep::new(cx.now().saturating_add_nanos(u64::try_from(wait.as_nanos()).unwrap())).await;
-            assert!(matches!(handle.request_cancel(cx).await,
-                Err(TaskCancellationError::NotAttempted(ManagedTasksError::Session(OAuthSessionError::LoginRequired)))));
+            Sleep::new(
+                cx.now()
+                    .saturating_add_nanos(u64::try_from(wait.as_nanos()).unwrap()),
+            )
+            .await;
+            assert!(matches!(
+                handle.request_cancel(cx).await,
+                Err(TaskCancellationError::NotAttempted(
+                    ManagedTasksError::Session(OAuthSessionError::LoginRequired)
+                ))
+            ));
             assert_eq!(handle.state(), TaskCancellationState::Ready);
-            assert!(matches!(driver.drive(cx, no_resolver, no_observer).await,
-                Err(ManagedTaskWatchDriveError::Watch(ManagedTaskWatchError::Session(OAuthSessionError::LoginRequired)))));
-            assert_eq!(peer.posts.load(Ordering::SeqCst), 2, "expired input authority cannot renew even while unpolled");
+            assert!(matches!(
+                driver.drive(cx, no_resolver, no_observer).await,
+                Err(ManagedTaskWatchDriveError::Watch(
+                    ManagedTaskWatchError::Session(OAuthSessionError::LoginRequired)
+                ))
+            ));
+            assert_eq!(
+                peer.posts.load(Ordering::SeqCst),
+                2,
+                "expired input authority cannot renew even while unpolled"
+            );
         } else {
             let phase = McpRequestCancellation::new();
             let cancel_entered = McpRequestCancellation::new();
@@ -565,7 +780,11 @@ mod input_driver {
                             ack(&mut cancel).await;
                         }
                         require_close(update).await;
-                        if matches!(case, InputCase::Update) { 8 } else { 6 }
+                        if matches!(case, InputCase::Update) {
+                            8
+                        } else {
+                            6
+                        }
                     }
                     InputCase::GetAfterUpdate | InputCase::Backoff => {
                         let mut update = update_head(peer).await;
@@ -599,8 +818,16 @@ mod input_driver {
                     _ => {
                         let mut cancel = cancel_head(peer).await;
                         match case {
-                            InputCase::WrongAck => json_reply(&mut cancel,
-                                &result("foreign-cancel-reply", json!({"resultType":"complete"}))).await,
+                            InputCase::WrongAck => {
+                                json_reply(
+                                    &mut cancel,
+                                    &result(
+                                        "foreign-cancel-reply",
+                                        json!({"resultType":"complete"}),
+                                    ),
+                                )
+                                .await
+                            }
                             InputCase::LostAck => lose_reply(cancel).await,
                             InputCase::DropResolver => {
                                 cancel_entered.cancel();
@@ -614,120 +841,212 @@ mod input_driver {
                             update_ack(&mut update).await;
                             get(peer, "cancelwatch:6", "cancelwatch:7", "completed").await;
                             10
-                        } else { 6 }
+                        } else {
+                            6
+                        }
                     }
                 }
             });
             let consumer = Box::pin(async {
-                let mut driving = Box::pin(driver.drive(cx, |pending: TaskInputRequests| {
-                    assert_eq!(pending.keys().map(String::as_str).collect::<Vec<_>>(), ["ask"]);
-                    resolutions.set(resolutions.get() + 1);
-                    assert_eq!(resolutions.get(), 1, "resolver work must never be replayed");
-                    let handle = handle.clone();
-                    let phase = &phase;
-                    let release = &release_resolver;
-                    let dropped = &resolver_dropped;
-                    async move {
-                        struct DropProof<'a>(&'a Cell<bool>);
-                        impl Drop for DropProof<'_> { fn drop(&mut self) { self.0.set(true); } }
-                        let _proof = DropProof(dropped);
-                        if resolver_waits(case) {
-                            phase.cancel();
-                            release.cancelled().await;
+                let mut driving = Box::pin(driver.drive(
+                    cx,
+                    |pending: TaskInputRequests| {
+                        assert_eq!(
+                            pending.keys().map(String::as_str).collect::<Vec<_>>(),
+                            ["ask"]
+                        );
+                        resolutions.set(resolutions.get() + 1);
+                        assert_eq!(resolutions.get(), 1, "resolver work must never be replayed");
+                        let handle = handle.clone();
+                        let phase = &phase;
+                        let release = &release_resolver;
+                        let dropped = &resolver_dropped;
+                        async move {
+                            struct DropProof<'a>(&'a Cell<bool>);
+                            impl Drop for DropProof<'_> {
+                                fn drop(&mut self) {
+                                    self.0.set(true);
+                                }
+                            }
+                            let _proof = DropProof(dropped);
+                            if resolver_waits(case) {
+                                phase.cancel();
+                                release.cancelled().await;
+                            }
+                            if matches!(case, InputCase::ReadyResolver) {
+                                // The real cancel ACK is admitted INSIDE the resolver
+                                // poll that returns valid answers. No update may follow.
+                                handle.request_cancel(cx).await.unwrap();
+                            }
+                            if matches!(case, InputCase::Return) {
+                                return Ok(ManagedTaskInputAction::ReturnToCaller);
+                            }
+                            let responses: TaskInputResponses =
+                                serde_json::from_value(json!({"ask":{"roots":[]}})).unwrap();
+                            Ok(ManagedTaskInputAction::Respond(responses))
                         }
-                        if matches!(case, InputCase::ReadyResolver) {
-                            // The real cancel ACK is admitted INSIDE the resolver
-                            // poll that returns valid answers. No update may follow.
-                            handle.request_cancel(cx).await.unwrap();
-                        }
-                        if matches!(case, InputCase::Return) {
-                            return Ok(ManagedTaskInputAction::ReturnToCaller);
-                        }
-                        let responses: TaskInputResponses = serde_json::from_value(json!({"ask":{"roots":[]}})).unwrap();
-                        Ok(ManagedTaskInputAction::Respond(responses))
-                    }
-                }, |task| {
-                    assert_eq!(task.base().task_id.as_str(), TASK_ID);
-                    observations.set(observations.get() + 1);
-                    Ok(())
-                }));
+                    },
+                    |task| {
+                        assert_eq!(task.base().task_id.as_str(), TASK_ID);
+                        observations.set(observations.get() + 1);
+                        Ok(())
+                    },
+                ));
                 if matches!(case, InputCase::DropResolver) {
-                    let mut attempt = Box::pin(async { phase.cancelled().await; handle.request_cancel(cx).await });
+                    let mut attempt = Box::pin(async {
+                        phase.cancelled().await;
+                        handle.request_cancel(cx).await
+                    });
                     let mut entered = Box::pin(cancel_entered.cancelled());
                     poll_fn(|task| {
                         assert!(driving.as_mut().poll(task).is_pending());
                         assert!(attempt.as_mut().poll(task).is_pending());
                         entered.as_mut().poll(task)
-                    }).await;
+                    })
+                    .await;
                     drop(driving);
-                    assert!(matches!(attempt.await, Err(TaskCancellationError::Unconfirmed(_))));
+                    assert!(matches!(
+                        attempt.await,
+                        Err(TaskCancellationError::Unconfirmed(_))
+                    ));
                     None
                 } else if matches!(case, InputCase::DropUpdate) {
                     let mut entered = Box::pin(phase.cancelled());
                     poll_fn(|task| {
                         assert!(driving.as_mut().poll(task).is_pending());
                         entered.as_mut().poll(task)
-                    }).await;
+                    })
+                    .await;
                     drop(driving);
                     None
                 } else {
                     let control = Box::pin(async {
-                        if matches!(case, InputCase::Terminal | InputCase::Return | InputCase::ReadyResolver | InputCase::Deadline) { return; }
+                        if matches!(
+                            case,
+                            InputCase::Terminal
+                                | InputCase::Return
+                                | InputCase::ReadyResolver
+                                | InputCase::Deadline
+                        ) {
+                            return;
+                        }
                         phase.cancelled().await;
-                        if matches!(case, InputCase::LocalCancel) { shared.cancel(); return; }
+                        if matches!(case, InputCase::LocalCancel) {
+                            shared.cancel();
+                            return;
+                        }
                         let cancelled = handle.request_cancel(cx).await;
                         if failed_cancel(case) {
-                            assert!(matches!(cancelled, Err(TaskCancellationError::Unconfirmed(_))));
+                            assert!(matches!(
+                                cancelled,
+                                Err(TaskCancellationError::Unconfirmed(_))
+                            ));
                             assert_eq!(handle.state(), TaskCancellationState::Unconfirmed);
                             release_resolver.cancel();
-                        } else { cancelled.unwrap(); }
+                        } else {
+                            cancelled.unwrap();
+                        }
                     });
                     Some(pair(driving, control).await.0)
                 }
             });
             let (expected_posts, outcome) = pair(server, consumer).await;
             if failed_cancel(case) || matches!(case, InputCase::Terminal) {
-                assert!(matches!(outcome.unwrap().unwrap(), ManagedTaskRunOutcome::Terminal(task)
-                    if matches!(*task, Task::Completed { .. })));
-                assert_eq!(handle.state(), if failed_cancel(case) { TaskCancellationState::Unconfirmed } else { TaskCancellationState::Ready });
+                assert!(
+                    matches!(outcome.unwrap().unwrap(), ManagedTaskRunOutcome::Terminal(task)
+                    if matches!(*task, Task::Completed { .. }))
+                );
+                assert_eq!(
+                    handle.state(),
+                    if failed_cancel(case) {
+                        TaskCancellationState::Unconfirmed
+                    } else {
+                        TaskCancellationState::Ready
+                    }
+                );
             } else {
                 match case {
-                    InputCase::Return => assert!(matches!(outcome.unwrap().unwrap(), ManagedTaskRunOutcome::InputRequired(_))),
+                    InputCase::Return => assert!(matches!(
+                        outcome.unwrap().unwrap(),
+                        ManagedTaskRunOutcome::InputRequired(_)
+                    )),
                     InputCase::DropResolver | InputCase::DropUpdate => assert!(outcome.is_none()),
-                    InputCase::LocalCancel => assert!(matches!(outcome.unwrap(), Err(ManagedTaskWatchDriveError::Watch(
-                        ManagedTaskWatchError::Session(OAuthSessionError::Cancelled))))),
-                    InputCase::Deadline => assert!(matches!(outcome.unwrap(), Err(ManagedTaskWatchDriveError::Watch(
-                        ManagedTaskWatchError::Session(OAuthSessionError::TimedOut))))),
-                    _ => assert!(matches!(outcome.unwrap(), Err(ManagedTaskWatchDriveError::CancellationRequested))),
+                    InputCase::LocalCancel => assert!(matches!(
+                        outcome.unwrap(),
+                        Err(ManagedTaskWatchDriveError::Watch(
+                            ManagedTaskWatchError::Session(OAuthSessionError::Cancelled)
+                        ))
+                    )),
+                    InputCase::Deadline => assert!(matches!(
+                        outcome.unwrap(),
+                        Err(ManagedTaskWatchDriveError::Watch(
+                            ManagedTaskWatchError::Session(OAuthSessionError::TimedOut)
+                        ))
+                    )),
+                    _ => assert!(matches!(
+                        outcome.unwrap(),
+                        Err(ManagedTaskWatchDriveError::CancellationRequested)
+                    )),
                 }
             }
-            let acknowledged = failed_cancel(case) || matches!(case, InputCase::GetAfterUpdate | InputCase::Backoff);
+            let acknowledged = failed_cancel(case)
+                || matches!(case, InputCase::GetAfterUpdate | InputCase::Backoff);
             let uncertain = matches!(case, InputCase::Update | InputCase::DropUpdate);
-            assert_eq!(driver.update_state(), if acknowledged { TaskInputUpdateState::Acknowledged }
-                else if uncertain { TaskInputUpdateState::Unconfirmed } else { TaskInputUpdateState::NotAttempted });
+            assert_eq!(
+                driver.update_state(),
+                if acknowledged {
+                    TaskInputUpdateState::Acknowledged
+                } else if uncertain {
+                    TaskInputUpdateState::Unconfirmed
+                } else {
+                    TaskInputUpdateState::NotAttempted
+                }
+            );
             assert_eq!(driver.acknowledged_updates(), usize::from(acknowledged));
-            assert_eq!(accepted_updates.get(), usize::from(acknowledged || uncertain));
-            assert_eq!(driver.last_update_request_id(),
-                (acknowledged || uncertain).then_some(&RequestId::String("cancelwatch:5".to_owned())));
-            assert_eq!(resolutions.get(), usize::from(!matches!(case, InputCase::Terminal)));
+            assert_eq!(
+                accepted_updates.get(),
+                usize::from(acknowledged || uncertain)
+            );
+            assert_eq!(
+                driver.last_update_request_id(),
+                (acknowledged || uncertain)
+                    .then_some(&RequestId::String("cancelwatch:5".to_owned()))
+            );
+            assert_eq!(
+                resolutions.get(),
+                usize::from(!matches!(case, InputCase::Terminal))
+            );
             assert_eq!(resolver_dropped.get(), !matches!(case, InputCase::Terminal));
             assert_eq!(observations.get(), if failed_cancel(case) { 2 } else { 1 });
             assert_eq!(peer.posts.load(Ordering::SeqCst), expected_posts);
-            assert_eq!(shared.is_cancel_requested(), matches!(case, InputCase::LocalCancel));
+            assert_eq!(
+                shared.is_cancel_requested(),
+                matches!(case, InputCase::LocalCancel)
+            );
         }
         let before = peer.posts.load(Ordering::SeqCst);
         let replay = driver.drive(cx, no_resolver, no_observer).await;
-        assert!(matches!(replay, Err(ManagedTaskWatchDriveError::CancellationRequested
-            | ManagedTaskWatchDriveError::Watch(ManagedTaskWatchError::Closed))));
+        assert!(matches!(
+            replay,
+            Err(ManagedTaskWatchDriveError::CancellationRequested
+                | ManagedTaskWatchDriveError::Watch(ManagedTaskWatchError::Closed))
+        ));
         let cancel_again = handle.clone().request_cancel(cx).await;
-        assert!(matches!(cancel_again, Err(TaskCancellationError::Closed | TaskCancellationError::AlreadyAttempted)));
+        assert!(matches!(
+            cancel_again,
+            Err(TaskCancellationError::Closed | TaskCancellationError::AlreadyAttempted)
+        ));
         let state = driver.update_state();
         let count = driver.acknowledged_updates();
         driver.close();
         assert_eq!(driver.update_state(), state);
         assert_eq!(driver.acknowledged_updates(), count);
         require_close(stream).await;
-        assert_eq!(peer.posts.load(Ordering::SeqCst), before, "no closed-owner update, cancel or observation replay");
+        assert_eq!(
+            peer.posts.load(Ordering::SeqCst),
+            before,
+            "no closed-owner update, cancel or observation replay"
+        );
         assert_eq!(peer.tokens.load(Ordering::SeqCst), 1);
         assert!(cx.checkpoint().is_ok());
         peer.quiet();
@@ -735,35 +1054,115 @@ mod input_driver {
     }
 
     #[test]
-    fn cancel_before_driving_prevents_initial_get_and_callbacks() { isolated_input("cancel_before_driving_prevents_initial_get_and_callbacks", InputCase::BeforeFirst); }
+    fn cancel_before_driving_prevents_initial_get_and_callbacks() {
+        isolated_input(
+            "cancel_before_driving_prevents_initial_get_and_callbacks",
+            InputCase::BeforeFirst,
+        );
+    }
     #[test]
-    fn admitted_cancel_interrupts_pending_input_resolver() { isolated_input("admitted_cancel_interrupts_pending_input_resolver", InputCase::Resolver); }
+    fn admitted_cancel_interrupts_pending_input_resolver() {
+        isolated_input(
+            "admitted_cancel_interrupts_pending_input_resolver",
+            InputCase::Resolver,
+        );
+    }
     #[test]
-    fn cancel_inside_ready_resolver_prevents_answer_dispatch() { isolated_input("cancel_inside_ready_resolver_prevents_answer_dispatch", InputCase::ReadyResolver); }
+    fn cancel_inside_ready_resolver_prevents_answer_dispatch() {
+        isolated_input(
+            "cancel_inside_ready_resolver_prevents_answer_dispatch",
+            InputCase::ReadyResolver,
+        );
+    }
     #[test]
-    fn cancel_during_update_preserves_unconfirmed_mutation() { isolated_input("cancel_during_update_preserves_unconfirmed_mutation", InputCase::Update); }
+    fn cancel_during_update_preserves_unconfirmed_mutation() {
+        isolated_input(
+            "cancel_during_update_preserves_unconfirmed_mutation",
+            InputCase::Update,
+        );
+    }
     #[test]
-    fn cancel_after_update_ack_preserves_receipt_while_closing_get() { isolated_input("cancel_after_update_ack_preserves_receipt_while_closing_get", InputCase::GetAfterUpdate); }
+    fn cancel_after_update_ack_preserves_receipt_while_closing_get() {
+        isolated_input(
+            "cancel_after_update_ack_preserves_receipt_while_closing_get",
+            InputCase::GetAfterUpdate,
+        );
+    }
     #[test]
-    fn cancel_after_lost_reconciliation_stops_backoff_without_replay() { isolated_input("cancel_after_lost_reconciliation_stops_backoff_without_replay", InputCase::Backoff); }
+    fn cancel_after_lost_reconciliation_stops_backoff_without_replay() {
+        isolated_input(
+            "cancel_after_lost_reconciliation_stops_backoff_without_replay",
+            InputCase::Backoff,
+        );
+    }
     #[test]
-    fn wrong_cancel_ack_does_not_discard_pending_input() { isolated_input("wrong_cancel_ack_does_not_discard_pending_input", InputCase::WrongAck); }
+    fn wrong_cancel_ack_does_not_discard_pending_input() {
+        isolated_input(
+            "wrong_cancel_ack_does_not_discard_pending_input",
+            InputCase::WrongAck,
+        );
+    }
     #[test]
-    fn lost_cancel_ack_does_not_discard_pending_input() { isolated_input("lost_cancel_ack_does_not_discard_pending_input", InputCase::LostAck); }
+    fn lost_cancel_ack_does_not_discard_pending_input() {
+        isolated_input(
+            "lost_cancel_ack_does_not_discard_pending_input",
+            InputCase::LostAck,
+        );
+    }
     #[test]
-    fn rejected_cancel_discovery_leaves_input_driver_usable() { isolated_input("rejected_cancel_discovery_leaves_input_driver_usable", InputCase::Refused); }
+    fn rejected_cancel_discovery_leaves_input_driver_usable() {
+        isolated_input(
+            "rejected_cancel_discovery_leaves_input_driver_usable",
+            InputCase::Refused,
+        );
+    }
     #[test]
-    fn dropped_driver_releases_resolver_and_outstanding_cancel() { isolated_input("dropped_driver_releases_resolver_and_outstanding_cancel", InputCase::DropResolver); }
+    fn dropped_driver_releases_resolver_and_outstanding_cancel() {
+        isolated_input(
+            "dropped_driver_releases_resolver_and_outstanding_cancel",
+            InputCase::DropResolver,
+        );
+    }
     #[test]
-    fn dropped_update_wait_keeps_uncertainty_and_retires_owner() { isolated_input("dropped_update_wait_keeps_uncertainty_and_retires_owner", InputCase::DropUpdate); }
+    fn dropped_update_wait_keeps_uncertainty_and_retires_owner() {
+        isolated_input(
+            "dropped_update_wait_keeps_uncertainty_and_retires_owner",
+            InputCase::DropUpdate,
+        );
+    }
     #[test]
-    fn terminal_delivery_retires_input_driver_cancel_authority() { isolated_input("terminal_delivery_retires_input_driver_cancel_authority", InputCase::Terminal); }
+    fn terminal_delivery_retires_input_driver_cancel_authority() {
+        isolated_input(
+            "terminal_delivery_retires_input_driver_cancel_authority",
+            InputCase::Terminal,
+        );
+    }
     #[test]
-    fn explicit_input_handoff_closes_run_without_sending_answers() { isolated_input("explicit_input_handoff_closes_run_without_sending_answers", InputCase::Return); }
+    fn explicit_input_handoff_closes_run_without_sending_answers() {
+        isolated_input(
+            "explicit_input_handoff_closes_run_without_sending_answers",
+            InputCase::Return,
+        );
+    }
     #[test]
-    fn local_cancellation_is_not_remote_cancellation() { isolated_input("local_cancellation_is_not_remote_cancellation", InputCase::LocalCancel); }
+    fn local_cancellation_is_not_remote_cancellation() {
+        isolated_input(
+            "local_cancellation_is_not_remote_cancellation",
+            InputCase::LocalCancel,
+        );
+    }
     #[test]
-    fn input_resolver_cannot_extend_original_driver_deadline() { isolated_input("input_resolver_cannot_extend_original_driver_deadline", InputCase::Deadline); }
+    fn input_resolver_cannot_extend_original_driver_deadline() {
+        isolated_input(
+            "input_resolver_cannot_extend_original_driver_deadline",
+            InputCase::Deadline,
+        );
+    }
     #[test]
-    fn unpolled_expired_driver_cannot_renew_cancel_authority() { isolated_input("unpolled_expired_driver_cannot_renew_cancel_authority", InputCase::ExpiredCredential); }
+    fn unpolled_expired_driver_cannot_renew_cancel_authority() {
+        isolated_input(
+            "unpolled_expired_driver_cannot_renew_cancel_authority",
+            InputCase::ExpiredCredential,
+        );
+    }
 }

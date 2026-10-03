@@ -15,13 +15,12 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use fastmcp_core::CanonicalHttpUrl;
 use fastmcp_protocol::http_headers::{
-    AdmittedToolHeaderSchema, MAX_MCP_HEADER_VALUE_BYTES, McpHeaderError,
-    ParameterHeaderBinding,
+    AdmittedToolHeaderSchema, MAX_MCP_HEADER_VALUE_BYTES, McpHeaderError, ParameterHeaderBinding,
 };
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
-    CoreRequest, FINAL_PROTOCOL_VERSION, FINAL_PROTOCOL_VERSION_META_KEY,
-    JsonRpcMessage, decode_strict_jsonrpc_message,
+    CoreRequest, FINAL_PROTOCOL_VERSION, FINAL_PROTOCOL_VERSION_META_KEY, JsonRpcMessage,
+    decode_strict_jsonrpc_message,
 };
 use serde_json::Value;
 
@@ -51,7 +50,9 @@ impl fmt::Display for ToolHeaderDispatchError {
             Self::TargetMismatch => "tool-header plan belongs to a different HTTPS resource",
             Self::OperationMismatch => "tool-header plan does not match the request operation",
             Self::AlreadyProjected => "tool parameter headers were already installed",
-            Self::InvalidRequest => "tool-header projection requires an admitted final tool request",
+            Self::InvalidRequest => {
+                "tool-header projection requires an admitted final tool request"
+            }
             Self::RequestTooLarge => "tool-header request exceeds the source-byte limit",
             Self::Projection(error) => return fmt::Display::fmt(error, f),
         })
@@ -61,7 +62,9 @@ impl fmt::Display for ToolHeaderDispatchError {
 impl std::error::Error for ToolHeaderDispatchError {}
 
 impl From<McpHeaderError> for ToolHeaderDispatchError {
-    fn from(error: McpHeaderError) -> Self { Self::Projection(error) }
+    fn from(error: McpHeaderError) -> Self {
+        Self::Projection(error)
+    }
 }
 
 /// Immutable approval of one exact tool schema at one canonical HTTPS resource.
@@ -107,13 +110,25 @@ impl ReviewedToolHeaders {
                 return Err(ToolHeaderDispatchError::DisclosureDenied);
             }
         }
-        Ok(Self { resource, tool_name, schema })
+        Ok(Self {
+            resource,
+            tool_name,
+            schema,
+        })
     }
 
-    pub fn resource(&self) -> &CanonicalHttpUrl { &self.resource }
-    pub fn tool_name(&self) -> &str { &self.tool_name }
-    pub fn schema(&self) -> &Value { self.schema.schema() }
-    pub fn bindings(&self) -> &[ParameterHeaderBinding] { self.schema.header_plan().bindings() }
+    pub fn resource(&self) -> &CanonicalHttpUrl {
+        &self.resource
+    }
+    pub fn tool_name(&self) -> &str {
+        &self.tool_name
+    }
+    pub fn schema(&self) -> &Value {
+        self.schema.schema()
+    }
+    pub fn bindings(&self) -> &[ParameterHeaderBinding] {
+        self.schema.header_plan().bindings()
+    }
 
     fn project_request(
         &self,
@@ -159,21 +174,34 @@ fn project_exact_tool_call(
     if envelope.id.is_none() || envelope.method != request.method {
         return Err(ToolHeaderDispatchError::InvalidRequest);
     }
-    let params = envelope.params.as_ref().and_then(Value::as_object)
+    let params = envelope
+        .params
+        .as_ref()
+        .and_then(Value::as_object)
         .ok_or(ToolHeaderDispatchError::InvalidRequest)?;
     if params.get("name").and_then(Value::as_str) != Some(tool_name) {
         return Err(ToolHeaderDispatchError::OperationMismatch);
     }
-    if params.get("_meta").and_then(|meta| meta.get(FINAL_PROTOCOL_VERSION_META_KEY))
-        .and_then(Value::as_str) != Some(FINAL_PROTOCOL_VERSION)
+    if params
+        .get("_meta")
+        .and_then(|meta| meta.get(FINAL_PROTOCOL_VERSION_META_KEY))
+        .and_then(Value::as_str)
+        != Some(FINAL_PROTOCOL_VERSION)
     {
         return Err(ToolHeaderDispatchError::InvalidRequest);
     }
     // Raw duplicate/batch admission precedes typed method/metadata admission.
     // Neither decoder rewrites the immutable body which the executor sends.
-    let _ = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", envelope.params.as_ref())
-        .map_err(|_| ToolHeaderDispatchError::InvalidRequest)?;
-    Ok(schema.header_plan().project(params.get("arguments"))?.into_fields())
+    let _ = CoreRequest::decode(
+        ProtocolEra::Modern2026,
+        "tools/call",
+        envelope.params.as_ref(),
+    )
+    .map_err(|_| ToolHeaderDispatchError::InvalidRequest)?;
+    Ok(schema
+        .header_plan()
+        .project(params.get("arguments"))?
+        .into_fields())
 }
 
 /// A gateway's `Mcp-Param-*` recomputation plans for one upstream, keyed by the
@@ -196,7 +224,8 @@ impl GatewayToolHeaders {
     /// leaves no plan behind. A schema with no admissible annotation recognizes
     /// nothing, as on the server, so its tool gets no plan rather than a guess.
     pub fn replace<'a>(&self, catalog: impl IntoIterator<Item = (&'a str, &'a Value)>) {
-        let plans = catalog.into_iter()
+        let plans = catalog
+            .into_iter()
             .filter_map(|(name, schema)| {
                 let admitted = AdmittedToolHeaderSchema::admit(schema.clone()).ok()?;
                 (!admitted.header_plan().bindings().is_empty())
@@ -207,14 +236,24 @@ impl GatewayToolHeaders {
     }
 
     fn plan(&self, tool_name: &str) -> Option<Arc<AdmittedToolHeaderSchema>> {
-        self.plans.read().unwrap_or_else(PoisonError::into_inner).get(tool_name).cloned()
+        self.plans
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(tool_name)
+            .cloned()
     }
 }
 
 impl fmt::Debug for GatewayToolHeaders {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let plans = self.plans.read().unwrap_or_else(PoisonError::into_inner).len();
-        f.debug_struct("GatewayToolHeaders").field("plan_count", &plans).finish()
+        let plans = self
+            .plans
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        f.debug_struct("GatewayToolHeaders")
+            .field("plan_count", &plans)
+            .finish()
     }
 }
 
@@ -256,7 +295,8 @@ impl ModernHttpRequest {
         let Some(schema) = self.name.as_deref().and_then(|name| gateway.plan(name)) else {
             return Ok(self);
         };
-        let headers = project_exact_tool_call(&self, self.name.as_deref().unwrap_or_default(), &schema)?;
+        let headers =
+            project_exact_tool_call(&self, self.name.as_deref().unwrap_or_default(), &schema)?;
         self.parameter_headers = Some(headers);
         Ok(self)
     }

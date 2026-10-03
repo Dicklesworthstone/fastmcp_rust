@@ -77,7 +77,9 @@ pub struct RequiredScopes {
 
 impl fmt::Debug for RequiredScopes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RequiredScopes").field("count", &self.scopes.len()).finish()
+        f.debug_struct("RequiredScopes")
+            .field("count", &self.scopes.len())
+            .finish()
     }
 }
 
@@ -86,20 +88,28 @@ impl RequiredScopes {
         validate_scopes(&scopes)?;
         let mut bytes = 0_usize;
         for scope in &scopes {
-            if scope == "offline_access" { return Err(ScopePolicyError::OfflineAccess); }
+            if scope == "offline_access" {
+                return Err(ScopePolicyError::OfflineAccess);
+            }
             bytes = bytes.saturating_add(scope.len()).saturating_add(1);
-            if bytes > MAX_REQUIRED_BYTES { return Err(ScopePolicyError::PolicyTooLarge); }
+            if bytes > MAX_REQUIRED_BYTES {
+                return Err(ScopePolicyError::PolicyTooLarge);
+            }
         }
         scopes.sort_unstable();
         scopes.dedup();
         Ok(Self { scopes })
     }
 
-    pub fn as_slice(&self) -> &[String] { &self.scopes }
+    pub fn as_slice(&self) -> &[String] {
+        &self.scopes
+    }
 
     /// All required scopes, not merely the first missing one or a graph-reduced
     /// subset. Tokens cannot contain quotes, backslashes or HTTP controls.
-    pub fn challenge_scope(&self) -> String { self.scopes.join(" ") }
+    pub fn challenge_scope(&self) -> String {
+        self.scopes.join(" ")
+    }
 }
 
 struct CompiledPolicy {
@@ -134,20 +144,33 @@ impl ScopeImplicationPolicy {
     /// Every pair is `(granted_scope, implied_scope)`. Configuration must be
     /// selected by the host for its provider, never deserialized from claims,
     /// introspection output, discovery extensions or request metadata.
-    pub fn new(revision: u64, implications: Vec<(String, String)>) -> Result<Self, ScopePolicyError> {
-        if revision == 0 { return Err(ScopePolicyError::ZeroRevision); }
-        if implications.len() > MAX_IMPLICATIONS { return Err(ScopePolicyError::TooManyImplications); }
+    pub fn new(
+        revision: u64,
+        implications: Vec<(String, String)>,
+    ) -> Result<Self, ScopePolicyError> {
+        if revision == 0 {
+            return Err(ScopePolicyError::ZeroRevision);
+        }
+        if implications.len() > MAX_IMPLICATIONS {
+            return Err(ScopePolicyError::TooManyImplications);
+        }
         let mut names = BTreeSet::new();
         let mut edges = BTreeSet::new();
         let mut bytes = 0_usize;
         for (granted, implied) in &implications {
             for scope in [granted, implied] {
                 validate_scope(scope)?;
-                if scope == "offline_access" { return Err(ScopePolicyError::OfflineAccess); }
+                if scope == "offline_access" {
+                    return Err(ScopePolicyError::OfflineAccess);
+                }
                 bytes = bytes.saturating_add(scope.len());
-                if bytes > MAX_POLICY_BYTES { return Err(ScopePolicyError::PolicyTooLarge); }
+                if bytes > MAX_POLICY_BYTES {
+                    return Err(ScopePolicyError::PolicyTooLarge);
+                }
                 names.insert(scope.clone());
-                if names.len() > MAX_SCOPES { return Err(ScopePolicyError::TooManyScopes); }
+                if names.len() > MAX_SCOPES {
+                    return Err(ScopePolicyError::TooManyScopes);
+                }
             }
             if !edges.insert((granted.as_str(), implied.as_str())) {
                 return Err(ScopePolicyError::RepeatedImplication);
@@ -156,19 +179,27 @@ impl ScopeImplicationPolicy {
         let scopes: Vec<String> = names.into_iter().collect();
         let mut reachable = vec![0_u64; scopes.len()];
         for (granted, implied) in edges {
-            let from = scopes.binary_search_by(|value| value.as_str().cmp(granted))
+            let from = scopes
+                .binary_search_by(|value| value.as_str().cmp(granted))
                 .map_err(|_| ScopePolicyError::InvalidScope)?;
-            let to = scopes.binary_search_by(|value| value.as_str().cmp(implied))
+            let to = scopes
+                .binary_search_by(|value| value.as_str().cmp(implied))
                 .map_err(|_| ScopePolicyError::InvalidScope)?;
             reachable[from] |= 1_u64 << to;
         }
         for via in 0..scopes.len() {
             let successors = reachable[via];
             for row in &mut reachable {
-                if *row & (1_u64 << via) != 0 { *row |= successors; }
+                if *row & (1_u64 << via) != 0 {
+                    *row |= successors;
+                }
             }
         }
-        if reachable.iter().enumerate().any(|(index, row)| row & (1_u64 << index) != 0) {
+        if reachable
+            .iter()
+            .enumerate()
+            .any(|(index, row)| row & (1_u64 << index) != 0)
+        {
             return Err(ScopePolicyError::CyclicImplication);
         }
         // Bind the revision AND actual semantics. Reusing a numeric revision for
@@ -183,30 +214,63 @@ impl ScopeImplicationPolicy {
         }
         let fingerprint = sha256_bounded(&identity, MAX_POLICY_BYTES)
             .map_err(|_| ScopePolicyError::PolicyTooLarge)?;
-        Ok(Self { inner: Arc::new(CompiledPolicy { revision, scopes, reachable, fingerprint }) })
+        Ok(Self {
+            inner: Arc::new(CompiledPolicy {
+                revision,
+                scopes,
+                reachable,
+                fingerprint,
+            }),
+        })
     }
 
-    pub fn exact(revision: u64) -> Result<Self, ScopePolicyError> { Self::new(revision, Vec::new()) }
-    pub fn revision(&self) -> u64 { self.inner.revision }
+    pub fn exact(revision: u64) -> Result<Self, ScopePolicyError> {
+        Self::new(revision, Vec::new())
+    }
+    pub fn revision(&self) -> u64 {
+        self.inner.revision
+    }
 
     /// Semantic policy identity for trusted cache/configuration owners. This is
     /// not a principal, issuer, audience, revocation handle or authorization lease.
-    pub fn fingerprint(&self) -> Sha256Digest { self.inner.fingerprint }
+    pub fn fingerprint(&self) -> Sha256Digest {
+        self.inner.fingerprint
+    }
 
     /// Tests every required scope using exact or explicitly transitive grants.
     /// All supplied grants are validated before any successful early return.
     /// `true` means scope sufficiency only, not authentication or visibility.
-    pub fn permits(&self, verified_grants: &[String], required: &RequiredScopes) -> Result<bool, ScopePolicyError> {
+    pub fn permits(
+        &self,
+        verified_grants: &[String],
+        required: &RequiredScopes,
+    ) -> Result<bool, ScopePolicyError> {
         validate_scopes(verified_grants)?;
         Ok(required.scopes.iter().all(|required| {
-            verified_grants.iter().any(|grant| self.implies(grant, required))
+            verified_grants
+                .iter()
+                .any(|grant| self.implies(grant, required))
         }))
     }
 
     fn implies(&self, granted: &str, required: &str) -> bool {
-        if granted == required { return true; }
-        let Ok(from) = self.inner.scopes.binary_search_by(|value| value.as_str().cmp(granted)) else { return false; };
-        let Ok(to) = self.inner.scopes.binary_search_by(|value| value.as_str().cmp(required)) else { return false; };
+        if granted == required {
+            return true;
+        }
+        let Ok(from) = self
+            .inner
+            .scopes
+            .binary_search_by(|value| value.as_str().cmp(granted))
+        else {
+            return false;
+        };
+        let Ok(to) = self
+            .inner
+            .scopes
+            .binary_search_by(|value| value.as_str().cmp(required))
+        else {
+            return false;
+        };
         self.inner.reachable[from] & (1_u64 << to) != 0
     }
 
@@ -217,17 +281,25 @@ impl ScopeImplicationPolicy {
     /// is performed. An empty anonymous context acquires no permissions.
     pub fn project_verified(&self, facts: &mut AuthContext) -> Result<(), ScopePolicyError> {
         validate_scopes(&facts.scopes)?;
-        if facts.scopes.is_empty() { return Ok(()); }
+        if facts.scopes.is_empty() {
+            return Ok(());
+        }
         if facts.subject.as_ref().is_some_and(String::is_empty)
             || (facts.subject.is_none() && facts.session_owner().is_none())
-        { return Err(ScopePolicyError::InvalidPrincipal); }
+        {
+            return Err(ScopePolicyError::InvalidPrincipal);
+        }
         let mut effective: BTreeSet<String> = facts.scopes.iter().cloned().collect();
         for grant in &facts.scopes {
-            let Ok(index) = self.inner.scopes.binary_search(grant) else { continue; };
+            let Ok(index) = self.inner.scopes.binary_search(grant) else {
+                continue;
+            };
             let row = self.inner.reachable[index];
             for (target, scope) in self.inner.scopes.iter().enumerate() {
                 if row & (1_u64 << target) != 0 && !effective.contains(scope) {
-                    if effective.len() == MAX_SCOPES { return Err(ScopePolicyError::EffectiveScopeLimit); }
+                    if effective.len() == MAX_SCOPES {
+                        return Err(ScopePolicyError::EffectiveScopeLimit);
+                    }
                     effective.insert(scope.clone());
                 }
             }
@@ -254,36 +326,53 @@ pub struct ScopePolicyAuthProvider {
 
 impl ScopePolicyAuthProvider {
     pub fn new<P: AuthProvider + 'static>(provider: P, policy: ScopeImplicationPolicy) -> Self {
-        Self { provider: Arc::new(provider), policy }
+        Self {
+            provider: Arc::new(provider),
+            policy,
+        }
     }
-    pub fn policy(&self) -> &ScopeImplicationPolicy { &self.policy }
+    pub fn policy(&self) -> &ScopeImplicationPolicy {
+        &self.policy
+    }
 }
 
 impl fmt::Debug for ScopePolicyAuthProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ScopePolicyAuthProvider").field("policy", &self.policy).finish_non_exhaustive()
+        f.debug_struct("ScopePolicyAuthProvider")
+            .field("policy", &self.policy)
+            .finish_non_exhaustive()
     }
 }
 
 impl AuthProvider for ScopePolicyAuthProvider {
     fn authenticate(&self, ctx: &McpContext, request: AuthRequest<'_>) -> McpResult<AuthContext> {
         let mut facts = self.provider.authenticate(ctx, request)?;
-        self.policy.project_verified(&mut facts)
-            .map_err(|_| McpError::internal_error("authentication scope policy rejected provider facts"))?;
+        self.policy.project_verified(&mut facts).map_err(|_| {
+            McpError::internal_error("authentication scope policy rejected provider facts")
+        })?;
         Ok(facts)
     }
 }
 
 fn validate_scope(scope: &str) -> Result<(), ScopePolicyError> {
-    if scope.is_empty() || scope.len() > MAX_SCOPE_BYTES
-        || !scope.bytes().all(|byte| matches!(byte, 0x21 | 0x23..=0x5b | 0x5d..=0x7e))
-    { return Err(ScopePolicyError::InvalidScope); }
+    if scope.is_empty()
+        || scope.len() > MAX_SCOPE_BYTES
+        || !scope
+            .bytes()
+            .all(|byte| matches!(byte, 0x21 | 0x23..=0x5b | 0x5d..=0x7e))
+    {
+        return Err(ScopePolicyError::InvalidScope);
+    }
     Ok(())
 }
 
 fn validate_scopes(scopes: &[String]) -> Result<(), ScopePolicyError> {
-    if scopes.len() > MAX_SCOPES { return Err(ScopePolicyError::TooManyScopes); }
-    for scope in scopes { validate_scope(scope)?; }
+    if scopes.len() > MAX_SCOPES {
+        return Err(ScopePolicyError::TooManyScopes);
+    }
+    for scope in scopes {
+        validate_scope(scope)?;
+    }
     Ok(())
 }
 
@@ -291,9 +380,18 @@ fn validate_scopes(scopes: &[String]) -> Result<(), ScopePolicyError> {
 mod tests {
     use super::*;
 
-    fn scopes(values: &[&str]) -> Vec<String> { values.iter().map(|value| (*value).to_owned()).collect() }
+    fn scopes(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
     fn policy(edges: &[(&str, &str)]) -> ScopeImplicationPolicy {
-        ScopeImplicationPolicy::new(7, edges.iter().map(|(a, b)| ((*a).to_owned(), (*b).to_owned())).collect()).unwrap()
+        ScopeImplicationPolicy::new(
+            7,
+            edges
+                .iter()
+                .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+                .collect(),
+        )
+        .unwrap()
     }
     fn facts(values: &[&str]) -> AuthContext {
         let mut facts = AuthContext::with_subject("verified-principal");
@@ -332,44 +430,88 @@ mod tests {
             assert!(!policy.permits(&scopes(&[granted]), &required).unwrap());
         }
         assert!(policy.permits(&scopes(&["files:read"]), &required).unwrap());
-        assert!(policy.permits(&scopes(&["explicit:*"]), &RequiredScopes::new(scopes(&["allowed"])).unwrap()).unwrap());
-        assert!(!policy.permits(&scopes(&["explicit:*"]), &RequiredScopes::new(scopes(&["other"])).unwrap()).unwrap());
+        assert!(
+            policy
+                .permits(
+                    &scopes(&["explicit:*"]),
+                    &RequiredScopes::new(scopes(&["allowed"])).unwrap()
+                )
+                .unwrap()
+        );
+        assert!(
+            !policy
+                .permits(
+                    &scopes(&["explicit:*"]),
+                    &RequiredScopes::new(scopes(&["other"])).unwrap()
+                )
+                .unwrap()
+        );
     }
 
     #[test]
     fn cycles_and_duplicate_edges_fail_during_configuration() {
-        for edges in [vec![("a", "a")], vec![("a", "b"), ("b", "a")],
-            vec![("a", "b"), ("b", "c"), ("c", "a")]]
-        {
-            let edges = edges.into_iter().map(|(a, b)| (a.to_owned(), b.to_owned())).collect();
-            assert!(matches!(ScopeImplicationPolicy::new(1, edges), Err(ScopePolicyError::CyclicImplication)));
+        for edges in [
+            vec![("a", "a")],
+            vec![("a", "b"), ("b", "a")],
+            vec![("a", "b"), ("b", "c"), ("c", "a")],
+        ] {
+            let edges = edges
+                .into_iter()
+                .map(|(a, b)| (a.to_owned(), b.to_owned()))
+                .collect();
+            assert!(matches!(
+                ScopeImplicationPolicy::new(1, edges),
+                Err(ScopePolicyError::CyclicImplication)
+            ));
         }
-        assert!(matches!(ScopeImplicationPolicy::new(1, vec![("a".to_owned(), "b".to_owned()); 2]),
-            Err(ScopePolicyError::RepeatedImplication)));
+        assert!(matches!(
+            ScopeImplicationPolicy::new(1, vec![("a".to_owned(), "b".to_owned()); 2]),
+            Err(ScopePolicyError::RepeatedImplication)
+        ));
         assert!(ScopeImplicationPolicy::new(1, vec![("a".to_owned(), "b".to_owned())]).is_ok());
     }
 
     #[test]
     fn configuration_limits_include_the_highest_bit_and_longest_transitive_path() {
-        let chain = |count: usize| (1..count).map(|i| (format!("s{:02}", i - 1), format!("s{i:02}"))).collect();
+        let chain = |count: usize| {
+            (1..count)
+                .map(|i| (format!("s{:02}", i - 1), format!("s{i:02}")))
+                .collect()
+        };
         let policy = ScopeImplicationPolicy::new(1, chain(64)).unwrap();
         let last = RequiredScopes::new(scopes(&["s63"])).unwrap();
         assert!(policy.permits(&scopes(&["s00"]), &last).unwrap());
         let mut facts = facts(&["s00"]);
         policy.project_verified(&mut facts).unwrap();
         assert_eq!(facts.scopes.len(), 64);
-        assert!(matches!(ScopeImplicationPolicy::new(1, chain(65)), Err(ScopePolicyError::TooManyScopes)));
-        assert!(matches!(ScopeImplicationPolicy::new(1, vec![("a".to_owned(), "b".to_owned()); 257]),
-            Err(ScopePolicyError::TooManyImplications)));
-        assert!(matches!(ScopeImplicationPolicy::exact(0), Err(ScopePolicyError::ZeroRevision)));
+        assert!(matches!(
+            ScopeImplicationPolicy::new(1, chain(65)),
+            Err(ScopePolicyError::TooManyScopes)
+        ));
+        assert!(matches!(
+            ScopeImplicationPolicy::new(1, vec![("a".to_owned(), "b".to_owned()); 257]),
+            Err(ScopePolicyError::TooManyImplications)
+        ));
+        assert!(matches!(
+            ScopeImplicationPolicy::exact(0),
+            Err(ScopePolicyError::ZeroRevision)
+        ));
     }
 
     #[test]
     fn diamond_paths_deduplicate_effective_permissions() {
-        let policy = policy(&[("admin", "left"), ("admin", "right"), ("left", "read"), ("right", "read")]);
+        let policy = policy(&[
+            ("admin", "left"),
+            ("admin", "right"),
+            ("left", "read"),
+            ("right", "read"),
+        ]);
         let mut facts = facts(&["admin", "outside", "admin"]);
         policy.project_verified(&mut facts).unwrap();
-        assert_eq!(facts.scopes, scopes(&["admin", "left", "outside", "read", "right"]));
+        assert_eq!(
+            facts.scopes,
+            scopes(&["admin", "left", "outside", "read", "right"])
+        );
         let before = serde_json::to_vec(&facts).unwrap();
         policy.project_verified(&mut facts).unwrap();
         assert_eq!(serde_json::to_vec(&facts).unwrap(), before);
@@ -382,7 +524,9 @@ mod tests {
         facts.claims = Some(serde_json::json!({"scope":"write", "tenant":"provider-selected"}));
         let subject = facts.subject.clone();
         let claims = facts.claims.clone();
-        policy(&[("write", "read")]).project_verified(&mut facts).unwrap();
+        policy(&[("write", "read")])
+            .project_verified(&mut facts)
+            .unwrap();
         assert_eq!(facts.subject, subject);
         assert_eq!(facts.session_owner(), Some(owner));
         assert_eq!(facts.claims, claims);
@@ -393,9 +537,14 @@ mod tests {
     fn projection_limit_failure_is_atomic() {
         let policy = policy(&[("admin", "extra")]);
         let mut facts = facts(&["admin"]);
-        facts.scopes.extend((0..63).map(|i| format!("unrelated-{i}")));
+        facts
+            .scopes
+            .extend((0..63).map(|i| format!("unrelated-{i}")));
         let before = serde_json::to_vec(&facts).unwrap();
-        assert_eq!(policy.project_verified(&mut facts), Err(ScopePolicyError::EffectiveScopeLimit));
+        assert_eq!(
+            policy.project_verified(&mut facts),
+            Err(ScopePolicyError::EffectiveScopeLimit)
+        );
         assert_eq!(serde_json::to_vec(&facts).unwrap(), before);
         facts.scopes.pop();
         policy.project_verified(&mut facts).unwrap();
@@ -405,11 +554,27 @@ mod tests {
     #[test]
     fn every_grant_is_validated_even_for_empty_or_already_satisfied_requirements() {
         let policy = ScopeImplicationPolicy::exact(1).unwrap();
-        for required in [RequiredScopes::new(vec![]).unwrap(), RequiredScopes::new(scopes(&["read"])).unwrap()] {
-            assert_eq!(policy.permits(&scopes(&["read", "invalid scope"]), &required), Err(ScopePolicyError::InvalidScope));
+        for required in [
+            RequiredScopes::new(vec![]).unwrap(),
+            RequiredScopes::new(scopes(&["read"])).unwrap(),
+        ] {
+            assert_eq!(
+                policy.permits(&scopes(&["read", "invalid scope"]), &required),
+                Err(ScopePolicyError::InvalidScope)
+            );
         }
-        assert!(policy.permits(&[], &RequiredScopes::new(vec![]).unwrap()).unwrap());
-        assert_eq!(policy.permits(&vec!["read".to_owned(); 65], &RequiredScopes::new(vec![]).unwrap()), Err(ScopePolicyError::TooManyScopes));
+        assert!(
+            policy
+                .permits(&[], &RequiredScopes::new(vec![]).unwrap())
+                .unwrap()
+        );
+        assert_eq!(
+            policy.permits(
+                &vec!["read".to_owned(); 65],
+                &RequiredScopes::new(vec![]).unwrap()
+            ),
+            Err(ScopePolicyError::TooManyScopes)
+        );
     }
 
     #[test]
@@ -420,20 +585,42 @@ mod tests {
         assert!(anonymous.scopes.is_empty());
         anonymous.scopes = scopes(&["admin"]);
         let before = serde_json::to_vec(&anonymous).unwrap();
-        assert_eq!(policy.project_verified(&mut anonymous), Err(ScopePolicyError::InvalidPrincipal));
+        assert_eq!(
+            policy.project_verified(&mut anonymous),
+            Err(ScopePolicyError::InvalidPrincipal)
+        );
         assert_eq!(serde_json::to_vec(&anonymous).unwrap(), before);
     }
 
     #[test]
     fn malformed_scopes_and_login_permissions_are_not_policy_or_challenge_authority() {
-        for invalid in ["", "two scopes", "scope\"quote", "scope\\slash", "line\r\n", "unicode-\u{e9}"] {
-            assert!(matches!(RequiredScopes::new(scopes(&[invalid])), Err(ScopePolicyError::InvalidScope)));
-            assert!(matches!(ScopeImplicationPolicy::new(1, vec![(invalid.to_owned(), "read".to_owned())]), Err(ScopePolicyError::InvalidScope)));
+        for invalid in [
+            "",
+            "two scopes",
+            "scope\"quote",
+            "scope\\slash",
+            "line\r\n",
+            "unicode-\u{e9}",
+        ] {
+            assert!(matches!(
+                RequiredScopes::new(scopes(&[invalid])),
+                Err(ScopePolicyError::InvalidScope)
+            ));
+            assert!(matches!(
+                ScopeImplicationPolicy::new(1, vec![(invalid.to_owned(), "read".to_owned())]),
+                Err(ScopePolicyError::InvalidScope)
+            ));
         }
         assert!(RequiredScopes::new(vec!["x".repeat(256)]).is_ok());
         assert!(RequiredScopes::new(vec!["x".repeat(257)]).is_err());
-        assert!(matches!(RequiredScopes::new(scopes(&["offline_access"])), Err(ScopePolicyError::OfflineAccess)));
-        assert!(matches!(ScopeImplicationPolicy::new(1, vec![("admin".to_owned(), "offline_access".to_owned())]), Err(ScopePolicyError::OfflineAccess)));
+        assert!(matches!(
+            RequiredScopes::new(scopes(&["offline_access"])),
+            Err(ScopePolicyError::OfflineAccess)
+        ));
+        assert!(matches!(
+            ScopeImplicationPolicy::new(1, vec![("admin".to_owned(), "offline_access".to_owned())]),
+            Err(ScopePolicyError::OfflineAccess)
+        ));
     }
 
     #[test]
@@ -442,8 +629,18 @@ mod tests {
         let reordered = policy(&[("b", "c"), ("a", "b")]);
         assert_eq!(left.fingerprint(), reordered.fingerprint());
         assert_ne!(left.fingerprint(), policy(&[("a", "b")]).fingerprint());
-        assert_ne!(left.fingerprint(), ScopeImplicationPolicy::new(8,
-            vec![("a".to_owned(), "b".to_owned()), ("b".to_owned(), "c".to_owned())]).unwrap().fingerprint());
+        assert_ne!(
+            left.fingerprint(),
+            ScopeImplicationPolicy::new(
+                8,
+                vec![
+                    ("a".to_owned(), "b".to_owned()),
+                    ("b".to_owned(), "c".to_owned())
+                ]
+            )
+            .unwrap()
+            .fingerprint()
+        );
         let clone = left.clone();
         assert_eq!(clone.revision(), 7);
         assert_eq!(clone.fingerprint(), left.fingerprint());
@@ -452,15 +649,28 @@ mod tests {
     #[test]
     fn provider_verifies_native_credentials_before_scope_projection() {
         use crate::{StaticTokenVerifier, TokenAuthProvider};
-        let verifier = StaticTokenVerifier::new([("test-only-token".to_owned(), facts(&["admin"]))]).unwrap();
-        let provider = ScopePolicyAuthProvider::new(TokenAuthProvider::new(verifier), policy(&[("admin", "read")]));
+        let verifier =
+            StaticTokenVerifier::new([("test-only-token".to_owned(), facts(&["admin"]))]).unwrap();
+        let provider = ScopePolicyAuthProvider::new(
+            TokenAuthProvider::new(verifier),
+            policy(&[("admin", "read")]),
+        );
         let ctx = McpContext::new(asupersync::Cx::for_testing(), 1);
         let request = |authorization| AuthRequest {
-            method: "tools/call", params: None, transport_authorization: authorization, request_id: 1,
+            method: "tools/call",
+            params: None,
+            transport_authorization: authorization,
+            request_id: 1,
         };
-        let admitted = provider.authenticate(&ctx, request(Some("Bearer test-only-token"))).unwrap();
+        let admitted = provider
+            .authenticate(&ctx, request(Some("Bearer test-only-token")))
+            .unwrap();
         assert_eq!(admitted.scopes, scopes(&["admin", "read"]));
-        assert!(provider.authenticate(&ctx, request(Some("Bearer wrong-token"))).is_err());
+        assert!(
+            provider
+                .authenticate(&ctx, request(Some("Bearer wrong-token")))
+                .is_err()
+        );
         assert!(provider.authenticate(&ctx, request(None)).is_err());
     }
 

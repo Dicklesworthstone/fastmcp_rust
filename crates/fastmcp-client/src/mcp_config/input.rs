@@ -82,7 +82,10 @@ mod tests {
 
     #[test]
     fn invalid_byte_limits_are_not_silently_saturated() {
-        assert!(matches!(checked_read_limit(0), Err(ConfigError::InvalidFileByteLimit)));
+        assert!(matches!(
+            checked_read_limit(0),
+            Err(ConfigError::InvalidFileByteLimit)
+        ));
         assert_eq!(checked_read_limit(1).unwrap(), 2);
         #[cfg(target_pointer_width = "64")]
         assert!(matches!(

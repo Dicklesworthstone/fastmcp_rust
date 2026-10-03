@@ -3,7 +3,8 @@
 use super::*;
 use fastmcp_client::http_auth::managed::OAuthSessionError;
 use fastmcp_client::http_auth::rpc::catalog::{
-    CollectedCatalog, ManagedCatalogClient, ManagedCatalogConsistency, ManagedCatalogError, ManagedCatalogLimits,
+    CollectedCatalog, ManagedCatalogClient, ManagedCatalogConsistency, ManagedCatalogError,
+    ManagedCatalogLimits,
 };
 use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta, JsonRpcRequest, ServerNotification};
 
@@ -12,13 +13,44 @@ const OTHER_CHANGED: &str = r#"{"jsonrpc":"2.0","method":"notifications/prompts/
 
 #[derive(Clone, Copy)]
 enum CatalogCase {
-    AllMethods, CacheHit, Clear, ExternalInvalidation, Metadata, ZeroTtl, Invalidate, Unrelated,
-    CursorLoop, Scope, PageLimit, ItemLimit, ByteLimit, NotificationLimit,
-    RepeatedId, Cancel, Close, Drop, LateId, Preflight, Renewal,
-    RevokedCache, RevokeBeforePost, ClearBeforePost, RevokeInObserver,
-    WholeCacheHit, WholeRefresh, WholeInvalidation, WholeRebuildLimit, WholePageLimit,
-    WholeItemLimit, WholeRepeatedId, WholeHostError, WholePreflight, RepeatedCursor,
-    WholeNotificationLimit, WholeByteLimit, WholeAmbiguousCache,
+    AllMethods,
+    CacheHit,
+    Clear,
+    ExternalInvalidation,
+    Metadata,
+    ZeroTtl,
+    Invalidate,
+    Unrelated,
+    CursorLoop,
+    Scope,
+    PageLimit,
+    ItemLimit,
+    ByteLimit,
+    NotificationLimit,
+    RepeatedId,
+    Cancel,
+    Close,
+    Drop,
+    LateId,
+    Preflight,
+    Renewal,
+    RevokedCache,
+    RevokeBeforePost,
+    ClearBeforePost,
+    RevokeInObserver,
+    WholeCacheHit,
+    WholeRefresh,
+    WholeInvalidation,
+    WholeRebuildLimit,
+    WholePageLimit,
+    WholeItemLimit,
+    WholeRepeatedId,
+    WholeHostError,
+    WholePreflight,
+    RepeatedCursor,
+    WholeNotificationLimit,
+    WholeByteLimit,
+    WholeAmbiguousCache,
 }
 
 fn isolated_catalog(name: &str, case: CatalogCase) {
@@ -29,40 +61,74 @@ fn isolated_catalog(name: &str, case: CatalogCase) {
     }
     let roots = RootFile::create();
     struct Child(std::process::Child);
-    impl Drop for Child { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
     let exact = format!("driver::catalogs::{name}");
-    let mut child = Child(Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
-        .env(CATALOG_CHILD, name).env("SSL_CERT_FILE", &roots.0).env_remove("SSL_CERT_DIR")
-        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap());
+    let mut child = Child(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
+            .env(CATALOG_CHILD, name)
+            .env("SSL_CERT_FILE", &roots.0)
+            .env_remove("SSL_CERT_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
     let end = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             assert!(status.success(), "public catalog TLS case failed");
             return;
         }
-        assert!(Instant::now() < end, "catalog TLS child exceeded its process bound");
+        assert!(
+            Instant::now() < end,
+            "catalog TLS child exceeded its process bound"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
 
 fn catalog_request(method: &str) -> CoreRequest {
-    CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&json!({
-        "_meta": FinalRequestMeta::new(ClientCapabilities::default()),
-        "includeTags":["selected"], "excludeTags":[],
-    }))).unwrap()
+    CoreRequest::decode(
+        ProtocolEra::Modern2026,
+        method,
+        Some(&json!({
+            "_meta": FinalRequestMeta::new(ClientCapabilities::default()),
+            "includeTags":["selected"], "excludeTags":[],
+        })),
+    )
+    .unwrap()
 }
 
 fn page(method: &str, name: &str, next: Option<&str>, ttl: u64, scope: &str) -> String {
     let (field, item) = match method {
-        "tools/list" => ("tools", json!({"name":name,"inputSchema":{"type":"object"}})),
-        "resources/list" => ("resources", json!({"name":name,"uri":format!("file:///{name}")})),
-        "resources/templates/list" => ("resourceTemplates", json!({"name":name,"uriTemplate":format!("file:///{name}/{{path}}")})),
+        "tools/list" => (
+            "tools",
+            json!({"name":name,"inputSchema":{"type":"object"}}),
+        ),
+        "resources/list" => (
+            "resources",
+            json!({"name":name,"uri":format!("file:///{name}")}),
+        ),
+        "resources/templates/list" => (
+            "resourceTemplates",
+            json!({"name":name,"uriTemplate":format!("file:///{name}/{{path}}")}),
+        ),
         "prompts/list" => ("prompts", json!({"name":name})),
         _ => panic!("unsupported catalog fixture"),
     };
-    let cursor = next.map_or(String::new(), |next| format!(",\"nextCursor\":{}", serde_json::to_string(next).unwrap()));
-    format!(r#"{{"resultType":"complete","{field}":[{item}],"ttlMs":{ttl},"cacheScope":"{scope}"{cursor},"x-exact":{{"z":900719925474099312345,"a":1.20e+4}}}}"#)
+    let cursor = next.map_or(String::new(), |next| {
+        format!(",\"nextCursor\":{}", serde_json::to_string(next).unwrap())
+    });
+    format!(
+        r#"{{"resultType":"complete","{field}":[{item}],"ttlMs":{ttl},"cacheScope":"{scope}"{cursor},"x-exact":{{"z":900719925474099312345,"a":1.20e+4}}}}"#
+    )
 }
 
 async fn serve_page(peer: &Peer, method: &str, id: i64, cursor: Option<&str>, result: &str) {
@@ -77,8 +143,22 @@ async fn serve_page(peer: &Peer, method: &str, id: i64, cursor: Option<&str>, re
 }
 
 async fn pages(peer: &Peer, method: &str, first: i64, ttl: u64, scope: &str) {
-    serve_page(peer, method, first, None, &page(method, "one", Some(""), 60000, scope)).await;
-    serve_page(peer, method, first + 1, Some(""), &page(method, "two", None, ttl, scope)).await;
+    serve_page(
+        peer,
+        method,
+        first,
+        None,
+        &page(method, "one", Some(""), 60000, scope),
+    )
+    .await;
+    serve_page(
+        peer,
+        method,
+        first + 1,
+        Some(""),
+        &page(method, "two", None, ttl, scope),
+    )
+    .await;
 }
 
 fn next_id(counter: &Cell<i64>) -> RequestId {
@@ -110,15 +190,21 @@ async fn accept_refresh(peer: &Peer) {
         let count = tls.read(&mut buffer).await.unwrap();
         assert!(count > 0 && wire.len() + count <= 32768);
         wire.extend_from_slice(&buffer[..count]);
-        if let Some(index) = wire.windows(4).position(|part| part == b"\r\n\r\n") { break index + 4; }
+        if let Some(index) = wire.windows(4).position(|part| part == b"\r\n\r\n") {
+            break index + 4;
+        }
     };
     let head = std::str::from_utf8(&wire[..end]).unwrap();
     assert!(head.starts_with("POST /token HTTP/1.1\r\n"));
     assert!(!head.to_ascii_lowercase().contains("authorization:"));
-    let size: usize = head.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
-    }).unwrap();
+    let size: usize = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().unwrap())
+        })
+        .unwrap();
     assert!(end + size <= 32768);
     while wire.len() < end + size {
         let count = tls.read(&mut buffer).await.unwrap();
@@ -616,78 +702,262 @@ fn run_catalog(case: CatalogCase) {
 }
 
 #[test]
-fn all_four_catalogs_follow_exact_empty_cursors_and_preserve_payloads() { isolated_catalog("all_four_catalogs_follow_exact_empty_cursors_and_preserve_payloads", CatalogCase::AllMethods); }
+fn all_four_catalogs_follow_exact_empty_cursors_and_preserve_payloads() {
+    isolated_catalog(
+        "all_four_catalogs_follow_exact_empty_cursors_and_preserve_payloads",
+        CatalogCase::AllMethods,
+    );
+}
 #[test]
-fn cached_pages_avoid_posts_but_public_hints_do_not_share_clients() { isolated_catalog("cached_pages_avoid_posts_but_public_hints_do_not_share_clients", CatalogCase::CacheHit); }
+fn cached_pages_avoid_posts_but_public_hints_do_not_share_clients() {
+    isolated_catalog(
+        "cached_pages_avoid_posts_but_public_hints_do_not_share_clients",
+        CatalogCase::CacheHit,
+    );
+}
 #[test]
-fn clearing_a_shared_cache_refetches_every_page() { isolated_catalog("clearing_a_shared_cache_refetches_every_page", CatalogCase::Clear); }
+fn clearing_a_shared_cache_refetches_every_page() {
+    isolated_catalog(
+        "clearing_a_shared_cache_refetches_every_page",
+        CatalogCase::Clear,
+    );
+}
 #[test]
-fn external_change_notification_invalidates_all_cached_catalog_pages() { isolated_catalog("external_change_notification_invalidates_all_cached_catalog_pages", CatalogCase::ExternalInvalidation); }
+fn external_change_notification_invalidates_all_cached_catalog_pages() {
+    isolated_catalog(
+        "external_change_notification_invalidates_all_cached_catalog_pages",
+        CatalogCase::ExternalInvalidation,
+    );
+}
 #[test]
-fn different_request_metadata_cannot_reuse_cached_pages() { isolated_catalog("different_request_metadata_cannot_reuse_cached_pages", CatalogCase::Metadata); }
+fn different_request_metadata_cannot_reuse_cached_pages() {
+    isolated_catalog(
+        "different_request_metadata_cannot_reuse_cached_pages",
+        CatalogCase::Metadata,
+    );
+}
 #[test]
-fn zero_ttl_refetches_only_the_uncacheable_page() { isolated_catalog("zero_ttl_refetches_only_the_uncacheable_page", CatalogCase::ZeroTtl); }
+fn zero_ttl_refetches_only_the_uncacheable_page() {
+    isolated_catalog(
+        "zero_ttl_refetches_only_the_uncacheable_page",
+        CatalogCase::ZeroTtl,
+    );
+}
 #[test]
-fn invalidation_is_delivered_before_rejecting_the_partial_collection() { isolated_catalog("invalidation_is_delivered_before_rejecting_the_partial_collection", CatalogCase::Invalidate); }
+fn invalidation_is_delivered_before_rejecting_the_partial_collection() {
+    isolated_catalog(
+        "invalidation_is_delivered_before_rejecting_the_partial_collection",
+        CatalogCase::Invalidate,
+    );
+}
 #[test]
-fn unrelated_catalog_changes_do_not_break_collection() { isolated_catalog("unrelated_catalog_changes_do_not_break_collection", CatalogCase::Unrelated); }
+fn unrelated_catalog_changes_do_not_break_collection() {
+    isolated_catalog(
+        "unrelated_catalog_changes_do_not_break_collection",
+        CatalogCase::Unrelated,
+    );
+}
 #[test]
-fn repeated_cursors_stop_only_at_the_page_budget() { isolated_catalog("repeated_cursors_stop_only_at_the_page_budget", CatalogCase::CursorLoop); }
+fn repeated_cursors_stop_only_at_the_page_budget() {
+    isolated_catalog(
+        "repeated_cursors_stop_only_at_the_page_budget",
+        CatalogCase::CursorLoop,
+    );
+}
 #[test]
-fn cache_scope_changes_cannot_produce_a_mixed_collection() { isolated_catalog("cache_scope_changes_cannot_produce_a_mixed_collection", CatalogCase::Scope); }
+fn cache_scope_changes_cannot_produce_a_mixed_collection() {
+    isolated_catalog(
+        "cache_scope_changes_cannot_produce_a_mixed_collection",
+        CatalogCase::Scope,
+    );
+}
 #[test]
-fn page_budget_prevents_a_later_post() { isolated_catalog("page_budget_prevents_a_later_post", CatalogCase::PageLimit); }
+fn page_budget_prevents_a_later_post() {
+    isolated_catalog("page_budget_prevents_a_later_post", CatalogCase::PageLimit);
+}
 #[test]
-fn item_budget_is_shared_across_pages() { isolated_catalog("item_budget_is_shared_across_pages", CatalogCase::ItemLimit); }
+fn item_budget_is_shared_across_pages() {
+    isolated_catalog("item_budget_is_shared_across_pages", CatalogCase::ItemLimit);
+}
 #[test]
-fn response_byte_budget_is_shared_across_pages() { isolated_catalog("response_byte_budget_is_shared_across_pages", CatalogCase::ByteLimit); }
+fn response_byte_budget_is_shared_across_pages() {
+    isolated_catalog(
+        "response_byte_budget_is_shared_across_pages",
+        CatalogCase::ByteLimit,
+    );
+}
 #[test]
-fn notification_budget_is_shared_across_pages() { isolated_catalog("notification_budget_is_shared_across_pages", CatalogCase::NotificationLimit); }
+fn notification_budget_is_shared_across_pages() {
+    isolated_catalog(
+        "notification_budget_is_shared_across_pages",
+        CatalogCase::NotificationLimit,
+    );
+}
 #[test]
-fn numeric_id_alias_is_rejected_before_a_later_post() { isolated_catalog("numeric_id_alias_is_rejected_before_a_later_post", CatalogCase::RepeatedId); }
+fn numeric_id_alias_is_rejected_before_a_later_post() {
+    isolated_catalog(
+        "numeric_id_alias_is_rejected_before_a_later_post",
+        CatalogCase::RepeatedId,
+    );
+}
 #[test]
-fn cancelled_collection_closes_the_pending_page_without_filling_it() { isolated_catalog("cancelled_collection_closes_the_pending_page_without_filling_it", CatalogCase::Cancel); }
+fn cancelled_collection_closes_the_pending_page_without_filling_it() {
+    isolated_catalog(
+        "cancelled_collection_closes_the_pending_page_without_filling_it",
+        CatalogCase::Cancel,
+    );
+}
 #[test]
-fn session_closure_interrupts_a_pending_catalog_page() { isolated_catalog("session_closure_interrupts_a_pending_catalog_page", CatalogCase::Close); }
+fn session_closure_interrupts_a_pending_catalog_page() {
+    isolated_catalog(
+        "session_closure_interrupts_a_pending_catalog_page",
+        CatalogCase::Close,
+    );
+}
 #[test]
-fn abandoned_collection_releases_the_pending_page() { isolated_catalog("abandoned_collection_releases_the_pending_page", CatalogCase::Drop); }
+fn abandoned_collection_releases_the_pending_page() {
+    isolated_catalog(
+        "abandoned_collection_releases_the_pending_page",
+        CatalogCase::Drop,
+    );
+}
 #[test]
-fn late_id_callback_cannot_dispatch_after_the_collection_deadline() { isolated_catalog("late_id_callback_cannot_dispatch_after_the_collection_deadline", CatalogCase::LateId); }
+fn late_id_callback_cannot_dispatch_after_the_collection_deadline() {
+    isolated_catalog(
+        "late_id_callback_cannot_dispatch_after_the_collection_deadline",
+        CatalogCase::LateId,
+    );
+}
 #[test]
-fn invalid_or_precancelled_collections_have_no_post_effects() { isolated_catalog("invalid_or_precancelled_collections_have_no_post_effects", CatalogCase::Preflight); }
+fn invalid_or_precancelled_collections_have_no_post_effects() {
+    isolated_catalog(
+        "invalid_or_precancelled_collections_have_no_post_effects",
+        CatalogCase::Preflight,
+    );
+}
 #[test]
-fn renewal_rejects_mixed_pages_and_old_cache_entries_are_not_reused() { isolated_catalog("renewal_rejects_mixed_pages_and_old_cache_entries_are_not_reused", CatalogCase::Renewal); }
+fn renewal_rejects_mixed_pages_and_old_cache_entries_are_not_reused() {
+    isolated_catalog(
+        "renewal_rejects_mixed_pages_and_old_cache_entries_are_not_reused",
+        CatalogCase::Renewal,
+    );
+}
 #[test]
-fn local_revocation_blocks_warm_catalog_cache_without_peer_effects() { isolated_catalog("local_revocation_blocks_warm_catalog_cache_without_peer_effects", CatalogCase::RevokedCache); }
+fn local_revocation_blocks_warm_catalog_cache_without_peer_effects() {
+    isolated_catalog(
+        "local_revocation_blocks_warm_catalog_cache_without_peer_effects",
+        CatalogCase::RevokedCache,
+    );
+}
 #[test]
-fn revocation_in_id_supplier_prevents_the_catalog_post() { isolated_catalog("revocation_in_id_supplier_prevents_the_catalog_post", CatalogCase::RevokeBeforePost); }
+fn revocation_in_id_supplier_prevents_the_catalog_post() {
+    isolated_catalog(
+        "revocation_in_id_supplier_prevents_the_catalog_post",
+        CatalogCase::RevokeBeforePost,
+    );
+}
 #[test]
-fn cache_clear_in_id_supplier_prevents_the_catalog_post() { isolated_catalog("cache_clear_in_id_supplier_prevents_the_catalog_post", CatalogCase::ClearBeforePost); }
+fn cache_clear_in_id_supplier_prevents_the_catalog_post() {
+    isolated_catalog(
+        "cache_clear_in_id_supplier_prevents_the_catalog_post",
+        CatalogCase::ClearBeforePost,
+    );
+}
 #[test]
-fn observer_revocation_retires_the_unfinished_page_without_a_fill() { isolated_catalog("observer_revocation_retires_the_unfinished_page_without_a_fill", CatalogCase::RevokeInObserver); }
+fn observer_revocation_retires_the_unfinished_page_without_a_fill() {
+    isolated_catalog(
+        "observer_revocation_retires_the_unfinished_page_without_a_fill",
+        CatalogCase::RevokeInObserver,
+    );
+}
 #[test]
-fn whole_catalog_policy_reuses_a_fully_fresh_cached_inventory() { isolated_catalog("whole_catalog_policy_reuses_a_fully_fresh_cached_inventory", CatalogCase::WholeCacheHit); }
+fn whole_catalog_policy_reuses_a_fully_fresh_cached_inventory() {
+    isolated_catalog(
+        "whole_catalog_policy_reuses_a_fully_fresh_cached_inventory",
+        CatalogCase::WholeCacheHit,
+    );
+}
 #[test]
-fn whole_catalog_policy_rebuilds_every_page_after_a_partial_cache_hit() { isolated_catalog("whole_catalog_policy_rebuilds_every_page_after_a_partial_cache_hit", CatalogCase::WholeRefresh); }
+fn whole_catalog_policy_rebuilds_every_page_after_a_partial_cache_hit() {
+    isolated_catalog(
+        "whole_catalog_policy_rebuilds_every_page_after_a_partial_cache_hit",
+        CatalogCase::WholeRefresh,
+    );
+}
 #[test]
-fn whole_catalog_policy_rebuilds_after_invalidation_without_exposing_old_pages() { isolated_catalog("whole_catalog_policy_rebuilds_after_invalidation_without_exposing_old_pages", CatalogCase::WholeInvalidation); }
+fn whole_catalog_policy_rebuilds_after_invalidation_without_exposing_old_pages() {
+    isolated_catalog(
+        "whole_catalog_policy_rebuilds_after_invalidation_without_exposing_old_pages",
+        CatalogCase::WholeInvalidation,
+    );
+}
 #[test]
-fn whole_catalog_rebuild_limit_stops_repeated_invalidations() { isolated_catalog("whole_catalog_rebuild_limit_stops_repeated_invalidations", CatalogCase::WholeRebuildLimit); }
+fn whole_catalog_rebuild_limit_stops_repeated_invalidations() {
+    isolated_catalog(
+        "whole_catalog_rebuild_limit_stops_repeated_invalidations",
+        CatalogCase::WholeRebuildLimit,
+    );
+}
 #[test]
-fn whole_catalog_page_budget_includes_the_discarded_cached_prefix() { isolated_catalog("whole_catalog_page_budget_includes_the_discarded_cached_prefix", CatalogCase::WholePageLimit); }
+fn whole_catalog_page_budget_includes_the_discarded_cached_prefix() {
+    isolated_catalog(
+        "whole_catalog_page_budget_includes_the_discarded_cached_prefix",
+        CatalogCase::WholePageLimit,
+    );
+}
 #[test]
-fn whole_catalog_item_budget_includes_discarded_pages() { isolated_catalog("whole_catalog_item_budget_includes_discarded_pages", CatalogCase::WholeItemLimit); }
+fn whole_catalog_item_budget_includes_discarded_pages() {
+    isolated_catalog(
+        "whole_catalog_item_budget_includes_discarded_pages",
+        CatalogCase::WholeItemLimit,
+    );
+}
 #[test]
-fn whole_catalog_rebuild_cannot_reuse_a_previous_request_id() { isolated_catalog("whole_catalog_rebuild_cannot_reuse_a_previous_request_id", CatalogCase::WholeRepeatedId); }
+fn whole_catalog_rebuild_cannot_reuse_a_previous_request_id() {
+    isolated_catalog(
+        "whole_catalog_rebuild_cannot_reuse_a_previous_request_id",
+        CatalogCase::WholeRepeatedId,
+    );
+}
 #[test]
-fn whole_catalog_policy_does_not_retry_a_host_invalidation_error() { isolated_catalog("whole_catalog_policy_does_not_retry_a_host_invalidation_error", CatalogCase::WholeHostError); }
+fn whole_catalog_policy_does_not_retry_a_host_invalidation_error() {
+    isolated_catalog(
+        "whole_catalog_policy_does_not_retry_a_host_invalidation_error",
+        CatalogCase::WholeHostError,
+    );
+}
 #[test]
-fn whole_catalog_policy_rejects_suffixes_and_invalid_rebuild_limits_before_posts() { isolated_catalog("whole_catalog_policy_rejects_suffixes_and_invalid_rebuild_limits_before_posts", CatalogCase::WholePreflight); }
+fn whole_catalog_policy_rejects_suffixes_and_invalid_rebuild_limits_before_posts() {
+    isolated_catalog(
+        "whole_catalog_policy_rejects_suffixes_and_invalid_rebuild_limits_before_posts",
+        CatalogCase::WholePreflight,
+    );
+}
 #[test]
-fn repeated_empty_cursors_complete_without_cached_response_replay() { isolated_catalog("repeated_empty_cursors_complete_without_cached_response_replay", CatalogCase::RepeatedCursor); }
+fn repeated_empty_cursors_complete_without_cached_response_replay() {
+    isolated_catalog(
+        "repeated_empty_cursors_complete_without_cached_response_replay",
+        CatalogCase::RepeatedCursor,
+    );
+}
 #[test]
-fn whole_catalog_notification_budget_spans_rebuilds() { isolated_catalog("whole_catalog_notification_budget_spans_rebuilds", CatalogCase::WholeNotificationLimit); }
+fn whole_catalog_notification_budget_spans_rebuilds() {
+    isolated_catalog(
+        "whole_catalog_notification_budget_spans_rebuilds",
+        CatalogCase::WholeNotificationLimit,
+    );
+}
 #[test]
-fn whole_catalog_payload_budget_spans_rebuilds() { isolated_catalog("whole_catalog_payload_budget_spans_rebuilds", CatalogCase::WholeByteLimit); }
+fn whole_catalog_payload_budget_spans_rebuilds() {
+    isolated_catalog(
+        "whole_catalog_payload_budget_spans_rebuilds",
+        CatalogCase::WholeByteLimit,
+    );
+}
 #[test]
-fn whole_catalog_rebuilds_ambiguous_cached_cursors_before_fetching() { isolated_catalog("whole_catalog_rebuilds_ambiguous_cached_cursors_before_fetching", CatalogCase::WholeAmbiguousCache); }
+fn whole_catalog_rebuilds_ambiguous_cached_cursors_before_fetching() {
+    isolated_catalog(
+        "whole_catalog_rebuilds_ambiguous_cached_cursors_before_fetching",
+        CatalogCase::WholeAmbiguousCache,
+    );
+}

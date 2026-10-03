@@ -21,22 +21,22 @@ use asupersync::Cx;
 use asupersync::types::Time;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
+#[cfg(feature = "tasks")]
+use fastmcp_protocol::tasks_extension::{
+    TASK_STATUS_NOTIFICATION, TASK_SUBSCRIPTION_IDS_KEY, TASKS_EXTENSION, TaskStatusNotification,
+    task_subscription_ids,
+};
 use fastmcp_protocol::{
     CompleteResult, CoreRequest, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION,
     FinalSubscriptionsListenResult, JsonInteger, RequestId, ServerNotification, SubscriptionFilter,
     decode_strict_jsonrpc_response,
 };
 #[cfg(feature = "tasks")]
-use fastmcp_protocol::tasks_extension::{
-    TASKS_EXTENSION, TASK_STATUS_NOTIFICATION, TASK_SUBSCRIPTION_IDS_KEY,
-    TaskStatusNotification, task_subscription_ids,
-};
-#[cfg(feature = "tasks")]
 use fastmcp_protocol::{CoreResult, ExtensionDirection, FinalCoreResult};
 
-use super::{ManagedOAuthResponse, ManagedOAuthSession, OAuthSessionError, deadline_after};
 #[cfg(feature = "tasks")]
 use super::OAuthCredentialSnapshot;
+use super::{ManagedOAuthResponse, ManagedOAuthSession, OAuthSessionError, deadline_after};
 use crate::http_executor::{
     ModernHttpRequest, ModernHttpResponseKind, ModernHttpSubscriptionListenError,
     ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener,
@@ -86,7 +86,12 @@ impl ManagedSubscriptionLimits {
         {
             return Err(ManagedSubscriptionError::InvalidLimits);
         }
-        Ok(Self { request_bytes, frame_bytes, records, timeout })
+        Ok(Self {
+            request_bytes,
+            frame_bytes,
+            records,
+            timeout,
+        })
     }
 }
 
@@ -113,11 +118,19 @@ impl fmt::Display for ManagedSubscriptionError {
         match self {
             Self::InvalidLimits => f.write_str("invalid managed subscription limits"),
             Self::InvalidRequest => f.write_str("invalid final subscription request"),
-            Self::UnsupportedExtension => f.write_str("subscription contains an extension outside its selected profile"),
-            Self::Negotiation => f.write_str("resource did not admit the official Tasks notification surface"),
-            Self::RequestTooLarge => f.write_str("managed subscription request exceeds its byte limit"),
+            Self::UnsupportedExtension => {
+                f.write_str("subscription contains an extension outside its selected profile")
+            }
+            Self::Negotiation => {
+                f.write_str("resource did not admit the official Tasks notification surface")
+            }
+            Self::RequestTooLarge => {
+                f.write_str("managed subscription request exceeds its byte limit")
+            }
             Self::InvalidResponse => f.write_str("managed subscription response failed admission"),
-            Self::MissingTerminal => f.write_str("managed subscription ended without a complete terminal result"),
+            Self::MissingTerminal => {
+                f.write_str("managed subscription ended without a complete terminal result")
+            }
             Self::RecordLimit => f.write_str("managed subscription record limit exceeded"),
             Self::Closed => f.write_str("managed subscription is closed"),
             Self::Remote { code } => write!(f, "managed subscription failed with JSON-RPC {code}"),
@@ -129,14 +142,18 @@ impl fmt::Display for ManagedSubscriptionError {
 impl std::error::Error for ManagedSubscriptionError {}
 
 impl From<OAuthSessionError> for ManagedSubscriptionError {
-    fn from(error: OAuthSessionError) -> Self { Self::Session(error) }
+    fn from(error: OAuthSessionError) -> Self {
+        Self::Session(error)
+    }
 }
 
 /// Incrementally delivered records. The existing native decoder enforces the
 /// first acknowledgement, its requested-filter subset, subsequent event
 /// categories/resource/task IDs, and the correlated terminal's subscription ID.
 pub enum ManagedSubscriptionEvent {
-    Acknowledged { accepted_filter: SubscriptionFilter },
+    Acknowledged {
+        accepted_filter: SubscriptionFilter,
+    },
     Notification(Box<ServerNotification>),
     /// Only the live-discovery-authorized Tasks path can yield this variant.
     /// Task completion is not subscription completion: only the correlated
@@ -172,9 +189,14 @@ impl ManagedOAuthSession {
         request_id: RequestId,
         limits: ManagedSubscriptionLimits,
     ) -> Result<ManagedSubscription, ManagedSubscriptionError> {
-        self.subscribe_core_with_cancellation(
-            cx, &McpRequestCancellation::new(), request, request_id, limits,
-        ).await
+        Box::pin(self.subscribe_core_with_cancellation(
+            cx,
+            &McpRequestCancellation::new(),
+            request,
+            request_id,
+            limits,
+        ))
+        .await
     }
 
     /// Retains one request-local cancellation domain through the entire listen.
@@ -191,10 +213,22 @@ impl ManagedOAuthSession {
         self.check(cx, cancellation)?;
         let deadline = deadline_after(cx, limits.timeout)?;
         let (wire, requested) = prepare(self.resource().as_str(), request, &request_id, limits)?;
-        let response = self.await_active(cx, cancellation, deadline, None, async {
-            self.execute_with_cancellation(cx, cancellation, &wire).await
-        }).await?;
-        ManagedSubscription::open_response(cx, response, request_id, requested, limits, deadline, SubscriptionProfile::Core).await
+        let response = self
+            .await_active(cx, cancellation, deadline, None, async {
+                self.execute_with_cancellation(cx, cancellation, &wire)
+                    .await
+            })
+            .await?;
+        Box::pin(ManagedSubscription::open_response(
+            cx,
+            response,
+            request_id,
+            requested,
+            limits,
+            deadline,
+            SubscriptionProfile::Core,
+        ))
+        .await
     }
 
     /// Opens an official Tasks listen, optionally composed with core filters.
@@ -217,9 +251,15 @@ impl ManagedOAuthSession {
         request_id: RequestId,
         limits: ManagedSubscriptionLimits,
     ) -> Result<ManagedSubscription, ManagedSubscriptionError> {
-        self.subscribe_tasks_with_cancellation(
-            cx, &McpRequestCancellation::new(), request, discovery_id, request_id, limits,
-        ).await
+        Box::pin(self.subscribe_tasks_with_cancellation(
+            cx,
+            &McpRequestCancellation::new(),
+            request,
+            discovery_id,
+            request_id,
+            limits,
+        ))
+        .await
     }
 
     /// The cancellation handle spans discovery, listen admission and all reads.
@@ -236,39 +276,72 @@ impl ManagedOAuthSession {
     ) -> Result<ManagedSubscription, ManagedSubscriptionError> {
         self.check(cx, cancellation)?;
         let deadline = deadline_after(cx, limits.timeout)?;
-        discovery_id.validate().map_err(|_| ManagedSubscriptionError::InvalidRequest)?;
+        discovery_id
+            .validate()
+            .map_err(|_| ManagedSubscriptionError::InvalidRequest)?;
         if discovery_id.correlates_with(&request_id) {
             return Err(ManagedSubscriptionError::InvalidRequest);
         }
         // Prepare both bounded documents before a credential refresh or POST.
-        let params = request.encode_params().map_err(|_| ManagedSubscriptionError::InvalidRequest)?
+        let params = request
+            .encode_params()
+            .map_err(|_| ManagedSubscriptionError::InvalidRequest)?
             .ok_or(ManagedSubscriptionError::InvalidRequest)?;
         let (wire, requested) = prepare_profile(
-            self.resource().as_str(), request, &request_id, limits, SubscriptionProfile::Tasks,
+            self.resource().as_str(),
+            request,
+            &request_id,
+            limits,
+            SubscriptionProfile::Tasks,
         )?;
-        let discovery = CoreRequest::decode(ProtocolEra::Modern2026, "server/discover", Some(
-            &serde_json::json!({"_meta": params["_meta"]}),
-        )).map_err(|_| ManagedSubscriptionError::InvalidRequest)?;
-        let discovery_wire = encode_wire(self.resource().as_str(), &discovery, &discovery_id, limits.request_bytes)?;
-        let credential = self.await_active(cx, cancellation, deadline, None, async {
-            self.credential_with_cancellation(cx, cancellation).await
-        }).await?;
-        let response = self.execute_subscription_snapshot(
-            cx, cancellation, deadline, &credential, &discovery_wire,
-        ).await?;
+        let discovery = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            "server/discover",
+            Some(&serde_json::json!({"_meta": params["_meta"]})),
+        )
+        .map_err(|_| ManagedSubscriptionError::InvalidRequest)?;
+        let discovery_wire = encode_wire(
+            self.resource().as_str(),
+            &discovery,
+            &discovery_id,
+            limits.request_bytes,
+        )?;
+        let credential = self
+            .await_active(cx, cancellation, deadline, None, async {
+                self.credential_with_cancellation(cx, cancellation).await
+            })
+            .await?;
+        let response = self
+            .execute_subscription_snapshot(cx, cancellation, deadline, &credential, &discovery_wire)
+            .await?;
         if response.metadata().kind() != ModernHttpResponseKind::Json {
             return Err(ManagedSubscriptionError::InvalidResponse);
         }
-        let bytes = self.await_active(cx, cancellation, deadline, Some(credential.expires_at), async {
-            response.read_to_end(cx, limits.frame_bytes).await
-        }).await?;
+        let bytes = self
+            .await_active(
+                cx,
+                cancellation,
+                deadline,
+                Some(credential.expires_at),
+                async { response.read_to_end(cx, limits.frame_bytes).await },
+            )
+            .await?;
         admit_tasks_discovery(&discovery, &bytes, &discovery_id, limits.frame_bytes)?;
         // No intervening credential lookup: discovery cannot authorize a POST
         // under a different token even when a sibling concurrently renews.
-        let response = self.execute_subscription_snapshot(
-            cx, cancellation, deadline, &credential, &wire,
-        ).await?;
-        ManagedSubscription::open_response(cx, response, request_id, requested, limits, deadline, SubscriptionProfile::Tasks).await
+        let response = self
+            .execute_subscription_snapshot(cx, cancellation, deadline, &credential, &wire)
+            .await?;
+        Box::pin(ManagedSubscription::open_response(
+            cx,
+            response,
+            request_id,
+            requested,
+            limits,
+            deadline,
+            SubscriptionProfile::Tasks,
+        ))
+        .await
     }
 
     #[cfg(feature = "tasks")]
@@ -286,21 +359,38 @@ impl ManagedOAuthSession {
         // Both discovery and listen require the selected live credential;
         // withholding its header must not silently dispatch anonymously.
         let wire = credential.authorize_request(wire)?;
-        let head_deadline = deadline.min(deadline_after(cx, self.inner.policy.response_head_timeout)?);
+        let head_deadline =
+            deadline.min(deadline_after(cx, self.inner.policy.response_head_timeout)?);
         let executor = self.inner.client.resource_http_executor();
-        let response = self.await_credential(cx, cancellation, head_deadline,
-            credential.expires_at, &credential.credential.revoked, async {
-                executor.execute_with_cancellation(cx, cancellation, &wire).await.map_err(OAuthSessionError::Http)
-            },
-        ).await?;
+        let response = self
+            .await_credential(
+                cx,
+                cancellation,
+                head_deadline,
+                credential.expires_at,
+                &credential.credential.revoked,
+                async {
+                    executor
+                        .execute_with_cancellation(cx, cancellation, &wire)
+                        .await
+                        .map_err(OAuthSessionError::Http)
+                },
+            )
+            .await?;
         if matches!(response.metadata().status(), 401 | 403) {
-            return Err(OAuthSessionError::AuthorizationRejected { status: response.metadata().status() }.into());
+            return Err(OAuthSessionError::AuthorizationRejected {
+                status: response.metadata().status(),
+            }
+            .into());
         }
         if response.metadata().status() != 200 {
             return Err(ManagedSubscriptionError::InvalidResponse);
         }
         Ok(ManagedOAuthResponse::from_snapshot(
-            response, self.clone(), cancellation.clone(), credential,
+            response,
+            self.clone(),
+            cancellation.clone(),
+            credential,
         ))
     }
 }
@@ -347,11 +437,15 @@ impl ManagedSubscription {
             let cancellation = response.cancellation.clone();
             let revocation = response.revocation.clone();
             let expires_at = response.expires_at;
-            let bytes = session.await_credential(
-                cx, &cancellation, deadline, expires_at, &revocation, async {
-                    response.read_to_end(cx, limits.frame_bytes).await
-                },
-            ).await?;
+            let bytes = Box::pin(session.await_credential(
+                cx,
+                &cancellation,
+                deadline,
+                expires_at,
+                &revocation,
+                async { response.read_to_end(cx, limits.frame_bytes).await },
+            ))
+            .await?;
             session.check(cx, &cancellation)?;
             if revocation.is_cancel_requested() || Instant::now() >= expires_at {
                 return Err(OAuthSessionError::LoginRequired.into());
@@ -372,30 +466,58 @@ impl ManagedSubscription {
         deadline: Time,
         profile: SubscriptionProfile,
     ) -> Result<Self, ManagedSubscriptionError> {
-        if response.metadata().status() != 200 || response.metadata().kind() != ModernHttpResponseKind::Sse {
+        if response.metadata().status() != 200
+            || response.metadata().kind() != ModernHttpResponseKind::Sse
+        {
             return Err(ManagedSubscriptionError::InvalidResponse);
         }
-        let ManagedOAuthResponse { response, session, cancellation, expires_at, generation, revocation } = response;
+        let ManagedOAuthResponse {
+            response,
+            session,
+            cancellation,
+            expires_at,
+            generation,
+            revocation,
+        } = response;
         let framing = SseLimits::new(limits.frame_bytes, limits.frame_bytes, 64)
             .ok_or(ManagedSubscriptionError::InvalidLimits)?;
-        let listener = response.into_final_subscriptions_listener(request_id.clone(), requested, framing)
+        let listener = response
+            .into_final_subscriptions_listener(request_id.clone(), requested, framing)
             .map_err(admission_error)?;
         Ok(Self {
-            listener: Some(Box::new(listener)), session, cancellation, request_id,
-            accepted_filter: None, profile, expires_at, generation, revocation, deadline, limits,
-            records: 0, finished: false,
+            listener: Some(Box::new(listener)),
+            session,
+            cancellation,
+            request_id,
+            accepted_filter: None,
+            profile,
+            expires_at,
+            generation,
+            revocation,
+            deadline,
+            limits,
+            records: 0,
+            finished: false,
         })
     }
 
-    pub fn request_id(&self) -> &RequestId { &self.request_id }
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
 
     /// Session-local generation, not a cross-session identity or replay cursor.
-    pub fn credential_generation(&self) -> u64 { self.generation }
+    pub fn credential_generation(&self) -> u64 {
+        self.generation
+    }
 
-    pub fn accepted_filter(&self) -> Option<&SubscriptionFilter> { self.accepted_filter.as_ref() }
+    pub fn accepted_filter(&self) -> Option<&SubscriptionFilter> {
+        self.accepted_filter.as_ref()
+    }
 
     /// Immediately releases this owned response without closing sibling calls.
-    pub fn close(&mut self) { self.listener = None; }
+    pub fn close(&mut self) {
+        self.listener = None;
+    }
 
     /// `None` is possible only after a complete terminal was already delivered.
     /// A polled read owns the socket until it yields a validated record. If the
@@ -404,22 +526,39 @@ impl ManagedSubscription {
         &mut self,
         cx: &Cx,
     ) -> Result<Option<ManagedSubscriptionEvent>, ManagedSubscriptionError> {
-        if self.finished { return Ok(None); }
-        let mut listener = self.listener.take().ok_or(ManagedSubscriptionError::Closed)?;
+        if self.finished {
+            return Ok(None);
+        }
+        let mut listener = self
+            .listener
+            .take()
+            .ok_or(ManagedSubscriptionError::Closed)?;
         self.session.check(cx, &self.cancellation)?;
         if self.records >= self.limits.records {
             return Err(ManagedSubscriptionError::RecordLimit);
         }
-        let record = self.session.await_credential(
-            cx, &self.cancellation, self.deadline, self.expires_at, &self.revocation, async {
-                // Keep protocol failures distinct without exposing their raw
-                // peer diagnostics through OAuthSessionError.
-                Ok(listener.next_event(cx).await)
-            },
-        ).await?.map_err(admission_error)?.ok_or(ManagedSubscriptionError::MissingTerminal)?;
+        let record = self
+            .session
+            .await_credential(
+                cx,
+                &self.cancellation,
+                self.deadline,
+                self.expires_at,
+                &self.revocation,
+                async {
+                    // Keep protocol failures distinct without exposing their raw
+                    // peer diagnostics through OAuthSessionError.
+                    Ok(listener.next_event(cx).await)
+                },
+            )
+            .await?
+            .map_err(admission_error)?
+            .ok_or(ManagedSubscriptionError::MissingTerminal)?;
         let record = select_record(record, self.profile)?;
         self.session.check(cx, &self.cancellation)?;
-        if self.revocation.is_cancel_requested() { return Err(OAuthSessionError::LoginRequired.into()); }
+        if self.revocation.is_cancel_requested() {
+            return Err(OAuthSessionError::LoginRequired.into());
+        }
         if Instant::now() >= self.expires_at {
             return Err(OAuthSessionError::LoginRequired.into());
         }
@@ -449,7 +588,11 @@ fn json_refusal(bytes: &[u8], request_id: &RequestId, maximum: usize) -> Managed
         Ok(decoded) => decoded.into_parts().0,
         Err(_) => return ManagedSubscriptionError::InvalidResponse,
     };
-    if !response.id.as_ref().is_some_and(|id| id.correlates_with(request_id)) {
+    if !response
+        .id
+        .as_ref()
+        .is_some_and(|id| id.correlates_with(request_id))
+    {
         return ManagedSubscriptionError::InvalidResponse;
     }
     match response.error {
@@ -477,27 +620,39 @@ fn select_record(
         ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter } => {
             Ok(ManagedSubscriptionEvent::Acknowledged { accepted_filter })
         }
-        ModernHttpSubscriptionListenEvent::Notification(notification) => {
-            Ok(ManagedSubscriptionEvent::Notification(Box::new(notification)))
-        }
-        ModernHttpSubscriptionListenEvent::Terminal { subscription_id, result } => {
-            Ok(ManagedSubscriptionEvent::Terminal { subscription_id, result: Box::new(result) })
-        }
+        ModernHttpSubscriptionListenEvent::Notification(notification) => Ok(
+            ManagedSubscriptionEvent::Notification(Box::new(notification)),
+        ),
+        ModernHttpSubscriptionListenEvent::Terminal {
+            subscription_id,
+            result,
+        } => Ok(ManagedSubscriptionEvent::Terminal {
+            subscription_id,
+            result: Box::new(result),
+        }),
         #[cfg(feature = "tasks")]
         ModernHttpSubscriptionListenEvent::TaskNotification(notification) => {
             if !matches!(profile, SubscriptionProfile::Tasks) {
                 return Err(ManagedSubscriptionError::UnsupportedExtension);
             }
-            Ok(ManagedSubscriptionEvent::TaskNotification(Box::new(notification)))
+            Ok(ManagedSubscriptionEvent::TaskNotification(Box::new(
+                notification,
+            )))
         }
     }
 }
 
 fn admission_error(error: ModernHttpSubscriptionListenError) -> ManagedSubscriptionError {
     match error {
-        ModernHttpSubscriptionListenError::RemoteError { code, .. } => ManagedSubscriptionError::Remote { code },
-        ModernHttpSubscriptionListenError::EndOfStream { .. } => ManagedSubscriptionError::MissingTerminal,
-        ModernHttpSubscriptionListenError::CallerCancelled { .. } => OAuthSessionError::Cancelled.into(),
+        ModernHttpSubscriptionListenError::RemoteError { code, .. } => {
+            ManagedSubscriptionError::Remote { code }
+        }
+        ModernHttpSubscriptionListenError::EndOfStream { .. } => {
+            ManagedSubscriptionError::MissingTerminal
+        }
+        ModernHttpSubscriptionListenError::CallerCancelled { .. } => {
+            OAuthSessionError::Cancelled.into()
+        }
         ModernHttpSubscriptionListenError::Executor(error) => OAuthSessionError::Http(error).into(),
         _ => ManagedSubscriptionError::InvalidResponse,
     }
@@ -509,7 +664,13 @@ fn prepare(
     request_id: &RequestId,
     limits: ManagedSubscriptionLimits,
 ) -> Result<(ModernHttpRequest, SubscriptionFilter), ManagedSubscriptionError> {
-    prepare_profile(target, request, request_id, limits, SubscriptionProfile::Core)
+    prepare_profile(
+        target,
+        request,
+        request_id,
+        limits,
+        SubscriptionProfile::Core,
+    )
 }
 
 fn prepare_profile(
@@ -522,19 +683,31 @@ fn prepare_profile(
     if request.era() != ProtocolEra::Modern2026 || request.method() != "subscriptions/listen" {
         return Err(ManagedSubscriptionError::InvalidRequest);
     }
-    request_id.validate().map_err(|_| ManagedSubscriptionError::InvalidRequest)?;
-    let params = request.encode_params().map_err(|_| ManagedSubscriptionError::InvalidRequest)?
+    request_id
+        .validate()
+        .map_err(|_| ManagedSubscriptionError::InvalidRequest)?;
+    let params = request
+        .encode_params()
+        .map_err(|_| ManagedSubscriptionError::InvalidRequest)?
         .ok_or(ManagedSubscriptionError::InvalidRequest)?;
-    let metadata = params.get("_meta").and_then(serde_json::Value::as_object)
+    let metadata = params
+        .get("_meta")
+        .and_then(serde_json::Value::as_object)
         .ok_or(ManagedSubscriptionError::InvalidRequest)?;
-    let extensions = metadata.get(FINAL_CLIENT_CAPABILITIES_META_KEY)
+    let extensions = metadata
+        .get(FINAL_CLIENT_CAPABILITIES_META_KEY)
         .and_then(|capabilities| capabilities.get("extensions"));
     let filter: SubscriptionFilter = serde_json::from_value(
-        params.get("notifications").cloned().ok_or(ManagedSubscriptionError::InvalidRequest)?,
-    ).map_err(|_| ManagedSubscriptionError::InvalidRequest)?;
+        params
+            .get("notifications")
+            .cloned()
+            .ok_or(ManagedSubscriptionError::InvalidRequest)?,
+    )
+    .map_err(|_| ManagedSubscriptionError::InvalidRequest)?;
     match profile {
         SubscriptionProfile::Core => {
-            if extensions.is_some_and(|value| !value.as_object().is_some_and(serde_json::Map::is_empty))
+            if extensions
+                .is_some_and(|value| !value.as_object().is_some_and(serde_json::Map::is_empty))
                 || !filter.additional.is_empty()
             {
                 return Err(ManagedSubscriptionError::UnsupportedExtension);
@@ -542,18 +715,34 @@ fn prepare_profile(
         }
         #[cfg(feature = "tasks")]
         SubscriptionProfile::Tasks => {
-            if !extensions.and_then(serde_json::Value::as_object).is_some_and(|extensions| {
-                extensions.len() == 1 && extensions.get(TASKS_EXTENSION)
-                    .and_then(serde_json::Value::as_object).is_some_and(serde_json::Map::is_empty)
-            }) || filter.additional.keys().any(|key| key != TASK_SUBSCRIPTION_IDS_KEY) {
+            if !extensions
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|extensions| {
+                    extensions.len() == 1
+                        && extensions
+                            .get(TASKS_EXTENSION)
+                            .and_then(serde_json::Value::as_object)
+                            .is_some_and(serde_json::Map::is_empty)
+                })
+                || filter
+                    .additional
+                    .keys()
+                    .any(|key| key != TASK_SUBSCRIPTION_IDS_KEY)
+            {
                 return Err(ManagedSubscriptionError::UnsupportedExtension);
             }
-            if task_subscription_ids(&filter).map_err(|_| ManagedSubscriptionError::InvalidRequest)?.is_none() {
+            if task_subscription_ids(&filter)
+                .map_err(|_| ManagedSubscriptionError::InvalidRequest)?
+                .is_none()
+            {
                 return Err(ManagedSubscriptionError::InvalidRequest);
             }
         }
     }
-    Ok((encode_wire(target, &request, request_id, limits.request_bytes)?, filter))
+    Ok((
+        encode_wire(target, &request, request_id, limits.request_bytes)?,
+        filter,
+    ))
 }
 
 fn encode_wire(
@@ -562,15 +751,27 @@ fn encode_wire(
     request_id: &RequestId,
     maximum: usize,
 ) -> Result<ModernHttpRequest, ManagedSubscriptionError> {
-    let params = request.encode_params().map_err(|_| ManagedSubscriptionError::InvalidRequest)?
+    let params = request
+        .encode_params()
+        .map_err(|_| ManagedSubscriptionError::InvalidRequest)?
         .ok_or(ManagedSubscriptionError::InvalidRequest)?;
     let envelope = serde_json::json!({
         "jsonrpc": "2.0", "id": request_id, "method": request.method(), "params": params,
     });
-    let mut writer = BoundedRequest { bytes: Vec::new(), maximum };
-    serde_json::to_writer(&mut writer, &envelope).map_err(|_| ManagedSubscriptionError::RequestTooLarge)?;
-    ModernHttpRequest::new(target, writer.bytes, FINAL_PROTOCOL_VERSION, request.method(), None)
-        .map_err(|_| ManagedSubscriptionError::InvalidRequest)
+    let mut writer = BoundedRequest {
+        bytes: Vec::new(),
+        maximum,
+    };
+    serde_json::to_writer(&mut writer, &envelope)
+        .map_err(|_| ManagedSubscriptionError::RequestTooLarge)?;
+    ModernHttpRequest::new(
+        target,
+        writer.bytes,
+        FINAL_PROTOCOL_VERSION,
+        request.method(),
+        None,
+    )
+    .map_err(|_| ManagedSubscriptionError::InvalidRequest)
 }
 
 #[cfg(feature = "tasks")]
@@ -581,27 +782,46 @@ fn admit_tasks_discovery(
     maximum: usize,
 ) -> Result<(), ManagedSubscriptionError> {
     let (response, source) = decode_strict_jsonrpc_response(bytes, maximum)
-        .map_err(|_| ManagedSubscriptionError::InvalidResponse)?.into_parts();
-    if !response.id.as_ref().is_some_and(|id| id.correlates_with(request_id)) {
+        .map_err(|_| ManagedSubscriptionError::InvalidResponse)?
+        .into_parts();
+    if !response
+        .id
+        .as_ref()
+        .is_some_and(|id| id.correlates_with(request_id))
+    {
         return Err(ManagedSubscriptionError::InvalidResponse);
     }
     if let Some(error) = &response.error {
-        return Err(ManagedSubscriptionError::Remote { code: error.code.clone() });
+        return Err(ManagedSubscriptionError::Remote {
+            code: error.code.clone(),
+        });
     }
     let source = source.ok_or(ManagedSubscriptionError::InvalidResponse)?;
-    let CoreResult::Final(FinalCoreResult::Discover(discovered)) = request.decode_response_result(&response, &source)
-        .map_err(|_| ManagedSubscriptionError::InvalidResponse)? else {
+    let CoreResult::Final(FinalCoreResult::Discover(discovered)) = request
+        .decode_response_result(&response, &source)
+        .map_err(|_| ManagedSubscriptionError::InvalidResponse)?
+    else {
         return Err(ManagedSubscriptionError::InvalidResponse);
     };
-    if !discovered.supported_versions().iter().any(|version| version == FINAL_PROTOCOL_VERSION) {
+    if !discovered
+        .supported_versions()
+        .iter()
+        .any(|version| version == FINAL_PROTOCOL_VERSION)
+    {
         return Err(ManagedSubscriptionError::Negotiation);
     }
     crate::admit_final_tasks_discovery_surface(
-        &discovered, TASK_STATUS_NOTIFICATION, ExtensionDirection::ServerToClient,
-    ).map_err(|_| ManagedSubscriptionError::Negotiation)
+        &discovered,
+        TASK_STATUS_NOTIFICATION,
+        ExtensionDirection::ServerToClient,
+    )
+    .map_err(|_| ManagedSubscriptionError::Negotiation)
 }
 
-struct BoundedRequest { bytes: Vec<u8>, maximum: usize }
+struct BoundedRequest {
+    bytes: Vec<u8>,
+    maximum: usize,
+}
 
 impl Write for BoundedRequest {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -611,7 +831,9 @@ impl Write for BoundedRequest {
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -621,42 +843,88 @@ mod tests {
     use serde_json::json;
 
     fn request(notifications: serde_json::Value, extensions: serde_json::Value) -> CoreRequest {
-        let mut meta = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
+        let mut meta =
+            serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
         meta[FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"] = extensions;
-        CoreRequest::decode(ProtocolEra::Modern2026, "subscriptions/listen", Some(&json!({
-            "_meta": meta, "notifications": notifications,
-        }))).unwrap()
+        CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            "subscriptions/listen",
+            Some(&json!({
+                "_meta": meta, "notifications": notifications,
+            })),
+        )
+        .unwrap()
     }
 
     #[test]
     fn prepared_subscription_preserves_correlation_metadata_and_core_filter() {
         let request = request(json!({"toolsListChanged": true}), json!({}));
-        let (wire, filter) = prepare("https://mcp.example/mcp", request, &RequestId::Number(0), ManagedSubscriptionLimits::default()).unwrap();
+        let (wire, filter) = prepare(
+            "https://mcp.example/mcp",
+            request,
+            &RequestId::Number(0),
+            ManagedSubscriptionLimits::default(),
+        )
+        .unwrap();
         assert_eq!(filter.tools_list_changed, Some(true));
         assert!(filter.additional.is_empty());
         let value: serde_json::Value = serde_json::from_slice(wire.body()).unwrap();
         assert_eq!(value["id"], 0);
         assert_eq!(value["method"], "subscriptions/listen");
         assert_eq!(value["params"]["notifications"]["toolsListChanged"], true);
-        assert!(wire.headers().iter().any(|(name, value)| name == "Mcp-Method" && value == "subscriptions/listen"));
-        assert!(!wire.headers().iter().any(|(name, _)| name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("last-event-id")));
+        assert!(
+            wire.headers()
+                .iter()
+                .any(|(name, value)| name == "Mcp-Method" && value == "subscriptions/listen")
+        );
+        assert!(
+            !wire
+                .headers()
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("authorization")
+                    || name.eq_ignore_ascii_case("last-event-id"))
+        );
     }
 
     #[test]
     fn core_subscription_rejects_unnegotiated_extensions_before_dispatch() {
         for (filter, extensions) in [
-            (json!({"toolsListChanged": true, "taskIds": ["private-task"]}), json!({})),
-            (json!({"toolsListChanged": true}), json!({"io.modelcontextprotocol/tasks": {}})),
+            (
+                json!({"toolsListChanged": true, "taskIds": ["private-task"]}),
+                json!({}),
+            ),
+            (
+                json!({"toolsListChanged": true}),
+                json!({"io.modelcontextprotocol/tasks": {}}),
+            ),
             (json!({"tools/list_changed": true}), json!({})),
         ] {
-            assert!(matches!(prepare("https://mcp.example/mcp", request(filter, extensions), &RequestId::Number(1), ManagedSubscriptionLimits::default()), Err(ManagedSubscriptionError::UnsupportedExtension)));
+            assert!(matches!(
+                prepare(
+                    "https://mcp.example/mcp",
+                    request(filter, extensions),
+                    &RequestId::Number(1),
+                    ManagedSubscriptionLimits::default()
+                ),
+                Err(ManagedSubscriptionError::UnsupportedExtension)
+            ));
         }
     }
 
     #[test]
     fn filter_presence_is_preserved_without_inventing_subscription_authority() {
-        for filter in [json!({}), json!({"toolsListChanged": false}), json!({"resourceSubscriptions": []})] {
-            let (wire, _) = prepare("https://mcp.example/mcp", request(filter.clone(), json!({})), &RequestId::Number(1), ManagedSubscriptionLimits::default()).unwrap();
+        for filter in [
+            json!({}),
+            json!({"toolsListChanged": false}),
+            json!({"resourceSubscriptions": []}),
+        ] {
+            let (wire, _) = prepare(
+                "https://mcp.example/mcp",
+                request(filter.clone(), json!({})),
+                &RequestId::Number(1),
+                ManagedSubscriptionLimits::default(),
+            )
+            .unwrap();
             let value: serde_json::Value = serde_json::from_slice(wire.body()).unwrap();
             assert_eq!(value["params"]["notifications"], filter);
         }
@@ -666,8 +934,19 @@ mod tests {
     fn subscription_request_limit_refuses_without_partial_output() {
         let mut limits = ManagedSubscriptionLimits::default();
         limits.request_bytes = 1;
-        assert!(matches!(prepare("https://mcp.example/mcp", request(json!({}), json!({})), &RequestId::Number(1), limits), Err(ManagedSubscriptionError::RequestTooLarge)));
-        let mut writer = BoundedRequest { bytes: b"ok".to_vec(), maximum: 2 };
+        assert!(matches!(
+            prepare(
+                "https://mcp.example/mcp",
+                request(json!({}), json!({})),
+                &RequestId::Number(1),
+                limits
+            ),
+            Err(ManagedSubscriptionError::RequestTooLarge)
+        ));
+        let mut writer = BoundedRequest {
+            bytes: b"ok".to_vec(),
+            maximum: 2,
+        };
         assert!(writer.write_all(b"x").is_err());
         assert_eq!(writer.bytes, b"ok");
     }
@@ -677,14 +956,18 @@ mod tests {
         let second = Duration::from_secs(1);
         assert!(ManagedSubscriptionLimits::new(1024, 1024, 2, second).is_ok());
         for (request, frame, records, timeout) in [
-            (0, 1024, 2, second), (1024, 0, 2, second),
-            (1024, 1024, 1, second), (1024, 1024, 4097, second),
-            (1024, 1024, 2, Duration::ZERO), (1024, 1024, 2, Duration::from_secs(3601)),
+            (0, 1024, 2, second),
+            (1024, 0, 2, second),
+            (1024, 1024, 1, second),
+            (1024, 1024, 4097, second),
+            (1024, 1024, 2, Duration::ZERO),
+            (1024, 1024, 2, Duration::from_secs(3601)),
         ] {
             assert!(ManagedSubscriptionLimits::new(request, frame, records, timeout).is_err());
         }
         let error = admission_error(ModernHttpSubscriptionListenError::RemoteError {
-            code: JsonInteger::from(-32603_i64), message: "peer-secret-canary".to_owned(),
+            code: JsonInteger::from(-32603_i64),
+            message: "peer-secret-canary".to_owned(),
         });
         assert!(!format!("{error:?} {error}").contains("peer-secret-canary"));
     }
@@ -693,7 +976,9 @@ mod tests {
     fn json_subscription_refusal_preserves_code_without_peer_diagnostics() {
         let frame = br#"{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"message-canary","data":{"token":"data-canary"}}}"#;
         let error = json_refusal(frame, &RequestId::Number(7), 4096);
-        assert!(matches!(&error, ManagedSubscriptionError::Remote { code } if code == &JsonInteger::from(-32602_i64)));
+        assert!(
+            matches!(&error, ManagedSubscriptionError::Remote { code } if code == &JsonInteger::from(-32602_i64))
+        );
         let diagnostic = format!("{error:?} {error}");
         assert!(!diagnostic.contains("message-canary"));
         assert!(!diagnostic.contains("data-canary"));
@@ -704,13 +989,19 @@ mod tests {
         for id in [json!(1), json!("7"), serde_json::Value::Null] {
             let frame = serde_json::to_vec(&json!({
                 "jsonrpc":"2.0", "id":id, "error":{"code":-32601,"message":"refused"},
-            })).unwrap();
-            assert!(matches!(json_refusal(&frame, &RequestId::Number(7), 4096),
-                ManagedSubscriptionError::InvalidResponse));
+            }))
+            .unwrap();
+            assert!(matches!(
+                json_refusal(&frame, &RequestId::Number(7), 4096),
+                ManagedSubscriptionError::InvalidResponse
+            ));
         }
-        let frame = br#"{"jsonrpc":"2.0","id":"listen","error":{"code":-32601,"message":"refused"}}"#;
-        assert!(matches!(json_refusal(frame, &RequestId::String("listen".to_owned()), 4096),
-            ManagedSubscriptionError::Remote { .. }));
+        let frame =
+            br#"{"jsonrpc":"2.0","id":"listen","error":{"code":-32601,"message":"refused"}}"#;
+        assert!(matches!(
+            json_refusal(frame, &RequestId::String("listen".to_owned()), 4096),
+            ManagedSubscriptionError::Remote { .. }
+        ));
     }
 
     #[test]
@@ -728,19 +1019,28 @@ mod tests {
     #[test]
     fn json_subscription_refusals_enforce_strict_envelopes_and_the_document_cap() {
         let frame = br#"{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"refused"}}"#;
-        assert!(matches!(json_refusal(frame, &RequestId::Number(7), frame.len()),
-            ManagedSubscriptionError::Remote { .. }));
-        assert!(matches!(json_refusal(frame, &RequestId::Number(7), frame.len() - 1),
-            ManagedSubscriptionError::InvalidResponse));
+        assert!(matches!(
+            json_refusal(frame, &RequestId::Number(7), frame.len()),
+            ManagedSubscriptionError::Remote { .. }
+        ));
+        assert!(matches!(
+            json_refusal(frame, &RequestId::Number(7), frame.len() - 1),
+            ManagedSubscriptionError::InvalidResponse
+        ));
         for malformed in [
-            br#"{"jsonrpc":"2.0","id":7,"id":7,"error":{"code":-32601,"message":"refused"}}"#.as_slice(),
-            br#"{"jsonrpc":"2.0","id":7,"result":{},"error":{"code":-32601,"message":"refused"}}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":7,"id":7,"error":{"code":-32601,"message":"refused"}}"#
+                .as_slice(),
+            br#"{"jsonrpc":"2.0","id":7,"result":{},"error":{"code":-32601,"message":"refused"}}"#
+                .as_slice(),
             br#"[{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"refused"}}]"#.as_slice(),
-            br#"{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"refused"}} {}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"refused"}} {}"#
+                .as_slice(),
             &[0xff],
         ] {
-            assert!(matches!(json_refusal(malformed, &RequestId::Number(7), 4096),
-                ManagedSubscriptionError::InvalidResponse));
+            assert!(matches!(
+                json_refusal(malformed, &RequestId::Number(7), 4096),
+                ManagedSubscriptionError::InvalidResponse
+            ));
         }
     }
 
@@ -750,11 +1050,29 @@ mod tests {
         for ids in [json!([]), json!(["task-one", "task-one", " task-two "])] {
             let filter = json!({"toolsListChanged":true, "taskIds":ids});
             let requested = request(filter.clone(), json!({TASKS_EXTENSION:{}}));
-            assert!(matches!(prepare("https://mcp.example/mcp", requested.clone(), &RequestId::Number(2), ManagedSubscriptionLimits::default()), Err(ManagedSubscriptionError::UnsupportedExtension)));
-            let (wire, admitted) = prepare_profile("https://mcp.example/mcp", requested, &RequestId::Number(2), ManagedSubscriptionLimits::default(), SubscriptionProfile::Tasks).unwrap();
+            assert!(matches!(
+                prepare(
+                    "https://mcp.example/mcp",
+                    requested.clone(),
+                    &RequestId::Number(2),
+                    ManagedSubscriptionLimits::default()
+                ),
+                Err(ManagedSubscriptionError::UnsupportedExtension)
+            ));
+            let (wire, admitted) = prepare_profile(
+                "https://mcp.example/mcp",
+                requested,
+                &RequestId::Number(2),
+                ManagedSubscriptionLimits::default(),
+                SubscriptionProfile::Tasks,
+            )
+            .unwrap();
             let wire: serde_json::Value = serde_json::from_slice(wire.body()).unwrap();
             assert_eq!(wire["params"]["notifications"], filter);
-            assert_eq!(wire["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"], json!({TASKS_EXTENSION:{}}));
+            assert_eq!(
+                wire["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"],
+                json!({TASKS_EXTENSION:{}})
+            );
             assert_eq!(admitted.tools_list_changed, Some(true));
         }
     }
@@ -764,16 +1082,40 @@ mod tests {
     fn tasks_profile_rejects_invalid_ids_settings_and_unselected_extensions() {
         for (filter, extensions) in [
             (json!({"taskIds":[""]}), json!({TASKS_EXTENSION:{}})),
-            (json!({"taskIds":["line\nbreak"]}), json!({TASKS_EXTENSION:{}})),
-            (json!({"taskIds":vec!["one";129]}), json!({TASKS_EXTENSION:{}})),
+            (
+                json!({"taskIds":["line\nbreak"]}),
+                json!({TASKS_EXTENSION:{}}),
+            ),
+            (
+                json!({"taskIds":vec!["one";129]}),
+                json!({TASKS_EXTENSION:{}}),
+            ),
             (json!({}), json!({TASKS_EXTENSION:{}})),
             (json!({"taskIds":["one"]}), json!({})),
-            (json!({"taskIds":["one"]}), json!({TASKS_EXTENSION:{"extra":true}})),
-            (json!({"taskIds":["one"]}), json!({TASKS_EXTENSION:{},"com.example/extra":{}})),
-            (json!({"taskIds":["one"],"extraFilter":true}), json!({TASKS_EXTENSION:{}})),
+            (
+                json!({"taskIds":["one"]}),
+                json!({TASKS_EXTENSION:{"extra":true}}),
+            ),
+            (
+                json!({"taskIds":["one"]}),
+                json!({TASKS_EXTENSION:{},"com.example/extra":{}}),
+            ),
+            (
+                json!({"taskIds":["one"],"extraFilter":true}),
+                json!({TASKS_EXTENSION:{}}),
+            ),
         ] {
             let requested = request(filter, extensions);
-            assert!(prepare_profile("https://mcp.example/mcp", requested, &RequestId::Number(2), ManagedSubscriptionLimits::default(), SubscriptionProfile::Tasks).is_err());
+            assert!(
+                prepare_profile(
+                    "https://mcp.example/mcp",
+                    requested,
+                    &RequestId::Number(2),
+                    ManagedSubscriptionLimits::default(),
+                    SubscriptionProfile::Tasks
+                )
+                .is_err()
+            );
         }
     }
 
@@ -786,9 +1128,22 @@ mod tests {
                 "taskId":"one", "status":"working", "createdAt":"2026-09-16T00:00:00Z",
                 "lastUpdatedAt":"2026-09-16T00:00:00Z", "ttlMs":60000
             }
-        })).unwrap();
-        assert!(matches!(select_record(ModernHttpSubscriptionListenEvent::TaskNotification(event.clone()), SubscriptionProfile::Core), Err(ManagedSubscriptionError::UnsupportedExtension)));
-        assert!(matches!(select_record(ModernHttpSubscriptionListenEvent::TaskNotification(event), SubscriptionProfile::Tasks), Ok(ManagedSubscriptionEvent::TaskNotification(_))));
+        }))
+        .unwrap();
+        assert!(matches!(
+            select_record(
+                ModernHttpSubscriptionListenEvent::TaskNotification(event.clone()),
+                SubscriptionProfile::Core
+            ),
+            Err(ManagedSubscriptionError::UnsupportedExtension)
+        ));
+        assert!(matches!(
+            select_record(
+                ModernHttpSubscriptionListenEvent::TaskNotification(event),
+                SubscriptionProfile::Tasks
+            ),
+            Ok(ManagedSubscriptionEvent::TaskNotification(_))
+        ));
     }
 
     #[cfg(feature = "tasks")]
@@ -796,23 +1151,54 @@ mod tests {
     fn task_discovery_requires_the_exact_version_extension_and_response_owner() {
         let listen = request(json!({"taskIds":["one"]}), json!({TASKS_EXTENSION:{}}));
         let params = listen.encode_params().unwrap().unwrap();
-        let discovery = CoreRequest::decode(ProtocolEra::Modern2026, "server/discover", Some(&json!({"_meta":params["_meta"]}))).unwrap();
+        let discovery = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            "server/discover",
+            Some(&json!({"_meta":params["_meta"]})),
+        )
+        .unwrap();
         let valid = json!({"jsonrpc":"2.0","id":1,"result":{
             "resultType":"complete", "supportedVersions":[FINAL_PROTOCOL_VERSION],
             "capabilities":{"extensions":{TASKS_EXTENSION:{}}},"ttlMs":0,"cacheScope":"private"
         }});
-        assert!(admit_tasks_discovery(&discovery, &serde_json::to_vec(&valid).unwrap(), &RequestId::Number(1), 4096).is_ok());
+        assert!(
+            admit_tasks_discovery(
+                &discovery,
+                &serde_json::to_vec(&valid).unwrap(),
+                &RequestId::Number(1),
+                4096
+            )
+            .is_ok()
+        );
         for dimension in 0..4 {
             let mut changed = valid.clone();
             match dimension {
                 0 => changed["id"] = json!(2),
                 1 => changed["result"]["supportedVersions"] = json!(["2024-11-05"]),
                 2 => changed["result"]["capabilities"]["extensions"] = json!({}),
-                _ => changed["result"]["capabilities"]["extensions"][TASKS_EXTENSION] = json!({"extra":true}),
+                _ => {
+                    changed["result"]["capabilities"]["extensions"][TASKS_EXTENSION] =
+                        json!({"extra":true});
+                }
             }
-            assert!(admit_tasks_discovery(&discovery, &serde_json::to_vec(&changed).unwrap(), &RequestId::Number(1), 4096).is_err());
+            assert!(
+                admit_tasks_discovery(
+                    &discovery,
+                    &serde_json::to_vec(&changed).unwrap(),
+                    &RequestId::Number(1),
+                    4096
+                )
+                .is_err()
+            );
         }
-        let error = admit_tasks_discovery(&discovery, br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"private-peer-detail"}}"#, &RequestId::Number(1), 4096).err().unwrap();
+        let error = admit_tasks_discovery(
+            &discovery,
+            br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"private-peer-detail"}}"#,
+            &RequestId::Number(1),
+            4096,
+        )
+        .err()
+        .unwrap();
         assert!(matches!(error, ManagedSubscriptionError::Remote { .. }));
         assert!(!format!("{error:?} {error}").contains("private-peer-detail"));
     }
@@ -820,14 +1206,14 @@ mod tests {
     #[cfg(feature = "tasks")]
     #[test]
     fn subscription_dispatch_refuses_revoked_credentials_on_its_first_poll() {
+        use crate::http_auth::managed::{OAuthSessionPolicy, SessionInner};
+        use crate::http_auth::oauth::{OAuthClient, OAuthClientConfiguration};
+        use crate::http_auth::{BoundBearerCredential, CanonicalHttpUrl};
+        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+        use asupersync::sync::Mutex;
         use std::future::{Future, poll_fn};
         use std::sync::{Arc, atomic::AtomicUsize};
         use std::task::Poll;
-        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
-        use asupersync::sync::Mutex;
-        use crate::http_auth::{BoundBearerCredential, CanonicalHttpUrl};
-        use crate::http_auth::managed::{OAuthSessionPolicy, SessionInner};
-        use crate::http_auth::oauth::{OAuthClient, OAuthClientConfiguration};
 
         RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap())
             .build().unwrap().block_on(async {

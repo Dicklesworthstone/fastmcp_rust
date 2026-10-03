@@ -41,8 +41,8 @@ use std::time::{Duration, Instant};
 // this target to be auto-discovered under the DEFAULT facade feature set, and
 // `cfg(test)`-only or lab-only behaviour cannot prove shipped behaviour (PL-3).
 // Every sibling target does the same; see `tests/e2e_stress.rs:18`.
-use asupersync::{CancelKind, Cx};
 use asupersync::runtime::RuntimeBuilder;
+use asupersync::{CancelKind, Cx};
 use fastmcp_rust::client::http_executor::{
     HTTP_03_A_EVALUATOR_MANIFEST_V1, HTTP_03_B_EVALUATOR_MANIFEST_V1,
     MAX_PENDING_MODERN_HTTP_SSE_EVENTS, ModernHttpFinalCoreEvent, ModernHttpFinalCoreListenError,
@@ -388,10 +388,13 @@ fn recompute_digest(manifest: &str) -> Sha256Digest {
 
 fn render_digest(digest: &Sha256Digest) -> String {
     use std::fmt::Write as _;
-    digest.as_bytes().iter().fold(String::new(), |mut rendered, byte| {
-        let _ = write!(rendered, "{byte:02x}");
-        rendered
-    })
+    digest
+        .as_bytes()
+        .iter()
+        .fold(String::new(), |mut rendered, byte| {
+            let _ = write!(rendered, "{byte:02x}");
+            rendered
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -770,7 +773,9 @@ struct LaneObservation {
 /// than a disconnect being misreported (HTTP-03.15).
 fn observe_lane(stall_then_hold: bool, idle_timeout: Duration) -> LaneObservation {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind the lane fixture");
-    let address = listener.local_addr().expect("read the lane fixture address");
+    let address = listener
+        .local_addr()
+        .expect("read the lane fixture address");
     let target = format!("http://{address}/mcp-lane");
     let (release_tx, release_rx) = mpsc::channel::<()>();
     let (report_tx, report_rx) = mpsc::channel::<(usize, usize, bool)>();
@@ -912,7 +917,9 @@ fn observe_lane(stall_then_hold: bool, idle_timeout: Duration) -> LaneObservatio
 
     let (requests_during_call, connections_after_return, server_held_connection_open) =
         report_rx.recv().expect("collect lane observations");
-    server.join().expect("the lane fixture thread must not panic");
+    server
+        .join()
+        .expect("the lane fixture thread must not panic");
 
     LaneObservation {
         outcome,
@@ -1035,7 +1042,10 @@ fn observe_caller_cancellation() -> CancellationObservation {
         }
 
         // The single variable: the caller cancels.
-        cx.cancel_with(CancelKind::User, Some("http-03-integration caller cancellation"));
+        cx.cancel_with(
+            CancelKind::User,
+            Some("http-03-integration caller cancellation"),
+        );
 
         let outcome = match stream_listener.next_event(&cx).await {
             Ok(Some(event)) => format!("unexpected-event::{event:?}"),
@@ -1348,9 +1358,7 @@ fn observe_extension_notification() -> NotificationObservation {
         .send(())
         .expect("release the notification fixture");
     let (requests_during_call, connections_after_return, second_request_resumption_header) =
-        report_rx
-            .recv()
-            .expect("collect notification observations");
+        report_rx.recv().expect("collect notification observations");
     server
         .join()
         .expect("the notification fixture thread must not panic");
@@ -4215,7 +4223,10 @@ fn case_no_event_id_retry_resumption(builder: &mut CaseBuilder, wire: &WireObser
         "a published event id must not become resumption state on a later request; the \
          follow-up request carried Last-Event-ID: {leaked:?}"
     );
-    builder.negative("stream-published-event-id", "no Last-Event-ID on the next request");
+    builder.negative(
+        "stream-published-event-id",
+        "no Last-Event-ID on the next request",
+    );
 }
 
 fn case_no_downgrade_matrix(builder: &mut CaseBuilder, matrix: &[MatrixCell]) {
@@ -4436,12 +4447,24 @@ fn http_03_i_planted_negative() {
     for (category, id, evidence) in [
         ("credential", "HTTP-03.17", "credential-debug"),
         ("era selection", "HTTP-03.20", "mcp-a-era"),
-        ("endpoint selection", "HTTP-03.22", "mcp-a-identity-deterministic"),
+        (
+            "endpoint selection",
+            "HTTP-03.22",
+            "mcp-a-identity-deterministic",
+        ),
         // The cache claim is the endpoint bundle key: a changed security
         // partition or configuration generation must not share a cache entry,
         // and both of those observations live in HTTP-03.22.
-        ("cache partition (security)", "HTTP-03.22", "security_partition=<other>"),
-        ("cache partition (generation)", "HTTP-03.22", "configuration_generation=2"),
+        (
+            "cache partition (security)",
+            "HTTP-03.22",
+            "security_partition=<other>",
+        ),
+        (
+            "cache partition (generation)",
+            "HTTP-03.22",
+            "configuration_generation=2",
+        ),
     ] {
         let planted_record = &planted.case(id).record;
         assert!(

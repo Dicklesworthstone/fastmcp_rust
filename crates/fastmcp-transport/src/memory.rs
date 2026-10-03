@@ -1328,7 +1328,10 @@ mod tests {
         assert_eq!(recv.receiver.as_ref().unwrap().len(), 0);
         assert!(!send.is_closed());
         assert!(!recv.is_closed());
-        assert!(matches!(recv.recv(&stopped), Err(TransportError::Cancelled)));
+        assert!(matches!(
+            recv.recv(&stopped),
+            Err(TransportError::Cancelled)
+        ));
     }
 
     #[test]
@@ -1342,12 +1345,13 @@ mod tests {
             // Checkpoints observe quotas; the runtime, not checkpoint(),
             // debits them. A real deadline advances even while sync I/O waits.
             let clock = Cx::for_testing();
-            let cx = Cx::for_testing_with_budget(
-                clock.budget_for_timeout(Duration::from_millis(20)),
-            );
+            let cx =
+                Cx::for_testing_with_budget(clock.budget_for_timeout(Duration::from_millis(20)));
             let cancelled = matches!(server.recv(&cx), Err(TransportError::Cancelled));
             let reason = cx.cancel_reason().map(|reason| reason.kind);
-            done_tx.send((cancelled, reason, server.is_closed())).unwrap();
+            done_tx
+                .send((cancelled, reason, server.is_closed()))
+                .unwrap();
             server
         });
 
@@ -1364,7 +1368,11 @@ mod tests {
         ));
         let live = Cx::for_testing();
         let request = JsonRpcRequest::new("after-deadline", None, 94_i64);
-        client.as_mut().unwrap().send_request(&live, &request).unwrap();
+        client
+            .as_mut()
+            .unwrap()
+            .send_request(&live, &request)
+            .unwrap();
         let JsonRpcMessage::Request(received) = server.recv(&live).unwrap() else {
             panic!("a deadline must not poison the endpoint");
         };

@@ -2309,8 +2309,11 @@ fn assert_http_client_subscription_cancellation(cancel_matching_id: bool) {
         assert_subscription_request(&request, &server_filter);
         assert_subscription_request_id(&request, 3);
         begin_sse_response(&mut replacement);
-        write_sse_event(&mut replacement, &subscription_ack_for_id(3, &server_filter))
-            .expect("write replacement acknowledgement");
+        write_sse_event(
+            &mut replacement,
+            &subscription_ack_for_id(3, &server_filter),
+        )
+        .expect("write replacement acknowledgement");
         write_sse_event(&mut replacement, &subscription_tools_changed_for_id(3))
             .expect("write replacement event");
         assert_connection_closed_by_client(&mut replacement);
@@ -2353,9 +2356,14 @@ fn assert_http_client_subscription_cancellation(cancel_matching_id: bool) {
             cancel_matching_id
         );
         assert_eq!(client.final_result_cache_stats(), cache_before);
-        attempt_tx.send(()).expect("release silent peer after cancel");
+        attempt_tx
+            .send(())
+            .expect("release silent peer after cancel");
         if !cancel_matching_id {
-            assert_eq!(client.active_http_subscription_request_id(), Some(&first_id));
+            assert_eq!(
+                client.active_http_subscription_request_id(),
+                Some(&first_id)
+            );
             assert!(matches!(
                 client.next_http_subscription_event(&cx).await,
                 Ok(Some(ModernHttpSubscriptionListenEvent::Acknowledged { .. }))
@@ -2413,7 +2421,9 @@ fn assert_http_client_subscription_cancellation(cancel_matching_id: bool) {
         assert!(cx.checkpoint().is_ok());
     });
 
-    server.join().expect("subscription cancellation peer must join");
+    server
+        .join()
+        .expect("subscription cancellation peer must join");
 }
 
 #[test]
@@ -2562,7 +2572,9 @@ fn http_client_cancel_catalog_preserves_task_listener() {
         write_sse_event(&mut replacement, &subscription_tools_changed_for_id(4))
             .expect("replacement catalog must continue delivering events");
         assert_connection_closed_by_client(&mut replacement);
-        closed_tx.send(()).expect("record replacement catalog close");
+        closed_tx
+            .send(())
+            .expect("record replacement catalog close");
         let mut ping = accept_bounded_stream(&listener);
         respond_listener_cancellation_ping(&mut ping, 5);
     });
@@ -4177,8 +4189,8 @@ mod authenticated_tls {
         let mut client = connected.expect("discovery remains successful");
         let cx = Cx::for_request();
         if stage == "tools/list" {
-            let error =
-                runtime_block_on(client.list_tools(&cx, None)).expect_err("peer rejects tools/list");
+            let error = runtime_block_on(client.list_tools(&cx, None))
+                .expect_err("peer rejects tools/list");
             format!("{error:?} {error}")
         } else {
             let mut stream = runtime_block_on(client.open_subscriptions_listener(
@@ -4435,10 +4447,19 @@ mod owned_execution {
     async fn connect(cx: &Cx, target: &str) -> ModernHttpClient {
         ModernHttpClient::connect(
             cx,
-            plan(target, "http://127.0.0.1:9/sse", "http://127.0.0.1:9/message", ProtocolPolicy::ModernOnly),
+            plan(
+                target,
+                "http://127.0.0.1:9/sse",
+                "http://127.0.0.1:9/message",
+                ProtocolPolicy::ModernOnly,
+            ),
             client_info(),
             ClientCapabilities::default(),
-        ).await.expect("modern discovery succeeds").into_modern().expect("modern selected")
+        )
+        .await
+        .expect("modern discovery succeeds")
+        .into_modern()
+        .expect("modern selected")
     }
 
     fn prepare(client: &ModernHttpClient, cx: &Cx, id: i64) -> ModernHttpRequestExecution {
@@ -4454,7 +4475,9 @@ mod owned_execution {
     }
 
     fn assert_cancelled_once(control: &ModernHttpRequestControl, reason: ExecutionTerminalReason) {
-        let event = control.take_cancellation_event().expect("one local cancellation indication");
+        let event = control
+            .take_cancellation_event()
+            .expect("one local cancellation indication");
         assert_eq!(event.request_id, *control.request_id());
         assert_eq!(event.reason, reason);
         assert!(control.take_cancellation_event().is_none());
@@ -4474,7 +4497,8 @@ mod owned_execution {
                         let mut stream = accept_bounded_stream(&listener);
                         let request = read_request(&mut stream);
                         assert_final_metadata(&request, "tools/call");
-                        let wire: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                        let wire: serde_json::Value =
+                            serde_json::from_slice(&request.body).unwrap();
                         assert!(wire["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
                             ["extensions"]["io.modelcontextprotocol/tasks"].is_null());
                         let result = if input_required {
@@ -4487,7 +4511,8 @@ mod owned_execution {
                         if sse {
                             begin_sse_response(&mut stream);
                             write_sse_event(&mut stream, &progress()).unwrap();
-                            write_sse_chunk(&mut stream, format!("data: {body}\n\n").as_bytes()).unwrap();
+                            write_sse_chunk(&mut stream, format!("data: {body}\n\n").as_bytes())
+                                .unwrap();
                             end_sse_response(&mut stream).unwrap();
                         } else {
                             write_response(&mut stream, 200, "application/json", body.as_bytes());
@@ -4499,22 +4524,38 @@ mod owned_execution {
                         let mut execution = prepare(&client, &cx, 2);
                         let control = execution.control();
                         if sse {
-                            assert!(matches!(execution.next_event(&cx).await.unwrap(),
-                                Some(ModernHttpFinalCoreEvent::Progress(_))));
+                            assert!(matches!(
+                                execution.next_event(&cx).await.unwrap(),
+                                Some(ModernHttpFinalCoreEvent::Progress(_))
+                            ));
                         }
                         let result = execution.next_event(&cx).await;
                         if wrong_id {
-                            assert!(matches!(result, Err(ModernHttpFinalCoreListenError::ResponseIdMismatch { .. })));
-                            assert_eq!(control.terminal_reason(), Some(ExecutionTerminalReason::PeerProtocol));
+                            assert!(matches!(
+                                result,
+                                Err(ModernHttpFinalCoreListenError::ResponseIdMismatch { .. })
+                            ));
+                            assert_eq!(
+                                control.terminal_reason(),
+                                Some(ExecutionTerminalReason::PeerProtocol)
+                            );
                         } else {
-                            let Some(ModernHttpFinalCoreEvent::Terminal(result)) = result.unwrap() else {
+                            let Some(ModernHttpFinalCoreEvent::Terminal(result)) = result.unwrap()
+                            else {
                                 panic!("expected the single typed terminal result");
                             };
                             let encoded = CoreResult::Final(result).encode().unwrap();
                             assert!(encoded.contains("9007199254740993"));
                             assert!(encoded.contains("1.2300e+42"));
-                            assert!(encoded.contains(if input_required { "opaque-continuation" } else { "owned-result" }));
-                            assert_eq!(control.terminal_reason(), Some(ExecutionTerminalReason::FinalResponse));
+                            assert!(encoded.contains(if input_required {
+                                "opaque-continuation"
+                            } else {
+                                "owned-result"
+                            }));
+                            assert_eq!(
+                                control.terminal_reason(),
+                                Some(ExecutionTerminalReason::FinalResponse)
+                            );
                         }
                         assert!(execution.next_event(&cx).await.unwrap().is_none());
                         assert!(!control.cancel());
@@ -4535,8 +4576,16 @@ mod owned_execution {
             let mut stream = accept_bounded_stream(&listener);
             let request = read_request(&mut stream);
             let wire: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-            assert_eq!(wire["id"], 3, "the cancelled owner must never create a POST");
-            write_response(&mut stream, 200, "application/json", &serde_json::to_vec(&terminal_event(3, "sibling")).unwrap());
+            assert_eq!(
+                wire["id"], 3,
+                "the cancelled owner must never create a POST"
+            );
+            write_response(
+                &mut stream,
+                200,
+                "application/json",
+                &serde_json::to_vec(&terminal_event(3, "sibling")).unwrap(),
+            );
             listener
         });
         runtime_block_on(async {
@@ -4545,17 +4594,25 @@ mod owned_execution {
             let mut execution = prepare(&client, &cx, 2);
             let control = execution.control();
             assert!(control.cancel());
-            assert!(matches!(execution.next_event(&cx).await,
-                Err(ModernHttpFinalCoreListenError::CallerCancelled { .. })));
+            assert!(matches!(
+                execution.next_event(&cx).await,
+                Err(ModernHttpFinalCoreListenError::CallerCancelled { .. })
+            ));
             assert!(execution.next_event(&cx).await.unwrap().is_none());
             assert_cancelled_once(&control, ExecutionTerminalReason::CallerCancelled);
             let mut sibling = prepare(&client, &cx, 3);
-            assert!(matches!(sibling.next_event(&cx).await.unwrap(), Some(ModernHttpFinalCoreEvent::Terminal(_))));
+            assert!(matches!(
+                sibling.next_event(&cx).await.unwrap(),
+                Some(ModernHttpFinalCoreEvent::Terminal(_))
+            ));
             assert!(cx.checkpoint().is_ok());
         });
         let listener = server.join().unwrap();
         listener.set_nonblocking(true).unwrap();
-        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]
@@ -4570,9 +4627,15 @@ mod owned_execution {
             received_tx.send(()).unwrap();
             assert_connection_closed_by_client(&mut stalled);
             let mut sibling = accept_bounded_stream(&listener);
-            let request: serde_json::Value = serde_json::from_slice(&read_request(&mut sibling).body).unwrap();
+            let request: serde_json::Value =
+                serde_json::from_slice(&read_request(&mut sibling).body).unwrap();
             assert_eq!(request["id"], 3);
-            write_response(&mut sibling, 200, "application/json", &serde_json::to_vec(&terminal_event(3, "sibling")).unwrap());
+            write_response(
+                &mut sibling,
+                200,
+                "application/json",
+                &serde_json::to_vec(&terminal_event(3, "sibling")).unwrap(),
+            );
         });
         runtime_block_on(async {
             let cx = Cx::current().unwrap();
@@ -4584,11 +4647,16 @@ mod owned_execution {
                 received_rx.recv_timeout(Duration::from_secs(2)).unwrap();
                 assert!(canceller.cancel());
             });
-            assert!(matches!(execution.next_event(&cx).await,
-                Err(ModernHttpFinalCoreListenError::CallerCancelled { .. })));
+            assert!(matches!(
+                execution.next_event(&cx).await,
+                Err(ModernHttpFinalCoreListenError::CallerCancelled { .. })
+            ));
             assert_cancelled_once(&control, ExecutionTerminalReason::CallerCancelled);
             let mut sibling = prepare(&client, &cx, 3);
-            assert!(matches!(sibling.next_event(&cx).await.unwrap(), Some(ModernHttpFinalCoreEvent::Terminal(_))));
+            assert!(matches!(
+                sibling.next_event(&cx).await.unwrap(),
+                Some(ModernHttpFinalCoreEvent::Terminal(_))
+            ));
             assert!(cx.checkpoint().is_ok());
             controller.join().unwrap();
         });
@@ -4606,7 +4674,12 @@ mod owned_execution {
                 read_request(&mut stream);
                 begin_sse_response(&mut stream);
                 let mut payload = format!("data: {}\n\n", progress());
-                if buffered { payload.push_str(&format!("data: {}\n\n", terminal_event(2, "must be discarded"))); }
+                if buffered {
+                    payload.push_str(&format!(
+                        "data: {}\n\n",
+                        terminal_event(2, "must be discarded")
+                    ));
+                }
                 write_sse_chunk(&mut stream, payload.as_bytes()).unwrap();
                 assert_connection_closed_by_client(&mut stream);
             });
@@ -4615,20 +4688,36 @@ mod owned_execution {
                 let client = connect(&cx, &target).await;
                 let mut execution = prepare(&client, &cx, 2);
                 let control = execution.control();
-                assert!(matches!(execution.next_event(&cx).await.unwrap(), Some(ModernHttpFinalCoreEvent::Progress(_))));
+                assert!(matches!(
+                    execution.next_event(&cx).await.unwrap(),
+                    Some(ModernHttpFinalCoreEvent::Progress(_))
+                ));
                 if buffered {
-                    assert!(control.cancel(), "unconsumed terminal bytes have not won admission");
+                    assert!(
+                        control.cancel(),
+                        "unconsumed terminal bytes have not won admission"
+                    );
                 } else {
                     let mut next = Box::pin(execution.next_event(&cx));
                     poll_fn(|task_cx| {
                         assert!(next.as_mut().poll(task_cx).is_pending());
                         Poll::Ready(())
-                    }).await;
-                    assert!(control.cancel(), "cancellation must wake a pending body poll");
-                    assert!(matches!(next.await, Err(ModernHttpFinalCoreListenError::CallerCancelled { .. })));
+                    })
+                    .await;
+                    assert!(
+                        control.cancel(),
+                        "cancellation must wake a pending body poll"
+                    );
+                    assert!(matches!(
+                        next.await,
+                        Err(ModernHttpFinalCoreListenError::CallerCancelled { .. })
+                    ));
                 }
                 if buffered {
-                    assert!(matches!(execution.next_event(&cx).await, Err(ModernHttpFinalCoreListenError::CallerCancelled { .. })));
+                    assert!(matches!(
+                        execution.next_event(&cx).await,
+                        Err(ModernHttpFinalCoreListenError::CallerCancelled { .. })
+                    ));
                 }
                 assert!(execution.next_event(&cx).await.unwrap().is_none());
                 assert_cancelled_once(&control, ExecutionTerminalReason::CallerCancelled);
@@ -4658,24 +4747,38 @@ mod owned_execution {
             let cx = Cx::current().unwrap();
             let client = connect(&cx, &target).await;
             let mut execution = prepare(&client, &cx, 2);
-            assert!(matches!(execution.next_event(&cx).await.unwrap(), Some(ModernHttpFinalCoreEvent::Progress(_))));
+            assert!(matches!(
+                execution.next_event(&cx).await.unwrap(),
+                Some(ModernHttpFinalCoreEvent::Progress(_))
+            ));
             {
                 let mut next = Box::pin(execution.next_event(&cx));
                 poll_fn(|task_cx| {
                     assert!(next.as_mut().poll(task_cx).is_pending());
                     Poll::Ready(())
-                }).await;
+                })
+                .await;
             }
             release_tx.send(()).unwrap();
-            let Some(ModernHttpFinalCoreEvent::Terminal(result)) = execution.next_event(&cx).await.unwrap() else {
+            let Some(ModernHttpFinalCoreEvent::Terminal(result)) =
+                execution.next_event(&cx).await.unwrap()
+            else {
                 panic!("resumed body must produce the original request's terminal");
             };
-            assert!(CoreResult::Final(result).encode().unwrap().contains("same POST"));
+            assert!(
+                CoreResult::Final(result)
+                    .encode()
+                    .unwrap()
+                    .contains("same POST")
+            );
             assert!(execution.control().take_cancellation_event().is_none());
         });
         let listener = server.join().unwrap();
         listener.set_nonblocking(true).unwrap();
-        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]
@@ -4690,12 +4793,21 @@ mod owned_execution {
                     read_request(&mut stream);
                     let body = if remote_error {
                         serde_json::json!({"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"declined"}})
-                    } else { terminal_event(2, "final won") };
+                    } else {
+                        terminal_event(2, "final won")
+                    };
                     if sse {
                         begin_sse_response(&mut stream);
                         write_sse_event(&mut stream, &body).unwrap();
                         end_sse_response(&mut stream).unwrap();
-                    } else { write_response(&mut stream, 200, "application/json", &serde_json::to_vec(&body).unwrap()); }
+                    } else {
+                        write_response(
+                            &mut stream,
+                            200,
+                            "application/json",
+                            &serde_json::to_vec(&body).unwrap(),
+                        );
+                    }
                 });
                 runtime_block_on(async {
                     let cx = Cx::current().unwrap();
@@ -4704,9 +4816,20 @@ mod owned_execution {
                     let control = execution.control();
                     let outcome = execution.next_event(&cx).await;
                     if remote_error {
-                        assert!(matches!(outcome, Err(ModernHttpFinalCoreListenError::RemoteError { .. })));
-                    } else { assert!(matches!(outcome.unwrap(), Some(ModernHttpFinalCoreEvent::Terminal(_)))); }
-                    assert_eq!(control.terminal_reason(), Some(ExecutionTerminalReason::FinalResponse));
+                        assert!(matches!(
+                            outcome,
+                            Err(ModernHttpFinalCoreListenError::RemoteError { .. })
+                        ));
+                    } else {
+                        assert!(matches!(
+                            outcome.unwrap(),
+                            Some(ModernHttpFinalCoreEvent::Terminal(_))
+                        ));
+                    }
+                    assert_eq!(
+                        control.terminal_reason(),
+                        Some(ExecutionTerminalReason::FinalResponse)
+                    );
                     assert!(!control.cancel());
                     drop(execution);
                     assert!(control.take_cancellation_event().is_none());
@@ -4731,18 +4854,47 @@ mod owned_execution {
                 let cx = Cx::current().unwrap();
                 let client = connect(&cx, &target).await;
                 let policy = RequestTimeoutPolicy::new(
-                    if absolute { Duration::from_secs(1) } else { Duration::from_millis(40) },
-                    if absolute { Duration::from_millis(40) } else { Duration::from_secs(1) },
-                ).unwrap();
-                let mut execution = client.execute_core(&cx, "tools/call",
-                    serde_json::json!({"name":"owned-tool", "arguments":{}}),
-                    RequestId::Number(2), limits(), policy).unwrap();
+                    if absolute {
+                        Duration::from_secs(1)
+                    } else {
+                        Duration::from_millis(40)
+                    },
+                    if absolute {
+                        Duration::from_millis(40)
+                    } else {
+                        Duration::from_secs(1)
+                    },
+                )
+                .unwrap();
+                let mut execution = client
+                    .execute_core(
+                        &cx,
+                        "tools/call",
+                        serde_json::json!({"name":"owned-tool", "arguments":{}}),
+                        RequestId::Number(2),
+                        limits(),
+                        policy,
+                    )
+                    .unwrap();
                 let control = execution.control();
                 let error = execution.next_event(&cx).await.unwrap_err();
-                let expected = if absolute { RequestTimeoutSource::Absolute } else { RequestTimeoutSource::Idle };
-                assert!(matches!(error, ModernHttpFinalCoreListenError::Executor(ModernHttpExecutorError::Timeout(source)) if source == expected));
+                let expected = if absolute {
+                    RequestTimeoutSource::Absolute
+                } else {
+                    RequestTimeoutSource::Idle
+                };
+                assert!(
+                    matches!(error, ModernHttpFinalCoreListenError::Executor(ModernHttpExecutorError::Timeout(source)) if source == expected)
+                );
                 assert!(execution.next_event(&cx).await.unwrap().is_none());
-                assert_cancelled_once(&control, if absolute { ExecutionTerminalReason::AbsoluteTimeout } else { ExecutionTerminalReason::IdleTimeout });
+                assert_cancelled_once(
+                    &control,
+                    if absolute {
+                        ExecutionTerminalReason::AbsoluteTimeout
+                    } else {
+                        ExecutionTerminalReason::IdleTimeout
+                    },
+                );
                 assert!(cx.checkpoint().is_ok());
             });
             server.join().unwrap();
@@ -4760,9 +4912,16 @@ mod owned_execution {
                 read_request(&mut stream);
                 begin_sse_response(&mut stream);
                 let mut second = progress();
-                second["params"]["progress"] = serde_json::json!(if malformed == 2 { 1 } else { 2 });
-                if malformed == 1 { second["params"]["progressToken"] = serde_json::json!("sibling-progress"); }
-                let payload = format!("data: {}\n\ndata: {second}\n\ndata: {}\n\n", progress(), terminal_event(2, "complete"));
+                second["params"]["progress"] =
+                    serde_json::json!(if malformed == 2 { 1 } else { 2 });
+                if malformed == 1 {
+                    second["params"]["progressToken"] = serde_json::json!("sibling-progress");
+                }
+                let payload = format!(
+                    "data: {}\n\ndata: {second}\n\ndata: {}\n\n",
+                    progress(),
+                    terminal_event(2, "complete")
+                );
                 write_sse_chunk(&mut stream, payload.as_bytes()).unwrap();
                 assert_connection_closed_by_client(&mut stream);
             });
@@ -4770,14 +4929,29 @@ mod owned_execution {
                 let cx = Cx::current().unwrap();
                 let client = connect(&cx, &target).await;
                 let mut execution = prepare(&client, &cx, 2);
-                assert!(matches!(execution.next_event(&cx).await.unwrap(), Some(ModernHttpFinalCoreEvent::Progress(_))));
+                assert!(matches!(
+                    execution.next_event(&cx).await.unwrap(),
+                    Some(ModernHttpFinalCoreEvent::Progress(_))
+                ));
                 let second = execution.next_event(&cx).await;
                 if malformed == 0 {
-                    assert!(matches!(second.unwrap(), Some(ModernHttpFinalCoreEvent::Progress(_))));
-                    assert!(matches!(execution.next_event(&cx).await.unwrap(), Some(ModernHttpFinalCoreEvent::Terminal(_))));
+                    assert!(matches!(
+                        second.unwrap(),
+                        Some(ModernHttpFinalCoreEvent::Progress(_))
+                    ));
+                    assert!(matches!(
+                        execution.next_event(&cx).await.unwrap(),
+                        Some(ModernHttpFinalCoreEvent::Terminal(_))
+                    ));
                 } else {
-                    assert!(matches!(second, Err(ModernHttpFinalCoreListenError::NotificationAdmission(_))));
-                    assert_eq!(execution.control().terminal_reason(), Some(ExecutionTerminalReason::PeerProtocol));
+                    assert!(matches!(
+                        second,
+                        Err(ModernHttpFinalCoreListenError::NotificationAdmission(_))
+                    ));
+                    assert_eq!(
+                        execution.control().terminal_reason(),
+                        Some(ExecutionTerminalReason::PeerProtocol)
+                    );
                 }
                 assert!(execution.next_event(&cx).await.unwrap().is_none());
                 assert!(execution.control().take_cancellation_event().is_none());
@@ -4800,7 +4974,12 @@ mod owned_execution {
                     stream.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
                     stream.flush().unwrap();
                 } else {
-                    write_response(&mut stream, status, "text/plain", b"peer diagnostic is not a protocol result");
+                    write_response(
+                        &mut stream,
+                        status,
+                        "text/plain",
+                        b"peer diagnostic is not a protocol result",
+                    );
                 }
                 listener
             });
@@ -4816,7 +4995,10 @@ mod owned_execution {
             });
             let listener = server.join().unwrap();
             listener.set_nonblocking(true).unwrap();
-            assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
         }
     }
 
@@ -4837,7 +5019,10 @@ mod owned_execution {
             let client = connect(&cx, &target).await;
             let mut execution = prepare(&client, &cx, 2);
             let control = execution.control();
-            assert!(matches!(execution.next_event(&cx).await.unwrap(), Some(ModernHttpFinalCoreEvent::Progress(_))));
+            assert!(matches!(
+                execution.next_event(&cx).await.unwrap(),
+                Some(ModernHttpFinalCoreEvent::Progress(_))
+            ));
             drop(execution);
             assert_cancelled_once(&control, ExecutionTerminalReason::CallerDropped);
             assert!(cx.checkpoint().is_ok());

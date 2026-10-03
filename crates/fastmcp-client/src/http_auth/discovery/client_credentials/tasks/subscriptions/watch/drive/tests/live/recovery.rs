@@ -5,23 +5,40 @@
 use super::*;
 use std::sync::atomic::AtomicBool;
 
-use crate::http_auth::discovery::client_credentials::{ClientCredentialsError, OAuthDiscoveryError};
-use crate::http_auth::discovery::client_credentials::tasks::{ClientCredentialsTasksError, ManagedTasksError};
 use crate::http_auth::discovery::client_credentials::tasks::subscriptions::watch::recovery::{
     ClientCredentialsTaskRecoveryError as RecoveryError,
     ClientCredentialsTaskRecoveryPolicy as RecoveryPolicy,
 };
+use crate::http_auth::discovery::client_credentials::tasks::{
+    ClientCredentialsTasksError, ManagedTasksError,
+};
+use crate::http_auth::discovery::client_credentials::{
+    ClientCredentialsError, OAuthDiscoveryError,
+};
 
 #[derive(Clone, Copy)]
 enum RecoveryCase {
-    Resume, OrdinaryStops, PartialAck, ForeignSnapshot, RemoteRefusal,
-    Exhausted, SnapshotLimit, RecordLimit, CancelBackoff, CloseOwner,
-    DropBackoff, RevokeBackoff, Deadline,
+    Resume,
+    OrdinaryStops,
+    PartialAck,
+    ForeignSnapshot,
+    RemoteRefusal,
+    Exhausted,
+    SnapshotLimit,
+    RecordLimit,
+    CancelBackoff,
+    CloseOwner,
+    DropBackoff,
+    RevokeBackoff,
+    Deadline,
 }
 
 impl RecoveryCase {
     fn controlled_backoff(self) -> bool {
-        matches!(self, Self::CancelBackoff | Self::CloseOwner | Self::DropBackoff | Self::RevokeBackoff)
+        matches!(
+            self,
+            Self::CancelBackoff | Self::CloseOwner | Self::DropBackoff | Self::RevokeBackoff
+        )
     }
 
     fn expected_requests(self) -> usize {
@@ -51,13 +68,20 @@ async fn get_foreign_snapshot(peer: &Peer) {
     assert_eq!(request["params"]["taskId"], "two");
     let mut result = task("foreign-task", "cancelled");
     result["resultType"] = json!("complete");
-    reply(&mut socket, json!({"jsonrpc":"2.0","id":request["id"],"result":result})).await;
+    reply(
+        &mut socket,
+        json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
+    )
+    .await;
 }
 
 fn is_interruption(error: &ClientCredentialsTaskWatchError) -> bool {
-    matches!(error,
+    matches!(
+        error,
         ClientCredentialsTaskWatchError::Interrupted
-        | ClientCredentialsTaskWatchError::Task(ClientCredentialsTasksError::Protocol(ManagedTasksError::MissingTerminal))
+            | ClientCredentialsTaskWatchError::Task(ClientCredentialsTasksError::Protocol(
+                ManagedTasksError::MissingTerminal
+            ))
     )
 }
 
@@ -252,31 +276,96 @@ fn run_recovery(case: RecoveryCase) {
 }
 
 #[test]
-fn tls_recovery_reconciles_only_unfinished_tasks() { isolated_recovery("tls_recovery_reconciles_only_unfinished_tasks", RecoveryCase::Resume); }
+fn tls_recovery_reconciles_only_unfinished_tasks() {
+    isolated_recovery(
+        "tls_recovery_reconciles_only_unfinished_tasks",
+        RecoveryCase::Resume,
+    );
+}
 #[test]
-fn tls_ordinary_watch_does_not_opt_into_recovery() { isolated_recovery("tls_ordinary_watch_does_not_opt_into_recovery", RecoveryCase::OrdinaryStops); }
+fn tls_ordinary_watch_does_not_opt_into_recovery() {
+    isolated_recovery(
+        "tls_ordinary_watch_does_not_opt_into_recovery",
+        RecoveryCase::OrdinaryStops,
+    );
+}
 #[test]
-fn tls_recovery_requires_complete_replacement_ack() { isolated_recovery("tls_recovery_requires_complete_replacement_ack", RecoveryCase::PartialAck); }
+fn tls_recovery_requires_complete_replacement_ack() {
+    isolated_recovery(
+        "tls_recovery_requires_complete_replacement_ack",
+        RecoveryCase::PartialAck,
+    );
+}
 #[test]
-fn tls_recovery_rejects_foreign_task_snapshots() { isolated_recovery("tls_recovery_rejects_foreign_task_snapshots", RecoveryCase::ForeignSnapshot); }
+fn tls_recovery_rejects_foreign_task_snapshots() {
+    isolated_recovery(
+        "tls_recovery_rejects_foreign_task_snapshots",
+        RecoveryCase::ForeignSnapshot,
+    );
+}
 #[test]
-fn tls_recovery_does_not_retry_authorization_refusal() { isolated_recovery("tls_recovery_does_not_retry_authorization_refusal", RecoveryCase::RemoteRefusal); }
+fn tls_recovery_does_not_retry_authorization_refusal() {
+    isolated_recovery(
+        "tls_recovery_does_not_retry_authorization_refusal",
+        RecoveryCase::RemoteRefusal,
+    );
+}
 #[test]
-fn tls_recovery_exhaustion_preserves_cause_and_closes() { isolated_recovery("tls_recovery_exhaustion_preserves_cause_and_closes", RecoveryCase::Exhausted); }
+fn tls_recovery_exhaustion_preserves_cause_and_closes() {
+    isolated_recovery(
+        "tls_recovery_exhaustion_preserves_cause_and_closes",
+        RecoveryCase::Exhausted,
+    );
+}
 #[test]
-fn tls_recovery_preserves_the_global_snapshot_budget() { isolated_recovery("tls_recovery_preserves_the_global_snapshot_budget", RecoveryCase::SnapshotLimit); }
+fn tls_recovery_preserves_the_global_snapshot_budget() {
+    isolated_recovery(
+        "tls_recovery_preserves_the_global_snapshot_budget",
+        RecoveryCase::SnapshotLimit,
+    );
+}
 #[test]
-fn tls_recovery_reserves_stream_records_without_refunding() { isolated_recovery("tls_recovery_reserves_stream_records_without_refunding", RecoveryCase::RecordLimit); }
+fn tls_recovery_reserves_stream_records_without_refunding() {
+    isolated_recovery(
+        "tls_recovery_reserves_stream_records_without_refunding",
+        RecoveryCase::RecordLimit,
+    );
+}
 #[test]
-fn tls_recovery_cancel_during_backoff_stops_contact() { isolated_recovery("tls_recovery_cancel_during_backoff_stops_contact", RecoveryCase::CancelBackoff); }
+fn tls_recovery_cancel_during_backoff_stops_contact() {
+    isolated_recovery(
+        "tls_recovery_cancel_during_backoff_stops_contact",
+        RecoveryCase::CancelBackoff,
+    );
+}
 #[test]
-fn tls_recovery_owner_close_during_backoff_stops_contact() { isolated_recovery("tls_recovery_owner_close_during_backoff_stops_contact", RecoveryCase::CloseOwner); }
+fn tls_recovery_owner_close_during_backoff_stops_contact() {
+    isolated_recovery(
+        "tls_recovery_owner_close_during_backoff_stops_contact",
+        RecoveryCase::CloseOwner,
+    );
+}
 #[test]
-fn tls_recovery_dropped_read_during_backoff_stays_closed() { isolated_recovery("tls_recovery_dropped_read_during_backoff_stays_closed", RecoveryCase::DropBackoff); }
+fn tls_recovery_dropped_read_during_backoff_stays_closed() {
+    isolated_recovery(
+        "tls_recovery_dropped_read_during_backoff_stays_closed",
+        RecoveryCase::DropBackoff,
+    );
+}
 #[test]
-fn tls_recovery_revocation_during_backoff_cannot_renew() { isolated_recovery("tls_recovery_revocation_during_backoff_cannot_renew", RecoveryCase::RevokeBackoff); }
+fn tls_recovery_revocation_during_backoff_cannot_renew() {
+    isolated_recovery(
+        "tls_recovery_revocation_during_backoff_cannot_renew",
+        RecoveryCase::RevokeBackoff,
+    );
+}
 #[test]
-fn tls_recovery_cannot_extend_deadline_to_fit_backoff() { isolated_recovery("tls_recovery_cannot_extend_deadline_to_fit_backoff", RecoveryCase::Deadline); }
+fn tls_recovery_cannot_extend_deadline_to_fit_backoff() {
+    isolated_recovery(
+        "tls_recovery_cannot_extend_deadline_to_fit_backoff",
+        RecoveryCase::Deadline,
+    );
+}
 
 // Public input-driver recovery shares this file's existing isolated TLS peer.
 // The original observation-only cases above retain their complete assertions.
@@ -289,37 +378,75 @@ mod input_driver {
 
     #[derive(Clone, Copy)]
     enum InputCase {
-        LostGet, EndedListen, InitialGet, NoRecovery, LostUpdate, MalformedGet,
-        ChangedAnswered, ChangedUnanswered, EmptyAck, Foreign, Refused, Exhausted,
-        SnapshotLimit, UpdateLimit, RemoteBackoff, RemoteAck, DropBackoff, DropAck,
-        LocalBackoff, RevokeBackoff, Deadline,
+        LostGet,
+        EndedListen,
+        InitialGet,
+        NoRecovery,
+        LostUpdate,
+        MalformedGet,
+        ChangedAnswered,
+        ChangedUnanswered,
+        EmptyAck,
+        Foreign,
+        Refused,
+        Exhausted,
+        SnapshotLimit,
+        UpdateLimit,
+        RemoteBackoff,
+        RemoteAck,
+        DropBackoff,
+        DropAck,
+        LocalBackoff,
+        RevokeBackoff,
+        Deadline,
     }
     impl InputCase {
         fn controlled_backoff(self) -> bool {
-            matches!(self, Self::RemoteBackoff | Self::DropBackoff | Self::LocalBackoff | Self::RevokeBackoff)
+            matches!(
+                self,
+                Self::RemoteBackoff | Self::DropBackoff | Self::LocalBackoff | Self::RevokeBackoff
+            )
         }
-        fn controlled_ack(self) -> bool { matches!(self, Self::RemoteAck | Self::DropAck) }
-        fn remote(self) -> bool { matches!(self, Self::RemoteBackoff | Self::RemoteAck) }
-        fn successful(self) -> bool { matches!(self, Self::LostGet | Self::EndedListen | Self::InitialGet) }
+        fn controlled_ack(self) -> bool {
+            matches!(self, Self::RemoteAck | Self::DropAck)
+        }
+        fn remote(self) -> bool {
+            matches!(self, Self::RemoteBackoff | Self::RemoteAck)
+        }
+        fn successful(self) -> bool {
+            matches!(self, Self::LostGet | Self::EndedListen | Self::InitialGet)
+        }
         fn numeric_requests(self) -> usize {
             match self {
                 Self::LostGet | Self::EndedListen | Self::InitialGet => 16,
                 Self::LostUpdate => 6,
                 Self::EmptyAck | Self::RemoteAck | Self::DropAck => 10,
                 Self::Refused => 9,
-                Self::ChangedAnswered | Self::ChangedUnanswered | Self::Foreign | Self::Exhausted | Self::UpdateLimit => 12,
+                Self::ChangedAnswered
+                | Self::ChangedUnanswered
+                | Self::Foreign
+                | Self::Exhausted
+                | Self::UpdateLimit => 12,
                 _ => 8,
             }
         }
         fn reconnects(self) -> usize {
-            usize::from(!matches!(self, Self::NoRecovery | Self::LostUpdate | Self::MalformedGet | Self::SnapshotLimit))
+            usize::from(!matches!(
+                self,
+                Self::NoRecovery | Self::LostUpdate | Self::MalformedGet | Self::SnapshotLimit
+            ))
         }
     }
 
     fn isolated_input(name: &str, case: InputCase) {
-        isolated_run(&format!("recovery::input_driver::{name}"), || run_input(case));
+        isolated_run(&format!("recovery::input_driver::{name}"), || {
+            run_input(case)
+        });
     }
-    fn no_resolver(_: TaskInputRequests) -> std::future::Ready<Result<ManagedTaskInputAction, ClientCredentialsTaskWatchDriveError>> {
+    fn no_resolver(
+        _: TaskInputRequests,
+    ) -> std::future::Ready<Result<ManagedTaskInputAction, ClientCredentialsTaskWatchDriveError>>
+    {
         panic!("closed or unpolled input driver must not resolve input")
     }
     fn no_observer(_: &Task) -> Result<(), ClientCredentialsTaskWatchDriveError> {
@@ -344,24 +471,39 @@ mod input_driver {
         peer.discover().await;
         let (mut socket, request) = peer.rpc("tasks/get").await;
         assert_eq!(request["params"]["taskId"], "one");
-        let mut result = task(if foreign { "foreign-task" } else { "one" }, "input_required");
+        let mut result = task(
+            if foreign { "foreign-task" } else { "one" },
+            "input_required",
+        );
         result["resultType"] = json!("complete");
         if let Some(key) = changed {
-            result["inputRequests"][key] = json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16}});
+            result["inputRequests"][key] =
+                json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16}});
         }
-        reply(&mut socket, json!({"jsonrpc":"2.0","id":request["id"],"result":result})).await;
+        reply(
+            &mut socket,
+            json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
+        )
+        .await;
     }
     async fn cancel(peer: &Peer) {
         peer.discover().await;
         let (mut socket, request) = peer.rpc("tasks/cancel").await;
         assert_eq!(request["id"], "input-recover:cancel:operation");
         assert_eq!(request["params"]["taskId"], "one");
-        reply(&mut socket, json!({"jsonrpc":"2.0","id":request["id"],"result":{"resultType":"complete"}})).await;
+        reply(
+            &mut socket,
+            json!({"jsonrpc":"2.0","id":request["id"],"result":{"resultType":"complete"}}),
+        )
+        .await;
     }
     async fn replacement_head(peer: &Peer) -> (TlsStream<TcpStream>, serde_json::Value) {
         peer.discover().await;
         let (mut socket, request) = peer.rpc("subscriptions/listen").await;
-        assert_eq!(request["params"]["notifications"], json!({"taskIds":["one"]}));
+        assert_eq!(
+            request["params"]["notifications"],
+            json!({"taskIds":["one"]})
+        );
         socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
         socket.flush().await.unwrap();
         (socket, request["id"].clone())
@@ -582,47 +724,152 @@ mod input_driver {
     }
 
     #[test]
-    fn tls_input_recovery_keeps_partial_answers_after_lost_get() { isolated_input("tls_input_recovery_keeps_partial_answers_after_lost_get", InputCase::LostGet); }
+    fn tls_input_recovery_keeps_partial_answers_after_lost_get() {
+        isolated_input(
+            "tls_input_recovery_keeps_partial_answers_after_lost_get",
+            InputCase::LostGet,
+        );
+    }
     #[test]
-    fn tls_input_recovery_keeps_partial_answers_after_ended_listen() { isolated_input("tls_input_recovery_keeps_partial_answers_after_ended_listen", InputCase::EndedListen); }
+    fn tls_input_recovery_keeps_partial_answers_after_ended_listen() {
+        isolated_input(
+            "tls_input_recovery_keeps_partial_answers_after_ended_listen",
+            InputCase::EndedListen,
+        );
+    }
     #[test]
-    fn tls_input_recovery_reconciles_an_interrupted_initial_get() { isolated_input("tls_input_recovery_reconciles_an_interrupted_initial_get", InputCase::InitialGet); }
+    fn tls_input_recovery_reconciles_an_interrupted_initial_get() {
+        isolated_input(
+            "tls_input_recovery_reconciles_an_interrupted_initial_get",
+            InputCase::InitialGet,
+        );
+    }
     #[test]
-    fn tls_input_recovery_is_never_implicitly_enabled() { isolated_input("tls_input_recovery_is_never_implicitly_enabled", InputCase::NoRecovery); }
+    fn tls_input_recovery_is_never_implicitly_enabled() {
+        isolated_input(
+            "tls_input_recovery_is_never_implicitly_enabled",
+            InputCase::NoRecovery,
+        );
+    }
     #[test]
-    fn tls_input_recovery_never_replays_a_lost_update_reply() { isolated_input("tls_input_recovery_never_replays_a_lost_update_reply", InputCase::LostUpdate); }
+    fn tls_input_recovery_never_replays_a_lost_update_reply() {
+        isolated_input(
+            "tls_input_recovery_never_replays_a_lost_update_reply",
+            InputCase::LostUpdate,
+        );
+    }
     #[test]
-    fn tls_input_recovery_rejects_complete_malformed_json() { isolated_input("tls_input_recovery_rejects_complete_malformed_json", InputCase::MalformedGet); }
+    fn tls_input_recovery_rejects_complete_malformed_json() {
+        isolated_input(
+            "tls_input_recovery_rejects_complete_malformed_json",
+            InputCase::MalformedGet,
+        );
+    }
     #[test]
-    fn tls_input_recovery_rejects_changed_answered_descriptors() { isolated_input("tls_input_recovery_rejects_changed_answered_descriptors", InputCase::ChangedAnswered); }
+    fn tls_input_recovery_rejects_changed_answered_descriptors() {
+        isolated_input(
+            "tls_input_recovery_rejects_changed_answered_descriptors",
+            InputCase::ChangedAnswered,
+        );
+    }
     #[test]
-    fn tls_input_recovery_rejects_changed_unanswered_descriptors() { isolated_input("tls_input_recovery_rejects_changed_unanswered_descriptors", InputCase::ChangedUnanswered); }
+    fn tls_input_recovery_rejects_changed_unanswered_descriptors() {
+        isolated_input(
+            "tls_input_recovery_rejects_changed_unanswered_descriptors",
+            InputCase::ChangedUnanswered,
+        );
+    }
     #[test]
-    fn tls_input_recovery_requires_complete_replacement_ack() { isolated_input("tls_input_recovery_requires_complete_replacement_ack", InputCase::EmptyAck); }
+    fn tls_input_recovery_requires_complete_replacement_ack() {
+        isolated_input(
+            "tls_input_recovery_requires_complete_replacement_ack",
+            InputCase::EmptyAck,
+        );
+    }
     #[test]
-    fn tls_input_recovery_rejects_foreign_snapshots() { isolated_input("tls_input_recovery_rejects_foreign_snapshots", InputCase::Foreign); }
+    fn tls_input_recovery_rejects_foreign_snapshots() {
+        isolated_input(
+            "tls_input_recovery_rejects_foreign_snapshots",
+            InputCase::Foreign,
+        );
+    }
     #[test]
-    fn tls_input_recovery_stops_at_current_authorization_refusal() { isolated_input("tls_input_recovery_stops_at_current_authorization_refusal", InputCase::Refused); }
+    fn tls_input_recovery_stops_at_current_authorization_refusal() {
+        isolated_input(
+            "tls_input_recovery_stops_at_current_authorization_refusal",
+            InputCase::Refused,
+        );
+    }
     #[test]
-    fn tls_input_recovery_cannot_refund_reconnections() { isolated_input("tls_input_recovery_cannot_refund_reconnections", InputCase::Exhausted); }
+    fn tls_input_recovery_cannot_refund_reconnections() {
+        isolated_input(
+            "tls_input_recovery_cannot_refund_reconnections",
+            InputCase::Exhausted,
+        );
+    }
     #[test]
-    fn tls_input_recovery_cannot_refund_snapshot_reservations() { isolated_input("tls_input_recovery_cannot_refund_snapshot_reservations", InputCase::SnapshotLimit); }
+    fn tls_input_recovery_cannot_refund_snapshot_reservations() {
+        isolated_input(
+            "tls_input_recovery_cannot_refund_snapshot_reservations",
+            InputCase::SnapshotLimit,
+        );
+    }
     #[test]
-    fn tls_input_recovery_cannot_refund_acknowledged_updates() { isolated_input("tls_input_recovery_cannot_refund_acknowledged_updates", InputCase::UpdateLimit); }
+    fn tls_input_recovery_cannot_refund_acknowledged_updates() {
+        isolated_input(
+            "tls_input_recovery_cannot_refund_acknowledged_updates",
+            InputCase::UpdateLimit,
+        );
+    }
     #[test]
-    fn tls_input_remote_cancel_interrupts_recovery_backoff() { isolated_input("tls_input_remote_cancel_interrupts_recovery_backoff", InputCase::RemoteBackoff); }
+    fn tls_input_remote_cancel_interrupts_recovery_backoff() {
+        isolated_input(
+            "tls_input_remote_cancel_interrupts_recovery_backoff",
+            InputCase::RemoteBackoff,
+        );
+    }
     #[test]
-    fn tls_input_remote_cancel_interrupts_replacement_ack() { isolated_input("tls_input_remote_cancel_interrupts_replacement_ack", InputCase::RemoteAck); }
+    fn tls_input_remote_cancel_interrupts_replacement_ack() {
+        isolated_input(
+            "tls_input_remote_cancel_interrupts_replacement_ack",
+            InputCase::RemoteAck,
+        );
+    }
     #[test]
-    fn tls_input_abandonment_closes_recovery_backoff() { isolated_input("tls_input_abandonment_closes_recovery_backoff", InputCase::DropBackoff); }
+    fn tls_input_abandonment_closes_recovery_backoff() {
+        isolated_input(
+            "tls_input_abandonment_closes_recovery_backoff",
+            InputCase::DropBackoff,
+        );
+    }
     #[test]
-    fn tls_input_abandonment_closes_replacement_ack() { isolated_input("tls_input_abandonment_closes_replacement_ack", InputCase::DropAck); }
+    fn tls_input_abandonment_closes_replacement_ack() {
+        isolated_input(
+            "tls_input_abandonment_closes_replacement_ack",
+            InputCase::DropAck,
+        );
+    }
     #[test]
-    fn tls_input_local_cancel_interrupts_recovery_without_remote_cancel() { isolated_input("tls_input_local_cancel_interrupts_recovery_without_remote_cancel", InputCase::LocalBackoff); }
+    fn tls_input_local_cancel_interrupts_recovery_without_remote_cancel() {
+        isolated_input(
+            "tls_input_local_cancel_interrupts_recovery_without_remote_cancel",
+            InputCase::LocalBackoff,
+        );
+    }
     #[test]
-    fn tls_input_revocation_during_recovery_cannot_renew_authority() { isolated_input("tls_input_revocation_during_recovery_cannot_renew_authority", InputCase::RevokeBackoff); }
+    fn tls_input_revocation_during_recovery_cannot_renew_authority() {
+        isolated_input(
+            "tls_input_revocation_during_recovery_cannot_renew_authority",
+            InputCase::RevokeBackoff,
+        );
+    }
     #[test]
-    fn tls_input_recovery_cannot_extend_the_original_deadline() { isolated_input("tls_input_recovery_cannot_extend_the_original_deadline", InputCase::Deadline); }
+    fn tls_input_recovery_cannot_extend_the_original_deadline() {
+        isolated_input(
+            "tls_input_recovery_cannot_extend_the_original_deadline",
+            InputCase::Deadline,
+        );
+    }
 }
 
 // Exercise the shipped input driver, not a second recovery implementation.
@@ -643,29 +890,56 @@ mod input {
 
     #[derive(Clone, Copy)]
     enum InputCase {
-        Reconcile, ObservationGap, ChangedAnswered, ChangedUnanswered,
-        LostUpdate, RejectedUpdate, UpdateLimit, SnapshotLimit, Exhausted,
-        PartialAck, Refused, CancelBackoff, DropBackoff, RevokeBackoff,
-        RemoteCancel, RefusedCancel, Deadline,
+        Reconcile,
+        ObservationGap,
+        ChangedAnswered,
+        ChangedUnanswered,
+        LostUpdate,
+        RejectedUpdate,
+        UpdateLimit,
+        SnapshotLimit,
+        Exhausted,
+        PartialAck,
+        Refused,
+        CancelBackoff,
+        DropBackoff,
+        RevokeBackoff,
+        RemoteCancel,
+        RefusedCancel,
+        Deadline,
     }
     impl InputCase {
         fn controlled(self) -> bool {
-            matches!(self, Self::CancelBackoff | Self::DropBackoff | Self::RevokeBackoff
-                | Self::RemoteCancel | Self::RefusedCancel)
+            matches!(
+                self,
+                Self::CancelBackoff
+                    | Self::DropBackoff
+                    | Self::RevokeBackoff
+                    | Self::RemoteCancel
+                    | Self::RefusedCancel
+            )
         }
-        fn cancel_attempt(self) -> bool { matches!(self, Self::RemoteCancel | Self::RefusedCancel) }
+        fn cancel_attempt(self) -> bool {
+            matches!(self, Self::RemoteCancel | Self::RefusedCancel)
+        }
         fn numeric_requests(self) -> usize {
             match self {
                 Self::Reconcile | Self::RefusedCancel => 16,
-                Self::ObservationGap | Self::ChangedAnswered | Self::ChangedUnanswered
-                    | Self::UpdateLimit | Self::Exhausted => 12,
+                Self::ObservationGap
+                | Self::ChangedAnswered
+                | Self::ChangedUnanswered
+                | Self::UpdateLimit
+                | Self::Exhausted => 12,
                 Self::PartialAck | Self::Refused => 10,
                 Self::LostUpdate | Self::RejectedUpdate => 6,
                 _ => 8,
             }
         }
         fn successful(self) -> bool {
-            matches!(self, Self::Reconcile | Self::ObservationGap | Self::RefusedCancel)
+            matches!(
+                self,
+                Self::Reconcile | Self::ObservationGap | Self::RefusedCancel
+            )
         }
         fn acknowledged_updates(self) -> usize {
             match self {
@@ -700,25 +974,37 @@ mod input {
         let (mut socket, request) = get_head(peer).await;
         let mut snapshot = task("one", "input_required");
         snapshot["resultType"] = json!("complete");
-        let key = if matches!(case, InputCase::ChangedAnswered) { Some("one") }
-            else if matches!(case, InputCase::ChangedUnanswered) { Some("two") }
-            else { None };
+        let key = if matches!(case, InputCase::ChangedAnswered) {
+            Some("one")
+        } else if matches!(case, InputCase::ChangedUnanswered) {
+            Some("two")
+        } else {
+            None
+        };
         if let Some(key) = key {
             snapshot["inputRequests"][key] = json!({"method":"sampling/createMessage",
                 "params":{"messages":[],"maxTokens":16}});
         }
-        reply(&mut socket, json!({"jsonrpc":"2.0","id":request["id"],"result":snapshot})).await;
+        reply(
+            &mut socket,
+            json!({"jsonrpc":"2.0","id":request["id"],"result":snapshot}),
+        )
+        .await;
     }
 
     async fn first_update(peer: &Peer, case: InputCase) {
         if !matches!(case, InputCase::LostUpdate) {
-            peer.update("one", matches!(case, InputCase::RejectedUpdate)).await;
+            peer.update("one", matches!(case, InputCase::RejectedUpdate))
+                .await;
             return;
         }
         peer.discover().await;
         let (socket, request) = peer.rpc("tasks/update").await;
         assert_eq!(request["params"]["taskId"], "one");
-        assert_eq!(request["params"]["inputResponses"], json!({"one":{"roots":[]}}));
+        assert_eq!(
+            request["params"]["inputResponses"],
+            json!({"one":{"roots":[]}})
+        );
         peer.updates.fetch_add(1, Ordering::SeqCst);
         missing_terminal(socket).await;
     }
@@ -729,17 +1015,28 @@ mod input {
         }
         peer.discover().await;
         let (mut socket, request) = peer.rpc("subscriptions/listen").await;
-        assert_eq!(request["params"]["notifications"], json!({"taskIds":["one"]}));
+        assert_eq!(
+            request["params"]["notifications"],
+            json!({"taskIds":["one"]})
+        );
         if matches!(case, InputCase::Refused) {
-            socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
             socket.shutdown().await.unwrap();
         } else {
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
                 .await.unwrap();
-            event(&mut socket, json!({"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged",
+            event(
+                &mut socket,
+                json!({"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged",
                 "params":{"_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):request["id"]},
-                    "notifications":{"taskIds":[]}}})).await;
+                    "notifications":{"taskIds":[]}}}),
+            )
+            .await;
         }
         closed(&mut socket).await;
         None
@@ -751,15 +1048,25 @@ mod input {
         assert_eq!(request["id"], format!("{PREFIX}:cancel:operation"));
         assert_eq!(request["params"]["taskId"], "one");
         if refused {
-            socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
             socket.shutdown().await.unwrap();
         } else {
-            reply(&mut socket, json!({"jsonrpc":"2.0","id":request["id"],"result":{"resultType":"complete"}})).await;
+            reply(
+                &mut socket,
+                json!({"jsonrpc":"2.0","id":request["id"],"result":{"resultType":"complete"}}),
+            )
+            .await;
         }
     }
 
-    fn no_resolver(_: TaskInputRequests) -> std::future::Ready<Result<ManagedTaskInputAction, DriveError>> {
+    fn no_resolver(
+        _: TaskInputRequests,
+    ) -> std::future::Ready<Result<ManagedTaskInputAction, DriveError>> {
         panic!("a completed or interrupted driver must not resolve another input");
     }
     fn no_observer(_: &Task) -> Result<(), DriveError> {
@@ -965,71 +1272,122 @@ mod input {
 
     #[test]
     fn tls_input_recovery_reconciles_after_ack_without_replaying_partial_answers() {
-        isolated_input("tls_input_recovery_reconciles_after_ack_without_replaying_partial_answers", InputCase::Reconcile);
+        isolated_input(
+            "tls_input_recovery_reconciles_after_ack_without_replaying_partial_answers",
+            InputCase::Reconcile,
+        );
     }
     #[test]
     fn tls_input_recovery_can_resolve_new_inputs_after_an_observation_gap() {
-        isolated_input("tls_input_recovery_can_resolve_new_inputs_after_an_observation_gap", InputCase::ObservationGap);
+        isolated_input(
+            "tls_input_recovery_can_resolve_new_inputs_after_an_observation_gap",
+            InputCase::ObservationGap,
+        );
     }
     #[test]
     fn tls_input_recovery_rejects_changed_acknowledged_descriptors() {
-        isolated_input("tls_input_recovery_rejects_changed_acknowledged_descriptors", InputCase::ChangedAnswered);
+        isolated_input(
+            "tls_input_recovery_rejects_changed_acknowledged_descriptors",
+            InputCase::ChangedAnswered,
+        );
     }
     #[test]
     fn tls_input_recovery_rejects_changed_unanswered_descriptors() {
-        isolated_input("tls_input_recovery_rejects_changed_unanswered_descriptors", InputCase::ChangedUnanswered);
+        isolated_input(
+            "tls_input_recovery_rejects_changed_unanswered_descriptors",
+            InputCase::ChangedUnanswered,
+        );
     }
     #[test]
     fn tls_input_recovery_never_replays_an_update_with_a_lost_reply() {
-        isolated_input("tls_input_recovery_never_replays_an_update_with_a_lost_reply", InputCase::LostUpdate);
+        isolated_input(
+            "tls_input_recovery_never_replays_an_update_with_a_lost_reply",
+            InputCase::LostUpdate,
+        );
     }
     #[test]
     fn tls_input_recovery_never_replays_a_rejected_update() {
-        isolated_input("tls_input_recovery_never_replays_a_rejected_update", InputCase::RejectedUpdate);
+        isolated_input(
+            "tls_input_recovery_never_replays_a_rejected_update",
+            InputCase::RejectedUpdate,
+        );
     }
     #[test]
     fn tls_input_recovery_does_not_reset_the_update_budget() {
-        isolated_input("tls_input_recovery_does_not_reset_the_update_budget", InputCase::UpdateLimit);
+        isolated_input(
+            "tls_input_recovery_does_not_reset_the_update_budget",
+            InputCase::UpdateLimit,
+        );
     }
     #[test]
     fn tls_input_recovery_does_not_refund_failed_reconciliation_capacity() {
-        isolated_input("tls_input_recovery_does_not_refund_failed_reconciliation_capacity", InputCase::SnapshotLimit);
+        isolated_input(
+            "tls_input_recovery_does_not_refund_failed_reconciliation_capacity",
+            InputCase::SnapshotLimit,
+        );
     }
     #[test]
     fn tls_input_recovery_exhaustion_retains_acknowledged_updates() {
-        isolated_input("tls_input_recovery_exhaustion_retains_acknowledged_updates", InputCase::Exhausted);
+        isolated_input(
+            "tls_input_recovery_exhaustion_retains_acknowledged_updates",
+            InputCase::Exhausted,
+        );
     }
     #[test]
     fn tls_input_recovery_requires_complete_replacement_ack_before_get_or_input() {
-        isolated_input("tls_input_recovery_requires_complete_replacement_ack_before_get_or_input", InputCase::PartialAck);
+        isolated_input(
+            "tls_input_recovery_requires_complete_replacement_ack_before_get_or_input",
+            InputCase::PartialAck,
+        );
     }
     #[test]
     fn tls_input_recovery_refuses_authorization_failure_without_more_callbacks() {
-        isolated_input("tls_input_recovery_refuses_authorization_failure_without_more_callbacks", InputCase::Refused);
+        isolated_input(
+            "tls_input_recovery_refuses_authorization_failure_without_more_callbacks",
+            InputCase::Refused,
+        );
     }
     #[test]
     fn tls_input_recovery_local_cancel_interrupts_backoff_without_remote_cancel() {
-        isolated_input("tls_input_recovery_local_cancel_interrupts_backoff_without_remote_cancel", InputCase::CancelBackoff);
+        isolated_input(
+            "tls_input_recovery_local_cancel_interrupts_backoff_without_remote_cancel",
+            InputCase::CancelBackoff,
+        );
     }
     #[test]
     fn tls_input_recovery_abandonment_closes_custody_and_retains_update_receipt() {
-        isolated_input("tls_input_recovery_abandonment_closes_custody_and_retains_update_receipt", InputCase::DropBackoff);
+        isolated_input(
+            "tls_input_recovery_abandonment_closes_custody_and_retains_update_receipt",
+            InputCase::DropBackoff,
+        );
     }
     #[test]
     fn tls_input_recovery_revocation_during_backoff_cannot_renew_authority() {
-        isolated_input("tls_input_recovery_revocation_during_backoff_cannot_renew_authority", InputCase::RevokeBackoff);
+        isolated_input(
+            "tls_input_recovery_revocation_during_backoff_cannot_renew_authority",
+            InputCase::RevokeBackoff,
+        );
     }
     #[test]
     fn tls_input_recovery_remote_cancel_ack_interrupts_backoff() {
-        isolated_input("tls_input_recovery_remote_cancel_ack_interrupts_backoff", InputCase::RemoteCancel);
+        isolated_input(
+            "tls_input_recovery_remote_cancel_ack_interrupts_backoff",
+            InputCase::RemoteCancel,
+        );
     }
     #[test]
     fn tls_input_recovery_failed_cancel_does_not_prevent_successful_reconciliation() {
-        isolated_input("tls_input_recovery_failed_cancel_does_not_prevent_successful_reconciliation", InputCase::RefusedCancel);
+        isolated_input(
+            "tls_input_recovery_failed_cancel_does_not_prevent_successful_reconciliation",
+            InputCase::RefusedCancel,
+        );
     }
     #[test]
     fn tls_input_recovery_cannot_extend_the_original_deadline() {
-        isolated_input("tls_input_recovery_cannot_extend_the_original_deadline", InputCase::Deadline);
+        isolated_input(
+            "tls_input_recovery_cannot_extend_the_original_deadline",
+            InputCase::Deadline,
+        );
     }
 }
 
@@ -1046,16 +1404,39 @@ mod observation_control {
     const PREFIX: &str = "cancel-recovery";
     #[derive(Clone, Copy)]
     enum Case {
-        Resume, PlainStops, AckBackoff, RefusedBackoff, DropBackoff, LocalCancel,
-        RevokeBackoff, PartialAck, AckReplacement, DropReplacement, Deadline, ExpiredPin,
+        Resume,
+        PlainStops,
+        AckBackoff,
+        RefusedBackoff,
+        DropBackoff,
+        LocalCancel,
+        RevokeBackoff,
+        PartialAck,
+        AckReplacement,
+        DropReplacement,
+        Deadline,
+        ExpiredPin,
     }
     impl Case {
         fn controlled_backoff(self) -> bool {
-            matches!(self, Self::AckBackoff | Self::RefusedBackoff | Self::DropBackoff
-                | Self::LocalCancel | Self::RevokeBackoff)
+            matches!(
+                self,
+                Self::AckBackoff
+                    | Self::RefusedBackoff
+                    | Self::DropBackoff
+                    | Self::LocalCancel
+                    | Self::RevokeBackoff
+            )
         }
-        fn replacement_wait(self) -> bool { matches!(self, Self::AckReplacement | Self::DropReplacement) }
-        fn cancel_attempt(self) -> bool { matches!(self, Self::AckBackoff | Self::RefusedBackoff | Self::AckReplacement) }
+        fn replacement_wait(self) -> bool {
+            matches!(self, Self::AckReplacement | Self::DropReplacement)
+        }
+        fn cancel_attempt(self) -> bool {
+            matches!(
+                self,
+                Self::AckBackoff | Self::RefusedBackoff | Self::AckReplacement
+            )
+        }
         fn numeric_requests(self) -> usize {
             match self {
                 Self::Resume | Self::RefusedBackoff => 8,
@@ -1066,7 +1447,9 @@ mod observation_control {
         }
     }
     fn isolated_control(name: &str, case: Case) {
-        isolated_run(&format!("recovery::observation_control::{name}"), || run_control(case));
+        isolated_run(&format!("recovery::observation_control::{name}"), || {
+            run_control(case)
+        });
     }
 
     async fn cancel_reply(peer: &Peer, refused: bool) {
@@ -1075,11 +1458,19 @@ mod observation_control {
         assert_eq!(request["id"], format!("{PREFIX}:cancel:operation"));
         assert_eq!(request["params"]["taskId"], "one");
         if refused {
-            socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
             socket.shutdown().await.unwrap();
         } else {
-            reply(&mut socket, json!({"jsonrpc":"2.0","id":request["id"],"result":{"resultType":"complete"}})).await;
+            reply(
+                &mut socket,
+                json!({"jsonrpc":"2.0","id":request["id"],"result":{"resultType":"complete"}}),
+            )
+            .await;
         }
     }
 
@@ -1265,50 +1656,86 @@ mod observation_control {
 
     #[test]
     fn tls_cancellable_recovery_observes_inputs_without_answering_or_renewing() {
-        isolated_control("tls_cancellable_recovery_observes_inputs_without_answering_or_renewing", Case::Resume);
+        isolated_control(
+            "tls_cancellable_recovery_observes_inputs_without_answering_or_renewing",
+            Case::Resume,
+        );
     }
     #[test]
     fn tls_plain_cancellable_watch_does_not_implicitly_reconnect() {
-        isolated_control("tls_plain_cancellable_watch_does_not_implicitly_reconnect", Case::PlainStops);
+        isolated_control(
+            "tls_plain_cancellable_watch_does_not_implicitly_reconnect",
+            Case::PlainStops,
+        );
     }
     #[test]
     fn tls_cancellable_recovery_ack_interrupts_backoff_without_terminal_fabrication() {
-        isolated_control("tls_cancellable_recovery_ack_interrupts_backoff_without_terminal_fabrication", Case::AckBackoff);
+        isolated_control(
+            "tls_cancellable_recovery_ack_interrupts_backoff_without_terminal_fabrication",
+            Case::AckBackoff,
+        );
     }
     #[test]
     fn tls_cancellable_recovery_refused_cancel_preserves_observation() {
-        isolated_control("tls_cancellable_recovery_refused_cancel_preserves_observation", Case::RefusedBackoff);
+        isolated_control(
+            "tls_cancellable_recovery_refused_cancel_preserves_observation",
+            Case::RefusedBackoff,
+        );
     }
     #[test]
     fn tls_cancellable_recovery_abandoned_backoff_retires_cancel_admission() {
-        isolated_control("tls_cancellable_recovery_abandoned_backoff_retires_cancel_admission", Case::DropBackoff);
+        isolated_control(
+            "tls_cancellable_recovery_abandoned_backoff_retires_cancel_admission",
+            Case::DropBackoff,
+        );
     }
     #[test]
     fn tls_cancellable_recovery_local_stop_does_not_cancel_the_remote_task() {
-        isolated_control("tls_cancellable_recovery_local_stop_does_not_cancel_the_remote_task", Case::LocalCancel);
+        isolated_control(
+            "tls_cancellable_recovery_local_stop_does_not_cancel_the_remote_task",
+            Case::LocalCancel,
+        );
     }
     #[test]
     fn tls_cancellable_recovery_revocation_never_acquires_replacement_authority() {
-        isolated_control("tls_cancellable_recovery_revocation_never_acquires_replacement_authority", Case::RevokeBackoff);
+        isolated_control(
+            "tls_cancellable_recovery_revocation_never_acquires_replacement_authority",
+            Case::RevokeBackoff,
+        );
     }
     #[test]
     fn tls_cancellable_recovery_requires_complete_selection_before_get() {
-        isolated_control("tls_cancellable_recovery_requires_complete_selection_before_get", Case::PartialAck);
+        isolated_control(
+            "tls_cancellable_recovery_requires_complete_selection_before_get",
+            Case::PartialAck,
+        );
     }
     #[test]
     fn tls_cancellable_recovery_ack_closes_a_replacement_waiting_for_admission() {
-        isolated_control("tls_cancellable_recovery_ack_closes_a_replacement_waiting_for_admission", Case::AckReplacement);
+        isolated_control(
+            "tls_cancellable_recovery_ack_closes_a_replacement_waiting_for_admission",
+            Case::AckReplacement,
+        );
     }
     #[test]
     fn tls_cancellable_recovery_abandoned_replacement_releases_its_socket() {
-        isolated_control("tls_cancellable_recovery_abandoned_replacement_releases_its_socket", Case::DropReplacement);
+        isolated_control(
+            "tls_cancellable_recovery_abandoned_replacement_releases_its_socket",
+            Case::DropReplacement,
+        );
     }
     #[test]
     fn tls_cancellable_recovery_does_not_extend_deadline_to_fit_backoff() {
-        isolated_control("tls_cancellable_recovery_does_not_extend_deadline_to_fit_backoff", Case::Deadline);
+        isolated_control(
+            "tls_cancellable_recovery_does_not_extend_deadline_to_fit_backoff",
+            Case::Deadline,
+        );
     }
     #[test]
     fn tls_cancellable_recovery_original_expiry_blocks_both_reads_and_cancel_without_renewal() {
-        isolated_control("tls_cancellable_recovery_original_expiry_blocks_both_reads_and_cancel_without_renewal", Case::ExpiredPin);
+        isolated_control(
+            "tls_cancellable_recovery_original_expiry_blocks_both_reads_and_cancel_without_renewal",
+            Case::ExpiredPin,
+        );
     }
 }

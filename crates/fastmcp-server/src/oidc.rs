@@ -1907,8 +1907,12 @@ impl OidcProvider {
     pub fn discovery_document(&self, base_url: impl Into<String>) -> DiscoveryDocument {
         let base_url = base_url.into();
         let mut doc = DiscoveryDocument::new(&self.config.issuer, base_url.as_str());
-        doc.grant_types_supported = self.oauth.supported_grant_types()
-            .into_iter().map(str::to_string).collect();
+        doc.grant_types_supported = self
+            .oauth
+            .supported_grant_types()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         doc.scopes_supported = self.config.supported_scopes.clone();
         if self.oauth.config().allow_public_clients {
             let base = base_url.trim_end_matches('/');
@@ -2535,33 +2539,59 @@ mod non_signing_tests {
             Some(vec!["S256".to_string()])
         );
         assert!(doc.authorization_response_iss_parameter_supported);
-        assert!(doc.token_endpoint_auth_methods_supported.iter().any(|method| method == "none"));
-        assert!(doc.revocation_endpoint_auth_methods_supported.iter().any(|method| method == "none"));
+        assert!(
+            doc.token_endpoint_auth_methods_supported
+                .iter()
+                .any(|method| method == "none")
+        );
+        assert!(
+            doc.revocation_endpoint_auth_methods_supported
+                .iter()
+                .any(|method| method == "none")
+        );
         let wire = serde_json::to_value(&doc).unwrap();
         assert_eq!(wire["authorization_response_iss_parameter_supported"], true);
-        assert_eq!(wire["revocation_endpoint_auth_methods_supported"][0], "none");
+        assert_eq!(
+            wire["revocation_endpoint_auth_methods_supported"][0],
+            "none"
+        );
     }
 
     #[test]
     fn discovery_auth_methods_follow_public_client_policy() {
         for (allow_public_clients, expects_none) in [(true, true), (false, false)] {
-            let oauth = Arc::new(OAuthServer::try_new(OAuthServerConfig {
-                issuer: "https://issuer.example".to_string(),
-                allow_public_clients,
-                ..OAuthServerConfig::default()
-            }).unwrap());
+            let oauth = Arc::new(
+                OAuthServer::try_new(OAuthServerConfig {
+                    issuer: "https://issuer.example".to_string(),
+                    allow_public_clients,
+                    ..OAuthServerConfig::default()
+                })
+                .unwrap(),
+            );
             let provider = OidcProvider::with_defaults(oauth).unwrap();
             let doc = provider.discovery_document("https://issuer.example");
             assert_eq!(
-                doc.token_endpoint_auth_methods_supported.iter().any(|method| method == "none"),
+                doc.token_endpoint_auth_methods_supported
+                    .iter()
+                    .any(|method| method == "none"),
                 expects_none,
             );
             assert_eq!(
-                doc.revocation_endpoint_auth_methods_supported.iter().any(|method| method == "none"),
+                doc.revocation_endpoint_auth_methods_supported
+                    .iter()
+                    .any(|method| method == "none"),
                 expects_none,
             );
-            assert!(doc.token_endpoint_auth_methods_supported.iter().any(|method| method == "client_secret_basic"));
-            assert!(doc.revocation_endpoint_auth_methods_supported.iter().any(|method| method == "client_secret_basic"));
+            assert!(
+                doc.token_endpoint_auth_methods_supported
+                    .iter()
+                    .any(|method| method == "client_secret_basic")
+            );
+            assert!(
+                doc.revocation_endpoint_auth_methods_supported
+                    .iter()
+                    .any(|method| method == "client_secret_basic")
+            );
             assert!(doc.authorization_response_iss_parameter_supported);
             assert_eq!(doc.registration_endpoint.is_some(), expects_none);
             if let Some(endpoint) = &doc.registration_endpoint {
@@ -2574,17 +2604,36 @@ mod non_signing_tests {
     #[test]
     fn discovery_client_credentials_tracks_explicit_development_issuer_opt_in() {
         for enabled in [false, true] {
-            let oauth = Arc::new(OAuthServer::try_new(OAuthServerConfig {
-                issuer: "https://issuer.example".to_string(),
-                allow_development_client_credentials: enabled,
-                ..OAuthServerConfig::default()
-            }).unwrap());
-            let routes = crate::oauth::OAuthHttpRoutes::new(Arc::clone(&oauth), "https://issuer.example/oauth").unwrap();
-            let discovery = OidcProvider::with_defaults(oauth).unwrap()
+            let oauth = Arc::new(
+                OAuthServer::try_new(OAuthServerConfig {
+                    issuer: "https://issuer.example".to_string(),
+                    allow_development_client_credentials: enabled,
+                    ..OAuthServerConfig::default()
+                })
+                .unwrap(),
+            );
+            let routes = crate::oauth::OAuthHttpRoutes::new(
+                Arc::clone(&oauth),
+                "https://issuer.example/oauth",
+            )
+            .unwrap();
+            let discovery = OidcProvider::with_defaults(oauth)
+                .unwrap()
                 .discovery_document(routes.public_endpoint_base());
-            assert_eq!(discovery.grant_types_supported,
-                routes.authorization_server_metadata().unwrap().grant_types_supported);
-            assert_eq!(discovery.grant_types_supported.iter().any(|grant| grant == "client_credentials"), enabled);
+            assert_eq!(
+                discovery.grant_types_supported,
+                routes
+                    .authorization_server_metadata()
+                    .unwrap()
+                    .grant_types_supported
+            );
+            assert_eq!(
+                discovery
+                    .grant_types_supported
+                    .iter()
+                    .any(|grant| grant == "client_credentials"),
+                enabled
+            );
             assert!(discovery.id_token_signing_alg_values_supported.is_empty());
             assert!(discovery.jwks_uri.is_none());
         }

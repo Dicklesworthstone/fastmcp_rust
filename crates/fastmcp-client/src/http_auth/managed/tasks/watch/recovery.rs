@@ -16,10 +16,10 @@ use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::tasks_extension::{Task, TaskId};
 
 use super::{
-    ManagedSubscriptionEvent, ManagedSubscriptionLimits, ManagedTaskSnapshot,
-    ManagedTaskSnapshotCause, ManagedTaskWatch, ManagedTaskWatchError,
-    ManagedTaskWatchPolicy, ManagedTasksClient, ManagedTasksError,
-    OAuthCredentialSnapshot, OAuthSessionError, WatchState, MAX_SELECTION_BYTES, listen_request,
+    MAX_SELECTION_BYTES, ManagedSubscriptionEvent, ManagedSubscriptionLimits, ManagedTaskSnapshot,
+    ManagedTaskSnapshotCause, ManagedTaskWatch, ManagedTaskWatchError, ManagedTaskWatchPolicy,
+    ManagedTasksClient, ManagedTasksError, OAuthCredentialSnapshot, OAuthSessionError, WatchState,
+    listen_request,
 };
 use crate::http_auth::managed::subscriptions::ManagedSubscriptionError;
 use crate::http_auth::rpc::interaction::recovery::recovery_http_interruption;
@@ -62,7 +62,11 @@ impl ManagedTaskRecoveryPolicy {
         {
             return Err(ManagedTaskRecoveryError::InvalidPolicy);
         }
-        Ok(Self { maximum_reconnections, minimum_delay, maximum_delay })
+        Ok(Self {
+            maximum_reconnections,
+            minimum_delay,
+            maximum_delay,
+        })
     }
 
     // Partition, rather than multiply, the original stream-record budget.
@@ -81,7 +85,9 @@ impl ManagedTaskRecoveryPolicy {
 
     fn delay(self, reconnection: usize) -> Duration {
         let shift = reconnection.saturating_sub(1).min(MAX_RECONNECTIONS) as u32;
-        self.minimum_delay.saturating_mul(1u32 << shift).min(self.maximum_delay)
+        self.minimum_delay
+            .saturating_mul(1u32 << shift)
+            .min(self.maximum_delay)
     }
 }
 
@@ -100,9 +106,13 @@ pub enum ManagedTaskRecoveryError {
 impl fmt::Display for ManagedTaskRecoveryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidPolicy => f.write_str("invalid managed Task recovery policy or record reservation"),
+            Self::InvalidPolicy => {
+                f.write_str("invalid managed Task recovery policy or record reservation")
+            }
             Self::RecoveryLimit => f.write_str("managed Task reconnection budget exhausted"),
-            Self::CredentialChanged => f.write_str("Task recovery credential differs from the pinned input authority"),
+            Self::CredentialChanged => {
+                f.write_str("Task recovery credential differs from the pinned input authority")
+            }
             Self::Watch(error) => error.fmt(f),
         }
     }
@@ -110,10 +120,14 @@ impl fmt::Display for ManagedTaskRecoveryError {
 
 impl std::error::Error for ManagedTaskRecoveryError {}
 impl From<ManagedTaskWatchError> for ManagedTaskRecoveryError {
-    fn from(error: ManagedTaskWatchError) -> Self { Self::Watch(error) }
+    fn from(error: ManagedTaskWatchError) -> Self {
+        Self::Watch(error)
+    }
 }
 impl From<OAuthSessionError> for ManagedTaskRecoveryError {
-    fn from(error: OAuthSessionError) -> Self { Self::Watch(error.into()) }
+    fn from(error: OAuthSessionError) -> Self {
+        Self::Watch(error.into())
+    }
 }
 
 impl ManagedTasksClient {
@@ -138,9 +152,14 @@ impl ManagedTasksClient {
         recovery_policy: ManagedTaskRecoveryPolicy,
     ) -> Result<RecoveringManagedTaskWatch, ManagedTaskRecoveryError> {
         self.watch_tasks_recovering_with_cancellation(
-            cx, &McpRequestCancellation::new(), task_ids, id_prefix,
-            watch_policy, recovery_policy,
-        ).await
+            cx,
+            &McpRequestCancellation::new(),
+            task_ids,
+            id_prefix,
+            watch_policy,
+            recovery_policy,
+        )
+        .await
     }
 
     /// The same request-local cancellation domain owns initial admission,
@@ -157,11 +176,15 @@ impl ManagedTasksClient {
         recovery_policy: ManagedTaskRecoveryPolicy,
     ) -> Result<RecoveringManagedTaskWatch, ManagedTaskRecoveryError> {
         let connection_policy = recovery_policy.connection_policy(watch_policy)?;
-        let watch = self.watch_tasks_with_cancellation(
-            cx, cancellation, task_ids, id_prefix, connection_policy,
-        ).await?;
+        let watch = self
+            .watch_tasks_with_cancellation(cx, cancellation, task_ids, id_prefix, connection_policy)
+            .await?;
         let recovery = RecoveryState::new(&watch, connection_policy, recovery_policy);
-        Ok(RecoveringManagedTaskWatch { watch: Some(watch), recovery, finished: false })
+        Ok(RecoveringManagedTaskWatch {
+            watch: Some(watch),
+            recovery,
+            finished: false,
+        })
     }
 }
 
@@ -184,28 +207,43 @@ pub struct RecoveringManagedTaskWatch {
 
 impl RecoveringManagedTaskWatch {
     /// Attempts started after the initial connection, not just successful ones.
-    pub fn reconnection_attempts(&self) -> usize { self.recovery.reconnections }
+    pub fn reconnection_attempts(&self) -> usize {
+        self.recovery.reconnections
+    }
 
-    pub fn close(&mut self) { self.watch = None; }
+    pub fn close(&mut self) {
+        self.watch = None;
+    }
 
     pub async fn next_snapshot(
         &mut self,
         cx: &Cx,
     ) -> Result<Option<ManagedTaskSnapshot>, ManagedTaskRecoveryError> {
-        if self.finished { return Ok(None); }
+        if self.finished {
+            return Ok(None);
+        }
         // Move the ENTIRE watch before awaiting. Cancellation/drop may not put
         // an old response, half-read decoder or retry opportunity back into it.
         let mut watch = self.watch.take().ok_or(ManagedTaskWatchError::Closed)?;
         let client = watch.client.clone();
         let cancellation = watch.cancellation.clone();
         let deadline = watch.deadline;
-        let snapshot = Box::pin(client.session.await_active(cx, &cancellation, deadline, None, async {
-            Ok(self.recovery.next_snapshot(cx, &mut watch, None).await)
-        })).await??;
+        let snapshot = Box::pin(client.session.await_active(
+            cx,
+            &cancellation,
+            deadline,
+            None,
+            async { Ok(Box::pin(self.recovery.next_snapshot(cx, &mut watch, None)).await) },
+        ))
+        .await??;
         client.session.check(cx, &cancellation)?;
-        if cx.now() >= deadline { return Err(OAuthSessionError::TimedOut.into()); }
+        if cx.now() >= deadline {
+            return Err(OAuthSessionError::TimedOut.into());
+        }
         self.finished = watch.finished;
-        if !self.finished { self.watch = Some(watch); }
+        if !self.finished {
+            self.watch = Some(watch);
+        }
         Ok(snapshot)
     }
 }
@@ -229,7 +267,8 @@ impl RecoveryState {
         policy: ManagedTaskRecoveryPolicy,
     ) -> Self {
         Self {
-            connection_policy, policy,
+            connection_policy,
+            policy,
             read_intervals: vec![policy.minimum_delay; watch.state.task_ids.len()],
             reconnections: 0,
         }
@@ -240,7 +279,11 @@ impl RecoveryState {
         watch: &ManagedTaskWatch,
         task: &Task,
     ) -> Result<(), ManagedTaskWatchError> {
-        let index = watch.state.task_ids.iter().position(|id| id == &task.base().task_id)
+        let index = watch
+            .state
+            .task_ids
+            .iter()
+            .position(|id| id == &task.base().task_id)
             .ok_or(ManagedTaskWatchError::UnexpectedEvent)?;
         if !watch.state.terminal[index] {
             self.read_intervals[index] = read_interval(task, self.policy.minimum_delay)?;
@@ -258,14 +301,16 @@ impl RecoveryState {
             match watch.next_snapshot_with_credential(cx, credential).await {
                 Ok(mut snapshot) => {
                     if let Some(snapshot) = &mut snapshot {
-                        if self.reconnections > 0 && snapshot.cause == ManagedTaskSnapshotCause::Initial {
+                        if self.reconnections > 0
+                            && snapshot.cause == ManagedTaskSnapshotCause::Initial
+                        {
                             snapshot.cause = ManagedTaskSnapshotCause::Reconnected;
                         }
                         self.record_snapshot(watch, &snapshot.task)?;
                     }
                     return Ok(snapshot);
                 }
-                Err(error) => self.reconnect_after(cx, watch, credential, error).await?,
+                Err(error) => Box::pin(self.reconnect_after(cx, watch, credential, error)).await?,
             }
         }
     }
@@ -279,7 +324,9 @@ impl RecoveryState {
         credential: Option<&OAuthCredentialSnapshot>,
         error: ManagedTaskWatchError,
     ) -> Result<(), ManagedTaskRecoveryError> {
-        if !recoverable(&error) { return Err(error.into()); }
+        if !recoverable(&error) {
+            return Err(error.into());
+        }
         // A failed reconciliation get may leave an older listen alive. Close
         // it too before admitting a replacement, keeping single-stream custody.
         watch.close();
@@ -291,20 +338,34 @@ impl RecoveryState {
             self.reconnections += 1;
             let mut delay = self.policy.delay(self.reconnections);
             for (index, terminal) in watch.state.terminal.iter().enumerate() {
-                if !terminal { delay = delay.max(self.read_intervals[index]); }
+                if !terminal {
+                    delay = delay.max(self.read_intervals[index]);
+                }
             }
-            let due = cx.now().saturating_add_nanos(
-                u64::try_from(delay.as_nanos()).unwrap_or(u64::MAX),
-            );
-            if cx.now() < due { Sleep::new(due).await; }
+            let due = cx
+                .now()
+                .saturating_add_nanos(u64::try_from(delay.as_nanos()).unwrap_or(u64::MAX));
+            if cx.now() < due {
+                Sleep::new(due).await;
+            }
             watch.client.session.check(cx, &watch.cancellation)?;
-            if cx.now() >= watch.deadline { return Err(OAuthSessionError::TimedOut.into()); }
+            if cx.now() >= watch.deadline {
+                return Err(OAuthSessionError::TimedOut.into());
+            }
             if credential.is_some_and(|credential| Instant::now() >= credential.expires_at) {
                 return Err(OAuthSessionError::LoginRequired.into());
             }
-            match reconnect(watch, cx, pending, self.connection_policy, credential).await {
+            match Box::pin(reconnect(
+                watch,
+                cx,
+                pending,
+                self.connection_policy,
+                credential,
+            ))
+            .await
+            {
                 Ok(()) => return Ok(()),
-                Err(ManagedTaskRecoveryError::Watch(error)) if recoverable(&error) => {},
+                Err(ManagedTaskRecoveryError::Watch(error)) if recoverable(&error) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -319,7 +380,9 @@ fn recoverable(error: &ManagedTaskWatchError) -> bool {
         ManagedTaskWatchError::Interrupted
         | ManagedTaskWatchError::Subscription(ManagedSubscriptionError::MissingTerminal)
         | ManagedTaskWatchError::Task(ManagedTasksError::MissingTerminal) => true,
-        ManagedTaskWatchError::Subscription(ManagedSubscriptionError::Session(OAuthSessionError::Http(error)))
+        ManagedTaskWatchError::Subscription(ManagedSubscriptionError::Session(
+            OAuthSessionError::Http(error),
+        ))
         | ManagedTaskWatchError::Task(ManagedTasksError::Session(OAuthSessionError::Http(error))) => {
             recovery_http_interruption(error)
         }
@@ -328,19 +391,36 @@ fn recoverable(error: &ManagedTaskWatchError) -> bool {
 }
 
 fn unfinished_selection(state: &WatchState) -> Result<Vec<TaskId>, ManagedTaskWatchError> {
-    let pending: Vec<_> = state.task_ids.iter().zip(&state.terminal)
-        .filter(|(_, terminal)| !**terminal).map(|(id, _)| id.clone()).collect();
-    if pending.is_empty() { return Err(ManagedTaskWatchError::UnexpectedEvent); }
-    if state.snapshots.checked_add(pending.len()).is_none_or(|needed| needed > state.maximum_snapshots) {
+    let pending: Vec<_> = state
+        .task_ids
+        .iter()
+        .zip(&state.terminal)
+        .filter(|(_, terminal)| !**terminal)
+        .map(|(id, _)| id.clone())
+        .collect();
+    if pending.is_empty() {
+        return Err(ManagedTaskWatchError::UnexpectedEvent);
+    }
+    if state
+        .snapshots
+        .checked_add(pending.len())
+        .is_none_or(|needed| needed > state.maximum_snapshots)
+    {
         return Err(ManagedTaskWatchError::SnapshotLimit);
     }
     Ok(pending)
 }
 
 fn read_interval(task: &Task, minimum: Duration) -> Result<Duration, ManagedTaskWatchError> {
-    let peer = task.base().poll_interval_ms.as_ref().map(|hint| hint.try_as_millis())
-        .transpose().map_err(|_| ManagedTaskWatchError::UnexpectedEvent)?
-        .map(Duration::from_millis).unwrap_or(minimum);
+    let peer = task
+        .base()
+        .poll_interval_ms
+        .as_ref()
+        .map(|hint| hint.try_as_millis())
+        .transpose()
+        .map_err(|_| ManagedTaskWatchError::UnexpectedEvent)?
+        .map(Duration::from_millis)
+        .unwrap_or(minimum);
     Ok(peer.max(minimum))
 }
 
@@ -364,22 +444,38 @@ async fn reconnect(
     let limits = ManagedSubscriptionLimits::new(
         watch.client.limits.request_bytes.min(MAX_SELECTION_BYTES),
         watch.client.limits.frame_bytes.min(MAX_SELECTION_BYTES),
-        policy.maximum_records, policy.timeout,
-    ).map_err(ManagedTaskWatchError::from)?;
-    let mut subscription = watch.client.session.subscribe_tasks_with_cancellation(
-        cx, &watch.cancellation, request, ids.discovery, ids.operation, limits,
-    ).await.map_err(ManagedTaskWatchError::from)?;
+        policy.maximum_records,
+        policy.timeout,
+    )
+    .map_err(ManagedTaskWatchError::from)?;
+    let mut subscription = Box::pin(watch.client.session.subscribe_tasks_with_cancellation(
+        cx,
+        &watch.cancellation,
+        request,
+        ids.discovery,
+        ids.operation,
+        limits,
+    ))
+    .await
+    .map_err(ManagedTaskWatchError::from)?;
     // Check credential identity before consuming a new ACK or allowing any
     // reconciliation/host-input work under the replacement connection.
-    admit_generation(credential.map(|credential| credential.generation), subscription.credential_generation())?;
-    let Some(ManagedSubscriptionEvent::Acknowledged { accepted_filter }) =
-        subscription.next_event(cx).await.map_err(ManagedTaskWatchError::from)?
+    admit_generation(
+        credential.map(|credential| credential.generation),
+        subscription.credential_generation(),
+    )?;
+    let Some(ManagedSubscriptionEvent::Acknowledged { accepted_filter }) = subscription
+        .next_event(cx)
+        .await
+        .map_err(ManagedTaskWatchError::from)?
     else {
         return Err(ManagedTaskWatchError::UnexpectedEvent.into());
     };
     selection.admit_acknowledgement(&accepted_filter)?;
     watch.client.session.check(cx, &watch.cancellation)?;
-    if cx.now() >= watch.deadline { return Err(OAuthSessionError::TimedOut.into()); }
+    if cx.now() >= watch.deadline {
+        return Err(OAuthSessionError::TimedOut.into());
+    }
     // Commit only the new initial-read queue and fully admitted response.
     // The original IDs, consumed snapshots, terminal ledger and deadline stay.
     watch.state.initial = selection.initial;
@@ -393,20 +489,29 @@ mod tests {
     use crate::http_executor::ModernHttpExecutorError;
     use serde_json::json;
 
-    fn id(text: &str) -> TaskId { TaskId::parse(text).unwrap() }
+    fn id(text: &str) -> TaskId {
+        TaskId::parse(text).unwrap()
+    }
     fn working(interval: Option<u64>) -> Task {
         let mut value = json!({
             "taskId":"one", "status":"working", "createdAt":"2026-09-17T00:00:00Z",
             "lastUpdatedAt":"2026-09-17T00:00:00Z", "ttlMs":60000,
         });
-        if let Some(interval) = interval { value["pollIntervalMs"] = interval.into(); }
+        if let Some(interval) = interval {
+            value["pollIntervalMs"] = interval.into();
+        }
         serde_json::from_value(value).unwrap()
     }
 
     #[test]
     fn recovery_partitions_instead_of_resetting_the_original_record_budget() {
         for retries in 1..=MAX_RECONNECTIONS {
-            let recovery = ManagedTaskRecoveryPolicy::new(retries, Duration::from_secs(1), Duration::from_secs(30)).unwrap();
+            let recovery = ManagedTaskRecoveryPolicy::new(
+                retries,
+                Duration::from_secs(1),
+                Duration::from_secs(30),
+            )
+            .unwrap();
             let watch = ManagedTaskWatchPolicy::new(Duration::from_secs(60), 100, 101).unwrap();
             let per = recovery.connection_policy(watch).unwrap();
             assert!(per.maximum_records * (retries + 1) <= watch.maximum_records);
@@ -414,17 +519,36 @@ mod tests {
             assert_eq!(per.timeout, watch.timeout);
         }
         let tiny = ManagedTaskWatchPolicy::new(Duration::from_secs(60), 100, 9).unwrap();
-        assert!(matches!(ManagedTaskRecoveryPolicy::default().connection_policy(tiny), Err(ManagedTaskRecoveryError::InvalidPolicy)));
+        assert!(matches!(
+            ManagedTaskRecoveryPolicy::default().connection_policy(tiny),
+            Err(ManagedTaskRecoveryError::InvalidPolicy)
+        ));
     }
 
     #[test]
     fn recovery_policy_and_backoff_have_finite_nonzero_bounds() {
         for (count, low, high) in [(0, 1, 2), (17, 1, 2), (1, 0, 2), (1, 3, 2), (1, 1, 61)] {
-            assert!(ManagedTaskRecoveryPolicy::new(count, Duration::from_secs(low), Duration::from_secs(high)).is_err());
+            assert!(
+                ManagedTaskRecoveryPolicy::new(
+                    count,
+                    Duration::from_secs(low),
+                    Duration::from_secs(high)
+                )
+                .is_err()
+            );
         }
-        let policy = ManagedTaskRecoveryPolicy::new(4, Duration::from_secs(2), Duration::from_secs(5)).unwrap();
-        assert_eq!((1..=4).map(|n| policy.delay(n)).collect::<Vec<_>>(),
-            vec![Duration::from_secs(2), Duration::from_secs(4), Duration::from_secs(5), Duration::from_secs(5)]);
+        let policy =
+            ManagedTaskRecoveryPolicy::new(4, Duration::from_secs(2), Duration::from_secs(5))
+                .unwrap();
+        assert_eq!(
+            (1..=4).map(|n| policy.delay(n)).collect::<Vec<_>>(),
+            vec![
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(5),
+                Duration::from_secs(5)
+            ]
+        );
     }
 
     #[test]
@@ -434,7 +558,10 @@ mod tests {
         state.snapshots = 2;
         assert_eq!(unfinished_selection(&state).unwrap(), vec![id("two")]);
         state.snapshots = 3;
-        assert!(matches!(unfinished_selection(&state), Err(ManagedTaskWatchError::SnapshotLimit)));
+        assert!(matches!(
+            unfinished_selection(&state),
+            Err(ManagedTaskWatchError::SnapshotLimit)
+        ));
         assert_eq!(state.terminal, [true, false]);
         assert_eq!(state.snapshots, 3);
     }
@@ -442,11 +569,16 @@ mod tests {
     #[test]
     fn recovery_allowlist_excludes_authentication_protocol_and_budget_failures() {
         assert!(recoverable(&ManagedTaskWatchError::Interrupted));
-        assert!(recoverable(&ManagedSubscriptionError::MissingTerminal.into()));
+        assert!(recoverable(
+            &ManagedSubscriptionError::MissingTerminal.into()
+        ));
         assert!(recoverable(&ManagedTasksError::MissingTerminal.into()));
-        assert!(recoverable(&ManagedSubscriptionError::Session(OAuthSessionError::Http(
-            ModernHttpExecutorError::ResponseBodyReadFailed,
-        )).into()));
+        assert!(recoverable(
+            &ManagedSubscriptionError::Session(OAuthSessionError::Http(
+                ModernHttpExecutorError::ResponseBodyReadFailed,
+            ))
+            .into()
+        ));
         for error in [
             ManagedTaskWatchError::IncompleteAcknowledgement,
             ManagedTaskWatchError::SnapshotLimit,
@@ -470,7 +602,10 @@ mod tests {
     #[test]
     fn reconciliation_honors_peer_minimum_and_clears_absent_snapshot_hint() {
         let minimum = Duration::from_secs(1);
-        assert_eq!(read_interval(&working(Some(3000)), minimum).unwrap(), Duration::from_secs(3));
+        assert_eq!(
+            read_interval(&working(Some(3000)), minimum).unwrap(),
+            Duration::from_secs(3)
+        );
         assert_eq!(read_interval(&working(None), minimum).unwrap(), minimum);
         assert_eq!(read_interval(&working(Some(1)), minimum).unwrap(), minimum);
     }
@@ -478,7 +613,10 @@ mod tests {
     #[test]
     fn pinned_recovery_rejects_renewed_authority_while_observation_can_renew() {
         assert!(admit_generation(Some(7), 7).is_ok());
-        assert!(matches!(admit_generation(Some(7), 8), Err(ManagedTaskRecoveryError::CredentialChanged)));
+        assert!(matches!(
+            admit_generation(Some(7), 8),
+            Err(ManagedTaskRecoveryError::CredentialChanged)
+        ));
         assert!(admit_generation(None, 8).is_ok());
         assert!(admit_generation(Some(7), 7).is_ok());
     }

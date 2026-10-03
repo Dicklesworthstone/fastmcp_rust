@@ -2165,36 +2165,46 @@ impl FinalTaskExecutionLimits {
         max_attempts: u32,
     ) -> McpResult<Self> {
         if total_runtime.is_zero()
-            || total_runtime > StdDuration::from_secs(30 * 24 * 60 * 60)
+            || total_runtime > StdDuration::from_hours(720)
             || attempt_runtime.is_zero()
-            || attempt_runtime > StdDuration::from_secs(24 * 60 * 60)
+            || attempt_runtime > StdDuration::from_hours(24)
             || !(1..=64).contains(&max_attempts)
         {
             return Err(McpError::invalid_params(
                 "Task execution limits require positive total <= 30 days, attempt <= 24 hours, and attempts <= 64",
             ));
         }
-        Ok(Self { total_runtime, attempt_runtime, max_attempts })
+        Ok(Self {
+            total_runtime,
+            attempt_runtime,
+            max_attempts,
+        })
     }
 
     /// Total lifetime from the backend's atomic creation boundary.
     #[must_use]
-    pub const fn total_runtime(self) -> StdDuration { self.total_runtime }
+    pub const fn total_runtime(self) -> StdDuration {
+        self.total_runtime
+    }
 
     /// Maximum time from each successful claim, including dispatch scheduling.
     #[must_use]
-    pub const fn attempt_runtime(self) -> StdDuration { self.attempt_runtime }
+    pub const fn attempt_runtime(self) -> StdDuration {
+        self.attempt_runtime
+    }
 
     /// Maximum number of successfully admitted initial and resumed claims.
     #[must_use]
-    pub const fn max_attempts(self) -> u32 { self.max_attempts }
+    pub const fn max_attempts(self) -> u32 {
+        self.max_attempts
+    }
 }
 
 impl Default for FinalTaskExecutionLimits {
     fn default() -> Self {
         Self {
-            total_runtime: StdDuration::from_secs(24 * 60 * 60),
-            attempt_runtime: StdDuration::from_secs(60 * 60),
+            total_runtime: StdDuration::from_hours(24),
+            attempt_runtime: StdDuration::from_hours(1),
             max_attempts: 8,
         }
     }
@@ -2222,26 +2232,41 @@ impl FinalTaskExecutionBudget {
             || attempt_deadline.is_some_and(|deadline| deadline > total_deadline)
             || (attempts == 0 && attempt_deadline.is_some())
         {
-            return Err(McpError::internal_error("Invalid final task execution accounting"));
+            return Err(McpError::internal_error(
+                "Invalid final task execution accounting",
+            ));
         }
-        Ok(Self { total_deadline, attempt_deadline, attempts, limits })
+        Ok(Self {
+            total_deadline,
+            attempt_deadline,
+            attempts,
+            limits,
+        })
     }
 
     /// Original creation-time deadline, unchanged across every input cycle.
     #[must_use]
-    pub const fn total_deadline(self) -> Instant { self.total_deadline }
+    pub const fn total_deadline(self) -> Instant {
+        self.total_deadline
+    }
 
     /// Active claim deadline, absent while queued or waiting for input.
     #[must_use]
-    pub const fn attempt_deadline(self) -> Option<Instant> { self.attempt_deadline }
+    pub const fn attempt_deadline(self) -> Option<Instant> {
+        self.attempt_deadline
+    }
 
     /// Claims already spent, including abandoned or restored attempts.
     #[must_use]
-    pub const fn attempts(self) -> u32 { self.attempts }
+    pub const fn attempts(self) -> u32 {
+        self.attempts
+    }
 
     /// The immutable limits retained at task creation.
     #[must_use]
-    pub const fn limits(self) -> FinalTaskExecutionLimits { self.limits }
+    pub const fn limits(self) -> FinalTaskExecutionLimits {
+        self.limits
+    }
 }
 
 /// One final task plus the opaque monotonic generation assigned by its store.
@@ -2514,7 +2539,9 @@ fn final_task_payload_bytes(
 ) -> McpResult<usize> {
     let mut counter = FinalTaskPayloadByteCounter { bytes: 0, limit };
     serde_json::to_writer(&mut counter, value).map_err(|_| {
-        McpError::invalid_params(format!("Final task {member} exceeds its encoded payload limit"))
+        McpError::invalid_params(format!(
+            "Final task {member} exceeds its encoded payload limit"
+        ))
     })?;
     Ok(counter.bytes)
 }
@@ -2552,7 +2579,10 @@ fn prepare_in_memory_final_task_payload_charge(
     accepted_input_bytes: usize,
     input_key_history: Option<&InMemoryFinalTaskInputKeyHistory>,
 ) -> McpResult<InMemoryFinalTaskPayloadCharge> {
-    let live = matches!(task, FinalTask::Working(_) | FinalTask::InputRequired { .. });
+    let live = matches!(
+        task,
+        FinalTask::Working(_) | FinalTask::InputRequired { .. }
+    );
     let metadata_limit = if live {
         MAX_FINAL_TASK_METADATA_BYTES - FINAL_TASK_CANCELLATION_METADATA_RESERVE_BYTES
     } else {
@@ -2895,7 +2925,8 @@ impl InMemoryFinalTaskStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = (self.clock)();
         let expires_at = in_memory_final_task_expiry(&task, now)?;
-        let execution_budget = new_in_memory_final_task_execution_budget(self.execution_limits, now)?;
+        let execution_budget =
+            new_in_memory_final_task_execution_budget(self.execution_limits, now)?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.tasks.contains_key(&task_id) {
             return Err(McpError::invalid_params("Task already exists"));
@@ -2923,7 +2954,9 @@ impl InMemoryFinalTaskStore {
             .insert(task_id.clone(), notification);
         state.tasks.insert(task_id.clone(), task);
         state.generations.insert(task_id.clone(), generation);
-        state.execution_budgets.insert(task_id.clone(), execution_budget);
+        state
+            .execution_budgets
+            .insert(task_id.clone(), execution_budget);
         state
             .work_descriptors
             .insert(task_id.clone(), work_descriptor.clone());
@@ -2956,22 +2989,33 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         &self,
         expected: &FinalTaskSnapshot,
     ) -> McpResult<Option<FinalTaskExecutionBudget>> {
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reclaim_expired_in_memory_final_tasks(&mut state, (self.clock)());
         let task_id = &expected.task().base().task_id;
         if state.generations.get(task_id) != Some(&expected.generation()) {
             return Ok(None);
         }
-        state.execution_budgets.get(task_id).copied().map(Some).ok_or_else(|| {
-            McpError::internal_error("In-memory final task is missing execution accounting")
-        })
+        state
+            .execution_budgets
+            .get(task_id)
+            .copied()
+            .map(Some)
+            .ok_or_else(|| {
+                McpError::internal_error("In-memory final task is missing execution accounting")
+            })
     }
 
     fn expire_task_execution_if_current(
         &self,
         expected: &FinalTaskSnapshot,
     ) -> McpResult<Option<FinalTaskSnapshot>> {
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = (self.clock)();
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         let task_id = &expected.task().base().task_id;
@@ -2986,7 +3030,9 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         })?;
         let task = FinalTask::Failed {
             base: transition_terminal_final_task_base(
-                retained.base().clone(), FinalTaskStatus::Failed, None,
+                retained.base().clone(),
+                FinalTaskStatus::Failed,
+                None,
             )?,
             error: FinalTaskError {
                 code: (-32000).into(),
@@ -2996,19 +3042,27 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             },
         };
         replace_in_memory_final_task(
-            &mut state, task.clone(), final_task_notification(&task), now,
+            &mut state,
+            task.clone(),
+            final_task_notification(&task),
+            now,
             InMemoryFinalTaskInputMutation::ExecutionExpiry,
         )?;
         committed_in_memory_final_task_snapshot(&state, task_id).map(Some)
     }
 
     fn next_expired_execution_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = (self.clock)();
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         let Some(task_id) = state.tasks.keys().find(|task_id| {
             in_memory_final_task_execution_exhaustion(&state, task_id, now).is_some()
-        }) else { return Ok(None); };
+        }) else {
+            return Ok(None);
+        };
         committed_in_memory_final_task_snapshot(&state, task_id).map(Some)
     }
 
@@ -3027,7 +3081,8 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = (self.clock)();
         let expires_at = in_memory_final_task_expiry(&task, now)?;
-        let execution_budget = new_in_memory_final_task_execution_budget(self.execution_limits, now)?;
+        let execution_budget =
+            new_in_memory_final_task_execution_budget(self.execution_limits, now)?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.tasks.contains_key(&task_id) {
             return Err(McpError::invalid_params("Task already exists"));
@@ -3059,7 +3114,9 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .insert(task_id.clone(), notification);
         state.tasks.insert(task_id.clone(), task);
         state.generations.insert(task_id.clone(), generation);
-        state.execution_budgets.insert(task_id.clone(), execution_budget);
+        state
+            .execution_budgets
+            .insert(task_id.clone(), execution_budget);
         if let Some(expires_at) = expires_at {
             state.expires_at.insert(task_id, expires_at);
         }
@@ -3862,11 +3919,15 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             match kind {
                 InMemoryFinalTaskHandoffKind::Initial => {
                     state.initial_work.remove(task_id);
-                    state.payload_accounting.release_handoff(task_id, true, false);
+                    state
+                        .payload_accounting
+                        .release_handoff(task_id, true, false);
                 }
                 InMemoryFinalTaskHandoffKind::Resumed => {
                     state.accepted_inputs.remove(task_id);
-                    state.payload_accounting.release_handoff(task_id, false, true);
+                    state
+                        .payload_accounting
+                        .release_handoff(task_id, false, true);
                 }
             }
         }
@@ -4290,7 +4351,9 @@ fn record_in_memory_final_task_cancellation(
 
     state.accepted_inputs.remove(task_id);
     state.initial_work.remove(task_id);
-    state.payload_accounting.release_handoff(task_id, true, true);
+    state
+        .payload_accounting
+        .release_handoff(task_id, true, true);
     if !dispatch_elected {
         state.handoff_leases.remove(task_id);
     }
@@ -4315,8 +4378,10 @@ fn replace_in_memory_final_task(
     input_mutation: InMemoryFinalTaskInputMutation,
 ) -> McpResult<()> {
     let task_id = task.base().task_id.clone();
-    if !matches!(input_mutation, InMemoryFinalTaskInputMutation::ExecutionExpiry)
-        && let Some(reason) = in_memory_final_task_execution_exhaustion(state, &task_id, now)
+    if !matches!(
+        input_mutation,
+        InMemoryFinalTaskInputMutation::ExecutionExpiry
+    ) && let Some(reason) = in_memory_final_task_execution_exhaustion(state, &task_id, now)
     {
         return Err(McpError::invalid_params(reason));
     }
@@ -4331,7 +4396,9 @@ fn replace_in_memory_final_task(
         &task,
     )?;
     let accepted_input_bytes = match &input_mutation {
-        InMemoryFinalTaskInputMutation::Clear | InMemoryFinalTaskInputMutation::ExecutionExpiry => 0,
+        InMemoryFinalTaskInputMutation::Clear | InMemoryFinalTaskInputMutation::ExecutionExpiry => {
+            0
+        }
         InMemoryFinalTaskInputMutation::Append(input_responses) => {
             let current_inputs = state.accepted_inputs.get(&task_id);
             if input_responses.is_empty() && current_inputs.is_none() {
@@ -4533,10 +4600,13 @@ fn insert_in_memory_final_task_handoff_lease(
     let budget = state.execution_budgets.get(&task_id).ok_or_else(|| {
         McpError::internal_error("In-memory final task is missing execution accounting")
     })?;
-    let attempts = budget.attempts.checked_add(1).filter(|attempts| {
-        *attempts <= budget.limits.max_attempts
-    }).ok_or_else(|| McpError::invalid_params(FINAL_TASK_ATTEMPTS_EXHAUSTED))?;
-    let attempt_deadline = now.checked_add(budget.limits.attempt_runtime)
+    let attempts = budget
+        .attempts
+        .checked_add(1)
+        .filter(|attempts| *attempts <= budget.limits.max_attempts)
+        .ok_or_else(|| McpError::invalid_params(FINAL_TASK_ATTEMPTS_EXHAUSTED))?;
+    let attempt_deadline = now
+        .checked_add(budget.limits.attempt_runtime)
         .ok_or_else(|| McpError::internal_error("Task attempt exceeds process-local clock range"))?
         .min(budget.total_deadline);
     if state.handoff_leases.contains_key(&task_id) {
@@ -4593,14 +4663,20 @@ fn in_memory_final_task_execution_exhaustion(
     now: Instant,
 ) -> Option<&'static str> {
     let task = state.tasks.get(task_id)?;
-    if !matches!(task, FinalTask::Working(_) | FinalTask::InputRequired { .. }) {
+    if !matches!(
+        task,
+        FinalTask::Working(_) | FinalTask::InputRequired { .. }
+    ) {
         return None;
     }
     let budget = state.execution_budgets.get(task_id)?;
     if now >= budget.total_deadline {
         return Some(FINAL_TASK_TOTAL_DEADLINE_EXCEEDED);
     }
-    if budget.attempt_deadline.is_some_and(|deadline| now >= deadline) {
+    if budget
+        .attempt_deadline
+        .is_some_and(|deadline| now >= deadline)
+    {
         return Some(FINAL_TASK_ATTEMPT_DEADLINE_EXCEEDED);
     }
     if budget.attempts == budget.limits.max_attempts
@@ -5631,7 +5707,9 @@ impl FinalTaskRuntime {
             work_steps += 1;
             if self.expire_execution_snapshot(&candidate)?.is_some() {
                 *recovery_cursor = Some(task_id);
-                if work_steps == MAX_FINAL_TASK_RECOVERY_CAS_RETRIES { break; }
+                if work_steps == MAX_FINAL_TASK_RECOVERY_CAS_RETRIES {
+                    break;
+                }
                 continue;
             }
             if !matches!(candidate.task(), FinalTask::Working(_)) {
@@ -5646,7 +5724,9 @@ impl FinalTaskRuntime {
                 .take_input_handoff_for_owner_if_current(&candidate, owner_id)?
             else {
                 lost_comparisons += 1;
-                if work_steps == MAX_FINAL_TASK_RECOVERY_CAS_RETRIES { break; }
+                if work_steps == MAX_FINAL_TASK_RECOVERY_CAS_RETRIES {
+                    break;
+                }
                 continue;
             };
             return self
@@ -5711,7 +5791,9 @@ impl FinalTaskRuntime {
         for _ in 0..MAX_FINAL_TASK_RECOVERY_CAS_RETRIES + excluded_task_ids.len() {
             cx.checkpoint()
                 .map_err(|error| McpError::internal_error(error.to_string()))?;
-            let Some(candidate) = self.store.next_initial_work_snapshot_after(recovery_cursor.as_ref())?
+            let Some(candidate) = self
+                .store
+                .next_initial_work_snapshot_after(recovery_cursor.as_ref())?
             else {
                 return Ok(None);
             };
@@ -5727,7 +5809,9 @@ impl FinalTaskRuntime {
             work_steps += 1;
             if self.expire_execution_snapshot(&candidate)?.is_some() {
                 *recovery_cursor = Some(task_id);
-                if work_steps == MAX_FINAL_TASK_RECOVERY_CAS_RETRIES { break; }
+                if work_steps == MAX_FINAL_TASK_RECOVERY_CAS_RETRIES {
+                    break;
+                }
                 continue;
             }
             if !matches!(candidate.task(), FinalTask::Working(_)) {
@@ -5742,7 +5826,9 @@ impl FinalTaskRuntime {
                 .take_initial_work_handoff_for_owner_if_current(&candidate, owner_id)?
             else {
                 lost_comparisons += 1;
-                if work_steps == MAX_FINAL_TASK_RECOVERY_CAS_RETRIES { break; }
+                if work_steps == MAX_FINAL_TASK_RECOVERY_CAS_RETRIES {
+                    break;
+                }
                 continue;
             };
             return self
@@ -5762,10 +5848,16 @@ impl FinalTaskRuntime {
 
     #[cfg(test)]
     fn recover_initial_work_with_checkpoints(
-        &self, cx: &Cx, owner_id: &str, after_task_id: Option<&FinalTaskId>,
+        &self,
+        cx: &Cx,
+        owner_id: &str,
+        after_task_id: Option<&FinalTaskId>,
     ) -> McpResult<Option<FinalTaskInitialWork>> {
         self.recover_initial_work_excluding(
-            cx, owner_id, &mut after_task_id.cloned(), &BTreeSet::new(),
+            cx,
+            owner_id,
+            &mut after_task_id.cloned(),
+            &BTreeSet::new(),
         )
     }
 
@@ -6248,8 +6340,7 @@ impl FinalTaskRuntime {
         // be followed by a read that can observe that newer terminal state.
         // Reversing these reads can pair a stale Working snapshot with the
         // already-consumed intent and reject a successfully committed cancel.
-        let cancellation_requested =
-            !terminal && self.store.is_cancellation_requested(task_id)?;
+        let cancellation_requested = !terminal && self.store.is_cancellation_requested(task_id)?;
         let committed = self.load_task_snapshot(task_id)?;
         if committed.authenticated_principal() != returned.authenticated_principal() {
             return Err(McpError::internal_error(
@@ -6378,22 +6469,27 @@ impl FinalTaskRuntime {
             return Ok(None);
         };
         let snapshot = self.validate_loaded_task_snapshot(snapshot, Some(task_id))?;
-        Ok(Some(self.expire_execution_snapshot(&snapshot)?.unwrap_or(snapshot)))
+        Ok(Some(
+            self.expire_execution_snapshot(&snapshot)?
+                .unwrap_or(snapshot),
+        ))
     }
 
     fn expire_execution_snapshot(
         &self,
         expected: &FinalTaskSnapshot,
     ) -> McpResult<Option<FinalTaskSnapshot>> {
-        if !matches!(expected.task(), FinalTask::Working(_) | FinalTask::InputRequired { .. }) {
+        if !matches!(
+            expected.task(),
+            FinalTask::Working(_) | FinalTask::InputRequired { .. }
+        ) {
             return Ok(None);
         }
         let Some(committed) = self.store.expire_task_execution_if_current(expected)? else {
             return Ok(None);
         };
-        let committed = self.validate_loaded_task_snapshot(
-            committed, Some(&expected.task().base().task_id),
-        )?;
+        let committed =
+            self.validate_loaded_task_snapshot(committed, Some(&expected.task().base().task_id))?;
         if !matches!(committed.task(), FinalTask::Failed { .. })
             || committed.generation() <= expected.generation()
             || committed.authenticated_principal() != expected.authenticated_principal()
@@ -6409,7 +6505,8 @@ impl FinalTaskRuntime {
 
     fn expire_pending_execution(&self, cx: &Cx) -> McpResult<()> {
         for turn in 0..MAX_FINAL_TASK_RECOVERY_HANDOFFS_PER_SCAN {
-            cx.checkpoint().map_err(|error| McpError::internal_error(error.to_string()))?;
+            cx.checkpoint()
+                .map_err(|error| McpError::internal_error(error.to_string()))?;
             let Some(candidate) = self.store.next_expired_execution_snapshot()? else {
                 break;
             };
@@ -6436,7 +6533,9 @@ impl FinalTaskRuntime {
     ) -> McpResult<FinalTaskSnapshot> {
         ctx.ensure_live()?;
         let principal = task_request_principal(ctx)?;
-        let snapshot = self.store.get_task_snapshot(task_id)?
+        let snapshot = self
+            .store
+            .get_task_snapshot(task_id)?
             .ok_or_else(|| McpError::invalid_params("Task not found"))?;
         let snapshot = self.validate_loaded_task_snapshot(snapshot, Some(task_id))?;
         if snapshot.authenticated_principal() != principal {
@@ -6444,7 +6543,9 @@ impl FinalTaskRuntime {
             // Never inspect its state or input ledger before this comparison.
             return Err(McpError::invalid_params("Task not found"));
         }
-        Ok(self.expire_execution_snapshot(&snapshot)?.unwrap_or(snapshot))
+        Ok(self
+            .expire_execution_snapshot(&snapshot)?
+            .unwrap_or(snapshot))
     }
 
     pub(crate) fn notification_matches_task_owner(
@@ -6559,7 +6660,9 @@ impl FinalTaskRuntime {
         // performed by dispatch election, where it is a normal completed
         // handoff rather than a malformed-backend error that stops the service.
         let task_id = &expected.task().base().task_id;
-        let current = self.store.get_task_snapshot(task_id)?
+        let current = self
+            .store
+            .get_task_snapshot(task_id)?
             .ok_or_else(|| McpError::invalid_params("Task not found"))?;
         let current = self.validate_loaded_task_snapshot(current, Some(task_id))?;
         if current.generation() != expected.generation()
@@ -6655,9 +6758,11 @@ impl FinalTaskRuntime {
         let notification = final_task_notification(&task);
         self.validate_new_task_write(&task, &notification)?;
         validate_final_task_work_descriptor(&work_descriptor)?;
-        let committed = self
-            .store
-            .create_task_with_work(task.clone(), notification.clone(), work_descriptor)?;
+        let committed = self.store.create_task_with_work(
+            task.clone(),
+            notification.clone(),
+            work_descriptor,
+        )?;
         let committed = self.validate_committed_new_task(&task, None, committed)?;
         // Creation has crossed the durable create-before-reply boundary. A
         // post-commit observer failure must never erase the client handle by
@@ -6768,7 +6873,8 @@ impl FinalTaskRuntime {
             expected,
             task.clone(),
             notification.clone(),
-        )? else {
+        )?
+        else {
             return Err(McpError::invalid_params(
                 "Task state changed before the transition could be recorded",
             ));
@@ -7280,13 +7386,17 @@ impl AuthorizedTaskServiceRunner {
             while active.len() < self.max_concurrent_handoffs
                 && scanned < MAX_FINAL_TASK_RECOVERY_HANDOFFS_PER_SCAN
             {
-                let excluded_task_ids = active.iter().map(|handoff| handoff.task_id.clone()).collect();
-                let (kind, handoff) = match self.next_recovery_handoff_excluding(cx, &excluded_task_ids) {
-                    Ok(Some(recovered)) => recovered,
-                    Ok(None) => break,
-                    Err(_) if cx.checkpoint().is_err() => return Ok(()),
-                    Err(error) => return Err(error),
-                };
+                let excluded_task_ids = active
+                    .iter()
+                    .map(|handoff| handoff.task_id.clone())
+                    .collect();
+                let (kind, handoff) =
+                    match self.next_recovery_handoff_excluding(cx, &excluded_task_ids) {
+                        Ok(Some(recovered)) => recovered,
+                        Ok(None) => break,
+                        Err(_) if cx.checkpoint().is_err() => return Ok(()),
+                        Err(error) => return Err(error),
+                    };
                 scanned += 1;
                 let task_id = final_task_handoff_task_id(&handoff).clone();
                 // Construct the restoration guard before the future enters
@@ -7988,7 +8098,9 @@ impl HostedTaskService {
 
     pub(crate) fn check_running(&self) -> McpResult<()> {
         if self.handle.is_finished() {
-            Err(McpError::internal_error("The hosted Task service stopped while serving"))
+            Err(McpError::internal_error(
+                "The hosted Task service stopped while serving",
+            ))
         } else {
             Ok(())
         }
@@ -8184,7 +8296,11 @@ impl FinalTaskExecutionGuard {
         if current.generation() != self.generation {
             return Ok(false);
         }
-        let Some(budget) = self.runtime.store.task_execution_budget_if_current(&current)? else {
+        let Some(budget) = self
+            .runtime
+            .store
+            .task_execution_budget_if_current(&current)?
+        else {
             return Ok(false);
         };
         if budget.attempt_deadline.is_none() || budget.attempts == 0 {
@@ -8218,7 +8334,9 @@ impl FinalTaskExecutionGuard {
     /// own committed transition. Only the current store generation may be
     /// failed; a cached old attempt never authorizes overwriting a successor.
     fn retire_if_execution_expired(&mut self) -> McpResult<bool> {
-        let Some(budget) = self.execution_budget else { return Ok(false); };
+        let Some(budget) = self.execution_budget else {
+            return Ok(false);
+        };
         let deadline = budget.attempt_deadline.unwrap_or(budget.total_deadline);
         if self.runtime.retention_clock_now() < deadline {
             return Ok(false);
@@ -8317,12 +8435,13 @@ impl FinalTaskExecutionGuard {
     }
 
     fn bounded_heartbeat_interval(&self) -> McpResult<StdDuration> {
-        let mut base_interval = self.heartbeat_interval()?.min(FINAL_TASK_RECOVERY_WAKE_INTERVAL);
+        let mut base_interval = self
+            .heartbeat_interval()?
+            .min(FINAL_TASK_RECOVERY_WAKE_INTERVAL);
         if let Some(budget) = self.execution_budget {
             let deadline = budget.attempt_deadline.unwrap_or(budget.total_deadline);
-            base_interval = base_interval.min(
-                deadline.saturating_duration_since(self.runtime.retention_clock_now()),
-            );
+            base_interval = base_interval
+                .min(deadline.saturating_duration_since(self.runtime.retention_clock_now()));
         }
         if let Some(FinalTaskRetentionDeadline::Finite(deadline)) = self.retention_deadline {
             let store_now = self.runtime.retention_clock_now();
@@ -9257,9 +9376,12 @@ mod tests {
             Box::pin(async move {
                 match handoff {
                     FinalTaskSupervisorHandoff::Initial(initial) => {
-                        if initial.work_descriptor().as_value().get("finish") == Some(&serde_json::Value::Bool(true)) {
+                        if initial.work_descriptor().as_value().get("finish")
+                            == Some(&serde_json::Value::Bool(true))
+                        {
                             initial.complete_task(
-                                serde_json::from_value(serde_json::json!({"content": []})).unwrap(), None,
+                                serde_json::from_value(serde_json::json!({"content": []})).unwrap(),
+                                None,
                             )?;
                             return Ok(());
                         }
@@ -9353,49 +9475,80 @@ mod tests {
         let (store, _clock) = execution_test_store(10_000, 5_000, 2);
         let runtime = final_task_runtime(store.clone(), Arc::new(AtomicBool::new(false)));
         let probe = Arc::new(TaskTransitionCleanupProbe::default());
-        let mut runner = runtime.install_task_service(2, probe.clone()).unwrap()
-            .with_max_concurrent_handoffs(2).unwrap();
-        RuntimeBuilder::current_thread().build().unwrap().block_on(async {
-            let cx = Cx::current().unwrap();
-            let mut service = Box::pin(runner.run_service(&cx));
-            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-            assert!(service.as_mut().poll(&mut context).is_pending());
-            let task = runtime.create_task_with_work(final_test_work_descriptor(), None).unwrap().task;
-            let task_id = task.base().task_id.clone();
-            assert!(service.as_mut().poll(&mut context).is_pending());
-            let inputs = serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
-            runtime.update_task(&task_id, &inputs).unwrap();
-            let successor = store.get_task_snapshot(&task_id).unwrap().unwrap();
-            let budget = store.task_execution_budget_if_current(&successor).unwrap().unwrap();
-            assert_eq!(budget.attempts(), 1);
-            assert!(budget.attempt_deadline().is_none());
-            // Wake recovery more times than the entire configured attempt
-            // allowance while the predecessor is still cleaning up.
-            for _ in 0..12 {
-                runtime.signal_task_service(task_id.clone());
+        let mut runner = runtime
+            .install_task_service(2, probe.clone())
+            .unwrap()
+            .with_max_concurrent_handoffs(2)
+            .unwrap();
+        RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let mut service = Box::pin(runner.run_service(&cx));
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
                 assert!(service.as_mut().poll(&mut context).is_pending());
-                assert_eq!(store.task_execution_budget_if_current(&successor).unwrap(), Some(budget));
-                assert_eq!(probe.resumed.load(AtomicOrdering::SeqCst), 0);
-            }
-            let healthy = runtime.create_task_with_work(
-                FinalTaskWorkDescriptor::new(serde_json::json!({"finish": true})).unwrap(), None,
-            ).unwrap().task;
-            assert!(service.as_mut().poll(&mut context).is_pending());
-            assert!(matches!(store.get_task(&healthy.base().task_id).unwrap(), Some(FinalTask::Completed { .. })),
-                "skipping a cleanup-owned successor must not hide healthy siblings");
-            assert_eq!(store.task_execution_budget_if_current(&successor).unwrap(), Some(budget));
-            probe.cleanup_ready.store(true, AtomicOrdering::SeqCst);
-            probe.cleanup_waker.lock().unwrap().take().unwrap().wake();
-            assert!(service.as_mut().poll(&mut context).is_pending());
-            assert_eq!(probe.resumed.load(AtomicOrdering::SeqCst), 1);
-            let completed = store.get_task_snapshot(&task_id).unwrap().unwrap();
-            assert!(matches!(completed.task(), FinalTask::Completed { .. }));
-            let final_budget = store.task_execution_budget_if_current(&completed).unwrap().unwrap();
-            assert_eq!(final_budget.attempts(), 2);
-            assert_eq!(final_budget.total_deadline(), budget.total_deadline());
-            assert!(runtime.is_task_service_ready());
-            drop(service);
-        });
+                let task = runtime
+                    .create_task_with_work(final_test_work_descriptor(), None)
+                    .unwrap()
+                    .task;
+                let task_id = task.base().task_id.clone();
+                assert!(service.as_mut().poll(&mut context).is_pending());
+                let inputs =
+                    serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
+                runtime.update_task(&task_id, &inputs).unwrap();
+                let successor = store.get_task_snapshot(&task_id).unwrap().unwrap();
+                let budget = store
+                    .task_execution_budget_if_current(&successor)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(budget.attempts(), 1);
+                assert!(budget.attempt_deadline().is_none());
+                // Wake recovery more times than the entire configured attempt
+                // allowance while the predecessor is still cleaning up.
+                for _ in 0..12 {
+                    runtime.signal_task_service(task_id.clone());
+                    assert!(service.as_mut().poll(&mut context).is_pending());
+                    assert_eq!(
+                        store.task_execution_budget_if_current(&successor).unwrap(),
+                        Some(budget)
+                    );
+                    assert_eq!(probe.resumed.load(AtomicOrdering::SeqCst), 0);
+                }
+                let healthy = runtime
+                    .create_task_with_work(
+                        FinalTaskWorkDescriptor::new(serde_json::json!({"finish": true})).unwrap(),
+                        None,
+                    )
+                    .unwrap()
+                    .task;
+                assert!(service.as_mut().poll(&mut context).is_pending());
+                assert!(
+                    matches!(
+                        store.get_task(&healthy.base().task_id).unwrap(),
+                        Some(FinalTask::Completed { .. })
+                    ),
+                    "skipping a cleanup-owned successor must not hide healthy siblings"
+                );
+                assert_eq!(
+                    store.task_execution_budget_if_current(&successor).unwrap(),
+                    Some(budget)
+                );
+                probe.cleanup_ready.store(true, AtomicOrdering::SeqCst);
+                probe.cleanup_waker.lock().unwrap().take().unwrap().wake();
+                assert!(service.as_mut().poll(&mut context).is_pending());
+                assert_eq!(probe.resumed.load(AtomicOrdering::SeqCst), 1);
+                let completed = store.get_task_snapshot(&task_id).unwrap().unwrap();
+                assert!(matches!(completed.task(), FinalTask::Completed { .. }));
+                let final_budget = store
+                    .task_execution_budget_if_current(&completed)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(final_budget.attempts(), 2);
+                assert_eq!(final_budget.total_deadline(), budget.total_deadline());
+                assert!(runtime.is_task_service_ready());
+                drop(service);
+            });
     }
 
     #[test]
@@ -11234,9 +11387,13 @@ mod tests {
         fn new(task: FinalTask) -> Self {
             Self {
                 snapshot: Mutex::new(FinalTaskSnapshot::new(task, 1)),
-                execution_budget: Mutex::new(new_in_memory_final_task_execution_budget(
-                    FinalTaskExecutionLimits::default(), Instant::now(),
-                ).expect("default probe deadline fits the process clock")),
+                execution_budget: Mutex::new(
+                    new_in_memory_final_task_execution_budget(
+                        FinalTaskExecutionLimits::default(),
+                        Instant::now(),
+                    )
+                    .expect("default probe deadline fits the process clock"),
+                ),
                 transition_write_calls: AtomicUsize::new(0),
                 transition_result_override: Mutex::new(None),
                 work_descriptor: Mutex::new(Some(final_test_work_descriptor())),
@@ -11277,7 +11434,8 @@ mod tests {
         }
 
         fn task_execution_budget_if_current(
-            &self, expected: &FinalTaskSnapshot,
+            &self,
+            expected: &FinalTaskSnapshot,
         ) -> McpResult<Option<FinalTaskExecutionBudget>> {
             let snapshot = self.snapshot.lock().unwrap();
             if snapshot.generation() != expected.generation()
@@ -11289,19 +11447,25 @@ mod tests {
         }
 
         fn expire_task_execution_if_current(
-            &self, expected: &FinalTaskSnapshot,
+            &self,
+            expected: &FinalTaskSnapshot,
         ) -> McpResult<Option<FinalTaskSnapshot>> {
             let mut snapshot = self.snapshot.lock().unwrap();
             if snapshot.generation() != expected.generation()
                 || snapshot.task().base().task_id != expected.task().base().task_id
-                || !matches!(snapshot.task(), FinalTask::Working(_) | FinalTask::InputRequired { .. })
+                || !matches!(
+                    snapshot.task(),
+                    FinalTask::Working(_) | FinalTask::InputRequired { .. }
+                )
                 || Instant::now() < self.execution_budget.lock().unwrap().total_deadline()
             {
                 return Ok(None);
             }
             let task = FinalTask::Failed {
                 base: transition_terminal_final_task_base(
-                    snapshot.task().base().clone(), FinalTaskStatus::Failed, None,
+                    snapshot.task().base().clone(),
+                    FinalTaskStatus::Failed,
+                    None,
                 )?,
                 error: FinalTaskError {
                     code: (-32000).into(),
@@ -11316,9 +11480,11 @@ mod tests {
 
         fn next_expired_execution_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
             let snapshot = self.snapshot();
-            Ok((matches!(snapshot.task(), FinalTask::Working(_) | FinalTask::InputRequired { .. })
-                && Instant::now() >= self.execution_budget.lock().unwrap().total_deadline())
-                .then_some(snapshot))
+            Ok((matches!(
+                snapshot.task(),
+                FinalTask::Working(_) | FinalTask::InputRequired { .. }
+            ) && Instant::now() >= self.execution_budget.lock().unwrap().total_deadline())
+            .then_some(snapshot))
         }
 
         fn create_task(
@@ -11338,7 +11504,8 @@ mod tests {
         ) -> McpResult<FinalTaskSnapshot> {
             let mut snapshot = self.snapshot.lock().unwrap();
             let budget = new_in_memory_final_task_execution_budget(
-                FinalTaskExecutionLimits::default(), Instant::now(),
+                FinalTaskExecutionLimits::default(),
+                Instant::now(),
             )?;
             *snapshot = FinalTaskSnapshot::new(task, snapshot.generation());
             *self.execution_budget.lock().unwrap() = budget;
@@ -12028,7 +12195,12 @@ mod tests {
             input_responses: FinalTaskInputResponses,
         ) -> McpResult<Option<FinalTaskSnapshot>> {
             self.inner
-                .replace_task_and_append_input_if_current(expected, task, notification, input_responses)
+                .replace_task_and_append_input_if_current(
+                    expected,
+                    task,
+                    notification,
+                    input_responses,
+                )
                 .map(|snapshot| snapshot.map(|snapshot| self.committed(snapshot)))
         }
 
@@ -12152,16 +12324,26 @@ mod tests {
                     let claimed = match phase {
                         AtomicTaskCommitPhase::Create => worker_inner
                             .take_initial_work_handoff_for_owner_if_current(&committed, OWNER)
-                            .unwrap().is_some(),
+                            .unwrap()
+                            .is_some(),
                         AtomicTaskCommitPhase::Update => worker_inner
                             .take_input_handoff_for_owner_if_current(&committed, OWNER)
-                            .unwrap().is_some(),
+                            .unwrap()
+                            .is_some(),
                         AtomicTaskCommitPhase::RequireInput => unreachable!(),
                     };
-                    assert!(claimed, "the real store provides the exact committed handoff");
-                    let fence = worker_inner.begin_handoff_dispatch_for_owner_if_current(
-                        &task_id, committed.generation(), OWNER,
-                    ).unwrap().unwrap();
+                    assert!(
+                        claimed,
+                        "the real store provides the exact committed handoff"
+                    );
+                    let fence = worker_inner
+                        .begin_handoff_dispatch_for_owner_if_current(
+                            &task_id,
+                            committed.generation(),
+                            OWNER,
+                        )
+                        .unwrap()
+                        .unwrap();
                     let successor = match phase {
                         AtomicTaskCommitPhase::Create => FinalTask::InputRequired {
                             base: transition_final_task_base(committed.task().base().clone(), FinalTaskStatus::InputRequired, None).unwrap(),
@@ -12173,21 +12355,31 @@ mod tests {
                         },
                         AtomicTaskCommitPhase::RequireInput => unreachable!(),
                     };
-                    worker_for_probe.persist_fenced_handoff_transition_clearing_input(
-                        &committed, OWNER, fence, false, successor,
-                    ).unwrap();
+                    worker_for_probe
+                        .persist_fenced_handoff_transition_clearing_input(
+                            &committed, OWNER, fence, false, successor,
+                        )
+                        .unwrap();
                 }
                 AtomicTaskCommitPhase::RequireInput => {
-                    worker_for_probe.update_task(&task_id, &serde_json::from_value(
-                        serde_json::json!({"roots": {"roots": []}}),
-                    ).unwrap()).unwrap();
+                    worker_for_probe
+                        .update_task(
+                            &task_id,
+                            &serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
+                                .unwrap(),
+                        )
+                        .unwrap();
                 }
             }
-            *after_worker.lock().unwrap() = Some((task_id.clone(), input_key_store_snapshot(&worker_inner, &task_id)));
+            *after_worker.lock().unwrap() = Some((
+                task_id.clone(),
+                input_key_store_snapshot(&worker_inner, &task_id),
+            ));
             if let Some(mutation) = mutation {
                 match mutation {
                     AtomicTaskReceiptMutation::Principal => {
-                        committed.authenticated_principal = Some(Sha256Digest::from_bytes([83; 32]));
+                        committed.authenticated_principal =
+                            Some(Sha256Digest::from_bytes([83; 32]));
                     }
                     AtomicTaskReceiptMutation::Generation => {
                         committed.generation = generation_for_probe.load(AtomicOrdering::SeqCst);
@@ -12204,7 +12396,9 @@ mod tests {
                         _ => unreachable!(),
                     },
                     AtomicTaskReceiptMutation::Payload => match &mut committed.task {
-                        FinalTask::Working(base) => base.status_message = Some("substituted receipt".to_owned()),
+                        FinalTask::Working(base) => {
+                            base.status_message = Some("substituted receipt".to_owned());
+                        }
                         FinalTask::InputRequired { input_requests, .. } => {
                             let roots = input_requests.remove("roots").unwrap();
                             input_requests.insert("substituted-input-key".to_owned(), roots);
@@ -12215,27 +12409,49 @@ mod tests {
             }
             committed
         });
-        let runner = runtime.install_task_service(1, Arc::new(FailingFinalTaskSupervisor)).unwrap();
+        let runner = runtime
+            .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
+            .unwrap();
         let service_cx = Cx::for_testing();
         let _running_service = enter_task_service_runner(runner, &service_cx);
         let result = match phase {
             AtomicTaskCommitPhase::Create => {
                 *probe.after_commit.lock().unwrap() = Some(hook);
-                runtime.create_task_for_request(&ctx, final_test_work_descriptor(), None).map(|_| ())
+                runtime
+                    .create_task_for_request(&ctx, final_test_work_descriptor(), None)
+                    .map(|_| ())
             }
             AtomicTaskCommitPhase::Update | AtomicTaskCommitPhase::RequireInput => {
                 let initial = final_working_task_with_ttl("atomic-commit-existing", 60_000);
                 let task_id = initial.base().task_id.clone();
                 let notification = final_task_notification(&initial);
                 let initial = if let Some(principal) = principal {
-                    inner.create_task_with_authenticated_work(initial, notification, final_test_work_descriptor(), principal).unwrap()
+                    inner
+                        .create_task_with_authenticated_work(
+                            initial,
+                            notification,
+                            final_test_work_descriptor(),
+                            principal,
+                        )
+                        .unwrap()
                 } else {
-                    inner.create_task_with_work(initial, notification, final_test_work_descriptor()).unwrap()
+                    inner
+                        .create_task_with_work(initial, notification, final_test_work_descriptor())
+                        .unwrap()
                 };
                 match phase {
                     AtomicTaskCommitPhase::Update => {
-                        worker.require_input(&task_id, final_roots_request(), None).unwrap();
-                        predecessor_generation.store(inner.get_task_snapshot(&task_id).unwrap().unwrap().generation(), AtomicOrdering::SeqCst);
+                        worker
+                            .require_input(&task_id, final_roots_request(), None)
+                            .unwrap();
+                        predecessor_generation.store(
+                            inner
+                                .get_task_snapshot(&task_id)
+                                .unwrap()
+                                .unwrap()
+                                .generation(),
+                            AtomicOrdering::SeqCst,
+                        );
                         notifications.lock().unwrap().clear();
                         *probe.after_commit.lock().unwrap() = Some(hook);
                         let mut parameters = final_task_method_parameters(&task_id);
@@ -12243,31 +12459,80 @@ mod tests {
                         dispatch_final_tasks_update(&runtime, &ctx, parameters).map(|_| ())
                     }
                     AtomicTaskCommitPhase::RequireInput => {
-                        assert!(inner.take_initial_work_handoff_for_owner_if_current(&initial, OWNER).unwrap().is_some());
-                        let fence = inner.begin_handoff_dispatch_for_owner_if_current(&task_id, initial.generation(), OWNER).unwrap().unwrap();
+                        assert!(
+                            inner
+                                .take_initial_work_handoff_for_owner_if_current(&initial, OWNER)
+                                .unwrap()
+                                .is_some()
+                        );
+                        let fence = inner
+                            .begin_handoff_dispatch_for_owner_if_current(
+                                &task_id,
+                                initial.generation(),
+                                OWNER,
+                            )
+                            .unwrap()
+                            .unwrap();
                         predecessor_generation.store(initial.generation(), AtomicOrdering::SeqCst);
                         *probe.after_commit.lock().unwrap() = Some(hook);
                         let awaiting = FinalTask::InputRequired {
-                            base: transition_final_task_base(initial.task().base().clone(), FinalTaskStatus::InputRequired, None).unwrap(),
+                            base: transition_final_task_base(
+                                initial.task().base().clone(),
+                                FinalTaskStatus::InputRequired,
+                                None,
+                            )
+                            .unwrap(),
                             input_requests: final_roots_request(),
                         };
-                        runtime.persist_fenced_handoff_transition_clearing_input(&initial, OWNER, fence, false, awaiting)
+                        runtime.persist_fenced_handoff_transition_clearing_input(
+                            &initial, OWNER, fence, false, awaiting,
+                        )
                     }
                     AtomicTaskCommitPhase::Create => unreachable!(),
                 }
             }
         };
         if mutation.is_some() {
-            assert_eq!(result.expect_err("a changed receipt cannot authorize acknowledgement").code, fastmcp_core::McpErrorCode::InternalError);
+            assert_eq!(
+                result
+                    .expect_err("a changed receipt cannot authorize acknowledgement")
+                    .code,
+                fastmcp_core::McpErrorCode::InternalError
+            );
         } else {
             result.expect("a committed operation succeeds even after a worker advances its task");
         }
-        let (task_id, snapshot) = retained_after_worker.lock().unwrap().clone().expect("independent worker ran");
-        assert_eq!(input_key_store_snapshot(&inner, &task_id), snapshot, "the request never rewrites its worker's later durable state");
-        assert_eq!(inner.get_task_snapshot(&task_id).unwrap().unwrap().authenticated_principal(), principal);
+        let (task_id, snapshot) = retained_after_worker
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("independent worker ran");
+        assert_eq!(
+            input_key_store_snapshot(&inner, &task_id),
+            snapshot,
+            "the request never rewrites its worker's later durable state"
+        );
+        assert_eq!(
+            inner
+                .get_task_snapshot(&task_id)
+                .unwrap()
+                .unwrap()
+                .authenticated_principal(),
+            principal
+        );
         let notifications = notifications.lock().unwrap();
-        assert_eq!(notifications.len(), 1, "the already-obsolete predecessor notification is not emitted");
-        assert!(final_tasks_match_exactly(&notifications[0].params.task, &inner.get_task(&task_id).unwrap().unwrap()).unwrap());
+        assert_eq!(
+            notifications.len(),
+            1,
+            "the already-obsolete predecessor notification is not emitted"
+        );
+        assert!(
+            final_tasks_match_exactly(
+                &notifications[0].params.task,
+                &inner.get_task(&task_id).unwrap().unwrap()
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -12306,10 +12571,18 @@ mod tests {
                 assert_atomic_task_receipt(phase, true, Some(mutation));
             }
             if !matches!(phase, AtomicTaskCommitPhase::Create) {
-                assert_atomic_task_receipt(phase, true, Some(AtomicTaskReceiptMutation::Generation));
+                assert_atomic_task_receipt(
+                    phase,
+                    true,
+                    Some(AtomicTaskReceiptMutation::Generation),
+                );
             }
             if matches!(phase, AtomicTaskCommitPhase::Update) {
-                assert_atomic_task_receipt(phase, true, Some(AtomicTaskReceiptMutation::OlderGeneration));
+                assert_atomic_task_receipt(
+                    phase,
+                    true,
+                    Some(AtomicTaskReceiptMutation::OlderGeneration),
+                );
             }
         }
     }
@@ -12325,16 +12598,31 @@ mod tests {
                 after_commit: Mutex::new(None),
                 fail_observation: AtomicBool::new(fail_observation),
             });
-            let runtime = FinalTaskRuntime::new(probe, FinalTaskRuntimeConfig::new(60_000, None).unwrap(), Arc::new(move |_| {
-                observed.fetch_add(1, AtomicOrdering::SeqCst);
-            }));
-            let runner = runtime.install_task_service(1, Arc::new(FailingFinalTaskSupervisor)).unwrap();
+            let runtime = FinalTaskRuntime::new(
+                probe,
+                FinalTaskRuntimeConfig::new(60_000, None).unwrap(),
+                Arc::new(move |_| {
+                    observed.fetch_add(1, AtomicOrdering::SeqCst);
+                }),
+            );
+            let runner = runtime
+                .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
+                .unwrap();
             let cx = Cx::for_testing();
             let _service = enter_task_service_runner(runner, &cx);
-            let created = runtime.create_task_with_work(final_test_work_descriptor(), None)
+            let created = runtime
+                .create_task_with_work(final_test_work_descriptor(), None)
                 .expect("notification observation cannot revoke the successfully committed task");
-            assert!(inner.get_task(&created.task.base().task_id).unwrap().is_some());
-            assert_eq!(notifications.load(AtomicOrdering::SeqCst), usize::from(!fail_observation));
+            assert!(
+                inner
+                    .get_task(&created.task.base().task_id)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                notifications.load(AtomicOrdering::SeqCst),
+                usize::from(!fail_observation)
+            );
         }
     }
 
@@ -12499,16 +12787,16 @@ mod tests {
                 let mut base = cancelled.base().clone();
                 match mutation {
                     CancellationReadbackMutation::Principal => {
-                        state.authenticated_principals.insert(
-                            task_for_worker.clone(),
-                            Sha256Digest::from_bytes([17; 32]),
-                        );
+                        state
+                            .authenticated_principals
+                            .insert(task_for_worker.clone(), Sha256Digest::from_bytes([17; 32]));
                     }
                     CancellationReadbackMutation::Identity => {
                         base.task_id = FinalTaskId::parse("substituted-task").unwrap();
                     }
                     CancellationReadbackMutation::CreatedAt => {
-                        base.created_at = FinalTaskTimestamp::parse("2026-07-28T12:00:00Z").unwrap();
+                        base.created_at =
+                            FinalTaskTimestamp::parse("2026-07-28T12:00:00Z").unwrap();
                     }
                     CancellationReadbackMutation::Retention => {
                         base.ttl_ms = None;
@@ -12517,10 +12805,9 @@ mod tests {
                         base.poll_interval_ms = Some(final_task_duration(9_999).unwrap());
                     }
                     CancellationReadbackMutation::SameGeneration => {
-                        state.generations.insert(
-                            task_for_worker.clone(),
-                            expected_for_worker.generation(),
-                        );
+                        state
+                            .generations
+                            .insert(task_for_worker.clone(), expected_for_worker.generation());
                     }
                     CancellationReadbackMutation::OlderGeneration => {
                         state.generations.insert(
@@ -12533,10 +12820,9 @@ mod tests {
                     }
                     CancellationReadbackMutation::WorkingWithoutIntent => {
                         base = expected_for_worker.task().base().clone();
-                        state.generations.insert(
-                            task_for_worker.clone(),
-                            expected_for_worker.generation(),
-                        );
+                        state
+                            .generations
+                            .insert(task_for_worker.clone(), expected_for_worker.generation());
                     }
                     CancellationReadbackMutation::ActiveSuccessor => {
                         // A newer non-terminal task has not consumed the
@@ -12674,7 +12960,9 @@ mod tests {
             let result =
                 runtime.validate_cancellation_store_result(&expected, &cancelled, returned);
             if advances {
-                assert!(result.expect("an exact retained terminal cancellation advances generation"));
+                assert!(
+                    result.expect("an exact retained terminal cancellation advances generation")
+                );
             } else {
                 let error = result.expect_err(
                     "changing only the committed generation to an older value must be rejected",
@@ -12925,21 +13213,32 @@ mod tests {
     fn task_02_final_payload_counter_counts_escaping_and_rejects_overflow() {
         let value = serde_json::json!({"text": "quoted \"line\"\n雪", "items": [null, true, 1]});
         let bytes = encoded_final_task_test_bytes(&value);
-        assert_eq!(final_task_payload_bytes(&value, bytes, "fixture").unwrap(), bytes);
+        assert_eq!(
+            final_task_payload_bytes(&value, bytes, "fixture").unwrap(),
+            bytes
+        );
         assert!(final_task_payload_bytes(&value, bytes - 1, "fixture").is_err());
-        let mut counter = FinalTaskPayloadByteCounter { bytes: usize::MAX, limit: usize::MAX };
+        let mut counter = FinalTaskPayloadByteCounter {
+            bytes: usize::MAX,
+            limit: usize::MAX,
+        };
         assert!(std::io::Write::write(&mut counter, b"x").is_err());
         assert_eq!(counter.bytes, usize::MAX);
         assert!(InMemoryFinalTaskStore::with_payload_capacity(1, 0).is_err());
-        assert!(InMemoryFinalTaskStore::with_payload_capacity(
-            1,
-            InMemoryFinalTaskStore::HARD_MAX_PAYLOAD_BYTES + 1,
-        ).is_err());
+        assert!(
+            InMemoryFinalTaskStore::with_payload_capacity(
+                1,
+                InMemoryFinalTaskStore::HARD_MAX_PAYLOAD_BYTES + 1,
+            )
+            .is_err()
+        );
         assert_eq!(
             InMemoryFinalTaskStore::with_payload_capacity(
                 1,
                 InMemoryFinalTaskStore::HARD_MAX_PAYLOAD_BYTES,
-            ).unwrap().max_payload_bytes(),
+            )
+            .unwrap()
+            .max_payload_bytes(),
             InMemoryFinalTaskStore::HARD_MAX_PAYLOAD_BYTES,
         );
     }
@@ -12954,10 +13253,13 @@ mod tests {
             for excess in [1, 0] {
                 let descriptor = FinalTaskWorkDescriptor::new(serde_json::Value::String(
                     "x".repeat(MAX_FINAL_TASK_DESCRIPTOR_BYTES - 2 + excess),
-                )).unwrap();
+                ))
+                .unwrap();
                 let result = if authenticated {
                     store.create_task_with_authenticated_work(
-                        task.clone(), final_task_notification(&task), descriptor,
+                        task.clone(),
+                        final_task_notification(&task),
+                        descriptor,
                         Sha256Digest::from_bytes([11; 32]),
                     )
                 } else {
@@ -12990,8 +13292,8 @@ mod tests {
         base.status_message = Some(String::new());
         base.last_updated_at = FinalTaskTimestamp::parse("2026-07-28T12:00:00Z").unwrap();
         let overhead = encoded_final_task_test_bytes(&base);
-        let metadata_limit = MAX_FINAL_TASK_METADATA_BYTES
-            - FINAL_TASK_CANCELLATION_METADATA_RESERVE_BYTES;
+        let metadata_limit =
+            MAX_FINAL_TASK_METADATA_BYTES - FINAL_TASK_CANCELLATION_METADATA_RESERVE_BYTES;
         let before = final_task_restoration_snapshot(&store, &base.task_id);
         for excess in [1, 0] {
             base.status_message = Some("x".repeat(metadata_limit - overhead + excess));
@@ -12999,7 +13301,10 @@ mod tests {
             let result = store.create_task(task.clone(), final_task_notification(&task));
             if excess == 1 {
                 assert!(result.is_err());
-                assert_eq!(final_task_restoration_snapshot(&store, &base.task_id), before);
+                assert_eq!(
+                    final_task_restoration_snapshot(&store, &base.task_id),
+                    before
+                );
             } else {
                 result.expect("exactly bounded metadata creates through the bare store path");
                 assert_final_task_payload_accounting(&store);
@@ -13007,17 +13312,23 @@ mod tests {
         }
         let snapshot = store.get_task_snapshot(&base.task_id).unwrap().unwrap();
         base.status = FinalTaskStatus::Cancelled;
-        base.last_updated_at = FinalTaskTimestamp::parse(
-            "2026-07-28T12:00:00.123456789+00:00",
-        ).unwrap();
+        base.last_updated_at =
+            FinalTaskTimestamp::parse("2026-07-28T12:00:00.123456789+00:00").unwrap();
         assert_eq!(
             encoded_final_task_test_bytes(&base),
             MAX_FINAL_TASK_METADATA_BYTES,
         );
         let cancelled = FinalTask::Cancelled(base);
-        assert!(store.request_cancellation_and_clear_input_if_current(
-            &snapshot, cancelled.clone(), final_task_notification(&cancelled),
-        ).unwrap().is_some());
+        assert!(
+            store
+                .request_cancellation_and_clear_input_if_current(
+                    &snapshot,
+                    cancelled.clone(),
+                    final_task_notification(&cancelled),
+                )
+                .unwrap()
+                .is_some()
+        );
         assert_final_task_payload_accounting(&store);
     }
 
@@ -13025,24 +13336,38 @@ mod tests {
     fn task_02_final_partial_input_payload_aggregate_is_atomic() {
         let (store, _now) = in_memory_store_with_test_clock(1);
         let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
-        let task_id = create_final_task_state_fixture(&runtime, None).task.base().task_id.clone();
+        let task_id = create_final_task_state_fixture(&runtime, None)
+            .task
+            .base()
+            .task_id
+            .clone();
         let requests: FinalTaskInputRequests = serde_json::from_value(serde_json::json!({
             "left": {"method": "roots/list"}, "right": {"method": "roots/list"}
-        })).unwrap();
+        }))
+        .unwrap();
         runtime.require_input(&task_id, requests, None).unwrap();
         let right_requests: FinalTaskInputRequests = serde_json::from_value(serde_json::json!({
             "right": {"method": "roots/list"}
-        })).unwrap();
+        }))
+        .unwrap();
         let combined_overflow = final_roots_input_with_encoded_bytes(
             "left",
             MAX_FINAL_TASK_INPUT_BYTES - encoded_final_task_test_bytes(&right_requests) + 1,
         );
         let before_partial = final_task_restoration_snapshot(&store, &task_id);
         assert!(runtime.update_task(&task_id, &combined_overflow).is_err());
-        assert_eq!(final_task_restoration_snapshot(&store, &task_id), before_partial);
+        assert_eq!(
+            final_task_restoration_snapshot(&store, &task_id),
+            before_partial
+        );
         let left = final_roots_input_with_encoded_bytes("left", MAX_FINAL_TASK_INPUT_BYTES - 512);
-        runtime.update_task(&task_id, &left).expect("partial input is retained");
-        assert!(matches!(store.get_task(&task_id).unwrap(), Some(FinalTask::InputRequired { .. })));
+        runtime
+            .update_task(&task_id, &left)
+            .expect("partial input is retained");
+        assert!(matches!(
+            store.get_task(&task_id).unwrap(),
+            Some(FinalTask::InputRequired { .. })
+        ));
         assert_final_task_payload_accounting(&store);
         let before = final_task_restoration_snapshot(&store, &task_id);
         // Two single-entry object encodings combine by removing two braces
@@ -13051,11 +13376,19 @@ mod tests {
         assert!(runtime.update_task(&task_id, &oversized).is_err());
         assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
         let right = final_roots_input_with_encoded_bytes("right", 513);
-        runtime.update_task(&task_id, &right).expect("exactly bounded merged input resumes work");
-        assert!(matches!(store.get_task(&task_id).unwrap(), Some(FinalTask::Working(_))));
+        runtime
+            .update_task(&task_id, &right)
+            .expect("exactly bounded merged input resumes work");
+        assert!(matches!(
+            store.get_task(&task_id).unwrap(),
+            Some(FinalTask::Working(_))
+        ));
         assert_final_task_payload_accounting(&store);
         let retained = store.state.lock().unwrap().accepted_inputs[&task_id].clone();
-        assert_eq!(encoded_final_task_test_bytes(&retained), MAX_FINAL_TASK_INPUT_BYTES);
+        assert_eq!(
+            encoded_final_task_test_bytes(&retained),
+            MAX_FINAL_TASK_INPUT_BYTES
+        );
     }
 
     #[test]
@@ -13063,7 +13396,10 @@ mod tests {
         let (store, _now) = in_memory_store_with_test_clock(1);
         let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
         let task_id = create_final_task_state_fixture(&runtime, None)
-            .task.base().task_id.clone();
+            .task
+            .base()
+            .task_id
+            .clone();
         let mut wire = serde_json::json!({
             "sample": {
                 "method": "sampling/createMessage",
@@ -13155,15 +13491,20 @@ mod tests {
                     }
                 };
                 let result = store.replace_task_and_clear_input_for_handoff_if_current(
-                    &snapshot, "result-owner", fence, false,
-                    replacement.clone(), final_task_notification(&replacement),
+                    &snapshot,
+                    "result-owner",
+                    fence,
+                    false,
+                    replacement.clone(),
+                    final_task_notification(&replacement),
                 );
                 if excess == 1 {
                     assert!(result.is_err());
                     assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
                 } else {
                     assert!(
-                        result.expect("exact terminal member is committed by its fenced owner")
+                        result
+                            .expect("exact terminal member is committed by its fenced owner")
                             .is_some()
                     );
                     assert!(store.retained_payload_bytes() >= 2 * MAX_FINAL_TASK_RESULT_BYTES);
@@ -13179,7 +13520,9 @@ mod tests {
         let task_id = task.base().task_id.clone();
         let descriptor = final_test_work_descriptor();
         let descriptor_bytes = encoded_final_task_test_bytes(descriptor.as_value());
-        let FinalTask::Working(mut grown_base) = task.clone() else { unreachable!() };
+        let FinalTask::Working(mut grown_base) = task.clone() else {
+            unreachable!()
+        };
         grown_base.status_message = Some("x".repeat(2_048));
         let grown = FinalTask::Working(grown_base.clone());
         let limit = encoded_final_task_test_bytes(&grown)
@@ -13188,18 +13531,34 @@ mod tests {
             + FINAL_TASK_CANCELLATION_RESERVE_BYTES;
         let insufficient = InMemoryFinalTaskStore::with_payload_capacity(2, limit - 1).unwrap();
         let before = final_task_restoration_snapshot(&insufficient, &task_id);
-        assert!(insufficient.create_task_with_work(
-            grown.clone(), final_task_notification(&grown), descriptor.clone(),
-        ).is_err());
-        assert_eq!(final_task_restoration_snapshot(&insufficient, &task_id), before);
+        assert!(
+            insufficient
+                .create_task_with_work(
+                    grown.clone(),
+                    final_task_notification(&grown),
+                    descriptor.clone(),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            final_task_restoration_snapshot(&insufficient, &task_id),
+            before
+        );
 
         let now = Arc::new(Mutex::new(Instant::now()));
         let clock = Arc::clone(&now);
         let store = InMemoryFinalTaskStore::with_clock_and_payload_capacity(
-            2, limit, Arc::new(move || *clock.lock().unwrap()),
-        ).unwrap();
+            2,
+            limit,
+            Arc::new(move || *clock.lock().unwrap()),
+        )
+        .unwrap();
         store
-            .create_task_with_work(task.clone(), final_task_notification(&task), descriptor.clone())
+            .create_task_with_work(
+                task.clone(),
+                final_task_notification(&task),
+                descriptor.clone(),
+            )
             .unwrap();
         let initial = store.get_task_snapshot(&task_id).unwrap().unwrap();
         assert!(
@@ -13207,7 +13566,10 @@ mod tests {
                 .replace_task_if_current(&initial, grown.clone(), final_task_notification(&grown))
                 .unwrap()
         );
-        assert_eq!(store.retained_payload_bytes() + FINAL_TASK_CANCELLATION_RESERVE_BYTES, limit);
+        assert_eq!(
+            store.retained_payload_bytes() + FINAL_TASK_CANCELLATION_RESERVE_BYTES,
+            limit
+        );
         assert_final_task_payload_accounting(&store);
         let current = store.get_task_snapshot(&task_id).unwrap().unwrap();
         let before = final_task_restoration_snapshot(&store, &task_id);
@@ -13225,7 +13587,11 @@ mod tests {
         assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
 
         let other = final_working_task_with_ttl("task-payload-sibling", 1_000);
-        assert!(store.create_task(other.clone(), final_task_notification(&other)).is_err());
+        assert!(
+            store
+                .create_task(other.clone(), final_task_notification(&other))
+                .is_err()
+        );
         assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
         let completed = FinalTask::Completed {
             base: transition_terminal_final_task_base(
@@ -13249,19 +13615,28 @@ mod tests {
             + encoded_final_task_test_bytes(&final_task_notification(&completed))
             + descriptor_bytes;
         assert_eq!(store.retained_payload_bytes(), terminal_bytes);
-        store.create_task(other.clone(), final_task_notification(&other))
+        store
+            .create_task(other.clone(), final_task_notification(&other))
             .expect("shrinking a replacement releases aggregate capacity");
         assert_final_task_payload_accounting(&store);
         assert!(store.retained_payload_bytes() > terminal_bytes);
 
         *now.lock().unwrap() += StdDuration::from_millis(1_000);
         assert_eq!(store.retained_payload_bytes(), 0);
-        assert_eq!(store.retained_payload_bytes(), 0, "expiry releases each charge once");
+        assert_eq!(
+            store.retained_payload_bytes(),
+            0,
+            "expiry releases each charge once"
+        );
         assert_eq!(store.task_count(), 0);
         assert_final_task_payload_accounting(&store);
-        store.create_task_with_work(grown.clone(), final_task_notification(&grown), descriptor)
+        store
+            .create_task_with_work(grown.clone(), final_task_notification(&grown), descriptor)
             .expect("expiry allows the full encoded capacity to be reused");
-        assert_eq!(store.retained_payload_bytes() + FINAL_TASK_CANCELLATION_RESERVE_BYTES, limit);
+        assert_eq!(
+            store.retained_payload_bytes() + FINAL_TASK_CANCELLATION_RESERVE_BYTES,
+            limit
+        );
         assert_final_task_payload_accounting(&store);
     }
 
@@ -13294,24 +13669,50 @@ mod tests {
                         .unwrap()
                         .unwrap();
                 }
-                let fence = store.begin_handoff_dispatch_for_owner_if_current(
-                    &task_id, snapshot.generation(), "payload-owner",
-                ).unwrap().unwrap();
+                let fence = store
+                    .begin_handoff_dispatch_for_owner_if_current(
+                        &task_id,
+                        snapshot.generation(),
+                        "payload-owner",
+                    )
+                    .unwrap()
+                    .unwrap();
                 let before = store.retained_payload_bytes();
                 if cancel {
                     assert!(store.request_cancellation_if_current(&snapshot).unwrap());
                     assert!(store.request_cancellation_if_current(&snapshot).unwrap());
                 } else {
-                    assert!(store.finish_handoff_dispatch_for_owner_if_current(
-                        &task_id, snapshot.generation(), "payload-owner", fence,
-                    ).unwrap());
-                    assert!(!store.finish_handoff_dispatch_for_owner_if_current(
-                        &task_id, snapshot.generation(), "payload-owner", fence,
-                    ).unwrap());
+                    assert!(
+                        store
+                            .finish_handoff_dispatch_for_owner_if_current(
+                                &task_id,
+                                snapshot.generation(),
+                                "payload-owner",
+                                fence,
+                            )
+                            .unwrap()
+                    );
+                    assert!(
+                        !store
+                            .finish_handoff_dispatch_for_owner_if_current(
+                                &task_id,
+                                snapshot.generation(),
+                                "payload-owner",
+                                fence,
+                            )
+                            .unwrap()
+                    );
                 }
                 assert_eq!(store.retained_payload_bytes(), before - released);
                 assert!(store.get_task(&task_id).unwrap().is_some());
-                assert!(store.state.lock().unwrap().work_descriptors.contains_key(&task_id));
+                assert!(
+                    store
+                        .state
+                        .lock()
+                        .unwrap()
+                        .work_descriptors
+                        .contains_key(&task_id)
+                );
                 assert_final_task_payload_accounting(&store);
             }
         }
@@ -13327,22 +13728,33 @@ mod tests {
         let initial_bytes = encoded_final_task_test_bytes(&task)
             + encoded_final_task_test_bytes(&final_task_notification(&task));
         for maximum_timestamp in [false, true] {
-            let store = Arc::new(InMemoryFinalTaskStore::with_payload_capacity(
-                1,
-                initial_bytes + FINAL_TASK_CANCELLATION_RESERVE_BYTES,
-            ).unwrap());
-            store.create_task(task.clone(), final_task_notification(&task)).unwrap();
+            let store = Arc::new(
+                InMemoryFinalTaskStore::with_payload_capacity(
+                    1,
+                    initial_bytes + FINAL_TASK_CANCELLATION_RESERVE_BYTES,
+                )
+                .unwrap(),
+            );
+            store
+                .create_task(task.clone(), final_task_notification(&task))
+                .unwrap();
             if maximum_timestamp {
                 let snapshot = store.get_task_snapshot(&task_id).unwrap().unwrap();
                 let mut base = task.base().clone();
                 base.status = FinalTaskStatus::Cancelled;
-                base.last_updated_at = FinalTaskTimestamp::parse(
-                    "2026-07-28T12:00:00.123456789+00:00",
-                ).unwrap();
+                base.last_updated_at =
+                    FinalTaskTimestamp::parse("2026-07-28T12:00:00.123456789+00:00").unwrap();
                 let cancelled = FinalTask::Cancelled(base);
-                assert!(store.request_cancellation_and_clear_input_if_current(
-                    &snapshot, cancelled.clone(), final_task_notification(&cancelled),
-                ).unwrap().is_some());
+                assert!(
+                    store
+                        .request_cancellation_and_clear_input_if_current(
+                            &snapshot,
+                            cancelled.clone(),
+                            final_task_notification(&cancelled),
+                        )
+                        .unwrap()
+                        .is_some()
+                );
                 assert_eq!(store.retained_payload_bytes(), initial_bytes + 34);
             } else {
                 let runtime =
@@ -13352,7 +13764,10 @@ mod tests {
                     .expect("cancellation can grow its control fields at capacity");
                 assert!(store.retained_payload_bytes() > initial_bytes);
             }
-            assert!(matches!(store.get_task(&task_id).unwrap(), Some(FinalTask::Cancelled(_))));
+            assert!(matches!(
+                store.get_task(&task_id).unwrap(),
+                Some(FinalTask::Cancelled(_))
+            ));
             assert_final_task_payload_accounting(&store);
         }
 
@@ -13367,14 +13782,20 @@ mod tests {
                 + FINAL_TASK_CANCELLATION_RESERVE_BYTES;
             let descriptor = FinalTaskWorkDescriptor::new(serde_json::Value::String(
                 "x".repeat(sibling_charge - 2),
-            )).unwrap();
+            ))
+            .unwrap();
             let capacity =
                 initial_bytes + 2 * sibling_charge + FINAL_TASK_CANCELLATION_RESERVE_BYTES;
             let now = Arc::new(Mutex::new(Instant::now()));
             let clock = Arc::clone(&now);
-            let store = Arc::new(InMemoryFinalTaskStore::with_clock_and_payload_capacity(
-                2, capacity, Arc::new(move || *clock.lock().unwrap()),
-            ).unwrap());
+            let store = Arc::new(
+                InMemoryFinalTaskStore::with_clock_and_payload_capacity(
+                    2,
+                    capacity,
+                    Arc::new(move || *clock.lock().unwrap()),
+                )
+                .unwrap(),
+            );
             store
                 .create_task_with_work(task.clone(), final_task_notification(&task), descriptor)
                 .unwrap();
@@ -13383,13 +13804,22 @@ mod tests {
                 .take_initial_work_handoff_for_owner_if_current(&snapshot, "cancel-owner")
                 .unwrap()
                 .unwrap();
-            let fence = store.begin_handoff_dispatch_for_owner_if_current(
-                &task_id, snapshot.generation(), "cancel-owner",
-            ).unwrap().unwrap();
+            let fence = store
+                .begin_handoff_dispatch_for_owner_if_current(
+                    &task_id,
+                    snapshot.generation(),
+                    "cancel-owner",
+                )
+                .unwrap()
+                .unwrap();
             let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
             runtime.cancel_task(&task_id).unwrap();
-            assert!(matches!(store.get_task(&task_id).unwrap(), Some(FinalTask::Working(_))));
-            store.create_task(sibling.clone(), final_task_notification(&sibling))
+            assert!(matches!(
+                store.get_task(&task_id).unwrap(),
+                Some(FinalTask::Working(_))
+            ));
+            store
+                .create_task(sibling.clone(), final_task_notification(&sibling))
                 .expect("the sibling may use the released initial descriptor bytes");
             assert_eq!(
                 store.retained_payload_bytes() + 2 * FINAL_TASK_CANCELLATION_RESERVE_BYTES,
@@ -13415,15 +13845,32 @@ mod tests {
             if expiry_retirement {
                 *now.lock().unwrap() += IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
             } else {
-                let cancelled = FinalTask::Cancelled(transition_terminal_final_task_base(
-                    task.base().clone(), FinalTaskStatus::Cancelled, None,
-                ).unwrap());
-                assert!(store.replace_task_and_clear_input_for_handoff_if_current(
-                    &snapshot, "cancel-owner", fence, true,
-                    cancelled.clone(), final_task_notification(&cancelled),
-                ).unwrap().is_some());
+                let cancelled = FinalTask::Cancelled(
+                    transition_terminal_final_task_base(
+                        task.base().clone(),
+                        FinalTaskStatus::Cancelled,
+                        None,
+                    )
+                    .unwrap(),
+                );
+                assert!(
+                    store
+                        .replace_task_and_clear_input_for_handoff_if_current(
+                            &snapshot,
+                            "cancel-owner",
+                            fence,
+                            true,
+                            cancelled.clone(),
+                            final_task_notification(&cancelled),
+                        )
+                        .unwrap()
+                        .is_some()
+                );
             }
-            assert!(matches!(store.get_task(&task_id).unwrap(), Some(FinalTask::Cancelled(_))));
+            assert!(matches!(
+                store.get_task(&task_id).unwrap(),
+                Some(FinalTask::Cancelled(_))
+            ));
             let sibling_after = store.get_task_snapshot(&sibling_id).unwrap().unwrap();
             assert_eq!(sibling_before.generation(), sibling_after.generation());
             assert_eq!(
@@ -14870,17 +15317,25 @@ mod tests {
     }
 
     fn execution_test_store(
-        total_ms: u64, attempt_ms: u64, max_attempts: u32,
+        total_ms: u64,
+        attempt_ms: u64,
+        max_attempts: u32,
     ) -> (Arc<InMemoryFinalTaskStore>, Arc<Mutex<Instant>>) {
         let clock = Arc::new(Mutex::new(Instant::now()));
         let clock_reader = Arc::clone(&clock);
         let limits = FinalTaskExecutionLimits::new(
-            StdDuration::from_millis(total_ms), StdDuration::from_millis(attempt_ms), max_attempts,
-        ).unwrap();
+            StdDuration::from_millis(total_ms),
+            StdDuration::from_millis(attempt_ms),
+            max_attempts,
+        )
+        .unwrap();
         let store = InMemoryFinalTaskStore::with_clock_payload_and_execution_limits(
-            4, InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES, limits,
+            4,
+            InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES,
+            limits,
             Arc::new(move || *clock_reader.lock().unwrap()),
-        ).unwrap();
+        )
+        .unwrap();
         (Arc::new(store), clock)
     }
 
@@ -14894,19 +15349,33 @@ mod tests {
 
     impl ApplicationTaskSupervisor for ExecutionPollingSupervisor {
         fn resume<'a>(
-            &'a self, _cx: &'a Cx, handoff: FinalTaskSupervisorHandoff,
+            &'a self,
+            _cx: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
         ) -> FinalTaskSupervisorFuture<'a> {
             Box::pin(async move {
-                self.budgets.lock().unwrap().push(handoff.execution_budget()?);
+                self.budgets
+                    .lock()
+                    .unwrap()
+                    .push(handoff.execution_budget()?);
                 let finishes = match &handoff {
                     FinalTaskSupervisorHandoff::Initial(initial) => initial.work_descriptor(),
                     FinalTaskSupervisorHandoff::Resumed(accepted) => accepted.work_descriptor(),
-                }.as_value().get("finish").and_then(serde_json::Value::as_bool) == Some(true);
+                }
+                .as_value()
+                .get("finish")
+                .and_then(serde_json::Value::as_bool)
+                    == Some(true);
                 if finishes {
-                    let result = serde_json::from_value(serde_json::json!({"content": []})).unwrap();
+                    let result =
+                        serde_json::from_value(serde_json::json!({"content": []})).unwrap();
                     match handoff {
-                        FinalTaskSupervisorHandoff::Initial(initial) => { initial.complete_task(result, None)?; }
-                        FinalTaskSupervisorHandoff::Resumed(accepted) => { accepted.complete_task(result, None)?; }
+                        FinalTaskSupervisorHandoff::Initial(initial) => {
+                            initial.complete_task(result, None)?;
+                        }
+                        FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                            accepted.complete_task(result, None)?;
+                        }
                     }
                     return Ok(());
                 }
@@ -14921,7 +15390,8 @@ mod tests {
                 std::future::poll_fn(|_| {
                     self.polls.fetch_add(1, AtomicOrdering::SeqCst);
                     std::task::Poll::Pending::<McpResult<()>>
-                }).await
+                })
+                .await
             })
         }
     }
@@ -14929,11 +15399,14 @@ mod tests {
     fn check_execution_before_application_repoll(expired: bool, total: bool) {
         for resumed in [false, true] {
             let (store, clock) = execution_test_store(
-                if total { 100 } else { 1_000 }, if total { 200 } else { 100 }, 8,
+                if total { 100 } else { 1_000 },
+                if total { 200 } else { 100 },
+                8,
             );
             let runtime = final_task_runtime(store.clone(), Arc::new(AtomicBool::new(false)));
             let supervisor = Arc::new(ExecutionPollingSupervisor {
-                require_initial_input: resumed, ..ExecutionPollingSupervisor::default()
+                require_initial_input: resumed,
+                ..ExecutionPollingSupervisor::default()
             });
             let mut runner = runtime.install_task_service(2, supervisor.clone()).unwrap();
             let application = RuntimeBuilder::current_thread().build().unwrap();
@@ -14943,14 +15416,21 @@ mod tests {
                 let mut running = Box::pin(runner.run_service(&cx));
                 let mut context = std::task::Context::from_waker(std::task::Waker::noop());
                 assert!(running.as_mut().poll(&mut context).is_pending());
-                let created = runtime.create_task_with_work(final_test_work_descriptor(), None).unwrap();
+                let created = runtime
+                    .create_task_with_work(final_test_work_descriptor(), None)
+                    .unwrap();
                 let task_id = created.task.base().task_id.clone();
                 assert!(running.as_mut().poll(&mut context).is_pending());
                 let first = supervisor.budgets.lock().unwrap()[0];
                 if resumed {
-                    assert!(matches!(store.get_task(&task_id).unwrap(), Some(FinalTask::InputRequired { .. })));
+                    assert!(matches!(
+                        store.get_task(&task_id).unwrap(),
+                        Some(FinalTask::InputRequired { .. })
+                    ));
                     *clock.lock().unwrap() += StdDuration::from_millis(10);
-                    let inputs = serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
+                    let inputs =
+                        serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
+                            .unwrap();
                     runtime.update_task(&task_id, &inputs).unwrap();
                     assert!(running.as_mut().poll(&mut context).is_pending());
                 }
@@ -14959,22 +15439,38 @@ mod tests {
                 assert_eq!(budget.attempts(), if resumed { 2 } else { 1 });
                 assert_eq!(supervisor.polls.load(AtomicOrdering::SeqCst), 1);
                 let deadline = budget.attempt_deadline().unwrap();
-                *clock.lock().unwrap() = if expired { deadline } else {
+                *clock.lock().unwrap() = if expired {
+                    deadline
+                } else {
                     deadline - StdDuration::from_millis(1)
                 };
-                assert!(running.as_mut().poll(&mut context).is_pending(), "expiry must not fail the service");
+                assert!(
+                    running.as_mut().poll(&mut context).is_pending(),
+                    "expiry must not fail the service"
+                );
                 let task = store.get_task(&task_id).unwrap().unwrap();
                 if expired {
                     assert_eq!(supervisor.polls.load(AtomicOrdering::SeqCst), 1);
                     assert!(supervisor.dropped.load(AtomicOrdering::SeqCst));
-                    let FinalTask::Failed { error, .. } = &task else { panic!("expired execution must retain failure"); };
-                    assert_eq!(error.message, if total {
-                        FINAL_TASK_TOTAL_DEADLINE_EXCEEDED
-                    } else { FINAL_TASK_ATTEMPT_DEADLINE_EXCEEDED });
+                    let FinalTask::Failed { error, .. } = &task else {
+                        panic!("expired execution must retain failure");
+                    };
+                    assert_eq!(
+                        error.message,
+                        if total {
+                            FINAL_TASK_TOTAL_DEADLINE_EXCEEDED
+                        } else {
+                            FINAL_TASK_ATTEMPT_DEADLINE_EXCEEDED
+                        }
+                    );
                     assert!(store.state.lock().unwrap().handoff_leases.is_empty());
-                    assert_eq!(serde_json::to_value(&task).unwrap(), serde_json::to_value(
-                        store.latest_notification(&task_id).unwrap().params.task,
-                    ).unwrap());
+                    assert_eq!(
+                        serde_json::to_value(&task).unwrap(),
+                        serde_json::to_value(
+                            store.latest_notification(&task_id).unwrap().params.task,
+                        )
+                        .unwrap()
+                    );
                 } else {
                     assert_eq!(supervisor.polls.load(AtomicOrdering::SeqCst), 2);
                     assert!(!supervisor.dropped.load(AtomicOrdering::SeqCst));
@@ -14982,15 +15478,28 @@ mod tests {
                 }
                 assert!(runtime.is_task_service_ready());
                 assert_eq!(cx.budget().deadline, service_budget.deadline);
-                assert_eq!(store.task_count(), 1, "execution expiry must preserve retained result");
+                assert_eq!(
+                    store.task_count(),
+                    1,
+                    "execution expiry must preserve retained result"
+                );
                 assert_final_task_payload_accounting(&store);
                 if expired {
-                    let sibling = runtime.create_task_with_work(
-                        FinalTaskWorkDescriptor::new(serde_json::json!({"finish": true})).unwrap(), None,
-                    ).unwrap();
+                    let sibling = runtime
+                        .create_task_with_work(
+                            FinalTaskWorkDescriptor::new(serde_json::json!({"finish": true}))
+                                .unwrap(),
+                            None,
+                        )
+                        .unwrap();
                     assert!(running.as_mut().poll(&mut context).is_pending());
-                    assert!(matches!(store.get_task(&sibling.task.base().task_id).unwrap(),
-                        Some(FinalTask::Completed { .. })), "a deadline failure must leave the service usable by healthy work");
+                    assert!(
+                        matches!(
+                            store.get_task(&sibling.task.base().task_id).unwrap(),
+                            Some(FinalTask::Completed { .. })
+                        ),
+                        "a deadline failure must leave the service usable by healthy work"
+                    );
                 }
                 drop(running);
             });
@@ -15020,19 +15529,33 @@ mod tests {
     #[test]
     fn task_02_execution_limits_validate_defaults_and_hard_ceilings() {
         let defaults = FinalTaskExecutionLimits::default();
-        assert_eq!(defaults.total_runtime(), StdDuration::from_secs(86_400));
+        assert_eq!(defaults.total_runtime(), StdDuration::from_hours(24));
         assert_eq!(defaults.attempt_runtime(), StdDuration::from_secs(3_600));
         assert_eq!(defaults.max_attempts(), 8);
-        assert!(FinalTaskExecutionLimits::new(
-            StdDuration::from_secs(30 * 86_400), StdDuration::from_secs(86_400), 64,
-        ).is_ok());
+        assert!(
+            FinalTaskExecutionLimits::new(
+                StdDuration::from_hours(720),
+                StdDuration::from_hours(24),
+                64,
+            )
+            .is_ok()
+        );
         for (total, attempt, claims) in [
-            (0, 1, 1), (1, 0, 1), (1, 1, 0), (30 * 86_400 + 1, 1, 1),
-            (1, 86_401, 1), (1, 1, 65),
+            (0, 1, 1),
+            (1, 0, 1),
+            (1, 1, 0),
+            (30 * 86_400 + 1, 1, 1),
+            (1, 86_401, 1),
+            (1, 1, 65),
         ] {
-            assert!(FinalTaskExecutionLimits::new(
-                StdDuration::from_secs(total), StdDuration::from_secs(attempt), claims,
-            ).is_err());
+            assert!(
+                FinalTaskExecutionLimits::new(
+                    StdDuration::from_secs(total),
+                    StdDuration::from_secs(attempt),
+                    claims,
+                )
+                .is_err()
+            );
         }
     }
 
@@ -15040,57 +15563,83 @@ mod tests {
         let (store, clock) = execution_test_store(100, 40, 8);
         let runtime = final_task_runtime(store.clone(), Arc::new(AtomicBool::new(false)));
         let supervisor = Arc::new(ExecutionPollingSupervisor {
-            require_initial_input: true, ..ExecutionPollingSupervisor::default()
+            require_initial_input: true,
+            ..ExecutionPollingSupervisor::default()
         });
         let mut runner = runtime.install_task_service(2, supervisor.clone()).unwrap();
-        RuntimeBuilder::current_thread().build().unwrap().block_on(async {
-            let cx = Cx::current().unwrap();
-            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-            let mut running = Box::pin(runner.run_service(&cx));
-            assert!(running.as_mut().poll(&mut context).is_pending());
-            let task = runtime.create_task_with_work(final_test_work_descriptor(), None).unwrap().task;
-            let task_id = task.base().task_id.clone();
-            assert!(running.as_mut().poll(&mut context).is_pending());
-            let waiting = store.get_task_snapshot(&task_id).unwrap().unwrap();
-            assert!(matches!(waiting.task(), FinalTask::InputRequired { .. }));
-            let original = store.task_execution_budget_if_current(&waiting).unwrap().unwrap();
-            assert_eq!(original.attempts(), 1);
-            assert!(original.attempt_deadline().is_none(), "waiting input has no active attempt");
-            drop(running);
-            drop(runner);
-            *clock.lock().unwrap() = original.total_deadline() - if expired {
-                StdDuration::ZERO
-            } else { StdDuration::from_millis(1) };
-            // A replacement runtime has a different retention policy. It must
-            // use the original task's execution deadline and retention record.
-            let recovered = FinalTaskRuntime::new(
-                store.clone(), FinalTaskRuntimeConfig::new(5_000, None).unwrap(), Arc::new(|_| {}),
-            );
-            let mut successor = recovered.install_task_service(2, supervisor.clone()).unwrap();
-            let mut recovering = Box::pin(successor.run_service(&cx));
-            assert!(recovering.as_mut().poll(&mut context).is_pending());
-            let current = store.get_task_snapshot(&task_id).unwrap().unwrap();
-            let current_budget = store.task_execution_budget_if_current(&current).unwrap().unwrap();
-            assert_eq!(current_budget.total_deadline(), original.total_deadline());
-            assert_eq!(current.task().base().ttl_ms, task.base().ttl_ms);
-            let inputs = serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
-            recovered.update_task(&task_id, &inputs).unwrap();
-            assert!(recovering.as_mut().poll(&mut context).is_pending());
-            if expired {
-                let FinalTask::Failed { error, .. } = current.task() else { panic!("recovery must expire input wait"); };
-                assert_eq!(error.message, FINAL_TASK_TOTAL_DEADLINE_EXCEEDED);
-                assert_eq!(supervisor.budgets.lock().unwrap().len(), 1);
-                assert!(store.state.lock().unwrap().accepted_inputs.is_empty());
-            } else {
-                assert!(matches!(current.task(), FinalTask::InputRequired { .. }));
-                let budget = *supervisor.budgets.lock().unwrap().last().unwrap();
-                assert_eq!(budget.attempts(), 2);
-                assert_eq!(budget.attempt_deadline(), Some(original.total_deadline()));
-                assert_eq!(supervisor.polls.load(AtomicOrdering::SeqCst), 1);
-            }
-            assert!(recovered.is_task_service_ready());
-            drop(recovering);
-        });
+        RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                let mut running = Box::pin(runner.run_service(&cx));
+                assert!(running.as_mut().poll(&mut context).is_pending());
+                let task = runtime
+                    .create_task_with_work(final_test_work_descriptor(), None)
+                    .unwrap()
+                    .task;
+                let task_id = task.base().task_id.clone();
+                assert!(running.as_mut().poll(&mut context).is_pending());
+                let waiting = store.get_task_snapshot(&task_id).unwrap().unwrap();
+                assert!(matches!(waiting.task(), FinalTask::InputRequired { .. }));
+                let original = store
+                    .task_execution_budget_if_current(&waiting)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(original.attempts(), 1);
+                assert!(
+                    original.attempt_deadline().is_none(),
+                    "waiting input has no active attempt"
+                );
+                drop(running);
+                drop(runner);
+                *clock.lock().unwrap() = original.total_deadline()
+                    - if expired {
+                        StdDuration::ZERO
+                    } else {
+                        StdDuration::from_millis(1)
+                    };
+                // A replacement runtime has a different retention policy. It must
+                // use the original task's execution deadline and retention record.
+                let recovered = FinalTaskRuntime::new(
+                    store.clone(),
+                    FinalTaskRuntimeConfig::new(5_000, None).unwrap(),
+                    Arc::new(|_| {}),
+                );
+                let mut successor = recovered
+                    .install_task_service(2, supervisor.clone())
+                    .unwrap();
+                let mut recovering = Box::pin(successor.run_service(&cx));
+                assert!(recovering.as_mut().poll(&mut context).is_pending());
+                let current = store.get_task_snapshot(&task_id).unwrap().unwrap();
+                let current_budget = store
+                    .task_execution_budget_if_current(&current)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(current_budget.total_deadline(), original.total_deadline());
+                assert_eq!(current.task().base().ttl_ms, task.base().ttl_ms);
+                let inputs =
+                    serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
+                recovered.update_task(&task_id, &inputs).unwrap();
+                assert!(recovering.as_mut().poll(&mut context).is_pending());
+                if expired {
+                    let FinalTask::Failed { error, .. } = current.task() else {
+                        panic!("recovery must expire input wait");
+                    };
+                    assert_eq!(error.message, FINAL_TASK_TOTAL_DEADLINE_EXCEEDED);
+                    assert_eq!(supervisor.budgets.lock().unwrap().len(), 1);
+                    assert!(store.state.lock().unwrap().accepted_inputs.is_empty());
+                } else {
+                    assert!(matches!(current.task(), FinalTask::InputRequired { .. }));
+                    let budget = *supervisor.budgets.lock().unwrap().last().unwrap();
+                    assert_eq!(budget.attempts(), 2);
+                    assert_eq!(budget.attempt_deadline(), Some(original.total_deadline()));
+                    assert_eq!(supervisor.polls.load(AtomicOrdering::SeqCst), 1);
+                }
+                assert!(recovered.is_task_service_ready());
+                drop(recovering);
+            });
     }
 
     #[test]
@@ -15109,38 +15658,126 @@ mod tests {
         let task = final_working_task_with_ttl("task-execution-recovery", 60_000);
         let task_id = task.base().task_id.clone();
         let descriptor = final_test_work_descriptor();
-        let original = store.create_task_with_work(task.clone(), final_task_notification(&task), descriptor.clone()).unwrap();
-        let created_budget = store.task_execution_budget_if_current(&original).unwrap().unwrap();
+        let original = store
+            .create_task_with_work(
+                task.clone(),
+                final_task_notification(&task),
+                descriptor.clone(),
+            )
+            .unwrap();
+        let created_budget = store
+            .task_execution_budget_if_current(&original)
+            .unwrap()
+            .unwrap();
         let start = *clock.lock().unwrap();
-        store.take_initial_work_handoff_for_owner_if_current(&original, "first").unwrap().unwrap();
-        let first = store.task_execution_budget_if_current(&original).unwrap().unwrap();
-        let fence = store.begin_handoff_dispatch_for_owner_if_current(&task_id, original.generation(), "first").unwrap().unwrap();
+        store
+            .take_initial_work_handoff_for_owner_if_current(&original, "first")
+            .unwrap()
+            .unwrap();
+        let first = store
+            .task_execution_budget_if_current(&original)
+            .unwrap()
+            .unwrap();
+        let fence = store
+            .begin_handoff_dispatch_for_owner_if_current(&task_id, original.generation(), "first")
+            .unwrap()
+            .unwrap();
         *clock.lock().unwrap() = start + StdDuration::from_millis(50);
-        assert!(store.renew_handoff_dispatch_if_current(&task_id, original.generation(), "first", fence).unwrap());
-        assert_eq!(store.task_execution_budget_if_current(&original).unwrap().unwrap(), first);
-        assert!(store.take_initial_work_handoff_for_owner_if_current(&original, "competitor").unwrap().is_none());
-        assert_eq!(store.task_execution_budget_if_current(&original).unwrap().unwrap().attempts(), 1);
-        assert!(store.restore_initial_work_for_owner_if_current(
-            &task_id, original.generation(), "first", Some(fence), descriptor.clone(),
-        ).unwrap());
-        let restored = store.task_execution_budget_if_current(&original).unwrap().unwrap();
+        assert!(
+            store
+                .renew_handoff_dispatch_if_current(&task_id, original.generation(), "first", fence)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .task_execution_budget_if_current(&original)
+                .unwrap()
+                .unwrap(),
+            first
+        );
+        assert!(
+            store
+                .take_initial_work_handoff_for_owner_if_current(&original, "competitor")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .task_execution_budget_if_current(&original)
+                .unwrap()
+                .unwrap()
+                .attempts(),
+            1
+        );
+        assert!(
+            store
+                .restore_initial_work_for_owner_if_current(
+                    &task_id,
+                    original.generation(),
+                    "first",
+                    Some(fence),
+                    descriptor.clone(),
+                )
+                .unwrap()
+        );
+        let restored = store
+            .task_execution_budget_if_current(&original)
+            .unwrap()
+            .unwrap();
         assert_eq!(restored.total_deadline(), created_budget.total_deadline());
         assert_eq!(restored.attempts(), 1);
         assert!(restored.attempt_deadline().is_none());
-        store.take_initial_work_handoff_for_owner_if_current(&original, "second").unwrap().unwrap();
-        let second = store.task_execution_budget_if_current(&original).unwrap().unwrap();
+        store
+            .take_initial_work_handoff_for_owner_if_current(&original, "second")
+            .unwrap()
+            .unwrap();
+        let second = store
+            .task_execution_budget_if_current(&original)
+            .unwrap()
+            .unwrap();
         assert_eq!(second.attempts(), 2);
         assert_eq!(second.total_deadline(), created_budget.total_deadline());
-        assert_eq!(second.attempt_deadline(), Some(start + StdDuration::from_millis(150)));
-        assert!(store.expire_task_execution_if_current(&original).unwrap().is_none(), "last allowed live attempt remains authorized");
-        assert!(!store.renew_handoff_dispatch_if_current(&task_id, original.generation(), "first", fence).unwrap());
-        assert!(store.restore_initial_work_for_owner_if_current(
-            &task_id, original.generation(), "second", None, descriptor,
-        ).unwrap());
-        let terminal = store.expire_task_execution_if_current(&original).unwrap().unwrap();
-        let FinalTask::Failed { error, .. } = terminal.task() else { panic!("exhausted claims fail deterministically"); };
+        assert_eq!(
+            second.attempt_deadline(),
+            Some(start + StdDuration::from_millis(150))
+        );
+        assert!(
+            store
+                .expire_task_execution_if_current(&original)
+                .unwrap()
+                .is_none(),
+            "last allowed live attempt remains authorized"
+        );
+        assert!(
+            !store
+                .renew_handoff_dispatch_if_current(&task_id, original.generation(), "first", fence)
+                .unwrap()
+        );
+        assert!(
+            store
+                .restore_initial_work_for_owner_if_current(
+                    &task_id,
+                    original.generation(),
+                    "second",
+                    None,
+                    descriptor,
+                )
+                .unwrap()
+        );
+        let terminal = store
+            .expire_task_execution_if_current(&original)
+            .unwrap()
+            .unwrap();
+        let FinalTask::Failed { error, .. } = terminal.task() else {
+            panic!("exhausted claims fail deterministically");
+        };
         assert_eq!(error.message, FINAL_TASK_ATTEMPTS_EXHAUSTED);
-        assert!(store.take_initial_work_handoff_for_owner_if_current(&terminal, "third").unwrap().is_none());
+        assert!(
+            store
+                .take_initial_work_handoff_for_owner_if_current(&terminal, "third")
+                .unwrap()
+                .is_none()
+        );
         assert_final_task_payload_accounting(&store);
     }
 
@@ -15153,17 +15790,35 @@ mod tests {
         let clock = Arc::new(Mutex::new(Instant::now()));
         let reader = clock.clone();
         let store = InMemoryFinalTaskStore::with_clock_payload_and_execution_limits(
-            2, payload + FINAL_TASK_CANCELLATION_RESERVE_BYTES,
-            FinalTaskExecutionLimits::new(StdDuration::from_millis(100), StdDuration::from_millis(100), 1).unwrap(),
+            2,
+            payload + FINAL_TASK_CANCELLATION_RESERVE_BYTES,
+            FinalTaskExecutionLimits::new(
+                StdDuration::from_millis(100),
+                StdDuration::from_millis(100),
+                1,
+            )
+            .unwrap(),
             Arc::new(move || *reader.lock().unwrap()),
-        ).unwrap();
-        store.create_task(task.clone(), final_task_notification(&task)).unwrap();
+        )
+        .unwrap();
+        store
+            .create_task(task.clone(), final_task_notification(&task))
+            .unwrap();
         let snapshot = store.get_task_snapshot(&task_id).unwrap().unwrap();
         let before = final_task_restoration_snapshot(&store, &task_id);
         let sibling = final_working_task_with_ttl("capacity-competitor", 60_000);
-        assert!(store.create_task(sibling.clone(), final_task_notification(&sibling)).is_err());
+        assert!(
+            store
+                .create_task(sibling.clone(), final_task_notification(&sibling))
+                .is_err()
+        );
         assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
-        assert!(store.expire_task_execution_if_current(&snapshot).unwrap().is_none());
+        assert!(
+            store
+                .expire_task_execution_if_current(&snapshot)
+                .unwrap()
+                .is_none()
+        );
         *clock.lock().unwrap() += StdDuration::from_millis(100);
         let mut forged_task = task.clone();
         if let FinalTask::Working(base) = &mut forged_task {
@@ -15171,7 +15826,10 @@ mod tests {
             base.created_at = FinalTaskTimestamp::parse("2000-01-01T00:00:00Z").unwrap();
         }
         let forged = FinalTaskSnapshot::new(forged_task, snapshot.generation());
-        let expired = store.expire_task_execution_if_current(&forged).unwrap().unwrap();
+        let expired = store
+            .expire_task_execution_if_current(&forged)
+            .unwrap()
+            .unwrap();
         assert_eq!(expired.task().base().created_at, task.base().created_at);
         assert_eq!(expired.task().base().ttl_ms, task.base().ttl_ms);
         assert!(matches!(expired.task(), FinalTask::Failed { .. }));
@@ -15185,41 +15843,103 @@ mod tests {
         for total in [false, true] {
             for expired in [false, true] {
                 let (store, clock) = execution_test_store(
-                    if total { 100 } else { 1_000 }, if total { 200 } else { 100 }, 8,
+                    if total { 100 } else { 1_000 },
+                    if total { 200 } else { 100 },
+                    8,
                 );
                 let task = final_working_task_with_ttl("task-atomic-execution-boundary", 60_000);
                 let task_id = task.base().task_id.clone();
-                let expected = store.create_task_with_work(
-                    task.clone(), final_task_notification(&task), final_test_work_descriptor(),
-                ).unwrap();
-                store.take_initial_work_handoff_for_owner_if_current(&expected, "owner").unwrap().unwrap();
-                let fence = store.begin_handoff_dispatch_for_owner_if_current(
-                    &task_id, expected.generation(), "owner",
-                ).unwrap().unwrap();
-                let budget = store.task_execution_budget_if_current(&expected).unwrap().unwrap();
+                let expected = store
+                    .create_task_with_work(
+                        task.clone(),
+                        final_task_notification(&task),
+                        final_test_work_descriptor(),
+                    )
+                    .unwrap();
+                store
+                    .take_initial_work_handoff_for_owner_if_current(&expected, "owner")
+                    .unwrap()
+                    .unwrap();
+                let fence = store
+                    .begin_handoff_dispatch_for_owner_if_current(
+                        &task_id,
+                        expected.generation(),
+                        "owner",
+                    )
+                    .unwrap()
+                    .unwrap();
+                let budget = store
+                    .task_execution_budget_if_current(&expected)
+                    .unwrap()
+                    .unwrap();
                 *clock.lock().unwrap() = budget.attempt_deadline().unwrap()
-                    - if expired { StdDuration::ZERO } else { StdDuration::from_millis(1) };
+                    - if expired {
+                        StdDuration::ZERO
+                    } else {
+                        StdDuration::from_millis(1)
+                    };
                 let before = final_task_restoration_snapshot(&store, &task_id);
                 let completed = FinalTask::Completed {
-                    base: transition_terminal_final_task_base(task.base().clone(), FinalTaskStatus::Completed, None).unwrap(),
+                    base: transition_terminal_final_task_base(
+                        task.base().clone(),
+                        FinalTaskStatus::Completed,
+                        None,
+                    )
+                    .unwrap(),
                     result: serde_json::from_value(serde_json::json!({"content": []})).unwrap(),
                 };
                 let write = store.replace_task_and_clear_input_for_handoff_if_current(
-                    &expected, "owner", fence, false, completed.clone(), final_task_notification(&completed),
+                    &expected,
+                    "owner",
+                    fence,
+                    false,
+                    completed.clone(),
+                    final_task_notification(&completed),
                 );
                 if expired {
-                    assert!(write.is_err(), "the atomic backend must refuse late completion without relying on a runner poll");
+                    assert!(
+                        write.is_err(),
+                        "the atomic backend must refuse late completion without relying on a runner poll"
+                    );
                     assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
-                    assert_eq!(store.task_execution_budget_if_current(&expected).unwrap().unwrap(), budget);
-                    let terminal = store.expire_task_execution_if_current(&expected).unwrap().unwrap();
-                    let FinalTask::Failed { error, .. } = terminal.task() else { panic!("deadline retirement must win"); };
-                    assert_eq!(error.message, if total { FINAL_TASK_TOTAL_DEADLINE_EXCEEDED } else { FINAL_TASK_ATTEMPT_DEADLINE_EXCEEDED });
-                    assert!(!store.finish_handoff_dispatch_for_owner_if_current(
-                        &task_id, expected.generation(), "owner", fence,
-                    ).unwrap());
+                    assert_eq!(
+                        store
+                            .task_execution_budget_if_current(&expected)
+                            .unwrap()
+                            .unwrap(),
+                        budget
+                    );
+                    let terminal = store
+                        .expire_task_execution_if_current(&expected)
+                        .unwrap()
+                        .unwrap();
+                    let FinalTask::Failed { error, .. } = terminal.task() else {
+                        panic!("deadline retirement must win");
+                    };
+                    assert_eq!(
+                        error.message,
+                        if total {
+                            FINAL_TASK_TOTAL_DEADLINE_EXCEEDED
+                        } else {
+                            FINAL_TASK_ATTEMPT_DEADLINE_EXCEEDED
+                        }
+                    );
+                    assert!(
+                        !store
+                            .finish_handoff_dispatch_for_owner_if_current(
+                                &task_id,
+                                expected.generation(),
+                                "owner",
+                                fence,
+                            )
+                            .unwrap()
+                    );
                 } else {
                     assert!(write.unwrap().is_some());
-                    assert!(matches!(store.get_task(&task_id).unwrap(), Some(FinalTask::Completed { .. })));
+                    assert!(matches!(
+                        store.get_task(&task_id).unwrap(),
+                        Some(FinalTask::Completed { .. })
+                    ));
                 }
             }
         }
@@ -15230,24 +15950,51 @@ mod tests {
         let (store, clock) = execution_test_store(120_000, 60_000, 8);
         let task = final_working_task_with_ttl("task-budget-lease-reclaim", 180_000);
         let task_id = task.base().task_id.clone();
-        let first = store.create_task_with_work(
-            task.clone(), final_task_notification(&task), final_test_work_descriptor(),
-        ).unwrap();
-        store.take_initial_work_handoff_for_owner_if_current(&first, "old").unwrap().unwrap();
-        let original = store.task_execution_budget_if_current(&first).unwrap().unwrap();
+        let first = store
+            .create_task_with_work(
+                task.clone(),
+                final_task_notification(&task),
+                final_test_work_descriptor(),
+            )
+            .unwrap();
+        store
+            .take_initial_work_handoff_for_owner_if_current(&first, "old")
+            .unwrap()
+            .unwrap();
+        let original = store
+            .task_execution_budget_if_current(&first)
+            .unwrap()
+            .unwrap();
         *clock.lock().unwrap() += IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
         let recovered = store.get_task_snapshot(&task_id).unwrap().unwrap();
         assert!(recovered.generation() > first.generation());
-        let awaiting = store.task_execution_budget_if_current(&recovered).unwrap().unwrap();
+        let awaiting = store
+            .task_execution_budget_if_current(&recovered)
+            .unwrap()
+            .unwrap();
         assert_eq!(awaiting.total_deadline(), original.total_deadline());
         assert_eq!(awaiting.attempts(), 1);
         assert!(awaiting.attempt_deadline().is_none());
-        store.take_initial_work_handoff_for_owner_if_current(&recovered, "new").unwrap().unwrap();
-        let retry = store.task_execution_budget_if_current(&recovered).unwrap().unwrap();
+        store
+            .take_initial_work_handoff_for_owner_if_current(&recovered, "new")
+            .unwrap()
+            .unwrap();
+        let retry = store
+            .task_execution_budget_if_current(&recovered)
+            .unwrap()
+            .unwrap();
         assert_eq!(retry.attempts(), 2);
         assert_eq!(retry.total_deadline(), original.total_deadline());
-        assert_eq!(retry.attempt_deadline(), Some(*clock.lock().unwrap() + StdDuration::from_secs(60)));
-        assert!(store.take_initial_work_handoff_for_owner_if_current(&first, "old").unwrap().is_none());
+        assert_eq!(
+            retry.attempt_deadline(),
+            Some(*clock.lock().unwrap() + StdDuration::from_secs(60))
+        );
+        assert!(
+            store
+                .take_initial_work_handoff_for_owner_if_current(&first, "old")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -15257,26 +16004,33 @@ mod tests {
             let runtime = final_task_runtime(store.clone(), Arc::new(AtomicBool::new(false)));
             let supervisor = Arc::new(ExecutionPollingSupervisor::default());
             let mut runner = runtime.install_task_service(1, supervisor.clone()).unwrap();
-            RuntimeBuilder::current_thread().build().unwrap().block_on(async {
-                let cx = Cx::current().unwrap();
-                let mut running = Box::pin(runner.run_service(&cx));
-                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-                assert!(running.as_mut().poll(&mut context).is_pending());
-                let task = runtime.create_task_with_work(final_test_work_descriptor(), None).unwrap().task;
-                *clock.lock().unwrap() += StdDuration::from_millis(if expired { 100 } else { 99 });
-                assert!(running.as_mut().poll(&mut context).is_pending());
-                let current = store.get_task(&task.base().task_id).unwrap().unwrap();
-                if expired {
-                    assert!(matches!(current, FinalTask::Failed { .. }));
-                    assert_eq!(supervisor.polls.load(AtomicOrdering::SeqCst), 0);
-                    assert!(supervisor.budgets.lock().unwrap().is_empty());
-                } else {
-                    assert!(matches!(current, FinalTask::Working(_)));
-                    assert_eq!(supervisor.polls.load(AtomicOrdering::SeqCst), 1);
-                }
-                assert!(runtime.is_task_service_ready());
-                drop(running);
-            });
+            RuntimeBuilder::current_thread()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let cx = Cx::current().unwrap();
+                    let mut running = Box::pin(runner.run_service(&cx));
+                    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                    assert!(running.as_mut().poll(&mut context).is_pending());
+                    let task = runtime
+                        .create_task_with_work(final_test_work_descriptor(), None)
+                        .unwrap()
+                        .task;
+                    *clock.lock().unwrap() +=
+                        StdDuration::from_millis(if expired { 100 } else { 99 });
+                    assert!(running.as_mut().poll(&mut context).is_pending());
+                    let current = store.get_task(&task.base().task_id).unwrap().unwrap();
+                    if expired {
+                        assert!(matches!(current, FinalTask::Failed { .. }));
+                        assert_eq!(supervisor.polls.load(AtomicOrdering::SeqCst), 0);
+                        assert!(supervisor.budgets.lock().unwrap().is_empty());
+                    } else {
+                        assert!(matches!(current, FinalTask::Working(_)));
+                        assert_eq!(supervisor.polls.load(AtomicOrdering::SeqCst), 1);
+                    }
+                    assert!(runtime.is_task_service_ready());
+                    drop(running);
+                });
         }
     }
 
@@ -15286,44 +16040,78 @@ mod tests {
             let expired_count = 2 * MAX_FINAL_TASK_RECOVERY_HANDOFFS_PER_SCAN + 2;
             let clock = Arc::new(Mutex::new(Instant::now()));
             let reader = clock.clone();
-            let store = Arc::new(InMemoryFinalTaskStore::with_clock_payload_and_execution_limits(
-                expired_count + 1, InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES,
-                FinalTaskExecutionLimits::new(StdDuration::from_millis(100), StdDuration::from_millis(100), 8).unwrap(),
-                Arc::new(move || *reader.lock().unwrap()),
-            ).unwrap());
+            let store = Arc::new(
+                InMemoryFinalTaskStore::with_clock_payload_and_execution_limits(
+                    expired_count + 1,
+                    InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES,
+                    FinalTaskExecutionLimits::new(
+                        StdDuration::from_millis(100),
+                        StdDuration::from_millis(100),
+                        8,
+                    )
+                    .unwrap(),
+                    Arc::new(move || *reader.lock().unwrap()),
+                )
+                .unwrap(),
+            );
             let runtime = final_task_runtime(store.clone(), Arc::new(AtomicBool::new(false)));
-            let inputs = serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
-            let descriptor = FinalTaskWorkDescriptor::new(serde_json::json!({"finish": true})).unwrap();
+            let inputs =
+                serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
+            let descriptor =
+                FinalTaskWorkDescriptor::new(serde_json::json!({"finish": true})).unwrap();
             for index in 0..=expired_count {
                 if index == expired_count {
                     *clock.lock().unwrap() += StdDuration::from_millis(100);
                 }
-                let task = final_working_task_with_ttl(&format!("task-expiry-backlog-{index:04}"), 60_000);
-                store.create_task_with_work(task.clone(), final_task_notification(&task), descriptor.clone()).unwrap();
+                let task =
+                    final_working_task_with_ttl(&format!("task-expiry-backlog-{index:04}"), 60_000);
+                store
+                    .create_task_with_work(
+                        task.clone(),
+                        final_task_notification(&task),
+                        descriptor.clone(),
+                    )
+                    .unwrap();
                 if resumed {
-                    runtime.require_input(&task.base().task_id, final_roots_request(), None).unwrap();
+                    runtime
+                        .require_input(&task.base().task_id, final_roots_request(), None)
+                        .unwrap();
                     runtime.update_task(&task.base().task_id, &inputs).unwrap();
                 }
             }
-            let live_id = FinalTaskId::parse(format!("task-expiry-backlog-{expired_count:04}")).unwrap();
+            let live_id =
+                FinalTaskId::parse(format!("task-expiry-backlog-{expired_count:04}")).unwrap();
             let supervisor = Arc::new(ExecutionPollingSupervisor::default());
             let mut runner = runtime.install_task_service(4, supervisor.clone()).unwrap();
-            RuntimeBuilder::current_thread().build().unwrap().block_on(async {
-                let cx = Cx::current().unwrap();
-                let mut running = Box::pin(runner.run_service(&cx));
-                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-                assert!(running.as_mut().poll(&mut context).is_pending(),
-                    "large expired backlog must not exhaust work-recovery CAS retries");
-                assert!(runtime.is_task_service_ready());
-                assert!(matches!(store.get_task(&live_id).unwrap(), Some(FinalTask::Completed { .. })));
-                assert_eq!(supervisor.budgets.lock().unwrap().len(), 1,
-                    "only the healthy record may enter application work");
-                assert!(store.next_expired_execution_snapshot().unwrap().is_none(),
-                    "bounded self-wake turns eventually retire the entire expired backlog");
-                assert_eq!(store.task_count(), expired_count + 1);
-                assert_final_task_payload_accounting(&store);
-                drop(running);
-            });
+            RuntimeBuilder::current_thread()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let cx = Cx::current().unwrap();
+                    let mut running = Box::pin(runner.run_service(&cx));
+                    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                    assert!(
+                        running.as_mut().poll(&mut context).is_pending(),
+                        "large expired backlog must not exhaust work-recovery CAS retries"
+                    );
+                    assert!(runtime.is_task_service_ready());
+                    assert!(matches!(
+                        store.get_task(&live_id).unwrap(),
+                        Some(FinalTask::Completed { .. })
+                    ));
+                    assert_eq!(
+                        supervisor.budgets.lock().unwrap().len(),
+                        1,
+                        "only the healthy record may enter application work"
+                    );
+                    assert!(
+                        store.next_expired_execution_snapshot().unwrap().is_none(),
+                        "bounded self-wake turns eventually retire the entire expired backlog"
+                    );
+                    assert_eq!(store.task_count(), expired_count + 1);
+                    assert_final_task_payload_accounting(&store);
+                    drop(running);
+                });
         }
     }
 
@@ -15337,21 +16125,32 @@ mod tests {
 
     impl ApplicationTaskSupervisor for ExecutionCompletionSupervisor {
         fn resume<'a>(
-            &'a self, _cx: &'a Cx, handoff: FinalTaskSupervisorHandoff,
+            &'a self,
+            _cx: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
         ) -> FinalTaskSupervisorFuture<'a> {
             Box::pin(async move {
                 let _lifetime = RetentionExpiryDropFlag(self.dropped.clone());
                 let budget = handoff.execution_budget()?;
                 if let Some(expired) = self.complete_at_deadline {
                     *self.clock.lock().unwrap() = budget.attempt_deadline().unwrap()
-                        - if expired { StdDuration::ZERO } else { StdDuration::from_millis(1) };
+                        - if expired {
+                            StdDuration::ZERO
+                        } else {
+                            StdDuration::from_millis(1)
+                        };
                 }
                 let result = serde_json::from_value(serde_json::json!({"content": []})).unwrap();
                 let committed = match &handoff {
-                    FinalTaskSupervisorHandoff::Initial(initial) => initial.complete_task(result, None),
-                    FinalTaskSupervisorHandoff::Resumed(accepted) => accepted.complete_task(result, None),
+                    FinalTaskSupervisorHandoff::Initial(initial) => {
+                        initial.complete_task(result, None)
+                    }
+                    FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                        accepted.complete_task(result, None)
+                    }
                 };
-                self.rejected.store(committed.is_err(), AtomicOrdering::SeqCst);
+                self.rejected
+                    .store(committed.is_err(), AtomicOrdering::SeqCst);
                 committed?;
                 if self.complete_at_deadline.is_some() {
                     return Ok(());
@@ -15359,7 +16158,8 @@ mod tests {
                 std::future::poll_fn(|_| {
                     self.cleanup_polls.fetch_add(1, AtomicOrdering::SeqCst);
                     std::task::Poll::Pending::<McpResult<()>>
-                }).await
+                })
+                .await
             })
         }
     }
@@ -15368,40 +16168,61 @@ mod tests {
         let (store, clock) = execution_test_store(1_000, 100, 8);
         let runtime = final_task_runtime(store.clone(), Arc::new(AtomicBool::new(false)));
         let supervisor = Arc::new(ExecutionCompletionSupervisor {
-            clock: clock.clone(), complete_at_deadline: (!cleanup).then_some(expired),
-            cleanup_polls: AtomicUsize::new(0), rejected: AtomicBool::new(false),
+            clock: clock.clone(),
+            complete_at_deadline: (!cleanup).then_some(expired),
+            cleanup_polls: AtomicUsize::new(0),
+            rejected: AtomicBool::new(false),
             dropped: Arc::new(AtomicBool::new(false)),
         });
         let mut runner = runtime.install_task_service(2, supervisor.clone()).unwrap();
-        RuntimeBuilder::current_thread().build().unwrap().block_on(async {
-            let cx = Cx::current().unwrap();
-            let mut running = Box::pin(runner.run_service(&cx));
-            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-            assert!(running.as_mut().poll(&mut context).is_pending());
-            let start = *clock.lock().unwrap();
-            let task = runtime.create_task_with_work(final_test_work_descriptor(), None).unwrap().task;
-            let task_id = task.base().task_id.clone();
-            assert!(running.as_mut().poll(&mut context).is_pending());
-            if cleanup {
-                assert_eq!(supervisor.cleanup_polls.load(AtomicOrdering::SeqCst), 1);
-                *clock.lock().unwrap() = start + StdDuration::from_millis(if expired { 100 } else { 99 });
+        RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let mut running = Box::pin(runner.run_service(&cx));
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
                 assert!(running.as_mut().poll(&mut context).is_pending());
-                assert_eq!(supervisor.cleanup_polls.load(AtomicOrdering::SeqCst), if expired { 1 } else { 2 });
-                assert_eq!(supervisor.dropped.load(AtomicOrdering::SeqCst), expired);
-                assert!(matches!(store.get_task(&task_id).unwrap(), Some(FinalTask::Completed { .. })),
-                    "bounded cleanup must preserve the already committed success");
-            } else {
-                assert_eq!(supervisor.rejected.load(AtomicOrdering::SeqCst), expired);
-                let current = store.get_task(&task_id).unwrap().unwrap();
-                if expired {
-                    let FinalTask::Failed { error, .. } = current else { panic!("late completion must fail"); };
-                    assert_eq!(error.message, FINAL_TASK_ATTEMPT_DEADLINE_EXCEEDED);
-                } else { assert!(matches!(current, FinalTask::Completed { .. })); }
-            }
-            assert!(runtime.is_task_service_ready());
-            assert_final_task_payload_accounting(&store);
-            drop(running);
-        });
+                let start = *clock.lock().unwrap();
+                let task = runtime
+                    .create_task_with_work(final_test_work_descriptor(), None)
+                    .unwrap()
+                    .task;
+                let task_id = task.base().task_id.clone();
+                assert!(running.as_mut().poll(&mut context).is_pending());
+                if cleanup {
+                    assert_eq!(supervisor.cleanup_polls.load(AtomicOrdering::SeqCst), 1);
+                    *clock.lock().unwrap() =
+                        start + StdDuration::from_millis(if expired { 100 } else { 99 });
+                    assert!(running.as_mut().poll(&mut context).is_pending());
+                    assert_eq!(
+                        supervisor.cleanup_polls.load(AtomicOrdering::SeqCst),
+                        if expired { 1 } else { 2 }
+                    );
+                    assert_eq!(supervisor.dropped.load(AtomicOrdering::SeqCst), expired);
+                    assert!(
+                        matches!(
+                            store.get_task(&task_id).unwrap(),
+                            Some(FinalTask::Completed { .. })
+                        ),
+                        "bounded cleanup must preserve the already committed success"
+                    );
+                } else {
+                    assert_eq!(supervisor.rejected.load(AtomicOrdering::SeqCst), expired);
+                    let current = store.get_task(&task_id).unwrap().unwrap();
+                    if expired {
+                        let FinalTask::Failed { error, .. } = current else {
+                            panic!("late completion must fail");
+                        };
+                        assert_eq!(error.message, FINAL_TASK_ATTEMPT_DEADLINE_EXCEEDED);
+                    } else {
+                        assert!(matches!(current, FinalTask::Completed { .. }));
+                    }
+                }
+                assert!(runtime.is_task_service_ready());
+                assert_final_task_payload_accounting(&store);
+                drop(running);
+            });
     }
 
     #[test]
@@ -15712,9 +16533,8 @@ mod tests {
             .base()
             .task_id
             .clone();
-        let handoff = FinalTaskSupervisorHandoff::Initial(
-            runtime.recover_initial_work().unwrap().unwrap(),
-        );
+        let handoff =
+            FinalTaskSupervisorHandoff::Initial(runtime.recover_initial_work().unwrap().unwrap());
         let polls = Arc::new(AtomicUsize::new(0));
         let dropped = Arc::new(AtomicBool::new(false));
         let runner = runtime
@@ -16056,14 +16876,15 @@ mod tests {
             task: FinalTask,
             notification: FinalTaskStatusNotification,
         ) -> McpResult<Option<FinalTaskSnapshot>> {
-            self.inner.replace_task_and_clear_input_for_handoff_if_current(
-                expected,
-                owner_id,
-                dispatch_fence,
-                cancellation_required,
-                task,
-                notification,
-            )
+            self.inner
+                .replace_task_and_clear_input_for_handoff_if_current(
+                    expected,
+                    owner_id,
+                    dispatch_fence,
+                    cancellation_required,
+                    task,
+                    notification,
+                )
         }
 
         fn begin_handoff_dispatch_if_current(
@@ -16167,9 +16988,8 @@ mod tests {
             .base()
             .task_id
             .clone();
-        let handoff = FinalTaskSupervisorHandoff::Initial(
-            runtime.recover_initial_work().unwrap().unwrap(),
-        );
+        let handoff =
+            FinalTaskSupervisorHandoff::Initial(runtime.recover_initial_work().unwrap().unwrap());
         let polls = Arc::new(AtomicUsize::new(0));
         let dropped = Arc::new(AtomicBool::new(false));
         let runner = runtime
@@ -17523,7 +18343,11 @@ mod tests {
                     .is_some()
             );
         } else {
-            assert!(result.expect("an identical outstanding descriptor remains valid").is_some());
+            assert!(
+                result
+                    .expect("an identical outstanding descriptor remains valid")
+                    .is_some()
+            );
         }
         let after = store.get_task_snapshot(&task_id).unwrap().unwrap();
         assert_ne!(after.generation(), current.generation());
@@ -24281,12 +25105,18 @@ mod tests {
     fn hosted_task_service_is_ready_only_while_hosted_and_serves_again() {
         let (runtime, host) = hosted_runtime();
         assert!(runtime.has_installed_task_service());
-        assert!(!runtime.is_task_service_ready(), "installing is not readiness");
+        assert!(
+            !runtime.is_task_service_ready(),
+            "installing is not readiness"
+        );
         hosting_runtime().block_on(async {
             let cx = Cx::current().expect("caller execution context");
             for serve in 0..2 {
                 let hosted = host.start_ready(&cx).await.expect("hosted service ready");
-                assert!(runtime.is_task_service_ready(), "serve {serve}: ready while hosted");
+                assert!(
+                    runtime.is_task_service_ready(),
+                    "serve {serve}: ready while hosted"
+                );
                 hosted.settle(&cx).await.expect("hosted service settles");
                 assert!(!runtime.is_task_service_ready(), "serve {serve}: settled");
             }
@@ -24299,7 +25129,10 @@ mod tests {
         hosting_runtime().block_on(async {
             let cx = Cx::current().expect("caller execution context");
             let hosted = host.start_ready(&cx).await.expect("hosted service ready");
-            assert!(host.start(&cx).is_err(), "one runner cannot be hosted twice");
+            assert!(
+                host.start(&cx).is_err(),
+                "one runner cannot be hosted twice"
+            );
             assert!(runtime.is_task_service_ready());
             hosted.settle(&cx).await.expect("hosted service settles");
             assert!(!runtime.is_task_service_ready());

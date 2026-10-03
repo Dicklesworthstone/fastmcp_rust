@@ -1073,9 +1073,9 @@ fn parse_tuple_fields(row: &str) -> Vec<String> {
 /// would make every assertion built on it vacuous while still looking green.
 fn parse_declared_tuple_rows(source: &str, name: &str) -> Vec<Vec<String>> {
     let marker = format!("const {name}:");
-    let start = source.find(&marker).unwrap_or_else(|| {
-        panic!("{name} is declared in {WORKSPACE_INPUT_DECLARATION_SOURCE}")
-    });
+    let start = source
+        .find(&marker)
+        .unwrap_or_else(|| panic!("{name} is declared in {WORKSPACE_INPUT_DECLARATION_SOURCE}"));
     let tail = &source[start..];
     let assignment = tail
         .find("= [")
@@ -1328,9 +1328,8 @@ fn workspace_input_shape_violations(rows: &[WorkspaceInputRow]) -> Vec<String> {
 /// their path sets are equal; this join re-derives that rather than assuming
 /// it, so a divergence shows up as a hard failure instead of a dropped row.
 fn declared_workspace_input_rows() -> Vec<WorkspaceInputRow> {
-    let source =
-        fs::read_to_string(workspace_root().join(WORKSPACE_INPUT_DECLARATION_SOURCE))
-            .expect("the FND-01 verifier source is readable");
+    let source = fs::read_to_string(workspace_root().join(WORKSPACE_INPUT_DECLARATION_SOURCE))
+        .expect("the FND-01 verifier source is readable");
 
     assert_workspace_input_tables_are_live(&source);
 
@@ -1484,9 +1483,9 @@ fn workspace_input_unaccounted_movers(rows: &[WorkspaceInputRow]) -> Vec<String>
 
         if anchored != current {
             let attribution = match (history.first(), position) {
-                (Some(latest), Some(later)) => format!(
-                    "{later} later commit(s) touched it, most recently {latest}"
-                ),
+                (Some(latest), Some(later)) => {
+                    format!("{later} later commit(s) touched it, most recently {latest}")
+                }
                 (Some(latest), None) => format!(
                     "its anchor is absent from this path's full history; most recent is {latest}"
                 ),
@@ -1608,7 +1607,11 @@ fn fnd_01_a_workspace_input_digest_move_is_refused() {
     let clean = workspace_input_provenance_drift(&rows);
     let accepted: Vec<&WorkspaceInputRow> = rows
         .iter()
-        .filter(|row| !clean.iter().any(|line| line.starts_with(&format!("{} @", row.path))))
+        .filter(|row| {
+            !clean
+                .iter()
+                .any(|line| line.starts_with(&format!("{} @", row.path)))
+        })
         .collect();
     assert!(
         accepted.len() >= 2,
@@ -1632,12 +1635,16 @@ fn fnd_01_a_workspace_input_digest_move_is_refused() {
 
     let drift = workspace_input_provenance_drift(&planted);
     assert!(
-        drift.iter().any(|line| line.starts_with(&format!("{target} @"))),
+        drift
+            .iter()
+            .any(|line| line.starts_with(&format!("{target} @"))),
         "a digest moved away from its anchor's bytes, with the provenance commit untouched, must \
          be refused; got {drift:?}"
     );
     assert!(
-        !drift.iter().any(|line| line.starts_with(&format!("{witness} @"))),
+        !drift
+            .iter()
+            .any(|line| line.starts_with(&format!("{witness} @"))),
         "the plant changed exactly one row, so {witness} must remain green; got {drift:?}"
     );
 }
@@ -1673,9 +1680,7 @@ fn fnd_01_a_workspace_input_stale_anchor_is_refused() {
         .iter()
         .find(|line| line.starts_with(&format!("{}: ", planted_row.path)))
         .unwrap_or_else(|| {
-            panic!(
-                "an anchor one commit behind the latest mover must be refused; got {movers:?}"
-            )
+            panic!("an anchor one commit behind the latest mover must be refused; got {movers:?}")
         });
     assert!(
         reported.contains("1 later commit(s)") && reported.contains(&latest),
@@ -1721,7 +1726,11 @@ fn fnd_01_a_workspace_input_identity_shapes_are_gated() {
         .clone();
 
     let plants: [(&str, fn(&mut WorkspaceInputRow), &str); 7] = [
-        ("abbreviated anchor", |row| row.revision.truncate(7), "not 40"),
+        (
+            "abbreviated anchor",
+            |row| row.revision.truncate(7),
+            "not 40",
+        ),
         (
             "uppercased anchor",
             |row| row.revision = row.revision.to_ascii_uppercase(),
@@ -1749,7 +1758,11 @@ fn fnd_01_a_workspace_input_identity_shapes_are_gated() {
             |row| row.path = format!("/{}", row.path),
             "absolute path",
         ),
-        ("empty bound input", |row| row.byte_length = 0, "zero byte_length"),
+        (
+            "empty bound input",
+            |row| row.byte_length = 0,
+            "zero byte_length",
+        ),
     ];
 
     for (label, plant, expected) in plants {

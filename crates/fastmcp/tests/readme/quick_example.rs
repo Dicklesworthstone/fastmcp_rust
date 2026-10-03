@@ -11,7 +11,7 @@ use fastmcp_rust::{auto::ServerBuilder, prelude::*};
 // Define a tool with automatic JSON schema generation
 #[tool(description = "Calculate the sum of two numbers")]
 async fn add(ctx: &McpContext, a: i64, b: i64) -> McpResult<String> {
-    ctx.checkpoint()?;  // Check the local cancellation token and budget
+    ctx.checkpoint()?; // Check the local cancellation token and budget
     Ok((a + b).to_string())
 }
 
@@ -45,7 +45,7 @@ fn main() {
             .tool(Add)
             .resource(ConfigResource)
             .prompt(GreetingPrompt)
-            .request_timeout(30)  // 30-second budget per request
+            .request_timeout(30) // 30-second budget per request
             .build()
             .run_stdio_with_cx(&cx)
             .await

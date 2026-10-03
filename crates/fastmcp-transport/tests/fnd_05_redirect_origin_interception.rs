@@ -29,8 +29,8 @@
 use std::net::SocketAddr;
 
 use fastmcp_transport::http::{
-    GuardedHttpFetchError, GuardedHttpFetchResponse, GuardedHttpPeerProvenance, GuardedHttpRedirect,
-    guarded_admit_native_response,
+    GuardedHttpFetchError, GuardedHttpFetchResponse, GuardedHttpPeerProvenance,
+    GuardedHttpRedirect, guarded_admit_native_response,
 };
 
 const ORIGIN_HOST: &str = "origin.example";
@@ -69,8 +69,11 @@ fn admit(
 
 #[test]
 fn fnd_05_redirect_is_surfaced_as_data_and_never_becomes_the_origin_positive() {
-    let response = admit(302, &[("Location", REDIRECT_TARGET), ("Content-Length", "0")])
-        .expect("a 302 is an admitted response, not a transport error");
+    let response = admit(
+        302,
+        &[("Location", REDIRECT_TARGET), ("Content-Length", "0")],
+    )
+    .expect("a 302 is an admitted response, not a transport error");
 
     // CLAIM 1 — the redirect is surfaced, typed, carrying its target.
     assert_eq!(
@@ -115,8 +118,7 @@ fn fnd_05_redirect_interception_planted_negatives() {
     // differ by one in the status alone and demand OPPOSITE outcomes, so no
     // implementation with a constant answer can satisfy both halves.
     for (status, expected_redirect) in [(299_u16, false), (300, true), (399, true), (400, false)] {
-        let response =
-            admit(status, &[("Location", REDIRECT_TARGET)]).expect("status is admitted");
+        let response = admit(status, &[("Location", REDIRECT_TARGET)]).expect("status is admitted");
         assert_eq!(
             response.redirect.is_some(),
             expected_redirect,

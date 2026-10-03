@@ -83,6 +83,12 @@ fn final_metadata() -> OpenMetadata {
             "io.modelcontextprotocol/protocolVersion".to_owned(),
             json!("2026-07-28"),
         ),
+        // Final request metadata that declares a protocol version must also
+        // carry client capabilities (MCP 2026-07-28 `_meta` contract).
+        (
+            "io.modelcontextprotocol/clientCapabilities".to_owned(),
+            json!({}),
+        ),
         (
             "io.modelcontextprotocol/clientInfo".to_owned(),
             json!({"name": "fastmcp", "version": "0.1.0"}),

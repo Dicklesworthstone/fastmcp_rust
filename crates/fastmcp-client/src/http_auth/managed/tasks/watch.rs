@@ -19,14 +19,13 @@ use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::tasks_extension::{Task, TaskId, task_subscription_ids};
 use fastmcp_protocol::{CoreRequest, RequestId, SubscriptionFilter};
 
-use super::{
-    BoundedWriter, ManagedTaskEvent, ManagedTaskRequest, ManagedTaskRequestIds,
-    ManagedTasksClient, ManagedTasksError, OAuthCredentialSnapshot, OAuthSessionError,
-    deadline_after, prepare,
-};
 use super::super::subscriptions::{
     ManagedSubscription, ManagedSubscriptionError, ManagedSubscriptionEvent,
     ManagedSubscriptionLimits,
+};
+use super::{
+    BoundedWriter, ManagedTaskEvent, ManagedTaskRequest, ManagedTaskRequestIds, ManagedTasksClient,
+    ManagedTasksError, OAuthCredentialSnapshot, OAuthSessionError, deadline_after, prepare,
 };
 
 /// Explicit remote cancellation coordinated with single-Task observation.
@@ -79,7 +78,9 @@ impl ManagedTaskWatchPolicy {
             return Err(ManagedTaskWatchError::InvalidPolicy);
         }
         Ok(Self {
-            timeout, maximum_snapshots, maximum_records,
+            timeout,
+            maximum_snapshots,
+            maximum_records,
         })
     }
 }
@@ -131,10 +132,14 @@ impl fmt::Display for ManagedTaskWatchError {
             Self::InvalidSelection => f.write_str("invalid managed Task watch selection"),
             Self::InvalidIdPrefix => f.write_str("invalid managed Task watch identity prefix"),
             Self::IdentityExhausted => f.write_str("managed Task watch identities exhausted"),
-            Self::IncompleteAcknowledgement => f.write_str("Task watch did not acknowledge the complete selection"),
+            Self::IncompleteAcknowledgement => {
+                f.write_str("Task watch did not acknowledge the complete selection")
+            }
             Self::SnapshotLimit => f.write_str("managed Task watch snapshot budget exhausted"),
             Self::UnexpectedEvent => f.write_str("unexpected managed Task watch event"),
-            Self::Interrupted => f.write_str("Task subscription ended before all tasks were terminal"),
+            Self::Interrupted => {
+                f.write_str("Task subscription ended before all tasks were terminal")
+            }
             Self::Closed => f.write_str("managed Task watch is closed"),
         }
     }
@@ -142,13 +147,19 @@ impl fmt::Display for ManagedTaskWatchError {
 
 impl std::error::Error for ManagedTaskWatchError {}
 impl From<OAuthSessionError> for ManagedTaskWatchError {
-    fn from(error: OAuthSessionError) -> Self { Self::Session(error) }
+    fn from(error: OAuthSessionError) -> Self {
+        Self::Session(error)
+    }
 }
 impl From<ManagedTasksError> for ManagedTaskWatchError {
-    fn from(error: ManagedTasksError) -> Self { Self::Task(error) }
+    fn from(error: ManagedTasksError) -> Self {
+        Self::Task(error)
+    }
 }
 impl From<ManagedSubscriptionError> for ManagedTaskWatchError {
-    fn from(error: ManagedSubscriptionError) -> Self { Self::Subscription(error) }
+    fn from(error: ManagedSubscriptionError) -> Self {
+        Self::Subscription(error)
+    }
 }
 
 impl ManagedTasksClient {
@@ -174,8 +185,13 @@ impl ManagedTasksClient {
         policy: ManagedTaskWatchPolicy,
     ) -> Result<ManagedTaskWatch, ManagedTaskWatchError> {
         self.watch_tasks_with_cancellation(
-            cx, &McpRequestCancellation::new(), task_ids, id_prefix, policy,
-        ).await
+            cx,
+            &McpRequestCancellation::new(),
+            task_ids,
+            id_prefix,
+            policy,
+        )
+        .await
     }
 
     /// Retains the supplied cancellation domain across admission, every get,
@@ -201,24 +217,42 @@ impl ManagedTasksClient {
             policy.timeout,
         )?;
         let deadline = deadline_after(cx, policy.timeout)?;
-        let subscription = Box::pin(self.session.await_active(cx, cancellation, deadline, None, async {
-            Ok(async {
-                let mut subscription = self.session.subscribe_tasks_with_cancellation(
-                    cx, cancellation, request, listen_ids.discovery, listen_ids.operation, limits,
-                ).await?;
-                let Some(ManagedSubscriptionEvent::Acknowledged { accepted_filter }) =
-                    subscription.next_event(cx).await?
-                else {
-                    return Err(ManagedTaskWatchError::UnexpectedEvent);
-                };
-                state.admit_acknowledgement(&accepted_filter)?;
-                Ok(subscription)
-            }.await)
-        })).await??;
+        let subscription =
+            Box::pin(
+                self.session
+                    .await_active(cx, cancellation, deadline, None, async {
+                        Ok(async {
+                            let mut subscription =
+                                Box::pin(self.session.subscribe_tasks_with_cancellation(
+                                    cx,
+                                    cancellation,
+                                    request,
+                                    listen_ids.discovery,
+                                    listen_ids.operation,
+                                    limits,
+                                ))
+                                .await?;
+                            let Some(ManagedSubscriptionEvent::Acknowledged { accepted_filter }) =
+                                subscription.next_event(cx).await?
+                            else {
+                                return Err(ManagedTaskWatchError::UnexpectedEvent);
+                            };
+                            state.admit_acknowledgement(&accepted_filter)?;
+                            Ok(subscription)
+                        }
+                        .await)
+                    }),
+            )
+            .await??;
         self.session.check(cx, cancellation)?;
         Ok(ManagedTaskWatch {
-            client: self.clone(), cancellation: cancellation.clone(),
-            subscription: Some(subscription), state, ids, deadline, finished: false,
+            client: self.clone(),
+            cancellation: cancellation.clone(),
+            subscription: Some(subscription),
+            state,
+            ids,
+            deadline,
+            finished: false,
         })
     }
 }
@@ -243,7 +277,11 @@ pub struct ManagedTaskWatch {
 impl ManagedTaskWatch {
     /// Number of selected tasks without a delivered terminal snapshot.
     pub fn remaining_tasks(&self) -> usize {
-        self.state.terminal.iter().filter(|terminal| !**terminal).count()
+        self.state
+            .terminal
+            .iter()
+            .filter(|terminal| !**terminal)
+            .count()
     }
 
     /// Releases observation immediately, without issuing a remote mutation or
@@ -270,57 +308,98 @@ impl ManagedTaskWatch {
         cx: &Cx,
         credential: Option<&OAuthCredentialSnapshot>,
     ) -> Result<Option<ManagedTaskSnapshot>, ManagedTaskWatchError> {
-        if self.finished { return Ok(None); }
+        if self.finished {
+            return Ok(None);
+        }
         // Transfer custody before the first await. Error/drop does not put this
         // response back into the watch, even while reconciling an initial get.
-        let mut subscription = self.subscription.take().ok_or(ManagedTaskWatchError::Closed)?;
+        let mut subscription = self
+            .subscription
+            .take()
+            .ok_or(ManagedTaskWatchError::Closed)?;
         let client = self.client.clone();
         let cancellation = self.cancellation.clone();
         let deadline = self.deadline;
         let expiry = credential.map(|credential| credential.expires_at);
-        let snapshot = Box::pin(client.session.await_active(cx, &cancellation, deadline, expiry, async {
-            Ok(async {
-                let (task_id, cause) = match self.state.initial.pop_front() {
-                    Some(id) => (id, ManagedTaskSnapshotCause::Initial),
-                    None => loop {
-                        match subscription.next_event(cx).await? {
-                            Some(ManagedSubscriptionEvent::TaskNotification(notification)) => {
-                                let id = &notification.params.task.base().task_id;
-                                if self.state.needs_snapshot(id)? {
-                                    break (id.clone(), ManagedTaskSnapshotCause::ChangeNotification);
+        let snapshot = Box::pin(client.session.await_active(
+            cx,
+            &cancellation,
+            deadline,
+            expiry,
+            async {
+                Ok(async {
+                    let (task_id, cause) = match self.state.initial.pop_front() {
+                        Some(id) => (id, ManagedTaskSnapshotCause::Initial),
+                        None => loop {
+                            match subscription.next_event(cx).await? {
+                                Some(ManagedSubscriptionEvent::TaskNotification(notification)) => {
+                                    let id = &notification.params.task.base().task_id;
+                                    if self.state.needs_snapshot(id)? {
+                                        break (
+                                            id.clone(),
+                                            ManagedTaskSnapshotCause::ChangeNotification,
+                                        );
+                                    }
+                                }
+                                Some(ManagedSubscriptionEvent::Notification(_)) => {}
+                                Some(ManagedSubscriptionEvent::Terminal { .. }) | None => {
+                                    return Err(ManagedTaskWatchError::Interrupted);
+                                }
+                                Some(ManagedSubscriptionEvent::Acknowledged { .. }) => {
+                                    return Err(ManagedTaskWatchError::UnexpectedEvent);
                                 }
                             }
-                            Some(ManagedSubscriptionEvent::Notification(_)) => {},
-                            Some(ManagedSubscriptionEvent::Terminal { .. }) | None => {
-                                return Err(ManagedTaskWatchError::Interrupted);
-                            }
-                            Some(ManagedSubscriptionEvent::Acknowledged { .. }) => {
-                                return Err(ManagedTaskWatchError::UnexpectedEvent);
-                            }
+                        },
+                    };
+                    self.state.reserve_snapshot()?;
+                    let ids = self.ids.next_pair()?;
+                    let mut call = match credential {
+                        Some(credential) => {
+                            let prepared = prepare(
+                                client.session.resource().as_str(),
+                                &client.metadata,
+                                &ids.operation,
+                                ManagedTaskRequest::Get(task_id),
+                                client.limits,
+                            )?;
+                            let round = client.prepare_round(ids, prepared)?;
+                            let call_deadline =
+                                deadline.min(deadline_after(cx, client.limits.timeout)?);
+                            client
+                                .execute_round(
+                                    cx,
+                                    &cancellation,
+                                    round,
+                                    credential,
+                                    call_deadline,
+                                    client.limits.records,
+                                )
+                                .await?
                         }
-                    },
-                };
-                self.state.reserve_snapshot()?;
-                let ids = self.ids.next_pair()?;
-                let mut call = match credential {
-                    Some(credential) => {
-                        let prepared = prepare(client.session.resource().as_str(), &client.metadata,
-                            &ids.operation, ManagedTaskRequest::Get(task_id), client.limits)?;
-                        let round = client.prepare_round(ids, prepared)?;
-                        let call_deadline = deadline.min(deadline_after(cx, client.limits.timeout)?);
-                        client.execute_round(cx, &cancellation, round, credential,
-                            call_deadline, client.limits.records).await?
-                    }
-                    None => client.request_with_cancellation(
-                        cx, &cancellation, ids, ManagedTaskRequest::Get(task_id),
-                    ).await?,
-                };
-                let Some(ManagedTaskEvent::Snapshot(result)) = call.next_event(cx).await? else {
-                    return Err(ManagedTaskWatchError::UnexpectedEvent);
-                };
-                Ok(ManagedTaskSnapshot { task: Box::new(result.task), cause })
-            }.await)
-        })).await??;
+                        None => {
+                            client
+                                .request_with_cancellation(
+                                    cx,
+                                    &cancellation,
+                                    ids,
+                                    ManagedTaskRequest::Get(task_id),
+                                )
+                                .await?
+                        }
+                    };
+                    let Some(ManagedTaskEvent::Snapshot(result)) = call.next_event(cx).await?
+                    else {
+                        return Err(ManagedTaskWatchError::UnexpectedEvent);
+                    };
+                    Ok(ManagedTaskSnapshot {
+                        task: Box::new(result.task),
+                        cause,
+                    })
+                }
+                .await)
+            },
+        ))
+        .await??;
         client.session.check(cx, &cancellation)?;
         if expiry.is_some_and(|expiry| std::time::Instant::now() >= expiry) {
             return Err(OAuthSessionError::LoginRequired.into());
@@ -338,10 +417,18 @@ impl ManagedTaskWatch {
     }
 }
 
-fn listen_request(metadata: &serde_json::Value, task_ids: &[TaskId]) -> Result<CoreRequest, ManagedTaskWatchError> {
-    CoreRequest::decode(ProtocolEra::Modern2026, "subscriptions/listen", Some(&serde_json::json!({
-        "_meta": metadata, "notifications": {"taskIds": task_ids},
-    }))).map_err(|_| ManagedTaskWatchError::InvalidSelection)
+fn listen_request(
+    metadata: &serde_json::Value,
+    task_ids: &[TaskId],
+) -> Result<CoreRequest, ManagedTaskWatchError> {
+    CoreRequest::decode(
+        ProtocolEra::Modern2026,
+        "subscriptions/listen",
+        Some(&serde_json::json!({
+            "_meta": metadata, "notifications": {"taskIds": task_ids},
+        })),
+    )
+    .map_err(|_| ManagedTaskWatchError::InvalidSelection)
 }
 
 struct WatchIds {
@@ -351,8 +438,11 @@ struct WatchIds {
 
 impl WatchIds {
     fn new(prefix: String) -> Result<Self, ManagedTaskWatchError> {
-        if prefix.is_empty() || prefix.len() > 128
-            || !prefix.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        if prefix.is_empty()
+            || prefix.len() > 128
+            || !prefix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
         {
             return Err(ManagedTaskWatchError::InvalidIdPrefix);
         }
@@ -360,7 +450,10 @@ impl WatchIds {
     }
 
     fn next_pair(&mut self) -> Result<ManagedTaskRequestIds, ManagedTaskWatchError> {
-        let following = self.next.checked_add(2).ok_or(ManagedTaskWatchError::IdentityExhausted)?;
+        let following = self
+            .next
+            .checked_add(2)
+            .ok_or(ManagedTaskWatchError::IdentityExhausted)?;
         let ids = ManagedTaskRequestIds::new(
             RequestId::String(format!("{}:{}", self.prefix, self.next)),
             RequestId::String(format!("{}:{}", self.prefix, self.next + 1)),
@@ -380,22 +473,38 @@ struct WatchState {
 
 impl WatchState {
     fn new(task_ids: Vec<TaskId>, maximum_snapshots: usize) -> Result<Self, ManagedTaskWatchError> {
-        if task_ids.is_empty() || task_ids.len() > MAX_WATCH_TASKS || task_ids.len() > maximum_snapshots {
+        if task_ids.is_empty()
+            || task_ids.len() > MAX_WATCH_TASKS
+            || task_ids.len() > maximum_snapshots
+        {
             return Err(ManagedTaskWatchError::InvalidSelection);
         }
         for (index, id) in task_ids.iter().enumerate() {
-            if task_ids[..index].contains(id) { return Err(ManagedTaskWatchError::InvalidSelection); }
+            if task_ids[..index].contains(id) {
+                return Err(ManagedTaskWatchError::InvalidSelection);
+            }
         }
-        let mut writer = BoundedWriter { bytes: Vec::new(), maximum: MAX_SELECTION_BYTES };
-        serde_json::to_writer(&mut writer, &task_ids).map_err(|_| ManagedTaskWatchError::InvalidSelection)?;
+        let mut writer = BoundedWriter {
+            bytes: Vec::new(),
+            maximum: MAX_SELECTION_BYTES,
+        };
+        serde_json::to_writer(&mut writer, &task_ids)
+            .map_err(|_| ManagedTaskWatchError::InvalidSelection)?;
         Ok(Self {
-            terminal: vec![false; task_ids.len()], initial: task_ids.iter().cloned().collect(),
-            task_ids, snapshots: 0, maximum_snapshots,
+            terminal: vec![false; task_ids.len()],
+            initial: task_ids.iter().cloned().collect(),
+            task_ids,
+            snapshots: 0,
+            maximum_snapshots,
         })
     }
 
-    fn admit_acknowledgement(&self, filter: &SubscriptionFilter) -> Result<(), ManagedTaskWatchError> {
-        let accepted = task_subscription_ids(filter).map_err(|_| ManagedTaskWatchError::IncompleteAcknowledgement)?
+    fn admit_acknowledgement(
+        &self,
+        filter: &SubscriptionFilter,
+    ) -> Result<(), ManagedTaskWatchError> {
+        let accepted = task_subscription_ids(filter)
+            .map_err(|_| ManagedTaskWatchError::IncompleteAcknowledgement)?
             .ok_or(ManagedTaskWatchError::IncompleteAcknowledgement)?;
         if accepted.len() != self.task_ids.len()
             || self.task_ids.iter().any(|id| !accepted.contains(id))
@@ -406,22 +515,35 @@ impl WatchState {
     }
 
     fn needs_snapshot(&self, task_id: &TaskId) -> Result<bool, ManagedTaskWatchError> {
-        let index = self.task_ids.iter().position(|id| id == task_id)
+        let index = self
+            .task_ids
+            .iter()
+            .position(|id| id == task_id)
             .ok_or(ManagedTaskWatchError::UnexpectedEvent)?;
         Ok(!self.terminal[index])
     }
 
     fn reserve_snapshot(&mut self) -> Result<(), ManagedTaskWatchError> {
-        if self.snapshots >= self.maximum_snapshots { return Err(ManagedTaskWatchError::SnapshotLimit); }
+        if self.snapshots >= self.maximum_snapshots {
+            return Err(ManagedTaskWatchError::SnapshotLimit);
+        }
         self.snapshots += 1;
         Ok(())
     }
 
     fn record_snapshot(&mut self, task: &Task) -> Result<bool, ManagedTaskWatchError> {
-        let index = self.task_ids.iter().position(|id| id == &task.base().task_id)
+        let index = self
+            .task_ids
+            .iter()
+            .position(|id| id == &task.base().task_id)
             .ok_or(ManagedTaskWatchError::UnexpectedEvent)?;
-        if self.terminal[index] { return Err(ManagedTaskWatchError::UnexpectedEvent); }
-        self.terminal[index] = matches!(task, Task::Completed { .. } | Task::Failed { .. } | Task::Cancelled(_));
+        if self.terminal[index] {
+            return Err(ManagedTaskWatchError::UnexpectedEvent);
+        }
+        self.terminal[index] = matches!(
+            task,
+            Task::Completed { .. } | Task::Failed { .. } | Task::Cancelled(_)
+        );
         Ok(self.terminal.iter().all(|terminal| *terminal))
     }
 }
@@ -429,15 +551,20 @@ impl WatchState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta, FINAL_CLIENT_CAPABILITIES_META_KEY};
+    use fastmcp_protocol::{
+        ClientCapabilities, FINAL_CLIENT_CAPABILITIES_META_KEY, FinalRequestMeta,
+    };
     use serde_json::json;
 
-    fn id(value: &str) -> TaskId { TaskId::parse(value).unwrap() }
+    fn id(value: &str) -> TaskId {
+        TaskId::parse(value).unwrap()
+    }
     fn task(value: &str, status: &str) -> Task {
         serde_json::from_value(json!({
             "taskId":value, "status":status, "createdAt":"2026-09-17T00:00:00Z",
             "lastUpdatedAt":"2026-09-17T00:00:00Z", "ttlMs":60000,
-        })).unwrap()
+        }))
+        .unwrap()
     }
     fn filter(ids: serde_json::Value) -> SubscriptionFilter {
         serde_json::from_value(json!({"taskIds":ids})).unwrap()
@@ -449,15 +576,29 @@ mod tests {
         assert!(WatchState::new(vec![], 2).is_err());
         assert!(WatchState::new(vec![id("one"), id("one")], 2).is_err());
         assert!(WatchState::new(vec![id("one"), id("two")], 1).is_err());
-        assert!(WatchState::new((0..129).map(|n| id(&format!("task-{n}"))).collect(), 129).is_err());
+        assert!(
+            WatchState::new((0..129).map(|n| id(&format!("task-{n}"))).collect(), 129).is_err()
+        );
     }
 
     #[test]
     fn acknowledgement_must_cover_every_selected_task_before_reconciliation() {
         let state = WatchState::new(vec![id("one"), id("two")], 8).unwrap();
-        assert!(state.admit_acknowledgement(&filter(json!(["two", "one"]))).is_ok());
-        for ids in [json!([]), json!(["one"]), json!(["one", "one"]), json!(["one", "other"])] {
-            assert!(matches!(state.admit_acknowledgement(&filter(ids)), Err(ManagedTaskWatchError::IncompleteAcknowledgement)));
+        assert!(
+            state
+                .admit_acknowledgement(&filter(json!(["two", "one"])))
+                .is_ok()
+        );
+        for ids in [
+            json!([]),
+            json!(["one"]),
+            json!(["one", "one"]),
+            json!(["one", "other"]),
+        ] {
+            assert!(matches!(
+                state.admit_acknowledgement(&filter(ids)),
+                Err(ManagedTaskWatchError::IncompleteAcknowledgement)
+            ));
             assert_eq!(state.initial.len(), 2);
             assert_eq!(state.snapshots, 0);
             assert_eq!(state.terminal, [false, false]);
@@ -468,7 +609,11 @@ mod tests {
     fn notification_is_only_an_invalidation_and_cannot_publish_a_terminal() {
         let mut state = WatchState::new(vec![id("one")], 8).unwrap();
         let notification_task = task("one", "cancelled");
-        assert!(state.needs_snapshot(&notification_task.base().task_id).unwrap());
+        assert!(
+            state
+                .needs_snapshot(&notification_task.base().task_id)
+                .unwrap()
+        );
         assert_eq!(state.terminal, [false]);
         assert_eq!(state.initial.pop_front(), Some(id("one")));
         assert!(!state.record_snapshot(&task("one", "working")).unwrap());
@@ -492,7 +637,10 @@ mod tests {
     fn snapshot_capacity_and_identity_exhaustion_are_checked_before_effects() {
         let mut state = WatchState::new(vec![id("one")], 1).unwrap();
         state.reserve_snapshot().unwrap();
-        assert!(matches!(state.reserve_snapshot(), Err(ManagedTaskWatchError::SnapshotLimit)));
+        assert!(matches!(
+            state.reserve_snapshot(),
+            Err(ManagedTaskWatchError::SnapshotLimit)
+        ));
         assert_eq!(state.snapshots, 1);
         let mut ids = WatchIds::new("watch".to_owned()).unwrap();
         let first = ids.next_pair().unwrap();
@@ -502,7 +650,10 @@ mod tests {
         assert_eq!(second.discovery, RequestId::String("watch:2".to_owned()));
         assert_eq!(second.operation, RequestId::String("watch:3".to_owned()));
         ids.next = u64::MAX - 1;
-        assert!(matches!(ids.next_pair(), Err(ManagedTaskWatchError::IdentityExhausted)));
+        assert!(matches!(
+            ids.next_pair(),
+            Err(ManagedTaskWatchError::IdentityExhausted)
+        ));
         assert_eq!(ids.next, u64::MAX - 1);
     }
 
@@ -515,19 +666,28 @@ mod tests {
         assert!(ManagedTaskWatchPolicy::new(Duration::from_secs(1), 4097, 2).is_err());
         assert!(ManagedTaskWatchPolicy::new(Duration::from_secs(1), 1, 1).is_err());
         assert!(ManagedTaskWatchPolicy::new(Duration::from_secs(1), 1, 4097).is_err());
-        for prefix in ["".to_owned(), "x".repeat(129), "line\nbreak".to_owned(), "a:b".to_owned()] {
+        for prefix in [
+            "".to_owned(),
+            "x".repeat(129),
+            "line\nbreak".to_owned(),
+            "a:b".to_owned(),
+        ] {
             assert!(WatchIds::new(prefix).is_err());
         }
     }
 
     #[test]
     fn listen_uses_the_existing_tasks_metadata_and_only_the_requested_filter() {
-        let metadata = super::super::tasks_metadata(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
+        let metadata =
+            super::super::tasks_metadata(FinalRequestMeta::new(ClientCapabilities::default()))
+                .unwrap();
         let request = listen_request(&metadata, &[id("one"), id("two")]).unwrap();
         let params = request.encode_params().unwrap().unwrap();
         assert_eq!(params["notifications"], json!({"taskIds":["one", "two"]}));
         assert_eq!(params["_meta"], metadata);
-        assert_eq!(params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"],
-            json!({"io.modelcontextprotocol/tasks":{}}));
+        assert_eq!(
+            params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"],
+            json!({"io.modelcontextprotocol/tasks":{}})
+        );
     }
 }

@@ -500,11 +500,16 @@ impl OAuthHttpRoutes {
         // removing terminating slashes only for this derived location. The
         // metadata issuer and RFC 9207 response preserve the configured value.
         let metadata_path = format!(
-            "/.well-known/oauth-authorization-server{}", issuer.path().trim_end_matches('/'),
+            "/.well-known/oauth-authorization-server{}",
+            issuer.path().trim_end_matches('/'),
         );
-        if [Some(authorization_path.as_str()), Some(token_path.as_str()),
-            Some(revocation_path.as_str()), registration_path.as_deref()]
-            .contains(&Some(metadata_path.as_str()))
+        if [
+            Some(authorization_path.as_str()),
+            Some(token_path.as_str()),
+            Some(revocation_path.as_str()),
+            registration_path.as_deref(),
+        ]
+        .contains(&Some(metadata_path.as_str()))
         {
             return Err(OAuthHttpRouteConfigurationError::InvalidPublicEndpointBase);
         }
@@ -592,7 +597,9 @@ impl OAuthHttpRoutes {
 
     /// Returns the issuer-derived RFC 8414 discovery path.
     #[must_use]
-    pub fn metadata_path(&self) -> &str { &self.metadata_path }
+    pub fn metadata_path(&self) -> &str {
+        &self.metadata_path
+    }
 
     /// Describes exactly the installed OAuth endpoints and supported flows.
     ///
@@ -601,17 +608,24 @@ impl OAuthHttpRoutes {
     /// global `scopes_supported` list is inferred from private registrations.
     /// Invalid issuer configuration returns an error instead of advertising a
     /// login flow that the server would reject.
-    pub fn authorization_server_metadata(&self) -> Result<OAuthAuthorizationServerMetadata, OAuthError> {
+    pub fn authorization_server_metadata(
+        &self,
+    ) -> Result<OAuthAuthorizationServerMetadata, OAuthError> {
         self.server.config().validate()?;
         let base = self.public_endpoint_base.trim_end_matches('/');
         let mut methods = vec!["client_secret_basic", "client_secret_post"];
-        if self.server.config().allow_public_clients { methods.push("none"); }
+        if self.server.config().allow_public_clients {
+            methods.push("none");
+        }
         Ok(OAuthAuthorizationServerMetadata {
             issuer: self.server.config().issuer.clone(),
             authorization_endpoint: format!("{base}/authorize"),
             token_endpoint: format!("{base}/token"),
             revocation_endpoint: format!("{base}/revoke"),
-            registration_endpoint: self.registration_path.as_ref().map(|_| format!("{base}/register")),
+            registration_endpoint: self
+                .registration_path
+                .as_ref()
+                .map(|_| format!("{base}/register")),
             response_types_supported: ["code"],
             response_modes_supported: ["query"],
             grant_types_supported: self.server.supported_grant_types(),
@@ -1467,7 +1481,9 @@ impl DevelopmentClientCredentialsGrant {
             .collect();
         let mut scopes = canonicalize_request_scopes(&scopes)?;
         if scopes.is_empty()
-            || scopes.iter().any(|scope| matches!(scope.as_str(), "openid" | "offline_access"))
+            || scopes
+                .iter()
+                .any(|scope| matches!(scope.as_str(), "openid" | "offline_access"))
         {
             return Err(OAuthError::InvalidScope(
                 "machine authorization requires nonempty resource scopes".to_string(),
@@ -1479,11 +1495,15 @@ impl DevelopmentClientCredentialsGrant {
 
     /// Returns the exact protected resource authorized by the administrator.
     #[must_use]
-    pub fn resource(&self) -> &CanonicalResourceId { &self.resource }
+    pub fn resource(&self) -> &CanonicalResourceId {
+        &self.resource
+    }
 
     /// Returns the admitted machine scopes in deterministic order.
     #[must_use]
-    pub fn scopes(&self) -> &[String] { &self.scopes }
+    pub fn scopes(&self) -> &[String] {
+        &self.scopes
+    }
 }
 
 #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
@@ -1629,11 +1649,7 @@ impl RegisteredOAuthClient {
         self.metadata.validate_scopes(scopes)
     }
 
-    fn authenticate(
-        &self,
-        provided: Option<&str>,
-        method: TokenEndpointAuthMethod,
-    ) -> bool {
+    fn authenticate(&self, provided: Option<&str>, method: TokenEndpointAuthMethod) -> bool {
         // Complete the same verifier work for a wrong method as a wrong
         // secret. Both failures use the same public invalid_client response.
         let credentials_match = match (self.secret_verifier.as_ref(), provided) {
@@ -1716,7 +1732,10 @@ impl std::fmt::Debug for OAuthClientMetadata {
         f.debug_struct("OAuthClientMetadata")
             .field("client_id_len", &self.client_id.len())
             .field("client_type", &self.client_type)
-            .field("token_endpoint_auth_method", &self.token_endpoint_auth_method)
+            .field(
+                "token_endpoint_auth_method",
+                &self.token_endpoint_auth_method,
+            )
             .field("redirect_uri_count", &self.redirect_uris.len())
             .field("allowed_scope_count", &self.allowed_scopes.len())
             .field("name_present", &self.name.is_some())
@@ -1767,7 +1786,10 @@ impl std::fmt::Debug for OAuthClient {
         f.debug_struct("OAuthClient")
             .field("client_id_len", &self.client_id.len())
             .field("client_secret_present", &self.client_secret.is_some())
-            .field("token_endpoint_auth_method", &self.token_endpoint_auth_method)
+            .field(
+                "token_endpoint_auth_method",
+                &self.token_endpoint_auth_method,
+            )
             .field("redirect_uri_count", &self.redirect_uris.len())
             .field("allowed_scope_count", &self.allowed_scopes.len())
             .field("name_present", &self.name.is_some())
@@ -1835,7 +1857,8 @@ impl OAuthClient {
                 || self.token_endpoint_auth_method != TokenEndpointAuthMethod::ClientSecretBasic)
         {
             return Err(OAuthError::InvalidRequest(
-                "development machine clients require confidential HTTP Basic registration".to_string(),
+                "development machine clients require confidential HTTP Basic registration"
+                    .to_string(),
             ));
         }
         if requires_redirect && self.redirect_uris.is_empty() {
@@ -1945,7 +1968,10 @@ impl std::fmt::Debug for OAuthClientBuilder {
                 "client_credential_present",
                 &self.client_credential.is_some(),
             )
-            .field("token_endpoint_auth_method", &self.token_endpoint_auth_method)
+            .field(
+                "token_endpoint_auth_method",
+                &self.token_endpoint_auth_method,
+            )
             .field("redirect_uri_count", &self.redirect_uris.len())
             .field("allowed_scope_count", &self.allowed_scopes.len())
             .field("name_present", &self.name.is_some())
@@ -1995,7 +2021,10 @@ impl OAuthClientBuilder {
     /// [`OAuthServerConfig::allow_development_client_credentials`].
     #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
     #[must_use]
-    pub fn development_client_credentials(mut self, grant: DevelopmentClientCredentialsGrant) -> Self {
+    pub fn development_client_credentials(
+        mut self,
+        grant: DevelopmentClientCredentialsGrant,
+    ) -> Self {
         self.development_client_credentials = Some(grant);
         self
     }
@@ -2064,10 +2093,12 @@ impl OAuthClientBuilder {
             ClientType::Public
         };
 
-        let token_endpoint_auth_method = self.token_endpoint_auth_method.unwrap_or(match client_type {
-            ClientType::Confidential => TokenEndpointAuthMethod::ClientSecretBasic,
-            ClientType::Public => TokenEndpointAuthMethod::None,
-        });
+        let token_endpoint_auth_method =
+            self.token_endpoint_auth_method
+                .unwrap_or(match client_type {
+                    ClientType::Confidential => TokenEndpointAuthMethod::ClientSecretBasic,
+                    ClientType::Public => TokenEndpointAuthMethod::None,
+                });
         let client = OAuthClient {
             client_id: self.client_id,
             client_secret: self.client_credential,
@@ -3413,16 +3444,24 @@ impl OAuthServer {
             || request.response_types[0] != "code"
             || request.grant_types.is_empty()
             || request.grant_types.len() > 2
-            || !request.grant_types.iter().any(|grant| grant == "authorization_code")
-            || request.grant_types.iter().any(|grant| {
-                grant != "authorization_code" && grant != "refresh_token"
-            })
-            || request.grant_types.iter().enumerate().any(|(index, grant)| {
-                request.grant_types[..index].contains(grant)
-            })
-            || request.redirect_uris.iter().enumerate().any(|(index, uri)| {
-                request.redirect_uris[..index].contains(uri)
-            })
+            || !request
+                .grant_types
+                .iter()
+                .any(|grant| grant == "authorization_code")
+            || request
+                .grant_types
+                .iter()
+                .any(|grant| grant != "authorization_code" && grant != "refresh_token")
+            || request
+                .grant_types
+                .iter()
+                .enumerate()
+                .any(|(index, grant)| request.grant_types[..index].contains(grant))
+            || request
+                .redirect_uris
+                .iter()
+                .enumerate()
+                .any(|(index, uri)| request.redirect_uris[..index].contains(uri))
         {
             return Err(OAuthError::InvalidRequest(
                 "dynamic registration is outside the native public-client profile".to_string(),
@@ -3439,9 +3478,10 @@ impl OAuthServer {
             Some(scope) => {
                 let values: Vec<String> = scope.split(' ').map(str::to_owned).collect();
                 if values.iter().any(String::is_empty)
-                    || values.iter().enumerate().any(|(index, value)| {
-                        values[..index].contains(value)
-                    })
+                    || values
+                        .iter()
+                        .enumerate()
+                        .any(|(index, value)| values[..index].contains(value))
                 {
                     return Err(OAuthError::InvalidRequest(
                         "dynamic registration scope is not canonical".to_string(),
@@ -3734,9 +3774,13 @@ impl OAuthServer {
 
     pub(crate) fn development_client_credentials_enabled(&self) -> bool {
         #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
-        { self.config.allow_development_client_credentials }
+        {
+            self.config.allow_development_client_credentials
+        }
         #[cfg(not(all(feature = "builtin-auth-server", feature = "oauth-client-credentials")))]
-        { false }
+        {
+            false
+        }
     }
 
     pub(crate) fn supported_grant_types(&self) -> Vec<&'static str> {
@@ -3785,20 +3829,26 @@ impl OAuthServer {
             &request.client_id,
             request.client_secret.as_deref(),
         )?;
-        if request.code.is_some() || request.redirect_uri.is_some()
-            || request.code_verifier.is_some() || request.refresh_token.is_some()
+        if request.code.is_some()
+            || request.redirect_uri.is_some()
+            || request.code_verifier.is_some()
+            || request.refresh_token.is_some()
         {
             return Err(OAuthError::InvalidRequest(
-                "machine requests cannot contain authorization-code or refresh credentials".to_string(),
+                "machine requests cannot contain authorization-code or refresh credentials"
+                    .to_string(),
             ));
         }
         let resource = request.resource.as_deref().ok_or_else(|| {
             OAuthError::InvalidRequest("machine requests require an explicit resource".to_string())
         })?;
         validate_optional_authorization_resource(Some(resource))?;
-        let mut scopes = canonicalize_request_scopes(request.scopes.as_deref().ok_or_else(|| {
-            OAuthError::InvalidScope("machine requests require explicit nonempty scopes".to_string())
-        })?)?;
+        let mut scopes =
+            canonicalize_request_scopes(request.scopes.as_deref().ok_or_else(|| {
+                OAuthError::InvalidScope(
+                    "machine requests require explicit nonempty scopes".to_string(),
+                )
+            })?)?;
         if scopes.is_empty() {
             return Err(OAuthError::InvalidScope(
                 "machine requests require explicit nonempty scopes".to_string(),
@@ -3810,9 +3860,10 @@ impl OAuthServer {
         // share one lock. In particular, a denied resource/scope/method request
         // may not even clean up unrelated expired state. Generate the candidate
         // only after every authorization and capacity decision succeeds.
-        let mut state = self.state.write().map_err(|_| {
-            OAuthError::ServerError("failed to acquire write lock".to_string())
-        })?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| OAuthError::ServerError("failed to acquire write lock".to_string()))?;
         let registration_epoch = authenticate_client_or_dummy(
             &state,
             &request.client_id,
@@ -3822,26 +3873,47 @@ impl OAuthServer {
         let client = state.clients.get(&request.client_id).ok_or_else(|| {
             OAuthError::InvalidClient(OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string())
         })?;
-        let grant = client.metadata.development_client_credentials.as_ref().ok_or_else(|| {
-            OAuthError::UnauthorizedClient("client is not authorized for machine grants".to_string())
-        })?;
+        let grant = client
+            .metadata
+            .development_client_credentials
+            .as_ref()
+            .ok_or_else(|| {
+                OAuthError::UnauthorizedClient(
+                    "client is not authorized for machine grants".to_string(),
+                )
+            })?;
         if client.metadata.client_type != ClientType::Confidential
             || request.client_authentication_method != TokenEndpointAuthMethod::ClientSecretBasic
         {
-            return Err(OAuthError::InvalidClient(OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string()));
+            return Err(OAuthError::InvalidClient(
+                OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string(),
+            ));
         }
         if resource != grant.resource.as_str() {
-            return Err(OAuthError::InvalidRequest("machine resource is not authorized".to_string()));
+            return Err(OAuthError::InvalidRequest(
+                "machine resource is not authorized".to_string(),
+            ));
         }
-        if !scopes.iter().all(|scope| grant.scopes.binary_search(scope).is_ok()) {
-            return Err(OAuthError::InvalidScope("machine scopes are not authorized".to_string()));
+        if !scopes
+            .iter()
+            .all(|scope| grant.scopes.binary_search(scope).is_ok())
+        {
+            return Err(OAuthError::InvalidScope(
+                "machine scopes are not authorized".to_string(),
+            ));
         }
         let now = Instant::now();
         ensure_capacity(
-            state.access_tokens.values().filter(|token| token.expires_at > now).count(),
-            state.access_tokens.values().filter(|token| {
-                token.expires_at > now && token.client_id == request.client_id
-            }).count(),
+            state
+                .access_tokens
+                .values()
+                .filter(|token| token.expires_at > now)
+                .count(),
+            state
+                .access_tokens
+                .values()
+                .filter(|token| token.expires_at > now && token.client_id == request.client_id)
+                .count(),
             self.config.max_access_tokens,
             self.config.max_access_tokens_per_client,
             "access tokens",
@@ -5394,10 +5466,15 @@ mod tests {
     fn development_machine_client(client_id: &str, secret: &str) -> OAuthClient {
         OAuthClient::builder(client_id)
             .secret(secret)
-            .development_client_credentials(DevelopmentClientCredentialsGrant::new(
-                configured_resource(TEST_MCP_RESOURCE), ["machine:read", "machine:write"],
-            ).unwrap())
-            .build().unwrap()
+            .development_client_credentials(
+                DevelopmentClientCredentialsGrant::new(
+                    configured_resource(TEST_MCP_RESOURCE),
+                    ["machine:read", "machine:write"],
+                )
+                .unwrap(),
+            )
+            .build()
+            .unwrap()
     }
 
     #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
@@ -5418,11 +5495,19 @@ mod tests {
 
     #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
     fn development_machine_server() -> Arc<OAuthServer> {
-        let server = Arc::new(OAuthServer::try_new(OAuthServerConfig {
-            allow_development_client_credentials: true,
-            ..OAuthServerConfig::default()
-        }).unwrap());
-        server.register_client(development_machine_client("machine-client", "machine-secret")).unwrap();
+        let server = Arc::new(
+            OAuthServer::try_new(OAuthServerConfig {
+                allow_development_client_credentials: true,
+                ..OAuthServerConfig::default()
+            })
+            .unwrap(),
+        );
+        server
+            .register_client(development_machine_client(
+                "machine-client",
+                "machine-secret",
+            ))
+            .unwrap();
         server
     }
 
@@ -5433,8 +5518,10 @@ mod tests {
         let client = server.get_client("machine-client").unwrap();
         assert!(client.redirect_uris.is_empty());
         assert!(client.allowed_scopes.is_empty());
-        assert_eq!(client.development_client_credentials.unwrap().scopes(),
-            ["machine:read", "machine:write"]);
+        assert_eq!(
+            client.development_client_credentials.unwrap().scopes(),
+            ["machine:read", "machine:write"]
+        );
         // OAuthServer::try_new installs the deny-all user approval backend.
         // Successful issuance therefore has no invented resource-owner consent.
         let response = server.token(&development_machine_request()).unwrap();
@@ -5444,7 +5531,9 @@ mod tests {
         let wire = serde_json::to_value(&response).unwrap();
         assert!(wire.get("refresh_token").is_none());
         assert!(wire.get("id_token").is_none());
-        let info = server.validate_access_token(&response.access_token).unwrap();
+        let info = server
+            .validate_access_token(&response.access_token)
+            .unwrap();
         assert_eq!(info.resource.as_deref(), Some(TEST_MCP_RESOURCE));
         assert_eq!(info.client_id, "machine-client");
         assert!(info.subject.is_none());
@@ -5456,21 +5545,36 @@ mod tests {
 
         let context = McpContext::new(asupersync::Cx::for_testing(), 1);
         let request = AuthRequest {
-            method: "tools/call", params: None, transport_authorization: None, request_id: 1,
+            method: "tools/call",
+            params: None,
+            transport_authorization: None,
+            request_id: 1,
         };
-        let access = AccessToken { scheme: "Bearer".to_string(), token: response.access_token };
+        let access = AccessToken {
+            scheme: "Bearer".to_string(),
+            token: response.access_token,
+        };
         let verifier = server.token_verifier(configured_resource(TEST_MCP_RESOURCE));
         let auth = verifier.verify(&context, request, &access).unwrap();
         assert_eq!(auth.subject.as_deref(), Some("machine-client"));
         assert_eq!(auth.scopes, ["machine:read"]);
-        assert_eq!(auth.claims.as_ref().unwrap()["grant_subject"], serde_json::Value::Null);
-        let registration_epoch = server.state.read().unwrap().clients["machine-client"].registration_epoch;
+        assert_eq!(
+            auth.claims.as_ref().unwrap()["grant_subject"],
+            serde_json::Value::Null
+        );
+        let registration_epoch =
+            server.state.read().unwrap().clients["machine-client"].registration_epoch;
         let owner_with_same_display_name = oauth_session_owner(
-            &server.config.issuer, "machine-client", registration_epoch,
-            Some("machine-client"), Some(TEST_MCP_RESOURCE),
-        ).unwrap();
+            &server.config.issuer,
+            "machine-client",
+            registration_epoch,
+            Some("machine-client"),
+            Some(TEST_MCP_RESOURCE),
+        )
+        .unwrap();
         assert_ne!(auth.session_owner(), Some(owner_with_same_display_name));
-        let other_resource = server.token_verifier(configured_resource("https://resource.example/other"));
+        let other_resource =
+            server.token_verifier(configured_resource("https://resource.example/other"));
         assert!(other_resource.verify(&context, request, &access).is_err());
         let other_issuer = development_machine_server();
         assert!(other_issuer.validate_access_token(&access.token).is_none());
@@ -5480,10 +5584,19 @@ mod tests {
             refresh_token: Some(access.token.clone()),
             ..development_machine_request()
         };
-        assert!(matches!(server.token(&refresh), Err(OAuthError::InvalidGrant(_))));
+        assert!(matches!(
+            server.token(&refresh),
+            Err(OAuthError::InvalidGrant(_))
+        ));
         assert!(server.validate_access_token(&access.token).is_some());
-        server.revoke(&access.token, "machine-client", Some("machine-secret"),
-            TokenEndpointAuthMethod::ClientSecretBasic).unwrap();
+        server
+            .revoke(
+                &access.token,
+                "machine-client",
+                Some("machine-secret"),
+                TokenEndpointAuthMethod::ClientSecretBasic,
+            )
+            .unwrap();
         assert!(verifier.verify(&context, request, &access).is_err());
         assert_eq!(server.stats().refresh_tokens, 0);
     }
@@ -5492,53 +5605,123 @@ mod tests {
     #[test]
     fn development_client_credentials_rejections_preserve_tokens_and_expired_state() {
         let server = development_machine_server();
-        server.register_client(OAuthClient::builder("browser-client")
-            .secret("machine-secret")
-            .redirect_uri("https://client.example/callback")
-            .scope("machine:read").build().unwrap()).unwrap();
-        server.register_client(OAuthClient::builder("public-client")
-            .redirect_uri("https://client.example/callback")
-            .scope("machine:read").build().unwrap()).unwrap();
+        server
+            .register_client(
+                OAuthClient::builder("browser-client")
+                    .secret("machine-secret")
+                    .redirect_uri("https://client.example/callback")
+                    .scope("machine:read")
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        server
+            .register_client(
+                OAuthClient::builder("public-client")
+                    .redirect_uri("https://client.example/callback")
+                    .scope("machine:read")
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
         let response = server.token(&development_machine_request()).unwrap();
-        let token_digest = digest_credential(CredentialKind::AccessToken, &response.access_token).unwrap();
+        let token_digest =
+            digest_credential(CredentialKind::AccessToken, &response.access_token).unwrap();
         let retained = server.state.read().unwrap().access_tokens[&token_digest].clone();
         let clients = server.list_clients();
         let expired = insert_expired_authorization_code_cleanup_canary(&server, "machine-client");
-        let expired_deadline = server.state.read().unwrap().authorization_codes[&expired].expires_at;
+        let expired_deadline =
+            server.state.read().unwrap().authorization_codes[&expired].expires_at;
 
         for case in 0..16 {
             let mut request = development_machine_request();
             let expected = match case {
-                0 => { request.client_secret = Some("wrong-secret".to_string()); "invalid_client" }
-                1 => { request.client_authentication_method = TokenEndpointAuthMethod::ClientSecretPost; "invalid_client" }
-                2 => { request.client_secret = None; request.client_authentication_method = TokenEndpointAuthMethod::None; "invalid_client" }
-                3 => { request.client_id = "unknown-client".to_string(); "invalid_client" }
-                4 => { request.resource = Some("https://resource.example/other".to_string()); "invalid_request" }
-                5 => { request.resource = None; "invalid_request" }
-                6 => { request.scopes = None; "invalid_scope" }
-                7 => { request.scopes = Some(Vec::new()); "invalid_scope" }
-                8 => { request.scopes = Some(vec!["machine:admin".to_string()]); "invalid_scope" }
-                9 => { request.scopes = Some(vec!["openid".to_string()]); "invalid_scope" }
-                10 => { request.code = Some(String::new()); "invalid_request" }
-                11 => { request.redirect_uri = Some("https://client.example/callback".to_string()); "invalid_request" }
-                12 => { request.code_verifier = Some("x".repeat(43)); "invalid_request" }
-                13 => { request.refresh_token = Some(response.access_token.clone()); "invalid_request" }
-                14 => { request.client_id = "browser-client".to_string(); "unauthorized_client" }
-                _ => { request.client_id = "public-client".to_string(); request.client_secret = None;
-                    request.client_authentication_method = TokenEndpointAuthMethod::None; "unauthorized_client" }
+                0 => {
+                    request.client_secret = Some("wrong-secret".to_string());
+                    "invalid_client"
+                }
+                1 => {
+                    request.client_authentication_method =
+                        TokenEndpointAuthMethod::ClientSecretPost;
+                    "invalid_client"
+                }
+                2 => {
+                    request.client_secret = None;
+                    request.client_authentication_method = TokenEndpointAuthMethod::None;
+                    "invalid_client"
+                }
+                3 => {
+                    request.client_id = "unknown-client".to_string();
+                    "invalid_client"
+                }
+                4 => {
+                    request.resource = Some("https://resource.example/other".to_string());
+                    "invalid_request"
+                }
+                5 => {
+                    request.resource = None;
+                    "invalid_request"
+                }
+                6 => {
+                    request.scopes = None;
+                    "invalid_scope"
+                }
+                7 => {
+                    request.scopes = Some(Vec::new());
+                    "invalid_scope"
+                }
+                8 => {
+                    request.scopes = Some(vec!["machine:admin".to_string()]);
+                    "invalid_scope"
+                }
+                9 => {
+                    request.scopes = Some(vec!["openid".to_string()]);
+                    "invalid_scope"
+                }
+                10 => {
+                    request.code = Some(String::new());
+                    "invalid_request"
+                }
+                11 => {
+                    request.redirect_uri = Some("https://client.example/callback".to_string());
+                    "invalid_request"
+                }
+                12 => {
+                    request.code_verifier = Some("x".repeat(43));
+                    "invalid_request"
+                }
+                13 => {
+                    request.refresh_token = Some(response.access_token.clone());
+                    "invalid_request"
+                }
+                14 => {
+                    request.client_id = "browser-client".to_string();
+                    "unauthorized_client"
+                }
+                _ => {
+                    request.client_id = "public-client".to_string();
+                    request.client_secret = None;
+                    request.client_authentication_method = TokenEndpointAuthMethod::None;
+                    "unauthorized_client"
+                }
             };
             let draws = std::cell::Cell::new(0);
-            let error = server.token_client_credentials_with_draw(&request, || {
-                draws.set(draws.get() + 1);
-                draw_security_identifier()
-            }).unwrap_err();
+            let error = server
+                .token_client_credentials_with_draw(&request, || {
+                    draws.set(draws.get() + 1);
+                    draw_security_identifier()
+                })
+                .unwrap_err();
             assert_eq!(error.error_code(), expected, "case {case}");
             assert_eq!(draws.get(), 0, "case {case}");
             assert_eq!(server.list_clients(), clients, "case {case}");
             let state = server.state.read().unwrap();
             assert_eq!(state.access_tokens.len(), 1, "case {case}");
             assert_eq!(state.authorization_codes.len(), 1, "case {case}");
-            assert_eq!(state.authorization_codes[&expired].expires_at, expired_deadline);
+            assert_eq!(
+                state.authorization_codes[&expired].expires_at,
+                expired_deadline
+            );
             assert!(state.refresh_tokens.is_empty());
             assert!(state.revoked_tokens.is_empty());
             assert_retained_token_unchanged(&retained, &state.access_tokens[&token_digest]);
@@ -5553,33 +5736,78 @@ mod tests {
     #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
     #[test]
     fn development_client_credentials_require_explicit_confidential_machine_registration() {
-        let grant = || DevelopmentClientCredentialsGrant::new(
-            configured_resource(TEST_MCP_RESOURCE), ["machine:read"],
-        ).unwrap();
-        assert!(OAuthClient::builder("public").development_client_credentials(grant()).build().is_err());
-        assert!(OAuthClient::builder("post").secret("secret")
-            .token_endpoint_auth_method(TokenEndpointAuthMethod::ClientSecretPost)
-            .development_client_credentials(grant()).build().is_err());
-        assert!(OAuthClient::builder("browser").secret("secret").build().is_err());
+        let grant = || {
+            DevelopmentClientCredentialsGrant::new(
+                configured_resource(TEST_MCP_RESOURCE),
+                ["machine:read"],
+            )
+            .unwrap()
+        };
+        assert!(
+            OAuthClient::builder("public")
+                .development_client_credentials(grant())
+                .build()
+                .is_err()
+        );
+        assert!(
+            OAuthClient::builder("post")
+                .secret("secret")
+                .token_endpoint_auth_method(TokenEndpointAuthMethod::ClientSecretPost)
+                .development_client_credentials(grant())
+                .build()
+                .is_err()
+        );
+        assert!(
+            OAuthClient::builder("browser")
+                .secret("secret")
+                .build()
+                .is_err()
+        );
         let machine = development_machine_client("machine", "secret");
         assert!(!machine.validate_redirect_uri("https://client.example/callback"));
         assert!(!machine.validate_scopes(&["machine:read".to_string()]));
-        for scopes in [Vec::<String>::new(), vec!["openid".to_string()],
-            vec!["offline_access".to_string()], vec!["a b".to_string()],
+        for scopes in [
+            Vec::<String>::new(),
+            vec!["openid".to_string()],
+            vec!["offline_access".to_string()],
+            vec!["a b".to_string()],
             vec!["x".repeat(MAX_OAUTH_SCOPE_BYTES + 1)],
-            (0..=MAX_OAUTH_SCOPES_PER_CLIENT).map(|i| format!("scope{i}")).collect()]
-        {
-            assert!(DevelopmentClientCredentialsGrant::new(configured_resource(TEST_MCP_RESOURCE), scopes).is_err());
+            (0..=MAX_OAUTH_SCOPES_PER_CLIENT)
+                .map(|i| format!("scope{i}"))
+                .collect(),
+        ] {
+            assert!(
+                DevelopmentClientCredentialsGrant::new(
+                    configured_resource(TEST_MCP_RESOURCE),
+                    scopes
+                )
+                .is_err()
+            );
         }
-        let exact = DevelopmentClientCredentialsGrant::new(configured_resource(TEST_MCP_RESOURCE),
-            (0..MAX_OAUTH_SCOPES_PER_CLIENT).map(|i| format!("scope{i}"))).unwrap();
+        let exact = DevelopmentClientCredentialsGrant::new(
+            configured_resource(TEST_MCP_RESOURCE),
+            (0..MAX_OAUTH_SCOPES_PER_CLIENT).map(|i| format!("scope{i}")),
+        )
+        .unwrap();
         assert_eq!(exact.scopes().len(), MAX_OAUTH_SCOPES_PER_CLIENT);
 
         let disabled = OAuthServer::try_new(OAuthServerConfig::default()).unwrap();
-        disabled.register_client(development_machine_client("machine-client", "machine-secret")).unwrap();
-        assert!(matches!(disabled.token(&development_machine_request()), Err(OAuthError::UnsupportedGrantType(_))));
+        disabled
+            .register_client(development_machine_client(
+                "machine-client",
+                "machine-secret",
+            ))
+            .unwrap();
+        assert!(matches!(
+            disabled.token(&development_machine_request()),
+            Err(OAuthError::UnsupportedGrantType(_))
+        ));
         assert_eq!(disabled.stats().access_tokens, 0);
-        assert!(!disabled.supported_grant_types().contains(&"client_credentials"));
+        assert!(
+            !disabled
+                .supported_grant_types()
+                .contains(&"client_credentials")
+        );
 
         // Revalidate public fields at retention after builder admission.
         let mut changed = development_machine_client("changed", "secret");
@@ -5592,26 +5820,59 @@ mod tests {
     #[test]
     fn development_client_credentials_rotation_revocation_and_expiry_remain_client_bound() {
         let server = development_machine_server();
-        server.register_client(development_machine_client("other-client", "other-secret")).unwrap();
+        server
+            .register_client(development_machine_client("other-client", "other-secret"))
+            .unwrap();
         let first = server.token(&development_machine_request()).unwrap();
-        server.revoke(&first.access_token, "other-client", Some("other-secret"),
-            TokenEndpointAuthMethod::ClientSecretBasic).unwrap();
+        server
+            .revoke(
+                &first.access_token,
+                "other-client",
+                Some("other-secret"),
+                TokenEndpointAuthMethod::ClientSecretBasic,
+            )
+            .unwrap();
         assert!(server.validate_access_token(&first.access_token).is_some());
-        assert!(server.revoke(&first.access_token, "machine-client", Some("machine-secret"),
-            TokenEndpointAuthMethod::ClientSecretPost).is_err());
+        assert!(
+            server
+                .revoke(
+                    &first.access_token,
+                    "machine-client",
+                    Some("machine-secret"),
+                    TokenEndpointAuthMethod::ClientSecretPost
+                )
+                .is_err()
+        );
         assert!(server.validate_access_token(&first.access_token).is_some());
-        assert!(server.register_client(development_machine_client("machine-client", "new-secret")).is_err());
+        assert!(
+            server
+                .register_client(development_machine_client("machine-client", "new-secret"))
+                .is_err()
+        );
         assert!(server.validate_access_token(&first.access_token).is_some());
         server.unregister_client("machine-client").unwrap();
-        server.register_client(development_machine_client("machine-client", "new-secret")).unwrap();
+        server
+            .register_client(development_machine_client("machine-client", "new-secret"))
+            .unwrap();
         assert!(server.validate_access_token(&first.access_token).is_none());
-        assert!(matches!(server.token(&development_machine_request()), Err(OAuthError::InvalidClient(_))));
+        assert!(matches!(
+            server.token(&development_machine_request()),
+            Err(OAuthError::InvalidClient(_))
+        ));
         let mut request = development_machine_request();
         request.client_secret = Some("new-secret".to_string());
         let second = server.token(&request).unwrap();
         assert_ne!(first.access_token, second.access_token);
         let digest = digest_credential(CredentialKind::AccessToken, &second.access_token).unwrap();
-        server.state.write().unwrap().access_tokens.get_mut(&digest).unwrap().metadata.expires_at = Instant::now();
+        server
+            .state
+            .write()
+            .unwrap()
+            .access_tokens
+            .get_mut(&digest)
+            .unwrap()
+            .metadata
+            .expires_at = Instant::now();
         assert!(server.validate_access_token(&second.access_token).is_none());
         assert_eq!(server.stats().refresh_tokens, 0);
     }
@@ -5624,26 +5885,57 @@ mod tests {
             max_access_tokens: 1,
             max_access_tokens_per_client: 1,
             ..OAuthServerConfig::default()
-        }).unwrap();
-        server.register_client(development_machine_client("machine-client", "machine-secret")).unwrap();
+        })
+        .unwrap();
+        server
+            .register_client(development_machine_client(
+                "machine-client",
+                "machine-secret",
+            ))
+            .unwrap();
         let first = server.token(&development_machine_request()).unwrap();
         let digest = digest_credential(CredentialKind::AccessToken, &first.access_token).unwrap();
         let expired = insert_expired_authorization_code_cleanup_canary(&server, "machine-client");
         let draws = std::cell::Cell::new(0);
-        let denied = server.token_client_credentials_with_draw(&development_machine_request(), || {
-            draws.set(draws.get() + 1); draw_security_identifier()
-        });
+        let denied =
+            server.token_client_credentials_with_draw(&development_machine_request(), || {
+                draws.set(draws.get() + 1);
+                draw_security_identifier()
+            });
         assert!(denied.is_err());
         assert_eq!(draws.get(), 0);
-        assert!(server.state.read().unwrap().authorization_codes.contains_key(&expired));
+        assert!(
+            server
+                .state
+                .read()
+                .unwrap()
+                .authorization_codes
+                .contains_key(&expired)
+        );
         assert!(server.validate_access_token(&first.access_token).is_some());
-        server.state.write().unwrap().access_tokens.get_mut(&digest).unwrap().metadata.expires_at = Instant::now();
-        let denied = server.token_client_credentials_with_draw(&development_machine_request(), || {
-            Err::<SecurityIdentifier, _>("forced RNG failure")
-        });
+        server
+            .state
+            .write()
+            .unwrap()
+            .access_tokens
+            .get_mut(&digest)
+            .unwrap()
+            .metadata
+            .expires_at = Instant::now();
+        let denied = server
+            .token_client_credentials_with_draw(&development_machine_request(), || {
+                Err::<SecurityIdentifier, _>("forced RNG failure")
+            });
         assert!(matches!(denied, Err(OAuthError::ServerError(_))));
         assert_eq!(server.stats().access_tokens, 1);
-        assert!(server.state.read().unwrap().authorization_codes.contains_key(&expired));
+        assert!(
+            server
+                .state
+                .read()
+                .unwrap()
+                .authorization_codes
+                .contains_key(&expired)
+        );
         let second = server.token(&development_machine_request()).unwrap();
         assert_eq!(server.stats().access_tokens, 1);
         assert_eq!(server.stats().authorization_codes, 0);
@@ -5656,24 +5948,36 @@ mod tests {
     fn development_client_credentials_collision_budget_is_atomic_and_retry_is_bounded() {
         let server = development_machine_server();
         let first = server.token(&development_machine_request()).unwrap();
-        let first_digest = digest_credential(CredentialKind::AccessToken, &first.access_token).unwrap();
+        let first_digest =
+            digest_credential(CredentialKind::AccessToken, &first.access_token).unwrap();
         let retained = server.state.read().unwrap().access_tokens[&first_digest].clone();
-        let candidates: Vec<_> = (0..4).map(|_| draw_security_identifier().unwrap()).collect();
+        let candidates: Vec<_> = (0..4)
+            .map(|_| draw_security_identifier().unwrap())
+            .collect();
         // Pre-existing entries match four future candidate draws. This changes
         // only the collision dimension of otherwise valid machine issuance.
         for candidate in &candidates {
             let value = base64url_encode(candidate.as_bytes());
             let digest = digest_credential(CredentialKind::AccessToken, &value).unwrap();
-            assert!(server.state.write().unwrap().access_tokens.insert(digest, retained.clone()).is_none());
+            assert!(
+                server
+                    .state
+                    .write()
+                    .unwrap()
+                    .access_tokens
+                    .insert(digest, retained.clone())
+                    .is_none()
+            );
         }
         let expired = insert_expired_authorization_code_cleanup_canary(&server, "machine-client");
         let before = server.state.read().unwrap().access_tokens.clone();
         let mut candidates = candidates.into_iter();
         let draws = std::cell::Cell::new(0);
-        let rejected = server.token_client_credentials_with_draw(&development_machine_request(), || {
-            draws.set(draws.get() + 1);
-            Ok::<_, &'static str>(candidates.next().expect("at most four candidate draws"))
-        });
+        let rejected =
+            server.token_client_credentials_with_draw(&development_machine_request(), || {
+                draws.set(draws.get() + 1);
+                Ok::<_, &'static str>(candidates.next().expect("at most four candidate draws"))
+            });
         assert!(matches!(rejected, Err(OAuthError::ServerError(_))));
         assert_eq!(draws.get(), 4);
         {
@@ -5688,23 +5992,40 @@ mod tests {
         }
 
         let collision = draw_security_identifier().unwrap();
-        let digest = digest_credential(CredentialKind::AccessToken,
-            &base64url_encode(collision.as_bytes())).unwrap();
-        server.state.write().unwrap().access_tokens.insert(digest, retained.clone());
+        let digest = digest_credential(
+            CredentialKind::AccessToken,
+            &base64url_encode(collision.as_bytes()),
+        )
+        .unwrap();
+        server
+            .state
+            .write()
+            .unwrap()
+            .access_tokens
+            .insert(digest, retained.clone());
         let fresh = draw_security_identifier().unwrap();
         let expected_value = base64url_encode(fresh.as_bytes());
         let mut candidates = vec![collision, fresh].into_iter();
         draws.set(0);
-        let response = server.token_client_credentials_with_draw(&development_machine_request(), || {
-            draws.set(draws.get() + 1);
-            Ok::<_, &'static str>(candidates.next().expect("collision followed by one fresh candidate"))
-        }).unwrap();
+        let response = server
+            .token_client_credentials_with_draw(&development_machine_request(), || {
+                draws.set(draws.get() + 1);
+                Ok::<_, &'static str>(
+                    candidates
+                        .next()
+                        .expect("collision followed by one fresh candidate"),
+                )
+            })
+            .unwrap();
         assert_eq!(draws.get(), 2);
         assert_eq!(response.access_token, expected_value);
         assert!(response.refresh_token.is_none());
         assert_eq!(server.stats().authorization_codes, 0);
         assert_eq!(server.stats().refresh_tokens, 0);
-        assert_retained_token_unchanged(&retained, &server.state.read().unwrap().access_tokens[&first_digest]);
+        assert_retained_token_unchanged(
+            &retained,
+            &server.state.read().unwrap().access_tokens[&first_digest],
+        );
     }
 
     #[derive(Clone, Copy)]
@@ -8100,7 +8421,10 @@ mod tests {
         server.register_client(confidential).unwrap();
         server.register_client(post).unwrap();
         assert_eq!(
-            server.get_client("post-method").unwrap().token_endpoint_auth_method,
+            server
+                .get_client("post-method")
+                .unwrap()
+                .token_endpoint_auth_method,
             TokenEndpointAuthMethod::ClientSecretPost,
         );
         for method in [
@@ -8172,7 +8496,9 @@ mod tests {
             {
                 let state = server.state.read().unwrap();
                 assert!(
-                    state.authorization_codes.contains_key(&authorization_code_digest(&code)),
+                    state
+                        .authorization_codes
+                        .contains_key(&authorization_code_digest(&code)),
                 );
                 assert!(state.authorization_codes.contains_key(&cleanup_canary));
             }
@@ -8222,7 +8548,11 @@ mod tests {
             server
                 .revoke(successor_refresh, "method-bound", secret, registered)
                 .unwrap();
-            assert!(server.validate_access_token(&successor.access_token).is_none());
+            assert!(
+                server
+                    .validate_access_token(&successor.access_token)
+                    .is_none()
+            );
         }
     }
 
@@ -10845,7 +11175,12 @@ mod tests {
         // c2 tries to revoke c1's tokens — both calls succeed silently, but
         // neither token may be removed or marked revoked.
         server
-            .revoke(&token_resp.access_token, "c2", None, TokenEndpointAuthMethod::None)
+            .revoke(
+                &token_resp.access_token,
+                "c2",
+                None,
+                TokenEndpointAuthMethod::None,
+            )
             .unwrap();
         server
             .revoke(&refresh_token, "c2", None, TokenEndpointAuthMethod::None)
@@ -10974,7 +11309,12 @@ mod tests {
 
         assert!(server.validate_access_token(&resp.access_token).is_some());
         server
-            .revoke(&resp.access_token, "c1", None, TokenEndpointAuthMethod::None)
+            .revoke(
+                &resp.access_token,
+                "c1",
+                None,
+                TokenEndpointAuthMethod::None,
+            )
             .unwrap();
         assert!(server.validate_access_token(&resp.access_token).is_none());
     }
@@ -11537,7 +11877,12 @@ mod tests {
         server.register_client(client).unwrap();
 
         let err = server
-            .revoke("any-token", "c1", Some("wrong"), TokenEndpointAuthMethod::ClientSecretBasic)
+            .revoke(
+                "any-token",
+                "c1",
+                Some("wrong"),
+                TokenEndpointAuthMethod::ClientSecretBasic,
+            )
             .unwrap_err();
         assert_eq!(err.error_code(), "invalid_client");
     }
@@ -12541,7 +12886,12 @@ mod tests {
         );
 
         server
-            .revoke(&blocker.access_token, "c1", None, TokenEndpointAuthMethod::None)
+            .revoke(
+                &blocker.access_token,
+                "c1",
+                None,
+                TokenEndpointAuthMethod::None,
+            )
             .unwrap();
         server.token(&request).unwrap();
         assert!(
@@ -13011,7 +13361,12 @@ mod tests {
             .expires_at;
 
         server
-            .revoke(&first.access_token, "c1", None, TokenEndpointAuthMethod::None)
+            .revoke(
+                &first.access_token,
+                "c1",
+                None,
+                TokenEndpointAuthMethod::None,
+            )
             .unwrap();
         server
             .revoke(&first_refresh, "c1", None, TokenEndpointAuthMethod::None)
@@ -13031,11 +13386,21 @@ mod tests {
         }
 
         server
-            .revoke(&second.access_token, "c2", None, TokenEndpointAuthMethod::None)
+            .revoke(
+                &second.access_token,
+                "c2",
+                None,
+                TokenEndpointAuthMethod::None,
+            )
             .unwrap();
         assert_eq!(server.stats().revoked_tokens, 2);
         server
-            .revoke(&third.access_token, "c3", None, TokenEndpointAuthMethod::None)
+            .revoke(
+                &third.access_token,
+                "c3",
+                None,
+                TokenEndpointAuthMethod::None,
+            )
             .unwrap();
 
         let state = server.state.read().unwrap();
@@ -13226,18 +13591,26 @@ mod tests {
                 "http://[::1]/oauth/callback".to_string(),
             ],
             token_endpoint_auth_method: "none".to_string(),
-            grant_types: vec!["authorization_code".to_string(), "refresh_token".to_string()],
+            grant_types: vec![
+                "authorization_code".to_string(),
+                "refresh_token".to_string(),
+            ],
             response_types: vec!["code".to_string()],
             scope: Some("tools:read tools:write".to_string()),
         };
         let response = server.register_native_public_client(request).unwrap();
         assert_eq!(response.application_type, "native");
         assert_eq!(response.token_endpoint_auth_method, "none");
-        assert_eq!(response.grant_types, ["authorization_code", "refresh_token"]);
+        assert_eq!(
+            response.grant_types,
+            ["authorization_code", "refresh_token"]
+        );
         assert_eq!(response.response_types, ["code"]);
         assert_eq!(response.scope.as_deref(), Some("tools:read tools:write"));
         assert_eq!(response.redirect_uris.len(), 2);
-        let retained = server.get_client(&response.client_id).expect("registered client");
+        let retained = server
+            .get_client(&response.client_id)
+            .expect("registered client");
         assert_eq!(retained.client_type, ClientType::Public);
         assert_eq!(retained.redirect_uris, response.redirect_uris);
         assert_eq!(retained.allowed_scopes.len(), 2);
@@ -13286,71 +13659,150 @@ mod tests {
         let disabled = OAuthServer::try_new(OAuthServerConfig {
             allow_public_clients: false,
             ..OAuthServerConfig::default()
-        }).unwrap();
-        assert!(disabled.register_native_public_client(NativePublicClientRegistrationRequest {
-            client_name: "Native app".to_string(),
-            application_type: "native".to_string(),
-            redirect_uris: vec!["http://127.0.0.1/oauth/callback".to_string()],
-            token_endpoint_auth_method: "none".to_string(),
-            grant_types: vec!["authorization_code".to_string()],
-            response_types: vec!["code".to_string()],
-            scope: None,
-        }).is_err());
+        })
+        .unwrap();
+        assert!(
+            disabled
+                .register_native_public_client(NativePublicClientRegistrationRequest {
+                    client_name: "Native app".to_string(),
+                    application_type: "native".to_string(),
+                    redirect_uris: vec!["http://127.0.0.1/oauth/callback".to_string()],
+                    token_endpoint_auth_method: "none".to_string(),
+                    grant_types: vec!["authorization_code".to_string()],
+                    response_types: vec!["code".to_string()],
+                    scope: None,
+                })
+                .is_err()
+        );
         assert!(disabled.list_clients().is_empty());
     }
 
     #[test]
     fn oauth_metadata_preserves_exact_issuer_and_inserts_before_its_path() {
         for (issuer, expected_path) in [
-            ("https://issuer.example", "/.well-known/oauth-authorization-server"),
-            ("https://issuer.example/", "/.well-known/oauth-authorization-server"),
-            ("https://issuer.example/tenant", "/.well-known/oauth-authorization-server/tenant"),
-            ("https://issuer.example/tenant/", "/.well-known/oauth-authorization-server/tenant"),
-            ("https://issuer.example/tenant%2Fone/", "/.well-known/oauth-authorization-server/tenant%2Fone"),
+            (
+                "https://issuer.example",
+                "/.well-known/oauth-authorization-server",
+            ),
+            (
+                "https://issuer.example/",
+                "/.well-known/oauth-authorization-server",
+            ),
+            (
+                "https://issuer.example/tenant",
+                "/.well-known/oauth-authorization-server/tenant",
+            ),
+            (
+                "https://issuer.example/tenant/",
+                "/.well-known/oauth-authorization-server/tenant",
+            ),
+            (
+                "https://issuer.example/tenant%2Fone/",
+                "/.well-known/oauth-authorization-server/tenant%2Fone",
+            ),
         ] {
-            let server = Arc::new(OAuthServer::try_new(OAuthServerConfig {
-                issuer: issuer.to_owned(), ..Default::default()
-            }).unwrap());
+            let server = Arc::new(
+                OAuthServer::try_new(OAuthServerConfig {
+                    issuer: issuer.to_owned(),
+                    ..Default::default()
+                })
+                .unwrap(),
+            );
             let routes = OAuthHttpRoutes::new(server, "https://issuer.example/login/").unwrap();
             let metadata = routes.authorization_server_metadata().unwrap();
             assert_eq!(routes.metadata_path(), expected_path);
             assert!(routes.has_path(expected_path));
-            assert!(routes.validate_non_overlapping_paths([expected_path]).is_err());
+            assert!(
+                routes
+                    .validate_non_overlapping_paths([expected_path])
+                    .is_err()
+            );
             assert_eq!(metadata.issuer, issuer);
-            assert_eq!(metadata.authorization_endpoint, "https://issuer.example/login/authorize");
-            assert_eq!(metadata.token_endpoint, "https://issuer.example/login/token");
-            assert_eq!(metadata.revocation_endpoint, "https://issuer.example/login/revoke");
-            assert_eq!(metadata.registration_endpoint.as_deref(), Some("https://issuer.example/login/register"));
+            assert_eq!(
+                metadata.authorization_endpoint,
+                "https://issuer.example/login/authorize"
+            );
+            assert_eq!(
+                metadata.token_endpoint,
+                "https://issuer.example/login/token"
+            );
+            assert_eq!(
+                metadata.revocation_endpoint,
+                "https://issuer.example/login/revoke"
+            );
+            assert_eq!(
+                metadata.registration_endpoint.as_deref(),
+                Some("https://issuer.example/login/register")
+            );
         }
     }
 
     #[test]
     fn oauth_metadata_advertises_only_enabled_native_issuer_capabilities() {
         for allow_public_clients in [true, false] {
-            let server = Arc::new(OAuthServer::try_new(OAuthServerConfig {
-                allow_public_clients, ..Default::default()
-            }).unwrap());
+            let server = Arc::new(
+                OAuthServer::try_new(OAuthServerConfig {
+                    allow_public_clients,
+                    ..Default::default()
+                })
+                .unwrap(),
+            );
             let routes = OAuthHttpRoutes::new(server, "https://fastmcp.invalid/oauth").unwrap();
             let metadata = routes.authorization_server_metadata().unwrap();
             assert_eq!(metadata.response_types_supported, ["code"]);
             assert_eq!(metadata.response_modes_supported, ["query"]);
-            assert_eq!(metadata.grant_types_supported, ["authorization_code", "refresh_token"]);
+            assert_eq!(
+                metadata.grant_types_supported,
+                ["authorization_code", "refresh_token"]
+            );
             assert_eq!(metadata.code_challenge_methods_supported, ["S256"]);
             assert!(metadata.authorization_response_iss_parameter_supported);
-            assert_eq!(metadata.token_endpoint_auth_methods_supported.contains(&"none"), allow_public_clients);
-            assert_eq!(metadata.registration_endpoint.is_some(), allow_public_clients);
-            assert_eq!(metadata.token_endpoint_auth_methods_supported, metadata.revocation_endpoint_auth_methods_supported);
-            assert!(metadata.token_endpoint_auth_methods_supported.contains(&"client_secret_basic"));
-            assert!(metadata.token_endpoint_auth_methods_supported.contains(&"client_secret_post"));
+            assert_eq!(
+                metadata
+                    .token_endpoint_auth_methods_supported
+                    .contains(&"none"),
+                allow_public_clients
+            );
+            assert_eq!(
+                metadata.registration_endpoint.is_some(),
+                allow_public_clients
+            );
+            assert_eq!(
+                metadata.token_endpoint_auth_methods_supported,
+                metadata.revocation_endpoint_auth_methods_supported
+            );
+            assert!(
+                metadata
+                    .token_endpoint_auth_methods_supported
+                    .contains(&"client_secret_basic")
+            );
+            assert!(
+                metadata
+                    .token_endpoint_auth_methods_supported
+                    .contains(&"client_secret_post")
+            );
             let wire = serde_json::to_value(metadata).unwrap();
-            assert_eq!(wire.get("registration_endpoint").is_some(), allow_public_clients);
-            for absent in ["jwks_uri", "id_token_signing_alg_values_supported", "userinfo_endpoint",
-                "scopes_supported", "signed_metadata", "client_id_metadata_document_supported"] {
-                assert!(wire.get(absent).is_none(), "unconfigured capability {absent}");
+            assert_eq!(
+                wire.get("registration_endpoint").is_some(),
+                allow_public_clients
+            );
+            for absent in [
+                "jwks_uri",
+                "id_token_signing_alg_values_supported",
+                "userinfo_endpoint",
+                "scopes_supported",
+                "signed_metadata",
+                "client_id_metadata_document_supported",
+            ] {
+                assert!(
+                    wire.get(absent).is_none(),
+                    "unconfigured capability {absent}"
+                );
             }
         }
         let invalid = Arc::new(OAuthServer::new(OAuthServerConfig {
-            max_clients: 0, ..Default::default()
+            max_clients: 0,
+            ..Default::default()
         }));
         let routes = OAuthHttpRoutes::new(invalid, "https://fastmcp.invalid/oauth").unwrap();
         assert!(routes.authorization_server_metadata().is_err());
@@ -13358,13 +13810,25 @@ mod tests {
 
     #[test]
     fn oauth_metadata_route_cannot_shadow_an_installed_token_endpoint() {
-        for (issuer, admissible) in [("https://issuer.example/tenant", true), ("https://issuer.example/token", false)] {
-            let server = Arc::new(OAuthServer::try_new(OAuthServerConfig {
-                issuer: issuer.to_owned(), ..Default::default()
-            }).unwrap());
-            assert_eq!(OAuthHttpRoutes::new(server,
-                "https://issuer.example/.well-known/oauth-authorization-server").is_ok(), admissible);
+        for (issuer, admissible) in [
+            ("https://issuer.example/tenant", true),
+            ("https://issuer.example/token", false),
+        ] {
+            let server = Arc::new(
+                OAuthServer::try_new(OAuthServerConfig {
+                    issuer: issuer.to_owned(),
+                    ..Default::default()
+                })
+                .unwrap(),
+            );
+            assert_eq!(
+                OAuthHttpRoutes::new(
+                    server,
+                    "https://issuer.example/.well-known/oauth-authorization-server"
+                )
+                .is_ok(),
+                admissible
+            );
         }
     }
-
 }

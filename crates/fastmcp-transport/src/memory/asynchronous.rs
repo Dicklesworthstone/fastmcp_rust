@@ -396,7 +396,10 @@ mod tests {
 
         assert_eq!(request_id(server.recv(&cx).unwrap()), RequestId::Number(1));
         assert!(counter.0.load(Ordering::SeqCst) > 0);
-        assert!(matches!(poll(sending.as_mut(), &waker), Poll::Ready(Ok(()))));
+        assert!(matches!(
+            poll(sending.as_mut(), &waker),
+            Poll::Ready(Ok(()))
+        ));
         assert_eq!(
             request_id(ready(server.recv_async(&cx)).unwrap()),
             RequestId::Number(2)
@@ -436,9 +439,15 @@ mod tests {
             ));
         }
         assert!(!client.is_closed());
-        assert_eq!(request_id(server.recv(&live).unwrap()), RequestId::Number(1));
+        assert_eq!(
+            request_id(server.recv(&live).unwrap()),
+            RequestId::Number(1)
+        );
         ready(client.send_async(&live, &request(3))).unwrap();
-        assert_eq!(request_id(server.recv(&live).unwrap()), RequestId::Number(3));
+        assert_eq!(
+            request_id(server.recv(&live).unwrap()),
+            RequestId::Number(3)
+        );
     }
 
     #[test]
@@ -674,7 +683,10 @@ mod tests {
         cx.set_cancel_requested(true);
         permit.send(&request(4)).unwrap();
         let live = Cx::for_testing();
-        assert_eq!(request_id(server.recv(&live).unwrap()), RequestId::Number(4));
+        assert_eq!(
+            request_id(server.recv(&live).unwrap()),
+            RequestId::Number(4)
+        );
         assert!(!client.is_closed());
     }
 
@@ -693,7 +705,10 @@ mod tests {
             .unwrap()
             .send(&request(5))
             .unwrap();
-        assert_eq!(request_id(server.recv(&live).unwrap()), RequestId::Number(5));
+        assert_eq!(
+            request_id(server.recv(&live).unwrap()),
+            RequestId::Number(5)
+        );
     }
 
     #[test]
@@ -715,12 +730,18 @@ mod tests {
             let mut reservation = pin!(client.reserve_send_async(&live));
             assert!(poll(reservation.as_mut(), Waker::noop()).is_pending());
         }
-        assert_eq!(request_id(server.recv(&live).unwrap()), RequestId::Number(1));
+        assert_eq!(
+            request_id(server.recv(&live).unwrap()),
+            RequestId::Number(1)
+        );
         ready(client.reserve_send_async(&live))
             .unwrap()
             .send(&request(6))
             .unwrap();
-        assert_eq!(request_id(server.recv(&live).unwrap()), RequestId::Number(6));
+        assert_eq!(
+            request_id(server.recv(&live).unwrap()),
+            RequestId::Number(6)
+        );
     }
 
     #[test]
@@ -776,9 +797,7 @@ mod tests {
             JsonRpcMessage::Request(request) => serde_json::to_vec(request).unwrap().len(),
             JsonRpcMessage::Response(_) => unreachable!(),
         };
-        let (mut client, mut server) = MemoryTransportBuilder::new()
-            .max_message_size(size)
-            .build();
+        let (mut client, mut server) = MemoryTransportBuilder::new().max_message_size(size).build();
         let cx = Cx::for_testing();
         let large = JsonRpcMessage::Request(JsonRpcRequest::new("x".repeat(size), None, 1_i64));
         let permit = ready(client.reserve_send_async(&cx)).unwrap();
@@ -1001,9 +1020,15 @@ mod tests {
             ));
         }
         assert_eq!(server.receiver.len(), 1);
-        assert_eq!(request_id(server.recv(&live).unwrap()), RequestId::Number(87));
+        assert_eq!(
+            request_id(server.recv(&live).unwrap()),
+            RequestId::Number(87)
+        );
         ready(client.send_async(&live, &request(89))).unwrap();
-        assert_eq!(request_id(server.recv(&live).unwrap()), RequestId::Number(89));
+        assert_eq!(
+            request_id(server.recv(&live).unwrap()),
+            RequestId::Number(89)
+        );
         assert_eq!(server.receiver.len(), 0);
         assert!(!client.is_closed());
     }

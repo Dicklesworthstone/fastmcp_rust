@@ -11,15 +11,20 @@ use asupersync::Cx;
 use asupersync::channel::oneshot;
 use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
 use fastmcp_client::http_auth::managed::{ManagedOAuthSession, OAuthSessionPolicy};
-use fastmcp_client::http_auth::rpc::{ManagedCoreEvent, ManagedCoreLimits};
-use fastmcp_client::http_auth::rpc::catalog::watch::{ManagedCatalogWatchControl, ManagedCatalogWatchOutcome};
-use fastmcp_client::http_auth::tool::{ManagedToolClient, ManagedToolError};
-use fastmcp_client::http_auth::tool::catalog::{
-    ManagedToolCatalogError, ManagedToolCatalogEvent, ManagedToolCatalogLimits, ManagedToolCatalogSnapshot,
+use fastmcp_client::http_auth::rpc::catalog::watch::{
+    ManagedCatalogWatchControl, ManagedCatalogWatchOutcome,
 };
+use fastmcp_client::http_auth::rpc::{ManagedCoreEvent, ManagedCoreLimits};
+use fastmcp_client::http_auth::tool::catalog::{
+    ManagedToolCatalogError, ManagedToolCatalogEvent, ManagedToolCatalogLimits,
+    ManagedToolCatalogSnapshot,
+};
+use fastmcp_client::http_auth::tool::{ManagedToolClient, ManagedToolError};
 use fastmcp_core::McpRequestCancellation;
-use fastmcp_protocol::{ClientCapabilities, CoreRequest, FinalRequestMeta, RequestId, ServerNotification};
 use fastmcp_protocol::protocol_policy::ProtocolEra;
+use fastmcp_protocol::{
+    ClientCapabilities, CoreRequest, FinalRequestMeta, RequestId, ServerNotification,
+};
 use serde_json::{Value, json};
 
 #[path = "oauth_tool_catalog/peer.rs"]
@@ -28,7 +33,11 @@ use peer::{Peer, ROOT, browser, chunk, closed, pair};
 
 const CHILD: &str = "FASTMCP_TEST_TOOL_CATALOG_CASE";
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Case { Replace, MalformedReplacement, Cancel }
+enum Case {
+    Replace,
+    MalformedReplacement,
+    Cancel,
+}
 
 fn isolated(name: &str, case: Case) {
     if let Ok(selected) = std::env::var(CHILD) {
@@ -38,34 +47,68 @@ fn isolated(name: &str, case: Case) {
     }
     struct Child(std::process::Child);
     impl Drop for Child {
-        fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
-    let roots = std::env::temp_dir().join(format!("fastmcp-tool-catalog-{}-{name}.pem", std::process::id()));
+    let roots = std::env::temp_dir().join(format!(
+        "fastmcp-tool-catalog-{}-{name}.pem",
+        std::process::id()
+    ));
     std::fs::write(&roots, ROOT).unwrap();
-    let mut child = Child(Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture", "--test-threads=1"])
-        .env(CHILD, name).env("SSL_CERT_FILE", roots).env_remove("SSL_CERT_DIR")
-        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap());
+    let mut child = Child(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, name)
+            .env("SSL_CERT_FILE", roots)
+            .env_remove("SSL_CERT_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if let Some(status) = child.0.try_wait().unwrap() { assert!(status.success(), "tool catalog TLS case failed"); return; }
-        assert!(Instant::now() < deadline, "tool catalog TLS case exceeded its process bound");
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "tool catalog TLS case failed");
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "tool catalog TLS case exceeded its process bound"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
 
 fn core(method: &str, mut params: Value) -> CoreRequest {
-    params["_meta"] = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
+    params["_meta"] =
+        serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
     CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&params)).unwrap()
 }
 
 fn call_request(count: i64) -> CoreRequest {
-    core("tools/call", json!({"name":"calculate","arguments":{"count":count}}))
+    core(
+        "tools/call",
+        json!({"name":"calculate","arguments":{"count":count}}),
+    )
 }
 
 async fn call(tool: &ManagedToolClient, cx: &Cx, id: i64, count: i64) {
-    let mut call = tool.request(cx, call_request(count), RequestId::Number(id), ManagedCoreLimits::default()).await.unwrap();
-    let Some(ManagedCoreEvent::Result(result)) = call.next_event(cx).await.unwrap() else { panic!("tool result expected"); };
+    let mut call = tool
+        .request(
+            cx,
+            call_request(count),
+            RequestId::Number(id),
+            ManagedCoreLimits::default(),
+        )
+        .await
+        .unwrap();
+    let Some(ManagedCoreEvent::Result(result)) = call.next_event(cx).await.unwrap() else {
+        panic!("tool result expected");
+    };
     assert!(result.encode().unwrap().contains("1.20e+4"));
     assert!(call.next_event(cx).await.unwrap().is_none());
 }
@@ -194,12 +237,18 @@ fn run(case: Case) {
 
 #[test]
 fn tool_watch_replaces_contracts_and_refuses_stale_calls() {
-    isolated("tool_watch_replaces_contracts_and_refuses_stale_calls", Case::Replace);
+    isolated(
+        "tool_watch_replaces_contracts_and_refuses_stale_calls",
+        Case::Replace,
+    );
 }
 
 #[test]
 fn tool_watch_invalid_replacement_refuses_all_handles() {
-    isolated("tool_watch_invalid_replacement_refuses_all_handles", Case::MalformedReplacement);
+    isolated(
+        "tool_watch_invalid_replacement_refuses_all_handles",
+        Case::MalformedReplacement,
+    );
 }
 
 #[test]

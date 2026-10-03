@@ -2904,25 +2904,32 @@ impl ServerBuilder {
         let task_service_host = match self.task_supervisor.take() {
             Some(supervisor) => {
                 if self.protocol_policy == ProtocolPolicy::LegacyOnly {
-                    return Err(ServerBuildError::InvalidConfiguration(vec![RefusedRegistration {
-                        kind: RegistrationKind::TaskService,
-                        name: "task_supervisor".to_owned(),
-                        reason: "a hosted Task supervisor requires a modern-capable protocol policy".to_owned(),
-                    }]));
+                    return Err(ServerBuildError::InvalidConfiguration(vec![
+                        RefusedRegistration {
+                            kind: RegistrationKind::TaskService,
+                            name: "task_supervisor".to_owned(),
+                            reason:
+                                "a hosted Task supervisor requires a modern-capable protocol policy"
+                                    .to_owned(),
+                        },
+                    ]));
                 }
                 let runtime = self.final_task_runtime.as_ref().ok_or_else(|| {
                     ServerBuildError::InvalidConfiguration(vec![RefusedRegistration {
                         kind: RegistrationKind::TaskService,
                         name: "task_supervisor".to_owned(),
-                        reason: "a hosted Task supervisor requires a local Tasks runtime".to_owned(),
+                        reason: "a hosted Task supervisor requires a local Tasks runtime"
+                            .to_owned(),
                     }])
                 })?;
                 if runtime.has_installed_task_service() {
-                    return Err(ServerBuildError::InvalidConfiguration(vec![RefusedRegistration {
-                        kind: RegistrationKind::TaskService,
-                        name: "task_supervisor".to_owned(),
-                        reason: "the Tasks runtime already has an installed service".to_owned(),
-                    }]));
+                    return Err(ServerBuildError::InvalidConfiguration(vec![
+                        RefusedRegistration {
+                            kind: RegistrationKind::TaskService,
+                            name: "task_supervisor".to_owned(),
+                            reason: "the Tasks runtime already has an installed service".to_owned(),
+                        },
+                    ]));
                 }
                 let host = TaskServiceHost::install(
                     runtime,
@@ -3126,14 +3133,19 @@ mod tests {
             let server = builder().task_supervisor(Arc::new(Supervisor)).build();
             let runtime = server.final_task_runtime().expect("default Tasks runtime");
             assert!(runtime.has_installed_task_service());
-            assert!(!runtime.is_task_service_ready(), "build creates no task or runtime");
+            assert!(
+                !runtime.is_task_service_ready(),
+                "build creates no task or runtime"
+            );
             assert!(server.task_service_host.is_some());
         }
 
         #[test]
         fn no_task_supervisor_keeps_default_runtime_without_a_service() {
             let server = builder().build();
-            let runtime = server.final_task_runtime().expect("same default Tasks runtime");
+            let runtime = server
+                .final_task_runtime()
+                .expect("same default Tasks runtime");
             assert!(!runtime.has_installed_task_service());
             assert!(!runtime.is_task_service_ready());
             assert!(server.task_service_host.is_none());
@@ -6295,7 +6307,9 @@ mod tests {
                     .and_then(|result| result.get("resultType")),
                 Some(&serde_json::json!("task"))
             );
-            let downstream_id = task.result.as_ref()
+            let downstream_id = task
+                .result
+                .as_ref()
                 .and_then(|result| result.get("taskId"))
                 .and_then(serde_json::Value::as_str)
                 .expect("the owner receives an issued downstream Task handle")
@@ -6714,8 +6728,8 @@ mod tests {
                 &request_sender,
             ))
             .expect("the public exact-2024 completion path returns a response")
-                .result
-                .expect("the exact-2024 completion response has a result payload");
+            .result
+            .expect("the exact-2024 completion response has a result payload");
             assert_eq!(
                 legacy["completion"]["values"],
                 serde_json::json!(["legacy-staging"])

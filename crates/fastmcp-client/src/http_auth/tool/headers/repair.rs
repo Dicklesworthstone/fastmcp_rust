@@ -19,17 +19,17 @@ use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::http_headers::ParameterHeaderBinding;
 use fastmcp_protocol::{CoreRequest, FinalTool, RequestId};
 
-use super::super::{
-    ManagedToolCall, ManagedToolClient, ManagedToolError, ToolContract,
-    await_validity, check_tool_call,
-};
-use crate::http_auth::rpc::{ManagedCoreCall, ManagedCoreEvent};
-use crate::http_auth::rpc::catalog::ManagedCatalogError;
 use super::super::interaction::ManagedToolInteraction;
+use super::super::{
+    ManagedToolCall, ManagedToolClient, ManagedToolError, ToolContract, await_validity,
+    check_tool_call,
+};
+use crate::http_auth::rpc::catalog::ManagedCatalogError;
 use crate::http_auth::rpc::tool_headers::repair::{
     RejectedToolHeaders, RepairedToolCall, ToolHeaderRepairContract, ToolHeaderRepairError,
     ToolHeaderRepairLimits, ToolHeaderRepairOutcome,
 };
+use crate::http_auth::rpc::{ManagedCoreCall, ManagedCoreEvent};
 
 /// Fixed diagnostics do not retain schema, argument or peer-response content.
 #[derive(Debug)]
@@ -42,7 +42,9 @@ pub enum ManagedToolRepairError {
 impl fmt::Display for ManagedToolRepairError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::HeaderReviewRequired => f.write_str("schema-bound header repair requires an installed disclosure review"),
+            Self::HeaderReviewRequired => {
+                f.write_str("schema-bound header repair requires an installed disclosure review")
+            }
             Self::Tool(error) => fmt::Display::fmt(error, f),
             Self::Repair(error) => fmt::Display::fmt(error, f),
         }
@@ -50,10 +52,14 @@ impl fmt::Display for ManagedToolRepairError {
 }
 impl std::error::Error for ManagedToolRepairError {}
 impl From<ManagedToolError> for ManagedToolRepairError {
-    fn from(error: ManagedToolError) -> Self { Self::Tool(error) }
+    fn from(error: ManagedToolError) -> Self {
+        Self::Tool(error)
+    }
 }
 impl From<ToolHeaderRepairError> for ManagedToolRepairError {
-    fn from(error: ToolHeaderRepairError) -> Self { Self::Repair(error) }
+    fn from(error: ToolHeaderRepairError) -> Self {
+        Self::Repair(error)
+    }
 }
 
 /// Only an admitted rejection permits the separate, consuming refresh action.
@@ -75,7 +81,8 @@ pub struct RejectedManagedToolHeaders {
 impl fmt::Debug for RejectedManagedToolHeaders {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RejectedManagedToolHeaders")
-            .field("invalidated", &self.contract.is_invalidated()).finish_non_exhaustive()
+            .field("invalidated", &self.contract.is_invalidated())
+            .finish_non_exhaustive()
     }
 }
 
@@ -88,17 +95,28 @@ pub struct ManagedToolRepairCall {
 }
 
 impl ManagedToolRepairCall {
-    pub fn close(&mut self) { self.call.close(); }
+    pub fn close(&mut self) {
+        self.call.close();
+    }
 
     /// Invalidation wakes a pending read and refuses even a simultaneously ready
     /// result. A failed or abandoned read closes the owned call, not the login.
     /// An input-required result is returned intact, never automatically resumed.
-    pub async fn next_event(&mut self, cx: &Cx) -> Result<Option<ManagedCoreEvent>, ManagedToolError> {
-        if self.call.finished { return Ok(None); }
+    pub async fn next_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<ManagedCoreEvent>, ManagedToolError> {
+        if self.call.finished {
+            return Ok(None);
+        }
         let cancellation = self.call.cancellation.clone();
-        let outcome = Box::pin(await_validity(cx, &cancellation, &self.source,
+        let outcome = Box::pin(await_validity(
+            cx,
+            &cancellation,
+            &self.source,
             self.call.next_event(cx),
-        )).await;
+        ))
+        .await;
         match outcome {
             Ok(result) => result,
             Err(error) => {
@@ -123,12 +141,22 @@ impl ManagedToolClient {
     /// This opt-in schema-bound API intentionally validates complete arguments.
     /// Use the core header API for transport-only null-omission semantics.
     pub async fn request_with_header_repair(
-        &self, cx: &Cx, request: CoreRequest, request_id: RequestId,
-        endpoint: ToolHeaderRepairContract, limits: ToolHeaderRepairLimits,
+        &self,
+        cx: &Cx,
+        request: CoreRequest,
+        request_id: RequestId,
+        endpoint: ToolHeaderRepairContract,
+        limits: ToolHeaderRepairLimits,
     ) -> Result<ManagedToolHeaderRepairOutcome, ManagedToolRepairError> {
-        Box::pin(self.request_with_header_repair_and_cancellation(cx,
-            &McpRequestCancellation::new(), request, request_id, endpoint, limits,
-        )).await
+        Box::pin(self.request_with_header_repair_and_cancellation(
+            cx,
+            &McpRequestCancellation::new(),
+            request,
+            request_id,
+            endpoint,
+            limits,
+        ))
+        .await
     }
 
     /// Request-local cancellation and tool/catalog invalidation both fence the
@@ -137,30 +165,56 @@ impl ManagedToolClient {
     /// existing fail-closed treatment of an uncertain refresh-token lineage.
     #[allow(clippy::too_many_arguments)]
     pub async fn request_with_header_repair_and_cancellation(
-        &self, cx: &Cx, cancellation: &McpRequestCancellation,
-        request: CoreRequest, request_id: RequestId,
-        endpoint: ToolHeaderRepairContract, limits: ToolHeaderRepairLimits,
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        request: CoreRequest,
+        request_id: RequestId,
+        endpoint: ToolHeaderRepairContract,
+        limits: ToolHeaderRepairLimits,
     ) -> Result<ManagedToolHeaderRepairOutcome, ManagedToolRepairError> {
         check_tool_call(cx, cancellation, &self.contract)?;
-        let reviewed = self.header_review.as_deref().ok_or(ManagedToolRepairError::HeaderReviewRequired)?;
+        let reviewed = self
+            .header_review
+            .as_deref()
+            .ok_or(ManagedToolRepairError::HeaderReviewRequired)?;
         self.contract.validate_request(&request)?;
-        self.contract.admit_headers(self.session.resource(), reviewed)?;
+        self.contract
+            .admit_headers(self.session.resource(), reviewed)?;
         check_tool_call(cx, cancellation, &self.contract)?;
         let original = request.clone();
-        let outcome = Box::pin(await_validity(cx, cancellation, &self.contract,
-            self.session.request_tool_with_header_repair_and_cancellation(cx, cancellation,
-                request, request_id, reviewed, endpoint, limits,
-            ),
-        )).await??;
+        let outcome = Box::pin(await_validity(
+            cx,
+            cancellation,
+            &self.contract,
+            self.session
+                .request_tool_with_header_repair_and_cancellation(
+                    cx,
+                    cancellation,
+                    request,
+                    request_id,
+                    reviewed,
+                    endpoint,
+                    limits,
+                ),
+        ))
+        .await??;
         check_tool_call(cx, cancellation, &self.contract)?;
         Ok(match outcome {
             ToolHeaderRepairOutcome::Call(call) => ManagedToolHeaderRepairOutcome::Call(bind_call(
-                call, Arc::clone(&self.contract), Arc::clone(&self.contract), cancellation.clone(),
+                call,
+                Arc::clone(&self.contract),
+                Arc::clone(&self.contract),
+                cancellation.clone(),
             )),
-            ToolHeaderRepairOutcome::Rejected(rejected) => ManagedToolHeaderRepairOutcome::Rejected(
-                RejectedManagedToolHeaders { rejected, original,
-                    contract: Arc::clone(&self.contract), cancellation: cancellation.clone() },
-            ),
+            ToolHeaderRepairOutcome::Rejected(rejected) => {
+                ManagedToolHeaderRepairOutcome::Rejected(RejectedManagedToolHeaders {
+                    rejected,
+                    original,
+                    contract: Arc::clone(&self.contract),
+                    cancellation: cancellation.clone(),
+                })
+            }
         })
     }
 }
@@ -181,7 +235,11 @@ impl RejectedManagedToolHeaders {
     /// cumulative byte accounting. A second rejection never creates another
     /// repair owner. Old clients remain unchanged and are never reactivated.
     pub async fn refresh_and_retry<I, A, R>(
-        self, cx: &Cx, next_id: I, approve: A, review: R,
+        self,
+        cx: &Cx,
+        next_id: I,
+        approve: A,
+        review: R,
     ) -> Result<ManagedToolRepairCall, ManagedToolRepairError>
     where
         I: FnMut() -> Result<RequestId, ManagedCatalogError>,
@@ -189,7 +247,12 @@ impl RejectedManagedToolHeaders {
         R: FnMut(&ParameterHeaderBinding) -> bool,
     {
         let bound = Box::pin(self.refresh_bound(cx, next_id, approve, review)).await?;
-        Ok(bind_call(bound.call.into_call(), bound.contract, bound.source, bound.cancellation))
+        Ok(bind_call(
+            bound.call.into_call(),
+            bound.contract,
+            bound.source,
+            bound.cancellation,
+        ))
     }
 
     /// Repairs once and retains the actual retry response as a schema-bound
@@ -205,8 +268,13 @@ impl RejectedManagedToolHeaders {
     /// request IDs, cancellation, deadline and charged bytes cannot be reset.
     #[allow(clippy::too_many_arguments)]
     pub async fn refresh_and_start_interaction<I, A, R>(
-        self, cx: &Cx, maximum_continuations: usize, maximum_input_responses: usize,
-        next_id: I, approve: A, review: R,
+        self,
+        cx: &Cx,
+        maximum_continuations: usize,
+        maximum_input_responses: usize,
+        next_id: I,
+        approve: A,
+        review: R,
     ) -> Result<ManagedToolInteraction, ManagedToolRepairError>
     where
         I: FnMut() -> Result<RequestId, ManagedCatalogError>,
@@ -214,46 +282,86 @@ impl RejectedManagedToolHeaders {
         R: FnMut(&ParameterHeaderBinding) -> bool,
     {
         check_tool_call(cx, &self.cancellation, &self.contract)?;
-        self.rejected.admit_interaction_limits(maximum_continuations, maximum_input_responses)?;
+        self.rejected
+            .admit_interaction_limits(maximum_continuations, maximum_input_responses)?;
         let bound = Box::pin(self.refresh_bound(cx, next_id, approve, review)).await?;
-        let operation = bound.call.into_interaction(cx, maximum_continuations, maximum_input_responses)?;
-        Ok(ManagedToolInteraction::from_repaired_call(cx, operation, bound.contract, bound.cancellation)?)
+        let operation =
+            bound
+                .call
+                .into_interaction(cx, maximum_continuations, maximum_input_responses)?;
+        Ok(ManagedToolInteraction::from_repaired_call(
+            cx,
+            operation,
+            bound.contract,
+            bound.cancellation,
+        )?)
     }
 
     async fn refresh_bound<I, A, R>(
-        self, cx: &Cx, mut next_id: I, approve: A, mut review: R,
+        self,
+        cx: &Cx,
+        mut next_id: I,
+        approve: A,
+        mut review: R,
     ) -> Result<BoundRepairedCall, ManagedToolRepairError>
     where
         I: FnMut() -> Result<RequestId, ManagedCatalogError>,
         A: FnOnce(&FinalTool) -> bool,
         R: FnMut(&ParameterHeaderBinding) -> bool,
     {
-        let Self { rejected, original, contract, cancellation } = self;
+        let Self {
+            rejected,
+            original,
+            contract,
+            cancellation,
+        } = self;
         check_tool_call(cx, &cancellation, &contract)?;
         let mut replacement = None;
         let mut admission_error = None;
-        let guarded_approve = |definition: &FinalTool| {
-            match approve_definition(cx, &cancellation, &contract, &original, definition, approve) {
-                Ok(Some(admitted)) => { replacement = Some(admitted); true }
-                Ok(None) => false,
-                Err(error) => { admission_error = Some(error); false }
+        let guarded_approve = |definition: &FinalTool| match approve_definition(
+            cx,
+            &cancellation,
+            &contract,
+            &original,
+            definition,
+            approve,
+        ) {
+            Ok(Some(admitted)) => {
+                replacement = Some(admitted);
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                admission_error = Some(error);
+                false
             }
         };
         let guarded_id = || supply_id(cx, &cancellation, &contract, &mut next_id);
         let guarded_review = |binding: &ParameterHeaderBinding| {
             review_binding(cx, &cancellation, &contract, &mut review, binding)
         };
-        let outcome = Box::pin(await_validity(cx, &cancellation, &contract,
+        let outcome = Box::pin(await_validity(
+            cx,
+            &cancellation,
+            &contract,
             rejected.refresh_owned(cx, guarded_id, guarded_approve, guarded_review),
-        )).await?;
+        ))
+        .await?;
         check_tool_call(cx, &cancellation, &contract)?;
         // A core policy refusal is only the internal stop signal for failed
         // schema admission. Preserve the actual fixed validation error.
-        if let Some(error) = admission_error { return Err(error.into()); }
+        if let Some(error) = admission_error {
+            return Err(error.into());
+        }
         let call = outcome?;
         let replacement = replacement.ok_or(ManagedToolError::InvalidDefinition)?;
         let replacement = inherit_source(replacement, &contract)?;
-        Ok(BoundRepairedCall { call, contract: replacement, source: contract, cancellation })
+        Ok(BoundRepairedCall {
+            call,
+            contract: replacement,
+            source: contract,
+            cancellation,
+        })
     }
 }
 
@@ -264,9 +372,10 @@ struct BoundRepairedCall {
     cancellation: McpRequestCancellation,
 }
 
-fn inherit_source(mut replacement: Arc<ToolContract>, source: &Arc<ToolContract>)
-    -> Result<Arc<ToolContract>, ManagedToolError>
-{
+fn inherit_source(
+    mut replacement: Arc<ToolContract>,
+    source: &Arc<ToolContract>,
+) -> Result<Arc<ToolContract>, ManagedToolError> {
     source.check()?;
     // Only a freshly admitted per-operation contract may inherit. This also
     // excludes self-cycles, shared mutation, and unbounded validity chains.
@@ -281,19 +390,32 @@ fn inherit_source(mut replacement: Arc<ToolContract>, source: &Arc<ToolContract>
 }
 
 fn bind_call(
-    call: ManagedCoreCall, contract: Arc<ToolContract>, source: Arc<ToolContract>,
+    call: ManagedCoreCall,
+    contract: Arc<ToolContract>,
+    source: Arc<ToolContract>,
     cancellation: McpRequestCancellation,
 ) -> ManagedToolRepairCall {
     ManagedToolRepairCall {
-        call: ManagedToolCall { call: Some(call), contract, cancellation, finished: false }, source,
+        call: ManagedToolCall {
+            call: Some(call),
+            contract,
+            cancellation,
+            finished: false,
+        },
+        source,
     }
 }
 
 fn approve_definition<A>(
-    cx: &Cx, cancellation: &McpRequestCancellation, source: &ToolContract,
-    original: &CoreRequest, definition: &FinalTool, approve: A,
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    source: &ToolContract,
+    original: &CoreRequest,
+    definition: &FinalTool,
+    approve: A,
 ) -> Result<Option<Arc<ToolContract>>, ManagedToolError>
-where A: FnOnce(&FinalTool) -> bool,
+where
+    A: FnOnce(&FinalTool) -> bool,
 {
     check_tool_call(cx, cancellation, source)?;
     let replacement = Arc::new(ToolContract::admit(definition.clone())?);
@@ -305,9 +427,13 @@ where A: FnOnce(&FinalTool) -> bool,
 }
 
 fn supply_id<I>(
-    cx: &Cx, cancellation: &McpRequestCancellation, source: &ToolContract, next: &mut I,
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    source: &ToolContract,
+    next: &mut I,
 ) -> Result<RequestId, ManagedCatalogError>
-where I: FnMut() -> Result<RequestId, ManagedCatalogError>,
+where
+    I: FnMut() -> Result<RequestId, ManagedCatalogError>,
 {
     check_tool_call(cx, cancellation, source).map_err(|_| ManagedCatalogError::AbortedByHost)?;
     let id = next();
@@ -316,12 +442,18 @@ where I: FnMut() -> Result<RequestId, ManagedCatalogError>,
 }
 
 fn review_binding<R>(
-    cx: &Cx, cancellation: &McpRequestCancellation, source: &ToolContract,
-    review: &mut R, binding: &ParameterHeaderBinding,
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    source: &ToolContract,
+    review: &mut R,
+    binding: &ParameterHeaderBinding,
 ) -> bool
-where R: FnMut(&ParameterHeaderBinding) -> bool,
+where
+    R: FnMut(&ParameterHeaderBinding) -> bool,
 {
-    if check_tool_call(cx, cancellation, source).is_err() { return false; }
+    if check_tool_call(cx, cancellation, source).is_err() {
+        return false;
+    }
     let approved = review(binding);
     approved && check_tool_call(cx, cancellation, source).is_ok()
 }
@@ -332,15 +464,21 @@ mod tests;
 #[cfg(test)]
 mod interaction_contract_tests {
     use super::*;
+    use serde_json::json;
     use std::future::Future;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{Context, Waker};
-    use serde_json::json;
 
     fn contract() -> Arc<ToolContract> {
-        Arc::new(ToolContract::admit(serde_json::from_value(json!({
-            "name":"lookup", "inputSchema":{"type":"object"}
-        })).unwrap()).unwrap())
+        Arc::new(
+            ToolContract::admit(
+                serde_json::from_value(json!({
+                    "name":"lookup", "inputSchema":{"type":"object"}
+                }))
+                .unwrap(),
+            )
+            .unwrap(),
+        )
     }
 
     #[test]
@@ -352,10 +490,15 @@ mod interaction_contract_tests {
         let mut task = Context::from_waker(Waker::noop());
         assert!(wait.as_mut().poll(&mut task).is_pending());
         drop(source);
-        let retained = weak.upgrade().expect("catalog's weak target must stay alive");
+        let retained = weak
+            .upgrade()
+            .expect("catalog's weak target must stay alive");
         retained.invalidate();
         assert!(wait.as_mut().poll(&mut task).is_ready());
-        assert!(matches!(replacement.check(), Err(ManagedToolError::Invalidated)));
+        assert!(matches!(
+            replacement.check(),
+            Err(ManagedToolError::Invalidated)
+        ));
         assert!(replacement.is_invalidated());
     }
 
@@ -366,21 +509,36 @@ mod interaction_contract_tests {
         Arc::get_mut(&mut source).unwrap().catalog_invalidated = Some(Arc::clone(&flag));
         let replacement = inherit_source(contract(), &source).unwrap();
         flag.store(true, Ordering::Release);
-        assert!(matches!(replacement.check(), Err(ManagedToolError::Invalidated)));
+        assert!(matches!(
+            replacement.check(),
+            Err(ManagedToolError::Invalidated)
+        ));
         let source = contract();
         let replacement = inherit_source(contract(), &source).unwrap();
         source.invalidated.store(true, Ordering::Release);
-        assert!(matches!(replacement.check(), Err(ManagedToolError::Invalidated)));
+        assert!(matches!(
+            replacement.check(),
+            Err(ManagedToolError::Invalidated)
+        ));
     }
 
     #[test]
     fn inheritance_refuses_shared_replacements_cycles_chains_and_stale_sources() {
         let source = contract();
-        assert!(matches!(inherit_source(Arc::clone(&source), &source), Err(ManagedToolError::InvalidDefinition)));
+        assert!(matches!(
+            inherit_source(Arc::clone(&source), &source),
+            Err(ManagedToolError::InvalidDefinition)
+        ));
         let first = inherit_source(contract(), &source).unwrap();
-        assert!(matches!(inherit_source(contract(), &first), Err(ManagedToolError::InvalidDefinition)));
+        assert!(matches!(
+            inherit_source(contract(), &first),
+            Err(ManagedToolError::InvalidDefinition)
+        ));
         source.invalidate();
-        assert!(matches!(inherit_source(contract(), &source), Err(ManagedToolError::Invalidated)));
+        assert!(matches!(
+            inherit_source(contract(), &source),
+            Err(ManagedToolError::Invalidated)
+        ));
         let independent = contract();
         independent.check().unwrap();
         assert!(!independent.invalidation.is_cancel_requested());

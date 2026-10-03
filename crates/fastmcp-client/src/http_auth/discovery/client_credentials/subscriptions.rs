@@ -22,15 +22,15 @@ use fastmcp_protocol::{
 use serde_json::json;
 
 use super::{
-    ClientCredentialsClient, ClientCredentialsError, ClientCredentialsSnapshot,
-    active, admit_resource, authorize, discovery_deadline, prepare,
-};
-use crate::http_executor::{
-    ModernHttpRequest, ModernHttpResponseKind,
-    ModernHttpSubscriptionListenError, ModernHttpSubscriptionListener,
+    ClientCredentialsClient, ClientCredentialsError, ClientCredentialsSnapshot, active,
+    admit_resource, authorize, discovery_deadline, prepare,
 };
 #[cfg(test)]
 use crate::http_executor::ModernHttpExecutor;
+use crate::http_executor::{
+    ModernHttpRequest, ModernHttpResponseKind, ModernHttpSubscriptionListenError,
+    ModernHttpSubscriptionListener,
+};
 use crate::sse::SseLimits;
 
 // Re-export the existing event vocabulary rather than inventing a second
@@ -70,7 +70,9 @@ impl fmt::Display for ClientCredentialsCoreSubscriptionError {
 impl std::error::Error for ClientCredentialsCoreSubscriptionError {}
 
 impl From<ClientCredentialsError> for ClientCredentialsCoreSubscriptionError {
-    fn from(error: ClientCredentialsError) -> Self { Self::Authentication(error) }
+    fn from(error: ClientCredentialsError) -> Self {
+        Self::Authentication(error)
+    }
 }
 
 /// Bounds acquisition, discovery, listen and all later response reads.
@@ -110,13 +112,26 @@ impl ClientCredentialsCoreSubscriptionLimits {
         {
             return Err(ClientCredentialsCoreSubscriptionError::InvalidLimits);
         }
-        Ok(Self { request_bytes, frame_bytes, records, timeout })
+        Ok(Self {
+            request_bytes,
+            frame_bytes,
+            records,
+            timeout,
+        })
     }
 
-    pub fn request_bytes(&self) -> usize { self.request_bytes }
-    pub fn frame_bytes(&self) -> usize { self.frame_bytes }
-    pub fn records(&self) -> usize { self.records }
-    pub fn timeout(&self) -> Duration { self.timeout }
+    pub fn request_bytes(&self) -> usize {
+        self.request_bytes
+    }
+    pub fn frame_bytes(&self) -> usize {
+        self.frame_bytes
+    }
+    pub fn records(&self) -> usize {
+        self.records
+    }
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
 }
 
 impl ClientCredentialsClient {
@@ -139,10 +154,16 @@ impl ClientCredentialsClient {
         filter: SubscriptionFilter,
         limits: ClientCredentialsCoreSubscriptionLimits,
     ) -> Result<ClientCredentialsCoreSubscription, ClientCredentialsCoreSubscriptionError> {
-        self.subscribe_core_with_cancellation(
-            cx, &McpRequestCancellation::new(), metadata,
-            discovery_id, request_id, filter, limits,
-        ).await
+        Box::pin(self.subscribe_core_with_cancellation(
+            cx,
+            &McpRequestCancellation::new(),
+            metadata,
+            discovery_id,
+            request_id,
+            filter,
+            limits,
+        ))
+        .await
     }
 
     /// Request-local cancellation spans acquisition, discovery, listen and reads.
@@ -162,37 +183,51 @@ impl ClientCredentialsClient {
         limits: ClientCredentialsCoreSubscriptionLimits,
     ) -> Result<ClientCredentialsCoreSubscription, ClientCredentialsCoreSubscriptionError> {
         let prepared = prepare_subscription(
-            self.resource(), metadata, &discovery_id, &request_id, filter, limits,
+            self.resource(),
+            metadata,
+            &discovery_id,
+            &request_id,
+            filter,
+            limits,
         )?;
         let deadline = discovery_deadline(cx, limits.timeout.min(self.inner.timeout))
             .map_err(ClientCredentialsError::from)?;
         let owner = &self.inner.closed;
         active(cx, deadline, owner, cancellation, None, async {
-            Ok(async {
+            Ok(Box::pin(async {
                 let snapshot = self.credential_with_cancellation(cx, cancellation).await?;
                 let executor = self.resource_http_executor();
                 let discovery_wire = authorize(&snapshot, prepared.discovery_wire)?;
                 let response = active(cx, deadline, owner, cancellation, Some(&snapshot), async {
-                    executor.execute_with_cancellation(cx, cancellation, &discovery_wire).await
+                    executor
+                        .execute_with_cancellation(cx, cancellation, &discovery_wire)
+                        .await
                         .map_err(|_| ClientCredentialsError::Transport)
-                }).await?;
+                })
+                .await?;
                 if response.metadata().status() != 200
                     || response.metadata().kind() != ModernHttpResponseKind::Json
                 {
                     return Err(ClientCredentialsError::Negotiation.into());
                 }
                 let bytes = active(cx, deadline, owner, cancellation, Some(&snapshot), async {
-                    response.read_to_end_with_cancellation(cx, cancellation, limits.frame_bytes).await
+                    response
+                        .read_to_end_with_cancellation(cx, cancellation, limits.frame_bytes)
+                        .await
                         .map_err(|_| ClientCredentialsError::UnexpectedResponse)
-                }).await?;
+                })
+                .await?;
                 // Admission validates strict response identity, typed discovery,
                 // protocol support and the official machine-auth extension.
                 admit_resource(&prepared.discovery, &discovery_id, &bytes)?;
                 let wire = authorize(&snapshot, prepared.listen_wire)?;
                 let response = active(cx, deadline, owner, cancellation, Some(&snapshot), async {
-                    executor.execute_with_cancellation(cx, cancellation, &wire).await
+                    executor
+                        .execute_with_cancellation(cx, cancellation, &wire)
+                        .await
                         .map_err(|_| ClientCredentialsError::Transport)
-                }).await?;
+                })
+                .await?;
                 if response.metadata().status() != 200
                     || response.metadata().kind() != ModernHttpResponseKind::Sse
                 {
@@ -200,16 +235,25 @@ impl ClientCredentialsClient {
                 }
                 let framing = SseLimits::new(limits.frame_bytes, limits.frame_bytes, 64)
                     .ok_or(ClientCredentialsCoreSubscriptionError::InvalidLimits)?;
-                let listener = response.into_final_subscriptions_listener(
-                    request_id.clone(), prepared.filter, framing,
-                ).map_err(subscription_error)?;
+                let listener = response
+                    .into_final_subscriptions_listener(request_id.clone(), prepared.filter, framing)
+                    .map_err(subscription_error)?;
                 Ok(ClientCredentialsCoreSubscription {
-                    listener: Some(Box::new(listener)), snapshot, owner: owner.clone(),
-                    cancellation: cancellation.clone(), request_id,
-                    accepted_filter: None, deadline, limits, records: 0, finished: false,
+                    listener: Some(Box::new(listener)),
+                    snapshot,
+                    owner: owner.clone(),
+                    cancellation: cancellation.clone(),
+                    request_id,
+                    accepted_filter: None,
+                    deadline,
+                    limits,
+                    records: 0,
+                    finished: false,
                 })
-            }.await)
-        }).await?
+            })
+            .await)
+        })
+        .await?
     }
 }
 
@@ -230,12 +274,24 @@ pub struct ClientCredentialsCoreSubscription {
 }
 
 impl ClientCredentialsCoreSubscription {
-    pub fn request_id(&self) -> &RequestId { &self.request_id }
-    pub fn credential_generation(&self) -> u64 { self.snapshot.generation() }
-    pub fn accepted_filter(&self) -> Option<&SubscriptionFilter> { self.accepted_filter.as_ref() }
-    pub fn records_delivered(&self) -> usize { self.records }
-    pub fn is_closed(&self) -> bool { self.listener.is_none() }
-    pub fn close(&mut self) { self.listener = None; }
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+    pub fn credential_generation(&self) -> u64 {
+        self.snapshot.generation()
+    }
+    pub fn accepted_filter(&self) -> Option<&SubscriptionFilter> {
+        self.accepted_filter.as_ref()
+    }
+    pub fn records_delivered(&self) -> usize {
+        self.records
+    }
+    pub fn is_closed(&self) -> bool {
+        self.listener.is_none()
+    }
+    pub fn close(&mut self) {
+        self.listener = None;
+    }
 
     /// Returns `None` only after a validated terminal was delivered. EOF,
     /// cancellation, exhausted limits and malformed streams are errors, not
@@ -245,24 +301,43 @@ impl ClientCredentialsCoreSubscription {
     pub async fn next_event(
         &mut self,
         cx: &Cx,
-    ) -> Result<Option<ModernHttpSubscriptionListenEvent>, ClientCredentialsCoreSubscriptionError> {
-        if self.finished { return Ok(None); }
-        let mut listener = self.listener.take().ok_or(ClientCredentialsCoreSubscriptionError::Closed)?;
+    ) -> Result<Option<ModernHttpSubscriptionListenEvent>, ClientCredentialsCoreSubscriptionError>
+    {
+        if self.finished {
+            return Ok(None);
+        }
+        let mut listener = self
+            .listener
+            .take()
+            .ok_or(ClientCredentialsCoreSubscriptionError::Closed)?;
         let event = active(
-            cx, self.deadline, &self.owner, &self.cancellation, Some(&self.snapshot), async {
+            cx,
+            self.deadline,
+            &self.owner,
+            &self.cancellation,
+            Some(&self.snapshot),
+            async {
                 Ok(async {
                     if self.records >= self.limits.records {
                         return Err(ClientCredentialsCoreSubscriptionError::RecordLimit);
                     }
-                    listener.next_event(cx).await.map_err(subscription_error)?
+                    listener
+                        .next_event(cx)
+                        .await
+                        .map_err(subscription_error)?
                         .ok_or(ClientCredentialsCoreSubscriptionError::MissingTerminal)
-                }.await)
+                }
+                .await)
             },
-        ).await??;
+        )
+        .await??;
         // Compiling Tasks does not opt this core-only owner into Task events.
         // Retire the body rather than exposing an extension event to the caller.
         #[cfg(feature = "tasks")]
-        if matches!(&event, ModernHttpSubscriptionListenEvent::TaskNotification(_)) {
+        if matches!(
+            &event,
+            ModernHttpSubscriptionListenEvent::TaskNotification(_)
+        ) {
             return Err(ClientCredentialsCoreSubscriptionError::InvalidResponse);
         }
         if let ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter } = &event {
@@ -293,43 +368,70 @@ fn prepare_subscription(
     filter: SubscriptionFilter,
     limits: ClientCredentialsCoreSubscriptionLimits,
 ) -> Result<PreparedSubscription, ClientCredentialsCoreSubscriptionError> {
-    discovery_id.validate().map_err(|_| ClientCredentialsCoreSubscriptionError::InvalidRequest)?;
-    request_id.validate().map_err(|_| ClientCredentialsCoreSubscriptionError::InvalidRequest)?;
+    discovery_id
+        .validate()
+        .map_err(|_| ClientCredentialsCoreSubscriptionError::InvalidRequest)?;
+    request_id
+        .validate()
+        .map_err(|_| ClientCredentialsCoreSubscriptionError::InvalidRequest)?;
     if discovery_id.correlates_with(request_id) || !filter.additional.is_empty() {
         return Err(ClientCredentialsCoreSubscriptionError::InvalidRequest);
     }
     let metadata = serde_json::to_value(metadata)
         .map_err(|_| ClientCredentialsCoreSubscriptionError::InvalidRequest)?;
     let discovery = CoreRequest::decode(
-        ProtocolEra::Modern2026, "server/discover", Some(&json!({"_meta": metadata})),
-    ).map_err(|_| ClientCredentialsCoreSubscriptionError::InvalidRequest)?;
+        ProtocolEra::Modern2026,
+        "server/discover",
+        Some(&json!({"_meta": metadata})),
+    )
+    .map_err(|_| ClientCredentialsCoreSubscriptionError::InvalidRequest)?;
     // Reuse the parent's core-only auth stamping and extension validation.
     let (discovery_wire, discovery) = prepare(resource, &discovery, discovery_id)?;
     if discovery_wire.body().len() > limits.request_bytes {
         return Err(ClientCredentialsCoreSubscriptionError::RequestTooLarge);
     }
-    let params = discovery.encode_params()
+    let params = discovery
+        .encode_params()
         .map_err(|_| ClientCredentialsCoreSubscriptionError::InvalidRequest)?
         .ok_or(ClientCredentialsCoreSubscriptionError::InvalidRequest)?;
     let listen = CoreRequest::decode(
-        ProtocolEra::Modern2026, "subscriptions/listen",
+        ProtocolEra::Modern2026,
+        "subscriptions/listen",
         Some(&json!({"_meta": params["_meta"], "notifications": filter})),
-    ).map_err(|_| ClientCredentialsCoreSubscriptionError::InvalidRequest)?;
-    let params = listen.encode_params()
+    )
+    .map_err(|_| ClientCredentialsCoreSubscriptionError::InvalidRequest)?;
+    let params = listen
+        .encode_params()
         .map_err(|_| ClientCredentialsCoreSubscriptionError::InvalidRequest)?
         .ok_or(ClientCredentialsCoreSubscriptionError::InvalidRequest)?;
     let envelope = json!({"jsonrpc":"2.0", "id":request_id,
         "method":"subscriptions/listen", "params":params});
-    let mut body = SubscriptionBody { bytes: Vec::new(), maximum: limits.request_bytes };
+    let mut body = SubscriptionBody {
+        bytes: Vec::new(),
+        maximum: limits.request_bytes,
+    };
     serde_json::to_writer(&mut body, &envelope)
         .map_err(|_| ClientCredentialsCoreSubscriptionError::RequestTooLarge)?;
     let listen_wire = ModernHttpRequest::new(
-        resource.as_str(), body.bytes, FINAL_PROTOCOL_VERSION, "subscriptions/listen", None,
-    ).map_err(|_| ClientCredentialsCoreSubscriptionError::InvalidRequest)?;
-    Ok(PreparedSubscription { discovery, discovery_wire, listen_wire, filter })
+        resource.as_str(),
+        body.bytes,
+        FINAL_PROTOCOL_VERSION,
+        "subscriptions/listen",
+        None,
+    )
+    .map_err(|_| ClientCredentialsCoreSubscriptionError::InvalidRequest)?;
+    Ok(PreparedSubscription {
+        discovery,
+        discovery_wire,
+        listen_wire,
+        filter,
+    })
 }
 
-struct SubscriptionBody { bytes: Vec<u8>, maximum: usize }
+struct SubscriptionBody {
+    bytes: Vec<u8>,
+    maximum: usize,
+}
 
 impl Write for SubscriptionBody {
     fn write(&mut self, input: &[u8]) -> io::Result<usize> {
@@ -339,15 +441,21 @@ impl Write for SubscriptionBody {
         self.bytes.extend_from_slice(input);
         Ok(input.len())
     }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
-fn subscription_error(error: ModernHttpSubscriptionListenError) -> ClientCredentialsCoreSubscriptionError {
+fn subscription_error(
+    error: ModernHttpSubscriptionListenError,
+) -> ClientCredentialsCoreSubscriptionError {
     match error {
-        ModernHttpSubscriptionListenError::RemoteError { code, .. } =>
-            ClientCredentialsCoreSubscriptionError::Remote { code },
-        ModernHttpSubscriptionListenError::EndOfStream { .. } =>
-            ClientCredentialsCoreSubscriptionError::MissingTerminal,
+        ModernHttpSubscriptionListenError::RemoteError { code, .. } => {
+            ClientCredentialsCoreSubscriptionError::Remote { code }
+        }
+        ModernHttpSubscriptionListenError::EndOfStream { .. } => {
+            ClientCredentialsCoreSubscriptionError::MissingTerminal
+        }
         _ => ClientCredentialsCoreSubscriptionError::InvalidResponse,
     }
 }
@@ -384,17 +492,27 @@ mod tests {
         limits: ClientCredentialsCoreSubscriptionLimits,
     ) -> Result<PreparedSubscription, ClientCredentialsCoreSubscriptionError> {
         prepare_subscription(
-            &resource(), metadata(), &RequestId::Number(6),
-            &RequestId::Number(7), filter(), limits,
+            &resource(),
+            metadata(),
+            &RequestId::Number(6),
+            &RequestId::Number(7),
+            filter(),
+            limits,
         )
     }
 
     #[test]
     fn defaults_are_valid_bounded_limits() {
         let limits = ClientCredentialsCoreSubscriptionLimits::default();
-        assert!(ClientCredentialsCoreSubscriptionLimits::new(
-            limits.request_bytes(), limits.frame_bytes(), limits.records(), limits.timeout(),
-        ).is_ok());
+        assert!(
+            ClientCredentialsCoreSubscriptionLimits::new(
+                limits.request_bytes(),
+                limits.frame_bytes(),
+                limits.records(),
+                limits.timeout(),
+            )
+            .is_ok()
+        );
         assert_eq!(limits.request_bytes(), 64 * 1024);
         assert_eq!(limits.frame_bytes(), 64 * 1024);
         assert_eq!(limits.records(), 1024);
@@ -419,9 +537,15 @@ mod tests {
                 Err(ClientCredentialsCoreSubscriptionError::InvalidLimits),
             ));
         }
-        assert!(ClientCredentialsCoreSubscriptionLimits::new(
-            65_536, 65_536, 4096, Duration::from_secs(3600),
-        ).is_ok());
+        assert!(
+            ClientCredentialsCoreSubscriptionLimits::new(
+                65_536,
+                65_536,
+                4096,
+                Duration::from_secs(3600),
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -439,18 +563,31 @@ mod tests {
         assert_eq!(discovery["id"], 6);
         assert_eq!(listen["method"], "subscriptions/listen");
         assert_eq!(listen["id"], 7);
-        assert_eq!(listen["params"]["notifications"], serde_json::to_value(filter()).unwrap());
+        assert_eq!(
+            listen["params"]["notifications"],
+            serde_json::to_value(filter()).unwrap()
+        );
         assert_eq!(listen["params"]["_meta"], discovery["params"]["_meta"]);
         assert!(prepared.filter.additional.is_empty());
     }
 
     #[test]
     fn reused_discovery_and_listen_ids_are_rejected() {
-        for id in [RequestId::Number(7), RequestId::String("same-id".to_owned())] {
-            assert!(matches!(prepare_subscription(
-                &resource(), metadata(), &id, &id, filter(),
-                ClientCredentialsCoreSubscriptionLimits::default(),
-            ), Err(ClientCredentialsCoreSubscriptionError::InvalidRequest)));
+        for id in [
+            RequestId::Number(7),
+            RequestId::String("same-id".to_owned()),
+        ] {
+            assert!(matches!(
+                prepare_subscription(
+                    &resource(),
+                    metadata(),
+                    &id,
+                    &id,
+                    filter(),
+                    ClientCredentialsCoreSubscriptionLimits::default(),
+                ),
+                Err(ClientCredentialsCoreSubscriptionError::InvalidRequest)
+            ));
         }
     }
 
@@ -458,43 +595,70 @@ mod tests {
     fn core_filter_rejects_tasks_even_when_the_task_filter_is_empty() {
         let mut filters = filter();
         filters.additional.insert("taskIds".to_owned(), json!([]));
-        assert!(matches!(prepare_subscription(
-            &resource(), metadata(), &RequestId::Number(6), &RequestId::Number(7), filters,
-            ClientCredentialsCoreSubscriptionLimits::default(),
-        ), Err(ClientCredentialsCoreSubscriptionError::InvalidRequest)));
+        assert!(matches!(
+            prepare_subscription(
+                &resource(),
+                metadata(),
+                &RequestId::Number(6),
+                &RequestId::Number(7),
+                filters,
+                ClientCredentialsCoreSubscriptionLimits::default(),
+            ),
+            Err(ClientCredentialsCoreSubscriptionError::InvalidRequest)
+        ));
     }
 
     #[test]
     fn core_filter_rejects_unknown_extensions() {
         let mut filters = filter();
-        filters.additional.insert("unnegotiated".to_owned(), json!({"enabled": true}));
-        assert!(matches!(prepare_subscription(
-            &resource(), metadata(), &RequestId::Number(6), &RequestId::Number(7), filters,
-            ClientCredentialsCoreSubscriptionLimits::default(),
-        ), Err(ClientCredentialsCoreSubscriptionError::InvalidRequest)));
+        filters
+            .additional
+            .insert("unnegotiated".to_owned(), json!({"enabled": true}));
+        assert!(matches!(
+            prepare_subscription(
+                &resource(),
+                metadata(),
+                &RequestId::Number(6),
+                &RequestId::Number(7),
+                filters,
+                ClientCredentialsCoreSubscriptionLimits::default(),
+            ),
+            Err(ClientCredentialsCoreSubscriptionError::InvalidRequest)
+        ));
     }
 
     #[test]
     fn admission_measures_both_stamped_requests_at_the_exact_byte_boundary() {
         let initial = prepared(ClientCredentialsCoreSubscriptionLimits::default()).unwrap();
-        let maximum = initial.discovery_wire.body().len().max(initial.listen_wire.body().len());
-        let with_bound = |bytes| ClientCredentialsCoreSubscriptionLimits::new(
-            bytes, 65_536, 2, Duration::from_secs(1),
-        ).unwrap();
+        let maximum = initial
+            .discovery_wire
+            .body()
+            .len()
+            .max(initial.listen_wire.body().len());
+        let with_bound = |bytes| {
+            ClientCredentialsCoreSubscriptionLimits::new(bytes, 65_536, 2, Duration::from_secs(1))
+                .unwrap()
+        };
         assert!(prepared(with_bound(maximum)).is_ok());
-        assert!(matches!(prepared(with_bound(maximum - 1)),
-            Err(ClientCredentialsCoreSubscriptionError::RequestTooLarge)));
+        assert!(matches!(
+            prepared(with_bound(maximum - 1)),
+            Err(ClientCredentialsCoreSubscriptionError::RequestTooLarge)
+        ));
 
         // Discovery itself must pass admission before the listen is prepared.
         assert!(initial.discovery_wire.body().len() > 1);
-        assert!(matches!(prepared(with_bound(1)),
-            Err(ClientCredentialsCoreSubscriptionError::RequestTooLarge)));
-
+        assert!(matches!(
+            prepared(with_bound(1)),
+            Err(ClientCredentialsCoreSubscriptionError::RequestTooLarge)
+        ));
     }
 
     #[test]
     fn bounded_serialization_does_not_partially_append_an_over_limit_write() {
-        let mut writer = SubscriptionBody { bytes: Vec::new(), maximum: 4 };
+        let mut writer = SubscriptionBody {
+            bytes: Vec::new(),
+            maximum: 4,
+        };
         writer.write_all(b"abc").unwrap();
         assert!(writer.write_all(b"de").is_err());
         assert_eq!(writer.bytes, b"abc");
@@ -569,7 +733,10 @@ mod tests {
         body: String,
         hold_partial_body: bool,
         limits: ClientCredentialsCoreSubscriptionLimits,
-    ) -> (ClientCredentialsCoreSubscription, std::thread::JoinHandle<()>) {
+    ) -> (
+        ClientCredentialsCoreSubscription,
+        std::thread::JoinHandle<()>,
+    ) {
         use std::io::{BufRead, Read};
         use std::net::TcpListener;
         use std::time::Instant;
@@ -583,14 +750,21 @@ mod tests {
                 match socket_listener.accept() {
                     Ok((socket, _)) => break socket,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < deadline, "subscription peer was never contacted");
+                        assert!(
+                            Instant::now() < deadline,
+                            "subscription peer was never contacted"
+                        );
                         std::thread::sleep(Duration::from_millis(1));
                     }
                     Err(error) => panic!("accept failed: {error}"),
                 }
             };
-            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             {
                 let mut reader = io::BufReader::new(&mut socket);
                 let mut length = None;
@@ -600,7 +774,9 @@ mod tests {
                     assert_ne!(reader.read_line(&mut line).unwrap(), 0);
                     header_bytes += line.len();
                     assert!(header_bytes <= 32 * 1024);
-                    if line == "\r\n" { break; }
+                    if line == "\r\n" {
+                        break;
+                    }
                     if let Some((name, value)) = line.split_once(':')
                         && name.eq_ignore_ascii_case("content-length")
                     {
@@ -623,39 +799,65 @@ mod tests {
             if hold_partial_body {
                 let mut byte = [0];
                 match socket.read(&mut byte) {
-                    Ok(0) => {},
-                    Err(error) if matches!(error.kind(),
-                        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted) => {},
+                    Ok(0) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                        ) => {}
                     other => panic!("abandoned subscription did not close its socket: {other:?}"),
                 }
             }
         });
         let prepared = prepared(limits).unwrap();
         let wire = ModernHttpRequest::new(
-            &format!("http://{address}/mcp"), prepared.listen_wire.body().to_vec(),
-            FINAL_PROTOCOL_VERSION, "subscriptions/listen", None,
-        ).unwrap();
+            &format!("http://{address}/mcp"),
+            prepared.listen_wire.body().to_vec(),
+            FINAL_PROTOCOL_VERSION,
+            "subscriptions/listen",
+            None,
+        )
+        .unwrap();
         let cancellation = McpRequestCancellation::new();
         let response = ModernHttpExecutor::new()
-            .execute_with_cancellation(cx, &cancellation, &wire).await.unwrap();
+            .execute_with_cancellation(cx, &cancellation, &wire)
+            .await
+            .unwrap();
         let framing = SseLimits::new(limits.frame_bytes, limits.frame_bytes, 64).unwrap();
-        let listener = response.into_final_subscriptions_listener(
-            RequestId::Number(7), prepared.filter, framing,
-        ).unwrap();
+        let listener = response
+            .into_final_subscriptions_listener(RequestId::Number(7), prepared.filter, framing)
+            .unwrap();
         let owner = McpRequestCancellation::new();
         let expires_at = Instant::now() + Duration::from_secs(60);
         let bearer = crate::http_auth::BoundBearerCredential::bind_with_expiry(
-            resource(), "subscription-lifetime-test-token", expires_at,
-        ).unwrap().for_owner(&owner).unwrap();
+            resource(),
+            "subscription-lifetime-test-token",
+            expires_at,
+        )
+        .unwrap()
+        .for_owner(&owner)
+        .unwrap();
         let snapshot = ClientCredentialsSnapshot {
-            bearer, scopes: vec![], expires_at, generation: 1,
+            bearer,
+            scopes: vec![],
+            expires_at,
+            generation: 1,
         };
-        (ClientCredentialsCoreSubscription {
-            listener: Some(Box::new(listener)), snapshot, owner, cancellation,
-            request_id: RequestId::Number(SUBSCRIPTION_ID), accepted_filter: None,
-            deadline: discovery_deadline(cx, Duration::from_secs(5)).unwrap(),
-            limits, records: 0, finished: false,
-        }, peer)
+        (
+            ClientCredentialsCoreSubscription {
+                listener: Some(Box::new(listener)),
+                snapshot,
+                owner,
+                cancellation,
+                request_id: RequestId::Number(SUBSCRIPTION_ID),
+                accepted_filter: None,
+                deadline: discovery_deadline(cx, Duration::from_secs(5)).unwrap(),
+                limits,
+                records: 0,
+                finished: false,
+            },
+            peer,
+        )
     }
 
     #[test]
@@ -663,21 +865,36 @@ mod tests {
         runtime().block_on(async {
             let cx = Cx::current().unwrap();
             let (mut subscription, peer) = native_subscription(
-                &cx, [ack(SUBSCRIPTION_ID).as_str(), UPDATE, TERMINAL].concat(), false,
+                &cx,
+                [ack(SUBSCRIPTION_ID).as_str(), UPDATE, TERMINAL].concat(),
+                false,
                 ClientCredentialsCoreSubscriptionLimits::default(),
-            ).await;
+            )
+            .await;
             assert!(subscription.accepted_filter().is_none());
-            assert_eq!(subscription.request_id(), &RequestId::Number(SUBSCRIPTION_ID));
+            assert_eq!(
+                subscription.request_id(),
+                &RequestId::Number(SUBSCRIPTION_ID)
+            );
             assert_eq!(subscription.credential_generation(), 1);
-            assert!(matches!(subscription.next_event(&cx).await.unwrap(),
-                Some(ModernHttpSubscriptionListenEvent::Acknowledged { .. })));
+            assert!(matches!(
+                subscription.next_event(&cx).await.unwrap(),
+                Some(ModernHttpSubscriptionListenEvent::Acknowledged { .. })
+            ));
             let accepted = subscription.accepted_filter().unwrap();
-            assert_eq!(accepted.resource_subscriptions, Some(vec!["file:///tmp/watched".to_owned()]));
+            assert_eq!(
+                accepted.resource_subscriptions,
+                Some(vec!["file:///tmp/watched".to_owned()])
+            );
             assert_eq!(accepted.tools_list_changed, None);
-            assert!(matches!(subscription.next_event(&cx).await.unwrap(),
-                Some(ModernHttpSubscriptionListenEvent::Notification(_))));
-            assert!(matches!(subscription.next_event(&cx).await.unwrap(),
-                Some(ModernHttpSubscriptionListenEvent::Terminal { .. })));
+            assert!(matches!(
+                subscription.next_event(&cx).await.unwrap(),
+                Some(ModernHttpSubscriptionListenEvent::Notification(_))
+            ));
+            assert!(matches!(
+                subscription.next_event(&cx).await.unwrap(),
+                Some(ModernHttpSubscriptionListenEvent::Terminal { .. })
+            ));
             assert_eq!(subscription.records_delivered(), 3);
             assert!(subscription.is_closed());
             assert!(subscription.next_event(&cx).await.unwrap().is_none());
@@ -721,20 +938,42 @@ mod tests {
             let cx = Cx::current().unwrap();
             for (body, has_ack) in [
                 (TERMINAL.to_owned(), false),
-                ([ack(SUBSCRIPTION_ID).as_str(), &TERMINAL.replace("\"id\":7", "\"id\":8")].concat(), true),
-                ([ack(SUBSCRIPTION_ID).as_str(), &TERMINAL.replace("subscriptionId\":7", "subscriptionId\":8")].concat(), true),
+                (
+                    [
+                        ack(SUBSCRIPTION_ID).as_str(),
+                        &TERMINAL.replace("\"id\":7", "\"id\":8"),
+                    ]
+                    .concat(),
+                    true,
+                ),
+                (
+                    [
+                        ack(SUBSCRIPTION_ID).as_str(),
+                        &TERMINAL.replace("subscriptionId\":7", "subscriptionId\":8"),
+                    ]
+                    .concat(),
+                    true,
+                ),
             ] {
                 let (mut subscription, peer) = native_subscription(
-                    &cx, body, false, ClientCredentialsCoreSubscriptionLimits::default(),
-                ).await;
+                    &cx,
+                    body,
+                    false,
+                    ClientCredentialsCoreSubscriptionLimits::default(),
+                )
+                .await;
                 if has_ack {
-                    assert!(matches!(subscription.next_event(&cx).await.unwrap(),
-                        Some(ModernHttpSubscriptionListenEvent::Acknowledged { .. })));
+                    assert!(matches!(
+                        subscription.next_event(&cx).await.unwrap(),
+                        Some(ModernHttpSubscriptionListenEvent::Acknowledged { .. })
+                    ));
                 }
                 assert!(subscription.next_event(&cx).await.is_err());
                 assert!(subscription.is_closed());
-                assert!(matches!(subscription.next_event(&cx).await,
-                    Err(ClientCredentialsCoreSubscriptionError::Closed)));
+                assert!(matches!(
+                    subscription.next_event(&cx).await,
+                    Err(ClientCredentialsCoreSubscriptionError::Closed)
+                ));
                 peer.join().unwrap();
             }
         });
@@ -746,11 +985,16 @@ mod tests {
             let cx = Cx::current().unwrap();
             let outside = UPDATE.replace("file:///tmp/watched", "file:///tmp/also-requested");
             let (mut subscription, peer) = native_subscription(
-                &cx, [ack(SUBSCRIPTION_ID).as_str(), &outside, TERMINAL].concat(), false,
+                &cx,
+                [ack(SUBSCRIPTION_ID).as_str(), &outside, TERMINAL].concat(),
+                false,
                 ClientCredentialsCoreSubscriptionLimits::default(),
-            ).await;
-            assert!(matches!(subscription.next_event(&cx).await.unwrap(),
-                Some(ModernHttpSubscriptionListenEvent::Acknowledged { .. })));
+            )
+            .await;
+            assert!(matches!(
+                subscription.next_event(&cx).await.unwrap(),
+                Some(ModernHttpSubscriptionListenEvent::Acknowledged { .. })
+            ));
             assert!(subscription.next_event(&cx).await.is_err());
             assert!(subscription.is_closed());
             assert_eq!(subscription.records_delivered(), 1);
@@ -763,13 +1007,18 @@ mod tests {
         runtime().block_on(async {
             let cx = Cx::current().unwrap();
             let (mut subscription, peer) = native_subscription(
-                &cx, [ack(SUBSCRIPTION_ID).as_str(), UPDATE].concat(), false,
+                &cx,
+                [ack(SUBSCRIPTION_ID).as_str(), UPDATE].concat(),
+                false,
                 ClientCredentialsCoreSubscriptionLimits::default(),
-            ).await;
+            )
+            .await;
             assert!(subscription.next_event(&cx).await.unwrap().is_some());
             assert!(subscription.next_event(&cx).await.unwrap().is_some());
-            assert!(matches!(subscription.next_event(&cx).await,
-                Err(ClientCredentialsCoreSubscriptionError::MissingTerminal)));
+            assert!(matches!(
+                subscription.next_event(&cx).await,
+                Err(ClientCredentialsCoreSubscriptionError::MissingTerminal)
+            ));
             assert!(subscription.is_closed());
             peer.join().unwrap();
         });
@@ -780,15 +1029,25 @@ mod tests {
         runtime().block_on(async {
             let cx = Cx::current().unwrap();
             let limits = ClientCredentialsCoreSubscriptionLimits::new(
-                65_536, 65_536, 2, Duration::from_secs(5),
-            ).unwrap();
+                65_536,
+                65_536,
+                2,
+                Duration::from_secs(5),
+            )
+            .unwrap();
             let (mut subscription, peer) = native_subscription(
-                &cx, [ack(SUBSCRIPTION_ID).as_str(), UPDATE, TERMINAL].concat(), false, limits,
-            ).await;
+                &cx,
+                [ack(SUBSCRIPTION_ID).as_str(), UPDATE, TERMINAL].concat(),
+                false,
+                limits,
+            )
+            .await;
             assert!(subscription.next_event(&cx).await.unwrap().is_some());
             assert!(subscription.next_event(&cx).await.unwrap().is_some());
-            assert!(matches!(subscription.next_event(&cx).await,
-                Err(ClientCredentialsCoreSubscriptionError::RecordLimit)));
+            assert!(matches!(
+                subscription.next_event(&cx).await,
+                Err(ClientCredentialsCoreSubscriptionError::RecordLimit)
+            ));
             assert_eq!(subscription.records_delivered(), 2);
             assert!(subscription.is_closed());
             peer.join().unwrap();
@@ -801,18 +1060,29 @@ mod tests {
             let cx = Cx::current().unwrap();
             for case in 0..5 {
                 let (mut subscription, peer) = native_subscription(
-                    &cx, [ack(SUBSCRIPTION_ID).as_str(), UPDATE, TERMINAL].concat(), false,
+                    &cx,
+                    [ack(SUBSCRIPTION_ID).as_str(), UPDATE, TERMINAL].concat(),
+                    false,
                     ClientCredentialsCoreSubscriptionLimits::default(),
-                ).await;
+                )
+                .await;
                 match case {
-                    0 => { subscription.cancellation.cancel(); },
-                    1 => { subscription.owner.cancel(); },
-                    2 => { subscription.snapshot.bearer.revoke(); },
+                    0 => {
+                        subscription.cancellation.cancel();
+                    }
+                    1 => {
+                        subscription.owner.cancel();
+                    }
+                    2 => {
+                        subscription.snapshot.bearer.revoke();
+                    }
                     3 => subscription.snapshot.expires_at = std::time::Instant::now(),
                     _ => subscription.deadline = cx.now(),
                 }
-                assert!(matches!(subscription.next_event(&cx).await,
-                    Err(ClientCredentialsCoreSubscriptionError::Authentication(_))));
+                assert!(matches!(
+                    subscription.next_event(&cx).await,
+                    Err(ClientCredentialsCoreSubscriptionError::Authentication(_))
+                ));
                 assert!(subscription.accepted_filter().is_none());
                 assert_eq!(subscription.records_delivered(), 0);
                 assert!(subscription.is_closed());
@@ -829,19 +1099,27 @@ mod tests {
         runtime().block_on(async {
             let cx = Cx::current().unwrap();
             let (mut subscription, peer) = native_subscription(
-                &cx, "data: {".to_owned(), true,
+                &cx,
+                "data: {".to_owned(),
+                true,
                 ClientCredentialsCoreSubscriptionLimits::default(),
-            ).await;
+            )
+            .await;
             {
                 let mut pending = std::pin::pin!(subscription.next_event(&cx));
                 poll_fn(|task| match pending.as_mut().poll(task) {
                     Poll::Pending => Poll::Ready(()),
-                    Poll::Ready(_) => panic!("incomplete subscription record should remain pending"),
-                }).await;
+                    Poll::Ready(_) => {
+                        panic!("incomplete subscription record should remain pending")
+                    }
+                })
+                .await;
             }
             assert!(subscription.is_closed());
-            assert!(matches!(subscription.next_event(&cx).await,
-                Err(ClientCredentialsCoreSubscriptionError::Closed)));
+            assert!(matches!(
+                subscription.next_event(&cx).await,
+                Err(ClientCredentialsCoreSubscriptionError::Closed)
+            ));
             peer.join().unwrap();
         });
     }
@@ -851,13 +1129,18 @@ mod tests {
         runtime().block_on(async {
             let cx = Cx::current().unwrap();
             let (mut subscription, peer) = native_subscription(
-                &cx, "data: {".to_owned(), true,
+                &cx,
+                "data: {".to_owned(),
+                true,
                 ClientCredentialsCoreSubscriptionLimits::default(),
-            ).await;
+            )
+            .await;
             subscription.close();
             assert!(subscription.is_closed());
-            assert!(matches!(subscription.next_event(&cx).await,
-                Err(ClientCredentialsCoreSubscriptionError::Closed)));
+            assert!(matches!(
+                subscription.next_event(&cx).await,
+                Err(ClientCredentialsCoreSubscriptionError::Closed)
+            ));
             assert!(!subscription.cancellation.is_cancel_requested());
             assert!(!subscription.owner.is_cancel_requested());
             peer.join().unwrap();

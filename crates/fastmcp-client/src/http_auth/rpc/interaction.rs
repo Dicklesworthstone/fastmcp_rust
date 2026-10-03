@@ -21,16 +21,16 @@ use asupersync::types::Time;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::exact_json_to_serde;
 use fastmcp_protocol::{
-    CoreRequest, CoreResult, FinalCoreRequest, FinalCoreResult,
+    CoreRequest, CoreResult, FINAL_CLIENT_CAPABILITIES_META_KEY, FinalCoreRequest, FinalCoreResult,
     FinalEmbeddedElicitationParams, FinalEmbeddedInputRequest, FinalInputResponses,
-    InputRequiredResult, RequestId, ServerNotification, FINAL_CLIENT_CAPABILITIES_META_KEY,
+    InputRequiredResult, RequestId, ServerNotification,
 };
 
-use super::{
-    ManagedCoreCall, ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits,
-    ManagedOAuthSession, bounded_wait, call_deadline, check_call,
-};
 use super::tool_headers::ManagedToolHeaderError;
+use super::{
+    ManagedCoreCall, ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits, ManagedOAuthSession,
+    bounded_wait, call_deadline, check_call,
+};
 use crate::http_executor::parameter_headers::{ReviewedToolHeaders, ToolHeaderDispatchError};
 
 /// Explicit reply recovery for independently configured continuation journals.
@@ -61,7 +61,9 @@ impl Default for ManagedInteractionLimits {
 }
 
 impl ManagedInteractionLimits {
-    pub(crate) fn core(self) -> ManagedCoreLimits { self.core }
+    pub(crate) fn core(self) -> ManagedCoreLimits {
+        self.core
+    }
 
     /// Zero continuations explicitly requires completion on the first POST.
     /// A zero input budget still permits bounded, explicitly resumed state-only
@@ -74,7 +76,11 @@ impl ManagedInteractionLimits {
         if max_continuations > 64 || max_input_responses > 1024 {
             return Err(ManagedInteractionError::InvalidLimits);
         }
-        Ok(Self { core, max_continuations, max_input_responses })
+        Ok(Self {
+            core,
+            max_continuations,
+            max_input_responses,
+        })
     }
 }
 
@@ -104,12 +110,20 @@ impl fmt::Display for ManagedInteractionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::InvalidLimits => "invalid managed interaction limits",
-            Self::InvalidInitialRequest => "interaction requires an initial final tool, resource or prompt request",
+            Self::InvalidInitialRequest => {
+                "interaction requires an initial final tool, resource or prompt request"
+            }
             Self::NotAwaitingInput => "interaction is not awaiting input",
-            Self::InputPending => "interaction requires explicit host input before another response read",
+            Self::InputPending => {
+                "interaction requires explicit host input before another response read"
+            }
             Self::InvalidInputResponses => "answers do not match the current input-required result",
-            Self::PartialStateRequired => "partial answers require a nonempty server continuation state",
-            Self::CapabilityNotAdvertised => "input-required result requests an unadvertised client capability",
+            Self::PartialStateRequired => {
+                "partial answers require a nonempty server continuation state"
+            }
+            Self::CapabilityNotAdvertised => {
+                "input-required result requests an unadvertised client capability"
+            }
             Self::ContinuationLimit => "interaction continuation limit exceeded",
             Self::InputLimit => "interaction input-response limit exceeded",
             Self::RepeatedRequestId => "interaction continuation requires a fresh request ID",
@@ -124,7 +138,9 @@ impl fmt::Display for ManagedInteractionError {
 impl std::error::Error for ManagedInteractionError {}
 
 impl From<ManagedCoreError> for ManagedInteractionError {
-    fn from(error: ManagedCoreError) -> Self { Self::Core(error) }
+    fn from(error: ManagedCoreError) -> Self {
+        Self::Core(error)
+    }
 }
 
 impl From<ManagedToolHeaderError> for ManagedInteractionError {
@@ -188,7 +204,10 @@ impl fmt::Debug for ManagedInteraction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ManagedInteraction")
             .field("continuations", &self.continuations)
-            .field("awaiting_input", &matches!(self.step, Some(Step::Awaiting(_))))
+            .field(
+                "awaiting_input",
+                &matches!(self.step, Some(Step::Awaiting(_))),
+            )
             .field("closed", &self.step.is_none())
             .finish_non_exhaustive()
     }
@@ -206,8 +225,13 @@ impl ManagedOAuthSession {
         limits: ManagedInteractionLimits,
     ) -> Result<ManagedInteraction, ManagedInteractionError> {
         self.start_core_interaction_with_cancellation(
-            cx, &McpRequestCancellation::new(), request, request_id, limits,
-        ).await
+            cx,
+            &McpRequestCancellation::new(),
+            request,
+            request_id,
+            limits,
+        )
+        .await
     }
 
     /// Retains the supplied request-local cancellation domain across every
@@ -221,9 +245,8 @@ impl ManagedOAuthSession {
         request_id: RequestId,
         limits: ManagedInteractionLimits,
     ) -> Result<ManagedInteraction, ManagedInteractionError> {
-        self.start_core_interaction_configured(
-            cx, cancellation, request, request_id, limits, None,
-        ).await
+        self.start_core_interaction_configured(cx, cancellation, request, request_id, limits, None)
+            .await
     }
 
     // Configuration is immutable before the first POST. Only the explicit
@@ -241,16 +264,29 @@ impl ManagedOAuthSession {
         let deadline = call_deadline(cx, cancellation, limits.core.timeout)?;
         validate_initial(&request)?;
         let mut operation = ManagedInteraction {
-            session: self.clone(), original: request, header_review, step: None,
-            cancellation: cancellation.clone(), deadline, limits,
-            used_ids: vec![request_id.clone()], continuations: 0, input_responses: 0,
-            response_bytes: 0, notifications: 0, generation: 0,
+            session: self.clone(),
+            original: request,
+            header_review,
+            step: None,
+            cancellation: cancellation.clone(),
+            deadline,
+            limits,
+            used_ids: vec![request_id.clone()],
+            continuations: 0,
+            input_responses: 0,
+            response_bytes: 0,
+            notifications: 0,
+            generation: 0,
         };
         let (wire, decoder) = operation.prepare_request(operation.original.clone(), request_id)?;
         let response = bounded_wait(cx, cancellation, deadline, async {
-            self.execute_with_cancellation(cx, cancellation, &wire).await.map_err(ManagedCoreError::from)
-        }).await?;
-        let call = ManagedCoreCall::from_response(response, decoder, cancellation.clone(), deadline)?;
+            self.execute_with_cancellation(cx, cancellation, &wire)
+                .await
+                .map_err(ManagedCoreError::from)
+        })
+        .await?;
+        let call =
+            ManagedCoreCall::from_response(response, decoder, cancellation.clone(), deadline)?;
         operation.generation = call.credential_generation();
         operation.step = Some(Step::Reading(Box::new(call)));
         Ok(operation)
@@ -268,14 +304,20 @@ impl ManagedInteraction {
         }
     }
 
-    pub fn continuation_count(&self) -> usize { self.continuations }
+    pub fn continuation_count(&self) -> usize {
+        self.continuations
+    }
 
     /// Credential generation of the most recently opened response, local to
     /// this login. It is neither an execution ID nor a cross-session cache key.
-    pub fn credential_generation(&self) -> u64 { self.generation }
+    pub fn credential_generation(&self) -> u64 {
+        self.generation
+    }
 
     /// Releases the current response or challenge without cancelling siblings.
-    pub fn close(&mut self) { self.step = None; }
+    pub fn close(&mut self) {
+        self.step = None;
+    }
 
     /// Runs this operation through explicitly supplied host callbacks.
     ///
@@ -308,7 +350,8 @@ impl ManagedInteraction {
         F: Future<Output = Result<ManagedInputReply, ManagedInteractionError>>,
         N: FnMut(Box<ServerNotification>) -> Result<(), ManagedInteractionError>,
     {
-        self.drive_selected(cx, resolve, notify, InputSelection::Complete).await
+        self.drive_selected(cx, resolve, notify, InputSelection::Complete)
+            .await
     }
 
     /// Drives an operation whose host may answer only some inputs per round.
@@ -328,7 +371,8 @@ impl ManagedInteraction {
         F: Future<Output = Result<ManagedInputReply, ManagedInteractionError>>,
         N: FnMut(Box<ServerNotification>) -> Result<(), ManagedInteractionError>,
     {
-        self.drive_selected(cx, resolve, notify, InputSelection::Partial).await
+        self.drive_selected(cx, resolve, notify, InputSelection::Partial)
+            .await
     }
 
     async fn drive_selected<R, F, N>(
@@ -347,7 +391,10 @@ impl ManagedInteraction {
             self.check(cx)?;
             let event = match self.pending_input() {
                 Some(input) => ManagedInteractionEvent::InputRequired(Box::new(input.clone())),
-                None => self.next_event(cx).await?.ok_or(ManagedInteractionError::Closed)?,
+                None => self
+                    .next_event(cx)
+                    .await?
+                    .ok_or(ManagedInteractionError::Closed)?,
             };
             self.check(cx)?;
             match event {
@@ -360,14 +407,22 @@ impl ManagedInteraction {
                     // pre-existing cancellation cannot run the resolver once.
                     let reply = bounded_wait(cx, &self.cancellation, self.deadline, async {
                         Ok(resolve(input).await)
-                    }).await??;
+                    })
+                    .await??;
                     self.check(cx)?;
                     // Absence/empty presence keep their strict meaning. Only
                     // a nonempty response map can opt into partial progress.
-                    let selected = if reply.input_responses.as_ref().is_some_and(|answers| !answers.is_empty()) {
+                    let selected = if reply
+                        .input_responses
+                        .as_ref()
+                        .is_some_and(|answers| !answers.is_empty())
+                    {
                         selection
-                    } else { InputSelection::Complete };
-                    self.resume_selected(cx, reply.request_id, reply.input_responses, selected).await?;
+                    } else {
+                        InputSelection::Complete
+                    };
+                    self.resume_selected(cx, reply.request_id, reply.input_responses, selected)
+                        .await?;
                 }
                 ManagedInteractionEvent::Complete(result) => return Ok(result),
             }
@@ -382,7 +437,9 @@ impl ManagedInteraction {
         &mut self,
         cx: &Cx,
     ) -> Result<Option<ManagedInteractionEvent>, ManagedInteractionError> {
-        if matches!(self.step, Some(Step::Complete)) { return Ok(None); }
+        if matches!(self.step, Some(Step::Complete)) {
+            return Ok(None);
+        }
         self.check(cx)?;
         let mut call = match self.step.take() {
             Some(Step::Reading(call)) => call,
@@ -393,7 +450,10 @@ impl ManagedInteraction {
             Some(Step::Complete) => return Ok(None),
             None => return Err(ManagedInteractionError::Closed),
         };
-        let event = call.next_event(cx).await?.ok_or(ManagedCoreError::MissingTerminal)?;
+        let event = call
+            .next_event(cx)
+            .await?
+            .ok_or(ManagedCoreError::MissingTerminal)?;
         self.response_bytes = call.decoder.bytes;
         self.notifications = call.decoder.notifications;
         self.check(cx)?;
@@ -410,8 +470,11 @@ impl ManagedInteraction {
                         return Err(ManagedCoreError::ResponseByteLimit.into());
                     }
                     admit_challenge(
-                        &self.original, input, self.limits,
-                        self.continuations, self.input_responses,
+                        &self.original,
+                        input,
+                        self.limits,
+                        self.continuations,
+                        self.input_responses,
                     )?;
                     self.check(cx)?;
                     let input = Box::new(input.clone());
@@ -442,7 +505,8 @@ impl ManagedInteraction {
         request_id: RequestId,
         responses: Option<FinalInputResponses>,
     ) -> Result<(), ManagedInteractionError> {
-        self.resume_selected(cx, request_id, responses, InputSelection::Complete).await
+        self.resume_selected(cx, request_id, responses, InputSelection::Complete)
+            .await
     }
 
     /// Submits a nonempty subset of the current challenge's answers. Unselected
@@ -461,7 +525,8 @@ impl ManagedInteraction {
         request_id: RequestId,
         responses: FinalInputResponses,
     ) -> Result<(), ManagedInteractionError> {
-        self.resume_selected(cx, request_id, Some(responses), InputSelection::Partial).await
+        self.resume_selected(cx, request_id, Some(responses), InputSelection::Partial)
+            .await
     }
 
     async fn resume_selected(
@@ -494,11 +559,17 @@ impl ManagedInteraction {
         self.continuations += 1;
         self.input_responses += count;
         let response = bounded_wait(cx, &self.cancellation, self.deadline, async {
-            self.session.execute_with_cancellation(cx, &self.cancellation, &wire)
-                .await.map_err(ManagedCoreError::from)
-        }).await?;
+            self.session
+                .execute_with_cancellation(cx, &self.cancellation, &wire)
+                .await
+                .map_err(ManagedCoreError::from)
+        })
+        .await?;
         let call = ManagedCoreCall::from_response(
-            response, decoder, self.cancellation.clone(), self.deadline,
+            response,
+            decoder,
+            self.cancellation.clone(),
+            self.deadline,
         )?;
         self.generation = call.credential_generation();
         self.step = Some(Step::Reading(Box::new(call)));
@@ -512,15 +583,24 @@ impl ManagedInteraction {
         &self,
         request: CoreRequest,
         request_id: RequestId,
-    ) -> Result<(crate::http_executor::ModernHttpRequest, super::CoreDecoder), ManagedInteractionError> {
+    ) -> Result<
+        (crate::http_executor::ModernHttpRequest, super::CoreDecoder),
+        ManagedInteractionError,
+    > {
         Ok(super::tool_headers::prepare_optional(
-            self.session.resource().as_str(), request, request_id, self.limits.core,
+            self.session.resource().as_str(),
+            request,
+            request_id,
+            self.limits.core,
             self.header_review.as_deref(),
         )?)
     }
 
     fn check(&mut self, cx: &Cx) -> Result<(), ManagedInteractionError> {
-        let deadline = cx.budget().deadline.map_or(self.deadline, |caller| caller.min(self.deadline));
+        let deadline = cx
+            .budget()
+            .deadline
+            .map_or(self.deadline, |caller| caller.min(self.deadline));
         if let Err(error) = check_call(cx, &self.cancellation, deadline) {
             self.close();
             return Err(error.into());
@@ -542,7 +622,11 @@ pub(crate) fn validate_initial(request: &CoreRequest) -> Result<(), ManagedInter
         }
         _ => false,
     };
-    if initial { Ok(()) } else { Err(ManagedInteractionError::InvalidInitialRequest) }
+    if initial {
+        Ok(())
+    } else {
+        Err(ManagedInteractionError::InvalidInitialRequest)
+    }
 }
 
 pub(crate) fn input_required(result: &CoreResult) -> Option<&InputRequiredResult> {
@@ -556,8 +640,12 @@ pub(crate) fn input_required(result: &CoreResult) -> Option<&InputRequiredResult
     }
 }
 
-pub(crate) fn admit_fresh_id(previous: &[RequestId], next: &RequestId) -> Result<(), ManagedInteractionError> {
-    next.validate().map_err(|_| ManagedCoreError::InvalidRequest)?;
+pub(crate) fn admit_fresh_id(
+    previous: &[RequestId],
+    next: &RequestId,
+) -> Result<(), ManagedInteractionError> {
+    next.validate()
+        .map_err(|_| ManagedCoreError::InvalidRequest)?;
     if previous.iter().any(|id| id.correlates_with(next)) {
         return Err(ManagedInteractionError::RepeatedRequestId);
     }
@@ -574,22 +662,27 @@ pub(crate) fn validate_embedded_input_shape(
         if !params.is_object() {
             return Err(ManagedCoreError::InvalidResult.into());
         }
-        if value.get("method").and_then(serde_json::Value::as_str) == Some("sampling/createMessage") {
+        if value.get("method").and_then(serde_json::Value::as_str) == Some("sampling/createMessage")
+        {
             // Derived Rust structs also accept sequences. Wire tool controls
             // and tool descriptors must retain their required object shape.
             if let Some(tools) = params.get("tools") {
-                if !tools.as_array().is_some_and(|tools| tools.iter().all(serde_json::Value::is_object)) {
-                    return Err(ManagedCoreError::InvalidResult.into());
-                }
-            }
-            if let Some(choice) = params.get("toolChoice") {
-                if !choice.is_object()
-                    || choice.get("mode").is_some_and(|mode| !mode.is_string())
+                if !tools
+                    .as_array()
+                    .is_some_and(|tools| tools.iter().all(serde_json::Value::is_object))
                 {
                     return Err(ManagedCoreError::InvalidResult.into());
                 }
             }
-            if params.get("includeContext").is_some_and(|context| !context.is_string()) {
+            if let Some(choice) = params.get("toolChoice") {
+                if !choice.is_object() || choice.get("mode").is_some_and(|mode| !mode.is_string()) {
+                    return Err(ManagedCoreError::InvalidResult.into());
+                }
+            }
+            if params
+                .get("includeContext")
+                .is_some_and(|context| !context.is_string())
+            {
                 return Err(ManagedCoreError::InvalidResult.into());
             }
         }
@@ -609,25 +702,35 @@ pub(crate) fn admit_embedded_input(
     value: serde_json::Value,
 ) -> Result<FinalEmbeddedInputRequest, ManagedInteractionError> {
     validate_embedded_input_shape(&value)?;
-    let descriptor: FinalEmbeddedInputRequest = serde_json::from_value(value)
-        .map_err(|_| ManagedCoreError::InvalidResult)?;
+    let descriptor: FinalEmbeddedInputRequest =
+        serde_json::from_value(value).map_err(|_| ManagedCoreError::InvalidResult)?;
     let advertised = match &descriptor {
-        FinalEmbeddedInputRequest::Roots(_) => {
-            capabilities.get("roots").is_some_and(serde_json::Value::is_object)
-        }
+        FinalEmbeddedInputRequest::Roots(_) => capabilities
+            .get("roots")
+            .is_some_and(serde_json::Value::is_object),
         FinalEmbeddedInputRequest::Sampling(params) => {
             let sampling = &capabilities["sampling"];
             sampling.is_object()
                 && ((params.tools.is_none() && params.tool_choice.is_none())
-                    || sampling.get("tools").is_some_and(serde_json::Value::is_object))
+                    || sampling
+                        .get("tools")
+                        .is_some_and(serde_json::Value::is_object))
         }
         FinalEmbeddedInputRequest::Elicitation(FinalEmbeddedElicitationParams::Form(_)) => {
-            capabilities.get("elicitation").and_then(serde_json::Value::as_object)
-                .is_some_and(|elicitation| elicitation.is_empty()
-                    || elicitation.get("form").is_some_and(serde_json::Value::is_object))
+            capabilities
+                .get("elicitation")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|elicitation| {
+                    elicitation.is_empty()
+                        || elicitation
+                            .get("form")
+                            .is_some_and(serde_json::Value::is_object)
+                })
         }
         FinalEmbeddedInputRequest::Elicitation(FinalEmbeddedElicitationParams::Url(_)) => {
-            capabilities["elicitation"].get("url").is_some_and(serde_json::Value::is_object)
+            capabilities["elicitation"]
+                .get("url")
+                .is_some_and(serde_json::Value::is_object)
         }
     };
     if !advertised {
@@ -647,8 +750,13 @@ pub(crate) fn normalize_embedded_input_context(
     if capabilities["sampling"]["context"].is_object() {
         return false;
     }
-    let FinalEmbeddedInputRequest::Sampling(params) = request else { return false };
-    if params.include_context.is_some_and(|context| context != fastmcp_protocol::IncludeContext::None) {
+    let FinalEmbeddedInputRequest::Sampling(params) = request else {
+        return false;
+    };
+    if params
+        .include_context
+        .is_some_and(|context| context != fastmcp_protocol::IncludeContext::None)
+    {
         params.include_context = None;
         true
     } else {
@@ -666,16 +774,23 @@ pub(crate) fn admit_challenge(
     if continuations >= limits.max_continuations {
         return Err(ManagedInteractionError::ContinuationLimit);
     }
-    let Some(requests) = input.input_requests() else { return Ok(()) };
+    let Some(requests) = input.input_requests() else {
+        return Ok(());
+    };
     let count = requests.members().len();
-    if count > MAX_INPUTS_PER_ROUND || count > limits.max_input_responses.saturating_sub(input_responses) {
+    if count > MAX_INPUTS_PER_ROUND
+        || count > limits.max_input_responses.saturating_sub(input_responses)
+    {
         return Err(ManagedInteractionError::InputLimit);
     }
-    let params = original.encode_params().map_err(|_| ManagedCoreError::InvalidRequest)?
+    let params = original
+        .encode_params()
+        .map_err(|_| ManagedCoreError::InvalidRequest)?
         .ok_or(ManagedCoreError::InvalidRequest)?;
     let capabilities = &params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY];
     for member in requests.members() {
-        let value = exact_json_to_serde(&member.value).map_err(|_| ManagedCoreError::InvalidResult)?;
+        let value =
+            exact_json_to_serde(&member.value).map_err(|_| ManagedCoreError::InvalidResult)?;
         admit_embedded_input(capabilities, value)?;
     }
     Ok(())
@@ -690,7 +805,10 @@ pub(crate) fn continuation_request(
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum InputSelection { Complete, Partial }
+pub(crate) enum InputSelection {
+    Complete,
+    Partial,
+}
 
 /// Validate only correlation/shape, never invoke a resolver or manufacture
 /// answers for omitted inputs. The interaction already admitted capabilities
@@ -699,23 +817,28 @@ pub(crate) fn validate_partial_responses(
     input: &InputRequiredResult,
     responses: &FinalInputResponses,
 ) -> Result<(), ManagedInteractionError> {
-    let requests = input.input_requests().ok_or(ManagedInteractionError::InvalidInputResponses)?;
-    if responses.is_empty() || responses.len() > requests.members().len()
+    let requests = input
+        .input_requests()
+        .ok_or(ManagedInteractionError::InvalidInputResponses)?;
+    if responses.is_empty()
+        || responses.len() > requests.members().len()
         || requests.members().len() > MAX_INPUTS_PER_ROUND
     {
         return Err(ManagedInteractionError::InvalidInputResponses);
     }
     for (key, response) in responses.entries() {
-        let request = requests.get(key).ok_or(ManagedInteractionError::InvalidInputResponses)?;
-        let request = exact_json_to_serde(request).map_err(|_| ManagedInteractionError::InvalidInputResponses)?;
+        let request = requests
+            .get(key)
+            .ok_or(ManagedInteractionError::InvalidInputResponses)?;
+        let request = exact_json_to_serde(request)
+            .map_err(|_| ManagedInteractionError::InvalidInputResponses)?;
         let descriptor: FinalEmbeddedInputRequest = serde_json::from_value(request)
             .map_err(|_| ManagedInteractionError::InvalidInputResponses)?;
         if !response.matches_kind(descriptor.response_kind()) {
             return Err(ManagedInteractionError::InvalidInputResponses);
         }
     }
-    if responses.len() < requests.members().len()
-        && input.request_state().is_none_or(str::is_empty)
+    if responses.len() < requests.members().len() && input.request_state().is_none_or(str::is_empty)
     {
         return Err(ManagedInteractionError::PartialStateRequired);
     }
@@ -729,11 +852,17 @@ pub(crate) fn continuation_request_selected(
     selection: InputSelection,
 ) -> Result<CoreRequest, ManagedInteractionError> {
     if matches!(selection, InputSelection::Partial) {
-        validate_partial_responses(input, responses.as_ref().ok_or(ManagedInteractionError::InvalidInputResponses)?)?;
+        validate_partial_responses(
+            input,
+            responses
+                .as_ref()
+                .ok_or(ManagedInteractionError::InvalidInputResponses)?,
+        )?;
     } else {
         match (input.input_requests(), responses.as_ref()) {
-            (None, None) => {},
-            (Some(_), Some(responses)) => responses.validate_against_input_required(input)
+            (None, None) => {}
+            (Some(_), Some(responses)) => responses
+                .validate_against_input_required(input)
                 .map_err(|_| ManagedInteractionError::InvalidInputResponses)?,
             _ => return Err(ManagedInteractionError::InvalidInputResponses),
         }
@@ -765,11 +894,17 @@ mod tests {
     use serde_json::{Value, json};
 
     fn request(method: &str, mut params: Value, capabilities: Value) -> CoreRequest {
-        let mut metadata = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
+        let mut metadata =
+            serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
         metadata[FINAL_CLIENT_CAPABILITIES_META_KEY] = capabilities;
         metadata["com.example/identity"] = json!("unchanged");
         params["_meta"] = metadata;
-        CoreRequest::decode(fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026, method, Some(&params)).unwrap()
+        CoreRequest::decode(
+            fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026,
+            method,
+            Some(&params),
+        )
+        .unwrap()
     }
 
     fn input(request: &CoreRequest, source: &str) -> InputRequiredResult {
@@ -777,19 +912,33 @@ mod tests {
         input_required(&result).unwrap().clone()
     }
 
-    fn answers(value: Value) -> FinalInputResponses { serde_json::from_value(value).unwrap() }
+    fn answers(value: Value) -> FinalInputResponses {
+        serde_json::from_value(value).unwrap()
+    }
 
     #[test]
     fn continuation_changes_only_current_answers_and_exact_opaque_state() {
         for (method, params) in [
-            ("tools/call", json!({"name":"echo","arguments":{"payload":"original"}})),
-            ("resources/read", json!({"uri":"file:///opaque/%2Fresource"})),
-            ("prompts/get", json!({"name":"prompt","arguments":{"subject":"original"}})),
+            (
+                "tools/call",
+                json!({"name":"echo","arguments":{"payload":"original"}}),
+            ),
+            (
+                "resources/read",
+                json!({"uri":"file:///opaque/%2Fresource"}),
+            ),
+            (
+                "prompts/get",
+                json!({"name":"prompt","arguments":{"subject":"original"}}),
+            ),
         ] {
             let original = request(method, params, json!({"roots":{}}));
             validate_initial(&original).unwrap();
             let before = original.encode_params().unwrap().unwrap();
-            let challenge = input(&original, r#"{"resultType":"input_required","inputRequests":{"roots-a":{"method":"roots/list"}},"requestState":"  opaque+/%\u0000  "}"#);
+            let challenge = input(
+                &original,
+                r#"{"resultType":"input_required","inputRequests":{"roots-a":{"method":"roots/list"}},"requestState":"  opaque+/%\u0000  "}"#,
+            );
             let supplied = answers(json!({"roots-a":{"roots":[]}}));
             let next = continuation_request(&original, &challenge, Some(supplied)).unwrap();
             let mut after = next.encode_params().unwrap().unwrap();
@@ -805,83 +954,198 @@ mod tests {
     #[test]
     fn continuation_preserves_absent_empty_and_state_only_distinctions() {
         let original = request("tools/call", json!({"name":"echo"}), json!({}));
-        let state_only = input(&original, r#"{"resultType":"input_required","requestState":""}"#);
-        let next = continuation_request(&original, &state_only, None).unwrap().encode_params().unwrap().unwrap();
+        let state_only = input(
+            &original,
+            r#"{"resultType":"input_required","requestState":""}"#,
+        );
+        let next = continuation_request(&original, &state_only, None)
+            .unwrap()
+            .encode_params()
+            .unwrap()
+            .unwrap();
         assert_eq!(next["requestState"], "");
         assert!(next.get("inputResponses").is_none());
         assert!(next.get("arguments").is_none());
-        assert!(matches!(continuation_request(&original, &state_only, Some(answers(json!({})))), Err(ManagedInteractionError::InvalidInputResponses)));
-        let empty_inputs = input(&original, r#"{"resultType":"input_required","inputRequests":{}}"#);
-        assert!(matches!(continuation_request(&original, &empty_inputs, None), Err(ManagedInteractionError::InvalidInputResponses)));
-        let next = continuation_request(&original, &empty_inputs, Some(answers(json!({})))).unwrap().encode_params().unwrap().unwrap();
+        assert!(matches!(
+            continuation_request(&original, &state_only, Some(answers(json!({})))),
+            Err(ManagedInteractionError::InvalidInputResponses)
+        ));
+        let empty_inputs = input(
+            &original,
+            r#"{"resultType":"input_required","inputRequests":{}}"#,
+        );
+        assert!(matches!(
+            continuation_request(&original, &empty_inputs, None),
+            Err(ManagedInteractionError::InvalidInputResponses)
+        ));
+        let next = continuation_request(&original, &empty_inputs, Some(answers(json!({}))))
+            .unwrap()
+            .encode_params()
+            .unwrap()
+            .unwrap();
         assert_eq!(next["inputResponses"], json!({}));
         assert!(next.get("requestState").is_none());
     }
 
     #[test]
     fn every_key_and_response_kind_must_match_the_current_challenge() {
-        let original = request("resources/read", json!({"uri":"file:///input"}), json!({"roots":{}}));
-        let challenge = input(&original, r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"sealed"}"#);
+        let original = request(
+            "resources/read",
+            json!({"uri":"file:///input"}),
+            json!({"roots":{}}),
+        );
+        let challenge = input(
+            &original,
+            r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"sealed"}"#,
+        );
         let before = original.encode_params().unwrap();
-        for invalid in [json!({}), json!({"other":{"roots":[]}}), json!({"roots":{"action":"decline"}}), json!({"roots":{"roots":[]},"extra":{"roots":[]}})] {
-            assert!(matches!(continuation_request(&original, &challenge, Some(answers(invalid))), Err(ManagedInteractionError::InvalidInputResponses)));
+        for invalid in [
+            json!({}),
+            json!({"other":{"roots":[]}}),
+            json!({"roots":{"action":"decline"}}),
+            json!({"roots":{"roots":[]},"extra":{"roots":[]}}),
+        ] {
+            assert!(matches!(
+                continuation_request(&original, &challenge, Some(answers(invalid))),
+                Err(ManagedInteractionError::InvalidInputResponses)
+            ));
             assert_eq!(original.encode_params().unwrap(), before);
         }
-        assert!(continuation_request(&original, &challenge, Some(answers(json!({"roots":{"roots":[]}})))).is_ok());
+        assert!(
+            continuation_request(
+                &original,
+                &challenge,
+                Some(answers(json!({"roots":{"roots":[]}})))
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn next_round_does_not_accumulate_old_answers_or_old_request_state() {
         let original = request("tools/call", json!({"name":"echo"}), json!({"roots":{}}));
-        let first = input(&original, r#"{"resultType":"input_required","inputRequests":{"first":{"method":"roots/list"}},"requestState":"old"}"#);
-        let first_retry = continuation_request(&original, &first, Some(answers(json!({"first":{"roots":[]}})))).unwrap();
-        let second = input(&first_retry, r#"{"resultType":"input_required","inputRequests":{"second":{"method":"roots/list"}}}"#);
-        let next = continuation_request(&original, &second, Some(answers(json!({"second":{"roots":[]}})))).unwrap().encode_params().unwrap().unwrap();
+        let first = input(
+            &original,
+            r#"{"resultType":"input_required","inputRequests":{"first":{"method":"roots/list"}},"requestState":"old"}"#,
+        );
+        let first_retry = continuation_request(
+            &original,
+            &first,
+            Some(answers(json!({"first":{"roots":[]}}))),
+        )
+        .unwrap();
+        let second = input(
+            &first_retry,
+            r#"{"resultType":"input_required","inputRequests":{"second":{"method":"roots/list"}}}"#,
+        );
+        let next = continuation_request(
+            &original,
+            &second,
+            Some(answers(json!({"second":{"roots":[]}}))),
+        )
+        .unwrap()
+        .encode_params()
+        .unwrap()
+        .unwrap();
         assert!(next.get("requestState").is_none());
         assert_eq!(next["inputResponses"], json!({"second":{"roots":[]}}));
-        assert!(matches!(continuation_request(&original, &second, Some(answers(json!({"first":{"roots":[]}})))), Err(ManagedInteractionError::InvalidInputResponses)));
+        assert!(matches!(
+            continuation_request(
+                &original,
+                &second,
+                Some(answers(json!({"first":{"roots":[]}})))
+            ),
+            Err(ManagedInteractionError::InvalidInputResponses)
+        ));
     }
 
     #[test]
     fn capability_and_round_budgets_are_checked_before_exposing_input() {
         let original = request("tools/call", json!({"name":"echo"}), json!({"roots":{}}));
-        let challenge = input(&original, r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}}}"#);
+        let challenge = input(
+            &original,
+            r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}}}"#,
+        );
         let limits = ManagedInteractionLimits::new(ManagedCoreLimits::default(), 1, 1).unwrap();
         assert!(admit_challenge(&original, &challenge, limits, 0, 0).is_ok());
         let unadvertised = request("tools/call", json!({"name":"echo"}), json!({}));
-        assert!(matches!(admit_challenge(&unadvertised, &challenge, limits, 0, 0), Err(ManagedInteractionError::CapabilityNotAdvertised)));
-        assert!(matches!(admit_challenge(&original, &challenge, limits, 1, 0), Err(ManagedInteractionError::ContinuationLimit)));
-        assert!(matches!(admit_challenge(&original, &challenge, limits, 0, 1), Err(ManagedInteractionError::InputLimit)));
-        let state_only = input(&original, r#"{"resultType":"input_required","requestState":"state"}"#);
+        assert!(matches!(
+            admit_challenge(&unadvertised, &challenge, limits, 0, 0),
+            Err(ManagedInteractionError::CapabilityNotAdvertised)
+        ));
+        assert!(matches!(
+            admit_challenge(&original, &challenge, limits, 1, 0),
+            Err(ManagedInteractionError::ContinuationLimit)
+        ));
+        assert!(matches!(
+            admit_challenge(&original, &challenge, limits, 0, 1),
+            Err(ManagedInteractionError::InputLimit)
+        ));
+        let state_only = input(
+            &original,
+            r#"{"resultType":"input_required","requestState":"state"}"#,
+        );
         assert!(admit_challenge(&original, &state_only, limits, 0, 1).is_ok());
-        assert!(matches!(admit_challenge(&original, &state_only, limits, 1, 1), Err(ManagedInteractionError::ContinuationLimit)));
+        assert!(matches!(
+            admit_challenge(&original, &state_only, limits, 1, 1),
+            Err(ManagedInteractionError::ContinuationLimit)
+        ));
     }
 
     #[test]
     fn embedded_capabilities_require_the_exact_hard_leaf() {
         let roots = json!({"method":"roots/list"});
-        let sampling = json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16}});
+        let sampling =
+            json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16}});
         let tools = json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,"tools":[]}});
         let choice = json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,"toolChoice":{"mode":"auto"}}});
         let form = json!({"method":"elicitation/create","params":{"mode":"form","message":"details","requestedSchema":{"type":"object","properties":{}}}});
         let url = json!({"method":"elicitation/create","params":{"mode":"url","message":"continue","url":"https://example.test/consent"}});
         for (descriptor, granted, denied) in [
-            (roots, json!({"roots":{}}), json!({"extensions":{"roots":{}}})),
+            (
+                roots,
+                json!({"roots":{}}),
+                json!({"extensions":{"roots":{}}}),
+            ),
             (sampling, json!({"sampling":{}}), json!({"sampling":null})),
-            (tools, json!({"sampling":{"tools":{}}}), json!({"sampling":{"context":{}}})),
-            (choice, json!({"sampling":{"tools":{}}}), json!({"sampling":{}})),
-            (form.clone(), json!({"elicitation":{}}), json!({"elicitation":{"unknown":{}}})),
-            (form, json!({"elicitation":{"form":{}}}), json!({"elicitation":{"url":{}}})),
-            (url, json!({"elicitation":{"url":{}}}), json!({"elicitation":{}})),
+            (
+                tools,
+                json!({"sampling":{"tools":{}}}),
+                json!({"sampling":{"context":{}}}),
+            ),
+            (
+                choice,
+                json!({"sampling":{"tools":{}}}),
+                json!({"sampling":{}}),
+            ),
+            (
+                form.clone(),
+                json!({"elicitation":{}}),
+                json!({"elicitation":{"unknown":{}}}),
+            ),
+            (
+                form,
+                json!({"elicitation":{"form":{}}}),
+                json!({"elicitation":{"url":{}}}),
+            ),
+            (
+                url,
+                json!({"elicitation":{"url":{}}}),
+                json!({"elicitation":{}}),
+            ),
         ] {
             assert!(admit_embedded_input(&granted, descriptor.clone()).is_ok());
-            assert!(matches!(admit_embedded_input(&denied, descriptor),
-                Err(ManagedInteractionError::CapabilityNotAdvertised)));
+            assert!(matches!(
+                admit_embedded_input(&denied, descriptor),
+                Err(ManagedInteractionError::CapabilityNotAdvertised)
+            ));
         }
         let choice = json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,"toolChoice":{"mode":"auto"}}});
         for grant in [Value::Null, json!(true), json!([]), json!("tools")] {
-            assert!(matches!(admit_embedded_input(&json!({"sampling":{"tools":grant}}), choice.clone()),
-                Err(ManagedInteractionError::CapabilityNotAdvertised)));
+            assert!(matches!(
+                admit_embedded_input(&json!({"sampling":{"tools":grant}}), choice.clone()),
+                Err(ManagedInteractionError::CapabilityNotAdvertised)
+            ));
         }
     }
 
@@ -894,27 +1158,49 @@ mod tests {
             let admitted = admit_embedded_input(&capabilities, descriptor.clone()).unwrap();
             assert_eq!(serde_json::to_value(admitted).unwrap(), descriptor);
         }
-        assert!(matches!(admit_embedded_input(&json!({}), descriptor),
-            Err(ManagedInteractionError::CapabilityNotAdvertised)));
+        assert!(matches!(
+            admit_embedded_input(&json!({}), descriptor),
+            Err(ManagedInteractionError::CapabilityNotAdvertised)
+        ));
     }
 
     #[test]
     fn embedded_admission_rejects_shape_and_null_before_optional_conversion() {
         let capabilities = json!({"roots":{},"sampling":{"tools":{},"context":{}}});
-        for params in [Value::Null, json!([]), json!(["sequence"]), json!(true), json!(1)] {
+        for params in [
+            Value::Null,
+            json!([]),
+            json!(["sequence"]),
+            json!(true),
+            json!(1),
+        ] {
             for method in ["roots/list", "sampling/createMessage"] {
-                assert!(matches!(admit_embedded_input(&capabilities, json!({"method":method,"params":params.clone()})),
-                    Err(ManagedInteractionError::Core(ManagedCoreError::InvalidResult))));
+                assert!(matches!(
+                    admit_embedded_input(
+                        &capabilities,
+                        json!({"method":method,"params":params.clone()})
+                    ),
+                    Err(ManagedInteractionError::Core(
+                        ManagedCoreError::InvalidResult
+                    ))
+                ));
             }
         }
         for field in ["tools", "toolChoice", "includeContext"] {
-            let mut descriptor = json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16}});
+            let mut descriptor =
+                json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16}});
             descriptor["params"][field] = Value::Null;
-            assert!(matches!(admit_embedded_input(&capabilities, descriptor),
-                Err(ManagedInteractionError::Core(ManagedCoreError::InvalidResult))));
+            assert!(matches!(
+                admit_embedded_input(&capabilities, descriptor),
+                Err(ManagedInteractionError::Core(
+                    ManagedCoreError::InvalidResult
+                ))
+            ));
         }
         assert!(admit_embedded_input(&capabilities, json!({"method":"roots/list"})).is_ok());
-        assert!(admit_embedded_input(&capabilities, json!({"method":"roots/list","params":{}})).is_ok());
+        assert!(
+            admit_embedded_input(&capabilities, json!({"method":"roots/list","params":{}})).is_ok()
+        );
         assert!(admit_embedded_input(&capabilities, json!({"method":"sampling/createMessage","params":{
             "messages":[],"maxTokens":16,"tools":[],"toolChoice":{"mode":"auto"},"includeContext":"none"
         }})).is_ok());
@@ -929,14 +1215,26 @@ mod tests {
             }});
             assert!(admit_embedded_input(&capabilities, descriptor).is_ok());
         }
-        for choice in [json!([]), json!(["auto"]), json!({"mode":null}), json!({"mode":{"auto":null}})] {
+        for choice in [
+            json!([]),
+            json!(["auto"]),
+            json!({"mode":null}),
+            json!({"mode":{"auto":null}}),
+        ] {
             let descriptor = json!({"method":"sampling/createMessage","params":{
                 "messages":[],"maxTokens":16,"toolChoice":choice
             }});
-            assert!(matches!(admit_embedded_input(&capabilities, descriptor),
-                Err(ManagedInteractionError::Core(ManagedCoreError::InvalidResult))));
+            assert!(matches!(
+                admit_embedded_input(&capabilities, descriptor),
+                Err(ManagedInteractionError::Core(
+                    ManagedCoreError::InvalidResult
+                ))
+            ));
         }
-        for tools in [json!([]), json!([{"name":"tool","inputSchema":{"type":"object"}}])] {
+        for tools in [
+            json!([]),
+            json!([{"name":"tool","inputSchema":{"type":"object"}}]),
+        ] {
             let descriptor = json!({"method":"sampling/createMessage","params":{
                 "messages":[],"maxTokens":16,"tools":tools
             }});
@@ -951,8 +1249,12 @@ mod tests {
             let descriptor = json!({"method":"sampling/createMessage","params":{
                 "messages":[],"maxTokens":16,"tools":tools
             }});
-            assert!(matches!(admit_embedded_input(&capabilities, descriptor),
-                Err(ManagedInteractionError::Core(ManagedCoreError::InvalidResult))));
+            assert!(matches!(
+                admit_embedded_input(&capabilities, descriptor),
+                Err(ManagedInteractionError::Core(
+                    ManagedCoreError::InvalidResult
+                ))
+            ));
         }
         for context in [json!("allServers"), json!("thisServer"), json!("none")] {
             let descriptor = json!({"method":"sampling/createMessage","params":{
@@ -964,22 +1266,39 @@ mod tests {
             let descriptor = json!({"method":"sampling/createMessage","params":{
                 "messages":[],"maxTokens":16,"includeContext":context
             }});
-            assert!(matches!(admit_embedded_input(&capabilities, descriptor),
-                Err(ManagedInteractionError::Core(ManagedCoreError::InvalidResult))));
+            assert!(matches!(
+                admit_embedded_input(&capabilities, descriptor),
+                Err(ManagedInteractionError::Core(
+                    ManagedCoreError::InvalidResult
+                ))
+            ));
         }
     }
 
     #[test]
     fn mixed_admission_checks_late_missing_capabilities_without_changing_state() {
-        let original = request("tools/call", json!({"name":"echo"}), json!({"roots":{},"sampling":{}}));
-        let challenge = input(&original, r#"{"resultType":"input_required","inputRequests":{"first":{"method":"roots/list"},"last":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,"toolChoice":{"mode":"auto"}}}},"requestState":"same-state"}"#);
+        let original = request(
+            "tools/call",
+            json!({"name":"echo"}),
+            json!({"roots":{},"sampling":{}}),
+        );
+        let challenge = input(
+            &original,
+            r#"{"resultType":"input_required","inputRequests":{"first":{"method":"roots/list"},"last":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,"toolChoice":{"mode":"auto"}}}},"requestState":"same-state"}"#,
+        );
         let before = format!("{challenge:?}");
         let limits = ManagedInteractionLimits::new(ManagedCoreLimits::default(), 1, 2).unwrap();
-        assert!(matches!(admit_challenge(&original, &challenge, limits, 0, 0),
-            Err(ManagedInteractionError::CapabilityNotAdvertised)));
+        assert!(matches!(
+            admit_challenge(&original, &challenge, limits, 0, 0),
+            Err(ManagedInteractionError::CapabilityNotAdvertised)
+        ));
         assert_eq!(format!("{challenge:?}"), before);
         assert_eq!(challenge.request_state(), Some("same-state"));
-        let capable = request("tools/call", json!({"name":"echo"}), json!({"roots":{},"sampling":{"tools":{}}}));
+        let capable = request(
+            "tools/call",
+            json!({"name":"echo"}),
+            json!({"roots":{},"sampling":{"tools":{}}}),
+        );
         assert!(admit_challenge(&capable, &challenge, limits, 0, 0).is_ok());
         assert_eq!(format!("{challenge:?}"), before);
     }
@@ -988,7 +1307,10 @@ mod tests {
     fn correlation_aliases_cannot_reuse_an_earlier_round_id() {
         let used = vec![RequestId::Number(1), RequestId::String("second".to_owned())];
         for id in ["1", "1.0", "1e0", "\"second\""] {
-            assert!(matches!(admit_fresh_id(&used, &serde_json::from_str(id).unwrap()), Err(ManagedInteractionError::RepeatedRequestId)));
+            assert!(matches!(
+                admit_fresh_id(&used, &serde_json::from_str(id).unwrap()),
+                Err(ManagedInteractionError::RepeatedRequestId)
+            ));
         }
         assert!(admit_fresh_id(&used, &RequestId::String("1".to_owned())).is_ok());
         assert!(admit_fresh_id(&used, &RequestId::Number(2)).is_ok());
@@ -996,10 +1318,19 @@ mod tests {
 
     #[test]
     fn starting_from_unowned_retry_state_is_refused() {
-        for params in [json!({"name":"echo","requestState":"injected"}), json!({"name":"echo","inputResponses":{}})] {
-            assert!(matches!(validate_initial(&request("tools/call", params, json!({}))), Err(ManagedInteractionError::InvalidInitialRequest)));
+        for params in [
+            json!({"name":"echo","requestState":"injected"}),
+            json!({"name":"echo","inputResponses":{}}),
+        ] {
+            assert!(matches!(
+                validate_initial(&request("tools/call", params, json!({}))),
+                Err(ManagedInteractionError::InvalidInitialRequest)
+            ));
         }
-        assert!(matches!(validate_initial(&request("tools/list", json!({}), json!({}))), Err(ManagedInteractionError::InvalidInitialRequest)));
+        assert!(matches!(
+            validate_initial(&request("tools/list", json!({}), json!({}))),
+            Err(ManagedInteractionError::InvalidInitialRequest)
+        ));
         assert!(ManagedInteractionLimits::new(ManagedCoreLimits::default(), 65, 1).is_err());
         assert!(ManagedInteractionLimits::new(ManagedCoreLimits::default(), 1, 1025).is_err());
     }
@@ -1008,7 +1339,9 @@ mod tests {
         let mut value = json!({"resultType":"input_required", "inputRequests":{
             "one":{"method":"roots/list"}, "two":{"method":"roots/list"}
         }});
-        if let Some(state) = state { value["requestState"] = json!(state); }
+        if let Some(state) = state {
+            value["requestState"] = json!(state);
+        }
         input(original, &value.to_string())
     }
 
@@ -1017,15 +1350,26 @@ mod tests {
         for (method, params) in [
             ("tools/call", json!({"name":"echo","arguments":{"x":1}})),
             ("resources/read", json!({"uri":"file:///unchanged/%2F"})),
-            ("prompts/get", json!({"name":"prompt","arguments":{"subject":"same"}})),
+            (
+                "prompts/get",
+                json!({"name":"prompt","arguments":{"subject":"same"}}),
+            ),
         ] {
             let original = request(method, params, json!({"roots":{}}));
             let before = original.encode_params().unwrap().unwrap();
             let challenge = two_inputs(&original, Some("  opaque\0  "));
             let supplied = answers(json!({"two":{"roots":[]}}));
-            assert!(continuation_request(&original, &challenge, Some(supplied.clone())).is_err(),
-                "the existing exhaustive API must not silently become partial");
-            let next = continuation_request_selected(&original, &challenge, Some(supplied), InputSelection::Partial).unwrap();
+            assert!(
+                continuation_request(&original, &challenge, Some(supplied.clone())).is_err(),
+                "the existing exhaustive API must not silently become partial"
+            );
+            let next = continuation_request_selected(
+                &original,
+                &challenge,
+                Some(supplied),
+                InputSelection::Partial,
+            )
+            .unwrap();
             let mut encoded = next.encode_params().unwrap().unwrap();
             assert_eq!(encoded["inputResponses"], json!({"two":{"roots":[]}}));
             assert_eq!(encoded["requestState"], "  opaque\0  ");
@@ -1042,38 +1386,63 @@ mod tests {
         let original = request("tools/call", json!({"name":"echo"}), json!({"roots":{}}));
         for state in [None, Some("")] {
             let challenge = two_inputs(&original, state);
-            assert!(matches!(validate_partial_responses(&challenge, &answers(json!({"one":{"roots":[]}}))),
-                Err(ManagedInteractionError::PartialStateRequired)));
-            assert!(validate_partial_responses(&challenge, &answers(json!({"one":{"roots":[]},"two":{"roots":[]}}))).is_ok());
+            assert!(matches!(
+                validate_partial_responses(&challenge, &answers(json!({"one":{"roots":[]}}))),
+                Err(ManagedInteractionError::PartialStateRequired)
+            ));
+            assert!(
+                validate_partial_responses(
+                    &challenge,
+                    &answers(json!({"one":{"roots":[]},"two":{"roots":[]}}))
+                )
+                .is_ok()
+            );
         }
         // Opaque whitespace is not a missing handle and must not be trimmed.
-        assert!(validate_partial_responses(&two_inputs(&original, Some(" ")), &answers(json!({"one":{"roots":[]}}))).is_ok());
+        assert!(
+            validate_partial_responses(
+                &two_inputs(&original, Some(" ")),
+                &answers(json!({"one":{"roots":[]}}))
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn partial_admission_rejects_empty_foreign_and_wrong_kind_answers() {
         let original = request("tools/call", json!({"name":"echo"}), json!({"roots":{}}));
         let challenge = two_inputs(&original, Some("state"));
-        for wire in [json!({}), json!({"other":{"roots":[]}}), json!({"one":{"action":"decline"}}),
-            json!({"one":{"roots":[]},"two":{"roots":[]},"other":{"roots":[]}})]
-        {
-            assert!(matches!(validate_partial_responses(&challenge, &answers(wire)),
-                Err(ManagedInteractionError::InvalidInputResponses)));
+        for wire in [
+            json!({}),
+            json!({"other":{"roots":[]}}),
+            json!({"one":{"action":"decline"}}),
+            json!({"one":{"roots":[]},"two":{"roots":[]},"other":{"roots":[]}}),
+        ] {
+            assert!(matches!(
+                validate_partial_responses(&challenge, &answers(wire)),
+                Err(ManagedInteractionError::InvalidInputResponses)
+            ));
             assert_eq!(challenge.request_state(), Some("state"));
             assert_eq!(challenge.input_requests().unwrap().members().len(), 2);
         }
-        assert!(validate_partial_responses(&challenge, &answers(json!({"one":{"roots":[]}}))).is_ok());
+        assert!(
+            validate_partial_responses(&challenge, &answers(json!({"one":{"roots":[]}}))).is_ok()
+        );
     }
 
     #[test]
     fn partial_resume_never_synthesizes_state_only_or_empty_map_responses() {
         let original = request("tools/call", json!({"name":"echo"}), json!({}));
-        for source in [r#"{"resultType":"input_required","requestState":"state"}"#,
-            r#"{"resultType":"input_required","inputRequests":{},"requestState":"state"}"#]
-        {
+        for source in [
+            r#"{"resultType":"input_required","requestState":"state"}"#,
+            r#"{"resultType":"input_required","inputRequests":{},"requestState":"state"}"#,
+        ] {
             let challenge = input(&original, source);
             assert!(validate_partial_responses(&challenge, &answers(json!({}))).is_err());
-            assert!(validate_partial_responses(&challenge, &answers(json!({"one":{"roots":[]}}))).is_err());
+            assert!(
+                validate_partial_responses(&challenge, &answers(json!({"one":{"roots":[]}})))
+                    .is_err()
+            );
         }
     }
 
@@ -1081,28 +1450,69 @@ mod tests {
     fn partial_round_uses_successor_state_and_does_not_resend_accepted_answers() {
         let original = request("tools/call", json!({"name":"echo"}), json!({"roots":{}}));
         let first = two_inputs(&original, Some("first-state"));
-        let _ = continuation_request_selected(&original, &first,
-            Some(answers(json!({"one":{"roots":[]}}))), InputSelection::Partial).unwrap();
-        let second = input(&original, r#"{"resultType":"input_required","inputRequests":{"two":{"method":"roots/list"}},"requestState":"second-state"}"#);
-        assert!(validate_partial_responses(&second, &answers(json!({"one":{"roots":[]}}))).is_err());
-        let next = continuation_request_selected(&original, &second,
-            Some(answers(json!({"two":{"roots":[]}}))), InputSelection::Partial).unwrap().encode_params().unwrap().unwrap();
+        let _ = continuation_request_selected(
+            &original,
+            &first,
+            Some(answers(json!({"one":{"roots":[]}}))),
+            InputSelection::Partial,
+        )
+        .unwrap();
+        let second = input(
+            &original,
+            r#"{"resultType":"input_required","inputRequests":{"two":{"method":"roots/list"}},"requestState":"second-state"}"#,
+        );
+        assert!(
+            validate_partial_responses(&second, &answers(json!({"one":{"roots":[]}}))).is_err()
+        );
+        let next = continuation_request_selected(
+            &original,
+            &second,
+            Some(answers(json!({"two":{"roots":[]}}))),
+            InputSelection::Partial,
+        )
+        .unwrap()
+        .encode_params()
+        .unwrap()
+        .unwrap();
         assert_eq!(next["requestState"], "second-state");
         assert_eq!(next["inputResponses"], json!({"two":{"roots":[]}}));
         let limits = ManagedInteractionLimits::new(ManagedCoreLimits::default(), 2, 2).unwrap();
         assert!(admit_challenge(&original, &second, limits, 1, 1).is_ok());
-        assert!(matches!(admit_challenge(&original, &second, limits, 2, 1), Err(ManagedInteractionError::ContinuationLimit)));
-        assert!(matches!(admit_challenge(&original, &second, limits, 1, 2), Err(ManagedInteractionError::InputLimit)));
+        assert!(matches!(
+            admit_challenge(&original, &second, limits, 2, 1),
+            Err(ManagedInteractionError::ContinuationLimit)
+        ));
+        assert!(matches!(
+            admit_challenge(&original, &second, limits, 1, 2),
+            Err(ManagedInteractionError::InputLimit)
+        ));
     }
 
     #[test]
     fn partial_answer_wire_order_is_preserved_and_duplicate_keys_are_refused() {
         let original = request("tools/call", json!({"name":"echo"}), json!({"roots":{}}));
-        let challenge = input(&original, r#"{"resultType":"input_required","inputRequests":{"a":{"method":"roots/list"},"m":{"method":"roots/list"},"z":{"method":"roots/list"}},"requestState":"state"}"#);
-        let responses: FinalInputResponses = serde_json::from_str(r#"{"z":{"roots":[]},"a":{"roots":[]}}"#).unwrap();
+        let challenge = input(
+            &original,
+            r#"{"resultType":"input_required","inputRequests":{"a":{"method":"roots/list"},"m":{"method":"roots/list"},"z":{"method":"roots/list"}},"requestState":"state"}"#,
+        );
+        let responses: FinalInputResponses =
+            serde_json::from_str(r#"{"z":{"roots":[]},"a":{"roots":[]}}"#).unwrap();
         validate_partial_responses(&challenge, &responses).unwrap();
-        assert_eq!(responses.entries().iter().map(|(name,_)| name.as_str()).collect::<Vec<_>>(), ["z","a"]);
-        assert_eq!(serde_json::to_string(&responses).unwrap(), r#"{"z":{"roots":[]},"a":{"roots":[]}}"#);
-        assert!(serde_json::from_str::<FinalInputResponses>(r#"{"z":{"roots":[]},"z":{"roots":[]}}"#).is_err());
+        assert_eq!(
+            responses
+                .entries()
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["z", "a"]
+        );
+        assert_eq!(
+            serde_json::to_string(&responses).unwrap(),
+            r#"{"z":{"roots":[]},"a":{"roots":[]}}"#
+        );
+        assert!(
+            serde_json::from_str::<FinalInputResponses>(r#"{"z":{"roots":[]},"z":{"roots":[]}}"#)
+                .is_err()
+        );
     }
 }

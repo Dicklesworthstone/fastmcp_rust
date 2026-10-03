@@ -20,8 +20,8 @@ use asupersync::http::h1::{HttpClient, Method, RedirectPolicy, RetryPolicy};
 use asupersync::types::Time;
 
 use super::{
-    OAuthClient, OAuthClientConfiguration, OAuthCredentials, OAuthError,
-    encode_form, operation_deadline, within,
+    OAuthClient, OAuthClientConfiguration, OAuthCredentials, OAuthError, encode_form,
+    operation_deadline, within,
 };
 use crate::http_auth::CanonicalHttpUrl;
 
@@ -55,13 +55,19 @@ pub struct OAuthRevocationReport {
 }
 
 impl OAuthRevocationReport {
-    pub fn refresh_token(&self) -> OAuthTokenRevocationOutcome { self.refresh_token }
-    pub fn access_token(&self) -> OAuthTokenRevocationOutcome { self.access_token }
+    pub fn refresh_token(&self) -> OAuthTokenRevocationOutcome {
+        self.refresh_token
+    }
+    pub fn access_token(&self) -> OAuthTokenRevocationOutcome {
+        self.access_token
+    }
 
     /// True only when every token that existed received HTTP 200.
     pub fn fully_revoked(&self) -> bool {
-        matches!(self.refresh_token, OAuthTokenRevocationOutcome::NotPresent | OAuthTokenRevocationOutcome::Succeeded)
-            && self.access_token == OAuthTokenRevocationOutcome::Succeeded
+        matches!(
+            self.refresh_token,
+            OAuthTokenRevocationOutcome::NotPresent | OAuthTokenRevocationOutcome::Succeeded
+        ) && self.access_token == OAuthTokenRevocationOutcome::Succeeded
     }
 }
 
@@ -81,7 +87,9 @@ impl fmt::Display for OAuthRevocationError {
         f.write_str(match self {
             Self::InvalidConfiguration => "invalid OAuth revocation configuration",
             Self::EndpointUnavailable => "OAuth revocation endpoint is unavailable",
-            Self::CredentialBindingMismatch => "OAuth credential belongs to a different revocation client",
+            Self::CredentialBindingMismatch => {
+                "OAuth credential belongs to a different revocation client"
+            }
             Self::RuntimeUnavailable => "OAuth revocation requires caller-owned I/O and time",
             Self::Cancelled => "OAuth revocation cancelled before local invalidation",
             Self::TimedOut => "OAuth revocation deadline expired before local invalidation",
@@ -133,7 +141,10 @@ impl OAuthClient {
         if credentials.configuration != self.configuration {
             return Err(OAuthRevocationError::CredentialBindingMismatch);
         }
-        let endpoint = self.configuration.revocation_endpoint.as_ref()
+        let endpoint = self
+            .configuration
+            .revocation_endpoint
+            .as_ref()
             .ok_or(OAuthRevocationError::EndpointUnavailable)?;
         let deadline = operation_deadline(cx, REVOCATION_TIMEOUT).map_err(map_preflight)?;
         // Preflight is now complete. From this point forward the old lineage is
@@ -142,7 +153,10 @@ impl OAuthClient {
         let refresh = credentials.refresh_token.take();
 
         let refresh_token = match refresh.as_deref() {
-            Some(token) => self.revoke_one(cx, deadline, endpoint, token, "refresh_token").await,
+            Some(token) => {
+                self.revoke_one(cx, deadline, endpoint, token, "refresh_token")
+                    .await
+            }
             None => OAuthTokenRevocationOutcome::NotPresent,
         };
         let access_token = if matches!(
@@ -151,9 +165,19 @@ impl OAuthClient {
         ) {
             OAuthTokenRevocationOutcome::NotAttempted
         } else {
-            self.revoke_one(cx, deadline, endpoint, &credentials.access.token, "access_token").await
+            self.revoke_one(
+                cx,
+                deadline,
+                endpoint,
+                &credentials.access.token,
+                "access_token",
+            )
+            .await
         };
-        Ok(OAuthRevocationReport { refresh_token, access_token })
+        Ok(OAuthRevocationReport {
+            refresh_token,
+            access_token,
+        })
     }
 
     // Shared only within native OAuth, including an exclusively consumed
@@ -182,25 +206,35 @@ impl OAuthClient {
             .max_body_size(MAX_REVOCATION_RESPONSE_BYTES)
             .max_total_connections(1);
         for der in &self.configuration.extra_root_certificates {
-            builder = builder.add_root_certificate(asupersync::tls::Certificate::from_der(der.clone()));
+            builder =
+                builder.add_root_certificate(asupersync::tls::Certificate::from_der(der.clone()));
         }
         let client = builder.build();
         let response = within(cx, deadline, async {
-            client.request(
-                cx,
-                Method::Post,
-                endpoint.as_str(),
-                vec![
-                    ("Content-Type".to_owned(), "application/x-www-form-urlencoded".to_owned()),
-                    ("Accept-Encoding".to_owned(), "identity".to_owned()),
-                    ("Connection".to_owned(), "close".to_owned()),
-                ],
-                body.into_bytes(),
-            ).await.map_err(|_| OAuthError::TransportFailed)
-        }).await;
+            client
+                .request(
+                    cx,
+                    Method::Post,
+                    endpoint.as_str(),
+                    vec![
+                        (
+                            "Content-Type".to_owned(),
+                            "application/x-www-form-urlencoded".to_owned(),
+                        ),
+                        ("Accept-Encoding".to_owned(), "identity".to_owned()),
+                        ("Connection".to_owned(), "close".to_owned()),
+                    ],
+                    body.into_bytes(),
+                )
+                .await
+                .map_err(|_| OAuthError::TransportFailed)
+        })
+        .await;
         match response {
             Ok(response) if response.status == 200 => OAuthTokenRevocationOutcome::Succeeded,
-            Ok(response) => OAuthTokenRevocationOutcome::Rejected { status: response.status },
+            Ok(response) => OAuthTokenRevocationOutcome::Rejected {
+                status: response.status,
+            },
             Err(OAuthError::Cancelled) => OAuthTokenRevocationOutcome::Cancelled,
             Err(OAuthError::TimedOut) => OAuthTokenRevocationOutcome::TimedOut,
             Err(_) => OAuthTokenRevocationOutcome::Uncertain,
@@ -222,10 +256,12 @@ pub(super) fn map_preflight(error: OAuthError) -> OAuthRevocationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
     use crate::http_auth::BoundBearerCredential;
+    use std::time::{Duration, Instant};
 
-    fn url(value: &str) -> CanonicalHttpUrl { CanonicalHttpUrl::parse(value).unwrap() }
+    fn url(value: &str) -> CanonicalHttpUrl {
+        CanonicalHttpUrl::parse(value).unwrap()
+    }
 
     fn config() -> OAuthClientConfiguration {
         OAuthClientConfiguration::from_trusted_endpoints(
@@ -235,7 +271,8 @@ mod tests {
             url("https://resource.example/mcp"),
             "native-client",
             vec![],
-        ).unwrap()
+        )
+        .unwrap()
     }
 
     fn credentials(configuration: OAuthClientConfiguration) -> OAuthCredentials {
@@ -243,8 +280,11 @@ mod tests {
         OAuthCredentials {
             configuration,
             access: BoundBearerCredential::bind_with_expiry(
-                url("https://resource.example/mcp"), "access-secret", expiry,
-            ).unwrap(),
+                url("https://resource.example/mcp"),
+                "access-secret",
+                expiry,
+            )
+            .unwrap(),
             refresh_token: Some("refresh-secret".to_owned()),
             scopes: vec![],
             expires_at: expiry,
@@ -260,13 +300,15 @@ mod tests {
             "https://issuer.example/revoke#fragment",
         ] {
             assert_eq!(
-                config().with_trusted_revocation_endpoint(url(invalid)).err(),
+                config()
+                    .with_trusted_revocation_endpoint(url(invalid))
+                    .err(),
                 Some(OAuthRevocationError::InvalidConfiguration),
             );
         }
-        let admitted = config().with_trusted_revocation_endpoint(
-            url("https://issuer.example/revoke"),
-        ).unwrap();
+        let admitted = config()
+            .with_trusted_revocation_endpoint(url("https://issuer.example/revoke"))
+            .unwrap();
         assert_eq!(
             admitted.revocation_endpoint().map(CanonicalHttpUrl::as_str),
             Some("https://issuer.example/revoke"),
@@ -292,7 +334,10 @@ mod tests {
             };
             result
         };
-        assert_eq!(result.unwrap_err(), OAuthRevocationError::EndpointUnavailable);
+        assert_eq!(
+            result.unwrap_err(),
+            OAuthRevocationError::EndpointUnavailable
+        );
         assert!(credential.has_refresh_token());
         assert!(!credential.bearer_credential().is_revoked());
     }
@@ -304,13 +349,19 @@ mod tests {
             access_token: OAuthTokenRevocationOutcome::Succeeded,
         };
         assert!(success.fully_revoked());
-        assert!(!OAuthRevocationReport {
-            refresh_token: OAuthTokenRevocationOutcome::Uncertain,
-            ..success
-        }.fully_revoked());
-        assert!(OAuthRevocationReport {
-            refresh_token: OAuthTokenRevocationOutcome::NotPresent,
-            ..success
-        }.fully_revoked());
+        assert!(
+            !OAuthRevocationReport {
+                refresh_token: OAuthTokenRevocationOutcome::Uncertain,
+                ..success
+            }
+            .fully_revoked()
+        );
+        assert!(
+            OAuthRevocationReport {
+                refresh_token: OAuthTokenRevocationOutcome::NotPresent,
+                ..success
+            }
+            .fully_revoked()
+        );
     }
 }

@@ -19,16 +19,15 @@ use asupersync::Cx;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::tasks_extension::{Task, TaskStatus};
 
-use crate::http_auth::managed::{OAuthSessionError, deadline_after};
+use super::super::ManagedTaskWatchCheckpoint;
+use super::{
+    MAX_RETENTION, TaskResumeBinding, TaskResumeError, TaskResumeRecord, timestamp_nanos, wall_now,
+};
 use crate::http_auth::managed::tasks::{
     ManagedTaskEvent, ManagedTaskRequest, ManagedTaskRequestIds, ManagedTasksClient,
     ManagedTasksError,
 };
-use super::{
-    MAX_RETENTION, TaskResumeBinding, TaskResumeError, TaskResumeRecord,
-    timestamp_nanos, wall_now,
-};
-use super::super::ManagedTaskWatchCheckpoint;
+use crate::http_auth::managed::{OAuthSessionError, deadline_after};
 
 /// A fresh remote observation, deliberately neither Clone nor serializable.
 /// A terminal Task may be failed/cancelled or contain a tool-level error.
@@ -62,15 +61,22 @@ pub enum TaskResumeReconciliationError {
 }
 impl fmt::Display for TaskResumeReconciliationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self { Self::Resume(error) => error.fmt(f), Self::Task(error) => error.fmt(f) }
+        match self {
+            Self::Resume(error) => error.fmt(f),
+            Self::Task(error) => error.fmt(f),
+        }
     }
 }
 impl std::error::Error for TaskResumeReconciliationError {}
 impl From<TaskResumeError> for TaskResumeReconciliationError {
-    fn from(error: TaskResumeError) -> Self { Self::Resume(error) }
+    fn from(error: TaskResumeError) -> Self {
+        Self::Resume(error)
+    }
 }
 impl From<ManagedTasksError> for TaskResumeReconciliationError {
-    fn from(error: ManagedTasksError) -> Self { Self::Task(error) }
+    fn from(error: ManagedTasksError) -> Self {
+        Self::Task(error)
+    }
 }
 
 impl ManagedTasksClient {
@@ -99,8 +105,13 @@ impl ManagedTasksClient {
         ids: ManagedTaskRequestIds,
     ) -> Result<TaskResumeReconciliation, TaskResumeReconciliationError> {
         Box::pin(self.reconcile_task_resume_with_cancellation(
-            cx, &McpRequestCancellation::new(), current, record, ids,
-        )).await
+            cx,
+            &McpRequestCancellation::new(),
+            current,
+            record,
+            ids,
+        ))
+        .await
     }
 
     /// Dropping/cancelling the future closes only its owned observation. No
@@ -113,21 +124,43 @@ impl ManagedTasksClient {
         record: &TaskResumeRecord,
         ids: ManagedTaskRequestIds,
     ) -> Result<TaskResumeReconciliation, TaskResumeReconciliationError> {
-        self.session.check(cx, cancellation).map_err(ManagedTasksError::from)?;
-        let retention_deadline = resume_read_deadline(cx, current, record, self.session.resource().as_str())?;
-        let deadline = retention_deadline.min(deadline_after(cx, self.limits.timeout).map_err(ManagedTasksError::from)?);
-        let observed = Box::pin(self.session.await_active(cx, cancellation, deadline, None, async {
-            Ok(async {
-                let mut call = self.request_with_cancellation(cx, cancellation, ids,
-                    ManagedTaskRequest::Get(record.task_id.clone())).await?;
-                let Some(ManagedTaskEvent::Snapshot(snapshot)) = call.next_event(cx).await? else {
-                    return Err(ManagedTasksError::InvalidResponse);
-                };
-                Ok::<_, ManagedTasksError>(snapshot.task)
-            }.await)
-        })).await;
-        self.session.check(cx, cancellation).map_err(ManagedTasksError::from)?;
-        if cx.now() >= retention_deadline { return Err(TaskResumeError::Unavailable.into()); }
+        self.session
+            .check(cx, cancellation)
+            .map_err(ManagedTasksError::from)?;
+        let retention_deadline =
+            resume_read_deadline(cx, current, record, self.session.resource().as_str())?;
+        let deadline = retention_deadline
+            .min(deadline_after(cx, self.limits.timeout).map_err(ManagedTasksError::from)?);
+        let observed =
+            Box::pin(
+                self.session
+                    .await_active(cx, cancellation, deadline, None, async {
+                        Ok(async {
+                            let mut call = self
+                                .request_with_cancellation(
+                                    cx,
+                                    cancellation,
+                                    ids,
+                                    ManagedTaskRequest::Get(record.task_id.clone()),
+                                )
+                                .await?;
+                            let Some(ManagedTaskEvent::Snapshot(snapshot)) =
+                                call.next_event(cx).await?
+                            else {
+                                return Err(ManagedTasksError::InvalidResponse);
+                            };
+                            Ok::<_, ManagedTasksError>(snapshot.task)
+                        }
+                        .await)
+                    }),
+            )
+            .await;
+        self.session
+            .check(cx, cancellation)
+            .map_err(ManagedTasksError::from)?;
+        if cx.now() >= retention_deadline {
+            return Err(TaskResumeError::Unavailable.into());
+        }
         record.admit(cx, current)?;
         let task = match observed {
             Ok(Ok(task)) => task,
@@ -137,14 +170,23 @@ impl ManagedTasksClient {
         let next = reconcile_controls(record, current, &task, wall_now())?;
         let outcome = match next {
             Some(record) => {
-                let selection = self.task_watch_checkpoint(vec![task.base().task_id.clone()])
+                let selection = self
+                    .task_watch_checkpoint(vec![task.base().task_id.clone()])
                     .map_err(|_| TaskResumeError::InvalidRecord)?;
-                TaskResumeReconciliation::Active { task: Box::new(task), record, selection }
+                TaskResumeReconciliation::Active {
+                    task: Box::new(task),
+                    record,
+                    selection,
+                }
             }
             None => TaskResumeReconciliation::Terminal(Box::new(task)),
         };
-        self.session.check(cx, cancellation).map_err(ManagedTasksError::from)?;
-        if cx.now() >= retention_deadline { return Err(TaskResumeError::Unavailable.into()); }
+        self.session
+            .check(cx, cancellation)
+            .map_err(ManagedTasksError::from)?;
+        if cx.now() >= retention_deadline {
+            return Err(TaskResumeError::Unavailable.into());
+        }
         record.admit(cx, current)?;
         Ok(outcome)
     }
@@ -162,8 +204,13 @@ pub(crate) fn resume_read_deadline(
     super::checkpoint(cx)?;
     let now = wall_now();
     admit_record(record, current, resource, now)?;
-    let remaining = record.retain_until.checked_sub(now).ok_or(TaskResumeError::Unavailable)?;
-    Ok(cx.now().saturating_add_nanos(u64::try_from(remaining).unwrap_or(u64::MAX)))
+    let remaining = record
+        .retain_until
+        .checked_sub(now)
+        .ok_or(TaskResumeError::Unavailable)?;
+    Ok(cx
+        .now()
+        .saturating_add_nanos(u64::try_from(remaining).unwrap_or(u64::MAX)))
 }
 
 fn admit_record(
@@ -172,16 +219,20 @@ fn admit_record(
     resource: &str,
     now: i128,
 ) -> Result<(), TaskResumeError> {
-    if current.resource.as_str() != resource { return Err(TaskResumeError::Unavailable); }
+    if current.resource.as_str() != resource {
+        return Err(TaskResumeError::Unavailable);
+    }
     record.admit_at(current, now)
 }
 
 fn classify_unavailable(error: ManagedTasksError) -> TaskResumeReconciliationError {
     match error {
-        ManagedTasksError::HttpStatus { status: 401 | 403 | 404 }
-        | ManagedTasksError::Session(OAuthSessionError::AuthorizationRejected { status: 401 | 403 | 404 }) => {
-            TaskResumeError::Unavailable.into()
+        ManagedTasksError::HttpStatus {
+            status: 401 | 403 | 404,
         }
+        | ManagedTasksError::Session(OAuthSessionError::AuthorizationRejected {
+            status: 401 | 403 | 404,
+        }) => TaskResumeError::Unavailable.into(),
         error => error.into(),
     }
 }
@@ -198,17 +249,31 @@ fn reconcile_controls(
 ) -> Result<Option<TaskResumeRecord>, TaskResumeError> {
     previous.admit_at(binding, now)?;
     let base = task.base();
-    let ttl = base.ttl_ms.as_ref().map(|ttl| ttl.try_as_millis())
-        .transpose().map_err(|_| TaskResumeError::InvalidRecord)?;
-    if base.task_id != previous.task_id || ttl != previous.ttl_ms
+    let ttl = base
+        .ttl_ms
+        .as_ref()
+        .map(|ttl| ttl.try_as_millis())
+        .transpose()
+        .map_err(|_| TaskResumeError::InvalidRecord)?;
+    if base.task_id != previous.task_id
+        || ttl != previous.ttl_ms
         || timestamp_nanos(&base.created_at)? != timestamp_nanos(&previous.created_at)?
-    { return Err(TaskResumeError::ConflictingSnapshot); }
+    {
+        return Err(TaskResumeError::ConflictingSnapshot);
+    }
     let old_time = timestamp_nanos(&previous.updated_at)?;
     let updated = timestamp_nanos(&base.last_updated_at)?;
-    if updated < old_time { return Err(TaskResumeError::StaleSnapshot); }
-    let poll = base.poll_interval_ms.as_ref().map(|hint| hint.try_as_millis())
-        .transpose().map_err(|_| TaskResumeError::InvalidRecord)?;
-    if updated == old_time && (base.status != previous.status || poll != previous.poll_interval_ms) {
+    if updated < old_time {
+        return Err(TaskResumeError::StaleSnapshot);
+    }
+    let poll = base
+        .poll_interval_ms
+        .as_ref()
+        .map(|hint| hint.try_as_millis())
+        .transpose()
+        .map_err(|_| TaskResumeError::InvalidRecord)?;
+    if updated == old_time && (base.status != previous.status || poll != previous.poll_interval_ms)
+    {
         return Err(TaskResumeError::ConflictingSnapshot);
     }
     let expected = match task {
@@ -218,12 +283,19 @@ fn reconcile_controls(
         Task::Failed { .. } => TaskStatus::Failed,
         Task::Cancelled(_) => TaskStatus::Cancelled,
     };
-    if base.status != expected { return Err(TaskResumeError::InvalidRecord); }
+    if base.status != expected {
+        return Err(TaskResumeError::InvalidRecord);
+    }
     if let Some(ttl) = ttl {
         let expiry = timestamp_nanos(&base.created_at)? + i128::from(ttl) * 1_000_000;
-        if now >= expiry || updated >= expiry { return Err(TaskResumeError::Unavailable); }
+        if now >= expiry || updated >= expiry {
+            return Err(TaskResumeError::Unavailable);
+        }
     }
-    if matches!(task, Task::Completed { .. } | Task::Failed { .. } | Task::Cancelled(_)) {
+    if matches!(
+        task,
+        Task::Completed { .. } | Task::Failed { .. } | Task::Cancelled(_)
+    ) {
         return Ok(None);
     }
     let mut next = TaskResumeRecord::capture_at(binding, task, MAX_RETENTION, now)?;
@@ -234,8 +306,8 @@ fn reconcile_controls(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::tests::{binding, now, record};
+    use super::*;
     use fastmcp_protocol::tasks_extension::TaskTimestamp;
     use serde_json::json;
 
@@ -243,7 +315,8 @@ mod tests {
         serde_json::from_value(json!({"taskId":"opaque / ID", "status":"input_required",
             "createdAt":"2026-09-21T00:00:00Z", "lastUpdatedAt":"2026-09-21T00:00:02Z",
             "ttlMs":60000, "pollIntervalMs":3000, "statusMessage":"SECRET-MESSAGE",
-            "inputRequests":{"SECRET-REQUEST":{"method":"roots/list"}}})).unwrap()
+            "inputRequests":{"SECRET-REQUEST":{"method":"roots/list"}}}))
+        .unwrap()
     }
 
     #[test]
@@ -251,14 +324,24 @@ mod tests {
         let previous = record();
         let before = previous.encode().unwrap();
         let task = current();
-        let next = reconcile_controls(&previous, &binding(1), &task, now() + 1_000_000_000).unwrap().unwrap();
+        let next = reconcile_controls(&previous, &binding(1), &task, now() + 1_000_000_000)
+            .unwrap()
+            .unwrap();
         assert_eq!(next.key(), previous.key());
         assert_eq!(next.retain_until, previous.retain_until);
         assert_eq!(next.poll_interval_ms, Some(3000));
         assert_eq!(next.updated_at.as_str(), "2026-09-21T00:00:02Z");
         assert_eq!(previous.encode().unwrap(), before);
-        assert!(!next.encode().unwrap().windows(6).any(|bytes| bytes == b"SECRET"));
-        assert!(matches!(task, Task::InputRequired { input_requests, .. } if input_requests.contains_key("SECRET-REQUEST")));
+        assert!(
+            !next
+                .encode()
+                .unwrap()
+                .windows(6)
+                .any(|bytes| bytes == b"SECRET")
+        );
+        assert!(
+            matches!(task, Task::InputRequired { input_requests, .. } if input_requests.contains_key("SECRET-REQUEST"))
+        );
     }
 
     #[test]
@@ -267,7 +350,9 @@ mod tests {
         if let Task::InputRequired { base, .. } = &mut task {
             base.created_at = TaskTimestamp::parse("2026-09-20T20:00:00-04:00").unwrap();
         }
-        let next = reconcile_controls(&record(), &binding(1), &task, now()).unwrap().unwrap();
+        let next = reconcile_controls(&record(), &binding(1), &task, now())
+            .unwrap()
+            .unwrap();
         assert_eq!(next.created_at.as_str(), "2026-09-20T20:00:00-04:00");
     }
 
@@ -279,14 +364,27 @@ mod tests {
             let mut task = current();
             if let Task::InputRequired { base, .. } = &mut task {
                 match dimension {
-                    0 => base.task_id = fastmcp_protocol::tasks_extension::TaskId::parse("other").unwrap(),
+                    0 => {
+                        base.task_id =
+                            fastmcp_protocol::tasks_extension::TaskId::parse("other").unwrap();
+                    }
                     1 => base.ttl_ms = None,
                     2 => base.created_at = TaskTimestamp::parse("2026-09-20T00:00:00Z").unwrap(),
-                    _ => base.last_updated_at = TaskTimestamp::parse("2026-09-21T00:00:00Z").unwrap(),
+                    _ => {
+                        base.last_updated_at =
+                            TaskTimestamp::parse("2026-09-21T00:00:00Z").unwrap();
+                    }
                 }
             }
             let error = reconcile_controls(&previous, &binding(1), &task, now()).unwrap_err();
-            assert_eq!(error, if dimension == 3 { TaskResumeError::StaleSnapshot } else { TaskResumeError::ConflictingSnapshot });
+            assert_eq!(
+                error,
+                if dimension == 3 {
+                    TaskResumeError::StaleSnapshot
+                } else {
+                    TaskResumeError::ConflictingSnapshot
+                }
+            );
             assert_eq!(previous.encode().unwrap(), before);
         }
         assert!(reconcile_controls(&previous, &binding(1), &current(), now()).is_ok());
@@ -296,34 +394,65 @@ mod tests {
     fn equal_timestamp_conflict_and_expired_terminal_do_not_bypass_admission() {
         let previous = record();
         let mut task = current();
-        if let Task::InputRequired { base, .. } = &mut task { base.last_updated_at = previous.updated_at.clone(); }
-        assert!(matches!(reconcile_controls(&previous, &binding(1), &task, now()), Err(TaskResumeError::ConflictingSnapshot)));
+        if let Task::InputRequired { base, .. } = &mut task {
+            base.last_updated_at = previous.updated_at.clone();
+        }
+        assert!(matches!(
+            reconcile_controls(&previous, &binding(1), &task, now()),
+            Err(TaskResumeError::ConflictingSnapshot)
+        ));
         let mut base = current().base().clone();
         base.status = TaskStatus::Cancelled;
         let terminal = Task::Cancelled(base);
-        assert!(reconcile_controls(&previous, &binding(1), &terminal, now()).unwrap().is_none());
-        assert!(matches!(reconcile_controls(&previous, &binding(1), &terminal, previous.retain_until), Err(TaskResumeError::Unavailable)));
+        assert!(
+            reconcile_controls(&previous, &binding(1), &terminal, now())
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            reconcile_controls(&previous, &binding(1), &terminal, previous.retain_until),
+            Err(TaskResumeError::Unavailable)
+        ));
     }
 
     #[test]
     fn preflight_rejects_wrong_owner_and_endpoint_without_interpreting_saved_state() {
         let previous = record();
         assert!(admit_record(&previous, &binding(1), "https://mcp.example/mcp", now()).is_ok());
-        for resource in ["https://mcp.example/other", "https://mcp.example/mcp?tenant=other", "http://mcp.example/mcp"] {
-            assert_eq!(admit_record(&previous, &binding(1), resource, now()), Err(TaskResumeError::Unavailable));
+        for resource in [
+            "https://mcp.example/other",
+            "https://mcp.example/mcp?tenant=other",
+            "http://mcp.example/mcp",
+        ] {
+            assert_eq!(
+                admit_record(&previous, &binding(1), resource, now()),
+                Err(TaskResumeError::Unavailable)
+            );
         }
-        assert_eq!(admit_record(&previous, &binding(2), "https://mcp.example/mcp", now()), Err(TaskResumeError::Unavailable));
+        assert_eq!(
+            admit_record(&previous, &binding(2), "https://mcp.example/mcp", now()),
+            Err(TaskResumeError::Unavailable)
+        );
     }
 
     #[test]
     fn http_unavailable_is_nondisclosing_but_operational_errors_are_not_hidden() {
         for status in [401, 403, 404] {
             let error = classify_unavailable(ManagedTasksError::HttpStatus { status });
-            assert!(matches!(error, TaskResumeReconciliationError::Resume(TaskResumeError::Unavailable)));
+            assert!(matches!(
+                error,
+                TaskResumeReconciliationError::Resume(TaskResumeError::Unavailable)
+            ));
         }
-        assert!(matches!(classify_unavailable(ManagedTasksError::HttpStatus { status: 503 }),
-            TaskResumeReconciliationError::Task(ManagedTasksError::HttpStatus { status: 503 })));
-        assert!(matches!(classify_unavailable(ManagedTasksError::Session(OAuthSessionError::Cancelled)),
-            TaskResumeReconciliationError::Task(ManagedTasksError::Session(OAuthSessionError::Cancelled))));
+        assert!(matches!(
+            classify_unavailable(ManagedTasksError::HttpStatus { status: 503 }),
+            TaskResumeReconciliationError::Task(ManagedTasksError::HttpStatus { status: 503 })
+        ));
+        assert!(matches!(
+            classify_unavailable(ManagedTasksError::Session(OAuthSessionError::Cancelled)),
+            TaskResumeReconciliationError::Task(ManagedTasksError::Session(
+                OAuthSessionError::Cancelled
+            ))
+        ));
     }
 }

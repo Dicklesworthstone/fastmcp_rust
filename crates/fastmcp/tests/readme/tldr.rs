@@ -11,7 +11,7 @@ use fastmcp_rust::{auto::ServerBuilder, prelude::*};
 
 #[tool]
 async fn greet(ctx: &McpContext, name: String) -> McpResult<String> {
-    ctx.checkpoint()?;  // Cancellation point
+    ctx.checkpoint()?; // Cancellation point
     Ok(format!("Hello, {name}!"))
 }
 

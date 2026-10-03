@@ -165,9 +165,9 @@ impl<'request> AuthRequestView<'request> {
             return Err(IngressAuthenticationError::SchemeTooLarge);
         }
         if scheme.is_empty()
-            || !scheme.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
-            })
+            || !scheme
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
         {
             return Err(IngressAuthenticationError::InvalidScheme);
         }
@@ -547,8 +547,18 @@ mod tests {
             assert_eq!(request.scheme(), scheme, "case must not be rewritten");
         }
         for scheme in [
-            "", "Bearer secret", " Bearer", "Bearer ", "Bearer\t", "Bearer\r\nX: value",
-            "Bearer/other", "Bearer=token", "\"Bearer\"", "Béarer", "\0", "\u{7f}",
+            "",
+            "Bearer secret",
+            " Bearer",
+            "Bearer ",
+            "Bearer\t",
+            "Bearer\r\nX: value",
+            "Bearer/other",
+            "Bearer=token",
+            "\"Bearer\"",
+            "Béarer",
+            "\0",
+            "\u{7f}",
         ] {
             assert_eq!(
                 AuthRequestView::new(b"opaque", scheme, "tls", RESOURCE).err(),
@@ -564,7 +574,11 @@ mod tests {
 
     #[test]
     fn resource_admission_counts_utf8_bytes_without_rewriting_targets() {
-        for resource in ["urn:example:resource", "https://example.test/%2F", "urn:example:é"] {
+        for resource in [
+            "urn:example:resource",
+            "https://example.test/%2F",
+            "urn:example:é",
+        ] {
             let request = AuthRequestView::new(b"opaque", "Bearer", "tls", resource).unwrap();
             assert_eq!(request.canonical_resource(), resource);
         }
@@ -589,22 +603,44 @@ mod tests {
             let oversized_scheme = "X".repeat(MAX_AUTH_SCHEME_BYTES + 1);
             let oversized_resource = "r".repeat(MAX_CANONICAL_RESOURCE_BYTES + 1);
             for (scheme, resource, expected) in [
-                ("Bearer secret", RESOURCE, IngressAuthenticationError::InvalidScheme),
-                (oversized_scheme.as_str(), RESOURCE, IngressAuthenticationError::SchemeTooLarge),
-                ("Bearer", "", IngressAuthenticationError::CanonicalResourceAbsent),
-                ("Bearer", oversized_resource.as_str(), IngressAuthenticationError::CanonicalResourceTooLarge),
+                (
+                    "Bearer secret",
+                    RESOURCE,
+                    IngressAuthenticationError::InvalidScheme,
+                ),
+                (
+                    oversized_scheme.as_str(),
+                    RESOURCE,
+                    IngressAuthenticationError::SchemeTooLarge,
+                ),
+                (
+                    "Bearer",
+                    "",
+                    IngressAuthenticationError::CanonicalResourceAbsent,
+                ),
+                (
+                    "Bearer",
+                    oversized_resource.as_str(),
+                    IngressAuthenticationError::CanonicalResourceTooLarge,
+                ),
             ] {
-                let result = AuthRequestView::new(b"opaque", scheme, "tls", resource)
-                    .and_then(|request| {
-                        authenticate_ingress(&cx, Some(&provider), &request, Duration::from_secs(60))
+                let result =
+                    AuthRequestView::new(b"opaque", scheme, "tls", resource).and_then(|request| {
+                        authenticate_ingress(
+                            &cx,
+                            Some(&provider),
+                            &request,
+                            Duration::from_secs(60),
+                        )
                     });
                 assert_eq!(result.unwrap_err(), expected);
                 assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
             }
             let request = AuthRequestView::new(b"opaque", "Bearer", "tls", RESOURCE).unwrap();
-            assert!(authenticate_ingress(
-                &cx, Some(&provider), &request, Duration::from_secs(60)
-            ).is_ok());
+            assert!(
+                authenticate_ingress(&cx, Some(&provider), &request, Duration::from_secs(60))
+                    .is_ok()
+            );
             assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
         });
     }
@@ -615,10 +651,11 @@ mod tests {
             let cx = Cx::current().expect("runtime context");
             let provider = Provider::new(RESOURCE, Duration::ZERO, false);
             let canary = "REQUEST-SECRET-CANARY";
-            let request = AuthRequestView::new(canary.as_bytes(), canary, canary, RESOURCE).unwrap();
-            let ingress = authenticate_ingress(
-                &cx, Some(&provider), &request, Duration::from_secs(60)
-            ).unwrap();
+            let request =
+                AuthRequestView::new(canary.as_bytes(), canary, canary, RESOURCE).unwrap();
+            let ingress =
+                authenticate_ingress(&cx, Some(&provider), &request, Duration::from_secs(60))
+                    .unwrap();
             assert_eq!(ingress.scheme(), canary);
             assert_eq!(ingress.transport_provenance(), canary);
             let diagnostic = format!("{ingress:?}");
@@ -626,7 +663,8 @@ mod tests {
             assert!(!diagnostic.contains(RESOURCE));
             assert!(diagnostic.contains("has_rotation_facts: false"));
             let error = AuthRequestView::new(canary.as_bytes(), "bad scheme", canary, RESOURCE)
-                .err().expect("malformed scheme must fail");
+                .err()
+                .expect("malformed scheme must fail");
             assert!(!format!("{error:?}: {error}").contains(canary));
         });
     }

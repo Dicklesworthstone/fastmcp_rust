@@ -34,8 +34,8 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use asupersync::Cx;
-use fastmcp_transport::TransportError;
 use fastmcp_transport::Transport;
+use fastmcp_transport::TransportError;
 use fastmcp_transport::sse::{SseClientTransport, SseWriter};
 
 /// Records bytes written and how often the writer was flushed.
@@ -56,7 +56,10 @@ struct WriterState {
 
 impl CountingWriter {
     fn flushes(&self) -> usize {
-        self.inner.lock().expect("writer mutex is uncontended").flushes
+        self.inner
+            .lock()
+            .expect("writer mutex is uncontended")
+            .flushes
     }
 
     fn wrote_nothing(&self) -> bool {
@@ -79,7 +82,10 @@ impl Write for CountingWriter {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.lock().expect("writer mutex is uncontended").flushes += 1;
+        self.inner
+            .lock()
+            .expect("writer mutex is uncontended")
+            .flushes += 1;
         Ok(())
     }
 }
@@ -102,8 +108,8 @@ mod ingress_budget {
     use asupersync::Cx;
     use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
     use fastmcp_transport::sse::{
-        LegacySseClientTransport, LegacySseMessagePost, LegacySsePostSink,
-        SseClientTransport, SseEvent, SseReader, SseServerTransport,
+        LegacySseClientTransport, LegacySseMessagePost, LegacySsePostSink, SseClientTransport,
+        SseEvent, SseReader, SseServerTransport,
     };
     use fastmcp_transport::{Transport, TransportError, TransportRecvHalf, TransportSendHalf};
     use std::io::{Cursor, Error, ErrorKind, Read};
@@ -225,10 +231,17 @@ mod ingress_budget {
     fn interrupted_read_then_cancellation_without_progress_is_retryable() {
         let cx = Cx::for_testing();
         let probe = ProbeReader::new(b"data: retained\n\n".to_vec(), usize::MAX);
-        probe.control.lock().expect("read control").cancel_before_progress = Some(cx.clone());
+        probe
+            .control
+            .lock()
+            .expect("read control")
+            .cancel_before_progress = Some(cx.clone());
         let effects = Arc::clone(&probe.effects);
         let mut reader = SseReader::new(probe);
-        assert!(matches!(reader.read_event(&cx), Err(TransportError::Cancelled)));
+        assert!(matches!(
+            reader.read_event(&cx),
+            Err(TransportError::Cancelled)
+        ));
         assert_eq!(snapshot(&effects), ReadEffects { calls: 1, bytes: 0 });
         let event = reader
             .read_event(&Cx::for_testing())
@@ -242,13 +255,22 @@ mod ingress_budget {
         for cancel in [false, true] {
             let cx = Cx::for_testing();
             let probe = ProbeReader::new(b"data: first\n\ndata: second\n\n".to_vec(), 3);
-            probe.control.lock().expect("read control").cancel_after_progress =
-                cancel.then(|| cx.clone());
+            probe
+                .control
+                .lock()
+                .expect("read control")
+                .cancel_after_progress = cancel.then(|| cx.clone());
             let effects = Arc::clone(&probe.effects);
             let mut reader = SseReader::new(probe);
             let result = reader.read_event(&cx);
             if !cancel {
-                assert_eq!(result.expect("same reader without cancellation").expect("first").data, "first");
+                assert_eq!(
+                    result
+                        .expect("same reader without cancellation")
+                        .expect("first")
+                        .data,
+                    "first"
+                );
                 let second = reader.read_event(&cx).expect("read").expect("second");
                 assert_eq!(second.data, "second");
                 continue;
@@ -260,7 +282,11 @@ mod ingress_budget {
                 reader.read_event(&Cx::for_testing()),
                 Err(TransportError::Closed)
             ));
-            assert_eq!(snapshot(&effects), stopped, "must not parse the abandoned suffix");
+            assert_eq!(
+                snapshot(&effects),
+                stopped,
+                "must not parse the abandoned suffix"
+            );
         }
     }
 
@@ -269,13 +295,24 @@ mod ingress_budget {
         let wire = b"id: 9\r\ndata: one\r\ndata: two\r\n\r\ndata: after\r\r";
         for chunk in [1, 2, 3, wire.len()] {
             let mut reader = SseReader::new(ProbeReader::new(wire.to_vec(), chunk));
-            let first = reader.read_event(&Cx::for_testing()).expect("read").expect("first");
+            let first = reader
+                .read_event(&Cx::for_testing())
+                .expect("read")
+                .expect("first");
             assert_eq!(first.data, "one\ntwo", "chunk={chunk}");
             assert_eq!(first.id.as_deref(), Some("9"));
-            let second = reader.read_event(&Cx::for_testing()).expect("read").expect("second");
+            let second = reader
+                .read_event(&Cx::for_testing())
+                .expect("read")
+                .expect("second");
             assert_eq!(second.data, "after", "chunk={chunk}");
             assert_eq!(second.id.as_deref(), Some("9"));
-            assert!(reader.read_event(&Cx::for_testing()).expect("EOF").is_none());
+            assert!(
+                reader
+                    .read_event(&Cx::for_testing())
+                    .expect("EOF")
+                    .is_none()
+            );
         }
     }
 
@@ -284,21 +321,36 @@ mod ingress_budget {
         let probe = ProbeReader::new(message_wire(), 3);
         let effects = Arc::clone(&probe.effects);
         let mut client = SseClientTransport::new(probe, Vec::<u8>::new());
-        assert!(matches!(client.recv(&expired_context()), Err(TransportError::Timeout)));
+        assert!(matches!(
+            client.recv(&expired_context()),
+            Err(TransportError::Timeout)
+        ));
         assert_eq!(snapshot(&effects), ReadEffects::default());
-        assert_response(client.recv(&Cx::for_testing()).expect("same response after timeout"));
+        assert_response(
+            client
+                .recv(&Cx::for_testing())
+                .expect("same response after timeout"),
+        );
     }
 
     #[test]
     fn generic_client_endpoint_timeout_keeps_the_original_endpoint() {
-        let endpoint = SseEvent::endpoint("/original").to_bytes().expect("endpoint");
+        let endpoint = SseEvent::endpoint("/original")
+            .to_bytes()
+            .expect("endpoint");
         let probe = ProbeReader::new(endpoint, 3);
         let effects = Arc::clone(&probe.effects);
         let mut client = SseClientTransport::new(probe, Vec::<u8>::new());
-        assert!(matches!(client.read_endpoint(&expired_context()), Err(TransportError::Timeout)));
+        assert!(matches!(
+            client.read_endpoint(&expired_context()),
+            Err(TransportError::Timeout)
+        ));
         assert_eq!(snapshot(&effects), ReadEffects::default());
         assert_eq!(
-            client.read_endpoint(&Cx::for_testing()).expect("retry").as_deref(),
+            client
+                .read_endpoint(&Cx::for_testing())
+                .expect("retry")
+                .as_deref(),
             Some("/original")
         );
     }
@@ -314,17 +366,28 @@ mod ingress_budget {
 
     #[test]
     fn exact_legacy_establish_and_receive_remain_retryable_before_progress() {
-        let mut wire = SseEvent::endpoint("/original").to_bytes().expect("endpoint");
+        let mut wire = SseEvent::endpoint("/original")
+            .to_bytes()
+            .expect("endpoint");
         wire.extend(message_wire());
         let probe = ProbeReader::new(wire, 3);
         let effects = Arc::clone(&probe.effects);
         let mut client = LegacySseClientTransport::new(probe, NoPost);
-        assert!(matches!(client.establish(&expired_context()), Err(TransportError::Timeout)));
+        assert!(matches!(
+            client.establish(&expired_context()),
+            Err(TransportError::Timeout)
+        ));
         assert_eq!(snapshot(&effects), ReadEffects::default());
         assert_eq!(client.advertised_endpoint(), None);
-        assert_eq!(client.establish(&Cx::for_testing()).expect("retry"), "/original");
+        assert_eq!(
+            client.establish(&Cx::for_testing()).expect("retry"),
+            "/original"
+        );
         let before_receive = snapshot(&effects);
-        assert!(matches!(client.recv(&expired_context()), Err(TransportError::Timeout)));
+        assert!(matches!(
+            client.recv(&expired_context()),
+            Err(TransportError::Timeout)
+        ));
         assert_eq!(snapshot(&effects), before_receive);
         assert_response(client.recv(&Cx::for_testing()).expect("preserved response"));
         assert_eq!(client.advertised_endpoint(), Some("/original"));
@@ -332,7 +395,9 @@ mod ingress_budget {
 
     #[test]
     fn exact_legacy_client_cannot_resume_an_abandoned_message() {
-        let mut wire = SseEvent::endpoint("/original").to_bytes().expect("endpoint");
+        let mut wire = SseEvent::endpoint("/original")
+            .to_bytes()
+            .expect("endpoint");
         wire.extend(message_wire());
         let probe = ProbeReader::new(wire, 1);
         let effects = Arc::clone(&probe.effects);
@@ -346,7 +411,10 @@ mod ingress_budget {
         let stopped = snapshot(&effects);
         assert_eq!(stopped.calls, before.calls + 1);
         assert_eq!(stopped.bytes, before.bytes + 1);
-        assert!(matches!(client.recv(&Cx::for_testing()), Err(TransportError::Closed)));
+        assert!(matches!(
+            client.recv(&Cx::for_testing()),
+            Err(TransportError::Closed)
+        ));
         assert_eq!(snapshot(&effects), stopped);
     }
 
@@ -384,7 +452,10 @@ mod ingress_budget {
     fn server_ingress_timeout_does_not_advance_or_discard_a_request() {
         let advances = Arc::new(AtomicUsize::new(0));
         let mut server = SseServerTransport::new(Vec::<u8>::new(), requests(&advances), "/mcp");
-        assert!(matches!(server.recv(&expired_context()), Err(TransportError::Timeout)));
+        assert!(matches!(
+            server.recv(&expired_context()),
+            Err(TransportError::Timeout)
+        ));
         assert_eq!(advances.load(Ordering::SeqCst), 0);
         assert_request(server.recv(&Cx::for_testing()).expect("retained request"));
         assert_eq!(advances.load(Ordering::SeqCst), 1);
@@ -395,7 +466,10 @@ mod ingress_budget {
         let advances = Arc::new(AtomicUsize::new(0));
         let (mut recv, _send) =
             SseServerTransport::new(Vec::<u8>::new(), requests(&advances), "/mcp").into_split();
-        assert!(matches!(recv.recv(&expired_context()), Err(TransportError::Timeout)));
+        assert!(matches!(
+            recv.recv(&expired_context()),
+            Err(TransportError::Timeout)
+        ));
         assert_eq!(advances.load(Ordering::SeqCst), 0);
         assert_request(recv.recv(&Cx::for_testing()).expect("retained request"));
         assert_eq!(advances.load(Ordering::SeqCst), 1);
@@ -413,15 +487,30 @@ mod ingress_budget {
         let advances = Arc::new(AtomicUsize::new(0));
         let sink = CountingWriter::default();
         let mut server = SseServerTransport::new(sink.clone(), requests(&advances), "/mcp");
-        assert!(matches!(server.close(&expired_context()), Err(TransportError::Timeout)));
+        assert!(matches!(
+            server.close(&expired_context()),
+            Err(TransportError::Timeout)
+        ));
         assert_eq!(sink.flushes(), 0);
         assert!(sink.wrote_nothing());
-        assert_request(server.recv(&Cx::for_testing()).expect("close refusal preserved ingress"));
-        server.send(&Cx::for_testing(), &response()).expect("close refusal preserved egress");
-        assert_eq!(sink.flushes(), 2, "endpoint and response each committed once");
+        assert_request(
+            server
+                .recv(&Cx::for_testing())
+                .expect("close refusal preserved ingress"),
+        );
+        server
+            .send(&Cx::for_testing(), &response())
+            .expect("close refusal preserved egress");
+        assert_eq!(
+            sink.flushes(),
+            2,
+            "endpoint and response each committed once"
+        );
         server.close(&Cx::for_testing()).expect("live close");
         assert_eq!(sink.flushes(), 3);
-        server.close(&expired_context()).expect("terminal close stays idempotent");
+        server
+            .close(&expired_context())
+            .expect("terminal close stays idempotent");
         assert_eq!(sink.flushes(), 3);
     }
 
@@ -431,10 +520,14 @@ mod ingress_budget {
         let sink = CountingWriter::default();
         let (_recv, mut send) =
             SseServerTransport::new(sink.clone(), requests(&advances), "/mcp").into_split();
-        assert!(matches!(send.close(&expired_context()), Err(TransportError::Timeout)));
+        assert!(matches!(
+            send.close(&expired_context()),
+            Err(TransportError::Timeout)
+        ));
         assert_eq!(sink.flushes(), 0);
         assert!(sink.wrote_nothing());
-        send.send(&Cx::for_testing(), &response()).expect("close refusal preserved egress");
+        send.send(&Cx::for_testing(), &response())
+            .expect("close refusal preserved egress");
         assert_eq!(sink.flushes(), 2);
         send.close(&Cx::for_testing()).expect("live close");
         send.close(&expired_context()).expect("idempotent close");
@@ -553,7 +646,9 @@ fn sse_close_stays_idempotent_under_a_cancelled_context() {
 // available here; it exposes no `is_closed()`, so the flush count carries every
 // observable rather than sharing the work with a terminal-state check.
 
-fn client_transport(sink: CountingWriter) -> SseClientTransport<std::io::Cursor<Vec<u8>>, CountingWriter> {
+fn client_transport(
+    sink: CountingWriter,
+) -> SseClientTransport<std::io::Cursor<Vec<u8>>, CountingWriter> {
     SseClientTransport::new(std::io::Cursor::new(Vec::new()), sink)
 }
 
@@ -567,7 +662,11 @@ fn sse_client_close_under_a_live_context_commits_and_flushes() {
         .close(&Cx::for_testing())
         .expect("a live caller context permits the terminal commit");
 
-    assert_eq!(sink.flushes(), 1, "the committed path flushes the sink once");
+    assert_eq!(
+        sink.flushes(),
+        1,
+        "the committed path flushes the sink once"
+    );
 }
 
 /// Limb one: cancellation.
@@ -654,8 +753,8 @@ mod egress_budget {
     use asupersync::Cx;
     use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest};
     use fastmcp_transport::sse::{
-        LegacySseClientTransport, LegacySseMessagePost, LegacySsePostSink,
-        SseClientTransport, SseEvent, SseReader, SseWriter,
+        LegacySseClientTransport, LegacySseMessagePost, LegacySsePostSink, SseClientTransport,
+        SseEvent, SseReader, SseWriter,
     };
     use fastmcp_transport::{Transport, TransportError};
     use std::io::{Cursor, Error, ErrorKind, Write};
@@ -771,13 +870,15 @@ mod egress_budget {
     fn expected_wire(operation: Operation) -> Vec<u8> {
         match operation {
             Operation::Event => SseEvent::message("payload").to_bytes().expect("event"),
-            Operation::Endpoint => SseEvent::endpoint("/messages").to_bytes().expect("endpoint"),
-            Operation::Message => SseEvent::message(
-                r#"{"jsonrpc":"2.0","id":41,"method":"tools/list"}"#,
-            )
-            .with_id("1")
-            .to_bytes()
-            .expect("message"),
+            Operation::Endpoint => SseEvent::endpoint("/messages")
+                .to_bytes()
+                .expect("endpoint"),
+            Operation::Message => {
+                SseEvent::message(r#"{"jsonrpc":"2.0","id":41,"method":"tools/list"}"#)
+                    .with_id("1")
+                    .to_bytes()
+                    .expect("message")
+            }
             Operation::Comment => b": alive\n".to_vec(),
             Operation::KeepAlive => b": keep-alive\n".to_vec(),
         }
@@ -885,14 +986,22 @@ mod egress_budget {
         let (mut probe, effects) = ProbeWriter::new();
         probe.cancel_before_progress = Some(cx.clone());
         let mut writer = SseWriter::new(probe);
-        assert!(matches!(writer.write_message(&cx, &request()), Err(TransportError::Cancelled)));
+        assert!(matches!(
+            writer.write_message(&cx, &request()),
+            Err(TransportError::Cancelled)
+        ));
         let refused = snapshot(&effects);
         assert!(refused.bytes.is_empty());
         assert_eq!(refused.writes, 1);
         assert_eq!(refused.flushes, 0);
-        writer.write_message(&Cx::for_testing(), &request()).expect("safe retry");
+        writer
+            .write_message(&Cx::for_testing(), &request())
+            .expect("safe retry");
         let mut reader = SseReader::new(Cursor::new(snapshot(&effects).bytes));
-        let event = reader.read_event(&Cx::for_testing()).expect("read").expect("event");
+        let event = reader
+            .read_event(&Cx::for_testing())
+            .expect("read")
+            .expect("event");
         assert_eq!(event.id.as_deref(), Some("1"));
         let json: serde_json::Value = serde_json::from_str(&event.data).expect("JSON");
         assert_eq!(json["id"], 41);
@@ -904,11 +1013,17 @@ mod egress_budget {
         let (mut probe, effects) = ProbeWriter::new();
         probe.cancel_after_progress = Some(cx.clone());
         let mut writer = SseWriter::new(probe);
-        assert!(matches!(writer.keep_alive(&cx), Err(TransportError::Cancelled)));
+        assert!(matches!(
+            writer.keep_alive(&cx),
+            Err(TransportError::Cancelled)
+        ));
         let stopped = snapshot(&effects);
         assert_eq!(stopped.bytes, b": keep-alive\n");
         assert_eq!(stopped.flushes, 0);
-        assert!(matches!(writer.keep_alive(&Cx::for_testing()), Err(TransportError::Closed)));
+        assert!(matches!(
+            writer.keep_alive(&Cx::for_testing()),
+            Err(TransportError::Closed)
+        ));
         assert_eq!(snapshot(&effects), stopped);
     }
 
@@ -918,11 +1033,15 @@ mod egress_budget {
         let (mut probe, effects) = ProbeWriter::new();
         probe.cancel_in_flush = Some(cx.clone());
         let mut writer = SseWriter::new(probe);
-        writer.keep_alive(&cx).expect("the frame was already committed");
+        writer
+            .keep_alive(&cx)
+            .expect("the frame was already committed");
         assert!(cx.is_cancel_requested());
         assert_eq!(snapshot(&effects).bytes, b": keep-alive\n");
         assert_eq!(snapshot(&effects).flushes, 1);
-        writer.keep_alive(&Cx::for_testing()).expect("successful commit did not poison the stream");
+        writer
+            .keep_alive(&Cx::for_testing())
+            .expect("successful commit did not poison the stream");
         assert_eq!(snapshot(&effects).bytes, b": keep-alive\n: keep-alive\n");
     }
 
@@ -931,12 +1050,17 @@ mod egress_budget {
         let (mut probe, effects) = ProbeWriter::new();
         probe.zero_write = true;
         let mut writer = SseWriter::new(probe);
-        let error = writer.keep_alive(&Cx::for_testing()).expect_err("write zero");
+        let error = writer
+            .keep_alive(&Cx::for_testing())
+            .expect_err("write zero");
         assert!(matches!(
             error,
             TransportError::Io(ref error) if error.kind() == ErrorKind::WriteZero
         ));
-        assert!(matches!(writer.keep_alive(&Cx::for_testing()), Err(TransportError::Closed)));
+        assert!(matches!(
+            writer.keep_alive(&Cx::for_testing()),
+            Err(TransportError::Closed)
+        ));
         assert_eq!(snapshot(&effects).writes, 1);
         assert_eq!(snapshot(&effects).flushes, 0);
     }
@@ -950,7 +1074,9 @@ mod egress_budget {
             Err(TransportError::Timeout)
         ));
         assert_eq!(snapshot(&effects), Effects::default());
-        client.send(&Cx::for_testing(), &request()).expect("live retry");
+        client
+            .send(&Cx::for_testing(), &request())
+            .expect("live retry");
         let committed = snapshot(&effects);
         assert_eq!(committed.flushes, 1);
         assert!(committed.bytes.ends_with(b"\n"));
@@ -967,12 +1093,18 @@ mod egress_budget {
         probe.chunk = 3;
         probe.cancel_after_progress = Some(cx.clone());
         let mut client = SseClientTransport::new(Cursor::new(Vec::<u8>::new()), probe);
-        assert!(matches!(client.send(&cx, &request()), Err(TransportError::Cancelled)));
+        assert!(matches!(
+            client.send(&cx, &request()),
+            Err(TransportError::Cancelled)
+        ));
         let stopped = snapshot(&effects);
         assert_eq!(stopped.bytes.len(), 3);
         assert_eq!(stopped.writes, 1);
         assert_eq!(stopped.flushes, 0);
-        assert!(matches!(client.send(&Cx::for_testing(), &request()), Err(TransportError::Closed)));
+        assert!(matches!(
+            client.send(&Cx::for_testing(), &request()),
+            Err(TransportError::Closed)
+        ));
         assert_eq!(snapshot(&effects), stopped);
     }
 
@@ -994,15 +1126,22 @@ mod egress_budget {
     #[test]
     fn exact_legacy_adapter_refuses_expired_budget_before_calling_the_post_sink() {
         let posts = PostLog::default();
-        let endpoint = SseEvent::endpoint("/messages?owner=one").to_bytes().expect("endpoint");
+        let endpoint = SseEvent::endpoint("/messages?owner=one")
+            .to_bytes()
+            .expect("endpoint");
         let mut client = LegacySseClientTransport::new(Cursor::new(endpoint), posts.clone());
-        assert_eq!(client.establish(&Cx::for_testing()).expect("establish"), "/messages?owner=one");
+        assert_eq!(
+            client.establish(&Cx::for_testing()).expect("establish"),
+            "/messages?owner=one"
+        );
         assert!(matches!(
             client.send(&expired_context(), &request()),
             Err(TransportError::Timeout)
         ));
         assert!(posts.0.lock().expect("post log").is_empty());
-        client.send(&Cx::for_testing(), &request()).expect("live retry");
+        client
+            .send(&Cx::for_testing(), &request())
+            .expect("live retry");
         let posts = posts.0.lock().expect("post log");
         assert_eq!(posts.len(), 1);
         assert_eq!(posts[0].0, "/messages?owner=one");

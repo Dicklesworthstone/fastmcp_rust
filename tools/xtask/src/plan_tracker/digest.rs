@@ -69,15 +69,27 @@ pub fn sha256(input: &[u8]) -> [u8; 32] {
     // `as_chunks` therefore yields an empty remainder, asserted below rather
     // than assumed.
     let (blocks, remainder) = padded.as_chunks::<64>();
-    debug_assert!(remainder.is_empty(), "padding must produce whole 64-byte blocks");
+    debug_assert!(
+        remainder.is_empty(),
+        "padding must produce whole 64-byte blocks"
+    );
     for chunk in blocks {
         for (index, word) in w.iter_mut().enumerate().take(16) {
             let base = index * 4;
-            *word = u32::from_be_bytes([chunk[base], chunk[base + 1], chunk[base + 2], chunk[base + 3]]);
+            *word = u32::from_be_bytes([
+                chunk[base],
+                chunk[base + 1],
+                chunk[base + 2],
+                chunk[base + 3],
+            ]);
         }
         for index in 16..64 {
-            let s0 = w[index - 15].rotate_right(7) ^ w[index - 15].rotate_right(18) ^ (w[index - 15] >> 3);
-            let s1 = w[index - 2].rotate_right(17) ^ w[index - 2].rotate_right(19) ^ (w[index - 2] >> 10);
+            let s0 = w[index - 15].rotate_right(7)
+                ^ w[index - 15].rotate_right(18)
+                ^ (w[index - 15] >> 3);
+            let s1 = w[index - 2].rotate_right(17)
+                ^ w[index - 2].rotate_right(19)
+                ^ (w[index - 2] >> 10);
             w[index] = w[index - 16]
                 .wrapping_add(s0)
                 .wrapping_add(w[index - 7])
@@ -146,11 +158,19 @@ pub fn sha1(input: &[u8]) -> [u8; 20] {
     // `as_chunks` therefore yields an empty remainder, asserted below rather
     // than assumed.
     let (blocks, remainder) = padded.as_chunks::<64>();
-    debug_assert!(remainder.is_empty(), "padding must produce whole 64-byte blocks");
+    debug_assert!(
+        remainder.is_empty(),
+        "padding must produce whole 64-byte blocks"
+    );
     for chunk in blocks {
         for (index, word) in w.iter_mut().enumerate().take(16) {
             let base = index * 4;
-            *word = u32::from_be_bytes([chunk[base], chunk[base + 1], chunk[base + 2], chunk[base + 3]]);
+            *word = u32::from_be_bytes([
+                chunk[base],
+                chunk[base + 1],
+                chunk[base + 2],
+                chunk[base + 3],
+            ]);
         }
         for index in 16..80 {
             w[index] = (w[index - 3] ^ w[index - 8] ^ w[index - 14] ^ w[index - 16]).rotate_left(1);
@@ -243,9 +263,14 @@ mod tests {
     #[test]
     fn sha1_matches_published_vectors() {
         assert_eq!(hex(&sha1(b"")), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
-        assert_eq!(hex(&sha1(b"abc")), "a9993e364706816aba3e25717850c26c9cd0d89d");
         assert_eq!(
-            hex(&sha1(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")),
+            hex(&sha1(b"abc")),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        assert_eq!(
+            hex(&sha1(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )),
             "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
         );
     }
@@ -253,7 +278,10 @@ mod tests {
     #[test]
     fn git_blob_identity_matches_git_hash_object() {
         // `printf '' | git hash-object -t blob --stdin`
-        assert_eq!(git_blob_hex(b""), "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391");
+        assert_eq!(
+            git_blob_hex(b""),
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+        );
         // `printf 'hello\n' | git hash-object -t blob --stdin`
         assert_eq!(
             git_blob_hex(b"hello\n"),
@@ -270,7 +298,11 @@ mod tests {
     fn hex_rendering_is_lowercase_and_bare() {
         let rendered = sha256_hex(b"abc");
         assert_eq!(rendered.len(), 64);
-        assert!(rendered.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        assert!(
+            rendered
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        );
         assert!(!rendered.contains("0x") && !rendered.contains(char::is_whitespace));
     }
 

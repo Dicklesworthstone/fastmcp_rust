@@ -18,8 +18,8 @@ use crate::{
     AdmissionController, AdmissionError, AdmissionPartition, AdmissionReservation,
     AuthorizationFlowQuotaKey, DEFAULT_CANCELLATION_REASON_MAX_BYTES, DEFAULT_CURSOR_MAX_BYTES,
     DEFAULT_JSON_RPC_MAX_BODY_BYTES, DEFAULT_METADATA_MAX_BYTES, DEFAULT_METADATA_MAX_ENTRIES,
-    DEFAULT_URI_MAX_BYTES, PreAuthSourceBucketKey,
-    ProtocolLimit, ProtocolLimits, ProtocolLimitsError, QuotaPartitionKey, SealedAdmissionKeyError,
+    DEFAULT_URI_MAX_BYTES, PreAuthSourceBucketKey, ProtocolLimit, ProtocolLimits,
+    ProtocolLimitsError, QuotaPartitionKey, SealedAdmissionKeyError,
 };
 
 /// The documented default snapshot every row starts from.
@@ -104,8 +104,8 @@ pub(crate) fn build_with_override(
         ProtocolLimit::MetadataEntries,
         DEFAULT_METADATA_MAX_ENTRIES as usize,
     );
-    let entries = u16::try_from(entries)
-        .map_err(|_| ProtocolLimitsError::ExceedsHardCeiling { limit })?;
+    let entries =
+        u16::try_from(entries).map_err(|_| ProtocolLimitsError::ExceedsHardCeiling { limit })?;
     ProtocolLimits::builder()
         .json_rpc_max_body_bytes(pick(
             ProtocolLimit::JsonRpcBodyBytes,
@@ -323,7 +323,8 @@ pub(crate) fn run_partition_rows() -> Vec<PartitionObservation> {
     // The request snapshot is immutable for its lifecycle: the generation read
     // after all five rows equals the one captured before the first.
     assert_eq!(
-        snapshot, accepted.snapshot(),
+        snapshot,
+        accepted.snapshot(),
         "the request snapshot must be immutable across its lifecycle"
     );
     rows
@@ -424,6 +425,7 @@ pub(crate) struct Counters {
     pub(crate) live: usize,
 }
 
+#[rustfmt::skip] // Identical in src/limit_01_rows.rs and tests/limit_01_rows/mod.rs.
 pub(crate) fn observe(controller: &AdmissionController, partition: &AdmissionPartition) -> Counters {
     Counters {
         global_in_use: controller.global_in_use(),
@@ -720,10 +722,7 @@ pub(crate) fn run_lifecycle_rows() -> Vec<LifecycleObservation> {
 
         let after = observe(&controller, &subject);
         let (repeated_commit, repeated_release) = match settled.as_mut() {
-            Some(reservation) => (
-                Some(reservation.commit()),
-                Some(reservation.release()),
-            ),
+            Some(reservation) => (Some(reservation.commit()), Some(reservation.release())),
             None => (None, None),
         };
         assert_eq!(
@@ -809,23 +808,22 @@ pub(crate) fn run_fairness_rows() -> Vec<FairnessObservation> {
     let right = partition_for("tcp:203.0.113.11");
     let mut rows = Vec::new();
 
-    let record =
-        |id: &'static str,
-         partition: &'static str,
-         requested: usize,
-         outcome: &'static str,
-         diagnostic: Option<AdmissionError>,
-         controller: &AdmissionController| FairnessObservation {
-            id,
-            partition,
-            requested,
-            outcome,
-            diagnostic,
-            global_in_use: controller.global_in_use(),
-            left_in_use: controller.partition_in_use(&left),
-            right_in_use: controller.partition_in_use(&right),
-            release_count: controller.release_count(),
-        };
+    let record = |id: &'static str,
+                  partition: &'static str,
+                  requested: usize,
+                  outcome: &'static str,
+                  diagnostic: Option<AdmissionError>,
+                  controller: &AdmissionController| FairnessObservation {
+        id,
+        partition,
+        requested,
+        outcome,
+        diagnostic,
+        global_in_use: controller.global_in_use(),
+        left_in_use: controller.partition_in_use(&left),
+        right_in_use: controller.partition_in_use(&right),
+        release_count: controller.release_count(),
+    };
 
     // LIMIT-B-03.01 — left saturates the global ceiling.
     let mut left_hold = controller

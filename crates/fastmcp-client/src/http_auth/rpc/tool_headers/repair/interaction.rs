@@ -19,9 +19,9 @@ use fastmcp_protocol::http_headers::ParameterHeaderBinding;
 use fastmcp_protocol::{CoreRequest, FinalTool, RequestId};
 
 use super::{
-    ManagedCatalogError, ManagedOAuthSession, RejectedToolHeaders,
-    ReviewedToolHeaders, ToolHeaderRepairContract, ToolHeaderRepairError,
-    ToolHeaderRepairLimits, ToolHeaderRepairOutcome,
+    ManagedCatalogError, ManagedOAuthSession, RejectedToolHeaders, ReviewedToolHeaders,
+    ToolHeaderRepairContract, ToolHeaderRepairError, ToolHeaderRepairLimits,
+    ToolHeaderRepairOutcome,
 };
 use crate::http_auth::rpc::interaction::{
     ManagedInteraction, ManagedInteractionError, ManagedInteractionLimits,
@@ -40,8 +40,11 @@ pub struct ToolHeaderInteractionLimits {
 
 impl Default for ToolHeaderInteractionLimits {
     fn default() -> Self {
-        Self { repair: ToolHeaderRepairLimits::default(),
-            maximum_continuations: 8, maximum_input_responses: 256 }
+        Self {
+            repair: ToolHeaderRepairLimits::default(),
+            maximum_continuations: 8,
+            maximum_input_responses: 256,
+        }
     }
 }
 
@@ -54,7 +57,11 @@ impl ToolHeaderInteractionLimits {
         maximum_input_responses: usize,
     ) -> Result<Self, ManagedInteractionError> {
         ManagedInteractionLimits::new(repair.core, maximum_continuations, maximum_input_responses)?;
-        Ok(Self { repair, maximum_continuations, maximum_input_responses })
+        Ok(Self {
+            repair,
+            maximum_continuations,
+            maximum_input_responses,
+        })
     }
 }
 
@@ -75,10 +82,14 @@ impl fmt::Display for ToolHeaderInteractionError {
 }
 impl std::error::Error for ToolHeaderInteractionError {}
 impl From<ToolHeaderRepairError> for ToolHeaderInteractionError {
-    fn from(error: ToolHeaderRepairError) -> Self { Self::Repair(error) }
+    fn from(error: ToolHeaderRepairError) -> Self {
+        Self::Repair(error)
+    }
 }
 impl From<ManagedInteractionError> for ToolHeaderInteractionError {
-    fn from(error: ManagedInteractionError) -> Self { Self::Interaction(error) }
+    fn from(error: ManagedInteractionError) -> Self {
+        Self::Interaction(error)
+    }
 }
 
 /// Success owns the unread response inside an ordinary interaction. Rejection
@@ -98,7 +109,8 @@ pub struct RejectedToolHeaderInteraction {
 }
 impl fmt::Debug for RejectedToolHeaderInteraction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RejectedToolHeaderInteraction").finish_non_exhaustive()
+        f.debug_struct("RejectedToolHeaderInteraction")
+            .finish_non_exhaustive()
     }
 }
 
@@ -110,13 +122,26 @@ impl ManagedOAuthSession {
     /// automatically. Use the explicit cancellation variant to abort host pauses.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_tool_interaction_with_header_repair(
-        &self, cx: &Cx, request: CoreRequest, request_id: RequestId,
-        reviewed: Arc<ReviewedToolHeaders>, endpoint: ToolHeaderRepairContract,
+        &self,
+        cx: &Cx,
+        request: CoreRequest,
+        request_id: RequestId,
+        reviewed: Arc<ReviewedToolHeaders>,
+        endpoint: ToolHeaderRepairContract,
         limits: ToolHeaderInteractionLimits,
     ) -> Result<ToolHeaderInteractionOutcome, ToolHeaderInteractionError> {
-        Box::pin(self.start_tool_interaction_with_header_repair_and_cancellation(
-            cx, &McpRequestCancellation::new(), request, request_id, reviewed, endpoint, limits,
-        )).await
+        Box::pin(
+            self.start_tool_interaction_with_header_repair_and_cancellation(
+                cx,
+                &McpRequestCancellation::new(),
+                request,
+                request_id,
+                reviewed,
+                endpoint,
+                limits,
+            ),
+        )
+        .await
     }
 
     /// Retains request-local cancellation across rejection, host approval,
@@ -124,21 +149,42 @@ impl ManagedOAuthSession {
     /// and siblings are not deliberately cancelled by this operation.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_tool_interaction_with_header_repair_and_cancellation(
-        &self, cx: &Cx, cancellation: &McpRequestCancellation,
-        request: CoreRequest, request_id: RequestId, reviewed: Arc<ReviewedToolHeaders>,
-        endpoint: ToolHeaderRepairContract, limits: ToolHeaderInteractionLimits,
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        request: CoreRequest,
+        request_id: RequestId,
+        reviewed: Arc<ReviewedToolHeaders>,
+        endpoint: ToolHeaderRepairContract,
+        limits: ToolHeaderInteractionLimits,
     ) -> Result<ToolHeaderInteractionOutcome, ToolHeaderInteractionError> {
         let outcome = Box::pin(self.request_tool_with_header_repair_and_cancellation(
-            cx, cancellation, request, request_id, &reviewed, endpoint, limits.repair,
-        )).await?;
+            cx,
+            cancellation,
+            request,
+            request_id,
+            &reviewed,
+            endpoint,
+            limits.repair,
+        ))
+        .await?;
         Ok(match outcome {
-            ToolHeaderRepairOutcome::Call(call) => ToolHeaderInteractionOutcome::Interaction(Box::new(
-                ManagedInteraction::from_initial_header_call(cx, self.clone(), call, reviewed,
-                    limits.maximum_continuations, limits.maximum_input_responses)?,
-            )),
-            ToolHeaderRepairOutcome::Rejected(rejected) => ToolHeaderInteractionOutcome::Rejected(Box::new(
-                RejectedToolHeaderInteraction { rejected, limits },
-            )),
+            ToolHeaderRepairOutcome::Call(call) => ToolHeaderInteractionOutcome::Interaction(
+                Box::new(ManagedInteraction::from_initial_header_call(
+                    cx,
+                    self.clone(),
+                    call,
+                    reviewed,
+                    limits.maximum_continuations,
+                    limits.maximum_input_responses,
+                )?),
+            ),
+            ToolHeaderRepairOutcome::Rejected(rejected) => {
+                ToolHeaderInteractionOutcome::Rejected(Box::new(RejectedToolHeaderInteraction {
+                    rejected,
+                    limits,
+                }))
+            }
         })
     }
 }
@@ -156,17 +202,26 @@ impl RejectedToolHeaderInteraction {
     /// are inherited rather than reset. Correctable input errors retain their
     /// challenge exactly as on an interaction opened without repair.
     pub async fn refresh_and_start<I, A, R>(
-        self, cx: &Cx, next_id: I, approve: A, review: R,
+        self,
+        cx: &Cx,
+        next_id: I,
+        approve: A,
+        review: R,
     ) -> Result<ManagedInteraction, ToolHeaderInteractionError>
     where
         I: FnMut() -> Result<RequestId, ManagedCatalogError>,
         A: FnOnce(&FinalTool) -> bool,
         R: FnMut(&ParameterHeaderBinding) -> bool,
     {
-        Ok(Box::pin(self.rejected.refresh_and_start_interaction(cx,
-            self.limits.maximum_continuations, self.limits.maximum_input_responses,
-            next_id, approve, review,
-        )).await?)
+        Ok(Box::pin(self.rejected.refresh_and_start_interaction(
+            cx,
+            self.limits.maximum_continuations,
+            self.limits.maximum_input_responses,
+            next_id,
+            approve,
+            review,
+        ))
+        .await?)
     }
 }
 

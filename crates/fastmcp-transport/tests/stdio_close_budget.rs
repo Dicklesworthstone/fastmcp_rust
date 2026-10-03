@@ -43,7 +43,10 @@ struct WriterState {
 
 impl CountingWriter {
     fn flushes(&self) -> usize {
-        self.inner.lock().expect("writer mutex is uncontended").flushes
+        self.inner
+            .lock()
+            .expect("writer mutex is uncontended")
+            .flushes
     }
 
     fn recorded(&self) -> Vec<u8> {
@@ -66,7 +69,10 @@ impl Write for CountingWriter {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.lock().expect("writer mutex is uncontended").flushes += 1;
+        self.inner
+            .lock()
+            .expect("writer mutex is uncontended")
+            .flushes += 1;
         Ok(())
     }
 }

@@ -14,16 +14,16 @@ use asupersync::types::Time;
 use fastmcp_core::McpRequestCancellation;
 
 use super::{
-    AsyncOAuthRefreshError, AsyncOAuthRefreshStore, CredentialCommitAnchor,
-    CredentialIoError, CredentialSlotTask, OAuthClient, OAuthGrantProtector,
-    OAuthRefreshCompletion, OAuthRefreshGrant, OAuthRefreshStoreError,
-    OAuthRefreshSubmissionFailure, PartitionAuthorization, SlotRevision,
+    AsyncOAuthRefreshError, AsyncOAuthRefreshStore, CredentialCommitAnchor, CredentialIoError,
+    CredentialSlotTask, OAuthClient, OAuthGrantProtector, OAuthRefreshCompletion,
+    OAuthRefreshGrant, OAuthRefreshStoreError, OAuthRefreshSubmissionFailure,
+    PartitionAuthorization, SlotRevision,
 };
 use crate::http_auth::managed::ManagedOAuthSession;
-use crate::http_auth::oauth::{OAuthError, operation_deadline, within};
 use crate::http_auth::oauth::revocation::{
     OAuthRevocationError, OAuthTokenRevocationOutcome, REVOCATION_TIMEOUT, map_preflight,
 };
+use crate::http_auth::oauth::{OAuthError, operation_deadline, within};
 
 impl OAuthClient {
     /// Consumes an exclusively owned refresh grant and attempts its revocation
@@ -51,10 +51,21 @@ impl OAuthClient {
         if grant.configuration != self.configuration {
             return Err(OAuthRevocationError::CredentialBindingMismatch);
         }
-        let endpoint = self.configuration.revocation_endpoint.as_ref()
+        let endpoint = self
+            .configuration
+            .revocation_endpoint
+            .as_ref()
             .ok_or(OAuthRevocationError::EndpointUnavailable)?;
         let deadline = operation_deadline(cx, REVOCATION_TIMEOUT).map_err(map_preflight)?;
-        Ok(self.revoke_one(cx, deadline, endpoint, &grant.refresh_token, "refresh_token").await)
+        Ok(self
+            .revoke_one(
+                cx,
+                deadline,
+                endpoint,
+                &grant.refresh_token,
+                "refresh_token",
+            )
+            .await)
     }
 }
 
@@ -82,15 +93,27 @@ pub struct OAuthRefreshLogoutReport {
     remote: OAuthPersistentRevocation,
 }
 impl OAuthRefreshLogoutReport {
-    pub fn local_session_closed(&self) -> bool { self.local_session_closed }
+    pub fn local_session_closed(&self) -> bool {
+        self.local_session_closed
+    }
     /// Some only after the coordinator proved a settled tombstone. It remains
     /// known after remote failure or cancellation; no new revision is invented.
-    pub fn retired_revision(&self) -> Option<SlotRevision> { self.retired_revision }
-    pub fn remote(&self) -> OAuthPersistentRevocation { self.remote }
+    pub fn retired_revision(&self) -> Option<SlotRevision> {
+        self.retired_revision
+    }
+    pub fn remote(&self) -> OAuthPersistentRevocation {
+        self.remote
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OAuthRefreshLogoutStage { ReadyToRetire, Retiring, ReadyToRevoke, Complete, Stopped }
+pub enum OAuthRefreshLogoutStage {
+    ReadyToRetire,
+    Retiring,
+    ReadyToRevoke,
+    Complete,
+    Stopped,
+}
 
 /// One completed local retirement. The grant, when present, has ALREADY left
 /// persistent custody. Explicit extraction transfers it, never reconstructs it.
@@ -101,13 +124,18 @@ pub struct OAuthRefreshRetirement {
     remote: OAuthPersistentRevocation,
 }
 impl OAuthRefreshRetirement {
-    pub fn into_parts(self) -> (SlotRevision, Option<OAuthRefreshGrant>, OAuthPersistentRevocation) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        SlotRevision,
+        Option<OAuthRefreshGrant>,
+        OAuthPersistentRevocation,
+    ) {
         (self.revision, self.grant, self.remote)
     }
 }
-pub type OAuthRefreshRetirementCompletion<A, P> = OAuthRefreshCompletion<
-    A, P, Result<OAuthRefreshRetirement, OAuthRefreshStoreError>,
->;
+pub type OAuthRefreshRetirementCompletion<A, P> =
+    OAuthRefreshCompletion<A, P, Result<OAuthRefreshRetirement, OAuthRefreshStoreError>>;
 
 /// Actual ownership on interrupted observation, usable for explicit cleanup.
 /// Pending storage completion may be observed with another live Cx to learn
@@ -117,7 +145,10 @@ pub enum OAuthRefreshLogoutCustody<A, P> {
     Retiring(CredentialSlotTask<OAuthRefreshRetirementCompletion<A, P>>),
     // The grant is boxed so this variant is no larger than the store-only
     // ones (bd-19tqe); its secret already lives in a heap String.
-    ReadyToRevoke { store: AsyncOAuthRefreshStore<A, P>, grant: Box<OAuthRefreshGrant> },
+    ReadyToRevoke {
+        store: AsyncOAuthRefreshStore<A, P>,
+        grant: Box<OAuthRefreshGrant>,
+    },
     Complete(AsyncOAuthRefreshStore<A, P>),
     Stopped(Option<AsyncOAuthRefreshStore<A, P>>),
 }
@@ -137,7 +168,9 @@ impl fmt::Display for OAuthRefreshLogoutError {
             Self::Submission(error) => error.fmt(f),
             Self::Completion(error) => error.fmt(f),
             Self::Storage(error) => error.fmt(f),
-            Self::Stopped => f.write_str("persistent OAuth logout stopped; inspect retained custody and report"),
+            Self::Stopped => {
+                f.write_str("persistent OAuth logout stopped; inspect retained custody and report")
+            }
         }
     }
 }
@@ -173,7 +206,9 @@ pub struct OAuthRefreshLogout<A, P> {
 }
 
 impl<A, P> AsyncOAuthRefreshStore<A, P>
-where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
+where
+    A: CredentialCommitAnchor + 'static,
+    P: OAuthGrantProtector + 'static,
 {
     /// Prepares one logout with no storage or network effects. Configuration,
     /// timeout and caller admission precede optional session closure; refusal
@@ -186,8 +221,12 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
     /// sessions and issuer-side access tokens are outside this operation.
     #[allow(clippy::too_many_arguments)]
     pub fn begin_logout(
-        self, cx: &Cx, client: &OAuthClient, authorization: PartitionAuthorization,
-        session: Option<&ManagedOAuthSession>, cancellation: &McpRequestCancellation,
+        self,
+        cx: &Cx,
+        client: &OAuthClient,
+        authorization: PartitionAuthorization,
+        session: Option<&ManagedOAuthSession>,
+        cancellation: &McpRequestCancellation,
         timeout: Duration,
     ) -> Result<OAuthRefreshLogout<A, P>, OAuthRefreshSubmissionFailure<A, P, ()>> {
         let admitted = (|| {
@@ -195,33 +234,53 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
                 return Err(AsyncOAuthRefreshError::Io(CredentialIoError::InvalidLimits));
             }
             if self.store.configuration != client.configuration
-                || session.is_some_and(|session| session.resource() != &client.configuration.resource)
+                || session
+                    .is_some_and(|session| session.resource() != &client.configuration.resource)
             {
-                return Err(AsyncOAuthRefreshError::Store(OAuthRefreshStoreError::ConfigurationMismatch));
+                return Err(AsyncOAuthRefreshError::Store(
+                    OAuthRefreshStoreError::ConfigurationMismatch,
+                ));
             }
             if cancellation.is_cancel_requested() {
-                return Err(AsyncOAuthRefreshError::Store(OAuthRefreshStoreError::ContextStopped));
+                return Err(AsyncOAuthRefreshError::Store(
+                    OAuthRefreshStoreError::ContextStopped,
+                ));
             }
             operation_deadline(cx, timeout)
                 .map_err(|_| AsyncOAuthRefreshError::Store(OAuthRefreshStoreError::ContextStopped))
         })();
         let deadline = match admitted {
             Ok(deadline) => deadline,
-            Err(cause) => return Err(OAuthRefreshSubmissionFailure { cause, retained: Some(Box::new((self, ()))) }),
+            Err(cause) => {
+                return Err(OAuthRefreshSubmissionFailure {
+                    cause,
+                    retained: Some(Box::new((self, ()))),
+                });
+            }
         };
-        if let Some(session) = session { session.close(); }
+        if let Some(session) = session {
+            session.close();
+        }
         Ok(OAuthRefreshLogout {
-            origin: cx.clone(), cancellation: cancellation.clone(), deadline,
-            client: client.clone(), authorization,
-            report: OAuthRefreshLogoutReport { local_session_closed: session.is_some(),
-                retired_revision: None, remote: OAuthPersistentRevocation::NotAttempted },
+            origin: cx.clone(),
+            cancellation: cancellation.clone(),
+            deadline,
+            client: client.clone(),
+            authorization,
+            report: OAuthRefreshLogoutReport {
+                local_session_closed: session.is_some(),
+                retired_revision: None,
+                remote: OAuthPersistentRevocation::NotAttempted,
+            },
             custody: OAuthRefreshLogoutCustody::ReadyToRetire(self),
         })
     }
 }
 
 impl<A, P> OAuthRefreshLogout<A, P> {
-    pub fn report(&self) -> OAuthRefreshLogoutReport { self.report }
+    pub fn report(&self) -> OAuthRefreshLogoutReport {
+        self.report
+    }
 
     pub fn stage(&self) -> OAuthRefreshLogoutStage {
         use OAuthRefreshLogoutCustody as C;
@@ -254,11 +313,16 @@ impl<A, P> OAuthRefreshLogout<A, P> {
 }
 
 impl<A, P> OAuthRefreshLogout<A, P>
-where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
+where
+    A: CredentialCommitAnchor + 'static,
+    P: OAuthGrantProtector + 'static,
 {
     /// No automatic submission or issuer retry. A completed remote refusal is
     /// returned in the report, not disguised as reversal of local retirement.
-    pub async fn run(&mut self, observer: &Cx) -> Result<OAuthRefreshLogoutReport, OAuthRefreshLogoutError> {
+    pub async fn run(
+        &mut self,
+        observer: &Cx,
+    ) -> Result<OAuthRefreshLogoutReport, OAuthRefreshLogoutError> {
         loop {
             if self.advance(observer).await? == OAuthRefreshLogoutStage::Complete {
                 return Ok(self.report);
@@ -268,13 +332,16 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
 
     /// Advances one boundary. Cancelling an observer does not replace the
     /// original operation's cancellation/deadline or resubmit a pending job.
-    pub async fn advance(&mut self, observer: &Cx) -> Result<OAuthRefreshLogoutStage, OAuthRefreshLogoutError> {
+    pub async fn advance(
+        &mut self,
+        observer: &Cx,
+    ) -> Result<OAuthRefreshLogoutStage, OAuthRefreshLogoutError> {
         let origin = self.origin.clone();
         let cancellation = self.cancellation.clone();
         let deadline = self.deadline;
-        let observer_deadline = observer.now().saturating_add_nanos(
-            deadline.as_nanos().saturating_sub(origin.now().as_nanos()),
-        );
+        let observer_deadline = observer
+            .now()
+            .saturating_add_nanos(deadline.as_nanos().saturating_sub(origin.now().as_nanos()));
         let result = {
             let work = async {
                 // Boxed at its source (bd-19tqe): the logout step holds the
@@ -283,35 +350,54 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
                 let mut cancelled = std::pin::pin!(cancellation.cancelled());
                 poll_fn(|task| {
                     if cancelled.as_mut().poll(task).is_ready() {
-                        return Poll::Ready(Err(OAuthRefreshLogoutError::Context(OAuthError::Cancelled)));
+                        return Poll::Ready(Err(OAuthRefreshLogoutError::Context(
+                            OAuthError::Cancelled,
+                        )));
                     }
                     let result = step.as_mut().poll(task);
                     if cancellation.is_cancel_requested() {
                         Poll::Ready(Err(OAuthRefreshLogoutError::Context(OAuthError::Cancelled)))
-                    } else { result }
-                }).await
+                    } else {
+                        result
+                    }
+                })
+                .await
             };
             within(observer, observer_deadline, async {
                 Ok(within(&origin, deadline, async { Ok(work.await) }).await)
-            }).await.map_err(OAuthRefreshLogoutError::Context)
-                .and_then(|result| result.map_err(OAuthRefreshLogoutError::Context))
-                .and_then(|result| result)
+            })
+            .await
+            .map_err(OAuthRefreshLogoutError::Context)
+            .and_then(|result| result.map_err(OAuthRefreshLogoutError::Context))
+            .and_then(|result| result)
         };
-        if cancellation.is_cancel_requested() || origin.is_cancel_requested() || origin.now() >= deadline {
+        if cancellation.is_cancel_requested()
+            || origin.is_cancel_requested()
+            || origin.now() >= deadline
+        {
             self.cancel_worker();
         }
         result
     }
 
-    async fn advance_inner(&mut self, cx: &Cx) -> Result<OAuthRefreshLogoutStage, OAuthRefreshLogoutError> {
+    async fn advance_inner(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<OAuthRefreshLogoutStage, OAuthRefreshLogoutError> {
         use OAuthRefreshLogoutCustody as C;
         if let C::Retiring(task) = &mut self.custody {
             let completion = match task.wait(cx).await {
                 Ok(completion) => completion,
                 Err(error) => {
-                    if matches!(error, CredentialIoError::WorkerStopped | CredentialIoError::WorkerPanicked
-                        | CredentialIoError::AlreadyReceived | CredentialIoError::ProcessChanged)
-                    { self.custody = C::Stopped(None); }
+                    if matches!(
+                        error,
+                        CredentialIoError::WorkerStopped
+                            | CredentialIoError::WorkerPanicked
+                            | CredentialIoError::AlreadyReceived
+                            | CredentialIoError::ProcessChanged
+                    ) {
+                        self.custody = C::Stopped(None);
+                    }
                     return Err(OAuthRefreshLogoutError::Completion(error));
                 }
             };
@@ -332,7 +418,10 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
                     // A post-settlement cancellation proves retirement but
                     // withheld the token. Record that fact without fabricating
                     // a remote attempt or erasing the original storage error.
-                    if let OAuthRefreshStoreError::Storage(super::CoordinatedSlotError::CommittedWithoutDelivery(revision)) = error {
+                    if let OAuthRefreshStoreError::Storage(
+                        super::CoordinatedSlotError::CommittedWithoutDelivery(revision),
+                    ) = error
+                    {
                         self.report.retired_revision = Some(revision);
                         self.report.remote = OAuthPersistentRevocation::GrantUnavailable;
                     }
@@ -347,11 +436,15 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
             C::ReadyToRetire(store) => {
                 let authorization = self.authorization;
                 let remote = self.client.configuration.revocation_endpoint.is_some();
-                match store.try_operate(cx, (), move |store, worker, ()| retire(store, worker, &authorization, remote)) {
+                match store.try_operate(cx, (), move |store, worker, ()| {
+                    retire(store, worker, &authorization, remote)
+                }) {
                     Ok(task) => self.custody = C::Retiring(task),
                     Err(failure) => {
                         let (cause, retained) = failure.into_parts();
-                        if let Some((store, ())) = retained { self.custody = C::ReadyToRetire(store); }
+                        if let Some((store, ())) = retained {
+                            self.custody = C::ReadyToRetire(store);
+                        }
                         return Err(OAuthRefreshLogoutError::Submission(cause));
                     }
                 }
@@ -366,7 +459,9 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
                     Ok(outcome) => OAuthPersistentRevocation::Outcome(outcome),
                     Err(error) => OAuthPersistentRevocation::PreflightRefused(error),
                 };
-                let C::Stopped(Some(store)) = std::mem::replace(&mut self.custody, C::Stopped(None)) else {
+                let C::Stopped(Some(store)) =
+                    std::mem::replace(&mut self.custody, C::Stopped(None))
+                else {
                     return Err(OAuthRefreshLogoutError::Stopped);
                 };
                 self.custody = C::Complete(store);
@@ -382,26 +477,42 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
 }
 
 fn retire<A: CredentialCommitAnchor, P: OAuthGrantProtector>(
-    store: &mut super::OAuthRefreshStore<A, P>, cx: &Cx,
-    authorization: &PartitionAuthorization, attempt_remote: bool,
+    store: &mut super::OAuthRefreshStore<A, P>,
+    cx: &Cx,
+    authorization: &PartitionAuthorization,
+    attempt_remote: bool,
 ) -> Result<OAuthRefreshRetirement, OAuthRefreshStoreError> {
     let remote = if attempt_remote {
         match store.take_refresh(cx, authorization) {
-            Ok(Some(grant)) => return Ok(OAuthRefreshRetirement {
-                revision: store.revision().ok_or(OAuthRefreshStoreError::InvalidGrant)?,
-                grant: Some(grant), remote: OAuthPersistentRevocation::NotAttempted,
-            }),
+            Ok(Some(grant)) => {
+                return Ok(OAuthRefreshRetirement {
+                    revision: store
+                        .revision()
+                        .ok_or(OAuthRefreshStoreError::InvalidGrant)?,
+                    grant: Some(grant),
+                    remote: OAuthPersistentRevocation::NotAttempted,
+                });
+            }
             Ok(None) => OAuthPersistentRevocation::NoStoredGrant,
             // These failures cannot authorize issuer contact. Local logout can
             // still discard an unreadable envelope, through fresh authorized
             // anchor admission. NEVER do this for uncertain storage failures.
-            Err(OAuthRefreshStoreError::Protection(_) | OAuthRefreshStoreError::InvalidGrant
-                | OAuthRefreshStoreError::TooLarge) => OAuthPersistentRevocation::GrantUnavailable,
+            Err(
+                OAuthRefreshStoreError::Protection(_)
+                | OAuthRefreshStoreError::InvalidGrant
+                | OAuthRefreshStoreError::TooLarge,
+            ) => OAuthPersistentRevocation::GrantUnavailable,
             Err(error) => return Err(error),
         }
-    } else { OAuthPersistentRevocation::EndpointUnavailable };
+    } else {
+        OAuthPersistentRevocation::EndpointUnavailable
+    };
     let revision = store.invalidate(cx, authorization)?;
-    Ok(OAuthRefreshRetirement { revision, grant: None, remote })
+    Ok(OAuthRefreshRetirement {
+        revision,
+        grant: None,
+        remote,
+    })
 }
 
 #[cfg(test)]

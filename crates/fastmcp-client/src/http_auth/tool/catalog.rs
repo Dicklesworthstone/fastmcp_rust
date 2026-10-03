@@ -22,16 +22,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use asupersync::Cx;
 use fastmcp_core::McpRequestCancellation;
-use fastmcp_protocol::{CoreRequest, CoreResult, FinalCoreResult, ServerNotification, SubscriptionFilter};
 use fastmcp_protocol::protocol_policy::ProtocolEra;
+use fastmcp_protocol::{
+    CoreRequest, CoreResult, FinalCoreResult, ServerNotification, SubscriptionFilter,
+};
 
 use super::{ManagedOAuthSession, ManagedToolClient, ManagedToolError, ToolContract};
-use crate::http_auth::rpc::catalog::{
-    CollectedCatalog, ManagedCatalogClient, ManagedCatalogError, ManagedCatalogLimits,
-};
 use crate::http_auth::rpc::catalog::watch::{
     ManagedCatalogWatchControl, ManagedCatalogWatchError, ManagedCatalogWatchEvent,
     ManagedCatalogWatchLimits, ManagedCatalogWatchOutcome,
+};
+use crate::http_auth::rpc::catalog::{
+    CollectedCatalog, ManagedCatalogClient, ManagedCatalogError, ManagedCatalogLimits,
 };
 use fastmcp_protocol::RequestId;
 
@@ -70,7 +72,12 @@ impl ManagedToolCatalogLimits {
         {
             return Err(ManagedToolCatalogError::InvalidLimits);
         }
-        Ok(Self { catalog, watch, maximum_tools, maximum_definition_bytes })
+        Ok(Self {
+            catalog,
+            watch,
+            maximum_tools,
+            maximum_definition_bytes,
+        })
     }
 }
 
@@ -141,23 +148,41 @@ impl fmt::Debug for ManagedToolCatalogSnapshot {
 }
 
 impl ManagedToolCatalogSnapshot {
-    pub fn len(&self) -> usize { self.0.contracts.len() }
-    pub fn is_empty(&self) -> bool { self.0.contracts.is_empty() }
-    pub fn is_invalidated(&self) -> bool { self.0.invalidated.load(Ordering::Acquire) }
-    pub fn catalog(&self) -> &CollectedCatalog { &self.0.catalog }
-    pub fn names(&self) -> impl Iterator<Item = &str> { self.0.contracts.keys().map(String::as_str) }
+    pub fn len(&self) -> usize {
+        self.0.contracts.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.contracts.is_empty()
+    }
+    pub fn is_invalidated(&self) -> bool {
+        self.0.invalidated.load(Ordering::Acquire)
+    }
+    pub fn catalog(&self) -> &CollectedCatalog {
+        &self.0.catalog
+    }
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.0.contracts.keys().map(String::as_str)
+    }
 
     /// A case-sensitive lookup, not permission to execute. A change racing this
     /// lookup still fences the returned client's own request/result admission.
     /// Invalidating an individual client does not invalidate sibling tools.
     pub fn tool(&self, name: &str) -> Result<Option<ManagedToolClient>, ManagedToolCatalogError> {
-        if self.is_invalidated() { return Err(ManagedToolCatalogError::Invalidated); }
-        let client = self.0.contracts.get(name).map(|contract| ManagedToolClient {
-            session: self.0.session.clone(),
-            contract: Arc::clone(contract),
-            header_review: None,
-        });
-        if self.is_invalidated() { return Err(ManagedToolCatalogError::Invalidated); }
+        if self.is_invalidated() {
+            return Err(ManagedToolCatalogError::Invalidated);
+        }
+        let client = self
+            .0
+            .contracts
+            .get(name)
+            .map(|contract| ManagedToolClient {
+                session: self.0.session.clone(),
+                contract: Arc::clone(contract),
+                header_review: None,
+            });
+        if self.is_invalidated() {
+            return Err(ManagedToolCatalogError::Invalidated);
+        }
         Ok(client)
     }
 }
@@ -182,11 +207,19 @@ impl ManagedOAuthSession {
     ) -> Result<ManagedCatalogWatchOutcome, ManagedToolCatalogError>
     where
         I: FnMut() -> Result<RequestId, ManagedCatalogError>,
-        O: FnMut(ManagedToolCatalogEvent) -> Result<ManagedCatalogWatchControl, ManagedToolCatalogError>,
+        O: FnMut(
+            ManagedToolCatalogEvent,
+        ) -> Result<ManagedCatalogWatchControl, ManagedToolCatalogError>,
     {
         self.watch_tool_catalog_with_cancellation(
-            cx, &McpRequestCancellation::new(), request, limits, next_id, observe,
-        ).await
+            cx,
+            &McpRequestCancellation::new(),
+            request,
+            limits,
+            next_id,
+            observe,
+        )
+        .await
     }
 
     /// One cancellation domain covers the existing listen and catalog calls.
@@ -203,7 +236,9 @@ impl ManagedOAuthSession {
     ) -> Result<ManagedCatalogWatchOutcome, ManagedToolCatalogError>
     where
         I: FnMut() -> Result<RequestId, ManagedCatalogError>,
-        O: FnMut(ManagedToolCatalogEvent) -> Result<ManagedCatalogWatchControl, ManagedToolCatalogError>,
+        O: FnMut(
+            ManagedToolCatalogEvent,
+        ) -> Result<ManagedCatalogWatchControl, ManagedToolCatalogError>,
     {
         if request.era() != ProtocolEra::Modern2026 || request.method() != "tools/list" {
             return Err(ManagedToolCatalogError::NotToolsList);
@@ -213,9 +248,8 @@ impl ManagedOAuthSession {
         let collector = ManagedCatalogClient::new(self.clone(), limits.catalog);
         let mut active = ActiveCatalog::default();
         let mut callback_error = None;
-        let result = collector.watch_with_cancellation(
-            cx, cancellation, request, limits.watch, next_id,
-            |event| {
+        let result = collector
+            .watch_with_cancellation(cx, cancellation, request, limits.watch, next_id, |event| {
                 let delivered = (|| {
                     let event = match event {
                         ManagedCatalogWatchEvent::Acknowledged { accepted_filter } => {
@@ -229,11 +263,17 @@ impl ManagedOAuthSession {
                             // Retire first, including when replacement admission
                             // fails. Failed refresh must never restore old handles.
                             active.invalidate();
-                            let (contracts, invalidated) = admit_contracts(catalog.pages(), limits)?;
+                            let (contracts, invalidated) =
+                                admit_contracts(catalog.pages(), limits)?;
                             active.install_contracts(Arc::clone(&invalidated), &contracts);
-                            ManagedToolCatalogEvent::Snapshot(ManagedToolCatalogSnapshot(Arc::new(Snapshot {
-                                session: self.clone(), catalog, contracts, invalidated,
-                            })))
+                            ManagedToolCatalogEvent::Snapshot(ManagedToolCatalogSnapshot(Arc::new(
+                                Snapshot {
+                                    session: self.clone(),
+                                    catalog,
+                                    contracts,
+                                    invalidated,
+                                },
+                            )))
                         }
                     };
                     observe(event)
@@ -245,8 +285,8 @@ impl ManagedOAuthSession {
                         Err(ManagedCatalogError::AbortedByHost)
                     }
                 }
-            },
-        ).await;
+            })
+            .await;
         // This same guard runs on future Drop and unwinding as well as ordinary
         // completion, including a clean subscription terminal without a change.
         drop(active);
@@ -267,7 +307,9 @@ impl ActiveCatalog {
             // may immediately schedule another sibling's next poll.
             invalidated.store(true, Ordering::Release);
         }
-        for signal in self.1.drain(..) { signal.cancel(); }
+        for signal in self.1.drain(..) {
+            signal.cancel();
+        }
     }
     fn install(&mut self, invalidated: Arc<AtomicBool>) {
         self.invalidate();
@@ -277,35 +319,54 @@ impl ActiveCatalog {
         self.install(invalidated);
         // The admitted catalog's hard tool-count bound also bounds this set.
         // Keep only wake signals, not schemas, pages, tool clients or sessions.
-        self.1.extend(contracts.values().map(|contract| contract.invalidation.clone()));
+        self.1.extend(
+            contracts
+                .values()
+                .map(|contract| contract.invalidation.clone()),
+        );
     }
     fn observe_notification(&mut self, notification: &ServerNotification) {
-        if matches!(notification, ServerNotification::ToolsListChanged(_)) { self.invalidate(); }
+        if matches!(notification, ServerNotification::ToolsListChanged(_)) {
+            self.invalidate();
+        }
     }
 }
 
 impl Drop for ActiveCatalog {
-    fn drop(&mut self) { self.invalidate(); }
+    fn drop(&mut self) {
+        self.invalidate();
+    }
 }
 
 fn admit_contracts(
     pages: &[CoreResult],
     limits: ManagedToolCatalogLimits,
 ) -> Result<(Contracts, Arc<AtomicBool>), ManagedToolCatalogError> {
-    if pages.is_empty() { return Err(ManagedToolCatalogError::InvalidSnapshot); }
+    if pages.is_empty() {
+        return Err(ManagedToolCatalogError::InvalidSnapshot);
+    }
     let invalidated = Arc::new(AtomicBool::new(false));
     let mut contracts = BTreeMap::new();
-    let mut bytes = DefinitionBytes { used: 0, maximum: limits.maximum_definition_bytes };
+    let mut bytes = DefinitionBytes {
+        used: 0,
+        maximum: limits.maximum_definition_bytes,
+    };
     for page in pages {
         let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = page else {
             return Err(ManagedToolCatalogError::InvalidSnapshot);
         };
         for definition in &result.payload.tools {
-            if contracts.len() >= limits.maximum_tools { return Err(ManagedToolCatalogError::ToolLimit); }
+            if contracts.len() >= limits.maximum_tools {
+                return Err(ManagedToolCatalogError::ToolLimit);
+            }
             // Bound retained source before cloning it for contract compilation.
-            serde_json::to_writer(&mut bytes, definition).map_err(|_| ManagedToolCatalogError::DefinitionBudget)?;
-            if contracts.contains_key(&definition.name) { return Err(ManagedToolCatalogError::DuplicateTool); }
-            let mut contract = ToolContract::admit(definition.clone()).map_err(ManagedToolCatalogError::Tool)?;
+            serde_json::to_writer(&mut bytes, definition)
+                .map_err(|_| ManagedToolCatalogError::DefinitionBudget)?;
+            if contracts.contains_key(&definition.name) {
+                return Err(ManagedToolCatalogError::DuplicateTool);
+            }
+            let mut contract =
+                ToolContract::admit(definition.clone()).map_err(ManagedToolCatalogError::Tool)?;
             contract.catalog_invalidated = Some(Arc::clone(&invalidated));
             contracts.insert(contract.name.clone(), Arc::new(contract));
         }
@@ -313,7 +374,10 @@ fn admit_contracts(
     Ok((contracts, invalidated))
 }
 
-struct DefinitionBytes { used: usize, maximum: usize }
+struct DefinitionBytes {
+    used: usize,
+    maximum: usize,
+}
 
 impl Write for DefinitionBytes {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
@@ -323,7 +387,9 @@ impl Write for DefinitionBytes {
         self.used += buffer.len();
         Ok(buffer.len())
     }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

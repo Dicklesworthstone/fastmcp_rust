@@ -300,7 +300,8 @@ pub struct ReachabilityDenialReceipt {
 // --- derivation from A's shipped surface ---
 
 fn digest_of(bytes: &[u8], field: &'static str) -> Result<Sha256Digest, ReachabilityDiagnostic> {
-    sha256_bounded(bytes, CANONICAL_INPUT_LIMIT_BYTES).map_err(|_| reject("E_CANONICAL_INPUT", field))
+    sha256_bounded(bytes, CANONICAL_INPUT_LIMIT_BYTES)
+        .map_err(|_| reject("E_CANONICAL_INPUT", field))
 }
 
 /// A registry request is any process invocation that reaches a package
@@ -308,7 +309,9 @@ fn digest_of(bytes: &[u8], field: &'static str) -> Result<Sha256Digest, Reachabi
 /// than trying to enumerate the safe ones.
 #[must_use]
 pub fn process_is_registry_request(process: &str) -> bool {
-    process.contains("cargo publish") || process.contains("crates.io") || process.contains("registry")
+    process.contains("cargo publish")
+        || process.contains("crates.io")
+        || process.contains("registry")
 }
 
 /// A release, tag or asset mutation is any process invocation that creates or
@@ -326,7 +329,9 @@ pub fn process_is_release_tag_or_asset_mutation(process: &str) -> bool {
 /// read-only. Fail-closed: an unrecognised permission counts as a grant.
 #[must_use]
 pub fn permission_is_provider_grant(permission: &str) -> bool {
-    !permission.ends_with(": read") && !permission.ends_with(":read") && !permission.ends_with("none")
+    !permission.ends_with(": read")
+        && !permission.ends_with(":read")
+        && !permission.ends_with("none")
 }
 
 fn counters_for(identity: &WorkflowIdentity) -> ZeroAuthorityCounters {

@@ -33,16 +33,50 @@ use std::path::{Path, PathBuf};
 /// subject under test instead of the source of truth.
 const COMMITTED_EXCLUSIONS: &[&str] = &[
     // --- from ~/.config/rch/config.toml exclude_patterns ---
-    "target/", "*.rlib", "*.rmeta", ".git/", "node_modules/", ".bun/", ".npm/",
-    ".pnpm-store/", "dist/", "/build/", ".next/", ".next*", "artifacts/", ".nuxt/",
-    ".turbo/", ".parcel-cache/", ".beads/", "/coverage/", ".nyc_output/",
-    ".cargo/credentials", ".cargo/credentials.toml", ".env", ".env.*",
-    "*.pem", "*.key", "credentials.json", "secrets.json", "secrets.yaml",
-    "secrets.yml", "secrets.toml", "secrets.env", "secrets.txt", "secrets.conf",
-    "secrets.cfg", "secrets.properties", "secrets.xml",
+    "target/",
+    "*.rlib",
+    "*.rmeta",
+    ".git/",
+    "node_modules/",
+    ".bun/",
+    ".npm/",
+    ".pnpm-store/",
+    "dist/",
+    "/build/",
+    ".next/",
+    ".next*",
+    "artifacts/",
+    ".nuxt/",
+    ".turbo/",
+    ".parcel-cache/",
+    ".beads/",
+    "/coverage/",
+    ".nyc_output/",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "credentials.json",
+    "secrets.json",
+    "secrets.yaml",
+    "secrets.yml",
+    "secrets.toml",
+    "secrets.env",
+    "secrets.txt",
+    "secrets.conf",
+    "secrets.cfg",
+    "secrets.properties",
+    "secrets.xml",
     // --- from the repository's own .rchignore ---
-    "target-*/", ".rch-target-*/", ".beads_polish_tmp/", ".wm-verify/", ".wm-verify2/",
-    ".grok/", "crates/fastmcp/test_traces/",
+    "target-*/",
+    ".rch-target-*/",
+    ".beads_polish_tmp/",
+    ".wm-verify/",
+    ".wm-verify2/",
+    ".grok/",
+    "crates/fastmcp/test_traces/",
 ];
 
 /// Compile-time file-reading macros. `include!` is deliberately included: it reads a
@@ -81,7 +115,9 @@ fn blank_comments(src: &str) -> String {
             if j < b.len() && b[j] == b'"' {
                 let close = format!("\"{}", "#".repeat(hashes));
                 let rest = &src[j + 1..];
-                let end = rest.find(&close).map_or(b.len(), |k| j + 1 + k + close.len());
+                let end = rest
+                    .find(&close)
+                    .map_or(b.len(), |k| j + 1 + k + close.len());
                 out[i..end.min(b.len())].copy_from_slice(&b[i..end.min(b.len())]);
                 i = end;
                 continue;
@@ -282,12 +318,14 @@ fn excluded_by(path: &Path, pattern: &str) -> bool {
         // makes `.git/` swallow `.github/` and `/build/` swallow `builder.rs` — the two
         // false positives the manual sweep also produced.
         return path.components().any(|c| {
-            c.as_os_str().to_str().is_some_and(|s| match dir.split_once('*') {
-                Some((pre, suf)) => {
-                    s.starts_with(pre) && s.ends_with(suf) && s.len() >= pre.len() + suf.len()
-                }
-                None => s == dir,
-            })
+            c.as_os_str()
+                .to_str()
+                .is_some_and(|s| match dir.split_once('*') {
+                    Some((pre, suf)) => {
+                        s.starts_with(pre) && s.ends_with(suf) && s.len() >= pre.len() + suf.len()
+                    }
+                    None => s == dir,
+                })
         });
     }
     if let Some((pre, suf)) = p.split_once('*') {
@@ -308,7 +346,9 @@ fn workspace_members(ws: &Path) -> Vec<PathBuf> {
 }
 
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for e in entries.flatten() {
         let p = e.path();
         if p.is_dir() {
@@ -334,10 +374,14 @@ fn no_compile_time_read_targets_a_transfer_excluded_path() {
         rust_sources(&member.join("benches"), &mut files);
         for file in files {
             scanned_files += 1;
-            let Ok(src) = fs::read_to_string(&file) else { continue };
+            let Ok(src) = fs::read_to_string(&file) else {
+                continue;
+            };
             for read in find_compile_time_reads(&src) {
                 scanned_reads += 1;
-                let Some(rel) = resolve(&read, &file, &member, &ws) else { continue };
+                let Some(rel) = resolve(&read, &file, &member, &ws) else {
+                    continue;
+                };
                 for pattern in COMMITTED_EXCLUSIONS {
                     if excluded_by(&rel, pattern) {
                         let shown = file.strip_prefix(&ws).unwrap_or(&file);
@@ -410,8 +454,10 @@ fn reconcile_committed_exclusions_against_operator_config() {
         .map(str::to_string)
         .collect();
 
-    let committed: BTreeSet<String> =
-        COMMITTED_EXCLUSIONS.iter().map(|s| (*s).to_string()).collect();
+    let committed: BTreeSet<String> = COMMITTED_EXCLUSIONS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
     let observed: BTreeSet<String> = live.union(&live_repo).cloned().collect();
 
     let missing: Vec<&String> = observed.difference(&committed).collect();

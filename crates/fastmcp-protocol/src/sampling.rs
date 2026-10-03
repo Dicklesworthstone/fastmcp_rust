@@ -16,8 +16,8 @@ use serde_json::Value;
 use crate::common_types::SamplingContentBlock;
 use crate::{
     AdmittedSchema, FinalCreateMessageResult, FinalEmbeddedCreateMessageParams,
-    FinalSamplingMessage, FinalSamplingMessageContent, FinalToolChoiceMode, RawJsonTopLevel,
-    Role, admit_final_schema, admit_raw_json_document,
+    FinalSamplingMessage, FinalSamplingMessageContent, FinalToolChoiceMode, RawJsonTopLevel, Role,
+    admit_final_schema, admit_raw_json_document,
 };
 
 /// Immutable local work limits. These restrict orchestration, not model billing
@@ -44,13 +44,21 @@ impl SamplingToolLoopLimits {
         {
             return Err(SamplingToolLoopError::InvalidLimits);
         }
-        Ok(Self { max_rounds, max_tool_calls, byte_ceiling })
+        Ok(Self {
+            max_rounds,
+            max_tool_calls,
+            byte_ceiling,
+        })
     }
 }
 
 impl Default for SamplingToolLoopLimits {
     fn default() -> Self {
-        Self { max_rounds: 16, max_tool_calls: 128, byte_ceiling: 4 * 1024 * 1024 }
+        Self {
+            max_rounds: 16,
+            max_tool_calls: 128,
+            byte_ceiling: 4 * 1024 * 1024,
+        }
     }
 }
 
@@ -154,13 +162,20 @@ impl SamplingToolLoop {
                 return Err(SamplingToolLoopError::InvalidRequest);
             }
             if tool.input_schema.get("type").and_then(Value::as_str) != Some("object")
-                || tool.output_schema.as_ref().is_some_and(|schema| !schema.is_object())
+                || tool
+                    .output_schema
+                    .as_ref()
+                    .is_some_and(|schema| !schema.is_object())
             {
                 return Err(SamplingToolLoopError::InvalidSchema);
             }
             let input = admit_final_schema(tool.input_schema.clone())
                 .map_err(|_| SamplingToolLoopError::InvalidSchema)?;
-            let output = tool.output_schema.clone().map(admit_final_schema).transpose()
+            let output = tool
+                .output_schema
+                .clone()
+                .map(admit_final_schema)
+                .transpose()
                 .map_err(|_| SamplingToolLoopError::InvalidSchema)?;
             schemas.insert(tool.name.clone(), ToolSchemas { input, output });
         }
@@ -173,9 +188,10 @@ impl SamplingToolLoop {
         let mut pending = Vec::new();
         for message in &request.messages {
             if pending.is_empty() {
-                if blocks(&message.content).iter().any(|block| {
-                    matches!(block, SamplingContentBlock::ToolResult { .. })
-                }) {
+                if blocks(&message.content)
+                    .iter()
+                    .any(|block| matches!(block, SamplingContentBlock::ToolResult { .. }))
+                {
                     return Err(SamplingToolLoopError::InvalidHistory);
                 }
                 let calls = admit_calls(&message.content, &schemas, &used_ids)?;
@@ -198,20 +214,33 @@ impl SamplingToolLoop {
         if !pending.is_empty() {
             return Err(SamplingToolLoopError::InvalidHistory);
         }
-        Ok(Self { request: Some(request), schemas, used_ids, phase: Phase::Ready, rounds: 0, limits })
+        Ok(Self {
+            request: Some(request),
+            schemas,
+            used_ids,
+            phase: Phase::Ready,
+            rounds: 0,
+            limits,
+        })
     }
 
     /// The exact next request. None means input is pending, complete, or closed.
     /// This borrow conveys neither capability admission nor consent to send it.
     pub fn request(&self) -> Option<&FinalEmbeddedCreateMessageParams> {
-        matches!(self.phase, Phase::Ready).then_some(self.request.as_ref()).flatten()
+        matches!(self.phase, Phase::Ready)
+            .then_some(self.request.as_ref())
+            .flatten()
     }
 
     /// Number of model responses accepted by this controller.
-    pub fn round_count(&self) -> usize { self.rounds }
+    pub fn round_count(&self) -> usize {
+        self.rounds
+    }
 
     /// Total admitted calls, including balanced calls in initial history.
-    pub fn tool_call_count(&self) -> usize { self.used_ids.len() }
+    pub fn tool_call_count(&self) -> usize {
+        self.used_ids.len()
+    }
 
     /// Admits a whole assistant response before exposing any tool for execution.
     /// Unknown stop reasons remain forward-open. `toolUse` without calls is
@@ -253,7 +282,9 @@ impl SamplingToolLoop {
         }
         let mut next = request.clone();
         next.messages.push(FinalSamplingMessage {
-            role: response.role, content: response.content, meta: response.meta,
+            role: response.role,
+            content: response.content,
+            meta: response.meta,
         });
         bounded_wire(&next, self.limits.byte_ceiling)?;
         let count = calls.len();
@@ -268,11 +299,17 @@ impl SamplingToolLoop {
     /// metadata remain in the retained assistant message without being flattened.
     pub fn pending_tool_calls(&self) -> impl Iterator<Item = &SamplingContentBlock> {
         let content = if matches!(self.phase, Phase::Tools(_)) {
-            self.request.as_ref().and_then(|r| r.messages.last()).map(|m| &m.content)
-        } else { None };
-        content.into_iter().flat_map(blocks).filter(|block| {
-            matches!(block, SamplingContentBlock::ToolUse { .. })
-        })
+            self.request
+                .as_ref()
+                .and_then(|r| r.messages.last())
+                .map(|m| &m.content)
+        } else {
+            None
+        };
+        content
+            .into_iter()
+            .flat_map(blocks)
+            .filter(|block| matches!(block, SamplingContentBlock::ToolUse { .. }))
     }
 
     /// Appends one user message consisting solely of results for the entire
@@ -290,9 +327,15 @@ impl SamplingToolLoop {
         };
         bounded_wire(&results, self.limits.byte_ceiling)?;
         admit_results(&results, pending, &self.schemas)?;
-        let mut next = self.request.as_ref().ok_or(SamplingToolLoopError::Closed)?.clone();
+        let mut next = self
+            .request
+            .as_ref()
+            .ok_or(SamplingToolLoopError::Closed)?
+            .clone();
         next.messages.push(FinalSamplingMessage {
-            role: Role::User, content: FinalSamplingMessageContent::Blocks(results), meta: None,
+            role: Role::User,
+            content: FinalSamplingMessageContent::Blocks(results),
+            meta: None,
         });
         bounded_wire(&next, self.limits.byte_ceiling)?;
         self.request = Some(next);
@@ -302,7 +345,10 @@ impl SamplingToolLoop {
 
     /// The complete model response, without changing its content shape or hints.
     pub fn result(&self) -> Option<&FinalCreateMessageResult> {
-        match &self.phase { Phase::Complete(result) => Some(result), _ => None }
+        match &self.phase {
+            Phase::Complete(result) => Some(result),
+            _ => None,
+        }
     }
 
     /// Retires this owner and releases retained conversation data. This does not
@@ -343,12 +389,18 @@ fn admit_calls(
     let mut calls = Vec::new();
     for block in blocks(content) {
         match block {
-            SamplingContentBlock::ToolUse { id, name, input, .. } => {
+            SamplingContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 if id.is_empty() || used.contains(id) || !ids.insert(id) {
                     return Err(SamplingToolLoopError::RepeatedToolId);
                 }
-                let schema = schemas.get(name).ok_or(SamplingToolLoopError::UnknownTool)?;
-                schema.input.validate(&Value::Object(input.clone()))
+                let schema = schemas
+                    .get(name)
+                    .ok_or(SamplingToolLoopError::UnknownTool)?;
+                schema
+                    .input
+                    .validate(&Value::Object(input.clone()))
                     .map_err(|_| SamplingToolLoopError::InvalidToolInput)?;
                 calls.push((id.clone(), name.clone()));
             }
@@ -371,18 +423,33 @@ fn admit_results(
     }
     let mut seen = BTreeSet::new();
     for result in results {
-        let SamplingContentBlock::ToolResult { tool_use_id, structured_content, is_error, .. } = result
-        else { return Err(SamplingToolLoopError::InvalidToolResults); };
-        let (_, name) = pending.iter().find(|(id, _)| id == tool_use_id)
+        let SamplingContentBlock::ToolResult {
+            tool_use_id,
+            structured_content,
+            is_error,
+            ..
+        } = result
+        else {
+            return Err(SamplingToolLoopError::InvalidToolResults);
+        };
+        let (_, name) = pending
+            .iter()
+            .find(|(id, _)| id == tool_use_id)
             .ok_or(SamplingToolLoopError::InvalidToolResults)?;
         if !seen.insert(tool_use_id) {
             return Err(SamplingToolLoopError::InvalidToolResults);
         }
-        let schema = schemas.get(name).ok_or(SamplingToolLoopError::UnknownTool)?;
+        let schema = schemas
+            .get(name)
+            .ok_or(SamplingToolLoopError::UnknownTool)?;
         if *is_error != Some(true) {
             if let Some(output) = &schema.output {
-                let value = structured_content.as_ref().ok_or(SamplingToolLoopError::InvalidToolOutput)?;
-                output.validate(value).map_err(|_| SamplingToolLoopError::InvalidToolOutput)?;
+                let value = structured_content
+                    .as_ref()
+                    .ok_or(SamplingToolLoopError::InvalidToolOutput)?;
+                output
+                    .validate(value)
+                    .map_err(|_| SamplingToolLoopError::InvalidToolOutput)?;
             }
         }
     }
@@ -391,7 +458,11 @@ fn admit_results(
 
 // Never serialize an unbounded intermediate String just to measure its size.
 fn bounded_wire(value: &impl Serialize, max: usize) -> Result<(), SamplingToolLoopError> {
-    struct Buffer { bytes: Vec<u8>, max: usize, exceeded: bool }
+    struct Buffer {
+        bytes: Vec<u8>,
+        max: usize,
+        exceeded: bool,
+    }
     impl Write for Buffer {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             if bytes.len() > self.max.saturating_sub(self.bytes.len()) {
@@ -401,12 +472,21 @@ fn bounded_wire(value: &impl Serialize, max: usize) -> Result<(), SamplingToolLo
             self.bytes.extend_from_slice(bytes);
             Ok(bytes.len())
         }
-        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
-    let mut buffer = Buffer { bytes: Vec::new(), max, exceeded: false };
+    let mut buffer = Buffer {
+        bytes: Vec::new(),
+        max,
+        exceeded: false,
+    };
     if serde_json::to_writer(&mut buffer, value).is_err() {
-        return Err(if buffer.exceeded { SamplingToolLoopError::ByteLimit }
-            else { SamplingToolLoopError::InvalidRequest });
+        return Err(if buffer.exceeded {
+            SamplingToolLoopError::ByteLimit
+        } else {
+            SamplingToolLoopError::InvalidRequest
+        });
     }
     admit_raw_json_document(&buffer.bytes, max, RawJsonTopLevel::AnyValue)
         .map_err(|_| SamplingToolLoopError::InvalidRequest)
@@ -424,38 +504,54 @@ mod tests {
             "tools":[{"name":"weather","inputSchema":{"type":"object",
                 "properties":{"city":{"type":"string"}},"required":["city"]}}],
             "metadata":{"private":"keep"}
-        })).unwrap()
+        }))
+        .unwrap()
     }
     fn response(content: Value) -> FinalCreateMessageResult {
-        serde_json::from_value(json!({"role":"assistant","model":"model","content":content})).unwrap()
+        serde_json::from_value(json!({"role":"assistant","model":"model","content":content}))
+            .unwrap()
     }
     fn call(id: &str) -> Value {
         json!({"type":"tool_use","id":id,"name":"weather","input":{"city":"Paris"}})
     }
     fn answer(id: &str) -> SamplingContentBlock {
         serde_json::from_value(json!({"type":"tool_result","toolUseId":id,
-            "content":[{"type":"text","text":"sunny"}],"structuredContent":null})).unwrap()
+            "content":[{"type":"text","text":"sunny"}],"structuredContent":null}))
+        .unwrap()
     }
-    fn ready() -> SamplingToolLoop { SamplingToolLoop::new(request(), SamplingToolLoopLimits::default()).unwrap() }
+    fn ready() -> SamplingToolLoop {
+        SamplingToolLoop::new(request(), SamplingToolLoopLimits::default()).unwrap()
+    }
 
     #[test]
     fn two_round_sampling_preserves_content_metadata_and_null() {
         let mut run = ready();
         let generated = response(json!([{"type":"text","text":"checking"},call("a"),call("b")]));
         let expected = generated.content.clone();
-        assert_eq!(run.accept_response(generated).unwrap(), SamplingToolLoopStep::Tools { count: 2 });
+        assert_eq!(
+            run.accept_response(generated).unwrap(),
+            SamplingToolLoopStep::Tools { count: 2 }
+        );
         assert!(run.request().is_none());
         assert_eq!(run.pending_tool_calls().count(), 2);
-        run.submit_tool_results(vec![answer("b"),answer("a")]).unwrap();
+        run.submit_tool_results(vec![answer("b"), answer("a")])
+            .unwrap();
         let next = run.request().unwrap();
         assert_eq!(next.messages[1].content, expected);
         assert_eq!(next.metadata.as_ref().unwrap()["private"], "keep");
         let wire = serde_json::to_value(next).unwrap();
         assert!(wire["messages"][2]["content"][0]["structuredContent"].is_null());
-        assert!(wire["messages"][2]["content"][0].get("structuredContent").is_some());
+        assert!(
+            wire["messages"][2]["content"][0]
+                .get("structuredContent")
+                .is_some()
+        );
         let mut final_reply = response(json!({"type":"text","text":"done"}));
         final_reply.stop_reason = Some("futureProviderReason".to_owned());
-        assert_eq!(run.accept_response(final_reply.clone()).unwrap(), SamplingToolLoopStep::Complete);
+        assert_eq!(
+            run.accept_response(final_reply.clone()).unwrap(),
+            SamplingToolLoopStep::Complete
+        );
         assert_eq!(run.result(), Some(&final_reply));
         assert_eq!(run.round_count(), 2);
         assert!(run.request().is_none());
@@ -463,14 +559,18 @@ mod tests {
 
     #[test]
     fn invalid_batch_exposes_no_partial_calls_and_keeps_request_unchanged() {
-        for content in [json!([call("a"),call("a")]),
+        for content in [
+            json!([call("a"), call("a")]),
             json!([call("a"),{"type":"tool_use","id":"b","name":"unknown","input":{}}]),
-            json!([call("a"),{"type":"tool_use","id":"b","name":"weather","input":{"city":7}}])]
-        {
+            json!([call("a"),{"type":"tool_use","id":"b","name":"weather","input":{"city":7}}]),
+        ] {
             let mut run = ready();
             let before = serde_json::to_value(run.request().unwrap()).unwrap();
             assert!(run.accept_response(response(content)).is_err());
-            assert_eq!(serde_json::to_value(run.request().unwrap()).unwrap(), before);
+            assert_eq!(
+                serde_json::to_value(run.request().unwrap()).unwrap(),
+                before
+            );
             assert_eq!(run.pending_tool_calls().count(), 0);
             assert_eq!(run.round_count(), 0);
             assert_eq!(run.tool_call_count(), 0);
@@ -480,44 +580,75 @@ mod tests {
     #[test]
     fn wrong_results_are_atomic_and_correctable() {
         let mut run = ready();
-        run.accept_response(response(json!([call("a"),call("b")]))).unwrap();
-        for invalid in [vec![answer("a")],vec![answer("a"),answer("a")],
-            vec![answer("a"),answer("foreign")],vec![answer("a"),serde_json::from_value(json!({"type":"text","text":"mixed"})).unwrap()]]
-        {
-            assert_eq!(run.submit_tool_results(invalid), Err(SamplingToolLoopError::InvalidToolResults));
+        run.accept_response(response(json!([call("a"), call("b")])))
+            .unwrap();
+        for invalid in [
+            vec![answer("a")],
+            vec![answer("a"), answer("a")],
+            vec![answer("a"), answer("foreign")],
+            vec![
+                answer("a"),
+                serde_json::from_value(json!({"type":"text","text":"mixed"})).unwrap(),
+            ],
+        ] {
+            assert_eq!(
+                run.submit_tool_results(invalid),
+                Err(SamplingToolLoopError::InvalidToolResults)
+            );
             assert_eq!(run.pending_tool_calls().count(), 2);
             assert!(run.request().is_none());
         }
-        run.submit_tool_results(vec![answer("b"),answer("a")]).unwrap();
-        assert_eq!(run.accept_response(response(call("a"))), Err(SamplingToolLoopError::RepeatedToolId));
+        run.submit_tool_results(vec![answer("b"), answer("a")])
+            .unwrap();
+        assert_eq!(
+            run.accept_response(response(call("a"))),
+            Err(SamplingToolLoopError::RepeatedToolId)
+        );
     }
 
     #[test]
     fn round_and_call_limits_refuse_before_tool_execution() {
         for (limits, error) in [
-            (SamplingToolLoopLimits::new(1, 10, 4096).unwrap(), SamplingToolLoopError::RoundLimit),
-            (SamplingToolLoopLimits::new(3, 0, 4096).unwrap(), SamplingToolLoopError::ToolCallLimit),
+            (
+                SamplingToolLoopLimits::new(1, 10, 4096).unwrap(),
+                SamplingToolLoopError::RoundLimit,
+            ),
+            (
+                SamplingToolLoopLimits::new(3, 0, 4096).unwrap(),
+                SamplingToolLoopError::ToolCallLimit,
+            ),
         ] {
             let mut run = SamplingToolLoop::new(request(), limits).unwrap();
             assert_eq!(run.accept_response(response(call("a"))), Err(error));
             assert_eq!(run.pending_tool_calls().count(), 0);
             assert_eq!(run.round_count(), 0);
-            run.accept_response(response(json!({"type":"text","text":"done"}))).unwrap();
+            run.accept_response(response(json!({"type":"text","text":"done"})))
+                .unwrap();
         }
     }
 
     #[test]
     fn tool_choice_and_response_role_are_enforced() {
-        for mode in ["none","required"] {
+        for mode in ["none", "required"] {
             let mut req = request();
             req.tool_choice = Some(serde_json::from_value(json!({"mode":mode})).unwrap());
             let mut run = SamplingToolLoop::new(req, SamplingToolLoopLimits::default()).unwrap();
-            let content = if mode == "none" { call("a") } else { json!({"type":"text","text":"no tool"}) };
-            assert_eq!(run.accept_response(response(content)), Err(SamplingToolLoopError::ToolChoiceViolation));
+            let content = if mode == "none" {
+                call("a")
+            } else {
+                json!({"type":"text","text":"no tool"})
+            };
+            assert_eq!(
+                run.accept_response(response(content)),
+                Err(SamplingToolLoopError::ToolChoiceViolation)
+            );
         }
         let mut reply = response(call("a"));
         reply.role = Role::User;
-        assert_eq!(ready().accept_response(reply), Err(SamplingToolLoopError::InvalidResponse));
+        assert_eq!(
+            ready().accept_response(reply),
+            Err(SamplingToolLoopError::InvalidResponse)
+        );
     }
 
     #[test]
@@ -526,9 +657,13 @@ mod tests {
         req.tools.as_mut().unwrap()[0].output_schema = Some(json!({"type":"number"}));
         let mut run = SamplingToolLoop::new(req, SamplingToolLoopLimits::default()).unwrap();
         run.accept_response(response(call("a"))).unwrap();
-        assert_eq!(run.submit_tool_results(vec![answer("a")]), Err(SamplingToolLoopError::InvalidToolOutput));
+        assert_eq!(
+            run.submit_tool_results(vec![answer("a")]),
+            Err(SamplingToolLoopError::InvalidToolOutput)
+        );
         let result = serde_json::from_value(json!({"type":"tool_result","toolUseId":"a",
-            "content":[],"isError":true})).unwrap();
+            "content":[],"isError":true}))
+        .unwrap();
         run.submit_tool_results(vec![result]).unwrap();
     }
 
@@ -537,25 +672,44 @@ mod tests {
         let mut first = ready();
         first.accept_response(response(call("a"))).unwrap();
         let unbalanced = first.request.as_ref().unwrap().clone();
-        assert!(matches!(SamplingToolLoop::new(unbalanced, SamplingToolLoopLimits::default()),
-            Err(SamplingToolLoopError::InvalidHistory)));
+        assert!(matches!(
+            SamplingToolLoop::new(unbalanced, SamplingToolLoopLimits::default()),
+            Err(SamplingToolLoopError::InvalidHistory)
+        ));
         first.submit_tool_results(vec![answer("a")]).unwrap();
-        let mut restored = SamplingToolLoop::new(first.request().unwrap().clone(), SamplingToolLoopLimits::default()).unwrap();
-        assert_eq!(restored.accept_response(response(call("a"))), Err(SamplingToolLoopError::RepeatedToolId));
+        let mut restored = SamplingToolLoop::new(
+            first.request().unwrap().clone(),
+            SamplingToolLoopLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.accept_response(response(call("a"))),
+            Err(SamplingToolLoopError::RepeatedToolId)
+        );
     }
 
     #[test]
     fn cumulative_bytes_close_and_redacted_diagnostics() {
         let req = request();
         let bytes = serde_json::to_vec(&req).unwrap().len();
-        let mut run = SamplingToolLoop::new(req, SamplingToolLoopLimits::new(4, 8, bytes).unwrap()).unwrap();
-        assert_eq!(run.accept_response(response(call("private-id"))), Err(SamplingToolLoopError::ByteLimit));
+        let mut run =
+            SamplingToolLoop::new(req, SamplingToolLoopLimits::new(4, 8, bytes).unwrap()).unwrap();
+        assert_eq!(
+            run.accept_response(response(call("private-id"))),
+            Err(SamplingToolLoopError::ByteLimit)
+        );
         assert_eq!(run.round_count(), 0);
         assert!(!format!("{run:?}").contains("private"));
         run.close();
         run.close();
         assert!(run.request().is_none());
-        assert_eq!(run.accept_response(response(call("a"))), Err(SamplingToolLoopError::Closed));
-        assert_eq!(run.submit_tool_results(vec![answer("a")]), Err(SamplingToolLoopError::Closed));
+        assert_eq!(
+            run.accept_response(response(call("a"))),
+            Err(SamplingToolLoopError::Closed)
+        );
+        assert_eq!(
+            run.submit_tool_results(vec![answer("a")]),
+            Err(SamplingToolLoopError::Closed)
+        );
     }
 }

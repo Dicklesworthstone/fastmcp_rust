@@ -73,10 +73,18 @@ impl Default for ManagedCoreLimits {
 }
 
 impl ManagedCoreLimits {
-    pub(crate) fn request_bytes(self) -> usize { self.request_bytes }
-    pub(crate) fn frame_bytes(self) -> usize { self.frame_bytes }
-    pub(crate) fn total_bytes(self) -> usize { self.total_bytes }
-    pub(crate) fn timeout(self) -> Duration { self.timeout }
+    pub(crate) fn request_bytes(self) -> usize {
+        self.request_bytes
+    }
+    pub(crate) fn frame_bytes(self) -> usize {
+        self.frame_bytes
+    }
+    pub(crate) fn total_bytes(self) -> usize {
+        self.total_bytes
+    }
+    pub(crate) fn timeout(self) -> Duration {
+        self.timeout
+    }
 
     /// A notification limit of zero intentionally requires a terminal-only
     /// response. The deadline includes credential acquisition, HTTP headers,
@@ -97,7 +105,13 @@ impl ManagedCoreLimits {
         {
             return Err(ManagedCoreError::InvalidLimits);
         }
-        Ok(Self { request_bytes, frame_bytes, total_bytes, notifications, timeout })
+        Ok(Self {
+            request_bytes,
+            frame_bytes,
+            total_bytes,
+            notifications,
+            timeout,
+        })
     }
 }
 
@@ -131,18 +145,26 @@ impl fmt::Display for ManagedCoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Remote { code } => write!(f, "managed core request failed with JSON-RPC {code}"),
-            Self::HttpStatus { status } => write!(f, "managed core request rejected with HTTP {status}"),
+            Self::HttpStatus { status } => {
+                write!(f, "managed core request rejected with HTTP {status}")
+            }
             Self::Session(error) => error.fmt(f),
             other => f.write_str(match other {
                 Self::InvalidLimits => "invalid managed core call limits",
                 Self::InvalidRequest => "invalid typed core request",
-                Self::UnsupportedRequest => "request requires a different protocol or extension client",
-                Self::UnsupportedResult => "result requires extension negotiation absent from this core call",
+                Self::UnsupportedRequest => {
+                    "request requires a different protocol or extension client"
+                }
+                Self::UnsupportedResult => {
+                    "result requires extension negotiation absent from this core call"
+                }
                 Self::RequestTooLarge => "typed core request exceeds the encoded-byte limit",
                 Self::InvalidResponse => "core response failed strict JSON-RPC admission",
                 Self::ResponseIdMismatch => "core response does not match the owning request ID",
                 Self::InvalidResult => "core result does not match its request's protocol contract",
-                Self::UnexpectedNotification => "unexpected control or reverse request in a core response",
+                Self::UnexpectedNotification => {
+                    "unexpected control or reverse request in a core response"
+                }
                 Self::InvalidProgress => "core response progress is uncorrelated or not increasing",
                 Self::NotificationLimit => "core response notification limit exceeded",
                 Self::ResponseByteLimit => "core response payload-byte limit exceeded",
@@ -160,7 +182,9 @@ impl fmt::Display for ManagedCoreError {
 impl std::error::Error for ManagedCoreError {}
 
 impl From<OAuthSessionError> for ManagedCoreError {
-    fn from(error: OAuthSessionError) -> Self { Self::Session(error) }
+    fn from(error: OAuthSessionError) -> Self {
+        Self::Session(error)
+    }
 }
 
 /// A notification is delivered before any later result/error. Results retain
@@ -186,8 +210,13 @@ impl ManagedOAuthSession {
         limits: ManagedCoreLimits,
     ) -> Result<ManagedCoreCall, ManagedCoreError> {
         self.request_core_with_cancellation(
-            cx, &McpRequestCancellation::new(), request, request_id, limits,
-        ).await
+            cx,
+            &McpRequestCancellation::new(),
+            request,
+            request_id,
+            limits,
+        )
+        .await
     }
 
     /// Like [`Self::request_core`], with a request-local cancellation domain
@@ -204,8 +233,11 @@ impl ManagedOAuthSession {
         let deadline = call_deadline(cx, cancellation, limits.timeout)?;
         let (wire, decoder) = prepare(self.resource().as_str(), request, request_id, limits)?;
         let response = bounded_wait(cx, cancellation, deadline, async {
-            self.execute_with_cancellation(cx, cancellation, &wire).await.map_err(ManagedCoreError::from)
-        }).await?;
+            self.execute_with_cancellation(cx, cancellation, &wire)
+                .await
+                .map_err(ManagedCoreError::from)
+        })
+        .await?;
         ManagedCoreCall::from_response(response, decoder, cancellation.clone(), deadline)
     }
 }
@@ -236,7 +268,9 @@ impl ManagedCoreCall {
         deadline: Time,
     ) -> Result<Self, ManagedCoreError> {
         if response.metadata().status() != 200 {
-            return Err(ManagedCoreError::HttpStatus { status: response.metadata().status() });
+            return Err(ManagedCoreError::HttpStatus {
+                status: response.metadata().status(),
+            });
         }
         let generation = response.credential_generation();
         let body = match response.metadata().kind() {
@@ -253,16 +287,27 @@ impl ManagedCoreCall {
             _ => return Err(ManagedCoreError::InvalidResponse),
         };
         Ok(Self {
-            body: Some(body), decoder, cancellation, deadline, generation, finished: false,
+            body: Some(body),
+            decoder,
+            cancellation,
+            deadline,
+            generation,
+            finished: false,
         })
     }
 
-    pub fn request_id(&self) -> &RequestId { &self.decoder.request_id }
+    pub fn request_id(&self) -> &RequestId {
+        &self.decoder.request_id
+    }
 
     /// Session-local credential generation, not a cross-session cache identity.
-    pub fn credential_generation(&self) -> u64 { self.generation }
+    pub fn credential_generation(&self) -> u64 {
+        self.generation
+    }
 
-    pub fn close(&mut self) { self.body = None; }
+    pub fn close(&mut self) {
+        self.body = None;
+    }
 
     /// Returns `None` only after delivering the single typed result. EOF before
     /// that result, a foreign ID, malformed ingress and remote errors fail the
@@ -270,22 +315,32 @@ impl ManagedCoreCall {
     /// An SSE result is withheld until clean body EOF: duplicate terminals,
     /// trailing notifications, read failures, cancellation and deadline expiry
     /// cannot turn a partial response into a published or cacheable success.
-    pub async fn next_event(&mut self, cx: &Cx) -> Result<Option<ManagedCoreEvent>, ManagedCoreError> {
-        if self.finished { return Ok(None); }
+    pub async fn next_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<ManagedCoreEvent>, ManagedCoreError> {
+        if self.finished {
+            return Ok(None);
+        }
         let body = self.body.take().ok_or(ManagedCoreError::Closed)?;
         check_call(cx, &self.cancellation, self.deadline)?;
         let (frame, remaining) = match body {
             CoreBody::Json(response) => {
                 let frame = bounded_wait(cx, &self.cancellation, self.deadline, async {
-                    response.read_to_end(cx, self.decoder.limits.frame_bytes)
-                        .await.map_err(ManagedCoreError::from)
-                }).await?;
+                    response
+                        .read_to_end(cx, self.decoder.limits.frame_bytes)
+                        .await
+                        .map_err(ManagedCoreError::from)
+                })
+                .await?;
                 (frame, None)
             }
             CoreBody::Sse(mut stream) => {
                 let payload = bounded_wait(cx, &self.cancellation, self.deadline, async {
                     stream.next_event(cx).await.map_err(ManagedCoreError::from)
-                }).await?.ok_or(ManagedCoreError::MissingTerminal)?;
+                })
+                .await?
+                .ok_or(ManagedCoreError::MissingTerminal)?;
                 (payload.into_bytes(), Some(CoreBody::Sse(stream)))
             }
         };
@@ -296,7 +351,8 @@ impl ManagedCoreCall {
                 if let Some(CoreBody::Sse(mut stream)) = remaining {
                     finish_finite_sse(cx, &self.cancellation, self.deadline, async {
                         stream.next_event(cx).await.map_err(ManagedCoreError::from)
-                    }).await?;
+                    })
+                    .await?;
                 }
                 check_call(cx, &self.cancellation, self.deadline)?;
                 self.finished = true;
@@ -325,7 +381,8 @@ pub(crate) async fn finish_finite_sse(
             None => Ok(()),
             Some(_) => Err(ManagedCoreError::InvalidResponse),
         }
-    }).await
+    })
+    .await
 }
 
 pub(crate) struct CoreDecoder {
@@ -344,34 +401,67 @@ fn prepare(
     request_id: RequestId,
     limits: ManagedCoreLimits,
 ) -> Result<(ModernHttpRequest, CoreDecoder), ManagedCoreError> {
-    if request.era() != ProtocolEra::Modern2026 || !matches!(request.method(),
-        "server/discover" | "tools/list" | "tools/call" | "resources/list"
-        | "resources/templates/list" | "resources/read" | "prompts/list"
-        | "prompts/get" | "completion/complete"
-    ) {
+    if request.era() != ProtocolEra::Modern2026
+        || !matches!(
+            request.method(),
+            "server/discover"
+                | "tools/list"
+                | "tools/call"
+                | "resources/list"
+                | "resources/templates/list"
+                | "resources/read"
+                | "prompts/list"
+                | "prompts/get"
+                | "completion/complete"
+        )
+    {
         return Err(ManagedCoreError::UnsupportedRequest);
     }
-    request_id.validate().map_err(|_| ManagedCoreError::InvalidRequest)?;
-    let params = request.encode_params().map_err(|_| ManagedCoreError::InvalidRequest)?
+    request_id
+        .validate()
+        .map_err(|_| ManagedCoreError::InvalidRequest)?;
+    let params = request
+        .encode_params()
+        .map_err(|_| ManagedCoreError::InvalidRequest)?
         .ok_or(ManagedCoreError::InvalidRequest)?;
-    let metadata = params.get("_meta").and_then(serde_json::Value::as_object)
+    let metadata = params
+        .get("_meta")
+        .and_then(serde_json::Value::as_object)
         .ok_or(ManagedCoreError::InvalidRequest)?;
-    if let Some(extensions) = metadata.get(FINAL_CLIENT_CAPABILITIES_META_KEY)
+    if let Some(extensions) = metadata
+        .get(FINAL_CLIENT_CAPABILITIES_META_KEY)
         .and_then(|capabilities| capabilities.get("extensions"))
-        && !extensions.as_object().is_some_and(serde_json::Map::is_empty)
+        && !extensions
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
     {
         return Err(ManagedCoreError::UnsupportedRequest);
     }
     let name = if matches!(request.method(), "tools/call" | "prompts/get") {
-        params.get("name").and_then(serde_json::Value::as_str).map(str::to_owned)
-    } else { None };
+        params
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    } else {
+        None
+    };
     let envelope = serde_json::json!({
         "jsonrpc": "2.0", "id": request_id, "method": request.method(), "params": params,
     });
-    let mut encoded = BoundedWriter { bytes: Vec::new(), maximum: limits.request_bytes };
-    serde_json::to_writer(&mut encoded, &envelope).map_err(|_| ManagedCoreError::RequestTooLarge)?;
-    let wire = ModernHttpRequest::new(target, encoded.bytes, FINAL_PROTOCOL_VERSION, request.method(), name)
-        .map_err(|_| ManagedCoreError::InvalidRequest)?;
+    let mut encoded = BoundedWriter {
+        bytes: Vec::new(),
+        maximum: limits.request_bytes,
+    };
+    serde_json::to_writer(&mut encoded, &envelope)
+        .map_err(|_| ManagedCoreError::RequestTooLarge)?;
+    let wire = ModernHttpRequest::new(
+        target,
+        encoded.bytes,
+        FINAL_PROTOCOL_VERSION,
+        request.method(),
+        name,
+    )
+    .map_err(|_| ManagedCoreError::InvalidRequest)?;
     Ok((wire, CoreDecoder::for_request(request, request_id, limits)?))
 }
 
@@ -384,24 +474,47 @@ impl CoreDecoder {
         request_id: RequestId,
         limits: ManagedCoreLimits,
     ) -> Result<Self, ManagedCoreError> {
-        if request.era() != ProtocolEra::Modern2026 || !matches!(request.method(),
-            "server/discover" | "tools/list" | "tools/call" | "resources/list"
-            | "resources/templates/list" | "resources/read" | "prompts/list"
-            | "prompts/get" | "completion/complete"
-        ) {
+        if request.era() != ProtocolEra::Modern2026
+            || !matches!(
+                request.method(),
+                "server/discover"
+                    | "tools/list"
+                    | "tools/call"
+                    | "resources/list"
+                    | "resources/templates/list"
+                    | "resources/read"
+                    | "prompts/list"
+                    | "prompts/get"
+                    | "completion/complete"
+            )
+        {
             return Err(ManagedCoreError::UnsupportedRequest);
         }
-        request_id.validate().map_err(|_| ManagedCoreError::InvalidRequest)?;
-        let params = request.encode_params().map_err(|_| ManagedCoreError::InvalidRequest)?
+        request_id
+            .validate()
+            .map_err(|_| ManagedCoreError::InvalidRequest)?;
+        let params = request
+            .encode_params()
+            .map_err(|_| ManagedCoreError::InvalidRequest)?
             .ok_or(ManagedCoreError::InvalidRequest)?;
-        let metadata = params.get("_meta").and_then(serde_json::Value::as_object)
+        let metadata = params
+            .get("_meta")
+            .and_then(serde_json::Value::as_object)
             .ok_or(ManagedCoreError::InvalidRequest)?;
-        let progress_marker = metadata.get("progressToken").map(|value| {
-            serde_json::from_value(value.clone()).map_err(|_| ManagedCoreError::InvalidRequest)
-        }).transpose()?;
+        let progress_marker = metadata
+            .get("progressToken")
+            .map(|value| {
+                serde_json::from_value(value.clone()).map_err(|_| ManagedCoreError::InvalidRequest)
+            })
+            .transpose()?;
         Ok(Self {
-            request, request_id, progress_marker, last_progress: None, limits,
-            bytes: 0, notifications: 0,
+            request,
+            request_id,
+            progress_marker,
+            last_progress: None,
+            limits,
+            bytes: 0,
+            notifications: 0,
         })
     }
 
@@ -411,7 +524,11 @@ impl CoreDecoder {
 
     // Only a fresh round decoder can inherit an interaction's cumulative work.
     // A previously active decoder must never have its counters rewound.
-    pub(crate) fn resume_usage(&mut self, bytes: usize, notifications: usize) -> Result<(), ManagedCoreError> {
+    pub(crate) fn resume_usage(
+        &mut self,
+        bytes: usize,
+        notifications: usize,
+    ) -> Result<(), ManagedCoreError> {
         if self.bytes != 0 || self.notifications != 0 {
             return Err(ManagedCoreError::InvalidResponse);
         }
@@ -426,7 +543,11 @@ impl CoreDecoder {
         Ok(())
     }
 
-    pub(crate) fn admit(&mut self, frame: &[u8], allow_notification: bool) -> Result<ManagedCoreEvent, ManagedCoreError> {
+    pub(crate) fn admit(
+        &mut self,
+        frame: &[u8],
+        allow_notification: bool,
+    ) -> Result<ManagedCoreEvent, ManagedCoreError> {
         if frame.len() > self.limits.frame_bytes
             || frame.len() > self.limits.total_bytes.saturating_sub(self.bytes)
         {
@@ -436,7 +557,11 @@ impl CoreDecoder {
             .map_err(|_| ManagedCoreError::InvalidResponse)?;
         let event = match message {
             JsonRpcMessage::Response(response) => {
-                if !response.id.as_ref().is_some_and(|id| id.correlates_with(&self.request_id)) {
+                if !response
+                    .id
+                    .as_ref()
+                    .is_some_and(|id| id.correlates_with(&self.request_id))
+                {
                     return Err(ManagedCoreError::ResponseIdMismatch);
                 }
                 if let Some(error) = response.error {
@@ -446,7 +571,10 @@ impl CoreDecoder {
                 // call's authority to accept a Task. Check the core discriminator
                 // boundary after strict envelope admission and before decoding
                 // any extension result, identically in every feature profile.
-                if response.result.as_ref().and_then(|result| result.get("resultType"))
+                if response
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("resultType"))
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|kind| !matches!(kind, "complete" | "input_required"))
                 {
@@ -456,7 +584,9 @@ impl CoreDecoder {
                     .map_err(|_| ManagedCoreError::InvalidResponse)?;
                 let (response, source) = admission.into_parts();
                 let source = source.ok_or(ManagedCoreError::InvalidResult)?;
-                let result = self.request.decode_response_result(&response, &source)
+                let result = self
+                    .request
+                    .decode_response_result(&response, &source)
                     .map_err(|_| ManagedCoreError::InvalidResult)?;
                 ManagedCoreEvent::Result(Box::new(result))
             }
@@ -471,25 +601,32 @@ impl CoreDecoder {
                 struct RawNotification {
                     params: Option<Box<serde_json::value::RawValue>>,
                 }
-                let raw: RawNotification = serde_json::from_slice(frame)
-                    .map_err(|_| ManagedCoreError::InvalidResponse)?;
+                let raw: RawNotification =
+                    serde_json::from_slice(frame).map_err(|_| ManagedCoreError::InvalidResponse)?;
                 let notification = match raw.params {
-                    Some(params) => ServerNotification::decode_with_raw_params(&request, params.get()),
+                    Some(params) => {
+                        ServerNotification::decode_with_raw_params(&request, params.get())
+                    }
                     None => ServerNotification::decode(&request),
-                }.map_err(|_| ManagedCoreError::UnexpectedNotification)?;
+                }
+                .map_err(|_| ManagedCoreError::UnexpectedNotification)?;
                 match &notification {
-                    ServerNotification::Cancelled(_) | ServerNotification::SubscriptionsAcknowledged(_) => {
+                    ServerNotification::Cancelled(_)
+                    | ServerNotification::SubscriptionsAcknowledged(_) => {
                         return Err(ManagedCoreError::UnexpectedNotification);
                     }
                     ServerNotification::Progress(progress) => {
                         if self.progress_marker.as_ref() != Some(&progress.progress_token)
-                            || self.last_progress.as_ref().is_some_and(|previous| progress.progress.cmp(previous).is_le())
+                            || self
+                                .last_progress
+                                .as_ref()
+                                .is_some_and(|previous| progress.progress.cmp(previous).is_le())
                         {
                             return Err(ManagedCoreError::InvalidProgress);
                         }
                         self.last_progress = Some(progress.progress.clone());
                     }
-                    _ => {},
+                    _ => {}
                 }
                 self.notifications += 1;
                 ManagedCoreEvent::Notification(Box::new(notification))
@@ -500,7 +637,10 @@ impl CoreDecoder {
     }
 }
 
-struct BoundedWriter { bytes: Vec<u8>, maximum: usize }
+struct BoundedWriter {
+    bytes: Vec<u8>,
+    maximum: usize,
+}
 
 impl Write for BoundedWriter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
@@ -510,22 +650,49 @@ impl Write for BoundedWriter {
         self.bytes.extend_from_slice(buffer);
         Ok(buffer.len())
     }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
-fn call_deadline(cx: &Cx, cancellation: &McpRequestCancellation, timeout: Duration) -> Result<Time, ManagedCoreError> {
-    if cancellation.is_cancel_requested() || cx.checkpoint().is_err() { return Err(ManagedCoreError::Cancelled); }
-    if cx.timer_driver().is_none() { return Err(ManagedCoreError::RuntimeUnavailable); }
+fn call_deadline(
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    timeout: Duration,
+) -> Result<Time, ManagedCoreError> {
+    if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+        return Err(ManagedCoreError::Cancelled);
+    }
+    if cx.timer_driver().is_none() {
+        return Err(ManagedCoreError::RuntimeUnavailable);
+    }
     let nanos = u64::try_from(timeout.as_nanos()).map_err(|_| ManagedCoreError::InvalidLimits)?;
-    let end = cx.now().as_nanos().checked_add(nanos).ok_or(ManagedCoreError::InvalidLimits)?;
-    let deadline = cx.budget().deadline.map_or(Time::from_nanos(end), |parent| parent.min(Time::from_nanos(end)));
+    let end = cx
+        .now()
+        .as_nanos()
+        .checked_add(nanos)
+        .ok_or(ManagedCoreError::InvalidLimits)?;
+    let deadline = cx
+        .budget()
+        .deadline
+        .map_or(Time::from_nanos(end), |parent| {
+            parent.min(Time::from_nanos(end))
+        });
     check_call(cx, cancellation, deadline)?;
     Ok(deadline)
 }
 
-fn check_call(cx: &Cx, cancellation: &McpRequestCancellation, deadline: Time) -> Result<(), ManagedCoreError> {
-    if cancellation.is_cancel_requested() || cx.checkpoint().is_err() { return Err(ManagedCoreError::Cancelled); }
-    if cx.now() >= deadline { return Err(ManagedCoreError::TimedOut); }
+fn check_call(
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    deadline: Time,
+) -> Result<(), ManagedCoreError> {
+    if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+        return Err(ManagedCoreError::Cancelled);
+    }
+    if cx.now() >= deadline {
+        return Err(ManagedCoreError::TimedOut);
+    }
     Ok(())
 }
 
@@ -535,8 +702,13 @@ async fn bounded_wait<T>(
     deadline: Time,
     future: impl Future<Output = Result<T, ManagedCoreError>>,
 ) -> Result<T, ManagedCoreError> {
-    if cx.timer_driver().is_none() { return Err(ManagedCoreError::RuntimeUnavailable); }
-    let deadline = cx.budget().deadline.map_or(deadline, |parent| parent.min(deadline));
+    if cx.timer_driver().is_none() {
+        return Err(ManagedCoreError::RuntimeUnavailable);
+    }
+    let deadline = cx
+        .budget()
+        .deadline
+        .map_or(deadline, |parent| parent.min(deadline));
     let mut sleep = std::pin::pin!(Sleep::new(deadline));
     let mut cancelled = std::pin::pin!(cancellation.cancelled());
     let (_sender, mut receiver) = oneshot::channel::<()>();
@@ -548,11 +720,14 @@ async fn bounded_wait<T>(
         if cancelled.as_mut().poll(task).is_ready() || ambient.as_mut().poll(task).is_ready() {
             return Poll::Ready(Err(ManagedCoreError::Cancelled));
         }
-        if sleep.as_mut().poll(task).is_ready() { return Poll::Ready(Err(ManagedCoreError::TimedOut)); }
+        if sleep.as_mut().poll(task).is_ready() {
+            return Poll::Ready(Err(ManagedCoreError::TimedOut));
+        }
         let value = future.as_mut().poll(task);
         check_call(cx, cancellation, deadline)?;
         value
-    }).await
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -562,12 +737,20 @@ mod tests {
     use serde_json::json;
 
     fn request(method: &str, mut params: serde_json::Value) -> CoreRequest {
-        params["_meta"] = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
+        params["_meta"] =
+            serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
         CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&params)).unwrap()
     }
 
     fn decoder(method: &str, params: serde_json::Value) -> CoreDecoder {
-        prepare("https://mcp.example/mcp", request(method, params), RequestId::Number(7), ManagedCoreLimits::default()).unwrap().1
+        prepare(
+            "https://mcp.example/mcp",
+            request(method, params),
+            RequestId::Number(7),
+            ManagedCoreLimits::default(),
+        )
+        .unwrap()
+        .1
     }
 
     fn frame(result: &str) -> Vec<u8> {
@@ -576,18 +759,46 @@ mod tests {
 
     #[test]
     fn preparation_preserves_typed_params_id_and_routing_name() {
-        let core = request("tools/call", json!({"name":"echo","arguments":{"text":"hello"}}));
-        let (wire, _) = prepare("https://mcp.example/mcp", core, RequestId::Number(7), ManagedCoreLimits::default()).unwrap();
+        let core = request(
+            "tools/call",
+            json!({"name":"echo","arguments":{"text":"hello"}}),
+        );
+        let (wire, _) = prepare(
+            "https://mcp.example/mcp",
+            core,
+            RequestId::Number(7),
+            ManagedCoreLimits::default(),
+        )
+        .unwrap();
         let body: serde_json::Value = serde_json::from_slice(wire.body()).unwrap();
         assert_eq!(body["id"], 7);
         assert_eq!(body["method"], "tools/call");
         assert_eq!(body["params"]["arguments"]["text"], "hello");
-        assert_eq!(body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"], FINAL_PROTOCOL_VERSION);
+        assert_eq!(
+            body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+            FINAL_PROTOCOL_VERSION
+        );
         let headers = wire.headers();
-        assert!(headers.iter().any(|(name, value)| name.eq_ignore_ascii_case("mcp-name") && value == "echo"));
-        assert!(!headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("authorization")));
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("mcp-name") && value == "echo")
+        );
+        assert!(
+            !headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        );
         let tiny = ManagedCoreLimits::new(10, 1024, 1024, 1, Duration::from_secs(1)).unwrap();
-        assert!(matches!(prepare("https://mcp.example/mcp", request("tools/list", json!({})), RequestId::Number(7), tiny), Err(ManagedCoreError::RequestTooLarge)));
+        assert!(matches!(
+            prepare(
+                "https://mcp.example/mcp",
+                request("tools/list", json!({})),
+                RequestId::Number(7),
+                tiny
+            ),
+            Err(ManagedCoreError::RequestTooLarge)
+        ));
     }
 
     #[test]
@@ -595,22 +806,39 @@ mod tests {
         let raw = r#"{"resultType":"complete","tools":[],"ttlMs":100,"cacheScope":"private","x-exact":{"z":900719925474099312345,"a":1.20e+4}}"#;
         for sse in [false, true] {
             let mut decoder = decoder("tools/list", json!({}));
-            let ManagedCoreEvent::Result(result) = decoder.admit(&frame(raw), sse).unwrap() else { panic!("terminal expected") };
+            let ManagedCoreEvent::Result(result) = decoder.admit(&frame(raw), sse).unwrap() else {
+                panic!("terminal expected")
+            };
             let encoded = result.encode().unwrap();
             assert!(encoded.contains("900719925474099312345"));
             assert!(encoded.contains("1.20e+4"));
             assert!(encoded.find("\"z\"").unwrap() < encoded.find("\"a\"").unwrap());
         }
         let mut decoder = decoder("tools/list", json!({}));
-        assert!(matches!(decoder.admit(&frame(r#"{"resultType":"complete","contents":[],"ttlMs":100,"cacheScope":"private"}"#), false), Err(ManagedCoreError::InvalidResult)));
+        assert!(matches!(
+            decoder.admit(
+                &frame(
+                    r#"{"resultType":"complete","contents":[],"ttlMs":100,"cacheScope":"private"}"#
+                ),
+                false
+            ),
+            Err(ManagedCoreError::InvalidResult)
+        ));
     }
 
     #[test]
     fn input_required_is_a_typed_terminal_not_an_automatic_retry() {
         let mut decoder = decoder("resources/read", json!({"uri":"file:///sample"}));
-        let response = frame(r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"opaque-state"}"#);
-        let ManagedCoreEvent::Result(result) = decoder.admit(&response, false).unwrap() else { panic!("terminal expected") };
-        assert!(matches!(*result, CoreResult::Final(fastmcp_protocol::FinalCoreResult::ResourcesReadInputRequired { .. })));
+        let response = frame(
+            r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"opaque-state"}"#,
+        );
+        let ManagedCoreEvent::Result(result) = decoder.admit(&response, false).unwrap() else {
+            panic!("terminal expected")
+        };
+        assert!(matches!(
+            *result,
+            CoreResult::Final(fastmcp_protocol::FinalCoreResult::ResourcesReadInputRequired { .. })
+        ));
     }
 
     #[test]
@@ -633,28 +861,49 @@ mod tests {
         let notification = br#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
         let mut state = decoder("tools/list", json!({}));
         state.limits.notifications = 1;
-        assert!(matches!(state.admit(notification, true), Ok(ManagedCoreEvent::Notification(_))));
+        assert!(matches!(
+            state.admit(notification, true),
+            Ok(ManagedCoreEvent::Notification(_))
+        ));
         let before = state.bytes;
-        assert!(matches!(state.admit(notification, true), Err(ManagedCoreError::NotificationLimit)));
+        assert!(matches!(
+            state.admit(notification, true),
+            Err(ManagedCoreError::NotificationLimit)
+        ));
         assert_eq!(state.bytes, before);
         assert_eq!(state.notifications, 1);
-        assert!(matches!(state.admit(&frame(r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}"#), true), Ok(ManagedCoreEvent::Result(_))));
+        assert!(matches!(
+            state.admit(
+                &frame(r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}"#),
+                true
+            ),
+            Ok(ManagedCoreEvent::Result(_))
+        ));
         let mut json_decoder = decoder("tools/list", json!({}));
-        assert!(matches!(json_decoder.admit(notification, false), Err(ManagedCoreError::UnexpectedNotification)));
+        assert!(matches!(
+            json_decoder.admit(notification, false),
+            Err(ManagedCoreError::UnexpectedNotification)
+        ));
     }
 
     #[test]
     fn foreign_or_nonincreasing_progress_cannot_advance_the_call() {
         let mut decoder = decoder("tools/call", json!({"name":"echo"}));
         decoder.progress_marker = Some(ProgressMarker::String("owned".to_owned()));
-        let progress = |token: &str, value: u64| serde_json::to_vec(&json!({
-            "jsonrpc":"2.0", "method":"notifications/progress",
-            "params":{"progressToken":token,"progress":value}
-        })).unwrap();
+        let progress = |token: &str, value: u64| {
+            serde_json::to_vec(&json!({
+                "jsonrpc":"2.0", "method":"notifications/progress",
+                "params":{"progressToken":token,"progress":value}
+            }))
+            .unwrap()
+        };
         assert!(decoder.admit(&progress("owned", 2), true).is_ok());
         let before = decoder.bytes;
         for (token, value) in [("foreign", 3), ("owned", 2), ("owned", 1)] {
-            assert!(matches!(decoder.admit(&progress(token, value), true), Err(ManagedCoreError::InvalidProgress)));
+            assert!(matches!(
+                decoder.admit(&progress(token, value), true),
+                Err(ManagedCoreError::InvalidProgress)
+            ));
             assert_eq!(decoder.bytes, before);
             assert_eq!(decoder.notifications, 1);
         }
@@ -676,7 +925,13 @@ mod tests {
         let mut decoder = decoder("tools/list", json!({}));
         decoder.limits.total_bytes = notification.len();
         assert!(decoder.admit(notification, true).is_ok());
-        assert!(matches!(decoder.admit(&frame(r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}"#), true), Err(ManagedCoreError::ResponseByteLimit)));
+        assert!(matches!(
+            decoder.admit(
+                &frame(r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}"#),
+                true
+            ),
+            Err(ManagedCoreError::ResponseByteLimit)
+        ));
         assert_eq!(decoder.notifications, 1);
     }
 
@@ -684,24 +939,47 @@ mod tests {
     fn compiled_extension_codecs_do_not_authorize_core_call_task_results() {
         let task = r#"{"resultType":"task","taskId":"opaque","status":"working","createdAt":"2026-09-16T00:00:00Z","lastUpdatedAt":"2026-09-16T00:00:00Z","ttlMs":1000}"#;
         #[cfg(feature = "tasks")]
-        assert!(matches!(request("tools/call", json!({"name":"echo"})).decode_result(task),
-            Ok(CoreResult::Final(fastmcp_protocol::FinalCoreResult::ToolsCallTask { .. }))));
+        assert!(matches!(
+            request("tools/call", json!({"name":"echo"})).decode_result(task),
+            Ok(CoreResult::Final(
+                fastmcp_protocol::FinalCoreResult::ToolsCallTask { .. }
+            ))
+        ));
         for sse in [false, true] {
             let mut decoder = decoder("tools/call", json!({"name":"echo"}));
-            assert!(matches!(decoder.admit(&frame(task), sse), Err(ManagedCoreError::UnsupportedResult)));
+            assert!(matches!(
+                decoder.admit(&frame(task), sse),
+                Err(ManagedCoreError::UnsupportedResult)
+            ));
             assert_eq!(decoder.bytes, 0);
             assert_eq!(decoder.notifications, 0);
-            assert!(matches!(decoder.admit(&frame(r#"{"resultType":"complete","content":[]}"#), sse), Ok(ManagedCoreEvent::Result(_))));
+            assert!(matches!(
+                decoder.admit(&frame(r#"{"resultType":"complete","content":[]}"#), sse),
+                Ok(ManagedCoreEvent::Result(_))
+            ));
         }
     }
 
     #[test]
     fn progress_identity_is_retained_from_the_actual_encoded_request() {
-        let mut params = request("tools/call", json!({"name":"echo"})).encode_params().unwrap().unwrap();
+        let mut params = request("tools/call", json!({"name":"echo"}))
+            .encode_params()
+            .unwrap()
+            .unwrap();
         params["_meta"]["progressToken"] = json!("owned");
-        let core = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).unwrap();
-        let (wire, decoder) = prepare("https://mcp.example/mcp", core, RequestId::Number(7), ManagedCoreLimits::default()).unwrap();
-        assert_eq!(decoder.progress_marker, Some(ProgressMarker::String("owned".to_owned())));
+        let core =
+            CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).unwrap();
+        let (wire, decoder) = prepare(
+            "https://mcp.example/mcp",
+            core,
+            RequestId::Number(7),
+            ManagedCoreLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            decoder.progress_marker,
+            Some(ProgressMarker::String("owned".to_owned()))
+        );
         let body: serde_json::Value = serde_json::from_slice(wire.body()).unwrap();
         assert_eq!(body["params"]["_meta"]["progressToken"], "owned");
     }
@@ -709,43 +987,71 @@ mod tests {
     #[test]
     fn same_poll_cancellation_withholds_a_ready_value_without_cancelling_parent() {
         use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
-        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(async {
-            let cx = Cx::current().unwrap();
-            let cancellation = McpRequestCancellation::new();
-            let deadline = call_deadline(&cx, &cancellation, Duration::from_secs(1)).unwrap();
-            let result = bounded_wait(&cx, &cancellation, deadline, async {
-                cancellation.cancel();
-                Ok(7_u8)
-            }).await;
-            assert!(matches!(result, Err(ManagedCoreError::Cancelled)));
-            assert!(cx.checkpoint().is_ok());
-        });
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let cancellation = McpRequestCancellation::new();
+                let deadline = call_deadline(&cx, &cancellation, Duration::from_secs(1)).unwrap();
+                let result = bounded_wait(&cx, &cancellation, deadline, async {
+                    cancellation.cancel();
+                    Ok(7_u8)
+                })
+                .await;
+                assert!(matches!(result, Err(ManagedCoreError::Cancelled)));
+                assert!(cx.checkpoint().is_ok());
+            });
     }
 
     #[test]
     fn dropping_a_polled_wait_drops_its_owned_future_without_parent_cancellation() {
-        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
         use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
         struct OwnedPending(Arc<AtomicBool>);
         impl Future for OwnedPending {
             type Output = Result<(), ManagedCoreError>;
-            fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<Self::Output> { Poll::Pending }
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> Poll<Self::Output> {
+                Poll::Pending
+            }
         }
         impl Drop for OwnedPending {
-            fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
         }
-        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(async {
-            let cx = Cx::current().unwrap();
-            let cancellation = McpRequestCancellation::new();
-            let dropped = Arc::new(AtomicBool::new(false));
-            let deadline = call_deadline(&cx, &cancellation, Duration::from_secs(1)).unwrap();
-            let mut waiting = Box::pin(bounded_wait(&cx, &cancellation, deadline, OwnedPending(Arc::clone(&dropped))));
-            poll_fn(|task| { assert!(waiting.as_mut().poll(task).is_pending()); Poll::Ready(()) }).await;
-            drop(waiting);
-            assert!(dropped.load(Ordering::Acquire));
-            assert!(!cancellation.is_cancel_requested());
-            assert!(cx.checkpoint().is_ok());
-        });
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let cancellation = McpRequestCancellation::new();
+                let dropped = Arc::new(AtomicBool::new(false));
+                let deadline = call_deadline(&cx, &cancellation, Duration::from_secs(1)).unwrap();
+                let mut waiting = Box::pin(bounded_wait(
+                    &cx,
+                    &cancellation,
+                    deadline,
+                    OwnedPending(Arc::clone(&dropped)),
+                ));
+                poll_fn(|task| {
+                    assert!(waiting.as_mut().poll(task).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                drop(waiting);
+                assert!(dropped.load(Ordering::Acquire));
+                assert!(!cancellation.is_cancel_requested());
+                assert!(cx.checkpoint().is_ok());
+            });
     }
 
     #[test]
@@ -777,61 +1083,95 @@ mod tests {
     #[test]
     fn finite_sse_retains_tail_read_errors_and_same_poll_cancellation() {
         use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
-        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(async {
-            let cx = Cx::current().unwrap();
-            let cancellation = McpRequestCancellation::new();
-            let deadline = call_deadline(&cx, &cancellation, Duration::from_secs(1)).unwrap();
-            let failed = finish_finite_sse(&cx, &cancellation, deadline, async {
-                Err(ManagedCoreError::ResponseByteLimit)
-            }).await;
-            assert!(matches!(failed, Err(ManagedCoreError::ResponseByteLimit)));
-            let cancelled = finish_finite_sse(&cx, &cancellation, deadline, async {
-                cancellation.cancel();
-                Ok(None)
-            }).await;
-            assert!(matches!(cancelled, Err(ManagedCoreError::Cancelled)));
-            assert!(cx.checkpoint().is_ok());
-        });
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let cancellation = McpRequestCancellation::new();
+                let deadline = call_deadline(&cx, &cancellation, Duration::from_secs(1)).unwrap();
+                let failed = finish_finite_sse(&cx, &cancellation, deadline, async {
+                    Err(ManagedCoreError::ResponseByteLimit)
+                })
+                .await;
+                assert!(matches!(failed, Err(ManagedCoreError::ResponseByteLimit)));
+                let cancelled = finish_finite_sse(&cx, &cancellation, deadline, async {
+                    cancellation.cancel();
+                    Ok(None)
+                })
+                .await;
+                assert!(matches!(cancelled, Err(ManagedCoreError::Cancelled)));
+                assert!(cx.checkpoint().is_ok());
+            });
     }
 
     #[test]
     fn finite_sse_pending_eof_uses_the_original_absolute_deadline() {
         use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
-        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(async {
-            let cx = Cx::current().unwrap();
-            let cancellation = McpRequestCancellation::new();
-            let deadline = call_deadline(&cx, &cancellation, Duration::from_millis(20)).unwrap();
-            let result = finish_finite_sse(&cx, &cancellation, deadline, std::future::pending()).await;
-            assert!(matches!(result, Err(ManagedCoreError::TimedOut)));
-            assert!(!cancellation.is_cancel_requested());
-            assert!(cx.checkpoint().is_ok());
-        });
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let cancellation = McpRequestCancellation::new();
+                let deadline =
+                    call_deadline(&cx, &cancellation, Duration::from_millis(20)).unwrap();
+                let result =
+                    finish_finite_sse(&cx, &cancellation, deadline, std::future::pending()).await;
+                assert!(matches!(result, Err(ManagedCoreError::TimedOut)));
+                assert!(!cancellation.is_cancel_requested());
+                assert!(cx.checkpoint().is_ok());
+            });
     }
 
     #[test]
     fn dropping_finite_sse_eof_wait_releases_its_owned_read() {
-        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
         use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
         struct OwnedRead(Arc<AtomicBool>);
         impl Future for OwnedRead {
             type Output = Result<Option<String>, ManagedCoreError>;
-            fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<Self::Output> { Poll::Pending }
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> Poll<Self::Output> {
+                Poll::Pending
+            }
         }
         impl Drop for OwnedRead {
-            fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
         }
-        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(async {
-            let cx = Cx::current().unwrap();
-            let cancellation = McpRequestCancellation::new();
-            let dropped = Arc::new(AtomicBool::new(false));
-            let deadline = call_deadline(&cx, &cancellation, Duration::from_secs(1)).unwrap();
-            let mut waiting = Box::pin(finish_finite_sse(&cx, &cancellation, deadline, OwnedRead(Arc::clone(&dropped))));
-            poll_fn(|task| { assert!(waiting.as_mut().poll(task).is_pending()); Poll::Ready(()) }).await;
-            drop(waiting);
-            assert!(dropped.load(Ordering::Acquire));
-            assert!(!cancellation.is_cancel_requested());
-            assert!(cx.checkpoint().is_ok());
-        });
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let cancellation = McpRequestCancellation::new();
+                let dropped = Arc::new(AtomicBool::new(false));
+                let deadline = call_deadline(&cx, &cancellation, Duration::from_secs(1)).unwrap();
+                let mut waiting = Box::pin(finish_finite_sse(
+                    &cx,
+                    &cancellation,
+                    deadline,
+                    OwnedRead(Arc::clone(&dropped)),
+                ));
+                poll_fn(|task| {
+                    assert!(waiting.as_mut().poll(task).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                drop(waiting);
+                assert!(dropped.load(Ordering::Acquire));
+                assert!(!cancellation.is_cancel_requested());
+                assert!(cx.checkpoint().is_ok());
+            });
     }
-
 }

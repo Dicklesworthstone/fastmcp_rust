@@ -12,28 +12,28 @@ use std::sync::atomic::AtomicU64;
 
 use asupersync::Cx;
 use fastmcp_client::http_auth::discovery::OAuthDiscoveryError;
-use fastmcp_client::http_auth::discovery::client_credentials::{
-    ClientCredentialsClient, ClientCredentialsError,
+use fastmcp_client::http_auth::discovery::client_credentials::rpc::catalog::{
+    ClientCredentialsCatalogClient, ClientCredentialsCatalogError, ClientCredentialsCatalogLimits,
 };
 use fastmcp_client::http_auth::discovery::client_credentials::rpc::{
     ClientCredentialsCoreCall, ClientCredentialsCoreError,
 };
-use fastmcp_client::http_auth::discovery::client_credentials::rpc::catalog::{
-    ClientCredentialsCatalogClient, ClientCredentialsCatalogError, ClientCredentialsCatalogLimits,
+use fastmcp_client::http_auth::discovery::client_credentials::{
+    ClientCredentialsClient, ClientCredentialsError,
 };
-use fastmcp_client::http_auth::rpc::{ManagedCoreEvent, ManagedCoreLimits};
 use fastmcp_client::http_auth::rpc::catalog::ManagedCatalogError;
+use fastmcp_client::http_auth::rpc::{ManagedCoreEvent, ManagedCoreLimits};
 use fastmcp_core::{McpContext, McpError, McpResult};
 use fastmcp_protocol::{CoreRequest, CoreResult, FinalCoreResult, RequestId};
 use serde_json::json;
 
-use interaction::{InteractiveMachineResponse, MachineInputs, interaction_error};
-use super::{ManagedOAuthResourceTemplate, build_templates};
 use super::super::{
     BoxFuture, CoreBackend, Forwarder, ManagedOAuthPrompt, ManagedOAuthResource, ManagedOAuthTool,
-    UNEXPECTED_RESULT, allocate_request_id, build_prompts, build_resources, build_tools,
-    check_cx, core_request, forward_notification, upstream_error,
+    UNEXPECTED_RESULT, allocate_request_id, build_prompts, build_resources, build_tools, check_cx,
+    core_request, forward_notification, upstream_error,
 };
+use super::{ManagedOAuthResourceTemplate, build_templates};
+use interaction::{InteractiveMachineResponse, MachineInputs, interaction_error};
 
 const MACHINE_FAILURE: &str = "Machine-authenticated upstream request failed";
 const CATALOG_FAILURE: &str = "Machine-authenticated upstream catalog acquisition failed";
@@ -115,7 +115,9 @@ impl ClientCredentialsProvider {
     /// allocator for BOTH discovery and operation IDs, including catalog pages.
     /// An explicitly installed input handler is retained with the new limits.
     pub fn with_limits(
-        mut self, calls: ManagedCoreLimits, catalogs: ClientCredentialsCatalogLimits,
+        mut self,
+        calls: ManagedCoreLimits,
+        catalogs: ClientCredentialsCatalogLimits,
     ) -> Self {
         self.forwarder = Arc::new(Forwarder {
             backend: Arc::clone(&self.forwarder.backend),
@@ -130,11 +132,15 @@ impl ClientCredentialsProvider {
     /// request names are unchanged. Invalid namespaces fail before any grant.
     pub fn with_namespace(mut self, namespace: impl Into<String>) -> McpResult<Self> {
         let namespace = namespace.into();
-        if namespace.is_empty() || namespace.len() > 64
-            || !namespace.bytes().all(|byte| byte.is_ascii_alphanumeric()
-                || matches!(byte, b'_' | b'-' | b'.'))
+        if namespace.is_empty()
+            || namespace.len() > 64
+            || !namespace
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
         {
-            return Err(McpError::invalid_params("Invalid machine provider namespace"));
+            return Err(McpError::invalid_params(
+                "Invalid machine provider namespace",
+            ));
         }
         self.namespace = Some(namespace);
         Ok(self)
@@ -150,7 +156,11 @@ impl ClientCredentialsProvider {
             };
             entries.extend(result.payload.tools);
         }
-        build_tools(Arc::clone(&self.forwarder), entries, self.namespace.as_deref())
+        build_tools(
+            Arc::clone(&self.forwarder),
+            entries,
+            self.namespace.as_deref(),
+        )
     }
 
     /// Fully collect concrete resources. Duplicate URIs reject the whole result.
@@ -176,16 +186,24 @@ impl ClientCredentialsProvider {
             };
             entries.extend(result.payload.prompts);
         }
-        build_prompts(Arc::clone(&self.forwarder), entries, self.namespace.as_deref())
+        build_prompts(
+            Arc::clone(&self.forwarder),
+            entries,
+            self.namespace.as_deref(),
+        )
     }
 
     /// Fully collect reversible resource templates, rejecting duplicate,
     /// client-direct HTTPS and non-reversible routes before exposing any handler.
     /// Returned templates also provide their route-bound completion handler.
-    pub async fn resource_templates(&self, cx: &Cx) -> McpResult<Vec<ManagedOAuthResourceTemplate>> {
+    pub async fn resource_templates(
+        &self,
+        cx: &Cx,
+    ) -> McpResult<Vec<ManagedOAuthResourceTemplate>> {
         let mut entries = Vec::new();
         for page in self.catalog(cx, "resources/templates/list").await? {
-            let CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, .. }) = page else {
+            let CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, .. }) = page
+            else {
                 return Err(McpError::invalid_request(UNEXPECTED_RESULT));
             };
             entries.extend(result.payload.resource_templates);
@@ -195,7 +213,10 @@ impl ClientCredentialsProvider {
 
     async fn catalog(&self, cx: &Cx, method: &'static str) -> McpResult<Vec<CoreResult>> {
         check_cx(cx)?;
-        let result = self.source.collect(cx, method, &self.forwarder.next_id, self.catalog_limits).await;
+        let result = self
+            .source
+            .collect(cx, method, &self.forwarder.next_id, self.catalog_limits)
+            .await;
         check_cx(cx)?;
         result
     }
@@ -213,62 +234,114 @@ struct MachineCall {
 
 trait MachineSource: Send + Sync {
     fn collect<'a>(
-        &'a self, cx: &'a Cx, method: &'static str, ids: &'a AtomicU64,
+        &'a self,
+        cx: &'a Cx,
+        method: &'static str,
+        ids: &'a AtomicU64,
         limits: ClientCredentialsCatalogLimits,
     ) -> BoxFuture<'a, McpResult<Vec<CoreResult>>>;
 
     fn start<'a>(
-        &'a self, ctx: &'a McpContext, cx: &'a Cx, call: MachineCall,
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        call: MachineCall,
     ) -> BoxFuture<'a, McpResult<Box<dyn MachineResponse>>>;
 }
 
 trait MachineResponse: Send {
-    fn next_event<'a>(&'a mut self, cx: &'a Cx)
-        -> BoxFuture<'a, McpResult<Option<ManagedCoreEvent>>>;
+    fn next_event<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> BoxFuture<'a, McpResult<Option<ManagedCoreEvent>>>;
 }
 
 struct NativeMachineSource(ClientCredentialsClient);
 
 impl MachineSource for NativeMachineSource {
     fn collect<'a>(
-        &'a self, cx: &'a Cx, method: &'static str, ids: &'a AtomicU64,
+        &'a self,
+        cx: &'a Cx,
+        method: &'static str,
+        ids: &'a AtomicU64,
         limits: ClientCredentialsCatalogLimits,
     ) -> BoxFuture<'a, McpResult<Vec<CoreResult>>> {
         Box::pin(async move {
             let request = core_request(method, json!({}), None)?;
             let collector = ClientCredentialsCatalogClient::new(self.0.clone(), limits);
-            let pages = collector.collect(
-                cx, request,
-                || next_pair(ids).map_err(|_| ClientCredentialsCatalogError::Catalog(
-                    ManagedCatalogError::AbortedByHost,
-                )),
-                // Empty capability metadata grants no notification stream.
-                // Invalidation during collection must not publish a partial catalog.
-                |_| Err(ClientCredentialsCatalogError::Catalog(ManagedCatalogError::AbortedByHost)),
-            ).await.map_err(catalog_error)?;
+            let pages = collector
+                .collect(
+                    cx,
+                    request,
+                    || {
+                        next_pair(ids).map_err(|_| {
+                            ClientCredentialsCatalogError::Catalog(
+                                ManagedCatalogError::AbortedByHost,
+                            )
+                        })
+                    },
+                    // Empty capability metadata grants no notification stream.
+                    // Invalidation during collection must not publish a partial catalog.
+                    |_| {
+                        Err(ClientCredentialsCatalogError::Catalog(
+                            ManagedCatalogError::AbortedByHost,
+                        ))
+                    },
+                )
+                .await
+                .map_err(catalog_error)?;
             Ok(pages.into_pages())
         })
     }
 
     fn start<'a>(
-        &'a self, ctx: &'a McpContext, cx: &'a Cx, call: MachineCall,
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        call: MachineCall,
     ) -> BoxFuture<'a, McpResult<Box<dyn MachineResponse>>> {
         Box::pin(async move {
-            let MachineCall { request, discovery_id, request_id, limits, inputs } = call;
+            let MachineCall {
+                request,
+                discovery_id,
+                request_id,
+                limits,
+                inputs,
+            } = call;
             let cancellation = ctx.request_cancellation();
             if let Some(inputs) = inputs {
-                let operation = self.0.start_core_interaction_with_cancellation(
-                    cx, &cancellation, request, discovery_id, request_id, inputs.policy.limits(limits)?,
-                ).await.map_err(interaction_error)?;
+                let operation = self
+                    .0
+                    .start_core_interaction_with_cancellation(
+                        cx,
+                        &cancellation,
+                        request,
+                        discovery_id,
+                        request_id,
+                        inputs.policy.limits(limits)?,
+                    )
+                    .await
+                    .map_err(interaction_error)?;
                 // Preserve request identity/auth/quota/lease while giving host
                 // callbacks the exact Cx selected by request-owned dispatch.
                 return Ok(Box::new(InteractiveMachineResponse::new(
-                    operation, ctx.clone().with_request_cx(cx.clone()), inputs,
+                    operation,
+                    ctx.clone().with_request_cx(cx.clone()),
+                    inputs,
                 )) as Box<dyn MachineResponse>);
             }
-            let call = self.0.request_core_with_cancellation(
-                cx, &cancellation, request, discovery_id, request_id, limits,
-            ).await.map_err(machine_error)?;
+            let call = self
+                .0
+                .request_core_with_cancellation(
+                    cx,
+                    &cancellation,
+                    request,
+                    discovery_id,
+                    request_id,
+                    limits,
+                )
+                .await
+                .map_err(machine_error)?;
             Ok(Box::new(NativeMachineResponse(call)) as Box<dyn MachineResponse>)
         })
     }
@@ -276,9 +349,10 @@ impl MachineSource for NativeMachineSource {
 
 struct NativeMachineResponse(ClientCredentialsCoreCall);
 impl MachineResponse for NativeMachineResponse {
-    fn next_event<'a>(&'a mut self, cx: &'a Cx)
-        -> BoxFuture<'a, McpResult<Option<ManagedCoreEvent>>>
-    {
+    fn next_event<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> BoxFuture<'a, McpResult<Option<ManagedCoreEvent>>> {
         Box::pin(async move { self.0.next_event(cx).await.map_err(machine_error) })
     }
 }
@@ -291,8 +365,12 @@ struct MachineBackend {
 
 impl CoreBackend for MachineBackend {
     fn execute<'a>(
-        &'a self, ctx: &'a McpContext, cx: &'a Cx, request: CoreRequest,
-        id: RequestId, limits: ManagedCoreLimits,
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        request: CoreRequest,
+        id: RequestId,
+        limits: ManagedCoreLimits,
     ) -> BoxFuture<'a, McpResult<FinalCoreResult>> {
         Box::pin(async move {
             ctx.checkpoint()?;
@@ -309,9 +387,20 @@ impl CoreBackend for MachineBackend {
             // The operation's ID already came from Forwarder. Discovery needs
             // another ID from that same allocator, never a fixed or reused ID.
             let discovery_id = allocate_request_id(&self.next_id)?;
-            let mut response = self.source.start(ctx, cx, MachineCall {
-                request, discovery_id, request_id: id, limits, inputs,
-            }).await?;
+            let mut response = self
+                .source
+                .start(
+                    ctx,
+                    cx,
+                    MachineCall {
+                        request,
+                        discovery_id,
+                        request_id: id,
+                        limits,
+                        inputs,
+                    },
+                )
+                .await?;
             loop {
                 ctx.checkpoint()?;
                 check_cx(cx)?;

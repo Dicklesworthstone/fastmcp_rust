@@ -248,15 +248,21 @@ fn prt_04_a_positive() {
     // PRT-04.02 — an absent discriminator defaults to complete in either era,
     // and only the modern omission records a peer-nonconformance diagnostic.
     let absent = r#"{"resultType-lookalike":"complete","note":"no discriminator"}"#;
-    let (legacy, legacy_diagnostic) =
-        decode_peer_result(absent, ResultPeerEra::Legacy, &CoreResultDiscriminatorPolicy)
-            .expect("an earlier-era peer may omit resultType");
+    let (legacy, legacy_diagnostic) = decode_peer_result(
+        absent,
+        ResultPeerEra::Legacy,
+        &CoreResultDiscriminatorPolicy,
+    )
+    .expect("an earlier-era peer may omit resultType");
     assert!(matches!(legacy, DecodedResult::Complete(_)));
     assert_eq!(legacy_diagnostic, None);
     seen.observe("absent-discriminator-defaults-complete");
-    let (modern, modern_diagnostic) =
-        decode_peer_result(absent, ResultPeerEra::Modern, &CoreResultDiscriminatorPolicy)
-            .expect("a final-era peer omission still decodes as complete");
+    let (modern, modern_diagnostic) = decode_peer_result(
+        absent,
+        ResultPeerEra::Modern,
+        &CoreResultDiscriminatorPolicy,
+    )
+    .expect("a final-era peer omission still decodes as complete");
     assert!(matches!(modern, DecodedResult::Complete(_)));
     assert_eq!(
         modern_diagnostic,
@@ -458,7 +464,11 @@ fn prt_04_a_positive() {
         Some(ExactJsonValue::Bool(true))
     ));
     assert_eq!(
-        common.meta.server_info.as_ref().map(|info| info.name.as_str()),
+        common
+            .meta
+            .server_info
+            .as_ref()
+            .map(|info| info.name.as_str()),
         Some("FastMCP")
     );
     for common_name in ["resultType", "_meta", "serverInfo"] {
@@ -534,11 +544,8 @@ fn prt_04_a_planted_negative() {
     // Planted mutation 1 — the forbidden dimension is the discriminator's JSON
     // kind. Exactly one input dimension differs from the accepted baseline:
     // `"complete"` becomes `null`. Every open sibling is byte-identical.
-    let planted_discriminator = OPEN_KINDS_COMPLETE.replacen(
-        r#""resultType":"complete""#,
-        r#""resultType":null"#,
-        1,
-    );
+    let planted_discriminator =
+        OPEN_KINDS_COMPLETE.replacen(r#""resultType":"complete""#, r#""resultType":null"#, 1);
     assert_ne!(planted_discriminator, OPEN_KINDS_COMPLETE);
     let error = decode_peer_result(
         &planted_discriminator,
@@ -941,13 +948,15 @@ fn prt_04_b_positive() {
 
     // PRT-04.13 — an invalid or unconsumed selected-known field is a typed
     // failure; it can never be smuggled into the inert open-member set.
-    let wrong_kind = TYPED_CANONICAL_COMPLETE.replacen(r#""status":"ready""#, r#""status":false"#, 1);
+    let wrong_kind =
+        TYPED_CANONICAL_COMPLETE.replacen(r#""status":"ready""#, r#""status":false"#, 1);
     let error = decode_typed_complete::<LookupResult>(&wrong_kind, ResultPeerEra::Modern)
         .expect_err("a selected member of the wrong JSON kind fails at that member");
     assert_eq!(error.kind(), ResultDecodeErrorKind::InvalidKnownMember);
     assert_eq!(error.path(), "$.status");
     seen.observe("invalid-known-member-not-smuggled-into-extras");
-    let residual = r#"{"resultType":"complete","status":"ready","record":{},"audit":{"who":"x"},"free":1}"#;
+    let residual =
+        r#"{"resultType":"complete","status":"ready","record":{},"audit":{"who":"x"},"free":1}"#;
     let error = decode_typed_complete::<PartialLookupResult>(residual, ResultPeerEra::Modern)
         .expect_err("a declared but unconsumed member cannot become an extra");
     assert_eq!(error.kind(), ResultDecodeErrorKind::InvalidKnownMember);
@@ -1031,11 +1040,9 @@ fn prt_04_b_positive() {
     assert_eq!(error.kind(), ResultDecodeErrorKind::UnexpectedResultType);
     assert_eq!(error.path(), "$.resultType");
     seen.observe("wrong-core-composition-refused");
-    let error = decode_typed_complete::<LookupResult>(
-        UNCLAIMED_DISCRIMINATOR,
-        ResultPeerEra::Modern,
-    )
-    .expect_err("typed decode cannot activate an unclaimed discriminator");
+    let error =
+        decode_typed_complete::<LookupResult>(UNCLAIMED_DISCRIMINATOR, ResultPeerEra::Modern)
+            .expect_err("typed decode cannot activate an unclaimed discriminator");
     assert_eq!(error.kind(), ResultDecodeErrorKind::RejectedExtension);
     seen.observe("wrong-core-composition-refused");
 

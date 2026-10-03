@@ -1000,8 +1000,7 @@ fn auth_00_integration_revision_bindings_are_falsifiable() {
         "A's revision and this leaf's revision must be distinct digests"
     );
     assert_ne!(
-        a_revision,
-        [0_u8; 32],
+        a_revision, [0_u8; 32],
         "a revision digest must not be the zero value a stubbed helper returns"
     );
 
@@ -1018,7 +1017,10 @@ fn auth_00_integration_revision_bindings_are_falsifiable() {
 
     // The path is bound too, not just the text: same bytes under a different
     // name is a different revision.
-    let renamed_source = [("crates/fastmcp-core/src/renamed.rs", AUTH_00_B_PUBLIC_API_SOURCE[0].1)];
+    let renamed_source = [(
+        "crates/fastmcp-core/src/renamed.rs",
+        AUTH_00_B_PUBLIC_API_SOURCE[0].1,
+    )];
     assert_ne!(
         b_revision,
         source_revision_digest(b"auth_00_b_public_api-v1", &renamed_source),

@@ -30,11 +30,10 @@ use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 
 use super::super::HttpSecurityPolicy;
 use crate::{
-    BoundHttpServer, HTTP_ACCEPT_CANCEL_POLL, HttpConnectionChildren,
-    HttpListenerShutdown, HttpNonquiescentShutdown, HttpServerShutdown,
-    MODERN_HTTP_SESSION_REAP_INTERVAL, Server, detach_live_modern_http_sessions,
-    expire_live_modern_http_sessions, finish_live_modern_http_sessions,
-    take_unsettled_retired_modern_http_dispatches,
+    BoundHttpServer, HTTP_ACCEPT_CANCEL_POLL, HttpConnectionChildren, HttpListenerShutdown,
+    HttpNonquiescentShutdown, HttpServerShutdown, MODERN_HTTP_SESSION_REAP_INTERVAL, Server,
+    detach_live_modern_http_sessions, expire_live_modern_http_sessions,
+    finish_live_modern_http_sessions, take_unsettled_retired_modern_http_dispatches,
 };
 
 /// Finite TLS-handshake, request-read and individual response-write bounds.
@@ -61,28 +60,41 @@ impl Default for SecuredHttpIoLimits {
 
 impl SecuredHttpIoLimits {
     pub fn new(request_timeout: Duration, write_timeout: Duration) -> McpResult<Self> {
-        if request_timeout.is_zero() || write_timeout.is_zero()
+        if request_timeout.is_zero()
+            || write_timeout.is_zero()
             || request_timeout > Duration::from_mins(15)
             || write_timeout > Duration::from_secs(300)
         {
             return Err(McpError::invalid_request("invalid secured HTTP I/O limits"));
         }
-        Ok(Self { handshake_bound: Duration::from_secs(10), request_timeout, write_timeout })
+        Ok(Self {
+            handshake_bound: Duration::from_secs(10),
+            request_timeout,
+            write_timeout,
+        })
     }
 
     /// Sets the total TLS handshake allowance, not a timeout per read or retry.
     /// The caller's tighter deadline still wins. Plain HTTP does not use it.
     pub fn with_handshake_timeout(mut self, timeout: Duration) -> McpResult<Self> {
         if timeout.is_zero() || timeout > Duration::from_secs(120) {
-            return Err(McpError::invalid_request("invalid secured HTTPS handshake timeout"));
+            return Err(McpError::invalid_request(
+                "invalid secured HTTPS handshake timeout",
+            ));
         }
         self.handshake_bound = timeout;
         Ok(self)
     }
 
-    pub fn handshake_timeout(self) -> Duration { self.handshake_bound }
-    pub fn request_timeout(self) -> Duration { self.request_timeout }
-    pub fn write_timeout(self) -> Duration { self.write_timeout }
+    pub fn handshake_timeout(self) -> Duration {
+        self.handshake_bound
+    }
+    pub fn request_timeout(self) -> Duration {
+        self.request_timeout
+    }
+    pub fn write_timeout(self) -> Duration {
+        self.write_timeout
+    }
 }
 
 /// Native bound socket and immutable security/TLS policy. Accepted connection
@@ -125,16 +137,24 @@ impl Server {
         policy: HttpSecurityPolicy,
         tls: Option<TlsAcceptor>,
     ) -> McpResult<BoundSecuredHttpServer> {
-        if cx.checkpoint().is_err() { return Err(McpError::request_cancelled()); }
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
         if self.protocol_policy != ProtocolPolicy::ModernOnly {
-            return Err(McpError::invalid_request("secured HTTP requires ModernOnly policy"));
+            return Err(McpError::invalid_request(
+                "secured HTTP requires ModernOnly policy",
+            ));
         }
         if self.http_config.handler_config.base_path != policy.endpoint().path() {
-            return Err(McpError::invalid_request("secured HTTP policy does not match the MCP route"));
+            return Err(McpError::invalid_request(
+                "secured HTTP policy does not match the MCP route",
+            ));
         }
         if let Some(routes) = &self.oauth_http_routes {
             if tls.is_none() {
-                return Err(McpError::invalid_request("secured HTTP requires separate OAuth routes; co-hosting requires native HTTPS"));
+                return Err(McpError::invalid_request(
+                    "secured HTTP requires separate OAuth routes; co-hosting requires native HTTPS",
+                ));
             }
             let issuer_base = CanonicalHttpUrl::parse(routes.public_endpoint_base())
                 .map_err(|_| McpError::invalid_request("invalid secured HTTPS OAuth endpoint"))?;
@@ -142,21 +162,37 @@ impl Server {
                 || issuer_base.host() != policy.public_origin.host()
                 || issuer_base.effective_port() != policy.public_origin.effective_port()
             {
-                return Err(McpError::invalid_request("secured HTTPS OAuth routes require the same configured public origin"));
+                return Err(McpError::invalid_request(
+                    "secured HTTPS OAuth routes require the same configured public origin",
+                ));
             }
-            if policy.resource_metadata_path().is_some_and(|path| routes.has_path(path)) {
-                return Err(McpError::invalid_request("secured HTTPS OAuth and resource metadata routes overlap"));
+            if policy
+                .resource_metadata_path()
+                .is_some_and(|path| routes.has_path(path))
+            {
+                return Err(McpError::invalid_request(
+                    "secured HTTPS OAuth and resource metadata routes overlap",
+                ));
             }
-            crate::validate_server_http_route_configuration(&self)
-                .map_err(|_| McpError::invalid_request("secured HTTPS OAuth routes overlap an installed server route"))?;
+            crate::validate_server_http_route_configuration(&self).map_err(|_| {
+                McpError::invalid_request(
+                    "secured HTTPS OAuth routes overlap an installed server route",
+                )
+            })?;
         }
         self.http_config.handler_config.allow_cors = true;
         self.http_config.handler_config.cors_origins = policy.origins.clone();
-        self.http_config.handler_config.max_body_size = self.http_config.handler_config.max_body_size
+        self.http_config.handler_config.max_body_size = self
+            .http_config
+            .handler_config
+            .max_body_size
             .min(policy.endpoint().limits().max_body_bytes());
         let inner = self.bind_http(cx, addr).await?;
         Ok(BoundSecuredHttpServer {
-            inner, policy: Arc::new(policy), io: SecuredHttpIoLimits::default(), tls,
+            inner,
+            policy: Arc::new(policy),
+            io: SecuredHttpIoLimits::default(),
+            tls,
         })
     }
 
@@ -194,12 +230,17 @@ impl Server {
         policy: HttpSecurityPolicy,
         acceptor: TlsAcceptor,
     ) -> McpResult<BoundSecuredHttpServer> {
-        if cx.checkpoint().is_err() { return Err(McpError::request_cancelled()); }
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
         tls::validate_acceptor(&acceptor)?;
         if cx.timer_driver().is_none() {
-            return Err(McpError::invalid_request("secured HTTPS requires caller-owned timers"));
+            return Err(McpError::invalid_request(
+                "secured HTTPS requires caller-owned timers",
+            ));
         }
-        self.bind_secured_listener(cx, addr, policy, Some(acceptor)).await
+        self.bind_secured_listener(cx, addr, policy, Some(acceptor))
+            .await
     }
 
     /// Binds and serves the secured native listener on the caller's runtime.
@@ -209,7 +250,10 @@ impl Server {
         addr: impl Into<String>,
         policy: HttpSecurityPolicy,
     ) -> McpResult<HttpServerShutdown> {
-        self.bind_secured_http(cx, addr, policy).await?.serve(cx).await
+        self.bind_secured_http(cx, addr, policy)
+            .await?
+            .serve(cx)
+            .await
     }
 
     /// Binds and serves native HTTPS on the caller's runtime and shutdown scope.
@@ -220,15 +264,22 @@ impl Server {
         policy: HttpSecurityPolicy,
         acceptor: TlsAcceptor,
     ) -> McpResult<HttpServerShutdown> {
-        self.bind_secured_https(cx, addr, policy, acceptor).await?.serve(cx).await
+        self.bind_secured_https(cx, addr, policy, acceptor)
+            .await?
+            .serve(cx)
+            .await
     }
 }
 
 impl BoundSecuredHttpServer {
-    pub fn local_addr(&self) -> McpResult<SocketAddr> { self.inner.local_addr() }
+    pub fn local_addr(&self) -> McpResult<SocketAddr> {
+        self.inner.local_addr()
+    }
 
     /// Whether this bound listener requires TLS on every accepted connection.
-    pub fn is_https(&self) -> bool { self.tls.is_some() }
+    pub fn is_https(&self) -> bool {
+        self.tls.is_some()
+    }
 
     /// Changes only this not-yet-served listener's finite I/O limits.
     pub fn with_io_limits(mut self, limits: SecuredHttpIoLimits) -> Self {
@@ -251,7 +302,9 @@ impl BoundSecuredHttpServer {
             let bound = self.inner;
             let server = Arc::clone(&bound.endpoint.server);
             server.init_rich_logging();
-            if let Some(stats) = &server.stats { stats.connection_opened(); }
+            if let Some(stats) = &server.stats {
+                stats.connection_opened();
+            }
             if !server.run_startup_hook() {
                 server.graceful_shutdown_returning();
                 return Err(McpError::internal_error("secured HTTP startup hook failed"));
@@ -273,7 +326,9 @@ impl BoundSecuredHttpServer {
                 let mut parked = Duration::ZERO;
                 loop {
                     asupersync::time::sleep(reaper_cx.now(), chunk).await;
-                    if reaper_cx.checkpoint().is_err() { break; }
+                    if reaper_cx.checkpoint().is_err() {
+                        break;
+                    }
                     parked += chunk;
                     if parked >= MODERN_HTTP_SESSION_REAP_INTERVAL {
                         parked = Duration::ZERO;
@@ -285,16 +340,21 @@ impl BoundSecuredHttpServer {
                 Ok(reaper) => reaper,
                 Err(_) => {
                     #[cfg(feature = "tasks")]
-                    let task_service_result = Server::settle_hosted_task_service(hosted_task_service, cx).await;
+                    let task_service_result =
+                        Server::settle_hosted_task_service(hosted_task_service, cx).await;
                     server.graceful_shutdown_returning();
                     #[cfg(feature = "tasks")]
                     task_service_result?;
-                    return Err(McpError::internal_error("secured HTTP reaper admission failed"));
+                    return Err(McpError::internal_error(
+                        "secured HTTP reaper admission failed",
+                    ));
                 }
             };
             let result = loop {
                 children.reap_finished();
-                if cx.checkpoint().is_err() { break Ok(()); }
+                if cx.checkpoint().is_err() {
+                    break Ok(());
+                }
                 #[cfg(feature = "tasks")]
                 if let Some(hosted) = hosted_task_service.as_ref()
                     && let Err(error) = hosted.check_running()
@@ -302,8 +362,12 @@ impl BoundSecuredHttpServer {
                     break Err(error);
                 }
                 let accepted = match asupersync::time::timeout(
-                    cx.now(), HTTP_ACCEPT_CANCEL_POLL, bound.listener.accept(),
-                ).await {
+                    cx.now(),
+                    HTTP_ACCEPT_CANCEL_POLL,
+                    bound.listener.accept(),
+                )
+                .await
+                {
                     Ok(accepted) => accepted,
                     Err(_) => continue,
                 };
@@ -326,17 +390,30 @@ impl BoundSecuredHttpServer {
                     let _permit = permit;
                     let stream = match acceptor {
                         Some(acceptor) => match tls::accept(
-                            &connection_cx, &stopping, stream, &acceptor, io.handshake_bound,
-                        ).await {
+                            &connection_cx,
+                            &stopping,
+                            stream,
+                            &acceptor,
+                            io.handshake_bound,
+                        )
+                        .await
+                        {
                             Some(stream) => stream,
                             None => return,
                         },
                         None => tls::ConnectionIo::Plain(stream),
                     };
                     let close = stream.tls_close_handle();
-                    let connection: std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> = Box::pin(
-                        connection::serve(&connection_cx, stream, endpoint, sessions, stopping, policy, io),
-                    );
+                    let connection: std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> =
+                        Box::pin(connection::serve(
+                            &connection_cx,
+                            stream,
+                            endpoint,
+                            sessions,
+                            stopping,
+                            policy,
+                            io,
+                        ));
                     // Per-I/O limits cannot bound a silent response wait or
                     // a handler that ignores its deadline. Keep the caller's
                     // cancellation and absolute deadline armed for the whole
@@ -349,13 +426,23 @@ impl BoundSecuredHttpServer {
                         // Application response ownership has finished. TLS
                         // close_notify is best-effort: its local timeout must
                         // not extend the caller's remaining connection budget.
-                        let _ = liveness::drive(&connection_cx, asupersync::time::timeout(
-                            connection_cx.now(), io.write_timeout, close.shutdown(),
-                        )).await;
+                        let _ = liveness::drive(
+                            &connection_cx,
+                            asupersync::time::timeout(
+                                connection_cx.now(),
+                                io.write_timeout,
+                                close.shutdown(),
+                            ),
+                        )
+                        .await;
                     }
                 }) {
                     Ok(child) => children.tasks.push(child),
-                    Err(_) => break Err(McpError::internal_error("secured HTTP connection admission failed")),
+                    Err(_) => {
+                        break Err(McpError::internal_error(
+                            "secured HTTP connection admission failed",
+                        ));
+                    }
                 }
             };
             shutdown.request();
@@ -365,26 +452,36 @@ impl BoundSecuredHttpServer {
             let _ = reaper.join(cx).await;
             let closing = detach_live_modern_http_sessions(&bound.modern_sessions);
             children.drain_terminal_controls(&terminal).await;
-            children.tasks.extend(finish_live_modern_http_sessions(&bound.modern_sessions, closing).await);
+            children
+                .tasks
+                .extend(finish_live_modern_http_sessions(&bound.modern_sessions, closing).await);
             server.cancel_active_requests(asupersync::types::CancelKind::Shutdown, false);
             let _ = children.drain_cooperative_shutdown().await;
-            children.tasks.extend(take_unsettled_retired_modern_http_dispatches(&bound.modern_sessions));
+            children
+                .tasks
+                .extend(take_unsettled_retired_modern_http_dispatches(
+                    &bound.modern_sessions,
+                ));
             children.reap_finished();
             #[cfg(feature = "tasks")]
-            let task_service_result = Server::settle_hosted_task_service(hosted_task_service, cx).await;
+            let task_service_result =
+                Server::settle_hosted_task_service(hosted_task_service, cx).await;
             #[cfg(not(feature = "tasks"))]
             let task_service_result: McpResult<()> = Ok(());
             server.graceful_shutdown_returning();
             let result = result.and(task_service_result);
             if children.tasks.is_empty() {
                 if !children.terminal_failures.is_empty() {
-                    return Err(McpError::internal_error("secured HTTP child settlement failed"));
+                    return Err(McpError::internal_error(
+                        "secured HTTP child settlement failed",
+                    ));
                 }
                 result?;
                 Ok(HttpServerShutdown::Quiescent)
             } else {
                 Ok(HttpServerShutdown::Nonquiescent(HttpNonquiescentShutdown {
-                    children, listener_error: result.err(),
+                    children,
+                    listener_error: result.err(),
                 }))
             }
         }
@@ -401,11 +498,23 @@ mod tests {
         assert!(SecuredHttpIoLimits::new(limits.request_timeout(), limits.write_timeout()).is_ok());
         assert!(SecuredHttpIoLimits::new(Duration::ZERO, Duration::from_secs(1)).is_err());
         assert!(SecuredHttpIoLimits::new(Duration::from_secs(1), Duration::ZERO).is_err());
-        assert!(SecuredHttpIoLimits::new(Duration::from_secs(901), Duration::from_secs(1)).is_err());
-        assert!(SecuredHttpIoLimits::new(Duration::from_secs(1), Duration::from_secs(301)).is_err());
+        assert!(
+            SecuredHttpIoLimits::new(Duration::from_secs(901), Duration::from_secs(1)).is_err()
+        );
+        assert!(
+            SecuredHttpIoLimits::new(Duration::from_secs(1), Duration::from_secs(301)).is_err()
+        );
         assert_eq!(limits.handshake_timeout(), Duration::from_secs(10));
-        assert!(limits.with_handshake_timeout(Duration::from_secs(120)).is_ok());
+        assert!(
+            limits
+                .with_handshake_timeout(Duration::from_secs(120))
+                .is_ok()
+        );
         assert!(limits.with_handshake_timeout(Duration::ZERO).is_err());
-        assert!(limits.with_handshake_timeout(Duration::from_secs(121)).is_err());
+        assert!(
+            limits
+                .with_handshake_timeout(Duration::from_secs(121))
+                .is_err()
+        );
     }
 }

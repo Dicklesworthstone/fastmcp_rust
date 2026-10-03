@@ -13,9 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use fastmcp_xtask::plan_tracker::{
-    self, SOURCES_PATH, TRACE_TABLE_PATH,
-    diagnostics::Code,
-    digest::git_blob_hex,
+    self, SOURCES_PATH, TRACE_TABLE_PATH, diagnostics::Code, digest::git_blob_hex,
     manifest::Outcome,
 };
 
@@ -68,10 +66,8 @@ struct Scratch {
 impl Scratch {
     fn new(label: &str) -> Self {
         let unique = SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "fnd-02-a-{label}-{}-{unique}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("fnd-02-a-{label}-{}-{unique}", std::process::id()));
         let source = repo_root();
 
         for relative in [
@@ -163,8 +159,7 @@ fn fnd_02_a_positive() {
     );
     assert!(run.manifest.required_item_count > 0);
     assert_eq!(
-        run.manifest.trace_row_count,
-        run.manifest.required_item_count,
+        run.manifest.trace_row_count, run.manifest.required_item_count,
         "exact-set coverage: one row per required corpus item"
     );
     assert!(run.manifest.observed_fields_per_row >= 12);
@@ -181,9 +176,16 @@ fn fnd_02_a_positive() {
     // Strictly read-only.
     assert_eq!(run.manifest.write_counters, [0; 6]);
     assert!(run.ledger.is_read_only());
-    assert!(run.ledger.files_read() > 0, "the checker must have read its inputs");
+    assert!(
+        run.ledger.files_read() > 0,
+        "the checker must have read its inputs"
+    );
 
-    assert_eq!(before, snapshot(&immutable_paths(&root)), "the checker wrote something");
+    assert_eq!(
+        before,
+        snapshot(&immutable_paths(&root)),
+        "the checker wrote something"
+    );
 }
 
 // ---------------------------------------------------------------- negative
@@ -226,7 +228,10 @@ fn fnd_02_a_planted_negative() {
     );
     let diagnostic = &run.report.diagnostics()[0];
     assert_eq!(diagnostic.field, "source_revision");
-    assert_eq!(diagnostic.subject, "core/2026-07-28/authorization/credentials-bound-to-issuer");
+    assert_eq!(
+        diagnostic.subject,
+        "core/2026-07-28/authorization/credentials-bound-to-issuer"
+    );
 
     // Only subcase A-04 fails; the other three still pass.
     let failed: Vec<&str> = run
@@ -253,7 +258,10 @@ fn fnd_02_a_planted_negative() {
         "the trace table WAS mutated; an unchanged digest would mean the \
          mutation never reached the evaluator"
     );
-    assert_eq!(run.manifest.trace_row_count, baseline.manifest.trace_row_count);
+    assert_eq!(
+        run.manifest.trace_row_count,
+        baseline.manifest.trace_row_count
+    );
     assert_eq!(run.manifest.write_counters, [0; 6]);
     assert!(run.ledger.is_read_only());
     assert_eq!(

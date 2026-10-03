@@ -3,14 +3,14 @@
 //! certificate, peer and browser fixture rather than a second parser or mock.
 
 use super::*;
-use fastmcp_client::http_auth::discovery::{
-    ResourceMetadataCause, ResourceMetadataFailureClass, ResourceMetadataLocation,
-    MAX_OAUTH_METADATA_BYTES,
-};
 use fastmcp_client::http_auth::discovery::challenge::{
     ChallengedOAuthDiscovery, OAuthChallengeError, ResourceMetadataChallenge,
 };
 use fastmcp_client::http_auth::discovery::client_credentials::ClientCredentialsPlan;
+use fastmcp_client::http_auth::discovery::{
+    MAX_OAUTH_METADATA_BYTES, ResourceMetadataCause, ResourceMetadataFailureClass,
+    ResourceMetadataLocation,
+};
 use fastmcp_client::http_auth::oauth::OAuthClientConfiguration;
 
 const PATH: &str = "/.well-known/oauth-protected-resource/mcp";
@@ -19,21 +19,35 @@ const ISSUER_PATH: &str = "/.well-known/oauth-authorization-server/tenant";
 
 fn expected(peer: &Peer, resource: &str) -> OAuthClientConfiguration {
     OAuthClientConfiguration::from_trusted_endpoints(
-        peer.issuer(), url(&format!("{}/authorize", peer.origin())),
-        url(&format!("{}/token", peer.origin())), url(resource),
-        "registered-native-client", vec!["tools:read".to_owned()],
-    ).unwrap().with_extra_root_certificate(root()).unwrap()
+        peer.issuer(),
+        url(&format!("{}/authorize", peer.origin())),
+        url(&format!("{}/token", peer.origin())),
+        url(resource),
+        "registered-native-client",
+        vec!["tools:read".to_owned()],
+    )
+    .unwrap()
+    .with_extra_root_certificate(root())
+    .unwrap()
+    // Every plan here trusts the resource root; discovery retains that exact
+    // resource TLS trust (and its fingerprint) in the admitted configuration.
+    .with_resource_root_certificate(root())
+    .unwrap()
 }
 
 async fn root_and_issuer(peer: &Peer) {
-    peer.serve(ROOT_PATH, 200, &peer.resource_document().to_string()).await;
-    peer.serve(ISSUER_PATH, 200, &peer.issuer_document().to_string()).await;
+    peer.serve(ROOT_PATH, 200, &peer.resource_document().to_string())
+        .await;
+    peer.serve(ISSUER_PATH, 200, &peer.issuer_document().to_string())
+        .await;
 }
 
 async fn assert_closed(mut socket: TlsStream<TcpStream>) {
     let mut byte = [0];
-    assert!(!matches!(socket.read(&mut byte).await, Ok(n) if n > 0),
-        "retired candidate must release its owned connection");
+    assert!(
+        !matches!(socket.read(&mut byte).await, Ok(n) if n > 0),
+        "retired candidate must release its owned connection"
+    );
 }
 
 #[test]
@@ -70,10 +84,12 @@ fn root_recovery_requires_full_metadata_admission_not_just_http_success() {
                 3 => document["bearer_methods_supported"] = json!(["body"]),
                 4 => document["signed_metadata"] = json!("must-not-verify-this.jwt"),
                 5 => document["authorization_servers"] = Value::Null,
-                _ => {},
+                _ => {}
             }
             let mut raw = document.to_string();
-            if dimension == 6 { raw = "{broken-json".to_owned(); }
+            if dimension == 6 {
+                raw = "{broken-json".to_owned();
+            }
             if dimension == 7 {
                 raw.pop();
                 raw.push_str(",\"res\\u006furce\":\"https://duplicate.invalid\"}");
@@ -124,7 +140,10 @@ fn stalled_first_head_or_body_cannot_starve_root_or_issuer() {
         run(async {
             let cx = Cx::current().unwrap();
             let peer = Peer::new().await;
-            let plan = peer.plan(true, true).with_timeout(Duration::from_secs(4)).unwrap();
+            let plan = peer
+                .plan(true, true)
+                .with_timeout(Duration::from_secs(4))
+                .unwrap();
             let server = async {
                 let (mut socket, _) = peer.request("GET", PATH).await;
                 if body_started {
@@ -175,7 +194,8 @@ fn each_resource_candidate_keeps_an_independent_full_body_allowance() {
         let server = async {
             peer.serve(PATH, 200, &invalid).await;
             peer.serve(ROOT_PATH, 200, &valid).await;
-            peer.serve(ISSUER_PATH, 200, &peer.issuer_document().to_string()).await;
+            peer.serve(ISSUER_PATH, 200, &peer.issuer_document().to_string())
+                .await;
         };
         let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
         assert_eq!(result.unwrap(), expected(&peer, &peer.resource()));
@@ -225,12 +245,30 @@ fn both_failures_remain_ordered_redacted_and_cannot_invoke_login() {
         let error = result.err().unwrap();
         let diagnostics = format!("{error:?} {error}");
         assert!(!diagnostics.contains("secret") && !diagnostics.contains("https://"));
-        let OAuthDiscoveryError::ResourceMetadataExhausted(failure) = error else { panic!("ordered aggregate expected") };
-        assert_eq!(failure.classification(), ResourceMetadataFailureClass::TrustOrIntegrity);
-        assert_eq!(failure.attempts().iter().map(|attempt| (attempt.location(), attempt.cause())).collect::<Vec<_>>(), [
-            (ResourceMetadataLocation::PathSpecific, ResourceMetadataCause::ResourceMismatch),
-            (ResourceMetadataLocation::OriginRoot, ResourceMetadataCause::HttpStatus(503)),
-        ]);
+        let OAuthDiscoveryError::ResourceMetadataExhausted(failure) = error else {
+            panic!("ordered aggregate expected")
+        };
+        assert_eq!(
+            failure.classification(),
+            ResourceMetadataFailureClass::TrustOrIntegrity
+        );
+        assert_eq!(
+            failure
+                .attempts()
+                .iter()
+                .map(|attempt| (attempt.location(), attempt.cause()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    ResourceMetadataLocation::PathSpecific,
+                    ResourceMetadataCause::ResourceMismatch
+                ),
+                (
+                    ResourceMetadataLocation::OriginRoot,
+                    ResourceMetadataCause::HttpStatus(503)
+                ),
+            ]
+        );
         assert_eq!(launches.load(Ordering::SeqCst), 0);
         assert_eq!(*peer.paths.lock().unwrap(), [PATH, ROOT_PATH]);
         peer.assert_no_extra_connections();
@@ -242,7 +280,10 @@ fn two_stalled_candidates_settle_without_misreporting_caller_cancellation() {
     run(async {
         let cx = Cx::current().unwrap();
         let peer = Peer::new().await;
-        let plan = peer.plan(true, true).with_timeout(Duration::from_secs(4)).unwrap();
+        let plan = peer
+            .plan(true, true)
+            .with_timeout(Duration::from_secs(4))
+            .unwrap();
         let server = async {
             for path in [PATH, ROOT_PATH] {
                 let (socket, _) = peer.request("GET", path).await;
@@ -250,10 +291,24 @@ fn two_stalled_candidates_settle_without_misreporting_caller_cancellation() {
             }
         };
         let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
-        let OAuthDiscoveryError::ResourceMetadataExhausted(failure) = result.unwrap_err() else { panic!("aggregate expected") };
-        assert_eq!(failure.classification(), ResourceMetadataFailureClass::Transport);
-        assert_eq!(failure.attempts().iter().map(|attempt| attempt.cause()).collect::<Vec<_>>(),
-            [ResourceMetadataCause::CandidateDeadline, ResourceMetadataCause::CandidateDeadline]);
+        let OAuthDiscoveryError::ResourceMetadataExhausted(failure) = result.unwrap_err() else {
+            panic!("aggregate expected")
+        };
+        assert_eq!(
+            failure.classification(),
+            ResourceMetadataFailureClass::Transport
+        );
+        assert_eq!(
+            failure
+                .attempts()
+                .iter()
+                .map(|attempt| attempt.cause())
+                .collect::<Vec<_>>(),
+            [
+                ResourceMetadataCause::CandidateDeadline,
+                ResourceMetadataCause::CandidateDeadline
+            ]
+        );
         assert!(cx.checkpoint().is_ok());
         assert_eq!(*peer.paths.lock().unwrap(), [PATH, ROOT_PATH]);
         peer.assert_no_extra_connections();
@@ -267,26 +322,56 @@ fn root_resource_fetches_one_exact_candidate_on_success_or_failure() {
             let cx = Cx::current().unwrap();
             let peer = Peer::new().await;
             let resource = format!("{}/", peer.origin());
-            let issuer = TrustedOAuthIssuer::new(peer.issuer()).unwrap().with_root_certificate(root()).unwrap();
-            let plan = OAuthDiscoveryPlan::new(url(&resource), vec![issuer], "registered-native-client", vec!["tools:read".to_owned()])
-                .unwrap().with_resource_root_certificate(root()).unwrap();
+            let issuer = TrustedOAuthIssuer::new(peer.issuer())
+                .unwrap()
+                .with_root_certificate(root())
+                .unwrap();
+            let plan = OAuthDiscoveryPlan::new(
+                url(&resource),
+                vec![issuer],
+                "registered-native-client",
+                vec!["tools:read".to_owned()],
+            )
+            .unwrap()
+            .with_resource_root_certificate(root())
+            .unwrap();
             let mut prm = peer.resource_document();
             prm["resource"] = json!(resource);
             let mut issuer = peer.issuer_document();
             issuer["protected_resources"] = json!([resource]);
             let server = async {
-                peer.serve(ROOT_PATH, if valid { 200 } else { 404 }, &if valid { prm.to_string() } else { String::new() }).await;
-                if valid { peer.serve(ISSUER_PATH, 200, &issuer.to_string()).await; }
+                peer.serve(
+                    ROOT_PATH,
+                    if valid { 200 } else { 404 },
+                    &if valid {
+                        prm.to_string()
+                    } else {
+                        String::new()
+                    },
+                )
+                .await;
+                if valid {
+                    peer.serve(ISSUER_PATH, 200, &issuer.to_string()).await;
+                }
             };
             let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
             if valid {
                 assert_eq!(result.unwrap(), expected(&peer, &resource));
                 assert_eq!(*peer.paths.lock().unwrap(), [ROOT_PATH, ISSUER_PATH]);
             } else {
-                let OAuthDiscoveryError::ResourceMetadataExhausted(failure) = result.unwrap_err() else { panic!("aggregate expected") };
+                let OAuthDiscoveryError::ResourceMetadataExhausted(failure) = result.unwrap_err()
+                else {
+                    panic!("aggregate expected")
+                };
                 assert_eq!(failure.attempts().len(), 1);
-                assert_eq!(failure.attempts()[0].location(), ResourceMetadataLocation::OriginRoot);
-                assert_eq!(failure.attempts()[0].cause(), ResourceMetadataCause::NotFound);
+                assert_eq!(
+                    failure.attempts()[0].location(),
+                    ResourceMetadataLocation::OriginRoot
+                );
+                assert_eq!(
+                    failure.attempts()[0].cause(),
+                    ResourceMetadataCause::NotFound
+                );
                 assert_eq!(*peer.paths.lock().unwrap(), [ROOT_PATH]);
             }
             peer.assert_no_extra_connections();
@@ -302,17 +387,31 @@ fn explicit_hint_failure_cannot_use_constructed_fallback_but_no_hint_can() {
             let peer = Peer::new().await;
             let field = if explicit {
                 format!("Bearer resource_metadata=\"{}/hint\"", peer.origin())
-            } else { "Bearer realm=fixture".to_owned() };
-            let challenge = ResourceMetadataChallenge::from_response(url(&peer.resource()), 401,
-                &[("WWW-Authenticate".to_owned(), field)]).unwrap();
+            } else {
+                "Bearer realm=fixture".to_owned()
+            };
+            let challenge = ResourceMetadataChallenge::from_response(
+                url(&peer.resource()),
+                401,
+                &[("WWW-Authenticate".to_owned(), field)],
+            )
+            .unwrap();
             let plan = ChallengedOAuthDiscovery::new(peer.plan(true, true), challenge).unwrap();
             let server = async {
-                peer.serve(if explicit { "/hint" } else { PATH }, 503, "").await;
-                if !explicit { root_and_issuer(&peer).await; }
+                peer.serve(if explicit { "/hint" } else { PATH }, 503, "")
+                    .await;
+                if !explicit {
+                    root_and_issuer(&peer).await;
+                }
             };
             let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
             if explicit {
-                assert!(matches!(result, Err(OAuthChallengeError::Discovery(OAuthDiscoveryError::HttpStatus { status: 503 }))));
+                assert!(matches!(
+                    result,
+                    Err(OAuthChallengeError::Discovery(
+                        OAuthDiscoveryError::HttpStatus { status: 503 }
+                    ))
+                ));
                 assert_eq!(*peer.paths.lock().unwrap(), ["/hint"]);
             } else {
                 assert_eq!(result.unwrap(), expected(&peer, &peer.resource()));
@@ -332,14 +431,23 @@ fn registration_reaches_one_write_after_root_metadata_wins() {
         let document = peer.registration_document(&format!("{}/register", peer.origin()));
         let server = async {
             peer.serve(PATH, 404, "").await;
-            peer.serve(ROOT_PATH, 200, &peer.resource_document().to_string()).await;
+            peer.serve(ROOT_PATH, 200, &peer.resource_document().to_string())
+                .await;
             peer.serve(ISSUER_PATH, 200, &document.to_string()).await;
             let (mut socket, request) = peer.request("POST", "/register").await;
-            reply(&mut socket, 201, &registration_reply(&request, "root-discovered-client").to_string()).await;
+            reply(
+                &mut socket,
+                201,
+                &registration_reply(&request, "root-discovered-client").to_string(),
+            )
+            .await;
         };
         let ((), registered) = pair(server, owner.register(&cx)).await;
         assert_eq!(registered.unwrap().client_id(), "root-discovered-client");
-        assert_eq!(*peer.paths.lock().unwrap(), [PATH, ROOT_PATH, ISSUER_PATH, "/register"]);
+        assert_eq!(
+            *peer.paths.lock().unwrap(),
+            [PATH, ROOT_PATH, ISSUER_PATH, "/register"]
+        );
         peer.assert_no_extra_connections();
     });
 }
@@ -349,18 +457,38 @@ fn machine_authentication_uses_root_metadata_without_a_browser_or_secret_on_get(
     run(async {
         let cx = Cx::current().unwrap();
         let peer = Peer::new().await;
-        let issuer = TrustedOAuthIssuer::new(peer.issuer()).unwrap().with_root_certificate(root()).unwrap();
-        let plan = ClientCredentialsPlan::new(url(&peer.resource()), issuer, "machine", "secret", vec!["tools:read".to_owned()])
-            .unwrap().with_resource_root_certificate(root()).unwrap();
+        let issuer = TrustedOAuthIssuer::new(peer.issuer())
+            .unwrap()
+            .with_root_certificate(root())
+            .unwrap();
+        let plan = ClientCredentialsPlan::new(
+            url(&peer.resource()),
+            issuer,
+            "machine",
+            "secret",
+            vec!["tools:read".to_owned()],
+        )
+        .unwrap()
+        .with_resource_root_certificate(root())
+        .unwrap();
         let server = async {
             peer.serve(PATH, 500, "").await;
-            peer.serve(ROOT_PATH, 200, &peer.resource_document().to_string()).await;
-            peer.serve(ISSUER_PATH, 200, &json!({
-                "issuer":peer.issuer(), "token_endpoint":format!("{}/token", peer.origin()),
-                "grant_types_supported":["client_credentials"],
-                "token_endpoint_auth_methods_supported":["client_secret_basic"],
-            }).to_string()).await;
-            let (mut socket, request) = peer.request_with_authorization("POST", "/token", Some("Basic bWFjaGluZTpzZWNyZXQ=")).await;
+            peer.serve(ROOT_PATH, 200, &peer.resource_document().to_string())
+                .await;
+            peer.serve(
+                ISSUER_PATH,
+                200,
+                &json!({
+                    "issuer":peer.issuer(), "token_endpoint":format!("{}/token", peer.origin()),
+                    "grant_types_supported":["client_credentials"],
+                    "token_endpoint_auth_methods_supported":["client_secret_basic"],
+                })
+                .to_string(),
+            )
+            .await;
+            let (mut socket, request) = peer
+                .request_with_authorization("POST", "/token", Some("Basic bWFjaGluZTpzZWNyZXQ="))
+                .await;
             let fields = form(std::str::from_utf8(&request).unwrap());
             assert_eq!(fields["grant_type"], "client_credentials");
             assert_eq!(fields["resource"], peer.resource());
@@ -371,11 +499,19 @@ fn machine_authentication_uses_root_metadata_without_a_browser_or_secret_on_get(
             let client = plan.discover(&cx).await.unwrap();
             let snapshot = client.credential(&cx).await.unwrap();
             assert_eq!(snapshot.generation(), 1);
-            assert_eq!(snapshot.credential().authorization_for_target(client.resource()), Some("Bearer root-service-token".to_owned()));
+            assert_eq!(
+                snapshot
+                    .credential()
+                    .authorization_for_target(client.resource()),
+                Some("Bearer root-service-token".to_owned())
+            );
             client.close();
         };
         Box::pin(pair(server, application)).await;
-        assert_eq!(*peer.paths.lock().unwrap(), [PATH, ROOT_PATH, ISSUER_PATH, "/token"]);
+        assert_eq!(
+            *peer.paths.lock().unwrap(),
+            [PATH, ROOT_PATH, ISSUER_PATH, "/token"]
+        );
         peer.assert_no_extra_connections();
     });
 }
@@ -389,8 +525,12 @@ fn dropping_either_resource_candidate_releases_it_without_another_get() {
             let plan = peer.plan(true, true);
             let (sender, mut receiver) = oneshot::channel::<()>();
             let server = async {
-                if on_root { peer.serve(PATH, 404, "").await; }
-                let (socket, _) = peer.request("GET", if on_root { ROOT_PATH } else { PATH }).await;
+                if on_root {
+                    peer.serve(PATH, 404, "").await;
+                }
+                let (socket, _) = peer
+                    .request("GET", if on_root { ROOT_PATH } else { PATH })
+                    .await;
                 sender.send(&cx, ()).unwrap();
                 assert_closed(socket).await;
             };
@@ -400,12 +540,17 @@ fn dropping_either_resource_candidate_releases_it_without_another_get() {
                 poll_fn(|task| {
                     assert!(discovery.as_mut().poll(task).is_pending());
                     started.as_mut().poll(task)
-                }).await.unwrap();
+                })
+                .await
+                .unwrap();
                 drop(discovery);
                 assert!(cx.checkpoint().is_ok());
             };
             pair(server, application).await;
-            assert_eq!(peer.paths.lock().unwrap().len(), if on_root { 2 } else { 1 });
+            assert_eq!(
+                peer.paths.lock().unwrap().len(),
+                if on_root { 2 } else { 1 }
+            );
             peer.assert_no_extra_connections();
         });
     }
@@ -429,12 +574,27 @@ fn caller_cancellation_prevents_reserved_root_and_retains_attempted_cause() {
             poll_fn(|task| {
                 assert!(discovery.as_mut().poll(task).is_pending());
                 started.as_mut().poll(task)
-            }).await.unwrap();
-            cx.cancel_with(asupersync::CancelKind::User, Some("stop resource discovery"));
-            let OAuthDiscoveryError::ResourceMetadataExhausted(failure) = discovery.await.unwrap_err() else { panic!("aggregate expected") };
-            assert_eq!(failure.classification(), ResourceMetadataFailureClass::Cancelled);
+            })
+            .await
+            .unwrap();
+            cx.cancel_with(
+                asupersync::CancelKind::User,
+                Some("stop resource discovery"),
+            );
+            let OAuthDiscoveryError::ResourceMetadataExhausted(failure) =
+                discovery.await.unwrap_err()
+            else {
+                panic!("aggregate expected")
+            };
+            assert_eq!(
+                failure.classification(),
+                ResourceMetadataFailureClass::Cancelled
+            );
             assert_eq!(failure.attempts().len(), 1);
-            assert_eq!(failure.attempts()[0].cause(), ResourceMetadataCause::Cancelled);
+            assert_eq!(
+                failure.attempts()[0].cause(),
+                ResourceMetadataCause::Cancelled
+            );
         };
         pair(server, application).await;
         assert_eq!(*peer.paths.lock().unwrap(), [PATH]);

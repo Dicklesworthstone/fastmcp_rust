@@ -42,8 +42,8 @@ fn limit_01_b_partition(source: &str) -> fastmcp_core::AdmissionPartition {
 fn limit_01_b_positive() {
     const N: usize = 4;
     let snapshot = limit_01_b_limits();
-    let controller =
-        fastmcp_core::AdmissionController::with_capacity(snapshot.snapshot(), N).expect("capacity N");
+    let controller = fastmcp_core::AdmissionController::with_capacity(snapshot.snapshot(), N)
+        .expect("capacity N");
     let partition = limit_01_b_partition("tcp:203.0.113.8");
 
     let mut held_n_minus_one = controller
@@ -126,8 +126,8 @@ fn limit_01_b_positive() {
     right_hold.release().expect("right release");
     assert_eq!(peer.live_reservation_count(), 0);
 
-    let leak_probe =
-        fastmcp_core::AdmissionController::with_capacity(snapshot.snapshot(), 1).expect("capacity one");
+    let leak_probe = fastmcp_core::AdmissionController::with_capacity(snapshot.snapshot(), 1)
+        .expect("capacity one");
     let leak_partition = limit_01_b_partition("tcp:203.0.113.12");
     for cycle in 0..64 {
         let mut reservation = leak_probe
@@ -169,8 +169,26 @@ fn limit_01_b_positive() {
         usize,
     ); 6] = [
         // Per-partition ceiling: N-1, N, N+1. No prefill.
-        ("LIMIT-B-01.01", "partition", B_PARTITION_CAPACITY - 1, "held", None, 2, 2, 1),
-        ("LIMIT-B-01.02", "partition", B_PARTITION_CAPACITY, "held", None, 3, 3, 1),
+        (
+            "LIMIT-B-01.01",
+            "partition",
+            B_PARTITION_CAPACITY - 1,
+            "held",
+            None,
+            2,
+            2,
+            1,
+        ),
+        (
+            "LIMIT-B-01.02",
+            "partition",
+            B_PARTITION_CAPACITY,
+            "held",
+            None,
+            3,
+            3,
+            1,
+        ),
         (
             "LIMIT-B-01.03",
             "partition",
@@ -212,7 +230,10 @@ fn limit_01_b_positive() {
         assert_eq!(row.ceiling, ceiling, "{id}: wrong binding ceiling");
         assert_eq!(row.requested, requested, "{id}: wrong requested units");
         assert_eq!(row.state, state, "{id}: wrong reservation state");
-        assert_eq!(row.diagnostic, diagnostic, "{id}: wrong rejection diagnostic");
+        assert_eq!(
+            row.diagnostic, diagnostic,
+            "{id}: wrong rejection diagnostic"
+        );
         assert_eq!(row.after.global_in_use, global, "{id}: wrong global_in_use");
         assert_eq!(
             row.after.partition_in_use, partition,
@@ -225,7 +246,10 @@ fn limit_01_b_positive() {
             "{id}: wrong live reservation count after the attempt"
         );
         // No attempt on any row has settled yet, so nothing has been released.
-        assert_eq!(row.after.release_count, 0, "{id}: nothing may have released");
+        assert_eq!(
+            row.after.release_count, 0,
+            "{id}: nothing may have released"
+        );
         assert_eq!(row.after.committed_work, 0, "{id}: reserve must not commit");
     }
     let reserve = limit_01_rows::reserve_receipt(&reserve_rows);
@@ -265,7 +289,10 @@ fn limit_01_b_positive() {
     .enumerate()
     {
         let row = &lifecycle_rows[index];
-        assert_eq!(row.id, id, "lifecycle row {index} is out of acceptance order");
+        assert_eq!(
+            row.id, id,
+            "lifecycle row {index} is out of acceptance order"
+        );
         assert_eq!(row.terminal, terminal, "{id}: wrong terminal disposition");
         assert_eq!(row.state, state, "{id}: wrong reservation state");
         // Every terminal path releases each charge exactly once: release_count
@@ -322,14 +349,20 @@ fn limit_01_b_positive() {
         expected_fairness.into_iter().enumerate()
     {
         let row = &fairness_rows[index];
-        assert_eq!(row.id, id, "fairness row {index} is out of acceptance order");
+        assert_eq!(
+            row.id, id,
+            "fairness row {index} is out of acceptance order"
+        );
         assert_eq!(row.partition, partition, "{id}: wrong acting partition");
         assert_eq!(row.outcome, outcome, "{id}: wrong outcome");
         // Saturation never exceeds global N.
         assert!(row.global_in_use <= 2, "{id}: global occupancy exceeded N");
         assert_eq!(row.global_in_use, global, "{id}: wrong global counter");
         assert_eq!(row.left_in_use, left, "{id}: wrong left partition counter");
-        assert_eq!(row.right_in_use, right, "{id}: wrong right partition counter");
+        assert_eq!(
+            row.right_in_use, right,
+            "{id}: wrong right partition counter"
+        );
     }
     // One partition cannot retain another partition's charge: once left
     // releases, its counter is zero even while right holds.
@@ -358,13 +391,12 @@ fn limit_01_b_positive() {
     assert_eq!(fairness[0], "LIMIT01-B-FAIRNESS-v1 rows=4");
 }
 
-
 /// LIMIT-01 B planted negative: one-variable N+1 and second release leave counters unchanged.
 #[test]
 fn limit_01_b_planted_negative() {
     let snapshot = limit_01_b_limits();
-    let controller =
-        fastmcp_core::AdmissionController::with_capacities(snapshot.snapshot(), 4, 2).expect("capacities");
+    let controller = fastmcp_core::AdmissionController::with_capacities(snapshot.snapshot(), 4, 2)
+        .expect("capacities");
     let left = limit_01_b_partition("tcp:203.0.113.10");
     let right = limit_01_b_partition("tcp:203.0.113.11");
     let mut left_hold = controller.reserve(left.clone(), 1).expect("left holds 1");
@@ -426,10 +458,8 @@ fn limit_01_b_planted_negative() {
     // -----------------------------------------------------------------------
 
     let reserve_before = limit_01_rows::reserve_receipt(&limit_01_rows::run_reserve_rows());
-    let lifecycle_before =
-        limit_01_rows::lifecycle_receipt(&limit_01_rows::run_lifecycle_rows());
-    let fairness_before =
-        limit_01_rows::fairness_receipt(&limit_01_rows::run_fairness_rows());
+    let lifecycle_before = limit_01_rows::lifecycle_receipt(&limit_01_rows::run_lifecycle_rows());
+    let fairness_before = limit_01_rows::fairness_receipt(&limit_01_rows::run_fairness_rows());
 
     // SENSITIVITY: perturb exactly one observed field per row set and require
     // the digest to move. A digest that cannot change witnesses nothing.

@@ -24,7 +24,7 @@ use fastmcp_rust::release_quarantine::{
     ORDERED_CONTEXTS, ORDERED_SINKS, ProviderObservation, SinkReachability,
 };
 use fastmcp_rust::release_quarantine_reachability::{
-    RESTORATION_RECEIPT_IDENTIFIER, Rel02ReceiptState, RefInputProvenance, canonical_cell_bytes,
+    RESTORATION_RECEIPT_IDENTIFIER, RefInputProvenance, Rel02ReceiptState, canonical_cell_bytes,
     frozen_mutation_reachability, rel_quar_00_b_reachability_denial,
 };
 
@@ -116,8 +116,8 @@ fn rel_quar_00_b_planted_negative() {
     // (1) One cell's terminal result flipped. Nothing else changes.
     let mut planted = pristine.clone();
     planted.cells[0].result = SinkReachability::MutationReachable;
-    let refusal = rel_quar_00_b_reachability_denial(&planted)
-        .expect_err("a reachable sink must be refused");
+    let refusal =
+        rel_quar_00_b_reachability_denial(&planted).expect_err("a reachable sink must be refused");
     assert_eq!(refusal.code, "E_MUTATION_REACHABLE");
     assert!(refusal.to_string().starts_with("RELQUAR00B|Error|"));
 
@@ -165,7 +165,10 @@ fn rel_quar_00_b_planted_negative() {
     // a short vector must be refused on its length rather than on whatever the
     // surviving cells happen to contain.
     let mut planted = pristine.clone();
-    planted.cells.pop().expect("the record carries cells to remove");
+    planted
+        .cells
+        .pop()
+        .expect("the record carries cells to remove");
     let refusal = rel_quar_00_b_reachability_denial(&planted)
         .expect_err("a short cell vector must be refused");
     assert_eq!(refusal.code, "E_CELL_COUNT");

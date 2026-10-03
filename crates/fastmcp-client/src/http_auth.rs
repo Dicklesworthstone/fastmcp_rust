@@ -65,9 +65,8 @@ impl fmt::Display for BearerBindingError {
                 formatter.write_str("bearer credentials bind only to https resources")
             }
             Self::EmptyToken => formatter.write_str("bearer token is empty"),
-            Self::InvalidTokenBytes => formatter.write_str(
-                "bearer token exceeds the byte limit or violates token68 syntax",
-            ),
+            Self::InvalidTokenBytes => formatter
+                .write_str("bearer token exceeds the byte limit or violates token68 syntax"),
         }
     }
 }
@@ -201,9 +200,10 @@ impl BoundBearerCredential {
     #[must_use]
     pub fn is_revoked(&self) -> bool {
         self.revoked.is_cancel_requested()
-            || self.owner_cancellation.as_ref().is_some_and(
-                McpRequestCancellation::is_cancel_requested,
-            )
+            || self
+                .owner_cancellation
+                .as_ref()
+                .is_some_and(McpRequestCancellation::is_cancel_requested)
     }
 
     /// Returns the `Authorization` header value for `target`, or `None`
@@ -347,9 +347,9 @@ mod tests {
 
         let resource = url("https://mcp.example/api");
         let deadline = Instant::now() + Duration::from_secs(60);
-        let credential = BoundBearerCredential::bind_with_expiry(
-            resource.clone(), "expiring-secret", deadline,
-        ).unwrap();
+        let credential =
+            BoundBearerCredential::bind_with_expiry(resource.clone(), "expiring-secret", deadline)
+                .unwrap();
         for credential in [credential.clone(), credential] {
             assert_eq!(credential.expires_at(), Some(deadline));
             assert_eq!(
@@ -357,10 +357,21 @@ mod tests {
                 Some("Bearer expiring-secret".to_owned()),
             );
             assert_eq!(credential.authorization_at(&resource, deadline), None);
-            assert_eq!(credential.authorization_at(&resource, deadline + Duration::from_nanos(1)), None);
-            assert_eq!(credential.authorization_at(&url("https://other.example/api"), deadline - Duration::from_secs(1)), None);
+            assert_eq!(
+                credential.authorization_at(&resource, deadline + Duration::from_nanos(1)),
+                None
+            );
+            assert_eq!(
+                credential.authorization_at(
+                    &url("https://other.example/api"),
+                    deadline - Duration::from_secs(1)
+                ),
+                None
+            );
         }
-        let expired = BoundBearerCredential::bind_with_expiry(resource.clone(), "expired", Instant::now()).unwrap();
+        let expired =
+            BoundBearerCredential::bind_with_expiry(resource.clone(), "expired", Instant::now())
+                .unwrap();
         assert_eq!(expired.authorization_for_target(&resource), None);
     }
 
@@ -373,7 +384,10 @@ mod tests {
         let independent = BoundBearerCredential::bind(resource.clone(), "shared-secret").unwrap();
         for candidate in [&credential, &clone, &independent] {
             assert!(!candidate.is_revoked());
-            assert_eq!(candidate.authorization_for_target(&resource), Some("Bearer shared-secret".to_owned()));
+            assert_eq!(
+                candidate.authorization_for_target(&resource),
+                Some("Bearer shared-secret".to_owned())
+            );
         }
 
         clone.revoke();
@@ -386,7 +400,10 @@ mod tests {
             assert!(!format!("{candidate:?}").contains("shared-secret"));
         }
         assert!(!independent.is_revoked());
-        assert_eq!(independent.authorization_for_target(&resource), Some("Bearer shared-secret".to_owned()));
+        assert_eq!(
+            independent.authorization_for_target(&resource),
+            Some("Bearer shared-secret".to_owned())
+        );
     }
 
     #[test]
@@ -396,9 +413,13 @@ mod tests {
         let resource = url("https://mcp.example/api");
         let now = Instant::now();
         let deadline = now + Duration::from_secs(60);
-        let credential = BoundBearerCredential::bind_with_expiry(resource.clone(), "secret", deadline).unwrap();
+        let credential =
+            BoundBearerCredential::bind_with_expiry(resource.clone(), "secret", deadline).unwrap();
         drop(credential.clone());
-        assert_eq!(credential.authorization_at(&resource, now), Some("Bearer secret".to_owned()));
+        assert_eq!(
+            credential.authorization_at(&resource, now),
+            Some("Bearer secret".to_owned())
+        );
         assert_eq!(credential.authorization_at(&resource, deadline), None);
         assert!(!credential.is_revoked(), "expiry is not local revocation");
         credential.revoke();
@@ -413,7 +434,9 @@ mod tests {
         let worker = credential.clone();
         let (revoked, observe) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
-            observe.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            observe
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
             assert!(worker.is_revoked());
             assert_eq!(worker.authorization_for_target(&resource), None);
         });
@@ -433,7 +456,10 @@ mod tests {
         let owned = source.for_owner(&owner).unwrap();
         let clone = owned.clone();
         assert!(owned.for_owner(&other).is_none());
-        assert_eq!(owned.authorization_for_target(&resource), Some("Bearer secret".to_owned()));
+        assert_eq!(
+            owned.authorization_for_target(&resource),
+            Some("Bearer secret".to_owned())
+        );
         owner.cancel();
         for candidate in [&owned, &clone] {
             assert!(candidate.is_revoked());
@@ -441,7 +467,10 @@ mod tests {
             assert!(candidate.for_owner(&other).is_none());
         }
         assert!(!source.is_revoked());
-        assert_eq!(source.authorization_for_target(&resource), Some("Bearer secret".to_owned()));
+        assert_eq!(
+            source.authorization_for_target(&resource),
+            Some("Bearer secret".to_owned())
+        );
         assert!(source.for_owner(&owner).unwrap().is_revoked());
     }
 
@@ -573,9 +602,11 @@ mod tests {
         use crate::http_executor::ModernHttpRequest;
 
         let resource = url("https://mcp.example/api");
-        for token in ["aZ09-._~+/==".to_owned(), "a".repeat(MAX_ACCESS_TOKEN_BYTES)] {
-            let credential =
-                BoundBearerCredential::bind(resource.clone(), token.clone()).unwrap();
+        for token in [
+            "aZ09-._~+/==".to_owned(),
+            "a".repeat(MAX_ACCESS_TOKEN_BYTES),
+        ] {
+            let credential = BoundBearerCredential::bind(resource.clone(), token.clone()).unwrap();
             let make_request = |target| {
                 ModernHttpRequest::new(
                     target,
@@ -592,7 +623,9 @@ mod tests {
                 .headers()
                 .into_iter()
                 .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"));
-            let (_, header) = headers.next().expect("bound target receives its credential");
+            let (_, header) = headers
+                .next()
+                .expect("bound target receives its credential");
             assert!(headers.next().is_none());
             assert_eq!(AccessToken::parse(&header).unwrap().token, token);
             let other = make_request("https://mcp.example/other");

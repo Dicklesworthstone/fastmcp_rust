@@ -91,9 +91,12 @@ impl ManagedOAuthSession {
         // policy; it does not renew credentials or retry the refused request.
         if matches!(response.metadata().kind(), ModernHttpResponseKind::Json) {
             let frame = bounded_wait(cx, cancellation, deadline, async {
-                response.read_to_end(cx, limits.frame_bytes.min(limits.total_bytes))
-                    .await.map_err(ManagedCoreError::from)
-            }).await?;
+                response
+                    .read_to_end(cx, limits.frame_bytes.min(limits.total_bytes))
+                    .await
+                    .map_err(ManagedCoreError::from)
+            })
+            .await?;
             check_call(cx, cancellation, deadline)?;
             return Err(json_subscription_error(&frame, &decoder.request_id, limits));
         }
@@ -103,13 +106,9 @@ impl ManagedOAuthSession {
             return Err(ManagedCoreError::InvalidResponse);
         }
         let generation = response.credential_generation();
-        let sse_limits = SseLimits::with_data_lines(
-            limits.frame_bytes + 16,
-            limits.frame_bytes + 64,
-            64,
-            4096,
-        )
-        .ok_or(ManagedCoreError::InvalidLimits)?;
+        let sse_limits =
+            SseLimits::with_data_lines(limits.frame_bytes + 16, limits.frame_bytes + 64, 64, 4096)
+                .ok_or(ManagedCoreError::InvalidLimits)?;
         let body = response.into_sse_stream(sse_limits)?;
         check_call(cx, cancellation, deadline)?;
         Ok(ManagedSubscription {
@@ -138,7 +137,11 @@ pub(crate) fn json_subscription_error(
         Ok(decoded) => decoded.into_parts().0,
         Err(_) => return ManagedCoreError::InvalidResponse,
     };
-    if !response.id.as_ref().is_some_and(|id| id.correlates_with(request_id)) {
+    if !response
+        .id
+        .as_ref()
+        .is_some_and(|id| id.correlates_with(request_id))
+    {
         return ManagedCoreError::ResponseIdMismatch;
     }
     match response.error {
@@ -228,39 +231,58 @@ fn prepare(
         return Err(ManagedCoreError::InvalidLimits);
     }
     validate_filter(&params.notifications)?;
-    request_id.validate().map_err(|_| ManagedCoreError::InvalidRequest)?;
+    request_id
+        .validate()
+        .map_err(|_| ManagedCoreError::InvalidRequest)?;
     let requested = params.notifications.clone();
     let request = CoreRequest::Final(FinalCoreRequest::SubscriptionsListen(params));
-    let params = request.encode_params().map_err(|_| ManagedCoreError::InvalidRequest)?
+    let params = request
+        .encode_params()
+        .map_err(|_| ManagedCoreError::InvalidRequest)?
         .ok_or(ManagedCoreError::InvalidRequest)?;
-    let metadata = params.get("_meta").and_then(Value::as_object)
+    let metadata = params
+        .get("_meta")
+        .and_then(Value::as_object)
         .ok_or(ManagedCoreError::InvalidRequest)?;
-    if let Some(extensions) = metadata.get(FINAL_CLIENT_CAPABILITIES_META_KEY)
+    if let Some(extensions) = metadata
+        .get(FINAL_CLIENT_CAPABILITIES_META_KEY)
         .and_then(|capabilities| capabilities.get("extensions"))
-        && !extensions.as_object().is_some_and(serde_json::Map::is_empty)
+        && !extensions
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
     {
         return Err(ManagedCoreError::UnsupportedRequest);
     }
     let envelope = serde_json::json!({
         "jsonrpc": "2.0", "id": request_id, "method": "subscriptions/listen", "params": params,
     });
-    let mut encoded = BoundedWriter { bytes: Vec::new(), maximum: limits.request_bytes };
+    let mut encoded = BoundedWriter {
+        bytes: Vec::new(),
+        maximum: limits.request_bytes,
+    };
     serde_json::to_writer(&mut encoded, &envelope)
         .map_err(|_| ManagedCoreError::RequestTooLarge)?;
     let wire = ModernHttpRequest::new(
-        target, encoded.bytes, FINAL_PROTOCOL_VERSION, "subscriptions/listen", None,
+        target,
+        encoded.bytes,
+        FINAL_PROTOCOL_VERSION,
+        "subscriptions/listen",
+        None,
     )
     .map_err(|_| ManagedCoreError::InvalidRequest)?;
-    Ok((wire, SubscriptionDecoder {
-        request,
-        request_id,
-        requested,
-        accepted: None,
-        limits,
-        bytes: 0,
-        notifications: 0,
-        terminal: false,
-    }))
+    Ok((
+        wire,
+        SubscriptionDecoder {
+            request,
+            request_id,
+            requested,
+            accepted: None,
+            limits,
+            bytes: 0,
+            notifications: 0,
+            terminal: false,
+        },
+    ))
 }
 
 fn validate_filter(filter: &SubscriptionFilter) -> Result<(), ManagedCoreError> {
@@ -286,12 +308,21 @@ fn validate_filter(filter: &SubscriptionFilter) -> Result<(), ManagedCoreError> 
 fn is_subset(accepted: &SubscriptionFilter, requested: &SubscriptionFilter) -> bool {
     validate_filter(accepted).is_ok()
         && (accepted.tools_list_changed != Some(true) || requested.tools_list_changed == Some(true))
-        && (accepted.resources_list_changed != Some(true) || requested.resources_list_changed == Some(true))
-        && (accepted.prompts_list_changed != Some(true) || requested.prompts_list_changed == Some(true))
-        && accepted.resource_subscriptions.as_ref().is_none_or(|accepted| {
-            accepted.iter().all(|uri| requested.resource_subscriptions.as_ref()
-                .is_some_and(|requested| requested.contains(uri)))
-        })
+        && (accepted.resources_list_changed != Some(true)
+            || requested.resources_list_changed == Some(true))
+        && (accepted.prompts_list_changed != Some(true)
+            || requested.prompts_list_changed == Some(true))
+        && accepted
+            .resource_subscriptions
+            .as_ref()
+            .is_none_or(|accepted| {
+                accepted.iter().all(|uri| {
+                    requested
+                        .resource_subscriptions
+                        .as_ref()
+                        .is_some_and(|requested| requested.contains(uri))
+                })
+            })
 }
 
 struct SubscriptionDecoder {
@@ -320,7 +351,11 @@ impl SubscriptionDecoder {
         let mut accepted = None;
         let event = match message {
             JsonRpcMessage::Response(response) => {
-                if !response.id.as_ref().is_some_and(|id| id.correlates_with(&self.request_id)) {
+                if !response
+                    .id
+                    .as_ref()
+                    .is_some_and(|id| id.correlates_with(&self.request_id))
+                {
                     return Err(ManagedCoreError::ResponseIdMismatch);
                 }
                 if let Some(error) = response.error {
@@ -329,12 +364,19 @@ impl SubscriptionDecoder {
                 if self.accepted.is_none() {
                     return Err(ManagedCoreError::UnexpectedNotification);
                 }
-                let (response, source) = decode_strict_jsonrpc_response(frame, self.limits.frame_bytes)
-                    .map_err(|_| ManagedCoreError::InvalidResponse)?.into_parts();
+                let (response, source) =
+                    decode_strict_jsonrpc_response(frame, self.limits.frame_bytes)
+                        .map_err(|_| ManagedCoreError::InvalidResponse)?
+                        .into_parts();
                 let source = source.ok_or(ManagedCoreError::InvalidResult)?;
-                let result = self.request.decode_response_result(&response, &source)
+                let result = self
+                    .request
+                    .decode_response_result(&response, &source)
                     .map_err(|_| ManagedCoreError::InvalidResult)?;
-                if !matches!(&result, CoreResult::Final(FinalCoreResult::SubscriptionsListen { .. })) {
+                if !matches!(
+                    &result,
+                    CoreResult::Final(FinalCoreResult::SubscriptionsListen { .. })
+                ) {
                     return Err(ManagedCoreError::InvalidResult);
                 }
                 ManagedCoreEvent::Result(Box::new(result))
@@ -346,7 +388,9 @@ impl SubscriptionDecoder {
                 if self.notifications >= self.limits.notifications {
                     return Err(ManagedCoreError::NotificationLimit);
                 }
-                let subscription_id = request.params.as_ref()
+                let subscription_id = request
+                    .params
+                    .as_ref()
                     .and_then(|params| params.get("_meta"))
                     .and_then(|meta| meta.get(FINAL_SUBSCRIPTION_ID_META_KEY))
                     .and_then(|id| serde_json::from_value::<RequestId>(id.clone()).ok())
@@ -358,25 +402,48 @@ impl SubscriptionDecoder {
                 struct RawNotification {
                     params: Box<serde_json::value::RawValue>,
                 }
-                let raw: RawNotification = serde_json::from_slice(frame)
-                    .map_err(|_| ManagedCoreError::InvalidResponse)?;
-                let notification = ServerNotification::decode_with_raw_params(&request, raw.params.get())
-                    .map_err(|_| ManagedCoreError::UnexpectedNotification)?;
-                if let ServerNotification::SubscriptionsAcknowledged(acknowledgement) = &notification {
-                    if self.accepted.is_some() || !is_subset(&acknowledgement.notifications, &self.requested) {
+                let raw: RawNotification =
+                    serde_json::from_slice(frame).map_err(|_| ManagedCoreError::InvalidResponse)?;
+                let notification =
+                    ServerNotification::decode_with_raw_params(&request, raw.params.get())
+                        .map_err(|_| ManagedCoreError::UnexpectedNotification)?;
+                if let ServerNotification::SubscriptionsAcknowledged(acknowledgement) =
+                    &notification
+                {
+                    if self.accepted.is_some()
+                        || !is_subset(&acknowledgement.notifications, &self.requested)
+                    {
                         return Err(ManagedCoreError::UnexpectedNotification);
                     }
                     accepted = Some(acknowledgement.notifications.clone());
                 } else {
-                    let filter = self.accepted.as_ref().ok_or(ManagedCoreError::UnexpectedNotification)?;
+                    let filter = self
+                        .accepted
+                        .as_ref()
+                        .ok_or(ManagedCoreError::UnexpectedNotification)?;
                     let selected = match request.method.as_str() {
-                        "notifications/tools/list_changed" => filter.tools_list_changed == Some(true),
-                        "notifications/resources/list_changed" => filter.resources_list_changed == Some(true),
-                        "notifications/prompts/list_changed" => filter.prompts_list_changed == Some(true),
-                        "notifications/resources/updated" => request.params.as_ref()
-                            .and_then(|params| params.get("uri")).and_then(Value::as_str)
-                            .is_some_and(|uri| filter.resource_subscriptions.as_ref()
-                                .is_some_and(|resources| resources.iter().any(|resource| resource == uri))),
+                        "notifications/tools/list_changed" => {
+                            filter.tools_list_changed == Some(true)
+                        }
+                        "notifications/resources/list_changed" => {
+                            filter.resources_list_changed == Some(true)
+                        }
+                        "notifications/prompts/list_changed" => {
+                            filter.prompts_list_changed == Some(true)
+                        }
+                        "notifications/resources/updated" => request
+                            .params
+                            .as_ref()
+                            .and_then(|params| params.get("uri"))
+                            .and_then(Value::as_str)
+                            .is_some_and(|uri| {
+                                filter
+                                    .resource_subscriptions
+                                    .as_ref()
+                                    .is_some_and(|resources| {
+                                        resources.iter().any(|resource| resource == uri)
+                                    })
+                            }),
                         _ => false,
                     };
                     if !selected {
@@ -415,7 +482,9 @@ mod json_error_tests {
     fn finite_json_refusal_preserves_only_the_correlated_remote_code() {
         let frame = br#"{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"private-message-canary","data":{"secret":"private-data-canary"}}}"#;
         let error = admit(frame);
-        assert!(matches!(&error, ManagedCoreError::Remote { code } if code.to_string() == "-32601"));
+        assert!(
+            matches!(&error, ManagedCoreError::Remote { code } if code.to_string() == "-32601")
+        );
         let diagnostic = format!("{error} {error:?}");
         assert!(!diagnostic.contains("private-message-canary"));
         assert!(!diagnostic.contains("private-data-canary"));
@@ -423,24 +492,48 @@ mod json_error_tests {
 
     #[test]
     fn finite_json_refusal_cannot_borrow_another_requests_id() {
-        for id in [serde_json::json!(8), serde_json::json!("7"), Value::Null] {
+        for id in [serde_json::json!(8), serde_json::json!("7")] {
             let frame = serde_json::to_vec(&serde_json::json!({
                 "jsonrpc":"2.0", "id":id,
                 "error":{"code":-32602,"message":"refused"},
-            })).unwrap();
-            assert!(matches!(admit(&frame), ManagedCoreError::ResponseIdMismatch));
+            }))
+            .unwrap();
+            assert!(matches!(
+                admit(&frame),
+                ManagedCoreError::ResponseIdMismatch
+            ));
         }
+        // A null ID is refused even earlier: strict response decoding rejects
+        // it as malformed before correlation, so it can never surface as this
+        // request's remote refusal either.
+        let frame = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc":"2.0", "id":Value::Null,
+            "error":{"code":-32602,"message":"refused"},
+        }))
+        .unwrap();
+        assert!(matches!(admit(&frame), ManagedCoreError::InvalidResponse));
     }
 
     #[test]
     fn string_request_ids_remain_distinct_and_correlate_exactly() {
-        let frame = br#"{"jsonrpc":"2.0","id":"owned","error":{"code":-32602,"message":"refused"}}"#;
-        assert!(matches!(json_subscription_error(
-            frame, &RequestId::String("owned".to_owned()), ManagedCoreLimits::default(),
-        ), ManagedCoreError::Remote { .. }));
-        assert!(matches!(json_subscription_error(
-            frame, &RequestId::String("other".to_owned()), ManagedCoreLimits::default(),
-        ), ManagedCoreError::ResponseIdMismatch));
+        let frame =
+            br#"{"jsonrpc":"2.0","id":"owned","error":{"code":-32602,"message":"refused"}}"#;
+        assert!(matches!(
+            json_subscription_error(
+                frame,
+                &RequestId::String("owned".to_owned()),
+                ManagedCoreLimits::default(),
+            ),
+            ManagedCoreError::Remote { .. }
+        ));
+        assert!(matches!(
+            json_subscription_error(
+                frame,
+                &RequestId::String("other".to_owned()),
+                ManagedCoreLimits::default(),
+            ),
+            ManagedCoreError::ResponseIdMismatch
+        ));
     }
 
     #[test]
@@ -457,10 +550,13 @@ mod json_error_tests {
     #[test]
     fn finite_json_refusals_require_one_strict_complete_envelope() {
         for frame in [
-            br#"{"jsonrpc":"2.0","id":7,"id":7,"error":{"code":-32601,"message":"refused"}}"#.as_slice(),
-            br#"{"jsonrpc":"2.0","id":7,"result":{},"error":{"code":-32601,"message":"refused"}}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":7,"id":7,"error":{"code":-32601,"message":"refused"}}"#
+                .as_slice(),
+            br#"{"jsonrpc":"2.0","id":7,"result":{},"error":{"code":-32601,"message":"refused"}}"#
+                .as_slice(),
             br#"[{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"refused"}}]"#.as_slice(),
-            br#"{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"refused"}} {}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"refused"}} {}"#
+                .as_slice(),
             br#"{"jsonrpc":"2.0","id":7,"error":{"code":-32601}}"#.as_slice(),
             &[0xff],
         ] {
@@ -474,14 +570,20 @@ mod json_error_tests {
         let mut limits = ManagedCoreLimits::default();
         limits.frame_bytes = frame.len();
         limits.total_bytes = frame.len();
-        assert!(matches!(json_subscription_error(frame, &RequestId::Number(7), limits),
-            ManagedCoreError::Remote { .. }));
+        assert!(matches!(
+            json_subscription_error(frame, &RequestId::Number(7), limits),
+            ManagedCoreError::Remote { .. }
+        ));
         limits.frame_bytes -= 1;
-        assert!(matches!(json_subscription_error(frame, &RequestId::Number(7), limits),
-            ManagedCoreError::ResponseByteLimit));
+        assert!(matches!(
+            json_subscription_error(frame, &RequestId::Number(7), limits),
+            ManagedCoreError::ResponseByteLimit
+        ));
         limits.frame_bytes = frame.len();
         limits.total_bytes -= 1;
-        assert!(matches!(json_subscription_error(frame, &RequestId::Number(7), limits),
-            ManagedCoreError::ResponseByteLimit));
+        assert!(matches!(
+            json_subscription_error(frame, &RequestId::Number(7), limits),
+            ManagedCoreError::ResponseByteLimit
+        ));
     }
 }

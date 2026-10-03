@@ -30,7 +30,9 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use asupersync::Cx;
 use fastmcp_core::crypto::{draw_security_identifier, sha256_bounded};
-use rustix::fs::{AtFlags, FlockOperation, Mode, OFlags, flock, openat, renameat, statat, unlinkat};
+use rustix::fs::{
+    AtFlags, FlockOperation, Mode, OFlags, flock, openat, renameat, statat, unlinkat,
+};
 use rustix::io::Errno;
 
 /// Generation-preserving custody and recovery of caller-protected blobs.
@@ -96,7 +98,9 @@ pub enum AtomicFileError {
     RecoveryRequired,
     /// Rename happened, but directory durability could not be established.
     /// Do not repeat the operation blindly. Use `reconcile` under the same lock.
-    CommitUncertain { attempted: AtomicFileVersion },
+    CommitUncertain {
+        attempted: AtomicFileVersion,
+    },
 }
 
 impl fmt::Display for AtomicFileError {
@@ -116,7 +120,9 @@ impl fmt::Display for AtomicFileError {
             Self::TimedOut => "atomic file operation deadline exceeded before commit",
             Self::Io => "atomic file filesystem operation failed",
             Self::RecoveryRequired => "atomic file requires explicit commit reconciliation",
-            Self::CommitUncertain { .. } => "atomic file rename completed but durability is uncertain",
+            Self::CommitUncertain { .. } => {
+                "atomic file rename completed but durability is uncertain"
+            }
         })
     }
 }
@@ -171,12 +177,15 @@ impl SecureAtomicFile {
         ) {
             Ok(fd) => (File::from(fd), true),
             Err(Errno::EXIST) => (
-                File::from(openat(
-                    &directory,
-                    lock_leaf.as_str(),
-                    private_open_flags() | OFlags::RDWR,
-                    Mode::empty(),
-                ).map_err(|_| AtomicFileError::UnsafeFile)?),
+                File::from(
+                    openat(
+                        &directory,
+                        lock_leaf.as_str(),
+                        private_open_flags() | OFlags::RDWR,
+                        Mode::empty(),
+                    )
+                    .map_err(|_| AtomicFileError::UnsafeFile)?,
+                ),
                 false,
             ),
             Err(_) => return Err(AtomicFileError::Io),
@@ -258,7 +267,8 @@ impl SecureAtomicFile {
             temporary.leaf.as_str(),
             &self.directory,
             self.leaf.as_str(),
-        ).map_err(|_| AtomicFileError::Io)?;
+        )
+        .map_err(|_| AtomicFileError::Io)?;
         temporary.renamed = true;
         drop(temporary);
         // No cancellation checkpoint is legal between rename and this durability
@@ -283,7 +293,8 @@ impl SecureAtomicFile {
         self.validate_authority()?;
         let current = self.read_current(cx)?;
         checkpoint(cx)?;
-        self.sync_directory().map_err(|_| AtomicFileError::RecoveryRequired)?;
+        self.sync_directory()
+            .map_err(|_| AtomicFileError::RecoveryRequired)?;
         self.recovery_required = false;
         Ok(current)
     }
@@ -300,15 +311,23 @@ impl SecureAtomicFile {
         validate_directory(&self.directory)?;
         let held = self.lock.metadata().map_err(|_| AtomicFileError::Io)?;
         validate_regular(&held)?;
-        let named = statat(&self.directory, self.lock_leaf.as_str(), AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(|_| AtomicFileError::LockReplaced)?;
+        let named = statat(
+            &self.directory,
+            self.lock_leaf.as_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|_| AtomicFileError::LockReplaced)?;
         if named.st_dev != held.dev() || named.st_ino != held.ino() {
             return Err(AtomicFileError::LockReplaced);
         }
         Ok(())
     }
 
-    fn check_expected(&self, cx: &Cx, expected: Option<AtomicFileVersion>) -> Result<(), AtomicFileError> {
+    fn check_expected(
+        &self,
+        cx: &Cx,
+        expected: Option<AtomicFileVersion>,
+    ) -> Result<(), AtomicFileError> {
         let observed = self.read_current(cx)?.map(|snapshot| snapshot.version);
         if observed != expected {
             return Err(AtomicFileError::Conflict);
@@ -358,13 +377,17 @@ impl SecureAtomicFile {
         if after.len() != bytes.len() as u64 || metadata.len() != after.len() {
             return Err(AtomicFileError::Conflict);
         }
-        Ok(Some(AtomicFileSnapshot { version: version(&bytes)?, bytes }))
+        Ok(Some(AtomicFileSnapshot {
+            version: version(&bytes)?,
+            bytes,
+        }))
     }
 
     fn create_temporary<'a>(&'a self, cx: &Cx) -> Result<Temporary<'a>, AtomicFileError> {
         for _ in 0..4 {
             checkpoint(cx)?;
-            let random = draw_security_identifier().map_err(|_| AtomicFileError::RandomUnavailable)?;
+            let random =
+                draw_security_identifier().map_err(|_| AtomicFileError::RandomUnavailable)?;
             let mut leaf = format!(".{}.tmp-", self.leaf);
             for byte in random.as_bytes() {
                 use std::fmt::Write as _;
@@ -383,7 +406,9 @@ impl SecureAtomicFile {
                         leaf,
                         renamed: false,
                     };
-                    temporary.file.set_permissions(Permissions::from_mode(0o600))
+                    temporary
+                        .file
+                        .set_permissions(Permissions::from_mode(0o600))
                         .map_err(|_| AtomicFileError::Io)?;
                     validate_regular(&temporary.file.metadata().map_err(|_| AtomicFileError::Io)?)?;
                     return Ok(temporary);
@@ -423,7 +448,11 @@ impl Drop for Temporary<'_> {
             // prefix, and never delete a recovered or another writer's file.
             if let (Ok(held), Ok(named)) = (
                 self.file.metadata(),
-                statat(self.directory, self.leaf.as_str(), AtFlags::SYMLINK_NOFOLLOW),
+                statat(
+                    self.directory,
+                    self.leaf.as_str(),
+                    AtFlags::SYMLINK_NOFOLLOW,
+                ),
             ) {
                 if named.st_dev == held.dev() && named.st_ino == held.ino() {
                     let _ = unlinkat(self.directory, self.leaf.as_str(), AtFlags::empty());
@@ -438,8 +467,11 @@ fn private_open_flags() -> OFlags {
 }
 
 fn validate_name(name: &str) -> Result<(), AtomicFileError> {
-    if name.is_empty() || name.len() > MAX_LEAF_BYTES
-        || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    if name.is_empty()
+        || name.len() > MAX_LEAF_BYTES
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     {
         return Err(AtomicFileError::InvalidName);
     }
@@ -448,7 +480,8 @@ fn validate_name(name: &str) -> Result<(), AtomicFileError> {
 
 fn validate_directory(directory: &File) -> Result<(), AtomicFileError> {
     let metadata = directory.metadata().map_err(|_| AtomicFileError::Io)?;
-    if !metadata.is_dir() || metadata.uid() != rustix::process::geteuid().as_raw()
+    if !metadata.is_dir()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
         || metadata.mode() & 0o7777 != 0o700
     {
         return Err(AtomicFileError::UnsafeDirectory);
@@ -457,8 +490,10 @@ fn validate_directory(directory: &File) -> Result<(), AtomicFileError> {
 }
 
 fn validate_regular(metadata: &Metadata) -> Result<(), AtomicFileError> {
-    if !metadata.is_file() || metadata.uid() != rustix::process::geteuid().as_raw()
-        || metadata.mode() & 0o7777 != 0o600 || metadata.nlink() != 1
+    if !metadata.is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
     {
         return Err(AtomicFileError::UnsafeFile);
     }
@@ -513,9 +548,14 @@ mod tests {
     impl PrivateDirectory {
         pub(super) fn new() -> Self {
             let id = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir()
-                .join(format!("fastmcp-commit-uncertain-{}-{id}", std::process::id()));
-            std::fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            let path = std::env::temp_dir().join(format!(
+                "fastmcp-commit-uncertain-{}-{id}",
+                std::process::id()
+            ));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .unwrap();
             Self(path)
         }
 
@@ -583,7 +623,10 @@ mod tests {
         // The post-state, not only the error: load and replace stay refused
         // until reconciliation establishes which value is durable.
         assert!(store.recovery_required);
-        assert!(matches!(store.load(&cx), Err(AtomicFileError::RecoveryRequired)));
+        assert!(matches!(
+            store.load(&cx),
+            Err(AtomicFileError::RecoveryRequired)
+        ));
         assert_eq!(
             store.replace(&cx, Some(attempted), b"again"),
             Err(AtomicFileError::RecoveryRequired),
@@ -606,7 +649,10 @@ mod tests {
         let previous = store.replace(&cx, None, b"previous").unwrap();
         let attempted = version(b"attempted").unwrap();
 
-        assert_eq!(store.replace(&cx, Some(previous), b"attempted"), Ok(attempted));
+        assert_eq!(
+            store.replace(&cx, Some(previous), b"attempted"),
+            Ok(attempted)
+        );
         assert!(!store.recovery_required);
         assert_eq!(store.load(&cx).unwrap().unwrap().version(), attempted);
     }

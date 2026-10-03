@@ -22,14 +22,14 @@ use asupersync::tls::Certificate;
 use fastmcp_core::{AccessToken, CanonicalHttpUrl};
 use serde::Deserialize;
 
-use super::{
-    OAuthDiscoveryError, OAuthDiscoveryPlan, TrustedOAuthIssuer, MAX_OAUTH_METADATA_BYTES,
-    check_context, decode_metadata, discovery_deadline, has, https_url, origin_of,
-    present, validate_headers, validate_https, within,
-};
 use super::super::BoundBearerCredential;
 use super::super::managed::{ManagedOAuthSession, OAuthSessionError, OAuthSessionPolicy};
 use super::super::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError};
+use super::{
+    MAX_OAUTH_METADATA_BYTES, OAuthDiscoveryError, OAuthDiscoveryPlan, TrustedOAuthIssuer,
+    check_context, decode_metadata, discovery_deadline, has, https_url, origin_of, present,
+    validate_headers, validate_https, within,
+};
 
 /// Exact loopback URI templates used by the existing native OAuth driver.
 /// RFC 8252 section 7.3 requires the authorization server to permit the actual
@@ -60,9 +60,13 @@ impl fmt::Display for OAuthRegistrationError {
             Self::Discovery(_) => "native OAuth registration discovery or exchange failed",
             Self::EndpointNotTrusted => "registration origin has no explicit write grant",
             Self::InvalidRegistrationMetadata => "issuer registration metadata is unusable",
-            Self::InitialCredentialRejected => "initial registration credential is invalid for this endpoint",
+            Self::InitialCredentialRejected => {
+                "initial registration credential is invalid for this endpoint"
+            }
             Self::HttpStatus { .. } => "OAuth registration did not return HTTP 201; not retried",
-            Self::ResponseRejected => "OAuth registration response did not preserve the requested native client",
+            Self::ResponseRejected => {
+                "OAuth registration response did not preserve the requested native client"
+            }
         })
     }
 }
@@ -70,7 +74,9 @@ impl fmt::Display for OAuthRegistrationError {
 impl std::error::Error for OAuthRegistrationError {}
 
 impl From<OAuthDiscoveryError> for OAuthRegistrationError {
-    fn from(error: OAuthDiscoveryError) -> Self { Self::Discovery(error) }
+    fn from(error: OAuthDiscoveryError) -> Self {
+        Self::Discovery(error)
+    }
 }
 
 /// A single explicit registration attempt. This type intentionally has no
@@ -86,7 +92,10 @@ pub struct NativeClientRegistration {
 impl fmt::Debug for NativeClientRegistration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NativeClientRegistration")
-            .field("initial_credential", &self.initial_credential.as_ref().map(|_| "<redacted>"))
+            .field(
+                "initial_credential",
+                &self.initial_credential.as_ref().map(|_| "<redacted>"),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -108,7 +117,8 @@ impl NativeClientRegistration {
         scopes: Vec<String>,
     ) -> Result<Self, OAuthRegistrationError> {
         let client_name = client_name.into();
-        if client_name.trim().is_empty() || client_name.len() > 256
+        if client_name.trim().is_empty()
+            || client_name.len() > 256
             || client_name.chars().any(char::is_control)
         {
             return Err(OAuthRegistrationError::InvalidPolicy);
@@ -128,7 +138,10 @@ impl NativeClientRegistration {
         Ok(self)
     }
 
-    pub fn with_resource_root_certificate(mut self, root: Certificate) -> Result<Self, OAuthRegistrationError> {
+    pub fn with_resource_root_certificate(
+        mut self,
+        root: Certificate,
+    ) -> Result<Self, OAuthRegistrationError> {
         self.discovery = self.discovery.with_resource_root_certificate(root)?;
         Ok(self)
     }
@@ -136,10 +149,14 @@ impl NativeClientRegistration {
     /// Authorizes writes to one additional HTTPS registration origin, not to
     /// arbitrary origins named by the issuer. The issuer's configured roots
     /// still apply; registration does not import the resource's private roots.
-    pub fn with_registration_origin(mut self, origin: CanonicalHttpUrl) -> Result<Self, OAuthRegistrationError> {
+    pub fn with_registration_origin(
+        mut self,
+        origin: CanonicalHttpUrl,
+    ) -> Result<Self, OAuthRegistrationError> {
         validate_https(&origin).map_err(|_| OAuthRegistrationError::InvalidPolicy)?;
         let value = origin_of(&origin);
-        if origin.path() != "/" || self.registration_origins.len() >= 8
+        if origin.path() != "/"
+            || self.registration_origins.len() >= 8
             || self.registration_origins.contains(&value)
         {
             return Err(OAuthRegistrationError::InvalidPolicy);
@@ -153,13 +170,20 @@ impl NativeClientRegistration {
     /// when the POST is constructed. It is never sent on metadata GETs, login,
     /// token redemption or refresh, and is dropped after this attempt. A local
     /// token expiry additionally bounds the entire attempt's lifetime.
-    pub fn with_initial_access_token(mut self, credential: BoundBearerCredential) -> Result<Self, OAuthRegistrationError> {
+    pub fn with_initial_access_token(
+        mut self,
+        credential: BoundBearerCredential,
+    ) -> Result<Self, OAuthRegistrationError> {
         if self.initial_credential.is_some() {
             return Err(OAuthRegistrationError::InvalidPolicy);
         }
-        let header = credential.authorization_for_target(credential.resource())
+        let header = credential
+            .authorization_for_target(credential.resource())
             .ok_or(OAuthRegistrationError::InitialCredentialRejected)?;
-        if !header.strip_prefix("Bearer ").is_some_and(AccessToken::is_valid_token68) {
+        if !header
+            .strip_prefix("Bearer ")
+            .is_some_and(AccessToken::is_valid_token68)
+        {
             return Err(OAuthRegistrationError::InitialCredentialRejected);
         }
         self.initial_credential = Some(credential);
@@ -171,13 +195,21 @@ impl NativeClientRegistration {
     /// Its consuming receiver prevents accidental replay of this attempt.
     pub async fn register(self, cx: &Cx) -> Result<RegisteredNativeClient, OAuthRegistrationError> {
         let mut deadline = discovery_deadline(cx, self.discovery.timeout)?;
-        if let Some(expiry) = self.initial_credential.as_ref().and_then(BoundBearerCredential::expires_at) {
-            let remaining = expiry.checked_duration_since(Instant::now())
+        if let Some(expiry) = self
+            .initial_credential
+            .as_ref()
+            .and_then(BoundBearerCredential::expires_at)
+        {
+            let remaining = expiry
+                .checked_duration_since(Instant::now())
                 .filter(|remaining| !remaining.is_zero())
                 .ok_or(OAuthRegistrationError::InitialCredentialRejected)?;
             deadline = deadline.min(discovery_deadline(cx, remaining)?);
         }
-        let (issuer, body) = self.discovery.discover_issuer_document(cx, deadline).await?;
+        let (issuer, body) = self
+            .discovery
+            .discover_issuer_document(cx, deadline)
+            .await?;
         let (authorization, token) = self.discovery.admit_issuer_endpoints(issuer, &body)?;
         let revocation = self.discovery.admit_revocation_endpoint(issuer, &body)?;
         let (endpoint, grants) = self.registration_endpoint(issuer, &body)?;
@@ -197,22 +229,35 @@ impl NativeClientRegistration {
         }
         let client = builder.build();
         let response = within(cx, deadline, async {
-            client.request(cx, Method::Post, endpoint.as_str(), headers, payload)
-                .await.map_err(|_| OAuthDiscoveryError::TransportFailed)
-        }).await?;
+            client
+                .request(cx, Method::Post, endpoint.as_str(), headers, payload)
+                .await
+                .map_err(|_| OAuthDiscoveryError::TransportFailed)
+        })
+        .await?;
         if response.status != 201 {
-            return Err(OAuthRegistrationError::HttpStatus { status: response.status });
+            return Err(OAuthRegistrationError::HttpStatus {
+                status: response.status,
+            });
         }
-        validate_headers(&response.headers).map_err(|_| OAuthRegistrationError::ResponseRejected)?;
+        validate_headers(&response.headers)
+            .map_err(|_| OAuthRegistrationError::ResponseRejected)?;
         if !response.trailers.is_empty() {
             return Err(OAuthRegistrationError::ResponseRejected);
         }
         let client_id = self.admit_response(&response.body, &grants)?;
         let configuration = self.discovery.configure_client(
-            issuer, authorization, token, revocation, &client_id,
+            issuer,
+            authorization,
+            token,
+            revocation,
+            &client_id,
         )?;
         check_context(cx, deadline)?;
-        Ok(RegisteredNativeClient { client_id, configuration })
+        Ok(RegisteredNativeClient {
+            client_id,
+            configuration,
+        })
     }
 
     fn registration_endpoint(
@@ -232,7 +277,11 @@ impl NativeClientRegistration {
         // admission. RFC 8414's absent grant_types_supported default does not
         // promise refresh_token, so it cannot cause that grant to be requested.
         let mut grants = vec!["authorization_code"];
-        if metadata.grant_types_supported.as_ref().is_some_and(|values| has(values, "refresh_token")) {
+        if metadata
+            .grant_types_supported
+            .as_ref()
+            .is_some_and(|values| has(values, "refresh_token"))
+        {
             grants.push("refresh_token");
         }
         Ok((endpoint, grants))
@@ -250,14 +299,18 @@ impl NativeClientRegistration {
         if !self.discovery.scopes.is_empty() {
             payload["scope"] = serde_json::Value::String(self.discovery.scopes.join(" "));
         }
-        let bytes = serde_json::to_vec(&payload).map_err(|_| OAuthRegistrationError::InvalidPolicy)?;
+        let bytes =
+            serde_json::to_vec(&payload).map_err(|_| OAuthRegistrationError::InvalidPolicy)?;
         if bytes.len() > MAX_OAUTH_METADATA_BYTES {
             return Err(OAuthRegistrationError::InvalidPolicy);
         }
         Ok(bytes)
     }
 
-    fn request_headers(&self, endpoint: &CanonicalHttpUrl) -> Result<Vec<(String, String)>, OAuthRegistrationError> {
+    fn request_headers(
+        &self,
+        endpoint: &CanonicalHttpUrl,
+    ) -> Result<Vec<(String, String)>, OAuthRegistrationError> {
         let mut headers = vec![
             ("Content-Type".to_owned(), "application/json".to_owned()),
             ("Accept".to_owned(), "application/json".to_owned()),
@@ -265,17 +318,23 @@ impl NativeClientRegistration {
             ("Connection".to_owned(), "close".to_owned()),
         ];
         if let Some(credential) = &self.initial_credential {
-            let header = credential.authorization_for_target(endpoint)
+            let header = credential
+                .authorization_for_target(endpoint)
                 .ok_or(OAuthRegistrationError::InitialCredentialRejected)?;
             headers.push(("Authorization".to_owned(), header));
         }
         Ok(headers)
     }
 
-    fn admit_response(&self, body: &[u8], grants: &[&str]) -> Result<String, OAuthRegistrationError> {
-        let metadata: RegisteredMetadata = decode_metadata(body)
-            .map_err(|_| OAuthRegistrationError::ResponseRejected)?;
-        if metadata.client_id.is_empty() || metadata.client_id.len() > 1024
+    fn admit_response(
+        &self,
+        body: &[u8],
+        grants: &[&str],
+    ) -> Result<String, OAuthRegistrationError> {
+        let metadata: RegisteredMetadata =
+            decode_metadata(body).map_err(|_| OAuthRegistrationError::ResponseRejected)?;
+        if metadata.client_id.is_empty()
+            || metadata.client_id.len() > 1024
             || metadata.client_id.chars().any(char::is_control)
             || metadata.application_type != "native"
             || metadata.token_endpoint_auth_method != "none"
@@ -291,7 +350,9 @@ impl NativeClientRegistration {
         }
         let scopes: Vec<String> = match metadata.scope {
             None => Vec::new(),
-            Some(scope) if scope.is_empty() => return Err(OAuthRegistrationError::ResponseRejected),
+            Some(scope) if scope.is_empty() => {
+                return Err(OAuthRegistrationError::ResponseRejected);
+            }
             Some(scope) => scope.split(' ').map(str::to_owned).collect(),
         };
         let requested: Vec<&str> = self.discovery.scopes.iter().map(String::as_str).collect();
@@ -320,14 +381,19 @@ pub struct RegisteredNativeClient {
 
 impl fmt::Debug for RegisteredNativeClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RegisteredNativeClient").finish_non_exhaustive()
+        f.debug_struct("RegisteredNativeClient")
+            .finish_non_exhaustive()
     }
 }
 
 impl RegisteredNativeClient {
-    pub fn client_id(&self) -> &str { &self.client_id }
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
 
-    pub fn configuration(&self) -> &OAuthClientConfiguration { &self.configuration }
+    pub fn configuration(&self) -> &OAuthClientConfiguration {
+        &self.configuration
+    }
 
     /// Runs the existing S256 loopback login with this already-admitted ID.
     /// It never contacts the registration endpoint or rediscovers another issuer.
@@ -342,15 +408,26 @@ impl RegisteredNativeClient {
         F: Future<Output = Result<(), OAuthError>>,
     {
         ManagedOAuthSession::authorize(
-            cx, OAuthClient::new(self.configuration.clone()), policy, launch_browser,
-        ).await
+            cx,
+            OAuthClient::new(self.configuration.clone()),
+            policy,
+            launch_browser,
+        )
+        .await
     }
 }
 
 fn exact_set(actual: &[String], expected: &[&str]) -> bool {
     actual.len() == expected.len()
-        && actual.iter().map(String::as_str).collect::<BTreeSet<_>>().len() == actual.len()
-        && actual.iter().all(|value| expected.contains(&value.as_str()))
+        && actual
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            .len()
+            == actual.len()
+        && actual
+            .iter()
+            .all(|value| expected.contains(&value.as_str()))
 }
 
 #[derive(Deserialize)]
@@ -387,14 +464,18 @@ mod tests {
     use super::*;
     use serde_json::{Value, json};
 
-    fn url(text: &str) -> CanonicalHttpUrl { CanonicalHttpUrl::parse(text).unwrap() }
+    fn url(text: &str) -> CanonicalHttpUrl {
+        CanonicalHttpUrl::parse(text).unwrap()
+    }
 
     fn registration() -> NativeClientRegistration {
         NativeClientRegistration::new(
             url("https://resource.example/mcp"),
             vec![TrustedOAuthIssuer::new("https://issuer.example/tenant").unwrap()],
-            "Native app", vec!["tools:read".to_owned(), "tools:write".to_owned()],
-        ).unwrap()
+            "Native app",
+            vec!["tools:read".to_owned(), "tools:write".to_owned()],
+        )
+        .unwrap()
     }
 
     fn response() -> Value {
@@ -406,16 +487,30 @@ mod tests {
         })
     }
 
-    fn admit(owner: &NativeClientRegistration, body: &Value) -> Result<String, OAuthRegistrationError> {
-        owner.admit_response(&serde_json::to_vec(body).unwrap(), &["authorization_code", "refresh_token"])
+    fn admit(
+        owner: &NativeClientRegistration,
+        body: &Value,
+    ) -> Result<String, OAuthRegistrationError> {
+        owner.admit_response(
+            &serde_json::to_vec(body).unwrap(),
+            &["authorization_code", "refresh_token"],
+        )
     }
 
     #[test]
     fn registration_request_and_response_preserve_exact_native_public_profile() {
         let owner = registration();
         assert!(owner.discovery.client_id.is_none());
-        let payload: Value = serde_json::from_slice(&owner.request_body(&["authorization_code", "refresh_token"]).unwrap()).unwrap();
-        assert_eq!(payload["redirect_uris"], json!(NATIVE_REGISTRATION_REDIRECT_URIS));
+        let payload: Value = serde_json::from_slice(
+            &owner
+                .request_body(&["authorization_code", "refresh_token"])
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            payload["redirect_uris"],
+            json!(NATIVE_REGISTRATION_REDIRECT_URIS)
+        );
         assert_eq!(payload["application_type"], "native");
         assert_eq!(payload["token_endpoint_auth_method"], "none");
         assert!(payload.get("client_id").is_none());
@@ -432,22 +527,45 @@ mod tests {
     fn registration_response_cannot_replace_redirects_auth_method_or_grants() {
         let owner = registration();
         for (key, value) in [
-            ("redirect_uris", json!(["https://attacker.invalid/callback", NATIVE_REGISTRATION_REDIRECT_URIS[1]])),
-            ("redirect_uris", json!([NATIVE_REGISTRATION_REDIRECT_URIS[0], NATIVE_REGISTRATION_REDIRECT_URIS[0]])),
-            ("redirect_uris", json!([NATIVE_REGISTRATION_REDIRECT_URIS[0]])),
+            (
+                "redirect_uris",
+                json!([
+                    "https://attacker.invalid/callback",
+                    NATIVE_REGISTRATION_REDIRECT_URIS[1]
+                ]),
+            ),
+            (
+                "redirect_uris",
+                json!([
+                    NATIVE_REGISTRATION_REDIRECT_URIS[0],
+                    NATIVE_REGISTRATION_REDIRECT_URIS[0]
+                ]),
+            ),
+            (
+                "redirect_uris",
+                json!([NATIVE_REGISTRATION_REDIRECT_URIS[0]]),
+            ),
             ("token_endpoint_auth_method", json!("client_secret_basic")),
             ("application_type", json!("web")),
-            ("grant_types", json!(["authorization_code", "client_credentials"])),
+            (
+                "grant_types",
+                json!(["authorization_code", "client_credentials"]),
+            ),
             ("grant_types", json!(["authorization_code"])),
             ("response_types", json!(["token"])),
             ("client_secret", json!("not-a-public-client")),
             ("client_secret", Value::Null),
-            ("scope", json!("admin")), ("scope", json!("tools:read tools:read")),
-            ("scope", Value::Null), ("client_id", json!("")),
+            ("scope", json!("admin")),
+            ("scope", json!("tools:read tools:read")),
+            ("scope", Value::Null),
+            ("client_id", json!("")),
         ] {
             let mut body = response();
             body[key] = value;
-            assert!(admit(&owner, &body).is_err(), "changed {key} must prevent login");
+            assert!(
+                admit(&owner, &body).is_err(),
+                "changed {key} must prevent login"
+            );
         }
         assert_eq!(admit(&owner, &response()).unwrap(), "new-client");
     }
@@ -456,25 +574,62 @@ mod tests {
     fn registration_response_is_object_only_duplicate_aware_and_bounded() {
         let owner = registration();
         let body = response().to_string();
-        for suffix in [",\"client_id\":\"duplicate\"", ",\"client_\\u0069d\":\"duplicate\""] {
+        for suffix in [
+            ",\"client_id\":\"duplicate\"",
+            ",\"client_\\u0069d\":\"duplicate\"",
+        ] {
             let duplicate = format!("{}{suffix}}}", &body[..body.len() - 1]);
-            assert!(owner.admit_response(duplicate.as_bytes(), &["authorization_code", "refresh_token"]).is_err());
+            assert!(
+                owner
+                    .admit_response(
+                        duplicate.as_bytes(),
+                        &["authorization_code", "refresh_token"]
+                    )
+                    .is_err()
+            );
         }
-        for body in [json!([response()]), json!(["client", "native", NATIVE_REGISTRATION_REDIRECT_URIS, "none", ["authorization_code"], ["code"]]), Value::Null] {
+        for body in [
+            json!([response()]),
+            json!([
+                "client",
+                "native",
+                NATIVE_REGISTRATION_REDIRECT_URIS,
+                "none",
+                ["authorization_code"],
+                ["code"]
+            ]),
+            Value::Null,
+        ] {
             assert!(admit(&owner, &body).is_err());
         }
-        assert!(owner.admit_response(&vec![b' '; MAX_OAUTH_METADATA_BYTES + 1], &["authorization_code"]).is_err());
+        assert!(
+            owner
+                .admit_response(
+                    &vec![b' '; MAX_OAUTH_METADATA_BYTES + 1],
+                    &["authorization_code"]
+                )
+                .is_err()
+        );
     }
 
     #[test]
     fn token_origin_permission_does_not_grant_registration_write_authority() {
         let mut owner = registration();
-        owner.discovery.issuers[0] = owner.discovery.issuers[0].clone()
-            .with_endpoint_origin(url("https://separate.example/")).unwrap();
+        owner.discovery.issuers[0] = owner.discovery.issuers[0]
+            .clone()
+            .with_endpoint_origin(url("https://separate.example/"))
+            .unwrap();
         let body = br#"{"registration_endpoint":"https://separate.example/register","grant_types_supported":["authorization_code","refresh_token"]}"#;
-        assert!(matches!(owner.registration_endpoint(&owner.discovery.issuers[0], body), Err(OAuthRegistrationError::EndpointNotTrusted)));
-        let owner = owner.with_registration_origin(url("https://separate.example/")).unwrap();
-        let (endpoint, grants) = owner.registration_endpoint(&owner.discovery.issuers[0], body).unwrap();
+        assert!(matches!(
+            owner.registration_endpoint(&owner.discovery.issuers[0], body),
+            Err(OAuthRegistrationError::EndpointNotTrusted)
+        ));
+        let owner = owner
+            .with_registration_origin(url("https://separate.example/"))
+            .unwrap();
+        let (endpoint, grants) = owner
+            .registration_endpoint(&owner.discovery.issuers[0], body)
+            .unwrap();
         assert_eq!(endpoint.as_str(), "https://separate.example/register");
         assert_eq!(grants, ["authorization_code", "refresh_token"]);
     }
@@ -483,7 +638,9 @@ mod tests {
     fn missing_refresh_advertisement_requests_only_authorization_code() {
         let owner = registration();
         let body = br#"{"registration_endpoint":"https://issuer.example/register"}"#;
-        let (_, grants) = owner.registration_endpoint(&owner.discovery.issuers[0], body).unwrap();
+        let (_, grants) = owner
+            .registration_endpoint(&owner.discovery.issuers[0], body)
+            .unwrap();
         assert_eq!(grants, ["authorization_code"]);
         for body in [
             br"{}".as_slice(),
@@ -499,15 +656,26 @@ mod tests {
     #[test]
     fn initial_access_token_is_endpoint_bound_redacted_and_not_laundered_as_client_id() {
         let endpoint = url("https://issuer.example/register");
-        let owner = registration().with_initial_access_token(
-            BoundBearerCredential::bind(endpoint.clone(), "initial-secret").unwrap(),
-        ).unwrap();
+        let owner = registration()
+            .with_initial_access_token(
+                BoundBearerCredential::bind(endpoint.clone(), "initial-secret").unwrap(),
+            )
+            .unwrap();
         assert!(!format!("{owner:?}").contains("initial-secret"));
-        assert!(owner.request_headers(&endpoint).unwrap().contains(&("Authorization".to_owned(), "Bearer initial-secret".to_owned())));
-        assert!(matches!(owner.request_headers(&url("https://issuer.example/token")), Err(OAuthRegistrationError::InitialCredentialRejected)));
+        assert!(owner.request_headers(&endpoint).unwrap().contains(&(
+            "Authorization".to_owned(),
+            "Bearer initial-secret".to_owned()
+        )));
+        assert!(matches!(
+            owner.request_headers(&url("https://issuer.example/token")),
+            Err(OAuthRegistrationError::InitialCredentialRejected)
+        ));
         let mut reflected = response();
         reflected["client_id"] = json!("prefix-initial-secret-suffix");
-        assert!(matches!(admit(&owner, &reflected), Err(OAuthRegistrationError::ResponseRejected)));
+        assert!(matches!(
+            admit(&owner, &reflected),
+            Err(OAuthRegistrationError::ResponseRejected)
+        ));
         assert!(admit(&owner, &response()).is_ok());
     }
 

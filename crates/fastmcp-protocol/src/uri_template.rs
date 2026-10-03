@@ -2130,19 +2130,20 @@ mod tests {
             for id in samples {
                 for identifier in samples {
                     for tag in samples {
-                        let values: TemplateValues = [
-                            ("id", id),
-                            ("identifier", identifier),
-                            ("id.tag", tag),
-                        ]
-                        .into_iter()
-                        .filter_map(|(name, value)| {
-                            value.map(|value| (name.to_owned(), TemplateValue::scalar(value)))
-                        })
-                        .collect();
+                        let values: TemplateValues =
+                            [("id", id), ("identifier", identifier), ("id.tag", tag)]
+                                .into_iter()
+                                .filter_map(|(name, value)| {
+                                    value.map(|value| {
+                                        (name.to_owned(), TemplateValue::scalar(value))
+                                    })
+                                })
+                                .collect();
                         let uri = matcher.expand(&values).expect("scalar values expand");
                         assert_eq!(
-                            matcher.match_uri(&uri).expect("matching stays within bounds"),
+                            matcher
+                                .match_uri(&uri)
+                                .expect("matching stays within bounds"),
                             Some(values),
                             "optional bindings must survive round-trip: {source} -> {uri}",
                         );
@@ -2161,14 +2162,13 @@ mod tests {
                     UriTemplate::parse(&source).expect("matrix template parses"),
                 )
                 .expect("the suffix supplies a reversible boundary");
-                let values = TemplateValues::from([(
-                    "flag".to_owned(),
-                    TemplateValue::scalar(""),
-                )]);
+                let values = TemplateValues::from([("flag".to_owned(), TemplateValue::scalar(""))]);
                 let uri = format!("mcp://items;flag{suffix}");
                 assert_eq!(matcher.expand(&values).expect("empty scalar expands"), uri);
                 assert_eq!(
-                    matcher.match_uri(&uri).expect("matching stays within bounds"),
+                    matcher
+                        .match_uri(&uri)
+                        .expect("matching stays within bounds"),
                     Some(values),
                     "an empty matrix parameter must survive before {suffix}",
                 );
@@ -2179,7 +2179,9 @@ mod tests {
                     absent_uri,
                 );
                 assert_eq!(
-                    matcher.match_uri(&absent_uri).expect("undefined value matches"),
+                    matcher
+                        .match_uri(&absent_uri)
+                        .expect("undefined value matches"),
                     Some(absent),
                     "omitting the parameter must not manufacture an empty binding",
                 );
@@ -2196,10 +2198,8 @@ mod tests {
             )
             .expect("distinct expression markers are reversible");
             for page in [None, Some("2")] {
-                let mut values = TemplateValues::from([(
-                    "flag".to_owned(),
-                    TemplateValue::scalar(""),
-                )]);
+                let mut values =
+                    TemplateValues::from([("flag".to_owned(), TemplateValue::scalar(""))]);
                 let uri = if let Some(page) = page {
                     values.insert("page".to_owned(), TemplateValue::scalar(page));
                     format!("mcp://items;flag?page={page}")
@@ -2208,7 +2208,9 @@ mod tests {
                 };
                 assert_eq!(matcher.expand(&values).expect("named values expand"), uri);
                 assert_eq!(
-                    matcher.match_uri(&uri).expect("matching stays within bounds"),
+                    matcher
+                        .match_uri(&uri)
+                        .expect("matching stays within bounds"),
                     Some(values),
                     "the following query must remain optional: {source} -> {uri}",
                 );
@@ -2222,10 +2224,7 @@ mod tests {
             UriTemplate::parse("mcp://items{?id,identifier}").expect("query template parses"),
         )
         .expect("named query variables are reversible");
-        let values = TemplateValues::from([(
-            "identifier".to_owned(),
-            TemplateValue::scalar("42"),
-        )]);
+        let values = TemplateValues::from([("identifier".to_owned(), TemplateValue::scalar("42"))]);
         assert_eq!(
             matcher
                 .match_uri("mcp://items?identifier=42")
@@ -2241,7 +2240,9 @@ mod tests {
             "mcp://items?identifier=%34%32",
         ] {
             assert_eq!(
-                matcher.match_uri(uri).expect("invalid URI is a bounded non-match"),
+                matcher
+                    .match_uri(uri)
+                    .expect("invalid URI is a bounded non-match"),
                 None,
                 "unknown names, malformed values, and noncanonical order remain rejected: {uri}",
             );
@@ -2254,10 +2255,7 @@ mod tests {
             UriTemplate::parse("mcp://items{;flag}/tail").expect("matrix template parses"),
         )
         .expect("literal suffix supplies a reversible boundary");
-        let values = TemplateValues::from([(
-            "flag".to_owned(),
-            TemplateValue::scalar(""),
-        )]);
+        let values = TemplateValues::from([("flag".to_owned(), TemplateValue::scalar(""))]);
         assert_eq!(
             matcher
                 .match_uri("mcp://items;flag/tail")
@@ -2273,7 +2271,9 @@ mod tests {
             "mcp://items;flag=%/tail",
         ] {
             assert_eq!(
-                matcher.match_uri(uri).expect("invalid URI is a bounded non-match"),
+                matcher
+                    .match_uri(uri)
+                    .expect("invalid URI is a bounded non-match"),
                 None,
                 "wrong names, malformed values, and changed suffixes remain rejected: {uri}",
             );

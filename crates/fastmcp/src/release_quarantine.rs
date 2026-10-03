@@ -442,7 +442,7 @@ fn quarantine_identity() -> WorkflowIdentity {
         },
         ActionIdentity {
             name: "dtolnay/rust-toolchain",
-            commit_sha: "6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772",
+            commit_sha: "02cb101ec7c40f2c49e1d9714d64511d8e1b74de",
         },
         ActionIdentity {
             name: "Swatinem/rust-cache",
@@ -450,7 +450,7 @@ fn quarantine_identity() -> WorkflowIdentity {
         },
         ActionIdentity {
             name: "taiki-e/install-action",
-            commit_sha: "ba47c86ac325773530516bb756137ac718732518",
+            commit_sha: "9983c65e42da123ff25d1f78505eb6de315aa172",
         },
         ActionIdentity {
             name: "actions/upload-artifact",
@@ -462,8 +462,8 @@ fn quarantine_identity() -> WorkflowIdentity {
         role: WorkflowRole::QuarantineVerification,
         workflow_name: "Release Quarantine Verification",
         path: WORKFLOW_PATH,
-        revision: "4661f69f0d7fe913b7aee1be5c59f8606087ca49",
-        definition_sha256_hex: "23ea1534d4ee97a60506d2efc48c27e67dc4acbcd98c1818fb46f23e744b5684",
+        revision: "1b22c88296e716e51eea81d9960a4d159bcb508a",
+        definition_sha256_hex: "48be2e3936a6f9769bacf8bac817ab8aa8976f05c6b43125feb0e5532965c719",
         events: &["workflow_dispatch"],
         jobs: &["preflight", "build"],
         declared_permissions: &[

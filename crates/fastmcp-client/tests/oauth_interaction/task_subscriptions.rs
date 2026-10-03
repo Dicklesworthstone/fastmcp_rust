@@ -8,19 +8,31 @@ use fastmcp_client::http_auth::managed::subscriptions::{
     ManagedSubscriptionLimits,
 };
 use fastmcp_client::http_auth::managed::tasks::{
-    ManagedTaskEvent, ManagedTaskRequest, ManagedTaskRequestIds,
-    ManagedTasksClient, ManagedTasksLimits,
+    ManagedTaskEvent, ManagedTaskRequest, ManagedTaskRequestIds, ManagedTasksClient,
+    ManagedTasksLimits,
 };
-use fastmcp_protocol::tasks_extension::{Task, TASKS_EXTENSION, task_subscription_ids};
-use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta, FINAL_SUBSCRIPTION_ID_META_KEY};
+use fastmcp_protocol::tasks_extension::{TASKS_EXTENSION, Task, task_subscription_ids};
+use fastmcp_protocol::{ClientCapabilities, FINAL_SUBSCRIPTION_ID_META_KEY, FinalRequestMeta};
 
 const WATCH_CASE: &str = "FASTMCP_TEST_TASK_SUBSCRIPTION_CASE";
 const DISCOVER: &str = r#"{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{"listChanged":true},"extensions":{"io.modelcontextprotocol/tasks":{}}},"ttlMs":0,"cacheScope":"private"}"#;
 
 #[derive(Clone, Copy)]
 enum WatchCase {
-    Live, Narrowed, BadAck, BadTask, Truncated, Discovery, Preflight,
-    Cancel, Close, DropRead, Expiry, Deadline, Limit, NoReplay,
+    Live,
+    Narrowed,
+    BadAck,
+    BadTask,
+    Truncated,
+    Discovery,
+    Preflight,
+    Cancel,
+    Close,
+    DropRead,
+    Expiry,
+    Deadline,
+    Limit,
+    NoReplay,
 }
 
 fn isolated_watch(name: &str, case: WatchCase) {
@@ -33,50 +45,85 @@ fn isolated_watch(name: &str, case: WatchCase) {
     let roots = RootFile::create();
     struct Child(std::process::Child);
     impl Drop for Child {
-        fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
-    let mut child = Child(Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", &exact_name, "--nocapture", "--test-threads=1"])
-        .env(WATCH_CASE, &exact_name).env("SSL_CERT_FILE", &roots.0).env_remove("SSL_CERT_DIR")
-        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap());
+    let mut child = Child(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &exact_name, "--nocapture", "--test-threads=1"])
+            .env(WATCH_CASE, &exact_name)
+            .env("SSL_CERT_FILE", &roots.0)
+            .env_remove("SSL_CERT_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
     let end = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.0.try_wait().unwrap() {
-            assert!(status.success(), "managed Task subscription HTTPS case failed");
+            assert!(
+                status.success(),
+                "managed Task subscription HTTPS case failed"
+            );
             return;
         }
-        assert!(Instant::now() < end, "managed Task subscription child exceeded its bound");
+        assert!(
+            Instant::now() < end,
+            "managed Task subscription child exceeded its bound"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
 
-fn filter() -> Value { json!({"taskIds":["task-one","task-two"],"toolsListChanged":true}) }
-fn watch_request(filter: Value, extensions: Value) -> CoreRequest {
-    CoreRequest::decode(ProtocolEra::Modern2026, "subscriptions/listen", Some(&json!({
-        "_meta": {
-            "io.modelcontextprotocol/protocolVersion":"2026-07-28",
-            "io.modelcontextprotocol/clientCapabilities":{"extensions":extensions},
-            "com.example/identity":"retained"
-        },
-        "notifications":filter
-    }))).unwrap()
+fn filter() -> Value {
+    json!({"taskIds":["task-one","task-two"],"toolsListChanged":true})
 }
-fn requested() -> CoreRequest { watch_request(filter(), json!({TASKS_EXTENSION:{}})) }
+fn watch_request(filter: Value, extensions: Value) -> CoreRequest {
+    CoreRequest::decode(
+        ProtocolEra::Modern2026,
+        "subscriptions/listen",
+        Some(&json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities":{"extensions":extensions},
+                "com.example/identity":"retained"
+            },
+            "notifications":filter
+        })),
+    )
+    .unwrap()
+}
+fn requested() -> CoreRequest {
+    watch_request(filter(), json!({TASKS_EXTENSION:{}}))
+}
 fn ack(id: i64, accepted: Value) -> String {
     json!({"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged", "params":{
         "_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):id}, "notifications":accepted,
-    }}).to_string()
+    }})
+    .to_string()
 }
 fn done(id: i64) -> String {
-    terminal(id, &json!({"resultType":"complete","_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):id}}).to_string())
+    terminal(
+        id,
+        &json!({"resultType":"complete","_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):id}}).to_string(),
+    )
 }
 fn task_event(id: i64, task: &str, status: &str) -> String {
     let extra = match status {
         "input_required" => r#", "inputRequests":{"roots":{"method":"roots/list"}}"#,
-        "completed" => r#", "result":{"content":[],"x-exact":{"z":900719925474099312345,"a":1.20e+4}}"#,
+        "completed" => {
+            r#", "result":{"content":[],"x-exact":{"z":900719925474099312345,"a":1.20e+4}}"#
+        }
         _ => "",
     };
-    format!(r#"{{"jsonrpc":"2.0","method":"notifications/tasks","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":{id}}},"taskId":{},"status":"{status}","createdAt":"2026-09-16T00:00:00Z","lastUpdatedAt":"2026-09-16T00:00:01Z","ttlMs":60000{extra}}}}}"#, serde_json::to_string(task).unwrap())
+    format!(
+        r#"{{"jsonrpc":"2.0","method":"notifications/tasks","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":{id}}},"taskId":{},"status":"{status}","createdAt":"2026-09-16T00:00:00Z","lastUpdatedAt":"2026-09-16T00:00:01Z","ttlMs":60000{extra}}}}}"#,
+        serde_json::to_string(task).unwrap()
+    )
 }
 async fn begin_watch(peer: &Peer, first_id: i64, discovery: &str) -> TlsStream<TcpStream> {
     let discovered = peer.response(first_id, discovery).await;
@@ -87,24 +134,40 @@ async fn begin_watch(peer: &Peer, first_id: i64, discovery: &str) -> TlsStream<T
     assert_eq!(listen["id"], first_id + 1);
     assert_eq!(listen["params"]["notifications"], filter());
     assert_eq!(listen["params"]["_meta"], discovered["params"]["_meta"]);
-    assert_eq!(listen["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"], json!({TASKS_EXTENSION:{}}));
+    assert_eq!(
+        listen["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"],
+        json!({TASKS_EXTENSION:{}})
+    );
     // Peer::request checks that BOTH discovery and listen carry the exact
     // admitted access token and never carry legacy session/replay headers.
     sse_head(&mut tls).await;
     tls
 }
 async fn consume_ack(watch: &mut ManagedSubscription, cx: &Cx) -> Value {
-    let Some(ManagedSubscriptionEvent::Acknowledged { accepted_filter }) = watch.next_event(cx).await.unwrap() else { panic!("first record must be the ACK") };
+    let Some(ManagedSubscriptionEvent::Acknowledged { accepted_filter }) =
+        watch.next_event(cx).await.unwrap()
+    else {
+        panic!("first record must be the ACK")
+    };
     assert_eq!(watch.credential_generation(), 1);
     assert!(watch.accepted_filter().is_some());
     serde_json::to_value(accepted_filter).unwrap()
 }
 async fn consume_task(watch: &mut ManagedSubscription, cx: &Cx) -> Task {
-    let Some(ManagedSubscriptionEvent::TaskNotification(event)) = watch.next_event(cx).await.unwrap() else { panic!("typed Task notification required") };
+    let Some(ManagedSubscriptionEvent::TaskNotification(event)) =
+        watch.next_event(cx).await.unwrap()
+    else {
+        panic!("typed Task notification required")
+    };
     event.params.task
 }
 async fn consume_done(watch: &mut ManagedSubscription, cx: &Cx, id: i64) {
-    let Some(ManagedSubscriptionEvent::Terminal { subscription_id, .. }) = watch.next_event(cx).await.unwrap() else { panic!("subscription terminal required") };
+    let Some(ManagedSubscriptionEvent::Terminal {
+        subscription_id, ..
+    }) = watch.next_event(cx).await.unwrap()
+    else {
+        panic!("subscription terminal required")
+    };
     assert!(subscription_id.correlates_with(&RequestId::Number(id)));
     assert!(watch.next_event(cx).await.unwrap().is_none());
 }
@@ -115,7 +178,16 @@ async fn reopen_after_gap(peer: &Peer, session: &ManagedOAuthSession, cx: &Cx) {
         event(&mut tls, &done(52), true).await;
     });
     let client = Box::pin(async {
-        let mut watch = session.subscribe_tasks(cx, requested(), RequestId::Number(51), RequestId::Number(52), ManagedSubscriptionLimits::default()).await.unwrap();
+        let mut watch = session
+            .subscribe_tasks(
+                cx,
+                requested(),
+                RequestId::Number(51),
+                RequestId::Number(52),
+                ManagedSubscriptionLimits::default(),
+            )
+            .await
+            .unwrap();
         consume_ack(&mut watch, cx).await;
         // No event from the failed listen is manufactured or replayed.
         consume_done(&mut watch, cx, 52).await;
@@ -343,30 +415,100 @@ fn run_watch(case: WatchCase) {
 }
 
 #[test]
-fn task_watch_delivers_mixed_events_and_allows_live_input_update() { isolated_watch("task_watch_delivers_mixed_events_and_allows_live_input_update", WatchCase::Live); }
+fn task_watch_delivers_mixed_events_and_allows_live_input_update() {
+    isolated_watch(
+        "task_watch_delivers_mixed_events_and_allows_live_input_update",
+        WatchCase::Live,
+    );
+}
 #[test]
-fn task_watch_enforces_the_narrowed_accepted_ids() { isolated_watch("task_watch_enforces_the_narrowed_accepted_ids", WatchCase::Narrowed); }
+fn task_watch_enforces_the_narrowed_accepted_ids() {
+    isolated_watch(
+        "task_watch_enforces_the_narrowed_accepted_ids",
+        WatchCase::Narrowed,
+    );
+}
 #[test]
-fn task_watch_rejects_widened_ack_without_publication() { isolated_watch("task_watch_rejects_widened_ack_without_publication", WatchCase::BadAck); }
+fn task_watch_rejects_widened_ack_without_publication() {
+    isolated_watch(
+        "task_watch_rejects_widened_ack_without_publication",
+        WatchCase::BadAck,
+    );
+}
 #[test]
-fn task_watch_rejects_foreign_ids_and_malformed_snapshots() { isolated_watch("task_watch_rejects_foreign_ids_and_malformed_snapshots", WatchCase::BadTask); }
+fn task_watch_rejects_foreign_ids_and_malformed_snapshots() {
+    isolated_watch(
+        "task_watch_rejects_foreign_ids_and_malformed_snapshots",
+        WatchCase::BadTask,
+    );
+}
 #[test]
-fn task_watch_requires_its_own_terminal_result() { isolated_watch("task_watch_requires_its_own_terminal_result", WatchCase::Truncated); }
+fn task_watch_requires_its_own_terminal_result() {
+    isolated_watch(
+        "task_watch_requires_its_own_terminal_result",
+        WatchCase::Truncated,
+    );
+}
 #[test]
-fn task_watch_discovery_failures_prevent_the_listen_post() { isolated_watch("task_watch_discovery_failures_prevent_the_listen_post", WatchCase::Discovery); }
+fn task_watch_discovery_failures_prevent_the_listen_post() {
+    isolated_watch(
+        "task_watch_discovery_failures_prevent_the_listen_post",
+        WatchCase::Discovery,
+    );
+}
 #[test]
-fn task_watch_preflight_refusals_make_no_peer_contact() { isolated_watch("task_watch_preflight_refusals_make_no_peer_contact", WatchCase::Preflight); }
+fn task_watch_preflight_refusals_make_no_peer_contact() {
+    isolated_watch(
+        "task_watch_preflight_refusals_make_no_peer_contact",
+        WatchCase::Preflight,
+    );
+}
 #[test]
-fn task_watch_does_not_retry_lost_redirected_or_forbidden_requests() { isolated_watch("task_watch_does_not_retry_lost_redirected_or_forbidden_requests", WatchCase::NoReplay); }
+fn task_watch_does_not_retry_lost_redirected_or_forbidden_requests() {
+    isolated_watch(
+        "task_watch_does_not_retry_lost_redirected_or_forbidden_requests",
+        WatchCase::NoReplay,
+    );
+}
 #[test]
-fn task_watch_cancellation_does_not_cancel_sibling_calls() { isolated_watch("task_watch_cancellation_does_not_cancel_sibling_calls", WatchCase::Cancel); }
+fn task_watch_cancellation_does_not_cancel_sibling_calls() {
+    isolated_watch(
+        "task_watch_cancellation_does_not_cancel_sibling_calls",
+        WatchCase::Cancel,
+    );
+}
 #[test]
-fn task_watch_session_closure_wakes_idle_reads() { isolated_watch("task_watch_session_closure_wakes_idle_reads", WatchCase::Close); }
+fn task_watch_session_closure_wakes_idle_reads() {
+    isolated_watch(
+        "task_watch_session_closure_wakes_idle_reads",
+        WatchCase::Close,
+    );
+}
 #[test]
-fn task_watch_abandoned_read_cannot_resume() { isolated_watch("task_watch_abandoned_read_cannot_resume", WatchCase::DropRead); }
+fn task_watch_abandoned_read_cannot_resume() {
+    isolated_watch(
+        "task_watch_abandoned_read_cannot_resume",
+        WatchCase::DropRead,
+    );
+}
 #[test]
-fn task_watch_original_token_expiry_is_terminal() { isolated_watch("task_watch_original_token_expiry_is_terminal", WatchCase::Expiry); }
+fn task_watch_original_token_expiry_is_terminal() {
+    isolated_watch(
+        "task_watch_original_token_expiry_is_terminal",
+        WatchCase::Expiry,
+    );
+}
 #[test]
-fn task_watch_deadline_includes_consumer_pauses() { isolated_watch("task_watch_deadline_includes_consumer_pauses", WatchCase::Deadline); }
+fn task_watch_deadline_includes_consumer_pauses() {
+    isolated_watch(
+        "task_watch_deadline_includes_consumer_pauses",
+        WatchCase::Deadline,
+    );
+}
 #[test]
-fn task_watch_bounds_records_without_claiming_completion() { isolated_watch("task_watch_bounds_records_without_claiming_completion", WatchCase::Limit); }
+fn task_watch_bounds_records_without_claiming_completion() {
+    isolated_watch(
+        "task_watch_bounds_records_without_claiming_completion",
+        WatchCase::Limit,
+    );
+}

@@ -706,7 +706,10 @@ mod tests {
             guard.generation()
         });
         assert_eq!(generation.pid(), std::process::id());
-        assert_eq!(ProcessGenerationGuard::install().unwrap().generation(), generation);
+        assert_eq!(
+            ProcessGenerationGuard::install().unwrap().generation(),
+            generation
+        );
     }
 
     #[test]

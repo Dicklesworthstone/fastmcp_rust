@@ -259,10 +259,9 @@ pub mod client {
         ClientHttpNegotiationDecision, ClientHttpNegotiationError, ClientHttpNegotiationState,
         ClientHttpResponse, ClientProtocolPlan, ClientProtocolPlanError, ClientSession,
         CollectedHttpCatalog, CompletionContext, CompletionParams, CompletionReference,
-        DEFAULT_FINAL_CACHE_CAPACITY,
-        DEFAULT_FINAL_CACHE_MAX_BYTES, ExecutionTerminalReason, ExecutionTerminalRecord,
-        ExecutionTerminalState, FinalCacheGeneration, FinalCacheInsert, FinalCacheKey,
-        FinalCacheLookup, FinalCacheMiss, FinalCacheResultSet, FinalCacheStats,
+        DEFAULT_FINAL_CACHE_CAPACITY, DEFAULT_FINAL_CACHE_MAX_BYTES, ExecutionTerminalReason,
+        ExecutionTerminalRecord, ExecutionTerminalState, FinalCacheGeneration, FinalCacheInsert,
+        FinalCacheKey, FinalCacheLookup, FinalCacheMiss, FinalCacheResultSet, FinalCacheStats,
         FinalCacheTtlDiagnostic, FinalResultCache, HttpClient, HttpClientError,
         HttpSubscriptionListener, ListPageLimits, MAX_FINAL_CACHE_CAPACITY,
         MAX_FINAL_CACHE_MAX_BYTES, MAX_HTTP_EXECUTION_REQUEST_BYTES, MAX_HTTP_IN_FLIGHT_EXECUTIONS,
@@ -287,9 +286,8 @@ pub mod client {
     /// MCP Apps client APIs are available only with the Apps extension.
     #[cfg(feature = "apps")]
     pub use crate::{
-        McpAppsBridgeTransport, McpAppsCatalogBinding, McpAppsClientWirePolicy,
-        McpAppsHost, McpAppsHostConfiguration,
-        McpAppsHostError, McpAppsHostPolicy, McpAppsHostRequestOutcome,
+        McpAppsBridgeTransport, McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHost,
+        McpAppsHostConfiguration, McpAppsHostError, McpAppsHostPolicy, McpAppsHostRequestOutcome,
         McpAppsHttpClientWirePolicy, McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport,
         McpAppsInMemoryWireHostTransport, McpAppsInMemoryWireViewTransport,
         McpAppsViewCallToolResult, McpAppsViewTool, McpAppsViewToolsPage,
@@ -420,10 +418,10 @@ pub mod server {
     pub use fastmcp_server::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
         FinalTaskAcceptedInput, FinalTaskExecutionBudget, FinalTaskExecutionLimits,
-        FinalTaskInitialWork, FinalTaskNotificationEmitter,
-        FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
-        FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
-        FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
+        FinalTaskInitialWork, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
+        FinalTaskRetentionDeadline, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
+        FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
+        FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
     };
     /// WebSocket server listener and lifecycle APIs.
     #[cfg(feature = "websocket-experimental")]
@@ -433,10 +431,10 @@ pub mod server {
     };
     #[cfg(feature = "proxy")]
     pub use fastmcp_server::{
-        FinalProgressCallback, ProxyAsyncRequest, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint,
-        ProxyClient, ProxyFinalCatalog, ProxyPromptCatalog, ProxyResourceCatalog, ProxyResourceTemplateCatalog,
-        ProxyToolCatalog, ProxyTypedCatalog, ProxyUpstreamAdapter, ProxyUpstreamBinding,
-        ProxyUpstreamBindingRegistry,
+        FinalProgressCallback, ProxyAsyncRequest, ProxyBackend, ProxyCatalog,
+        ProxyCatalogCacheHint, ProxyClient, ProxyFinalCatalog, ProxyPromptCatalog,
+        ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog,
+        ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
     };
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     pub use fastmcp_server::{ProxyFinalTaskListener, ProxyFinalTaskListenerEvent};
@@ -814,19 +812,19 @@ pub use fastmcp_server::{
 pub use fastmcp_server::{
     ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
     FinalTaskAcceptedInput, FinalTaskExecutionBudget, FinalTaskExecutionLimits,
-    FinalTaskInitialWork, FinalTaskNotificationEmitter,
-    FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
-    FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
-    FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
+    FinalTaskInitialWork, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
+    FinalTaskRetentionDeadline, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
+    FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
+    InMemoryFinalTaskStore,
 };
 
 /// Proxy APIs are available only with the proxy profile.
 #[cfg(feature = "proxy")]
 pub use fastmcp_server::{
     FinalProgressCallback, ProxyAsyncRequest, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint,
-    ProxyClient, ProxyFinalCatalog, ProxyPromptCatalog, ProxyResourceCatalog, ProxyResourceTemplateCatalog,
-    ProxyToolCatalog, ProxyTypedCatalog, ProxyUpstreamAdapter, ProxyUpstreamBinding,
-    ProxyUpstreamBindingRegistry,
+    ProxyClient, ProxyFinalCatalog, ProxyPromptCatalog, ProxyResourceCatalog,
+    ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog, ProxyUpstreamAdapter,
+    ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
 };
 
 /// Final Tasks proxy-listener APIs require both extensions.
@@ -876,10 +874,9 @@ pub use fastmcp_client::{
     ClientHttpNegotiationDecision, ClientHttpNegotiationError, ClientHttpNegotiationState,
     ClientHttpResponse, ClientProtocolPlan, ClientProtocolPlanError, ClientSession,
     CollectedHttpCatalog, CompletionContext, CompletionParams, CompletionReference,
-    DEFAULT_FINAL_CACHE_CAPACITY,
-    DEFAULT_FINAL_CACHE_MAX_BYTES, ExecutionTerminalReason, ExecutionTerminalRecord,
-    ExecutionTerminalState, FinalCacheGeneration, FinalCacheInsert, FinalCacheKey,
-    FinalCacheLookup, FinalCacheMiss, FinalCacheResultSet, FinalCacheStats,
+    DEFAULT_FINAL_CACHE_CAPACITY, DEFAULT_FINAL_CACHE_MAX_BYTES, ExecutionTerminalReason,
+    ExecutionTerminalRecord, ExecutionTerminalState, FinalCacheGeneration, FinalCacheInsert,
+    FinalCacheKey, FinalCacheLookup, FinalCacheMiss, FinalCacheResultSet, FinalCacheStats,
     FinalCacheTtlDiagnostic, FinalResultCache, HttpClient, HttpClientError,
     HttpSubscriptionListener, ListPageLimits, MAX_FINAL_CACHE_CAPACITY, MAX_FINAL_CACHE_MAX_BYTES,
     MAX_HTTP_EXECUTION_REQUEST_BYTES, MAX_HTTP_IN_FLIGHT_EXECUTIONS,
@@ -901,15 +898,14 @@ pub use fastmcp_client::{
 
 #[cfg(feature = "apps")]
 pub use fastmcp_client::{
-    McpAppsHostRequestOutcome, McpAppsViewCallToolResult, McpAppsViewTool,
-    McpAppsViewToolsPage, McpAppsWireHostResponse,
-    McpAppsBridgeTransport, McpAppsCatalogBinding, McpAppsClientWirePolicy,
-    McpAppsHost, McpAppsHostConfiguration,
-    McpAppsHostError, McpAppsHostPolicy, McpAppsHttpClientWirePolicy, McpAppsInMemoryHostTransport,
-    McpAppsInMemoryViewTransport, McpAppsInMemoryWireHostTransport,
-    McpAppsInMemoryWireViewTransport, McpAppsWireBridgeTransport, McpAppsWireHost,
+    McpAppsBridgeTransport, McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHost,
+    McpAppsHostConfiguration, McpAppsHostError, McpAppsHostPolicy, McpAppsHostRequestOutcome,
+    McpAppsHttpClientWirePolicy, McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport,
+    McpAppsInMemoryWireHostTransport, McpAppsInMemoryWireViewTransport, McpAppsViewCallToolResult,
+    McpAppsViewTool, McpAppsViewToolsPage, McpAppsWireBridgeTransport, McpAppsWireHost,
     McpAppsWireHostConfiguration, McpAppsWireHostEffects, McpAppsWireHostPolicy,
-    McpAppsWireHostWithEffects, mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
+    McpAppsWireHostResponse, McpAppsWireHostWithEffects, mcp_apps_in_memory_pair,
+    mcp_apps_in_memory_wire_pair,
 };
 
 /// Exact-2024 HTTP request staging is available only with its adapter profile.
@@ -967,13 +963,12 @@ pub mod auto {
         Client, ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
         ClientHttpNegotiationDecision, ClientHttpNegotiationError, ClientHttpNegotiationState,
         ClientHttpResponse, ClientProtocolPlan, ClientProtocolPlanError, ClientSession,
-        CollectedHttpCatalog, CompletionContext, CompletionParams, CompletionReference,
-        HttpClient, HttpClientError,
-        HttpSubscriptionListener, MAX_HTTP_EXECUTION_REQUEST_BYTES, MAX_HTTP_IN_FLIGHT_EXECUTIONS,
-        MAX_HTTP_RETAINED_EXECUTION_BYTES, MrtrInputResponses, Request, RequestExecution,
-        RequestExecutor, ReverseRequest, ReverseRequestCancellation, ReverseRequestHandlers,
-        StdioRequestExecution, StdioRequestExecutor, StdioSubscriptionEvent, SubscriptionFilter,
-        SubscriptionListenCollector,
+        CollectedHttpCatalog, CompletionContext, CompletionParams, CompletionReference, HttpClient,
+        HttpClientError, HttpSubscriptionListener, MAX_HTTP_EXECUTION_REQUEST_BYTES,
+        MAX_HTTP_IN_FLIGHT_EXECUTIONS, MAX_HTTP_RETAINED_EXECUTION_BYTES, MrtrInputResponses,
+        Request, RequestExecution, RequestExecutor, ReverseRequest, ReverseRequestCancellation,
+        ReverseRequestHandlers, StdioRequestExecution, StdioRequestExecutor,
+        StdioSubscriptionEvent, SubscriptionFilter, SubscriptionListenCollector,
     };
     pub use fastmcp_core::{CanonicalHttpUrl, Cx, McpError, McpResult};
     pub use fastmcp_protocol::extensions::{
@@ -1004,10 +999,10 @@ pub mod auto {
     #[cfg(feature = "apps")]
     pub use fastmcp_client::{
         McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHostError,
-        McpAppsInMemoryWireHostTransport,
-        McpAppsInMemoryWireViewTransport, McpAppsWireBridgeTransport, McpAppsWireHost,
-        McpAppsWireHostConfiguration, McpAppsWireHostEffects, McpAppsWireHostPolicy,
-        McpAppsWireHostWithEffects, mcp_apps_in_memory_wire_pair,
+        McpAppsInMemoryWireHostTransport, McpAppsInMemoryWireViewTransport,
+        McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostConfiguration,
+        McpAppsWireHostEffects, McpAppsWireHostPolicy, McpAppsWireHostWithEffects,
+        mcp_apps_in_memory_wire_pair,
     };
     #[cfg(feature = "apps")]
     pub use fastmcp_protocol::extensions::McpAppsClientSettings;
@@ -2887,17 +2882,16 @@ pub mod modern {
     pub use fastmcp_server::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
         FinalTaskAcceptedInput, FinalTaskExecutionBudget, FinalTaskExecutionLimits,
-        FinalTaskInitialWork, FinalTaskNotificationEmitter,
-        FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
-        FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
-        FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
+        FinalTaskInitialWork, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
+        FinalTaskRetentionDeadline, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
+        FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
+        FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
     };
 
     #[cfg(feature = "apps")]
     pub use fastmcp_client::{
-        McpAppsBridgeTransport, McpAppsCatalogBinding, McpAppsClientWirePolicy,
-        McpAppsHost, McpAppsHostConfiguration,
-        McpAppsHostError, McpAppsHostPolicy, McpAppsHttpClientWirePolicy,
+        McpAppsBridgeTransport, McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHost,
+        McpAppsHostConfiguration, McpAppsHostError, McpAppsHostPolicy, McpAppsHttpClientWirePolicy,
         McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport,
         McpAppsInMemoryWireHostTransport, McpAppsInMemoryWireViewTransport,
         McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostConfiguration,
@@ -4340,7 +4334,8 @@ pub mod modern {
             T: McpAppsWireBridgeTransport,
             P: McpAppsWireHostPolicy,
         {
-            self.inner.mcp_apps_wire_host_with_policy(transport, configuration, policy)
+            self.inner
+                .mcp_apps_wire_host_with_policy(transport, configuration, policy)
         }
 
         /// Proves this modern stdio peer is answering with a stateless
@@ -5175,11 +5170,13 @@ pub mod modern {
             client_info: ClientInfo,
             client_capabilities: ClientCapabilities,
         ) -> Result<Self, HttpClientConnectError> {
-            Box::pin(ClientBuilder::new()
-                .client_info(client_info.name, client_info.version)
-                .capabilities(client_capabilities)
-                .connect_http_with_cx(cx, endpoint))
-                .await
+            Box::pin(
+                ClientBuilder::new()
+                    .client_info(client_info.name, client_info.version)
+                    .capabilities(client_capabilities)
+                    .connect_http_with_cx(cx, endpoint),
+            )
+            .await
         }
 
         /// Returns the exact final discovery response that admitted this connection.
@@ -5299,7 +5296,8 @@ pub mod modern {
             T: McpAppsWireBridgeTransport,
             P: McpAppsWireHostPolicy,
         {
-            self.inner.mcp_apps_wire_host_with_policy(transport, configuration, policy)
+            self.inner
+                .mcp_apps_wire_host_with_policy(transport, configuration, policy)
         }
 
         /// Attaches a durable final Task and retains its latest admitted snapshot.
@@ -10580,9 +10578,9 @@ pub mod evidence_binding;
 #[doc(hidden)]
 pub mod release_quarantine;
 #[doc(hidden)]
-pub mod release_quarantine_reachability;
-#[doc(hidden)]
 pub mod release_quarantine_integration;
+#[doc(hidden)]
+pub mod release_quarantine_reachability;
 
 // Testing helpers are opt-in and do not widen the production facade.
 #[cfg(any(feature = "testing", feature = "testing-lab"))]
@@ -10819,15 +10817,15 @@ pub mod prelude {
     pub use crate::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
         FinalTask, FinalTaskAcceptedInput, FinalTaskCallToolResult, FinalTaskExecutionBudget,
-        FinalTaskExecutionLimits, FinalTaskHandle, FinalTaskId,
-        FinalTaskInitialWork, FinalTaskInputResponses, FinalTaskNotificationEmitter,
-        FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
-        FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStatusNotification, FinalTaskStore,
-        FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWatch, FinalTaskWatchEvent,
-        FinalTaskWorkDescriptor, FinalToolCallOutcome, FinalUpdateTaskResult,
-        InMemoryFinalTaskStore, OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
-        OfficialTasksNegotiationResolver, TASK_UPDATE, official_tasks_descriptor,
-        official_tasks_empty_settings, register_official_tasks_extension, tasks_extension,
+        FinalTaskExecutionLimits, FinalTaskHandle, FinalTaskId, FinalTaskInitialWork,
+        FinalTaskInputResponses, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
+        FinalTaskRetentionDeadline, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
+        FinalTaskStatusNotification, FinalTaskStore, FinalTaskSupervisorFuture,
+        FinalTaskSupervisorHandoff, FinalTaskWatch, FinalTaskWatchEvent, FinalTaskWorkDescriptor,
+        FinalToolCallOutcome, FinalUpdateTaskResult, InMemoryFinalTaskStore,
+        OFFICIAL_TASKS_RESULT_DISCRIMINATOR, OfficialTasksNegotiationResolver, TASK_UPDATE,
+        official_tasks_descriptor, official_tasks_empty_settings,
+        register_official_tasks_extension, tasks_extension,
     };
     #[cfg(feature = "websocket-experimental")]
     pub use crate::{

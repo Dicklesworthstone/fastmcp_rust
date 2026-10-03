@@ -11,8 +11,8 @@ use asupersync::Cx;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::{CoreResult, InputRequiredResult, ServerNotification};
 
-use super::{ManagedInteractionError, ManagedToolInteraction, ManagedToolInteractionError};
 use super::super::{ManagedToolError, ToolContract, await_validity, check_tool_call};
+use super::{ManagedInteractionError, ManagedToolInteraction, ManagedToolInteractionError};
 use crate::http_auth::rpc::interaction::ManagedInputReply;
 
 impl ManagedToolInteraction {
@@ -82,7 +82,9 @@ impl ManagedToolInteraction {
         N: FnMut(Box<ServerNotification>) -> Result<(), ManagedInteractionError>,
     {
         check_tool_call(cx, &self.cancellation, &self.contract)?;
-        if self.finished { return Err(ManagedToolError::Closed.into()); }
+        if self.finished {
+            return Err(ManagedToolError::Closed.into());
+        }
         let operation = self.operation.take().ok_or(ManagedToolError::Closed)?;
         let contract = self.contract.as_ref();
         let cancellation = &self.cancellation;
@@ -98,11 +100,14 @@ impl ManagedToolInteraction {
         };
         let result = Box::pin(await_validity(cx, cancellation, contract, async {
             if partial {
-                operation.drive_partial(cx, guarded_resolve, guarded_notify).await
+                operation
+                    .drive_partial(cx, guarded_resolve, guarded_notify)
+                    .await
             } else {
                 operation.drive(cx, guarded_resolve, guarded_notify).await
             }
-        })).await?;
+        }))
+        .await?;
         check_tool_call(cx, cancellation, contract)?;
         let result = result?;
         contract.validate_result(&result)?;
@@ -139,7 +144,8 @@ where
     // input and start a continuation in the same poll. Refuse an answer here
     // before the core driver can consume it. The outer fence preserves the
     // actual Invalidated/Cancelled error instead of this internal stop signal.
-    await_validity(cx, cancellation, contract, future).await
+    await_validity(cx, cancellation, contract, future)
+        .await
         .map_err(|_| ManagedInteractionError::AbortedByHost)?
 }
 
@@ -153,9 +159,11 @@ fn deliver_notification<N>(
 where
     N: FnMut(Box<ServerNotification>) -> Result<(), ManagedInteractionError>,
 {
-    check_tool_call(cx, cancellation, contract).map_err(|_| ManagedInteractionError::AbortedByHost)?;
+    check_tool_call(cx, cancellation, contract)
+        .map_err(|_| ManagedInteractionError::AbortedByHost)?;
     let outcome = notify(notification);
-    check_tool_call(cx, cancellation, contract).map_err(|_| ManagedInteractionError::AbortedByHost)?;
+    check_tool_call(cx, cancellation, contract)
+        .map_err(|_| ManagedInteractionError::AbortedByHost)?;
     outcome
 }
 

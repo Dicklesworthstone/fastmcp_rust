@@ -4711,8 +4711,13 @@ impl Router {
                     ));
                 };
                 encode_stateless_handler_result(
-                    self.handle_completion_final_in_request(request_ctx, request_cx, params, handler_admission)
-                        .await,
+                    self.handle_completion_final_in_request(
+                        request_ctx,
+                        request_cx,
+                        params,
+                        handler_admission,
+                    )
+                    .await,
                 )?
             }
             "tools/list" => {
@@ -5609,9 +5614,7 @@ impl Router {
             effective_budget,
             "tool",
             None,
-            |child_cx| {
-                handler.call_async_in_request(&ctx, child_cx, arguments)
-            },
+            |child_cx| handler.call_async_in_request(&ctx, child_cx, arguments),
         )
         .await?;
 
@@ -6358,9 +6361,7 @@ impl Router {
             effective_budget,
             "prompt",
             None,
-            |child_cx| {
-                handler.get_async_in_request(&ctx, child_cx, arguments)
-            },
+            |child_cx| handler.get_async_in_request(&ctx, child_cx, arguments),
         )
         .await?;
 
@@ -13611,11 +13612,7 @@ mod router_tests {
         );
         let modern = block_on(router.dispatch_stateless(
             &request_ctx,
-            &final_tools_call_request(
-                "duplicate-invariant-tool",
-                serde_json::json!({}),
-                85_i64,
-            ),
+            &final_tools_call_request("duplicate-invariant-tool", serde_json::json!({}), 85_i64),
         ))
         .expect("modern dispatch uses replacement");
         assert_eq!(modern["content"][0]["text"], "replacement");
@@ -16021,12 +16018,7 @@ mod router_tests {
         router.set_list_page_size(Some(1));
         let first_page = block_on(router.dispatch_stateless(
             &request_ctx,
-            &final_tools_list_request(
-                None,
-                Some(vec!["visible"]),
-                Some(vec!["excluded"]),
-                164_i64,
-            ),
+            &final_tools_list_request(None, Some(vec!["visible"]), Some(vec!["excluded"]), 164_i64),
         ))
         .expect("the first final page contains the first admitted entry");
         assert_eq!(first_page["tools"][0]["name"], "peer/first");
@@ -16747,8 +16739,8 @@ mod router_tests {
             meta: None,
         };
         let request_ctx = request_context(&cx, 1, budget, &state);
-        let err = block_on(r.handle_tools_call(&request_ctx, params, state, None, None))
-            .unwrap_err();
+        let err =
+            block_on(r.handle_tools_call(&request_ctx, params, state, None, None)).unwrap_err();
         assert!(err.message.contains("disabled"));
     }
 
@@ -16768,8 +16760,8 @@ mod router_tests {
         };
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, budget, &state);
-        let result = block_on(r.handle_tools_call(&request_ctx, params, state, None, None))
-            .unwrap();
+        let result =
+            block_on(r.handle_tools_call(&request_ctx, params, state, None, None)).unwrap();
         assert!(!result.is_error);
         assert_ne!(result.content.len(), 0);
     }
@@ -16788,8 +16780,8 @@ mod router_tests {
         };
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, budget, &state);
-        let err = block_on(r.handle_tools_call(&request_ctx, params, state, None, None))
-            .unwrap_err();
+        let err =
+            block_on(r.handle_tools_call(&request_ctx, params, state, None, None)).unwrap_err();
         // The refusal deliberately does not echo the peer-controlled tool
         // name; only the sanitized method-not-found classification surfaces.
         assert_eq!(err.code, McpErrorCode::MethodNotFound);
@@ -16888,8 +16880,8 @@ mod router_tests {
         };
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, budget, &state);
-        let result = block_on(r.handle_resources_read(&request_ctx, &params, state, None, None))
-            .unwrap();
+        let result =
+            block_on(r.handle_resources_read(&request_ctx, &params, state, None, None)).unwrap();
         assert_eq!(result.contents.len(), 1);
         let [
             LegacyResourceContent::Text {
@@ -16962,8 +16954,8 @@ mod router_tests {
             meta: None,
         };
         let request_ctx = request_context(&cx, 1, budget, &state);
-        let err = block_on(r.handle_prompts_get(&request_ctx, params, state, None, None))
-            .unwrap_err();
+        let err =
+            block_on(r.handle_prompts_get(&request_ctx, params, state, None, None)).unwrap_err();
         assert!(err.message.contains("disabled"));
     }
 
@@ -17078,8 +17070,8 @@ mod router_tests {
         };
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, budget, &state);
-        let err = block_on(r.handle_prompts_get(&request_ctx, params, state, None, None))
-            .unwrap_err();
+        let err =
+            block_on(r.handle_prompts_get(&request_ctx, params, state, None, None)).unwrap_err();
         assert!(err.message.contains("missing") || err.message.contains("not found"));
     }
 
@@ -18098,8 +18090,8 @@ mod router_tests {
         };
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, budget, &state);
-        let err = block_on(r.handle_tools_call(&request_ctx, params, state, None, None))
-            .unwrap_err();
+        let err =
+            block_on(r.handle_tools_call(&request_ctx, params, state, None, None)).unwrap_err();
         assert_eq!(err.code, McpErrorCode::RequestCancelled);
     }
 
@@ -18135,8 +18127,8 @@ mod router_tests {
         };
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 1, budget, &state);
-        let err = block_on(r.handle_prompts_get(&request_ctx, params, state, None, None))
-            .unwrap_err();
+        let err =
+            block_on(r.handle_prompts_get(&request_ctx, params, state, None, None)).unwrap_err();
         assert_eq!(err.code, McpErrorCode::RequestCancelled);
     }
 
@@ -18436,7 +18428,8 @@ mod router_tests {
                     "completion handler returned more than 100 values"
                 );
             } else {
-                let result = result.expect("a bounded legacy result remains accepted after refusal");
+                let result =
+                    result.expect("a bounded legacy result remains accepted after refusal");
                 assert_eq!(result.completion.values.len(), count);
                 assert_eq!(
                     result.completion.values[0],
@@ -18711,10 +18704,7 @@ mod router_tests {
             })),
             184_i64,
         );
-        assert!(
-            block_on(router.dispatch_legacy_completion(&request_ctx, &request))
-                .is_ok()
-        );
+        assert!(block_on(router.dispatch_legacy_completion(&request_ctx, &request)).is_ok());
 
         let mut final_request = request.clone();
         final_request
@@ -21036,11 +21026,7 @@ mod router_tests {
 
         let observed = block_on(router.dispatch_stateless(
             &request_ctx,
-            &final_tools_call_request(
-                "canonical-capability-error",
-                serde_json::json!({}),
-                159_i64,
-            ),
+            &final_tools_call_request("canonical-capability-error", serde_json::json!({}), 159_i64),
         ))
         .expect_err("the exact framework-owned refusal remains a JSON-RPC error");
         assert_eq!(observed.code, canonical.code);
@@ -21088,10 +21074,9 @@ mod router_tests {
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 160, Budget::INFINITE, &state);
 
-        let result = block_on(router.dispatch_stateless(
-            &request_ctx,
-            &final_task_capable_tool_request(160_i64),
-        ))
+        let result = block_on(
+            router.dispatch_stateless(&request_ctx, &final_task_capable_tool_request(160_i64)),
+        )
         .expect("the admitted task-capable outcome creates a work-bound task");
         assert_eq!(result["resultType"], "task");
         assert_eq!(result["status"], "working");
@@ -21171,10 +21156,9 @@ mod router_tests {
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 161, Budget::INFINITE, &state);
 
-        let error = block_on(router.dispatch_stateless(
-            &request_ctx,
-            &final_task_capable_tool_request(161_i64),
-        ))
+        let error = block_on(
+            router.dispatch_stateless(&request_ctx, &final_task_capable_tool_request(161_i64)),
+        )
         .expect_err("a CreateTask outcome cannot persist without a final Tasks runtime");
         assert_eq!(error.code, McpErrorCode::InternalError);
         assert_eq!(
@@ -21209,10 +21193,9 @@ mod router_tests {
         let state = SessionState::new();
         let request_ctx = request_context(&cx, 162, Budget::INFINITE, &state);
 
-        let error = block_on(router.dispatch_stateless(
-            &request_ctx,
-            &final_task_capable_tool_request(162_i64),
-        ))
+        let error = block_on(
+            router.dispatch_stateless(&request_ctx, &final_task_capable_tool_request(162_i64)),
+        )
         .expect_err("an installed but unready task service is refused before task creation");
         assert_eq!(error.code, McpErrorCode::InvalidParams);
         assert_eq!(
@@ -21256,11 +21239,7 @@ mod router_tests {
 
         let error = block_on(router.dispatch_stateless(
             &request_ctx,
-            &final_tools_call_request(
-                "task-capable-router-tool",
-                serde_json::json!({}),
-                162_i64,
-            ),
+            &final_tools_call_request("task-capable-router-tool", serde_json::json!({}), 162_i64),
         ))
         .expect_err("a missing peer Tasks capability is refused before task-store mutation");
         assert!(matches!(error.code, McpErrorCode::Custom(_)));
@@ -21478,8 +21457,9 @@ mod router_tests {
             resource_request.params.as_ref(),
         )
         .expect("final resources/read request decodes");
-        let resource_response = block_on(router.dispatch_stateless(&request_ctx, &resource_request))
-            .expect("public final resources/read dispatch encodes input_required");
+        let resource_response =
+            block_on(router.dispatch_stateless(&request_ctx, &resource_request))
+                .expect("public final resources/read dispatch encodes input_required");
         assert_eq!(resource_response["resultType"], "input_required");
         assert_ne!(resource_response["requestState"], "resource-retry-state");
         assert_eq!(
@@ -21641,8 +21621,7 @@ mod router_tests {
         };
         let mut initial_request =
             final_tools_call_request("context-elicitation-tool", serde_json::json!({}), 950_i64);
-        initial_request.params.as_mut().expect("initial params")["_meta"]
-            ["io.modelcontextprotocol/clientCapabilities"] = serde_json::json!({
+        initial_request.params.as_mut().expect("initial params")["_meta"]["io.modelcontextprotocol/clientCapabilities"] = serde_json::json!({
             "elicitation": {"form": {}},
         });
         let initial = block_on(router.dispatch_stateless(&context_for(950), &initial_request))
@@ -21684,14 +21663,10 @@ mod router_tests {
             assert_eq!(resumed_calls.load(Ordering::SeqCst), 0);
             assert_eq!(router.mrtr_exchanges.active_len(), 1);
         }
-        let mut valid = final_tools_call_request(
-            "context-elicitation-tool",
-            serde_json::json!({}),
-            955_i64,
-        );
+        let mut valid =
+            final_tools_call_request("context-elicitation-tool", serde_json::json!({}), 955_i64);
         let params = valid.params.as_mut().expect("valid retry params");
-        params["_meta"] =
-            initial_request.params.as_ref().expect("initial params")["_meta"].clone();
+        params["_meta"] = initial_request.params.as_ref().expect("initial params")["_meta"].clone();
         params["requestState"] = serde_json::json!(state);
         params["inputResponses"] = serde_json::json!({
             "approval": {"action": "accept", "content": {"approved": true}},
@@ -21868,12 +21843,14 @@ mod router_tests {
             "input-required-tool",
             tool_retry_body.as_bytes(),
         );
-        block_on(router.dispatch_stateless_with_continuation_cancellation_and_raw_params(
-            &request_ctx,
-            &tool_retry,
-            tool_retry_raw.as_deref(),
-            &cancellation,
-        ))
+        block_on(
+            router.dispatch_stateless_with_continuation_cancellation_and_raw_params(
+                &request_ctx,
+                &tool_retry,
+                tool_retry_raw.as_deref(),
+                &cancellation,
+            ),
+        )
         .expect("HTTP-admitted ordered tool retry reaches the handler");
 
         let resource_initial_body = serde_json::to_vec(&serde_json::json!({
@@ -21938,12 +21915,14 @@ mod router_tests {
             2,
             "the rejected resource sidecar leaves its continuation available"
         );
-        block_on(router.dispatch_stateless_with_continuation_cancellation_and_raw_params(
-            &request_ctx,
-            &resource_retry,
-            resource_retry_raw.as_deref(),
-            &cancellation,
-        ))
+        block_on(
+            router.dispatch_stateless_with_continuation_cancellation_and_raw_params(
+                &request_ctx,
+                &resource_retry,
+                resource_retry_raw.as_deref(),
+                &cancellation,
+            ),
+        )
         .expect("HTTP-admitted ordered resource retry reaches the handler");
 
         let prompt_initial_body = serde_json::to_vec(&serde_json::json!({
@@ -22001,12 +21980,14 @@ mod router_tests {
             3,
             "the rejected prompt sidecar leaves its continuation available"
         );
-        block_on(router.dispatch_stateless_with_continuation_cancellation_and_raw_params(
-            &request_ctx,
-            &prompt_retry,
-            prompt_retry_raw.as_deref(),
-            &cancellation,
-        ))
+        block_on(
+            router.dispatch_stateless_with_continuation_cancellation_and_raw_params(
+                &request_ctx,
+                &prompt_retry,
+                prompt_retry_raw.as_deref(),
+                &cancellation,
+            ),
+        )
         .expect("HTTP-admitted ordered prompt retry reaches the handler");
 
         assert_eq!(tool_calls.load(Ordering::SeqCst), 2);
@@ -22668,11 +22649,10 @@ mod router_tests {
                 "roots".to_owned(),
                 serde_json::Value::String("x".repeat(MAX_MRTR_RAW_INPUT_RESPONSES_BYTES + 1)),
             );
-        let tool_bytes_error =
-            block_on(router.dispatch_stateless(&request_ctx, &tool_oversized_bytes))
-                .expect_err(
-                    "only an oversized tool response value is refused before retry decoding",
-                );
+        let tool_bytes_error = block_on(
+            router.dispatch_stateless(&request_ctx, &tool_oversized_bytes),
+        )
+        .expect_err("only an oversized tool response value is refused before retry decoding");
         assert_eq!(tool_bytes_error.code, McpErrorCode::InvalidParams);
         assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
 
@@ -22835,11 +22815,10 @@ mod router_tests {
                 "roots".to_owned(),
                 serde_json::Value::Array(vec![serde_json::Value::Null; MAX_MRTR_RAW_JSON_VALUES]),
             );
-        let prompt_values_error =
-            block_on(router.dispatch_stateless(&request_ctx, &prompt_oversized_values))
-                .expect_err(
-                    "only an oversized prompt response value set is refused before retry decoding",
-                );
+        let prompt_values_error = block_on(
+            router.dispatch_stateless(&request_ctx, &prompt_oversized_values),
+        )
+        .expect_err("only an oversized prompt response value set is refused before retry decoding");
         assert_eq!(prompt_values_error.code, McpErrorCode::InvalidParams);
         assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 1);
 
@@ -23121,20 +23100,18 @@ mod router_tests {
         let tools =
             block_on(router.dispatch_stateless(&request_ctx, &list_request("tools/list", 614_i64)))
                 .expect("enabled tool is discovered");
-        let resources = block_on(router.dispatch_stateless(
-            &request_ctx,
-            &list_request("resources/list", 615_i64),
-        ))
+        let resources = block_on(
+            router.dispatch_stateless(&request_ctx, &list_request("resources/list", 615_i64)),
+        )
         .expect("enabled resource is discovered");
         let templates = block_on(router.dispatch_stateless(
             &request_ctx,
             &list_request("resources/templates/list", 616_i64),
         ))
         .expect("enabled resource template is discovered");
-        let prompts = block_on(router.dispatch_stateless(
-            &request_ctx,
-            &list_request("prompts/list", 617_i64),
-        ))
+        let prompts = block_on(
+            router.dispatch_stateless(&request_ctx, &list_request("prompts/list", 617_i64)),
+        )
         .expect("enabled prompt is discovered");
         assert_eq!(tools["tools"][0]["name"], "connection-scoped-tool");
         assert_eq!(
@@ -23155,20 +23132,18 @@ mod router_tests {
         let discovered_tools =
             block_on(router.dispatch_stateless(&request_ctx, &list_request("tools/list", 618_i64)))
                 .expect("disabled tool remains in the immutable final catalog");
-        let discovered_resources = block_on(router.dispatch_stateless(
-            &request_ctx,
-            &list_request("resources/list", 619_i64),
-        ))
+        let discovered_resources = block_on(
+            router.dispatch_stateless(&request_ctx, &list_request("resources/list", 619_i64)),
+        )
         .expect("disabled resource remains in the immutable final catalog");
         let discovered_templates = block_on(router.dispatch_stateless(
             &request_ctx,
             &list_request("resources/templates/list", 620_i64),
         ))
         .expect("disabled template remains in the immutable final catalog");
-        let discovered_prompts = block_on(router.dispatch_stateless(
-            &request_ctx,
-            &list_request("prompts/list", 621_i64),
-        ))
+        let discovered_prompts = block_on(
+            router.dispatch_stateless(&request_ctx, &list_request("prompts/list", 621_i64)),
+        )
         .expect("disabled prompt remains in the immutable final catalog");
         assert_eq!(
             discovered_tools["tools"][0]["name"],
@@ -23837,46 +23812,50 @@ mod router_tests {
             "io.modelcontextprotocol/clientCapabilities": {},
         });
 
-        let prompt = block_on(router.dispatch_stateless(
-            &InboundRequestContext::with_modern_connection(
-                cx.clone(),
-                973,
-                InboundRequestTransport::Memory,
-                &connection,
-            )
-            .request_context(),
-            &JsonRpcRequest::new(
-                "prompts/get",
-                Some(serde_json::json!({
-                    "_meta": metadata.clone(),
-                    "name": "client-direct-https-prompt",
-                })),
-                973_i64,
+        let prompt = block_on(
+            router.dispatch_stateless(
+                &InboundRequestContext::with_modern_connection(
+                    cx.clone(),
+                    973,
+                    InboundRequestTransport::Memory,
+                    &connection,
+                )
+                .request_context(),
+                &JsonRpcRequest::new(
+                    "prompts/get",
+                    Some(serde_json::json!({
+                        "_meta": metadata.clone(),
+                        "name": "client-direct-https-prompt",
+                    })),
+                    973_i64,
+                ),
             ),
-        ))
+        )
         .expect("a client-direct HTTPS resource link is emitted from the public prompt path");
         assert_eq!(
             prompt["messages"][0]["content"]["uri"],
             "https://client.example.test/prompt-link"
         );
 
-        let initial = block_on(router.dispatch_stateless(
-            &InboundRequestContext::with_modern_connection(
-                cx.clone(),
-                974,
-                InboundRequestTransport::Memory,
-                &connection,
-            )
-            .request_context(),
-            &JsonRpcRequest::new(
-                "resources/read",
-                Some(serde_json::json!({
-                    "_meta": metadata.clone(),
-                    "uri": "mcp://uri-policy/mrtr",
-                })),
-                974_i64,
+        let initial = block_on(
+            router.dispatch_stateless(
+                &InboundRequestContext::with_modern_connection(
+                    cx.clone(),
+                    974,
+                    InboundRequestTransport::Memory,
+                    &connection,
+                )
+                .request_context(),
+                &JsonRpcRequest::new(
+                    "resources/read",
+                    Some(serde_json::json!({
+                        "_meta": metadata.clone(),
+                        "uri": "mcp://uri-policy/mrtr",
+                    })),
+                    974_i64,
+                ),
             ),
-        ))
+        )
         .expect("initial public resource request mints MRTR state");
         assert_eq!(initial["resultType"], "input_required");
         let request_state = initial["requestState"]
@@ -23895,16 +23874,18 @@ mod router_tests {
             })),
             975_i64,
         );
-        let error = block_on(router.dispatch_stateless(
-            &InboundRequestContext::with_modern_connection(
-                cx,
-                975,
-                InboundRequestTransport::Memory,
-                &connection,
-            )
-            .request_context(),
-            &retry,
-        ))
+        let error = block_on(
+            router.dispatch_stateless(
+                &InboundRequestContext::with_modern_connection(
+                    cx,
+                    975,
+                    InboundRequestTransport::Memory,
+                    &connection,
+                )
+                .request_context(),
+                &retry,
+            ),
+        )
         .expect_err(
             "an MRTR-resumed HTTPS embedded resource remains server-mediated and is refused",
         );

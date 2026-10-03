@@ -13,8 +13,8 @@ use asupersync::Cx;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::{FinalInputResponses, RequestId};
 
-use super::{ManagedInteractionEvent, ManagedToolInteraction};
 use super::super::{ManagedToolError, ToolContract, await_validity, check_tool_call};
+use super::{ManagedInteractionEvent, ManagedToolInteraction};
 use crate::http_auth::rpc::interaction::recovery::{
     ContinuationRecoveryError, ContinuationReplayContract, RecoverableManagedContinuation,
 };
@@ -39,11 +39,15 @@ impl fmt::Display for ManagedToolRecoveryError {
 impl std::error::Error for ManagedToolRecoveryError {}
 
 impl From<ManagedToolError> for ManagedToolRecoveryError {
-    fn from(error: ManagedToolError) -> Self { Self::Tool(error) }
+    fn from(error: ManagedToolError) -> Self {
+        Self::Tool(error)
+    }
 }
 
 impl From<ContinuationRecoveryError> for ManagedToolRecoveryError {
-    fn from(error: ContinuationRecoveryError) -> Self { Self::Recovery(error) }
+    fn from(error: ContinuationRecoveryError) -> Self {
+        Self::Recovery(error)
+    }
 }
 
 impl ManagedToolInteraction {
@@ -67,7 +71,9 @@ impl ManagedToolInteraction {
         let operation = operation.prepare_recoverable_continuation(cx, responses, replay)?;
         check_tool_call(cx, &self.cancellation, &self.contract)?;
         Ok(RecoverableManagedToolContinuation {
-            operation, contract: self.contract, cancellation: self.cancellation,
+            operation,
+            contract: self.contract,
+            cancellation: self.cancellation,
             publication: Publication::Pending,
         })
     }
@@ -106,7 +112,9 @@ impl fmt::Debug for RecoverableManagedToolContinuation {
 
 impl RecoverableManagedToolContinuation {
     /// Includes the first continuation send and every explicit recovery attempt.
-    pub fn attempts(&self) -> usize { self.operation.attempts() }
+    pub fn attempts(&self) -> usize {
+        self.operation.attempts()
+    }
 
     /// An observation, not authority to retry. `recover` rechecks all guards.
     pub fn is_recovery_pending(&self) -> bool {
@@ -122,28 +130,51 @@ impl RecoverableManagedToolContinuation {
     }
 
     /// Sends the prepared continuation once, without implicitly replaying it.
-    pub async fn send(&mut self, cx: &Cx, request_id: RequestId) -> Result<(), ManagedToolRecoveryError> {
+    pub async fn send(
+        &mut self,
+        cx: &Cx,
+        request_id: RequestId,
+    ) -> Result<(), ManagedToolRecoveryError> {
         Box::pin(self.attempt(cx, request_id, false)).await
     }
 
     /// Explicitly recovers an interrupted reply using a fresh correlation ID.
     /// The underlying core owner enforces journal, phase and attempt limits.
-    pub async fn recover(&mut self, cx: &Cx, request_id: RequestId) -> Result<(), ManagedToolRecoveryError> {
+    pub async fn recover(
+        &mut self,
+        cx: &Cx,
+        request_id: RequestId,
+    ) -> Result<(), ManagedToolRecoveryError> {
         Box::pin(self.attempt(cx, request_id, true)).await
     }
 
-    async fn attempt(&mut self, cx: &Cx, request_id: RequestId, recovery: bool)
-        -> Result<(), ManagedToolRecoveryError>
-    {
+    async fn attempt(
+        &mut self,
+        cx: &Cx,
+        request_id: RequestId,
+        recovery: bool,
+    ) -> Result<(), ManagedToolRecoveryError> {
         self.check(cx)?;
-        let outcome = Box::pin(await_validity(cx, &self.cancellation, &self.contract, async {
-            if recovery { self.operation.recover(cx, request_id).await }
-            else { self.operation.send(cx, request_id).await }
-        })).await;
+        let outcome = Box::pin(await_validity(
+            cx,
+            &self.cancellation,
+            &self.contract,
+            async {
+                if recovery {
+                    self.operation.recover(cx, request_id).await
+                } else {
+                    self.operation.send(cx, request_id).await
+                }
+            },
+        ))
+        .await;
         // Borrow, do not take, the core owner across the await: abandoning a
         // polled attempt must preserve its explicitly configured recovery state.
         match outcome {
-            Err(error) => { self.close(); Err(error.into()) }
+            Err(error) => {
+                self.close();
+                Err(error.into())
+            }
             Ok(outcome) => {
                 self.check(cx)?;
                 outcome.map_err(ManagedToolRecoveryError::from)
@@ -154,15 +185,30 @@ impl RecoverableManagedToolContinuation {
     /// Publishes exactly one schema-checked terminal or successor challenge.
     /// A tool execution error is preserved as a tool result, not retried. The
     /// original lossless result is returned, never the validation parse copy.
-    pub async fn next_event(&mut self, cx: &Cx) -> Result<ManagedInteractionEvent, ManagedToolRecoveryError> {
+    pub async fn next_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<ManagedInteractionEvent, ManagedToolRecoveryError> {
         self.check(cx)?;
         if self.publication != Publication::Pending {
             return Err(ContinuationRecoveryError::WrongPhase.into());
         }
-        let outcome = await_validity(cx, &self.cancellation, &self.contract, self.operation.next_event(cx)).await;
+        let outcome = Box::pin(await_validity(
+            cx,
+            &self.cancellation,
+            &self.contract,
+            self.operation.next_event(cx),
+        ))
+        .await;
         let event = match outcome {
-            Err(error) => { self.close(); return Err(error.into()); }
-            Ok(Err(error)) => { self.check(cx)?; return Err(error.into()); }
+            Err(error) => {
+                self.close();
+                return Err(error.into());
+            }
+            Ok(Err(error)) => {
+                self.check(cx)?;
+                return Err(error.into());
+            }
             Ok(Ok(event)) => event,
         };
         self.check(cx)?;
@@ -178,7 +224,10 @@ impl RecoverableManagedToolContinuation {
     /// A successor keeps its new challenge and the original contract. A terminal
     /// result is already delivered, so the returned interaction is finished.
     /// Calling this before reading/validation cannot expose the core owner.
-    pub fn into_interaction(mut self, cx: &Cx) -> Result<ManagedToolInteraction, ManagedToolRecoveryError> {
+    pub fn into_interaction(
+        mut self,
+        cx: &Cx,
+    ) -> Result<ManagedToolInteraction, ManagedToolRecoveryError> {
         self.check(cx)?;
         if !self.publication.can_return() {
             return Err(ContinuationRecoveryError::WrongPhase.into());
@@ -186,8 +235,10 @@ impl RecoverableManagedToolContinuation {
         let operation = self.operation.into_interaction()?;
         check_tool_call(cx, &self.cancellation, &self.contract)?;
         Ok(ManagedToolInteraction {
-            operation: Some(operation), contract: self.contract,
-            cancellation: self.cancellation, finished: self.publication == Publication::Complete,
+            operation: Some(operation),
+            contract: self.contract,
+            cancellation: self.cancellation,
+            finished: self.publication == Publication::Complete,
         })
     }
 
@@ -204,15 +255,26 @@ impl RecoverableManagedToolContinuation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Publication { Pending, Successor, Complete, Closed }
+enum Publication {
+    Pending,
+    Successor,
+    Complete,
+    Closed,
+}
 
 impl Publication {
-    fn can_return(self) -> bool { matches!(self, Self::Successor | Self::Complete) }
+    fn can_return(self) -> bool {
+        matches!(self, Self::Successor | Self::Complete)
+    }
 
-    fn admit(&mut self, contract: &ToolContract, event: &ManagedInteractionEvent)
-        -> Result<(), ManagedToolRecoveryError>
-    {
-        if *self != Self::Pending { return Err(ContinuationRecoveryError::WrongPhase.into()); }
+    fn admit(
+        &mut self,
+        contract: &ToolContract,
+        event: &ManagedInteractionEvent,
+    ) -> Result<(), ManagedToolRecoveryError> {
+        if *self != Self::Pending {
+            return Err(ContinuationRecoveryError::WrongPhase.into());
+        }
         // Fail closed before validation. Even though core already consumed its
         // reply, validation failure must never unlock unchecked hand-back.
         *self = Self::Closed;
@@ -223,7 +285,9 @@ impl Publication {
                 Self::Complete
             }
             ManagedInteractionEvent::InputRequired(_) => Self::Successor,
-            ManagedInteractionEvent::Notification(_) => return Err(ContinuationRecoveryError::JsonReplyRequired.into()),
+            ManagedInteractionEvent::Notification(_) => {
+                return Err(ContinuationRecoveryError::JsonReplyRequired.into());
+            }
         };
         contract.check()?;
         *self = next;
@@ -234,38 +298,55 @@ impl Publication {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastmcp_protocol::{ClientCapabilities, CoreRequest, FinalRequestMeta, FinalTool, ServerNotification};
     use fastmcp_protocol::protocol_policy::ProtocolEra;
+    use fastmcp_protocol::{
+        ClientCapabilities, CoreRequest, FinalRequestMeta, FinalTool, ServerNotification,
+    };
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn contract() -> ToolContract {
         ToolContract::admit(FinalTool {
-            name: "checkout".to_owned(), title: None, description: None, icons: None,
+            name: "checkout".to_owned(),
+            title: None,
+            description: None,
+            icons: None,
             input_schema: json!({"type":"object"}),
-            output_schema: Some(json!({"type":"object", "properties":{"quantity":{"type":"integer"}},
-                "required":["quantity"], "additionalProperties":false})),
-            annotations: None, meta: None,
-        }).unwrap()
+            output_schema: Some(
+                json!({"type":"object", "properties":{"quantity":{"type":"integer"}},
+                "required":["quantity"], "additionalProperties":false}),
+            ),
+            annotations: None,
+            meta: None,
+        })
+        .unwrap()
     }
 
     fn event(raw: &str) -> ManagedInteractionEvent {
-        let params = json!({"name":"checkout","_meta":FinalRequestMeta::new(ClientCapabilities::default())});
-        let request = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).unwrap();
+        let params =
+            json!({"name":"checkout","_meta":FinalRequestMeta::new(ClientCapabilities::default())});
+        let request =
+            CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).unwrap();
         let result = request.decode_result(raw).unwrap();
         if let Some(input) = crate::http_auth::rpc::interaction::input_required(&result) {
             ManagedInteractionEvent::InputRequired(Box::new(input.clone()))
-        } else { ManagedInteractionEvent::Complete(Box::new(result)) }
+        } else {
+            ManagedInteractionEvent::Complete(Box::new(result))
+        }
     }
 
     fn success() -> ManagedInteractionEvent {
-        event(r#"{"resultType":"complete","content":[],"structuredContent":{"quantity":7},"x-exact":1.20e+4}"#)
+        event(
+            r#"{"resultType":"complete","content":[],"structuredContent":{"quantity":7},"x-exact":1.20e+4}"#,
+        )
     }
 
     #[test]
     fn recovered_success_keeps_the_lossless_result_and_unlocks_only_finished_handback() {
         let event = success();
-        let ManagedInteractionEvent::Complete(result) = &event else { unreachable!() };
+        let ManagedInteractionEvent::Complete(result) = &event else {
+            unreachable!()
+        };
         let before = result.encode().unwrap();
         let mut publication = Publication::Pending;
         publication.admit(&contract(), &event).unwrap();
@@ -283,13 +364,22 @@ mod tests {
         ] {
             let mut publication = Publication::Pending;
             let error = publication.admit(&contract(), &event(raw)).err().unwrap();
-            assert!(matches!(error, ManagedToolRecoveryError::Tool(
-                ManagedToolError::MissingStructuredOutput | ManagedToolError::InvalidStructuredOutput)));
+            assert!(matches!(
+                error,
+                ManagedToolRecoveryError::Tool(
+                    ManagedToolError::MissingStructuredOutput
+                        | ManagedToolError::InvalidStructuredOutput
+                )
+            ));
             assert!(!format!("{error:?} {error}").contains("private-output-canary"));
             assert_eq!(publication, Publication::Closed);
             assert!(!publication.can_return());
-            assert!(matches!(publication.admit(&contract(), &success()),
-                Err(ManagedToolRecoveryError::Recovery(ContinuationRecoveryError::WrongPhase))));
+            assert!(matches!(
+                publication.admit(&contract(), &success()),
+                Err(ManagedToolRecoveryError::Recovery(
+                    ContinuationRecoveryError::WrongPhase
+                ))
+            ));
         }
     }
 
@@ -303,26 +393,38 @@ mod tests {
 
     #[test]
     fn successor_retains_opaque_state_without_demanding_final_output() {
-        let event = event(r#"{"resultType":"input_required","requestState":"  successor\u0000  "}"#);
+        let event =
+            event(r#"{"resultType":"input_required","requestState":"  successor\u0000  "}"#);
         let mut publication = Publication::Pending;
         publication.admit(&contract(), &event).unwrap();
         assert_eq!(publication, Publication::Successor);
         assert!(publication.can_return());
-        let ManagedInteractionEvent::InputRequired(input) = &event else { unreachable!() };
+        let ManagedInteractionEvent::InputRequired(input) = &event else {
+            unreachable!()
+        };
         assert_eq!(input.request_state(), Some("  successor\0  "));
     }
 
     #[test]
     fn individual_and_catalog_invalidation_fence_both_terminal_and_successor_replies() {
         for catalog in [false, true] {
-            for event in [success(), event(r#"{"resultType":"input_required","requestState":"state"}"#)] {
+            for event in [
+                success(),
+                event(r#"{"resultType":"input_required","requestState":"state"}"#),
+            ] {
                 let mut contract = contract();
                 if catalog {
                     contract.catalog_invalidated = Some(Arc::new(AtomicBool::new(true)));
-                } else { contract.invalidate(); }
+                } else {
+                    contract.invalidate();
+                }
                 let mut publication = Publication::Pending;
-                assert!(matches!(publication.admit(&contract, &event),
-                    Err(ManagedToolRecoveryError::Tool(ManagedToolError::Invalidated))));
+                assert!(matches!(
+                    publication.admit(&contract, &event),
+                    Err(ManagedToolRecoveryError::Tool(
+                        ManagedToolError::Invalidated
+                    ))
+                ));
                 assert_eq!(publication, Publication::Closed);
                 assert!(!publication.can_return());
             }
@@ -333,8 +435,12 @@ mod tests {
     fn duplicate_publication_is_refused_without_reopening_a_delivered_reply() {
         let mut publication = Publication::Pending;
         publication.admit(&contract(), &success()).unwrap();
-        assert!(matches!(publication.admit(&contract(), &success()),
-            Err(ManagedToolRecoveryError::Recovery(ContinuationRecoveryError::WrongPhase))));
+        assert!(matches!(
+            publication.admit(&contract(), &success()),
+            Err(ManagedToolRecoveryError::Recovery(
+                ContinuationRecoveryError::WrongPhase
+            ))
+        ));
         assert_eq!(publication, Publication::Complete);
     }
 
@@ -342,9 +448,15 @@ mod tests {
     fn notifications_and_unread_results_do_not_unlock_handback() {
         let mut publication = Publication::Pending;
         assert!(!publication.can_return());
-        let notification = ManagedInteractionEvent::Notification(Box::new(ServerNotification::ToolsListChanged(None)));
-        assert!(matches!(publication.admit(&contract(), &notification),
-            Err(ManagedToolRecoveryError::Recovery(ContinuationRecoveryError::JsonReplyRequired))));
+        let notification = ManagedInteractionEvent::Notification(Box::new(
+            ServerNotification::ToolsListChanged(None),
+        ));
+        assert!(matches!(
+            publication.admit(&contract(), &notification),
+            Err(ManagedToolRecoveryError::Recovery(
+                ContinuationRecoveryError::JsonReplyRequired
+            ))
+        ));
         assert!(!publication.can_return());
         assert_eq!(publication, Publication::Closed);
     }
@@ -353,7 +465,14 @@ mod tests {
     fn invalid_recovered_output_does_not_invalidate_the_shared_contract_or_siblings() {
         let contract = contract();
         let mut failed = Publication::Pending;
-        assert!(failed.admit(&contract, &event(r#"{"resultType":"complete","content":[]}"#)).is_err());
+        assert!(
+            failed
+                .admit(
+                    &contract,
+                    &event(r#"{"resultType":"complete","content":[]}"#)
+                )
+                .is_err()
+        );
         assert!(!contract.invalidated.load(Ordering::Acquire));
         assert!(contract.check().is_ok());
         let mut sibling = Publication::Pending;

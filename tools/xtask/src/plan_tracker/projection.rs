@@ -59,7 +59,6 @@ fn canonical_label(package_id: &str) -> String {
     format!("{WP_PARENT_PREFIX}{}", package_id.to_ascii_lowercase())
 }
 
-
 /// One exported Bead row. Only the fields the projection needs are read;
 /// unknown fields are ignored so an unrelated tracker change does not break
 /// parsing.
@@ -198,13 +197,17 @@ pub fn check_package_label_parity(plan_ids: &[&str], projection: &Projection) ->
             ));
             continue;
         }
-        let Some(derived) = label.strip_prefix(WP_PARENT_PREFIX).map(str::to_ascii_uppercase)
+        let Some(derived) = label
+            .strip_prefix(WP_PARENT_PREFIX)
+            .map(str::to_ascii_uppercase)
         else {
             report.push(Diagnostic::new(
                 Code::PackageLabelMapping,
                 *package_id,
                 "alias",
-                format!("the admitted alias {label:?} does not carry the {WP_PARENT_PREFIX} prefix"),
+                format!(
+                    "the admitted alias {label:?} does not carry the {WP_PARENT_PREFIX} prefix"
+                ),
             ));
             continue;
         };
@@ -225,7 +228,10 @@ pub fn check_package_label_parity(plan_ids: &[&str], projection: &Projection) ->
             Code::PackageLabelMapping,
             *missing,
             "wp-parent",
-            format!("the plan declares {missing:?} but no Bead carries {}", canonical_label(missing)),
+            format!(
+                "the plan declares {missing:?} but no Bead carries {}",
+                canonical_label(missing)
+            ),
         ));
     }
     for extra in tracked.difference(&declared) {
@@ -313,7 +319,12 @@ mod tests {
     #[test]
     fn a_row_without_a_parent_label_is_projected_to_no_package() {
         let projection = parse_export(EXPORT, "export").expect("parses");
-        assert!(!projection.packages.values().any(|ids| ids.contains(&"bd-3".to_owned())));
+        assert!(
+            !projection
+                .packages
+                .values()
+                .any(|ids| ids.contains(&"bd-3".to_owned()))
+        );
     }
 
     #[test]
@@ -482,7 +493,10 @@ mod tests {
     #[test]
     fn prerequisite_and_dependent_maps_are_transposes() {
         let edges = vec![("B".to_owned(), "A".to_owned())];
-        assert_eq!(prerequisite_map(&edges)["B"], BTreeSet::from(["A".to_owned()]));
+        assert_eq!(
+            prerequisite_map(&edges)["B"],
+            BTreeSet::from(["A".to_owned()])
+        );
         assert_eq!(dependent_map(&edges)["A"], BTreeSet::from(["B".to_owned()]));
     }
 }

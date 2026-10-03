@@ -18,14 +18,13 @@ use asupersync::types::Time;
 use fastmcp_core::McpRequestCancellation;
 
 use super::{
-    AsyncOAuthRefreshError, AsyncOAuthRefreshStore, CredentialCommitAnchor,
-    CredentialIoError, CredentialSlotTask, OAuthClient, OAuthCredentials,
-    OAuthGrantProtector, OAuthRefreshGrant, OAuthRefreshStoreError,
-    OAuthRefreshSubmissionFailure, OAuthRefreshTake, OAuthRefreshWrite,
+    AsyncOAuthRefreshError, AsyncOAuthRefreshStore, CredentialCommitAnchor, CredentialIoError,
+    CredentialSlotTask, OAuthClient, OAuthCredentials, OAuthGrantProtector, OAuthRefreshGrant,
+    OAuthRefreshStoreError, OAuthRefreshSubmissionFailure, OAuthRefreshTake, OAuthRefreshWrite,
     PartitionAuthorization, SlotRevision,
 };
-use crate::http_auth::oauth::{OAuthError, operation_deadline, within};
 use crate::http_auth::managed::{ManagedOAuthSession, OAuthSessionError, OAuthSessionPolicy};
+use crate::http_auth::oauth::{OAuthError, operation_deadline, within};
 
 /// Non-secret progress. ReadyToPersist never means the replacement is durable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,11 +49,24 @@ pub enum OAuthRefreshRenewalStage {
 pub enum OAuthRefreshRenewalCustody<A, P> {
     ReadyToTake(AsyncOAuthRefreshStore<A, P>),
     Taking(CredentialSlotTask<OAuthRefreshTake<A, P>>),
-    ReadyToExchange { store: AsyncOAuthRefreshStore<A, P>, grant: OAuthRefreshGrant },
-    ReadyToPersist { store: AsyncOAuthRefreshStore<A, P>, credentials: OAuthCredentials },
+    ReadyToExchange {
+        store: AsyncOAuthRefreshStore<A, P>,
+        grant: OAuthRefreshGrant,
+    },
+    ReadyToPersist {
+        store: AsyncOAuthRefreshStore<A, P>,
+        credentials: OAuthCredentials,
+    },
     Persisting(CredentialSlotTask<OAuthRefreshWrite<A, P>>),
-    Complete { store: AsyncOAuthRefreshStore<A, P>, credentials: OAuthCredentials, revision: SlotRevision },
-    Stopped { store: Option<AsyncOAuthRefreshStore<A, P>>, credentials: Option<OAuthCredentials> },
+    Complete {
+        store: AsyncOAuthRefreshStore<A, P>,
+        credentials: OAuthCredentials,
+        revision: SlotRevision,
+    },
+    Stopped {
+        store: Option<AsyncOAuthRefreshStore<A, P>>,
+        credentials: Option<OAuthCredentials>,
+    },
 }
 
 #[derive(Debug)]
@@ -76,9 +88,13 @@ impl fmt::Display for OAuthRefreshRenewalError {
             Self::Completion(error) => error.fmt(f),
             Self::Storage(error) => error.fmt(f),
             Self::Session(error) => error.fmt(f),
-            Self::NoStoredGrant => f.write_str("no stored OAuth refresh grant; explicit login required"),
+            Self::NoStoredGrant => {
+                f.write_str("no stored OAuth refresh grant; explicit login required")
+            }
             Self::NotComplete => f.write_str("persistent OAuth renewal is not complete"),
-            Self::Stopped => f.write_str("persistent OAuth renewal stopped; no exchange retry is authorized"),
+            Self::Stopped => {
+                f.write_str("persistent OAuth renewal stopped; no exchange retry is authorized")
+            }
         }
     }
 }
@@ -110,36 +126,54 @@ pub struct OAuthRefreshRenewal<A, P> {
 }
 
 impl<A, P> AsyncOAuthRefreshStore<A, P>
-where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
+where
+    A: CredentialCommitAnchor + 'static,
+    P: OAuthGrantProtector + 'static,
 {
     /// Prepares persistent renewal without file, provider or network effects.
     /// Reject a different issuer/client/resource/trust configuration BEFORE
     /// consuming its stored lineage. Failure returns the original store owner.
     /// Timeout covers the entire run, including pauses, and is at most 5 minutes.
     pub fn begin_renewal(
-        self, cx: &Cx, client: &OAuthClient, authorization: PartitionAuthorization,
-        cancellation: &McpRequestCancellation, timeout: Duration,
+        self,
+        cx: &Cx,
+        client: &OAuthClient,
+        authorization: PartitionAuthorization,
+        cancellation: &McpRequestCancellation,
+        timeout: Duration,
     ) -> Result<OAuthRefreshRenewal<A, P>, OAuthRefreshSubmissionFailure<A, P, ()>> {
         let admitted = (|| {
             if timeout.is_zero() || timeout > Duration::from_secs(300) {
                 return Err(AsyncOAuthRefreshError::Io(CredentialIoError::InvalidLimits));
             }
             if self.store.configuration != client.configuration {
-                return Err(AsyncOAuthRefreshError::Store(OAuthRefreshStoreError::ConfigurationMismatch));
+                return Err(AsyncOAuthRefreshError::Store(
+                    OAuthRefreshStoreError::ConfigurationMismatch,
+                ));
             }
             if cancellation.is_cancel_requested() {
-                return Err(AsyncOAuthRefreshError::Store(OAuthRefreshStoreError::ContextStopped));
+                return Err(AsyncOAuthRefreshError::Store(
+                    OAuthRefreshStoreError::ContextStopped,
+                ));
             }
             operation_deadline(cx, timeout)
                 .map_err(|_| AsyncOAuthRefreshError::Store(OAuthRefreshStoreError::ContextStopped))
         })();
         let deadline = match admitted {
             Ok(deadline) => deadline,
-            Err(cause) => return Err(OAuthRefreshSubmissionFailure { cause, retained: Some(Box::new((self, ()))) }),
+            Err(cause) => {
+                return Err(OAuthRefreshSubmissionFailure {
+                    cause,
+                    retained: Some(Box::new((self, ()))),
+                });
+            }
         };
         Ok(OAuthRefreshRenewal {
-            origin: cx.clone(), cancellation: cancellation.clone(), deadline,
-            client: client.clone(), authorization,
+            origin: cx.clone(),
+            cancellation: cancellation.clone(),
+            deadline,
+            client: client.clone(),
+            authorization,
             custody: OAuthRefreshRenewalCustody::ReadyToTake(self),
         })
     }
@@ -165,7 +199,9 @@ impl<A, P> OAuthRefreshRenewal<A, P> {
     /// Returned access credentials retain their ORIGINAL issuer-admitted expiry
     /// and no in-memory refresh token. They can authorize native HTTP requests;
     /// renewing them later requires another explicit persistent renewal.
-    pub fn into_custody(self) -> OAuthRefreshRenewalCustody<A, P> { self.custody }
+    pub fn into_custody(self) -> OAuthRefreshRenewalCustody<A, P> {
+        self.custody
+    }
 
     /// Hands a completed renewal to the ordinary managed client exactly once.
     /// The returned store retains the persistent refresh lineage; the session
@@ -174,22 +210,60 @@ impl<A, P> OAuthRefreshRenewal<A, P> {
     /// A premature/cancelled call preserves custody. If native session admission
     /// fails after extraction, the store remains in Stopped for explicit cleanup.
     pub fn take_managed_session(
-        &mut self, observer: &Cx, policy: OAuthSessionPolicy,
-    ) -> Result<(ManagedOAuthSession, AsyncOAuthRefreshStore<A, P>, SlotRevision), OAuthRefreshRenewalError> {
-        if self.cancellation.is_cancel_requested() || self.origin.checkpoint().is_err() || observer.checkpoint().is_err() {
+        &mut self,
+        observer: &Cx,
+        policy: OAuthSessionPolicy,
+    ) -> Result<
+        (
+            ManagedOAuthSession,
+            AsyncOAuthRefreshStore<A, P>,
+            SlotRevision,
+        ),
+        OAuthRefreshRenewalError,
+    > {
+        if self.cancellation.is_cancel_requested()
+            || self.origin.checkpoint().is_err()
+            || observer.checkpoint().is_err()
+        {
             return Err(OAuthRefreshRenewalError::Context(OAuthError::Cancelled));
         }
-        if self.origin.now() >= self.deadline || observer.budget().deadline.is_some_and(|deadline| observer.now() >= deadline) {
+        if self.origin.now() >= self.deadline
+            || observer
+                .budget()
+                .deadline
+                .is_some_and(|deadline| observer.now() >= deadline)
+        {
             return Err(OAuthRefreshRenewalError::Context(OAuthError::TimedOut));
         }
-        if self.stage() != OAuthRefreshRenewalStage::Complete { return Err(OAuthRefreshRenewalError::NotComplete); }
-        let OAuthRefreshRenewalCustody::Complete { store, credentials, revision } = std::mem::replace(
-            &mut self.custody, OAuthRefreshRenewalCustody::Stopped { store: None, credentials: None },
-        ) else { return Err(OAuthRefreshRenewalError::NotComplete); };
-        match ManagedOAuthSession::from_credentials(observer, self.client.clone(), policy, credentials) {
+        if self.stage() != OAuthRefreshRenewalStage::Complete {
+            return Err(OAuthRefreshRenewalError::NotComplete);
+        }
+        let OAuthRefreshRenewalCustody::Complete {
+            store,
+            credentials,
+            revision,
+        } = std::mem::replace(
+            &mut self.custody,
+            OAuthRefreshRenewalCustody::Stopped {
+                store: None,
+                credentials: None,
+            },
+        )
+        else {
+            return Err(OAuthRefreshRenewalError::NotComplete);
+        };
+        match ManagedOAuthSession::from_credentials(
+            observer,
+            self.client.clone(),
+            policy,
+            credentials,
+        ) {
             Ok(session) => Ok((session, store, revision)),
             Err(error) => {
-                self.custody = OAuthRefreshRenewalCustody::Stopped { store: Some(store), credentials: None };
+                self.custody = OAuthRefreshRenewalCustody::Stopped {
+                    store: Some(store),
+                    credentials: None,
+                };
                 Err(OAuthRefreshRenewalError::Session(error))
             }
         }
@@ -205,37 +279,48 @@ impl<A, P> OAuthRefreshRenewal<A, P> {
 
     fn cancel_worker(&self) {
         match &self.custody {
-            OAuthRefreshRenewalCustody::Taking(task) => { let _ = task.request_cancel(); }
-            OAuthRefreshRenewalCustody::Persisting(task) => { let _ = task.request_cancel(); }
-            _ => {},
+            OAuthRefreshRenewalCustody::Taking(task) => {
+                let _ = task.request_cancel();
+            }
+            OAuthRefreshRenewalCustody::Persisting(task) => {
+                let _ = task.request_cancel();
+            }
+            _ => {}
         }
     }
 }
 
 impl<A, P> OAuthRefreshRenewal<A, P>
-where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
+where
+    A: CredentialCommitAnchor + 'static,
+    P: OAuthGrantProtector + 'static,
 {
     /// Drives until persistence completes, or returns the first error. It never
     /// retries a refused submission, token exchange or storage transaction.
     /// After admission refusal only, a later explicit call may retry admission.
     pub async fn run(&mut self, observer: &Cx) -> Result<(), OAuthRefreshRenewalError> {
         loop {
-            if self.advance(observer).await? == OAuthRefreshRenewalStage::Complete { return Ok(()); }
+            if self.advance(observer).await? == OAuthRefreshRenewalStage::Complete {
+                return Ok(());
+            }
         }
     }
 
     /// Advances one boundary, retaining a pending storage task across cancelled
     /// or abandoned waits. No result is released merely because a timer fired.
-    pub async fn advance(&mut self, observer: &Cx) -> Result<OAuthRefreshRenewalStage, OAuthRefreshRenewalError> {
+    pub async fn advance(
+        &mut self,
+        observer: &Cx,
+    ) -> Result<OAuthRefreshRenewalStage, OAuthRefreshRenewalError> {
         let origin = self.origin.clone();
         let cancellation = self.cancellation.clone();
         let deadline = self.deadline;
         // A fresh observer can have a different runtime clock origin. Only
         // the original clock defines the operation end; translate its remaining
         // duration for the observer, while still guarding the original deadline.
-        let observer_deadline = observer.now().saturating_add_nanos(
-            deadline.as_nanos().saturating_sub(origin.now().as_nanos()),
-        );
+        let observer_deadline = observer
+            .now()
+            .saturating_add_nanos(deadline.as_nanos().saturating_sub(origin.now().as_nanos()));
         let result = {
             let work = async {
                 // Boxed at its source (bd-19tqe): the renewal step holds the
@@ -244,30 +329,44 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
                 let mut cancelled = std::pin::pin!(cancellation.cancelled());
                 poll_fn(|task| {
                     if cancelled.as_mut().poll(task).is_ready() {
-                        return Poll::Ready(Err(OAuthRefreshRenewalError::Context(OAuthError::Cancelled)));
+                        return Poll::Ready(Err(OAuthRefreshRenewalError::Context(
+                            OAuthError::Cancelled,
+                        )));
                     }
                     let result = step.as_mut().poll(task);
                     if cancellation.is_cancel_requested() {
-                        Poll::Ready(Err(OAuthRefreshRenewalError::Context(OAuthError::Cancelled)))
-                    } else { result }
-                }).await
+                        Poll::Ready(Err(OAuthRefreshRenewalError::Context(
+                            OAuthError::Cancelled,
+                        )))
+                    } else {
+                        result
+                    }
+                })
+                .await
             };
             // Both contexts register cancellation wakes; changing an observer
             // never replaces the original operation's lifetime or authority.
             within(observer, observer_deadline, async {
                 Ok(within(&origin, deadline, async { Ok(work.await) }).await)
-            }).await
-                .map_err(OAuthRefreshRenewalError::Context)
-                .and_then(|result| result.map_err(OAuthRefreshRenewalError::Context))
-                .and_then(|result| result)
+            })
+            .await
+            .map_err(OAuthRefreshRenewalError::Context)
+            .and_then(|result| result.map_err(OAuthRefreshRenewalError::Context))
+            .and_then(|result| result)
         };
-        if cancellation.is_cancel_requested() || origin.is_cancel_requested() || origin.now() >= deadline {
+        if cancellation.is_cancel_requested()
+            || origin.is_cancel_requested()
+            || origin.now() >= deadline
+        {
             self.cancel_worker();
         }
         result
     }
 
-    async fn advance_inner(&mut self, cx: &Cx) -> Result<OAuthRefreshRenewalStage, OAuthRefreshRenewalError> {
+    async fn advance_inner(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<OAuthRefreshRenewalStage, OAuthRefreshRenewalError> {
         use OAuthRefreshRenewalCustody as C;
         match &mut self.custody {
             C::Taking(task) => {
@@ -275,7 +374,10 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
                     Ok(completion) => completion,
                     Err(error) => {
                         if terminal_completion(error) {
-                            self.custody = C::Stopped { store: None, credentials: None };
+                            self.custody = C::Stopped {
+                                store: None,
+                                credentials: None,
+                            };
                         }
                         return Err(OAuthRefreshRenewalError::Completion(error));
                     }
@@ -284,11 +386,17 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
                 match outcome {
                     Ok(Some(grant)) => self.custody = C::ReadyToExchange { store, grant },
                     Ok(None) => {
-                        self.custody = C::Stopped { store: Some(store), credentials: None };
+                        self.custody = C::Stopped {
+                            store: Some(store),
+                            credentials: None,
+                        };
                         return Err(OAuthRefreshRenewalError::NoStoredGrant);
                     }
                     Err(error) => {
-                        self.custody = C::Stopped { store: Some(store), credentials: None };
+                        self.custody = C::Stopped {
+                            store: Some(store),
+                            credentials: None,
+                        };
                         return Err(OAuthRefreshRenewalError::Storage(error));
                     }
                 }
@@ -299,41 +407,77 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
                     Ok(completion) => completion,
                     Err(error) => {
                         if terminal_completion(error) {
-                            self.custody = C::Stopped { store: None, credentials: None };
+                            self.custody = C::Stopped {
+                                store: None,
+                                credentials: None,
+                            };
                         }
                         return Err(OAuthRefreshRenewalError::Completion(error));
                     }
                 };
                 let (store, (credentials, outcome)) = completion.into_parts();
                 match outcome {
-                    Ok(revision) => self.custody = C::Complete { store, credentials, revision },
+                    Ok(revision) => {
+                        self.custody = C::Complete {
+                            store,
+                            credentials,
+                            revision,
+                        }
+                    }
                     Err(error) => {
-                        self.custody = C::Stopped { store: Some(store), credentials: Some(credentials) };
+                        self.custody = C::Stopped {
+                            store: Some(store),
+                            credentials: Some(credentials),
+                        };
                         return Err(OAuthRefreshRenewalError::Storage(error));
                     }
                 }
                 return Ok(self.stage());
             }
-            _ => {},
+            _ => {}
         }
-        let previous = std::mem::replace(&mut self.custody, C::Stopped { store: None, credentials: None });
+        let previous = std::mem::replace(
+            &mut self.custody,
+            C::Stopped {
+                store: None,
+                credentials: None,
+            },
+        );
         match previous {
             C::ReadyToTake(store) => match store.try_take_refresh(cx, self.authorization) {
                 Ok(task) => self.custody = C::Taking(task),
                 Err(failure) => {
                     let (cause, retained) = failure.into_parts();
-                    if let Some((store, ())) = retained { self.custody = C::ReadyToTake(store); }
+                    if let Some((store, ())) = retained {
+                        self.custody = C::ReadyToTake(store);
+                    }
                     return Err(OAuthRefreshRenewalError::Submission(cause));
                 }
             },
             C::ReadyToExchange { store, grant } => {
                 // Commit this election before the first possible network poll.
                 // Dropping or failing the exchange cannot restore its grant.
-                self.custody = C::Stopped { store: Some(store), credentials: None };
-                let credentials = self.client.refresh_grant(cx, grant).await.map_err(OAuthRefreshRenewalError::Context)?;
-                let C::Stopped { store: Some(store), .. } = std::mem::replace(
-                    &mut self.custody, C::Stopped { store: None, credentials: None },
-                ) else { return Err(OAuthRefreshRenewalError::Stopped); };
+                self.custody = C::Stopped {
+                    store: Some(store),
+                    credentials: None,
+                };
+                let credentials = self
+                    .client
+                    .refresh_grant(cx, grant)
+                    .await
+                    .map_err(OAuthRefreshRenewalError::Context)?;
+                let C::Stopped {
+                    store: Some(store), ..
+                } = std::mem::replace(
+                    &mut self.custody,
+                    C::Stopped {
+                        store: None,
+                        credentials: None,
+                    },
+                )
+                else {
+                    return Err(OAuthRefreshRenewalError::Stopped);
+                };
                 self.custody = C::ReadyToPersist { store, credentials };
             }
             C::ReadyToPersist { store, credentials } => {
@@ -351,7 +495,9 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
             }
             other => {
                 self.custody = other;
-                if self.stage() != OAuthRefreshRenewalStage::Complete { return Err(OAuthRefreshRenewalError::Stopped); }
+                if self.stage() != OAuthRefreshRenewalStage::Complete {
+                    return Err(OAuthRefreshRenewalError::Stopped);
+                }
             }
         }
         Ok(self.stage())
@@ -359,7 +505,12 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
 }
 
 fn terminal_completion(error: CredentialIoError) -> bool {
-    matches!(error, CredentialIoError::WorkerStopped | CredentialIoError::WorkerPanicked | CredentialIoError::AlreadyReceived)
+    matches!(
+        error,
+        CredentialIoError::WorkerStopped
+            | CredentialIoError::WorkerPanicked
+            | CredentialIoError::AlreadyReceived
+    )
 }
 
 #[cfg(test)]

@@ -2,10 +2,10 @@
 //! POSTs, with an in-process browser-callback simulator. No external IdP/browser
 //! is exercised. All registration writes are confined to the local TLS fixture.
 
-#[path = "oauth_discovery/resource_metadata.rs"]
-mod resource_metadata;
 #[path = "oauth_discovery/issuer_metadata.rs"]
 mod issuer_metadata;
+#[path = "oauth_discovery/resource_metadata.rs"]
+mod resource_metadata;
 
 use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
@@ -20,16 +20,26 @@ use asupersync::channel::oneshot;
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener, TcpStream};
 use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
-use asupersync::tls::{Certificate, CertificateChain, PrivateKey, TlsAcceptor, TlsAcceptorBuilder, TlsStream};
-use fastmcp_client::http_auth::BoundBearerCredential;
-use fastmcp_client::http_auth::discovery::{OAuthDiscoveryError, OAuthDiscoveryPlan, TrustedOAuthIssuer};
-use fastmcp_client::http_auth::discovery::issuer::{IssuerMetadataCause, IssuerMetadataFailureClass};
-use fastmcp_client::http_auth::discovery::registration::{
-    NativeClientRegistration, OAuthRegistrationError, NATIVE_REGISTRATION_REDIRECT_URIS,
+use asupersync::tls::{
+    Certificate, CertificateChain, PrivateKey, TlsAcceptor, TlsAcceptorBuilder, TlsStream,
 };
-use fastmcp_client::http_auth::managed::{ManagedOAuthSession, OAuthSessionError, OAuthSessionPolicy};
+use fastmcp_client::http_auth::BoundBearerCredential;
+use fastmcp_client::http_auth::discovery::issuer::{
+    IssuerMetadataCause, IssuerMetadataFailureClass,
+};
+use fastmcp_client::http_auth::discovery::registration::{
+    NATIVE_REGISTRATION_REDIRECT_URIS, NativeClientRegistration, OAuthRegistrationError,
+};
+use fastmcp_client::http_auth::discovery::{
+    OAuthDiscoveryError, OAuthDiscoveryPlan, TrustedOAuthIssuer,
+};
+use fastmcp_client::http_auth::managed::{
+    ManagedOAuthSession, OAuthSessionError, OAuthSessionPolicy,
+};
 use fastmcp_client::http_auth::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError};
-use fastmcp_client::http_executor::{ModernHttpExecutor, ModernHttpExecutorError, ModernHttpRequest};
+use fastmcp_client::http_executor::{
+    ModernHttpExecutor, ModernHttpExecutorError, ModernHttpRequest,
+};
 use fastmcp_core::CanonicalHttpUrl;
 use serde_json::{Value, json};
 
@@ -44,19 +54,27 @@ const ROOT: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBgzCCASmgAwIBAgICA+kwCgYIK
 const LEAF: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBjjCCATSgAwIBAgICA+owCgYIKoZIzj0EAwIwJzElMCMGA1UEAwwcRmFzdE1D\nUCBPQXV0aCBURVNUIE9OTFkgUm9vdDAeFw0yMDAxMDEwMDAwMDBaFw00OTEyMzEw\nMDAwMDBaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDBZMBMGByqGSM49AgEGCCqGSM49\nAwEHA0IABPPKylLna9VpWAlpshHBhSsQHNOv3BaEGX4HSBhHiBVel0ce+qfHF15O\n0T63Zlp7TtxlMdEY+rPpgioSFDQVadijYzBhMAwGA1UdEwEB/wQCMAAwLAYDVR0R\nBCUwI4IJbG9jYWxob3N0hwR/AAABhxAAAAAAAAAAAAAAAAAAAAABMBMGA1UdJQQM\nMAoGCCsGAQUFBwMBMA4GA1UdDwEB/wQEAwIHgDAKBggqhkjOPQQDAgNIADBFAiEA\n6qrAr2qp/t6K62T9Et2mUU/zfd4kJb+ekyoAim1yTFcCICb6SdVY2fg15/SXf0vE\nIvYelqtTk8FQInCEcIxvfF3m\n-----END CERTIFICATE-----\n";
 const KEY: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcCe44IBKhbw+D/s7\nBjDHOOV0g+EoxFno7VJGKhJeer2hRANCAATzyspS52vVaVgJabIRwYUrEBzTr9wW\nhBl+B0gYR4gVXpdHHvqnxxdeTtE+t2Zae07cZTHRGPqz6YIqEhQ0FWnY\n-----END PRIVATE KEY-----\n";
 
-fn root() -> Certificate { Certificate::from_pem(ROOT).unwrap().remove(0) }
-fn url(value: &str) -> CanonicalHttpUrl { CanonicalHttpUrl::parse(value).unwrap() }
+fn root() -> Certificate {
+    Certificate::from_pem(ROOT).unwrap().remove(0)
+}
+fn url(value: &str) -> CanonicalHttpUrl {
+    CanonicalHttpUrl::parse(value).unwrap()
+}
 
 fn run(future: impl Future<Output = ()>) {
-    RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap())
-        .build().unwrap().block_on(async {
+    RuntimeBuilder::current_thread()
+        .with_reactor(create_reactor().unwrap())
+        .build()
+        .unwrap()
+        .block_on(async {
             let cx = Cx::current().unwrap();
             // The bound is the harness's, not the test's. Several tests cancel
             // this very Cx, and an unmasked Sleep completes early under ambient
             // cancellation, so a fixture still settling one turn after its
             // cancel would be reported as Elapsed. Mask only the bound's poll.
             let mut future = std::pin::pin!(future);
-            let mut bound = std::pin::pin!(asupersync::time::sleep(cx.now(), Duration::from_secs(20)));
+            let mut bound =
+                std::pin::pin!(asupersync::time::sleep(cx.now(), Duration::from_secs(20)));
             poll_fn(|task| {
                 if future.as_mut().poll(task).is_ready() {
                     return Poll::Ready(());
@@ -66,7 +84,8 @@ fn run(future: impl Future<Output = ()>) {
                     "complete discovery fixture must settle within its bound"
                 );
                 Poll::Pending
-            }).await;
+            })
+            .await;
         });
 }
 
@@ -77,15 +96,22 @@ async fn pair<L: Future, R: Future>(left: L, right: R) -> (L::Output, R::Output)
     let mut right_result = None;
     poll_fn(|task| {
         if left_result.is_none() {
-            if let Poll::Ready(value) = left.as_mut().poll(task) { left_result = Some(value); }
+            if let Poll::Ready(value) = left.as_mut().poll(task) {
+                left_result = Some(value);
+            }
         }
         if right_result.is_none() {
-            if let Poll::Ready(value) = right.as_mut().poll(task) { right_result = Some(value); }
+            if let Poll::Ready(value) = right.as_mut().poll(task) {
+                right_result = Some(value);
+            }
         }
         if left_result.is_some() && right_result.is_some() {
             Poll::Ready((left_result.take().unwrap(), right_result.take().unwrap()))
-        } else { Poll::Pending }
-    }).await
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 struct Peer {
@@ -99,30 +125,62 @@ impl Peer {
         Self {
             listener: TcpListener::bind("127.0.0.1:0").await.unwrap(),
             acceptor: TlsAcceptorBuilder::new(
-                CertificateChain::from_pem(LEAF).unwrap(), PrivateKey::from_pem(KEY).unwrap(),
-            ).alpn_protocols(vec![b"http/1.1".to_vec()]).build().unwrap(),
+                CertificateChain::from_pem(LEAF).unwrap(),
+                PrivateKey::from_pem(KEY).unwrap(),
+            )
+            .alpn_protocols(vec![b"http/1.1".to_vec()])
+            .build()
+            .unwrap(),
             paths: Mutex::new(Vec::new()),
         }
     }
 
-    fn origin(&self) -> String { format!("https://{}", self.listener.local_addr().unwrap()) }
-    fn issuer(&self) -> String { format!("{}/tenant", self.origin()) }
-    fn resource(&self) -> String { format!("{}/mcp", self.origin()) }
+    fn origin(&self) -> String {
+        format!("https://{}", self.listener.local_addr().unwrap())
+    }
+    fn issuer(&self) -> String {
+        format!("{}/tenant", self.origin())
+    }
+    fn resource(&self) -> String {
+        format!("{}/mcp", self.origin())
+    }
 
     fn plan(&self, trust_resource: bool, trust_issuer: bool) -> OAuthDiscoveryPlan {
         let issuer = TrustedOAuthIssuer::new(self.issuer()).unwrap();
-        let issuer = if trust_issuer { issuer.with_root_certificate(root()).unwrap() } else { issuer };
-        let plan = OAuthDiscoveryPlan::new(url(&self.resource()), vec![issuer],
-            "registered-native-client", vec!["tools:read".to_owned()]).unwrap();
-        if trust_resource { plan.with_resource_root_certificate(root()).unwrap() } else { plan }
+        let issuer = if trust_issuer {
+            issuer.with_root_certificate(root()).unwrap()
+        } else {
+            issuer
+        };
+        let plan = OAuthDiscoveryPlan::new(
+            url(&self.resource()),
+            vec![issuer],
+            "registered-native-client",
+            vec!["tools:read".to_owned()],
+        )
+        .unwrap();
+        if trust_resource {
+            plan.with_resource_root_certificate(root()).unwrap()
+        } else {
+            plan
+        }
     }
 
     fn registration(&self) -> NativeClientRegistration {
         NativeClientRegistration::new(
             url(&self.resource()),
-            vec![TrustedOAuthIssuer::new(self.issuer()).unwrap().with_root_certificate(root()).unwrap()],
-            "Dynamic native integration", vec!["tools:read".to_owned()],
-        ).unwrap().with_resource_root_certificate(root()).unwrap()
+            vec![
+                TrustedOAuthIssuer::new(self.issuer())
+                    .unwrap()
+                    .with_root_certificate(root())
+                    .unwrap(),
+            ],
+            "Dynamic native integration",
+            vec!["tools:read".to_owned()],
+        )
+        .unwrap()
+        .with_resource_root_certificate(root())
+        .unwrap()
     }
 
     fn resource_document(&self) -> Value {
@@ -156,8 +214,18 @@ impl Peer {
     }
 
     async fn registration_discovery(&self, document: &Value) {
-        self.serve("/.well-known/oauth-protected-resource/mcp", 200, &self.resource_document().to_string()).await;
-        self.serve("/.well-known/oauth-authorization-server/tenant", 200, &document.to_string()).await;
+        self.serve(
+            "/.well-known/oauth-protected-resource/mcp",
+            200,
+            &self.resource_document().to_string(),
+        )
+        .await;
+        self.serve(
+            "/.well-known/oauth-authorization-server/tenant",
+            200,
+            &document.to_string(),
+        )
+        .await;
     }
 
     async fn request(&self, method: &str, path: &str) -> (TlsStream<TcpStream>, Vec<u8>) {
@@ -165,7 +233,10 @@ impl Peer {
     }
 
     async fn request_with_authorization(
-        &self, method: &str, path: &str, expected: Option<&str>,
+        &self,
+        method: &str,
+        path: &str,
+        expected: Option<&str>,
     ) -> (TlsStream<TcpStream>, Vec<u8>) {
         let (socket, _) = self.listener.accept().await.unwrap();
         let mut tls = self.acceptor.accept(socket).await.unwrap();
@@ -175,23 +246,33 @@ impl Peer {
             let count = tls.read(&mut chunk).await.unwrap();
             assert!(count > 0 && wire.len() + count <= 16 * 1024);
             wire.extend_from_slice(&chunk[..count]);
-            if let Some(index) = wire.windows(4).position(|value| value == b"\r\n\r\n") { break index + 4; }
+            if let Some(index) = wire.windows(4).position(|value| value == b"\r\n\r\n") {
+                break index + 4;
+            }
         };
         let head = std::str::from_utf8(&wire[..end]).unwrap();
         assert!(head.starts_with(&format!("{method} {path} HTTP/1.1\r\n")));
-        let authorization: Vec<&str> = head.lines().filter_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("authorization").then(|| value.trim())
-        }).collect();
+        let authorization: Vec<&str> = head
+            .lines()
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("authorization")
+                    .then(|| value.trim())
+            })
+            .collect();
         match expected {
             None => assert!(authorization.is_empty()),
             Some(expected) => assert_eq!(authorization, vec![expected]),
         }
         assert!(!head.to_ascii_lowercase().contains("cookie:"));
-        let length = head.lines().find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
-        }).unwrap_or(0);
+        let length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
         assert!(end + length <= 16 * 1024);
         while wire.len() < end + length {
             let count = tls.read(&mut chunk).await.unwrap();
@@ -199,7 +280,9 @@ impl Peer {
             wire.extend_from_slice(&chunk[..count]);
         }
         assert_eq!(wire.len(), end + length);
-        if method == "GET" { assert_eq!(length, 0); }
+        if method == "GET" {
+            assert_eq!(length, 0);
+        }
         self.paths.lock().unwrap().push(path.to_owned());
         (tls, wire[end..].to_vec())
     }
@@ -253,7 +336,8 @@ impl Peer {
 
 async fn reply(tls: &mut TlsStream<TcpStream>, status: u16, body: &str) {
     let response = format!(
-        "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nLocation: https://127.0.0.1:9/must-not-follow\r\nConnection: close\r\n\r\n{body}", body.len(),
+        "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nLocation: https://127.0.0.1:9/must-not-follow\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
     );
     tls.write_all(response.as_bytes()).await.unwrap();
     tls.shutdown().await.unwrap();
@@ -277,10 +361,13 @@ fn decode_component(input: &str) -> String {
 }
 
 fn form(input: &str) -> BTreeMap<String, String> {
-    input.split('&').map(|field| {
-        let (name, value) = field.split_once('=').unwrap();
-        (decode_component(name), decode_component(value))
-    }).collect()
+    input
+        .split('&')
+        .map(|field| {
+            let (name, value) = field.split_once('=').unwrap();
+            (decode_component(name), decode_component(value))
+        })
+        .collect()
 }
 
 fn encode_component(input: &str) -> String {
@@ -296,24 +383,46 @@ fn encode_component(input: &str) -> String {
     output
 }
 
-async fn callback(authorization: CanonicalHttpUrl, issuer: &str, resource: &str) -> Result<(), OAuthError> {
+async fn callback(
+    authorization: CanonicalHttpUrl,
+    issuer: &str,
+    resource: &str,
+) -> Result<(), OAuthError> {
     callback_for_client(authorization, issuer, resource, "registered-native-client").await
 }
 
 async fn callback_for_client(
-    authorization: CanonicalHttpUrl, issuer: &str, resource: &str, client_id: &str,
+    authorization: CanonicalHttpUrl,
+    issuer: &str,
+    resource: &str,
+    client_id: &str,
 ) -> Result<(), OAuthError> {
     let fields = form(authorization.query().unwrap());
     assert_eq!(fields["client_id"], client_id);
     assert_eq!(fields["resource"], resource);
     assert_eq!(fields["code_challenge_method"], "S256");
-    let address: SocketAddr = fields["redirect_uri"].strip_prefix("http://").unwrap()
-        .split('/').next().unwrap().parse().unwrap();
+    let address: SocketAddr = fields["redirect_uri"]
+        .strip_prefix("http://")
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
     assert!(address.ip().is_loopback());
-    let query = format!("code=fixture-code&iss={}&state={}", encode_component(issuer), fields["state"]);
+    let query = format!(
+        "code=fixture-code&iss={}&state={}",
+        encode_component(issuer),
+        fields["state"]
+    );
     let request = format!("GET /oauth/callback?{query} HTTP/1.1\r\nHost: {address}\r\n\r\n");
-    let mut socket = TcpStream::connect(address).await.map_err(|_| OAuthError::CallbackRejected)?;
-    socket.write_all(request.as_bytes()).await.map_err(|_| OAuthError::CallbackRejected)
+    let mut socket = TcpStream::connect(address)
+        .await
+        .map_err(|_| OAuthError::CallbackRejected)?;
+    socket
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|_| OAuthError::CallbackRejected)
 }
 
 #[test]
@@ -326,10 +435,22 @@ fn public_discovery_fallbacks_feed_managed_pkce_login_and_private_resource_post(
         let resource = peer.resource();
         let launches = AtomicUsize::new(0);
         let server = async {
-            peer.serve("/.well-known/oauth-protected-resource/mcp", 200, &peer.resource_document().to_string()).await;
-            peer.serve("/.well-known/oauth-authorization-server/tenant", 404, "").await;
-            peer.serve("/.well-known/openid-configuration/tenant", 410, "").await;
-            peer.serve("/tenant/.well-known/openid-configuration", 200, &peer.issuer_document().to_string()).await;
+            peer.serve(
+                "/.well-known/oauth-protected-resource/mcp",
+                200,
+                &peer.resource_document().to_string(),
+            )
+            .await;
+            peer.serve("/.well-known/oauth-authorization-server/tenant", 404, "")
+                .await;
+            peer.serve("/.well-known/openid-configuration/tenant", 410, "")
+                .await;
+            peer.serve(
+                "/tenant/.well-known/openid-configuration",
+                200,
+                &peer.issuer_document().to_string(),
+            )
+            .await;
             let (mut tls, body) = peer.request("POST", "/token").await;
             let fields = form(std::str::from_utf8(&body).unwrap());
             assert_eq!(fields["grant_type"], "authorization_code");
@@ -340,29 +461,51 @@ fn public_discovery_fallbacks_feed_managed_pkce_login_and_private_resource_post(
             reply(&mut tls, 200,
                 r#"{"access_token":"discovered-access","token_type":"Bearer","expires_in":300,"refresh_token":"discovered-refresh","scope":"tools:read"}"#,
             ).await;
-            let (mut tls, body) = peer.request_with_authorization(
-                "POST", "/mcp", Some("Bearer discovered-access"),
-            ).await;
-            assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["method"], "tools/list");
-            reply(&mut tls, 200, r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#).await;
+            let (mut tls, body) = peer
+                .request_with_authorization("POST", "/mcp", Some("Bearer discovered-access"))
+                .await;
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap()["method"],
+                "tools/list"
+            );
+            reply(
+                &mut tls,
+                200,
+                r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#,
+            )
+            .await;
         };
         let application = async {
-            let session = plan.authorize_managed(&cx, OAuthSessionPolicy::default(), |authorization| {
-                launches.fetch_add(1, Ordering::SeqCst);
-                callback(authorization, &issuer, &resource)
-            }).await.unwrap();
+            let session = plan
+                .authorize_managed(&cx, OAuthSessionPolicy::default(), |authorization| {
+                    launches.fetch_add(1, Ordering::SeqCst);
+                    callback(authorization, &issuer, &resource)
+                })
+                .await
+                .unwrap();
             let snapshot = session.credential(&cx).await.unwrap();
             assert_eq!(snapshot.generation(), 1);
-            assert_eq!(snapshot.credential().authorization_for_target(&url(&resource)), Some("Bearer discovered-access".to_owned()));
+            assert_eq!(
+                snapshot
+                    .credential()
+                    .authorization_for_target(&url(&resource)),
+                Some("Bearer discovered-access".to_owned())
+            );
             let request = ModernHttpRequest::new(
                 resource.clone(),
                 br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#.to_vec(),
-                "2026-07-28", "tools/list", None,
-            ).unwrap();
+                "2026-07-28",
+                "tools/list",
+                None,
+            )
+            .unwrap();
             let response = session.clone().execute(&cx, &request).await.unwrap();
             assert_eq!(response.credential_generation(), 1);
             let body = response.read_to_end(&cx, 4096).await.unwrap();
-            assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["result"]["tools"], json!([]));
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap()["result"]["tools"],
+                json!([])
+            );
             session.close();
         };
         Box::pin(pair(server, application)).await;
@@ -380,10 +523,12 @@ fn private_resource_trust_executes_only_the_exact_https_endpoint() {
         let other = Peer::new().await;
         let resource = url(&peer.resource());
         let executor = ModernHttpExecutor::new()
-            .with_resource_root_certificate(resource.clone(), root()).unwrap();
-        let request = |target: String| ModernHttpRequest::new(
-            target, b"{}".to_vec(), "2026-07-28", "tools/list", None,
-        ).unwrap();
+            .with_resource_root_certificate(resource.clone(), root())
+            .unwrap();
+        let request = |target: String| {
+            ModernHttpRequest::new(target, b"{}".to_vec(), "2026-07-28", "tools/list", None)
+                .unwrap()
+        };
         let server = async {
             for _ in 0..2 {
                 let (mut tls, body) = peer.request("POST", "/mcp").await;
@@ -393,7 +538,11 @@ fn private_resource_trust_executes_only_the_exact_https_endpoint() {
         };
         let application = async {
             for target in [peer.resource(), format!("{}/other/../mcp", peer.origin())] {
-                let response = executor.clone().execute(&cx, &request(target)).await.unwrap();
+                let response = executor
+                    .clone()
+                    .execute(&cx, &request(target))
+                    .await
+                    .unwrap();
                 assert_eq!(response.read_to_end(&cx, 4096).await.unwrap(), b"{}");
             }
             for target in [
@@ -402,21 +551,35 @@ fn private_resource_trust_executes_only_the_exact_https_endpoint() {
                 peer.resource().replacen("https:", "http:", 1),
                 format!("{}?different", peer.resource()),
             ] {
-                assert!(matches!(executor.execute(&cx, &request(target)).await,
-                    Err(ModernHttpExecutorError::ResourceTlsTargetMismatch)));
+                assert!(matches!(
+                    executor.execute(&cx, &request(target)).await,
+                    Err(ModernHttpExecutorError::ResourceTlsTargetMismatch)
+                ));
             }
         };
         pair(server, application).await;
         assert_eq!(*peer.paths.lock().unwrap(), ["/mcp", "/mcp"]);
         peer.assert_no_extra_connections();
         other.assert_no_extra_connections();
-        assert!(matches!(executor.clone().with_resource_root_certificate(resource.clone(), root()),
-            Err(ModernHttpExecutorError::InvalidResourceTlsTrust)));
-        assert!(matches!(executor.with_resource_root_certificate(url(&other.resource()), root()),
-            Err(ModernHttpExecutorError::ResourceTlsTargetMismatch)));
-        for certificate in [Certificate::from_der(vec![0; 32]), Certificate::from_der(vec![0; 16 * 1024 + 1])] {
-            assert!(matches!(ModernHttpExecutor::new().with_resource_root_certificate(resource.clone(), certificate),
-                Err(ModernHttpExecutorError::InvalidResourceTlsTrust)));
+        assert!(matches!(
+            executor
+                .clone()
+                .with_resource_root_certificate(resource.clone(), root()),
+            Err(ModernHttpExecutorError::InvalidResourceTlsTrust)
+        ));
+        assert!(matches!(
+            executor.with_resource_root_certificate(url(&other.resource()), root()),
+            Err(ModernHttpExecutorError::ResourceTlsTargetMismatch)
+        ));
+        for certificate in [
+            Certificate::from_der(vec![0; 32]),
+            Certificate::from_der(vec![0; 16 * 1024 + 1]),
+        ] {
+            assert!(matches!(
+                ModernHttpExecutor::new()
+                    .with_resource_root_certificate(resource.clone(), certificate),
+                Err(ModernHttpExecutorError::InvalidResourceTlsTrust)
+            ));
         }
     });
 }
@@ -429,30 +592,50 @@ fn managed_private_resource_does_not_inherit_token_issuer_trust() {
         let issuer = peer.issuer();
         let resource = peer.resource();
         let configuration = OAuthClientConfiguration::from_trusted_endpoints(
-            issuer.clone(), url(&format!("{}/authorize", peer.origin())),
-            url(&format!("{}/token", peer.origin())), url(&resource),
-            "registered-native-client", vec!["tools:read".to_owned()],
-        ).unwrap().with_extra_root_certificate(root()).unwrap();
+            issuer.clone(),
+            url(&format!("{}/authorize", peer.origin())),
+            url(&format!("{}/token", peer.origin())),
+            url(&resource),
+            "registered-native-client",
+            vec!["tools:read".to_owned()],
+        )
+        .unwrap()
+        .with_extra_root_certificate(root())
+        .unwrap();
         let server = async {
             let (mut tls, _) = peer.request("POST", "/token").await;
             reply(&mut tls, 200,
                 r#"{"access_token":"issuer-only-access","token_type":"Bearer","expires_in":300,"scope":"tools:read"}"#,
             ).await;
             let (socket, _) = peer.listener.accept().await.unwrap();
-            assert!(peer.acceptor.accept(socket).await.is_err(), "resource handshake must reject the issuer-only CA before sending HTTP");
+            assert!(
+                peer.acceptor.accept(socket).await.is_err(),
+                "resource handshake must reject the issuer-only CA before sending HTTP"
+            );
         };
         let application = async {
             let session = ManagedOAuthSession::authorize(
-                &cx, OAuthClient::new(configuration), OAuthSessionPolicy::default(),
+                &cx,
+                OAuthClient::new(configuration),
+                OAuthSessionPolicy::default(),
                 |authorization| callback(authorization, &issuer, &resource),
-            ).await.unwrap();
+            )
+            .await
+            .unwrap();
             let request = ModernHttpRequest::new(
-                resource.clone(), b"{}".to_vec(), "2026-07-28", "tools/list", None,
-            ).unwrap();
-            assert!(matches!(session.execute(&cx, &request).await,
+                resource.clone(),
+                b"{}".to_vec(),
+                "2026-07-28",
+                "tools/list",
+                None,
+            )
+            .unwrap();
+            assert!(matches!(
+                session.execute(&cx, &request).await,
                 Err(OAuthSessionError::Http(ModernHttpExecutorError::Transport(
                     asupersync::http::h1::ClientError::TlsError(_),
-                )))));
+                )))
+            ));
         };
         Box::pin(pair(server, application)).await;
         assert_eq!(*peer.paths.lock().unwrap(), ["/token"]);
@@ -467,18 +650,27 @@ fn private_resource_trust_preserves_tls_hostname_verification() {
         let mut peer = Peer::new().await;
         peer.listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
         // The fixture certificate includes 127.0.0.1, but not 127.0.0.2.
-        let target = format!("https://127.0.0.2:{}/mcp", peer.listener.local_addr().unwrap().port());
+        let target = format!(
+            "https://127.0.0.2:{}/mcp",
+            peer.listener.local_addr().unwrap().port()
+        );
         let executor = ModernHttpExecutor::new()
-            .with_resource_root_certificate(url(&target), root()).unwrap();
-        let request = ModernHttpRequest::new(target, b"{}".to_vec(), "2026-07-28", "tools/list", None).unwrap();
+            .with_resource_root_certificate(url(&target), root())
+            .unwrap();
+        let request =
+            ModernHttpRequest::new(target, b"{}".to_vec(), "2026-07-28", "tools/list", None)
+                .unwrap();
         let server = async {
             let (socket, _) = peer.listener.accept().await.unwrap();
             assert!(peer.acceptor.accept(socket).await.is_err());
         };
         let ((), result) = pair(server, executor.execute(&cx, &request)).await;
-        assert!(matches!(result, Err(ModernHttpExecutorError::Transport(
-            asupersync::http::h1::ClientError::TlsError(_),
-        ))));
+        assert!(matches!(
+            result,
+            Err(ModernHttpExecutorError::Transport(
+                asupersync::http::h1::ClientError::TlsError(_),
+            ))
+        ));
         assert!(peer.paths.lock().unwrap().is_empty());
         peer.assert_no_extra_connections();
     });
@@ -492,16 +684,29 @@ fn private_resource_trust_survives_public_builder_discovery_and_requests() {
         let resource = url(&peer.resource());
         let plan = fastmcp_client::ClientProtocolPlan::http(
             fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly,
-            Some(resource.clone()), None, None,
-            "private-resource".to_owned(), "private-resource".to_owned(), "native-h1".to_owned(),
-            1, 1, 0,
-        ).unwrap();
-        let builder = fastmcp_client::ClientBuilder::new().protocol_plan(plan)
-            .http_bearer_credential(BoundBearerCredential::bind(resource.clone(), "builder-access").unwrap())
-            .http_resource_root_certificate(resource, root()).unwrap();
+            Some(resource.clone()),
+            None,
+            None,
+            "private-resource".to_owned(),
+            "private-resource".to_owned(),
+            "native-h1".to_owned(),
+            1,
+            1,
+            0,
+        )
+        .unwrap();
+        let builder = fastmcp_client::ClientBuilder::new()
+            .protocol_plan(plan)
+            .http_bearer_credential(
+                BoundBearerCredential::bind(resource.clone(), "builder-access").unwrap(),
+            )
+            .http_resource_root_certificate(resource, root())
+            .unwrap();
         let server = async {
             for method in ["server/discover", "tools/list"] {
-                let (mut tls, body) = peer.request_with_authorization("POST", "/mcp", Some("Bearer builder-access")).await;
+                let (mut tls, body) = peer
+                    .request_with_authorization("POST", "/mcp", Some("Bearer builder-access"))
+                    .await;
                 let request: Value = serde_json::from_slice(&body).unwrap();
                 assert_eq!(request["method"], method);
                 let result = if method == "server/discover" {
@@ -509,12 +714,26 @@ fn private_resource_trust_survives_public_builder_discovery_and_requests() {
                 } else {
                     json!({"resultType":"complete","tools":[]})
                 };
-                reply(&mut tls, 200, &json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string()).await;
+                reply(
+                    &mut tls,
+                    200,
+                    &json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string(),
+                )
+                .await;
             }
         };
         let application = async {
             let mut client = builder.connect_http_with_cx(&cx).await.unwrap();
-            let response = client.request_json(&cx, "tools/list", json!({}), fastmcp_protocol::RequestId::Number(2), 4096).await.unwrap();
+            let response = client
+                .request_json(
+                    &cx,
+                    "tools/list",
+                    json!({}),
+                    fastmcp_protocol::RequestId::Number(2),
+                    4096,
+                )
+                .await
+                .unwrap();
             assert_eq!(response.result.unwrap()["tools"], json!([]));
         };
         Box::pin(pair(server, application)).await;
@@ -532,8 +751,15 @@ fn issuer_http_failures_exhaust_the_same_issuer_without_launching_the_browser() 
             let plan = peer.plan(true, true);
             let launches = AtomicUsize::new(0);
             let server = async {
-                peer.serve("/.well-known/oauth-protected-resource/mcp", 200, &peer.resource_document().to_string()).await;
-                for path in ISSUER_CANDIDATES { peer.serve(path, status, "peer-error-canary").await; }
+                peer.serve(
+                    "/.well-known/oauth-protected-resource/mcp",
+                    200,
+                    &peer.resource_document().to_string(),
+                )
+                .await;
+                for path in ISSUER_CANDIDATES {
+                    peer.serve(path, status, "peer-error-canary").await;
+                }
             };
             let application = plan.authorize_managed(&cx, OAuthSessionPolicy::default(), |_| {
                 launches.fetch_add(1, Ordering::SeqCst);
@@ -542,10 +768,21 @@ fn issuer_http_failures_exhaust_the_same_issuer_without_launching_the_browser() 
             let ((), result) = Box::pin(pair(server, application)).await;
             let error = result.err().unwrap();
             assert!(!format!("{error:?} {error}").contains("peer-error-canary"));
-            let OAuthDiscoveryError::IssuerMetadataExhausted(failure) = error else { panic!("all candidate failures must remain visible") };
-            assert_eq!(failure.attempts().iter().map(|attempt| attempt.cause()).collect::<Vec<_>>(),
-                [IssuerMetadataCause::HttpStatus(status); 3]);
-            assert_eq!(failure.classification(), IssuerMetadataFailureClass::ProtocolOrHttp);
+            let OAuthDiscoveryError::IssuerMetadataExhausted(failure) = error else {
+                panic!("all candidate failures must remain visible")
+            };
+            assert_eq!(
+                failure
+                    .attempts()
+                    .iter()
+                    .map(|attempt| attempt.cause())
+                    .collect::<Vec<_>>(),
+                [IssuerMetadataCause::HttpStatus(status); 3]
+            );
+            assert_eq!(
+                failure.classification(),
+                IssuerMetadataFailureClass::ProtocolOrHttp
+            );
             assert_eq!(launches.load(Ordering::SeqCst), 0);
             assert_eq!(peer.paths.lock().unwrap().len(), 4);
             peer.assert_no_extra_connections();
@@ -568,7 +805,7 @@ fn invalid_issuer_metadata_has_no_browser_or_token_endpoint_effects() {
                 3 => document["authorization_response_iss_parameter_supported"] = Value::Null,
                 4 => document["scopes_supported"] = json!(["admin"]),
                 5 => document["signed_metadata"] = json!("unverified.jwt.value"),
-                _ => {},
+                _ => {}
             }
             let mut body = document.to_string();
             if dimension == 6 {
@@ -577,15 +814,25 @@ fn invalid_issuer_metadata_has_no_browser_or_token_endpoint_effects() {
             }
             let launches = AtomicUsize::new(0);
             let server = async {
-                peer.serve("/.well-known/oauth-protected-resource/mcp", 200, &peer.resource_document().to_string()).await;
-                for path in ISSUER_CANDIDATES { peer.serve(path, 200, &body).await; }
+                peer.serve(
+                    "/.well-known/oauth-protected-resource/mcp",
+                    200,
+                    &peer.resource_document().to_string(),
+                )
+                .await;
+                for path in ISSUER_CANDIDATES {
+                    peer.serve(path, 200, &body).await;
+                }
             };
             let application = plan.authorize_managed(&cx, OAuthSessionPolicy::default(), |_| {
                 launches.fetch_add(1, Ordering::SeqCst);
                 async { Ok(()) }
             });
             let ((), result) = Box::pin(pair(server, application)).await;
-            let OAuthDiscoveryError::IssuerMetadataExhausted(failure) = result.err().unwrap() else { panic!("aggregate expected") };
+            let OAuthDiscoveryError::IssuerMetadataExhausted(failure) = result.err().unwrap()
+            else {
+                panic!("aggregate expected")
+            };
             let expected = match dimension {
                 0 => IssuerMetadataCause::IssuerMismatch,
                 1 => IssuerMetadataCause::EndpointNotTrusted,
@@ -594,7 +841,14 @@ fn invalid_issuer_metadata_has_no_browser_or_token_endpoint_effects() {
                 5 => IssuerMetadataCause::SignedMetadataUnsupported,
                 _ => IssuerMetadataCause::InvalidMetadata,
             };
-            assert_eq!(failure.attempts().iter().map(|attempt| attempt.cause()).collect::<Vec<_>>(), [expected; 3]);
+            assert_eq!(
+                failure
+                    .attempts()
+                    .iter()
+                    .map(|attempt| attempt.cause())
+                    .collect::<Vec<_>>(),
+                [expected; 3]
+            );
             assert_eq!(launches.load(Ordering::SeqCst), 0);
             assert_eq!(peer.paths.lock().unwrap().len(), 4);
             peer.assert_no_extra_connections();
@@ -604,7 +858,9 @@ fn invalid_issuer_metadata_has_no_browser_or_token_endpoint_effects() {
 
 #[test]
 fn invalid_resource_identity_or_untrusted_issuer_stops_before_issuer_contact() {
-    use fastmcp_client::http_auth::discovery::{ResourceMetadataCause, ResourceMetadataFailureClass};
+    use fastmcp_client::http_auth::discovery::{
+        ResourceMetadataCause, ResourceMetadataFailureClass,
+    };
     for trusted in [false, true] {
         run(async {
             let cx = Cx::current().unwrap();
@@ -617,17 +873,35 @@ fn invalid_resource_identity_or_untrusted_issuer_stops_before_issuer_contact() {
                 document["authorization_servers"] = json!(["https://127.0.0.1:9/forbidden"]);
             }
             let server = async {
-                for path in ["/.well-known/oauth-protected-resource/mcp", "/.well-known/oauth-protected-resource"] {
+                for path in [
+                    "/.well-known/oauth-protected-resource/mcp",
+                    "/.well-known/oauth-protected-resource",
+                ] {
                     peer.serve(path, 200, &document.to_string()).await;
                 }
             };
             let ((), result) = pair(server, plan.discover(&cx)).await;
-            let OAuthDiscoveryError::ResourceMetadataExhausted(failure) = result.unwrap_err() else {
+            let OAuthDiscoveryError::ResourceMetadataExhausted(failure) = result.unwrap_err()
+            else {
                 panic!("both unusable resource candidates must retain their admission causes");
             };
-            let expected = if trusted { ResourceMetadataCause::ResourceMismatch } else { ResourceMetadataCause::NoTrustedIssuer };
-            assert_eq!(failure.classification(), ResourceMetadataFailureClass::TrustOrIntegrity);
-            assert_eq!(failure.attempts().iter().map(|attempt| attempt.cause()).collect::<Vec<_>>(), [expected, expected]);
+            let expected = if trusted {
+                ResourceMetadataCause::ResourceMismatch
+            } else {
+                ResourceMetadataCause::NoTrustedIssuer
+            };
+            assert_eq!(
+                failure.classification(),
+                ResourceMetadataFailureClass::TrustOrIntegrity
+            );
+            assert_eq!(
+                failure
+                    .attempts()
+                    .iter()
+                    .map(|attempt| attempt.cause())
+                    .collect::<Vec<_>>(),
+                [expected, expected]
+            );
             assert_eq!(peer.paths.lock().unwrap().len(), 2);
             peer.assert_no_extra_connections();
         });
@@ -644,27 +918,58 @@ fn each_discovery_leg_requires_its_own_tls_trust_before_sending_a_get() {
             let plan = peer.plan(trust_resource, false);
             let server = async {
                 if trust_resource {
-                    peer.serve("/.well-known/oauth-protected-resource/mcp", 200, &peer.resource_document().to_string()).await;
+                    peer.serve(
+                        "/.well-known/oauth-protected-resource/mcp",
+                        200,
+                        &peer.resource_document().to_string(),
+                    )
+                    .await;
                 }
                 // Neither resource candidate may send a GET without trusted TLS.
                 // Once PRM succeeds, all three issuer candidates retain that boundary.
                 for _ in 0..if trust_resource { 3 } else { 2 } {
                     let (socket, _) = peer.listener.accept().await.unwrap();
-                    assert!(peer.acceptor.accept(socket).await.is_err(), "untrusted certificate cannot become an HTTP stream");
+                    assert!(
+                        peer.acceptor.accept(socket).await.is_err(),
+                        "untrusted certificate cannot become an HTTP stream"
+                    );
                 }
             };
             let ((), result) = pair(server, plan.discover(&cx)).await;
             if trust_resource {
-                let OAuthDiscoveryError::IssuerMetadataExhausted(failure) = result.unwrap_err() else { panic!("issuer TLS failures must remain visible") };
-                assert_eq!(failure.attempts().iter().map(|attempt| attempt.cause()).collect::<Vec<_>>(), [IssuerMetadataCause::TransportFailed; 3]);
+                let OAuthDiscoveryError::IssuerMetadataExhausted(failure) = result.unwrap_err()
+                else {
+                    panic!("issuer TLS failures must remain visible")
+                };
+                assert_eq!(
+                    failure
+                        .attempts()
+                        .iter()
+                        .map(|attempt| attempt.cause())
+                        .collect::<Vec<_>>(),
+                    [IssuerMetadataCause::TransportFailed; 3]
+                );
             } else {
-                let OAuthDiscoveryError::ResourceMetadataExhausted(failure) = result.unwrap_err() else {
+                let OAuthDiscoveryError::ResourceMetadataExhausted(failure) = result.unwrap_err()
+                else {
                     panic!("both resource TLS failures must remain visible");
                 };
-                assert_eq!(failure.attempts().iter().map(|attempt| attempt.cause()).collect::<Vec<_>>(),
-                    [ResourceMetadataCause::TransportFailed, ResourceMetadataCause::TransportFailed]);
+                assert_eq!(
+                    failure
+                        .attempts()
+                        .iter()
+                        .map(|attempt| attempt.cause())
+                        .collect::<Vec<_>>(),
+                    [
+                        ResourceMetadataCause::TransportFailed,
+                        ResourceMetadataCause::TransportFailed
+                    ]
+                );
             }
-            assert_eq!(peer.paths.lock().unwrap().len(), usize::from(trust_resource));
+            assert_eq!(
+                peer.paths.lock().unwrap().len(),
+                usize::from(trust_resource)
+            );
             peer.assert_no_extra_connections();
         });
     }
@@ -678,8 +983,15 @@ fn dropping_an_active_discovery_releases_its_socket_without_cancelling_the_paren
         let plan = peer.plan(true, true);
         let (started_tx, mut started_rx) = oneshot::channel::<()>();
         let server = async {
-            peer.serve("/.well-known/oauth-protected-resource/mcp", 200, &peer.resource_document().to_string()).await;
-            let (mut socket, _) = peer.request("GET", "/.well-known/oauth-authorization-server/tenant").await;
+            peer.serve(
+                "/.well-known/oauth-protected-resource/mcp",
+                200,
+                &peer.resource_document().to_string(),
+            )
+            .await;
+            let (mut socket, _) = peer
+                .request("GET", "/.well-known/oauth-authorization-server/tenant")
+                .await;
             started_tx.send(&cx, ()).unwrap();
             let mut byte = [0];
             assert!(!matches!(socket.read(&mut byte).await, Ok(count) if count > 0));
@@ -690,7 +1002,9 @@ fn dropping_an_active_discovery_releases_its_socket_without_cancelling_the_paren
             poll_fn(|task| {
                 assert!(discovery.as_mut().poll(task).is_pending());
                 started.as_mut().poll(task)
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             drop(discovery);
             assert!(cx.checkpoint().is_ok());
         };
@@ -707,34 +1021,64 @@ fn metadata_location_exhaustion_is_bounded_and_precancellation_has_no_contact() 
         let peer = Peer::new().await;
         let plan = peer.plan(true, true);
         let server = async {
-            peer.serve("/.well-known/oauth-protected-resource/mcp", 200, &peer.resource_document().to_string()).await;
-            for path in ["/.well-known/oauth-authorization-server/tenant", "/.well-known/openid-configuration/tenant", "/tenant/.well-known/openid-configuration"] {
+            peer.serve(
+                "/.well-known/oauth-protected-resource/mcp",
+                200,
+                &peer.resource_document().to_string(),
+            )
+            .await;
+            for path in [
+                "/.well-known/oauth-authorization-server/tenant",
+                "/.well-known/openid-configuration/tenant",
+                "/tenant/.well-known/openid-configuration",
+            ] {
                 peer.serve(path, 404, "").await;
             }
         };
         let ((), result) = pair(server, plan.discover(&cx)).await;
-        let OAuthDiscoveryError::IssuerMetadataExhausted(failure) = result.unwrap_err() else { panic!("issuer exhaustion expected") };
-        assert_eq!(failure.attempts().iter().map(|attempt| attempt.cause()).collect::<Vec<_>>(), [IssuerMetadataCause::NotFound; 3]);
-        assert_eq!(failure.classification(), IssuerMetadataFailureClass::NotFound);
+        let OAuthDiscoveryError::IssuerMetadataExhausted(failure) = result.unwrap_err() else {
+            panic!("issuer exhaustion expected")
+        };
+        assert_eq!(
+            failure
+                .attempts()
+                .iter()
+                .map(|attempt| attempt.cause())
+                .collect::<Vec<_>>(),
+            [IssuerMetadataCause::NotFound; 3]
+        );
+        assert_eq!(
+            failure.classification(),
+            IssuerMetadataFailureClass::NotFound
+        );
         assert_eq!(peer.paths.lock().unwrap().len(), 4);
         // Cancel the caller's real, capability-carrying context rather than a
         // detached one: `Cx::detached_cancel_context` yields an empty capability
         // mask, which `discover` cannot accept, and a detached context would not
         // reproduce how a production caller cancels an in-flight discovery.
         cx.cancel_with(asupersync::CancelKind::User, Some("test cancellation"));
-        assert!(matches!(plan.discover(&cx).await, Err(OAuthDiscoveryError::Cancelled)));
+        assert!(matches!(
+            plan.discover(&cx).await,
+            Err(OAuthDiscoveryError::Cancelled)
+        ));
         peer.assert_no_extra_connections();
     });
 }
 
 fn registration_reply(request: &[u8], client_id: &str) -> Value {
     let mut body: Value = serde_json::from_slice(request).unwrap();
-    assert!(body.get("client_id").is_none(), "registration must not invent an identity");
+    assert!(
+        body.get("client_id").is_none(),
+        "registration must not invent an identity"
+    );
     assert!(body.get("client_secret").is_none());
     assert_eq!(body["application_type"], "native");
     assert_eq!(body["token_endpoint_auth_method"], "none");
     assert_eq!(body["response_types"], json!(["code"]));
-    assert_eq!(body["redirect_uris"], json!(NATIVE_REGISTRATION_REDIRECT_URIS));
+    assert_eq!(
+        body["redirect_uris"],
+        json!(NATIVE_REGISTRATION_REDIRECT_URIS)
+    );
     assert_eq!(body["scope"], "tools:read");
     body["client_id"] = json!(client_id);
     // These unrequested extension values remain inert, never fetched or
@@ -753,19 +1097,34 @@ fn native_registration_login_and_refresh_reuse_one_admitted_client_id() {
             let endpoint = format!("{}/register", peer.origin());
             let issuer = peer.issuer();
             let resource = peer.resource();
-            let assigned_id = format!("dynamic-client-{}", peer.listener.local_addr().unwrap().port());
+            let assigned_id = format!(
+                "dynamic-client-{}",
+                peer.listener.local_addr().unwrap().port()
+            );
             let document = peer.registration_document(&endpoint);
             let owner = peer.registration();
             let owner = if protected {
-                owner.with_initial_access_token(BoundBearerCredential::bind(url(&endpoint), "initial-registration-canary").unwrap()).unwrap()
-            } else { owner };
+                owner
+                    .with_initial_access_token(
+                        BoundBearerCredential::bind(url(&endpoint), "initial-registration-canary")
+                            .unwrap(),
+                    )
+                    .unwrap()
+            } else {
+                owner
+            };
             let observed_redirect = Mutex::new(None::<String>);
             let server = async {
                 peer.registration_discovery(&document).await;
                 let expected = protected.then_some("Bearer initial-registration-canary");
-                let (mut socket, request) = peer.request_with_authorization("POST", "/register", expected).await;
+                let (mut socket, request) = peer
+                    .request_with_authorization("POST", "/register", expected)
+                    .await;
                 let registered = registration_reply(&request, &assigned_id);
-                assert_eq!(registered["grant_types"], json!(["authorization_code", "refresh_token"]));
+                assert_eq!(
+                    registered["grant_types"],
+                    json!(["authorization_code", "refresh_token"])
+                );
                 reply(&mut socket, 201, &registered.to_string()).await;
                 let (mut socket, request) = peer.request("POST", "/token").await;
                 let request = form(std::str::from_utf8(&request).unwrap());
@@ -773,7 +1132,10 @@ fn native_registration_login_and_refresh_reuse_one_admitted_client_id() {
                 assert_eq!(request["resource"], resource);
                 assert_eq!(request["grant_type"], "authorization_code");
                 assert_eq!(request["code"], "fixture-code");
-                assert_eq!(Some(&request["redirect_uri"]), observed_redirect.lock().unwrap().as_ref());
+                assert_eq!(
+                    Some(&request["redirect_uri"]),
+                    observed_redirect.lock().unwrap().as_ref()
+                );
                 assert_eq!(request["code_verifier"].len(), 64);
                 reply(&mut socket, 200, r#"{"access_token":"registration-access-one","token_type":"Bearer","expires_in":1,"refresh_token":"registration-refresh-one","scope":"tools:read"}"#).await;
                 let (mut socket, request) = peer.request("POST", "/token").await;
@@ -792,28 +1154,50 @@ fn native_registration_login_and_refresh_reuse_one_admitted_client_id() {
                 assert!(!diagnostics.contains("management-token-canary"));
                 // A browser launch failure does not discard the registration or
                 // cause another registration POST on the next explicit login.
-                assert!(registered.authorize_managed(&cx, OAuthSessionPolicy::default(), |_| async {
-                    Err(OAuthError::BrowserLaunchFailed)
-                }).await.is_err());
-                let session = registered.authorize_managed(&cx, OAuthSessionPolicy::default(), |authorization| {
-                    let fields = form(authorization.query().unwrap());
-                    let redirect = url(&fields["redirect_uri"]);
-                    assert_eq!(redirect.path(), "/oauth/callback");
-                    assert!(redirect.as_str().starts_with("http://127.0.0.1:") || redirect.as_str().starts_with("http://[::1]:"));
-                    *observed_redirect.lock().unwrap() = Some(fields["redirect_uri"].clone());
-                    callback_for_client(authorization, &issuer, &resource, &assigned_id)
-                }).await.unwrap();
+                assert!(
+                    registered
+                        .authorize_managed(&cx, OAuthSessionPolicy::default(), |_| async {
+                            Err(OAuthError::BrowserLaunchFailed)
+                        })
+                        .await
+                        .is_err()
+                );
+                let session = registered
+                    .authorize_managed(&cx, OAuthSessionPolicy::default(), |authorization| {
+                        let fields = form(authorization.query().unwrap());
+                        let redirect = url(&fields["redirect_uri"]);
+                        assert_eq!(redirect.path(), "/oauth/callback");
+                        assert!(
+                            redirect.as_str().starts_with("http://127.0.0.1:")
+                                || redirect.as_str().starts_with("http://[::1]:")
+                        );
+                        *observed_redirect.lock().unwrap() = Some(fields["redirect_uri"].clone());
+                        callback_for_client(authorization, &issuer, &resource, &assigned_id)
+                    })
+                    .await
+                    .unwrap();
                 asupersync::time::Sleep::new(cx.now().saturating_add_nanos(1_100_000_000)).await;
                 let snapshot = session.credential(&cx).await.unwrap();
                 assert_eq!(snapshot.generation(), 2);
-                assert_eq!(snapshot.credential().authorization_for_target(&url(&resource)), Some("Bearer registration-access-two".to_owned()));
+                assert_eq!(
+                    snapshot
+                        .credential()
+                        .authorization_for_target(&url(&resource)),
+                    Some("Bearer registration-access-two".to_owned())
+                );
                 session.close();
             };
             Box::pin(pair(server, application)).await;
-            assert_eq!(*peer.paths.lock().unwrap(), vec![
-                "/.well-known/oauth-protected-resource/mcp", "/.well-known/oauth-authorization-server/tenant",
-                "/register", "/token", "/token",
-            ]);
+            assert_eq!(
+                *peer.paths.lock().unwrap(),
+                vec![
+                    "/.well-known/oauth-protected-resource/mcp",
+                    "/.well-known/oauth-authorization-server/tenant",
+                    "/register",
+                    "/token",
+                    "/token",
+                ]
+            );
             peer.assert_no_extra_connections();
         });
     }
@@ -826,28 +1210,56 @@ fn cross_origin_registration_requires_its_own_write_grant_over_tls() {
             let cx = Cx::current().unwrap();
             let issuer = Peer::new().await;
             let registrar = Peer::new().await;
-            let document = issuer.registration_document(&format!("{}/register", registrar.origin()));
-            let trusted = TrustedOAuthIssuer::new(issuer.issuer()).unwrap()
-                .with_root_certificate(root()).unwrap()
-                .with_endpoint_origin(url(&format!("{}/", registrar.origin()))).unwrap();
-            let owner = NativeClientRegistration::new(url(&issuer.resource()), vec![trusted],
-                "Separate registration", vec!["tools:read".to_owned()]).unwrap()
-                .with_resource_root_certificate(root()).unwrap();
+            let document =
+                issuer.registration_document(&format!("{}/register", registrar.origin()));
+            let trusted = TrustedOAuthIssuer::new(issuer.issuer())
+                .unwrap()
+                .with_root_certificate(root())
+                .unwrap()
+                .with_endpoint_origin(url(&format!("{}/", registrar.origin())))
+                .unwrap();
+            let owner = NativeClientRegistration::new(
+                url(&issuer.resource()),
+                vec![trusted],
+                "Separate registration",
+                vec!["tools:read".to_owned()],
+            )
+            .unwrap()
+            .with_resource_root_certificate(root())
+            .unwrap();
             let owner = if permitted {
-                owner.with_registration_origin(url(&format!("{}/", registrar.origin()))).unwrap()
-            } else { owner };
+                owner
+                    .with_registration_origin(url(&format!("{}/", registrar.origin())))
+                    .unwrap()
+            } else {
+                owner
+            };
             let server = async {
                 issuer.registration_discovery(&document).await;
                 if permitted {
                     let (mut socket, request) = registrar.request("POST", "/register").await;
-                    reply(&mut socket, 201, &registration_reply(&request, "separate-client").to_string()).await;
+                    reply(
+                        &mut socket,
+                        201,
+                        &registration_reply(&request, "separate-client").to_string(),
+                    )
+                    .await;
                 }
             };
             let ((), result) = pair(server, owner.register(&cx)).await;
-            if permitted { assert_eq!(result.unwrap().client_id(), "separate-client"); }
-            else { assert!(matches!(result, Err(OAuthRegistrationError::EndpointNotTrusted))); }
+            if permitted {
+                assert_eq!(result.unwrap().client_id(), "separate-client");
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(OAuthRegistrationError::EndpointNotTrusted)
+                ));
+            }
             assert_eq!(issuer.paths.lock().unwrap().len(), 2);
-            assert_eq!(registrar.paths.lock().unwrap().len(), usize::from(permitted));
+            assert_eq!(
+                registrar.paths.lock().unwrap().len(),
+                usize::from(permitted)
+            );
             issuer.assert_no_extra_connections();
             registrar.assert_no_extra_connections();
         });
@@ -876,7 +1288,7 @@ fn changed_registration_metadata_never_reaches_the_browser() {
                     5 => body["application_type"] = json!("web"),
                     6 => body["client_id"] = Value::Null,
                     7 => body = json!([body]),
-                    _ => {},
+                    _ => {}
                 }
                 let mut wire = body.to_string();
                 if dimension == 8 {
@@ -888,10 +1300,12 @@ fn changed_registration_metadata_never_reaches_the_browser() {
             let application = async {
                 let result = owner.register(&cx).await;
                 if let Ok(registered) = &result {
-                    let _ = registered.authorize_managed(&cx, OAuthSessionPolicy::default(), |_| {
-                        launches.fetch_add(1, Ordering::SeqCst);
-                        async { Err(OAuthError::BrowserLaunchFailed) }
-                    }).await;
+                    let _ = registered
+                        .authorize_managed(&cx, OAuthSessionPolicy::default(), |_| {
+                            launches.fetch_add(1, Ordering::SeqCst);
+                            async { Err(OAuthError::BrowserLaunchFailed) }
+                        })
+                        .await;
                 }
                 result
             };
@@ -917,17 +1331,27 @@ fn registration_checks_the_complete_code_flow_before_creating_remote_state() {
                 0 => document["code_challenge_methods_supported"] = json!(["plain"]),
                 1 => document["issuer"] = json!("https://other.invalid/tenant"),
                 2 => document["token_endpoint"] = json!("https://untrusted.invalid/token"),
-                _ => { document.as_object_mut().unwrap().remove("registration_endpoint"); },
+                _ => {
+                    document
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("registration_endpoint");
+                }
             }
             let server = async {
                 peer.registration_discovery(&document).await;
                 if matches!(dimension, 1 | 2) {
-                    for path in &ISSUER_CANDIDATES[1..] { peer.serve(path, 200, &document.to_string()).await; }
+                    for path in &ISSUER_CANDIDATES[1..] {
+                        peer.serve(path, 200, &document.to_string()).await;
+                    }
                 }
             };
             let ((), result) = pair(server, peer.registration().register(&cx)).await;
             assert!(result.is_err());
-            assert_eq!(peer.paths.lock().unwrap().len(), if matches!(dimension, 1 | 2) { 4 } else { 2 });
+            assert_eq!(
+                peer.paths.lock().unwrap().len(),
+                if matches!(dimension, 1 | 2) { 4 } else { 2 }
+            );
             peer.assert_no_extra_connections();
         });
     }
@@ -944,15 +1368,27 @@ fn registration_status_redirect_and_lost_response_never_retry_the_post() {
                 peer.registration_discovery(&document).await;
                 let (mut socket, request) = peer.request("POST", "/register").await;
                 if let Some(status) = status {
-                    reply(&mut socket, status, &registration_reply(&request, "candidate").to_string()).await;
+                    reply(
+                        &mut socket,
+                        status,
+                        &registration_reply(&request, "candidate").to_string(),
+                    )
+                    .await;
                 }
                 // In the lost-response case, the registration might already
                 // exist remotely. Dropping the socket must not provoke a retry.
             };
             let ((), result) = pair(server, peer.registration().register(&cx)).await;
             match status {
-                Some(status) => assert!(matches!(result, Err(OAuthRegistrationError::HttpStatus { status: actual }) if actual == status)),
-                None => assert!(matches!(result, Err(OAuthRegistrationError::Discovery(OAuthDiscoveryError::TransportFailed)))),
+                Some(status) => assert!(
+                    matches!(result, Err(OAuthRegistrationError::HttpStatus { status: actual }) if actual == status)
+                ),
+                None => assert!(matches!(
+                    result,
+                    Err(OAuthRegistrationError::Discovery(
+                        OAuthDiscoveryError::TransportFailed
+                    ))
+                )),
             }
             assert_eq!(peer.paths.lock().unwrap().len(), 3);
             peer.assert_no_extra_connections();
@@ -966,11 +1402,21 @@ fn initial_registration_credential_cannot_be_sent_to_a_different_endpoint() {
         let cx = Cx::current().unwrap();
         let peer = Peer::new().await;
         let document = peer.registration_document(&format!("{}/register", peer.origin()));
-        let owner = peer.registration().with_initial_access_token(
-            BoundBearerCredential::bind(url(&format!("{}/other-registration", peer.origin())), "initial-registration-canary").unwrap(),
-        ).unwrap();
+        let owner = peer
+            .registration()
+            .with_initial_access_token(
+                BoundBearerCredential::bind(
+                    url(&format!("{}/other-registration", peer.origin())),
+                    "initial-registration-canary",
+                )
+                .unwrap(),
+            )
+            .unwrap();
         let ((), result) = pair(peer.registration_discovery(&document), owner.register(&cx)).await;
-        assert!(matches!(result, Err(OAuthRegistrationError::InitialCredentialRejected)));
+        assert!(matches!(
+            result,
+            Err(OAuthRegistrationError::InitialCredentialRejected)
+        ));
         assert_eq!(peer.paths.lock().unwrap().len(), 2);
         peer.assert_no_extra_connections();
     });
@@ -996,7 +1442,9 @@ fn dropping_a_registration_after_post_closes_the_owned_exchange_without_replay()
             poll_fn(|task| {
                 assert!(attempt.as_mut().poll(task).is_pending());
                 started.as_mut().poll(task)
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             drop(attempt);
             assert!(cx.checkpoint().is_ok());
         };
@@ -1012,7 +1460,10 @@ fn registration_deadline_covers_the_post_and_precancellation_has_no_contact() {
         let cx = Cx::current().unwrap();
         let peer = Peer::new().await;
         let document = peer.registration_document(&format!("{}/register", peer.origin()));
-        let owner = peer.registration().with_timeout(Duration::from_secs(2)).unwrap();
+        let owner = peer
+            .registration()
+            .with_timeout(Duration::from_secs(2))
+            .unwrap();
         let server = async {
             peer.registration_discovery(&document).await;
             let (mut socket, _) = peer.request("POST", "/register").await;
@@ -1020,15 +1471,24 @@ fn registration_deadline_covers_the_post_and_precancellation_has_no_contact() {
             assert!(!matches!(socket.read(&mut byte).await, Ok(count) if count > 0));
         };
         let ((), result) = pair(server, owner.register(&cx)).await;
-        assert!(matches!(result, Err(OAuthRegistrationError::Discovery(OAuthDiscoveryError::TimedOut))));
+        assert!(matches!(
+            result,
+            Err(OAuthRegistrationError::Discovery(
+                OAuthDiscoveryError::TimedOut
+            ))
+        ));
         assert!(cx.checkpoint().is_ok());
         assert_eq!(peer.paths.lock().unwrap().len(), 3);
         // Same reasoning as the discovery cancellation above: cancel the real
         // capability-carrying context, which is both what `register` accepts and
         // what a production caller actually does.
         cx.cancel_with(asupersync::CancelKind::User, Some("registration preflight"));
-        assert!(matches!(peer.registration().register(&cx).await,
-            Err(OAuthRegistrationError::Discovery(OAuthDiscoveryError::Cancelled))));
+        assert!(matches!(
+            peer.registration().register(&cx).await,
+            Err(OAuthRegistrationError::Discovery(
+                OAuthDiscoveryError::Cancelled
+            ))
+        ));
         peer.assert_no_extra_connections();
     });
 }

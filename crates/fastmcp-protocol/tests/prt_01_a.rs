@@ -11,10 +11,10 @@
 use fastmcp_protocol::{
     ClientIngressFailureScope, CorrelationKey, JsonRpcAdmissionError, JsonRpcEndpointRole,
     JsonRpcMessage, JsonRpcMessageDirection, JsonRpcRequest, JsonRpcResponse,
-    MAX_JSONRPC_STRING_ID_ENCODED_BYTES, MAX_RAW_JSON_PATH_SEGMENT_BYTES,
-    RawJsonAdmissionError, RawJsonRpcDisposition,
-    RawJsonTopLevel, RequestId, UncorrelatedJsonRpcErrorResponse, admit_raw_json_document,
-    admit_raw_jsonrpc_document, decode_strict_jsonrpc_message, dispose_raw_jsonrpc_failure,
+    MAX_JSONRPC_STRING_ID_ENCODED_BYTES, MAX_RAW_JSON_PATH_SEGMENT_BYTES, RawJsonAdmissionError,
+    RawJsonRpcDisposition, RawJsonTopLevel, RequestId, UncorrelatedJsonRpcErrorResponse,
+    admit_raw_json_document, admit_raw_jsonrpc_document, decode_strict_jsonrpc_message,
+    dispose_raw_jsonrpc_failure,
 };
 use serde_json::{Value, json};
 
@@ -670,9 +670,12 @@ fn prt_01_a_redacted_path_bounds_bytes_not_characters() {
     );
 
     let document = format!("{{\"{name}\":1,\"{name}\":2}}");
-    let failure =
-        admit_raw_json_document(document.as_bytes(), DOCUMENT_LIMIT, RawJsonTopLevel::AnyValue)
-            .expect_err("a duplicate member is refused whatever its name encodes to");
+    let failure = admit_raw_json_document(
+        document.as_bytes(),
+        DOCUMENT_LIMIT,
+        RawJsonTopLevel::AnyValue,
+    )
+    .expect_err("a duplicate member is refused whatever its name encodes to");
     assert_eq!(
         failure.error(),
         RawJsonAdmissionError::DuplicateObjectMember

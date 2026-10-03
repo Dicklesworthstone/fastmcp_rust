@@ -27,13 +27,15 @@ use std::sync::Arc;
 use asupersync::Cx;
 use fastmcp_core::{McpContext, McpError, McpOutcome, McpResult};
 use fastmcp_protocol::{
-    CompletionValues, FinalCompletionParams, FinalCompletionReference,
-    FinalCompletionValues, FinalCoreResult, LegacyCompletionParams, UriTemplatePart,
+    CompletionValues, FinalCompletionParams, FinalCompletionReference, FinalCompletionValues,
+    FinalCoreResult, LegacyCompletionParams, UriTemplatePart,
 };
 use serde_json::{Value, json};
 
+use super::super::{
+    Forwarder, MODERN_ASYNC_ONLY, ManagedOAuthPrompt, UNEXPECTED_RESULT, check_cx, outcome,
+};
 use super::ManagedOAuthResourceTemplate;
-use super::super::{Forwarder, MODERN_ASYNC_ONLY, ManagedOAuthPrompt, UNEXPECTED_RESULT, check_cx, outcome};
 use crate::handler::{BoxFuture, CompletionHandler};
 
 impl ManagedOAuthPrompt {
@@ -88,14 +90,21 @@ impl ManagedOAuthResourceTemplate {
 
 fn admit_argument(arguments: &mut HashSet<String>, name: &str) -> McpResult<()> {
     if name.is_empty() || !arguments.insert(name.to_owned()) {
-        return Err(McpError::invalid_request("Managed OAuth completion arguments are empty or duplicated"));
+        return Err(McpError::invalid_request(
+            "Managed OAuth completion arguments are empty or duplicated",
+        ));
     }
     Ok(())
 }
 
 enum CompletionTarget {
-    Prompt { published_name: String, upstream_name: String },
-    Resource { uri_template: String },
+    Prompt {
+        published_name: String,
+        upstream_name: String,
+    },
+    Resource {
+        uri_template: String,
+    },
 }
 
 /// One modern completion route minted by a managed prompt or template handler.
@@ -114,24 +123,38 @@ pub struct ManagedOAuthCompletion {
 impl ManagedOAuthCompletion {
     fn parameters(&self, params: FinalCompletionParams) -> McpResult<Value> {
         let reference = match (&self.target, params.reference) {
-            (CompletionTarget::Prompt { published_name, upstream_name },
-                FinalCompletionReference::Prompt { name }) if name == *published_name => {
-                FinalCompletionReference::Prompt { name: upstream_name.clone() }
-            }
-            (CompletionTarget::Prompt { published_name, upstream_name },
-                FinalCompletionReference::PromptWithTitle { name, title }) if name == *published_name => {
-                FinalCompletionReference::PromptWithTitle { name: upstream_name.clone(), title }
-            }
-            (CompletionTarget::Resource { uri_template },
-                FinalCompletionReference::Resource { uri }) if uri == *uri_template => {
-                FinalCompletionReference::Resource { uri }
-            }
+            (
+                CompletionTarget::Prompt {
+                    published_name,
+                    upstream_name,
+                },
+                FinalCompletionReference::Prompt { name },
+            ) if name == *published_name => FinalCompletionReference::Prompt {
+                name: upstream_name.clone(),
+            },
+            (
+                CompletionTarget::Prompt {
+                    published_name,
+                    upstream_name,
+                },
+                FinalCompletionReference::PromptWithTitle { name, title },
+            ) if name == *published_name => FinalCompletionReference::PromptWithTitle {
+                name: upstream_name.clone(),
+                title,
+            },
+            (
+                CompletionTarget::Resource { uri_template },
+                FinalCompletionReference::Resource { uri },
+            ) if uri == *uri_template => FinalCompletionReference::Resource { uri },
             _ => return Err(unregistered_target()),
         };
         if !self.arguments.contains(&params.argument.name) {
             return Err(unregistered_target());
         }
-        if let Some(arguments) = params.context.as_ref().and_then(|context| context.arguments.as_ref())
+        if let Some(arguments) = params
+            .context
+            .as_ref()
+            .and_then(|context| context.arguments.as_ref())
             && arguments.keys().any(|name| !self.arguments.contains(name))
         {
             return Err(unregistered_target());
@@ -143,19 +166,27 @@ impl ManagedOAuthCompletion {
         if let Some(context) = params.context {
             // The protocol serializer enforces context count/key/value/byte
             // bounds. Keep absent, present-empty, and populated states distinct.
-            parameters["context"] = serde_json::to_value(context)
-                .map_err(|_| McpError::invalid_params("Invalid managed OAuth completion context"))?;
+            parameters["context"] = serde_json::to_value(context).map_err(|_| {
+                McpError::invalid_params("Invalid managed OAuth completion context")
+            })?;
         }
         Ok(parameters)
     }
 
     async fn invoke(
-        &self, ctx: &McpContext, cx: &Cx, params: FinalCompletionParams,
+        &self,
+        ctx: &McpContext,
+        cx: &Cx,
+        params: FinalCompletionParams,
     ) -> McpResult<FinalCompletionValues> {
         ctx.checkpoint()?;
         check_cx(cx)?;
         let parameters = self.parameters(params)?;
-        match self.forwarder.execute(ctx, cx, "completion/complete", parameters).await? {
+        match self
+            .forwarder
+            .execute(ctx, cx, "completion/complete", parameters)
+            .await?
+        {
             FinalCoreResult::Completion { result, .. } => Ok(result.payload.completion),
             _ => Err(McpError::invalid_request(UNEXPECTED_RESULT)),
         }
@@ -163,23 +194,38 @@ impl ManagedOAuthCompletion {
 }
 
 fn unregistered_target() -> McpError {
-    McpError::invalid_params("Completion reference or argument is not registered for this managed OAuth handler")
+    McpError::invalid_params(
+        "Completion reference or argument is not registered for this managed OAuth handler",
+    )
 }
 
 impl CompletionHandler for ManagedOAuthCompletion {
-    fn complete_legacy(&self, _ctx: &McpContext, _params: LegacyCompletionParams) -> McpResult<CompletionValues> {
+    fn complete_legacy(
+        &self,
+        _ctx: &McpContext,
+        _params: LegacyCompletionParams,
+    ) -> McpResult<CompletionValues> {
         Err(McpError::invalid_request(MODERN_ASYNC_ONLY))
     }
-    fn complete_final(&self, _ctx: &McpContext, _params: FinalCompletionParams) -> McpResult<FinalCompletionValues> {
+    fn complete_final(
+        &self,
+        _ctx: &McpContext,
+        _params: FinalCompletionParams,
+    ) -> McpResult<FinalCompletionValues> {
         Err(McpError::invalid_request(MODERN_ASYNC_ONLY))
     }
     fn complete_final_async<'a>(
-        &'a self, ctx: &'a McpContext, params: FinalCompletionParams,
+        &'a self,
+        ctx: &'a McpContext,
+        params: FinalCompletionParams,
     ) -> BoxFuture<'a, McpOutcome<FinalCompletionValues>> {
         Box::pin(async move { outcome(self.invoke(ctx, ctx.cx(), params).await) })
     }
     fn complete_final_async_in_request<'a>(
-        &'a self, ctx: &'a McpContext, cx: &'a Cx, params: FinalCompletionParams,
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        params: FinalCompletionParams,
     ) -> BoxFuture<'a, McpOutcome<FinalCompletionValues>> {
         Box::pin(async move { outcome(self.invoke(ctx, cx, params).await) })
     }
@@ -187,15 +233,17 @@ impl CompletionHandler for ManagedOAuthCompletion {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::{CoreBackend, build_prompts, core_request};
+    use super::super::build_templates;
     use super::*;
+    use fastmcp_client::http_auth::rpc::ManagedCoreLimits;
+    use fastmcp_core::block_on;
+    use fastmcp_protocol::{
+        CoreRequest, CoreResult, FinalPrompt, FinalResourceTemplate, RequestId,
+    };
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use fastmcp_core::block_on;
-    use fastmcp_client::http_auth::rpc::ManagedCoreLimits;
-    use fastmcp_protocol::{CoreRequest, CoreResult, FinalPrompt, FinalResourceTemplate, RequestId};
-    use super::super::build_templates;
-    use super::super::super::{CoreBackend, build_prompts, core_request};
 
     struct Backend {
         calls: Mutex<Vec<(RequestId, Value)>>,
@@ -204,13 +252,25 @@ mod tests {
     }
     impl CoreBackend for Backend {
         fn execute<'a>(
-            &'a self, ctx: &'a McpContext, _cx: &'a Cx, request: CoreRequest,
-            id: RequestId, _limits: ManagedCoreLimits,
+            &'a self,
+            ctx: &'a McpContext,
+            _cx: &'a Cx,
+            request: CoreRequest,
+            id: RequestId,
+            _limits: ManagedCoreLimits,
         ) -> BoxFuture<'a, McpResult<FinalCoreResult>> {
             Box::pin(async move {
-                self.calls.lock().unwrap().push((id, request.encode_params().unwrap().unwrap()));
-                if self.cancel { ctx.request_cancellation().cancel(); }
-                self.responses.lock().unwrap().pop_front()
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((id, request.encode_params().unwrap().unwrap()));
+                if self.cancel {
+                    ctx.request_cancellation().cancel();
+                }
+                self.responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
                     .ok_or_else(|| McpError::internal_error("test response queue exhausted"))
             })
         }
@@ -219,36 +279,64 @@ mod tests {
         serde_json::from_value(json!({
             "_meta": {"authorization":"Bearer downstream-secret"},
             "ref":reference,"argument":{"name":argument,"value":"al"}
-        })).unwrap()
+        }))
+        .unwrap()
     }
     fn prompt_params() -> FinalCompletionParams {
-        params(json!({"type":"ref/prompt","name":"remote/summarize"}), "report")
+        params(
+            json!({"type":"ref/prompt","name":"remote/summarize"}),
+            "report",
+        )
     }
     fn result() -> FinalCoreResult {
-        let request = core_request("completion/complete", json!({
-            "ref":{"type":"ref/prompt","name":"summarize"},
-            "argument":{"name":"report","value":"al"}
-        }), None).unwrap();
+        let request = core_request(
+            "completion/complete",
+            json!({
+                "ref":{"type":"ref/prompt","name":"summarize"},
+                "argument":{"name":"report","value":"al"}
+            }),
+            None,
+        )
+        .unwrap();
         let CoreResult::Final(result) = request.decode_result(r#"{
             "resultType":"complete","completion":{"values":["alpha","alpine"],"total":42,"hasMore":true}
         }"#).unwrap() else { panic!("expected final completion") };
         result
     }
-    fn fixture(responses: Vec<FinalCoreResult>, cancel: bool)
-        -> (ManagedOAuthPrompt, ManagedOAuthResourceTemplate, Arc<Backend>)
-    {
-        let backend = Arc::new(Backend { calls: Mutex::new(Vec::new()), responses: Mutex::new(responses.into()), cancel });
+    fn fixture(
+        responses: Vec<FinalCoreResult>,
+        cancel: bool,
+    ) -> (
+        ManagedOAuthPrompt,
+        ManagedOAuthResourceTemplate,
+        Arc<Backend>,
+    ) {
+        let backend = Arc::new(Backend {
+            calls: Mutex::new(Vec::new()),
+            responses: Mutex::new(responses.into()),
+            cancel,
+        });
         let forwarder = Arc::new(Forwarder {
-            backend: backend.clone(), next_id: Arc::new(AtomicU64::new(1)), limits: ManagedCoreLimits::default(),
+            backend: backend.clone(),
+            next_id: Arc::new(AtomicU64::new(1)),
+            limits: ManagedCoreLimits::default(),
         });
         let prompt: FinalPrompt = serde_json::from_value(json!({
             "name":"summarize","arguments":[{"name":"report"},{"name":"style"}]
-        })).unwrap();
+        }))
+        .unwrap();
         let template: FinalResourceTemplate = serde_json::from_value(json!({
             "name":"Report","uriTemplate":"report://monthly/{year}/{name}"
-        })).unwrap();
-        let prompt = build_prompts(Arc::clone(&forwarder), vec![prompt], Some("remote")).unwrap().pop().unwrap();
-        let template = build_templates(forwarder, vec![template]).unwrap().pop().unwrap();
+        }))
+        .unwrap();
+        let prompt = build_prompts(Arc::clone(&forwarder), vec![prompt], Some("remote"))
+            .unwrap()
+            .pop()
+            .unwrap();
+        let template = build_templates(forwarder, vec![template])
+            .unwrap()
+            .pop()
+            .unwrap();
         (prompt, template, backend)
     }
 
@@ -256,19 +344,39 @@ mod tests {
     fn prompt_completion_keeps_title_context_and_values_but_rebuilds_metadata() {
         let (prompt, _, backend) = fixture(vec![result()], false);
         let completion = prompt.completion_handler().unwrap();
-        let mut parameters = params(json!({"type":"ref/prompt","name":"remote/summarize","title":"Display title"}), "report");
-        parameters.context = Some(serde_json::from_value(json!({"arguments":{"style":"Unicode: 日本語"}})).unwrap());
+        let mut parameters = params(
+            json!({"type":"ref/prompt","name":"remote/summarize","title":"Display title"}),
+            "report",
+        );
+        parameters.context =
+            Some(serde_json::from_value(json!({"arguments":{"style":"Unicode: 日本語"}})).unwrap());
         let cx = Cx::for_testing();
         let ctx = McpContext::new(cx.clone(), 1);
         let handler: &dyn CompletionHandler = &completion;
-        let values = block_on(handler.complete_final_async_in_request(&ctx, &cx, parameters)).unwrap();
-        assert_eq!(serde_json::to_value(values).unwrap(), json!({"values":["alpha","alpine"],"total":42,"hasMore":true}));
+        let values =
+            block_on(handler.complete_final_async_in_request(&ctx, &cx, parameters)).unwrap();
+        assert_eq!(
+            serde_json::to_value(values).unwrap(),
+            json!({"values":["alpha","alpine"],"total":42,"hasMore":true})
+        );
         let calls = backend.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].1["ref"], json!({"type":"ref/prompt","name":"summarize","title":"Display title"}));
-        assert_eq!(calls[0].1["argument"], json!({"name":"report","value":"al"}));
-        assert_eq!(calls[0].1["context"], json!({"arguments":{"style":"Unicode: 日本語"}}));
-        assert_eq!(calls[0].1["_meta"][fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY], json!({}));
+        assert_eq!(
+            calls[0].1["ref"],
+            json!({"type":"ref/prompt","name":"summarize","title":"Display title"})
+        );
+        assert_eq!(
+            calls[0].1["argument"],
+            json!({"name":"report","value":"al"})
+        );
+        assert_eq!(
+            calls[0].1["context"],
+            json!({"arguments":{"style":"Unicode: 日本語"}})
+        );
+        assert_eq!(
+            calls[0].1["_meta"][fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY],
+            json!({})
+        );
         assert!(!calls[0].1.to_string().contains("downstream-secret"));
     }
 
@@ -276,8 +384,12 @@ mod tests {
     fn template_completion_uses_exact_template_and_declared_variables() {
         let (_, template, backend) = fixture(vec![result()], false);
         let completion = template.completion_handler().unwrap();
-        let mut parameters = params(json!({"type":"ref/resource","uri":"report://monthly/{year}/{name}"}), "name");
-        parameters.context = Some(serde_json::from_value(json!({"arguments":{"year":"2026"}})).unwrap());
+        let mut parameters = params(
+            json!({"type":"ref/resource","uri":"report://monthly/{year}/{name}"}),
+            "name",
+        );
+        parameters.context =
+            Some(serde_json::from_value(json!({"arguments":{"year":"2026"}})).unwrap());
         let ctx = McpContext::new(Cx::for_testing(), 1);
         assert!(block_on(completion.complete_final_async(&ctx, parameters)).is_ok());
         let calls = backend.calls.lock().unwrap();
@@ -293,14 +405,26 @@ mod tests {
         let ctx = McpContext::new(Cx::for_testing(), 1);
         for parameters in [
             params(json!({"type":"ref/prompt","name":"summarize"}), "report"),
-            params(json!({"type":"ref/prompt","name":"remote/private"}), "report"),
-            params(json!({"type":"ref/resource","uri":"report://monthly/{year}/{name}"}), "report"),
-            params(json!({"type":"ref/prompt","name":"remote/summarize"}), "private"),
+            params(
+                json!({"type":"ref/prompt","name":"remote/private"}),
+                "report",
+            ),
+            params(
+                json!({"type":"ref/resource","uri":"report://monthly/{year}/{name}"}),
+                "report",
+            ),
+            params(
+                json!({"type":"ref/prompt","name":"remote/summarize"}),
+                "private",
+            ),
         ] {
             assert!(block_on(completion.complete_final_async(&ctx, parameters)).is_err());
         }
         let completion = template.completion_handler().unwrap();
-        let expanded = params(json!({"type":"ref/resource","uri":"report://monthly/2026/alpha"}), "name");
+        let expanded = params(
+            json!({"type":"ref/resource","uri":"report://monthly/2026/alpha"}),
+            "name",
+        );
         assert!(block_on(completion.complete_final_async(&ctx, expanded)).is_err());
         assert!(backend.calls.lock().unwrap().is_empty());
         assert_eq!(backend.responses.lock().unwrap().len(), 1);
@@ -312,7 +436,8 @@ mod tests {
         let (prompt, _, backend) = fixture(vec![result()], false);
         let completion = prompt.completion_handler().unwrap();
         let mut parameters = prompt_params();
-        parameters.context = Some(serde_json::from_value(json!({"arguments":{"private":"secret"}})).unwrap());
+        parameters.context =
+            Some(serde_json::from_value(json!({"arguments":{"private":"secret"}})).unwrap());
         let ctx = McpContext::new(Cx::for_testing(), 1);
         assert!(block_on(completion.complete_final_async(&ctx, parameters)).is_err());
         assert!(backend.calls.lock().unwrap().is_empty());
@@ -323,11 +448,20 @@ mod tests {
     fn absent_and_present_empty_completion_contexts_remain_distinct() {
         let (prompt, _, _) = fixture(vec![], false);
         let completion = prompt.completion_handler().unwrap();
-        assert!(completion.parameters(prompt_params()).unwrap().get("context").is_none());
+        assert!(
+            completion
+                .parameters(prompt_params())
+                .unwrap()
+                .get("context")
+                .is_none()
+        );
         for context in [json!({}), json!({"arguments":{}})] {
             let mut parameters = prompt_params();
             parameters.context = Some(serde_json::from_value(context.clone()).unwrap());
-            assert_eq!(completion.parameters(parameters).unwrap()["context"], context);
+            assert_eq!(
+                completion.parameters(parameters).unwrap()["context"],
+                context
+            );
         }
     }
 
@@ -340,7 +474,8 @@ mod tests {
         // rather than letting the inbound decoder reject this fixture first.
         parameters.context = Some(fastmcp_protocol::FinalCompletionContext {
             arguments: Some(std::collections::BTreeMap::from([(
-                "style".to_owned(), "x".repeat(fastmcp_protocol::MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES + 1),
+                "style".to_owned(),
+                "x".repeat(fastmcp_protocol::MAX_COMPLETION_CONTEXT_ARGUMENT_VALUE_BYTES + 1),
             )])),
         });
         let ctx = McpContext::new(Cx::for_testing(), 1);
@@ -355,10 +490,16 @@ mod tests {
         let prompt_completion = prompt.completion_handler().unwrap();
         let template_completion = template.completion_handler().unwrap();
         assert!(Arc::ptr_eq(&prompt.forwarder, &prompt_completion.forwarder));
-        assert!(Arc::ptr_eq(&template.forwarder, &template_completion.forwarder));
+        assert!(Arc::ptr_eq(
+            &template.forwarder,
+            &template_completion.forwarder
+        ));
         let ctx = McpContext::new(Cx::for_testing(), 1);
         assert!(block_on(prompt_completion.complete_final_async(&ctx, prompt_params())).is_ok());
-        let parameters = params(json!({"type":"ref/resource","uri":"report://monthly/{year}/{name}"}), "name");
+        let parameters = params(
+            json!({"type":"ref/resource","uri":"report://monthly/{year}/{name}"}),
+            "name",
+        );
         assert!(block_on(template_completion.complete_final_async(&ctx, parameters)).is_ok());
         let calls = backend.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
@@ -387,7 +528,9 @@ mod tests {
             let (prompt, _, backend) = fixture(vec![result()], late);
             let completion = prompt.completion_handler().unwrap();
             let ctx = McpContext::new(Cx::for_testing(), 1);
-            if !late { ctx.request_cancellation().cancel(); }
+            if !late {
+                ctx.request_cancellation().cancel();
+            }
             assert!(block_on(completion.complete_final_async(&ctx, prompt_params())).is_err());
             assert_eq!(backend.calls.lock().unwrap().len(), usize::from(late));
         }
@@ -396,8 +539,12 @@ mod tests {
     #[test]
     fn wrong_method_result_is_refused_without_retry() {
         let request = core_request("prompts/get", json!({"name":"summarize"}), None).unwrap();
-        let CoreResult::Final(wrong) = request.decode_result(r#"{"resultType":"complete","messages":[]}"#).unwrap()
-            else { panic!("expected final prompt") };
+        let CoreResult::Final(wrong) = request
+            .decode_result(r#"{"resultType":"complete","messages":[]}"#)
+            .unwrap()
+        else {
+            panic!("expected final prompt")
+        };
         let (prompt, _, backend) = fixture(vec![wrong, result()], false);
         let completion = prompt.completion_handler().unwrap();
         let ctx = McpContext::new(Cx::for_testing(), 1);
@@ -408,7 +555,10 @@ mod tests {
 
     #[test]
     fn ambiguous_prompt_arguments_cannot_mint_completion_routes() {
-        for arguments in [json!([{"name":"report"},{"name":"report"}]), json!([{"name":""}])] {
+        for arguments in [
+            json!([{"name":"report"},{"name":"report"}]),
+            json!([{"name":""}]),
+        ] {
             let (mut prompt, _, backend) = fixture(vec![], false);
             prompt.definition.arguments = Some(serde_json::from_value(arguments).unwrap());
             assert!(prompt.completion_handler().is_err());

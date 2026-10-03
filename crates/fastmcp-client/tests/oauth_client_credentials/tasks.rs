@@ -10,28 +10,61 @@ use fastmcp_client::http_auth::discovery::client_credentials::tasks::{
     ClientCredentialsTasksClient, ClientCredentialsTasksError as TaskError,
     ClientCredentialsTasksLimits, ManagedTaskEvent, ManagedTaskRequest, ManagedTasksError,
 };
-use fastmcp_protocol::tasks_extension::{Task, TaskId, TASKS_EXTENSION};
+use fastmcp_protocol::tasks_extension::{TASKS_EXTENSION, Task, TaskId};
 
 const TASK_CHILD: &str = "FASTMCP_TEST_MACHINE_TASKS_CASE";
 const PROGRESS: &str = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"work","progress":1}}"#;
 #[derive(Clone, Copy)]
 enum TaskCase {
-    Lifecycle, MissingTasks, MalformedAuth, WrongResponse, WrongTask, InvalidProgress,
-    Truncated, Cancel, Close, Abandon, Expiry, Deadline, RecordLimit,
-    Denied, Redirect, LostMutation, Preflight, Renewal,
+    Lifecycle,
+    MissingTasks,
+    MalformedAuth,
+    WrongResponse,
+    WrongTask,
+    InvalidProgress,
+    Truncated,
+    Cancel,
+    Close,
+    Abandon,
+    Expiry,
+    Deadline,
+    RecordLimit,
+    Denied,
+    Redirect,
+    LostMutation,
+    Preflight,
+    Renewal,
 }
 
 fn isolated_task(name: &str, case: TaskCase) {
-    if let Ok(selected) = std::env::var(TASK_CHILD) { assert_eq!(selected, name); run_tasks(case); return; }
+    if let Ok(selected) = std::env::var(TASK_CHILD) {
+        assert_eq!(selected, name);
+        run_tasks(case);
+        return;
+    }
     let roots = RootFile::create();
-    let mut child = Child(Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture", "--test-threads=1"])
-        .env(TASK_CHILD, name).env("SSL_CERT_FILE", &roots.0).env_remove("SSL_CERT_DIR")
-        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap());
+    let mut child = Child(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(TASK_CHILD, name)
+            .env("SSL_CERT_FILE", &roots.0)
+            .env_remove("SSL_CERT_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
     let end = Instant::now() + Duration::from_secs(30);
     loop {
-        if let Some(status) = child.0.try_wait().unwrap() { assert!(status.success(), "machine Tasks TLS case failed"); return; }
-        assert!(Instant::now() < end, "machine Tasks child exceeded its bound");
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "machine Tasks TLS case failed");
+            return;
+        }
+        assert!(
+            Instant::now() < end,
+            "machine Tasks child exceeded its bound"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -42,12 +75,21 @@ fn metadata() -> FinalRequestMeta {
     metadata["io.modelcontextprotocol/clientCapabilities"]["roots"] = json!({});
     serde_json::from_value(metadata).unwrap()
 }
-fn task_id() -> TaskId { TaskId::parse("machine-task").unwrap() }
-fn call_tool() -> ManagedTaskRequest { ManagedTaskRequest::CallTool { name:"compute".to_owned(), arguments:Some(json!({"n":7})) } }
+fn task_id() -> TaskId {
+    TaskId::parse("machine-task").unwrap()
+}
+fn call_tool() -> ManagedTaskRequest {
+    ManagedTaskRequest::CallTool {
+        name: "compute".to_owned(),
+        arguments: Some(json!({"n":7})),
+    }
+}
 fn task(status: &str, discriminator: &str) -> String {
     let mut task = json!({"resultType":discriminator,"taskId":"machine-task","status":status,
         "createdAt":"2026-09-17T00:00:00Z","lastUpdatedAt":"2026-09-17T00:00:00Z","ttlMs":60000});
-    if status == "input_required" { task["inputRequests"] = json!({"roots":{"method":"roots/list"}}); }
+    if status == "input_required" {
+        task["inputRequests"] = json!({"roots":{"method":"roots/list"}});
+    }
     task.to_string()
 }
 fn discovery() -> Value {
@@ -60,7 +102,11 @@ async fn rpc(peer: &Peer, id: i64, method: &str, token: &str) -> (TlsStream<TcpS
     let (tls, start, headers, bytes) = peer.request().await;
     assert_eq!(start, "POST /mcp HTTP/1.1");
     assert_eq!(headers["authorization"], format!("Bearer {token}"));
-    assert!(!headers.values().any(|value| value.contains("service-secret") || value == BASIC));
+    assert!(
+        !headers
+            .values()
+            .any(|value| value.contains("service-secret") || value == BASIC)
+    );
     assert_eq!(headers["mcp-method"], method);
     assert_eq!(headers["mcp-protocol-version"], "2026-07-28");
     assert!(!headers.contains_key("mcp-session-id") && !headers.contains_key("last-event-id"));
@@ -69,9 +115,13 @@ async fn rpc(peer: &Peer, id: i64, method: &str, token: &str) -> (TlsStream<TcpS
     assert_eq!(body["method"], method);
     let metadata = &body["params"]["_meta"];
     assert_eq!(metadata["com.example/tenant"], "unchanged");
-    assert_eq!(metadata["io.modelcontextprotocol/clientCapabilities"]["extensions"],
-        json!({CLIENT_CREDENTIALS_EXTENSION:{},TASKS_EXTENSION:{}}));
-    if method == "tools/call" { assert_eq!(headers["mcp-name"], "compute"); }
+    assert_eq!(
+        metadata["io.modelcontextprotocol/clientCapabilities"]["extensions"],
+        json!({CLIENT_CREDENTIALS_EXTENSION:{},TASKS_EXTENSION:{}})
+    );
+    if method == "tools/call" {
+        assert_eq!(headers["mcp-name"], "compute");
+    }
     peer.rpcs.fetch_add(1, Ordering::SeqCst);
     (tls, body)
 }
@@ -81,14 +131,34 @@ async fn discover(peer: &Peer, id: i64, token: &str, document: &Value) {
 }
 async fn operation(peer: &Peer, id: i64, method: &str, token: &str, result: &str) -> Value {
     discover(peer, id, token, &discovery()).await;
-    let (mut tls, request) = rpc(peer, id+1, method, token).await;
-    json_reply(&mut tls, &terminal(id+1, result)).await;
+    let (mut tls, request) = rpc(peer, id + 1, method, token).await;
+    json_reply(&mut tls, &terminal(id + 1, result)).await;
     request
 }
-async fn result(client: &ClientCredentialsTasksClient, cx: &Cx, id: i64, request: ManagedTaskRequest) -> ManagedTaskEvent {
-    let mut call = client.request(cx, RequestId::Number(id), RequestId::Number(id+1), request).await.unwrap();
-    assert!(call.request_id().correlates_with(&RequestId::Number(id+1)));
-    let result = call.next_event(cx).await.unwrap().expect("one terminal event");
+async fn result(
+    client: &ClientCredentialsTasksClient,
+    cx: &Cx,
+    id: i64,
+    request: ManagedTaskRequest,
+) -> ManagedTaskEvent {
+    let mut call = client
+        .request(
+            cx,
+            RequestId::Number(id),
+            RequestId::Number(id + 1),
+            request,
+        )
+        .await
+        .unwrap();
+    assert!(
+        call.request_id()
+            .correlates_with(&RequestId::Number(id + 1))
+    );
+    let result = call
+        .next_event(cx)
+        .await
+        .unwrap()
+        .expect("one terminal event");
     assert!(call.next_event(cx).await.unwrap().is_none());
     result
 }
@@ -303,38 +373,128 @@ fn explicit_resource_ca_survives_machine_task_create_input_update_and_cancel() {
 }
 
 #[test]
-fn machine_tasks_complete_the_create_input_update_cancel_lifecycle() { isolated_task("tasks::machine_tasks_complete_the_create_input_update_cancel_lifecycle",TaskCase::Lifecycle); }
+fn machine_tasks_complete_the_create_input_update_cancel_lifecycle() {
+    isolated_task(
+        "tasks::machine_tasks_complete_the_create_input_update_cancel_lifecycle",
+        TaskCase::Lifecycle,
+    );
+}
 #[test]
-fn missing_tasks_advertisement_prevents_mutation_and_preserves_the_client() { isolated_task("tasks::missing_tasks_advertisement_prevents_mutation_and_preserves_the_client",TaskCase::MissingTasks); }
+fn missing_tasks_advertisement_prevents_mutation_and_preserves_the_client() {
+    isolated_task(
+        "tasks::missing_tasks_advertisement_prevents_mutation_and_preserves_the_client",
+        TaskCase::MissingTasks,
+    );
+}
 #[test]
-fn malformed_machine_auth_advertisement_prevents_mutation_and_preserves_the_client() { isolated_task("tasks::malformed_machine_auth_advertisement_prevents_mutation_and_preserves_the_client",TaskCase::MalformedAuth); }
+fn malformed_machine_auth_advertisement_prevents_mutation_and_preserves_the_client() {
+    isolated_task(
+        "tasks::malformed_machine_auth_advertisement_prevents_mutation_and_preserves_the_client",
+        TaskCase::MalformedAuth,
+    );
+}
 #[test]
-fn wrong_response_identity_closes_only_its_task_call() { isolated_task("tasks::wrong_response_identity_closes_only_its_task_call",TaskCase::WrongResponse); }
+fn wrong_response_identity_closes_only_its_task_call() {
+    isolated_task(
+        "tasks::wrong_response_identity_closes_only_its_task_call",
+        TaskCase::WrongResponse,
+    );
+}
 #[test]
-fn wrong_task_identity_closes_only_its_task_call() { isolated_task("tasks::wrong_task_identity_closes_only_its_task_call",TaskCase::WrongTask); }
+fn wrong_task_identity_closes_only_its_task_call() {
+    isolated_task(
+        "tasks::wrong_task_identity_closes_only_its_task_call",
+        TaskCase::WrongTask,
+    );
+}
 #[test]
-fn foreign_progress_is_not_delivered_as_owned_activity() { isolated_task("tasks::foreign_progress_is_not_delivered_as_owned_activity",TaskCase::InvalidProgress); }
+fn foreign_progress_is_not_delivered_as_owned_activity() {
+    isolated_task(
+        "tasks::foreign_progress_is_not_delivered_as_owned_activity",
+        TaskCase::InvalidProgress,
+    );
+}
 #[test]
-fn truncated_task_stream_is_not_successful_completion() { isolated_task("tasks::truncated_task_stream_is_not_successful_completion",TaskCase::Truncated); }
+fn truncated_task_stream_is_not_successful_completion() {
+    isolated_task(
+        "tasks::truncated_task_stream_is_not_successful_completion",
+        TaskCase::Truncated,
+    );
+}
 #[test]
-fn cancelling_a_task_call_does_not_cancel_the_remote_task() { isolated_task("tasks::cancelling_a_task_call_does_not_cancel_the_remote_task",TaskCase::Cancel); }
+fn cancelling_a_task_call_does_not_cancel_the_remote_task() {
+    isolated_task(
+        "tasks::cancelling_a_task_call_does_not_cancel_the_remote_task",
+        TaskCase::Cancel,
+    );
+}
 #[test]
-fn machine_owner_close_wakes_an_idle_task_read() { isolated_task("tasks::machine_owner_close_wakes_an_idle_task_read",TaskCase::Close); }
+fn machine_owner_close_wakes_an_idle_task_read() {
+    isolated_task(
+        "tasks::machine_owner_close_wakes_an_idle_task_read",
+        TaskCase::Close,
+    );
+}
 #[test]
-fn abandoned_task_reads_release_the_socket_and_cannot_be_reused() { isolated_task("tasks::abandoned_task_reads_release_the_socket_and_cannot_be_reused",TaskCase::Abandon); }
+fn abandoned_task_reads_release_the_socket_and_cannot_be_reused() {
+    isolated_task(
+        "tasks::abandoned_task_reads_release_the_socket_and_cannot_be_reused",
+        TaskCase::Abandon,
+    );
+}
 #[test]
-fn task_streams_cannot_outlive_the_opening_machine_token() { isolated_task("tasks::task_streams_cannot_outlive_the_opening_machine_token",TaskCase::Expiry); }
+fn task_streams_cannot_outlive_the_opening_machine_token() {
+    isolated_task(
+        "tasks::task_streams_cannot_outlive_the_opening_machine_token",
+        TaskCase::Expiry,
+    );
+}
 #[test]
-fn task_call_deadlines_include_idle_stream_reads() { isolated_task("tasks::task_call_deadlines_include_idle_stream_reads",TaskCase::Deadline); }
+fn task_call_deadlines_include_idle_stream_reads() {
+    isolated_task(
+        "tasks::task_call_deadlines_include_idle_stream_reads",
+        TaskCase::Deadline,
+    );
+}
 #[test]
-fn task_record_limit_closes_the_stream_without_an_extra_request() { isolated_task("tasks::task_record_limit_closes_the_stream_without_an_extra_request",TaskCase::RecordLimit); }
+fn task_record_limit_closes_the_stream_without_an_extra_request() {
+    isolated_task(
+        "tasks::task_record_limit_closes_the_stream_without_an_extra_request",
+        TaskCase::RecordLimit,
+    );
+}
 #[test]
-fn denied_task_mutations_are_not_replayed() { isolated_task("tasks::denied_task_mutations_are_not_replayed",TaskCase::Denied); }
+fn denied_task_mutations_are_not_replayed() {
+    isolated_task(
+        "tasks::denied_task_mutations_are_not_replayed",
+        TaskCase::Denied,
+    );
+}
 #[test]
-fn task_mutation_redirects_are_not_followed() { isolated_task("tasks::task_mutation_redirects_are_not_followed",TaskCase::Redirect); }
+fn task_mutation_redirects_are_not_followed() {
+    isolated_task(
+        "tasks::task_mutation_redirects_are_not_followed",
+        TaskCase::Redirect,
+    );
+}
 #[test]
-fn lost_task_mutation_replies_do_not_cause_replay() { isolated_task("tasks::lost_task_mutation_replies_do_not_cause_replay",TaskCase::LostMutation); }
+fn lost_task_mutation_replies_do_not_cause_replay() {
+    isolated_task(
+        "tasks::lost_task_mutation_replies_do_not_cause_replay",
+        TaskCase::LostMutation,
+    );
+}
 #[test]
-fn cancelled_and_invalid_task_requests_fail_before_credential_acquisition() { isolated_task("tasks::cancelled_and_invalid_task_requests_fail_before_credential_acquisition",TaskCase::Preflight); }
+fn cancelled_and_invalid_task_requests_fail_before_credential_acquisition() {
+    isolated_task(
+        "tasks::cancelled_and_invalid_task_requests_fail_before_credential_acquisition",
+        TaskCase::Preflight,
+    );
+}
 #[test]
-fn token_renewal_renegotiates_tasks_under_the_replacement_credential() { isolated_task("tasks::token_renewal_renegotiates_tasks_under_the_replacement_credential",TaskCase::Renewal); }
+fn token_renewal_renegotiates_tasks_under_the_replacement_credential() {
+    isolated_task(
+        "tasks::token_renewal_renegotiates_tasks_under_the_replacement_credential",
+        TaskCase::Renewal,
+    );
+}

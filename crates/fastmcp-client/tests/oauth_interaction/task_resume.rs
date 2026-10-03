@@ -2,26 +2,38 @@
 //! Run oauth_interaction with tasks,native-tls-roots. These cases qualify the
 //! read-only client boundary, not a durable encryption provider or file store.
 use super::*;
-use fastmcp_core::partition::{DurableOwnerKey, PartitionDescriptor};
 use fastmcp_client::http_auth::managed::OAuthSessionError;
-use fastmcp_client::http_auth::managed::tasks::{
-    ManagedTaskRequestIds, ManagedTasksClient, ManagedTasksError, ManagedTasksLimits,
+use fastmcp_client::http_auth::managed::tasks::watch::checkpoint::resume::client::{
+    TaskResumeReconciliation, TaskResumeReconciliationError,
 };
 use fastmcp_client::http_auth::managed::tasks::watch::checkpoint::resume::{
     TaskResumeBinding, TaskResumeError, TaskResumeRecord,
 };
-use fastmcp_client::http_auth::managed::tasks::watch::checkpoint::resume::client::{
-    TaskResumeReconciliation, TaskResumeReconciliationError,
+use fastmcp_client::http_auth::managed::tasks::{
+    ManagedTaskRequestIds, ManagedTasksClient, ManagedTasksError, ManagedTasksLimits,
 };
-use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta};
+use fastmcp_core::partition::{DurableOwnerKey, PartitionDescriptor};
 use fastmcp_protocol::tasks_extension::Task;
+use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta};
 
 const CASE_ENV: &str = "FASTMCP_TEST_TASK_RESUME_RECONCILIATION";
 const DISCOVER: &str = r#"{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"extensions":{"io.modelcontextprotocol/tasks":{}}},"ttlMs":0,"cacheScope":"private"}"#;
 
 #[derive(Clone, Copy)]
-enum Case { Active, Terminal, GetUnavailable, DiscoveryUnavailable, ForeignTask,
-    ChangedBirth, Regressed, Cancel, Drop, Expired, WrongOwner, WrongEndpoint }
+enum Case {
+    Active,
+    Terminal,
+    GetUnavailable,
+    DiscoveryUnavailable,
+    ForeignTask,
+    ChangedBirth,
+    Regressed,
+    Cancel,
+    Drop,
+    Expired,
+    WrongOwner,
+    WrongEndpoint,
+}
 
 fn isolated(name: &str, case: Case) {
     let exact = format!("driver::task_resume::{name}");
@@ -33,19 +45,33 @@ fn isolated(name: &str, case: Case) {
     let roots = RootFile::create();
     struct Child(std::process::Child);
     impl Drop for Child {
-        fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
-    let mut child = Child(Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
-        .env(CASE_ENV, &exact).env("SSL_CERT_FILE", &roots.0).env_remove("SSL_CERT_DIR")
-        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap());
+    let mut child = Child(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
+            .env(CASE_ENV, &exact)
+            .env("SSL_CERT_FILE", &roots.0)
+            .env_remove("SSL_CERT_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             assert!(status.success(), "Task resume HTTPS case failed");
             return;
         }
-        assert!(Instant::now() < deadline, "Task resume HTTPS child exceeded its bound");
+        assert!(
+            Instant::now() < deadline,
+            "Task resume HTTPS child exceeded its bound"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -54,12 +80,28 @@ fn binding(resource: &str, subject: &str) -> TaskResumeBinding {
     // Fixture-authenticated account facts. No peer checkpoint supplies any of
     // these fields, and the production binding constructor accepts a typed key.
     let descriptor = PartitionDescriptor::from_verified_facts(
-        "fixture-provider", 1, "https://issuer.example", resource, "fixture-tenant",
-        subject, "interaction-client", 1, 1, &[b"resource-bound".as_slice()],
-    ).unwrap();
+        "fixture-provider",
+        1,
+        "https://issuer.example",
+        resource,
+        "fixture-tenant",
+        subject,
+        "interaction-client",
+        1,
+        1,
+        &[b"resource-bound".as_slice()],
+    )
+    .unwrap();
     let owner = DurableOwnerKey::derive(&descriptor, 1).unwrap();
-    TaskResumeBinding::from_verified_owner(url(resource), "fixture", &owner,
-        [2; 32], [3; 32], [4; 32]).unwrap()
+    TaskResumeBinding::from_verified_owner(
+        url(resource),
+        "fixture",
+        &owner,
+        [2; 32],
+        [3; 32],
+        [4; 32],
+    )
+    .unwrap()
 }
 
 fn working() -> Task {
@@ -67,10 +109,16 @@ fn working() -> Task {
     // tests expire when the calendar passes a hard-coded fixture date.
     serde_json::from_value(json!({"taskId":"checkpoint task", "status":"working",
         "createdAt":"2020-01-01T00:00:00Z", "lastUpdatedAt":"2020-01-01T00:00:01Z",
-        "ttlMs":null, "pollIntervalMs":10})).unwrap()
+        "ttlMs":null, "pollIntervalMs":10}))
+    .unwrap()
 }
 async fn reject(tls: &mut TlsStream<TcpStream>, status: u16) {
-    tls.write_all(format!("HTTP/1.1 {status} Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    tls.write_all(
+        format!("HTTP/1.1 {status} Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
     tls.flush().await.unwrap();
 }
 
@@ -219,43 +267,116 @@ fn run(case: Case) {
 }
 
 #[test]
-fn restored_record_yields_fresh_input_state_and_existing_watch_selection() { isolated("restored_record_yields_fresh_input_state_and_existing_watch_selection", Case::Active); }
+fn restored_record_yields_fresh_input_state_and_existing_watch_selection() {
+    isolated(
+        "restored_record_yields_fresh_input_state_and_existing_watch_selection",
+        Case::Active,
+    );
+}
 #[test]
-fn completion_after_checkpoint_returns_result_without_persisting_it() { isolated("completion_after_checkpoint_returns_result_without_persisting_it", Case::Terminal); }
+fn completion_after_checkpoint_returns_result_without_persisting_it() {
+    isolated(
+        "completion_after_checkpoint_returns_result_without_persisting_it",
+        Case::Terminal,
+    );
+}
 #[test]
-fn unavailable_get_is_not_retried_or_recreated() { isolated("unavailable_get_is_not_retried_or_recreated", Case::GetUnavailable); }
+fn unavailable_get_is_not_retried_or_recreated() {
+    isolated(
+        "unavailable_get_is_not_retried_or_recreated",
+        Case::GetUnavailable,
+    );
+}
 #[test]
-fn rejected_discovery_never_sends_task_id() { isolated("rejected_discovery_never_sends_task_id", Case::DiscoveryUnavailable); }
+fn rejected_discovery_never_sends_task_id() {
+    isolated(
+        "rejected_discovery_never_sends_task_id",
+        Case::DiscoveryUnavailable,
+    );
+}
 #[test]
-fn foreign_task_response_cannot_replace_checkpoint_identity() { isolated("foreign_task_response_cannot_replace_checkpoint_identity", Case::ForeignTask); }
+fn foreign_task_response_cannot_replace_checkpoint_identity() {
+    isolated(
+        "foreign_task_response_cannot_replace_checkpoint_identity",
+        Case::ForeignTask,
+    );
+}
 #[test]
-fn reused_task_id_with_changed_creation_is_rejected() { isolated("reused_task_id_with_changed_creation_is_rejected", Case::ChangedBirth); }
+fn reused_task_id_with_changed_creation_is_rejected() {
+    isolated(
+        "reused_task_id_with_changed_creation_is_rejected",
+        Case::ChangedBirth,
+    );
+}
 #[test]
-fn regressed_remote_snapshot_does_not_replace_saved_controls() { isolated("regressed_remote_snapshot_does_not_replace_saved_controls", Case::Regressed); }
+fn regressed_remote_snapshot_does_not_replace_saved_controls() {
+    isolated(
+        "regressed_remote_snapshot_does_not_replace_saved_controls",
+        Case::Regressed,
+    );
+}
 #[test]
-fn cancelled_resume_closes_its_socket_without_mutation() { isolated("cancelled_resume_closes_its_socket_without_mutation", Case::Cancel); }
+fn cancelled_resume_closes_its_socket_without_mutation() {
+    isolated(
+        "cancelled_resume_closes_its_socket_without_mutation",
+        Case::Cancel,
+    );
+}
 #[test]
-fn abandoned_resume_closes_its_socket_without_changing_record() { isolated("abandoned_resume_closes_its_socket_without_changing_record", Case::Drop); }
+fn abandoned_resume_closes_its_socket_without_changing_record() {
+    isolated(
+        "abandoned_resume_closes_its_socket_without_changing_record",
+        Case::Drop,
+    );
+}
 #[test]
-fn expired_record_is_rejected_without_contacting_peer() { isolated("expired_record_is_rejected_without_contacting_peer", Case::Expired); }
+fn expired_record_is_rejected_without_contacting_peer() {
+    isolated(
+        "expired_record_is_rejected_without_contacting_peer",
+        Case::Expired,
+    );
+}
 #[test]
-fn wrong_current_owner_is_rejected_before_discovery() { isolated("wrong_current_owner_is_rejected_before_discovery", Case::WrongOwner); }
+fn wrong_current_owner_is_rejected_before_discovery() {
+    isolated(
+        "wrong_current_owner_is_rejected_before_discovery",
+        Case::WrongOwner,
+    );
+}
 #[test]
-fn wrong_selected_endpoint_is_rejected_before_discovery() { isolated("wrong_selected_endpoint_is_rejected_before_discovery", Case::WrongEndpoint); }
+fn wrong_selected_endpoint_is_rejected_before_discovery() {
+    isolated(
+        "wrong_selected_endpoint_is_rejected_before_discovery",
+        Case::WrongEndpoint,
+    );
+}
 
 mod restart {
     use super::*;
-    use fastmcp_protocol::tasks_extension::TaskId;
     use fastmcp_client::http_auth::managed::tasks::watch::checkpoint::resume::client::restart::{
-        TaskResumeRestartError, TaskResumeRestartOutcome, TaskResumeRestartPlan, TaskResumeRestartPolicy,
+        TaskResumeRestartError, TaskResumeRestartOutcome, TaskResumeRestartPlan,
+        TaskResumeRestartPolicy,
     };
+    use fastmcp_protocol::tasks_extension::TaskId;
 
     const RESTART_ENV: &str = "FASTMCP_TEST_TASK_RESTART";
     #[derive(Clone, Copy)]
     enum RestartCase {
-        Mixed, Duplicate, Expired, Unavailable(u16), DiscoveryDenied,
-        ForeignTask, LostReply, Cancel, DropRead, Deadline, SessionClose,
-        WrongOwner, WrongEndpoint, Precancel, Empty,
+        Mixed,
+        Duplicate,
+        Expired,
+        Unavailable(u16),
+        DiscoveryDenied,
+        ForeignTask,
+        LostReply,
+        Cancel,
+        DropRead,
+        Deadline,
+        SessionClose,
+        WrongOwner,
+        WrongEndpoint,
+        Precancel,
+        Empty,
     }
 
     fn isolated_restart(name: &str, case: RestartCase) {
@@ -268,43 +389,67 @@ mod restart {
         let roots = RootFile::create();
         struct Child(std::process::Child);
         impl Drop for Child {
-            fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
         }
-        let mut child = Child(Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
-            .env(RESTART_ENV, &exact).env("SSL_CERT_FILE", &roots.0).env_remove("SSL_CERT_DIR")
-            .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap());
+        let mut child = Child(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
+                .env(RESTART_ENV, &exact)
+                .env("SSL_CERT_FILE", &roots.0)
+                .env_remove("SSL_CERT_DIR")
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if let Some(status) = child.0.try_wait().unwrap() {
                 assert!(status.success(), "Task restart HTTPS case failed");
                 return;
             }
-            assert!(Instant::now() < deadline, "Task restart child exceeded its bound");
+            assert!(
+                Instant::now() < deadline,
+                "Task restart child exceeded its bound"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
 
     fn source_records(cx: &Cx, current: &TaskResumeBinding) -> Vec<TaskResumeRecord> {
-        let mut records: Vec<_> = ["one", "two", "three"].into_iter().map(|suffix| {
-            let mut task = working();
-            if let Task::Working(base) = &mut task {
-                base.task_id = TaskId::parse(format!("restart-{suffix}")).unwrap();
-            }
-            TaskResumeRecord::capture(cx, current, &task, Duration::from_secs(120)).unwrap()
-        }).collect();
+        let mut records: Vec<_> = ["one", "two", "three"]
+            .into_iter()
+            .map(|suffix| {
+                let mut task = working();
+                if let Task::Working(base) = &mut task {
+                    base.task_id = TaskId::parse(format!("restart-{suffix}")).unwrap();
+                }
+                TaskResumeRecord::capture(cx, current, &task, Duration::from_secs(120)).unwrap()
+            })
+            .collect();
         records.sort_by_key(TaskResumeRecord::key);
         records
     }
     fn response(number: usize, result: Value) -> String {
         json!({"jsonrpc":"2.0", "id":format!("restart:{number}"), "result":result}).to_string()
     }
-    async fn exact_request(peer: &Peer, number: usize, method: &str) -> (TlsStream<TcpStream>, Value) {
+    async fn exact_request(
+        peer: &Peer,
+        number: usize,
+        method: &str,
+    ) -> (TlsStream<TcpStream>, Value) {
         let (socket, bytes) = peer.request(false).await;
         let request: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(request["id"], format!("restart:{number}"));
         assert_eq!(request["method"], method);
-        assert!(matches!(method, "server/discover" | "tasks/get"), "restart cannot mutate, poll or subscribe");
+        assert!(
+            matches!(method, "server/discover" | "tasks/get"),
+            "restart cannot mutate, poll or subscribe"
+        );
         assert!(request["params"].get("inputResponses").is_none());
         assert!(request["params"].get("requestState").is_none());
         // The shared peer also asserts exact bearer and method/version routing.
@@ -522,66 +667,114 @@ mod restart {
 
     #[test]
     fn restart_reconciles_all_records_and_preserves_active_terminal_distinctions() {
-        isolated_restart("restart_reconciles_all_records_and_preserves_active_terminal_distinctions", RestartCase::Mixed);
+        isolated_restart(
+            "restart_reconciles_all_records_and_preserves_active_terminal_distinctions",
+            RestartCase::Mixed,
+        );
     }
     #[test]
     fn duplicate_imports_do_not_repeat_remote_reconciliation() {
-        isolated_restart("duplicate_imports_do_not_repeat_remote_reconciliation", RestartCase::Duplicate);
+        isolated_restart(
+            "duplicate_imports_do_not_repeat_remote_reconciliation",
+            RestartCase::Duplicate,
+        );
     }
     #[test]
     fn expired_record_is_an_explicit_item_without_a_remote_read() {
-        isolated_restart("expired_record_is_an_explicit_item_without_a_remote_read", RestartCase::Expired);
+        isolated_restart(
+            "expired_record_is_an_explicit_item_without_a_remote_read",
+            RestartCase::Expired,
+        );
     }
     #[test]
     fn missing_task_does_not_hide_later_live_tasks() {
-        isolated_restart("missing_task_does_not_hide_later_live_tasks", RestartCase::Unavailable(404));
+        isolated_restart(
+            "missing_task_does_not_hide_later_live_tasks",
+            RestartCase::Unavailable(404),
+        );
     }
     #[test]
     fn forbidden_task_has_the_same_unavailable_disposition() {
-        isolated_restart("forbidden_task_has_the_same_unavailable_disposition", RestartCase::Unavailable(403));
+        isolated_restart(
+            "forbidden_task_has_the_same_unavailable_disposition",
+            RestartCase::Unavailable(403),
+        );
     }
     #[test]
     fn rejected_discovery_never_discloses_that_records_task_id() {
-        isolated_restart("rejected_discovery_never_discloses_that_records_task_id", RestartCase::DiscoveryDenied);
+        isolated_restart(
+            "rejected_discovery_never_discloses_that_records_task_id",
+            RestartCase::DiscoveryDenied,
+        );
     }
     #[test]
     fn foreign_reply_keeps_pending_and_unvisited_controls_without_retry() {
-        isolated_restart("foreign_reply_keeps_pending_and_unvisited_controls_without_retry", RestartCase::ForeignTask);
+        isolated_restart(
+            "foreign_reply_keeps_pending_and_unvisited_controls_without_retry",
+            RestartCase::ForeignTask,
+        );
     }
     #[test]
     fn lost_reply_closes_restart_without_skipping_or_replaying_the_record() {
-        isolated_restart("lost_reply_closes_restart_without_skipping_or_replaying_the_record", RestartCase::LostReply);
+        isolated_restart(
+            "lost_reply_closes_restart_without_skipping_or_replaying_the_record",
+            RestartCase::LostReply,
+        );
     }
     #[test]
     fn cancelled_restart_retains_pending_and_unvisited_records() {
-        isolated_restart("cancelled_restart_retains_pending_and_unvisited_records", RestartCase::Cancel);
+        isolated_restart(
+            "cancelled_restart_retains_pending_and_unvisited_records",
+            RestartCase::Cancel,
+        );
     }
     #[test]
     fn abandoned_restart_read_retains_custody_and_closes_its_socket() {
-        isolated_restart("abandoned_restart_read_retains_custody_and_closes_its_socket", RestartCase::DropRead);
+        isolated_restart(
+            "abandoned_restart_read_retains_custody_and_closes_its_socket",
+            RestartCase::DropRead,
+        );
     }
     #[test]
     fn one_original_deadline_includes_pauses_between_records() {
-        isolated_restart("one_original_deadline_includes_pauses_between_records", RestartCase::Deadline);
+        isolated_restart(
+            "one_original_deadline_includes_pauses_between_records",
+            RestartCase::Deadline,
+        );
     }
     #[test]
     fn closed_login_cannot_resume_the_next_record() {
-        isolated_restart("closed_login_cannot_resume_the_next_record", RestartCase::SessionClose);
+        isolated_restart(
+            "closed_login_cannot_resume_the_next_record",
+            RestartCase::SessionClose,
+        );
     }
     #[test]
     fn current_owner_must_match_before_any_restart_contact() {
-        isolated_restart("current_owner_must_match_before_any_restart_contact", RestartCase::WrongOwner);
+        isolated_restart(
+            "current_owner_must_match_before_any_restart_contact",
+            RestartCase::WrongOwner,
+        );
     }
     #[test]
     fn current_endpoint_must_match_before_any_restart_contact() {
-        isolated_restart("current_endpoint_must_match_before_any_restart_contact", RestartCase::WrongEndpoint);
+        isolated_restart(
+            "current_endpoint_must_match_before_any_restart_contact",
+            RestartCase::WrongEndpoint,
+        );
     }
     #[test]
     fn precancelled_restart_has_no_peer_effects() {
-        isolated_restart("precancelled_restart_has_no_peer_effects", RestartCase::Precancel);
+        isolated_restart(
+            "precancelled_restart_has_no_peer_effects",
+            RestartCase::Precancel,
+        );
     }
     #[test]
     fn empty_restart_finishes_without_discovery_or_task_requests() {
-        isolated_restart("empty_restart_finishes_without_discovery_or_task_requests", RestartCase::Empty);
+        isolated_restart(
+            "empty_restart_finishes_without_discovery_or_task_requests",
+            RestartCase::Empty,
+        );
     }
 }

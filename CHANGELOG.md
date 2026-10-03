@@ -8,6 +8,49 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ## Unreleased
 
+### HTTP disconnect cancellation (#76)
+
+- On the secured native listener (`bind_secured_http`), a peer that drops its
+  socket, half-closes it (FIN) or resets it while a request is in flight now
+  cancels that request's `McpContext`, so a synchronous tool polling
+  `ctx.is_cancelled()` stops early instead of running until its deadline.
+  Sibling requests, including ones that reuse the same JSON-RPC ID, and the
+  listener's own `Cx` are unaffected. Normal completion still finalizes the
+  request without cancelling it.
+- This covers both `Accept: application/json` and
+  `Accept: application/json, text/event-stream`. Previously, the second form
+  ran a JSON-elected dispatch inline with an unowned cancellation token and no
+  peer monitor, so the disconnect was never observed.
+- Policy: the native one-request listener treats a write-half-close (FIN)
+  before the response completes as abandonment. Clients must keep their write
+  side open until they have read the response.
+- The plain `bind_http` listener is unchanged: there, EOF is still an ordinary
+  request half-close, and a full close is observed when the response write
+  fails.
+
+### Qualification repairs
+
+- `cargo fmt --check` and `cargo clippy --workspace --all-targets -D warnings`
+  (pinned `nightly-2026-08-25`) pass, and the full workspace test suite was
+  run. Several fixtures were brought back in line with the production
+  contracts they test, without relaxing any security check:
+  - OAuth discovery expectations now include the retained resource TLS trust.
+  - The scope-authorization SSE probe now uses one token provider per
+    identity.
+  - The PRT-02 metadata fixture now carries the required
+    `clientCapabilities`.
+  - The null-ID refusal fixture now asserts its exact `InvalidResponse`.
+  - The release-quarantine identity was re-frozen to the current pinned
+    actions in the (disabled) workflow file.
+- Known open items, tracked rather than hidden:
+  - The client deferred-control maintenance-budget test is ignored (#79): its
+    premise cannot occur, because `Cx::checkpoint` never consumes poll quota.
+  - FND-01 evidence-binding and FND-04-B plan-qualification checks remain
+    red. They track unfinished plan work (stale evidence anchors, a
+    harness-only binary, and an unmet upstream asupersync stdio prerequisite),
+    not regressions of shipped behavior since v0.10.0.
+
+
 ### MCP 2026-07-28 wire behaviour (official conformance suite findings)
 
 - A modern request without `_meta` is answered `-32602` (HTTP 400), and a

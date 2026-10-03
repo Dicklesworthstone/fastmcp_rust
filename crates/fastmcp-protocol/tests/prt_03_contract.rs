@@ -7,10 +7,10 @@
 //! so `--exact <bare name>` selects these and only these.
 
 use fastmcp_protocol::protocol_version::{
-    FINAL_PROTOCOL_VERSION, FinalHttpRequestMetadata, HEADER_MISMATCH_ERROR_CODE,
-    HeaderMismatchReason, MCP_METHOD_HEADER, MCP_NAME_HEADER, MCP_PROTOCOL_VERSION_HEADER,
-    MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE, MissingRequiredClientCapabilityError,
-    FINAL_ADMISSION_PRECEDENCE, FinalAdmissionRule, RequestAdmissionError, RequestVersionMetadata,
+    FINAL_ADMISSION_PRECEDENCE, FINAL_PROTOCOL_VERSION, FinalAdmissionRule,
+    FinalHttpRequestMetadata, HEADER_MISMATCH_ERROR_CODE, HeaderMismatchReason, MCP_METHOD_HEADER,
+    MCP_NAME_HEADER, MCP_PROTOCOL_VERSION_HEADER, MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE,
+    MissingRequiredClientCapabilityError, RequestAdmissionError, RequestVersionMetadata,
     RequiredCapabilitiesError, SUPPORTED_FINAL_PROTOCOL_VERSIONS,
     UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE, admit_final_http_request, admit_final_request,
 };
@@ -86,10 +86,7 @@ fn prt_03_a_positive() {
         ..admissible()
     })
     .expect("a method that does not require Mcp-Name needs no name mirror");
-    assert_eq!(
-        nameless.protocol_version().as_str(),
-        FINAL_PROTOCOL_VERSION
-    );
+    assert_eq!(nameless.protocol_version().as_str(), FINAL_PROTOCOL_VERSION);
     // The complement, which makes the conditionality a real distinction rather
     // than a single observation: the SAME absent name mirror that `tools/list`
     // tolerates is refused for `tools/call`. Without this, "conditional" could
@@ -253,9 +250,7 @@ fn prt_03_a_planted_negative() {
         Err(other) => panic!("expected an unsupported-version refusal, got {other:?}"),
     };
     assert!(
-        !unsupported
-            .supported_versions()
-            .contains(&"2025-11-25"),
+        !unsupported.supported_versions().contains(&"2025-11-25"),
         "the rejected version must not appear in the supported list"
     );
 
@@ -432,9 +427,7 @@ fn violates(rule: FinalAdmissionRule, metadata: &FinalHttpRequestMetadata<'_>) -
         (metadata.header_method, metadata.body_method),
         (Some(header), Some(body)) if !header.is_empty() && header == body
     ) && method_requires_name(metadata);
-    let differ = |header: Option<&str>, body: Option<&str>| {
-        matches!((header, body), (Some(header), Some(body)) if header != body)
-    };
+    let differ = |header: Option<&str>, body: Option<&str>| matches!((header, body), (Some(header), Some(body)) if header != body);
     match reason {
         HeaderMismatchReason::MissingHeader => header_version.is_none(),
         HeaderMismatchReason::MissingBodyVersion => body_version.is_none(),
@@ -448,9 +441,13 @@ fn violates(rule: FinalAdmissionRule, metadata: &FinalHttpRequestMetadata<'_>) -
         HeaderMismatchReason::HeaderBodyMethodMismatch => {
             differ(metadata.header_method, metadata.body_method)
         }
-        HeaderMismatchReason::MissingNameHeader => name_stage_live && metadata.header_name.is_none(),
+        HeaderMismatchReason::MissingNameHeader => {
+            name_stage_live && metadata.header_name.is_none()
+        }
         HeaderMismatchReason::MissingBodyName => name_stage_live && metadata.body_name.is_none(),
-        HeaderMismatchReason::EmptyNameHeader => name_stage_live && metadata.header_name == Some(""),
+        HeaderMismatchReason::EmptyNameHeader => {
+            name_stage_live && metadata.header_name == Some("")
+        }
         HeaderMismatchReason::EmptyBodyName => name_stage_live && metadata.body_name == Some(""),
         HeaderMismatchReason::HeaderBodyNameMismatch => {
             name_stage_live && differ(metadata.header_name, metadata.body_name)
@@ -463,10 +460,7 @@ fn winner_under(
     order: &[FinalAdmissionRule],
     metadata: &FinalHttpRequestMetadata<'_>,
 ) -> Option<FinalAdmissionRule> {
-    order
-        .iter()
-        .copied()
-        .find(|rule| violates(*rule, metadata))
+    order.iter().copied().find(|rule| violates(*rule, metadata))
 }
 
 /// The published order with two adjacent entries exchanged.
@@ -608,8 +602,7 @@ fn prt_03_b_planted_negative() {
         }
 
         assert_eq!(
-            shipped_order_predicts,
-            FINAL_ADMISSION_PRECEDENCE[index],
+            shipped_order_predicts, FINAL_ADMISSION_PRECEDENCE[index],
             "the independent oracle must agree the shipped order selects rule {index}"
         );
         assert_eq!(
@@ -620,7 +613,8 @@ fn prt_03_b_planted_negative() {
 
         let observed = refusing_rule(contended);
         assert_eq!(
-            observed, shipped_order_predicts,
+            observed,
+            shipped_order_predicts,
             "the implementation must follow the published order at pair ({index}, {})",
             index + 1
         );

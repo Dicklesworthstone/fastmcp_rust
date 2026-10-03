@@ -1151,9 +1151,11 @@ fn validate_final_schema_node(
     // A selected custom meta-schema may impose a closed keyword contract.
     // Preserve that existing restriction until custom-dialect admission also
     // enforces its complete meta-schema; do not infer it from $vocabulary alone.
-    let unknown_annotations = object.get("$schema").map_or(unknown_annotations, |dialect| {
-        dialect.as_str() == Some(FINAL_JSON_SCHEMA_DIALECT)
-    });
+    let unknown_annotations = object
+        .get("$schema")
+        .map_or(unknown_annotations, |dialect| {
+            dialect.as_str() == Some(FINAL_JSON_SCHEMA_DIALECT)
+        });
     validate_supported_schema_keywords(object, path, root, unknown_annotations)?;
     validate_schema_id_keyword(object, path)?;
     validate_schema_dialect_keyword(object, root_schema, path)?;
@@ -1405,10 +1407,12 @@ fn validate_supported_schema_keywords(
         // so custom dialects retain their existing closed keyword contract.
         // The other reserved deprecated keywords still require their own
         // semantics and must not become unchecked extension annotations.
-        let unsupported_reserved = matches!(keyword.as_str(),
+        let unsupported_reserved = matches!(
+            keyword.as_str(),
             "dependencies" | "$recursiveAnchor" | "$recursiveRef"
         );
-        if unsupported_reserved || (!unknown_annotations && !SUPPORTED.contains(&keyword.as_str())) {
+        if unsupported_reserved || (!unknown_annotations && !SUPPORTED.contains(&keyword.as_str()))
+        {
             return Err(SchemaAdmissionError::new(
                 format!("{path}.{keyword}"),
                 "unsupported Draft 2020-12 vocabulary keyword",
@@ -4588,12 +4592,7 @@ fn validate_string(
     // The schema application already paid one work unit; charge the remaining
     // byte chunks before a potentially multi-megabyte scan.
     if schema.contains_key("minLength") || schema.contains_key("maxLength") {
-        if !consume_required_work_units(
-            context,
-            additional_string_work(s.len()),
-            path,
-            errors,
-        ) {
+        if !consume_required_work_units(context, additional_string_work(s.len()), path, errors) {
             return;
         }
         // Admitted final schemas preserve arbitrary-width count bounds; raw
@@ -4954,22 +4953,19 @@ fn json_schema_equal_with_work(
         return None;
     }
     match (left, right) {
-        (Value::Number(left), Value::Number(right)) if context.enforce_unevaluated_properties => Some(
-            ExactDecimal::from_number(left)
-                .zip(ExactDecimal::from_number(right))
-                .is_some_and(|(left, right)| left.compare(&right) == Ordering::Equal),
-        ),
+        (Value::Number(left), Value::Number(right)) if context.enforce_unevaluated_properties => {
+            Some(
+                ExactDecimal::from_number(left)
+                    .zip(ExactDecimal::from_number(right))
+                    .is_some_and(|(left, right)| left.compare(&right) == Ordering::Equal),
+            )
+        }
         (Value::String(left), Value::String(right)) => {
             if left.len() != right.len() {
                 return Some(false);
             }
-            consume_required_work_units(
-                context,
-                additional_string_work(left.len()),
-                path,
-                errors,
-            )
-            .then(|| left == right)
+            consume_required_work_units(context, additional_string_work(left.len()), path, errors)
+                .then(|| left == right)
         }
         (Value::Array(left), Value::Array(right)) => {
             if left.len() != right.len() {
@@ -6438,9 +6434,8 @@ mod tests {
         malformed["properties"]["value"]["type"] = json!(17);
         assert!(admit_final_schema(malformed).is_err());
 
-        let numeric: Value = serde_json::from_str(
-            r#"{"type":"integer","x-number":1.20e+9000}"#,
-        ).unwrap();
+        let numeric: Value =
+            serde_json::from_str(r#"{"type":"integer","x-number":1.20e+9000}"#).unwrap();
         let numeric = admit_final_schema(numeric).unwrap();
         let Value::Number(number) = &numeric.schema()["x-number"] else {
             panic!("numeric annotation must retain its JSON type");
@@ -6473,10 +6468,18 @@ mod tests {
         let admitted = admit_final_schema(source.clone()).unwrap();
         assert!(admitted.validate(&json!(3)).is_ok());
         assert!(admitted.validate(&json!(2)).is_err());
-        for target in ["#/x-ui", "#annotation", "#dynamic", "https://schemas.example/annotation"] {
+        for target in [
+            "#/x-ui",
+            "#annotation",
+            "#dynamic",
+            "https://schemas.example/annotation",
+        ] {
             let mut invalid = source.clone();
             invalid["$ref"] = json!(target);
-            assert!(admit_final_schema(invalid).is_err(), "opaque data must not resolve: {target}");
+            assert!(
+                admit_final_schema(invalid).is_err(),
+                "opaque data must not resolve: {target}"
+            );
         }
         let mut dialect = source;
         dialect["$schema"] = json!("https://schemas.example/annotation");
@@ -6504,40 +6507,65 @@ mod tests {
         assert!(admitted.validate(&json!({"value": 3})).is_ok());
         assert!(admitted.validate(&json!({"value": "3"})).is_err());
         let mut inherited = source.clone();
-        inherited["properties"]["value"].as_object_mut().unwrap().remove("$schema");
+        inherited["properties"]["value"]
+            .as_object_mut()
+            .unwrap()
+            .remove("$schema");
         let error = admit_final_schema(inherited).unwrap_err();
         assert_eq!(error.path(), "$.properties.value.x-ui");
         let mut root_annotation = source;
         root_annotation["x-ui"] = json!(true);
-        assert_eq!(admit_final_schema(root_annotation).unwrap_err().path(), "$.x-ui");
+        assert_eq!(
+            admit_final_schema(root_annotation).unwrap_err().path(),
+            "$.x-ui"
+        );
     }
 
     #[test]
     fn opaque_annotations_share_document_byte_node_and_depth_bounds() {
         let overhead = serde_json::to_vec(&json!({"x-note": ""})).unwrap().len();
         let source = json!({"x-note": "x".repeat(MAX_SCHEMA_DOCUMENT_BYTES - overhead)});
-        assert_eq!(serde_json::to_vec(&source).unwrap().len(), MAX_SCHEMA_DOCUMENT_BYTES);
+        assert_eq!(
+            serde_json::to_vec(&source).unwrap().len(),
+            MAX_SCHEMA_DOCUMENT_BYTES
+        );
         assert!(admit_final_schema(source.clone()).is_ok());
         let mut oversized = source;
         oversized["x-note"] = json!("x".repeat(MAX_SCHEMA_DOCUMENT_BYTES - overhead + 1));
-        assert_eq!(admit_final_schema(oversized).unwrap_err().reason(), "schema document byte limit exceeded");
+        assert_eq!(
+            admit_final_schema(oversized).unwrap_err().reason(),
+            "schema document byte limit exceeded"
+        );
 
         let mut wide = json!({"x-data": vec![Value::Null; MAX_SCHEMA_DOCUMENT_NODES - 2]});
         assert!(admit_final_schema(wide.clone()).is_ok());
         wide["x-data"].as_array_mut().unwrap().push(Value::Null);
-        assert_eq!(admit_final_schema(wide).unwrap_err().reason(), "schema document node limit exceeded");
+        assert_eq!(
+            admit_final_schema(wide).unwrap_err().reason(),
+            "schema document node limit exceeded"
+        );
 
         let mut nested = Value::Null;
         for _ in 0..MAX_SCHEMA_VALIDATION_DEPTH - 2 {
             nested = Value::Array(vec![nested]);
         }
         assert!(admit_final_schema(json!({"x-data": nested.clone()})).is_ok());
-        assert_eq!(admit_final_schema(json!({"x-data": [nested]})).unwrap_err().reason(), "schema document nesting limit exceeded");
+        assert_eq!(
+            admit_final_schema(json!({"x-data": [nested]}))
+                .unwrap_err()
+                .reason(),
+            "schema document nesting limit exceeded"
+        );
     }
 
     #[test]
     fn reserved_deprecated_keywords_do_not_become_unchecked_custom_annotations() {
-        for keyword in ["definitions", "dependencies", "$recursiveAnchor", "$recursiveRef"] {
+        for keyword in [
+            "definitions",
+            "dependencies",
+            "$recursiveAnchor",
+            "$recursiveRef",
+        ] {
             let mut source = json!({"type": "integer", "x-ui": {"type": 17}});
             source[keyword] = json!(17);
             assert!(admit_final_schema(source).is_err());
@@ -6579,10 +6607,12 @@ mod tests {
 
         let mut default_dialect = source;
         default_dialect.as_object_mut().unwrap().remove("$schema");
-        assert!(admit_final_schema(default_dialect)
-            .unwrap()
-            .validate(&json!({"id": 3, "label": "ok"}))
-            .is_ok());
+        assert!(
+            admit_final_schema(default_dialect)
+                .unwrap()
+                .validate(&json!({"id": 3, "label": "ok"}))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -6634,7 +6664,8 @@ mod tests {
         let dynamic = admit_final_schema(json!({
             "$dynamicRef": "#value",
             "definitions": {"value": {"$dynamicAnchor": "value", "type": "boolean"}}
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(dynamic.validate(&json!(true)).is_ok());
         assert!(dynamic.validate(&json!("true")).is_err());
     }
@@ -6648,7 +6679,10 @@ mod tests {
         assert!(admit_final_schema(source.clone()).is_ok());
         let mut malformed = source;
         malformed["definitions"]["value"]["type"] = json!(17);
-        assert_eq!(admit_final_schema(malformed).unwrap_err().path(), "$.definitions.value.type");
+        assert_eq!(
+            admit_final_schema(malformed).unwrap_err().path(),
+            "$.definitions.value.type"
+        );
         for keyword in ["$ref", "$dynamicRef"] {
             let unresolved = json!({"definitions": {"value": {
                 keyword: "https://unregistered.example/schema"
@@ -6661,7 +6695,10 @@ mod tests {
 
         for keyword in ["$anchor", "$dynamicAnchor", "$id"] {
             let (first, second) = if keyword == "$id" {
-                ("https://schemas.example/first", "https://schemas.example/second")
+                (
+                    "https://schemas.example/first",
+                    "https://schemas.example/second",
+                )
             } else {
                 ("first", "second")
             };
@@ -6700,7 +6737,10 @@ mod tests {
         assert!(admitted.validate(&json!({"value": 3})).is_ok());
         assert!(admitted.validate(&json!({"value": "3"})).is_err());
         let mut inherited = source;
-        inherited["properties"]["value"].as_object_mut().unwrap().remove("$schema");
+        inherited["properties"]["value"]
+            .as_object_mut()
+            .unwrap()
+            .remove("$schema");
         assert_eq!(
             admit_final_schema(inherited).unwrap_err().path(),
             "$.properties.value.definitions"
@@ -6710,7 +6750,11 @@ mod tests {
         assert!(admit_final_form_schema(form.clone()).is_ok());
         for at_root in [true, false] {
             let mut nested = form.clone();
-            let target = if at_root { &mut nested } else { &mut nested["properties"]["value"] };
+            let target = if at_root {
+                &mut nested
+            } else {
+                &mut nested["properties"]["value"]
+            };
             target["definitions"] = json!({"value": {"type": "integer"}});
             assert!(admit_final_schema(nested.clone()).is_ok());
             assert!(admit_final_form_schema(nested).is_err());
@@ -6738,7 +6782,9 @@ mod tests {
         }
         assert!(admit_final_schema(nested.clone()).is_ok());
         assert_eq!(
-            admit_final_schema(json!({"definitions": {"child": nested}})).unwrap_err().reason(),
+            admit_final_schema(json!({"definitions": {"child": nested}}))
+                .unwrap_err()
+                .reason(),
             "schema document nesting limit exceeded"
         );
 
@@ -6749,14 +6795,24 @@ mod tests {
         let mut entries: serde_json::Map<String, Value> = (0..MAX_SCHEMA_VALIDATION_WORK - 6)
             .map(|index| (format!("unused_{index:04}"), Value::Bool(false)))
             .collect();
-        entries.insert("zz_target".to_owned(), json!({"$anchor": "target", "type": "boolean"}));
+        entries.insert(
+            "zz_target".to_owned(),
+            json!({"$anchor": "target", "type": "boolean"}),
+        );
         let source = json!({"definitions": entries, "$ref": "#target"});
         let admitted = admit_final_schema(source.clone()).unwrap();
         assert!(admitted.validate(&json!(true)).is_ok());
         let mut excessive = source.clone();
         excessive["definitions"]["unused_extra"] = Value::Bool(false);
-        let errors = admit_final_schema(excessive).unwrap().validate(&json!(true)).unwrap_err();
-        assert!(errors.iter().any(|error| error.message == "schema validation work limit exceeded"));
+        let errors = admit_final_schema(excessive)
+            .unwrap()
+            .validate(&json!(true))
+            .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message == "schema validation work limit exceeded")
+        );
         assert_eq!(admitted.schema(), &source);
     }
 
@@ -6770,7 +6826,10 @@ mod tests {
             }},
             "$ref": "#/definitions/record"
         });
-        assert_eq!(SchemaGenerator::new().finish(source.clone()).unwrap(), source);
+        assert_eq!(
+            SchemaGenerator::new().finish(source.clone()).unwrap(),
+            source
+        );
         assert!(validate_strict(&source, &json!({"value": 3})).is_ok());
         assert!(validate_strict(&source, &json!({"value": 3, "extra": true})).is_err());
 
@@ -6780,7 +6839,10 @@ mod tests {
         unscoped["definitions"]["alias"] = json!({"$ref": "#/definitions/record"});
         let mut generator = SchemaGenerator::new();
         assert_eq!(generator.inline_schema(unscoped), Value::Bool(false));
-        assert_eq!(generator.finish(json!({})), Err(SchemaGenerationError::ReferenceResourceBoundary));
+        assert_eq!(
+            generator.finish(json!({})),
+            Err(SchemaGenerationError::ReferenceResourceBoundary)
+        );
 
         let mut generator = SchemaGenerator::new();
         let first = generator.subschema_for::<GeneratedText>();
@@ -6791,7 +6853,10 @@ mod tests {
                 "$id": "https://schemas.example/nested", "allOf": [reused]
             }}
         });
-        assert_eq!(generator.finish(root), Err(SchemaGenerationError::ReferenceResourceBoundary));
+        assert_eq!(
+            generator.finish(root),
+            Err(SchemaGenerationError::ReferenceResourceBoundary)
+        );
     }
 
     #[test]

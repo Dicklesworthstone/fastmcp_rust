@@ -3,9 +3,11 @@
 //! machine authentication does not execute a browser or authorization-code flow.
 use super::*;
 use fastmcp_client::http_auth::discovery::TrustedOAuthIssuer;
-use fastmcp_client::http_auth::discovery::client_credentials::{ClientCredentialsPlan, CLIENT_CREDENTIALS_EXTENSION};
 use fastmcp_client::http_auth::discovery::client_credentials::rpc::interaction::{
-    ClientCredentialsInteraction, ClientCredentialsInteractionError, ClientCredentialsInputReply,
+    ClientCredentialsInputReply, ClientCredentialsInteraction, ClientCredentialsInteractionError,
+};
+use fastmcp_client::http_auth::discovery::client_credentials::{
+    CLIENT_CREDENTIALS_EXTENSION, ClientCredentialsPlan,
 };
 
 #[path = "mixed_inputs.rs"]
@@ -19,7 +21,12 @@ const TWO: &str = r#"{"resultType":"input_required","inputRequests":{"one":{"met
 const REST: &str = r#"{"resultType":"input_required","inputRequests":{"two":{"method":"roots/list"}},"requestState":"machine-next"}"#;
 const BASIC: &str = "Basic c2VydmljZS1jbGllbnQ6c2VydmljZS1zZWNyZXQ=";
 #[derive(Clone, Copy)]
-enum MachineCase { Manual(&'static str), Driver, OwnerClose, DiscoveryRefusal }
+enum MachineCase {
+    Manual(&'static str),
+    Driver,
+    OwnerClose,
+    DiscoveryRefusal,
+}
 
 fn isolated_machine(name: &str, case: MachineCase) {
     if let Ok(selected) = std::env::var(CHILD) {
@@ -29,22 +36,48 @@ fn isolated_machine(name: &str, case: MachineCase) {
     }
     let roots = RootFile::create();
     struct Child(std::process::Child);
-    impl Drop for Child { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
-    let mut child = Child(Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture", "--test-threads=1"])
-        .env(CHILD, name).env("SSL_CERT_FILE", &roots.0).env_remove("SSL_CERT_DIR")
-        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap());
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Child(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, name)
+            .env("SSL_CERT_FILE", &roots.0)
+            .env_remove("SSL_CERT_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
     let end = Instant::now() + Duration::from_secs(30);
     loop {
-        if let Some(status) = child.0.try_wait().unwrap() { assert!(status.success()); return; }
-        assert!(Instant::now() < end, "machine partial TLS child exceeded its bound");
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success());
+            return;
+        }
+        assert!(
+            Instant::now() < end,
+            "machine partial TLS child exceeded its bound"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
 
 // The inherited Peer::request enforces the MCP side. Bootstrap GET/token POSTs
 // have different authentication and therefore use this bounded fixture reader.
-async fn bootstrap_request(peer: &Peer) -> (TlsStream<TcpStream>, String, BTreeMap<String,String>, Vec<u8>) {
+async fn bootstrap_request(
+    peer: &Peer,
+) -> (
+    TlsStream<TcpStream>,
+    String,
+    BTreeMap<String, String>,
+    Vec<u8>,
+) {
     let (socket, _) = peer.listener.accept().await.unwrap();
     let mut socket = peer.acceptor.accept(socket).await.unwrap();
     let mut bytes = Vec::new();
@@ -53,16 +86,24 @@ async fn bootstrap_request(peer: &Peer) -> (TlsStream<TcpStream>, String, BTreeM
         let count = socket.read(&mut chunk).await.unwrap();
         assert!(count > 0 && bytes.len() + count <= 32768);
         bytes.extend_from_slice(&chunk[..count]);
-        if let Some(offset) = bytes.windows(4).position(|slice| slice == b"\r\n\r\n") { break offset + 4; }
+        if let Some(offset) = bytes.windows(4).position(|slice| slice == b"\r\n\r\n") {
+            break offset + 4;
+        }
     };
     let head = std::str::from_utf8(&bytes[..end]).unwrap();
     let start = head.lines().next().unwrap().to_owned();
     let mut headers = BTreeMap::new();
     for line in head.lines().skip(1).filter(|line| !line.is_empty()) {
-        let (name,value) = line.split_once(':').unwrap();
-        assert!(headers.insert(name.to_ascii_lowercase(), value.trim().to_owned()).is_none());
+        let (name, value) = line.split_once(':').unwrap();
+        assert!(
+            headers
+                .insert(name.to_ascii_lowercase(), value.trim().to_owned())
+                .is_none()
+        );
     }
-    let size = headers.get("content-length").map_or(0, |size| size.parse::<usize>().unwrap());
+    let size = headers
+        .get("content-length")
+        .map_or(0, |size| size.parse::<usize>().unwrap());
     assert!(end + size <= 32768);
     while bytes.len() < end + size {
         let count = socket.read(&mut chunk).await.unwrap();
@@ -72,22 +113,43 @@ async fn bootstrap_request(peer: &Peer) -> (TlsStream<TcpStream>, String, BTreeM
     assert_eq!(bytes.len(), end + size);
     (socket, start, headers, bytes[end..].to_vec())
 }
-fn origin(peer: &Peer) -> String { format!("https://{}", peer.listener.local_addr().unwrap()) }
+fn origin(peer: &Peer) -> String {
+    format!("https://{}", peer.listener.local_addr().unwrap())
+}
 fn plan(peer: &Peer) -> ClientCredentialsPlan {
     let root = Certificate::from_pem(ROOT).unwrap().remove(0);
-    let issuer = TrustedOAuthIssuer::new(format!("{}/issuer", origin(peer))).unwrap()
-        .with_root_certificate(root.clone()).unwrap();
-    ClientCredentialsPlan::new(url(&peer.resource()), issuer, "service-client", "service-secret", vec!["read".to_owned()]).unwrap()
-        .with_resource_root_certificate(root).unwrap().with_renewal_leeway(Duration::ZERO).unwrap()
-        .with_timeout(Duration::from_secs(15)).unwrap()
+    let issuer = TrustedOAuthIssuer::new(format!("{}/issuer", origin(peer)))
+        .unwrap()
+        .with_root_certificate(root.clone())
+        .unwrap();
+    ClientCredentialsPlan::new(
+        url(&peer.resource()),
+        issuer,
+        "service-client",
+        "service-secret",
+        vec!["read".to_owned()],
+    )
+    .unwrap()
+    .with_resource_root_certificate(root)
+    .unwrap()
+    .with_renewal_leeway(Duration::ZERO)
+    .unwrap()
+    .with_timeout(Duration::from_secs(15))
+    .unwrap()
 }
 async fn metadata(peer: &Peer) {
     for (path, result) in [
-        ("/.well-known/oauth-protected-resource/mcp", json!({"resource":peer.resource(),
-            "authorization_servers":[format!("{}/issuer", origin(peer))], "scopes_supported":["read"]})),
-        ("/.well-known/oauth-authorization-server/issuer", json!({"issuer":format!("{}/issuer", origin(peer)),
+        (
+            "/.well-known/oauth-protected-resource/mcp",
+            json!({"resource":peer.resource(),
+            "authorization_servers":[format!("{}/issuer", origin(peer))], "scopes_supported":["read"]}),
+        ),
+        (
+            "/.well-known/oauth-authorization-server/issuer",
+            json!({"issuer":format!("{}/issuer", origin(peer)),
             "token_endpoint":format!("{}/token", origin(peer)), "grant_types_supported":["client_credentials"],
-            "token_endpoint_auth_methods_supported":["client_secret_basic"], "scopes_supported":["read"]})),
+            "token_endpoint_auth_methods_supported":["client_secret_basic"], "scopes_supported":["read"]}),
+        ),
     ] {
         let (mut socket, start, headers, body) = bootstrap_request(peer).await;
         assert_eq!(start, format!("GET {path} HTTP/1.1"));
@@ -103,15 +165,21 @@ async fn grant(peer: &Peer) {
     assert_eq!(fields["grant_type"], "client_credentials");
     assert_eq!(fields["resource"], peer.resource());
     assert_eq!(fields["scope"], "read");
-    assert_eq!(fields.len(), 3, "no browser code or refresh token in a machine grant");
+    assert_eq!(
+        fields.len(),
+        3,
+        "no browser code or refresh token in a machine grant"
+    );
     peer.tokens.fetch_add(1, Ordering::SeqCst);
     json_reply(&mut socket, r#"{"access_token":"interaction-access","token_type":"Bearer","expires_in":300,"scope":"read"}"#).await;
 }
 async fn round(peer: &Peer, id: i64, result: &str) -> Value {
     let discovery = peer.response(id, DISCOVERY).await;
     assert_eq!(discovery["method"], "server/discover");
-    assert_eq!(discovery["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"],
-        json!({CLIENT_CREDENTIALS_EXTENSION:{}}));
+    assert_eq!(
+        discovery["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"],
+        json!({CLIENT_CREDENTIALS_EXTENSION:{}})
+    );
     peer.response(id + 1, result).await
 }
 fn assert_wire(wire: &Value, original: &Value, key: &str, state: &str) {
@@ -123,10 +191,16 @@ fn assert_wire(wire: &Value, original: &Value, key: &str, state: &str) {
     assert_eq!(&params, original);
 }
 async fn challenge(operation: &mut ClientCredentialsInteraction, cx: &Cx) {
-    assert!(matches!(operation.next_event(cx).await.unwrap(), Some(ManagedInteractionEvent::InputRequired(_))));
+    assert!(matches!(
+        operation.next_event(cx).await.unwrap(),
+        Some(ManagedInteractionEvent::InputRequired(_))
+    ));
 }
 async fn complete_machine(operation: &mut ClientCredentialsInteraction, cx: &Cx) {
-    let Some(ManagedInteractionEvent::Complete(result)) = operation.next_event(cx).await.unwrap() else { panic!("complete machine result expected"); };
+    let Some(ManagedInteractionEvent::Complete(result)) = operation.next_event(cx).await.unwrap()
+    else {
+        panic!("complete machine result expected");
+    };
     assert!(result.encode().unwrap().contains("1.20e+4"));
     assert!(operation.next_event(cx).await.unwrap().is_none());
 }
@@ -232,25 +306,43 @@ fn run_machine(case: MachineCase) {
 
 #[test]
 fn machine_partial_tool_uses_fresh_discovery_and_exact_successor() {
-    isolated_machine("driver::machine_partial::machine_partial_tool_uses_fresh_discovery_and_exact_successor", MachineCase::Manual("tools/call"));
+    isolated_machine(
+        "driver::machine_partial::machine_partial_tool_uses_fresh_discovery_and_exact_successor",
+        MachineCase::Manual("tools/call"),
+    );
 }
 #[test]
 fn machine_partial_resource_uses_fresh_discovery_and_exact_successor() {
-    isolated_machine("driver::machine_partial::machine_partial_resource_uses_fresh_discovery_and_exact_successor", MachineCase::Manual("resources/read"));
+    isolated_machine(
+        "driver::machine_partial::machine_partial_resource_uses_fresh_discovery_and_exact_successor",
+        MachineCase::Manual("resources/read"),
+    );
 }
 #[test]
 fn machine_partial_prompt_uses_fresh_discovery_and_exact_successor() {
-    isolated_machine("driver::machine_partial::machine_partial_prompt_uses_fresh_discovery_and_exact_successor", MachineCase::Manual("prompts/get"));
+    isolated_machine(
+        "driver::machine_partial::machine_partial_prompt_uses_fresh_discovery_and_exact_successor",
+        MachineCase::Manual("prompts/get"),
+    );
 }
 #[test]
 fn machine_partial_driver_honors_the_selected_answers_only() {
-    isolated_machine("driver::machine_partial::machine_partial_driver_honors_the_selected_answers_only", MachineCase::Driver);
+    isolated_machine(
+        "driver::machine_partial::machine_partial_driver_honors_the_selected_answers_only",
+        MachineCase::Driver,
+    );
 }
 #[test]
 fn machine_partial_owner_close_prevents_the_next_discovery() {
-    isolated_machine("driver::machine_partial::machine_partial_owner_close_prevents_the_next_discovery", MachineCase::OwnerClose);
+    isolated_machine(
+        "driver::machine_partial::machine_partial_owner_close_prevents_the_next_discovery",
+        MachineCase::OwnerClose,
+    );
 }
 #[test]
 fn machine_partial_discovery_refusal_cannot_authorize_a_replay() {
-    isolated_machine("driver::machine_partial::machine_partial_discovery_refusal_cannot_authorize_a_replay", MachineCase::DiscoveryRefusal);
+    isolated_machine(
+        "driver::machine_partial::machine_partial_discovery_refusal_cannot_authorize_a_replay",
+        MachineCase::DiscoveryRefusal,
+    );
 }

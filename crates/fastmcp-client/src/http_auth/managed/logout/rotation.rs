@@ -13,7 +13,9 @@ use asupersync::sync::OwnedMutexGuard;
 use asupersync::types::Time;
 use fastmcp_core::McpRequestCancellation;
 
-use super::super::{ManagedOAuthSession, OAuthSessionError, PendingPermit, SessionGuard, deadline_after};
+use super::super::{
+    ManagedOAuthSession, OAuthSessionError, PendingPermit, SessionGuard, deadline_after,
+};
 use crate::http_auth::oauth::{OAuthClient, OAuthCredentials, OAuthError};
 
 /// A local access-installation refusal. It does not undo a completed durable
@@ -33,16 +35,26 @@ impl fmt::Display for OAuthAccessRotationError {
         match self {
             Self::Context(error) => fmt::Display::fmt(error, f),
             Self::Session(error) => fmt::Display::fmt(error, f),
-            Self::NotComplete => f.write_str("persistent renewal has no completed access grant to install"),
-            Self::GenerationMismatch => f.write_str("managed OAuth generation changed before access installation"),
-            Self::InMemoryRefreshOwnership => f.write_str("persistent access installation cannot replace in-memory refresh ownership"),
-            Self::ScopeExpansion => f.write_str("persistent access installation would expand the current session scopes"),
+            Self::NotComplete => {
+                f.write_str("persistent renewal has no completed access grant to install")
+            }
+            Self::GenerationMismatch => {
+                f.write_str("managed OAuth generation changed before access installation")
+            }
+            Self::InMemoryRefreshOwnership => f.write_str(
+                "persistent access installation cannot replace in-memory refresh ownership",
+            ),
+            Self::ScopeExpansion => f.write_str(
+                "persistent access installation would expand the current session scopes",
+            ),
         }
     }
 }
 impl std::error::Error for OAuthAccessRotationError {}
 impl From<OAuthSessionError> for OAuthAccessRotationError {
-    fn from(error: OAuthSessionError) -> Self { Self::Session(error) }
+    fn from(error: OAuthSessionError) -> Self {
+        Self::Session(error)
+    }
 }
 
 pub(crate) struct AccessRotation<'a> {
@@ -67,20 +79,32 @@ impl ManagedOAuthSession {
         self.check(cx, cancellation)?;
         admit_candidate(self, candidate)?;
         let deadline = deadline_after(cx, self.inner.policy.acquisition_timeout)?;
-        let permit = PendingPermit::acquire(&self.inner.pending, self.inner.policy.max_pending_acquisitions)?;
+        let permit = PendingPermit::acquire(
+            &self.inner.pending,
+            self.inner.policy.max_pending_acquisitions,
+        )?;
         // Expiry of the OLD access token must not prevent its replacement.
         // Session closure, cancellation and acquisition time still apply.
-        let guard = self.await_active(cx, cancellation, deadline, None, async {
-            let guard = OwnedMutexGuard::lock(Arc::clone(&self.inner.state), cx)
-                .await.map_err(|_| OAuthSessionError::StateUnavailable)?;
-            Ok(SessionGuard {
-                guard,
-                closed: &self.inner.closed,
-                logout_handoff: &self.inner.logout_handoff,
+        let guard = self
+            .await_active(cx, cancellation, deadline, None, async {
+                let guard = OwnedMutexGuard::lock(Arc::clone(&self.inner.state), cx)
+                    .await
+                    .map_err(|_| OAuthSessionError::StateUnavailable)?;
+                Ok(SessionGuard {
+                    guard,
+                    closed: &self.inner.closed,
+                    logout_handoff: &self.inner.logout_handoff,
+                })
             })
-        }).await?;
+            .await?;
         let reserved = AccessRotation {
-            session: self, guard, _permit: permit, cx, cancellation, deadline, expected_generation,
+            session: self,
+            guard,
+            _permit: permit,
+            cx,
+            cancellation,
+            deadline,
+            expected_generation,
         };
         reserved.admit(candidate)?;
         Ok(reserved)
@@ -106,19 +130,27 @@ impl AccessRotation<'_> {
         if state.renewal_failed || state.credentials.bearer_credential().is_revoked() {
             return Err(OAuthSessionError::LoginRequired.into());
         }
-        if candidate.scopes().iter().any(|scope| !state.credentials.scopes().contains(scope)) {
+        if candidate
+            .scopes()
+            .iter()
+            .any(|scope| !state.credentials.scopes().contains(scope))
+        {
             return Err(OAuthAccessRotationError::ScopeExpansion);
         }
-        state.generation.checked_add(1).ok_or(OAuthSessionError::GenerationExhausted.into())
+        state
+            .generation
+            .checked_add(1)
+            .ok_or(OAuthSessionError::GenerationExhausted.into())
     }
 
     /// Every refusal returns the original candidate without changing state.
     /// No await, callback, serialization, or further fallible step follows the
     /// ownership election. Existing response/snapshot lifetimes are untouched.
     /// The returned candidate is boxed so this Result stays small (bd-19tqe).
-    pub(crate) fn commit(mut self, candidate: OAuthCredentials)
-        -> Result<u64, (OAuthAccessRotationError, Box<OAuthCredentials>)>
-    {
+    pub(crate) fn commit(
+        mut self,
+        candidate: OAuthCredentials,
+    ) -> Result<u64, (OAuthAccessRotationError, Box<OAuthCredentials>)> {
         let generation = match self.admit(&candidate) {
             Ok(generation) => generation,
             Err(error) => return Err((error, Box::new(candidate))),
@@ -133,9 +165,10 @@ impl AccessRotation<'_> {
     }
 }
 
-fn admit_candidate(session: &ManagedOAuthSession, candidate: &OAuthCredentials)
-    -> Result<(), OAuthAccessRotationError>
-{
+fn admit_candidate(
+    session: &ManagedOAuthSession,
+    candidate: &OAuthCredentials,
+) -> Result<(), OAuthAccessRotationError> {
     if !session.inner.client.accepts_credentials(candidate) {
         return Err(OAuthSessionError::OAuth(OAuthError::CredentialBindingMismatch).into());
     }
@@ -159,13 +192,17 @@ impl fmt::Display for OAuthRefreshTransferError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Session(error) => fmt::Display::fmt(error, f),
-            Self::GenerationMismatch => f.write_str("managed OAuth generation changed before refresh transfer"),
+            Self::GenerationMismatch => {
+                f.write_str("managed OAuth generation changed before refresh transfer")
+            }
         }
     }
 }
 impl std::error::Error for OAuthRefreshTransferError {}
 impl From<OAuthSessionError> for OAuthRefreshTransferError {
-    fn from(error: OAuthSessionError) -> Self { Self::Session(error) }
+    fn from(error: OAuthSessionError) -> Self {
+        Self::Session(error)
+    }
 }
 
 pub(crate) struct RefreshTransfer<'a> {
@@ -181,26 +218,41 @@ pub(crate) struct RefreshTransfer<'a> {
 
 impl ManagedOAuthSession {
     pub(crate) async fn reserve_refresh_transfer<'a>(
-        &'a self, cx: &'a Cx, cancellation: &'a McpRequestCancellation,
-        expected_generation: u64, client: &'a OAuthClient,
+        &'a self,
+        cx: &'a Cx,
+        cancellation: &'a McpRequestCancellation,
+        expected_generation: u64,
+        client: &'a OAuthClient,
     ) -> Result<RefreshTransfer<'a>, OAuthRefreshTransferError> {
         self.check(cx, cancellation)?;
         let deadline = deadline_after(cx, self.inner.policy.acquisition_timeout)?;
-        let permit = PendingPermit::acquire(&self.inner.pending, self.inner.policy.max_pending_acquisitions)?;
+        let permit = PendingPermit::acquire(
+            &self.inner.pending,
+            self.inner.policy.max_pending_acquisitions,
+        )?;
         // Serialize with renewal/rotation/logout, but NEVER renew in order to
         // capture. Even an expired access token can own a valid refresh grant.
-        let guard = self.await_active(cx, cancellation, deadline, None, async {
-            let guard = OwnedMutexGuard::lock(Arc::clone(&self.inner.state), cx)
-                .await.map_err(|_| OAuthSessionError::StateUnavailable)?;
-            Ok(SessionGuard {
-                guard,
-                closed: &self.inner.closed,
-                logout_handoff: &self.inner.logout_handoff,
+        let guard = self
+            .await_active(cx, cancellation, deadline, None, async {
+                let guard = OwnedMutexGuard::lock(Arc::clone(&self.inner.state), cx)
+                    .await
+                    .map_err(|_| OAuthSessionError::StateUnavailable)?;
+                Ok(SessionGuard {
+                    guard,
+                    closed: &self.inner.closed,
+                    logout_handoff: &self.inner.logout_handoff,
+                })
             })
-        }).await?;
+            .await?;
         let reserved = RefreshTransfer {
-            session: self, guard, _permit: permit, cx, cancellation,
-            client, deadline, expected_generation,
+            session: self,
+            guard,
+            _permit: permit,
+            cx,
+            cancellation,
+            client,
+            deadline,
+            expected_generation,
         };
         reserved.admit()?;
         Ok(reserved)
@@ -210,7 +262,9 @@ impl ManagedOAuthSession {
 impl RefreshTransfer<'_> {
     fn admit(&self) -> Result<(), OAuthRefreshTransferError> {
         self.session.check(self.cx, self.cancellation)?;
-        if self.cx.now() >= self.deadline { return Err(OAuthSessionError::TimedOut.into()); }
+        if self.cx.now() >= self.deadline {
+            return Err(OAuthSessionError::TimedOut.into());
+        }
         let state = self.guard.as_ref().ok_or(OAuthSessionError::Closed)?;
         if state.generation != self.expected_generation {
             return Err(OAuthRefreshTransferError::GenerationMismatch);
@@ -233,7 +287,9 @@ impl RefreshTransfer<'_> {
     pub(crate) fn commit(mut self) -> Result<OAuthCredentials, OAuthRefreshTransferError> {
         self.admit()?;
         let state = self.guard.as_mut().ok_or(OAuthSessionError::Closed)?;
-        let credentials = state.credentials.take_persistence_credentials(&self.session.inner.closed)
+        let credentials = state
+            .credentials
+            .take_persistence_credentials(&self.session.inner.closed)
             .map_err(OAuthSessionError::OAuth)?;
         // The access token did not change, so its generation must not change.
         // In-memory acquisition can now use access until expiry, not attempt

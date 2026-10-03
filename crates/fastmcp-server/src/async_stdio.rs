@@ -34,31 +34,28 @@ const SUBSCRIPTION_LIFETIME: Duration = Duration::from_hours(1);
 const TASK_SERVICE_HEALTH_INTERVAL: Duration = Duration::from_millis(100);
 
 type RequestWork = Pin<Box<dyn Future<Output = McpResult<()>> + Send>>;
-type ReadWork<R> = Pin<
-    Box<
-        dyn Future<
-                Output = (R, Result<ReceivedTransportFrame, TransportError>),
-            > + Send,
-    >,
->;
-type WriteWork<W> = Pin<
-    Box<dyn Future<Output = (W, Result<(), TransportError>, usize)> + Send>,
->;
+type ReadWork<R> =
+    Pin<Box<dyn Future<Output = (R, Result<ReceivedTransportFrame, TransportError>)> + Send>>;
+type WriteWork<W> = Pin<Box<dyn Future<Output = (W, Result<(), TransportError>, usize)> + Send>>;
 
 /// Internal framing seam shared by native stdio and WebSocket connections.
 /// The read future remains owned until it completes or the connection stops.
 trait ConnectionReader: Send + 'static {
-    fn receive(&mut self, cx: &Cx)
-        -> impl Future<Output = Result<ReceivedTransportFrame, TransportError>> + Send;
+    fn receive(
+        &mut self,
+        cx: &Cx,
+    ) -> impl Future<Output = Result<ReceivedTransportFrame, TransportError>> + Send;
 }
 
 /// A dropped partial send must latch `is_closed`; cancellation before its
 /// first byte may leave this independently owned writer usable.
 trait ConnectionWriter: Send + 'static {
-    fn send(&mut self, cx: &Cx, message: &JsonRpcMessage)
-        -> impl Future<Output = Result<(), TransportError>> + Send;
-    fn close(&mut self, cx: &Cx)
-        -> impl Future<Output = Result<(), TransportError>> + Send;
+    fn send(
+        &mut self,
+        cx: &Cx,
+        message: &JsonRpcMessage,
+    ) -> impl Future<Output = Result<(), TransportError>> + Send;
+    fn close(&mut self, cx: &Cx) -> impl Future<Output = Result<(), TransportError>> + Send;
     fn is_closed(&self) -> bool;
 }
 
@@ -339,10 +336,7 @@ impl Drop for ConnectionLifetime {
     }
 }
 
-fn receive<R: ConnectionReader>(
-    mut reader: R,
-    cx: Cx,
-) -> ReadWork<R> {
+fn receive<R: ConnectionReader>(mut reader: R, cx: Cx) -> ReadWork<R> {
     Box::pin(async move {
         let result = reader.receive(&cx).await;
         (reader, result)
@@ -527,15 +521,12 @@ fn prepare_request(
         // rejection therefore cannot leave an unconsumed registry entry.
         sanitize_websocket_decoded_request(custody, &mut request);
     }
-    let receipt = match lifetime
-        .server
-        .admit_modern_pump_authentication(
-            &inbound,
-            &request,
-            lifetime.binding.auth_custody.as_ref(),
-            lifetime.binding.auth_generation,
-        )
-    {
+    let receipt = match lifetime.server.admit_modern_pump_authentication(
+        &inbound,
+        &request,
+        lifetime.binding.auth_custody.as_ref(),
+        lifetime.binding.auth_generation,
+    ) {
         Ok(receipt) => receipt,
         Err(error) => {
             if let Some(id) = request.id {
@@ -667,10 +658,7 @@ fn prepare_request(
 }
 
 enum Event<R, W> {
-    Read(
-        R,
-        Result<ReceivedTransportFrame, TransportError>,
-    ),
+    Read(R, Result<ReceivedTransportFrame, TransportError>),
     Written(W, Result<(), TransportError>, usize),
     Completed(usize, McpResult<()>),
     Output,
@@ -862,7 +850,10 @@ impl Server {
     ) -> (McpResult<()>, bool) {
         #[cfg(feature = "tasks")]
         let mut task_service_check = hosted_tasks.as_ref().map(|_| {
-            Box::pin(asupersync::time::sleep(cx.now(), TASK_SERVICE_HEALTH_INTERVAL))
+            Box::pin(asupersync::time::sleep(
+                cx.now(),
+                TASK_SERVICE_HEALTH_INTERVAL,
+            ))
         });
         if let Some(stats) = &server.stats {
             stats.connection_opened();
@@ -924,9 +915,10 @@ impl Server {
                         }
                         // A failed service must stop a silent connection as
                         // well as one actively supplying request frames.
-                        if task_service_check.as_mut().is_some_and(|check| {
-                            check.as_mut().poll(task).is_ready()
-                        }) {
+                        if task_service_check
+                            .as_mut()
+                            .is_some_and(|check| check.as_mut().poll(task).is_ready())
+                        {
                             return Poll::Ready(Event::TaskServiceCheck);
                         }
                     }
@@ -1305,14 +1297,14 @@ mod tests {
                         false
                     }
                 });
-                let result = asupersync::time::timeout(
-                    cx.now(),
-                    Duration::from_secs(8),
-                    test(cx.clone()),
-                )
-                .await;
+                let result =
+                    asupersync::time::timeout(cx.now(), Duration::from_secs(8), test(cx.clone()))
+                        .await;
                 let _ = finished.send(());
-                assert!(!watchdog.join().unwrap(), "native bridge blocked its runtime");
+                assert!(
+                    !watchdog.join().unwrap(),
+                    "native bridge blocked its runtime"
+                );
                 result.expect("native WebSocket operation exceeded its bound");
             });
         }
@@ -1410,10 +1402,20 @@ mod tests {
                 peer.send(&cx, &cancel(201)).await.unwrap();
                 until(&cx, || gate.dropped.load(Ordering::Acquire) == 1).await;
                 peer.send(&cx, &call(203, false)).await.unwrap();
-                assert!(response(&cx, &mut peer, 203, &[201, 202]).await.error.is_none());
+                assert!(
+                    response(&cx, &mut peer, 203, &[201, 202])
+                        .await
+                        .error
+                        .is_none()
+                );
                 peer.send(&cx, &cancel(202)).await.unwrap();
                 peer.send(&cx, &discover(204)).await.unwrap();
-                assert!(response(&cx, &mut peer, 204, &[201, 202]).await.error.is_none());
+                assert!(
+                    response(&cx, &mut peer, 204, &[201, 202])
+                        .await
+                        .error
+                        .is_none()
+                );
                 stop(&cx, peer, serving).await;
                 assert_eq!(gate.dropped.load(Ordering::Acquire), 2);
                 assert!(cx.checkpoint().is_ok());
@@ -1431,7 +1433,12 @@ mod tests {
                 // This case changes only the cancellation target above.
                 peer.send(&cx, &cancel(999)).await.unwrap();
                 peer.send(&cx, &call(203, false)).await.unwrap();
-                assert!(response(&cx, &mut peer, 203, &[201, 202]).await.error.is_none());
+                assert!(
+                    response(&cx, &mut peer, 203, &[201, 202])
+                        .await
+                        .error
+                        .is_none()
+                );
                 assert_eq!(gate.dropped.load(Ordering::Acquire), 1);
                 gate.release();
                 assert!(response(&cx, &mut peer, 201, &[202]).await.error.is_none());
@@ -1478,7 +1485,9 @@ mod tests {
                 };
                 mixed.params.as_mut().unwrap()["_meta"]["token"] =
                     serde_json::json!("must-not-reach-application");
-                peer.send(&cx, &JsonRpcMessage::Request(mixed)).await.unwrap();
+                peer.send(&cx, &JsonRpcMessage::Request(mixed))
+                    .await
+                    .unwrap();
                 let refused = response(&cx, &mut peer, 501, &[]).await;
                 assert_eq!(
                     refused.error.unwrap().code.as_i32(),
@@ -1508,9 +1517,14 @@ mod tests {
                 first.close(&cx).await.unwrap();
                 drop(first);
                 // Wait until the closed connection has retired its own lease.
-                until(&cx, || subscriptions.inner.lock().unwrap().entries.len() == 1).await;
+                until(&cx, || {
+                    subscriptions.inner.lock().unwrap().entries.len() == 1
+                })
+                .await;
                 assert_eq!(
-                    subscriptions.publish(ServerNotification::ToolsListChanged(None)).unwrap(),
+                    subscriptions
+                        .publish(ServerNotification::ToolsListChanged(None))
+                        .unwrap(),
                     1,
                 );
                 let JsonRpcMessage::Request(notification) = second.recv(&cx).await.unwrap() else {
@@ -1518,7 +1532,12 @@ mod tests {
                 };
                 assert_eq!(notification.method, "notifications/tools/list_changed");
                 second.send(&cx, &call(603, false)).await.unwrap();
-                assert!(response(&cx, &mut second, 603, &[602]).await.error.is_none());
+                assert!(
+                    response(&cx, &mut second, 603, &[602])
+                        .await
+                        .error
+                        .is_none()
+                );
                 second.send(&cx, &cancel(602)).await.unwrap();
                 stop(&cx, second, serving).await;
             });
@@ -2340,10 +2359,8 @@ mod tests {
                                 }),
                             )
                             .expect("work and accepted roots produce a final tool result");
-                            accepted.complete_task(
-                                result,
-                                Some("resumed and completed".to_owned()),
-                            )?;
+                            accepted
+                                .complete_task(result, Some("resumed and completed".to_owned()))?;
                             self.0.resumed.fetch_add(1, Ordering::AcqRel);
                         }
                     }
@@ -2621,7 +2638,9 @@ mod tests {
             run(|cx| async move {
                 for panic_on_failure in [false, true] {
                     let probe = Arc::new(TaskProbe::default());
-                    probe.panic_on_failure.store(panic_on_failure, Ordering::Release);
+                    probe
+                        .panic_on_failure
+                        .store(panic_on_failure, Ordering::Release);
                     let TaskServer {
                         server,
                         runtime,
@@ -2681,10 +2700,8 @@ mod tests {
                     .unwrap()
                     .task_supervisor(Arc::new(TaskSupervisor(Arc::clone(&probe))))
                     .on_startup(move || {
-                        startup_flag.store(
-                            !startup_runtime.is_task_service_ready(),
-                            Ordering::Release,
-                        );
+                        startup_flag
+                            .store(!startup_runtime.is_task_service_ready(), Ordering::Release);
                         Err(io::Error::other("planted startup failure"))
                     })
                     .build();

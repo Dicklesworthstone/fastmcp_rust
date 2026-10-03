@@ -21,20 +21,22 @@ use asupersync::Cx;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::http_headers::AdmittedToolHeaderSchema;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
-use fastmcp_protocol::{AdmittedSchema, CoreRequest, CoreResult, FinalTool, RequestId, admit_final_schema};
+use fastmcp_protocol::{
+    AdmittedSchema, CoreRequest, CoreResult, FinalTool, RequestId, admit_final_schema,
+};
 use serde_json::Value;
 
 use super::managed::ManagedOAuthSession;
-use super::rpc::{ManagedCoreCall, ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits};
 use super::rpc::tool_headers::ManagedToolHeaderError;
+use super::rpc::{ManagedCoreCall, ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits};
 use crate::http_executor::parameter_headers::{ReviewedToolHeaders, ToolHeaderDispatchError};
 
-/// Explicit multi-round tool operations retaining this same schema contract.
-pub mod interaction;
 /// Caller-driven catalog watches publishing invalidation-bound tool clients.
 pub mod catalog;
 /// Disclosure review bound to this client's exact schema and invalidation.
 pub mod headers;
+/// Explicit multi-round tool operations retaining this same schema contract.
+pub mod interaction;
 
 mod validity;
 use validity::await_validity;
@@ -73,8 +75,12 @@ impl fmt::Display for ManagedToolError {
             Self::RequestMismatch => "request does not match the bound modern tool",
             Self::InvalidArguments => "tool arguments do not satisfy the admitted input schema",
             Self::InvalidResult => "managed tool result failed protocol admission",
-            Self::MissingStructuredOutput => "successful tool result omitted required structured output",
-            Self::InvalidStructuredOutput => "tool structured output does not satisfy its admitted schema",
+            Self::MissingStructuredOutput => {
+                "successful tool result omitted required structured output"
+            }
+            Self::InvalidStructuredOutput => {
+                "tool structured output does not satisfy its admitted schema"
+            }
             Self::HeaderBindingMismatch => "header review does not match the bound tool contract",
             Self::Invalidated => "managed tool contract has been invalidated",
             Self::Closed => "managed tool call is closed",
@@ -126,7 +132,11 @@ impl ToolContract {
         if tool.input_schema.get("type").and_then(Value::as_str) != Some("object") {
             return Err(ManagedToolError::InvalidInputSchema);
         }
-        if tool.output_schema.as_ref().is_some_and(|schema| !schema.is_object()) {
+        if tool
+            .output_schema
+            .as_ref()
+            .is_some_and(|schema| !schema.is_object())
+        {
             return Err(ManagedToolError::InvalidOutputSchema);
         }
         // Standard header annotations are part of the tool definition, not
@@ -135,7 +145,10 @@ impl ToolContract {
         // Admission itself never executes this plan or approves disclosure.
         let input = AdmittedToolHeaderSchema::admit(tool.input_schema)
             .map_err(|_| ManagedToolError::InvalidInputSchema)?;
-        let output = tool.output_schema.map(admit_final_schema).transpose()
+        let output = tool
+            .output_schema
+            .map(admit_final_schema)
+            .transpose()
             .map_err(|_| ManagedToolError::InvalidOutputSchema)?;
         // Shared admission bounds nesting/nodes before serialization. Counting
         // does not allocate another copy of potentially large schema strings.
@@ -146,9 +159,15 @@ impl ToolContract {
             serde_json::to_writer(&mut bytes, output.schema())
                 .map_err(|_| ManagedToolError::SchemaTooLarge)?;
         }
-        Ok(Self { name: tool.name, input, output, invalidated: AtomicBool::new(false),
-            invalidation: McpRequestCancellation::new(), catalog_invalidated: None,
-            source_contract: None })
+        Ok(Self {
+            name: tool.name,
+            input,
+            output,
+            invalidated: AtomicBool::new(false),
+            invalidation: McpRequestCancellation::new(),
+            catalog_invalidated: None,
+            source_contract: None,
+        })
     }
 
     fn invalidate(&self) {
@@ -158,8 +177,14 @@ impl ToolContract {
 
     fn is_invalidated(&self) -> bool {
         self.invalidated.load(Ordering::Acquire)
-            || self.catalog_invalidated.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire))
-            || self.source_contract.as_ref().is_some_and(|source| source.is_invalidated())
+            || self
+                .catalog_invalidated
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+            || self
+                .source_contract
+                .as_ref()
+                .is_some_and(|source| source.is_invalidated())
     }
 
     fn check(&self) -> Result<(), ManagedToolError> {
@@ -175,7 +200,9 @@ impl ToolContract {
         if request.era() != ProtocolEra::Modern2026 || request.method() != "tools/call" {
             return Err(ManagedToolError::RequestMismatch);
         }
-        let params = request.encode_params().map_err(|_| ManagedToolError::InvalidArguments)?
+        let params = request
+            .encode_params()
+            .map_err(|_| ManagedToolError::InvalidArguments)?
             .ok_or(ManagedToolError::InvalidArguments)?;
         if params.get("name").and_then(Value::as_str) != Some(self.name.as_str()) {
             return Err(ManagedToolError::RequestMismatch);
@@ -188,23 +215,29 @@ impl ToolContract {
         if !arguments.is_object() {
             return Err(ManagedToolError::InvalidArguments);
         }
-        self.input.validate(arguments).map_err(|_| ManagedToolError::InvalidArguments)?;
+        self.input
+            .validate(arguments)
+            .map_err(|_| ManagedToolError::InvalidArguments)?;
         self.check()
     }
 
     fn validate_result(&self, result: &CoreResult) -> Result<(), ManagedToolError> {
         self.check()?;
-        let Some(output) = &self.output else { return Ok(()); };
+        let Some(output) = &self.output else {
+            return Ok(());
+        };
         // This is called only on the method-owned result produced by the
         // bound call's protocol decoder, never on an arbitrary result supplied
         // by the application. Keep and return that original lossless result.
-        let encoded = result.encode().map_err(|_| ManagedToolError::InvalidResult)?;
-        let value: Value = serde_json::from_str(&encoded)
+        let encoded = result
+            .encode()
             .map_err(|_| ManagedToolError::InvalidResult)?;
+        let value: Value =
+            serde_json::from_str(&encoded).map_err(|_| ManagedToolError::InvalidResult)?;
         match value.get("resultType").and_then(Value::as_str) {
             // A suspended invocation has not produced the tool's output yet.
             Some("input_required") => return self.check(),
-            Some("complete") => {},
+            Some("complete") => {}
             _ => return Err(ManagedToolError::InvalidResult),
         }
         // A tool-level execution error is not successful structured output.
@@ -212,9 +245,12 @@ impl ToolContract {
         if value.get("isError").and_then(Value::as_bool) == Some(true) {
             return self.check();
         }
-        let structured = value.get("structuredContent")
+        let structured = value
+            .get("structuredContent")
             .ok_or(ManagedToolError::MissingStructuredOutput)?;
-        output.validate(structured).map_err(|_| ManagedToolError::InvalidStructuredOutput)?;
+        output
+            .validate(structured)
+            .map_err(|_| ManagedToolError::InvalidStructuredOutput)?;
         self.check()
     }
 }
@@ -230,7 +266,9 @@ impl Write for SchemaBytes {
         Ok(buffer.len())
     }
 
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// One tool definition bound to one managed login. Clones share the same
@@ -260,10 +298,16 @@ impl ManagedToolClient {
     /// server and approving its use with this exact managed login.
     pub fn new(session: ManagedOAuthSession, tool: FinalTool) -> Result<Self, ManagedToolError> {
         let contract = Arc::new(ToolContract::admit(tool)?);
-        Ok(Self { session, contract, header_review: None })
+        Ok(Self {
+            session,
+            contract,
+            header_review: None,
+        })
     }
 
-    pub fn tool_name(&self) -> &str { &self.contract.name }
+    pub fn tool_name(&self) -> &str {
+        &self.contract.name
+    }
 
     /// Refuses newly started calls and later publication through every clone.
     /// Calls admitted before invalidation may already be dispatching.
@@ -274,9 +318,13 @@ impl ManagedToolClient {
     /// are not cancelled. Abandoning an in-flight OAuth renewal still retains
     /// the session's existing fail-closed refresh-lineage policy and may require
     /// a new login. A new definition requires a new client.
-    pub fn invalidate(&self) { self.contract.invalidate(); }
+    pub fn invalidate(&self) {
+        self.contract.invalidate();
+    }
 
-    pub fn is_invalidated(&self) -> bool { self.contract.is_invalidated() }
+    pub fn is_invalidated(&self) -> bool {
+        self.contract.is_invalidated()
+    }
 
     /// Validates an invocation without acquiring credentials or dispatching it.
     /// The exact name, protocol era and full argument schema must match.
@@ -293,7 +341,14 @@ impl ManagedToolClient {
         request_id: RequestId,
         limits: ManagedCoreLimits,
     ) -> Result<ManagedToolCall, ManagedToolError> {
-        Box::pin(self.request_with_cancellation(cx, &McpRequestCancellation::new(), request, request_id, limits)).await
+        Box::pin(self.request_with_cancellation(
+            cx,
+            &McpRequestCancellation::new(),
+            request,
+            request_id,
+            limits,
+        ))
+        .await
     }
 
     pub async fn request_with_cancellation(
@@ -308,21 +363,44 @@ impl ManagedToolClient {
         self.contract.validate_request(&request)?;
         check_tool_call(cx, cancellation, &self.contract)?;
         let call = match self.header_review.as_deref() {
-            Some(reviewed) => await_validity(cx, cancellation, &self.contract,
-                self.session.request_tool_with_headers_and_cancellation(
-                    cx, cancellation, request, request_id, reviewed, limits,
-                ),
-            ).await??,
-            None => await_validity(cx, cancellation, &self.contract,
-                self.session.request_core_with_cancellation(
-                    cx, cancellation, request, request_id, limits,
-                ),
-            ).await??,
+            Some(reviewed) => {
+                Box::pin(await_validity(
+                    cx,
+                    cancellation,
+                    &self.contract,
+                    self.session.request_tool_with_headers_and_cancellation(
+                        cx,
+                        cancellation,
+                        request,
+                        request_id,
+                        reviewed,
+                        limits,
+                    ),
+                ))
+                .await??
+            }
+            None => {
+                Box::pin(await_validity(
+                    cx,
+                    cancellation,
+                    &self.contract,
+                    self.session.request_core_with_cancellation(
+                        cx,
+                        cancellation,
+                        request,
+                        request_id,
+                        limits,
+                    ),
+                ))
+                .await??
+            }
         };
         check_tool_call(cx, cancellation, &self.contract)?;
         Ok(ManagedToolCall {
-            call: Some(call), contract: self.contract.clone(),
-            cancellation: cancellation.clone(), finished: false,
+            call: Some(call),
+            contract: self.contract.clone(),
+            cancellation: cancellation.clone(),
+            finished: false,
         })
     }
 }
@@ -338,14 +416,27 @@ pub struct ManagedToolCall {
 }
 
 impl ManagedToolCall {
-    pub fn close(&mut self) { self.call = None; }
+    pub fn close(&mut self) {
+        self.call = None;
+    }
 
-    pub async fn next_event(&mut self, cx: &Cx) -> Result<Option<ManagedCoreEvent>, ManagedToolError> {
-        if self.finished { return Ok(None); }
+    pub async fn next_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<ManagedCoreEvent>, ManagedToolError> {
+        if self.finished {
+            return Ok(None);
+        }
         let mut call = self.call.take().ok_or(ManagedToolError::Closed)?;
         check_tool_call(cx, &self.cancellation, &self.contract)?;
-        let event = await_validity(cx, &self.cancellation, &self.contract, call.next_event(cx))
-            .await??.ok_or(ManagedCoreError::MissingTerminal)?;
+        let event = Box::pin(await_validity(
+            cx,
+            &self.cancellation,
+            &self.contract,
+            call.next_event(cx),
+        ))
+        .await??
+        .ok_or(ManagedCoreError::MissingTerminal)?;
         check_tool_call(cx, &self.cancellation, &self.contract)?;
         match &event {
             ManagedCoreEvent::Result(result) => {

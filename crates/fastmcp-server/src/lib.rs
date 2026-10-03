@@ -105,8 +105,7 @@ pub use auth::{
     TokenVerifier,
 };
 pub use builder::{
-    RefusedRegistration, RegistrationKind, ServerBuildError, ServerBuilder,
-    ServerLaunchPolicyError,
+    RefusedRegistration, RegistrationKind, ServerBuildError, ServerBuilder, ServerLaunchPolicyError,
 };
 pub use extensions::{
     ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
@@ -114,6 +113,9 @@ pub use extensions::{
 };
 pub use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 pub use fastmcp_console::stats::{ServerStats, StatsSnapshot};
+use fastmcp_protocol::{
+    MAX_CLIENT_REGISTRATION_BYTES, SecurityDocumentKind, admit_security_document,
+};
 /// Cancellation-aware server-side WebSocket message adapter.
 ///
 /// [`BoundWebSocketServer`] owns the listener and HTTP Upgrade boundary; this
@@ -130,24 +132,21 @@ pub use handler::{
     create_context_with_progress_and_senders, promote_legacy_prompt_messages,
     promote_legacy_resource_contents, promote_legacy_tool_content,
 };
-pub use middleware::{Middleware, MiddlewareDecision};
 pub use middleware::continuation_replay::{
     ContinuationReplayAuthority, ContinuationReplayLimits, ContinuationReplayMiddleware,
 };
+pub use middleware::{Middleware, MiddlewareDecision};
 use oauth::{
     AuthorizationRequest, CodeChallengeMethod, NativePublicClientRegistrationRequest, OAuthError,
     OAuthHttpRoutes, OAuthParameterAdmission, OAuthParameterEndpoint, OAuthParameterName,
     TokenRequest,
 };
-use fastmcp_protocol::{
-    MAX_CLIENT_REGISTRATION_BYTES, SecurityDocumentKind, admit_security_document,
-};
 #[cfg(feature = "proxy")]
 pub use proxy::{
     FinalProgressCallback, ProgressCallback, ProxyAsyncRequest, ProxyBackend, ProxyCatalog,
-    ProxyCatalogCacheHint, ProxyClient, ProxyFinalCatalog, ProxyLegacyPeerNotifications, ProxyPromptCatalog,
-    ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog,
-    ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
+    ProxyCatalogCacheHint, ProxyClient, ProxyFinalCatalog, ProxyLegacyPeerNotifications,
+    ProxyPromptCatalog, ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog,
+    ProxyTypedCatalog, ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
 };
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 use proxy::{ProxyCatalogListener, ProxyCatalogListenerEvent, ProxyFinalTaskRelay};
@@ -168,12 +167,12 @@ use session::{
 #[cfg(feature = "tasks")]
 pub use tasks::{
     ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
-    FinalTaskAcceptedInput, FinalTaskExecutionBudget, FinalTaskExecutionLimits, FinalTaskInitialWork,
-    FinalTaskNotificationEmitter,
-    FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
-    FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
-    FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
-    MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES, MAX_IN_MEMORY_FINAL_TASK_INPUT_KEYS,
+    FinalTaskAcceptedInput, FinalTaskExecutionBudget, FinalTaskExecutionLimits,
+    FinalTaskInitialWork, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
+    FinalTaskRetentionDeadline, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
+    FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
+    InMemoryFinalTaskStore, MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES,
+    MAX_IN_MEMORY_FINAL_TASK_INPUT_KEYS,
 };
 #[cfg(all(test, feature = "tasks"))]
 pub(crate) use tasks::{SharedTaskManager, TaskManager};
@@ -7780,8 +7779,7 @@ impl BoundWebSocketServer {
             }
         }
         #[cfg(feature = "tasks")]
-        let task_service_result =
-            Server::settle_hosted_task_service(hosted_task_service, cx).await;
+        let task_service_result = Server::settle_hosted_task_service(hosted_task_service, cx).await;
         #[cfg(not(feature = "tasks"))]
         let task_service_result: McpResult<()> = Ok(());
         let accept_result = accept_result.and(task_service_result);
@@ -9682,11 +9680,17 @@ impl ServerHttpSession {
     /// Long-lived subscriptions can stream after pre-admission, while ordinary
     /// request-scoped SSE defers its wire representation until the final
     /// outcome has elected it.
+    ///
+    /// `modern_request_cancellation` is the connection-owned cancellation
+    /// domain for a request whose representation is elected as JSON here. That
+    /// dispatch completes inline, before any SSE response owner exists, so the
+    /// caller must observe its peer while awaiting this method (#76).
     async fn begin_modern_sse(
         &mut self,
         cx: &Cx,
         request: HttpRequest,
         transport_authorization: TransportAuthorization,
+        modern_request_cancellation: Option<McpRequestCancellation>,
     ) -> Result<
         Result<
             (
@@ -9758,7 +9762,7 @@ impl ServerHttpSession {
                     raw_params,
                     Some(http_parameter_headers),
                     Some(auth_receipt),
-                    None,
+                    modern_request_cancellation,
                 )
                 .await
                 .map(|response| Err(Box::new(response)));
@@ -10205,9 +10209,10 @@ fn oauth_http_client_credentials(
     let Some(authorization) = authorization else {
         let client_id = oauth_required_parameter(admission, OAuthParameterName::ClientId)
             .map_err(oauth_http_error)?;
-        let client_secret_present = admission.parameters().iter().any(|parameter| {
-            parameter.is_defined() && parameter.name() == "client_secret"
-        });
+        let client_secret_present = admission
+            .parameters()
+            .iter()
+            .any(|parameter| parameter.is_defined() && parameter.name() == "client_secret");
         let client_secret = admission
             .take_defined_value(OAuthParameterName::ClientSecret)
             .map(|value| value.into_string())
@@ -10382,14 +10387,24 @@ fn oauth_token_request(
     development_client_credentials_enabled: bool,
 ) -> Result<TokenRequest, OAuthError> {
     let grant_type = oauth_required_parameter(admission, OAuthParameterName::GrantType)?;
-    let machine_grant = development_client_credentials_enabled && grant_type == "client_credentials";
-    if machine_grant && admission.parameters().iter().any(|parameter| {
-        matches!(parameter.name(),
-            "code" | "redirect_uri" | "code_verifier" | "refresh_token"
-                | "client_assertion" | "client_assertion_type")
-    }) {
+    let machine_grant =
+        development_client_credentials_enabled && grant_type == "client_credentials";
+    if machine_grant
+        && admission.parameters().iter().any(|parameter| {
+            matches!(
+                parameter.name(),
+                "code"
+                    | "redirect_uri"
+                    | "code_verifier"
+                    | "refresh_token"
+                    | "client_assertion"
+                    | "client_assertion_type"
+            )
+        })
+    {
         return Err(OAuthError::InvalidRequest(
-            "machine requests must use only the configured client authentication method".to_string(),
+            "machine requests must use only the configured client authentication method"
+                .to_string(),
         ));
     }
     let scopes = admission
@@ -10400,17 +10415,20 @@ fn oauth_token_request(
                 // RFC 6749 scope is a nonempty SP-separated sequence. Do not
                 // normalize tabs, repeated spaces or leading/trailing spaces
                 // into an authorized machine request.
-                if value.split(' ').any(|scope| scope.is_empty()
-                    || !scope.bytes().all(|byte| matches!(byte, 0x21 | 0x23..=0x5B | 0x5D..=0x7E)))
-                {
-                    return Err(OAuthError::InvalidScope("invalid machine scope syntax".to_string()));
+                if value.split(' ').any(|scope| {
+                    scope.is_empty()
+                        || !scope
+                            .bytes()
+                            .all(|byte| matches!(byte, 0x21 | 0x23..=0x5B | 0x5D..=0x7E))
+                }) {
+                    return Err(OAuthError::InvalidScope(
+                        "invalid machine scope syntax".to_string(),
+                    ));
                 }
             }
-            Ok(value
-                .split_ascii_whitespace()
-                .map(str::to_owned)
-                .collect())
-        }).transpose()?;
+            Ok(value.split_ascii_whitespace().map(str::to_owned).collect())
+        })
+        .transpose()?;
     Ok(TokenRequest {
         grant_type,
         code: admission
@@ -10589,7 +10607,8 @@ fn dispatch_oauth_h1_request(
         if let Err(response) = oauth_json_content_type(request) {
             return oauth_http_no_store(response);
         }
-        if admit_security_document(SecurityDocumentKind::ClientRegistration, &request.body).is_err() {
+        if admit_security_document(SecurityDocumentKind::ClientRegistration, &request.body).is_err()
+        {
             return oauth_http_invalid_request();
         }
         let registration =
@@ -10598,9 +10617,9 @@ fn dispatch_oauth_h1_request(
                 Err(_) => return oauth_http_invalid_request(),
             };
         return match routes.server().register_native_public_client(registration) {
-            Ok(response) => oauth_http_no_store(
-                HttpResponse::new(HttpStatus(201)).with_json(&response),
-            ),
+            Ok(response) => {
+                oauth_http_no_store(HttpResponse::new(HttpStatus(201)).with_json(&response))
+            }
             Err(error) => oauth_http_error(error),
         };
     }
@@ -10666,15 +10685,12 @@ fn dispatch_oauth_h1_request(
             Ok(credentials) => credentials,
             Err(response) => return response,
         };
-    match routes
-        .server()
-        .revoke(
-            &token,
-            &client_id,
-            client_secret.as_deref(),
-            client_authentication_method,
-        )
-    {
+    match routes.server().revoke(
+        &token,
+        &client_id,
+        client_secret.as_deref(),
+        client_authentication_method,
+    ) {
         Ok(()) => oauth_http_no_store(HttpResponse::ok()),
         Err(error) => oauth_http_client_authentication_error(error, authorization_header.is_some()),
     }
@@ -11145,7 +11161,8 @@ enum ModernSseDispatchElection {
     Failed,
 }
 
-enum ModernSseNotificationDelivery {    Pending(Vec<JsonRpcRequest>),
+enum ModernSseNotificationDelivery {
+    Pending(Vec<JsonRpcRequest>),
     Admitted,
     Streaming,
 }
@@ -11278,7 +11295,8 @@ impl ModernSseNotificationGate {
     }
 }
 
-enum ModernSseOutcomeGateState {    AwaitingElection(oneshot::Sender<ModernSseDispatchElection>),
+enum ModernSseOutcomeGateState {
+    AwaitingElection(oneshot::Sender<ModernSseDispatchElection>),
     Elected { stream: bool },
 }
 
@@ -12484,7 +12502,7 @@ async fn serve_http_connection(
         let http_parameter_headers = http_admission::http_parameter_headers(&request.headers);
         let response = {
             match session
-                .begin_modern_sse(cx, request.clone(), transport_authorization.clone())
+                .begin_modern_sse(cx, request.clone(), transport_authorization.clone(), None)
                 .await
             {
                 Ok(Ok((request, response, raw_params, auth_receipt))) => Ok(Ok((
@@ -12875,7 +12893,7 @@ async fn serve_modern_http_connection(
         let http_parameter_headers = http_admission::http_parameter_headers(&request.headers);
         let response = {
             match session
-                .begin_modern_sse(cx, request.clone(), transport_authorization.clone())
+                .begin_modern_sse(cx, request.clone(), transport_authorization.clone(), None)
                 .await
             {
                 Ok(Ok((request, response, raw_params, auth_receipt))) => Ok(Ok((
@@ -13143,7 +13161,10 @@ impl Server {
     }
 
     #[cfg(feature = "tasks")]
-    async fn start_hosted_task_service(&self, cx: &Cx) -> McpResult<Option<tasks::HostedTaskService>> {
+    async fn start_hosted_task_service(
+        &self,
+        cx: &Cx,
+    ) -> McpResult<Option<tasks::HostedTaskService>> {
         match self.task_service_host.as_ref() {
             Some(host) => host.start_ready(cx).await.map(Some),
             None => Ok(None),
@@ -13156,7 +13177,11 @@ impl Server {
         cx: &Cx,
         owns_server_lifecycle: bool,
     ) -> McpResult<Option<tasks::HostedTaskService>> {
-        match self.task_service_host.as_ref().filter(|_| owns_server_lifecycle) {
+        match self
+            .task_service_host
+            .as_ref()
+            .filter(|_| owns_server_lifecycle)
+        {
             Some(host) => host.start_ready_blocking(cx).map(Some),
             None => Ok(None),
         }
@@ -14949,10 +14974,11 @@ impl Server {
         // Reserve count and retained bytes before authentication or task
         // submission. The owner moves into the task, including while it is
         // queued or still blocked in application middleware.
-        let reservation = match queue.admit_modern_request(&request, Arc::new(AtomicBool::new(false))) {
-            Ok(reservation) => reservation,
-            Err(error) => return request.id.map(|id| JsonRpcResponse::error(Some(id), error)),
-        };
+        let reservation =
+            match queue.admit_modern_request(&request, Arc::new(AtomicBool::new(false))) {
+                Ok(reservation) => reservation,
+                Err(error) => return request.id.map(|id| JsonRpcResponse::error(Some(id), error)),
+            };
         let request_cancellation = reservation.cancellation();
         // Establish the connection principal before receiving another frame.
         // A cancellation of this opening request must work even if its child
@@ -16533,24 +16559,24 @@ impl Server {
             return 1;
         }
         #[cfg(feature = "tasks")]
-        let hosted_task_service = match server
-            .start_hosted_task_service_blocking(dispatch_cx, owns_server_lifecycle)
-        {
-            Ok(hosted) => hosted,
-            Err(error) => {
-                error!(target: targets::SERVER, "Hosted Task service startup failed: {error}");
-                server.graceful_shutdown_returning();
-                return 1;
-            }
-        };
+        let hosted_task_service =
+            match server.start_hosted_task_service_blocking(dispatch_cx, owns_server_lifecycle) {
+                Ok(hosted) => hosted,
+                Err(error) => {
+                    error!(target: targets::SERVER, "Hosted Task service startup failed: {error}");
+                    server.graceful_shutdown_returning();
+                    return 1;
+                }
+            };
 
         let modern_connection = ModernConnection::new();
         let send = Arc::new(Mutex::new(send));
         let mut classifier = StdioEraClassifier::new(runtime_stdio_policy(server.protocol_policy));
         #[cfg(feature = "tasks")]
-        let worker_failed = hosted_task_service
-            .as_ref()
-            .map_or_else(|| Arc::new(AtomicBool::new(false)), tasks::HostedTaskService::failure_signal);
+        let worker_failed = hosted_task_service.as_ref().map_or_else(
+            || Arc::new(AtomicBool::new(false)),
+            tasks::HostedTaskService::failure_signal,
+        );
         #[cfg(not(feature = "tasks"))]
         let worker_failed = Arc::new(AtomicBool::new(false));
         let queue = Arc::new(DispatchQueueState::default());
@@ -17012,16 +17038,15 @@ impl Server {
             return 1;
         }
         #[cfg(feature = "tasks")]
-        let hosted_task_service = match self
-            .start_hosted_task_service_blocking(dispatch_cx, owns_server_lifecycle)
-        {
-            Ok(hosted) => hosted,
-            Err(error) => {
-                error!(target: targets::SERVER, "Hosted Task service startup failed: {error}");
-                self.graceful_shutdown_returning();
-                return 1;
-            }
-        };
+        let hosted_task_service =
+            match self.start_hosted_task_service_blocking(dispatch_cx, owns_server_lifecycle) {
+                Ok(hosted) => hosted,
+                Err(error) => {
+                    error!(target: targets::SERVER, "Hosted Task service startup failed: {error}");
+                    self.graceful_shutdown_returning();
+                    return 1;
+                }
+            };
 
         let traffic_renderer = self.configured_traffic_renderer();
 
@@ -17032,9 +17057,10 @@ impl Server {
         let send = Arc::new(Mutex::new(send));
         let queue_state = Arc::new(DispatchQueueState::default());
         #[cfg(feature = "tasks")]
-        let worker_failed = hosted_task_service
-            .as_ref()
-            .map_or_else(|| Arc::new(AtomicBool::new(false)), tasks::HostedTaskService::failure_signal);
+        let worker_failed = hosted_task_service.as_ref().map_or_else(
+            || Arc::new(AtomicBool::new(false)),
+            tasks::HostedTaskService::failure_signal,
+        );
         #[cfg(not(feature = "tasks"))]
         let worker_failed = Arc::new(AtomicBool::new(false));
         let pending_requests = Arc::new(
@@ -18436,8 +18462,9 @@ impl Server {
         #[cfg(feature = "legacy-2024-11-05")]
         let legacy_binding = runtime_legacy_binding(session.id());
         #[cfg(feature = "legacy-2024-11-05")]
-        let mut legacy_adapter: Option<Legacy2024ServerAdapter<LiveLegacy2024RuntimeHandler<'_>>> =
-            None;
+        let mut legacy_adapter: Option<
+            Legacy2024ServerAdapter<LiveLegacy2024RuntimeHandler<'_>>,
+        > = None;
         #[cfg(feature = "legacy-2024-11-05")]
         let legacy_active_request = Arc::new(Mutex::new(None));
         let mut era_classifier =
@@ -18789,7 +18816,11 @@ impl Server {
                                 };
                                 let legacy_response = poll_on_cx(
                                     cx,
-                                    legacy_adapter_response_async(adapter, legacy_binding, &request),
+                                    legacy_adapter_response_async(
+                                        adapter,
+                                        legacy_binding,
+                                        &request,
+                                    ),
                                 );
                                 sync_live_legacy_runtime_from_adapter(&legacy_runtime, adapter);
                                 let active_request =
@@ -18803,7 +18834,10 @@ impl Server {
                                     // advancing lifecycle, and one malformed peer
                                     // notification must not terminate the connection.
                                     Err(error)
-                                        if matches!(error.code().as_i32(), Some(-32602..=-32600)) =>
+                                        if matches!(
+                                            error.code().as_i32(),
+                                            Some(-32602..=-32600)
+                                        ) =>
                                     {
                                         debug!(
                                             target: targets::SESSION,
@@ -18855,8 +18889,11 @@ impl Server {
                                         "Legacy MCP 2024-11-05 adapter is unavailable for a client response",
                                     ));
                                 };
-                                if !legacy_adapter_accept_response(adapter, legacy_binding, &response)
-                                {
+                                if !legacy_adapter_accept_response(
+                                    adapter,
+                                    legacy_binding,
+                                    &response,
+                                ) {
                                     return Err(server_run_error(
                                         "protocol",
                                         "legacy_adapter",
@@ -25482,7 +25519,9 @@ mod lib_unit_tests {
         let generation = next_server_final_task_generation(state)?;
         state.tasks.insert(task_id.clone(), task);
         state.generations.insert(task_id.clone(), generation);
-        state.execution_budgets.insert(task_id.clone(), execution_budget);
+        state
+            .execution_budgets
+            .insert(task_id.clone(), execution_budget);
         state.accepted_inputs.remove(task_id);
         state.initial_work.remove(task_id);
         state.handoff_leases.remove(task_id);
@@ -25536,7 +25575,9 @@ mod lib_unit_tests {
                 };
                 if let Ok(generation) = next_server_final_task_generation(state) {
                     state.handoff_leases.remove(&task_id);
-                    state.execution_budgets.insert(task_id.clone(), execution_budget);
+                    state
+                        .execution_budgets
+                        .insert(task_id.clone(), execution_budget);
                     state.generations.insert(task_id, generation);
                 }
             } else {
@@ -25604,7 +25645,9 @@ mod lib_unit_tests {
             attempts,
             budget.limits(),
         )?;
-        state.execution_budgets.insert(task_id.clone(), execution_budget);
+        state
+            .execution_budgets
+            .insert(task_id.clone(), execution_budget);
         state.handoff_leases.insert(
             task_id,
             ServerFinalTaskHandoffLease {
@@ -25659,7 +25702,9 @@ mod lib_unit_tests {
         state.initial_work.remove(task_id);
         if !dispatch_elected {
             state.handoff_leases.remove(task_id);
-            state.execution_budgets.insert(task_id.clone(), execution_budget);
+            state
+                .execution_budgets
+                .insert(task_id.clone(), execution_budget);
         }
         state.cancellation_requests.insert(task_id.clone());
         if let Some(next_generation) = next_generation {
@@ -25758,7 +25803,9 @@ mod lib_unit_tests {
             let generation = next_server_final_task_generation(&mut state)?;
             state.tasks.insert(task_id.clone(), task.clone());
             state.generations.insert(task_id.clone(), generation);
-            state.execution_budgets.insert(task_id.clone(), execution_budget);
+            state
+                .execution_budgets
+                .insert(task_id.clone(), execution_budget);
             state.initial_work.remove(task_id);
             state.accepted_inputs.remove(task_id);
             state.handoff_leases.remove(task_id);
@@ -25808,7 +25855,9 @@ mod lib_unit_tests {
             let generation = next_server_final_task_generation(&mut state)?;
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
-            state.execution_budgets.insert(task_id.clone(), execution_budget);
+            state
+                .execution_budgets
+                .insert(task_id.clone(), execution_budget);
             state.notifications.push(notification);
             if let Some(expires_at) = expires_at {
                 state.expires_at.insert(task_id, expires_at);
@@ -25845,7 +25894,9 @@ mod lib_unit_tests {
             let generation = next_server_final_task_generation(&mut state)?;
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
-            state.execution_budgets.insert(task_id.clone(), execution_budget);
+            state
+                .execution_budgets
+                .insert(task_id.clone(), execution_budget);
             state
                 .work_descriptors
                 .insert(task_id.clone(), work_descriptor.clone());
@@ -25916,7 +25967,9 @@ mod lib_unit_tests {
             );
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
-            state.execution_budgets.insert(task_id.clone(), execution_budget);
+            state
+                .execution_budgets
+                .insert(task_id.clone(), execution_budget);
             state.accepted_inputs.remove(&task_id);
             state.handoff_leases.remove(&task_id);
             state.initial_work.remove(&task_id);
@@ -25961,7 +26014,9 @@ mod lib_unit_tests {
             );
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
-            state.execution_budgets.insert(task_id.clone(), execution_budget);
+            state
+                .execution_budgets
+                .insert(task_id.clone(), execution_budget);
             state.accepted_inputs.remove(&task_id);
             state.handoff_leases.remove(&task_id);
             state.initial_work.remove(&task_id);
@@ -26001,7 +26056,9 @@ mod lib_unit_tests {
             let generation = next_server_final_task_generation(&mut state)?;
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
-            state.execution_budgets.insert(task_id.clone(), execution_budget);
+            state
+                .execution_budgets
+                .insert(task_id.clone(), execution_budget);
             state.handoff_leases.remove(&task_id);
             state.initial_work.remove(&task_id);
             let committed = FinalTaskSnapshot::new(state.tasks[&task_id].clone(), generation);
@@ -26050,7 +26107,9 @@ mod lib_unit_tests {
             );
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
-            state.execution_budgets.insert(task_id.clone(), execution_budget);
+            state
+                .execution_budgets
+                .insert(task_id.clone(), execution_budget);
             state.accepted_inputs.remove(&task_id);
             state.handoff_leases.remove(&task_id);
             state.initial_work.remove(&task_id);
@@ -26119,7 +26178,9 @@ mod lib_unit_tests {
             );
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
-            state.execution_budgets.insert(task_id.clone(), execution_budget);
+            state
+                .execution_budgets
+                .insert(task_id.clone(), execution_budget);
             state.accepted_inputs.remove(&task_id);
             state.handoff_leases.remove(&task_id);
             state.initial_work.remove(&task_id);
@@ -26223,7 +26284,8 @@ mod lib_unit_tests {
                     }) && !state.handoff_leases.contains_key(task_id)
                         && server_final_task_execution_exhaustion(&state, task_id, now)?.is_none())
                 },
-            )? else {
+            )?
+            else {
                 return Ok(None);
             };
             let task = state.tasks.get(&task_id).cloned().ok_or_else(|| {
@@ -26316,7 +26378,9 @@ mod lib_unit_tests {
             }
             let execution_budget = released_server_final_task_execution_budget(&state, task_id)?;
             state.handoff_leases.remove(task_id);
-            state.execution_budgets.insert(task_id.clone(), execution_budget);
+            state
+                .execution_budgets
+                .insert(task_id.clone(), execution_budget);
             Ok(true)
         }
 
@@ -26339,7 +26403,8 @@ mod lib_unit_tests {
                     }) && !state.handoff_leases.contains_key(task_id)
                         && server_final_task_execution_exhaustion(&state, task_id, now)?.is_none())
                 },
-            )? else {
+            )?
+            else {
                 return Ok(None);
             };
             let task = state.tasks.get(&task_id).cloned().ok_or_else(|| {
@@ -26398,7 +26463,9 @@ mod lib_unit_tests {
             }
             let execution_budget = released_server_final_task_execution_budget(&state, task_id)?;
             state.handoff_leases.remove(task_id);
-            state.execution_budgets.insert(task_id.clone(), execution_budget);
+            state
+                .execution_budgets
+                .insert(task_id.clone(), execution_budget);
             Ok(true)
         }
 
@@ -26508,7 +26575,9 @@ mod lib_unit_tests {
             let still_dispatchable = server_final_task_is_working(&state, task_id, generation);
             let execution_budget = released_server_final_task_execution_budget(&state, task_id)?;
             state.handoff_leases.remove(task_id);
-            state.execution_budgets.insert(task_id.clone(), execution_budget);
+            state
+                .execution_budgets
+                .insert(task_id.clone(), execution_budget);
             if still_dispatchable {
                 match kind {
                     ServerFinalTaskHandoffKind::Initial => {
@@ -26603,7 +26672,9 @@ mod lib_unit_tests {
             let generation = next_server_final_task_generation(&mut state)?;
             state.tasks.insert(task_id.clone(), cancelled_task.clone());
             state.generations.insert(task_id.clone(), generation);
-            state.execution_budgets.insert(task_id.clone(), execution_budget);
+            state
+                .execution_budgets
+                .insert(task_id.clone(), execution_budget);
             state.accepted_inputs.remove(task_id);
             state.initial_work.remove(task_id);
             state.handoff_leases.remove(task_id);
@@ -26915,7 +26986,11 @@ mod lib_unit_tests {
             .expect_err("late fenced completion cannot replace the pending timeout");
         assert_eq!(error.code, McpErrorCode::InvalidParams);
         assert_eq!(
-            store.get_task_snapshot(&task_id).unwrap().unwrap().generation(),
+            store
+                .get_task_snapshot(&task_id)
+                .unwrap()
+                .unwrap()
+                .generation(),
             snapshot.generation()
         );
         assert_eq!(
@@ -26991,7 +27066,8 @@ mod lib_unit_tests {
 
         *clock_now
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = start + Duration::from_millis(100);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            start + Duration::from_millis(100);
         assert!(store.next_initial_work_snapshot().unwrap().is_none());
         let fastmcp_protocol::Task::Failed { error, .. } =
             runtime.get_task(&sibling.task.base().task_id).unwrap().task
@@ -28991,11 +29067,9 @@ mod lib_unit_tests {
         let inbound =
             InboundRequestContext::new(Cx::for_testing(), 81, InboundRequestTransport::Memory);
 
-        let admitted = block_on(server.dispatch_stateless(
-            &inbound,
-            &final_task_creating_tool_request(true),
-        ))
-        .expect("declared final Tasks tool request must respond");
+        let admitted =
+            block_on(server.dispatch_stateless(&inbound, &final_task_creating_tool_request(true)))
+                .expect("declared final Tasks tool request must respond");
         assert!(admitted.error.is_none());
         assert_eq!(
             admitted.result.as_ref().map(|result| &result["resultType"]),
@@ -29030,11 +29104,9 @@ mod lib_unit_tests {
             "the admitted request publishes exactly one durable task transition"
         );
 
-        let rejected = block_on(server.dispatch_stateless(
-            &inbound,
-            &final_task_creating_tool_request(false),
-        ))
-        .expect("missing-capability final tool request must respond");
+        let rejected =
+            block_on(server.dispatch_stateless(&inbound, &final_task_creating_tool_request(false)))
+                .expect("missing-capability final tool request must respond");
         let error = rejected
             .error
             .expect("removing only the Tasks declaration must reject task creation");
@@ -30111,23 +30183,25 @@ mod lib_unit_tests {
         assert!(ping.error.is_none());
 
         assert!(
-            block_on(server.dispatch_request(
-                &Cx::for_testing(),
-                &mut session,
-                JsonRpcRequest::notification(
-                    "notifications/cancelled",
-                    Some(
-                        serde_json::to_value(CancelledParams {
-                            request_id: RequestId::Number(999),
-                            reason: None,
-                            meta: None,
-                        })
-                        .expect("serialize cancellation"),
+            block_on(
+                server.dispatch_request(
+                    &Cx::for_testing(),
+                    &mut session,
+                    JsonRpcRequest::notification(
+                        "notifications/cancelled",
+                        Some(
+                            serde_json::to_value(CancelledParams {
+                                request_id: RequestId::Number(999),
+                                reason: None,
+                                meta: None,
+                            })
+                            .expect("serialize cancellation"),
+                        ),
                     ),
-                ),
-                &notification_sender,
-                &request_sender,
-            ))
+                    &notification_sender,
+                    &request_sender,
+                )
+            )
             .is_none()
         );
 
@@ -39143,22 +39217,41 @@ mod lib_unit_tests {
 
     #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
     fn native_development_machine_fixture(enabled: bool) -> (OAuthHttpRoutes, String) {
-        let oauth = Arc::new(oauth::OAuthServer::try_new(oauth::OAuthServerConfig {
-            allow_development_client_credentials: enabled,
-            ..oauth::OAuthServerConfig::default()
-        }).unwrap());
-        let endpoint = fastmcp_core::CanonicalHttpUrl::parse("https://resource.example/api").unwrap();
+        let oauth = Arc::new(
+            oauth::OAuthServer::try_new(oauth::OAuthServerConfig {
+                allow_development_client_credentials: enabled,
+                ..oauth::OAuthServerConfig::default()
+            })
+            .unwrap(),
+        );
+        let endpoint =
+            fastmcp_core::CanonicalHttpUrl::parse("https://resource.example/api").unwrap();
         let resource = fastmcp_core::CanonicalResourceId::parse_for_endpoint(
-            endpoint.as_str(), &endpoint, fastmcp_core::CanonicalResourceIdPolicy::DEFAULT,
-        ).unwrap();
-        oauth.register_client(oauth::OAuthClient::builder("native-machine")
-            .secret("machine-secret")
-            .scope("browser:admin")
-            .development_client_credentials(oauth::DevelopmentClientCredentialsGrant::new(
-                resource, ["machine:read", "machine:write"],
-            ).unwrap()).build().unwrap()).unwrap();
-        (OAuthHttpRoutes::new(oauth, "https://fastmcp.invalid/oauth").unwrap(),
-            native_oauth_basic_header("native-machine:machine-secret"))
+            endpoint.as_str(),
+            &endpoint,
+            fastmcp_core::CanonicalResourceIdPolicy::DEFAULT,
+        )
+        .unwrap();
+        oauth
+            .register_client(
+                oauth::OAuthClient::builder("native-machine")
+                    .secret("machine-secret")
+                    .scope("browser:admin")
+                    .development_client_credentials(
+                        oauth::DevelopmentClientCredentialsGrant::new(
+                            resource,
+                            ["machine:read", "machine:write"],
+                        )
+                        .unwrap(),
+                    )
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        (
+            OAuthHttpRoutes::new(oauth, "https://fastmcp.invalid/oauth").unwrap(),
+            native_oauth_basic_header("native-machine:machine-secret"),
+        )
     }
 
     #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
@@ -39169,8 +39262,14 @@ mod lib_unit_tests {
         let request = native_oauth_form_request(routes.token_path(), form, Some(&basic));
         let response = dispatch_oauth_h1_request(&routes, &request, routes.token_path(), "");
         assert_eq!(response.status, HttpStatus::OK);
-        assert_eq!(response.headers.get("cache-control").map(String::as_str), Some("no-store"));
-        assert_eq!(response.headers.get("pragma").map(String::as_str), Some("no-cache"));
+        assert_eq!(
+            response.headers.get("cache-control").map(String::as_str),
+            Some("no-store")
+        );
+        assert_eq!(
+            response.headers.get("pragma").map(String::as_str),
+            Some("no-cache")
+        );
         let issued: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(issued["scope"], "machine:read machine:write");
         assert_eq!(issued["expires_in"], 900);
@@ -39180,21 +39279,35 @@ mod lib_unit_tests {
         let retained = routes.server().validate_access_token(token).unwrap();
         assert_eq!(retained.client_id, "native-machine");
         assert!(retained.subject.is_none());
-        assert_eq!(retained.resource.as_deref(), Some("https://resource.example/api"));
+        assert_eq!(
+            retained.resource.as_deref(),
+            Some("https://resource.example/api")
+        );
 
         let mut metadata_request = native_oauth_form_request(routes.metadata_path(), "", None);
         metadata_request.method = Http1Method::Get;
         metadata_request.headers.clear();
-        let metadata = dispatch_oauth_h1_request(&routes, &metadata_request, routes.metadata_path(), "");
+        let metadata =
+            dispatch_oauth_h1_request(&routes, &metadata_request, routes.metadata_path(), "");
         assert_eq!(metadata.status, HttpStatus::OK);
         let metadata: serde_json::Value = serde_json::from_slice(&metadata.body).unwrap();
-        assert_eq!(metadata["grant_types_supported"], serde_json::json!([
-            "authorization_code", "refresh_token", "client_credentials",
-        ]));
-        assert!(metadata["token_endpoint_auth_methods_supported"].as_array().unwrap()
-            .iter().any(|method| method == "client_secret_basic"));
+        assert_eq!(
+            metadata["grant_types_supported"],
+            serde_json::json!(["authorization_code", "refresh_token", "client_credentials",])
+        );
+        assert!(
+            metadata["token_endpoint_auth_methods_supported"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|method| method == "client_secret_basic")
+        );
 
-        let revoke = native_oauth_form_request(routes.revocation_path(), &format!("token={token}"), Some(&basic));
+        let revoke = native_oauth_form_request(
+            routes.revocation_path(),
+            &format!("token={token}"),
+            Some(&basic),
+        );
         let response = dispatch_oauth_h1_request(&routes, &revoke, routes.revocation_path(), "");
         assert_eq!(response.status, HttpStatus::OK);
         assert!(routes.server().validate_access_token(token).is_none());
@@ -39212,34 +39325,100 @@ mod lib_unit_tests {
         let issued: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         let token = issued["access_token"].as_str().unwrap();
         for (form, authorization, status, error, challenge) in [
-            (base.to_string(), Some(native_oauth_basic_header("native-machine:wrong-secret")),
-                HttpStatus::UNAUTHORIZED, "invalid_client", Some("Basic realm=\"oauth\"")),
-            (format!("{base}&client_id=native-machine&client_secret=machine-secret"), None,
-                HttpStatus::BAD_REQUEST, "invalid_client", None),
-            (base.replace("resource.example%2Fapi", "resource.example%2Fother"), Some(basic.clone()),
-                HttpStatus::BAD_REQUEST, "invalid_request", None),
-            (base.replace("machine%3Aread", "browser%3Aadmin"), Some(basic.clone()),
-                HttpStatus::BAD_REQUEST, "invalid_scope", None),
-            (base.replace("machine%3Aread", "machine%3Aread%09machine%3Awrite"), Some(basic.clone()),
-                HttpStatus::BAD_REQUEST, "invalid_request", None),
-            (base.replace("machine%3Aread", "+machine%3Aread"), Some(basic.clone()),
-                HttpStatus::BAD_REQUEST, "invalid_scope", None),
-            (base.replace("machine%3Aread", "machine%3Aread++machine%3Awrite"), Some(basic.clone()),
-                HttpStatus::BAD_REQUEST, "invalid_scope", None),
-            (base.replace("&scope=machine%3Aread", ""), Some(basic.clone()),
-                HttpStatus::BAD_REQUEST, "invalid_scope", None),
-            (format!("{base}&scope=machine%3Aread"), Some(basic.clone()),
-                HttpStatus::BAD_REQUEST, "invalid_request", None),
-            (format!("{base}&resource=https%3A%2F%2Fresource.example%2Fapi"), Some(basic.clone()),
-                HttpStatus::BAD_REQUEST, "invalid_request", None),
-            (format!("{base}&code="), Some(basic.clone()),
-                HttpStatus::BAD_REQUEST, "invalid_request", None),
-            (format!("{base}&client_assertion=ignored"), Some(basic.clone()),
-                HttpStatus::BAD_REQUEST, "invalid_request", None),
-            (format!("{base}&client_assertion_type=ignored"), Some(basic.clone()),
-                HttpStatus::BAD_REQUEST, "invalid_request", None),
+            (
+                base.to_string(),
+                Some(native_oauth_basic_header("native-machine:wrong-secret")),
+                HttpStatus::UNAUTHORIZED,
+                "invalid_client",
+                Some("Basic realm=\"oauth\""),
+            ),
+            (
+                format!("{base}&client_id=native-machine&client_secret=machine-secret"),
+                None,
+                HttpStatus::BAD_REQUEST,
+                "invalid_client",
+                None,
+            ),
+            (
+                base.replace("resource.example%2Fapi", "resource.example%2Fother"),
+                Some(basic.clone()),
+                HttpStatus::BAD_REQUEST,
+                "invalid_request",
+                None,
+            ),
+            (
+                base.replace("machine%3Aread", "browser%3Aadmin"),
+                Some(basic.clone()),
+                HttpStatus::BAD_REQUEST,
+                "invalid_scope",
+                None,
+            ),
+            (
+                base.replace("machine%3Aread", "machine%3Aread%09machine%3Awrite"),
+                Some(basic.clone()),
+                HttpStatus::BAD_REQUEST,
+                "invalid_request",
+                None,
+            ),
+            (
+                base.replace("machine%3Aread", "+machine%3Aread"),
+                Some(basic.clone()),
+                HttpStatus::BAD_REQUEST,
+                "invalid_scope",
+                None,
+            ),
+            (
+                base.replace("machine%3Aread", "machine%3Aread++machine%3Awrite"),
+                Some(basic.clone()),
+                HttpStatus::BAD_REQUEST,
+                "invalid_scope",
+                None,
+            ),
+            (
+                base.replace("&scope=machine%3Aread", ""),
+                Some(basic.clone()),
+                HttpStatus::BAD_REQUEST,
+                "invalid_scope",
+                None,
+            ),
+            (
+                format!("{base}&scope=machine%3Aread"),
+                Some(basic.clone()),
+                HttpStatus::BAD_REQUEST,
+                "invalid_request",
+                None,
+            ),
+            (
+                format!("{base}&resource=https%3A%2F%2Fresource.example%2Fapi"),
+                Some(basic.clone()),
+                HttpStatus::BAD_REQUEST,
+                "invalid_request",
+                None,
+            ),
+            (
+                format!("{base}&code="),
+                Some(basic.clone()),
+                HttpStatus::BAD_REQUEST,
+                "invalid_request",
+                None,
+            ),
+            (
+                format!("{base}&client_assertion=ignored"),
+                Some(basic.clone()),
+                HttpStatus::BAD_REQUEST,
+                "invalid_request",
+                None,
+            ),
+            (
+                format!("{base}&client_assertion_type=ignored"),
+                Some(basic.clone()),
+                HttpStatus::BAD_REQUEST,
+                "invalid_request",
+                None,
+            ),
         ] {
-            let request = native_oauth_form_request(routes.token_path(), &form, authorization.as_deref());
+            let request =
+                native_oauth_form_request(routes.token_path(), &form, authorization.as_deref());
             let response = dispatch_oauth_h1_request(&routes, &request, routes.token_path(), "");
             assert_native_oauth_error(&response, status, error, challenge);
             assert_eq!(routes.server().stats().access_tokens, 1);
@@ -39253,15 +39432,28 @@ mod lib_unit_tests {
     #[test]
     fn native_development_client_credentials_opt_in_does_not_change_disabled_issuer_behavior() {
         let (routes, basic) = native_development_machine_fixture(false);
-        assert_eq!(routes.authorization_server_metadata().unwrap().grant_types_supported,
-            ["authorization_code", "refresh_token"]);
+        assert_eq!(
+            routes
+                .authorization_server_metadata()
+                .unwrap()
+                .grant_types_supported,
+            ["authorization_code", "refresh_token"]
+        );
         let base = "grant_type=client_credentials&resource=https%3A%2F%2Fresource.example%2Fapi&scope=machine%3Aread";
-        for form in [base.to_string(), format!("{base}&code="), format!("{base}&client_assertion=ignored"),
-            base.replace("machine%3Aread", "machine%3Aread++machine%3Awrite")]
-        {
+        for form in [
+            base.to_string(),
+            format!("{base}&code="),
+            format!("{base}&client_assertion=ignored"),
+            base.replace("machine%3Aread", "machine%3Aread++machine%3Awrite"),
+        ] {
             let request = native_oauth_form_request(routes.token_path(), &form, Some(&basic));
             let response = dispatch_oauth_h1_request(&routes, &request, routes.token_path(), "");
-            assert_native_oauth_error(&response, HttpStatus::BAD_REQUEST, "unsupported_grant_type", None);
+            assert_native_oauth_error(
+                &response,
+                HttpStatus::BAD_REQUEST,
+                "unsupported_grant_type",
+                None,
+            );
             assert_eq!(routes.server().stats().access_tokens, 0);
             assert_eq!(routes.server().stats().refresh_tokens, 0);
         }
@@ -39530,7 +39722,11 @@ mod lib_unit_tests {
             assert_method_rejection(&dispatch_oauth_h1_request(&routes, &denied, token_path, ""));
             let accepted = request(token_path, &code_form, basic_registered);
             let issued = dispatch_oauth_h1_request(&routes, &accepted, token_path, "");
-            assert_eq!(issued.status, HttpStatus::OK, "same code remains redeemable");
+            assert_eq!(
+                issued.status,
+                HttpStatus::OK,
+                "same code remains redeemable"
+            );
             let issued: serde_json::Value = serde_json::from_slice(&issued.body).unwrap();
             let access = issued["access_token"].as_str().unwrap();
             let refresh = issued["refresh_token"].as_str().unwrap();
@@ -39538,11 +39734,20 @@ mod lib_unit_tests {
             let denied = request(token_path, &refresh_form, !basic_registered);
             assert_method_rejection(&dispatch_oauth_h1_request(&routes, &denied, token_path, ""));
             let denied = request(revoke_path, &format!("token={refresh}"), !basic_registered);
-            assert_method_rejection(&dispatch_oauth_h1_request(&routes, &denied, revoke_path, ""));
+            assert_method_rejection(&dispatch_oauth_h1_request(
+                &routes,
+                &denied,
+                revoke_path,
+                "",
+            ));
             assert!(routes.server().validate_access_token(access).is_some());
             let accepted = request(token_path, &refresh_form, basic_registered);
             let successor = dispatch_oauth_h1_request(&routes, &accepted, token_path, "");
-            assert_eq!(successor.status, HttpStatus::OK, "same refresh remains usable");
+            assert_eq!(
+                successor.status,
+                HttpStatus::OK,
+                "same refresh remains usable"
+            );
             let successor: serde_json::Value = serde_json::from_slice(&successor.body).unwrap();
             let access = successor["access_token"].as_str().unwrap();
             let refresh = successor["refresh_token"].as_str().unwrap();
@@ -51248,7 +51453,9 @@ mod lib_unit_tests {
     impl Transport for ModernReturningScriptTransport {
         fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
             self.received.fetch_add(1, Ordering::AcqRel);
-            self.steps.pop_front().unwrap_or(Err(TransportError::Closed))
+            self.steps
+                .pop_front()
+                .unwrap_or(Err(TransportError::Closed))
         }
 
         fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
@@ -51592,17 +51799,25 @@ mod lib_unit_tests {
             assert_eq!(error.data.as_ref().unwrap()["stage"], "receive");
             assert_eq!(error.data.as_ref().unwrap()["kind"], "codec");
             assert_eq!(received.load(Ordering::Acquire), 1);
-            assert!(messages.is_empty(), "an unbounded frame must receive no reply");
+            assert!(
+                messages.is_empty(),
+                "an unbounded frame must receive no reply"
+            );
         } else {
             result.expect("a complete malformed JSON frame must permit the next request");
             assert_eq!(received.load(Ordering::Acquire), 3);
-            let [JsonRpcMessage::Response(parse_error), JsonRpcMessage::Response(discovery)] =
-                messages.as_slice()
+            let [
+                JsonRpcMessage::Response(parse_error),
+                JsonRpcMessage::Response(discovery),
+            ] = messages.as_slice()
             else {
                 panic!("expected one parse error followed by one discovery response");
             };
             assert!(parse_error.id.is_none());
-            assert_eq!(parse_error.error.as_ref().unwrap().code.as_i32(), Some(-32700));
+            assert_eq!(
+                parse_error.error.as_ref().unwrap().code.as_i32(),
+                Some(-32700)
+            );
             assert!(parse_error.error.as_ref().unwrap().data.is_none());
             assert_eq!(discovery.id, Some(9911_i64.into()));
             assert!(discovery.error.is_none());
@@ -56072,10 +56287,9 @@ mod lib_unit_tests {
             "text/*;q=0, */*;q=1",
             "text/event-stream, text/event-stream;q=0, application/json",
         ] {
-            let response = block_on(
-                session.handle_async(&cx, request.clone().with_header("accept", accept)),
-            )
-            .expect("zero-quality SSE request must be rejected before dispatch");
+            let response =
+                block_on(session.handle_async(&cx, request.clone().with_header("accept", accept)))
+                    .expect("zero-quality SSE request must be rejected before dispatch");
             assert!(matches!(
                 response,
                 ServerHttpEndpointResponse::Immediate(response)
@@ -56100,7 +56314,9 @@ mod lib_unit_tests {
         };
         let progress = sse.recv_event(&cx).expect("progress frame must be queued");
         let log = sse.recv_event(&cx).expect("log frame must be queued");
-        let terminal = sse.recv_event(&cx).expect("terminal response must be queued");
+        let terminal = sse
+            .recv_event(&cx)
+            .expect("terminal response must be queued");
         assert!(matches!(
             Codec::new().decode_complete_message(progress.data.as_bytes()),
             Ok(JsonRpcMessage::Request(notification))
@@ -56939,7 +57155,9 @@ mod lib_unit_tests {
                     Ok(Some(_)) => received += 1,
                     Ok(None) if Instant::now() < deadline => thread::yield_now(),
                     Ok(None) => {
-                        return Err(format!("only {received} of {COMMITS} commits were observed"));
+                        return Err(format!(
+                            "only {received} of {COMMITS} commits were observed"
+                        ));
                     }
                     Err(error) => {
                         return Err(format!(
@@ -57082,6 +57300,7 @@ mod lib_unit_tests {
                                 .expect("typed cancellation notification must serialize"),
                         ),
                     TransportAuthorization::default(),
+                    None,
                 )
                 .await
                 .map_err(|error| format!("streaming cancellation rejection failed: {error}"))?

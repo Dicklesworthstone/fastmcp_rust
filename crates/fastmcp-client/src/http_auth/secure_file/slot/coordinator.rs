@@ -25,11 +25,11 @@ use asupersync::Cx;
 use fastmcp_core::crypto::sha256_bounded;
 use fastmcp_core::partition::{CredentialStoreKey, PartitionAuthorization};
 
-use super::{
-    CredentialSlotError, DurableCredentialSlot, PreparedSlotMutation, SlotCommit,
-    SlotCommitIntent, SlotRecoveryOutcome, SlotRevision,
-};
 use super::super::{SecureAtomicFile, checkpoint};
+use super::{
+    CredentialSlotError, DurableCredentialSlot, PreparedSlotMutation, SlotCommit, SlotCommitIntent,
+    SlotRecoveryOutcome, SlotRevision,
+};
 
 /// Caller-owned asynchronous transactions with recoverable completion custody.
 pub mod asynchronous;
@@ -95,7 +95,8 @@ impl CredentialAnchorBinding {
 
 impl fmt::Debug for CredentialAnchorBinding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CredentialAnchorBinding").finish_non_exhaustive()
+        f.debug_struct("CredentialAnchorBinding")
+            .finish_non_exhaustive()
     }
 }
 
@@ -126,12 +127,22 @@ impl CredentialAnchorSnapshot {
         sequence: u64,
         state: CredentialAnchorState,
     ) -> Self {
-        Self { binding, sequence, state }
+        Self {
+            binding,
+            sequence,
+            state,
+        }
     }
 
-    pub fn binding(self) -> CredentialAnchorBinding { self.binding }
-    pub fn sequence(self) -> u64 { self.sequence }
-    pub fn state(self) -> CredentialAnchorState { self.state }
+    pub fn binding(self) -> CredentialAnchorBinding {
+        self.binding
+    }
+    pub fn sequence(self) -> u64 {
+        self.sequence
+    }
+    pub fn state(self) -> CredentialAnchorState {
+        self.state
+    }
 }
 
 /// Closed, non-secret provider failures. An error from a mutation is never
@@ -194,11 +205,19 @@ impl fmt::Display for CoordinatedSlotError {
             Self::InvalidNamespace => f.write_str("invalid credential-anchor namespace"),
             Self::Slot(error) => error.fmt(f),
             Self::Anchor(_) => f.write_str("credential-anchor operation failed"),
-            Self::InvalidAnchorResponse => f.write_str("credential-anchor response failed correlation"),
-            Self::AnchorChanged => f.write_str("credential anchor changed outside the active owner"),
+            Self::InvalidAnchorResponse => {
+                f.write_str("credential-anchor response failed correlation")
+            }
+            Self::AnchorChanged => {
+                f.write_str("credential anchor changed outside the active owner")
+            }
             Self::SequenceExhausted => f.write_str("credential-anchor sequence exhausted"),
-            Self::RecoveryRequired => f.write_str("credential transaction requires reopen and reconciliation"),
-            Self::CommittedWithoutDelivery(_) => f.write_str("credential transaction committed without payload delivery"),
+            Self::RecoveryRequired => {
+                f.write_str("credential transaction requires reopen and reconciliation")
+            }
+            Self::CommittedWithoutDelivery(_) => {
+                f.write_str("credential transaction committed without payload delivery")
+            }
         }
     }
 }
@@ -206,11 +225,15 @@ impl fmt::Display for CoordinatedSlotError {
 impl std::error::Error for CoordinatedSlotError {}
 
 impl From<CredentialSlotError> for CoordinatedSlotError {
-    fn from(error: CredentialSlotError) -> Self { Self::Slot(error) }
+    fn from(error: CredentialSlotError) -> Self {
+        Self::Slot(error)
+    }
 }
 
 impl From<CredentialAnchorError> for CoordinatedSlotError {
-    fn from(error: CredentialAnchorError) -> Self { Self::Anchor(error) }
+    fn from(error: CredentialAnchorError) -> Self {
+        Self::Anchor(error)
+    }
 }
 
 /// Enforces prepare-anchor -> commit-file -> settle-anchor -> deliver.
@@ -246,11 +269,13 @@ impl<A: CredentialCommitAnchor> CoordinatedCredentialSlot<A> {
         validate_snapshot(binding, snapshot)?;
         check(cx)?;
         let (slot, recovery) = match snapshot.state {
-            CredentialAnchorState::Stable(revision) => {
-                (DurableCredentialSlot::open(cx, file, key, authorization, revision)?, None)
-            }
+            CredentialAnchorState::Stable(revision) => (
+                DurableCredentialSlot::open(cx, file, key, authorization, revision)?,
+                None,
+            ),
             CredentialAnchorState::Pending(intent) => {
-                let (slot, outcome) = DurableCredentialSlot::recover(cx, file, key, authorization, intent)?;
+                let (slot, outcome) =
+                    DurableCredentialSlot::recover(cx, file, key, authorization, intent)?;
                 let next = CredentialAnchorState::Stable(slot.revision());
                 snapshot = transition(cx, &mut anchor, snapshot, next)?;
                 (slot, Some(outcome))
@@ -259,12 +284,27 @@ impl<A: CredentialCommitAnchor> CoordinatedCredentialSlot<A> {
         // No payload has been handed out, so cancellation after a recovery
         // settlement can safely refuse opening; a new open observes the settled state.
         check(cx)?;
-        Ok((Self { slot, anchor, binding, snapshot, quarantined: false }, recovery))
+        Ok((
+            Self {
+                slot,
+                anchor,
+                binding,
+                snapshot,
+                quarantined: false,
+            },
+            recovery,
+        ))
     }
 
-    pub fn revision(&self) -> Option<SlotRevision> { self.slot.revision() }
-    pub fn requires_recovery(&self) -> bool { self.quarantined }
-    pub fn maximum_payload_bytes(&self) -> usize { self.slot.maximum_payload_bytes() }
+    pub fn revision(&self) -> Option<SlotRevision> {
+        self.slot.revision()
+    }
+    pub fn requires_recovery(&self) -> bool {
+        self.quarantined
+    }
+    pub fn maximum_payload_bytes(&self) -> usize {
+        self.slot.maximum_payload_bytes()
+    }
 
     /// Requires fresh matching anchor state before reading any protected value.
     pub fn load(
@@ -274,7 +314,9 @@ impl<A: CredentialCommitAnchor> CoordinatedCredentialSlot<A> {
     ) -> Result<Option<Vec<u8>>, CoordinatedSlotError> {
         self.admit(cx, authorization)?;
         let result = self.slot.load(cx, authorization);
-        if result.is_err() { self.quarantined = true; }
+        if result.is_err() {
+            self.quarantined = true;
+        }
         Ok(result?)
     }
 
@@ -288,7 +330,9 @@ impl<A: CredentialCommitAnchor> CoordinatedCredentialSlot<A> {
         protected_payload: &[u8],
     ) -> Result<SlotRevision, CoordinatedSlotError> {
         self.admit(cx, authorization)?;
-        let mutation = self.slot.prepare_replace(cx, authorization, expected, protected_payload)?;
+        let mutation = self
+            .slot
+            .prepare_replace(cx, authorization, expected, protected_payload)?;
         Ok(self.commit(cx, authorization, mutation)?.revision())
     }
 
@@ -340,11 +384,17 @@ impl<A: CredentialCommitAnchor> CoordinatedCredentialSlot<A> {
         Ok(self.commit(cx, authorization, mutation)?.revision())
     }
 
-    fn admit(&mut self, cx: &Cx, authorization: &PartitionAuthorization) -> Result<(), CoordinatedSlotError> {
+    fn admit(
+        &mut self,
+        cx: &Cx,
+        authorization: &PartitionAuthorization,
+    ) -> Result<(), CoordinatedSlotError> {
         // A different caller must not even query the original owner's anchor.
         self.slot.check_authorization(authorization)?;
         check(cx)?;
-        if self.quarantined { return Err(CoordinatedSlotError::RecoveryRequired); }
+        if self.quarantined {
+            return Err(CoordinatedSlotError::RecoveryRequired);
+        }
         let observed = match self.anchor.current(cx, &self.binding) {
             Ok(observed) => observed,
             Err(error) => {
@@ -371,14 +421,24 @@ impl<A: CredentialCommitAnchor> CoordinatedCredentialSlot<A> {
     ) -> Result<SlotCommit, CoordinatedSlotError> {
         // Reserve both sequence increments before any effect; a pending state
         // must never be stranded merely because its settlement cannot increment.
-        self.snapshot.sequence.checked_add(2).ok_or(CoordinatedSlotError::SequenceExhausted)?;
+        self.snapshot
+            .sequence
+            .checked_add(2)
+            .ok_or(CoordinatedSlotError::SequenceExhausted)?;
         check(cx)?;
         let intent = mutation.intent();
         self.quarantined = true;
-        self.snapshot = transition(cx, &mut self.anchor, self.snapshot, CredentialAnchorState::Pending(intent))?;
+        self.snapshot = transition(
+            cx,
+            &mut self.anchor,
+            self.snapshot,
+            CredentialAnchorState::Pending(intent),
+        )?;
         let committed = self.slot.commit(cx, authorization, mutation)?;
         self.snapshot = transition(
-            cx, &mut self.anchor, self.snapshot,
+            cx,
+            &mut self.anchor,
+            self.snapshot,
             CredentialAnchorState::Stable(Some(committed.revision())),
         )?;
         self.quarantined = false;
@@ -386,7 +446,9 @@ impl<A: CredentialCommitAnchor> CoordinatedCredentialSlot<A> {
             // The full transaction is known committed; ordinary Cancelled would
             // falsely imply no effect. Drop the retained handoff rather than
             // releasing it to a cancelled owner or making it recoverable again.
-            return Err(CoordinatedSlotError::CommittedWithoutDelivery(committed.revision()));
+            return Err(CoordinatedSlotError::CommittedWithoutDelivery(
+                committed.revision(),
+            ));
         }
         Ok(committed)
     }
@@ -396,7 +458,10 @@ fn check(cx: &Cx) -> Result<(), CoordinatedSlotError> {
     checkpoint(cx).map_err(|error| CoordinatedSlotError::Slot(CredentialSlotError::Storage(error)))
 }
 
-fn validate_snapshot(binding: CredentialAnchorBinding, snapshot: CredentialAnchorSnapshot) -> Result<(), CoordinatedSlotError> {
+fn validate_snapshot(
+    binding: CredentialAnchorBinding,
+    snapshot: CredentialAnchorSnapshot,
+) -> Result<(), CoordinatedSlotError> {
     if snapshot.binding != binding || !binding.accepts(snapshot.state) {
         return Err(CoordinatedSlotError::InvalidAnchorResponse);
     }
@@ -409,7 +474,10 @@ fn transition<A: CredentialCommitAnchor>(
     previous: CredentialAnchorSnapshot,
     next: CredentialAnchorState,
 ) -> Result<CredentialAnchorSnapshot, CoordinatedSlotError> {
-    let sequence = previous.sequence.checked_add(1).ok_or(CoordinatedSlotError::SequenceExhausted)?;
+    let sequence = previous
+        .sequence
+        .checked_add(1)
+        .ok_or(CoordinatedSlotError::SequenceExhausted)?;
     check(cx)?;
     let actual = anchor.compare_exchange(cx, &previous, next)?;
     validate_snapshot(previous.binding, actual)?;

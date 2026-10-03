@@ -21,12 +21,12 @@ use fastmcp_protocol::FINAL_PROTOCOL_VERSION;
 use fastmcp_protocol::tasks_extension::TaskId;
 use serde::{Deserialize, Serialize};
 
-use super::{
-    BoundedWriter, ManagedTaskWatch, ManagedTaskWatchError, ManagedTaskWatchPolicy,
-    ManagedTasksClient, WatchState, MAX_WATCH_TASKS,
-};
 use super::recovery::{
     ManagedTaskRecoveryError, ManagedTaskRecoveryPolicy, RecoveringManagedTaskWatch,
+};
+use super::{
+    BoundedWriter, MAX_WATCH_TASKS, ManagedTaskWatch, ManagedTaskWatchError,
+    ManagedTaskWatchPolicy, ManagedTasksClient, WatchState,
 };
 
 /// Owner-bound lifecycle records and explicitly protected atomic storage.
@@ -91,7 +91,9 @@ impl fmt::Display for ManagedTaskCheckpointError {
             Self::UnsupportedProtocol => "unsupported Task watch checkpoint protocol era",
             Self::InvalidResource => "invalid Task watch checkpoint resource",
             Self::InvalidSelection => "invalid Task watch checkpoint selection",
-            Self::ResourceMismatch => "Task watch checkpoint does not match the configured resource",
+            Self::ResourceMismatch => {
+                "Task watch checkpoint does not match the configured resource"
+            }
             Self::Watch(_) => "Task watch checkpoint admission failed",
             Self::Recovery(_) => "recovering Task watch checkpoint admission failed",
         })
@@ -108,19 +110,29 @@ impl std::error::Error for ManagedTaskCheckpointError {
     }
 }
 impl From<ManagedTaskWatchError> for ManagedTaskCheckpointError {
-    fn from(error: ManagedTaskWatchError) -> Self { Self::Watch(error) }
+    fn from(error: ManagedTaskWatchError) -> Self {
+        Self::Watch(error)
+    }
 }
 impl From<ManagedTaskRecoveryError> for ManagedTaskCheckpointError {
-    fn from(error: ManagedTaskRecoveryError) -> Self { Self::Recovery(error) }
+    fn from(error: ManagedTaskRecoveryError) -> Self {
+        Self::Recovery(error)
+    }
 }
 
 impl ManagedTaskWatchCheckpoint {
-    fn new(resource: &CanonicalHttpUrl, task_ids: Vec<TaskId>) -> Result<Self, ManagedTaskCheckpointError> {
+    fn new(
+        resource: &CanonicalHttpUrl,
+        task_ids: Vec<TaskId>,
+    ) -> Result<Self, ManagedTaskCheckpointError> {
         // Reuse the live watch's exact uniqueness, cardinality and encoded
         // selection bounds. The restart policy will separately bound snapshots.
         let state = WatchState::new(task_ids, MAX_WATCH_TASKS)
             .map_err(|_| ManagedTaskCheckpointError::InvalidSelection)?;
-        let checkpoint = Self { resource: resource.clone(), task_ids: state.task_ids };
+        let checkpoint = Self {
+            resource: resource.clone(),
+            task_ids: state.task_ids,
+        };
         checkpoint.encode()?;
         Ok(checkpoint)
     }
@@ -133,7 +145,12 @@ impl ManagedTaskWatchCheckpoint {
         }
         // Serde's derived struct visitor also supports positional sequences.
         // The portable format is an object, not an order-dependent tuple.
-        if bytes.iter().copied().find(|byte| !byte.is_ascii_whitespace()) != Some(b'{') {
+        if bytes
+            .iter()
+            .copied()
+            .find(|byte| !byte.is_ascii_whitespace())
+            != Some(b'{')
+        {
             return Err(ManagedTaskCheckpointError::InvalidDocument);
         }
         let wire: CheckpointWire = serde_json::from_slice(bytes)
@@ -156,24 +173,37 @@ impl ManagedTaskWatchCheckpoint {
     /// state, deadline, token, client policy or Task contents enters the bytes.
     pub fn encode(&self) -> Result<Vec<u8>, ManagedTaskCheckpointError> {
         let wire = CheckpointWire {
-            format: CHECKPOINT_FORMAT.to_owned(), version: CHECKPOINT_VERSION,
+            format: CHECKPOINT_FORMAT.to_owned(),
+            version: CHECKPOINT_VERSION,
             protocol_version: FINAL_PROTOCOL_VERSION.to_owned(),
-            resource: self.resource.as_str().to_owned(), task_ids: self.task_ids.clone(),
+            resource: self.resource.as_str().to_owned(),
+            task_ids: self.task_ids.clone(),
         };
-        let mut writer = BoundedWriter { bytes: Vec::new(), maximum: MAX_TASK_WATCH_CHECKPOINT_BYTES };
-        serde_json::to_writer(&mut writer, &wire).map_err(|_| ManagedTaskCheckpointError::TooLarge)?;
+        let mut writer = BoundedWriter {
+            bytes: Vec::new(),
+            maximum: MAX_TASK_WATCH_CHECKPOINT_BYTES,
+        };
+        serde_json::to_writer(&mut writer, &wire)
+            .map_err(|_| ManagedTaskCheckpointError::TooLarge)?;
         Ok(writer.bytes)
     }
 
     /// Exact, canonical resource to inspect before explicitly choosing a login.
     /// Restore never constructs a client or discovers an endpoint from this URL.
-    pub fn resource(&self) -> &CanonicalHttpUrl { &self.resource }
+    pub fn resource(&self) -> &CanonicalHttpUrl {
+        &self.resource
+    }
 
     /// All originally selected IDs, in reconciliation order. Completed IDs are
     /// not suppressed using untrusted persisted state after a restart.
-    pub fn task_ids(&self) -> &[TaskId] { &self.task_ids }
+    pub fn task_ids(&self) -> &[TaskId] {
+        &self.task_ids
+    }
 
-    fn admit_resource(&self, resource: &CanonicalHttpUrl) -> Result<(), ManagedTaskCheckpointError> {
+    fn admit_resource(
+        &self,
+        resource: &CanonicalHttpUrl,
+    ) -> Result<(), ManagedTaskCheckpointError> {
         if self.resource.as_str() != resource.as_str() {
             return Err(ManagedTaskCheckpointError::ResourceMismatch);
         }
@@ -186,7 +216,8 @@ impl ManagedTaskWatch {
     /// were already delivered. Works after close/failure too; it does not revive
     /// the old stream, extend its deadline or grant authority to replay inputs.
     pub fn checkpoint(&self) -> Result<ManagedTaskWatchCheckpoint, ManagedTaskCheckpointError> {
-        self.client.task_watch_checkpoint(self.state.task_ids.clone())
+        self.client
+            .task_watch_checkpoint(self.state.task_ids.clone())
     }
 }
 
@@ -196,7 +227,8 @@ impl ManagedTasksClient {
     /// the host needs to retain the selection independently of that owner.
     /// It is not available for an uncertain creation with no admitted Task ID.
     pub fn task_watch_checkpoint(
-        &self, task_ids: Vec<TaskId>,
+        &self,
+        task_ids: Vec<TaskId>,
     ) -> Result<ManagedTaskWatchCheckpoint, ManagedTaskCheckpointError> {
         ManagedTaskWatchCheckpoint::new(self.session.resource(), task_ids)
     }
@@ -210,50 +242,88 @@ impl ManagedTasksClient {
     /// Supply a new ID prefix and explicit finite observation policy. Old
     /// monotonic deadlines and delivery ledgers are not portable across restart.
     pub async fn resume_task_watch(
-        &self, cx: &Cx, checkpoint: &ManagedTaskWatchCheckpoint,
-        id_prefix: String, policy: ManagedTaskWatchPolicy,
+        &self,
+        cx: &Cx,
+        checkpoint: &ManagedTaskWatchCheckpoint,
+        id_prefix: String,
+        policy: ManagedTaskWatchPolicy,
     ) -> Result<ManagedTaskWatch, ManagedTaskCheckpointError> {
         self.resume_task_watch_with_cancellation(
-            cx, &McpRequestCancellation::new(), checkpoint, id_prefix, policy,
-        ).await
+            cx,
+            &McpRequestCancellation::new(),
+            checkpoint,
+            id_prefix,
+            policy,
+        )
+        .await
     }
 
     /// Cancellation remains local to observation; no remote cancellation or
     /// mutation is sent while restoring, reading, closing or dropping a watch.
     pub async fn resume_task_watch_with_cancellation(
-        &self, cx: &Cx, cancellation: &McpRequestCancellation,
-        checkpoint: &ManagedTaskWatchCheckpoint, id_prefix: String,
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        checkpoint: &ManagedTaskWatchCheckpoint,
+        id_prefix: String,
         policy: ManagedTaskWatchPolicy,
     ) -> Result<ManagedTaskWatch, ManagedTaskCheckpointError> {
         checkpoint.admit_resource(self.session.resource())?;
-        Ok(self.watch_tasks_with_cancellation(
-            cx, cancellation, checkpoint.task_ids.clone(), id_prefix, policy,
-        ).await?)
+        Ok(self
+            .watch_tasks_with_cancellation(
+                cx,
+                cancellation,
+                checkpoint.task_ids.clone(),
+                id_prefix,
+                policy,
+            )
+            .await?)
     }
 
     /// Restore with the existing bounded, observation-only reconnect policy.
     /// The new finite watch budget spans all reconnects; checkpoint restore is
     /// not an automatic way to reset an exhausted owner's limits.
     pub async fn resume_task_watch_recovering(
-        &self, cx: &Cx, checkpoint: &ManagedTaskWatchCheckpoint,
-        id_prefix: String, policy: ManagedTaskWatchPolicy, recovery: ManagedTaskRecoveryPolicy,
+        &self,
+        cx: &Cx,
+        checkpoint: &ManagedTaskWatchCheckpoint,
+        id_prefix: String,
+        policy: ManagedTaskWatchPolicy,
+        recovery: ManagedTaskRecoveryPolicy,
     ) -> Result<RecoveringManagedTaskWatch, ManagedTaskCheckpointError> {
         self.resume_task_watch_recovering_with_cancellation(
-            cx, &McpRequestCancellation::new(), checkpoint, id_prefix, policy, recovery,
-        ).await
+            cx,
+            &McpRequestCancellation::new(),
+            checkpoint,
+            id_prefix,
+            policy,
+            recovery,
+        )
+        .await
     }
 
     /// Restored admission, backoff and reconciliation share one caller-owned
     /// cancellation domain and preserve typed recovery/admission diagnostics.
     pub async fn resume_task_watch_recovering_with_cancellation(
-        &self, cx: &Cx, cancellation: &McpRequestCancellation,
-        checkpoint: &ManagedTaskWatchCheckpoint, id_prefix: String,
-        policy: ManagedTaskWatchPolicy, recovery: ManagedTaskRecoveryPolicy,
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        checkpoint: &ManagedTaskWatchCheckpoint,
+        id_prefix: String,
+        policy: ManagedTaskWatchPolicy,
+        recovery: ManagedTaskRecoveryPolicy,
     ) -> Result<RecoveringManagedTaskWatch, ManagedTaskCheckpointError> {
         checkpoint.admit_resource(self.session.resource())?;
-        Ok(self.watch_tasks_recovering_with_cancellation(
-            cx, cancellation, checkpoint.task_ids.clone(), id_prefix, policy, recovery,
-        ).await?)
+        Ok(self
+            .watch_tasks_recovering_with_cancellation(
+                cx,
+                cancellation,
+                checkpoint.task_ids.clone(),
+                id_prefix,
+                policy,
+                recovery,
+            )
+            .await?)
     }
 }
 
@@ -262,8 +332,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn resource() -> CanonicalHttpUrl { CanonicalHttpUrl::parse("https://service.example/mcp").unwrap() }
-    fn id(value: &str) -> TaskId { TaskId::parse(value).unwrap() }
+    fn resource() -> CanonicalHttpUrl {
+        CanonicalHttpUrl::parse("https://service.example/mcp").unwrap()
+    }
+    fn id(value: &str) -> TaskId {
+        TaskId::parse(value).unwrap()
+    }
     fn document() -> serde_json::Value {
         json!({"format":CHECKPOINT_FORMAT, "version":1, "protocolVersion":FINAL_PROTOCOL_VERSION,
             "resource":"https://service.example/mcp", "taskIds":["second", "first"]})
@@ -271,25 +345,40 @@ mod tests {
 
     #[test]
     fn checkpoint_round_trip_preserves_exact_resource_and_selection_order() {
-        let saved = ManagedTaskWatchCheckpoint::new(&resource(), vec![id("second"), id("first")]).unwrap();
+        let saved =
+            ManagedTaskWatchCheckpoint::new(&resource(), vec![id("second"), id("first")]).unwrap();
         let encoded = saved.encode().unwrap();
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&encoded).unwrap(), document());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&encoded).unwrap(),
+            document()
+        );
         let decoded = ManagedTaskWatchCheckpoint::decode(&encoded).unwrap();
         assert_eq!(decoded.resource(), &resource());
         assert_eq!(decoded.task_ids(), [id("second"), id("first")]);
         assert_eq!(decoded.encode().unwrap(), encoded);
         let debug = format!("{decoded:?}");
         assert!(debug.contains("task_count: 2"));
-        for secret in ["service.example", "second", "first"] { assert!(!debug.contains(secret)); }
+        for secret in ["service.example", "second", "first"] {
+            assert!(!debug.contains(secret));
+        }
     }
 
     #[test]
     fn checkpoint_requires_an_object_even_when_a_sequence_has_all_valid_fields() {
         let object = document().to_string();
         assert!(ManagedTaskWatchCheckpoint::decode(object.as_bytes()).is_ok());
-        let sequence = json!([CHECKPOINT_FORMAT, 1, FINAL_PROTOCOL_VERSION,
-            "https://service.example/mcp", ["second", "first"]]).to_string();
-        assert!(matches!(ManagedTaskWatchCheckpoint::decode(sequence.as_bytes()), Err(ManagedTaskCheckpointError::InvalidDocument)));
+        let sequence = json!([
+            CHECKPOINT_FORMAT,
+            1,
+            FINAL_PROTOCOL_VERSION,
+            "https://service.example/mcp",
+            ["second", "first"]
+        ])
+        .to_string();
+        assert!(matches!(
+            ManagedTaskWatchCheckpoint::decode(sequence.as_bytes()),
+            Err(ManagedTaskCheckpointError::InvalidDocument)
+        ));
     }
 
     #[test]
@@ -297,34 +386,62 @@ mod tests {
         let encoded = document().to_string();
         assert!(ManagedTaskWatchCheckpoint::decode(encoded.as_bytes()).is_ok());
         for suffix in [
-            r#", "version":1"#, r#", "ver\u0073ion":1"#,
-            r#", "taskIds":["second","first"]"#, r#", "terminal":[true,true]"#,
-            r#", "accessToken":"secret""#, r#", "requestState":"secret""#,
+            r#", "version":1"#,
+            r#", "ver\u0073ion":1"#,
+            r#", "taskIds":["second","first"]"#,
+            r#", "terminal":[true,true]"#,
+            r#", "accessToken":"secret""#,
+            r#", "requestState":"secret""#,
         ] {
             let invalid = format!("{}{suffix}}}", &encoded[..encoded.len() - 1]);
-            assert!(matches!(ManagedTaskWatchCheckpoint::decode(invalid.as_bytes()), Err(ManagedTaskCheckpointError::InvalidDocument)));
+            assert!(matches!(
+                ManagedTaskWatchCheckpoint::decode(invalid.as_bytes()),
+                Err(ManagedTaskCheckpointError::InvalidDocument)
+            ));
         }
-        for field in ["format", "version", "protocolVersion", "resource", "taskIds"] {
+        for field in [
+            "format",
+            "version",
+            "protocolVersion",
+            "resource",
+            "taskIds",
+        ] {
             let mut missing = document();
             missing.as_object_mut().unwrap().remove(field);
-            assert!(matches!(ManagedTaskWatchCheckpoint::decode(missing.to_string().as_bytes()), Err(ManagedTaskCheckpointError::InvalidDocument)));
+            assert!(matches!(
+                ManagedTaskWatchCheckpoint::decode(missing.to_string().as_bytes()),
+                Err(ManagedTaskCheckpointError::InvalidDocument)
+            ));
         }
         for invalid in [format!("{encoded}{{}}"), "null".to_owned(), "[]".to_owned()] {
-            assert!(matches!(ManagedTaskWatchCheckpoint::decode(invalid.as_bytes()), Err(ManagedTaskCheckpointError::InvalidDocument)));
+            assert!(matches!(
+                ManagedTaskWatchCheckpoint::decode(invalid.as_bytes()),
+                Err(ManagedTaskCheckpointError::InvalidDocument)
+            ));
         }
     }
 
     #[test]
     fn checkpoint_format_and_era_cannot_select_a_legacy_or_future_path() {
-        for (field, value) in [("format", json!("other")), ("version", json!(0)), ("version", json!(2))] {
+        for (field, value) in [
+            ("format", json!("other")),
+            ("version", json!(0)),
+            ("version", json!(2)),
+        ] {
             let mut invalid = document();
             invalid[field] = value;
-            assert!(matches!(ManagedTaskWatchCheckpoint::decode(invalid.to_string().as_bytes()), Err(ManagedTaskCheckpointError::UnsupportedFormat)));
+            assert!(matches!(
+                ManagedTaskWatchCheckpoint::decode(invalid.to_string().as_bytes()),
+                Err(ManagedTaskCheckpointError::UnsupportedFormat)
+            ));
         }
         for era in ["2024-11-05", "2025-11-25", "unknown"] {
             let mut invalid = document();
             invalid["protocolVersion"] = json!(era);
-            assert!(matches!(ManagedTaskWatchCheckpoint::decode(invalid.to_string().as_bytes()), Err(ManagedTaskCheckpointError::UnsupportedProtocol)));
+            assert!(matches!(
+                ManagedTaskWatchCheckpoint::decode(invalid.to_string().as_bytes()),
+                Err(ManagedTaskCheckpointError::UnsupportedProtocol)
+            ));
         }
     }
 
@@ -333,12 +450,27 @@ mod tests {
         for count in [1, MAX_WATCH_TASKS] {
             let ids = (0..count).map(|n| id(&format!("task-{n}"))).collect();
             let checkpoint = ManagedTaskWatchCheckpoint::new(&resource(), ids).unwrap();
-            assert_eq!(ManagedTaskWatchCheckpoint::decode(&checkpoint.encode().unwrap()).unwrap().task_ids().len(), count);
+            assert_eq!(
+                ManagedTaskWatchCheckpoint::decode(&checkpoint.encode().unwrap())
+                    .unwrap()
+                    .task_ids()
+                    .len(),
+                count
+            );
         }
-        for ids in [vec![], vec![id("one"), id("one")], (0..=MAX_WATCH_TASKS).map(|n| id(&format!("task-{n}"))).collect()] {
+        for ids in [
+            vec![],
+            vec![id("one"), id("one")],
+            (0..=MAX_WATCH_TASKS)
+                .map(|n| id(&format!("task-{n}")))
+                .collect(),
+        ] {
             let mut invalid = document();
             invalid["taskIds"] = json!(ids);
-            assert!(matches!(ManagedTaskWatchCheckpoint::decode(invalid.to_string().as_bytes()), Err(ManagedTaskCheckpointError::InvalidSelection)));
+            assert!(matches!(
+                ManagedTaskWatchCheckpoint::decode(invalid.to_string().as_bytes()),
+                Err(ManagedTaskCheckpointError::InvalidSelection)
+            ));
         }
     }
 
@@ -346,15 +478,29 @@ mod tests {
     fn checkpoint_resource_is_canonical_and_restore_checks_the_full_endpoint() {
         let checkpoint = ManagedTaskWatchCheckpoint::new(&resource(), vec![id("one")]).unwrap();
         assert!(checkpoint.admit_resource(&resource()).is_ok());
-        for different in ["http://service.example/mcp", "https://other.example/mcp",
-            "https://service.example:444/mcp", "https://service.example/other", "https://service.example/mcp?tenant=other"]
-        {
-            assert!(matches!(checkpoint.admit_resource(&CanonicalHttpUrl::parse(different).unwrap()), Err(ManagedTaskCheckpointError::ResourceMismatch)));
+        for different in [
+            "http://service.example/mcp",
+            "https://other.example/mcp",
+            "https://service.example:444/mcp",
+            "https://service.example/other",
+            "https://service.example/mcp?tenant=other",
+        ] {
+            assert!(matches!(
+                checkpoint.admit_resource(&CanonicalHttpUrl::parse(different).unwrap()),
+                Err(ManagedTaskCheckpointError::ResourceMismatch)
+            ));
         }
-        for repaired in ["https://SERVICE.example/mcp", "https://service.example:443/mcp", "not-a-url"] {
+        for repaired in [
+            "https://SERVICE.example/mcp",
+            "https://service.example:443/mcp",
+            "not-a-url",
+        ] {
             let mut invalid = document();
             invalid["resource"] = json!(repaired);
-            assert!(matches!(ManagedTaskWatchCheckpoint::decode(invalid.to_string().as_bytes()), Err(ManagedTaskCheckpointError::InvalidResource)));
+            assert!(matches!(
+                ManagedTaskWatchCheckpoint::decode(invalid.to_string().as_bytes()),
+                Err(ManagedTaskCheckpointError::InvalidResource)
+            ));
         }
     }
 
@@ -364,7 +510,10 @@ mod tests {
         bytes.resize(MAX_TASK_WATCH_CHECKPOINT_BYTES, b' ');
         assert!(ManagedTaskWatchCheckpoint::decode(&bytes).is_ok());
         bytes.push(b' ');
-        assert!(matches!(ManagedTaskWatchCheckpoint::decode(&bytes), Err(ManagedTaskCheckpointError::TooLarge)));
+        assert!(matches!(
+            ManagedTaskWatchCheckpoint::decode(&bytes),
+            Err(ManagedTaskCheckpointError::TooLarge)
+        ));
         assert!(ManagedTaskWatchCheckpoint::decode(&[0xff]).is_err());
         let error = ManagedTaskWatchCheckpoint::decode(b"secret-not-json").unwrap_err();
         assert!(!format!("{error:?} {error}").contains("secret"));

@@ -221,7 +221,9 @@ mod tests {
             assert!(completion.complete_final(&ctx, final_params()).is_err());
             assert!(calls.lock().unwrap().is_empty());
             for result in [
-                completion.complete_legacy_async(&ctx, legacy_params()).await,
+                completion
+                    .complete_legacy_async(&ctx, legacy_params())
+                    .await,
                 completion
                     .complete_legacy_async_in_request(&ctx, ctx.cx(), legacy_params())
                     .await,
@@ -304,7 +306,9 @@ mod tests {
                 }
                 let (completion, calls) = fixture(lane.clone());
                 assert!(matches!(
-                    completion.complete_legacy_async(&ctx, legacy_params()).await,
+                    completion
+                        .complete_legacy_async(&ctx, legacy_params())
+                        .await,
                     Outcome::Err(_)
                 ));
                 assert!(matches!(
@@ -323,10 +327,12 @@ mod tests {
             let ctx = McpContext::new(Cx::current().unwrap(), 97);
             let lane = BlockingHandlerLane::new(1).unwrap();
             let (completion, calls) = fixture(lane.clone());
-            let expired = McpContext::new(ctx.cx().clone(), 97)
-                .with_operation_deadline(Some(ctx.cx().now()));
+            let expired =
+                McpContext::new(ctx.cx().clone(), 97).with_operation_deadline(Some(ctx.cx().now()));
             assert!(matches!(
-                completion.complete_final_async(&expired, final_params()).await,
+                completion
+                    .complete_final_async(&expired, final_params())
+                    .await,
                 Outcome::Err(_)
             ));
             assert!(calls.lock().unwrap().is_empty());
@@ -338,9 +344,9 @@ mod tests {
             ));
             assert_eq!(calls.lock().unwrap().len(), 1);
             let peer = McpContext::new(ctx.cx().clone(), 97);
-            let drain = peer.clone().with_operation_deadline(Some(
-                peer.cx().now().saturating_add_nanos(5_000_000_000),
-            ));
+            let drain = peer
+                .clone()
+                .with_operation_deadline(Some(peer.cx().now().saturating_add_nanos(5_000_000_000)));
             lane.wait_idle(&drain).await.unwrap();
             assert!(matches!(
                 completion.complete_final_async(&peer, final_params()).await,
@@ -403,7 +409,8 @@ mod tests {
             fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(vec![
-                    serde_json::from_value(json!({"uri": "report://ready", "text": "ready"})).unwrap(),
+                    serde_json::from_value(json!({"uri": "report://ready", "text": "ready"}))
+                        .unwrap(),
                 ])
             }
         }
@@ -450,9 +457,9 @@ mod tests {
             assert!(calls.lock().unwrap().is_empty());
             assert!(peer.ensure_live().is_ok());
             release.send(()).unwrap();
-            let drain = peer.clone().with_operation_deadline(Some(
-                peer.cx().now().saturating_add_nanos(5_000_000_000),
-            ));
+            let drain = peer
+                .clone()
+                .with_operation_deadline(Some(peer.cx().now().saturating_add_nanos(5_000_000_000)));
             lane.wait_idle(&drain).await.unwrap();
             let Outcome::Ok(contents) = resource.read_async(&peer).await else {
                 panic!("resource must recover capacity")
@@ -466,7 +473,9 @@ mod tests {
             assert_eq!(calls.lock().unwrap().len(), 1);
             lane.close().unwrap();
             assert!(matches!(
-                completion.complete_legacy_async(&peer, legacy_params()).await,
+                completion
+                    .complete_legacy_async(&peer, legacy_params())
+                    .await,
                 Outcome::Err(_)
             ));
             assert_eq!(calls.lock().unwrap().len(), 1);

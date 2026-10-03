@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use fastmcp_xtask::plan_tracker::{
-    b_eval::{self, BEADS_EXPORT_PATH, B_SUBCASES, PLAN_PATH, ReservationInputs},
+    b_eval::{self, B_SUBCASES, BEADS_EXPORT_PATH, PLAN_PATH, ReservationInputs},
     diagnostics::Code,
     digest::git_blob_hex,
     fingerprint,
@@ -114,7 +114,10 @@ fn snapshot() -> ReservationSnapshot {
             exclusive: true,
             issue_id: "bd-mcp-fnd-02-b-3srw".to_owned(),
             expires_at: NOW + 7_200,
-            history: vec![Renewal { at: CLAIMED_AT - 60, until: NOW + 7_200 }],
+            history: vec![Renewal {
+                at: CLAIMED_AT - 60,
+                until: NOW + 7_200,
+            }],
         }],
     }
 }
@@ -138,10 +141,8 @@ struct Fixture {
 impl Fixture {
     fn new(label: &str) -> Self {
         let unique = SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "fnd-02-b-{label}-{}-{unique}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("fnd-02-b-{label}-{}-{unique}", std::process::id()));
         let source = repo_root();
 
         fs::create_dir_all(root.join(".beads")).expect("scratch is creatable");
@@ -151,8 +152,11 @@ impl Fixture {
         // The real checker crate, copied verbatim: the policy and inventory
         // subcases must observe the shipped crate, not a stand-in.
         fs::create_dir_all(root.join(".cargo")).expect("scratch is creatable");
-        fs::copy(source.join(".cargo/config.toml"), root.join(".cargo/config.toml"))
-            .expect(".cargo/config.toml is copyable");
+        fs::copy(
+            source.join(".cargo/config.toml"),
+            root.join(".cargo/config.toml"),
+        )
+        .expect(".cargo/config.toml is copyable");
         fs::copy(source.join("Cargo.toml"), root.join("Cargo.toml"))
             .expect("Cargo.toml is copyable");
         fs::create_dir_all(root.join("tools/xtask/src/plan_tracker")).expect("scratch");
@@ -179,7 +183,6 @@ impl Fixture {
                     .expect("module is copyable");
             }
         }
-
 
         // Every declared workspace member's manifest, because the unsafe-code
         // policy check reads each one. Only the manifests are needed; the
@@ -308,8 +311,8 @@ fn fnd_02_b_planted_negative() {
             })
             .collect();
 
-    let error = b_eval::run(&fixture.root, &inputs())
-        .expect_err("an unresolved edge must be rejected");
+    let error =
+        b_eval::run(&fixture.root, &inputs()).expect_err("an unresolved edge must be rejected");
     assert_eq!(error.code, Code::DependencyUnresolved);
     assert_eq!(error.subject, "PRT-01");
 
@@ -342,8 +345,14 @@ fn fnd_02_b_02_03_reservation_modes_reject_a_stale_snapshot() {
     let run = b_eval::run(&fixture.root, &stale).expect("fixture loads");
     assert!(!run.passed());
     assert!(run.report.has(Code::ReservationSnapshotStale));
-    assert_eq!(run.subcase("FND-02-B-02").expect("B-02").outcome, Outcome::Fail);
-    assert_eq!(run.subcase("FND-02-B-03").expect("B-03").outcome, Outcome::Fail);
+    assert_eq!(
+        run.subcase("FND-02-B-02").expect("B-02").outcome,
+        Outcome::Fail
+    );
+    assert_eq!(
+        run.subcase("FND-02-B-03").expect("B-03").outcome,
+        Outcome::Fail
+    );
 }
 
 /// B-03: a renewal gap fails close but not claim.
@@ -352,13 +361,22 @@ fn fnd_02_b_03_preclose_rejects_a_renewal_gap() {
     let fixture = Fixture::new("renewal-gap");
     let mut gapped = inputs();
     gapped.snapshot.as_mut().expect("snapshot").leases[0].history = vec![
-        Renewal { at: CLAIMED_AT - 60, until: CLAIMED_AT + 10 },
-        Renewal { at: CLAIMED_AT + 600, until: NOW + 7_200 },
+        Renewal {
+            at: CLAIMED_AT - 60,
+            until: CLAIMED_AT + 10,
+        },
+        Renewal {
+            at: CLAIMED_AT + 600,
+            until: NOW + 7_200,
+        },
     ];
 
     let run = b_eval::run(&fixture.root, &gapped).expect("fixture loads");
     assert!(run.report.has(Code::ReservationRenewalGap));
-    assert_eq!(run.subcase("FND-02-B-03").expect("B-03").outcome, Outcome::Fail);
+    assert_eq!(
+        run.subcase("FND-02-B-03").expect("B-03").outcome,
+        Outcome::Fail
+    );
     assert_eq!(
         run.subcase("FND-02-B-02").expect("B-02").outcome,
         Outcome::Pass,
@@ -370,11 +388,13 @@ fn fnd_02_b_03_preclose_rejects_a_renewal_gap() {
 #[test]
 fn fnd_02_b_05_a_missing_snapshot_does_not_pass_vacuously() {
     let fixture = Fixture::new("no-snapshot");
-    let run = b_eval::run(&fixture.root, &ReservationInputs::default())
-        .expect("fixture loads");
+    let run = b_eval::run(&fixture.root, &ReservationInputs::default()).expect("fixture loads");
     assert!(!run.passed());
     assert!(run.report.has(Code::ReservationSnapshotMissing));
-    assert_eq!(run.subcase("FND-02-B-05").expect("B-05").outcome, Outcome::Fail);
+    assert_eq!(
+        run.subcase("FND-02-B-05").expect("B-05").outcome,
+        Outcome::Fail
+    );
 }
 
 /// B-07: a package heading hidden inside a fence never becomes a package,
@@ -387,8 +407,8 @@ fn fnd_02_b_07_fence_corpus() {
 
     let unclosed = Fixture::new("unclosed-fence");
     unclosed.mutate_once(PLAN_PATH, "- None.\n```", "- None.");
-    let error = b_eval::run(&unclosed.root, &inputs())
-        .expect_err("an unclosed fence must be rejected");
+    let error =
+        b_eval::run(&unclosed.root, &inputs()).expect_err("an unclosed fence must be rejected");
     assert_eq!(error.code, Code::PlanFenceUnclosed);
 }
 
@@ -396,18 +416,32 @@ fn fnd_02_b_07_fence_corpus() {
 #[test]
 fn fnd_02_b_08_package_grammar_boundaries() {
     let cases: [(&str, &str, Code); 4] = [
-        ("### PRT-01 \u{2014} Introduce strict JSON-RPC envelopes",
-         "### prt-01 \u{2014} Lowercase identifier", Code::PackageIdInvalid),
-        ("### PRT-01 \u{2014} Introduce strict JSON-RPC envelopes",
-         "### PRT-01 - Hyphen instead of em dash", Code::PackageHeadingInvalid),
-        ("- FND-01.\n- FND-02.", "- FND-01\n- FND-02.", Code::DependencyBulletInvalid),
-        ("- FND-01.\n- FND-02.", "- None.\n- FND-02.", Code::DependencyMixedSentinel),
+        (
+            "### PRT-01 \u{2014} Introduce strict JSON-RPC envelopes",
+            "### prt-01 \u{2014} Lowercase identifier",
+            Code::PackageIdInvalid,
+        ),
+        (
+            "### PRT-01 \u{2014} Introduce strict JSON-RPC envelopes",
+            "### PRT-01 - Hyphen instead of em dash",
+            Code::PackageHeadingInvalid,
+        ),
+        (
+            "- FND-01.\n- FND-02.",
+            "- FND-01\n- FND-02.",
+            Code::DependencyBulletInvalid,
+        ),
+        (
+            "- FND-01.\n- FND-02.",
+            "- None.\n- FND-02.",
+            Code::DependencyMixedSentinel,
+        ),
     ];
     for (from, to, expected) in cases {
         let fixture = Fixture::new("grammar");
         fixture.mutate_once(PLAN_PATH, from, to);
-        let error = b_eval::run(&fixture.root, &inputs())
-            .expect_err(&format!("{to:?} must be rejected"));
+        let error =
+            b_eval::run(&fixture.root, &inputs()).expect_err(&format!("{to:?} must be rejected"));
         assert_eq!(error.code, expected, "for mutation {to:?}");
     }
 }
@@ -420,13 +454,19 @@ fn fnd_02_b_09_10_11_stream_mutations() {
     let run = b_eval::run(&fixture.root, &inputs()).expect("fixture loads");
 
     let limits = Limits::default();
-    let parsed = plan::parse(&fs::read(fixture.root.join(PLAN_PATH)).unwrap(), &limits)
-        .expect("parses");
+    let parsed =
+        plan::parse(&fs::read(fixture.root.join(PLAN_PATH)).unwrap(), &limits).expect("parses");
     let graph = fingerprint::encode_graph(&parsed);
     let corpus = fingerprint::encode_corpus(&parsed);
 
-    assert_eq!(fingerprint::fingerprint_hex(&graph), run.manifest.canonical_graph_sha256);
-    assert_eq!(fingerprint::fingerprint_hex(&corpus), run.manifest.canonical_corpus_sha256);
+    assert_eq!(
+        fingerprint::fingerprint_hex(&graph),
+        run.manifest.canonical_graph_sha256
+    );
+    assert_eq!(
+        fingerprint::fingerprint_hex(&corpus),
+        run.manifest.canonical_corpus_sha256
+    );
 
     // Domain separation.
     assert!(fingerprint::decode_corpus(&graph, &limits).is_err());
@@ -437,12 +477,19 @@ fn fnd_02_b_09_10_11_stream_mutations() {
     for index in 0..graph.len() {
         let mut mutated = graph.clone();
         mutated[index] ^= 0x01;
-        assert_ne!(baseline, fingerprint::fingerprint_hex(&mutated), "byte {index}");
+        assert_ne!(
+            baseline,
+            fingerprint::fingerprint_hex(&mutated),
+            "byte {index}"
+        );
     }
 
     // Every truncation is rejected.
     for cut in 0..graph.len() {
-        assert!(fingerprint::decode_graph(&graph[..cut], &limits).is_err(), "cut {cut}");
+        assert!(
+            fingerprint::decode_graph(&graph[..cut], &limits).is_err(),
+            "cut {cut}"
+        );
     }
 
     // Unsigned byte ordering, not natural sort.
@@ -463,7 +510,10 @@ fn fnd_02_b_13_14_workspace_policy() {
     );
     let run = b_eval::run(&alias.root, &inputs()).expect("fixture loads");
     assert!(run.report.has(Code::WorkspacePolicy));
-    assert_eq!(run.subcase("FND-02-B-13").expect("B-13").outcome, Outcome::Fail);
+    assert_eq!(
+        run.subcase("FND-02-B-13").expect("B-13").outcome,
+        Outcome::Fail
+    );
 
     let unsafe_policy = Fixture::new("no-forbid");
     unsafe_policy.mutate_once(
@@ -473,12 +523,22 @@ fn fnd_02_b_13_14_workspace_policy() {
     );
     let run = b_eval::run(&unsafe_policy.root, &inputs()).expect("fixture loads");
     assert!(run.report.has(Code::WorkspacePolicy));
-    assert_eq!(run.subcase("FND-02-B-14").expect("B-14").outcome, Outcome::Fail);
+    assert_eq!(
+        run.subcase("FND-02-B-14").expect("B-14").outcome,
+        Outcome::Fail
+    );
 
     let publishable = Fixture::new("publishable");
-    publishable.mutate_once("tools/xtask/Cargo.toml", "publish = false", "publish = true");
+    publishable.mutate_once(
+        "tools/xtask/Cargo.toml",
+        "publish = false",
+        "publish = true",
+    );
     let run = b_eval::run(&publishable.root, &inputs()).expect("fixture loads");
-    assert_eq!(run.subcase("FND-02-B-13").expect("B-13").outcome, Outcome::Fail);
+    assert_eq!(
+        run.subcase("FND-02-B-13").expect("B-13").outcome,
+        Outcome::Fail
+    );
 }
 
 /// B-15: package/label mapping parity is an exact set in both directions.
@@ -490,7 +550,10 @@ fn fnd_02_b_15_generated_inventory_closure() {
     let run = b_eval::run(&extra.root, &inputs()).expect("fixture loads");
     assert!(!run.passed());
     assert_eq!(run.report.codes(), vec![Code::PackageLabelMapping]);
-    assert_eq!(run.subcase("FND-02-B-15").expect("B-15").outcome, Outcome::Fail);
+    assert_eq!(
+        run.subcase("FND-02-B-15").expect("B-15").outcome,
+        Outcome::Fail
+    );
     // Both directions are reported: PRT-01 untracked, PRT-99 undeclared.
     let subjects: Vec<&str> = run
         .report
@@ -520,9 +583,16 @@ fn fnd_02_b_06_strict_read_only() {
 
     assert_eq!(run.manifest.write_counters, [0; 6]);
     assert!(run.ledger.is_read_only());
-    assert_eq!(run.subcase("FND-02-B-06").expect("B-06").outcome, Outcome::Pass);
+    assert_eq!(
+        run.subcase("FND-02-B-06").expect("B-06").outcome,
+        Outcome::Pass
+    );
     for (path, bytes) in before {
-        assert_eq!(bytes, fs::read(&path).expect("input is readable"), "{path:?}");
+        assert_eq!(
+            bytes,
+            fs::read(&path).expect("input is readable"),
+            "{path:?}"
+        );
     }
 }
 
@@ -581,9 +651,18 @@ fn fnd_02_b_parses_the_live_campaign_plan() {
     let bytes = fs::read(repo_root().join(PLAN_PATH)).expect("the plan is readable");
     let parsed = plan::parse(&bytes, &Limits::default()).expect("the live plan parses");
 
-    assert!(parsed.packages.len() > 100, "observed {}", parsed.packages.len());
+    assert!(
+        parsed.packages.len() > 100,
+        "observed {}",
+        parsed.packages.len()
+    );
     assert!(parsed.edges.len() > parsed.packages.len());
-    assert!(parsed.packages.iter().all(|p| plan::is_package_id(&p.id, 64)));
+    assert!(
+        parsed
+            .packages
+            .iter()
+            .all(|p| plan::is_package_id(&p.id, 64))
+    );
     assert!(parsed.ids().contains(&"FND-01"));
     assert!(parsed.ids().contains(&"FND-02"));
 

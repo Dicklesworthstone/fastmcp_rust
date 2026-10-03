@@ -3,22 +3,45 @@
 //! traverse native HTTP/SSE. The parent target requires native-tls-roots.
 use super::*;
 use fastmcp_client::http_auth::managed::OAuthSessionError;
-use fastmcp_client::http_auth::rpc::catalog::{ManagedCatalogClient, ManagedCatalogConsistency, ManagedCatalogError, ManagedCatalogLimits};
 use fastmcp_client::http_auth::rpc::catalog::watch::{
-    ManagedCatalogWatchControl as Control, ManagedCatalogWatchEvent as WatchEvent,
-    ManagedCatalogWatchError as WatchError, ManagedCatalogWatchLimits,
+    ManagedCatalogWatchControl as Control, ManagedCatalogWatchError as WatchError,
+    ManagedCatalogWatchEvent as WatchEvent, ManagedCatalogWatchLimits,
     ManagedCatalogWatchOutcome as Outcome,
 };
-use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta, FINAL_SUBSCRIPTION_ID_META_KEY};
+use fastmcp_client::http_auth::rpc::catalog::{
+    ManagedCatalogClient, ManagedCatalogConsistency, ManagedCatalogError, ManagedCatalogLimits,
+};
+use fastmcp_protocol::{ClientCapabilities, FINAL_SUBSCRIPTION_ID_META_KEY, FinalRequestMeta};
 
 const WATCH_CHILD: &str = "FASTMCP_TEST_CATALOG_WATCH_CASE";
 
 #[derive(Clone, Copy)]
 enum WatchCase {
-    Live, Resources, Templates, Prompts, DuringPage, ChangeOnPage, NarrowAck,
-    Gap, Terminal, Malformed, RebuildLimit, RepeatedId, Cancel, SessionClose,
-    Drop, Timeout, Expired, StopAck, Preflight, Revoked, CallbackOverrun, ScopedCache,
-    ClearPublication, WholeLive, WholeClearPublication,
+    Live,
+    Resources,
+    Templates,
+    Prompts,
+    DuringPage,
+    ChangeOnPage,
+    NarrowAck,
+    Gap,
+    Terminal,
+    Malformed,
+    RebuildLimit,
+    RepeatedId,
+    Cancel,
+    SessionClose,
+    Drop,
+    Timeout,
+    Expired,
+    StopAck,
+    Preflight,
+    Revoked,
+    CallbackOverrun,
+    ScopedCache,
+    ClearPublication,
+    WholeLive,
+    WholeClearPublication,
 }
 
 fn isolated_watch(name: &str, case: WatchCase) {
@@ -29,28 +52,49 @@ fn isolated_watch(name: &str, case: WatchCase) {
     }
     let roots = RootFile::create();
     struct Child(std::process::Child);
-    impl Drop for Child { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
     let exact = format!("driver::catalog_watch::{name}");
-    let mut child = Child(Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
-        .env(WATCH_CHILD, name).env("SSL_CERT_FILE", &roots.0).env_remove("SSL_CERT_DIR")
-        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap());
+    let mut child = Child(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
+            .env(WATCH_CHILD, name)
+            .env("SSL_CERT_FILE", &roots.0)
+            .env_remove("SSL_CERT_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
     let until = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             assert!(status.success(), "catalog watch HTTPS case failed");
             return;
         }
-        assert!(Instant::now() < until, "catalog watch child exceeded its process bound");
+        assert!(
+            Instant::now() < until,
+            "catalog watch child exceeded its process bound"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
 
 fn request(method: &str) -> CoreRequest {
-    CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&json!({
-        "_meta": FinalRequestMeta::new(ClientCapabilities::default()),
-        "includeTags":["selected"], "excludeTags":[],
-    }))).unwrap()
+    CoreRequest::decode(
+        ProtocolEra::Modern2026,
+        method,
+        Some(&json!({
+            "_meta": FinalRequestMeta::new(ClientCapabilities::default()),
+            "includeTags":["selected"], "excludeTags":[],
+        })),
+    )
+    .unwrap()
 }
 
 fn filter(method: &str) -> Value {
@@ -74,19 +118,33 @@ fn notification(method: &str) -> String {
 
 fn ack(accepted: Value) -> String {
     json!({"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged",
-        "params":{"_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):1},"notifications":accepted}}).to_string()
+        "params":{"_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):1},"notifications":accepted}})
+    .to_string()
 }
 
 fn page(method: &str, name: &str, next: Option<&str>) -> String {
     let (key, item) = match method {
-        "tools/list" => ("tools", json!({"name":name,"inputSchema":{"type":"object"}})),
-        "resources/list" => ("resources", json!({"name":name,"uri":format!("file:///{name}")})),
-        "resources/templates/list" => ("resourceTemplates", json!({"name":name,"uriTemplate":format!("file:///{name}/{{key}}")})),
+        "tools/list" => (
+            "tools",
+            json!({"name":name,"inputSchema":{"type":"object"}}),
+        ),
+        "resources/list" => (
+            "resources",
+            json!({"name":name,"uri":format!("file:///{name}")}),
+        ),
+        "resources/templates/list" => (
+            "resourceTemplates",
+            json!({"name":name,"uriTemplate":format!("file:///{name}/{{key}}")}),
+        ),
         "prompts/list" => ("prompts", json!({"name":name})),
         _ => unreachable!(),
     };
-    let cursor = next.map_or(String::new(), |next| format!(",\"nextCursor\":{}", serde_json::to_string(next).unwrap()));
-    format!(r#"{{"resultType":"complete","{key}":[{item}],"ttlMs":60000,"cacheScope":"private"{cursor},"x-exact":{{"z":900719925474099312345,"a":1.20e+4}}}}"#)
+    let cursor = next.map_or(String::new(), |next| {
+        format!(",\"nextCursor\":{}", serde_json::to_string(next).unwrap())
+    });
+    format!(
+        r#"{{"resultType":"complete","{key}":[{item}],"ttlMs":60000,"cacheScope":"private"{cursor},"x-exact":{{"z":900719925474099312345,"a":1.20e+4}}}}"#
+    )
 }
 
 async fn accept_listen(peer: &Peer, cx: &Cx, method: &str) -> TlsStream<TcpStream> {
@@ -95,7 +153,10 @@ async fn accept_listen(peer: &Peer, cx: &Cx, method: &str) -> TlsStream<TcpStrea
     assert_eq!(wire["id"], 1);
     assert_eq!(wire["method"], "subscriptions/listen");
     assert_eq!(wire["params"]["notifications"], filter(method));
-    assert_eq!(wire["params"]["_meta"], request(method).encode_params().unwrap().unwrap()["_meta"]);
+    assert_eq!(
+        wire["params"]["_meta"],
+        request(method).encode_params().unwrap().unwrap()["_meta"]
+    );
     assert!(wire["params"].get("includeTags").is_none());
     sse_head(&mut tls).await;
     tls.flush().await.unwrap();
@@ -104,25 +165,42 @@ async fn accept_listen(peer: &Peer, cx: &Cx, method: &str) -> TlsStream<TcpStrea
     tls
 }
 
-async fn accept_page(peer: &Peer, method: &str, id: i64, cursor: Option<&str>) -> TlsStream<TcpStream> {
+async fn accept_page(
+    peer: &Peer,
+    method: &str,
+    id: i64,
+    cursor: Option<&str>,
+) -> TlsStream<TcpStream> {
     let (tls, body) = peer.request(false).await;
     let wire: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(wire["id"], id);
     assert_eq!(wire["method"], method);
     let mut expected = request(method).encode_params().unwrap().unwrap();
-    if let Some(cursor) = cursor { expected["cursor"] = json!(cursor); }
+    if let Some(cursor) = cursor {
+        expected["cursor"] = json!(cursor);
+    }
     assert_eq!(wire["params"], expected);
     tls
 }
 
-async fn serve_page(peer: &Peer, method: &str, id: i64, cursor: Option<&str>, name: &str, next: Option<&str>) {
+async fn serve_page(
+    peer: &Peer,
+    method: &str,
+    id: i64,
+    cursor: Option<&str>,
+    name: &str,
+    next: Option<&str>,
+) {
     let mut tls = accept_page(peer, method, id, cursor).await;
     json_reply(&mut tls, &terminal(id, &page(method, name, next))).await;
 }
 
 async fn closed(mut tls: TlsStream<TcpStream>) {
     let mut byte = [0];
-    assert!(!matches!(tls.read(&mut byte).await, Ok(count) if count > 0), "the driver must release its response socket");
+    assert!(
+        !matches!(tls.read(&mut byte).await, Ok(count) if count > 0),
+        "the driver must release its response socket"
+    );
 }
 
 fn run_watch(case: WatchCase) {
@@ -359,52 +437,177 @@ fn run_watch(case: WatchCase) {
 }
 
 #[test]
-fn tools_watch_refreshes_live_and_discards_preexisting_cache() { isolated_watch("tools_watch_refreshes_live_and_discards_preexisting_cache", WatchCase::Live); }
+fn tools_watch_refreshes_live_and_discards_preexisting_cache() {
+    isolated_watch(
+        "tools_watch_refreshes_live_and_discards_preexisting_cache",
+        WatchCase::Live,
+    );
+}
 #[test]
-fn resources_watch_uses_resource_catalog_changes() { isolated_watch("resources_watch_uses_resource_catalog_changes", WatchCase::Resources); }
+fn resources_watch_uses_resource_catalog_changes() {
+    isolated_watch(
+        "resources_watch_uses_resource_catalog_changes",
+        WatchCase::Resources,
+    );
+}
 #[test]
-fn templates_watch_uses_resource_catalog_changes() { isolated_watch("templates_watch_uses_resource_catalog_changes", WatchCase::Templates); }
+fn templates_watch_uses_resource_catalog_changes() {
+    isolated_watch(
+        "templates_watch_uses_resource_catalog_changes",
+        WatchCase::Templates,
+    );
+}
 #[test]
-fn prompts_watch_uses_prompt_catalog_changes() { isolated_watch("prompts_watch_uses_prompt_catalog_changes", WatchCase::Prompts); }
+fn prompts_watch_uses_prompt_catalog_changes() {
+    isolated_watch(
+        "prompts_watch_uses_prompt_catalog_changes",
+        WatchCase::Prompts,
+    );
+}
 #[test]
-fn change_during_pagination_cancels_obsolete_page_and_restarts_from_first() { isolated_watch("change_during_pagination_cancels_obsolete_page_and_restarts_from_first", WatchCase::DuringPage); }
+fn change_during_pagination_cancels_obsolete_page_and_restarts_from_first() {
+    isolated_watch(
+        "change_during_pagination_cancels_obsolete_page_and_restarts_from_first",
+        WatchCase::DuringPage,
+    );
+}
 #[test]
-fn change_on_a_catalog_response_reconciles_without_restarting_the_listen() { isolated_watch("change_on_a_catalog_response_reconciles_without_restarting_the_listen", WatchCase::ChangeOnPage); }
+fn change_on_a_catalog_response_reconciles_without_restarting_the_listen() {
+    isolated_watch(
+        "change_on_a_catalog_response_reconciles_without_restarting_the_listen",
+        WatchCase::ChangeOnPage,
+    );
+}
 #[test]
-fn missing_acknowledgment_coverage_prevents_any_list_post() { isolated_watch("missing_acknowledgment_coverage_prevents_any_list_post", WatchCase::NarrowAck); }
+fn missing_acknowledgment_coverage_prevents_any_list_post() {
+    isolated_watch(
+        "missing_acknowledgment_coverage_prevents_any_list_post",
+        WatchCase::NarrowAck,
+    );
+}
 #[test]
-fn subscription_gap_cancels_pending_list_and_never_publishes_partial_state() { isolated_watch("subscription_gap_cancels_pending_list_and_never_publishes_partial_state", WatchCase::Gap); }
+fn subscription_gap_cancels_pending_list_and_never_publishes_partial_state() {
+    isolated_watch(
+        "subscription_gap_cancels_pending_list_and_never_publishes_partial_state",
+        WatchCase::Gap,
+    );
+}
 #[test]
-fn graceful_subscription_end_does_not_bridge_cache_across_the_gap() { isolated_watch("graceful_subscription_end_does_not_bridge_cache_across_the_gap", WatchCase::Terminal); }
+fn graceful_subscription_end_does_not_bridge_cache_across_the_gap() {
+    isolated_watch(
+        "graceful_subscription_end_does_not_bridge_cache_across_the_gap",
+        WatchCase::Terminal,
+    );
+}
 #[test]
-fn malformed_page_is_not_retried_as_an_invalidation() { isolated_watch("malformed_page_is_not_retried_as_an_invalidation", WatchCase::Malformed); }
+fn malformed_page_is_not_retried_as_an_invalidation() {
+    isolated_watch(
+        "malformed_page_is_not_retried_as_an_invalidation",
+        WatchCase::Malformed,
+    );
+}
 #[test]
-fn reconciliation_budget_prevents_another_traversal() { isolated_watch("reconciliation_budget_prevents_another_traversal", WatchCase::RebuildLimit); }
+fn reconciliation_budget_prevents_another_traversal() {
+    isolated_watch(
+        "reconciliation_budget_prevents_another_traversal",
+        WatchCase::RebuildLimit,
+    );
+}
 #[test]
-fn listen_request_id_cannot_be_reused_by_a_catalog_page() { isolated_watch("listen_request_id_cannot_be_reused_by_a_catalog_page", WatchCase::RepeatedId); }
+fn listen_request_id_cannot_be_reused_by_a_catalog_page() {
+    isolated_watch(
+        "listen_request_id_cannot_be_reused_by_a_catalog_page",
+        WatchCase::RepeatedId,
+    );
+}
 #[test]
-fn cancellation_wakes_an_idle_watch_without_cancelling_the_context() { isolated_watch("cancellation_wakes_an_idle_watch_without_cancelling_the_context", WatchCase::Cancel); }
+fn cancellation_wakes_an_idle_watch_without_cancelling_the_context() {
+    isolated_watch(
+        "cancellation_wakes_an_idle_watch_without_cancelling_the_context",
+        WatchCase::Cancel,
+    );
+}
 #[test]
-fn session_close_wakes_an_idle_catalog_watch() { isolated_watch("session_close_wakes_an_idle_catalog_watch", WatchCase::SessionClose); }
+fn session_close_wakes_an_idle_catalog_watch() {
+    isolated_watch(
+        "session_close_wakes_an_idle_catalog_watch",
+        WatchCase::SessionClose,
+    );
+}
 #[test]
-fn dropped_watch_releases_its_subscription_and_invalidates_cached_pages() { isolated_watch("dropped_watch_releases_its_subscription_and_invalidates_cached_pages", WatchCase::Drop); }
+fn dropped_watch_releases_its_subscription_and_invalidates_cached_pages() {
+    isolated_watch(
+        "dropped_watch_releases_its_subscription_and_invalidates_cached_pages",
+        WatchCase::Drop,
+    );
+}
 #[test]
-fn whole_watch_deadline_includes_idle_time_after_a_snapshot() { isolated_watch("whole_watch_deadline_includes_idle_time_after_a_snapshot", WatchCase::Timeout); }
+fn whole_watch_deadline_includes_idle_time_after_a_snapshot() {
+    isolated_watch(
+        "whole_watch_deadline_includes_idle_time_after_a_snapshot",
+        WatchCase::Timeout,
+    );
+}
 #[test]
-fn opening_token_expiry_ends_the_watch_without_renewal_or_reconnect() { isolated_watch("opening_token_expiry_ends_the_watch_without_renewal_or_reconnect", WatchCase::Expired); }
+fn opening_token_expiry_ends_the_watch_without_renewal_or_reconnect() {
+    isolated_watch(
+        "opening_token_expiry_ends_the_watch_without_renewal_or_reconnect",
+        WatchCase::Expired,
+    );
+}
 #[test]
-fn host_can_stop_after_acknowledgment_without_a_catalog_post() { isolated_watch("host_can_stop_after_acknowledgment_without_a_catalog_post", WatchCase::StopAck); }
+fn host_can_stop_after_acknowledgment_without_a_catalog_post() {
+    isolated_watch(
+        "host_can_stop_after_acknowledgment_without_a_catalog_post",
+        WatchCase::StopAck,
+    );
+}
 #[test]
-fn watch_preflight_rejects_suffixes_mutations_and_precancellation() { isolated_watch("watch_preflight_rejects_suffixes_mutations_and_precancellation", WatchCase::Preflight); }
+fn watch_preflight_rejects_suffixes_mutations_and_precancellation() {
+    isolated_watch(
+        "watch_preflight_rejects_suffixes_mutations_and_precancellation",
+        WatchCase::Preflight,
+    );
+}
 #[test]
-fn callback_revocation_prevents_further_watch_effects() { isolated_watch("callback_revocation_prevents_further_watch_effects", WatchCase::Revoked); }
+fn callback_revocation_prevents_further_watch_effects() {
+    isolated_watch(
+        "callback_revocation_prevents_further_watch_effects",
+        WatchCase::Revoked,
+    );
+}
 #[test]
-fn overdue_acknowledgment_callback_cannot_start_a_catalog_fetch() { isolated_watch("overdue_acknowledgment_callback_cannot_start_a_catalog_fetch", WatchCase::CallbackOverrun); }
+fn overdue_acknowledgment_callback_cannot_start_a_catalog_fetch() {
+    isolated_watch(
+        "overdue_acknowledgment_callback_cannot_start_a_catalog_fetch",
+        WatchCase::CallbackOverrun,
+    );
+}
 #[test]
-fn closing_one_catalog_watch_does_not_flush_unrelated_catalogs() { isolated_watch("closing_one_catalog_watch_does_not_flush_unrelated_catalogs", WatchCase::ScopedCache); }
+fn closing_one_catalog_watch_does_not_flush_unrelated_catalogs() {
+    isolated_watch(
+        "closing_one_catalog_watch_does_not_flush_unrelated_catalogs",
+        WatchCase::ScopedCache,
+    );
+}
 #[test]
-fn external_clear_after_collection_prevents_snapshot_publication() { isolated_watch("external_clear_after_collection_prevents_snapshot_publication", WatchCase::ClearPublication); }
+fn external_clear_after_collection_prevents_snapshot_publication() {
+    isolated_watch(
+        "external_clear_after_collection_prevents_snapshot_publication",
+        WatchCase::ClearPublication,
+    );
+}
 #[test]
-fn whole_catalog_policy_composes_with_live_watch_snapshots() { isolated_watch("whole_catalog_policy_composes_with_live_watch_snapshots", WatchCase::WholeLive); }
+fn whole_catalog_policy_composes_with_live_watch_snapshots() {
+    isolated_watch(
+        "whole_catalog_policy_composes_with_live_watch_snapshots",
+        WatchCase::WholeLive,
+    );
+}
 #[test]
-fn whole_catalog_policy_preserves_the_external_clear_publication_fence() { isolated_watch("whole_catalog_policy_preserves_the_external_clear_publication_fence", WatchCase::WholeClearPublication); }
+fn whole_catalog_policy_preserves_the_external_clear_publication_fence() {
+    isolated_watch(
+        "whole_catalog_policy_preserves_the_external_clear_publication_fence",
+        WatchCase::WholeClearPublication,
+    );
+}

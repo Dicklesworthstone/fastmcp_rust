@@ -31,10 +31,9 @@ use fastmcp_protocol::{
     DeferringResultDiscriminatorPolicy, ExactJsonMember, ExactJsonObject, ExactJsonValue,
     MAX_PRT_04_MANIFEST_BYTES, PRT_04_A_EVALUATOR_MANIFEST_V1, PRT_04_B_EVALUATOR_MANIFEST_V1,
     PeerCacheTtl, PeerCacheTtlDeviation, ResultDecodeError, ResultDecodeErrorKind, ResultMeta,
-    ResultPeerDiagnostic, ResultPeerEra,
-    TypedCompleteMembers, UnknownResultMembers, decode_peer_result, decode_typed_complete,
-    decode_peer_cache_ttl, encode_complete_result, encode_result, prt_04_a_manifest_digest,
-    prt_04_b_manifest_digest,
+    ResultPeerDiagnostic, ResultPeerEra, TypedCompleteMembers, UnknownResultMembers,
+    decode_peer_cache_ttl, decode_peer_result, decode_typed_complete, encode_complete_result,
+    encode_result, prt_04_a_manifest_digest, prt_04_b_manifest_digest,
 };
 
 // ---------------------------------------------------------------------------
@@ -104,7 +103,10 @@ fn parse_published_half(text: &str, half: &'static str, header: &str) -> Vec<Joi
                 .expect("each case row declares `floor=<N>`")
                 .parse()
                 .expect("each floor is numeric");
-            assert!(floor >= 1, "{half}: case row {index} declares a positive floor");
+            assert!(
+                floor >= 1,
+                "{half}: case row {index} declares a positive floor"
+            );
             JoinedCase {
                 id: fields[0].to_owned(),
                 name: fields[1].to_owned(),
@@ -167,7 +169,9 @@ fn joined_manifest() -> Vec<JoinedCase> {
             "the ordered union must be contiguous with no omission, duplication, or reorder"
         );
         assert!(
-            union[..index].iter().all(|earlier| earlier.name != case.name),
+            union[..index]
+                .iter()
+                .all(|earlier| earlier.name != case.name),
             "case names must be unique across both halves; `{}` repeats",
             case.name
         );
@@ -293,9 +297,12 @@ fn known_members_of(payload: &JoinLookupResult) -> Vec<ExactJsonMember> {
 }
 
 fn decode_complete(source: &str) -> (Vec<ExactJsonMember>, Option<ResultPeerDiagnostic>) {
-    let (decoded, diagnostic) =
-        decode_peer_result(source, ResultPeerEra::Modern, &CoreResultDiscriminatorPolicy)
-            .expect("the public codec admits this bounded complete result");
+    let (decoded, diagnostic) = decode_peer_result(
+        source,
+        ResultPeerEra::Modern,
+        &CoreResultDiscriminatorPolicy,
+    )
+    .expect("the public codec admits this bounded complete result");
     let DecodedResult::Complete(complete) = decoded else {
         panic!("complete result");
     };
@@ -336,14 +343,20 @@ fn observe(case: &str) -> usize {
         }
         "absent-discriminator-defaults-complete" => {
             let absent = r#"{"note":"no discriminator"}"#;
-            let (legacy, legacy_diagnostic) =
-                decode_peer_result(absent, ResultPeerEra::Legacy, &CoreResultDiscriminatorPolicy)
-                    .expect("an earlier-era peer may omit resultType");
+            let (legacy, legacy_diagnostic) = decode_peer_result(
+                absent,
+                ResultPeerEra::Legacy,
+                &CoreResultDiscriminatorPolicy,
+            )
+            .expect("an earlier-era peer may omit resultType");
             assert!(matches!(legacy, DecodedResult::Complete(_)));
             assert_eq!(legacy_diagnostic, None);
-            let (modern, modern_diagnostic) =
-                decode_peer_result(absent, ResultPeerEra::Modern, &CoreResultDiscriminatorPolicy)
-                    .expect("a final-era omission still decodes as complete");
+            let (modern, modern_diagnostic) = decode_peer_result(
+                absent,
+                ResultPeerEra::Modern,
+                &CoreResultDiscriminatorPolicy,
+            )
+            .expect("a final-era omission still decodes as complete");
             assert!(matches!(modern, DecodedResult::Complete(_)));
             assert_eq!(
                 modern_diagnostic,
@@ -359,9 +372,12 @@ fn observe(case: &str) -> usize {
                 r#"{"resultType":7,"n":1}"#,
                 r#"{"resultType":true,"n":1}"#,
             ] {
-                let error =
-                    decode_peer_result(wrong, ResultPeerEra::Modern, &CoreResultDiscriminatorPolicy)
-                        .expect_err("a non-string resultType is never guessed at");
+                let error = decode_peer_result(
+                    wrong,
+                    ResultPeerEra::Modern,
+                    &CoreResultDiscriminatorPolicy,
+                )
+                .expect_err("a non-string resultType is never guessed at");
                 assert_eq!(error.kind(), ResultDecodeErrorKind::InvalidDiscriminator);
                 assert_eq!(error.path(), "$.resultType");
                 assert!(
@@ -387,9 +403,12 @@ fn observe(case: &str) -> usize {
             )
             .expect("an unclaimed discriminator defers");
             assert!(matches!(deferred, DecodedResult::Deferred(_)));
-            let rejected =
-                decode_peer_result(UNCLAIMED, ResultPeerEra::Modern, &CoreResultDiscriminatorPolicy)
-                    .expect_err("the core policy refuses what it cannot claim");
+            let rejected = decode_peer_result(
+                UNCLAIMED,
+                ResultPeerEra::Modern,
+                &CoreResultDiscriminatorPolicy,
+            )
+            .expect_err("the core policy refuses what it cannot claim");
             assert_eq!(rejected.kind(), ResultDecodeErrorKind::RejectedExtension);
             assert_eq!(
                 rejected
@@ -465,9 +484,12 @@ fn observe(case: &str) -> usize {
             6
         }
         "open-member-byte-faithful-reencode" => {
-            let (complete, _) =
-                decode_peer_result(OPEN_KINDS, ResultPeerEra::Modern, &CoreResultDiscriminatorPolicy)
-                    .expect("complete admits");
+            let (complete, _) = decode_peer_result(
+                OPEN_KINDS,
+                ResultPeerEra::Modern,
+                &CoreResultDiscriminatorPolicy,
+            )
+            .expect("complete admits");
             assert_eq!(encode_result(&complete), OPEN_KINDS);
             let (input_required, _) = decode_peer_result(
                 FOREIGN_INPUT_REQUIRED,
@@ -626,16 +648,16 @@ fn observe(case: &str) -> usize {
             2
         }
         "invalid-known-member-not-smuggled-into-extras" => {
-            let wrong =
-                TYPED_CANONICAL.replacen(r#""status":"ready""#, r#""status":false"#, 1);
+            let wrong = TYPED_CANONICAL.replacen(r#""status":"ready""#, r#""status":false"#, 1);
             let error = decode_typed_complete::<JoinLookupResult>(&wrong, ResultPeerEra::Modern)
                 .expect_err("a selected member of the wrong kind fails at that member");
             assert_eq!(error.kind(), ResultDecodeErrorKind::InvalidKnownMember);
             assert_eq!(error.path(), "$.status");
             let residual =
                 r#"{"resultType":"complete","status":"ready","audit":{"who":"x"},"free":1}"#;
-            let error = decode_typed_complete::<JoinResidualResult>(residual, ResultPeerEra::Modern)
-                .expect_err("a declared but unconsumed member cannot become an extra");
+            let error =
+                decode_typed_complete::<JoinResidualResult>(residual, ResultPeerEra::Modern)
+                    .expect_err("a declared but unconsumed member cannot become an extra");
             assert_eq!(error.kind(), ResultDecodeErrorKind::InvalidKnownMember);
             assert_eq!(error.path(), "$.audit");
             let clean = r#"{"resultType":"complete","status":"ready","free":1}"#;
@@ -776,7 +798,6 @@ fn observe(case: &str) -> usize {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Integration-owned capability: tolerant peer cache TTL
 // ---------------------------------------------------------------------------
@@ -796,8 +817,9 @@ fn observe(case: &str) -> usize {
 /// cases are still refused.
 fn assert_peer_cache_ttl_contract() {
     // Conforming: a nonnegative integer is usable and carries no diagnostic.
-    let (ttl, diagnostic) = decode_peer_cache_ttl(Some(&ExactJsonValue::Number("60000".to_owned())))
-        .expect("a nonnegative peer ttlMs conforms");
+    let (ttl, diagnostic) =
+        decode_peer_cache_ttl(Some(&ExactJsonValue::Number("60000".to_owned())))
+            .expect("a nonnegative peer ttlMs conforms");
     assert_eq!(diagnostic, None);
     assert_eq!(
         ttl.conforming().map(fastmcp_protocol::CacheTtl::as_str),
@@ -865,10 +887,9 @@ fn assert_peer_cache_ttl_contract() {
     }
 
     // An integral exponent spelling is a conforming integer, not a fraction.
-    let (exponent, diagnostic) = decode_peer_cache_ttl(Some(&ExactJsonValue::Number(
-        "6e4".to_owned(),
-    )))
-    .expect("an integral exponent spelling is still an integer");
+    let (exponent, diagnostic) =
+        decode_peer_cache_ttl(Some(&ExactJsonValue::Number("6e4".to_owned())))
+            .expect("an integral exponent spelling is still an integer");
     assert_eq!(diagnostic, None);
     assert_eq!(exponent.freshness_millis(), Ok(60_000));
 }
@@ -955,7 +976,10 @@ fn prt_04_i_planted_negative() {
     let mut renamed_names = 0;
     for (before, after) in published_a.iter().zip(&renamed_cases) {
         assert_eq!(before.id, after.id, "the rename must not move an ordinal");
-        assert_eq!(before.floor, after.floor, "the rename must not move a floor");
+        assert_eq!(
+            before.floor, after.floor,
+            "the rename must not move a floor"
+        );
         if before.name != after.name {
             renamed_names += 1;
         }
@@ -965,8 +989,8 @@ fn prt_04_i_planted_negative() {
         "exactly one case name differs, so the digest can only have moved because of it"
     );
 
-    let renamed_digest = sha256_bounded(renamed.as_bytes(), MAX_PRT_04_MANIFEST_BYTES)
-        .expect("within bound");
+    let renamed_digest =
+        sha256_bounded(renamed.as_bytes(), MAX_PRT_04_MANIFEST_BYTES).expect("within bound");
     assert_ne!(
         renamed_digest.as_bytes(),
         prt_04_a_manifest_digest().as_bytes(),
@@ -1006,8 +1030,12 @@ fn prt_04_i_planted_negative() {
     )
     .expect("baseline deferral");
     assert!(matches!(accepted, DecodedResult::Deferred(_)));
-    let error = decode_peer_result(UNCLAIMED, ResultPeerEra::Modern, &CoreResultDiscriminatorPolicy)
-        .expect_err("only the injected policy changed");
+    let error = decode_peer_result(
+        UNCLAIMED,
+        ResultPeerEra::Modern,
+        &CoreResultDiscriminatorPolicy,
+    )
+    .expect_err("only the injected policy changed");
     assert_eq!(error.kind(), ResultDecodeErrorKind::RejectedExtension);
     assert_eq!(
         error

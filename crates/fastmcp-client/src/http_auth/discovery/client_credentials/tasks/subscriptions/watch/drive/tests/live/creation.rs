@@ -2,65 +2,139 @@
 //! provides a pre-acquired machine token and TLS peer. Storage below is an
 //! insert-only in-memory fault fixture, not physical or cryptographic evidence.
 use super::*;
+use crate::http_auth::discovery::client_credentials::tasks::creation::{
+    ClientCredentialsTaskCreationError as Error, ClientCredentialsTaskCreationState as State,
+    ClientCredentialsTaskPersistenceWarning as Warning,
+    PersistedClientCredentialsTaskSubmissionEvent as Event, TaskResumeBinding,
+    TaskResumeCapturePolicy, TaskResumeInsert, TaskResumePersistenceState as Saved,
+    TaskResumeRecord,
+};
+use fastmcp_core::partition::{DurableOwnerKey, PartitionDescriptor};
+use fastmcp_protocol::FinalCoreResult;
 use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::task::Context;
-use fastmcp_core::partition::{DurableOwnerKey, PartitionDescriptor};
-use fastmcp_protocol::FinalCoreResult;
-use crate::http_auth::discovery::client_credentials::tasks::creation::{
-    ClientCredentialsTaskCreationError as Error, ClientCredentialsTaskCreationState as State,
-    ClientCredentialsTaskPersistenceWarning as Warning, PersistedClientCredentialsTaskSubmissionEvent as Event,
-    TaskResumeBinding, TaskResumeCapturePolicy, TaskResumeInsert, TaskResumePersistenceState as Saved,
-    TaskResumeRecord,
-};
 
 #[derive(Clone, Copy)]
 enum Case {
-    Working, TaskInput, Ordinary, CoreInput, Completed, Failed, Cancelled,
-    GatedSave, FailedSave, LostSave, AbandonSave, CancelSave, CloseSave,
-    ExpireSave, DeadlineSave, AckCancel, ExpiredTask, LostReply, ForeignReply,
-    MissingTasks, Progress, AbandonRead,
+    Working,
+    TaskInput,
+    Ordinary,
+    CoreInput,
+    Completed,
+    Failed,
+    Cancelled,
+    GatedSave,
+    FailedSave,
+    LostSave,
+    AbandonSave,
+    CancelSave,
+    CloseSave,
+    ExpireSave,
+    DeadlineSave,
+    AckCancel,
+    ExpiredTask,
+    LostReply,
+    ForeignReply,
+    MissingTasks,
+    Progress,
+    AbandonRead,
 }
 impl Case {
     fn gated(self) -> bool {
-        matches!(self, Self::GatedSave | Self::AbandonSave | Self::CancelSave | Self::CloseSave
-            | Self::ExpireSave | Self::DeadlineSave)
+        matches!(
+            self,
+            Self::GatedSave
+                | Self::AbandonSave
+                | Self::CancelSave
+                | Self::CloseSave
+                | Self::ExpireSave
+                | Self::DeadlineSave
+        )
     }
     fn bypasses_save(self) -> bool {
-        matches!(self, Self::Ordinary | Self::CoreInput | Self::Completed | Self::Failed | Self::Cancelled
-            | Self::ExpiredTask | Self::LostReply | Self::ForeignReply | Self::MissingTasks | Self::AbandonRead)
+        matches!(
+            self,
+            Self::Ordinary
+                | Self::CoreInput
+                | Self::Completed
+                | Self::Failed
+                | Self::Cancelled
+                | Self::ExpiredTask
+                | Self::LostReply
+                | Self::ForeignReply
+                | Self::MissingTasks
+                | Self::AbandonRead
+        )
     }
 }
 const TASK_ID: &str = "  PRIVATE / machine-é  ";
 fn binding(client: &ClientCredentialsTasksClient) -> TaskResumeBinding {
     let resource = client.client.resource();
-    let facts = PartitionDescriptor::from_verified_facts("fixture", 1, "issuer", resource.as_str(),
-        "tenant", "machine-owner", "client", 1, 1, &[b"fixture".as_slice()]).unwrap();
-    TaskResumeBinding::from_verified_owner(resource.clone(), "machine-creation",
-        &DurableOwnerKey::derive(&facts, 1).unwrap(), [1; 32], [2; 32], [3; 32]).unwrap()
+    let facts = PartitionDescriptor::from_verified_facts(
+        "fixture",
+        1,
+        "issuer",
+        resource.as_str(),
+        "tenant",
+        "machine-owner",
+        "client",
+        1,
+        1,
+        &[b"fixture".as_slice()],
+    )
+    .unwrap();
+    TaskResumeBinding::from_verified_owner(
+        resource.clone(),
+        "machine-creation",
+        &DurableOwnerKey::derive(&facts, 1).unwrap(),
+        [1; 32],
+        [2; 32],
+        [3; 32],
+    )
+    .unwrap()
 }
 fn result(case: Case) -> serde_json::Value {
-    if matches!(case, Case::Ordinary) { return json!({"resultType":"complete","content":[],"isError":true}); }
-    if matches!(case, Case::CoreInput) { return json!({"resultType":"input_required","requestState":"PRIVATE-STATE"}); }
-    let status = match case { Case::TaskInput => "input_required", Case::Completed => "completed",
-        Case::Failed => "failed", Case::Cancelled => "cancelled", _ => "working" };
+    if matches!(case, Case::Ordinary) {
+        return json!({"resultType":"complete","content":[],"isError":true});
+    }
+    if matches!(case, Case::CoreInput) {
+        return json!({"resultType":"input_required","requestState":"PRIVATE-STATE"});
+    }
+    let status = match case {
+        Case::TaskInput => "input_required",
+        Case::Completed => "completed",
+        Case::Failed => "failed",
+        Case::Cancelled => "cancelled",
+        _ => "working",
+    };
     let mut value = json!({"resultType":"task","taskId":TASK_ID,"status":status,
         "createdAt":"2000-01-01T00:00:00Z","lastUpdatedAt":"2000-01-01T00:00:00Z",
         "ttlMs":null,"statusMessage":"PRIVATE-STATUS"});
     match case {
-        Case::TaskInput => value["inputRequests"] = json!({"PRIVATE-INPUT":{"method":"roots/list"}}),
-        Case::Completed => value["result"] = json!({"content":[{"type":"text","text":"PRIVATE-RESULT"}]}),
+        Case::TaskInput => {
+            value["inputRequests"] = json!({"PRIVATE-INPUT":{"method":"roots/list"}})
+        }
+        Case::Completed => {
+            value["result"] = json!({"content":[{"type":"text","text":"PRIVATE-RESULT"}]})
+        }
         Case::Failed => value["error"] = json!({"code":-32603,"message":"PRIVATE-ERROR"}),
         Case::ExpiredTask => value["ttlMs"] = json!(1),
-        _ => {},
+        _ => {}
     }
     value
 }
 
 #[derive(Default)]
-struct Storage { record: Option<TaskResumeRecord> }
+struct Storage {
+    record: Option<TaskResumeRecord>,
+}
 struct DropProbe(Arc<AtomicUsize>);
-impl Drop for DropProbe { fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); } }
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 fn run_creation(case: Case) {
     runtime().block_on(async {
@@ -298,28 +372,86 @@ fn run_creation(case: Case) {
 macro_rules! creation_case {
     ($name:ident, $case:ident) => {
         #[test]
-        fn $name() { isolated_run(concat!("creation::", stringify!($name)), || run_creation(Case::$case)); }
+        fn $name() {
+            isolated_run(concat!("creation::", stringify!($name)), || {
+                run_creation(Case::$case)
+            });
+        }
     };
 }
-creation_case!(tls_created_working_task_is_inserted_before_publication, Working);
-creation_case!(tls_created_input_task_is_saved_without_resolving_its_inputs, TaskInput);
+creation_case!(
+    tls_created_working_task_is_inserted_before_publication,
+    Working
+);
+creation_case!(
+    tls_created_input_task_is_saved_without_resolving_its_inputs,
+    TaskInput
+);
 creation_case!(tls_ordinary_tool_result_never_invokes_storage, Ordinary);
-creation_case!(tls_core_input_result_is_neither_persisted_nor_replayed, CoreInput);
+creation_case!(
+    tls_core_input_result_is_neither_persisted_nor_replayed,
+    CoreInput
+);
 creation_case!(tls_completed_task_result_needs_no_resume_insert, Completed);
 creation_case!(tls_failed_task_result_needs_no_resume_insert, Failed);
 creation_case!(tls_cancelled_task_result_needs_no_resume_insert, Cancelled);
-creation_case!(tls_pending_initial_save_withholds_publication_until_ack, GatedSave);
-creation_case!(tls_failed_initial_save_returns_real_task_with_warning, FailedSave);
-creation_case!(tls_committed_initial_save_with_lost_reply_is_not_retried, LostSave);
-creation_case!(tls_abandoned_initial_save_keeps_accepted_task_custody, AbandonSave);
-creation_case!(tls_local_cancellation_of_initial_save_returns_known_task, CancelSave);
-creation_case!(tls_machine_close_during_initial_save_returns_known_task, CloseSave);
-creation_case!(tls_opening_credential_expiry_bounds_initial_save, ExpireSave);
-creation_case!(tls_original_creating_deadline_bounds_initial_save, DeadlineSave);
-creation_case!(tls_save_ack_racing_cancellation_survives_with_real_task, AckCancel);
-creation_case!(tls_expired_created_task_survives_failed_control_capture, ExpiredTask);
-creation_case!(tls_lost_creating_reply_never_invents_or_replays_task, LostReply);
-creation_case!(tls_foreign_creating_reply_never_reaches_checkpoint_store, ForeignReply);
-creation_case!(tls_unnegotiated_tasks_profile_prevents_creating_call, MissingTasks);
-creation_case!(tls_creation_progress_stays_incremental_and_finishes_once, Progress);
-creation_case!(tls_abandoned_creating_read_releases_socket_without_replay, AbandonRead);
+creation_case!(
+    tls_pending_initial_save_withholds_publication_until_ack,
+    GatedSave
+);
+creation_case!(
+    tls_failed_initial_save_returns_real_task_with_warning,
+    FailedSave
+);
+creation_case!(
+    tls_committed_initial_save_with_lost_reply_is_not_retried,
+    LostSave
+);
+creation_case!(
+    tls_abandoned_initial_save_keeps_accepted_task_custody,
+    AbandonSave
+);
+creation_case!(
+    tls_local_cancellation_of_initial_save_returns_known_task,
+    CancelSave
+);
+creation_case!(
+    tls_machine_close_during_initial_save_returns_known_task,
+    CloseSave
+);
+creation_case!(
+    tls_opening_credential_expiry_bounds_initial_save,
+    ExpireSave
+);
+creation_case!(
+    tls_original_creating_deadline_bounds_initial_save,
+    DeadlineSave
+);
+creation_case!(
+    tls_save_ack_racing_cancellation_survives_with_real_task,
+    AckCancel
+);
+creation_case!(
+    tls_expired_created_task_survives_failed_control_capture,
+    ExpiredTask
+);
+creation_case!(
+    tls_lost_creating_reply_never_invents_or_replays_task,
+    LostReply
+);
+creation_case!(
+    tls_foreign_creating_reply_never_reaches_checkpoint_store,
+    ForeignReply
+);
+creation_case!(
+    tls_unnegotiated_tasks_profile_prevents_creating_call,
+    MissingTasks
+);
+creation_case!(
+    tls_creation_progress_stays_incremental_and_finishes_once,
+    Progress
+);
+creation_case!(
+    tls_abandoned_creating_read_releases_socket_without_replay,
+    AbandonRead
+);

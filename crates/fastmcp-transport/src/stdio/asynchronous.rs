@@ -890,17 +890,18 @@ mod tests {
     fn async_stdio_dropped_recv_half_discards_retained_prefix_and_closes_egress() {
         let feed = Arc::new(Feed::default());
         feed.push(b"{\"jsonrpc\":\"2.0\"");
-        let (mut reader, mut writer) = AsyncStdioTransport::from_io(
-            FeedReader(Arc::clone(&feed)),
-            Vec::<u8>::new(),
-        )
-        .into_split();
+        let (mut reader, mut writer) =
+            AsyncStdioTransport::from_io(FeedReader(Arc::clone(&feed)), Vec::<u8>::new())
+                .into_split();
         let cx = Cx::for_testing();
         {
             let mut receiving = pin!(reader.recv_async(&cx));
             assert!(poll(receiving.as_mut(), Waker::noop()).is_pending());
         }
-        assert!(!writer.is_closed(), "dropping only the operation is retryable");
+        assert!(
+            !writer.is_closed(),
+            "dropping only the operation is retryable"
+        );
         assert!(!reader.state.buffer.is_empty());
         drop(reader);
         assert!(writer.is_closed());
@@ -918,11 +919,9 @@ mod tests {
         // a caller need not perform one extra receive before dropping ingress.
         for receive_closed in [false, true] {
             let output = Output::new(usize::MAX);
-            let (mut reader, mut writer) = AsyncStdioTransport::from_io(
-                source.as_slice(),
-                TestWriter(Arc::clone(&output)),
-            )
-            .into_split();
+            let (mut reader, mut writer) =
+                AsyncStdioTransport::from_io(source.as_slice(), TestWriter(Arc::clone(&output)))
+                    .into_split();
             let cx = Cx::for_testing();
             assert_eq!(
                 ready(reader.recv_with_source_async(&cx)).unwrap().source(),

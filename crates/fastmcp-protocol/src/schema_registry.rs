@@ -57,7 +57,11 @@ impl Default for SchemaRegistryLimits {
 }
 
 impl SchemaRegistryLimits {
-    pub fn new(resources: usize, resource_bytes: usize, total_bytes: usize) -> Result<Self, SchemaRegistryError> {
+    pub fn new(
+        resources: usize,
+        resource_bytes: usize,
+        total_bytes: usize,
+    ) -> Result<Self, SchemaRegistryError> {
         if !(1..=MAX_SCHEMA_REGISTRY_RESOURCES).contains(&resources)
             || !(1..=MAX_SCHEMA_REGISTRY_RESOURCE_BYTES).contains(&resource_bytes)
             || !(1..=MAX_SCHEMA_REGISTRY_BYTES).contains(&total_bytes)
@@ -65,7 +69,11 @@ impl SchemaRegistryLimits {
         {
             return Err(SchemaRegistryError::InvalidLimits);
         }
-        Ok(Self { resources, resource_bytes, total_bytes })
+        Ok(Self {
+            resources,
+            resource_bytes,
+            total_bytes,
+        })
     }
 }
 
@@ -91,9 +99,15 @@ impl fmt::Display for SchemaRegistryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidLimits => f.write_str("invalid schema registry limits"),
-            Self::InvalidResourceId => f.write_str("schema resource identity must be a bounded absolute URI without a fragment"),
-            Self::IdentityMismatch => f.write_str("schema root identifier differs from its registered identity"),
-            Self::DuplicateResource => f.write_str("schema resource identity is already registered"),
+            Self::InvalidResourceId => f.write_str(
+                "schema resource identity must be a bounded absolute URI without a fragment",
+            ),
+            Self::IdentityMismatch => {
+                f.write_str("schema root identifier differs from its registered identity")
+            }
+            Self::DuplicateResource => {
+                f.write_str("schema resource identity is already registered")
+            }
             Self::UnknownResource => f.write_str("schema resource is not registered"),
             Self::InvalidSchema => f.write_str("schema resource has an invalid document shape"),
             Self::ResourceLimit => f.write_str("schema registry resource limit exceeded"),
@@ -107,7 +121,9 @@ impl fmt::Display for SchemaRegistryError {
 }
 impl std::error::Error for SchemaRegistryError {}
 impl From<SchemaAdmissionError> for SchemaRegistryError {
-    fn from(error: SchemaAdmissionError) -> Self { Self::Admission(error) }
+    fn from(error: SchemaAdmissionError) -> Self {
+        Self::Admission(error)
+    }
 }
 
 /// One explicit trust domain's candidates. There is no global registry, cache,
@@ -120,7 +136,9 @@ pub struct SchemaResourceRegistry {
 }
 
 impl Default for SchemaResourceRegistry {
-    fn default() -> Self { Self::new(SchemaRegistryLimits::default()) }
+    fn default() -> Self {
+        Self::new(SchemaRegistryLimits::default())
+    }
 }
 
 impl fmt::Debug for SchemaResourceRegistry {
@@ -134,14 +152,25 @@ impl fmt::Debug for SchemaResourceRegistry {
 
 impl SchemaResourceRegistry {
     pub fn new(limits: SchemaRegistryLimits) -> Self {
-        Self { resources: BTreeMap::new(), retained_bytes: 0, value_nodes: 0, limits }
+        Self {
+            resources: BTreeMap::new(),
+            retained_bytes: 0,
+            value_nodes: 0,
+            limits,
+        }
     }
 
-    pub fn len(&self) -> usize { self.resources.len() }
-    pub fn is_empty(&self) -> bool { self.resources.is_empty() }
+    pub fn len(&self) -> usize {
+        self.resources.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.resources.is_empty()
+    }
     /// Serialized candidate bytes plus their separately retained lookup keys.
     /// Map/allocation overhead is separately bounded by resource and node counts.
-    pub fn retained_bytes(&self) -> usize { self.retained_bytes }
+    pub fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
 
     /// Stage one resource atomically. Forward and cyclic references may be
     /// registered in any order; compilation, not insertion, resolves them.
@@ -149,10 +178,18 @@ impl SchemaResourceRegistry {
     pub fn insert(&mut self, identity: &str, schema: Value) -> Result<(), SchemaRegistryError> {
         let uri = AbsoluteUri::parse_with_max_bytes(identity, MAX_SCHEMA_ASSERTION_STRING_BYTES)
             .map_err(|_| SchemaRegistryError::InvalidResourceId)?;
-        if uri.fragment().is_some() { return Err(SchemaRegistryError::InvalidResourceId); }
-        if self.resources.contains_key(identity) { return Err(SchemaRegistryError::DuplicateResource); }
-        if self.resources.len() >= self.limits.resources { return Err(SchemaRegistryError::ResourceLimit); }
-        if !schema.is_object() && !schema.is_boolean() { return Err(SchemaRegistryError::InvalidSchema); }
+        if uri.fragment().is_some() {
+            return Err(SchemaRegistryError::InvalidResourceId);
+        }
+        if self.resources.contains_key(identity) {
+            return Err(SchemaRegistryError::DuplicateResource);
+        }
+        if self.resources.len() >= self.limits.resources {
+            return Err(SchemaRegistryError::ResourceLimit);
+        }
+        if !schema.is_object() && !schema.is_boolean() {
+            return Err(SchemaRegistryError::InvalidSchema);
+        }
 
         // Bound all JSON values, including annotations that the semantic schema
         // walker need not visit. Do this before wrapping, retaining or cloning.
@@ -160,7 +197,10 @@ impl SchemaResourceRegistry {
         count_values(&schema, 0, &mut nodes)?;
         let mut schema = match schema {
             Value::Object(mut object) => {
-                if object.get("$id").is_some_and(|id| id.as_str() != Some(identity)) {
+                if object
+                    .get("$id")
+                    .is_some_and(|id| id.as_str() != Some(identity))
+                {
                     return Err(SchemaRegistryError::IdentityMismatch);
                 }
                 if !object.contains_key("$id") {
@@ -184,15 +224,20 @@ impl SchemaResourceRegistry {
         }
         let bytes = encoded_size(&schema, self.limits.resource_bytes)
             .ok_or(SchemaRegistryError::ResourceTooLarge)?;
-        let retained = self.retained_bytes.checked_add(identity.len())
+        let retained = self
+            .retained_bytes
+            .checked_add(identity.len())
             .and_then(|total| total.checked_add(bytes))
             .filter(|total| *total <= self.limits.total_bytes)
             .ok_or(SchemaRegistryError::TotalByteLimit)?;
-        let total_nodes = self.value_nodes.checked_add(nodes)
+        let total_nodes = self
+            .value_nodes
+            .checked_add(nodes)
             .filter(|total| *total <= MAX_REGISTRY_VALUE_NODES)
             .ok_or(SchemaRegistryError::NodeLimit)?;
         // All validation and accounting precede the single retained mutation.
-        self.resources.insert(identity.to_owned(), std::mem::take(&mut schema));
+        self.resources
+            .insert(identity.to_owned(), std::mem::take(&mut schema));
         self.retained_bytes = retained;
         self.value_nodes = total_nodes;
         Ok(())
@@ -208,21 +253,34 @@ impl SchemaResourceRegistry {
     /// base. Unreferenced staged documents are also admitted; construct a
     /// separate registry when another document belongs to a different policy.
     pub fn compile(&self, identity: &str) -> Result<AdmittedSchema, SchemaRegistryError> {
-        let mut root = self.resources.get(identity).ok_or(SchemaRegistryError::UnknownResource)?.clone();
-        let object = root.as_object_mut().ok_or(SchemaRegistryError::InvalidSchema)?;
+        let mut root = self
+            .resources
+            .get(identity)
+            .ok_or(SchemaRegistryError::UnknownResource)?
+            .clone();
+        let object = root
+            .as_object_mut()
+            .ok_or(SchemaRegistryError::InvalidSchema)?;
         if self.resources.len() > 1 {
-            let definitions = object.entry("$defs".to_owned()).or_insert_with(|| Value::Object(Map::new()))
-                .as_object_mut().ok_or(SchemaRegistryError::InvalidSchema)?;
+            let definitions = object
+                .entry("$defs".to_owned())
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+                .ok_or(SchemaRegistryError::InvalidSchema)?;
             let mut index = 0usize;
             for (other, resource) in &self.resources {
-                if other == identity { continue; }
+                if other == identity {
+                    continue;
+                }
                 // Preserve even a caller's preexisting generated-looking name.
                 // Each collision consumes one existing member; the candidate
                 // node/resource bounds also bound this loop.
                 let name = loop {
                     let name = format!("_fastmcp_registry_{index}");
                     index += 1;
-                    if !definitions.contains_key(&name) { break name; }
+                    if !definitions.contains_key(&name) {
+                        break name;
+                    }
                 };
                 definitions.insert(name, resource.clone());
             }
@@ -235,29 +293,45 @@ impl SchemaResourceRegistry {
 }
 
 fn count_values(value: &Value, depth: usize, count: &mut usize) -> Result<(), SchemaRegistryError> {
-    if depth >= MAX_SCHEMA_VALIDATION_DEPTH { return Err(SchemaRegistryError::NestingLimit); }
+    if depth >= MAX_SCHEMA_VALIDATION_DEPTH {
+        return Err(SchemaRegistryError::NestingLimit);
+    }
     *count += 1;
-    if *count > MAX_SCHEMA_ADMISSION_NODES { return Err(SchemaRegistryError::NodeLimit); }
+    if *count > MAX_SCHEMA_ADMISSION_NODES {
+        return Err(SchemaRegistryError::NodeLimit);
+    }
     match value {
         Value::Array(values) => {
-            for value in values { count_values(value, depth + 1, count)?; }
+            for value in values {
+                count_values(value, depth + 1, count)?;
+            }
         }
         Value::Object(values) => {
-            for value in values.values() { count_values(value, depth + 1, count)?; }
+            for value in values.values() {
+                count_values(value, depth + 1, count)?;
+            }
         }
         _ => {}
     }
     Ok(())
 }
 
-struct SizeWriter { size: usize, maximum: usize }
+struct SizeWriter {
+    size: usize,
+    maximum: usize,
+}
 impl Write for SizeWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.size = self.size.checked_add(bytes.len()).filter(|size| *size <= self.maximum)
+        self.size = self
+            .size
+            .checked_add(bytes.len())
+            .filter(|size| *size <= self.maximum)
             .ok_or_else(|| io::Error::other("schema byte limit"))?;
         Ok(bytes.len())
     }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 fn encoded_size(value: &Value, maximum: usize) -> Option<usize> {
     let mut writer = SizeWriter { size: 0, maximum };
@@ -275,11 +349,18 @@ mod tests {
 
     fn registry() -> SchemaResourceRegistry {
         let mut registry = SchemaResourceRegistry::default();
-        registry.insert(ROOT, json!({
-            "type":"object", "properties":{"value":{"$ref":"value"}},
-            "required":["value"], "additionalProperties":false,
-        })).unwrap();
-        registry.insert(VALUE, json!({"type":"integer", "minimum":1})).unwrap();
+        registry
+            .insert(
+                ROOT,
+                json!({
+                    "type":"object", "properties":{"value":{"$ref":"value"}},
+                    "required":["value"], "additionalProperties":false,
+                }),
+            )
+            .unwrap();
+        registry
+            .insert(VALUE, json!({"type":"integer", "minimum":1}))
+            .unwrap();
         registry
     }
 
@@ -314,7 +395,10 @@ mod tests {
 
     #[test]
     fn registry_does_not_fetch_files_or_network_references() {
-        for target in ["https://unregistered.example/schema", "file:///private/schema.json"] {
+        for target in [
+            "https://unregistered.example/schema",
+            "file:///private/schema.json",
+        ] {
             let mut registry = SchemaResourceRegistry::default();
             registry.insert(ROOT, json!({"$ref":target})).unwrap();
             assert!(registry.compile(ROOT).is_err());
@@ -325,13 +409,21 @@ mod tests {
     #[test]
     fn existing_root_pointers_and_generated_looking_definitions_survive() {
         let mut registry = SchemaResourceRegistry::default();
-        registry.insert(ROOT, json!({
-            "$defs":{"_fastmcp_registry_0":{"const":7}, "a/b":{"const":9}},
-            "allOf":[{"$ref":"#/$defs/_fastmcp_registry_0"},{"$ref":VALUE}],
-        })).unwrap();
+        registry
+            .insert(
+                ROOT,
+                json!({
+                    "$defs":{"_fastmcp_registry_0":{"const":7}, "a/b":{"const":9}},
+                    "allOf":[{"$ref":"#/$defs/_fastmcp_registry_0"},{"$ref":VALUE}],
+                }),
+            )
+            .unwrap();
         registry.insert(VALUE, json!({"type":"integer"})).unwrap();
         let schema = registry.compile(ROOT).unwrap();
-        assert_eq!(schema.schema()["$defs"]["_fastmcp_registry_0"], json!({"const":7}));
+        assert_eq!(
+            schema.schema()["$defs"]["_fastmcp_registry_0"],
+            json!({"const":7})
+        );
         assert_eq!(schema.schema()["$defs"]["a/b"], json!({"const":9}));
         assert!(schema.validate(&json!(7)).is_ok());
         assert!(schema.validate(&json!(8)).is_err());
@@ -340,10 +432,17 @@ mod tests {
     #[test]
     fn nested_identifiers_keep_their_base_and_anchor_scope() {
         let mut registry = SchemaResourceRegistry::default();
-        registry.insert(ROOT, json!({"$ref":"nested/item#value"})).unwrap();
-        registry.insert(VALUE, json!({"$defs":{"nested":{
-            "$id":"nested/item", "$anchor":"value", "type":"string", "minLength":2,
-        }}})).unwrap();
+        registry
+            .insert(ROOT, json!({"$ref":"nested/item#value"}))
+            .unwrap();
+        registry
+            .insert(
+                VALUE,
+                json!({"$defs":{"nested":{
+                    "$id":"nested/item", "$anchor":"value", "type":"string", "minLength":2,
+                }}}),
+            )
+            .unwrap();
         let schema = registry.compile(ROOT).unwrap();
         assert!(schema.validate(&json!("yes")).is_ok());
         assert!(schema.validate(&json!("x")).is_err());
@@ -369,8 +468,18 @@ mod tests {
             let mut registry = SchemaResourceRegistry::default();
             registry.insert(ROOT, json!({"$ref":VALUE})).unwrap();
             registry.insert(VALUE, Value::Bool(allowed)).unwrap();
-            assert_eq!(registry.compile(ROOT).unwrap().validate(&json!(42)).is_ok(), allowed);
-            assert_eq!(registry.compile(VALUE).unwrap().validate(&json!(42)).is_ok(), allowed);
+            assert_eq!(
+                registry.compile(ROOT).unwrap().validate(&json!(42)).is_ok(),
+                allowed
+            );
+            assert_eq!(
+                registry
+                    .compile(VALUE)
+                    .unwrap()
+                    .validate(&json!(42))
+                    .is_ok(),
+                allowed
+            );
         }
     }
 
@@ -378,17 +487,31 @@ mod tests {
     fn duplicate_identity_refuses_without_replacing_the_validator() {
         let mut registry = registry();
         let before = (registry.len(), registry.retained_bytes());
-        assert_eq!(registry.insert(VALUE, json!(true)), Err(SchemaRegistryError::DuplicateResource));
+        assert_eq!(
+            registry.insert(VALUE, json!(true)),
+            Err(SchemaRegistryError::DuplicateResource)
+        );
         assert_eq!((registry.len(), registry.retained_bytes()), before);
-        assert!(registry.compile(ROOT).unwrap().validate(&json!({"value":0})).is_err());
+        assert!(
+            registry
+                .compile(ROOT)
+                .unwrap()
+                .validate(&json!({"value":0}))
+                .is_err()
+        );
     }
 
     #[test]
     fn nested_duplicate_identifiers_fail_at_compilation() {
         let mut registry = registry();
-        registry.insert("https://schemas.example/other", json!({"$defs":{"duplicate":{
-            "$id":VALUE, "type":"string",
-        }}})).unwrap();
+        registry
+            .insert(
+                "https://schemas.example/other",
+                json!({"$defs":{"duplicate":{
+                    "$id":VALUE, "type":"string",
+                }}}),
+            )
+            .unwrap();
         let before = (registry.len(), registry.retained_bytes());
         assert!(registry.compile(ROOT).is_err());
         assert_eq!((registry.len(), registry.retained_bytes()), before);
@@ -397,7 +520,12 @@ mod tests {
     #[test]
     fn identifier_lookalikes_in_annotations_are_not_resources() {
         let mut registry = SchemaResourceRegistry::default();
-        registry.insert(ROOT, json!({"$ref":VALUE,"examples":[{"$id":VALUE,"type":"integer"}]})).unwrap();
+        registry
+            .insert(
+                ROOT,
+                json!({"$ref":VALUE,"examples":[{"$id":VALUE,"type":"integer"}]}),
+            )
+            .unwrap();
         assert!(registry.compile(ROOT).is_err());
         registry.insert(VALUE, json!({"type":"integer"})).unwrap();
         assert!(registry.compile(ROOT).unwrap().validate(&json!(1)).is_ok());
@@ -407,12 +535,28 @@ mod tests {
     fn invalid_identity_shape_and_root_alias_leave_accounting_unchanged() {
         let mut registry = registry();
         let before = (registry.len(), registry.retained_bytes());
-        for id in ["relative", "https://schemas.example/part#anchor", "https://schemas.example/part#"] {
-            assert_eq!(registry.insert(id, json!({})), Err(SchemaRegistryError::InvalidResourceId));
+        for id in [
+            "relative",
+            "https://schemas.example/part#anchor",
+            "https://schemas.example/part#",
+        ] {
+            assert_eq!(
+                registry.insert(id, json!({})),
+                Err(SchemaRegistryError::InvalidResourceId)
+            );
         }
-        assert_eq!(registry.insert("https://schemas.example/other", json!({"$id":ROOT})), Err(SchemaRegistryError::IdentityMismatch));
-        assert_eq!(registry.insert("https://schemas.example/other", json!([])), Err(SchemaRegistryError::InvalidSchema));
-        assert_eq!(registry.insert("https://schemas.example/other", json!({"$defs":[]})), Err(SchemaRegistryError::InvalidSchema));
+        assert_eq!(
+            registry.insert("https://schemas.example/other", json!({"$id":ROOT})),
+            Err(SchemaRegistryError::IdentityMismatch)
+        );
+        assert_eq!(
+            registry.insert("https://schemas.example/other", json!([])),
+            Err(SchemaRegistryError::InvalidSchema)
+        );
+        assert_eq!(
+            registry.insert("https://schemas.example/other", json!({"$defs":[]})),
+            Err(SchemaRegistryError::InvalidSchema)
+        );
         assert_eq!((registry.len(), registry.retained_bytes()), before);
     }
 
@@ -420,14 +564,26 @@ mod tests {
     fn resource_capacity_and_encoded_byte_bounds_are_atomic() {
         let limits = SchemaRegistryLimits::new(1, 128, 128).unwrap();
         let mut registry = SchemaResourceRegistry::new(limits);
-        assert_eq!(registry.insert(ROOT, json!({"description":"x".repeat(129)})), Err(SchemaRegistryError::ResourceTooLarge));
+        assert_eq!(
+            registry.insert(ROOT, json!({"description":"x".repeat(129)})),
+            Err(SchemaRegistryError::ResourceTooLarge)
+        );
         assert!(registry.is_empty());
         assert_eq!(registry.retained_bytes(), 0);
         registry.insert(ROOT, json!(true)).unwrap();
         let before = registry.retained_bytes();
-        assert_eq!(registry.insert(VALUE, json!(true)), Err(SchemaRegistryError::ResourceLimit));
+        assert_eq!(
+            registry.insert(VALUE, json!(true)),
+            Err(SchemaRegistryError::ResourceLimit)
+        );
         assert_eq!(registry.retained_bytes(), before);
-        assert!(registry.compile(ROOT).unwrap().validate(&json!(null)).is_ok());
+        assert!(
+            registry
+                .compile(ROOT)
+                .unwrap()
+                .validate(&json!(null))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -438,7 +594,10 @@ mod tests {
         let mut registry = SchemaResourceRegistry::new(limits);
         registry.insert(ROOT, schema).unwrap();
         assert_eq!(registry.retained_bytes(), charged);
-        assert_eq!(registry.insert(VALUE, json!(true)), Err(SchemaRegistryError::TotalByteLimit));
+        assert_eq!(
+            registry.insert(VALUE, json!(true)),
+            Err(SchemaRegistryError::TotalByteLimit)
+        );
         assert_eq!(registry.retained_bytes(), charged);
         assert_eq!(registry.len(), 1);
     }
@@ -446,11 +605,19 @@ mod tests {
     #[test]
     fn deep_and_wide_annotations_are_bounded_before_retention() {
         let mut nested = Value::Null;
-        for _ in 0..MAX_SCHEMA_VALIDATION_DEPTH { nested = Value::Array(vec![nested]); }
+        for _ in 0..MAX_SCHEMA_VALIDATION_DEPTH {
+            nested = Value::Array(vec![nested]);
+        }
         let mut registry = SchemaResourceRegistry::default();
-        assert_eq!(registry.insert(ROOT, json!({"examples":[nested]})), Err(SchemaRegistryError::NestingLimit));
+        assert_eq!(
+            registry.insert(ROOT, json!({"examples":[nested]})),
+            Err(SchemaRegistryError::NestingLimit)
+        );
         let wide = vec![Value::Null; MAX_SCHEMA_ADMISSION_NODES];
-        assert_eq!(registry.insert(ROOT, json!({"examples":wide})), Err(SchemaRegistryError::NodeLimit));
+        assert_eq!(
+            registry.insert(ROOT, json!({"examples":wide})),
+            Err(SchemaRegistryError::NodeLimit)
+        );
         assert!(registry.is_empty());
         assert_eq!(registry.retained_bytes(), 0);
     }
@@ -458,9 +625,20 @@ mod tests {
     #[test]
     fn compilation_keeps_shared_vocabulary_admission_in_force() {
         let mut registry = registry();
-        registry.insert("https://schemas.example/invalid", json!({"type":"invented"})).unwrap();
-        assert!(matches!(registry.compile(ROOT), Err(SchemaRegistryError::Admission(_))));
-        assert!(matches!(registry.compile("https://schemas.example/missing"), Err(SchemaRegistryError::UnknownResource)));
+        registry
+            .insert(
+                "https://schemas.example/invalid",
+                json!({"type":"invented"}),
+            )
+            .unwrap();
+        assert!(matches!(
+            registry.compile(ROOT),
+            Err(SchemaRegistryError::Admission(_))
+        ));
+        assert!(matches!(
+            registry.compile("https://schemas.example/missing"),
+            Err(SchemaRegistryError::UnknownResource)
+        ));
     }
 
     #[test]
@@ -468,13 +646,25 @@ mod tests {
         let mut first = registry();
         let compiled = first.compile(ROOT).unwrap();
         let mut second = SchemaResourceRegistry::default();
-        second.insert(VALUE, json!({"type":"integer","minimum":1})).unwrap();
-        second.insert(ROOT, json!({
-            "type":"object", "properties":{"value":{"$ref":"value"}},
-            "required":["value"], "additionalProperties":false,
-        })).unwrap();
+        second
+            .insert(VALUE, json!({"type":"integer","minimum":1}))
+            .unwrap();
+        second
+            .insert(
+                ROOT,
+                json!({
+                    "type":"object", "properties":{"value":{"$ref":"value"}},
+                    "required":["value"], "additionalProperties":false,
+                }),
+            )
+            .unwrap();
         assert_eq!(compiled.schema(), second.compile(ROOT).unwrap().schema());
-        first.insert("https://schemas.example/invalid", json!({"type":"invented"})).unwrap();
+        first
+            .insert(
+                "https://schemas.example/invalid",
+                json!({"type":"invented"}),
+            )
+            .unwrap();
         assert!(first.compile(ROOT).is_err());
         assert!(compiled.validate(&json!({"value":3})).is_ok());
         assert!(compiled.validate(&json!({"value":0})).is_err());

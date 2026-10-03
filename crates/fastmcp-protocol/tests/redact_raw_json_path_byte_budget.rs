@@ -31,9 +31,7 @@
 //! The mutation was reverted from a pristine copy and the file's blob hash
 //! verified identical to `HEAD` afterwards.
 
-use fastmcp_protocol::{
-    MAX_RAW_JSON_PATH_SEGMENT_BYTES, RawJsonTopLevel, admit_raw_json_document,
-};
+use fastmcp_protocol::{MAX_RAW_JSON_PATH_SEGMENT_BYTES, RawJsonTopLevel, admit_raw_json_document};
 
 /// A three-byte UTF-8 character. If any redaction branch ever emits the
 /// character itself, or swaps `'*'` for a multi-byte replacement, the rendered

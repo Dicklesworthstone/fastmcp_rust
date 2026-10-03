@@ -5,19 +5,19 @@ use super::*;
 use std::collections::BTreeSet;
 use std::future::poll_fn;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
+use crate::http_auth::BoundBearerCredential;
+use crate::http_auth::discovery::client_credentials::tasks::subscriptions::watch::ManagedTaskSnapshotCause;
+use crate::http_auth::discovery::client_credentials::{CLIENT_CREDENTIALS_EXTENSION, ServiceToken};
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener, TcpStream};
 use asupersync::tls::{CertificateChain, PrivateKey, TlsAcceptor, TlsAcceptorBuilder, TlsStream};
 use fastmcp_core::CanonicalHttpUrl;
 use fastmcp_protocol::FINAL_SUBSCRIPTION_ID_META_KEY;
-use crate::http_auth::BoundBearerCredential;
-use crate::http_auth::discovery::client_credentials::{CLIENT_CREDENTIALS_EXTENSION, ServiceToken};
-use crate::http_auth::discovery::client_credentials::tasks::subscriptions::watch::ManagedTaskSnapshotCause;
 use fastmcp_protocol::tasks_extension::TASKS_EXTENSION;
 
 const CHILD: &str = "FASTMCP_TEST_MACHINE_WATCH_DRIVE_CASE";
@@ -32,7 +32,15 @@ const LEAF: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBjjCCATSgAwIBAgICA+owCgYIK
 const KEY: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcCe44IBKhbw+D/s7\nBjDHOOV0g+EoxFno7VJGKhJeer2hRANCAATzyspS52vVaVgJabIRwYUrEBzTr9wW\nhBl+B0gYR4gVXpdHHvqnxxdeTtE+t2Zae07cZTHRGPqz6YIqEhQ0FWnY\n-----END PRIVATE KEY-----\n";
 
 #[derive(Clone, Copy)]
-enum Case { PartialInputs, RejectUpdate, CancelResolver, ObservationOnly, PartialAck, Multi, Abandon }
+enum Case {
+    PartialInputs,
+    RejectUpdate,
+    CancelResolver,
+    ObservationOnly,
+    PartialAck,
+    Multi,
+    Abandon,
+}
 
 fn isolated(name: &str, case: Case) {
     isolated_run(name, || run(case));
@@ -43,7 +51,11 @@ fn isolated(name: &str, case: Case) {
 // path segment is not a unique key; `-` cannot occur in a Rust identifier, so
 // substituting it for `::` stays injective over these paths.
 fn root_authority_file(scenario: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("fastmcp-machine-watch-{}-{}.pem", std::process::id(), scenario.replace("::", "-")))
+    std::env::temp_dir().join(format!(
+        "fastmcp-machine-watch-{}-{}.pem",
+        std::process::id(),
+        scenario.replace("::", "-")
+    ))
 }
 
 #[test]
@@ -53,10 +65,14 @@ fn sibling_scenarios_sharing_a_leaf_name_get_distinct_root_authority_files() {
     // named one file, so whichever child exited first had its `Root` remove
     // the authority the other child was still presenting; that handshake then
     // failed as Authentication(Transport) with no deadline involved.
-    for leaf in ["tls_input_recovery_cannot_extend_the_original_deadline",
-        "tls_input_recovery_rejects_changed_unanswered_descriptors"]
-    {
-        let (driver, input) = (format!("recovery::input_driver::{leaf}"), format!("recovery::input::{leaf}"));
+    for leaf in [
+        "tls_input_recovery_cannot_extend_the_original_deadline",
+        "tls_input_recovery_rejects_changed_unanswered_descriptors",
+    ] {
+        let (driver, input) = (
+            format!("recovery::input_driver::{leaf}"),
+            format!("recovery::input::{leaf}"),
+        );
         // The retired key is equal for this very pair, so the inequality below
         // is a property of the new key and not of the chosen names.
         assert_eq!(driver.rsplit("::").next(), input.rsplit("::").next());
@@ -64,8 +80,14 @@ fn sibling_scenarios_sharing_a_leaf_name_get_distinct_root_authority_files() {
         for scenario in [&driver, &input] {
             let file = root_authority_file(scenario);
             let file = file.file_name().unwrap().to_str().unwrap();
-            assert!(file.len() < 255, "root authority file name must stay legal: {file}");
-            assert!(file.ends_with(&format!("{leaf}.pem")), "the leaf stays greppable: {file}");
+            assert!(
+                file.len() < 255,
+                "root authority file name must stay legal: {file}"
+            );
+            assert!(
+                file.ends_with(&format!("{leaf}.pem")),
+                "the leaf stays greppable: {file}"
+            );
         }
     }
 }
@@ -79,19 +101,42 @@ fn isolated_run(name: &str, scenario: impl FnOnce()) {
         return;
     }
     struct Root(std::path::PathBuf);
-    impl Drop for Root { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); } }
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
     struct Child(std::process::Child);
-    impl Drop for Child { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
     let root = Root(authority);
     std::fs::write(&root.0, ROOT).unwrap();
-    let mut child = Child(Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", &name, "--nocapture", "--test-threads=1"])
-        .env(CHILD, &name).env("SSL_CERT_FILE", &root.0).env_remove("SSL_CERT_DIR")
-        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap());
+    let mut child = Child(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, &name)
+            .env("SSL_CERT_FILE", &root.0)
+            .env_remove("SSL_CERT_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if let Some(status) = child.0.try_wait().unwrap() { assert!(status.success()); return; }
-        assert!(Instant::now() < deadline, "machine watch TLS child exceeded its bound");
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success());
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "machine watch TLS child exceeded its bound"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -101,11 +146,23 @@ async fn pair<L: Future, R: Future>(left: L, right: R) -> (L::Output, R::Output)
     let mut right = std::pin::pin!(right);
     let (mut one, mut two) = (None, None);
     poll_fn(|cx| {
-        if one.is_none() { if let Poll::Ready(value) = left.as_mut().poll(cx) { one = Some(value); } }
-        if two.is_none() { if let Poll::Ready(value) = right.as_mut().poll(cx) { two = Some(value); } }
-        if one.is_some() && two.is_some() { Poll::Ready((one.take().unwrap(), two.take().unwrap())) }
-        else { Poll::Pending }
-    }).await
+        if one.is_none() {
+            if let Poll::Ready(value) = left.as_mut().poll(cx) {
+                one = Some(value);
+            }
+        }
+        if two.is_none() {
+            if let Poll::Ready(value) = right.as_mut().poll(cx) {
+                two = Some(value);
+            }
+        }
+        if one.is_some() && two.is_some() {
+            Poll::Ready((one.take().unwrap(), two.take().unwrap()))
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
 }
 async fn request(socket: &mut TlsStream<TcpStream>) -> (String, serde_json::Value) {
     let mut bytes = Vec::new();
@@ -114,13 +171,19 @@ async fn request(socket: &mut TlsStream<TcpStream>) -> (String, serde_json::Valu
         let n = socket.read(&mut chunk).await.unwrap();
         assert!(n > 0 && bytes.len() + n <= 64 * 1024);
         bytes.extend_from_slice(&chunk[..n]);
-        if let Some(offset) = bytes.windows(4).position(|v| v == b"\r\n\r\n") { break offset + 4; }
+        if let Some(offset) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+            break offset + 4;
+        }
     };
     let head = std::str::from_utf8(&bytes[..end]).unwrap().to_owned();
-    let size = head.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
-    }).unwrap();
+    let size = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().unwrap())
+        })
+        .unwrap();
     assert!(end + size <= 64 * 1024);
     while bytes.len() < end + size {
         let n = socket.read(&mut chunk).await.unwrap();
@@ -137,43 +200,79 @@ async fn reply(socket: &mut TlsStream<TcpStream>, value: serde_json::Value) {
 }
 async fn event(socket: &mut TlsStream<TcpStream>, value: serde_json::Value) {
     let body = format!("data: {value}\n\n");
-    socket.write_all(format!("{:X}\r\n{body}\r\n",body.len()).as_bytes()).await.unwrap();
+    socket
+        .write_all(format!("{:X}\r\n{body}\r\n", body.len()).as_bytes())
+        .await
+        .unwrap();
     socket.flush().await.unwrap();
 }
 async fn closed(socket: &mut TlsStream<TcpStream>) {
     let mut byte = [0];
-    assert!(!matches!(socket.read(&mut byte).await, Ok(n) if n > 0), "subscription must be released");
+    assert!(
+        !matches!(socket.read(&mut byte).await, Ok(n) if n > 0),
+        "subscription must be released"
+    );
 }
 fn task(id: &str, status: &str) -> serde_json::Value {
     let mut task = json!({"taskId":id,"status":status,"createdAt":"2026-09-19T00:00:00Z",
         "lastUpdatedAt":"2026-09-19T00:00:00Z","ttlMs":60000});
-    if status == "input_required" { task["inputRequests"] = serde_json::to_value(two()).unwrap(); }
+    if status == "input_required" {
+        task["inputRequests"] = serde_json::to_value(two()).unwrap();
+    }
     task
 }
-struct Peer { listener: TcpListener, tls: TlsAcceptor, seen: Mutex<BTreeSet<String>>, updates: AtomicUsize }
+struct Peer {
+    listener: TcpListener,
+    tls: TlsAcceptor,
+    seen: Mutex<BTreeSet<String>>,
+    updates: AtomicUsize,
+}
 impl Peer {
     async fn new() -> Self {
-        Self { listener: TcpListener::bind("127.0.0.1:0").await.unwrap(),
-            tls: TlsAcceptorBuilder::new(CertificateChain::from_pem(LEAF).unwrap(),PrivateKey::from_pem(KEY).unwrap())
-                .alpn_protocols(vec![b"http/1.1".to_vec()]).build().unwrap(),
-            seen: Mutex::new(BTreeSet::new()), updates: AtomicUsize::new(0) }
+        Self {
+            listener: TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            tls: TlsAcceptorBuilder::new(
+                CertificateChain::from_pem(LEAF).unwrap(),
+                PrivateKey::from_pem(KEY).unwrap(),
+            )
+            .alpn_protocols(vec![b"http/1.1".to_vec()])
+            .build()
+            .unwrap(),
+            seen: Mutex::new(BTreeSet::new()),
+            updates: AtomicUsize::new(0),
+        }
     }
     fn client(&self) -> ClientCredentialsTasksClient {
         let mut client = consumer();
         let inner = Arc::get_mut(&mut client.client.inner).unwrap();
-        inner.resource = CanonicalHttpUrl::parse(&format!("https://{}/mcp",self.listener.local_addr().unwrap())).unwrap();
+        inner.resource = CanonicalHttpUrl::parse(&format!(
+            "https://{}/mcp",
+            self.listener.local_addr().unwrap()
+        ))
+        .unwrap();
         let expires_at = Instant::now() + Duration::from_secs(600);
-        let bearer = BoundBearerCredential::bind_with_expiry(inner.resource.clone(),"watched-access",expires_at)
-            .unwrap().for_owner(&inner.closed).unwrap();
+        let bearer = BoundBearerCredential::bind_with_expiry(
+            inner.resource.clone(),
+            "watched-access",
+            expires_at,
+        )
+        .unwrap()
+        .for_owner(&inner.closed)
+        .unwrap();
         let mut state = inner.state.try_lock_owned().unwrap();
-        state.current = Some(ServiceToken { bearer, scopes:vec![], expires_at, renew_after:expires_at });
+        state.current = Some(ServiceToken {
+            bearer,
+            scopes: vec![],
+            expires_at,
+            renew_after: expires_at,
+        });
         state.generation = 7;
         drop(state);
         client.metadata[FINAL_CLIENT_CAPABILITIES_META_KEY]["roots"] = json!({"listChanged":true});
         client
     }
     async fn rpc(&self, method: &str) -> (TlsStream<TcpStream>, serde_json::Value) {
-        let (socket,_) = self.listener.accept().await.unwrap();
+        let (socket, _) = self.listener.accept().await.unwrap();
         let mut socket = self.tls.accept(socket).await.unwrap();
         let (head, request) = request(&mut socket).await;
         assert!(head.starts_with("POST /mcp HTTP/1.1\r\n"));
@@ -181,10 +280,17 @@ impl Peer {
         assert!(headers.contains("authorization: bearer watched-access\r\n"));
         assert!(!headers.contains("mcp-session-id:") && !headers.contains("last-event-id:"));
         assert_eq!(request["method"], method);
-        assert_eq!(request["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"],
-            json!({TASKS_EXTENSION:{},CLIENT_CREDENTIALS_EXTENSION:{}}));
-        assert!(self.seen.lock().unwrap().insert(request["id"].as_str().unwrap().to_owned()));
-        (socket,request)
+        assert_eq!(
+            request["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"],
+            json!({TASKS_EXTENSION:{},CLIENT_CREDENTIALS_EXTENSION:{}})
+        );
+        assert!(
+            self.seen
+                .lock()
+                .unwrap()
+                .insert(request["id"].as_str().unwrap().to_owned())
+        );
+        (socket, request)
     }
     async fn discover(&self) {
         let (mut socket, request) = self.rpc("server/discover").await;
@@ -192,37 +298,57 @@ impl Peer {
             "resultType":"complete","supportedVersions":["2026-07-28"],"ttlMs":0,"cacheScope":"private",
             "capabilities":{"extensions":{TASKS_EXTENSION:{},CLIENT_CREDENTIALS_EXTENSION:{}}}}})).await;
     }
-    async fn listen(&self, selected: serde_json::Value, partial: bool) -> (TlsStream<TcpStream>,serde_json::Value) {
+    async fn listen(
+        &self,
+        selected: serde_json::Value,
+        partial: bool,
+    ) -> (TlsStream<TcpStream>, serde_json::Value) {
         self.discover().await;
         let (mut socket, request) = self.rpc("subscriptions/listen").await;
-        assert_eq!(request["params"]["notifications"],json!({"taskIds":selected}));
+        assert_eq!(
+            request["params"]["notifications"],
+            json!({"taskIds":selected})
+        );
         socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
         let accepted = if partial { json!(["one"]) } else { selected };
         event(&mut socket,json!({"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{
             "_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):request["id"]},"notifications":{"taskIds":accepted}}})).await;
-        (socket,request["id"].clone())
+        (socket, request["id"].clone())
     }
     async fn get(&self, id: &str, status: &str) {
         self.discover().await;
-        let (mut socket,request) = self.rpc("tasks/get").await;
-        assert_eq!(request["params"]["taskId"],id);
-        let mut result = task(id,status);
+        let (mut socket, request) = self.rpc("tasks/get").await;
+        assert_eq!(request["params"]["taskId"], id);
+        let mut result = task(id, status);
         result["resultType"] = json!("complete");
-        reply(&mut socket,json!({"jsonrpc":"2.0","id":request["id"],"result":result})).await;
+        reply(
+            &mut socket,
+            json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
+        )
+        .await;
     }
     async fn update(&self, key: &str, reject: bool) {
         self.discover().await;
-        let (mut socket,request) = self.rpc("tasks/update").await;
-        assert_eq!(request["params"]["taskId"],"one");
-        assert_eq!(request["params"]["inputResponses"],json!({key:{"roots":[]}}));
-        self.updates.fetch_add(1,Ordering::SeqCst);
-        let response = if reject { json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32603,"message":"private-peer-detail"}}) }
-            else { json!({"jsonrpc":"2.0","id":request["id"],"result":{"resultType":"complete"}}) };
-        reply(&mut socket,response).await;
+        let (mut socket, request) = self.rpc("tasks/update").await;
+        assert_eq!(request["params"]["taskId"], "one");
+        assert_eq!(
+            request["params"]["inputResponses"],
+            json!({key:{"roots":[]}})
+        );
+        self.updates.fetch_add(1, Ordering::SeqCst);
+        let response = if reject {
+            json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32603,"message":"private-peer-detail"}})
+        } else {
+            json!({"jsonrpc":"2.0","id":request["id"],"result":{"resultType":"complete"}})
+        };
+        reply(&mut socket, response).await;
     }
     fn quiet(&self) {
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(self.listener.poll_accept(&mut cx).is_pending(), "unexpected polling, retry or mutation");
+        assert!(
+            self.listener.poll_accept(&mut cx).is_pending(),
+            "unexpected polling, retry or mutation"
+        );
     }
 }
 
@@ -337,22 +463,48 @@ fn run(case: Case) {
 }
 
 #[test]
-fn tls_partial_inputs_progress_without_notifications() { isolated("tls_partial_inputs_progress_without_notifications",Case::PartialInputs); }
+fn tls_partial_inputs_progress_without_notifications() {
+    isolated(
+        "tls_partial_inputs_progress_without_notifications",
+        Case::PartialInputs,
+    );
+}
 #[test]
-fn tls_rejected_update_is_never_replayed() { isolated("tls_rejected_update_is_never_replayed",Case::RejectUpdate); }
+fn tls_rejected_update_is_never_replayed() {
+    isolated("tls_rejected_update_is_never_replayed", Case::RejectUpdate);
+}
 #[test]
-fn tls_resolver_cancellation_prevents_update() { isolated("tls_resolver_cancellation_prevents_update",Case::CancelResolver); }
+fn tls_resolver_cancellation_prevents_update() {
+    isolated(
+        "tls_resolver_cancellation_prevents_update",
+        Case::CancelResolver,
+    );
+}
 #[test]
-fn tls_observation_only_never_resolves_input() { isolated("tls_observation_only_never_resolves_input",Case::ObservationOnly); }
+fn tls_observation_only_never_resolves_input() {
+    isolated(
+        "tls_observation_only_never_resolves_input",
+        Case::ObservationOnly,
+    );
+}
 #[test]
-fn tls_partial_ack_prevents_initial_gets() { isolated("tls_partial_ack_prevents_initial_gets",Case::PartialAck); }
+fn tls_partial_ack_prevents_initial_gets() {
+    isolated("tls_partial_ack_prevents_initial_gets", Case::PartialAck);
+}
 #[test]
-fn tls_multiple_tasks_use_one_credential_and_ignore_late_terminals() { isolated("tls_multiple_tasks_use_one_credential_and_ignore_late_terminals",Case::Multi); }
+fn tls_multiple_tasks_use_one_credential_and_ignore_late_terminals() {
+    isolated(
+        "tls_multiple_tasks_use_one_credential_and_ignore_late_terminals",
+        Case::Multi,
+    );
+}
 #[test]
-fn tls_abandoned_watch_read_releases_socket() { isolated("tls_abandoned_watch_read_releases_socket",Case::Abandon); }
+fn tls_abandoned_watch_read_releases_socket() {
+    isolated("tls_abandoned_watch_read_releases_socket", Case::Abandon);
+}
 
-mod recovery;
 mod cancellation;
+mod recovery;
 
 mod input_journal;
 

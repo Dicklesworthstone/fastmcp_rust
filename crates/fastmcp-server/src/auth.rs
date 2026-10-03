@@ -638,7 +638,9 @@ impl AuthProvider for TokenAuthProvider {
         };
         let auth = self.verifier.verify(ctx, request, &access)?;
         if principal_fingerprint(Some(&auth)).is_err() {
-            return Err(auth_error("Token verifier returned invalid authentication facts"));
+            return Err(auth_error(
+                "Token verifier returned invalid authentication facts",
+            ));
         }
         if auth.session_owner().is_some() {
             return Ok(auth);
@@ -651,7 +653,10 @@ impl AuthProvider for TokenAuthProvider {
         ctx.checkpoint()
             .map_err(|_| McpError::request_cancelled())?;
         if ctx.deadline_expired() {
-            return Err(McpError::new(McpErrorCode::RequestCancelled, "Request timeout exceeded"));
+            return Err(McpError::new(
+                McpErrorCode::RequestCancelled,
+                "Request timeout exceeded",
+            ));
         }
         let namespace = self
             .owner_namespace
@@ -662,7 +667,10 @@ impl AuthProvider for TokenAuthProvider {
         ctx.checkpoint()
             .map_err(|_| McpError::request_cancelled())?;
         if ctx.deadline_expired() {
-            return Err(McpError::new(McpErrorCode::RequestCancelled, "Request timeout exceeded"));
+            return Err(McpError::new(
+                McpErrorCode::RequestCancelled,
+                "Request timeout exceeded",
+            ));
         }
         Ok(auth.with_session_owner(owner))
     }
@@ -1639,7 +1647,9 @@ mod tests {
         assert!(provider.owner_namespace.get().is_none());
 
         let first = authenticate_header(&provider, "Bearer alpha-secret").unwrap();
-        let owner = first.session_owner().expect("verified token receives an owner");
+        let owner = first
+            .session_owner()
+            .expect("verified token receives an owner");
         for repeated in [
             authenticate_header(&provider, "Bearer alpha-secret").unwrap(),
             authenticate_header(&cloned, "bearer alpha-secret").unwrap(),
@@ -1695,7 +1705,9 @@ mod tests {
         );
 
         refreshed.subject = Some("bob".to_owned());
-        controls.replace_tokens([("same-secret", refreshed)]).unwrap();
+        controls
+            .replace_tokens([("same-secret", refreshed)])
+            .unwrap();
         let reassigned = authenticate_header(&provider, "Bearer same-secret").unwrap();
         assert_ne!(reassigned.session_owner(), before.session_owner());
         assert_ne!(
@@ -2580,7 +2592,9 @@ mod tests {
             fingerprint,
             principal_fingerprint(Some(&AuthContext::with_subject("alice"))).unwrap()
         );
-        let repeated = provider.authenticate(&ctx(), req).expect("verified token retry");
+        let repeated = provider
+            .authenticate(&ctx(), req)
+            .expect("verified token retry");
         assert_eq!(fingerprint, principal_fingerprint(Some(&repeated)).unwrap());
     }
 

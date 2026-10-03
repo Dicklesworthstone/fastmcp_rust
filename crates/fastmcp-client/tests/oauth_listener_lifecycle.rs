@@ -267,12 +267,12 @@ async fn login_until_bound<'client>(
             // itself already reports which way it returned. `OAuthError` is
             // `Debug`, so the failure arm can name the cause.
             match result {
-                Ok(_) => panic!(
-                    "authorize completed successfully before its callback bound a listener"
-                ),
-                Err(error) => panic!(
-                    "authorize failed before its callback bound a listener: {error:?}"
-                ),
+                Ok(_) => {
+                    panic!("authorize completed successfully before its callback bound a listener")
+                }
+                Err(error) => {
+                    panic!("authorize failed before its callback bound a listener: {error:?}")
+                }
             }
         }
         match bound.get() {

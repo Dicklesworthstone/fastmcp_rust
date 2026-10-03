@@ -1718,9 +1718,11 @@ async fn poll_server_io<IO, T>(
     mut operation: impl FnMut(&mut IO, &mut std::task::Context<'_>) -> Poll<std::io::Result<T>>,
 ) -> Result<T, TransportError> {
     let mut lock = std::pin::pin!(OwnedMutexGuard::lock(Arc::clone(io), cx));
-    let mut terminal_changed = std::pin::pin!(terminal.changed.wait_until(|| {
-        WebSocketTerminalState::load(&terminal.state) != expected_state
-    }));
+    let mut terminal_changed = std::pin::pin!(
+        terminal
+            .changed
+            .wait_until(|| { WebSocketTerminalState::load(&terminal.state) != expected_state })
+    );
     let (_cancel_sender, mut cancel_receiver) = oneshot::channel::<()>();
     let mut cancellation = std::pin::pin!(cancel_receiver.recv(cx));
     std::future::poll_fn(|task_cx| {
@@ -1757,7 +1759,6 @@ impl<IO> ServerWebSocketWriter<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
-
     async fn write_frame(
         &mut self,
         cx: &Cx,
@@ -1809,13 +1810,9 @@ where
             complete: false,
         };
         while !self.write_buf.is_empty() {
-            let written = poll_server_io(
-                cx,
-                &self.io,
-                terminal,
-                expected_state,
-                |io, task_cx| Pin::new(io).poll_write(task_cx, &self.write_buf),
-            )
+            let written = poll_server_io(cx, &self.io, terminal, expected_state, |io, task_cx| {
+                Pin::new(io).poll_write(task_cx, &self.write_buf)
+            })
             .await?;
             if written == 0 {
                 return Err(TransportError::Io(std::io::Error::new(
@@ -1854,7 +1851,10 @@ where
     let result = writer
         .write_frame(cx, terminal, WebSocketTerminalState::Open, frame)
         .await;
-    if matches!(result, Err(TransportError::Io(_) | TransportError::Codec(_))) {
+    if matches!(
+        result,
+        Err(TransportError::Io(_) | TransportError::Codec(_))
+    ) {
         terminal.set(WebSocketTerminalState::Failed);
     }
     result
@@ -5195,20 +5195,30 @@ mod tests {
             .expect("idle receive must not retain the socket lock")
             .expect("independent response write");
             let mut header = [0; 2];
-            peer.read_exact(&mut header).await.expect("read response header");
+            peer.read_exact(&mut header)
+                .await
+                .expect("read response header");
             assert_eq!(header[0], 0x81);
             assert_eq!(header[1] & 0x80, 0, "server frames remain unmasked");
             let mut payload = vec![0; usize::from(header[1])];
-            peer.read_exact(&mut payload).await.expect("read response payload");
+            peer.read_exact(&mut payload)
+                .await
+                .expect("read response payload");
             assert_eq!(
-                serde_json::to_value(Codec::new().decode_complete_message(&payload)
-                    .expect("JSON response")).expect("serialize received response"),
+                serde_json::to_value(
+                    Codec::new()
+                        .decode_complete_message(&payload)
+                        .expect("JSON response")
+                )
+                .expect("serialize received response"),
                 serde_json::to_value(&outbound).expect("serialize expected response")
             );
             peer.write_all(&inbound[1..])
                 .await
                 .expect("finish the earlier partial peer frame");
-            let received = receive.await.expect("resume exactly the buffered peer frame");
+            let received = receive
+                .await
+                .expect("resume exactly the buffered peer frame");
             assert_eq!(received.source(), source);
             assert!(!sender.is_closed());
         });
@@ -5238,7 +5248,9 @@ mod tests {
         if masked {
             assert_eq!(received.expect("masked fragmented source").source(), source);
             let mut pong = [0; 3];
-            peer.read_exact(&mut pong).await.expect("read unmasked Pong");
+            peer.read_exact(&mut pong)
+                .await
+                .expect("read unmasked Pong");
             assert_eq!(pong, [0x8A, 0x01, b'p']);
             assert!(!receiver.is_closed());
             assert!(!sender.is_closed());
@@ -5250,12 +5262,17 @@ mod tests {
             assert!(receiver.is_closed());
             assert!(sender.is_closed());
             let mut close = [0; 4];
-            peer.read_exact(&mut close).await.expect("read protocol-error Close");
+            peer.read_exact(&mut close)
+                .await
+                .expect("read protocol-error Close");
             assert_eq!(close, [0x88, 0x02, 0x03, 0xEA]);
             assert!(matches!(
-                sender.send(&cx, &JsonRpcMessage::Request(JsonRpcRequest::new(
-                    "ping", None, 904_i64,
-                ))).await,
+                sender
+                    .send(
+                        &cx,
+                        &JsonRpcMessage::Request(JsonRpcRequest::new("ping", None, 904_i64,))
+                    )
+                    .await,
                 Err(TransportError::Closed)
             ));
         }
@@ -5282,7 +5299,8 @@ mod tests {
         });
         let (mut receiver, mut sender) = server.into_split();
         let first = JsonRpcMessage::Response(JsonRpcResponse::success(
-            RequestId::Number(905), serde_json::json!({"dropped": true}),
+            RequestId::Number(905),
+            serde_json::json!({"dropped": true}),
         ));
         let mut send = Box::pin(sender.send(&cx, &first));
         std::future::poll_fn(|task_cx| {
@@ -5294,29 +5312,54 @@ mod tests {
         drop(send);
         released.store(true, Ordering::Release);
         let successor = JsonRpcMessage::Response(JsonRpcResponse::success(
-            RequestId::Number(906), serde_json::json!({"successor": true}),
+            RequestId::Number(906),
+            serde_json::json!({"successor": true}),
         ));
         if prefix == 0 {
             assert!(!sender.is_closed());
-            sender.send(&cx, &successor).await.expect("retry after uncommitted drop");
+            sender
+                .send(&cx, &successor)
+                .await
+                .expect("retry after uncommitted drop");
             let bytes = output.lock().expect("captured successor").clone();
             let mut encoded = BytesMut::from(bytes.as_slice());
-            let frame = FrameCodec::client().decode(&mut encoded)
-                .expect("valid successor frame").expect("one successor frame");
+            let frame = FrameCodec::client()
+                .decode(&mut encoded)
+                .expect("valid successor frame")
+                .expect("one successor frame");
             assert_eq!(
-                serde_json::to_value(Codec::new().decode_complete_message(&frame.payload)
-                    .expect("JSON successor")).expect("serialize received successor"),
+                serde_json::to_value(
+                    Codec::new()
+                        .decode_complete_message(&frame.payload)
+                        .expect("JSON successor")
+                )
+                .expect("serialize received successor"),
                 serde_json::to_value(&successor).expect("serialize expected successor")
             );
-            assert!(encoded.is_empty(), "dropped message must not leak to the next send");
+            assert!(
+                encoded.is_empty(),
+                "dropped message must not leak to the next send"
+            );
             assert!(!receiver.is_closed());
         } else {
             assert!(sender.is_closed());
             assert!(receiver.is_closed());
-            assert!(matches!(sender.send(&cx, &successor).await, Err(TransportError::Closed)));
-            assert!(matches!(sender.close(&cx).await, Err(TransportError::Closed)));
-            assert!(matches!(receiver.recv(&cx).await, Err(TransportError::Closed)));
-            assert_eq!(output.lock().expect("unchanged partial frame").len(), prefix);
+            assert!(matches!(
+                sender.send(&cx, &successor).await,
+                Err(TransportError::Closed)
+            ));
+            assert!(matches!(
+                sender.close(&cx).await,
+                Err(TransportError::Closed)
+            ));
+            assert!(matches!(
+                receiver.recv(&cx).await,
+                Err(TransportError::Closed)
+            ));
+            assert_eq!(
+                output.lock().expect("unchanged partial frame").len(),
+                prefix
+            );
         }
     }
 
@@ -5345,7 +5388,8 @@ mod tests {
                 });
                 let (receiver, mut sender) = server.into_split();
                 let message = JsonRpcMessage::Response(JsonRpcResponse::success(
-                    RequestId::Number(907), serde_json::json!({"cancel": true}),
+                    RequestId::Number(907),
+                    serde_json::json!({"cancel": true}),
                 ));
                 let mut send = Box::pin(sender.send(&caller, &message));
                 std::future::poll_fn(|task_cx| {
@@ -5353,9 +5397,15 @@ mod tests {
                     Poll::Ready(())
                 })
                 .await;
-                caller.cancel_with(asupersync::types::CancelKind::User, Some("cancel exact writer"));
+                caller.cancel_with(
+                    asupersync::types::CancelKind::User,
+                    Some("cancel exact writer"),
+                );
                 assert!(matches!(send.await, Err(TransportError::Cancelled)));
-                assert!(!cx.is_cancel_requested(), "caller cancellation must not reach its sibling");
+                assert!(
+                    !cx.is_cancel_requested(),
+                    "caller cancellation must not reach its sibling"
+                );
                 assert_eq!(sender.is_closed(), prefix > 0);
                 assert_eq!(receiver.is_closed(), prefix > 0);
                 assert_eq!(output.lock().expect("captured prefix").len(), prefix);
@@ -5370,23 +5420,33 @@ mod tests {
             let (mut peer, server_socket) = virtual_socket_pair();
             let read_started = Arc::new(AtomicBool::new(false));
             let server = AsyncWsServerTransport::from_upgraded(ReadNotifyingIo::new(
-                server_socket, Arc::clone(&read_started),
+                server_socket,
+                Arc::clone(&read_started),
             ));
             let (mut receiver, mut sender) = server.into_split();
-            let mut receive = cx.spawn(move |task_cx| async move {
-                receiver.recv_with_source(&task_cx).await
-            }).expect("spawn idle split receive");
+            let mut receive = cx
+                .spawn(move |task_cx| async move { receiver.recv_with_source(&task_cx).await })
+                .expect("spawn idle split receive");
             wait_for_idle_read(&read_started).await;
             assert!(!receive.is_finished());
             sender.close(&cx).await.expect("normal server close");
             let result = asupersync::time::timeout(
-                cx.now(), std::time::Duration::from_secs(2), receive.join(&cx),
-            ).await.expect("terminal notification must wake idle receive");
+                cx.now(),
+                std::time::Duration::from_secs(2),
+                receive.join(&cx),
+            )
+            .await
+            .expect("terminal notification must wake idle receive");
             assert!(matches!(result, Ok(Err(TransportError::Closed))));
             assert!(sender.is_closed());
-            sender.close(&cx).await.expect("repeated close succeeds without another frame");
+            sender
+                .close(&cx)
+                .await
+                .expect("repeated close succeeds without another frame");
             let mut close = [0; 4];
-            peer.read_exact(&mut close).await.expect("read unmasked normal Close");
+            peer.read_exact(&mut close)
+                .await
+                .expect("read unmasked normal Close");
             assert_eq!(close, [0x88, 0x02, 0x03, 0xE8]);
         });
     }
@@ -5397,18 +5457,27 @@ mod tests {
             let cx = Cx::current().expect("runtime root context");
             let caller = Cx::for_testing();
             let (mut peer, server_socket) = virtual_socket_pair();
-            let (receiver, mut sender) = AsyncWsServerTransport::from_upgraded(server_socket)
-                .into_split();
+            let (receiver, mut sender) =
+                AsyncWsServerTransport::from_upgraded(server_socket).into_split();
             let writer = Arc::clone(&sender.writer);
             let held = OwnedMutexGuard::lock(Arc::clone(&writer), &cx)
-                .await.expect("hold writer before close election");
+                .await
+                .expect("hold writer before close election");
             let mut close = Box::pin(sender.close(&caller));
             std::future::poll_fn(|task_cx| {
                 assert!(close.as_mut().poll(task_cx).is_pending());
                 Poll::Ready(())
-            }).await;
-            assert_eq!(writer.waiters(), 1, "queued close retains its lock registration");
-            caller.cancel_with(asupersync::types::CancelKind::User, Some("cancel queued close"));
+            })
+            .await;
+            assert_eq!(
+                writer.waiters(),
+                1,
+                "queued close retains its lock registration"
+            );
+            caller.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("cancel queued close"),
+            );
             assert!(matches!(close.await, Err(TransportError::Cancelled)));
             assert_eq!(writer.waiters(), 0);
             assert!(!sender.is_closed());
@@ -5416,7 +5485,9 @@ mod tests {
             drop(held);
             sender.close(&cx).await.expect("retry unelected close");
             let mut close = [0; 4];
-            peer.read_exact(&mut close).await.expect("exactly one normal Close");
+            peer.read_exact(&mut close)
+                .await
+                .expect("exactly one normal Close");
             assert_eq!(close, [0x88, 0x02, 0x03, 0xE8]);
         });
     }
@@ -5429,8 +5500,10 @@ mod tests {
                 let (mut peer, server_socket) = virtual_socket_pair();
                 let payload: &[u8] = if valid { &[0x03, 0xE8] } else { &[0x03] };
                 let server = AsyncWsServerTransport::from_upgraded_with_initial_bytes(
-                    server_socket, build_masked_frame(0x08, true, payload).into_boxed_slice(),
-                ).expect("bounded peer Close");
+                    server_socket,
+                    build_masked_frame(0x08, true, payload).into_boxed_slice(),
+                )
+                .expect("bounded peer Close");
                 let (mut receiver, sender) = server.into_split();
                 let result = receiver.recv(&cx).await;
                 if valid {
@@ -5442,7 +5515,9 @@ mod tests {
                 assert!(sender.is_closed());
                 assert!(receiver.is_closed());
                 let mut close = [0; 4];
-                peer.read_exact(&mut close).await.expect("read server Close reply");
+                peer.read_exact(&mut close)
+                    .await
+                    .expect("read server Close reply");
                 assert_eq!(close, [0x88, 0x02, 0x03, if valid { 0xE8 } else { 0xEA }]);
             }
         });
@@ -5453,14 +5528,24 @@ mod tests {
         let released = Arc::new(AtomicBool::new(false));
         let output = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut inbound = build_masked_frame(0x09, true, b"control");
-        inbound.extend(build_masked_frame(0x01, true, br#"{"jsonrpc":"2.0","id":908,"method":"ping"}"#));
+        inbound.extend(build_masked_frame(
+            0x01,
+            true,
+            br#"{"jsonrpc":"2.0","id":908,"method":"ping"}"#,
+        ));
         let server = AsyncWsServerTransport::from_upgraded_with_initial_bytes(
-            ServerPrefixWriteIo { prefix: 1, released: Arc::clone(&released), output: Arc::clone(&output) },
+            ServerPrefixWriteIo {
+                prefix: 1,
+                released: Arc::clone(&released),
+                output: Arc::clone(&output),
+            },
             inbound.into_boxed_slice(),
-        ).expect("bounded Ping and request frames");
+        )
+        .expect("bounded Ping and request frames");
         let (mut receiver, mut sender) = server.into_split();
         let message = JsonRpcMessage::Response(JsonRpcResponse::success(
-            RequestId::Number(909), serde_json::json!({"before_pong": true}),
+            RequestId::Number(909),
+            serde_json::json!({"before_pong": true}),
         ));
         let mut send = Box::pin(sender.send(&cx, &message));
         let mut receive = Box::pin(receiver.recv(&cx));
@@ -5468,30 +5553,48 @@ mod tests {
             assert!(send.as_mut().poll(task_cx).is_pending());
             assert!(receive.as_mut().poll(task_cx).is_pending());
             Poll::Ready(())
-        }).await;
+        })
+        .await;
         assert_eq!(output.lock().expect("one data prefix").len(), 1);
         released.store(true, Ordering::Release);
         if complete {
-            send.await.expect("complete the data frame before its queued Pong");
+            send.await
+                .expect("complete the data frame before its queued Pong");
             assert!(matches!(receive.await, Ok(JsonRpcMessage::Request(_))));
             let bytes = output.lock().expect("data frame followed by Pong").clone();
             let mut encoded = BytesMut::from(bytes.as_slice());
             let mut codec = FrameCodec::client();
-            let data = codec.decode(&mut encoded).expect("valid text frame").expect("text frame");
+            let data = codec
+                .decode(&mut encoded)
+                .expect("valid text frame")
+                .expect("text frame");
             assert_eq!(data.opcode, Opcode::Text);
             assert_eq!(
-                serde_json::to_value(Codec::new().decode_complete_message(&data.payload)
-                    .expect("data JSON")).expect("serialize received data"),
+                serde_json::to_value(
+                    Codec::new()
+                        .decode_complete_message(&data.payload)
+                        .expect("data JSON")
+                )
+                .expect("serialize received data"),
                 serde_json::to_value(&message).expect("serialize expected data")
             );
-            let pong = codec.decode(&mut encoded).expect("valid Pong").expect("Pong frame");
+            let pong = codec
+                .decode(&mut encoded)
+                .expect("valid Pong")
+                .expect("Pong frame");
             assert_eq!(pong.opcode, Opcode::Pong);
             assert_eq!(pong.payload.as_ref(), b"control");
             assert!(encoded.is_empty());
         } else {
             drop(send);
             assert!(matches!(receive.await, Err(TransportError::Closed)));
-            assert_eq!(output.lock().expect("no control frame after partial data").as_slice(), &[0x81]);
+            assert_eq!(
+                output
+                    .lock()
+                    .expect("no control frame after partial data")
+                    .as_slice(),
+                &[0x81]
+            );
             assert!(sender.is_closed());
         }
     }

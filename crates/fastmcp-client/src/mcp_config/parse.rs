@@ -60,7 +60,11 @@ where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    unique_map(deserializer, "duplicate server name in configuration registry").map(Some)
+    unique_map(
+        deserializer,
+        "duplicate server name in configuration registry",
+    )
+    .map(Some)
 }
 
 fn extra_fields<'de, D>(deserializer: D) -> Result<HashMap<String, serde_json::Value>, D::Error>
@@ -342,7 +346,8 @@ mod tests {
     #[test]
     fn duplicate_server_names_cannot_replace_disabled_definitions() {
         let distinct = r#"{"first":{"command":"original","disabled":true},"second":{"command":"replacement"}}"#;
-        let duplicate = r#"{"first":{"command":"original","disabled":true},"first":{"command":"replacement"}}"#;
+        let duplicate =
+            r#"{"first":{"command":"original","disabled":true},"first":{"command":"replacement"}}"#;
         for registry in ["mcpServers", "mcp_servers", "servers"] {
             let valid = format!(r#"{{"{registry}":{distinct}}}"#);
             let invalid = format!(r#"{{"{registry}":{duplicate}}}"#);
@@ -403,7 +408,11 @@ mod tests {
         ] {
             let json = format!(r#"{{"servers":{{"local":{{"command":"server"}}}},{controls}}}"#);
             let error = serde_json::from_str::<McpConfig>(&json).unwrap_err();
-            assert!(error.to_string().contains("duplicate top-level configuration field"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("duplicate top-level configuration field")
+            );
             assert!(McpConfig::from_json(&json).is_err());
             assert!(McpConfig::from_jsonc(&json).is_err());
         }
@@ -415,7 +424,8 @@ mod tests {
 
     #[test]
     fn unique_top_level_controls_keep_their_existing_validation() {
-        let valid = r#"{"servers":{"local":{"command":"server"}},"inputs":[],"$schema":"schema.json"}"#;
+        let valid =
+            r#"{"servers":{"local":{"command":"server"}},"inputs":[],"$schema":"schema.json"}"#;
         let config = McpConfig::from_json(valid).unwrap();
         assert_eq!(config.get_server("local").unwrap().command, "server");
         assert!(McpConfig::from_jsonc(valid).is_ok());

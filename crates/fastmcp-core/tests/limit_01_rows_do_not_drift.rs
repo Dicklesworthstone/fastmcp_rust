@@ -158,7 +158,11 @@ fn the_drift_check_compares_substantive_content() {
     // The execution logic is the half a row-data digest could not see, and therefore the
     // half this check exists to cover. If normalization ever stopped including it, this
     // file would silently become the weaker instrument it was chosen over.
-    for executor in ["fn run_bound_rows", "fn run_partition_rows", "fn run_fairness_rows"] {
+    for executor in [
+        "fn run_bound_rows",
+        "fn run_partition_rows",
+        "fn run_fairness_rows",
+    ] {
         assert!(
             in_crate.contains(executor),
             "normalization removed {executor}, so the check no longer covers the row-running \

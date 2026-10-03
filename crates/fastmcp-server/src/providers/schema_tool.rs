@@ -16,8 +16,8 @@ use fastmcp_core::{McpContext, McpOutcome, McpResult};
 use fastmcp_protocol::common_types::{OpenMetadata, RawIcon};
 use fastmcp_protocol::http_headers::NonSensitiveHeaderExposure;
 use fastmcp_protocol::{
-    CompleteResult, Content, FinalCallToolResult, FinalTool, Icon,
-    SchemaRegistryError, SchemaResourceRegistry, Tool, ToolAnnotations, admit_final_schema,
+    CompleteResult, Content, FinalCallToolResult, FinalTool, Icon, SchemaRegistryError,
+    SchemaResourceRegistry, Tool, ToolAnnotations, admit_final_schema,
 };
 use serde_json::Value;
 
@@ -36,17 +36,25 @@ pub enum RegisteredSchemaToolError {
 impl fmt::Display for RegisteredSchemaToolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingFinalDefinition => f.write_str("handler has no exact final tool definition"),
+            Self::MissingFinalDefinition => {
+                f.write_str("handler has no exact final tool definition")
+            }
             Self::NameMismatch => f.write_str("final tool name differs from its handler identity"),
-            Self::UpstreamSchemaAuthority => f.write_str("registered schemas require locally owned tool validation"),
-            Self::InputMustBeObject => f.write_str("registered tool input schema must declare type object"),
+            Self::UpstreamSchemaAuthority => {
+                f.write_str("registered schemas require locally owned tool validation")
+            }
+            Self::InputMustBeObject => {
+                f.write_str("registered tool input schema must declare type object")
+            }
             Self::Schema(error) => error.fmt(f),
         }
     }
 }
 impl std::error::Error for RegisteredSchemaToolError {}
 impl From<SchemaRegistryError> for RegisteredSchemaToolError {
-    fn from(error: SchemaRegistryError) -> Self { Self::Schema(error) }
+    fn from(error: SchemaRegistryError) -> Self {
+        Self::Schema(error)
+    }
 }
 
 /// A normal `ToolHandler` with immutable, registry-backed final schemas.
@@ -88,7 +96,9 @@ impl<H: ToolHandler> RegisteredSchemaTool<H> {
             return Err(RegisteredSchemaToolError::UpstreamSchemaAuthority);
         }
         let legacy = handler.definition();
-        if legacy.name != definition.name { return Err(RegisteredSchemaToolError::NameMismatch); }
+        if legacy.name != definition.name {
+            return Err(RegisteredSchemaToolError::NameMismatch);
+        }
         let input = registry.compile(input_identity)?;
         if input.schema().get("type").and_then(Value::as_str) != Some("object") {
             return Err(RegisteredSchemaToolError::InputMustBeObject);
@@ -96,15 +106,25 @@ impl<H: ToolHandler> RegisteredSchemaTool<H> {
         let output = match output_identity {
             Some(identity) => Some(registry.compile(identity)?.schema().clone()),
             None => match definition.output_schema.take() {
-                Some(schema) if !schema.is_object() => return Err(SchemaRegistryError::InvalidSchema.into()),
-                Some(schema) => Some(admit_final_schema(schema)
-                    .map_err(SchemaRegistryError::from)?.schema().clone()),
+                Some(schema) if !schema.is_object() => {
+                    return Err(SchemaRegistryError::InvalidSchema.into());
+                }
+                Some(schema) => Some(
+                    admit_final_schema(schema)
+                        .map_err(SchemaRegistryError::from)?
+                        .schema()
+                        .clone(),
+                ),
                 None => None,
             },
         };
         definition.input_schema = input.schema().clone();
         definition.output_schema = output;
-        Ok(Self { handler, legacy, definition })
+        Ok(Self {
+            handler,
+            legacy,
+            definition,
+        })
     }
 
     /// Uses the handler's exact final catalog metadata. Legacy-first handlers
@@ -115,25 +135,54 @@ impl<H: ToolHandler> RegisteredSchemaTool<H> {
         input_identity: &str,
         output_identity: Option<&str>,
     ) -> Result<Self, RegisteredSchemaToolError> {
-        let definition = handler.final_definition()
+        let definition = handler
+            .final_definition()
             .ok_or(RegisteredSchemaToolError::MissingFinalDefinition)?;
-        Self::new(handler, definition, registry, input_identity, output_identity)
+        Self::new(
+            handler,
+            definition,
+            registry,
+            input_identity,
+            output_identity,
+        )
     }
 
-    pub fn compiled_definition(&self) -> &FinalTool { &self.definition }
+    pub fn compiled_definition(&self) -> &FinalTool {
+        &self.definition
+    }
 }
 
 impl<H: ToolHandler> ToolHandler for RegisteredSchemaTool<H> {
-    fn definition(&self) -> Tool { self.legacy.clone() }
-    fn icon(&self) -> Option<&Icon> { self.handler.icon() }
-    fn version(&self) -> Option<&str> { self.handler.version() }
-    fn tags(&self) -> &[String] { self.handler.tags() }
-    fn annotations(&self) -> Option<&ToolAnnotations> { self.handler.annotations() }
-    fn output_schema(&self) -> Option<Value> { self.handler.output_schema() }
-    fn final_title(&self) -> Option<&str> { self.definition.title.as_deref() }
-    fn final_icons(&self) -> Option<&[RawIcon]> { self.definition.icons.as_deref() }
-    fn final_metadata(&self) -> Option<&OpenMetadata> { self.definition.meta.as_ref() }
-    fn final_definition(&self) -> Option<FinalTool> { Some(self.definition.clone()) }
+    fn definition(&self) -> Tool {
+        self.legacy.clone()
+    }
+    fn icon(&self) -> Option<&Icon> {
+        self.handler.icon()
+    }
+    fn version(&self) -> Option<&str> {
+        self.handler.version()
+    }
+    fn tags(&self) -> &[String] {
+        self.handler.tags()
+    }
+    fn annotations(&self) -> Option<&ToolAnnotations> {
+        self.handler.annotations()
+    }
+    fn output_schema(&self) -> Option<Value> {
+        self.handler.output_schema()
+    }
+    fn final_title(&self) -> Option<&str> {
+        self.definition.title.as_deref()
+    }
+    fn final_icons(&self) -> Option<&[RawIcon]> {
+        self.definition.icons.as_deref()
+    }
+    fn final_metadata(&self) -> Option<&OpenMetadata> {
+        self.definition.meta.as_ref()
+    }
+    fn final_definition(&self) -> Option<FinalTool> {
+        Some(self.definition.clone())
+    }
     // Reviews bind an exact schema revision, so one made for the handler's
     // own schema cannot cover a registered schema that differs from it.
     fn header_exposure_reviews(&self) -> Vec<NonSensitiveHeaderExposure> {
@@ -144,68 +193,111 @@ impl<H: ToolHandler> ToolHandler for RegisteredSchemaTool<H> {
     fn final_tool_error_structured_content(&self, kind: ToolErrorKind) -> Option<Value> {
         self.handler.final_tool_error_structured_content(kind)
     }
-    fn timeout(&self) -> Option<Duration> { self.handler.timeout() }
-    fn execution_mode(&self) -> ToolExecutionMode { self.handler.execution_mode() }
-    fn declares_final_tasks(&self) -> bool { self.handler.declares_final_tasks() }
-    fn declares_final_mrtr(&self) -> bool { self.handler.declares_final_mrtr() }
+    fn timeout(&self) -> Option<Duration> {
+        self.handler.timeout()
+    }
+    fn execution_mode(&self) -> ToolExecutionMode {
+        self.handler.execution_mode()
+    }
+    fn declares_final_tasks(&self) -> bool {
+        self.handler.declares_final_tasks()
+    }
+    fn declares_final_mrtr(&self) -> bool {
+        self.handler.declares_final_mrtr()
+    }
 
     fn call(&self, ctx: &McpContext, arguments: Value) -> McpResult<Vec<Content>> {
         self.handler.call(ctx, arguments)
     }
-    fn call_async<'a>(&'a self, ctx: &'a McpContext, arguments: Value)
-        -> BoxFuture<'a, McpOutcome<Vec<Content>>>
-    {
+    fn call_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: Value,
+    ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
         self.handler.call_async(ctx, arguments)
     }
-    fn call_final(&self, ctx: &McpContext, arguments: Value)
-        -> McpResult<CompleteResult<FinalCallToolResult>>
-    {
+    fn call_final(
+        &self,
+        ctx: &McpContext,
+        arguments: Value,
+    ) -> McpResult<CompleteResult<FinalCallToolResult>> {
         self.handler.call_final(ctx, arguments)
     }
-    fn call_final_async<'a>(&'a self, ctx: &'a McpContext, arguments: Value)
-        -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCallToolResult>>>
-    {
+    fn call_final_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: Value,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCallToolResult>>> {
         self.handler.call_final_async(ctx, arguments)
     }
     fn call_async_in_request<'a>(
-        &'a self, ctx: &'a McpContext, request_cx: &'a Cx, arguments: Value,
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: Value,
     ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
-        self.handler.call_async_in_request(ctx, request_cx, arguments)
+        self.handler
+            .call_async_in_request(ctx, request_cx, arguments)
     }
     fn call_final_async_in_request<'a>(
-        &'a self, ctx: &'a McpContext, request_cx: &'a Cx, arguments: Value,
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: Value,
     ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCallToolResult>>> {
-        self.handler.call_final_async_in_request(ctx, request_cx, arguments)
+        self.handler
+            .call_final_async_in_request(ctx, request_cx, arguments)
     }
-    fn call_final_outcome(&self, ctx: &McpContext, arguments: Value) -> McpResult<FinalToolOutcome> {
+    fn call_final_outcome(
+        &self,
+        ctx: &McpContext,
+        arguments: Value,
+    ) -> McpResult<FinalToolOutcome> {
         self.handler.call_final_outcome(ctx, arguments)
     }
-    fn call_final_outcome_async<'a>(&'a self, ctx: &'a McpContext, arguments: Value)
-        -> BoxFuture<'a, McpOutcome<FinalToolOutcome>>
-    {
+    fn call_final_outcome_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: Value,
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
         self.handler.call_final_outcome_async(ctx, arguments)
     }
     fn call_final_outcome_async_in_request<'a>(
-        &'a self, ctx: &'a McpContext, request_cx: &'a Cx, arguments: Value,
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: Value,
     ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
-        self.handler.call_final_outcome_async_in_request(ctx, request_cx, arguments)
+        self.handler
+            .call_final_outcome_async_in_request(ctx, request_cx, arguments)
     }
     fn call_final_outcome_async_resuming_in_request<'a>(
-        &'a self, ctx: &'a McpContext, request_cx: &'a Cx, arguments: Value,
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: Value,
         resume_inputs: Option<&'a MrtrCompletedInputs>,
     ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
-        self.handler.call_final_outcome_async_resuming_in_request(ctx, request_cx, arguments, resume_inputs)
+        self.handler.call_final_outcome_async_resuming_in_request(
+            ctx,
+            request_cx,
+            arguments,
+            resume_inputs,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use crate::Router;
     use fastmcp_core::{Outcome, SessionState};
     use fastmcp_protocol::{JsonRpcRequest, ResultMeta};
     use serde_json::json;
-    use crate::Router;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     const INPUT: &str = "https://schemas.example/input";
     const OUTPUT: &str = "https://schemas.example/output";
@@ -213,21 +305,29 @@ mod tests {
 
     fn registry() -> SchemaResourceRegistry {
         let mut registry = SchemaResourceRegistry::default();
-        registry.insert(INPUT, json!({"type":"object", "properties":{"value":{"$ref":INTEGER}},
-            "required":["value"], "additionalProperties":false})).unwrap();
+        registry
+            .insert(
+                INPUT,
+                json!({"type":"object", "properties":{"value":{"$ref":INTEGER}},
+            "required":["value"], "additionalProperties":false}),
+            )
+            .unwrap();
         registry.insert(OUTPUT, json!({"type":"object", "oneOf":[
             {"properties":{"value":{"$ref":INTEGER}}, "required":["value"], "additionalProperties":false},
             {"properties":{"error":{"enum":["invalid_input","handler_error"]}},
                 "required":["error"], "additionalProperties":false}
         ]})).unwrap();
-        registry.insert(INTEGER, json!({"type":"integer", "minimum":1})).unwrap();
+        registry
+            .insert(INTEGER, json!({"type":"integer", "minimum":1}))
+            .unwrap();
         registry
     }
     fn definition() -> FinalTool {
         serde_json::from_value(json!({"name":"registered", "title":"Display title",
             "description":"Preserve final metadata", "inputSchema":{"type":"object"},
             "annotations":{"title":"Annotation title", "readOnlyHint":true},
-            "_meta":{"com.example/source":{"revision":7}}})).unwrap()
+            "_meta":{"com.example/source":{"revision":7}}}))
+        .unwrap()
     }
     struct Handler {
         effects: Arc<AtomicUsize>,
@@ -237,42 +337,80 @@ mod tests {
         mapper: bool,
     }
     fn handler(payload: Value) -> Handler {
-        Handler { effects: Arc::new(AtomicUsize::new(0)), owned_calls: Arc::new(AtomicUsize::new(0)),
-            payload, is_error: false, mapper: true }
+        Handler {
+            effects: Arc::new(AtomicUsize::new(0)),
+            owned_calls: Arc::new(AtomicUsize::new(0)),
+            payload,
+            is_error: false,
+            mapper: true,
+        }
     }
     impl ToolHandler for Handler {
         fn definition(&self) -> Tool {
-            Tool { name:"registered".to_owned(), description:Some("Legacy definition".to_owned()),
-                input_schema:json!({"type":"object"}), output_schema:None, icon:None,
-                version:Some("legacy-version".to_owned()), tags:vec!["local".to_owned()], annotations:None }
+            Tool {
+                name: "registered".to_owned(),
+                description: Some("Legacy definition".to_owned()),
+                input_schema: json!({"type":"object"}),
+                output_schema: None,
+                icon: None,
+                version: Some("legacy-version".to_owned()),
+                tags: vec!["local".to_owned()],
+                annotations: None,
+            }
         }
-        fn final_definition(&self) -> Option<FinalTool> { Some(definition()) }
-        fn execution_mode(&self) -> ToolExecutionMode { ToolExecutionMode::Async }
-        fn timeout(&self) -> Option<Duration> { Some(Duration::from_secs(2)) }
+        fn final_definition(&self) -> Option<FinalTool> {
+            Some(definition())
+        }
+        fn execution_mode(&self) -> ToolExecutionMode {
+            ToolExecutionMode::Async
+        }
+        fn timeout(&self) -> Option<Duration> {
+            Some(Duration::from_secs(2))
+        }
         fn final_tool_error_structured_content(&self, kind: ToolErrorKind) -> Option<Value> {
-            self.mapper.then(|| json!({"error":match kind {
-                ToolErrorKind::InputValidation => "invalid_input",
-                ToolErrorKind::Handler => "handler_error",
-            }}))
+            self.mapper.then(|| {
+                json!({"error":match kind {
+                    ToolErrorKind::InputValidation => "invalid_input",
+                    ToolErrorKind::Handler => "handler_error",
+                }})
+            })
         }
         fn call(&self, _ctx: &McpContext, _arguments: Value) -> McpResult<Vec<Content>> {
             self.effects.fetch_add(1, Ordering::SeqCst);
-            Ok(vec![Content::Text { text:"legacy-result".to_owned() }])
+            Ok(vec![Content::Text {
+                text: "legacy-result".to_owned(),
+            }])
         }
-        fn call_final(&self, _ctx: &McpContext, _arguments: Value)
-            -> McpResult<CompleteResult<FinalCallToolResult>>
-        {
+        fn call_final(
+            &self,
+            _ctx: &McpContext,
+            _arguments: Value,
+        ) -> McpResult<CompleteResult<FinalCallToolResult>> {
             self.effects.fetch_add(1, Ordering::SeqCst);
-            Ok(CompleteResult::new(FinalCallToolResult { content:vec![], is_error:self.is_error,
-                structured_content:Some(self.payload.clone()) }, ResultMeta::empty()))
+            Ok(CompleteResult::new(
+                FinalCallToolResult {
+                    content: vec![],
+                    is_error: self.is_error,
+                    structured_content: Some(self.payload.clone()),
+                },
+                ResultMeta::empty(),
+            ))
         }
         fn call_final_outcome_async_resuming_in_request<'a>(
-            &'a self, ctx: &'a McpContext, request_cx: &'a Cx, arguments: Value,
+            &'a self,
+            ctx: &'a McpContext,
+            request_cx: &'a Cx,
+            arguments: Value,
             resume_inputs: Option<&'a MrtrCompletedInputs>,
         ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
             self.owned_calls.fetch_add(1, Ordering::SeqCst);
-            assert!(resume_inputs.is_none(), "ordinary test call has no admitted continuation");
-            request_cx.checkpoint().expect("the forwarded request-owned context remains live");
+            assert!(
+                resume_inputs.is_none(),
+                "ordinary test call has no admitted continuation"
+            );
+            request_cx
+                .checkpoint()
+                .expect("the forwarded request-owned context remains live");
             Box::pin(async move {
                 match self.call_final(ctx, arguments) {
                     Ok(result) => Outcome::Ok(FinalToolOutcome::Complete(result)),
@@ -287,16 +425,27 @@ mod tests {
     fn runtime() -> asupersync::runtime::Runtime {
         asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
-            .blocking_threads(0, 2).build().unwrap()
+            .blocking_threads(0, 2)
+            .build()
+            .unwrap()
     }
     async fn call(router: Arc<Router>, id: i64, arguments: Value) -> McpResult<Value> {
         let cx = Cx::current().expect("test runtime owns request authority");
         let ctx = McpContext::with_state(cx, id as u64, SessionState::new());
-        router.dispatch_stateless_owned(ctx, JsonRpcRequest::new("tools/call", Some(json!({
-            "name":"registered", "arguments":arguments,
-            "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
-                "io.modelcontextprotocol/clientCapabilities":{}},
-        })), id)).await
+        router
+            .dispatch_stateless_owned(
+                ctx,
+                JsonRpcRequest::new(
+                    "tools/call",
+                    Some(json!({
+                        "name":"registered", "arguments":arguments,
+                        "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities":{}},
+                    })),
+                    id,
+                ),
+            )
+            .await
     }
 
     #[test]
@@ -326,9 +475,20 @@ mod tests {
     fn absent_output_selection_keeps_the_existing_output_contract() {
         let mut original = definition();
         original.output_schema = Some(json!({"type":"integer", "minimum":5}));
-        let tool = RegisteredSchemaTool::new(handler(json!(5)), original.clone(), &registry(), INPUT, None).unwrap();
-        assert_eq!(tool.compiled_definition().output_schema, original.output_schema);
-        let schema = admit_final_schema(tool.compiled_definition().output_schema.clone().unwrap()).unwrap();
+        let tool = RegisteredSchemaTool::new(
+            handler(json!(5)),
+            original.clone(),
+            &registry(),
+            INPUT,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            tool.compiled_definition().output_schema,
+            original.output_schema
+        );
+        let schema =
+            admit_final_schema(tool.compiled_definition().output_schema.clone().unwrap()).unwrap();
         assert!(schema.validate(&json!(5)).is_ok());
         assert!(schema.validate(&json!(4)).is_err());
     }
@@ -337,18 +497,37 @@ mod tests {
     fn constructor_rejects_wrong_identity_unresolved_output_and_nonobject_input() {
         let mut wrong = definition();
         wrong.name = "different".to_owned();
-        assert!(matches!(RegisteredSchemaTool::new(handler(json!(1)), wrong, &registry(), INPUT, None),
-            Err(RegisteredSchemaToolError::NameMismatch)));
-        assert!(matches!(RegisteredSchemaTool::from_handler(handler(json!(1)), &registry(), INPUT, Some("https://missing.example/schema")),
-            Err(RegisteredSchemaToolError::Schema(SchemaRegistryError::UnknownResource))));
-        assert!(matches!(RegisteredSchemaTool::from_handler(handler(json!(1)), &registry(), INTEGER, None),
-            Err(RegisteredSchemaToolError::InputMustBeObject)));
+        assert!(matches!(
+            RegisteredSchemaTool::new(handler(json!(1)), wrong, &registry(), INPUT, None),
+            Err(RegisteredSchemaToolError::NameMismatch)
+        ));
+        assert!(matches!(
+            RegisteredSchemaTool::from_handler(
+                handler(json!(1)),
+                &registry(),
+                INPUT,
+                Some("https://missing.example/schema")
+            ),
+            Err(RegisteredSchemaToolError::Schema(
+                SchemaRegistryError::UnknownResource
+            ))
+        ));
+        assert!(matches!(
+            RegisteredSchemaTool::from_handler(handler(json!(1)), &registry(), INTEGER, None),
+            Err(RegisteredSchemaToolError::InputMustBeObject)
+        ));
         let mut invalid = definition();
         invalid.output_schema = Some(json!({"$ref":"https://missing.example/schema"}));
-        assert!(RegisteredSchemaTool::new(handler(json!(1)), invalid, &registry(), INPUT, None).is_err());
+        assert!(
+            RegisteredSchemaTool::new(handler(json!(1)), invalid, &registry(), INPUT, None)
+                .is_err()
+        );
         let mut invalid = definition();
         invalid.output_schema = Some(json!(true));
-        assert!(RegisteredSchemaTool::new(handler(json!(1)), invalid, &registry(), INPUT, None).is_err());
+        assert!(
+            RegisteredSchemaTool::new(handler(json!(1)), invalid, &registry(), INPUT, None)
+                .is_err()
+        );
     }
 
     #[test]
@@ -367,7 +546,10 @@ mod tests {
             assert_eq!(owned.load(Ordering::SeqCst), 1);
             let invalid = call(router, 2, json!({"value":0})).await.unwrap();
             assert_eq!(invalid["isError"], true);
-            assert_eq!(invalid["structuredContent"], json!({"error":"invalid_input"}));
+            assert_eq!(
+                invalid["structuredContent"],
+                json!({"error":"invalid_input"})
+            );
             assert_eq!(effects.load(Ordering::SeqCst), 1);
             assert_eq!(owned.load(Ordering::SeqCst), 1);
         });
@@ -388,10 +570,14 @@ mod tests {
         let handler = handler(json!({"value":2}));
         let effects = handler.effects.clone();
         let owned = handler.owned_calls.clone();
-        let tool = RegisteredSchemaTool::new(handler, definition(), &registry, INPUT, None).unwrap();
+        let tool =
+            RegisteredSchemaTool::new(handler, definition(), &registry, INPUT, None).unwrap();
         let catalog_schema = &tool.compiled_definition().input_schema;
         assert_eq!(catalog_schema["x-display"], input["x-display"]);
-        assert_eq!(catalog_schema["properties"]["value"]["x-ui"], input["properties"]["value"]["x-ui"]);
+        assert_eq!(
+            catalog_schema["properties"]["value"]["x-ui"],
+            input["properties"]["value"]["x-ui"]
+        );
         let mut router = Router::new();
         router.add_tool(tool).unwrap();
         runtime().block_on(async {
@@ -435,10 +621,13 @@ mod tests {
         let valid_handler = handler(json!({"value": 2}));
         let effects = valid_handler.effects.clone();
         let owned = valid_handler.owned_calls.clone();
-        let tool = RegisteredSchemaTool::from_handler(
-            valid_handler, &registry, INPUT, Some(OUTPUT),
-        ).unwrap();
-        assert_eq!(tool.compiled_definition().input_schema["definitions"], input["definitions"]);
+        let tool =
+            RegisteredSchemaTool::from_handler(valid_handler, &registry, INPUT, Some(OUTPUT))
+                .unwrap();
+        assert_eq!(
+            tool.compiled_definition().input_schema["definitions"],
+            input["definitions"]
+        );
         assert_eq!(
             tool.compiled_definition().output_schema.as_ref().unwrap()["definitions"],
             output["definitions"]
@@ -454,7 +643,10 @@ mod tests {
             assert_eq!(owned.load(Ordering::SeqCst), 1);
             let invalid = call(router, 2, json!({"value": 0})).await.unwrap();
             assert_eq!(invalid["isError"], true);
-            assert_eq!(invalid["structuredContent"], json!({"error": "invalid_input"}));
+            assert_eq!(
+                invalid["structuredContent"],
+                json!({"error": "invalid_input"})
+            );
             assert_eq!(effects.load(Ordering::SeqCst), 1);
             assert_eq!(owned.load(Ordering::SeqCst), 1);
         });
@@ -462,15 +654,20 @@ mod tests {
         let invalid_handler = handler(json!({"value": 0}));
         let effects = invalid_handler.effects.clone();
         let owned = invalid_handler.owned_calls.clone();
-        let tool = RegisteredSchemaTool::from_handler(
-            invalid_handler, &registry, INPUT, Some(OUTPUT),
-        ).unwrap();
+        let tool =
+            RegisteredSchemaTool::from_handler(invalid_handler, &registry, INPUT, Some(OUTPUT))
+                .unwrap();
         let mut router = Router::new();
         router.add_tool(tool).unwrap();
         runtime().block_on(async {
-            let error = call(Arc::new(router), 1, json!({"value": 2})).await.unwrap_err();
+            let error = call(Arc::new(router), 1, json!({"value": 2}))
+                .await
+                .unwrap_err();
             assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
-            assert_eq!(error.message, "tool output does not match the declared output schema");
+            assert_eq!(
+                error.message,
+                "tool output does not match the declared output schema"
+            );
             assert_eq!(effects.load(Ordering::SeqCst), 1);
             assert_eq!(owned.load(Ordering::SeqCst), 1);
         });
@@ -484,8 +681,15 @@ mod tests {
         router.add_tool(adapter(handler)).unwrap();
         runtime().block_on(async {
             let result = call(Arc::new(router), 1, json!({"value":2})).await;
-            assert!(result.is_err(), "invalid structured output must not become a successful result");
-            assert_eq!(effects.load(Ordering::SeqCst), 1, "validation does not replay or undo the handler");
+            assert!(
+                result.is_err(),
+                "invalid structured output must not become a successful result"
+            );
+            assert_eq!(
+                effects.load(Ordering::SeqCst),
+                1,
+                "validation does not replay or undo the handler"
+            );
         });
     }
 
@@ -510,8 +714,11 @@ mod tests {
             router.add_tool(adapter(handler)).unwrap();
             runtime().block_on(async {
                 let result = call(Arc::new(router), 1, json!({"value":2})).await;
-                if accepted { assert_eq!(result.unwrap()["isError"], true); }
-                else { assert!(result.is_err()); }
+                if accepted {
+                    assert_eq!(result.unwrap()["isError"], true);
+                } else {
+                    assert!(result.is_err());
+                }
                 assert_eq!(effects.load(Ordering::SeqCst), 1);
             });
         }

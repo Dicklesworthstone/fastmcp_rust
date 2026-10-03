@@ -2770,22 +2770,24 @@ mod router_tests {
             "MCP forbids notifications/message before logging/setLevel"
         );
 
-        let _ = fastmcp_core::block_on(server.handle_request(
-            &cx,
-            &mut session,
-            fastmcp_protocol::JsonRpcRequest::new(
-                "logging/setLevel",
-                Some(
-                    serde_json::to_value(SetLogLevelParams {
-                        level: LogLevel::Info,
-                    })
-                    .expect("set level params"),
+        let _ = fastmcp_core::block_on(
+            server.handle_request(
+                &cx,
+                &mut session,
+                fastmcp_protocol::JsonRpcRequest::new(
+                    "logging/setLevel",
+                    Some(
+                        serde_json::to_value(SetLogLevelParams {
+                            level: LogLevel::Info,
+                        })
+                        .expect("set level params"),
+                    ),
+                    2_i64,
                 ),
-                2_i64,
+                &sender,
+                &create_test_request_sender(),
             ),
-            &sender,
-            &create_test_request_sender(),
-        ))
+        )
         .expect("setLevel must respond");
         notifications
             .lock()
@@ -2947,24 +2949,26 @@ mod router_tests {
             "2024-11-05".to_string(),
         );
         let session_sender: NotificationSender = Arc::new(|_| {});
-        let _ = fastmcp_core::block_on(server.handle_request(
-            &cx,
-            &mut session,
-            fastmcp_protocol::JsonRpcRequest::new(
-                "tools/call",
-                Some(
-                    serde_json::to_value(CallToolParams {
-                        name: "hide_greet".to_string(),
-                        arguments: Some(serde_json::json!({})),
-                        meta: None,
-                    })
-                    .expect("tool params"),
+        let _ = fastmcp_core::block_on(
+            server.handle_request(
+                &cx,
+                &mut session,
+                fastmcp_protocol::JsonRpcRequest::new(
+                    "tools/call",
+                    Some(
+                        serde_json::to_value(CallToolParams {
+                            name: "hide_greet".to_string(),
+                            arguments: Some(serde_json::json!({})),
+                            meta: None,
+                        })
+                        .expect("tool params"),
+                    ),
+                    1_i64,
                 ),
-                1_i64,
+                &session_sender,
+                &create_test_request_sender(),
             ),
-            &session_sender,
-            &create_test_request_sender(),
-        ))
+        )
         .expect("hide_greet must respond");
         let delivered = sent
             .lock()
@@ -3022,24 +3026,26 @@ mod router_tests {
             "2024-11-05".to_string(),
         );
         let session_sender: NotificationSender = Arc::new(|_| {});
-        let response = fastmcp_core::block_on(server.handle_request(
-            &cx,
-            &mut session,
-            fastmcp_protocol::JsonRpcRequest::new(
-                "tools/call",
-                Some(
-                    serde_json::to_value(CallToolParams {
-                        name: "touch_file".to_string(),
-                        arguments: Some(serde_json::json!({ "uri": URI })),
-                        meta: None,
-                    })
-                    .expect("tool params"),
+        let response = fastmcp_core::block_on(
+            server.handle_request(
+                &cx,
+                &mut session,
+                fastmcp_protocol::JsonRpcRequest::new(
+                    "tools/call",
+                    Some(
+                        serde_json::to_value(CallToolParams {
+                            name: "touch_file".to_string(),
+                            arguments: Some(serde_json::json!({ "uri": URI })),
+                            meta: None,
+                        })
+                        .expect("tool params"),
+                    ),
+                    1_i64,
                 ),
-                1_i64,
+                &session_sender,
+                &create_test_request_sender(),
             ),
-            &session_sender,
-            &create_test_request_sender(),
-        ))
+        )
         .expect("touch_file must respond");
         assert_eq!(
             response

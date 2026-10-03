@@ -126,14 +126,24 @@ fn load_sources(
 ) -> Result<(ResolvedSources, Report, String, TraceTable, String), Diagnostic> {
     let registry_path = root.join(SOURCES_PATH);
     let registry_text = fs::read_to_string(&registry_path).map_err(|error| {
-        Diagnostic::new(Code::SourceUnreadable, SOURCES_PATH, "path", error.to_string())
+        Diagnostic::new(
+            Code::SourceUnreadable,
+            SOURCES_PATH,
+            "path",
+            error.to_string(),
+        )
     })?;
     ledger.record_read();
     let registry = sources::parse_registry(&registry_text, SOURCES_PATH)?;
 
     let table_path = root.join(TRACE_TABLE_PATH);
     let table_text = fs::read_to_string(&table_path).map_err(|error| {
-        Diagnostic::new(Code::SourceUnreadable, TRACE_TABLE_PATH, "path", error.to_string())
+        Diagnostic::new(
+            Code::SourceUnreadable,
+            TRACE_TABLE_PATH,
+            "path",
+            error.to_string(),
+        )
     })?;
     ledger.record_read();
     let table = trace::parse_table(&table_text, TRACE_TABLE_PATH)?;
@@ -162,8 +172,7 @@ fn load_sources(
 /// test-only path.
 pub fn run_all(root: &Path) -> Result<CheckRun, Diagnostic> {
     let mut ledger = EffectLedger::new();
-    let (resolved, mut report, tree_digest, table, table_digest) =
-        load_sources(root, &mut ledger)?;
+    let (resolved, mut report, tree_digest, table, table_digest) = load_sources(root, &mut ledger)?;
 
     // A binding that failed to resolve has already been reported. Continuing
     // with a partial source set would let a subcase pass by having nothing to
@@ -220,7 +229,11 @@ pub fn run_all(root: &Path) -> Result<CheckRun, Diagnostic> {
             &ledger,
         );
         report.canonicalize();
-        return Ok(CheckRun { manifest, report, ledger });
+        return Ok(CheckRun {
+            manifest,
+            report,
+            ledger,
+        });
     }
 
     // The conformance inventory is parsed first: its scenarios are part of
@@ -253,7 +266,10 @@ pub fn run_all(root: &Path) -> Result<CheckRun, Diagnostic> {
     // and the whole changelog half of A-01 coverage silently disappears from a
     // GREEN run. The conformance path fifteen lines above reports exactly this
     // failure as `SourceUnreadable`; this path now matches it.
-    let changelog_text = match resolved.get(SOURCE_ID_CHANGELOG).map(|source| source.text()) {
+    let changelog_text = match resolved
+        .get(SOURCE_ID_CHANGELOG)
+        .map(|source| source.text())
+    {
         Some(Some(text)) => text,
         Some(None) => {
             first.push(Diagnostic::new(
@@ -334,7 +350,11 @@ pub fn run_all(root: &Path) -> Result<CheckRun, Diagnostic> {
         &ledger,
     );
 
-    Ok(CheckRun { manifest, report, ledger })
+    Ok(CheckRun {
+        manifest,
+        report,
+        ledger,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -424,7 +444,10 @@ mod tests {
     #[test]
     fn the_four_subcases_are_ordered_and_distinct() {
         let ids: Vec<&str> = A_SUBCASES.iter().map(|(id, _)| *id).collect();
-        assert_eq!(ids, ["FND-02-A-01", "FND-02-A-02", "FND-02-A-03", "FND-02-A-04"]);
+        assert_eq!(
+            ids,
+            ["FND-02-A-01", "FND-02-A-02", "FND-02-A-03", "FND-02-A-04"]
+        );
         let mut sorted = ids.clone();
         sorted.sort_unstable();
         sorted.dedup();

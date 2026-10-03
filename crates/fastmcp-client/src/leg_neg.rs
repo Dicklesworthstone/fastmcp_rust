@@ -144,7 +144,10 @@ impl std::fmt::Display for HttpFallbackError {
                 "attempt {admitted_attempt} was already admitted by this coordinator"
             ),
             Self::ReplayedObservation { attempt_id } => {
-                write!(formatter, "attempt {attempt_id} was replayed after settling")
+                write!(
+                    formatter,
+                    "attempt {attempt_id} was replayed after settling"
+                )
             }
             Self::IneligibleObservation { status, body } => write!(
                 formatter,
@@ -162,9 +165,8 @@ impl std::fmt::Display for HttpFallbackError {
             Self::EndpointEventMalformed => {
                 formatter.write_str("the endpoint event carried no usable target")
             }
-            Self::EndpointEventTargetMismatch => {
-                formatter.write_str("the advertised endpoint is not the configured message POST target")
-            }
+            Self::EndpointEventTargetMismatch => formatter
+                .write_str("the advertised endpoint is not the configured message POST target"),
             Self::DuplicateEndpointEvent => {
                 formatter.write_str("the era was already selected by an earlier endpoint event")
             }

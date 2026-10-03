@@ -73,9 +73,9 @@ impl<H: Legacy2024Handler> Legacy2024ServerAdapter<H> {
                         method: method.name,
                         params,
                     }),
-                    Err(error) => Ok(PreparedReceive::Outbound(
-                        Legacy2024Outbound::Response(error_response(id, error)),
-                    )),
+                    Err(error) => Ok(PreparedReceive::Outbound(Legacy2024Outbound::Response(
+                        error_response(id, error),
+                    ))),
                 }
             }
             Legacy2024Envelope::Notification { method, params } => {
@@ -184,10 +184,11 @@ impl<H: Legacy2024Handler> Legacy2024ServerAdapter<H> {
                 TOOLS_CALL | RESOURCES_READ | PROMPTS_GET => {
                     translate_legacy_2024_result(method, result).map_err(|_| {
                         Legacy2024AdapterError {
-                            code: JsonInteger::from(-32603),
-                            message: "handler result is not losslessly representable in exact MCP 2024-11-05"
-                                .to_owned(),
-                        }
+                    code: JsonInteger::from(-32603),
+                    message:
+                        "handler result is not losslessly representable in exact MCP 2024-11-05"
+                            .to_owned(),
+                }
                     })
                 }
                 _ => Ok(result),
@@ -230,30 +231,51 @@ mod tests {
                 }),
                 ..Legacy2024ServerCapabilities::default()
             },
-            server_info: Legacy2024ServerInfo { name: "dispatch-test".into(), version: "1".into() },
+            server_info: Legacy2024ServerInfo {
+                name: "dispatch-test".into(),
+                version: "1".into(),
+            },
             instructions: None,
         };
         Legacy2024ServerAdapter::install(binding(), config, handler).unwrap()
     }
 
     fn initialize<H: Legacy2024Handler>(adapter: &mut Legacy2024ServerAdapter<H>) {
-        let response = adapter.receive(binding(), json!({
-            "jsonrpc":"2.0", "id":1, "method":INITIALIZE,
-            "params":{"protocolVersion":"2024-11-05", "capabilities":{},
-                "clientInfo":{"name":"test", "version":"1"}}
-        })).unwrap();
-        let Legacy2024Outbound::Response(response) = response else { panic!("initialize response") };
+        let response = adapter
+            .receive(
+                binding(),
+                json!({
+                    "jsonrpc":"2.0", "id":1, "method":INITIALIZE,
+                    "params":{"protocolVersion":"2024-11-05", "capabilities":{},
+                        "clientInfo":{"name":"test", "version":"1"}}
+                }),
+            )
+            .unwrap();
+        let Legacy2024Outbound::Response(response) = response else {
+            panic!("initialize response")
+        };
         assert!(response.get("error").is_none(), "{response}");
-        assert_eq!(adapter.receive(binding(), json!({
-            "jsonrpc":"2.0", "method":NOTIFICATIONS_INITIALIZED,
-        })).unwrap(), Legacy2024Outbound::NoResponse);
+        assert_eq!(
+            adapter
+                .receive(
+                    binding(),
+                    json!({
+                        "jsonrpc":"2.0", "method":NOTIFICATIONS_INITIALIZED,
+                    })
+                )
+                .unwrap(),
+            Legacy2024Outbound::NoResponse
+        );
     }
 
     // No executor is created: only a future known to be immediately ready may
     // pass this helper. Suspension tests explicitly observe Pending themselves.
     fn ready<T>(future: impl Future<Output = T>) -> T {
         let mut future = pin!(future);
-        match future.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        match future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
             Poll::Ready(result) => result,
             Poll::Pending => panic!("unexpected suspension"),
         }
@@ -264,22 +286,33 @@ mod tests {
     }
 
     impl Legacy2024Handler for SyncOnly {
-        fn handle_legacy_2024(&mut self, _: &'static str, _: Option<&Value>)
-            -> Result<Value, Legacy2024HandlerError>
-        {
+        fn handle_legacy_2024(
+            &mut self,
+            _: &'static str,
+            _: Option<&Value>,
+        ) -> Result<Value, Legacy2024HandlerError> {
             panic!("the exact request-ID hook must be selected")
         }
 
         fn handle_legacy_2024_with_request_id(
-            &mut self, id: &Value, method: &'static str, params: Option<&Value>,
+            &mut self,
+            id: &Value,
+            method: &'static str,
+            params: Option<&Value>,
         ) -> Result<Value, Legacy2024HandlerError> {
-            assert!(asupersync::Cx::current().is_none(), "adapter installed a hidden runtime");
+            assert!(
+                asupersync::Cx::current().is_none(),
+                "adapter installed a hidden runtime"
+            );
             self.calls.set(self.calls.get() + 1);
             Ok(json!({"id":id, "method":method, "params":params}))
         }
 
         fn handle_legacy_2024_with_request_id_async<'a>(
-            &'a mut self, _: &'a Value, _: &'static str, _: Option<&'a Value>,
+            &'a mut self,
+            _: &'a Value,
+            _: &'static str,
+            _: Option<&'a Value>,
         ) -> crate::BoxFuture<'a, Result<Value, Legacy2024HandlerError>> {
             panic!("synchronous receive must not construct an async handler future")
         }
@@ -289,17 +322,27 @@ mod tests {
     fn synchronous_receive_calls_the_exact_sync_hook_without_a_runtime() {
         let _ambient = asupersync::Cx::set_current(None);
         let calls = Rc::new(Cell::new(0));
-        let mut adapter = adapter(SyncOnly { calls: Rc::clone(&calls) });
+        let mut adapter = adapter(SyncOnly {
+            calls: Rc::clone(&calls),
+        });
         initialize(&mut adapter);
         let id = json!("sync-request-61");
         let params = json!({"cursor":"exact-cursor"});
-        let response = adapter.receive(binding(), json!({
-            "jsonrpc":"2.0", "id":id, "method":TOOLS_LIST, "params":params,
-        })).unwrap();
-        assert_eq!(response, Legacy2024Outbound::Response(json!({
-            "jsonrpc":"2.0", "id":id,
-            "result":{"id":id, "method":TOOLS_LIST, "params":params},
-        })));
+        let response = adapter
+            .receive(
+                binding(),
+                json!({
+                    "jsonrpc":"2.0", "id":id, "method":TOOLS_LIST, "params":params,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            response,
+            Legacy2024Outbound::Response(json!({
+                "jsonrpc":"2.0", "id":id,
+                "result":{"id":id, "method":TOOLS_LIST, "params":params},
+            }))
+        );
         assert_eq!(calls.get(), 1);
         assert!(asupersync::Cx::current().is_none());
     }
@@ -311,18 +354,25 @@ mod tests {
 
     struct Dropped(Arc<AtomicUsize>);
     impl Drop for Dropped {
-        fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     impl Legacy2024Handler for AsyncOnly {
-        fn handle_legacy_2024(&mut self, _: &'static str, _: Option<&Value>)
-            -> Result<Value, Legacy2024HandlerError>
-        {
+        fn handle_legacy_2024(
+            &mut self,
+            _: &'static str,
+            _: Option<&Value>,
+        ) -> Result<Value, Legacy2024HandlerError> {
             panic!("async receive must not invoke a synchronous application hook")
         }
 
         fn handle_legacy_2024_with_request_id_async<'a>(
-            &'a mut self, id: &'a Value, method: &'static str, params: Option<&'a Value>,
+            &'a mut self,
+            id: &'a Value,
+            method: &'static str,
+            params: Option<&'a Value>,
         ) -> crate::BoxFuture<'a, Result<Value, Legacy2024HandlerError>> {
             let polls = Arc::clone(&self.polls);
             let dropped = Dropped(Arc::clone(&self.drops));
@@ -345,22 +395,31 @@ mod tests {
     fn async_receive_suspends_and_preserves_the_exact_request_hook() {
         let polls = Arc::new(AtomicUsize::new(0));
         let drops = Arc::new(AtomicUsize::new(0));
-        let mut adapter = adapter(AsyncOnly { polls: Arc::clone(&polls), drops: Arc::clone(&drops) });
+        let mut adapter = adapter(AsyncOnly {
+            polls: Arc::clone(&polls),
+            drops: Arc::clone(&drops),
+        });
         initialize(&mut adapter);
         let before = adapter.snapshot();
         let params = json!({"cursor":"async-cursor"});
-        let request = json!({"jsonrpc":"2.0", "id":"async-61", "method":TOOLS_LIST, "params":params});
+        let request =
+            json!({"jsonrpc":"2.0", "id":"async-61", "method":TOOLS_LIST, "params":params});
         let mut task = Context::from_waker(Waker::noop());
         {
             let mut future = pin!(adapter.receive_async(binding(), request));
             assert_eq!(polls.load(Ordering::SeqCst), 0);
             assert!(future.as_mut().poll(&mut task).is_pending());
             assert_eq!(polls.load(Ordering::SeqCst), 1);
-            let Poll::Ready(result) = future.as_mut().poll(&mut task) else { panic!("second poll") };
-            assert_eq!(result.unwrap(), Legacy2024Outbound::Response(json!({
-                "jsonrpc":"2.0", "id":"async-61",
-                "result":{"id":"async-61", "method":TOOLS_LIST, "params":params},
-            })));
+            let Poll::Ready(result) = future.as_mut().poll(&mut task) else {
+                panic!("second poll")
+            };
+            assert_eq!(
+                result.unwrap(),
+                Legacy2024Outbound::Response(json!({
+                    "jsonrpc":"2.0", "id":"async-61",
+                    "result":{"id":"async-61", "method":TOOLS_LIST, "params":params},
+                }))
+            );
         }
         assert_eq!(polls.load(Ordering::SeqCst), 2);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -371,22 +430,40 @@ mod tests {
     fn abandoning_async_subscription_drops_the_handler_without_committing_state() {
         let polls = Arc::new(AtomicUsize::new(0));
         let drops = Arc::new(AtomicUsize::new(0));
-        let mut adapter = adapter(AsyncOnly { polls: Arc::clone(&polls), drops: Arc::clone(&drops) });
+        let mut adapter = adapter(AsyncOnly {
+            polls: Arc::clone(&polls),
+            drops: Arc::clone(&drops),
+        });
         initialize(&mut adapter);
         let before = adapter.snapshot();
         {
-            let mut future = pin!(adapter.receive_async(binding(), json!({
-                "jsonrpc":"2.0", "id":2, "method":RESOURCES_SUBSCRIBE,
-                "params":{"uri":"file:///abandoned"},
-            })));
-            assert!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+            let mut future = pin!(adapter.receive_async(
+                binding(),
+                json!({
+                    "jsonrpc":"2.0", "id":2, "method":RESOURCES_SUBSCRIBE,
+                    "params":{"uri":"file:///abandoned"},
+                })
+            ));
+            assert!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
         }
         assert_eq!(polls.load(Ordering::SeqCst), 1);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert_eq!(adapter.snapshot(), before);
-        assert_eq!(ready(adapter.receive_async(binding(), json!({
-            "jsonrpc":"2.0", "id":3, "method":PING,
-        }))).unwrap(), Legacy2024Outbound::Response(json!({"jsonrpc":"2.0", "id":3, "result":{}})));
+        assert_eq!(
+            ready(adapter.receive_async(
+                binding(),
+                json!({
+                    "jsonrpc":"2.0", "id":3, "method":PING,
+                })
+            ))
+            .unwrap(),
+            Legacy2024Outbound::Response(json!({"jsonrpc":"2.0", "id":3, "result":{}}))
+        );
     }
 
     #[derive(Default)]
@@ -401,10 +478,16 @@ mod tests {
             method: &'static str,
             _params: Option<&Value>,
         ) -> Result<Value, Legacy2024HandlerError> {
-            assert!(matches!(method, RESOURCES_SUBSCRIBE | RESOURCES_UNSUBSCRIBE));
+            assert!(matches!(
+                method,
+                RESOURCES_SUBSCRIBE | RESOURCES_UNSUBSCRIBE
+            ));
             self.calls += 1;
             if self.fail {
-                Err(Legacy2024HandlerError::with_code(-32001, "subscription hook failed"))
+                Err(Legacy2024HandlerError::with_code(
+                    -32001,
+                    "subscription hook failed",
+                ))
             } else {
                 Ok(json!({}))
             }
@@ -429,9 +512,12 @@ mod tests {
     }
 
     fn assert_subscribed(response: Legacy2024Outbound) {
-        assert_eq!(response, Legacy2024Outbound::Response(json!({
-            "jsonrpc":"2.0", "id":"subscription-61", "result":{}
-        })));
+        assert_eq!(
+            response,
+            Legacy2024Outbound::Response(json!({
+                "jsonrpc":"2.0", "id":"subscription-61", "result":{}
+            }))
+        );
     }
 
     fn assert_rejected(response: Legacy2024Outbound, code: i32) {
@@ -448,7 +534,9 @@ mod tests {
         reservations: usize,
     ) {
         while adapter.snapshot().reservation_count < reservations as u64 {
-            let response = adapter.make_reverse_request(binding(), PING, json!({})).unwrap();
+            let response = adapter
+                .make_reverse_request(binding(), PING, json!({}))
+                .unwrap();
             assert!(matches!(response, Legacy2024Outbound::ReverseRequest(_)));
         }
         assert_eq!(adapter.snapshot().reservation_count, reservations as u64);
@@ -463,19 +551,31 @@ mod tests {
             let before = adapter.snapshot();
             let request = subscription(RESOURCES_SUBSCRIBE, "file:///quota");
 
-            assert_rejected(receive_ready(&mut adapter, asynchronous, request.clone()), -32600);
+            assert_rejected(
+                receive_ready(&mut adapter, asynchronous, request.clone()),
+                -32600,
+            );
             assert_eq!(adapter.handler.calls, 0);
             assert_eq!(adapter.snapshot(), before);
 
             // A real response, not a fixture counter edit, frees the shared slot.
-            assert_eq!(receive_ready(&mut adapter, asynchronous, json!({
-                "jsonrpc":"2.0", "id":1, "result":{}
-            })), Legacy2024Outbound::NoResponse);
+            assert_eq!(
+                receive_ready(
+                    &mut adapter,
+                    asynchronous,
+                    json!({
+                        "jsonrpc":"2.0", "id":1, "result":{}
+                    })
+                ),
+                Legacy2024Outbound::NoResponse
+            );
             assert_subscribed(receive_ready(&mut adapter, asynchronous, request));
             assert_eq!(adapter.handler.calls, 1);
             assert_eq!(adapter.snapshot().subscriptions, ["file:///quota"]);
-            assert_eq!(adapter.snapshot().reservation_count,
-                LEGACY_2024_MAX_ADAPTER_RESERVATIONS as u64);
+            assert_eq!(
+                adapter.snapshot().reservation_count,
+                LEGACY_2024_MAX_ADAPTER_RESERVATIONS as u64
+            );
         }
     }
 
@@ -492,12 +592,21 @@ mod tests {
             assert_subscribed(receive_ready(&mut adapter, asynchronous, request));
             assert_eq!(adapter.snapshot(), full);
             assert_eq!(adapter.handler.calls, 2);
-            assert_subscribed(receive_ready(&mut adapter, asynchronous,
-                subscription(RESOURCES_UNSUBSCRIBE, "file:///existing")));
-            assert_eq!(adapter.snapshot().reservation_count, full.reservation_count - 1);
+            assert_subscribed(receive_ready(
+                &mut adapter,
+                asynchronous,
+                subscription(RESOURCES_UNSUBSCRIBE, "file:///existing"),
+            ));
+            assert_eq!(
+                adapter.snapshot().reservation_count,
+                full.reservation_count - 1
+            );
             assert!(adapter.snapshot().subscriptions.is_empty());
-            assert_subscribed(receive_ready(&mut adapter, asynchronous,
-                subscription(RESOURCES_SUBSCRIBE, "file:///replacement")));
+            assert_subscribed(receive_ready(
+                &mut adapter,
+                asynchronous,
+                subscription(RESOURCES_SUBSCRIBE, "file:///replacement"),
+            ));
             assert_eq!(adapter.snapshot().reservation_count, full.reservation_count);
             assert_eq!(adapter.snapshot().subscriptions, ["file:///replacement"]);
             assert_eq!(adapter.handler.calls, 4);
@@ -515,7 +624,10 @@ mod tests {
             let unsubscribe = subscription(RESOURCES_UNSUBSCRIBE, "file:///retryable");
 
             adapter.handler.fail = true;
-            assert_rejected(receive_ready(&mut adapter, asynchronous, subscribe.clone()), -32001);
+            assert_rejected(
+                receive_ready(&mut adapter, asynchronous, subscribe.clone()),
+                -32001,
+            );
             assert_eq!(adapter.snapshot(), before);
             adapter.handler.fail = false;
             assert_subscribed(receive_ready(&mut adapter, asynchronous, subscribe));
@@ -523,7 +635,10 @@ mod tests {
             assert_eq!(subscribed.reservation_count, before.reservation_count + 1);
 
             adapter.handler.fail = true;
-            assert_rejected(receive_ready(&mut adapter, asynchronous, unsubscribe.clone()), -32001);
+            assert_rejected(
+                receive_ready(&mut adapter, asynchronous, unsubscribe.clone()),
+                -32001,
+            );
             assert_eq!(adapter.snapshot(), subscribed);
             adapter.handler.fail = false;
             assert_subscribed(receive_ready(&mut adapter, asynchronous, unsubscribe));
@@ -537,13 +652,20 @@ mod tests {
         let polls = Arc::new(AtomicUsize::new(0));
         let drops = Arc::new(AtomicUsize::new(0));
         let mut adapter = adapter(AsyncOnly {
-            polls: Arc::clone(&polls), drops: Arc::clone(&drops),
+            polls: Arc::clone(&polls),
+            drops: Arc::clone(&drops),
         });
         initialize(&mut adapter);
         fill_reverse_to(&mut adapter, LEGACY_2024_MAX_ADAPTER_RESERVATIONS);
         let before = adapter.snapshot();
-        assert_rejected(receive_ready(&mut adapter, true,
-            subscription(RESOURCES_SUBSCRIBE, "file:///must-not-start")), -32600);
+        assert_rejected(
+            receive_ready(
+                &mut adapter,
+                true,
+                subscription(RESOURCES_SUBSCRIBE, "file:///must-not-start"),
+            ),
+            -32600,
+        );
         assert_eq!(polls.load(Ordering::SeqCst), 0);
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         assert_eq!(adapter.snapshot(), before);

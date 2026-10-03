@@ -20,18 +20,18 @@ use std::time::Instant;
 use asupersync::Cx;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::{
-    CoreRequest, CoreResult, FinalCoreRequest, FinalCoreResult, RequestId,
-    ServerNotification, FINAL_PROTOCOL_VERSION,
+    CoreRequest, CoreResult, FINAL_PROTOCOL_VERSION, FinalCoreRequest, FinalCoreResult, RequestId,
+    ServerNotification,
 };
 
 use super::{
-    ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits, ManagedOAuthSession,
-    bounded_wait, call_deadline, check_call, prepare,
+    ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits, ManagedOAuthSession, bounded_wait,
+    call_deadline, check_call, prepare,
 };
 use crate::cache::{
-    CachePartitionKey, FinalCacheGeneration, FinalCacheInsert, FinalCacheKey,
-    FinalCacheLookup, FinalCacheResultSet, FinalCacheStats, FinalResultCache,
-    MAX_FINAL_CACHE_CAPACITY, MAX_FINAL_CACHE_MAX_BYTES,
+    CachePartitionKey, FinalCacheGeneration, FinalCacheInsert, FinalCacheKey, FinalCacheLookup,
+    FinalCacheResultSet, FinalCacheStats, FinalResultCache, MAX_FINAL_CACHE_CAPACITY,
+    MAX_FINAL_CACHE_MAX_BYTES,
 };
 use crate::http_auth::managed::OAuthCredentialSnapshot;
 
@@ -47,13 +47,24 @@ pub struct ManagedResourceLimits {
 }
 impl Default for ManagedResourceLimits {
     fn default() -> Self {
-        Self { core: ManagedCoreLimits::default(), maximum_contents: 1024 }
+        Self {
+            core: ManagedCoreLimits::default(),
+            maximum_contents: 1024,
+        }
     }
 }
 impl ManagedResourceLimits {
-    pub fn new(core: ManagedCoreLimits, maximum_contents: usize) -> Result<Self, ManagedResourceError> {
-        if maximum_contents > 100_000 { return Err(ManagedResourceError::InvalidLimits); }
-        Ok(Self { core, maximum_contents })
+    pub fn new(
+        core: ManagedCoreLimits,
+        maximum_contents: usize,
+    ) -> Result<Self, ManagedResourceError> {
+        if maximum_contents > 100_000 {
+            return Err(ManagedResourceError::InvalidLimits);
+        }
+        Ok(Self {
+            core,
+            maximum_contents,
+        })
     }
 }
 
@@ -80,8 +91,12 @@ impl fmt::Display for ManagedResourceError {
             Self::InvalidResult => f.write_str("result is not an admitted resource-read outcome"),
             Self::ContentsLimit => f.write_str("resource contents count exceeds its limit"),
             Self::Invalidated => f.write_str("resource read was invalidated before delivery"),
-            Self::CredentialChanged => f.write_str("resource request used a different credential generation"),
-            Self::CredentialUnavailable => f.write_str("resource credential is expired or locally revoked"),
+            Self::CredentialChanged => {
+                f.write_str("resource request used a different credential generation")
+            }
+            Self::CredentialUnavailable => {
+                f.write_str("resource credential is expired or locally revoked")
+            }
             Self::CacheUnavailable => f.write_str("resource cache state is unavailable"),
             Self::AbortedByHost => f.write_str("resource read stopped by its host"),
         }
@@ -89,7 +104,9 @@ impl fmt::Display for ManagedResourceError {
 }
 impl std::error::Error for ManagedResourceError {}
 impl From<ManagedCoreError> for ManagedResourceError {
-    fn from(error: ManagedCoreError) -> Self { Self::Core(error) }
+    fn from(error: ManagedCoreError) -> Self {
+        Self::Core(error)
+    }
 }
 
 /// The exact typed outcome of one read. Complete and input-required remain
@@ -103,13 +120,26 @@ pub struct ManagedResourceRead {
     cache_hit: bool,
 }
 impl ManagedResourceRead {
-    pub fn uri(&self) -> &str { &self.uri }
-    pub fn result(&self) -> &CoreResult { &self.result }
-    pub fn into_result(self) -> CoreResult { self.result }
-    pub fn credential_generation(&self) -> u64 { self.credential_generation }
-    pub fn is_cache_hit(&self) -> bool { self.cache_hit }
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+    pub fn result(&self) -> &CoreResult {
+        &self.result
+    }
+    pub fn into_result(self) -> CoreResult {
+        self.result
+    }
+    pub fn credential_generation(&self) -> u64 {
+        self.credential_generation
+    }
+    pub fn is_cache_hit(&self) -> bool {
+        self.cache_hit
+    }
     pub fn is_complete(&self) -> bool {
-        matches!(&self.result, CoreResult::Final(FinalCoreResult::ResourcesRead { .. }))
+        matches!(
+            &self.result,
+            CoreResult::Final(FinalCoreResult::ResourcesRead { .. })
+        )
     }
 }
 
@@ -127,15 +157,25 @@ impl ManagedResourceClient {
     pub fn new(session: ManagedOAuthSession, limits: ManagedResourceLimits) -> Self {
         let mut cache = FinalResultCache::default();
         cache.set_enabled(false);
-        Self { session, limits, cache: Arc::new(Mutex::new(cache)) }
+        Self {
+            session,
+            limits,
+            cache: Arc::new(Mutex::new(cache)),
+        }
     }
 
     /// Creates an explicitly enabled bounded cache for this returned consumer.
     /// Earlier clones keep their prior cache; later clones share the new one.
-    pub fn with_cache_limits(mut self, entries: usize, bytes: usize) -> Result<Self, ManagedResourceError> {
+    pub fn with_cache_limits(
+        mut self,
+        entries: usize,
+        bytes: usize,
+    ) -> Result<Self, ManagedResourceError> {
         if !(1..=MAX_FINAL_CACHE_CAPACITY).contains(&entries)
             || !(1..=MAX_FINAL_CACHE_MAX_BYTES).contains(&bytes)
-        { return Err(ManagedResourceError::InvalidLimits); }
+        {
+            return Err(ManagedResourceError::InvalidLimits);
+        }
         self.cache = Arc::new(Mutex::new(FinalResultCache::with_limits(entries, bytes)));
         Ok(self)
     }
@@ -149,7 +189,10 @@ impl ManagedResourceClient {
     /// Accepts already-validated server notifications, including those received
     /// on a separate subscription. Resource updates and resource-list changes
     /// invalidate reads; unrelated catalog changes do not. No URI map is grown.
-    pub fn invalidate_notification(&self, notification: &ServerNotification) -> Result<(), ManagedResourceError> {
+    pub fn invalidate_notification(
+        &self,
+        notification: &ServerNotification,
+    ) -> Result<(), ManagedResourceError> {
         self.cache()?.invalidate_notification(notification);
         Ok(())
     }
@@ -162,13 +205,24 @@ impl ManagedResourceClient {
     /// cached data does not allocate an ID or replay old notifications. observe
     /// is incremental and never called while the cache mutex is held.
     pub async fn read<I, O>(
-        &self, cx: &Cx, request: CoreRequest, next_id: I, observe: O,
+        &self,
+        cx: &Cx,
+        request: CoreRequest,
+        next_id: I,
+        observe: O,
     ) -> Result<ManagedResourceRead, ManagedResourceError>
     where
         I: FnOnce() -> Result<RequestId, ManagedResourceError>,
         O: FnMut(Box<ServerNotification>) -> Result<(), ManagedResourceError>,
     {
-        self.read_with_cancellation(cx, &McpRequestCancellation::new(), request, next_id, observe).await
+        self.read_with_cancellation(
+            cx,
+            &McpRequestCancellation::new(),
+            request,
+            next_id,
+            observe,
+        )
+        .await
     }
 
     /// One deadline covers credential acquisition, callbacks and response reads.
@@ -176,8 +230,12 @@ impl ManagedResourceClient {
     /// cause a later POST, fill or delivery. Synchronous host work must cooperate;
     /// it cannot be forcibly preempted by this async API.
     pub async fn read_with_cancellation<I, O>(
-        &self, cx: &Cx, cancellation: &McpRequestCancellation,
-        request: CoreRequest, next_id: I, mut observe: O,
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        request: CoreRequest,
+        next_id: I,
+        mut observe: O,
     ) -> Result<ManagedResourceRead, ManagedResourceError>
     where
         I: FnOnce() -> Result<RequestId, ManagedResourceError>,
@@ -188,18 +246,32 @@ impl ManagedResourceClient {
         let uri = uri.to_owned();
         // The shared encoder/profile check precedes even a cache hit or token
         // renewal. This provisional ID is never sent or supplied to the host.
-        let _ = prepare(self.session.resource().as_str(), request.clone(), RequestId::Number(0), self.limits.core)?;
+        let _ = prepare(
+            self.session.resource().as_str(),
+            request.clone(),
+            RequestId::Number(0),
+            self.limits.core,
+        )?;
         let result_set = FinalCacheResultSet::Resource(uri.clone());
         let captured = self.cache()?.begin_fetch(&result_set);
         bounded_wait(cx, cancellation, deadline, async {
             Ok(async {
-                let credential = self.session.credential_with_cancellation(cx, cancellation)
-                    .await.map_err(ManagedCoreError::from)?;
+                let credential = self
+                    .session
+                    .credential_with_cancellation(cx, cancellation)
+                    .await
+                    .map_err(ManagedCoreError::from)?;
                 require_credential(&credential)?;
                 self.require_generation(&result_set, captured)?;
                 let key = if reusable {
-                    Some(cache_key(self.session.resource().as_str(), &request, credential.generation())?)
-                } else { None };
+                    Some(cache_key(
+                        self.session.resource().as_str(),
+                        &request,
+                        credential.generation(),
+                    )?)
+                } else {
+                    None
+                };
                 // Continuation requests do not even look up retained data: a
                 // complete answer to a previous one-shot continuation is not
                 // permission to skip or duplicate its next explicit operation.
@@ -212,8 +284,12 @@ impl ManagedResourceClient {
                 };
                 let cache_hit = cached.is_some();
                 let (result, receipt) = if let Some(result) = cached {
-                    let bytes = result.encode().map_err(|_| ManagedResourceError::InvalidResult)?.len();
-                    if bytes > self.limits.core.frame_bytes || bytes > self.limits.core.total_bytes {
+                    let bytes = result
+                        .encode()
+                        .map_err(|_| ManagedResourceError::InvalidResult)?
+                        .len();
+                    if bytes > self.limits.core.frame_bytes || bytes > self.limits.core.total_bytes
+                    {
                         return Err(ManagedCoreError::ResponseByteLimit.into());
                     }
                     (result, Instant::now())
@@ -223,8 +299,13 @@ impl ManagedResourceClient {
                     require_credential(&credential)?;
                     self.require_generation(&result_set, captured)?;
                     let mut call = Box::pin(self.session.request_core_with_cancellation(
-                        cx, cancellation, request, id, self.limits.core,
-                    )).await?;
+                        cx,
+                        cancellation,
+                        request,
+                        id,
+                        self.limits.core,
+                    ))
+                    .await?;
                     // A read may race another caller's renewal, but it must not
                     // populate or return a result in the prior token partition.
                     if call.credential_generation() != credential.generation() {
@@ -232,7 +313,10 @@ impl ManagedResourceClient {
                     }
                     call.deadline = deadline;
                     let result = loop {
-                        let event = call.next_event(cx).await?.ok_or(ManagedResourceError::InvalidResult)?;
+                        let event = call
+                            .next_event(cx)
+                            .await?
+                            .ok_or(ManagedResourceError::InvalidResult)?;
                         check_call(cx, cancellation, deadline)?;
                         require_credential(&credential)?;
                         match event {
@@ -254,13 +338,17 @@ impl ManagedResourceClient {
                 // cannot win and then have this old fetch repopulate the cache.
                 {
                     let mut cache = self.cache()?;
-                    if cache.begin_fetch(&result_set) != captured { return Err(ManagedResourceError::Invalidated); }
+                    if cache.begin_fetch(&result_set) != captured {
+                        return Err(ManagedResourceError::Invalidated);
+                    }
                     require_credential(&credential)?;
                     if complete && !cache_hit && cache.is_enabled() {
                         if let Some(key) = key {
                             if cache.insert_if_current_at(key, captured, result.clone(), receipt)
                                 == FinalCacheInsert::InvalidatedDuringFetch
-                            { return Err(ManagedResourceError::Invalidated); }
+                            {
+                                return Err(ManagedResourceError::Invalidated);
+                            }
                         }
                     }
                 }
@@ -268,17 +356,30 @@ impl ManagedResourceClient {
                 require_credential(&credential)?;
                 self.require_generation(&result_set, captured)?;
                 Ok(ManagedResourceRead {
-                    uri, result, credential_generation: credential.generation(), cache_hit,
+                    uri,
+                    result,
+                    credential_generation: credential.generation(),
+                    cache_hit,
                 })
-            }.await)
-        }).await?
+            }
+            .await)
+        })
+        .await?
     }
 
     fn cache(&self) -> Result<MutexGuard<'_, FinalResultCache>, ManagedResourceError> {
-        self.cache.lock().map_err(|_| ManagedResourceError::CacheUnavailable)
+        self.cache
+            .lock()
+            .map_err(|_| ManagedResourceError::CacheUnavailable)
     }
-    fn require_generation(&self, result_set: &FinalCacheResultSet, captured: FinalCacheGeneration) -> Result<(), ManagedResourceError> {
-        if self.cache()?.begin_fetch(result_set) != captured { return Err(ManagedResourceError::Invalidated); }
+    fn require_generation(
+        &self,
+        result_set: &FinalCacheResultSet,
+        captured: FinalCacheGeneration,
+    ) -> Result<(), ManagedResourceError> {
+        if self.cache()?.begin_fetch(result_set) != captured {
+            return Err(ManagedResourceError::Invalidated);
+        }
         Ok(())
     }
 }
@@ -294,27 +395,53 @@ fn read_identity(request: &CoreRequest) -> Result<(&str, bool), ManagedResourceE
     let CoreRequest::Final(FinalCoreRequest::ResourcesRead(params)) = request else {
         return Err(ManagedResourceError::NotResourceRead);
     };
-    Ok((params.uri.as_str(), params.input_responses.is_none() && params.request_state.is_none()))
+    Ok((
+        params.uri.as_str(),
+        params.input_responses.is_none() && params.request_state.is_none(),
+    ))
 }
 
-fn cache_key(target: &str, request: &CoreRequest, generation: u64) -> Result<FinalCacheKey, ManagedResourceError> {
+fn cache_key(
+    target: &str,
+    request: &CoreRequest,
+    generation: u64,
+) -> Result<FinalCacheKey, ManagedResourceError> {
     let (uri, reusable) = read_identity(request)?;
-    if !reusable { return Err(ManagedCoreError::InvalidRequest.into()); }
-    let params = request.encode_params().map_err(|_| ManagedCoreError::InvalidRequest)?
+    if !reusable {
+        return Err(ManagedCoreError::InvalidRequest.into());
+    }
+    let params = request
+        .encode_params()
+        .map_err(|_| ManagedCoreError::InvalidRequest)?
         .ok_or(ManagedCoreError::InvalidRequest)?;
-    let projection = serde_json::to_string(&params).map_err(|_| ManagedCoreError::InvalidRequest)?;
+    let projection =
+        serde_json::to_string(&params).map_err(|_| ManagedCoreError::InvalidRequest)?;
     Ok(FinalCacheKey::new(
-        target, FINAL_PROTOCOL_VERSION, "included-in-exact-params", "core-only",
-        "resources/read", projection, None, 0, 0, 0, 0,
+        target,
+        FINAL_PROTOCOL_VERSION,
+        "included-in-exact-params",
+        "core-only",
+        "resources/read",
+        projection,
+        None,
+        0,
+        0,
+        0,
+        0,
         CachePartitionKey::new(format!("managed-resource-generation-{generation}")),
         FinalCacheResultSet::Resource(uri.to_owned()),
     ))
 }
 
-fn admit_result(result: &CoreResult, maximum_contents: usize) -> Result<bool, ManagedResourceError> {
+fn admit_result(
+    result: &CoreResult,
+    maximum_contents: usize,
+) -> Result<bool, ManagedResourceError> {
     match result {
         CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }) => {
-            if result.payload.contents.len() > maximum_contents { return Err(ManagedResourceError::ContentsLimit); }
+            if result.payload.contents.len() > maximum_contents {
+                return Err(ManagedResourceError::ContentsLimit);
+            }
             Ok(true)
         }
         CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { .. }) => Ok(false),
@@ -325,15 +452,16 @@ fn admit_result(result: &CoreResult, maximum_contents: usize) -> Result<bool, Ma
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta, JsonRpcRequest};
     use fastmcp_protocol::protocol_policy::ProtocolEra;
+    use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta, JsonRpcRequest};
     use serde_json::json;
 
     fn request(uri: &str) -> CoreRequest {
         decode(json!({"uri":uri}))
     }
     fn decode(mut params: serde_json::Value) -> CoreRequest {
-        params["_meta"] = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
+        params["_meta"] =
+            serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
         CoreRequest::decode(ProtocolEra::Modern2026, "resources/read", Some(&params)).unwrap()
     }
     fn complete(request: &CoreRequest, ttl: u64, scope: &str) -> CoreResult {
@@ -348,7 +476,10 @@ mod tests {
         let request = request("file:///one");
         let result = complete(&request, 60000, "private");
         assert!(admit_result(&result, 2).unwrap());
-        assert!(matches!(admit_result(&result, 1), Err(ManagedResourceError::ContentsLimit)));
+        assert!(matches!(
+            admit_result(&result, 1),
+            Err(ManagedResourceError::ContentsLimit)
+        ));
         let encoded = result.encode().unwrap();
         assert!(encoded.contains("file:///two") && encoded.contains("AAEC"));
         assert!(encoded.contains("900719925474099312345") && encoded.contains("1.20e+4"));
@@ -381,13 +512,26 @@ mod tests {
     fn cache_identity_includes_uri_metadata_target_and_credential_generation() {
         let original = request("file:///one");
         let baseline = cache_key("https://mcp.example/mcp", &original, 1).unwrap();
-        assert_ne!(baseline, cache_key("https://mcp.example/mcp", &original, 2).unwrap());
-        assert_ne!(baseline, cache_key("https://other.example/mcp", &original, 1).unwrap());
-        assert_ne!(baseline, cache_key("https://mcp.example/mcp", &request("file:///two"), 1).unwrap());
+        assert_ne!(
+            baseline,
+            cache_key("https://mcp.example/mcp", &original, 2).unwrap()
+        );
+        assert_ne!(
+            baseline,
+            cache_key("https://other.example/mcp", &original, 1).unwrap()
+        );
+        assert_ne!(
+            baseline,
+            cache_key("https://mcp.example/mcp", &request("file:///two"), 1).unwrap()
+        );
         let mut params = original.encode_params().unwrap().unwrap();
         params["_meta"]["com.example/tenant"] = json!("other");
-        let changed = CoreRequest::decode(ProtocolEra::Modern2026, "resources/read", Some(&params)).unwrap();
-        assert_ne!(baseline, cache_key("https://mcp.example/mcp", &changed, 1).unwrap());
+        let changed =
+            CoreRequest::decode(ProtocolEra::Modern2026, "resources/read", Some(&params)).unwrap();
+        assert_ne!(
+            baseline,
+            cache_key("https://mcp.example/mcp", &changed, 1).unwrap()
+        );
     }
 
     #[test]
@@ -396,7 +540,10 @@ mod tests {
         let key = cache_key("https://mcp.example/mcp", &request, 1).unwrap();
         let mut cache = FinalResultCache::default();
         let generation = cache.begin_fetch(key.result_set());
-        assert_eq!(cache.insert_if_current(key.clone(), generation, complete(&request, 60000, "public")), FinalCacheInsert::Stored);
+        assert_eq!(
+            cache.insert_if_current(key.clone(), generation, complete(&request, 60000, "public")),
+            FinalCacheInsert::Stored
+        );
         assert!(matches!(cache.lookup(&key), FinalCacheLookup::Fresh(_)));
         let other = cache_key("https://mcp.example/mcp", &request, 2).unwrap();
         assert!(matches!(cache.lookup(&other), FinalCacheLookup::Miss(_)));
@@ -407,14 +554,20 @@ mod tests {
         let request = request("file:///one");
         let key = cache_key("https://mcp.example/mcp", &request, 1).unwrap();
         for (method, params) in [
-            ("notifications/resources/updated", Some(json!({"uri":"file:///one"}))),
+            (
+                "notifications/resources/updated",
+                Some(json!({"uri":"file:///one"})),
+            ),
             ("notifications/resources/list_changed", None),
         ] {
             let mut cache = FinalResultCache::default();
             let before = cache.begin_fetch(key.result_set());
             cache.invalidate_notification(&notification(method, params));
             assert_ne!(cache.begin_fetch(key.result_set()), before);
-            assert_eq!(cache.insert_if_current(key.clone(), before, complete(&request, 60000, "private")), FinalCacheInsert::InvalidatedDuringFetch);
+            assert_eq!(
+                cache.insert_if_current(key.clone(), before, complete(&request, 60000, "private")),
+                FinalCacheInsert::InvalidatedDuringFetch
+            );
         }
         let mut cache = FinalResultCache::default();
         let before = cache.begin_fetch(key.result_set());
@@ -428,18 +581,39 @@ mod tests {
         let key = cache_key("https://mcp.example/mcp", &request, 1).unwrap();
         let mut cache = FinalResultCache::with_limits(1, 1);
         let generation = cache.begin_fetch(key.result_set());
-        assert_eq!(cache.insert_if_current(key.clone(), generation, complete(&request, 0, "private")), FinalCacheInsert::ImmediatelyStale);
-        assert_eq!(cache.insert_if_current(key.clone(), generation, complete(&request, 60000, "private")), FinalCacheInsert::Oversized);
+        assert_eq!(
+            cache.insert_if_current(key.clone(), generation, complete(&request, 0, "private")),
+            FinalCacheInsert::ImmediatelyStale
+        );
+        assert_eq!(
+            cache.insert_if_current(
+                key.clone(),
+                generation,
+                complete(&request, 60000, "private")
+            ),
+            FinalCacheInsert::Oversized
+        );
         assert!(matches!(cache.lookup(&key), FinalCacheLookup::Miss(_)));
     }
 
     #[test]
     fn non_read_requests_and_non_read_results_are_not_reinterpreted() {
         let params = json!({"_meta":FinalRequestMeta::new(ClientCapabilities::default())});
-        let catalog = CoreRequest::decode(ProtocolEra::Modern2026, "resources/list", Some(&params)).unwrap();
-        assert!(matches!(read_identity(&catalog), Err(ManagedResourceError::NotResourceRead)));
-        let result = catalog.decode_result(r#"{"resultType":"complete","resources":[],"ttlMs":0,"cacheScope":"private"}"#).unwrap();
-        assert!(matches!(admit_result(&result, 10), Err(ManagedResourceError::InvalidResult)));
+        let catalog =
+            CoreRequest::decode(ProtocolEra::Modern2026, "resources/list", Some(&params)).unwrap();
+        assert!(matches!(
+            read_identity(&catalog),
+            Err(ManagedResourceError::NotResourceRead)
+        ));
+        let result = catalog
+            .decode_result(
+                r#"{"resultType":"complete","resources":[],"ttlMs":0,"cacheScope":"private"}"#,
+            )
+            .unwrap();
+        assert!(matches!(
+            admit_result(&result, 10),
+            Err(ManagedResourceError::InvalidResult)
+        ));
         assert!(ManagedResourceLimits::new(ManagedCoreLimits::default(), 100_001).is_err());
     }
 }

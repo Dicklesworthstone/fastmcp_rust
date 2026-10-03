@@ -40,7 +40,8 @@ pub(super) async fn await_validity<T>(
         // dropped on this error; partially read work cannot become reusable.
         check_tool_call(cx, cancellation, contract)?;
         outcome.map(Ok)
-    }).await
+    })
+    .await
 }
 
 #[cfg(test)]

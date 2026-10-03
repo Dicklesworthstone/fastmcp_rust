@@ -1990,18 +1990,17 @@ mod tests {
             "tools/call",
             SERVER_DISCOVER_METHOD,
         ] {
-            let middleware = ResponseCachingMiddleware::new()
-                .include_tools(vec!["deterministic".to_owned()]);
+            let middleware =
+                ResponseCachingMiddleware::new().include_tools(vec!["deterministic".to_owned()]);
             let request = match method {
                 SERVER_DISCOVER_METHOD => final_discovery_request(FINAL_PROTOCOL_VERSION),
                 "resources/read" => test_request(
                     method,
                     Some(serde_json::json!({"uri": "file:///generation-test"})),
                 ),
-                "prompts/get" | "tools/call" => test_request(
-                    method,
-                    Some(serde_json::json!({"name": "deterministic"})),
-                ),
+                "prompts/get" | "tools/call" => {
+                    test_request(method, Some(serde_json::json!({"name": "deterministic"})))
+                }
                 _ => test_request(method, Some(serde_json::json!({"cursor": "page-two"}))),
             };
             let mut response = if method == SERVER_DISCOVER_METHOD {
@@ -2071,7 +2070,11 @@ mod tests {
                 ));
                 continue;
             }
-            assert_eq!(middleware.stats().entries, 0, "{method}: late fill rejected");
+            assert_eq!(
+                middleware.stats().entries,
+                0,
+                "{method}: late fill rejected"
+            );
             assert_eq!(middleware.stats().size_bytes, 0);
             assert!(matches!(lookup, MiddlewareDecision::Continue));
             assert!(matches!(

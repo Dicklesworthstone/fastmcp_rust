@@ -13,15 +13,18 @@ use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::{CoreRequest, FinalInputResponses, InputRequiredResult, RequestId};
 
 use super::{ManagedToolClient, ManagedToolError, ToolContract, await_validity, check_tool_call};
-use crate::http_auth::rpc::{ManagedCoreError, interaction::{
-    ManagedInteraction, ManagedInteractionError, ManagedInteractionEvent,
-    ManagedInteractionLimits,
-}};
+use crate::http_auth::rpc::{
+    ManagedCoreError,
+    interaction::{
+        ManagedInteraction, ManagedInteractionError, ManagedInteractionEvent,
+        ManagedInteractionLimits,
+    },
+};
 
-/// Explicit journal-backed recovery retaining the tool's original contract.
-pub mod recovery;
 /// Caller-owned input resolution retaining schemas, headers, and invalidation.
 pub mod drive;
+/// Explicit journal-backed recovery retaining the tool's original contract.
+pub mod recovery;
 
 /// Errors retain the core interaction's correctable-input distinctions without
 /// retaining the challenge, submitted answer, schema, or tool output.
@@ -43,11 +46,15 @@ impl fmt::Display for ManagedToolInteractionError {
 impl std::error::Error for ManagedToolInteractionError {}
 
 impl From<ManagedToolError> for ManagedToolInteractionError {
-    fn from(error: ManagedToolError) -> Self { Self::Tool(error) }
+    fn from(error: ManagedToolError) -> Self {
+        Self::Tool(error)
+    }
 }
 
 impl From<ManagedInteractionError> for ManagedToolInteractionError {
-    fn from(error: ManagedInteractionError) -> Self { Self::Interaction(error) }
+    fn from(error: ManagedInteractionError) -> Self {
+        Self::Interaction(error)
+    }
 }
 
 impl ManagedToolClient {
@@ -64,8 +71,13 @@ impl ManagedToolClient {
         limits: ManagedInteractionLimits,
     ) -> Result<ManagedToolInteraction, ManagedToolInteractionError> {
         Box::pin(self.start_interaction_with_cancellation(
-            cx, &McpRequestCancellation::new(), request, request_id, limits,
-        )).await
+            cx,
+            &McpRequestCancellation::new(),
+            request,
+            request_id,
+            limits,
+        ))
+        .await
     }
 
     /// Retains the request-local cancellation domain while reading, awaiting
@@ -81,15 +93,26 @@ impl ManagedToolClient {
         check_tool_call(cx, cancellation, &self.contract)?;
         self.contract.validate_request(&request)?;
         check_tool_call(cx, cancellation, &self.contract)?;
-        let operation = Box::pin(await_validity(cx, cancellation, &self.contract,
+        let operation = Box::pin(await_validity(
+            cx,
+            cancellation,
+            &self.contract,
             self.session.start_core_interaction_configured(
-                cx, cancellation, request, request_id, limits, self.header_review.clone(),
+                cx,
+                cancellation,
+                request,
+                request_id,
+                limits,
+                self.header_review.clone(),
             ),
-        )).await??;
+        ))
+        .await??;
         check_tool_call(cx, cancellation, &self.contract)?;
         Ok(ManagedToolInteraction {
-            operation: Some(operation), contract: self.contract.clone(),
-            cancellation: cancellation.clone(), finished: false,
+            operation: Some(operation),
+            contract: self.contract.clone(),
+            cancellation: cancellation.clone(),
+            finished: false,
         })
     }
 }
@@ -124,11 +147,18 @@ impl ManagedToolInteraction {
     // Only the repair adapter supplies this unread core owner and its already
     // admitted replacement. No public conversion can bypass output validation.
     pub(in crate::http_auth::tool) fn from_repaired_call(
-        cx: &Cx, operation: ManagedInteraction, contract: Arc<ToolContract>,
+        cx: &Cx,
+        operation: ManagedInteraction,
+        contract: Arc<ToolContract>,
         cancellation: McpRequestCancellation,
     ) -> Result<Self, ManagedToolError> {
         check_tool_call(cx, &cancellation, &contract)?;
-        Ok(Self { operation: Some(operation), contract, cancellation, finished: false })
+        Ok(Self {
+            operation: Some(operation),
+            contract,
+            cancellation,
+            finished: false,
+        })
     }
 
     /// Borrows the current challenge without authorizing any requested action.
@@ -137,10 +167,14 @@ impl ManagedToolInteraction {
         if self.contract.check().is_err() || self.cancellation.is_cancel_requested() {
             return None;
         }
-        self.operation.as_ref().and_then(ManagedInteraction::pending_input)
+        self.operation
+            .as_ref()
+            .and_then(ManagedInteraction::pending_input)
     }
 
-    pub fn close(&mut self) { self.operation = None; }
+    pub fn close(&mut self) {
+        self.operation = None;
+    }
 
     /// Delivers notifications and challenges unchanged. Complete results are
     /// checked against the retained output schema before publication. Reading
@@ -149,13 +183,23 @@ impl ManagedToolInteraction {
         &mut self,
         cx: &Cx,
     ) -> Result<Option<ManagedInteractionEvent>, ManagedToolInteractionError> {
-        if self.finished { return Ok(None); }
+        if self.finished {
+            return Ok(None);
+        }
         let mut operation = self.take_checked(cx)?;
-        let next = await_validity(cx, &self.cancellation, &self.contract, operation.next_event(cx)).await?;
+        let next = Box::pin(await_validity(
+            cx,
+            &self.cancellation,
+            &self.contract,
+            operation.next_event(cx),
+        ))
+        .await?;
         check_tool_call(cx, &self.cancellation, &self.contract)?;
         let event = match next {
             Ok(Some(event)) => event,
-            Ok(None) => return Err(ManagedToolError::Core(ManagedCoreError::MissingTerminal).into()),
+            Ok(None) => {
+                return Err(ManagedToolError::Core(ManagedCoreError::MissingTerminal).into());
+            }
             Err(error) => {
                 // Core read admission leaves a challenge only for a local
                 // InputPending refusal. Transport/decoder failures retire it.
@@ -213,15 +257,22 @@ impl ManagedToolInteraction {
             self.operation = Some(operation);
             return Err(ManagedInteractionError::NotAwaitingInput.into());
         }
-        let outcome = await_validity(cx, &self.cancellation, &self.contract, async {
-            if partial {
-                // Only resume_partial supplies this mode, always with a map.
-                let responses = responses.ok_or(ManagedInteractionError::InvalidInputResponses)?;
-                operation.resume_partial(cx, request_id, responses).await
-            } else {
-                operation.resume(cx, request_id, responses).await
-            }
-        }).await?;
+        let outcome = Box::pin(await_validity(
+            cx,
+            &self.cancellation,
+            &self.contract,
+            async {
+                if partial {
+                    // Only resume_partial supplies this mode, always with a map.
+                    let responses =
+                        responses.ok_or(ManagedInteractionError::InvalidInputResponses)?;
+                    operation.resume_partial(cx, request_id, responses).await
+                } else {
+                    operation.resume(cx, request_id, responses).await
+                }
+            },
+        ))
+        .await?;
         check_tool_call(cx, &self.cancellation, &self.contract)?;
         // Before dispatch, the core owner retains a challenge on local refusal.
         // After dispatch, failures erase it. Never infer retry permission from
@@ -239,14 +290,19 @@ impl ManagedToolInteraction {
     }
 }
 
-fn admit_event(contract: &ToolContract, event: &ManagedInteractionEvent) -> Result<bool, ManagedToolError> {
+fn admit_event(
+    contract: &ToolContract,
+    event: &ManagedInteractionEvent,
+) -> Result<bool, ManagedToolError> {
     contract.check()?;
     match event {
         ManagedInteractionEvent::Complete(result) => {
             contract.validate_result(result)?;
             Ok(true)
         }
-        ManagedInteractionEvent::Notification(_) | ManagedInteractionEvent::InputRequired(_) => Ok(false),
+        ManagedInteractionEvent::Notification(_) | ManagedInteractionEvent::InputRequired(_) => {
+            Ok(false)
+        }
     }
 }
 

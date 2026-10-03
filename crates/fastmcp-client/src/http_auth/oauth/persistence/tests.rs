@@ -1,25 +1,29 @@
-use super::*;
 use super::super::tests as native;
 use super::super::{bind_loopback, within};
+use super::*;
 use crate::http_auth::CanonicalHttpUrl;
+use crate::http_auth::secure_file::slot::coordinator::{
+    CredentialAnchorError, CredentialAnchorSnapshot, CredentialAnchorState,
+};
 use asupersync::io::AsyncWriteExt;
+use fastmcp_core::partition::{DurableOwnerKey, PartitionDescriptor};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use fastmcp_core::partition::{DurableOwnerKey, PartitionDescriptor};
-use crate::http_auth::secure_file::slot::coordinator::{
-    CredentialAnchorError, CredentialAnchorSnapshot, CredentialAnchorState,
-};
 
-fn url(value: &str) -> CanonicalHttpUrl { CanonicalHttpUrl::parse(value).unwrap() }
+fn url(value: &str) -> CanonicalHttpUrl {
+    CanonicalHttpUrl::parse(value).unwrap()
+}
 
 fn encoded(configuration: &OAuthClientConfiguration, binding: OAuthGrantBinding) -> Vec<u8> {
     let scopes = vec!["tools:read".to_owned()];
     let encoding = OAuthGrantEncoding {
-        binding, refresh_token: "refresh-only-secret", scopes: &scopes,
+        binding,
+        refresh_token: "refresh-only-secret",
+        scopes: &scopes,
     };
     validate_refresh(encoding.refresh_token, encoding.scopes, configuration).unwrap();
     let mut bytes = Vec::new();
@@ -31,7 +35,8 @@ fn encoded(configuration: &OAuthClientConfiguration, binding: OAuthGrantBinding)
 #[test]
 fn canonical_refresh_record_round_trips_without_an_access_token_or_expiry() {
     let configuration = native::config();
-    let binding = grant_binding(configuration_digest(&configuration).unwrap(), &[3; 32], 1).unwrap();
+    let binding =
+        grant_binding(configuration_digest(&configuration).unwrap(), &[3; 32], 1).unwrap();
     let bytes = encoded(&configuration, binding);
     let grant = decode_grant(&configuration, binding, &bytes).unwrap();
     assert_eq!(grant.refresh_token, "refresh-only-secret");
@@ -39,7 +44,10 @@ fn canonical_refresh_record_round_trips_without_an_access_token_or_expiry() {
     assert_eq!(grant.configuration, configuration);
     // This exact closed binary layout has only binding, refresh token and
     // scopes; no persisted Instant/access token can be reconstructed from it.
-    assert_eq!(bytes.len(), 8 + 32 + 4 + "refresh-only-secret".len() + 1 + 2 + "tools:read".len());
+    assert_eq!(
+        bytes.len(),
+        8 + 32 + 4 + "refresh-only-secret".len() + 1 + 2 + "tools:read".len()
+    );
 }
 
 #[test]
@@ -67,7 +75,8 @@ fn refresh_record_rejects_every_truncation_trailing_data_and_wrong_binding() {
 #[test]
 fn refresh_record_bounds_lengths_and_rejects_scope_expansion() {
     let configuration = native::config();
-    let binding = grant_binding(configuration_digest(&configuration).unwrap(), &[3; 32], 1).unwrap();
+    let binding =
+        grant_binding(configuration_digest(&configuration).unwrap(), &[3; 32], 1).unwrap();
     let bytes = encoded(&configuration, binding);
     let mut changed = bytes.clone();
     changed[40..44].copy_from_slice(&u32::MAX.to_be_bytes());
@@ -79,11 +88,19 @@ fn refresh_record_bounds_lengths_and_rejects_scope_expansion() {
     changed[44 + "refresh-only-secret".len()] = 33;
     assert!(decode_grant(&configuration, binding, &changed).is_err());
     assert!(matches!(
-        decode_grant(&configuration, binding, &vec![0; MAX_ENCODED_REFRESH_GRANT_BYTES + 1]),
+        decode_grant(
+            &configuration,
+            binding,
+            &vec![0; MAX_ENCODED_REFRESH_GRANT_BYTES + 1]
+        ),
         Err(OAuthRefreshStoreError::TooLarge)
     ));
     let scopes = vec!["admin".to_owned()];
-    let encoding = OAuthGrantEncoding { binding, refresh_token: "refresh-only-secret", scopes: &scopes };
+    let encoding = OAuthGrantEncoding {
+        binding,
+        refresh_token: "refresh-only-secret",
+        scopes: &scopes,
+    };
     let mut expanded = Vec::new();
     encoding.write_to(&mut expanded).unwrap();
     assert!(decode_grant(&configuration, binding, &expanded).is_err());
@@ -94,7 +111,10 @@ fn refresh_record_bounds_lengths_and_rejects_scope_expansion() {
 fn refresh_configuration_binding_covers_endpoints_policy_registration_and_roots() {
     let configuration = native::config();
     let original = configuration_digest(&configuration).unwrap();
-    assert_eq!(configuration_digest(&configuration.clone()).unwrap(), original);
+    assert_eq!(
+        configuration_digest(&configuration.clone()).unwrap(),
+        original
+    );
     for dimension in 0..10 {
         let mut changed = configuration.clone();
         match dimension {
@@ -106,10 +126,16 @@ fn refresh_configuration_binding_covers_endpoints_policy_registration_and_roots(
             5 => changed.scopes.reverse(),
             6 => changed.authorization_timeout = Duration::from_secs(1),
             7 => changed.max_access_token_lifetime = Duration::from_secs(1),
-            8 => changed.extra_root_certificates.push(native::test_root().as_der().to_vec()),
+            8 => changed
+                .extra_root_certificates
+                .push(native::test_root().as_der().to_vec()),
             _ => changed.revocation_endpoint = Some(url("https://issuer.example/revoke")),
         }
-        assert_ne!(configuration_digest(&changed).unwrap(), original, "dimension {dimension}");
+        assert_ne!(
+            configuration_digest(&changed).unwrap(),
+            original,
+            "dimension {dimension}"
+        );
     }
 }
 
@@ -117,14 +143,24 @@ fn refresh_configuration_binding_covers_endpoints_policy_registration_and_roots(
 fn live_grant_transfer_is_single_use_and_keeps_original_access_expiry() {
     let configuration = native::config();
     let mut credentials = native::renewable_grant(&configuration);
-    let access = credentials.access.authorization_for_target(&configuration.resource);
+    let access = credentials
+        .access
+        .authorization_for_target(&configuration.resource);
     let expiry = credentials.expires_at();
     let grant = credentials.take_refresh_grant().unwrap();
     assert_eq!(grant.refresh_token, "refresh-one");
     assert_eq!(grant.scopes(), configuration.scopes);
     assert!(!credentials.has_refresh_token());
-    assert_eq!(credentials.take_refresh_grant().err(), Some(OAuthError::RefreshUnavailable));
-    assert_eq!(credentials.access.authorization_for_target(&configuration.resource), access);
+    assert_eq!(
+        credentials.take_refresh_grant().err(),
+        Some(OAuthError::RefreshUnavailable)
+    );
+    assert_eq!(
+        credentials
+            .access
+            .authorization_for_target(&configuration.resource),
+        access
+    );
     assert_eq!(credentials.expires_at(), expiry);
 }
 
@@ -145,14 +181,22 @@ struct VaultState {
 }
 impl OAuthGrantProtector for TestVault {
     type Plaintext = Vec<u8>;
-    fn seal(&mut self, cx: &Cx, binding: &OAuthGrantBinding, grant: &OAuthGrantEncoding<'_>)
-        -> Result<Vec<u8>, OAuthGrantProtectionError>
-    {
-        cx.checkpoint().map_err(|_| OAuthGrantProtectionError::Cancelled)?;
+    fn seal(
+        &mut self,
+        cx: &Cx,
+        binding: &OAuthGrantBinding,
+        grant: &OAuthGrantEncoding<'_>,
+    ) -> Result<Vec<u8>, OAuthGrantProtectionError> {
+        cx.checkpoint()
+            .map_err(|_| OAuthGrantProtectionError::Cancelled)?;
         let mut state = self.0.lock().unwrap();
         state.seals += 1;
-        if state.refuse_seal { return Err(OAuthGrantProtectionError::Unavailable); }
-        if state.oversized_seal { return Ok(vec![7; MAX_PROTECTED_REFRESH_GRANT_BYTES + 1]); }
+        if state.refuse_seal {
+            return Err(OAuthGrantProtectionError::Unavailable);
+        }
+        if state.oversized_seal {
+            return Ok(vec![7; MAX_PROTECTED_REFRESH_GRANT_BYTES + 1]);
+        }
         let mut bytes = Vec::new();
         grant.write_to(&mut bytes)?;
         state.next += 1;
@@ -160,17 +204,27 @@ impl OAuthGrantProtector for TestVault {
         state.records.insert(envelope.clone(), (*binding, bytes));
         Ok(envelope)
     }
-    fn open(&mut self, cx: &Cx, binding: &OAuthGrantBinding, protected: &[u8])
-        -> Result<Self::Plaintext, OAuthGrantProtectionError>
-    {
-        cx.checkpoint().map_err(|_| OAuthGrantProtectionError::Cancelled)?;
+    fn open(
+        &mut self,
+        cx: &Cx,
+        binding: &OAuthGrantBinding,
+        protected: &[u8],
+    ) -> Result<Self::Plaintext, OAuthGrantProtectionError> {
+        cx.checkpoint()
+            .map_err(|_| OAuthGrantProtectionError::Cancelled)?;
         let mut state = self.0.lock().unwrap();
         state.opens += 1;
-        let (recorded, bytes) = state.records.get(protected)
+        let (recorded, bytes) = state
+            .records
+            .get(protected)
             .ok_or(OAuthGrantProtectionError::InvalidEnvelope)?;
-        if recorded != binding { return Err(OAuthGrantProtectionError::InvalidEnvelope); }
+        if recorded != binding {
+            return Err(OAuthGrantProtectionError::InvalidEnvelope);
+        }
         let mut bytes = bytes.clone();
-        if state.corrupt_open { bytes.push(0); }
+        if state.corrupt_open {
+            bytes.push(0);
+        }
         Ok(bytes)
     }
 }
@@ -182,22 +236,38 @@ struct AnchorState {
     lose_settlement_reply: bool,
 }
 impl CredentialCommitAnchor for TestAnchor {
-    fn current(&mut self, cx: &Cx, binding: &CredentialAnchorBinding)
-        -> Result<CredentialAnchorSnapshot, CredentialAnchorError>
-    {
-        cx.checkpoint().map_err(|_| CredentialAnchorError::Unavailable)?;
+    fn current(
+        &mut self,
+        cx: &Cx,
+        binding: &CredentialAnchorBinding,
+    ) -> Result<CredentialAnchorSnapshot, CredentialAnchorError> {
+        cx.checkpoint()
+            .map_err(|_| CredentialAnchorError::Unavailable)?;
         let state = self.0.lock().unwrap();
-        if state.snapshot.binding() != *binding { return Err(CredentialAnchorError::NotProvisioned); }
+        if state.snapshot.binding() != *binding {
+            return Err(CredentialAnchorError::NotProvisioned);
+        }
         Ok(state.snapshot)
     }
-    fn compare_exchange(&mut self, cx: &Cx, expected: &CredentialAnchorSnapshot, next: CredentialAnchorState)
-        -> Result<CredentialAnchorSnapshot, CredentialAnchorError>
-    {
-        cx.checkpoint().map_err(|_| CredentialAnchorError::Unavailable)?;
+    fn compare_exchange(
+        &mut self,
+        cx: &Cx,
+        expected: &CredentialAnchorSnapshot,
+        next: CredentialAnchorState,
+    ) -> Result<CredentialAnchorSnapshot, CredentialAnchorError> {
+        cx.checkpoint()
+            .map_err(|_| CredentialAnchorError::Unavailable)?;
         let mut state = self.0.lock().unwrap();
-        if state.snapshot != *expected { return Err(CredentialAnchorError::Conflict); }
+        if state.snapshot != *expected {
+            return Err(CredentialAnchorError::Conflict);
+        }
         state.snapshot = CredentialAnchorSnapshot::new(
-            expected.binding(), expected.sequence().checked_add(1).ok_or(CredentialAnchorError::Unavailable)?, next,
+            expected.binding(),
+            expected
+                .sequence()
+                .checked_add(1)
+                .ok_or(CredentialAnchorError::Unavailable)?,
+            next,
         );
         if state.lose_settlement_reply && matches!(next, CredentialAnchorState::Stable(_)) {
             return Err(CredentialAnchorError::Uncertain);
@@ -208,12 +278,23 @@ impl CredentialCommitAnchor for TestAnchor {
 
 fn partition(subject: &str) -> (CredentialStoreKey, PartitionAuthorization) {
     let descriptor = PartitionDescriptor::from_verified_facts(
-        "test-provider", 1, "https://issuer.example", "https://mcp.example/mcp",
-        "tenant", subject, "native-client", 1, 1, &[b"oauth-resource"],
-    ).unwrap();
+        "test-provider",
+        1,
+        "https://issuer.example",
+        "https://mcp.example/mcp",
+        "tenant",
+        subject,
+        "native-client",
+        1,
+        1,
+        &[b"oauth-resource"],
+    )
+    .unwrap();
     let owner = DurableOwnerKey::derive(&descriptor, 1).unwrap();
     let authorization = PartitionAuthorization::current(&descriptor, &owner);
-    let key = CredentialStoreKey::derive(&descriptor, "native-store", "oauth-refresh", "lineage-one").unwrap();
+    let key =
+        CredentialStoreKey::derive(&descriptor, "native-store", "oauth-refresh", "lineage-one")
+            .unwrap();
     (key, authorization)
 }
 
@@ -228,28 +309,63 @@ impl Fixture {
     fn new() -> Self {
         let nonce = fastmcp_core::draw_security_identifier().unwrap();
         let directory = std::env::temp_dir().join(format!(
-            "fastmcp-oauth-custody-{}-{}", std::process::id(), super::super::hex(nonce.as_bytes()),
+            "fastmcp-oauth-custody-{}-{}",
+            std::process::id(),
+            super::super::hex(nonce.as_bytes()),
         ));
-        fs::DirBuilder::new().mode(0o700).create(&directory).unwrap();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
         let (key, authorization) = partition("alice");
-        let binding = CredentialAnchorBinding::for_store("native-oauth", &key, &authorization).unwrap();
+        let binding =
+            CredentialAnchorBinding::for_store("native-oauth", &key, &authorization).unwrap();
         let anchor = TestAnchor(Arc::new(Mutex::new(AnchorState {
-            snapshot: CredentialAnchorSnapshot::new(binding, 0, CredentialAnchorState::Stable(None)),
+            snapshot: CredentialAnchorSnapshot::new(
+                binding,
+                0,
+                CredentialAnchorState::Stable(None),
+            ),
             lose_settlement_reply: false,
         })));
-        Self { directory, key, authorization, anchor, vault: TestVault::default() }
+        Self {
+            directory,
+            key,
+            authorization,
+            anchor,
+            vault: TestVault::default(),
+        }
     }
-    fn open(&self, cx: &Cx, client: &OAuthClient)
-        -> Result<OAuthRefreshStore<TestAnchor, TestVault>, OAuthRefreshStoreError>
-    {
+    fn open(
+        &self,
+        cx: &Cx,
+        client: &OAuthClient,
+    ) -> Result<OAuthRefreshStore<TestAnchor, TestVault>, OAuthRefreshStoreError> {
         let file = SecureAtomicFile::open(
-            cx, File::open(&self.directory).unwrap(), "grant", MAX_PROTECTED_REFRESH_GRANT_BYTES + 256,
-        ).unwrap();
-        OAuthRefreshStore::open(cx, file, &self.key, &self.authorization, "native-oauth",
-            self.anchor.clone(), self.vault.clone(), client).map(|(store, _)| store)
+            cx,
+            File::open(&self.directory).unwrap(),
+            "grant",
+            MAX_PROTECTED_REFRESH_GRANT_BYTES + 256,
+        )
+        .unwrap();
+        OAuthRefreshStore::open(
+            cx,
+            file,
+            &self.key,
+            &self.authorization,
+            "native-oauth",
+            self.anchor.clone(),
+            self.vault.clone(),
+            client,
+        )
+        .map(|(store, _)| store)
     }
-    fn sequence(&self) -> u64 { self.anchor.0.lock().unwrap().snapshot.sequence() }
-    fn bytes(&self) -> Vec<u8> { fs::read(self.directory.join("grant")).unwrap() }
+    fn sequence(&self) -> u64 {
+        self.anchor.0.lock().unwrap().snapshot.sequence()
+    }
+    fn bytes(&self) -> Vec<u8> {
+        fs::read(self.directory.join("grant")).unwrap()
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -269,27 +385,54 @@ fn anchored_refresh_custody_survives_file_reopen_and_consumes_exactly_once() {
     let fixture = Fixture::new();
     let mut store = fixture.open(&cx, &client).unwrap();
     let mut credentials = native::renewable_grant(&configuration);
-    let access = credentials.access.authorization_for_target(&configuration.resource);
+    let access = credentials
+        .access
+        .authorization_for_target(&configuration.resource);
     let expiry = credentials.expires_at();
-    let revision = store.store_refresh(&cx, &fixture.authorization, None, &mut credentials).unwrap();
+    let revision = store
+        .store_refresh(&cx, &fixture.authorization, None, &mut credentials)
+        .unwrap();
     assert_eq!(revision.generation(), 1);
     assert!(!credentials.has_refresh_token());
-    assert_eq!(credentials.access.authorization_for_target(&configuration.resource), access);
+    assert_eq!(
+        credentials
+            .access
+            .authorization_for_target(&configuration.resource),
+        access
+    );
     assert_eq!(credentials.expires_at(), expiry);
     for secret in [b"refresh-one".as_slice(), b"access-one".as_slice()] {
-        assert!(!fixture.bytes().windows(secret.len()).any(|bytes| bytes == secret));
+        assert!(
+            !fixture
+                .bytes()
+                .windows(secret.len())
+                .any(|bytes| bytes == secret)
+        );
     }
     drop(store);
     let mut reopened = fixture.open(&cx, &client).unwrap();
-    let grant = reopened.take_refresh(&cx, &fixture.authorization).unwrap().unwrap();
+    let grant = reopened
+        .take_refresh(&cx, &fixture.authorization)
+        .unwrap()
+        .unwrap();
     assert_eq!(grant.refresh_token, "refresh-one");
     assert_eq!(grant.scopes(), configuration.scopes);
     assert_eq!(reopened.revision().unwrap().generation(), 2);
-    assert!(reopened.take_refresh(&cx, &fixture.authorization).unwrap().is_none());
+    assert!(
+        reopened
+            .take_refresh(&cx, &fixture.authorization)
+            .unwrap()
+            .is_none()
+    );
     drop(grant);
     drop(reopened);
     let mut reopened = fixture.open(&cx, &client).unwrap();
-    assert!(reopened.take_refresh(&cx, &fixture.authorization).unwrap().is_none());
+    assert!(
+        reopened
+            .take_refresh(&cx, &fixture.authorization)
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(reopened.revision().unwrap().generation(), 2);
 }
 
@@ -307,7 +450,11 @@ fn refused_sealing_and_oversized_envelopes_preserve_live_refresh_ownership() {
             state.refuse_seal = !oversized;
             state.oversized_seal = oversized;
         }
-        assert!(store.store_refresh(&cx, &fixture.authorization, None, &mut credentials).is_err());
+        assert!(
+            store
+                .store_refresh(&cx, &fixture.authorization, None, &mut credentials)
+                .is_err()
+        );
         assert!(credentials.has_refresh_token());
         assert_eq!(store.revision(), None);
         assert_eq!(fixture.sequence(), 0);
@@ -317,9 +464,16 @@ fn refused_sealing_and_oversized_envelopes_preserve_live_refresh_ownership() {
             state.refuse_seal = false;
             state.oversized_seal = false;
         }
-        store.store_refresh(&cx, &fixture.authorization, None, &mut credentials).unwrap();
+        store
+            .store_refresh(&cx, &fixture.authorization, None, &mut credentials)
+            .unwrap();
         assert!(!credentials.has_refresh_token());
-        assert!(store.take_refresh(&cx, &fixture.authorization).unwrap().is_some());
+        assert!(
+            store
+                .take_refresh(&cx, &fixture.authorization)
+                .unwrap()
+                .is_some()
+        );
     }
 }
 
@@ -331,7 +485,9 @@ fn wrong_authorization_and_malformed_plaintext_cannot_consume_stored_grants() {
     let fixture = Fixture::new();
     let mut store = fixture.open(&cx, &client).unwrap();
     let mut credentials = native::renewable_grant(&configuration);
-    store.store_refresh(&cx, &fixture.authorization, None, &mut credentials).unwrap();
+    store
+        .store_refresh(&cx, &fixture.authorization, None, &mut credentials)
+        .unwrap();
     let (_, intruder) = partition("mallory");
     let before = fixture.bytes();
     let sequence = fixture.sequence();
@@ -340,11 +496,19 @@ fn wrong_authorization_and_malformed_plaintext_cannot_consume_stored_grants() {
     assert_eq!(fixture.sequence(), sequence);
     assert_eq!(fixture.bytes(), before);
     fixture.vault.0.lock().unwrap().corrupt_open = true;
-    assert!(matches!(store.take_refresh(&cx, &fixture.authorization), Err(OAuthRefreshStoreError::InvalidGrant)));
+    assert!(matches!(
+        store.take_refresh(&cx, &fixture.authorization),
+        Err(OAuthRefreshStoreError::InvalidGrant)
+    ));
     assert_eq!(fixture.sequence(), sequence);
     assert_eq!(fixture.bytes(), before);
     fixture.vault.0.lock().unwrap().corrupt_open = false;
-    assert!(store.take_refresh(&cx, &fixture.authorization).unwrap().is_some());
+    assert!(
+        store
+            .take_refresh(&cx, &fixture.authorization)
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]
@@ -355,19 +519,30 @@ fn changed_client_binding_does_not_destroy_the_original_persisted_grant() {
     let fixture = Fixture::new();
     let mut store = fixture.open(&cx, &client).unwrap();
     let mut credentials = native::renewable_grant(&configuration);
-    store.store_refresh(&cx, &fixture.authorization, None, &mut credentials).unwrap();
+    store
+        .store_refresh(&cx, &fixture.authorization, None, &mut credentials)
+        .unwrap();
     let before = fixture.bytes();
     let sequence = fixture.sequence();
     drop(store);
     let mut different = configuration.clone();
     different.client_id.push_str("-other");
     let mut mismatched = fixture.open(&cx, &OAuthClient::new(different)).unwrap();
-    assert!(mismatched.take_refresh(&cx, &fixture.authorization).is_err());
+    assert!(
+        mismatched
+            .take_refresh(&cx, &fixture.authorization)
+            .is_err()
+    );
     assert_eq!(fixture.bytes(), before);
     assert_eq!(fixture.sequence(), sequence);
     drop(mismatched);
     let mut original = fixture.open(&cx, &client).unwrap();
-    assert!(original.take_refresh(&cx, &fixture.authorization).unwrap().is_some());
+    assert!(
+        original
+            .take_refresh(&cx, &fixture.authorization)
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]
@@ -378,7 +553,9 @@ fn lost_take_settlement_reply_and_rollback_never_redeliver_refresh_ownership() {
     let fixture = Fixture::new();
     let mut store = fixture.open(&cx, &client).unwrap();
     let mut credentials = native::renewable_grant(&configuration);
-    store.store_refresh(&cx, &fixture.authorization, None, &mut credentials).unwrap();
+    store
+        .store_refresh(&cx, &fixture.authorization, None, &mut credentials)
+        .unwrap();
     let old_file = fixture.bytes();
     fixture.anchor.0.lock().unwrap().lose_settlement_reply = true;
     assert!(store.take_refresh(&cx, &fixture.authorization).is_err());
@@ -386,7 +563,12 @@ fn lost_take_settlement_reply_and_rollback_never_redeliver_refresh_ownership() {
     drop(store);
     fixture.anchor.0.lock().unwrap().lose_settlement_reply = false;
     let mut recovered = fixture.open(&cx, &client).unwrap();
-    assert!(recovered.take_refresh(&cx, &fixture.authorization).unwrap().is_none());
+    assert!(
+        recovered
+            .take_refresh(&cx, &fixture.authorization)
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(recovered.revision().unwrap().generation(), 2);
     drop(recovered);
     // Change only the replaceable data file, not its independent anchor.
@@ -404,23 +586,43 @@ fn stale_revision_and_cancelled_store_preserve_grants_and_provider_state() {
     let mut credentials = native::renewable_grant(&configuration);
     let stopped = Cx::for_testing();
     stopped.set_cancel_requested(true);
-    assert_eq!(store.store_refresh(&stopped, &fixture.authorization, None, &mut credentials).err(),
-        Some(OAuthRefreshStoreError::ContextStopped));
+    assert_eq!(
+        store
+            .store_refresh(&stopped, &fixture.authorization, None, &mut credentials)
+            .err(),
+        Some(OAuthRefreshStoreError::ContextStopped)
+    );
     assert_eq!(fixture.vault.0.lock().unwrap().seals, 0);
     assert_eq!(fixture.sequence(), 0);
     assert!(credentials.has_refresh_token());
-    store.store_refresh(&cx, &fixture.authorization, None, &mut credentials).unwrap();
+    store
+        .store_refresh(&cx, &fixture.authorization, None, &mut credentials)
+        .unwrap();
     let mut successor = native::renewable_grant(&configuration);
-    assert_eq!(store.store_refresh(&cx, &fixture.authorization, None, &mut successor).err(),
-        Some(OAuthRefreshStoreError::RevisionMismatch));
+    assert_eq!(
+        store
+            .store_refresh(&cx, &fixture.authorization, None, &mut successor)
+            .err(),
+        Some(OAuthRefreshStoreError::RevisionMismatch)
+    );
     assert!(successor.has_refresh_token());
     assert_eq!(fixture.vault.0.lock().unwrap().seals, 1);
     let revision = store.invalidate(&cx, &fixture.authorization).unwrap();
     let sequence = fixture.sequence();
-    assert_eq!(store.invalidate(&cx, &fixture.authorization).unwrap(), revision);
+    assert_eq!(
+        store.invalidate(&cx, &fixture.authorization).unwrap(),
+        revision
+    );
     assert_eq!(fixture.sequence(), sequence);
-    assert!(store.take_refresh(&cx, &fixture.authorization).unwrap().is_none());
-    store.store_refresh(&cx, &fixture.authorization, Some(revision), &mut successor).unwrap();
+    assert!(
+        store
+            .take_refresh(&cx, &fixture.authorization)
+            .unwrap()
+            .is_none()
+    );
+    store
+        .store_refresh(&cx, &fixture.authorization, Some(revision), &mut successor)
+        .unwrap();
     assert!(!successor.has_refresh_token());
 }
 

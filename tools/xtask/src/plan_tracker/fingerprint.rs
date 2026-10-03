@@ -102,7 +102,11 @@ struct Cursor<'a> {
 
 impl<'a> Cursor<'a> {
     fn new(bytes: &'a [u8], subject: &'static str) -> Self {
-        Self { bytes, offset: 0, subject }
+        Self {
+            bytes,
+            offset: 0,
+            subject,
+        }
     }
 
     fn fail(&self, field: &str, detail: impl Into<String>) -> Diagnostic {
@@ -145,7 +149,10 @@ impl<'a> Cursor<'a> {
     fn identifier(&mut self, limits: &Limits) -> Result<String, Diagnostic> {
         let length = usize::from(self.u16()?);
         if length == 0 || length > limits.max_id_bytes {
-            return Err(self.fail("id_len", format!("{length} is outside 1..={}", limits.max_id_bytes)));
+            return Err(self.fail(
+                "id_len",
+                format!("{length} is outside 1..={}", limits.max_id_bytes),
+            ));
         }
         let bytes = self.take(length)?;
         String::from_utf8(bytes.to_vec()).map_err(|error| self.fail("id", error.to_string()))
@@ -162,10 +169,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
-fn expect_header(
-    cursor: &mut Cursor<'_>,
-    magic: &[u8; 8],
-) -> Result<(), Diagnostic> {
+fn expect_header(cursor: &mut Cursor<'_>, magic: &[u8; 8]) -> Result<(), Diagnostic> {
     let observed = cursor.take(8)?;
     if observed != magic {
         return Err(cursor.fail(
@@ -192,7 +196,10 @@ pub fn decode_graph(bytes: &[u8], limits: &Limits) -> Result<DecodedGraph, Diagn
 
     let node_count = cursor.u32()? as usize;
     if node_count > limits.max_packages {
-        return Err(cursor.fail("node_count", format!("{node_count} exceeds {}", limits.max_packages)));
+        return Err(cursor.fail(
+            "node_count",
+            format!("{node_count} exceeds {}", limits.max_packages),
+        ));
     }
     let mut nodes = Vec::with_capacity(node_count.min(limits.max_packages));
     let mut previous: Option<String> = None;
@@ -201,7 +208,10 @@ pub fn decode_graph(bytes: &[u8], limits: &Limits) -> Result<DecodedGraph, Diagn
         if let Some(last) = &previous
             && byte_order(last, &id) != std::cmp::Ordering::Less
         {
-            return Err(cursor.fail("node_order", format!("{last:?} then {id:?} is not ascending")));
+            return Err(cursor.fail(
+                "node_order",
+                format!("{last:?} then {id:?} is not ascending"),
+            ));
         }
         previous = Some(id.clone());
         nodes.push(id);
@@ -209,7 +219,10 @@ pub fn decode_graph(bytes: &[u8], limits: &Limits) -> Result<DecodedGraph, Diagn
 
     let edge_count = cursor.u32()? as usize;
     if edge_count > limits.max_edges {
-        return Err(cursor.fail("edge_count", format!("{edge_count} exceeds {}", limits.max_edges)));
+        return Err(cursor.fail(
+            "edge_count",
+            format!("{edge_count} exceeds {}", limits.max_edges),
+        ));
     }
     let known: BTreeSet<&str> = nodes.iter().map(String::as_str).collect();
     let mut edges = Vec::with_capacity(edge_count.min(limits.max_edges));
@@ -228,8 +241,8 @@ pub fn decode_graph(bytes: &[u8], limits: &Limits) -> Result<DecodedGraph, Diagn
         }
         let candidate = (dependent, prerequisite);
         if let Some(last) = &previous_edge {
-            let ordering = byte_order(&last.0, &candidate.0)
-                .then_with(|| byte_order(&last.1, &candidate.1));
+            let ordering =
+                byte_order(&last.0, &candidate.0).then_with(|| byte_order(&last.1, &candidate.1));
             if ordering != std::cmp::Ordering::Less {
                 return Err(cursor.fail(
                     "edge_order",
@@ -252,7 +265,10 @@ pub fn decode_corpus(bytes: &[u8], limits: &Limits) -> Result<DecodedCorpus, Dia
 
     let count = cursor.u32()? as usize;
     if count > limits.max_packages {
-        return Err(cursor.fail("package_count", format!("{count} exceeds {}", limits.max_packages)));
+        return Err(cursor.fail(
+            "package_count",
+            format!("{count} exceeds {}", limits.max_packages),
+        ));
     }
     let mut packages = Vec::with_capacity(count.min(limits.max_packages));
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -320,8 +336,8 @@ pub fn graph_reencodes_identically(bytes: &[u8], limits: &Limits) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::plan::Package;
+    use super::*;
 
     fn limits() -> Limits {
         Limits::default()
@@ -578,12 +594,20 @@ mod tests {
         let stream = encode_graph(&plan(&["A"], &[]));
         let rendered = fingerprint_hex(&stream);
         assert_eq!(rendered.len(), 64);
-        assert!(rendered.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert!(
+            rendered
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
 
         // Distinct wrong answers.
         let raw = fingerprint(&stream);
         assert_ne!(rendered, hex(&sha256(&raw)), "double hashing");
-        assert_ne!(rendered, hex(&sha256(rendered.as_bytes())), "hashing the hex text");
+        assert_ne!(
+            rendered,
+            hex(&sha256(rendered.as_bytes())),
+            "hashing the hex text"
+        );
         assert_ne!(rendered, rendered[..32].to_owned(), "truncation");
         assert_ne!(rendered, rendered.to_uppercase(), "uppercase");
     }

@@ -10,28 +10,43 @@ use std::task::{Context, Wake, Waker};
 
 async fn pending_once<F: Future + ?Sized>(mut future: Pin<&mut F>) {
     poll_fn(|task| {
-        assert!(future.as_mut().poll(task).is_pending(), "operation must remain pending at this rendezvous");
+        assert!(
+            future.as_mut().poll(task).is_pending(),
+            "operation must remain pending at this rendezvous"
+        );
         Poll::Ready(())
-    }).await;
+    })
+    .await;
 }
 
 async fn reached_issuer<F: Future + ?Sized>(
-    cx: &Cx, mut future: Pin<&mut F>, notice: &mut oneshot::Receiver<()>,
+    cx: &Cx,
+    mut future: Pin<&mut F>,
+    notice: &mut oneshot::Receiver<()>,
 ) {
     let mut notice = std::pin::pin!(notice.recv(cx));
     poll_fn(|task| {
         assert!(future.as_mut().poll(task).is_pending());
         notice.as_mut().poll(task)
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }
 
 async fn incoming(peer: &Peer, post: bool) -> TlsStream<TcpStream> {
-    if post { post_token_request(peer, "service-client", "service-secret").await }
-    else { peer.token_request().await }
+    if post {
+        post_token_request(peer, "service-client", "service-secret").await
+    } else {
+        peer.token_request().await
+    }
 }
 
 #[derive(Clone, Copy)]
-enum Rejection { InvalidToken, Denied, Lost }
+enum Rejection {
+    InvalidToken,
+    Denied,
+    Lost,
+}
 async fn reject(socket: &mut TlsStream<TcpStream>, rejection: Rejection) {
     match rejection {
         Rejection::InvalidToken => {
@@ -44,7 +59,7 @@ async fn reject(socket: &mut TlsStream<TcpStream>, rejection: Rejection) {
             socket.write_all(format!("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
             socket.flush().await.unwrap();
         }
-        Rejection::Lost => {}, // Drop the accepted TLS connection without a reply.
+        Rejection::Lost => {} // Drop the accepted TLS connection without a reply.
     }
 }
 fn assert_leader_error(error: Error, rejection: Rejection) {
@@ -74,12 +89,18 @@ fn failed_grant_does_not_turn_joined_callers_into_issuer_retries() {
                 let application = async {
                     let mut leader = Box::pin(client.credential(&cx));
                     reached_issuer(&cx, leader.as_mut(), &mut arrival).await;
-                    let mut followers: Vec<_> = (0..8).map(|_| Box::pin(client.credential(&cx))).collect();
-                    for follower in &mut followers { pending_once(follower.as_mut()).await; }
+                    let mut followers: Vec<_> =
+                        (0..8).map(|_| Box::pin(client.credential(&cx))).collect();
+                    for follower in &mut followers {
+                        pending_once(follower.as_mut()).await;
+                    }
                     release.send(&cx, ()).unwrap();
                     assert_leader_error(leader.await.err().unwrap(), rejection);
                     for follower in followers {
-                        assert!(matches!(follower.await, Err(Error::ConcurrentAcquisitionFailed)));
+                        assert!(matches!(
+                            follower.await,
+                            Err(Error::ConcurrentAcquisitionFailed)
+                        ));
                     }
                 };
                 pair(server, application).await;
@@ -88,7 +109,11 @@ fn failed_grant_does_not_turn_joined_callers_into_issuer_retries() {
                 peer.quiet();
                 let body = ordinary_token().to_string();
                 let ((), result) = pair(reply(&peer, post, &body), client.credential(&cx)).await;
-                assert_eq!(result.unwrap().generation(), 1, "later explicit acquisition is not a follower retry");
+                assert_eq!(
+                    result.unwrap().generation(),
+                    1,
+                    "later explicit acquisition is not a follower retry"
+                );
                 core_succeeds(&peer, &cx, &client, "admitted-access").await;
                 assert_eq!(peer.grants.load(Ordering::SeqCst), 2);
                 assert!(cx.checkpoint().is_ok());
@@ -100,8 +125,12 @@ fn failed_grant_does_not_turn_joined_callers_into_issuer_retries() {
 
 struct WakeCount(AtomicUsize);
 impl Wake for WakeCount {
-    fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
-    fn wake_by_ref(self: &Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 #[test]
@@ -119,16 +148,30 @@ fn abandoned_leader_wakes_every_joiner_and_cannot_be_replaced_by_a_later_success
             let application = async {
                 let mut leader = Box::pin(client.credential(&cx));
                 reached_issuer(&cx, leader.as_mut(), &mut arrival).await;
-                let mut followers: Vec<_> = (0..8).map(|_| Box::pin(client.credential(&cx))).collect();
-                let counters: Vec<_> = (0..followers.len()).map(|_| Arc::new(WakeCount(AtomicUsize::new(0)))).collect();
+                let mut followers: Vec<_> =
+                    (0..8).map(|_| Box::pin(client.credential(&cx))).collect();
+                let counters: Vec<_> = (0..followers.len())
+                    .map(|_| Arc::new(WakeCount(AtomicUsize::new(0))))
+                    .collect();
                 for (follower, counter) in followers.iter_mut().zip(&counters) {
                     let waker = Waker::from(counter.clone());
-                    assert!(follower.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+                    assert!(
+                        follower
+                            .as_mut()
+                            .poll(&mut Context::from_waker(&waker))
+                            .is_pending()
+                    );
                 }
-                let before: Vec<_> = counters.iter().map(|counter| counter.0.load(Ordering::SeqCst)).collect();
+                let before: Vec<_> = counters
+                    .iter()
+                    .map(|counter| counter.0.load(Ordering::SeqCst))
+                    .collect();
                 drop(leader);
                 for (counter, before) in counters.iter().zip(before) {
-                    assert!(counter.0.load(Ordering::SeqCst) > before, "abandonment must actually wake EVERY registered public caller");
+                    assert!(
+                        counter.0.load(Ordering::SeqCst) > before,
+                        "abandonment must actually wake EVERY registered public caller"
+                    );
                 }
                 followers
             };
@@ -141,7 +184,10 @@ fn abandoned_leader_wakes_every_joiner_and_cannot_be_replaced_by_a_later_success
             let ((), fresh) = pair(reply(&peer, post, &body), client.credential(&cx)).await;
             assert_eq!(fresh.unwrap().generation(), 1);
             for follower in followers {
-                assert!(matches!(follower.await, Err(Error::ConcurrentAcquisitionFailed)));
+                assert!(matches!(
+                    follower.await,
+                    Err(Error::ConcurrentAcquisitionFailed)
+                ));
             }
             core_succeeds(&peer, &cx, &client, "admitted-access").await;
             assert_eq!(peer.grants.load(Ordering::SeqCst), 2);
@@ -175,18 +221,30 @@ fn cancelled_and_dropped_joiners_release_capacity_without_stopping_the_leader() 
                 pending_once(dropped.as_mut()).await;
                 // The existing declared bound is 64, counting the elected
                 // leader and every waiting caller, not just network sockets.
-                let mut followers: Vec<_> = (0..61).map(|_| Box::pin(client.credential(&cx))).collect();
-                for follower in &mut followers { pending_once(follower.as_mut()).await; }
-                assert!(matches!(client.credential(&cx).await, Err(Error::Saturated)));
+                let mut followers: Vec<_> =
+                    (0..61).map(|_| Box::pin(client.credential(&cx))).collect();
+                for follower in &mut followers {
+                    pending_once(follower.as_mut()).await;
+                }
+                assert!(matches!(
+                    client.credential(&cx).await,
+                    Err(Error::Saturated)
+                ));
                 cancelled.cancel();
-                assert!(matches!(stopped.await, Err(Error::Discovery(OAuthDiscoveryError::Cancelled))));
+                assert!(matches!(
+                    stopped.await,
+                    Err(Error::Discovery(OAuthDiscoveryError::Cancelled))
+                ));
                 drop(dropped);
                 for _ in 0..2 {
                     let mut replacement = Box::pin(client.credential(&cx));
                     pending_once(replacement.as_mut()).await;
                     followers.push(replacement);
                 }
-                assert!(matches!(client.credential(&cx).await, Err(Error::Saturated)));
+                assert!(matches!(
+                    client.credential(&cx).await,
+                    Err(Error::Saturated)
+                ));
                 release.send(&cx, ()).unwrap();
                 let admitted = leader.await.unwrap();
                 for follower in followers {
@@ -220,7 +278,11 @@ fn shared_renewal_handoffs_keep_the_new_generation_after_old_revocation() {
             let ((), old) = pair(reply(&peer, post, &body), client.credential(&cx)).await;
             let old = old.unwrap();
             let old_expiry = old.expires_at();
-            asupersync::time::sleep(cx.now(), old_expiry.saturating_duration_since(Instant::now()) + Duration::from_millis(20)).await;
+            asupersync::time::sleep(
+                cx.now(),
+                old_expiry.saturating_duration_since(Instant::now()) + Duration::from_millis(20),
+            )
+            .await;
             assert!(Instant::now() >= old_expiry);
             let (arrived, mut arrival) = oneshot::channel();
             let (release, mut released) = oneshot::channel();
@@ -235,8 +297,11 @@ fn shared_renewal_handoffs_keep_the_new_generation_after_old_revocation() {
             let application = async {
                 let mut leader = Box::pin(client.credential(&cx));
                 reached_issuer(&cx, leader.as_mut(), &mut arrival).await;
-                let mut followers: Vec<_> = (0..8).map(|_| Box::pin(client.credential(&cx))).collect();
-                for follower in &mut followers { pending_once(follower.as_mut()).await; }
+                let mut followers: Vec<_> =
+                    (0..8).map(|_| Box::pin(client.credential(&cx))).collect();
+                for follower in &mut followers {
+                    pending_once(follower.as_mut()).await;
+                }
                 release.send(&cx, ()).unwrap();
                 let admitted = leader.await.unwrap();
                 assert_eq!(admitted.generation(), 2);
@@ -274,11 +339,16 @@ fn owner_closure_wakes_all_joiners_and_never_dispatches_a_second_grant() {
             let application = async {
                 let mut leader = Box::pin(client.credential(&cx));
                 reached_issuer(&cx, leader.as_mut(), &mut arrival).await;
-                let mut followers: Vec<_> = (0..8).map(|_| Box::pin(client.credential(&cx))).collect();
-                for follower in &mut followers { pending_once(follower.as_mut()).await; }
+                let mut followers: Vec<_> =
+                    (0..8).map(|_| Box::pin(client.credential(&cx))).collect();
+                for follower in &mut followers {
+                    pending_once(follower.as_mut()).await;
+                }
                 client.close();
                 assert!(matches!(leader.await, Err(Error::Closed)));
-                for follower in followers { assert!(matches!(follower.await, Err(Error::Closed))); }
+                for follower in followers {
+                    assert!(matches!(follower.await, Err(Error::Closed)));
+                }
             };
             pair(server, application).await;
             assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
@@ -319,7 +389,10 @@ fn separately_discovered_clients_do_not_share_a_failed_flight_or_token() {
                 assert_eq!(independent.generation(), 1);
                 release.send(&cx, ()).unwrap();
                 assert!(matches!(leader.await, Err(Error::InvalidToken)));
-                assert!(matches!(follower.await, Err(Error::ConcurrentAcquisitionFailed)));
+                assert!(matches!(
+                    follower.await,
+                    Err(Error::ConcurrentAcquisitionFailed)
+                ));
                 first.close();
                 assert!(!independent.credential().is_revoked());
             };

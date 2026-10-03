@@ -361,10 +361,8 @@ pub fn run(root: &Path, reservations_input: &ReservationInputs) -> Result<BRun, 
 
     // B-14 workspace-unsafe-policy: the crate roots carry the attribute and
     // every workspace member inherits the root lint policy.
-    let mut b14 = policy::check_unsafe_policy(
-        root,
-        &["tools/xtask/src/lib.rs", "tools/xtask/src/main.rs"],
-    );
+    let mut b14 =
+        policy::check_unsafe_policy(root, &["tools/xtask/src/lib.rs", "tools/xtask/src/main.rs"]);
     b14.extend(policy::check_workspace_unsafe_policy(root));
     reports.push(b14);
 

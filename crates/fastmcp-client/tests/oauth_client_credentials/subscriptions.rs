@@ -7,17 +7,37 @@ use fastmcp_client::http_auth::discovery::client_credentials::tasks::subscriptio
     ClientCredentialsSubscriptionLimits, ClientCredentialsTaskSubscription,
 };
 use fastmcp_client::http_executor::ModernHttpSubscriptionListenEvent as ListenEvent;
-use fastmcp_protocol::{SubscriptionFilter, FINAL_SUBSCRIPTION_ID_META_KEY};
 use fastmcp_protocol::tasks_extension::task_subscription_ids;
+use fastmcp_protocol::{FINAL_SUBSCRIPTION_ID_META_KEY, SubscriptionFilter};
 
 const SUB_CHILD: &str = "FASTMCP_TEST_MACHINE_TASK_SUBSCRIPTION_CASE";
 
 #[derive(Clone, Copy)]
 enum SubCase {
-    Live, MissingTasks, MalformedAuth, WrongAck, WidenedAck, BeforeAck,
-    WrongTask, WrongSubscription, WrongResource, DuplicateAck, Truncated,
-    RemoteError, Cancel, Close, Abandon, Expiry, Deadline, RecordLimit,
-    Renewal, Preflight, Denied, Redirect, LostListen, NarrowedAck,
+    Live,
+    MissingTasks,
+    MalformedAuth,
+    WrongAck,
+    WidenedAck,
+    BeforeAck,
+    WrongTask,
+    WrongSubscription,
+    WrongResource,
+    DuplicateAck,
+    Truncated,
+    RemoteError,
+    Cancel,
+    Close,
+    Abandon,
+    Expiry,
+    Deadline,
+    RecordLimit,
+    Renewal,
+    Preflight,
+    Denied,
+    Redirect,
+    LostListen,
+    NarrowedAck,
 }
 
 fn isolated_subscription(name: &str, case: SubCase) {
@@ -27,71 +47,136 @@ fn isolated_subscription(name: &str, case: SubCase) {
         return;
     }
     let roots = RootFile::create();
-    let mut child = Child(Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture", "--test-threads=1"])
-        .env(SUB_CHILD, name).env("SSL_CERT_FILE", &roots.0).env_remove("SSL_CERT_DIR")
-        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit())
-        .spawn().unwrap());
+    let mut child = Child(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(SUB_CHILD, name)
+            .env("SSL_CERT_FILE", &roots.0)
+            .env_remove("SSL_CERT_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             assert!(status.success(), "machine subscription TLS case failed");
             return;
         }
-        assert!(Instant::now() < deadline, "machine subscription process bound expired");
+        assert!(
+            Instant::now() < deadline,
+            "machine subscription process bound expired"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
 
 fn selected() -> SubscriptionFilter {
     serde_json::from_value(json!({"taskIds":["machine-task"], "toolsListChanged":true,
-        "resourceSubscriptions":["file:///watched"]})).unwrap()
+        "resourceSubscriptions":["file:///watched"]}))
+    .unwrap()
 }
 fn ack(id: i64, filter: &SubscriptionFilter) -> String {
     json!({"jsonrpc":"2.0", "method":"notifications/subscriptions/acknowledged",
-        "params":{"_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):id}, "notifications":filter}}).to_string()
+        "params":{"_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):id}, "notifications":filter}})
+    .to_string()
 }
 fn terminal_listen(id: i64) -> String {
-    terminal(id, &json!({"resultType":"complete", "_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):id}}).to_string())
+    terminal(
+        id,
+        &json!({"resultType":"complete", "_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):id}})
+            .to_string(),
+    )
 }
 fn task_notice(subscription: i64, task_id: &str, status: &str) -> String {
     json!({"jsonrpc":"2.0", "method":"notifications/tasks", "params":{
         "_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):subscription}, "taskId":task_id,
         "status":status, "createdAt":"2026-09-17T00:00:00Z",
         "lastUpdatedAt":"2026-09-17T00:00:00Z", "ttlMs":60000
-    }}).to_string()
+    }})
+    .to_string()
 }
 fn resource_notice(uri: &str) -> String {
-    json!({"jsonrpc":"2.0", "method":"notifications/resources/updated", "params":{"uri":uri}}).to_string()
+    json!({"jsonrpc":"2.0", "method":"notifications/resources/updated", "params":{"uri":uri}})
+        .to_string()
 }
-async fn stream(peer: &Peer, id: i64, token: &str, filter: &SubscriptionFilter) -> TlsStream<TcpStream> {
+async fn stream(
+    peer: &Peer,
+    id: i64,
+    token: &str,
+    filter: &SubscriptionFilter,
+) -> TlsStream<TcpStream> {
     discover(peer, id, token, &discovery()).await;
     let (mut tls, request) = rpc(peer, id + 1, "subscriptions/listen", token).await;
-    assert_eq!(request["params"]["notifications"], serde_json::to_value(filter).unwrap());
-    tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+    assert_eq!(
+        request["params"]["notifications"],
+        serde_json::to_value(filter).unwrap()
+    );
+    tls.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+    )
+    .await
+    .unwrap();
     tls.flush().await.unwrap();
     tls
 }
-async fn open(tasks: &ClientCredentialsTasksClient, cx: &Cx, id: i64) -> ClientCredentialsTaskSubscription {
-    tasks.subscribe(cx, RequestId::Number(id), RequestId::Number(id + 1), selected(),
-        ClientCredentialsSubscriptionLimits::default()).await.unwrap()
+async fn open(
+    tasks: &ClientCredentialsTasksClient,
+    cx: &Cx,
+    id: i64,
+) -> ClientCredentialsTaskSubscription {
+    tasks
+        .subscribe(
+            cx,
+            RequestId::Number(id),
+            RequestId::Number(id + 1),
+            selected(),
+            ClientCredentialsSubscriptionLimits::default(),
+        )
+        .await
+        .unwrap()
 }
-async fn receive_ack(subscription: &mut ClientCredentialsTaskSubscription, cx: &Cx, filter: &SubscriptionFilter) {
+async fn receive_ack(
+    subscription: &mut ClientCredentialsTaskSubscription,
+    cx: &Cx,
+    filter: &SubscriptionFilter,
+) {
     assert!(subscription.accepted_filter().is_none());
-    let Some(ListenEvent::Acknowledged { accepted_filter }) = subscription.next_event(cx).await.unwrap()
-        else { panic!("first record must be the admitted ACK"); };
-    assert_eq!(serde_json::to_value(&accepted_filter).unwrap(), serde_json::to_value(filter).unwrap());
-    assert_eq!(serde_json::to_value(subscription.accepted_filter().unwrap()).unwrap(),
-        serde_json::to_value(filter).unwrap());
+    let Some(ListenEvent::Acknowledged { accepted_filter }) =
+        subscription.next_event(cx).await.unwrap()
+    else {
+        panic!("first record must be the admitted ACK");
+    };
+    assert_eq!(
+        serde_json::to_value(&accepted_filter).unwrap(),
+        serde_json::to_value(filter).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(subscription.accepted_filter().unwrap()).unwrap(),
+        serde_json::to_value(filter).unwrap()
+    );
 }
 async fn receive_terminal(subscription: &mut ClientCredentialsTaskSubscription, cx: &Cx, id: i64) {
-    let Some(ListenEvent::Terminal { subscription_id, .. }) = subscription.next_event(cx).await.unwrap()
-        else { panic!("correlated listen terminal required"); };
+    let Some(ListenEvent::Terminal {
+        subscription_id, ..
+    }) = subscription.next_event(cx).await.unwrap()
+    else {
+        panic!("correlated listen terminal required");
+    };
     assert!(subscription_id.correlates_with(&RequestId::Number(id)));
     assert!(subscription.next_event(cx).await.unwrap().is_none());
     assert!(subscription.next_event(cx).await.unwrap().is_none());
 }
-async fn healthy_listen(peer: &Peer, tasks: &ClientCredentialsTasksClient, cx: &Cx, id: i64, token: &str, generation: u64) {
+async fn healthy_listen(
+    peer: &Peer,
+    tasks: &ClientCredentialsTasksClient,
+    cx: &Cx,
+    id: i64,
+    token: &str,
+    generation: u64,
+) {
     let server = async {
         let mut tls = stream(peer, id, token, &selected()).await;
         event(&mut tls, &ack(id + 1, &selected()), false).await;
@@ -375,50 +460,170 @@ fn explicit_resource_ca_survives_machine_task_and_resource_subscription() {
 }
 
 #[test]
-fn machine_subscriptions_deliver_live_task_catalog_and_resource_events() { isolated_subscription("tasks::subscriptions::machine_subscriptions_deliver_live_task_catalog_and_resource_events", SubCase::Live); }
+fn machine_subscriptions_deliver_live_task_catalog_and_resource_events() {
+    isolated_subscription(
+        "tasks::subscriptions::machine_subscriptions_deliver_live_task_catalog_and_resource_events",
+        SubCase::Live,
+    );
+}
 #[test]
-fn missing_tasks_advertisement_prevents_the_listen_post() { isolated_subscription("tasks::subscriptions::missing_tasks_advertisement_prevents_the_listen_post", SubCase::MissingTasks); }
+fn missing_tasks_advertisement_prevents_the_listen_post() {
+    isolated_subscription(
+        "tasks::subscriptions::missing_tasks_advertisement_prevents_the_listen_post",
+        SubCase::MissingTasks,
+    );
+}
 #[test]
-fn malformed_auth_advertisement_prevents_the_listen_post() { isolated_subscription("tasks::subscriptions::malformed_auth_advertisement_prevents_the_listen_post", SubCase::MalformedAuth); }
+fn malformed_auth_advertisement_prevents_the_listen_post() {
+    isolated_subscription(
+        "tasks::subscriptions::malformed_auth_advertisement_prevents_the_listen_post",
+        SubCase::MalformedAuth,
+    );
+}
 #[test]
-fn foreign_ack_identity_does_not_publish_filter_state() { isolated_subscription("tasks::subscriptions::foreign_ack_identity_does_not_publish_filter_state", SubCase::WrongAck); }
+fn foreign_ack_identity_does_not_publish_filter_state() {
+    isolated_subscription(
+        "tasks::subscriptions::foreign_ack_identity_does_not_publish_filter_state",
+        SubCase::WrongAck,
+    );
+}
 #[test]
-fn widened_ack_does_not_publish_filter_state() { isolated_subscription("tasks::subscriptions::widened_ack_does_not_publish_filter_state", SubCase::WidenedAck); }
+fn widened_ack_does_not_publish_filter_state() {
+    isolated_subscription(
+        "tasks::subscriptions::widened_ack_does_not_publish_filter_state",
+        SubCase::WidenedAck,
+    );
+}
 #[test]
-fn task_event_before_ack_is_not_delivered() { isolated_subscription("tasks::subscriptions::task_event_before_ack_is_not_delivered", SubCase::BeforeAck); }
+fn task_event_before_ack_is_not_delivered() {
+    isolated_subscription(
+        "tasks::subscriptions::task_event_before_ack_is_not_delivered",
+        SubCase::BeforeAck,
+    );
+}
 #[test]
-fn unselected_task_event_closes_only_its_listen() { isolated_subscription("tasks::subscriptions::unselected_task_event_closes_only_its_listen", SubCase::WrongTask); }
+fn unselected_task_event_closes_only_its_listen() {
+    isolated_subscription(
+        "tasks::subscriptions::unselected_task_event_closes_only_its_listen",
+        SubCase::WrongTask,
+    );
+}
 #[test]
-fn task_event_requires_the_opening_subscription_identity() { isolated_subscription("tasks::subscriptions::task_event_requires_the_opening_subscription_identity", SubCase::WrongSubscription); }
+fn task_event_requires_the_opening_subscription_identity() {
+    isolated_subscription(
+        "tasks::subscriptions::task_event_requires_the_opening_subscription_identity",
+        SubCase::WrongSubscription,
+    );
+}
 #[test]
-fn unselected_resource_event_closes_only_its_listen() { isolated_subscription("tasks::subscriptions::unselected_resource_event_closes_only_its_listen", SubCase::WrongResource); }
+fn unselected_resource_event_closes_only_its_listen() {
+    isolated_subscription(
+        "tasks::subscriptions::unselected_resource_event_closes_only_its_listen",
+        SubCase::WrongResource,
+    );
+}
 #[test]
-fn duplicate_ack_cannot_replace_the_accepted_filter() { isolated_subscription("tasks::subscriptions::duplicate_ack_cannot_replace_the_accepted_filter", SubCase::DuplicateAck); }
+fn duplicate_ack_cannot_replace_the_accepted_filter() {
+    isolated_subscription(
+        "tasks::subscriptions::duplicate_ack_cannot_replace_the_accepted_filter",
+        SubCase::DuplicateAck,
+    );
+}
 #[test]
-fn clean_http_eof_without_a_listen_terminal_is_failure() { isolated_subscription("tasks::subscriptions::clean_http_eof_without_a_listen_terminal_is_failure", SubCase::Truncated); }
+fn clean_http_eof_without_a_listen_terminal_is_failure() {
+    isolated_subscription(
+        "tasks::subscriptions::clean_http_eof_without_a_listen_terminal_is_failure",
+        SubCase::Truncated,
+    );
+}
 #[test]
-fn subscription_errors_never_expose_peer_secrets() { isolated_subscription("tasks::subscriptions::subscription_errors_never_expose_peer_secrets", SubCase::RemoteError); }
+fn subscription_errors_never_expose_peer_secrets() {
+    isolated_subscription(
+        "tasks::subscriptions::subscription_errors_never_expose_peer_secrets",
+        SubCase::RemoteError,
+    );
+}
 #[test]
-fn idle_listen_cancellation_is_local_and_does_not_cancel_tasks() { isolated_subscription("tasks::subscriptions::idle_listen_cancellation_is_local_and_does_not_cancel_tasks", SubCase::Cancel); }
+fn idle_listen_cancellation_is_local_and_does_not_cancel_tasks() {
+    isolated_subscription(
+        "tasks::subscriptions::idle_listen_cancellation_is_local_and_does_not_cancel_tasks",
+        SubCase::Cancel,
+    );
+}
 #[test]
-fn machine_owner_close_wakes_an_idle_subscription() { isolated_subscription("tasks::subscriptions::machine_owner_close_wakes_an_idle_subscription", SubCase::Close); }
+fn machine_owner_close_wakes_an_idle_subscription() {
+    isolated_subscription(
+        "tasks::subscriptions::machine_owner_close_wakes_an_idle_subscription",
+        SubCase::Close,
+    );
+}
 #[test]
-fn abandoned_subscription_read_releases_its_socket_and_parser() { isolated_subscription("tasks::subscriptions::abandoned_subscription_read_releases_its_socket_and_parser", SubCase::Abandon); }
+fn abandoned_subscription_read_releases_its_socket_and_parser() {
+    isolated_subscription(
+        "tasks::subscriptions::abandoned_subscription_read_releases_its_socket_and_parser",
+        SubCase::Abandon,
+    );
+}
 #[test]
-fn subscription_cannot_outlive_its_opening_access_token() { isolated_subscription("tasks::subscriptions::subscription_cannot_outlive_its_opening_access_token", SubCase::Expiry); }
+fn subscription_cannot_outlive_its_opening_access_token() {
+    isolated_subscription(
+        "tasks::subscriptions::subscription_cannot_outlive_its_opening_access_token",
+        SubCase::Expiry,
+    );
+}
 #[test]
-fn subscription_deadline_fires_without_peer_activity() { isolated_subscription("tasks::subscriptions::subscription_deadline_fires_without_peer_activity", SubCase::Deadline); }
+fn subscription_deadline_fires_without_peer_activity() {
+    isolated_subscription(
+        "tasks::subscriptions::subscription_deadline_fires_without_peer_activity",
+        SubCase::Deadline,
+    );
+}
 #[test]
-fn record_budget_closes_without_polling_or_reconnecting() { isolated_subscription("tasks::subscriptions::record_budget_closes_without_polling_or_reconnecting", SubCase::RecordLimit); }
+fn record_budget_closes_without_polling_or_reconnecting() {
+    isolated_subscription(
+        "tasks::subscriptions::record_budget_closes_without_polling_or_reconnecting",
+        SubCase::RecordLimit,
+    );
+}
 #[test]
-fn renewed_machine_token_cannot_extend_an_existing_subscription() { isolated_subscription("tasks::subscriptions::renewed_machine_token_cannot_extend_an_existing_subscription", SubCase::Renewal); }
+fn renewed_machine_token_cannot_extend_an_existing_subscription() {
+    isolated_subscription(
+        "tasks::subscriptions::renewed_machine_token_cannot_extend_an_existing_subscription",
+        SubCase::Renewal,
+    );
+}
 #[test]
-fn invalid_and_cancelled_subscription_requests_have_no_grant_effect() { isolated_subscription("tasks::subscriptions::invalid_and_cancelled_subscription_requests_have_no_grant_effect", SubCase::Preflight); }
+fn invalid_and_cancelled_subscription_requests_have_no_grant_effect() {
+    isolated_subscription(
+        "tasks::subscriptions::invalid_and_cancelled_subscription_requests_have_no_grant_effect",
+        SubCase::Preflight,
+    );
+}
 #[test]
-fn unauthorized_listen_is_not_replayed_with_a_new_token() { isolated_subscription("tasks::subscriptions::unauthorized_listen_is_not_replayed_with_a_new_token", SubCase::Denied); }
+fn unauthorized_listen_is_not_replayed_with_a_new_token() {
+    isolated_subscription(
+        "tasks::subscriptions::unauthorized_listen_is_not_replayed_with_a_new_token",
+        SubCase::Denied,
+    );
+}
 #[test]
-fn listen_redirect_is_not_followed() { isolated_subscription("tasks::subscriptions::listen_redirect_is_not_followed", SubCase::Redirect); }
+fn listen_redirect_is_not_followed() {
+    isolated_subscription(
+        "tasks::subscriptions::listen_redirect_is_not_followed",
+        SubCase::Redirect,
+    );
+}
 #[test]
-fn lost_listen_response_does_not_trigger_reconnection() { isolated_subscription("tasks::subscriptions::lost_listen_response_does_not_trigger_reconnection", SubCase::LostListen); }
+fn lost_listen_response_does_not_trigger_reconnection() {
+    isolated_subscription(
+        "tasks::subscriptions::lost_listen_response_does_not_trigger_reconnection",
+        SubCase::LostListen,
+    );
+}
 #[test]
-fn narrowed_ack_exposes_only_the_actually_watched_selection() { isolated_subscription("tasks::subscriptions::narrowed_ack_exposes_only_the_actually_watched_selection", SubCase::NarrowedAck); }
+fn narrowed_ack_exposes_only_the_actually_watched_selection() {
+    isolated_subscription(
+        "tasks::subscriptions::narrowed_ack_exposes_only_the_actually_watched_selection",
+        SubCase::NarrowedAck,
+    );
+}

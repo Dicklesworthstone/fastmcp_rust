@@ -16,10 +16,9 @@ use fastmcp_core::CanonicalHttpUrl;
 use fastmcp_protocol::{CoreRequest, FinalInputResponses, InputRequiredResult, RequestId};
 
 use super::{
-    InputSelection, ManagedCoreCall, ManagedCoreError, ManagedCoreEvent,
-    ManagedInteraction, ManagedInteractionError, ManagedInteractionEvent, Step,
-    admit_challenge, admit_fresh_id, bounded_wait, continuation_request_selected,
-    input_required,
+    InputSelection, ManagedCoreCall, ManagedCoreError, ManagedCoreEvent, ManagedInteraction,
+    ManagedInteractionError, ManagedInteractionEvent, Step, admit_challenge, admit_fresh_id,
+    bounded_wait, continuation_request_selected, input_required,
 };
 use crate::http_auth::managed::OAuthSessionError;
 use crate::http_executor::{ModernHttpExecutorError, ModernHttpResponseKind};
@@ -51,16 +50,25 @@ pub struct ContinuationReplayContract {
     maximum_recoveries: usize,
 }
 impl ContinuationReplayContract {
-    pub fn for_configured_endpoint(resource: CanonicalHttpUrl, maximum_recoveries: usize)
-        -> Result<Self, ContinuationRecoveryError>
-    {
-        if !resource.as_str().starts_with("https://") || !(1..=MAX_RECOVERIES).contains(&maximum_recoveries) {
+    pub fn for_configured_endpoint(
+        resource: CanonicalHttpUrl,
+        maximum_recoveries: usize,
+    ) -> Result<Self, ContinuationRecoveryError> {
+        if !resource.as_str().starts_with("https://")
+            || !(1..=MAX_RECOVERIES).contains(&maximum_recoveries)
+        {
             return Err(ContinuationRecoveryError::InvalidContract);
         }
-        Ok(Self { resource, maximum_recoveries })
+        Ok(Self {
+            resource,
+            maximum_recoveries,
+        })
     }
 
-    pub(crate) fn admit_endpoint(&self, resource: &CanonicalHttpUrl) -> Result<usize, ContinuationRecoveryError> {
+    pub(crate) fn admit_endpoint(
+        &self,
+        resource: &CanonicalHttpUrl,
+    ) -> Result<usize, ContinuationRecoveryError> {
         if resource.as_str() != self.resource.as_str() {
             return Err(ContinuationRecoveryError::EndpointMismatch);
         }
@@ -70,7 +78,8 @@ impl ContinuationReplayContract {
 impl fmt::Debug for ContinuationReplayContract {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ContinuationReplayContract")
-            .field("maximum_recoveries", &self.maximum_recoveries).finish_non_exhaustive()
+            .field("maximum_recoveries", &self.maximum_recoveries)
+            .finish_non_exhaustive()
     }
 }
 
@@ -90,27 +99,47 @@ pub enum ContinuationRecoveryError {
 impl fmt::Display for ContinuationRecoveryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Interrupted => f.write_str("continuation reply interrupted; recovery requires an explicit host decision"),
+            Self::Interrupted => f.write_str(
+                "continuation reply interrupted; recovery requires an explicit host decision",
+            ),
             Self::InvalidContract => f.write_str("invalid configured continuation replay contract"),
-            Self::EndpointMismatch => f.write_str("continuation replay contract names another endpoint"),
-            Self::StateRequired => f.write_str("reply recovery requires nonempty server continuation state"),
-            Self::WrongPhase => f.write_str("continuation recovery operation is not in the required phase"),
+            Self::EndpointMismatch => {
+                f.write_str("continuation replay contract names another endpoint")
+            }
+            Self::StateRequired => {
+                f.write_str("reply recovery requires nonempty server continuation state")
+            }
+            Self::WrongPhase => {
+                f.write_str("continuation recovery operation is not in the required phase")
+            }
             Self::RecoveryLimit => f.write_str("continuation reply recovery budget exhausted"),
-            Self::JsonReplyRequired => f.write_str("continuation reply recovery requires a finite JSON response"),
+            Self::JsonReplyRequired => {
+                f.write_str("continuation reply recovery requires a finite JSON response")
+            }
             Self::Interaction(error) => error.fmt(f),
         }
     }
 }
 impl std::error::Error for ContinuationRecoveryError {}
 impl From<ManagedInteractionError> for ContinuationRecoveryError {
-    fn from(error: ManagedInteractionError) -> Self { Self::Interaction(error) }
+    fn from(error: ManagedInteractionError) -> Self {
+        Self::Interaction(error)
+    }
 }
 impl From<ManagedCoreError> for ContinuationRecoveryError {
-    fn from(error: ManagedCoreError) -> Self { Self::Interaction(error.into()) }
+    fn from(error: ManagedCoreError) -> Self {
+        Self::Interaction(error.into())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Phase { Prepared, Reading, Recoverable, Delivered, Closed }
+enum Phase {
+    Prepared,
+    Reading,
+    Recoverable,
+    Delivered,
+    Closed,
+}
 
 /// Exclusive custody of one answered continuation and its reply recovery.
 ///
@@ -144,7 +173,9 @@ pub struct RecoverableManagedContinuation {
 impl fmt::Debug for RecoverableManagedContinuation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RecoverableManagedContinuation")
-            .field("phase", &self.phase).field("attempts", &self.attempts).finish_non_exhaustive()
+            .field("phase", &self.phase)
+            .field("attempts", &self.attempts)
+            .finish_non_exhaustive()
     }
 }
 
@@ -158,12 +189,23 @@ impl ManagedInteraction {
     /// Only this interaction's original request and pending challenge can be
     /// used: callers cannot inject a replacement target, metadata or state.
     pub fn prepare_recoverable_continuation(
-        mut self, cx: &Cx, responses: Option<FinalInputResponses>, contract: ContinuationReplayContract,
+        mut self,
+        cx: &Cx,
+        responses: Option<FinalInputResponses>,
+        contract: ContinuationReplayContract,
     ) -> Result<RecoverableManagedContinuation, ContinuationRecoveryError> {
         self.check(cx)?;
         let maximum_recoveries = contract.admit_endpoint(self.session.resource())?;
-        let input = self.pending_input().ok_or(ManagedInteractionError::NotAwaitingInput)?;
-        admit_challenge(&self.original, input, self.limits, self.continuations, self.input_responses)?;
+        let input = self
+            .pending_input()
+            .ok_or(ManagedInteractionError::NotAwaitingInput)?;
+        admit_challenge(
+            &self.original,
+            input,
+            self.limits,
+            self.continuations,
+            self.input_responses,
+        )?;
         admit_answer_bytes(responses.as_ref(), self.limits.core.request_bytes)?;
         let answer_count = responses.as_ref().map_or(0, FinalInputResponses::len);
         let request = recovery_request(&self.original, input, responses)?;
@@ -172,25 +214,42 @@ impl ManagedInteraction {
         let _ = self.prepare_request(request.clone(), RequestId::Number(0))?;
         self.step = None;
         Ok(RecoverableManagedContinuation {
-            interaction: self, request: Some(request), call: None, phase: Phase::Prepared,
-            maximum_recoveries, attempts: 0, answer_count,
+            interaction: self,
+            request: Some(request),
+            call: None,
+            phase: Phase::Prepared,
+            maximum_recoveries,
+            attempts: 0,
+            answer_count,
         })
     }
 }
 
 impl RecoverableManagedContinuation {
-    pub fn attempts(&self) -> usize { self.attempts }
-    pub fn is_recovery_pending(&self) -> bool { self.phase == Phase::Recoverable }
+    pub fn attempts(&self) -> usize {
+        self.attempts
+    }
+    pub fn is_recovery_pending(&self) -> bool {
+        self.phase == Phase::Recoverable
+    }
 
     /// Executes the first continuation attempt. There is no automatic retry.
-    pub async fn send(&mut self, cx: &Cx, request_id: RequestId) -> Result<(), ContinuationRecoveryError> {
+    pub async fn send(
+        &mut self,
+        cx: &Cx,
+        request_id: RequestId,
+    ) -> Result<(), ContinuationRecoveryError> {
         self.attempt(cx, request_id, false).await
     }
 
     /// Explicitly requests the same reply using a fresh correlation ID. Only an
     /// interrupted send/read can enter this phase. No answer/metadata/state
     /// replacement is accepted. A remote JSON-RPC error ends recovery.
-    pub async fn recover(&mut self, cx: &Cx, request_id: RequestId) -> Result<(), ContinuationRecoveryError> {
+    pub async fn recover(
+        &mut self,
+        cx: &Cx,
+        request_id: RequestId,
+    ) -> Result<(), ContinuationRecoveryError> {
         self.attempt(cx, request_id, true).await
     }
 
@@ -204,10 +263,18 @@ impl RecoverableManagedContinuation {
     /// Delivers one complete or successor input-required result. Recovery is
     /// finite-JSON-only: notification/SSE streams cannot be replayed by this API.
     /// On success the captured answers are released before publishing the event.
-    pub async fn next_event(&mut self, cx: &Cx) -> Result<ManagedInteractionEvent, ContinuationRecoveryError> {
+    pub async fn next_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<ManagedInteractionEvent, ContinuationRecoveryError> {
         self.check(cx)?;
-        if self.phase != Phase::Reading { return Err(ContinuationRecoveryError::WrongPhase); }
-        let mut call = self.call.take().ok_or(ContinuationRecoveryError::WrongPhase)?;
+        if self.phase != Phase::Reading {
+            return Err(ContinuationRecoveryError::WrongPhase);
+        }
+        let mut call = self
+            .call
+            .take()
+            .ok_or(ContinuationRecoveryError::WrongPhase)?;
         // Abandonment preserves only the conservative reservation and request,
         // never a partially consumed parser or a reusable network response.
         self.phase = Phase::Recoverable;
@@ -215,7 +282,10 @@ impl RecoverableManagedContinuation {
         self.check(cx)?;
         let result = match outcome {
             Ok(Some(ManagedCoreEvent::Result(result))) => result,
-            Ok(_) => { self.close(); return Err(ContinuationRecoveryError::JsonReplyRequired); }
+            Ok(_) => {
+                self.close();
+                return Err(ContinuationRecoveryError::JsonReplyRequired);
+            }
             Err(error) => return Err(self.failed(error)),
         };
         // The decoder accounts the actual successful frame plus earlier work.
@@ -226,9 +296,13 @@ impl RecoverableManagedContinuation {
                 self.close();
                 return Err(ManagedCoreError::ResponseByteLimit.into());
             }
-            if let Err(error) = admit_challenge(&self.interaction.original, input, self.interaction.limits,
-                self.interaction.continuations, self.interaction.input_responses)
-            {
+            if let Err(error) = admit_challenge(
+                &self.interaction.original,
+                input,
+                self.interaction.limits,
+                self.interaction.continuations,
+                self.interaction.input_responses,
+            ) {
                 self.close();
                 return Err(error.into());
             }
@@ -249,15 +323,24 @@ impl RecoverableManagedContinuation {
     /// delivered. Its new challenge can be resolved normally or transferred to
     /// another recoverable continuation. Never returns the old answered input.
     pub fn into_interaction(self) -> Result<ManagedInteraction, ContinuationRecoveryError> {
-        if self.phase != Phase::Delivered { return Err(ContinuationRecoveryError::WrongPhase); }
+        if self.phase != Phase::Delivered {
+            return Err(ContinuationRecoveryError::WrongPhase);
+        }
         Ok(self.interaction)
     }
 
-    async fn attempt(&mut self, cx: &Cx, request_id: RequestId, recovery: bool)
-        -> Result<(), ContinuationRecoveryError>
-    {
+    async fn attempt(
+        &mut self,
+        cx: &Cx,
+        request_id: RequestId,
+        recovery: bool,
+    ) -> Result<(), ContinuationRecoveryError> {
         self.check(cx)?;
-        let expected = if recovery { Phase::Recoverable } else { Phase::Prepared };
+        let expected = if recovery {
+            Phase::Recoverable
+        } else {
+            Phase::Prepared
+        };
         if self.phase != expected {
             return Err(ContinuationRecoveryError::WrongPhase);
         }
@@ -269,9 +352,19 @@ impl RecoverableManagedContinuation {
         }
         admit_fresh_id(&self.interaction.used_ids, &request_id)?;
         let core = self.interaction.limits.core;
-        let reserved = reserve_frame(self.interaction.response_bytes, core.frame_bytes, core.total_bytes)?;
-        let request = self.request.as_ref().ok_or(ContinuationRecoveryError::WrongPhase)?.clone();
-        let (wire, mut decoder) = self.interaction.prepare_request(request, request_id.clone())?;
+        let reserved = reserve_frame(
+            self.interaction.response_bytes,
+            core.frame_bytes,
+            core.total_bytes,
+        )?;
+        let request = self
+            .request
+            .as_ref()
+            .ok_or(ContinuationRecoveryError::WrongPhase)?
+            .clone();
+        let (wire, mut decoder) = self
+            .interaction
+            .prepare_request(request, request_id.clone())?;
         decoder.bytes = self.interaction.response_bytes;
         decoder.notifications = self.interaction.notifications;
         self.check(cx)?;
@@ -286,18 +379,34 @@ impl RecoverableManagedContinuation {
         self.interaction.used_ids.push(request_id);
         self.attempts += 1;
         self.phase = Phase::Recoverable;
-        let response = bounded_wait(cx, &self.interaction.cancellation, self.interaction.deadline, async {
-            self.interaction.session.execute_with_cancellation(cx, &self.interaction.cancellation, &wire)
-                .await.map_err(ManagedCoreError::from)
-        }).await;
+        let response = bounded_wait(
+            cx,
+            &self.interaction.cancellation,
+            self.interaction.deadline,
+            async {
+                self.interaction
+                    .session
+                    .execute_with_cancellation(cx, &self.interaction.cancellation, &wire)
+                    .await
+                    .map_err(ManagedCoreError::from)
+            },
+        )
+        .await;
         self.check(cx)?;
-        let response = match response { Ok(response) => response, Err(error) => return Err(self.failed(error)) };
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => return Err(self.failed(error)),
+        };
         if response.metadata().kind() != ModernHttpResponseKind::Json {
             self.close();
             return Err(ContinuationRecoveryError::JsonReplyRequired);
         }
-        let call = ManagedCoreCall::from_response(response, decoder,
-            self.interaction.cancellation.clone(), self.interaction.deadline);
+        let call = ManagedCoreCall::from_response(
+            response,
+            decoder,
+            self.interaction.cancellation.clone(),
+            self.interaction.deadline,
+        );
         match call {
             Ok(call) => {
                 self.interaction.generation = call.credential_generation();
@@ -317,28 +426,54 @@ impl RecoverableManagedContinuation {
         Ok(())
     }
     fn failed(&mut self, error: ManagedCoreError) -> ContinuationRecoveryError {
-        if recoverable_transport_failure(&error) { return ContinuationRecoveryError::Interrupted; }
+        if recoverable_transport_failure(&error) {
+            return ContinuationRecoveryError::Interrupted;
+        }
         self.close();
         error.into()
     }
 }
 
-pub(crate) fn recovery_request(original: &CoreRequest, input: &InputRequiredResult, responses: Option<FinalInputResponses>)
-    -> Result<CoreRequest, ContinuationRecoveryError>
-{
-    if input.request_state().is_none_or(str::is_empty) { return Err(ContinuationRecoveryError::StateRequired); }
-    let selection = if responses.as_ref().is_some_and(|answers| !answers.is_empty()) {
+pub(crate) fn recovery_request(
+    original: &CoreRequest,
+    input: &InputRequiredResult,
+    responses: Option<FinalInputResponses>,
+) -> Result<CoreRequest, ContinuationRecoveryError> {
+    if input.request_state().is_none_or(str::is_empty) {
+        return Err(ContinuationRecoveryError::StateRequired);
+    }
+    let selection = if responses
+        .as_ref()
+        .is_some_and(|answers| !answers.is_empty())
+    {
         InputSelection::Partial
-    } else { InputSelection::Complete };
-    Ok(continuation_request_selected(original, input, responses, selection)?)
+    } else {
+        InputSelection::Complete
+    };
+    Ok(continuation_request_selected(
+        original, input, responses, selection,
+    )?)
 }
-pub(crate) fn reserve_frame(used: usize, frame: usize, total: usize) -> Result<usize, ManagedCoreError> {
-    used.checked_add(frame).filter(|reserved| *reserved <= total).ok_or(ManagedCoreError::ResponseByteLimit)
+pub(crate) fn reserve_frame(
+    used: usize,
+    frame: usize,
+    total: usize,
+) -> Result<usize, ManagedCoreError> {
+    used.checked_add(frame)
+        .filter(|reserved| *reserved <= total)
+        .ok_or(ManagedCoreError::ResponseByteLimit)
 }
-pub(crate) fn admit_answer_bytes(responses: Option<&FinalInputResponses>, maximum: usize) -> Result<(), ManagedCoreError> {
+pub(crate) fn admit_answer_bytes(
+    responses: Option<&FinalInputResponses>,
+    maximum: usize,
+) -> Result<(), ManagedCoreError> {
     if let Some(responses) = responses {
-        let mut encoded = super::super::BoundedWriter { bytes: Vec::new(), maximum };
-        serde_json::to_writer(&mut encoded, responses).map_err(|_| ManagedCoreError::RequestTooLarge)?;
+        let mut encoded = super::super::BoundedWriter {
+            bytes: Vec::new(),
+            maximum,
+        };
+        serde_json::to_writer(&mut encoded, responses)
+            .map_err(|_| ManagedCoreError::RequestTooLarge)?;
     }
     Ok(())
 }
@@ -353,9 +488,16 @@ fn recoverable_transport_failure(error: &ManagedCoreError) -> bool {
 // answer from its capture rather than re-execute. Task watch recovery reaches
 // this classifier only for listen/`tasks/get` observation, never an update.
 pub(crate) fn recovery_http_interruption(error: &ModernHttpExecutorError) -> bool {
-    matches!(error, ModernHttpExecutorError::ResponseBodyReadFailed
-        | ModernHttpExecutorError::Transport(ClientError::Io(_) | ClientError::HttpError(HttpError::Io(_)))
-        | ModernHttpExecutorError::DispatchUncertain(ClientError::Io(_) | ClientError::HttpError(HttpError::Io(_))))
+    matches!(
+        error,
+        ModernHttpExecutorError::ResponseBodyReadFailed
+            | ModernHttpExecutorError::Transport(
+                ClientError::Io(_) | ClientError::HttpError(HttpError::Io(_))
+            )
+            | ModernHttpExecutorError::DispatchUncertain(
+                ClientError::Io(_) | ClientError::HttpError(HttpError::Io(_))
+            )
+    )
 }
 
 #[cfg(test)]

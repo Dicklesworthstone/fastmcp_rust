@@ -23,14 +23,13 @@ use std::time::Duration;
 use fastmcp_rust::modern::{FinalMethodOutcome, MrtrCompletedInputs};
 use fastmcp_rust::prelude::*;
 use fastmcp_rust::{
-    ApplicationTaskSupervisor, CacheScope, CompleteResult,
-    ContentBlock, EmbeddedResourceContents, FinalAbsoluteUri, FinalCallToolResult,
-    FinalCompletionParams, FinalCompletionReference, FinalCompletionValues,
-    FinalElicitationContextExt, FinalEmbeddedRootsListParams, FinalPromptMessage,
-    FinalRootsContextExt, FinalSamplingContextExt, FinalTaskInputRequests, FinalTaskRuntime,
-    FinalTaskRuntimeConfig, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
-    FinalTaskWorkDescriptor, FinalToolOutcome, InputRequiredResult, RawIcon, ResultMeta,
-    StdioTransport, ToolErrorKind, ToolHandler,
+    ApplicationTaskSupervisor, CacheScope, CompleteResult, ContentBlock, EmbeddedResourceContents,
+    FinalAbsoluteUri, FinalCallToolResult, FinalCompletionParams, FinalCompletionReference,
+    FinalCompletionValues, FinalElicitationContextExt, FinalEmbeddedRootsListParams,
+    FinalPromptMessage, FinalRootsContextExt, FinalSamplingContextExt, FinalTaskInputRequests,
+    FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSupervisorFuture,
+    FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, FinalToolOutcome, InputRequiredResult,
+    RawIcon, ResultMeta, StdioTransport, ToolErrorKind, ToolHandler,
 };
 use fastmcp_server::ServerBuilder;
 use fastmcp_server::caching::ResponseCachingMiddleware;

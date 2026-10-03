@@ -18,7 +18,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use fastmcp_core::{Sha256Digest, sha256_bounded};
 use serde_json::Value;
 
-use crate::schema::{AdmittedSchema, ValidationResult, MAX_SCHEMA_ADMISSION_NODES, MAX_SCHEMA_VALIDATION_DEPTH};
+use crate::schema::{
+    AdmittedSchema, MAX_SCHEMA_ADMISSION_NODES, MAX_SCHEMA_VALIDATION_DEPTH, ValidationResult,
+};
 
 /// Maximum bindings in one tool's HTTP projection plan.
 pub const MAX_PARAMETER_HEADERS: usize = 64;
@@ -29,8 +31,8 @@ pub const MAX_PARAMETER_HEADER_PATH_BYTES: usize = 16 * 1024;
 /// Maximum UTF-8 bytes in one decoded header value.
 pub const MAX_MCP_HEADER_VALUE_BYTES: usize = 8 * 1024;
 /// Includes the sentinel and Base64 expansion of the maximum decoded value.
-pub const MAX_MCP_ENCODED_HEADER_VALUE_BYTES: usize = 4 * MAX_MCP_HEADER_VALUE_BYTES.div_ceil(3)
-    + SENTINEL_PREFIX.len() + SENTINEL_SUFFIX.len();
+pub const MAX_MCP_ENCODED_HEADER_VALUE_BYTES: usize =
+    4 * MAX_MCP_HEADER_VALUE_BYTES.div_ceil(3) + SENTINEL_PREFIX.len() + SENTINEL_SUFFIX.len();
 /// Maximum complete field-name/value bytes produced by one projection.
 pub const MAX_PARAMETER_HEADER_BLOCK_BYTES: usize = 64 * 1024;
 /// Numeric mirrors use the exact JavaScript-safe integer range, not f64.
@@ -61,7 +63,9 @@ impl fmt::Display for McpHeaderError {
         f.write_str(match self {
             Self::InvalidSchema => "invalid MCP tool header schema",
             Self::InvalidAnnotation => "invalid MCP parameter-header annotation",
-            Self::UnreachableAnnotation => "MCP parameter-header annotation is not statically reachable",
+            Self::UnreachableAnnotation => {
+                "MCP parameter-header annotation is not statically reachable"
+            }
             Self::DuplicateAnnotation => "duplicate MCP parameter-header annotation",
             Self::InvalidParameter => "MCP parameter cannot be represented by its header type",
             Self::InvalidHeaderValue => "invalid MCP encoded header value",
@@ -90,13 +94,29 @@ impl AdmittedToolHeaderSchema {
         separate_header_annotations(&mut validation);
         let validation = crate::schema::admit_final_schema(validation)
             .map_err(|_| McpHeaderError::InvalidSchema)?;
-        let mut compiler = Compiler { bindings: Vec::new(), nodes: 0, path_bytes: 0 };
+        let mut compiler = Compiler {
+            bindings: Vec::new(),
+            nodes: 0,
+            path_bytes: 0,
+        };
         compiler.visit(&source, &mut Vec::new(), true, 0)?;
-        Ok(Self { source, validation, plan: ToolParameterHeaderPlan { bindings: compiler.bindings } })
+        Ok(Self {
+            source,
+            validation,
+            plan: ToolParameterHeaderPlan {
+                bindings: compiler.bindings,
+            },
+        })
     }
-    pub fn schema(&self) -> &Value { &self.source }
-    pub fn header_plan(&self) -> &ToolParameterHeaderPlan { &self.plan }
-    pub fn validate(&self, arguments: &Value) -> ValidationResult { self.validation.validate(arguments) }
+    pub fn schema(&self) -> &Value {
+        &self.source
+    }
+    pub fn header_plan(&self) -> &ToolParameterHeaderPlan {
+        &self.plan
+    }
+    pub fn validate(&self, arguments: &Value) -> ValidationResult {
+        self.validation.validate(arguments)
+    }
 }
 
 /// Admits a tool's final input schema for local registration. Ordinary custom
@@ -130,7 +150,9 @@ impl ToolSchemaRevision {
     /// Parses the 64 lowercase hex digits this revision displays as.
     pub fn from_hex(hex: &str) -> Option<Self> {
         let hex = hex.as_bytes();
-        if hex.len() != 64 { return None; }
+        if hex.len() != 64 {
+            return None;
+        }
         let digit = |byte: u8| match byte {
             b'0'..=b'9' => Some(byte - b'0'),
             b'a'..=b'f' => Some(byte - b'a' + 10),
@@ -145,7 +167,10 @@ impl ToolSchemaRevision {
 }
 impl fmt::Display for ToolSchemaRevision {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.as_bytes().iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+        self.0
+            .as_bytes()
+            .iter()
+            .try_for_each(|byte| write!(f, "{byte:02x}"))
     }
 }
 impl fmt::Debug for ToolSchemaRevision {
@@ -172,11 +197,21 @@ impl NonSensitiveHeaderExposure {
         revision: ToolSchemaRevision,
         path: impl IntoIterator<Item = P>,
     ) -> Self {
-        Self { tool: tool.into(), revision, path: path.into_iter().map(Into::into).collect() }
+        Self {
+            tool: tool.into(),
+            revision,
+            path: path.into_iter().map(Into::into).collect(),
+        }
     }
-    pub fn tool(&self) -> &str { &self.tool }
-    pub fn revision(&self) -> ToolSchemaRevision { self.revision }
-    pub fn property_path(&self) -> &[String] { &self.path }
+    pub fn tool(&self) -> &str {
+        &self.tool
+    }
+    pub fn revision(&self) -> ToolSchemaRevision {
+        self.revision
+    }
+    pub fn property_path(&self) -> &[String] {
+        &self.path
+    }
 }
 
 /// Why local registration refused a tool's parameter-header annotations.
@@ -189,9 +224,15 @@ pub enum HeaderExposureError {
     /// The property is `writeOnly` or password-formatted; no review applies.
     SecretField { path: Vec<String> },
     /// No review names this tool and property path.
-    Unreviewed { path: Vec<String>, revision: ToolSchemaRevision },
+    Unreviewed {
+        path: Vec<String>,
+        revision: ToolSchemaRevision,
+    },
     /// This tool and path were reviewed, but for another schema revision.
-    StaleReview { path: Vec<String>, revision: ToolSchemaRevision },
+    StaleReview {
+        path: Vec<String>,
+        revision: ToolSchemaRevision,
+    },
 }
 impl fmt::Display for HeaderExposureError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -204,16 +245,24 @@ impl fmt::Display for HeaderExposureError {
             pointer
         };
         match self {
-            Self::Annotation(error) => write!(f, "tool declares invalid x-mcp-header annotations: {error}"),
-            Self::SecretField { path } => write!(f,
+            Self::Annotation(error) => {
+                write!(f, "tool declares invalid x-mcp-header annotations: {error}")
+            }
+            Self::SecretField { path } => write!(
+                f,
                 "x-mcp-header at {} marks a writeOnly or password field, which is never exposed",
-                pointer(path)),
-            Self::Unreviewed { path, revision } => write!(f,
+                pointer(path)
+            ),
+            Self::Unreviewed { path, revision } => write!(
+                f,
                 "x-mcp-header at {} needs a NonSensitiveHeaderExposure review of schema revision {revision}",
-                pointer(path)),
-            Self::StaleReview { path, revision } => write!(f,
+                pointer(path)
+            ),
+            Self::StaleReview { path, revision } => write!(
+                f,
                 "x-mcp-header at {} was reviewed for another schema revision; the current revision is {revision}",
-                pointer(path)),
+                pointer(path)
+            ),
         }
     }
 }
@@ -236,20 +285,30 @@ pub fn admit_local_tool_input_schema(
         return admit_final_tool_input_schema(source).map_err(HeaderExposureError::Annotation);
     }
     let revision = ToolSchemaRevision::of(&source).map_err(HeaderExposureError::Annotation)?;
-    let admitted = AdmittedToolHeaderSchema::admit(source).map_err(HeaderExposureError::Annotation)?;
+    let admitted =
+        AdmittedToolHeaderSchema::admit(source).map_err(HeaderExposureError::Annotation)?;
     for binding in admitted.header_plan().bindings() {
         let path = binding.property_path();
         if binding.marks_secret_field() {
-            return Err(HeaderExposureError::SecretField { path: path.to_vec() });
+            return Err(HeaderExposureError::SecretField {
+                path: path.to_vec(),
+            });
         }
-        let mut reviewed = reviews.iter()
+        let mut reviewed = reviews
+            .iter()
             .filter(|review| review.tool == tool && review.path == path)
             .peekable();
         if reviewed.peek().is_none() {
-            return Err(HeaderExposureError::Unreviewed { path: path.to_vec(), revision });
+            return Err(HeaderExposureError::Unreviewed {
+                path: path.to_vec(),
+                revision,
+            });
         }
         if !reviewed.any(|review| review.revision == revision) {
-            return Err(HeaderExposureError::StaleReview { path: path.to_vec(), revision });
+            return Err(HeaderExposureError::StaleReview {
+                path: path.to_vec(),
+                revision,
+            });
         }
     }
     Ok(admitted.validation)
@@ -259,25 +318,40 @@ pub fn admit_local_tool_input_schema(
 // bounded before this walk; examples/defaults and unknown keyword
 // payloads can contain header-shaped data without creating disclosure authority.
 fn has_header_annotations(schema: &Value) -> bool {
-    let Some(schema) = schema.as_object() else { return false; };
-    if schema.contains_key("x-mcp-header") { return true; }
-    schema.iter().any(|(keyword, value)| match keyword.as_str() {
-        "properties" | "$defs" | "patternProperties" | "dependentSchemas" => {
-            value.as_object().is_some_and(|children| children.values().any(has_header_annotations))
-        }
-        "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
-            value.as_array().is_some_and(|children| children.iter().any(has_header_annotations))
-        }
-        "items" | "contains" | "additionalProperties" | "unevaluatedProperties"
-        | "unevaluatedItems" | "propertyNames" | "not" | "if" | "then" | "else" | "contentSchema" => {
-            has_header_annotations(value)
-        }
-        _ => false,
-    })
+    let Some(schema) = schema.as_object() else {
+        return false;
+    };
+    if schema.contains_key("x-mcp-header") {
+        return true;
+    }
+    schema
+        .iter()
+        .any(|(keyword, value)| match keyword.as_str() {
+            "properties" | "$defs" | "patternProperties" | "dependentSchemas" => value
+                .as_object()
+                .is_some_and(|children| children.values().any(has_header_annotations)),
+            "allOf" | "anyOf" | "oneOf" | "prefixItems" => value
+                .as_array()
+                .is_some_and(|children| children.iter().any(has_header_annotations)),
+            "items"
+            | "contains"
+            | "additionalProperties"
+            | "unevaluatedProperties"
+            | "unevaluatedItems"
+            | "propertyNames"
+            | "not"
+            | "if"
+            | "then"
+            | "else"
+            | "contentSchema" => has_header_annotations(value),
+            _ => false,
+        })
 }
 impl fmt::Debug for AdmittedToolHeaderSchema {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AdmittedToolHeaderSchema").field("plan", &self.plan).finish_non_exhaustive()
+        f.debug_struct("AdmittedToolHeaderSchema")
+            .field("plan", &self.plan)
+            .finish_non_exhaustive()
     }
 }
 
@@ -296,7 +370,9 @@ fn bound_schema_source(source: &Value) -> Result<(), McpHeaderError> {
                     return Err(McpHeaderError::LimitExceeded);
                 }
                 for (key, child) in object {
-                    bytes = bytes.checked_add(key.len()).ok_or(McpHeaderError::LimitExceeded)?;
+                    bytes = bytes
+                        .checked_add(key.len())
+                        .ok_or(McpHeaderError::LimitExceeded)?;
                     pending.push((child, depth + 1));
                 }
             }
@@ -307,24 +383,31 @@ fn bound_schema_source(source: &Value) -> Result<(), McpHeaderError> {
                 pending.extend(array.iter().map(|child| (child, depth + 1)));
             }
             Value::String(value) => {
-                bytes = bytes.checked_add(value.len()).ok_or(McpHeaderError::LimitExceeded)?;
+                bytes = bytes
+                    .checked_add(value.len())
+                    .ok_or(McpHeaderError::LimitExceeded)?;
             }
             Value::Number(number) => {
                 struct NumberBytes(usize);
                 impl fmt::Write for NumberBytes {
                     fn write_str(&mut self, value: &str) -> fmt::Result {
                         self.0 = self.0.checked_add(value.len()).ok_or(fmt::Error)?;
-                        if self.0 > MAX_TOOL_HEADER_SCHEMA_BYTES { return Err(fmt::Error); }
+                        if self.0 > MAX_TOOL_HEADER_SCHEMA_BYTES {
+                            return Err(fmt::Error);
+                        }
                         Ok(())
                     }
                 }
                 let mut measured = NumberBytes(bytes);
-                fmt::write(&mut measured, format_args!("{number}")).map_err(|_| McpHeaderError::LimitExceeded)?;
+                fmt::write(&mut measured, format_args!("{number}"))
+                    .map_err(|_| McpHeaderError::LimitExceeded)?;
                 bytes = measured.0;
             }
             Value::Bool(_) | Value::Null => {}
         }
-        if bytes > MAX_TOOL_HEADER_SCHEMA_BYTES { return Err(McpHeaderError::LimitExceeded); }
+        if bytes > MAX_TOOL_HEADER_SCHEMA_BYTES {
+            return Err(McpHeaderError::LimitExceeded);
+        }
     }
     Ok(())
 }
@@ -332,22 +415,37 @@ fn bound_schema_source(source: &Value) -> Result<(), McpHeaderError> {
 // The source was depth/node/byte bounded before cloning or recursive descent.
 // Instance-valued keywords are intentionally not visited or rewritten.
 fn separate_header_annotations(schema: &mut Value) {
-    let Some(schema) = schema.as_object_mut() else { return; };
+    let Some(schema) = schema.as_object_mut() else {
+        return;
+    };
     schema.remove("x-mcp-header");
     for (keyword, value) in schema {
         match keyword.as_str() {
             "properties" | "$defs" | "patternProperties" | "dependentSchemas" => {
                 if let Some(children) = value.as_object_mut() {
-                    for child in children.values_mut() { separate_header_annotations(child); }
+                    for child in children.values_mut() {
+                        separate_header_annotations(child);
+                    }
                 }
             }
             "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
                 if let Some(children) = value.as_array_mut() {
-                    for child in children { separate_header_annotations(child); }
+                    for child in children {
+                        separate_header_annotations(child);
+                    }
                 }
             }
-            "items" | "contains" | "additionalProperties" | "unevaluatedProperties"
-            | "unevaluatedItems" | "propertyNames" | "not" | "if" | "then" | "else" | "contentSchema" => {
+            "items"
+            | "contains"
+            | "additionalProperties"
+            | "unevaluatedProperties"
+            | "unevaluatedItems"
+            | "propertyNames"
+            | "not"
+            | "if"
+            | "then"
+            | "else"
+            | "contentSchema" => {
                 separate_header_annotations(value);
             }
             _ => {}
@@ -358,12 +456,20 @@ fn separate_header_annotations(schema: &mut Value) {
 /// Encode a `Mcp-Name` or parameter value without trimming or changing it.
 /// Sentinel-looking literals are wrapped too, so a receiver decodes only once.
 pub fn encode_mcp_header_value(value: &str) -> Result<String, McpHeaderError> {
-    if value.len() > MAX_MCP_HEADER_VALUE_BYTES { return Err(McpHeaderError::LimitExceeded); }
+    if value.len() > MAX_MCP_HEADER_VALUE_BYTES {
+        return Err(McpHeaderError::LimitExceeded);
+    }
     let plain = value.bytes().all(is_field_value_byte)
-        && !value.starts_with([' ', '\t']) && !value.ends_with([' ', '\t'])
+        && !value.starts_with([' ', '\t'])
+        && !value.ends_with([' ', '\t'])
         && !is_sentinel(value);
-    if plain { return Ok(value.to_owned()); }
-    Ok(format!("{SENTINEL_PREFIX}{}{SENTINEL_SUFFIX}", STANDARD.encode(value.as_bytes())))
+    if plain {
+        return Ok(value.to_owned());
+    }
+    Ok(format!(
+        "{SENTINEL_PREFIX}{}{SENTINEL_SUFFIX}",
+        STANDARD.encode(value.as_bytes())
+    ))
 }
 
 /// Admit raw field-value bytes before string conversion, remove only HTTP OWS,
@@ -371,8 +477,12 @@ pub fn encode_mcp_header_value(value: &str) -> Result<String, McpHeaderError> {
 /// control characters remain data and must never be re-emitted as raw headers.
 /// This function does not decode protocol-version or method headers.
 pub fn decode_mcp_header_value(value: &[u8]) -> Result<String, McpHeaderError> {
-    if value.len() > MAX_MCP_ENCODED_HEADER_VALUE_BYTES { return Err(McpHeaderError::LimitExceeded); }
-    if !value.iter().copied().all(is_field_value_byte) { return Err(McpHeaderError::InvalidHeaderValue); }
+    if value.len() > MAX_MCP_ENCODED_HEADER_VALUE_BYTES {
+        return Err(McpHeaderError::LimitExceeded);
+    }
+    if !value.iter().copied().all(is_field_value_byte) {
+        return Err(McpHeaderError::InvalidHeaderValue);
+    }
     // Every byte is now ASCII. No Unicode whitespace normalization is allowed.
     let value = std::str::from_utf8(value).map_err(|_| McpHeaderError::InvalidHeaderValue)?;
     let value = value.trim_matches([' ', '\t']);
@@ -381,11 +491,16 @@ pub fn decode_mcp_header_value(value: &[u8]) -> Result<String, McpHeaderError> {
         // Remove them sequentially rather than constructing an unchecked range.
         // Keep is_sentinel's broad recognition: the encoder must still wrap
         // malformed sentinel-looking literals so they round-trip as data.
-        let encoded = value.strip_prefix(SENTINEL_PREFIX)
+        let encoded = value
+            .strip_prefix(SENTINEL_PREFIX)
             .and_then(|payload| payload.strip_suffix(SENTINEL_SUFFIX))
             .ok_or(McpHeaderError::InvalidHeaderValue)?;
-        let decoded = STANDARD.decode(encoded).map_err(|_| McpHeaderError::InvalidHeaderValue)?;
-        if decoded.len() > MAX_MCP_HEADER_VALUE_BYTES { return Err(McpHeaderError::LimitExceeded); }
+        let decoded = STANDARD
+            .decode(encoded)
+            .map_err(|_| McpHeaderError::InvalidHeaderValue)?;
+        if decoded.len() > MAX_MCP_HEADER_VALUE_BYTES {
+            return Err(McpHeaderError::LimitExceeded);
+        }
         String::from_utf8(decoded).map_err(|_| McpHeaderError::InvalidHeaderValue)
     } else if value.len() > MAX_MCP_HEADER_VALUE_BYTES {
         Err(McpHeaderError::LimitExceeded)
@@ -397,13 +512,19 @@ pub fn decode_mcp_header_value(value: &[u8]) -> Result<String, McpHeaderError> {
 fn is_sentinel(value: &str) -> bool {
     value.starts_with(SENTINEL_PREFIX) && value.ends_with(SENTINEL_SUFFIX)
 }
-fn is_field_value_byte(byte: u8) -> bool { matches!(byte, b'\t' | b' '..=b'~') }
+fn is_field_value_byte(byte: u8) -> bool {
+    matches!(byte, b'\t' | b' '..=b'~')
+}
 fn is_tchar(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParameterHeaderType { String, Integer, Boolean }
+pub enum ParameterHeaderType {
+    String,
+    Integer,
+    Boolean,
+}
 
 /// One exact property path. A slash, tilde, dot or numeric-looking member name
 /// is an ordinary object key, not a JSON Pointer, dotted path or array index.
@@ -415,17 +536,27 @@ pub struct ParameterHeaderBinding {
     secret: bool,
 }
 impl ParameterHeaderBinding {
-    pub fn property_path(&self) -> &[String] { &self.path }
-    pub fn header_name(&self) -> &str { &self.name }
-    pub fn parameter_type(&self) -> ParameterHeaderType { self.kind }
+    pub fn property_path(&self) -> &[String] {
+        &self.path
+    }
+    pub fn header_name(&self) -> &str {
+        &self.name
+    }
+    pub fn parameter_type(&self) -> ParameterHeaderType {
+        self.kind
+    }
     /// Whether the annotated property marks itself `writeOnly` or
     /// password-formatted, which no exposure review can override.
-    pub fn marks_secret_field(&self) -> bool { self.secret }
+    pub fn marks_secret_field(&self) -> bool {
+        self.secret
+    }
 }
 impl fmt::Debug for ParameterHeaderBinding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ParameterHeaderBinding").field("path_depth", &self.path.len())
-            .field("kind", &self.kind).finish_non_exhaustive()
+        f.debug_struct("ParameterHeaderBinding")
+            .field("path_depth", &self.path.len())
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
     }
 }
 
@@ -433,37 +564,61 @@ impl fmt::Debug for ParameterHeaderBinding {
 /// Invalid annotations reject the entire plan. The HTTP catalog owner can then
 /// omit that tool without discarding valid siblings. No reference is fetched.
 #[derive(Clone, PartialEq, Eq)]
-pub struct ToolParameterHeaderPlan { bindings: Vec<ParameterHeaderBinding> }
+pub struct ToolParameterHeaderPlan {
+    bindings: Vec<ParameterHeaderBinding>,
+}
 impl fmt::Debug for ToolParameterHeaderPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ToolParameterHeaderPlan").field("binding_count", &self.bindings.len()).finish()
+        f.debug_struct("ToolParameterHeaderPlan")
+            .field("binding_count", &self.bindings.len())
+            .finish()
     }
 }
 impl ToolParameterHeaderPlan {
     /// Compile a schema already admitted by the generic schema engine. Use
     /// `AdmittedToolHeaderSchema::admit` for a source containing `x-mcp-header`.
     pub fn compile(schema: &AdmittedSchema) -> Result<Self, McpHeaderError> {
-        let mut compiler = Compiler { bindings: Vec::new(), nodes: 0, path_bytes: 0 };
+        let mut compiler = Compiler {
+            bindings: Vec::new(),
+            nodes: 0,
+            path_bytes: 0,
+        };
         compiler.visit(schema.schema(), &mut Vec::new(), true, 0)?;
-        Ok(Self { bindings: compiler.bindings })
+        Ok(Self {
+            bindings: compiler.bindings,
+        })
     }
 
-    pub fn bindings(&self) -> &[ParameterHeaderBinding] { &self.bindings }
+    pub fn bindings(&self) -> &[ParameterHeaderBinding] {
+        &self.bindings
+    }
 
     /// Produce all required fields atomically, leaving the complete original
     /// arguments untouched. Absent and null values omit their fields; a wrong
     /// primitive or unsafe integer fails the whole projection, never a subset.
     /// The invocation owner must approve disclosure before sending these fields.
-    pub fn project(&self, arguments: Option<&Value>) -> Result<ProjectedParameterHeaders, McpHeaderError> {
-        if arguments.is_some_and(|value| !value.is_object()) { return Err(McpHeaderError::InvalidParameter); }
+    pub fn project(
+        &self,
+        arguments: Option<&Value>,
+    ) -> Result<ProjectedParameterHeaders, McpHeaderError> {
+        if arguments.is_some_and(|value| !value.is_object()) {
+            return Err(McpHeaderError::InvalidParameter);
+        }
         let mut fields = Vec::new();
         let mut bytes = 0_usize;
         for binding in &self.bindings {
-            let Some(value) = value_at(arguments, &binding.path).filter(|value| !value.is_null()) else { continue; };
+            let Some(value) = value_at(arguments, &binding.path).filter(|value| !value.is_null())
+            else {
+                continue;
+            };
             let encoded = encode_mcp_header_value(&primitive_value(binding.kind, value)?)?;
-            bytes = bytes.checked_add(binding.name.len()).and_then(|n| n.checked_add(encoded.len()))
+            bytes = bytes
+                .checked_add(binding.name.len())
+                .and_then(|n| n.checked_add(encoded.len()))
                 .ok_or(McpHeaderError::LimitExceeded)?;
-            if bytes > MAX_PARAMETER_HEADER_BLOCK_BYTES { return Err(McpHeaderError::LimitExceeded); }
+            if bytes > MAX_PARAMETER_HEADER_BLOCK_BYTES {
+                return Err(McpHeaderError::LimitExceeded);
+            }
             fields.push((binding.name.clone(), encoded));
         }
         Ok(ProjectedParameterHeaders { fields })
@@ -473,30 +628,52 @@ impl ToolParameterHeaderPlan {
     /// authorization. Pass duplicate-preserving transport fields. Unknown fields
     /// do not create schema mappings; their syntax/framing limits remain with
     /// transport admission. This is not general tool argument validation.
-    pub fn validate(&self, arguments: Option<&Value>, headers: &[(String, String)]) -> Result<(), McpHeaderError> {
-        if arguments.is_some_and(|value| !value.is_object()) { return Err(McpHeaderError::InvalidParameter); }
+    pub fn validate(
+        &self,
+        arguments: Option<&Value>,
+        headers: &[(String, String)],
+    ) -> Result<(), McpHeaderError> {
+        if arguments.is_some_and(|value| !value.is_object()) {
+            return Err(McpHeaderError::InvalidParameter);
+        }
         // Bound inspection independently from the transport's own header limit.
-        if headers.len() > 1024 { return Err(McpHeaderError::LimitExceeded); }
+        if headers.len() > 1024 {
+            return Err(McpHeaderError::LimitExceeded);
+        }
         let mut total = 0_usize;
         for binding in &self.bindings {
-            let mut values = headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case(&binding.name));
+            let mut values = headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case(&binding.name));
             let header = values.next();
-            if values.next().is_some() { return Err(McpHeaderError::HeaderMismatch); }
+            if values.next().is_some() {
+                return Err(McpHeaderError::HeaderMismatch);
+            }
             let value = value_at(arguments, &binding.path).filter(|value| !value.is_null());
             let (Some(value), Some((name, header))) = (value, header) else {
-                if value.is_some() || header.is_some() { return Err(McpHeaderError::HeaderMismatch); }
+                if value.is_some() || header.is_some() {
+                    return Err(McpHeaderError::HeaderMismatch);
+                }
                 continue;
             };
-            total = total.checked_add(name.len()).and_then(|n| n.checked_add(header.len()))
+            total = total
+                .checked_add(name.len())
+                .and_then(|n| n.checked_add(header.len()))
                 .ok_or(McpHeaderError::LimitExceeded)?;
-            if total > MAX_PARAMETER_HEADER_BLOCK_BYTES { return Err(McpHeaderError::LimitExceeded); }
+            if total > MAX_PARAMETER_HEADER_BLOCK_BYTES {
+                return Err(McpHeaderError::LimitExceeded);
+            }
             let decoded = decode_mcp_header_value(header.as_bytes())?;
             let expected = primitive_value(binding.kind, value)?;
             let equal = match binding.kind {
-                ParameterHeaderType::Integer => safe_integer(&decoded).is_some_and(|value| value.to_string() == expected),
+                ParameterHeaderType::Integer => {
+                    safe_integer(&decoded).is_some_and(|value| value.to_string() == expected)
+                }
                 _ => decoded == expected,
             };
-            if !equal { return Err(McpHeaderError::HeaderMismatch); }
+            if !equal {
+                return Err(McpHeaderError::HeaderMismatch);
+            }
         }
         Ok(())
     }
@@ -506,56 +683,95 @@ impl ToolParameterHeaderPlan {
 /// runtime data. Access to wire values is explicit; the original body is never
 /// replaced by this projection.
 #[derive(PartialEq, Eq)]
-pub struct ProjectedParameterHeaders { fields: Vec<(String, String)> }
+pub struct ProjectedParameterHeaders {
+    fields: Vec<(String, String)>,
+}
 impl ProjectedParameterHeaders {
-    pub fn fields(&self) -> &[(String, String)] { &self.fields }
-    pub fn into_fields(self) -> Vec<(String, String)> { self.fields }
+    pub fn fields(&self) -> &[(String, String)] {
+        &self.fields
+    }
+    pub fn into_fields(self) -> Vec<(String, String)> {
+        self.fields
+    }
 }
 impl fmt::Debug for ProjectedParameterHeaders {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ProjectedParameterHeaders").field("field_count", &self.fields.len()).finish()
+        f.debug_struct("ProjectedParameterHeaders")
+            .field("field_count", &self.fields.len())
+            .finish()
     }
 }
 
 fn value_at<'a>(mut value: Option<&'a Value>, path: &[String]) -> Option<&'a Value> {
-    for key in path { value = value?.as_object()?.get(key); }
+    for key in path {
+        value = value?.as_object()?.get(key);
+    }
     value
 }
 fn primitive_value(kind: ParameterHeaderType, value: &Value) -> Result<String, McpHeaderError> {
     match (kind, value) {
-        (ParameterHeaderType::String, Value::String(value)) if value.len() <= MAX_MCP_HEADER_VALUE_BYTES => Ok(value.clone()),
+        (ParameterHeaderType::String, Value::String(value))
+            if value.len() <= MAX_MCP_HEADER_VALUE_BYTES =>
+        {
+            Ok(value.clone())
+        }
         (ParameterHeaderType::String, Value::String(_)) => Err(McpHeaderError::LimitExceeded),
         (ParameterHeaderType::Boolean, Value::Bool(value)) => Ok(value.to_string()),
         (ParameterHeaderType::Integer, Value::Number(value)) => {
             struct Lexeme(String);
             impl fmt::Write for Lexeme {
                 fn write_str(&mut self, value: &str) -> fmt::Result {
-                    if value.len() > MAX_INTEGER_LEXEME_BYTES - self.0.len() { return Err(fmt::Error); }
+                    if value.len() > MAX_INTEGER_LEXEME_BYTES - self.0.len() {
+                        return Err(fmt::Error);
+                    }
                     self.0.push_str(value);
                     Ok(())
                 }
             }
             let mut source = Lexeme(String::new());
-            fmt::write(&mut source, format_args!("{value}")).map_err(|_| McpHeaderError::LimitExceeded)?;
-            safe_integer(&source.0).map(|value| value.to_string()).ok_or(McpHeaderError::InvalidParameter)
+            fmt::write(&mut source, format_args!("{value}"))
+                .map_err(|_| McpHeaderError::LimitExceeded)?;
+            safe_integer(&source.0)
+                .map(|value| value.to_string())
+                .ok_or(McpHeaderError::InvalidParameter)
         }
         _ => Err(McpHeaderError::InvalidParameter),
     }
 }
 
-struct Compiler { bindings: Vec<ParameterHeaderBinding>, nodes: usize, path_bytes: usize }
+struct Compiler {
+    bindings: Vec<ParameterHeaderBinding>,
+    nodes: usize,
+    path_bytes: usize,
+}
 impl Compiler {
-    fn visit(&mut self, schema: &Value, path: &mut Vec<String>, reachable: bool, depth: usize) -> Result<(), McpHeaderError> {
+    fn visit(
+        &mut self,
+        schema: &Value,
+        path: &mut Vec<String>,
+        reachable: bool,
+        depth: usize,
+    ) -> Result<(), McpHeaderError> {
         self.nodes += 1;
         if self.nodes > MAX_SCHEMA_ADMISSION_NODES || depth > MAX_SCHEMA_VALIDATION_DEPTH {
             return Err(McpHeaderError::LimitExceeded);
         }
-        let Some(schema) = schema.as_object() else { return Ok(()); };
+        let Some(schema) = schema.as_object() else {
+            return Ok(());
+        };
         if let Some(annotation) = schema.get("x-mcp-header") {
-            if !reachable || path.is_empty() { return Err(McpHeaderError::UnreachableAnnotation); }
-            let suffix = annotation.as_str().ok_or(McpHeaderError::InvalidAnnotation)?;
-            if suffix.is_empty() || !suffix.bytes().all(is_tchar) { return Err(McpHeaderError::InvalidAnnotation); }
-            if suffix.len() > MAX_PARAMETER_HEADER_NAME_BYTES - PREFIX.len() || self.bindings.len() >= MAX_PARAMETER_HEADERS {
+            if !reachable || path.is_empty() {
+                return Err(McpHeaderError::UnreachableAnnotation);
+            }
+            let suffix = annotation
+                .as_str()
+                .ok_or(McpHeaderError::InvalidAnnotation)?;
+            if suffix.is_empty() || !suffix.bytes().all(is_tchar) {
+                return Err(McpHeaderError::InvalidAnnotation);
+            }
+            if suffix.len() > MAX_PARAMETER_HEADER_NAME_BYTES - PREFIX.len()
+                || self.bindings.len() >= MAX_PARAMETER_HEADERS
+            {
                 return Err(McpHeaderError::LimitExceeded);
             }
             let kind = match schema.get("type").and_then(Value::as_str) {
@@ -565,43 +781,75 @@ impl Compiler {
                 _ => return Err(McpHeaderError::InvalidAnnotation),
             };
             let name = format!("{PREFIX}{suffix}");
-            if self.bindings.iter().any(|binding| binding.name.eq_ignore_ascii_case(&name)) {
+            if self
+                .bindings
+                .iter()
+                .any(|binding| binding.name.eq_ignore_ascii_case(&name))
+            {
                 return Err(McpHeaderError::DuplicateAnnotation);
             }
-            self.path_bytes = path.iter().try_fold(self.path_bytes, |n, key| n.checked_add(key.len()))
+            self.path_bytes = path
+                .iter()
+                .try_fold(self.path_bytes, |n, key| n.checked_add(key.len()))
                 .ok_or(McpHeaderError::LimitExceeded)?;
-            if self.path_bytes > MAX_PARAMETER_HEADER_PATH_BYTES { return Err(McpHeaderError::LimitExceeded); }
+            if self.path_bytes > MAX_PARAMETER_HEADER_PATH_BYTES {
+                return Err(McpHeaderError::LimitExceeded);
+            }
             let secret = schema.get("writeOnly") == Some(&Value::Bool(true))
-                || schema.get("format").and_then(Value::as_str)
+                || schema
+                    .get("format")
+                    .and_then(Value::as_str)
                     .is_some_and(|format| format.eq_ignore_ascii_case("password"));
-            self.bindings.push(ParameterHeaderBinding { path: path.clone(), name, kind, secret });
+            self.bindings.push(ParameterHeaderBinding {
+                path: path.clone(),
+                name,
+                kind,
+                secret,
+            });
         }
         // Walk schema locations, not literal example/default/enum/const data.
         // Even unused definitions must be checked: an annotation there is not
         // reachable solely through properties and invalidates the tool.
         for (keyword, value) in schema {
             match keyword.as_str() {
-                "properties" => if let Some(properties) = value.as_object() {
-                    for (name, child) in properties {
-                        if name.len() > MAX_PARAMETER_HEADER_PATH_BYTES { return Err(McpHeaderError::LimitExceeded); }
-                        path.push(name.clone());
-                        let result = self.visit(child, path, reachable, depth + 1);
-                        path.pop();
-                        result?;
+                "properties" => {
+                    if let Some(properties) = value.as_object() {
+                        for (name, child) in properties {
+                            if name.len() > MAX_PARAMETER_HEADER_PATH_BYTES {
+                                return Err(McpHeaderError::LimitExceeded);
+                            }
+                            path.push(name.clone());
+                            let result = self.visit(child, path, reachable, depth + 1);
+                            path.pop();
+                            result?;
+                        }
                     }
-                },
+                }
                 "$defs" | "patternProperties" | "dependentSchemas" => {
                     if let Some(children) = value.as_object() {
-                        for child in children.values() { self.visit(child, path, false, depth + 1)?; }
+                        for child in children.values() {
+                            self.visit(child, path, false, depth + 1)?;
+                        }
                     }
                 }
                 "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
                     if let Some(children) = value.as_array() {
-                        for child in children { self.visit(child, path, false, depth + 1)?; }
+                        for child in children {
+                            self.visit(child, path, false, depth + 1)?;
+                        }
                     }
                 }
-                "items" | "contains" | "additionalProperties" | "unevaluatedProperties"
-                | "unevaluatedItems" | "propertyNames" | "not" | "if" | "then" | "else" | "contentSchema" => {
+                "items"
+                | "contains"
+                | "additionalProperties"
+                | "unevaluatedProperties"
+                | "unevaluatedItems"
+                | "propertyNames"
+                | "not"
+                | "if"
+                | "then"
+                | "else"
+                | "contentSchema" => {
                     self.visit(value, path, false, depth + 1)?;
                 }
                 _ => {}
@@ -615,7 +863,9 @@ impl Compiler {
 // fractions and exponent notation are accepted only when their exact value is
 // an integer in the safe range. Header values use the same grammar as the body.
 fn safe_integer(source: &str) -> Option<i64> {
-    if source.is_empty() || source.len() > MAX_INTEGER_LEXEME_BYTES { return None; }
+    if source.is_empty() || source.len() > MAX_INTEGER_LEXEME_BYTES {
+        return None;
+    }
     let bytes = source.as_bytes();
     let negative = bytes[0] == b'-';
     let mut position = usize::from(negative);
@@ -624,13 +874,17 @@ fn safe_integer(source: &str) -> Option<i64> {
     if first == b'0' {
         digits.push(0);
         position += 1;
-        if bytes.get(position).is_some_and(u8::is_ascii_digit) { return None; }
+        if bytes.get(position).is_some_and(u8::is_ascii_digit) {
+            return None;
+        }
     } else if (b'1'..=b'9').contains(&first) {
         while let Some(byte) = bytes.get(position).filter(|byte| byte.is_ascii_digit()) {
             digits.push(*byte - b'0');
             position += 1;
         }
-    } else { return None; }
+    } else {
+        return None;
+    }
     let mut fraction = 0_i32;
     if bytes.get(position) == Some(&b'.') {
         position += 1;
@@ -639,36 +893,64 @@ fn safe_integer(source: &str) -> Option<i64> {
             fraction += 1;
             position += 1;
         }
-        if fraction == 0 { return None; }
+        if fraction == 0 {
+            return None;
+        }
     }
     let mut exponent = 0_i32;
     if matches!(bytes.get(position), Some(b'e' | b'E')) {
         position += 1;
         let subtract = bytes.get(position) == Some(&b'-');
-        if matches!(bytes.get(position), Some(b'+' | b'-')) { position += 1; }
-        let start = position;
-        while let Some(byte) = bytes.get(position).filter(|byte| byte.is_ascii_digit()) {
-            exponent = exponent.checked_mul(10)?.checked_add(i32::from(*byte - b'0'))?;
+        if matches!(bytes.get(position), Some(b'+' | b'-')) {
             position += 1;
         }
-        if position == start { return None; }
-        if subtract { exponent = exponent.checked_neg()?; }
+        let start = position;
+        while let Some(byte) = bytes.get(position).filter(|byte| byte.is_ascii_digit()) {
+            exponent = exponent
+                .checked_mul(10)?
+                .checked_add(i32::from(*byte - b'0'))?;
+            position += 1;
+        }
+        if position == start {
+            return None;
+        }
+        if subtract {
+            exponent = exponent.checked_neg()?;
+        }
     }
-    if position != bytes.len() { return None; }
-    let Some(first) = digits.iter().position(|digit| *digit != 0) else { return Some(0); };
+    if position != bytes.len() {
+        return None;
+    }
+    let Some(first) = digits.iter().position(|digit| *digit != 0) else {
+        return Some(0);
+    };
     let mut digits = &digits[first..];
     let scale = exponent.checked_sub(fraction)?;
     if scale < 0 {
         let remove = usize::try_from(scale.checked_neg()?).ok()?;
-        if remove >= digits.len() || digits[digits.len() - remove..].iter().any(|digit| *digit != 0) { return None; }
+        if remove >= digits.len()
+            || digits[digits.len() - remove..]
+                .iter()
+                .any(|digit| *digit != 0)
+        {
+            return None;
+        }
         digits = &digits[..digits.len() - remove];
     }
     let zeros = usize::try_from(scale.max(0)).ok()?;
-    if digits.len().checked_add(zeros)? > 16 { return None; }
+    if digits.len().checked_add(zeros)? > 16 {
+        return None;
+    }
     let mut value = 0_i64;
-    for digit in digits { value = value.checked_mul(10)?.checked_add(i64::from(*digit))?; }
-    for _ in 0..zeros { value = value.checked_mul(10)?; }
-    if value > MAX_PARAMETER_HEADER_INTEGER { return None; }
+    for digit in digits {
+        value = value.checked_mul(10)?.checked_add(i64::from(*digit))?;
+    }
+    for _ in 0..zeros {
+        value = value.checked_mul(10)?;
+    }
+    if value > MAX_PARAMETER_HEADER_INTEGER {
+        return None;
+    }
     Some(if negative { -value } else { value })
 }
 
@@ -681,43 +963,76 @@ mod tests {
         AdmittedToolHeaderSchema::admit(schema).map(|schema| schema.plan)
     }
     fn scalar(kind: &str) -> ToolParameterHeaderPlan {
-        plan(json!({"type":"object", "properties":{"value":{"type":kind,"x-mcp-header":"Value"}}})).unwrap()
+        plan(json!({"type":"object", "properties":{"value":{"type":kind,"x-mcp-header":"Value"}}}))
+            .unwrap()
     }
 
     #[test]
     fn header_values_round_trip_without_injection_or_double_decoding() {
-        for value in ["", "us-west1", "inside \t space", "Hello, 世界", " padded ", "line1\nline2", "\0", "=?base64?bGl0ZXJhbA==?="] {
+        for value in [
+            "",
+            "us-west1",
+            "inside \t space",
+            "Hello, 世界",
+            " padded ",
+            "line1\nline2",
+            "\0",
+            "=?base64?bGl0ZXJhbA==?=",
+        ] {
             let encoded = encode_mcp_header_value(value).unwrap();
             assert!(encoded.bytes().all(is_field_value_byte));
             assert_eq!(decode_mcp_header_value(encoded.as_bytes()).unwrap(), value);
         }
-        assert_eq!(encode_mcp_header_value(" padded ").unwrap(), "=?base64?IHBhZGRlZCA=?=");
-        assert_eq!(decode_mcp_header_value(b" \t=?base64?IHBhZGRlZCA=?=\t ").unwrap(), " padded ");
-        assert_eq!(decode_mcp_header_value(b"=?BASE64?YWJj?=").unwrap(), "=?BASE64?YWJj?=");
+        assert_eq!(
+            encode_mcp_header_value(" padded ").unwrap(),
+            "=?base64?IHBhZGRlZCA=?="
+        );
+        assert_eq!(
+            decode_mcp_header_value(b" \t=?base64?IHBhZGRlZCA=?=\t ").unwrap(),
+            " padded "
+        );
+        assert_eq!(
+            decode_mcp_header_value(b"=?BASE64?YWJj?=").unwrap(),
+            "=?BASE64?YWJj?="
+        );
     }
 
     #[test]
     fn overlapping_sentinel_is_rejected_without_panicking_or_reinterpreting_it() {
         for raw in [b"=?base64?=".as_slice(), b" \t=?base64?=\t "] {
-            assert_eq!(decode_mcp_header_value(raw), Err(McpHeaderError::InvalidHeaderValue));
+            assert_eq!(
+                decode_mcp_header_value(raw),
+                Err(McpHeaderError::InvalidHeaderValue)
+            );
         }
         // The empty encoding has two distinct question marks, not an overlap.
         assert_eq!(decode_mcp_header_value(b"=?base64??="), Ok(String::new()));
         for literal in ["=?base64?=", "=?base64??=", "=?base64?YQ==?="] {
             let encoded = encode_mcp_header_value(literal).unwrap();
-            assert_ne!(encoded, literal, "sentinel-looking literals must be escaped");
-            assert_eq!(decode_mcp_header_value(encoded.as_bytes()).unwrap(), literal);
+            assert_ne!(
+                encoded, literal,
+                "sentinel-looking literals must be escaped"
+            );
+            assert_eq!(
+                decode_mcp_header_value(encoded.as_bytes()).unwrap(),
+                literal
+            );
         }
     }
 
     #[test]
     fn encoded_values_round_trip_at_every_base64_padding_boundary() {
-        for length in [MAX_MCP_HEADER_VALUE_BYTES - 2, MAX_MCP_HEADER_VALUE_BYTES - 1,
-            MAX_MCP_HEADER_VALUE_BYTES] {
+        for length in [
+            MAX_MCP_HEADER_VALUE_BYTES - 2,
+            MAX_MCP_HEADER_VALUE_BYTES - 1,
+            MAX_MCP_HEADER_VALUE_BYTES,
+        ] {
             for value in ["\0".repeat(length), format!("{} ", "x".repeat(length - 1))] {
                 let encoded = encode_mcp_header_value(&value).unwrap();
-                assert_eq!(encoded.len(), SENTINEL_PREFIX.len() + 4 * length.div_ceil(3)
-                    + SENTINEL_SUFFIX.len());
+                assert_eq!(
+                    encoded.len(),
+                    SENTINEL_PREFIX.len() + 4 * length.div_ceil(3) + SENTINEL_SUFFIX.len()
+                );
                 assert!(encoded.len() <= MAX_MCP_ENCODED_HEADER_VALUE_BYTES);
                 assert_eq!(decode_mcp_header_value(encoded.as_bytes()).unwrap(), value);
             }
@@ -725,10 +1040,19 @@ mod tests {
         // The byte immediately beyond the decoded limit can occupy the same
         // Base64 quantum as a valid maximum-length value. Check both bounds.
         let oversized = "\0".repeat(MAX_MCP_HEADER_VALUE_BYTES + 1);
-        assert_eq!(encode_mcp_header_value(&oversized), Err(McpHeaderError::LimitExceeded));
-        let wire = format!("{SENTINEL_PREFIX}{}{SENTINEL_SUFFIX}", STANDARD.encode(oversized));
+        assert_eq!(
+            encode_mcp_header_value(&oversized),
+            Err(McpHeaderError::LimitExceeded)
+        );
+        let wire = format!(
+            "{SENTINEL_PREFIX}{}{SENTINEL_SUFFIX}",
+            STANDARD.encode(oversized)
+        );
         assert_eq!(wire.len(), MAX_MCP_ENCODED_HEADER_VALUE_BYTES);
-        assert_eq!(decode_mcp_header_value(wire.as_bytes()), Err(McpHeaderError::LimitExceeded));
+        assert_eq!(
+            decode_mcp_header_value(wire.as_bytes()),
+            Err(McpHeaderError::LimitExceeded)
+        );
     }
 
     #[test]
@@ -738,8 +1062,13 @@ mod tests {
         let before = arguments.clone();
         let projected = plan.project(Some(&arguments)).unwrap();
         plan.validate(Some(&arguments), projected.fields()).unwrap();
-        assert_eq!(plan.validate(Some(&arguments), &[("Mcp-Param-Value".to_owned(),
-            "=?base64?=".to_owned())]), Err(McpHeaderError::InvalidHeaderValue));
+        assert_eq!(
+            plan.validate(
+                Some(&arguments),
+                &[("Mcp-Param-Value".to_owned(), "=?base64?=".to_owned())]
+            ),
+            Err(McpHeaderError::InvalidHeaderValue)
+        );
         assert_eq!(arguments, before);
     }
 
@@ -749,11 +1078,17 @@ mod tests {
         let arguments = json!({"value":"\0".repeat(MAX_MCP_HEADER_VALUE_BYTES)});
         let before = arguments.clone();
         let projected = plan.project(Some(&arguments)).unwrap();
-        assert_eq!(projected.fields()[0].1.len(), MAX_MCP_ENCODED_HEADER_VALUE_BYTES);
+        assert_eq!(
+            projected.fields()[0].1.len(),
+            MAX_MCP_ENCODED_HEADER_VALUE_BYTES
+        );
         plan.validate(Some(&arguments), projected.fields()).unwrap();
         assert_eq!(arguments, before);
         let oversized = json!({"value":"\0".repeat(MAX_MCP_HEADER_VALUE_BYTES + 1)});
-        assert_eq!(plan.project(Some(&oversized)), Err(McpHeaderError::LimitExceeded));
+        assert_eq!(
+            plan.project(Some(&oversized)),
+            Err(McpHeaderError::LimitExceeded)
+        );
     }
 
     #[test]
@@ -775,21 +1110,45 @@ mod tests {
         assert!(custom.validate(&json!({"value":2})).is_err());
         let mut invalid = annotated;
         invalid["properties"]["value"]["minimum"] = json!("not-a-number");
-        assert!(matches!(AdmittedToolHeaderSchema::admit(invalid), Err(McpHeaderError::InvalidSchema)));
+        assert!(matches!(
+            AdmittedToolHeaderSchema::admit(invalid),
+            Err(McpHeaderError::InvalidSchema)
+        ));
         let large = json!({"type":"object","default":"x".repeat(MAX_TOOL_HEADER_SCHEMA_BYTES + 1)});
-        assert!(matches!(AdmittedToolHeaderSchema::admit(large), Err(McpHeaderError::LimitExceeded)));
+        assert!(matches!(
+            AdmittedToolHeaderSchema::admit(large),
+            Err(McpHeaderError::LimitExceeded)
+        ));
     }
 
     #[test]
     fn header_admission_rejects_raw_non_ascii_controls_and_malformed_sentinels() {
-        for raw in [b"x\r\ny".as_slice(), b"\x80", b"\xff", "世界".as_bytes(), b"\x7f", b"=?base64?%%%?=", b"=?base64?/w==?=", b"=?base64?YR==?="] {
+        for raw in [
+            b"x\r\ny".as_slice(),
+            b"\x80",
+            b"\xff",
+            "世界".as_bytes(),
+            b"\x7f",
+            b"=?base64?%%%?=",
+            b"=?base64?/w==?=",
+            b"=?base64?YR==?=",
+        ] {
             assert!(decode_mcp_header_value(raw).is_err());
         }
         assert!(decode_mcp_header_value(b"=?base64?YQ==?=").is_ok());
-        assert_eq!(encode_mcp_header_value(&"x".repeat(MAX_MCP_HEADER_VALUE_BYTES + 1)), Err(McpHeaderError::LimitExceeded));
-        assert_eq!(decode_mcp_header_value(&vec![b'x'; MAX_MCP_ENCODED_HEADER_VALUE_BYTES + 1]), Err(McpHeaderError::LimitExceeded));
+        assert_eq!(
+            encode_mcp_header_value(&"x".repeat(MAX_MCP_HEADER_VALUE_BYTES + 1)),
+            Err(McpHeaderError::LimitExceeded)
+        );
+        assert_eq!(
+            decode_mcp_header_value(&vec![b'x'; MAX_MCP_ENCODED_HEADER_VALUE_BYTES + 1]),
+            Err(McpHeaderError::LimitExceeded)
+        );
         let maximum = "界".repeat(MAX_MCP_HEADER_VALUE_BYTES / 3);
-        assert_eq!(decode_mcp_header_value(encode_mcp_header_value(&maximum).unwrap().as_bytes()).unwrap(), maximum);
+        assert_eq!(
+            decode_mcp_header_value(encode_mcp_header_value(&maximum).unwrap().as_bytes()).unwrap(),
+            maximum
+        );
     }
 
     #[test]
@@ -801,7 +1160,8 @@ mod tests {
         let admitted = AdmittedToolHeaderSchema::admit(schema.clone()).unwrap();
         assert_eq!(admitted.schema(), &schema);
         let plan = admitted.header_plan();
-        let arguments = json!({"verbose":null,"options":{"a/b~.0":"Hello, 世界"},"unrelated":"private"});
+        let arguments =
+            json!({"verbose":null,"options":{"a/b~.0":"Hello, 世界"},"unrelated":"private"});
         let before = arguments.clone();
         assert!(admitted.validate(&arguments).is_err());
         let fields = plan.project(Some(&arguments)).unwrap();
@@ -822,7 +1182,19 @@ mod tests {
             schema[keyword] = json!([property]);
             assert_eq!(plan(schema), Err(McpHeaderError::UnreachableAnnotation));
         }
-        for keyword in ["items", "contains", "additionalProperties", "unevaluatedProperties", "unevaluatedItems", "not", "if", "then", "else", "propertyNames", "contentSchema"] {
+        for keyword in [
+            "items",
+            "contains",
+            "additionalProperties",
+            "unevaluatedProperties",
+            "unevaluatedItems",
+            "not",
+            "if",
+            "then",
+            "else",
+            "propertyNames",
+            "contentSchema",
+        ] {
             let mut schema = json!({"type":"object"});
             schema[keyword] = property.clone();
             assert_eq!(plan(schema), Err(McpHeaderError::UnreachableAnnotation));
@@ -832,45 +1204,115 @@ mod tests {
             schema[keyword] = json!({"hidden":property});
             assert_eq!(plan(schema), Err(McpHeaderError::UnreachableAnnotation));
         }
-        let schema = json!({"type":"object", "default":property, "examples":[property], "const":property});
-        assert!(plan(schema).unwrap().bindings().is_empty(), "literal data is not a schema annotation");
+        let schema =
+            json!({"type":"object", "default":property, "examples":[property], "const":property});
+        assert!(
+            plan(schema).unwrap().bindings().is_empty(),
+            "literal data is not a schema annotation"
+        );
         assert_eq!(plan(annotated), Err(McpHeaderError::UnreachableAnnotation));
     }
 
     #[test]
     fn one_invalid_annotation_rejects_the_plan_without_salvaging_valid_bindings() {
-        for bad in [json!(""), json!("bad name"), json!("x\r\ny"), json!("世界"), json!(true), json!(null)] {
+        for bad in [
+            json!(""),
+            json!("bad name"),
+            json!("x\r\ny"),
+            json!("世界"),
+            json!(true),
+            json!(null),
+        ] {
             let schema = json!({"type":"object","properties":{
                 "good":{"type":"string","x-mcp-header":"Good"},
                 "bad":{"type":"string","x-mcp-header":bad}
             }});
             assert!(plan(schema).is_err());
         }
-        for kind in [json!("number"), json!("array"), json!("object"), json!("null"), json!(["string", "null"])] {
-            assert_eq!(plan(json!({"properties":{"v":{"type":kind,"x-mcp-header":"V"}}})), Err(McpHeaderError::InvalidAnnotation));
+        for kind in [
+            json!("number"),
+            json!("array"),
+            json!("object"),
+            json!("null"),
+            json!(["string", "null"]),
+        ] {
+            assert_eq!(
+                plan(json!({"properties":{"v":{"type":kind,"x-mcp-header":"V"}}})),
+                Err(McpHeaderError::InvalidAnnotation)
+            );
         }
-        assert_eq!(plan(json!({"properties":{"v":{"x-mcp-header":"V"}}})), Err(McpHeaderError::InvalidAnnotation));
-        assert_eq!(plan(json!({"properties":{"a":{"type":"string","x-mcp-header":"Region"},"b":{"type":"boolean","x-mcp-header":"rEGION"}}})), Err(McpHeaderError::DuplicateAnnotation));
+        assert_eq!(
+            plan(json!({"properties":{"v":{"x-mcp-header":"V"}}})),
+            Err(McpHeaderError::InvalidAnnotation)
+        );
+        assert_eq!(
+            plan(
+                json!({"properties":{"a":{"type":"string","x-mcp-header":"Region"},"b":{"type":"boolean","x-mcp-header":"rEGION"}}})
+            ),
+            Err(McpHeaderError::DuplicateAnnotation)
+        );
         let mut properties = serde_json::Map::new();
         for index in 0..=MAX_PARAMETER_HEADERS {
-            properties.insert(format!("v{index}"), json!({"type":"string","x-mcp-header":format!("H{index}")}));
+            properties.insert(
+                format!("v{index}"),
+                json!({"type":"string","x-mcp-header":format!("H{index}")}),
+            );
         }
-        assert_eq!(plan(json!({"type":"object","properties":properties})), Err(McpHeaderError::LimitExceeded));
+        assert_eq!(
+            plan(json!({"type":"object","properties":properties})),
+            Err(McpHeaderError::LimitExceeded)
+        );
     }
 
     #[test]
     fn exact_integers_accept_equivalent_lexemes_without_rounding_fractional_values() {
-        for (lexeme, expected) in [("42",42), ("42.0",42), ("4.2e1",42), ("4200e-2",42), ("-0",0), ("0.000e100",0), ("9007199254740991",MAX_PARAMETER_HEADER_INTEGER), ("-9007199254740991",-MAX_PARAMETER_HEADER_INTEGER)] {
+        for (lexeme, expected) in [
+            ("42", 42),
+            ("42.0", 42),
+            ("4.2e1", 42),
+            ("4200e-2", 42),
+            ("-0", 0),
+            ("0.000e100", 0),
+            ("9007199254740991", MAX_PARAMETER_HEADER_INTEGER),
+            ("-9007199254740991", -MAX_PARAMETER_HEADER_INTEGER),
+        ] {
             assert_eq!(safe_integer(lexeme), Some(expected), "{lexeme}");
         }
-        for lexeme in ["9007199254740992", "-9007199254740992", "9007199254740990.5", "42.00000000000000001", "0.1", "1e100", "1e-100", "01", "+1", "1.", "1e", "NaN", "1e999999999999999"] {
+        for lexeme in [
+            "9007199254740992",
+            "-9007199254740992",
+            "9007199254740990.5",
+            "42.00000000000000001",
+            "0.1",
+            "1e100",
+            "1e-100",
+            "01",
+            "+1",
+            "1.",
+            "1e",
+            "NaN",
+            "1e999999999999999",
+        ] {
             assert_eq!(safe_integer(lexeme), None, "{lexeme}");
         }
         let plan = scalar("integer");
         let arguments: Value = serde_json::from_str("{\"value\":42.0}").unwrap();
         assert_eq!(plan.project(Some(&arguments)).unwrap().fields()[0].1, "42");
-        plan.validate(Some(&arguments), &[("mcp-param-value".to_owned(), "4.2e1".to_owned())]).unwrap();
-        assert!(plan.validate(Some(&arguments), &[("Mcp-Param-Value".to_owned(), "42.00000000000000001".to_owned())]).is_err());
+        plan.validate(
+            Some(&arguments),
+            &[("mcp-param-value".to_owned(), "4.2e1".to_owned())],
+        )
+        .unwrap();
+        assert!(
+            plan.validate(
+                Some(&arguments),
+                &[(
+                    "Mcp-Param-Value".to_owned(),
+                    "42.00000000000000001".to_owned()
+                )]
+            )
+            .is_err()
+        );
         let arguments: Value = serde_json::from_str("{\"value\":9007199254740990.5}").unwrap();
         assert!(plan.project(Some(&arguments)).is_err());
     }
@@ -883,10 +1325,25 @@ mod tests {
         plan.validate(Some(&arguments), &valid).unwrap();
         let mut duplicate = valid.clone();
         duplicate.push(("Mcp-Param-Value".to_owned(), "PrivateCanary".to_owned()));
-        assert_eq!(plan.validate(Some(&arguments), &duplicate), Err(McpHeaderError::HeaderMismatch));
-        assert_eq!(plan.validate(Some(&arguments), &[]), Err(McpHeaderError::HeaderMismatch));
-        assert_eq!(plan.validate(Some(&json!({"value":null})), &valid), Err(McpHeaderError::HeaderMismatch));
-        assert_eq!(plan.validate(Some(&arguments), &[("Mcp-Param-Value".to_owned(), "privatecanary".to_owned())]), Err(McpHeaderError::HeaderMismatch));
+        assert_eq!(
+            plan.validate(Some(&arguments), &duplicate),
+            Err(McpHeaderError::HeaderMismatch)
+        );
+        assert_eq!(
+            plan.validate(Some(&arguments), &[]),
+            Err(McpHeaderError::HeaderMismatch)
+        );
+        assert_eq!(
+            plan.validate(Some(&json!({"value":null})), &valid),
+            Err(McpHeaderError::HeaderMismatch)
+        );
+        assert_eq!(
+            plan.validate(
+                Some(&arguments),
+                &[("Mcp-Param-Value".to_owned(), "privatecanary".to_owned())]
+            ),
+            Err(McpHeaderError::HeaderMismatch)
+        );
         let mut unknown = valid;
         unknown.push(("Mcp-Param-Unrecognized".to_owned(), "other".to_owned()));
         plan.validate(Some(&arguments), &unknown).unwrap();
@@ -897,23 +1354,46 @@ mod tests {
     #[test]
     fn wrong_types_and_aggregate_limits_never_return_partial_projection() {
         let plan = scalar("boolean");
-        assert_eq!(plan.project(Some(&json!({"value":"true"}))), Err(McpHeaderError::InvalidParameter));
-        assert_eq!(plan.project(Some(&json!([true]))), Err(McpHeaderError::InvalidParameter));
-        assert_eq!(plan.project(Some(&json!({"value":true}))).unwrap().fields()[0].1, "true");
+        assert_eq!(
+            plan.project(Some(&json!({"value":"true"}))),
+            Err(McpHeaderError::InvalidParameter)
+        );
+        assert_eq!(
+            plan.project(Some(&json!([true]))),
+            Err(McpHeaderError::InvalidParameter)
+        );
+        assert_eq!(
+            plan.project(Some(&json!({"value":true}))).unwrap().fields()[0].1,
+            "true"
+        );
         let mut properties = serde_json::Map::new();
         let mut arguments = serde_json::Map::new();
         for index in 0..9 {
-            properties.insert(format!("v{index}"), json!({"type":"string","x-mcp-header":format!("H{index}")}));
-            arguments.insert(format!("v{index}"), Value::String("x".repeat(MAX_MCP_HEADER_VALUE_BYTES)));
+            properties.insert(
+                format!("v{index}"),
+                json!({"type":"string","x-mcp-header":format!("H{index}")}),
+            );
+            arguments.insert(
+                format!("v{index}"),
+                Value::String("x".repeat(MAX_MCP_HEADER_VALUE_BYTES)),
+            );
         }
         let plan = self::plan(json!({"type":"object","properties":properties})).unwrap();
-        assert_eq!(plan.project(Some(&Value::Object(arguments))), Err(McpHeaderError::LimitExceeded));
+        assert_eq!(
+            plan.project(Some(&Value::Object(arguments))),
+            Err(McpHeaderError::LimitExceeded)
+        );
     }
 
     #[test]
     fn tool_input_schema_admission_keeps_plain_schemas_and_admits_annotations() {
         let plain = json!({"type":"object","properties":{"region":{"type":"string"}}});
-        assert_eq!(admit_final_tool_input_schema(plain.clone()).unwrap().schema(), &plain);
+        assert_eq!(
+            admit_final_tool_input_schema(plain.clone())
+                .unwrap()
+                .schema(),
+            &plain
+        );
         let annotated = json!({"type":"object","properties":{
             "region":{"type":"string","x-mcp-header":"Region"}
         }});
@@ -956,8 +1436,19 @@ mod tests {
             source[keyword] = json!({"value":{"type":17,"x-mcp-header":false}});
             let admitted = admit_final_tool_input_schema(source.clone()).unwrap();
             assert_eq!(admitted.schema(), &source);
-            assert!(ToolParameterHeaderPlan::compile(&admitted).unwrap().bindings().is_empty());
-            assert!(AdmittedToolHeaderSchema::admit(source).unwrap().header_plan().bindings().is_empty());
+            assert!(
+                ToolParameterHeaderPlan::compile(&admitted)
+                    .unwrap()
+                    .bindings()
+                    .is_empty()
+            );
+            assert!(
+                AdmittedToolHeaderSchema::admit(source)
+                    .unwrap()
+                    .header_plan()
+                    .bindings()
+                    .is_empty()
+            );
         }
     }
 
@@ -988,14 +1479,19 @@ mod tests {
     }
 
     fn region_review(schema: &Value) -> NonSensitiveHeaderExposure {
-        NonSensitiveHeaderExposure::new("lookup", ToolSchemaRevision::of(schema).unwrap(), ["region"])
+        NonSensitiveHeaderExposure::new(
+            "lookup",
+            ToolSchemaRevision::of(schema).unwrap(),
+            ["region"],
+        )
     }
 
     #[test]
     fn local_admission_accepts_a_review_of_the_exact_tool_revision_and_path() {
         let schema = reviewed_schema();
-        let admitted = admit_local_tool_input_schema("lookup", schema.clone(), &[region_review(&schema)])
-            .expect("the reviewed annotation admits");
+        let admitted =
+            admit_local_tool_input_schema("lookup", schema.clone(), &[region_review(&schema)])
+                .expect("the reviewed annotation admits");
         assert!(admitted.validate(&json!({"region":"eu-west"})).is_ok());
         assert!(admitted.validate(&json!({"region":7})).is_err());
         // Unannotated schemas need no review, exactly as before.
@@ -1011,26 +1507,64 @@ mod tests {
         let refuse = |schema: Value, reviews: &[NonSensitiveHeaderExposure]| {
             admit_local_tool_input_schema("lookup", schema, reviews).expect_err("refused")
         };
-        assert_eq!(refuse(schema.clone(), &[]),
-            HeaderExposureError::Unreviewed { path: path.clone(), revision });
+        assert_eq!(
+            refuse(schema.clone(), &[]),
+            HeaderExposureError::Unreviewed {
+                path: path.clone(),
+                revision
+            }
+        );
         let mut earlier = schema.clone();
         earlier["properties"]["note"]["maxLength"] = json!(64);
-        assert_eq!(refuse(schema.clone(), &[region_review(&earlier)]),
-            HeaderExposureError::StaleReview { path: path.clone(), revision });
-        assert_eq!(refuse(schema.clone(), &[NonSensitiveHeaderExposure::new("lookup", revision, ["note"])]),
-            HeaderExposureError::Unreviewed { path: path.clone(), revision });
-        assert_eq!(refuse(schema.clone(), &[NonSensitiveHeaderExposure::new("other", revision, ["region"])]),
-            HeaderExposureError::Unreviewed { path: path.clone(), revision });
+        assert_eq!(
+            refuse(schema.clone(), &[region_review(&earlier)]),
+            HeaderExposureError::StaleReview {
+                path: path.clone(),
+                revision
+            }
+        );
+        assert_eq!(
+            refuse(
+                schema.clone(),
+                &[NonSensitiveHeaderExposure::new(
+                    "lookup",
+                    revision,
+                    ["note"]
+                )]
+            ),
+            HeaderExposureError::Unreviewed {
+                path: path.clone(),
+                revision
+            }
+        );
+        assert_eq!(
+            refuse(
+                schema.clone(),
+                &[NonSensitiveHeaderExposure::new(
+                    "other",
+                    revision,
+                    ["region"]
+                )]
+            ),
+            HeaderExposureError::Unreviewed {
+                path: path.clone(),
+                revision
+            }
+        );
         for (keyword, value) in [("writeOnly", json!(true)), ("format", json!("password"))] {
             let mut secret = schema.clone();
             secret["properties"]["region"][keyword] = value;
-            assert_eq!(refuse(secret.clone(), &[region_review(&secret)]),
-                HeaderExposureError::SecretField { path: path.clone() });
+            assert_eq!(
+                refuse(secret.clone(), &[region_review(&secret)]),
+                HeaderExposureError::SecretField { path: path.clone() }
+            );
         }
         let mut untokened = schema.clone();
         untokened["properties"]["region"]["x-mcp-header"] = json!("Re gion");
-        assert_eq!(refuse(untokened.clone(), &[region_review(&untokened)]),
-            HeaderExposureError::Annotation(McpHeaderError::InvalidAnnotation));
+        assert_eq!(
+            refuse(untokened.clone(), &[region_review(&untokened)]),
+            HeaderExposureError::Annotation(McpHeaderError::InvalidAnnotation)
+        );
     }
 
     #[test]

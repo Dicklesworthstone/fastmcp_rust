@@ -1275,7 +1275,8 @@ mod tests {
     fn claim_limits_apply_before_deduplication_and_include_names_and_values() {
         let claims = vec![("scope", "read"); MAX_VERIFIED_IDENTITY_CLAIMS];
         let admitted =
-            VerifiedIngressAuthentication::from_verified_provider_output(identity(&claims)).unwrap();
+            VerifiedIngressAuthentication::from_verified_provider_output(identity(&claims))
+                .unwrap();
         assert_eq!(admitted.verified_claims().len(), 1);
         let mut too_many = claims;
         too_many.push(("scope", "read"));
@@ -1299,7 +1300,9 @@ mod tests {
             );
         }
         assert_eq!(
-            VerifiedIngressAuthentication::from_verified_provider_output(identity(&[("", "value")])),
+            VerifiedIngressAuthentication::from_verified_provider_output(identity(&[(
+                "", "value"
+            )])),
             Err(IngressFactsError::InvalidVerifiedClaim)
         );
     }
@@ -1333,7 +1336,9 @@ mod tests {
 
     #[test]
     fn oauth_binding_rejects_each_contradiction_without_rejecting_approved_aliases() {
-        assert!(VerifiedIngressAuthentication::from_verified_provider_output(identity(&[])).is_ok());
+        assert!(
+            VerifiedIngressAuthentication::from_verified_provider_output(identity(&[])).is_ok()
+        );
         for mutation in 0..5 {
             let mut facts = identity(&[]);
             let VerifiedAudienceBinding::OAuth {

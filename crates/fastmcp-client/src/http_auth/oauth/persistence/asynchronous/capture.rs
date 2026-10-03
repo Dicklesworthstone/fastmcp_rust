@@ -17,18 +17,17 @@ use asupersync::types::Time;
 use fastmcp_core::McpRequestCancellation;
 
 use super::{
-    AsyncOAuthRefreshError, AsyncOAuthRefreshStore, CredentialCommitAnchor,
-    CredentialIoError, CredentialSlotTask, OAuthClient, OAuthCredentials,
-    OAuthGrantProtector, OAuthRefreshCompletion, OAuthRefreshStoreError,
-    OAuthRefreshSubmissionFailure, OAuthRefreshWrite, PartitionAuthorization, SlotRevision,
+    AsyncOAuthRefreshError, AsyncOAuthRefreshStore, CredentialCommitAnchor, CredentialIoError,
+    CredentialSlotTask, OAuthClient, OAuthCredentials, OAuthGrantProtector, OAuthRefreshCompletion,
+    OAuthRefreshStoreError, OAuthRefreshSubmissionFailure, OAuthRefreshWrite,
+    PartitionAuthorization, SlotRevision,
 };
+pub use crate::http_auth::managed::logout::rotation::OAuthRefreshTransferError;
 use crate::http_auth::managed::{ManagedOAuthSession, OAuthSessionError};
 use crate::http_auth::oauth::{OAuthError, operation_deadline, within};
-pub use crate::http_auth::managed::logout::rotation::OAuthRefreshTransferError;
 
-pub type OAuthRefreshCaptureCheck<A, P> = OAuthRefreshCompletion<
-    A, P, Result<(), OAuthRefreshStoreError>,
->;
+pub type OAuthRefreshCaptureCheck<A, P> =
+    OAuthRefreshCompletion<A, P, Result<(), OAuthRefreshStoreError>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OAuthRefreshCaptureStage {
@@ -54,10 +53,19 @@ pub enum OAuthRefreshCaptureCustody<A, P> {
     ReadyToCheck(AsyncOAuthRefreshStore<A, P>),
     Checking(CredentialSlotTask<OAuthRefreshCaptureCheck<A, P>>),
     ReadyToTransfer(AsyncOAuthRefreshStore<A, P>),
-    ReadyToStore { store: AsyncOAuthRefreshStore<A, P>, credentials: OAuthCredentials },
+    ReadyToStore {
+        store: AsyncOAuthRefreshStore<A, P>,
+        credentials: OAuthCredentials,
+    },
     Storing(CredentialSlotTask<OAuthRefreshWrite<A, P>>),
-    Complete { store: AsyncOAuthRefreshStore<A, P>, revision: SlotRevision },
-    Stopped { store: Option<AsyncOAuthRefreshStore<A, P>>, credentials: Option<OAuthCredentials> },
+    Complete {
+        store: AsyncOAuthRefreshStore<A, P>,
+        revision: SlotRevision,
+    },
+    Stopped {
+        store: Option<AsyncOAuthRefreshStore<A, P>>,
+        credentials: Option<OAuthCredentials>,
+    },
 }
 
 #[derive(Debug)]
@@ -80,8 +88,12 @@ impl fmt::Display for OAuthRefreshCaptureError {
             Self::Submission(error) => fmt::Display::fmt(error, f),
             Self::Completion(error) => fmt::Display::fmt(error, f),
             Self::Storage(error) => fmt::Display::fmt(error, f),
-            Self::NotComplete => f.write_str("managed refresh capture has not completed persistence"),
-            Self::Stopped => f.write_str("managed refresh capture stopped; inspect its retained custody"),
+            Self::NotComplete => {
+                f.write_str("managed refresh capture has not completed persistence")
+            }
+            Self::Stopped => {
+                f.write_str("managed refresh capture stopped; inspect its retained custody")
+            }
         }
     }
 }
@@ -118,7 +130,9 @@ pub struct OAuthRefreshCapture<A, P> {
 }
 
 impl<A, P> AsyncOAuthRefreshStore<A, P>
-where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
+where
+    A: CredentialCommitAnchor + 'static,
+    P: OAuthGrantProtector + 'static,
 {
     /// Prepare without transferring credentials or contacting a provider.
     /// `expected_revision` authorizes only that exact replacement, including
@@ -129,9 +143,14 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
     /// the grant being captured. Timeout must be positive and at most 5 minutes.
     #[allow(clippy::too_many_arguments)]
     pub fn begin_capture(
-        self, cx: &Cx, session: &ManagedOAuthSession, expected_generation: u64,
-        authorization: PartitionAuthorization, expected_revision: Option<SlotRevision>,
-        cancellation: &McpRequestCancellation, timeout: Duration,
+        self,
+        cx: &Cx,
+        session: &ManagedOAuthSession,
+        expected_generation: u64,
+        authorization: PartitionAuthorization,
+        expected_revision: Option<SlotRevision>,
+        cancellation: &McpRequestCancellation,
+        timeout: Duration,
     ) -> Result<OAuthRefreshCapture<A, P>, OAuthRefreshSubmissionFailure<A, P, ()>> {
         let admitted = (|| {
             if expected_generation == 0 || timeout.is_zero() || timeout > Duration::from_secs(300) {
@@ -151,13 +170,24 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
         })();
         let deadline = match admitted {
             Ok(deadline) => deadline,
-            Err(cause) => return Err(OAuthRefreshSubmissionFailure { cause, retained: Some(Box::new((self, ()))) }),
+            Err(cause) => {
+                return Err(OAuthRefreshSubmissionFailure {
+                    cause,
+                    retained: Some(Box::new((self, ()))),
+                });
+            }
         };
         let client = OAuthClient::new(self.store.configuration.clone());
         Ok(OAuthRefreshCapture {
-            origin: cx.clone(), cancellation: cancellation.clone(), deadline,
-            session: session.clone(), client, authorization, expected_revision,
-            expected_generation, custody: OAuthRefreshCaptureCustody::ReadyToCheck(self),
+            origin: cx.clone(),
+            cancellation: cancellation.clone(),
+            deadline,
+            session: session.clone(),
+            client,
+            authorization,
+            expected_revision,
+            expected_generation,
+            custody: OAuthRefreshCaptureCustody::ReadyToCheck(self),
         })
     }
 }
@@ -177,50 +207,76 @@ impl<A, P> OAuthRefreshCapture<A, P> {
         }
     }
 
-    pub fn into_custody(self) -> OAuthRefreshCaptureCustody<A, P> { self.custody }
+    pub fn into_custody(self) -> OAuthRefreshCaptureCustody<A, P> {
+        self.custody
+    }
 
     /// Returns only proven completed persistent custody. This remains usable
     /// for cleanup after the source session closes or the capture deadline ends.
     /// It grants no access token or new authority to execute a transaction.
-    pub fn take_store(&mut self) -> Result<(AsyncOAuthRefreshStore<A, P>, SlotRevision), OAuthRefreshCaptureError> {
-        if self.stage() != OAuthRefreshCaptureStage::Complete { return Err(OAuthRefreshCaptureError::NotComplete); }
+    pub fn take_store(
+        &mut self,
+    ) -> Result<(AsyncOAuthRefreshStore<A, P>, SlotRevision), OAuthRefreshCaptureError> {
+        if self.stage() != OAuthRefreshCaptureStage::Complete {
+            return Err(OAuthRefreshCaptureError::NotComplete);
+        }
         let OAuthRefreshCaptureCustody::Complete { store, revision } = std::mem::replace(
-            &mut self.custody, OAuthRefreshCaptureCustody::Stopped { store: None, credentials: None },
-        ) else { return Err(OAuthRefreshCaptureError::NotComplete); };
+            &mut self.custody,
+            OAuthRefreshCaptureCustody::Stopped {
+                store: None,
+                credentials: None,
+            },
+        ) else {
+            return Err(OAuthRefreshCaptureError::NotComplete);
+        };
         Ok((store, revision))
     }
 
     /// Requests local cancellation, not issuer revocation or durable logout.
     /// A running provider may finish a transaction; retain its task to observe it.
-    pub fn cancel(&self) { self.cancellation.cancel(); self.cancel_worker(); }
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
+        self.cancel_worker();
+    }
 
     fn cancel_worker(&self) {
         match &self.custody {
-            OAuthRefreshCaptureCustody::Checking(task) => { let _ = task.request_cancel(); }
-            OAuthRefreshCaptureCustody::Storing(task) => { let _ = task.request_cancel(); }
-            _ => {},
+            OAuthRefreshCaptureCustody::Checking(task) => {
+                let _ = task.request_cancel();
+            }
+            OAuthRefreshCaptureCustody::Storing(task) => {
+                let _ = task.request_cancel();
+            }
+            _ => {}
         }
     }
 }
 
 impl<A, P> OAuthRefreshCapture<A, P>
-where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
+where
+    A: CredentialCommitAnchor + 'static,
+    P: OAuthGrantProtector + 'static,
 {
     /// Stops on the first refusal. No provider/transaction failure is retried.
     pub async fn run(&mut self, observer: &Cx) -> Result<(), OAuthRefreshCaptureError> {
         loop {
-            if self.advance(observer).await? == OAuthRefreshCaptureStage::Complete { return Ok(()); }
+            if self.advance(observer).await? == OAuthRefreshCaptureStage::Complete {
+                return Ok(());
+            }
         }
     }
 
-    pub async fn advance(&mut self, observer: &Cx) -> Result<OAuthRefreshCaptureStage, OAuthRefreshCaptureError> {
+    pub async fn advance(
+        &mut self,
+        observer: &Cx,
+    ) -> Result<OAuthRefreshCaptureStage, OAuthRefreshCaptureError> {
         let origin = self.origin.clone();
         let cancellation = self.cancellation.clone();
         let session = self.session.clone();
         let deadline = self.deadline;
-        let observer_deadline = observer.now().saturating_add_nanos(
-            deadline.as_nanos().saturating_sub(origin.now().as_nanos()),
-        );
+        let observer_deadline = observer
+            .now()
+            .saturating_add_nanos(deadline.as_nanos().saturating_sub(origin.now().as_nanos()));
         let result = {
             let work = async {
                 // Boxed at its source (bd-19tqe): the capture step's state is
@@ -229,40 +285,62 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
                 let mut cancelled = std::pin::pin!(cancellation.cancelled());
                 poll_fn(|task| {
                     if cancelled.as_mut().poll(task).is_ready() {
-                        return Poll::Ready(Err(OAuthRefreshCaptureError::Context(OAuthError::Cancelled)));
+                        return Poll::Ready(Err(OAuthRefreshCaptureError::Context(
+                            OAuthError::Cancelled,
+                        )));
                     }
                     let result = step.as_mut().poll(task);
                     if cancellation.is_cancel_requested() {
-                        Poll::Ready(Err(OAuthRefreshCaptureError::Context(OAuthError::Cancelled)))
-                    } else { result }
-                }).await
+                        Poll::Ready(Err(OAuthRefreshCaptureError::Context(
+                            OAuthError::Cancelled,
+                        )))
+                    } else {
+                        result
+                    }
+                })
+                .await
             };
             within(observer, observer_deadline, async {
                 Ok(within(&origin, deadline, async {
                     Ok(session.run_while_open(work).await)
-                }).await)
-            }).await
-                .map_err(OAuthRefreshCaptureError::Context)
-                .and_then(|r| r.map_err(OAuthRefreshCaptureError::Context))
-                .and_then(|r| r.map_err(OAuthRefreshCaptureError::Session))
-                .and_then(|r| r)
+                })
+                .await)
+            })
+            .await
+            .map_err(OAuthRefreshCaptureError::Context)
+            .and_then(|r| r.map_err(OAuthRefreshCaptureError::Context))
+            .and_then(|r| r.map_err(OAuthRefreshCaptureError::Session))
+            .and_then(|r| r)
         };
-        if cancellation.is_cancel_requested() || origin.is_cancel_requested() || origin.now() >= deadline
-            || matches!(&result, Err(OAuthRefreshCaptureError::Session(OAuthSessionError::Closed)))
+        if cancellation.is_cancel_requested()
+            || origin.is_cancel_requested()
+            || origin.now() >= deadline
+            || matches!(
+                &result,
+                Err(OAuthRefreshCaptureError::Session(OAuthSessionError::Closed))
+            )
         {
             self.cancel_worker();
         }
         result
     }
 
-    async fn advance_inner(&mut self, cx: &Cx) -> Result<OAuthRefreshCaptureStage, OAuthRefreshCaptureError> {
+    async fn advance_inner(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<OAuthRefreshCaptureStage, OAuthRefreshCaptureError> {
         use OAuthRefreshCaptureCustody as C;
         match &mut self.custody {
             C::Checking(task) => {
                 let completion = match task.wait(cx).await {
                     Ok(completion) => completion,
                     Err(error) => {
-                        if terminal_completion(error) { self.custody = C::Stopped { store: None, credentials: None }; }
+                        if terminal_completion(error) {
+                            self.custody = C::Stopped {
+                                store: None,
+                                credentials: None,
+                            };
+                        }
                         return Err(OAuthRefreshCaptureError::Completion(error));
                     }
                 };
@@ -270,7 +348,10 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
                 match outcome {
                     Ok(()) => self.custody = C::ReadyToTransfer(store),
                     Err(error) => {
-                        self.custody = C::Stopped { store: Some(store), credentials: None };
+                        self.custody = C::Stopped {
+                            store: Some(store),
+                            credentials: None,
+                        };
                         return Err(OAuthRefreshCaptureError::Storage(error));
                     }
                 }
@@ -280,7 +361,12 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
                 let completion = match task.wait(cx).await {
                     Ok(completion) => completion,
                     Err(error) => {
-                        if terminal_completion(error) { self.custody = C::Stopped { store: None, credentials: None }; }
+                        if terminal_completion(error) {
+                            self.custody = C::Stopped {
+                                store: None,
+                                credentials: None,
+                            };
+                        }
                         return Err(OAuthRefreshCaptureError::Completion(error));
                     }
                 };
@@ -293,7 +379,10 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
                         self.custody = C::Complete { store, revision };
                     }
                     Err(error) => {
-                        self.custody = C::Stopped { store: Some(store), credentials: Some(credentials) };
+                        self.custody = C::Stopped {
+                            store: Some(store),
+                            credentials: Some(credentials),
+                        };
                         return Err(OAuthRefreshCaptureError::Storage(error));
                     }
                 }
@@ -306,27 +395,44 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
                 let session = self.session.clone();
                 let cancellation = self.cancellation.clone();
                 let client = self.client.clone();
-                let reservation = session.reserve_refresh_transfer(
-                    cx, &cancellation, self.expected_generation, &client,
-                ).await.map_err(OAuthRefreshCaptureError::Transfer)?;
-                let credentials = reservation.commit().map_err(OAuthRefreshCaptureError::Transfer)?;
+                let reservation = session
+                    .reserve_refresh_transfer(cx, &cancellation, self.expected_generation, &client)
+                    .await
+                    .map_err(OAuthRefreshCaptureError::Transfer)?;
+                let credentials = reservation
+                    .commit()
+                    .map_err(OAuthRefreshCaptureError::Transfer)?;
                 // No await or fallible work after transfer and before retaining
                 // the sole refresh owner. Later guard refusal keeps this custody.
                 let C::ReadyToTransfer(store) = std::mem::replace(
-                    &mut self.custody, C::Stopped { store: None, credentials: None },
-                ) else { unreachable!("exclusive capture changed during synchronous transfer"); };
+                    &mut self.custody,
+                    C::Stopped {
+                        store: None,
+                        credentials: None,
+                    },
+                ) else {
+                    unreachable!("exclusive capture changed during synchronous transfer");
+                };
                 self.custody = C::ReadyToStore { store, credentials };
                 return Ok(self.stage());
             }
-            _ => {},
+            _ => {}
         }
-        let previous = std::mem::replace(&mut self.custody, C::Stopped { store: None, credentials: None });
+        let previous = std::mem::replace(
+            &mut self.custody,
+            C::Stopped {
+                store: None,
+                credentials: None,
+            },
+        );
         match previous {
             C::ReadyToCheck(store) => {
                 let authorization = self.authorization;
                 let expected = self.expected_revision;
                 match store.try_operate(cx, (), move |store, worker, ()| {
-                    if store.revision() != expected { return Err(OAuthRefreshStoreError::RevisionMismatch); }
+                    if store.revision() != expected {
+                        return Err(OAuthRefreshStoreError::RevisionMismatch);
+                    }
                     // Fresh partition/anchor/file admission BEFORE taking any
                     // refresh credential from the live session. No decryption.
                     drop(store.slot.load(worker, &authorization)?);
@@ -335,24 +441,35 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
                     Ok(task) => self.custody = C::Checking(task),
                     Err(failure) => {
                         let (cause, retained) = failure.into_parts();
-                        if let Some((store, ())) = retained { self.custody = C::ReadyToCheck(store); }
+                        if let Some((store, ())) = retained {
+                            self.custody = C::ReadyToCheck(store);
+                        }
                         return Err(OAuthRefreshCaptureError::Submission(cause));
                     }
                 }
             }
             C::ReadyToStore { store, credentials } => {
-                match store.try_store_refresh(cx, self.authorization, self.expected_revision, credentials) {
+                match store.try_store_refresh(
+                    cx,
+                    self.authorization,
+                    self.expected_revision,
+                    credentials,
+                ) {
                     Ok(task) => self.custody = C::Storing(task),
                     Err(failure) => {
                         let (cause, retained) = failure.into_parts();
-                        if let Some((store, credentials)) = retained { self.custody = C::ReadyToStore { store, credentials }; }
+                        if let Some((store, credentials)) = retained {
+                            self.custody = C::ReadyToStore { store, credentials };
+                        }
                         return Err(OAuthRefreshCaptureError::Submission(cause));
                     }
                 }
             }
             other => {
                 self.custody = other;
-                if self.stage() != OAuthRefreshCaptureStage::Complete { return Err(OAuthRefreshCaptureError::Stopped); }
+                if self.stage() != OAuthRefreshCaptureStage::Complete {
+                    return Err(OAuthRefreshCaptureError::Stopped);
+                }
             }
         }
         Ok(self.stage())
@@ -360,26 +477,45 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
 }
 
 fn terminal_completion(error: CredentialIoError) -> bool {
-    matches!(error, CredentialIoError::WorkerStopped | CredentialIoError::WorkerPanicked
-        | CredentialIoError::AlreadyReceived | CredentialIoError::ProcessChanged)
+    matches!(
+        error,
+        CredentialIoError::WorkerStopped
+            | CredentialIoError::WorkerPanicked
+            | CredentialIoError::AlreadyReceived
+            | CredentialIoError::ProcessChanged
+    )
 }
 
 impl OAuthCredentials {
     // Only the managed grant-lock transfer uses this. Allocation and validation
     // precede taking the token. Access is already clonable, but refresh is MOVED.
     // Neither the original nor the copy gets a new access lifetime or scopes.
-    pub(crate) fn take_persistence_credentials(&mut self, owner: &McpRequestCancellation) -> Result<Self, OAuthError> {
-        let token = self.refresh_token.as_deref().ok_or(OAuthError::RefreshUnavailable)?;
+    pub(crate) fn take_persistence_credentials(
+        &mut self,
+        owner: &McpRequestCancellation,
+    ) -> Result<Self, OAuthError> {
+        let token = self
+            .refresh_token
+            .as_deref()
+            .ok_or(OAuthError::RefreshUnavailable)?;
         super::super::validate_refresh(token, &self.scopes, &self.configuration)
             .map_err(|_| OAuthError::InvalidTokenResponse)?;
         let configuration = self.configuration.clone();
         // Do not let cleanup custody become a way to escape source-session
         // closure. Refresh persistence is independent; access remains bound
         // to the same local owner as every already-issued snapshot.
-        let access = self.access.for_owner(owner).ok_or(OAuthError::CredentialBindingMismatch)?;
+        let access = self
+            .access
+            .for_owner(owner)
+            .ok_or(OAuthError::CredentialBindingMismatch)?;
         let scopes = self.scopes.clone();
-        Ok(Self { configuration, access, scopes, expires_at: self.expires_at,
-            refresh_token: self.refresh_token.take() })
+        Ok(Self {
+            configuration,
+            access,
+            scopes,
+            expires_at: self.expires_at,
+            refresh_token: self.refresh_token.take(),
+        })
     }
 }
 

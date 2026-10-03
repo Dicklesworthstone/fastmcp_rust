@@ -284,7 +284,10 @@ fn assert_manifest_digest_refuses_perturbation() {
 
     let perturbations = [
         ("reordering two case rows", reordered.join("\n")),
-        ("raising one declared floor", text.replacen("floor=3", "floor=4", 1)),
+        (
+            "raising one declared floor",
+            text.replacen("floor=3", "floor=4", 1),
+        ),
         ("omitting one group row", omitted.join("\n")),
     ];
 
@@ -295,7 +298,8 @@ fn assert_manifest_digest_refuses_perturbation() {
              otherwise this case proves nothing"
         );
         assert_ne!(
-            manifest_digest_hex(&perturbed), HTTP_03_A_MANIFEST_DIGEST_HEX,
+            manifest_digest_hex(&perturbed),
+            HTTP_03_A_MANIFEST_DIGEST_HEX,
             "{dimension}: the frozen anchor must refuse a manifest differing in this dimension"
         );
     }
@@ -418,7 +422,8 @@ fn assert_shipped_manifest() {
     );
 
     assert_eq!(
-        manifest_digest_hex(text), HTTP_03_A_MANIFEST_DIGEST_HEX,
+        manifest_digest_hex(text),
+        HTTP_03_A_MANIFEST_DIGEST_HEX,
         "the published manifest bytes changed: a reordering, an omitted group, floor or \
          negative, or any other edit fails this slice until the frozen digest is re-approved"
     );
@@ -1588,9 +1593,13 @@ async fn positive_04_identity_accept_encoding(cx: &Cx) {
     // Delivery control on the same lane: a body that fully satisfies its
     // declared length is returned intact, so the truncation negative differs
     // from it in delivery alone.
-    let complete = Box::pin(truncated_body_outcome(cx, COMPLETE_RESPONSE_BODY.len(), COMPLETE_RESPONSE_BODY))
-        .await
-        .expect("a fully delivered body must be readable");
+    let complete = Box::pin(truncated_body_outcome(
+        cx,
+        COMPLETE_RESPONSE_BODY.len(),
+        COMPLETE_RESPONSE_BODY,
+    ))
+    .await
+    .expect("a fully delivered body must be readable");
     assert_eq!(complete.as_slice(), COMPLETE_RESPONSE_BODY);
 }
 
@@ -1708,9 +1717,13 @@ async fn negative_04_compressed_response(cx: &Cx) {
         COMPLETE_RESPONSE_BODY.len(),
         "the planted negative under-delivers by exactly one byte"
     );
-    let refusal = Box::pin(truncated_body_outcome(cx, COMPLETE_RESPONSE_BODY.len(), truncated))
-        .await
-        .expect_err("a body shorter than its declared length must not be delivered");
+    let refusal = Box::pin(truncated_body_outcome(
+        cx,
+        COMPLETE_RESPONSE_BODY.len(),
+        truncated,
+    ))
+    .await
+    .expect_err("a body shorter than its declared length must not be delivered");
     assert!(
         matches!(
             refusal,
@@ -1721,9 +1734,13 @@ async fn negative_04_compressed_response(cx: &Cx) {
     // Unchanged state: the same lane still delivers a complete body verbatim
     // after the truncated one failed, so the refusal closed only its own
     // response.
-    let restored = Box::pin(truncated_body_outcome(cx, COMPLETE_RESPONSE_BODY.len(), COMPLETE_RESPONSE_BODY))
-        .await
-        .expect("a complete body must still be delivered after a truncation refusal");
+    let restored = Box::pin(truncated_body_outcome(
+        cx,
+        COMPLETE_RESPONSE_BODY.len(),
+        COMPLETE_RESPONSE_BODY,
+    ))
+    .await
+    .expect("a complete body must still be delivered after a truncation refusal");
     assert_eq!(restored.as_slice(), COMPLETE_RESPONSE_BODY);
 }
 
@@ -1830,7 +1847,13 @@ async fn positive_05_routing_headers(cx: &Cx) {
     // A client that hardcoded `name` passes the tools/call case above and fails
     // both of these.
     // -----------------------------------------------------------------------
-    let listed = Box::pin(capture_request_head(cx, "tools/list", serde_json::json!({}), 5)).await;
+    let listed = Box::pin(capture_request_head(
+        cx,
+        "tools/list",
+        serde_json::json!({}),
+        5,
+    ))
+    .await;
     assert_eq!(
         exactly_one_header(&listed.head, "MCP-Protocol-Version"),
         "2026-07-28"
@@ -2043,9 +2066,12 @@ async fn positive_06_json_strict_utf8(cx: &Cx) {
     // lane refuses MALFORMED BYTES, not the replacement character itself - and
     // the distinction matters, because the negative half proves the same
     // logical character arrives legitimately over SSE.
-    Box::pin(direct_json_admission(cx, json_response_with_raw_note("\u{FFFD}".as_bytes())))
-        .await
-        .expect("a well-formed U+FFFD is ordinary UTF-8 and must be admitted");
+    Box::pin(direct_json_admission(
+        cx,
+        json_response_with_raw_note("\u{FFFD}".as_bytes()),
+    ))
+    .await
+    .expect("a well-formed U+FFFD is ordinary UTF-8 and must be admitted");
 }
 
 async fn negative_06_json_byte_order_mark(cx: &Cx) {
@@ -2103,9 +2129,12 @@ async fn negative_06_json_byte_order_mark(cx: &Cx) {
     midstream_note.extend_from_slice(b"before");
     midstream_note.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
     midstream_note.extend_from_slice(b"after");
-    let midstream = Box::pin(direct_json_admission(cx, json_response_with_raw_note(&midstream_note)))
-        .await
-        .expect_err("a midstream BOM must be refused, not just a leading one");
+    let midstream = Box::pin(direct_json_admission(
+        cx,
+        json_response_with_raw_note(&midstream_note),
+    ))
+    .await
+    .expect_err("a midstream BOM must be refused, not just a leading one");
     assert!(
         matches!(
             midstream,
@@ -2129,9 +2158,12 @@ async fn negative_06_json_byte_order_mark(cx: &Cx) {
     // ---------------------------------------------------------------------
     const LONE_CONTINUATION: &[u8] = &[0xFF];
 
-    let malformed = Box::pin(direct_json_admission(cx, json_response_with_raw_note(LONE_CONTINUATION)))
-        .await
-        .expect_err("malformed UTF-8 must be refused on the direct lane, never repaired");
+    let malformed = Box::pin(direct_json_admission(
+        cx,
+        json_response_with_raw_note(LONE_CONTINUATION),
+    ))
+    .await
+    .expect_err("malformed UTF-8 must be refused on the direct lane, never repaired");
     assert!(
         matches!(
             malformed,
@@ -2989,20 +3021,32 @@ async fn positive_08_replacement_decoder_and_bom(cx: &Cx) {
         "the whole-body decode must be the declared golden"
     );
 
-    let byte_by_byte = Box::pin(drain_sse_in_chunks(cx, &sweep_peer, corpus.clone(), limits(), 1))
-        .await
-        .expect("the golden corpus must assemble one byte at a time");
+    let byte_by_byte = Box::pin(drain_sse_in_chunks(
+        cx,
+        &sweep_peer,
+        corpus.clone(),
+        limits(),
+        1,
+    ))
+    .await
+    .expect("the golden corpus must assemble one byte at a time");
     assert_eq!(
         byte_by_byte, golden,
         "byte-by-byte delivery must not change the dispatched events"
     );
 
     for split in 1..corpus.len() {
-        let observed = Box::pin(drain_sse_split_at(cx, &sweep_peer, &corpus, limits(), split))
-            .await
-            .unwrap_or_else(|error| {
-                panic!("a chunk boundary at byte {split} must not fail the stream: {error:?}")
-            });
+        let observed = Box::pin(drain_sse_split_at(
+            cx,
+            &sweep_peer,
+            &corpus,
+            limits(),
+            split,
+        ))
+        .await
+        .unwrap_or_else(|error| {
+            panic!("a chunk boundary at byte {split} must not fail the stream: {error:?}")
+        });
         assert_eq!(
             observed, golden,
             "a chunk boundary at byte {split} changed the dispatched events"
@@ -3336,9 +3380,15 @@ async fn positive_09_line_endings_and_data_fields(cx: &Cx) {
     for chunk_bytes in [1_usize, 7, body.len()] {
         let peer = Peer::bind().await;
         by_chunking.push(
-            Box::pin(drain_sse_in_chunks(cx, &peer, body.clone(), limits(), chunk_bytes))
-                .await
-                .expect("a well-formed event stream must assemble without refusal"),
+            Box::pin(drain_sse_in_chunks(
+                cx,
+                &peer,
+                body.clone(),
+                limits(),
+                chunk_bytes,
+            ))
+            .await
+            .expect("a well-formed event stream must assemble without refusal"),
         );
     }
     assert_eq!(
@@ -4510,8 +4560,7 @@ async fn negative_11_one_byte_over_bounds(cx: &Cx) {
     );
     assert!(
         matches!(
-            second
-                .expect_err("the second read must not deliver a clean end"),
+            second.expect_err("the second read must not deliver a clean end"),
             ModernHttpExecutorError::SseStreamClosed
         ),
         "a refused stream reports itself closed on every later read"
@@ -5044,7 +5093,8 @@ async fn positive_13_terminal_outcome_and_progress(cx: &Cx) {
     // against, and it is also the contrast for idempotency: a healthy ended
     // stream repeats Ok(None), where a refused one must repeat a closure.
     // -----------------------------------------------------------------------
-    let (ended, ended_again) = Box::pin(stream_reads_under_budget(cx, &Cx::for_testing(), false)).await;
+    let (ended, ended_again) =
+        Box::pin(stream_reads_under_budget(cx, &Cx::for_testing(), false)).await;
     assert!(
         matches!(ended, Ok(None)),
         "a live budget on a terminated stream reports a clean end, saw {ended:?}"
@@ -5126,8 +5176,7 @@ async fn negative_13_terminal_id_mismatch(cx: &Cx) {
         SseLimits::new(CLOSE_LINE_CEILING, 65_536, 64).expect("stream-close limits"),
     )
     .await;
-    let refusal = first
-        .expect_err("a line one octet over the ceiling must be refused");
+    let refusal = first.expect_err("a line one octet over the ceiling must be refused");
     assert!(
         matches!(
             refusal,
@@ -5218,9 +5267,14 @@ async fn negative_13_terminal_id_mismatch(cx: &Cx) {
 
     // Side 2: the cancellation limb. The sole changed variable against the
     // control is the budget's cancellation bit.
-    let (cancelled, _) = Box::pin(stream_reads_under_budget(cx, &cancelled_budget_context(), true)).await;
-    let cancelled = cancelled
-        .expect_err("a cancelled budget must end the wait on an endless response");
+    let (cancelled, _) = Box::pin(stream_reads_under_budget(
+        cx,
+        &cancelled_budget_context(),
+        true,
+    ))
+    .await;
+    let cancelled =
+        cancelled.expect_err("a cancelled budget must end the wait on an endless response");
     assert!(
         matches!(cancelled, ModernHttpExecutorError::Cancelled),
         "cancellation maps to Cancelled, saw {cancelled:?}"
@@ -5231,10 +5285,13 @@ async fn negative_13_terminal_id_mismatch(cx: &Cx) {
     // read only the cancellation flag would collapse these two into one answer
     // and a caller could not tell "someone cancelled me" from "I ran out of
     // time".
-    let (expired, expired_again) =
-        Box::pin(stream_reads_under_budget(cx, &expired_budget_context(), true)).await;
-    let expired = expired
-        .expect_err("an expired budget must end the wait on an endless response");
+    let (expired, expired_again) = Box::pin(stream_reads_under_budget(
+        cx,
+        &expired_budget_context(),
+        true,
+    ))
+    .await;
+    let expired = expired.expect_err("an expired budget must end the wait on an endless response");
     assert!(
         matches!(expired, ModernHttpExecutorError::Transport(_)),
         "an expired deadline is a transport-level deadline outcome, saw {expired:?}"

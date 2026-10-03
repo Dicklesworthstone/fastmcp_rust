@@ -32,13 +32,15 @@ fn definition(input_schema: Value, output_schema: Option<Value>) -> FinalTool {
 }
 
 fn request(mut params: Value) -> CoreRequest {
-    params["_meta"] = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
+    params["_meta"] =
+        serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
     CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).unwrap()
 }
 
 fn result(raw: &str) -> CoreResult {
     request(json!({"name": "calculate", "arguments": {"count": 2}}))
-        .decode_result(raw).unwrap()
+        .decode_result(raw)
+        .unwrap()
 }
 
 #[test]
@@ -55,7 +57,10 @@ fn annotated_contract_retains_source_and_exact_invocation() {
     assert_eq!(contract.input.schema(), &source);
     assert_eq!(request.encode_params().unwrap(), before);
     assert_eq!(contract.input.header_plan().bindings().len(), 2);
-    assert_eq!(source["properties"]["payload"]["default"]["x-mcp-header"], "literal-data");
+    assert_eq!(
+        source["properties"]["payload"]["default"]["x-mcp-header"],
+        "literal-data"
+    );
 }
 
 #[test]
@@ -70,10 +75,15 @@ fn annotations_do_not_weaken_required_type_or_range_validation() {
         json!({"count": 2, "extra": true}),
     ] {
         let request = request(json!({"name": "calculate", "arguments": arguments}));
-        assert!(matches!(contract.validate_request(&request), Err(ManagedToolError::InvalidArguments)));
+        assert!(matches!(
+            contract.validate_request(&request),
+            Err(ManagedToolError::InvalidArguments)
+        ));
     }
-    assert!(matches!(contract.validate_request(&request(json!({"name": "calculate"}))),
-        Err(ManagedToolError::InvalidArguments)));
+    assert!(matches!(
+        contract.validate_request(&request(json!({"name": "calculate"}))),
+        Err(ManagedToolError::InvalidArguments)
+    ));
 }
 
 #[test]
@@ -114,7 +124,10 @@ fn unknown_schema_annotations_preserve_contracts_without_header_authority() {
     assert_eq!(accepted.encode_params().unwrap(), before);
     for arguments in [json!({"count": 0}), json!({"count": "2"}), json!({})] {
         let rejected = request(json!({"name": "calculate", "arguments": arguments}));
-        assert!(matches!(contract.validate_request(&rejected), Err(ManagedToolError::InvalidArguments)));
+        assert!(matches!(
+            contract.validate_request(&rejected),
+            Err(ManagedToolError::InvalidArguments)
+        ));
     }
 }
 
@@ -132,7 +145,10 @@ fn malformed_annotations_and_recognized_validation_keywords_still_fail_closed() 
         }}),
         json!({"type": "object", "$defs": {"hidden": {"type": "string", "x-mcp-header": "Hidden"}}}),
     ] {
-        assert!(matches!(ToolContract::admit(definition(source, None)), Err(ManagedToolError::InvalidInputSchema)));
+        assert!(matches!(
+            ToolContract::admit(definition(source, None)),
+            Err(ManagedToolError::InvalidInputSchema)
+        ));
     }
 }
 
@@ -140,14 +156,22 @@ fn malformed_annotations_and_recognized_validation_keywords_still_fail_closed() 
 fn annotated_input_does_not_relax_output_schema_or_lossless_result_validation() {
     let output = json!({"type": "object", "properties": {"total": {"type": "integer"}}, "required": ["total"]});
     let contract = ToolContract::admit(definition(schema(), Some(output))).unwrap();
-    let valid = result(r#"{"resultType":"complete","content":[],"structuredContent":{"total":2},"x-exact":1.20e+4}"#);
+    let valid = result(
+        r#"{"resultType":"complete","content":[],"structuredContent":{"total":2},"x-exact":1.20e+4}"#,
+    );
     let before = valid.encode().unwrap();
     contract.validate_result(&valid).unwrap();
     assert_eq!(valid.encode().unwrap(), before);
-    assert!(matches!(contract.validate_result(&result(r#"{"resultType":"complete","content":[]}"#)),
-        Err(ManagedToolError::MissingStructuredOutput)));
-    assert!(matches!(contract.validate_result(&result(r#"{"resultType":"complete","content":[],"structuredContent":{"total":"wrong"}}"#)),
-        Err(ManagedToolError::InvalidStructuredOutput)));
+    assert!(matches!(
+        contract.validate_result(&result(r#"{"resultType":"complete","content":[]}"#)),
+        Err(ManagedToolError::MissingStructuredOutput)
+    ));
+    assert!(matches!(
+        contract.validate_result(&result(
+            r#"{"resultType":"complete","content":[],"structuredContent":{"total":"wrong"}}"#
+        )),
+        Err(ManagedToolError::InvalidStructuredOutput)
+    ));
     for raw in [
         r#"{"resultType":"input_required","requestState":"opaque"}"#,
         r#"{"resultType":"complete","content":[],"isError":true}"#,
@@ -163,13 +187,19 @@ fn annotated_input_does_not_relax_output_schema_or_lossless_result_validation() 
 fn annotated_source_is_charged_to_the_existing_combined_schema_budget() {
     let mut properties = serde_json::Map::new();
     for index in 0..100 {
-        properties.insert(format!("field{index}"), json!({"type": "string", "description": "d".repeat(3072)}));
+        properties.insert(
+            format!("field{index}"),
+            json!({"type": "string", "description": "d".repeat(3072)}),
+        );
     }
     let output = json!({"type": "object", "properties": properties});
     let mut input = output.clone();
     input["properties"]["field0"]["x-mcp-header"] = json!("Field");
     assert!(ToolContract::admit(definition(input.clone(), None)).is_ok());
-    assert!(matches!(ToolContract::admit(definition(input, Some(output))), Err(ManagedToolError::SchemaTooLarge)));
+    assert!(matches!(
+        ToolContract::admit(definition(input, Some(output))),
+        Err(ManagedToolError::SchemaTooLarge)
+    ));
 }
 
 #[test]
@@ -181,7 +211,12 @@ fn annotated_contract_invalidation_is_shared_and_diagnostics_remain_redacted() {
     assert!(!format!("{error:?} {error}").contains("private-canary"));
     contract.invalidated.store(true, Ordering::Release);
     let valid = request(json!({"name": "calculate", "arguments": {"count": 2}}));
-    assert!(matches!(clone.validate_request(&valid), Err(ManagedToolError::Invalidated)));
-    assert!(matches!(clone.validate_result(&result(r#"{"resultType":"complete","content":[]}"#)),
-        Err(ManagedToolError::Invalidated)));
+    assert!(matches!(
+        clone.validate_request(&valid),
+        Err(ManagedToolError::Invalidated)
+    ));
+    assert!(matches!(
+        clone.validate_result(&result(r#"{"resultType":"complete","content":[]}"#)),
+        Err(ManagedToolError::Invalidated)
+    ));
 }

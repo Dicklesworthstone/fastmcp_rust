@@ -28,11 +28,19 @@ fn notification(id: Value, method: &str, mut params: Value) -> Vec<u8> {
 }
 
 fn ack(id: Value, filter: Value) -> Vec<u8> {
-    notification(id, "notifications/subscriptions/acknowledged", json!({"notifications":filter}))
+    notification(
+        id,
+        "notifications/subscriptions/acknowledged",
+        json!({"notifications":filter}),
+    )
 }
 
 fn changed(id: Value, category: &str) -> Vec<u8> {
-    notification(id, &format!("notifications/{category}/list_changed"), json!({}))
+    notification(
+        id,
+        &format!("notifications/{category}/list_changed"),
+        json!({}),
+    )
 }
 
 fn updated(id: Value, uri: &str) -> Vec<u8> {
@@ -46,7 +54,12 @@ fn complete(id: Value, subscription_id: Value) -> Vec<u8> {
 }
 
 fn snapshot(state: &SubscriptionDecoder) -> (usize, usize, bool, Option<SubscriptionFilter>) {
-    (state.bytes, state.notifications, state.terminal, state.accepted.clone())
+    (
+        state.bytes,
+        state.notifications,
+        state.terminal,
+        state.accepted.clone(),
+    )
 }
 
 #[test]
@@ -56,16 +69,32 @@ fn preparation_preserves_filter_presence_metadata_and_owned_id() {
         "resourceSubscriptions":[],
     });
     let (wire, state) = prepare(
-        "https://mcp.example/mcp", params(filter.clone()),
-        RequestId::String("owned-stream".to_owned()), ManagedCoreLimits::default(),
-    ).unwrap();
+        "https://mcp.example/mcp",
+        params(filter.clone()),
+        RequestId::String("owned-stream".to_owned()),
+        ManagedCoreLimits::default(),
+    )
+    .unwrap();
     let body: Value = serde_json::from_slice(wire.body()).unwrap();
     assert_eq!(body["id"], "owned-stream");
     assert_eq!(body["method"], "subscriptions/listen");
     assert_eq!(body["params"]["notifications"], filter);
-    assert_eq!(body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"], FINAL_PROTOCOL_VERSION);
-    assert!(wire.headers().iter().any(|(name, value)| name.eq_ignore_ascii_case("mcp-method") && value == "subscriptions/listen"));
-    assert!(!wire.headers().iter().any(|(name, _)| name.eq_ignore_ascii_case("authorization")));
+    assert_eq!(
+        body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+        FINAL_PROTOCOL_VERSION
+    );
+    assert!(
+        wire.headers()
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("mcp-method")
+                && value == "subscriptions/listen")
+    );
+    assert!(
+        !wire
+            .headers()
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+    );
     assert!(state.accepted.is_none());
 }
 
@@ -93,10 +122,17 @@ fn notification_or_success_before_acknowledgement_cannot_advance_state() {
     let mut state = decoder(json!({"toolsListChanged":true}));
     for frame in [changed(json!(7), "tools"), complete(json!(7), json!(7))] {
         let before = snapshot(&state);
-        assert!(matches!(state.admit(&frame), Err(ManagedCoreError::UnexpectedNotification)));
+        assert!(matches!(
+            state.admit(&frame),
+            Err(ManagedCoreError::UnexpectedNotification)
+        ));
         assert_eq!(snapshot(&state), before);
     }
-    assert!(state.admit(&ack(json!(7), json!({"toolsListChanged":true}))).is_ok());
+    assert!(
+        state
+            .admit(&ack(json!(7), json!({"toolsListChanged":true})))
+            .is_ok()
+    );
 }
 
 #[test]
@@ -109,7 +145,11 @@ fn acknowledgement_may_narrow_but_cannot_widen_any_core_filter() {
         json!({"toolsListChanged":false,"resourceSubscriptions":[]}),
         json!({}),
     ] {
-        assert!(decoder(requested.clone()).admit(&ack(json!(7), accepted)).is_ok());
+        assert!(
+            decoder(requested.clone())
+                .admit(&ack(json!(7), accepted))
+                .is_ok()
+        );
     }
     for widened in [
         json!({"promptsListChanged":true}),
@@ -131,10 +171,18 @@ fn accepted_filter_not_original_request_controls_notification_delivery() {
         "toolsListChanged":true,"promptsListChanged":true,
         "resourceSubscriptions":["file:///a","file:///b"],
     }));
-    state.admit(&ack(json!(7), json!({"promptsListChanged":true,"resourceSubscriptions":["file:///a"]}))).unwrap();
+    state
+        .admit(&ack(
+            json!(7),
+            json!({"promptsListChanged":true,"resourceSubscriptions":["file:///a"]}),
+        ))
+        .unwrap();
     for frame in [changed(json!(7), "tools"), updated(json!(7), "file:///b")] {
         let before = snapshot(&state);
-        assert!(matches!(state.admit(&frame), Err(ManagedCoreError::UnexpectedNotification)));
+        assert!(matches!(
+            state.admit(&frame),
+            Err(ManagedCoreError::UnexpectedNotification)
+        ));
         assert_eq!(snapshot(&state), before);
     }
     assert!(state.admit(&changed(json!(7), "prompts")).is_ok());
@@ -147,7 +195,10 @@ fn resource_selectors_use_exact_spelling_without_percent_or_query_normalization(
     let filter = json!({"resourceSubscriptions":[uri]});
     let mut state = decoder(filter.clone());
     state.admit(&ack(json!(7), filter)).unwrap();
-    for other in ["https://resource.example/a/b?q=one", "https://resource.example/a%2Fb?q=two"] {
+    for other in [
+        "https://resource.example/a/b?q=one",
+        "https://resource.example/a%2Fb?q=two",
+    ] {
         assert!(state.admit(&updated(json!(7), other)).is_err());
     }
     assert!(state.admit(&updated(json!(7), uri)).is_ok());
@@ -158,7 +209,10 @@ fn foreign_missing_and_type_confused_subscription_ids_are_refused() {
     let filter = json!({"toolsListChanged":true});
     let mut state = decoder(filter.clone());
     for id in [json!(8), json!("7"), Value::Null] {
-        assert!(matches!(state.admit(&ack(id, filter.clone())), Err(ManagedCoreError::ResponseIdMismatch)));
+        assert!(matches!(
+            state.admit(&ack(id, filter.clone())),
+            Err(ManagedCoreError::ResponseIdMismatch)
+        ));
         assert!(state.accepted.is_none());
     }
     let absent = br#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"notifications":{"toolsListChanged":true}}}"#;
@@ -176,7 +230,9 @@ fn foreign_missing_and_type_confused_subscription_ids_are_refused() {
 fn duplicate_acknowledgements_do_not_replace_the_accepted_filter() {
     let filter = json!({"toolsListChanged":true,"promptsListChanged":true});
     let mut state = decoder(filter.clone());
-    state.admit(&ack(json!(7), json!({"toolsListChanged":true}))).unwrap();
+    state
+        .admit(&ack(json!(7), json!({"toolsListChanged":true})))
+        .unwrap();
     let before = snapshot(&state);
     assert!(state.admit(&ack(json!(7), filter)).is_err());
     assert_eq!(snapshot(&state), before);
@@ -185,7 +241,12 @@ fn duplicate_acknowledgements_do_not_replace_the_accepted_filter() {
 
 #[test]
 fn terminal_requires_both_owning_response_id_and_subscription_metadata_id() {
-    for (id, subscription_id) in [(json!(8), json!(7)), (json!(7), json!(8)), (json!("7"), json!(7)), (json!(7), json!("7"))] {
+    for (id, subscription_id) in [
+        (json!(8), json!(7)),
+        (json!(7), json!(8)),
+        (json!("7"), json!(7)),
+        (json!(7), json!("7")),
+    ] {
         let mut state = decoder(json!({}));
         state.admit(&ack(json!(7), json!({}))).unwrap();
         let before = snapshot(&state);
@@ -198,13 +259,19 @@ fn terminal_requires_both_owning_response_id_and_subscription_metadata_id() {
 #[test]
 fn reverse_requests_batches_duplicate_members_and_noncore_events_are_refused() {
     let mut state = decoder(json!({"toolsListChanged":true}));
-    state.admit(&ack(json!(7), json!({"toolsListChanged":true}))).unwrap();
+    state
+        .admit(&ack(json!(7), json!({"toolsListChanged":true})))
+        .unwrap();
     for frame in [
         br#"{"jsonrpc":"2.0","id":9,"method":"roots/list"}"#.to_vec(),
         br#"[{"jsonrpc":"2.0","id":7,"result":{}}]"#.to_vec(),
         br#"{"jsonrpc":"2.0","id":7,"id":7,"result":{}}"#.to_vec(),
         vec![0xff],
-        notification(json!(7), "notifications/progress", json!({"progressToken":"unowned","progress":1})),
+        notification(
+            json!(7),
+            "notifications/progress",
+            json!({"progressToken":"unowned","progress":1}),
+        ),
         notification(json!(7), "notifications/cancelled", json!({"requestId":7})),
     ] {
         let before = snapshot(&state);
@@ -219,21 +286,30 @@ fn frame_total_byte_and_notification_limits_are_transactional() {
     let change = changed(json!(7), "tools");
     let mut state = decoder(json!({"toolsListChanged":true}));
     state.limits.frame_bytes = acknowledgement.len() - 1;
-    assert!(matches!(state.admit(&acknowledgement), Err(ManagedCoreError::ResponseByteLimit)));
+    assert!(matches!(
+        state.admit(&acknowledgement),
+        Err(ManagedCoreError::ResponseByteLimit)
+    ));
     assert_eq!(snapshot(&state), (0, 0, false, None));
     state.limits.frame_bytes = acknowledgement.len();
     state.limits.total_bytes = acknowledgement.len() + change.len();
     state.admit(&acknowledgement).unwrap();
     state.admit(&change).unwrap();
     let before = snapshot(&state);
-    assert!(matches!(state.admit(&change), Err(ManagedCoreError::ResponseByteLimit)));
+    assert!(matches!(
+        state.admit(&change),
+        Err(ManagedCoreError::ResponseByteLimit)
+    ));
     assert_eq!(snapshot(&state), before);
 
     let mut state = decoder(json!({"toolsListChanged":true}));
     state.limits.notifications = 1;
     state.admit(&acknowledgement).unwrap();
     let before = snapshot(&state);
-    assert!(matches!(state.admit(&change), Err(ManagedCoreError::NotificationLimit)));
+    assert!(matches!(
+        state.admit(&change),
+        Err(ManagedCoreError::NotificationLimit)
+    ));
     assert_eq!(snapshot(&state), before);
     assert!(state.admit(&complete(json!(7), json!(7))).is_ok());
 }
@@ -247,22 +323,55 @@ fn preflight_refuses_unnegotiated_filters_duplicate_resources_and_oversized_requ
         json!({"resourceSubscriptions":["x".repeat(MAX_MANAGED_SUBSCRIPTION_RESOURCE_BYTES + 1)]}),
         json!({"resourceSubscriptions": (0..=MAX_MANAGED_SUBSCRIPTION_RESOURCES).map(|i| format!("file:///{i}")).collect::<Vec<_>>()}),
     ] {
-        assert!(prepare("https://mcp.example/mcp", params(filter), RequestId::Number(7), ManagedCoreLimits::default()).is_err());
+        assert!(
+            prepare(
+                "https://mcp.example/mcp",
+                params(filter),
+                RequestId::Number(7),
+                ManagedCoreLimits::default()
+            )
+            .is_err()
+        );
     }
     let mut limits = ManagedCoreLimits::default();
     limits.notifications = 0;
-    assert!(matches!(prepare("https://mcp.example/mcp", params(json!({})), RequestId::Number(7), limits), Err(ManagedCoreError::InvalidLimits)));
+    assert!(matches!(
+        prepare(
+            "https://mcp.example/mcp",
+            params(json!({})),
+            RequestId::Number(7),
+            limits
+        ),
+        Err(ManagedCoreError::InvalidLimits)
+    ));
     limits.notifications = 1;
     limits.request_bytes = 1;
-    assert!(matches!(prepare("https://mcp.example/mcp", params(json!({})), RequestId::Number(7), limits), Err(ManagedCoreError::RequestTooLarge)));
+    assert!(matches!(
+        prepare(
+            "https://mcp.example/mcp",
+            params(json!({})),
+            RequestId::Number(7),
+            limits
+        ),
+        Err(ManagedCoreError::RequestTooLarge)
+    ));
 }
 
 #[test]
 fn extension_capability_advertisements_are_refused_before_dispatch() {
     let mut value = serde_json::to_value(params(json!({}))).unwrap();
-    value["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"] = json!({"io.modelcontextprotocol/tasks":{}});
+    value["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"] =
+        json!({"io.modelcontextprotocol/tasks":{}});
     let params = serde_json::from_value(value).unwrap();
-    assert!(prepare("https://mcp.example/mcp", params, RequestId::Number(7), ManagedCoreLimits::default()).is_err());
+    assert!(
+        prepare(
+            "https://mcp.example/mcp",
+            params,
+            RequestId::Number(7),
+            ManagedCoreLimits::default()
+        )
+        .is_err()
+    );
 }
 
 #[test]

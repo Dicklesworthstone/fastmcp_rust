@@ -2,10 +2,14 @@
 //! Runs only under tasks,native-tls-roots; zero-test feature-off output is not proof.
 use super::*;
 use fastmcp_client::http_auth::managed::OAuthSessionError;
-use fastmcp_client::http_auth::managed::tasks::{ManagedTasksClient, ManagedTasksError, ManagedTasksLimits, ManagedTaskRequestIds};
-use fastmcp_client::http_auth::managed::tasks::driver::{ManagedTaskDriverPolicy, ManagedTaskDriverError, ManagedTaskInputAction, ManagedTaskRunOutcome};
-use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta};
+use fastmcp_client::http_auth::managed::tasks::driver::{
+    ManagedTaskDriverError, ManagedTaskDriverPolicy, ManagedTaskInputAction, ManagedTaskRunOutcome,
+};
+use fastmcp_client::http_auth::managed::tasks::{
+    ManagedTaskRequestIds, ManagedTasksClient, ManagedTasksError, ManagedTasksLimits,
+};
 use fastmcp_protocol::tasks_extension::{Task, TaskId, TaskInputResponses};
+use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta};
 
 const RUN_CHILD: &str = "FASTMCP_TEST_TASK_DRIVER_CASE";
 const DISCOVER: &str = r#"{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"extensions":{"io.modelcontextprotocol/tasks":{}}},"ttlMs":0,"cacheScope":"private"}"#;
@@ -14,10 +18,27 @@ const UPDATED: &str = r#"{"resultType":"complete"}"#;
 
 #[derive(Clone, Copy)]
 enum RunCase {
-    Complete, ObserveOnly, Pause, InvalidReply, Capability, LostUpdate,
-    CancelResolver, CloseResolver, TimeoutResolver, DropResolver, CancelSleep,
-    LargeHint, RepeatId, PollLimit, UpdateLimit, InputReuse, ObserverRefusal,
-    Failed, Cancelled, PreCancelled, LateResolver,
+    Complete,
+    ObserveOnly,
+    Pause,
+    InvalidReply,
+    Capability,
+    LostUpdate,
+    CancelResolver,
+    CloseResolver,
+    TimeoutResolver,
+    DropResolver,
+    CancelSleep,
+    LargeHint,
+    RepeatId,
+    PollLimit,
+    UpdateLimit,
+    InputReuse,
+    ObserverRefusal,
+    Failed,
+    Cancelled,
+    PreCancelled,
+    LateResolver,
 }
 
 fn isolated_run(name: &str, case: RunCase) {
@@ -29,20 +50,34 @@ fn isolated_run(name: &str, case: RunCase) {
     let roots = RootFile::create();
     struct Child(std::process::Child);
     impl Drop for Child {
-        fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
     let exact = format!("driver::task_driver::{name}");
-    let mut child = Child(Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
-        .env(RUN_CHILD, name).env("SSL_CERT_FILE", &roots.0).env_remove("SSL_CERT_DIR")
-        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap());
+    let mut child = Child(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
+            .env(RUN_CHILD, name)
+            .env("SSL_CERT_FILE", &roots.0)
+            .env_remove("SSL_CERT_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             assert!(status.success(), "Task driver HTTPS case failed");
             return;
         }
-        assert!(Instant::now() < deadline, "Task driver child exceeded its bound");
+        assert!(
+            Instant::now() < deadline,
+            "Task driver child exceeded its bound"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -52,22 +87,33 @@ fn snapshot(status: &str, hint: u64, keys: &[&str]) -> String {
         "createdAt":"2026-09-17T00:00:00Z","lastUpdatedAt":"2026-09-17T00:00:00Z",
         "ttlMs":null,"pollIntervalMs":hint});
     if status == "input_required" {
-        value["inputRequests"] = Value::Object(keys.iter().map(|key| ((*key).to_owned(), json!({"method":"roots/list"}))).collect());
+        value["inputRequests"] = Value::Object(
+            keys.iter()
+                .map(|key| ((*key).to_owned(), json!({"method":"roots/list"})))
+                .collect(),
+        );
     }
-    if status == "failed" { value["error"] = json!({"code":-32603,"message":"task failed"}); }
+    if status == "failed" {
+        value["error"] = json!({"code":-32603,"message":"task failed"});
+    }
     value.to_string()
 }
 
 async fn serve(peer: &Peer, number: i64, method: &str, result: Option<&str>) -> Value {
     let discovery = peer.response(number, DISCOVER).await;
     assert_eq!(discovery["method"], "server/discover");
-    assert_eq!(discovery["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"], json!({"io.modelcontextprotocol/tasks":{}}));
+    assert_eq!(
+        discovery["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"],
+        json!({"io.modelcontextprotocol/tasks":{}})
+    );
     let (mut tls, body) = peer.request(false).await;
     let request: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(request["id"], number + 1);
     assert_eq!(request["method"], method);
     assert_eq!(request["params"]["taskId"], "task-one");
-    if let Some(result) = result { json_reply(&mut tls, &terminal(number + 1, result)).await; }
+    if let Some(result) = result {
+        json_reply(&mut tls, &terminal(number + 1, result)).await;
+    }
     // A None response models an update accepted by the peer whose reply is lost.
     request
 }
@@ -89,11 +135,16 @@ impl Future for Resolution<'_> {
             // Ready, never yielding to the outer deadline guard first.
             std::thread::sleep(Duration::from_millis(1100));
         }
-        match this.action.take() { Some(action) => Poll::Ready(action), None => Poll::Pending }
+        match this.action.take() {
+            Some(action) => Poll::Ready(action),
+            None => Poll::Pending,
+        }
     }
 }
 impl Drop for Resolution<'_> {
-    fn drop(&mut self) { self.dropped.set(true); }
+    fn drop(&mut self) {
+        self.dropped.set(true);
+    }
 }
 
 fn run_task_driver(case: RunCase) {
@@ -289,44 +340,149 @@ fn run_task_driver(case: RunCase) {
 }
 
 #[test]
-fn polls_partial_inputs_and_stale_snapshots_to_exact_completion() { isolated_run("polls_partial_inputs_and_stale_snapshots_to_exact_completion", RunCase::Complete); }
+fn polls_partial_inputs_and_stale_snapshots_to_exact_completion() {
+    isolated_run(
+        "polls_partial_inputs_and_stale_snapshots_to_exact_completion",
+        RunCase::Complete,
+    );
+}
 #[test]
-fn observation_only_never_invokes_input_handlers() { isolated_run("observation_only_never_invokes_input_handlers", RunCase::ObserveOnly); }
+fn observation_only_never_invokes_input_handlers() {
+    isolated_run(
+        "observation_only_never_invokes_input_handlers",
+        RunCase::ObserveOnly,
+    );
+}
 #[test]
-fn host_can_return_input_without_submitting_an_update() { isolated_run("host_can_return_input_without_submitting_an_update", RunCase::Pause); }
+fn host_can_return_input_without_submitting_an_update() {
+    isolated_run(
+        "host_can_return_input_without_submitting_an_update",
+        RunCase::Pause,
+    );
+}
 #[test]
-fn invalid_answers_have_no_update_or_new_id_effect() { isolated_run("invalid_answers_have_no_update_or_new_id_effect", RunCase::InvalidReply); }
+fn invalid_answers_have_no_update_or_new_id_effect() {
+    isolated_run(
+        "invalid_answers_have_no_update_or_new_id_effect",
+        RunCase::InvalidReply,
+    );
+}
 #[test]
-fn unadvertised_input_never_reaches_the_resolver() { isolated_run("unadvertised_input_never_reaches_the_resolver", RunCase::Capability); }
+fn unadvertised_input_never_reaches_the_resolver() {
+    isolated_run(
+        "unadvertised_input_never_reaches_the_resolver",
+        RunCase::Capability,
+    );
+}
 #[test]
-fn uncertain_update_is_not_replayed_or_followed_by_polling() { isolated_run("uncertain_update_is_not_replayed_or_followed_by_polling", RunCase::LostUpdate); }
+fn uncertain_update_is_not_replayed_or_followed_by_polling() {
+    isolated_run(
+        "uncertain_update_is_not_replayed_or_followed_by_polling",
+        RunCase::LostUpdate,
+    );
+}
 #[test]
-fn cancellation_interrupts_an_idle_input_resolver() { isolated_run("cancellation_interrupts_an_idle_input_resolver", RunCase::CancelResolver); }
+fn cancellation_interrupts_an_idle_input_resolver() {
+    isolated_run(
+        "cancellation_interrupts_an_idle_input_resolver",
+        RunCase::CancelResolver,
+    );
+}
 #[test]
-fn closing_the_session_interrupts_an_idle_input_resolver() { isolated_run("closing_the_session_interrupts_an_idle_input_resolver", RunCase::CloseResolver); }
+fn closing_the_session_interrupts_an_idle_input_resolver() {
+    isolated_run(
+        "closing_the_session_interrupts_an_idle_input_resolver",
+        RunCase::CloseResolver,
+    );
+}
 #[test]
-fn whole_run_deadline_interrupts_an_idle_input_resolver() { isolated_run("whole_run_deadline_interrupts_an_idle_input_resolver", RunCase::TimeoutResolver); }
+fn whole_run_deadline_interrupts_an_idle_input_resolver() {
+    isolated_run(
+        "whole_run_deadline_interrupts_an_idle_input_resolver",
+        RunCase::TimeoutResolver,
+    );
+}
 #[test]
-fn dropping_the_run_releases_its_host_resolver() { isolated_run("dropping_the_run_releases_its_host_resolver", RunCase::DropResolver); }
+fn dropping_the_run_releases_its_host_resolver() {
+    isolated_run(
+        "dropping_the_run_releases_its_host_resolver",
+        RunCase::DropResolver,
+    );
+}
 #[test]
-fn cancelling_a_poll_delay_does_not_cancel_the_remote_task() { isolated_run("cancelling_a_poll_delay_does_not_cancel_the_remote_task", RunCase::CancelSleep); }
+fn cancelling_a_poll_delay_does_not_cancel_the_remote_task() {
+    isolated_run(
+        "cancelling_a_poll_delay_does_not_cancel_the_remote_task",
+        RunCase::CancelSleep,
+    );
+}
 #[test]
-fn huge_peer_poll_interval_expires_without_early_polling() { isolated_run("huge_peer_poll_interval_expires_without_early_polling", RunCase::LargeHint); }
+fn huge_peer_poll_interval_expires_without_early_polling() {
+    isolated_run(
+        "huge_peer_poll_interval_expires_without_early_polling",
+        RunCase::LargeHint,
+    );
+}
 #[test]
-fn numeric_request_id_reuse_is_rejected_before_discovery() { isolated_run("numeric_request_id_reuse_is_rejected_before_discovery", RunCase::RepeatId); }
+fn numeric_request_id_reuse_is_rejected_before_discovery() {
+    isolated_run(
+        "numeric_request_id_reuse_is_rejected_before_discovery",
+        RunCase::RepeatId,
+    );
+}
 #[test]
-fn poll_budget_prevents_an_extra_discovery_and_get() { isolated_run("poll_budget_prevents_an_extra_discovery_and_get", RunCase::PollLimit); }
+fn poll_budget_prevents_an_extra_discovery_and_get() {
+    isolated_run(
+        "poll_budget_prevents_an_extra_discovery_and_get",
+        RunCase::PollLimit,
+    );
+}
 #[test]
-fn update_budget_prevents_an_extra_resolver_and_update() { isolated_run("update_budget_prevents_an_extra_resolver_and_update", RunCase::UpdateLimit); }
+fn update_budget_prevents_an_extra_resolver_and_update() {
+    isolated_run(
+        "update_budget_prevents_an_extra_resolver_and_update",
+        RunCase::UpdateLimit,
+    );
+}
 #[test]
-fn changed_answered_input_key_never_runs_a_second_resolver() { isolated_run("changed_answered_input_key_never_runs_a_second_resolver", RunCase::InputReuse); }
+fn changed_answered_input_key_never_runs_a_second_resolver() {
+    isolated_run(
+        "changed_answered_input_key_never_runs_a_second_resolver",
+        RunCase::InputReuse,
+    );
+}
 #[test]
-fn observer_refusal_stops_the_run_without_more_peer_effects() { isolated_run("observer_refusal_stops_the_run_without_more_peer_effects", RunCase::ObserverRefusal); }
+fn observer_refusal_stops_the_run_without_more_peer_effects() {
+    isolated_run(
+        "observer_refusal_stops_the_run_without_more_peer_effects",
+        RunCase::ObserverRefusal,
+    );
+}
 #[test]
-fn failed_task_is_a_typed_terminal_not_a_success_projection() { isolated_run("failed_task_is_a_typed_terminal_not_a_success_projection", RunCase::Failed); }
+fn failed_task_is_a_typed_terminal_not_a_success_projection() {
+    isolated_run(
+        "failed_task_is_a_typed_terminal_not_a_success_projection",
+        RunCase::Failed,
+    );
+}
 #[test]
-fn remotely_cancelled_task_is_a_typed_terminal() { isolated_run("remotely_cancelled_task_is_a_typed_terminal", RunCase::Cancelled); }
+fn remotely_cancelled_task_is_a_typed_terminal() {
+    isolated_run(
+        "remotely_cancelled_task_is_a_typed_terminal",
+        RunCase::Cancelled,
+    );
+}
 #[test]
-fn precancelled_driver_has_no_new_peer_effects() { isolated_run("precancelled_driver_has_no_new_peer_effects", RunCase::PreCancelled); }
+fn precancelled_driver_has_no_new_peer_effects() {
+    isolated_run(
+        "precancelled_driver_has_no_new_peer_effects",
+        RunCase::PreCancelled,
+    );
+}
 #[test]
-fn ready_resolver_after_deadline_cannot_allocate_ids_or_submit_input() { isolated_run("ready_resolver_after_deadline_cannot_allocate_ids_or_submit_input", RunCase::LateResolver); }
+fn ready_resolver_after_deadline_cannot_allocate_ids_or_submit_input() {
+    isolated_run(
+        "ready_resolver_after_deadline_cannot_allocate_ids_or_submit_input",
+        RunCase::LateResolver,
+    );
+}

@@ -29,9 +29,9 @@ use fastmcp_protocol::{
 use serde_json::{Map, Value, json};
 
 use super::{
-    BoxFuture, CoreBackend, FINAL_CLIENT_CAPABILITIES_META_KEY, Forwarder,
-    ManagedOAuthProvider, NativeBackend, ProtocolEra, UNEXPECTED_RESULT, UPSTREAM_FAILURE,
-    allocate_request_id, check_cx, forward_notification, upstream_error,
+    BoxFuture, CoreBackend, FINAL_CLIENT_CAPABILITIES_META_KEY, Forwarder, ManagedOAuthProvider,
+    NativeBackend, ProtocolEra, UNEXPECTED_RESULT, UPSTREAM_FAILURE, allocate_request_id, check_cx,
+    forward_notification, upstream_error,
 };
 
 /// Local capability declarations for the explicitly supplied input handler.
@@ -161,8 +161,11 @@ impl ManagedOAuthInputPolicy {
 
     pub(super) fn limits(self, calls: ManagedCoreLimits) -> McpResult<ManagedInteractionLimits> {
         ManagedInteractionLimits::new(
-            calls, self.maximum_continuations, self.maximum_input_responses,
-        ).map_err(|_| McpError::invalid_params("Invalid managed OAuth input policy"))
+            calls,
+            self.maximum_continuations,
+            self.maximum_input_responses,
+        )
+        .map_err(|_| McpError::invalid_params("Invalid managed OAuth input policy"))
     }
 }
 
@@ -234,58 +237,106 @@ struct InteractiveBackend {
 }
 
 impl CoreBackend for InteractiveBackend {
-    fn with_reviewed_headers(&self, reviewed: Arc<ReviewedToolHeaders>) -> McpResult<Arc<dyn CoreBackend>> {
+    fn with_reviewed_headers(
+        &self,
+        reviewed: Arc<ReviewedToolHeaders>,
+    ) -> McpResult<Arc<dyn CoreBackend>> {
         super::headers::admit_resource(self.session.resource(), &reviewed)?;
         if self.header_review.is_some() {
-            return Err(McpError::invalid_params("Managed OAuth tool headers are already configured"));
+            return Err(McpError::invalid_params(
+                "Managed OAuth tool headers are already configured",
+            ));
         }
         Ok(Arc::new(Self {
-            session: self.session.clone(), policy: self.policy,
-            handler: Arc::clone(&self.handler), next_id: Arc::clone(&self.next_id),
+            session: self.session.clone(),
+            policy: self.policy,
+            handler: Arc::clone(&self.handler),
+            next_id: Arc::clone(&self.next_id),
             header_review: Some(reviewed),
         }))
     }
 
     fn execute<'a>(
-        &'a self, ctx: &'a McpContext, cx: &'a Cx, request: CoreRequest,
-        id: RequestId, limits: ManagedCoreLimits,
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        request: CoreRequest,
+        id: RequestId,
+        limits: ManagedCoreLimits,
     ) -> BoxFuture<'a, McpResult<FinalCoreResult>> {
         Box::pin(async move {
             admit_reviewed_method(&request, self.header_review.as_deref())?;
             let Some(interactive) = self.policy.select_request(&request)? else {
                 // completion/complete is not an MRTR method. Configuring a
                 // resolver must not disable the provider's completion handler.
-                return NativeBackend(self.session.clone()).execute(ctx, cx, request, id, limits).await;
+                return NativeBackend(self.session.clone())
+                    .execute(ctx, cx, request, id, limits)
+                    .await;
             };
             ctx.checkpoint()?;
             check_cx(cx)?;
             let cancellation = ctx.request_cancellation();
             let limits = self.policy.limits(limits)?;
             let operation = match &self.header_review {
-                Some(reviewed) => self.session.start_tool_interaction_with_headers_and_cancellation(
-                    cx, &cancellation, interactive, id, Arc::clone(reviewed), limits,
-                ).await,
-                None => self.session.start_core_interaction_with_cancellation(
-                    cx, &cancellation, interactive, id, limits,
-                ).await,
-            }.map_err(interaction_error)?;
+                Some(reviewed) => {
+                    self.session
+                        .start_tool_interaction_with_headers_and_cancellation(
+                            cx,
+                            &cancellation,
+                            interactive,
+                            id,
+                            Arc::clone(reviewed),
+                            limits,
+                        )
+                        .await
+                }
+                None => {
+                    self.session
+                        .start_core_interaction_with_cancellation(
+                            cx,
+                            &cancellation,
+                            interactive,
+                            id,
+                            limits,
+                        )
+                        .await
+                }
+            }
+            .map_err(interaction_error)?;
             // Both paths consume the same operation owner. In particular, a
             // partial reply must not reopen an interaction with renewed budgets
             // or make a lost intermediate response eligible for automatic retry.
             let result = match self.policy.response_mode {
-                ManagedOAuthInputResponseMode::Complete => operation.drive(
-                    cx,
-                    |input| resolve_reply(self.handler.as_ref(), ctx, cx, &self.next_id, input),
-                    |notification| forward_notification(ctx, *notification)
-                        .map_err(ManagedInteractionError::host_error),
-                ).await,
-                ManagedOAuthInputResponseMode::Partial => operation.drive_partial(
-                    cx,
-                    |input| resolve_reply(self.handler.as_ref(), ctx, cx, &self.next_id, input),
-                    |notification| forward_notification(ctx, *notification)
-                        .map_err(ManagedInteractionError::host_error),
-                ).await,
-            }.map_err(interaction_error)?;
+                ManagedOAuthInputResponseMode::Complete => {
+                    operation
+                        .drive(
+                            cx,
+                            |input| {
+                                resolve_reply(self.handler.as_ref(), ctx, cx, &self.next_id, input)
+                            },
+                            |notification| {
+                                forward_notification(ctx, *notification)
+                                    .map_err(ManagedInteractionError::host_error)
+                            },
+                        )
+                        .await
+                }
+                ManagedOAuthInputResponseMode::Partial => {
+                    operation
+                        .drive_partial(
+                            cx,
+                            |input| {
+                                resolve_reply(self.handler.as_ref(), ctx, cx, &self.next_id, input)
+                            },
+                            |notification| {
+                                forward_notification(ctx, *notification)
+                                    .map_err(ManagedInteractionError::host_error)
+                            },
+                        )
+                        .await
+                }
+            }
+            .map_err(interaction_error)?;
             ctx.checkpoint()?;
             check_cx(cx)?;
             match *result {
@@ -299,9 +350,15 @@ impl CoreBackend for InteractiveBackend {
 // Header-bearing backends belong to one reviewed tool. Do not let method
 // fallback silently discard that plan or authorize unrelated prompt/resource
 // work. Exact body/name/resource checks remain in the native projector.
-fn admit_reviewed_method(request: &CoreRequest, reviewed: Option<&ReviewedToolHeaders>) -> McpResult<()> {
-    if reviewed.is_some() && !matches!(request, CoreRequest::Final(FinalCoreRequest::ToolsCall(_))) {
-        return Err(McpError::invalid_params("Reviewed tool headers require a modern tools/call"));
+fn admit_reviewed_method(
+    request: &CoreRequest,
+    reviewed: Option<&ReviewedToolHeaders>,
+) -> McpResult<()> {
+    if reviewed.is_some() && !matches!(request, CoreRequest::Final(FinalCoreRequest::ToolsCall(_)))
+    {
+        return Err(McpError::invalid_params(
+            "Reviewed tool headers require a modern tools/call",
+        ));
     }
     Ok(())
 }
@@ -316,12 +373,18 @@ fn interaction_request(
         CoreRequest::Final(FinalCoreRequest::PromptsGet(_)) => "prompts/get",
         _ => return Ok(None),
     };
-    let mut params = request.encode_params()
+    let mut params = request
+        .encode_params()
         .map_err(|_| McpError::invalid_params("Invalid upstream interaction request"))?
         .ok_or_else(|| McpError::invalid_params("Missing upstream interaction parameters"))?;
-    let metadata = params.get_mut("_meta").and_then(Value::as_object_mut)
+    let metadata = params
+        .get_mut("_meta")
+        .and_then(Value::as_object_mut)
         .ok_or_else(|| McpError::invalid_params("Missing upstream interaction metadata"))?;
-    metadata.insert(FINAL_CLIENT_CAPABILITIES_META_KEY.to_owned(), capabilities.metadata());
+    metadata.insert(
+        FINAL_CLIENT_CAPABILITIES_META_KEY.to_owned(),
+        capabilities.metadata(),
+    );
     CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&params))
         .map(Some)
         .map_err(|_| McpError::invalid_params("Invalid upstream interaction capabilities"))
@@ -338,7 +401,10 @@ async fn resolve_reply(
     // Check before invoking even the callback's synchronous future constructor.
     E::host_checkpoint(ctx)?;
     check_cx(cx).map_err(E::host_error)?;
-    let responses = handler.resolve(ctx, cx, input).await.map_err(E::host_error)?;
+    let responses = handler
+        .resolve(ctx, cx, input)
+        .await
+        .map_err(E::host_error)?;
     E::host_checkpoint(ctx)?;
     check_cx(cx).map_err(E::host_error)?;
     Ok(ManagedInputReply {
@@ -410,7 +476,10 @@ mod tests {
     use crate::providers::managed_oauth::core_request;
 
     fn roots() -> ManagedOAuthInputCapabilities {
-        ManagedOAuthInputCapabilities { roots: true, ..Default::default() }
+        ManagedOAuthInputCapabilities {
+            roots: true,
+            ..Default::default()
+        }
     }
 
     fn challenge() -> Box<InputRequiredResult> {
@@ -423,14 +492,47 @@ mod tests {
 
     #[test]
     fn capabilities_are_local_explicit_and_do_not_enable_unrelated_inputs() {
-        assert_eq!(ManagedOAuthInputCapabilities::default().metadata(), json!({}));
+        assert_eq!(
+            ManagedOAuthInputCapabilities::default().metadata(),
+            json!({})
+        );
         assert_eq!(roots().metadata(), json!({"roots":{}}));
         for (caps, expected) in [
-            (ManagedOAuthInputCapabilities { sampling: true, ..Default::default() }, json!({"sampling":{}})),
-            (ManagedOAuthInputCapabilities { sampling_tools: true, ..Default::default() }, json!({"sampling":{"tools":{}}})),
-            (ManagedOAuthInputCapabilities { sampling_context: true, ..Default::default() }, json!({"sampling":{"context":{}}})),
-            (ManagedOAuthInputCapabilities { form_elicitation: true, ..Default::default() }, json!({"elicitation":{"form":{}}})),
-            (ManagedOAuthInputCapabilities { url_elicitation: true, ..Default::default() }, json!({"elicitation":{"url":{}}})),
+            (
+                ManagedOAuthInputCapabilities {
+                    sampling: true,
+                    ..Default::default()
+                },
+                json!({"sampling":{}}),
+            ),
+            (
+                ManagedOAuthInputCapabilities {
+                    sampling_tools: true,
+                    ..Default::default()
+                },
+                json!({"sampling":{"tools":{}}}),
+            ),
+            (
+                ManagedOAuthInputCapabilities {
+                    sampling_context: true,
+                    ..Default::default()
+                },
+                json!({"sampling":{"context":{}}}),
+            ),
+            (
+                ManagedOAuthInputCapabilities {
+                    form_elicitation: true,
+                    ..Default::default()
+                },
+                json!({"elicitation":{"form":{}}}),
+            ),
+            (
+                ManagedOAuthInputCapabilities {
+                    url_elicitation: true,
+                    ..Default::default()
+                },
+                json!({"elicitation":{"url":{}}}),
+            ),
         ] {
             assert_eq!(caps.metadata(), expected);
             assert!(caps.metadata().get("extensions").is_none());
@@ -440,15 +542,24 @@ mod tests {
     #[test]
     fn interaction_keeps_all_three_methods_arguments_and_progress_exact() {
         for (method, params) in [
-            ("tools/call", json!({"name":"work", "arguments":{"_meta":{"authorization":"ordinary argument"},"x":1}})),
+            (
+                "tools/call",
+                json!({"name":"work", "arguments":{"_meta":{"authorization":"ordinary argument"},"x":1}}),
+            ),
             ("resources/read", json!({"uri":"file:///unchanged/%2F"})),
-            ("prompts/get", json!({"name":"work","arguments":{"x":"日本語"}})),
+            (
+                "prompts/get",
+                json!({"name":"work","arguments":{"x":"日本語"}}),
+            ),
         ] {
             let original = core_request(method, params, Some(json!("own-progress"))).unwrap();
             let before = original.encode_params().unwrap();
             let selected = interaction_request(&original, roots()).unwrap().unwrap();
             let mut after = selected.encode_params().unwrap().unwrap();
-            assert_eq!(after["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY], json!({"roots":{}}));
+            assert_eq!(
+                after["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY],
+                json!({"roots":{}})
+            );
             assert_eq!(after["_meta"]["progressToken"], "own-progress");
             after["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY] = json!({});
             assert_eq!(Some(after), before);
@@ -458,15 +569,26 @@ mod tests {
 
     #[test]
     fn catalog_and_completion_calls_keep_the_native_single_post_path() {
-        for method in ["tools/list", "resources/list", "resources/templates/list", "prompts/list"] {
+        for method in [
+            "tools/list",
+            "resources/list",
+            "resources/templates/list",
+            "prompts/list",
+        ] {
             let request = core_request(method, json!({}), None).unwrap();
             assert!(interaction_request(&request, roots()).unwrap().is_none());
         }
         // Use the protocol's typed reference serialization, not a second wire schema.
-        let reference: FinalCompletionReference = serde_json::from_value(json!({"type":"ref/prompt","name":"work"})).unwrap();
-        let request = core_request("completion/complete", json!({
-            "ref": reference, "argument":{"name":"x","value":"a"}
-        }), None).unwrap();
+        let reference: FinalCompletionReference =
+            serde_json::from_value(json!({"type":"ref/prompt","name":"work"})).unwrap();
+        let request = core_request(
+            "completion/complete",
+            json!({
+                "ref": reference, "argument":{"name":"x","value":"a"}
+            }),
+            None,
+        )
+        .unwrap();
         assert!(interaction_request(&request, roots()).unwrap().is_none());
     }
 
@@ -482,8 +604,11 @@ mod tests {
     fn reviewed_tool_methods_cannot_fall_back_to_an_unreviewed_backend() {
         let reviewed = ReviewedToolHeaders::new(
             fastmcp_core::CanonicalHttpUrl::parse("https://upstream.example/mcp").unwrap(),
-            "work", json!({"type":"object"}), |_| true,
-        ).unwrap();
+            "work",
+            json!({"type":"object"}),
+            |_| true,
+        )
+        .unwrap();
         let tool = core_request("tools/call", json!({"name":"work"}), None).unwrap();
         assert!(admit_reviewed_method(&tool, Some(&reviewed)).is_ok());
         for (method, params) in [
@@ -503,62 +628,126 @@ mod tests {
         use fastmcp_protocol::http_headers::decode_mcp_header_value;
         let reviewed = ReviewedToolHeaders::new(
             fastmcp_core::CanonicalHttpUrl::parse("https://upstream.example/mcp").unwrap(),
-            "work", json!({"type":"object","properties":{
+            "work",
+            json!({"type":"object","properties":{
                 "region":{"type":"string","x-mcp-header":"Region"}
-            }}), |_| true,
-        ).unwrap();
+            }}),
+            |_| true,
+        )
+        .unwrap();
         let arguments = json!({"region":"雪\r\n", "private":"body-only-canary"});
-        let request = core_request("tools/call", json!({"name":"work","arguments":arguments}), None).unwrap();
+        let request = core_request(
+            "tools/call",
+            json!({"name":"work","arguments":arguments}),
+            None,
+        )
+        .unwrap();
         let request = interaction_request(&request, roots()).unwrap().unwrap();
         let params = request.encode_params().unwrap().unwrap();
         assert_eq!(params["arguments"], arguments);
-        assert_eq!(params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY], json!({"roots":{}}));
-        let source = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":params})).unwrap();
-        let wire = ModernHttpRequest::new(reviewed.resource().as_str(), source.clone(),
-            fastmcp_protocol::FINAL_PROTOCOL_VERSION, "tools/call", Some("work".to_owned()))
-            .unwrap().with_reviewed_tool_headers(&reviewed).unwrap();
+        assert_eq!(
+            params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY],
+            json!({"roots":{}})
+        );
+        let source = serde_json::to_vec(
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":params}),
+        )
+        .unwrap();
+        let wire = ModernHttpRequest::new(
+            reviewed.resource().as_str(),
+            source.clone(),
+            fastmcp_protocol::FINAL_PROTOCOL_VERSION,
+            "tools/call",
+            Some("work".to_owned()),
+        )
+        .unwrap()
+        .with_reviewed_tool_headers(&reviewed)
+        .unwrap();
         assert_eq!(wire.body(), source);
         let fields = wire.headers();
-        let region = &fields.iter().find(|(name, _)| name == "Mcp-Param-Region").unwrap().1;
-        assert_eq!(decode_mcp_header_value(region.as_bytes()).unwrap(), "雪\r\n");
-        assert!(!fields.iter().any(|(_, value)| value.contains("body-only-canary")));
+        let region = &fields
+            .iter()
+            .find(|(name, _)| name == "Mcp-Param-Region")
+            .unwrap()
+            .1;
+        assert_eq!(
+            decode_mcp_header_value(region.as_bytes()).unwrap(),
+            "雪\r\n"
+        );
+        assert!(
+            !fields
+                .iter()
+                .any(|(_, value)| value.contains("body-only-canary"))
+        );
     }
 
     #[test]
     fn partial_input_replies_require_explicit_local_opt_in() {
-        assert_eq!(ManagedOAuthInputResponseMode::default(), ManagedOAuthInputResponseMode::Complete);
-        assert_eq!(ManagedOAuthInputPolicy::default().response_mode(), ManagedOAuthInputResponseMode::Complete);
+        assert_eq!(
+            ManagedOAuthInputResponseMode::default(),
+            ManagedOAuthInputResponseMode::Complete
+        );
+        assert_eq!(
+            ManagedOAuthInputPolicy::default().response_mode(),
+            ManagedOAuthInputResponseMode::Complete
+        );
         let original = ManagedOAuthInputPolicy::new(roots(), 2, 3).unwrap();
         let partial = original.with_response_mode(ManagedOAuthInputResponseMode::Partial);
-        assert_eq!(original.response_mode(), ManagedOAuthInputResponseMode::Complete);
-        assert_eq!(partial.response_mode(), ManagedOAuthInputResponseMode::Partial);
+        assert_eq!(
+            original.response_mode(),
+            ManagedOAuthInputResponseMode::Complete
+        );
+        assert_eq!(
+            partial.response_mode(),
+            ManagedOAuthInputResponseMode::Partial
+        );
         assert_eq!(partial.capabilities, original.capabilities);
         assert_eq!(partial.maximum_continuations, 2);
         assert_eq!(partial.maximum_input_responses, 3);
         assert_eq!(
-            partial.with_response_mode(ManagedOAuthInputResponseMode::Complete).response_mode(),
+            partial
+                .with_response_mode(ManagedOAuthInputResponseMode::Complete)
+                .response_mode(),
             ManagedOAuthInputResponseMode::Complete,
         );
     }
 
     #[derive(Clone, Copy)]
-    enum Action { Answer, StateOnly, Decline, CancelRequest, CancelContext }
+    enum Action {
+        Answer,
+        StateOnly,
+        Decline,
+        CancelRequest,
+        CancelContext,
+    }
 
-    struct Host { calls: AtomicUsize, action: Action }
+    struct Host {
+        calls: AtomicUsize,
+        action: Action,
+    }
     impl ManagedOAuthInputHandler for Host {
         fn resolve<'a>(
-            &'a self, ctx: &'a McpContext, cx: &'a Cx, input: Box<InputRequiredResult>,
+            &'a self,
+            ctx: &'a McpContext,
+            cx: &'a Cx,
+            input: Box<InputRequiredResult>,
         ) -> BoxFuture<'a, McpResult<Option<FinalInputResponses>>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 assert_eq!(input.request_state(), Some("opaque-state"));
                 match self.action {
                     Action::Decline => return Err(McpError::invalid_params("PRIVATE-HOST-ERROR")),
-                    Action::CancelRequest => { ctx.request_cancellation().cancel(); }
-                    Action::CancelContext => { cx.set_cancel_requested(true); }
-                    _ => {},
+                    Action::CancelRequest => {
+                        ctx.request_cancellation().cancel();
+                    }
+                    Action::CancelContext => {
+                        cx.set_cancel_requested(true);
+                    }
+                    _ => {}
                 }
-                Ok(if matches!(self.action, Action::StateOnly) { None } else {
+                Ok(if matches!(self.action, Action::StateOnly) {
+                    None
+                } else {
                     Some(serde_json::from_value(json!({"roots":{"roots":[]}})).unwrap())
                 })
             })
@@ -570,7 +759,10 @@ mod tests {
         let ctx = McpContext::new(Cx::for_testing(), 1);
         let cx = Cx::for_testing();
         let ids = AtomicU64::new(10);
-        let host = Host { calls: AtomicUsize::new(0), action: Action::Answer };
+        let host = Host {
+            calls: AtomicUsize::new(0),
+            action: Action::Answer,
+        };
         let before = allocate_request_id(&ids).unwrap();
         let reply = block_on(resolve_reply(&host, &ctx, &cx, &ids, challenge())).unwrap();
         let after = allocate_request_id(&ids).unwrap();
@@ -586,11 +778,23 @@ mod tests {
         for cancel_context in [false, true] {
             let ctx = McpContext::new(Cx::for_testing(), 1);
             let cx = Cx::for_testing();
-            if cancel_context { cx.set_cancel_requested(true); } else { ctx.request_cancellation().cancel(); }
+            if cancel_context {
+                cx.set_cancel_requested(true);
+            } else {
+                ctx.request_cancellation().cancel();
+            }
             let ids = AtomicU64::new(1);
-            let host = Host { calls: AtomicUsize::new(0), action: Action::Answer };
-            let error = block_on(resolve_reply(&host, &ctx, &cx, &ids, challenge())).err().unwrap();
-            assert_eq!(interaction_error(error).code, McpErrorCode::RequestCancelled);
+            let host = Host {
+                calls: AtomicUsize::new(0),
+                action: Action::Answer,
+            };
+            let error = block_on(resolve_reply(&host, &ctx, &cx, &ids, challenge()))
+                .err()
+                .unwrap();
+            assert_eq!(
+                interaction_error(error).code,
+                McpErrorCode::RequestCancelled
+            );
             assert_eq!(host.calls.load(Ordering::SeqCst), 0);
             assert_eq!(ids.load(Ordering::SeqCst), 1);
         }
@@ -603,9 +807,17 @@ mod tests {
             let cx = Cx::for_testing();
             let sibling = Cx::for_testing();
             let ids = AtomicU64::new(1);
-            let host = Host { calls: AtomicUsize::new(0), action };
-            let error = block_on(resolve_reply(&host, &ctx, &cx, &ids, challenge())).err().unwrap();
-            assert_eq!(interaction_error(error).code, McpErrorCode::RequestCancelled);
+            let host = Host {
+                calls: AtomicUsize::new(0),
+                action,
+            };
+            let error = block_on(resolve_reply(&host, &ctx, &cx, &ids, challenge()))
+                .err()
+                .unwrap();
+            assert_eq!(
+                interaction_error(error).code,
+                McpErrorCode::RequestCancelled
+            );
             assert_eq!(host.calls.load(Ordering::SeqCst), 1);
             assert_eq!(ids.load(Ordering::SeqCst), 1);
             assert!(!sibling.is_cancel_requested());
@@ -643,12 +855,20 @@ mod tests {
         let ctx = McpContext::new(Cx::for_testing(), 1);
         let cx = Cx::for_testing();
         let ids = AtomicU64::new(7);
-        let host = Host { calls: AtomicUsize::new(0), action: Action::CancelRequest };
+        let host = Host {
+            calls: AtomicUsize::new(0),
+            action: Action::CancelRequest,
+        };
 
-        let error = block_on(resolve_reply(&host, &ctx, &cx, &ids, challenge())).err().unwrap();
+        let error = block_on(resolve_reply(&host, &ctx, &cx, &ids, challenge()))
+            .err()
+            .unwrap();
 
         assert!(
-            matches!(error, ManagedInteractionError::Core(ManagedCoreError::Cancelled)),
+            matches!(
+                error,
+                ManagedInteractionError::Core(ManagedCoreError::Cancelled)
+            ),
             "the post-callback checkpoint must yield Core(Cancelled), not {error:?}",
         );
         assert_eq!(host.calls.load(Ordering::SeqCst), 1);
@@ -671,15 +891,23 @@ mod tests {
         let cx = Cx::for_testing();
         let ids = AtomicU64::new(7);
         // Only `action` differs from the positive above.
-        let host = Host { calls: AtomicUsize::new(0), action: Action::Decline };
+        let host = Host {
+            calls: AtomicUsize::new(0),
+            action: Action::Decline,
+        };
 
-        let error = block_on(resolve_reply(&host, &ctx, &cx, &ids, challenge())).err().unwrap();
+        let error = block_on(resolve_reply(&host, &ctx, &cx, &ids, challenge()))
+            .err()
+            .unwrap();
 
         assert!(
             matches!(error, ManagedInteractionError::AbortedByHost),
             "a declining host must be refused as AbortedByHost, not {error:?}",
         );
-        assert!(!matches!(error, ManagedInteractionError::Core(ManagedCoreError::Cancelled)));
+        assert!(!matches!(
+            error,
+            ManagedInteractionError::Core(ManagedCoreError::Cancelled)
+        ));
         assert_eq!(host.calls.load(Ordering::SeqCst), 1);
         assert!(!cx.is_cancel_requested());
         assert_eq!(ids.load(Ordering::SeqCst), 7);
@@ -711,10 +939,19 @@ mod tests {
         let ctx = McpContext::new(Cx::for_testing(), 1);
         let cx = Cx::for_testing();
         let ids = AtomicU64::new(1);
-        let host = Host { calls: AtomicUsize::new(0), action: Action::Decline };
-        let error = block_on(resolve_reply(&host, &ctx, &cx, &ids, challenge())).err().unwrap();
+        let host = Host {
+            calls: AtomicUsize::new(0),
+            action: Action::Decline,
+        };
+        let error = block_on(resolve_reply(&host, &ctx, &cx, &ids, challenge()))
+            .err()
+            .unwrap();
         assert!(matches!(error, ManagedInteractionError::AbortedByHost));
-        assert!(!interaction_error(error).to_string().contains("PRIVATE-HOST-ERROR"));
+        assert!(
+            !interaction_error(error)
+                .to_string()
+                .contains("PRIVATE-HOST-ERROR")
+        );
         assert_eq!(ids.load(Ordering::SeqCst), 1);
         assert_eq!(host.calls.load(Ordering::SeqCst), 1);
     }
@@ -724,7 +961,10 @@ mod tests {
         let ctx = McpContext::new(Cx::for_testing(), 1);
         let cx = Cx::for_testing();
         let ids = AtomicU64::new(1);
-        let host = Host { calls: AtomicUsize::new(0), action: Action::StateOnly };
+        let host = Host {
+            calls: AtomicUsize::new(0),
+            action: Action::StateOnly,
+        };
         let reply = block_on(resolve_reply(&host, &ctx, &cx, &ids, challenge())).unwrap();
         assert!(reply.input_responses.is_none());
         // Matching the answer to its challenge remains with the protocol driver;

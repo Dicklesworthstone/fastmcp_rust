@@ -24,7 +24,9 @@ use std::fmt;
 use asupersync::Cx;
 use fastmcp_core::partition::{CredentialStoreKey, PartitionAuthorization};
 
-use super::{AtomicFileError, AtomicFileSnapshot, AtomicFileVersion, SecureAtomicFile, checkpoint, version};
+use super::{
+    AtomicFileError, AtomicFileSnapshot, AtomicFileVersion, SecureAtomicFile, checkpoint, version,
+};
 
 /// Enforced independent-anchor transaction ordering and restart reconciliation.
 pub mod coordinator;
@@ -46,7 +48,9 @@ pub struct SlotRevision {
 }
 
 impl SlotRevision {
-    pub fn generation(self) -> u64 { self.generation }
+    pub fn generation(self) -> u64 {
+        self.generation
+    }
 
     pub fn to_bytes(self) -> [u8; SLOT_REVISION_BYTES] {
         let mut bytes = [0; SLOT_REVISION_BYTES];
@@ -58,11 +62,24 @@ impl SlotRevision {
     /// Decode only from the owner's independently authenticated anchor. Reading
     /// these bytes beside the credential file does not establish rollback safety.
     pub fn from_trusted_bytes(bytes: &[u8]) -> Result<Self, CredentialSlotError> {
-        if bytes.len() != SLOT_REVISION_BYTES { return Err(CredentialSlotError::InvalidRecord); }
-        let generation = u64::from_be_bytes(bytes[..8].try_into().map_err(|_| CredentialSlotError::InvalidRecord)?);
-        if generation == 0 { return Err(CredentialSlotError::InvalidRecord); }
-        let digest = bytes[8..].try_into().map_err(|_| CredentialSlotError::InvalidRecord)?;
-        Ok(Self { generation, file_version: AtomicFileVersion(digest) })
+        if bytes.len() != SLOT_REVISION_BYTES {
+            return Err(CredentialSlotError::InvalidRecord);
+        }
+        let generation = u64::from_be_bytes(
+            bytes[..8]
+                .try_into()
+                .map_err(|_| CredentialSlotError::InvalidRecord)?,
+        );
+        if generation == 0 {
+            return Err(CredentialSlotError::InvalidRecord);
+        }
+        let digest = bytes[8..]
+            .try_into()
+            .map_err(|_| CredentialSlotError::InvalidRecord)?;
+        Ok(Self {
+            generation,
+            file_version: AtomicFileVersion(digest),
+        })
     }
 }
 
@@ -85,8 +102,12 @@ impl fmt::Debug for SlotCommitIntent {
 }
 
 impl SlotCommitIntent {
-    pub fn previous(self) -> Option<SlotRevision> { self.previous }
-    pub fn proposed(self) -> SlotRevision { self.proposed }
+    pub fn previous(self) -> Option<SlotRevision> {
+        self.previous
+    }
+    pub fn proposed(self) -> SlotRevision {
+        self.proposed
+    }
 
     pub fn to_bytes(self) -> [u8; SLOT_INTENT_BYTES] {
         let mut bytes = [0; SLOT_INTENT_BYTES];
@@ -113,10 +134,16 @@ impl SlotCommitIntent {
             _ => return Err(CredentialSlotError::InvalidRecord),
         };
         let proposed = SlotRevision::from_trusted_bytes(&bytes[113..])?;
-        if next_generation(previous)? != proposed.generation { return Err(CredentialSlotError::InvalidRecord); }
+        if next_generation(previous)? != proposed.generation {
+            return Err(CredentialSlotError::InvalidRecord);
+        }
         Ok(Self {
-            key: bytes[8..40].try_into().map_err(|_| CredentialSlotError::InvalidRecord)?,
-            authorization: bytes[40..72].try_into().map_err(|_| CredentialSlotError::InvalidRecord)?,
+            key: bytes[8..40]
+                .try_into()
+                .map_err(|_| CredentialSlotError::InvalidRecord)?,
+            authorization: bytes[40..72]
+                .try_into()
+                .map_err(|_| CredentialSlotError::InvalidRecord)?,
             previous,
             proposed,
         })
@@ -132,7 +159,9 @@ pub struct PreparedSlotMutation {
 }
 
 impl PreparedSlotMutation {
-    pub fn intent(&self) -> SlotCommitIntent { self.intent }
+    pub fn intent(&self) -> SlotCommitIntent {
+        self.intent
+    }
 }
 
 /// A durably committed mutation. A take's payload becomes available only here.
@@ -142,8 +171,12 @@ pub struct SlotCommit {
 }
 
 impl SlotCommit {
-    pub fn revision(&self) -> SlotRevision { self.revision }
-    pub fn into_consumed(self) -> Option<Vec<u8>> { self.consumed }
+    pub fn revision(&self) -> SlotRevision {
+        self.revision
+    }
+    pub fn into_consumed(self) -> Option<Vec<u8>> {
+        self.consumed
+    }
 }
 
 /// Recovery does not redeliver a consumed payload, even when the proposed
@@ -185,10 +218,16 @@ impl fmt::Display for CredentialSlotError {
             Self::Storage(error) => error.fmt(f),
             Self::InvalidRecord => f.write_str("protected credential slot record is invalid"),
             Self::BindingMismatch => f.write_str("protected credential slot binding mismatch"),
-            Self::RevisionMismatch => f.write_str("protected credential slot revision disagrees with trusted custody"),
+            Self::RevisionMismatch => {
+                f.write_str("protected credential slot revision disagrees with trusted custody")
+            }
             Self::Empty => f.write_str("protected credential slot has no payload"),
-            Self::GenerationExhausted => f.write_str("protected credential slot generation exhausted"),
-            Self::CommitUncertain { .. } => f.write_str("protected credential slot commit requires intent reconciliation"),
+            Self::GenerationExhausted => {
+                f.write_str("protected credential slot generation exhausted")
+            }
+            Self::CommitUncertain { .. } => {
+                f.write_str("protected credential slot commit requires intent reconciliation")
+            }
         }
     }
 }
@@ -250,7 +289,9 @@ const _: () = assert!(SLOT_REVISION_BYTES == 40);
 const _: () = assert!(SLOT_INTENT_BYTES == 153);
 
 impl From<AtomicFileError> for CredentialSlotError {
-    fn from(error: AtomicFileError) -> Self { Self::Storage(error) }
+    fn from(error: AtomicFileError) -> Self {
+        Self::Storage(error)
+    }
 }
 
 /// One exclusively owned, partition-bound credential slot. The filesystem lock
@@ -280,7 +321,10 @@ impl DurableCredentialSlot {
         if record.as_ref().map(|record| record.revision) != trusted_revision {
             return Err(CredentialSlotError::RevisionMismatch);
         }
-        Ok(Self { current: trusted_revision, ..slot })
+        Ok(Self {
+            current: trusted_revision,
+            ..slot
+        })
     }
 
     /// Reconciles after a crash/uncertain commit against an independently
@@ -297,7 +341,11 @@ impl DurableCredentialSlot {
         slot.check_intent_binding(&intent)?;
         // Explicit reconciliation establishes durability before declaring either
         // outcome; normal load remains unavailable after uncertain file commit.
-        let record = slot.file.reconcile(cx)?.map(|raw| slot.decode(raw)).transpose()?;
+        let record = slot
+            .file
+            .reconcile(cx)?
+            .map(|raw| slot.decode(raw))
+            .transpose()?;
         let actual = record.as_ref().map(|record| record.revision);
         let outcome = if actual == Some(intent.proposed) {
             SlotRecoveryOutcome::Committed(intent.proposed)
@@ -310,12 +358,20 @@ impl DurableCredentialSlot {
         Ok((slot, outcome))
     }
 
-    pub fn revision(&self) -> Option<SlotRevision> { self.current }
-    pub fn maximum_payload_bytes(&self) -> usize { self.file.maximum_bytes() - HEADER_BYTES }
+    pub fn revision(&self) -> Option<SlotRevision> {
+        self.current
+    }
+    pub fn maximum_payload_bytes(&self) -> usize {
+        self.file.maximum_bytes() - HEADER_BYTES
+    }
 
     /// Reads only under the current matching authorization and the last trusted
     /// full revision. Callers must verify the protected envelope before using it.
-    pub fn load(&self, cx: &Cx, authorization: &PartitionAuthorization) -> Result<Option<Vec<u8>>, CredentialSlotError> {
+    pub fn load(
+        &self,
+        cx: &Cx,
+        authorization: &PartitionAuthorization,
+    ) -> Result<Option<Vec<u8>>, CredentialSlotError> {
         self.check_authorization(authorization)?;
         Ok(self.read_current(cx)?.and_then(|record| record.payload))
     }
@@ -329,7 +385,9 @@ impl DurableCredentialSlot {
     ) -> Result<PreparedSlotMutation, CredentialSlotError> {
         self.check_authorization(authorization)?;
         checkpoint(cx)?;
-        if expected != self.current { return Err(CredentialSlotError::RevisionMismatch); }
+        if expected != self.current {
+            return Err(CredentialSlotError::RevisionMismatch);
+        }
         self.read_current(cx)?;
         if protected_payload.len() > self.maximum_payload_bytes() {
             return Err(AtomicFileError::TooLarge.into());
@@ -347,8 +405,12 @@ impl DurableCredentialSlot {
     ) -> Result<PreparedSlotMutation, CredentialSlotError> {
         self.check_authorization(authorization)?;
         checkpoint(cx)?;
-        if Some(expected) != self.current { return Err(CredentialSlotError::RevisionMismatch); }
-        let payload = self.read_current(cx)?.and_then(|record| record.payload)
+        if Some(expected) != self.current {
+            return Err(CredentialSlotError::RevisionMismatch);
+        }
+        let payload = self
+            .read_current(cx)?
+            .and_then(|record| record.payload)
             .ok_or(CredentialSlotError::Empty)?;
         self.prepare(None, Some(payload))
     }
@@ -366,14 +428,23 @@ impl DurableCredentialSlot {
         self.check_authorization(authorization)?;
         self.check_intent_binding(&mutation.intent)?;
         checkpoint(cx)?;
-        if mutation.intent.previous != self.current { return Err(CredentialSlotError::RevisionMismatch); }
-        match self.file.replace(cx, self.current.map(|current| current.file_version), &mutation.record) {
+        if mutation.intent.previous != self.current {
+            return Err(CredentialSlotError::RevisionMismatch);
+        }
+        match self.file.replace(
+            cx,
+            self.current.map(|current| current.file_version),
+            &mutation.record,
+        ) {
             Ok(file_version) => {
                 // The record was hashed before external intent custody; the
                 // exact same bytes are what the atomic-file operation committed.
                 debug_assert_eq!(file_version, mutation.intent.proposed.file_version);
                 self.current = Some(mutation.intent.proposed);
-                Ok(SlotCommit { revision: mutation.intent.proposed, consumed: mutation.consumed })
+                Ok(SlotCommit {
+                    revision: mutation.intent.proposed,
+                    consumed: mutation.consumed,
+                })
             }
             Err(AtomicFileError::CommitUncertain { .. }) => {
                 Err(CredentialSlotError::CommitUncertain {
@@ -385,13 +456,29 @@ impl DurableCredentialSlot {
         }
     }
 
-    fn new(file: SecureAtomicFile, key: &CredentialStoreKey, authorization: &PartitionAuthorization) -> Result<Self, CredentialSlotError> {
-        if file.maximum_bytes() < HEADER_BYTES { return Err(AtomicFileError::InvalidLimit.into()); }
-        Ok(Self { file, key: *key.as_bytes(), authorization: *authorization.as_bytes(), current: None })
+    fn new(
+        file: SecureAtomicFile,
+        key: &CredentialStoreKey,
+        authorization: &PartitionAuthorization,
+    ) -> Result<Self, CredentialSlotError> {
+        if file.maximum_bytes() < HEADER_BYTES {
+            return Err(AtomicFileError::InvalidLimit.into());
+        }
+        Ok(Self {
+            file,
+            key: *key.as_bytes(),
+            authorization: *authorization.as_bytes(),
+            current: None,
+        })
     }
 
-    fn check_authorization(&self, authorization: &PartitionAuthorization) -> Result<(), CredentialSlotError> {
-        if self.authorization != *authorization.as_bytes() { return Err(CredentialSlotError::BindingMismatch); }
+    fn check_authorization(
+        &self,
+        authorization: &PartitionAuthorization,
+    ) -> Result<(), CredentialSlotError> {
+        if self.authorization != *authorization.as_bytes() {
+            return Err(CredentialSlotError::BindingMismatch);
+        }
         Ok(())
     }
 
@@ -414,7 +501,11 @@ impl DurableCredentialSlot {
         Ok(record)
     }
 
-    fn prepare(&self, payload: Option<&[u8]>, consumed: Option<Vec<u8>>) -> Result<PreparedSlotMutation, CredentialSlotError> {
+    fn prepare(
+        &self,
+        payload: Option<&[u8]>,
+        consumed: Option<Vec<u8>>,
+    ) -> Result<PreparedSlotMutation, CredentialSlotError> {
         let generation = next_generation(self.current)?;
         let payload_len = payload.map_or(0, <[u8]>::len);
         let mut record = Vec::with_capacity(HEADER_BYTES + payload_len);
@@ -425,10 +516,20 @@ impl DurableCredentialSlot {
         record.extend_from_slice(&generation.to_be_bytes());
         record.push(u8::from(payload.is_some()));
         record.extend_from_slice(&(payload_len as u32).to_be_bytes());
-        if let Some(payload) = payload { record.extend_from_slice(payload); }
-        let proposed = SlotRevision { generation, file_version: version(&record)? };
+        if let Some(payload) = payload {
+            record.extend_from_slice(payload);
+        }
+        let proposed = SlotRevision {
+            generation,
+            file_version: version(&record)?,
+        };
         Ok(PreparedSlotMutation {
-            intent: SlotCommitIntent { key: self.key, authorization: self.authorization, previous: self.current, proposed },
+            intent: SlotCommitIntent {
+                key: self.key,
+                authorization: self.authorization,
+                previous: self.current,
+                proposed,
+            },
             record,
             consumed,
         })
@@ -436,45 +537,82 @@ impl DurableCredentialSlot {
 
     fn decode(&self, raw: AtomicFileSnapshot) -> Result<Record, CredentialSlotError> {
         let bytes = raw.bytes();
-        if bytes.len() < HEADER_BYTES || &bytes[..8] != MAGIC
+        if bytes.len() < HEADER_BYTES
+            || &bytes[..8] != MAGIC
             || bytes[8..10] != FORMAT_VERSION.to_be_bytes()
-        { return Err(CredentialSlotError::InvalidRecord); }
+        {
+            return Err(CredentialSlotError::InvalidRecord);
+        }
         if bytes[10..42] != self.key || bytes[42..74] != self.authorization {
             return Err(CredentialSlotError::BindingMismatch);
         }
-        let generation = u64::from_be_bytes(bytes[74..82].try_into().map_err(|_| CredentialSlotError::InvalidRecord)?);
-        let length = u32::from_be_bytes(bytes[83..87].try_into().map_err(|_| CredentialSlotError::InvalidRecord)?) as usize;
-        if generation == 0 || length != bytes.len() - HEADER_BYTES || bytes[82] > 1
+        let generation = u64::from_be_bytes(
+            bytes[74..82]
+                .try_into()
+                .map_err(|_| CredentialSlotError::InvalidRecord)?,
+        );
+        let length = u32::from_be_bytes(
+            bytes[83..87]
+                .try_into()
+                .map_err(|_| CredentialSlotError::InvalidRecord)?,
+        ) as usize;
+        if generation == 0
+            || length != bytes.len() - HEADER_BYTES
+            || bytes[82] > 1
             || (bytes[82] == 0 && length != 0)
-        { return Err(CredentialSlotError::InvalidRecord); }
-        let revision = SlotRevision { generation, file_version: raw.version() };
+        {
+            return Err(CredentialSlotError::InvalidRecord);
+        }
+        let revision = SlotRevision {
+            generation,
+            file_version: raw.version(),
+        };
         let payload = (bytes[82] == 1).then(|| bytes[HEADER_BYTES..].to_vec());
         Ok(Record { revision, payload })
     }
 }
 
-struct Record { revision: SlotRevision, payload: Option<Vec<u8>> }
+struct Record {
+    revision: SlotRevision,
+    payload: Option<Vec<u8>>,
+}
 
 fn next_generation(current: Option<SlotRevision>) -> Result<u64, CredentialSlotError> {
-    current.map_or(0, |current| current.generation).checked_add(1)
+    current
+        .map_or(0, |current| current.generation)
+        .checked_add(1)
         .ok_or(CredentialSlotError::GenerationExhausted)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::tests::{PrivateDirectory, failing_directory_sync};
+    use super::*;
     use fastmcp_core::partition::{DurableOwnerKey, PartitionDescriptor};
 
     fn identity() -> (CredentialStoreKey, PartitionAuthorization) {
         let descriptor = PartitionDescriptor::from_verified_facts(
-            "fixture-provider", 1, "https://issuer.example", "https://resource.example/mcp",
-            "fixture-tenant", "fixture-subject", "native-client", 1, 1, &[b"fixture-audience"],
-        ).unwrap();
+            "fixture-provider",
+            1,
+            "https://issuer.example",
+            "https://resource.example/mcp",
+            "fixture-tenant",
+            "fixture-subject",
+            "native-client",
+            1,
+            1,
+            &[b"fixture-audience"],
+        )
+        .unwrap();
         let owner = DurableOwnerKey::derive(&descriptor, 1).unwrap();
         (
-            CredentialStoreKey::derive(&descriptor, "fixture-store", "refresh-family", "stable-lineage")
-                .unwrap(),
+            CredentialStoreKey::derive(
+                &descriptor,
+                "fixture-store",
+                "refresh-family",
+                "stable-lineage",
+            )
+            .unwrap(),
             PartitionAuthorization::current(&descriptor, &owner),
         )
     }
@@ -485,8 +623,11 @@ mod tests {
         let directory = PrivateDirectory::new();
         let (key, authorization) = identity();
         let mut slot =
-            DurableCredentialSlot::open(&cx, directory.open(&cx), &key, &authorization, None).unwrap();
-        let mutation = slot.prepare_replace(&cx, &authorization, None, b"protected").unwrap();
+            DurableCredentialSlot::open(&cx, directory.open(&cx), &key, &authorization, None)
+                .unwrap();
+        let mutation = slot
+            .prepare_replace(&cx, &authorization, None, b"protected")
+            .unwrap();
         let intent = mutation.intent();
         slot.file.directory_sync = failing_directory_sync;
 
@@ -497,12 +638,17 @@ mod tests {
                 proposed: intent.proposed(),
             }),
         );
-        assert_eq!(slot.revision(), None, "an uncertain commit must not advance the trusted revision");
+        assert_eq!(
+            slot.revision(),
+            None,
+            "an uncertain commit must not advance the trusted revision"
+        );
 
         // Recovery takes a fresh handle and the independently retained intent.
         drop(slot);
         let (_, outcome) =
-            DurableCredentialSlot::recover(&cx, directory.open(&cx), &key, &authorization, intent).unwrap();
+            DurableCredentialSlot::recover(&cx, directory.open(&cx), &key, &authorization, intent)
+                .unwrap();
         assert_eq!(outcome, SlotRecoveryOutcome::Committed(intent.proposed()));
     }
 
@@ -514,8 +660,11 @@ mod tests {
         let directory = PrivateDirectory::new();
         let (key, authorization) = identity();
         let mut slot =
-            DurableCredentialSlot::open(&cx, directory.open(&cx), &key, &authorization, None).unwrap();
-        let mutation = slot.prepare_replace(&cx, &authorization, None, b"protected").unwrap();
+            DurableCredentialSlot::open(&cx, directory.open(&cx), &key, &authorization, None)
+                .unwrap();
+        let mutation = slot
+            .prepare_replace(&cx, &authorization, None, b"protected")
+            .unwrap();
         let intent = mutation.intent();
 
         let commit = slot.commit(&cx, &authorization, mutation).unwrap();

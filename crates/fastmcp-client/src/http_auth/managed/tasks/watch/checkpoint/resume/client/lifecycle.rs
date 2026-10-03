@@ -18,17 +18,19 @@ use asupersync::types::Time;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::tasks_extension::Task;
 
-use crate::http_auth::managed::{OAuthSessionError, deadline_after};
+use super::super::{
+    TaskResumeBinding, TaskResumeError, TaskResumeKey, TaskResumeRecord, checkpoint, wall_now,
+};
+use super::{admit_record, reconcile_controls};
 use crate::http_auth::managed::tasks::ManagedTasksClient;
-use crate::http_auth::managed::tasks::watch::{ManagedTaskSnapshot, ManagedTaskWatchPolicy};
 use crate::http_auth::managed::tasks::watch::cancellation::{
     CancellableTaskWatchError, ManagedTaskCancelHandle,
 };
 use crate::http_auth::managed::tasks::watch::recovery::{
     ManagedTaskRecoveryError, ManagedTaskRecoveryPolicy, RecoveringManagedTaskWatch,
 };
-use super::{admit_record, reconcile_controls};
-use super::super::{TaskResumeBinding, TaskResumeError, TaskResumeKey, TaskResumeRecord, checkpoint, wall_now};
+use crate::http_auth::managed::tasks::watch::{ManagedTaskSnapshot, ManagedTaskWatchPolicy};
+use crate::http_auth::managed::{OAuthSessionError, deadline_after};
 
 /// An immutable compare-and-replace (or compare-and-remove) of one saved record.
 /// The expected version includes exact controls and original retention, not
@@ -73,28 +75,49 @@ impl TaskResumeChange {
     /// Applying the command compares the entire physical record, including
     /// expired-but-unpruned controls. It never deletes a changed/newer version.
     pub fn discard(
-        cx: &Cx, current: &TaskResumeBinding, previous: &TaskResumeRecord,
+        cx: &Cx,
+        current: &TaskResumeBinding,
+        previous: &TaskResumeRecord,
     ) -> Result<Self, TaskResumeError> {
         checkpoint(cx)?;
-        if previous.binding != current.digest { return Err(TaskResumeError::Unavailable); }
+        if previous.binding != current.digest {
+            return Err(TaskResumeError::Unavailable);
+        }
         previous.validate()?;
-        Ok(Self { previous: previous.clone(), replacement: None })
+        Ok(Self {
+            previous: previous.clone(),
+            replacement: None,
+        })
     }
 
     fn prepare_at(
-        current: &TaskResumeBinding, previous: &TaskResumeRecord, task: &Task, now: i128,
+        current: &TaskResumeBinding,
+        previous: &TaskResumeRecord,
+        task: &Task,
+        now: i128,
     ) -> Result<Self, TaskResumeError> {
         let replacement = reconcile_controls(previous, current, task, now)?;
-        Ok(Self { previous: previous.clone(), replacement })
+        Ok(Self {
+            previous: previous.clone(),
+            replacement,
+        })
     }
 
-    pub fn key(&self) -> TaskResumeKey { self.previous.key() }
-    pub fn previous(&self) -> &TaskResumeRecord { &self.previous }
-    pub fn replacement(&self) -> Option<&TaskResumeRecord> { self.replacement.as_ref() }
+    pub fn key(&self) -> TaskResumeKey {
+        self.previous.key()
+    }
+    pub fn previous(&self) -> &TaskResumeRecord {
+        &self.previous
+    }
+    pub fn replacement(&self) -> Option<&TaskResumeRecord> {
+        self.replacement.as_ref()
+    }
 
     #[cfg(any(target_os = "linux", test))]
     fn admit_expected(&self, actual: Option<&TaskResumeRecord>) -> Result<(), TaskResumeError> {
-        if actual != Some(&self.previous) { return Err(TaskResumeError::ConflictingSnapshot); }
+        if actual != Some(&self.previous) {
+            return Err(TaskResumeError::ConflictingSnapshot);
+        }
         Ok(())
     }
 
@@ -123,7 +146,9 @@ impl TaskResumeChange {
         self.previous.admit(cx, current)?;
         let actual = store.get(cx, current, self.key())?;
         self.admit_expected(actual.as_ref())?;
-        if record != &self.previous { store.put(cx, current, record.clone())?; }
+        if record != &self.previous {
+            store.put(cx, current, record.clone())?;
+        }
         Ok(())
     }
 }
@@ -150,17 +175,30 @@ pub struct PendingTaskResumeSnapshot {
     persistence: TaskResumePersistenceState,
 }
 impl PendingTaskResumeSnapshot {
-    pub fn snapshot(&self) -> &ManagedTaskSnapshot { &self.snapshot }
-    pub fn change(&self) -> &TaskResumeChange { &self.change }
-    pub fn persistence(&self) -> TaskResumePersistenceState { self.persistence }
-    pub fn into_parts(self) -> (ManagedTaskSnapshot, TaskResumeChange, TaskResumePersistenceState) {
+    pub fn snapshot(&self) -> &ManagedTaskSnapshot {
+        &self.snapshot
+    }
+    pub fn change(&self) -> &TaskResumeChange {
+        &self.change
+    }
+    pub fn persistence(&self) -> TaskResumePersistenceState {
+        self.persistence
+    }
+    pub fn into_parts(
+        self,
+    ) -> (
+        ManagedTaskSnapshot,
+        TaskResumeChange,
+        TaskResumePersistenceState,
+    ) {
         (self.snapshot, self.change, self.persistence)
     }
 }
 impl fmt::Debug for PendingTaskResumeSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PendingTaskResumeSnapshot")
-            .field("persistence", &self.persistence).finish_non_exhaustive()
+            .field("persistence", &self.persistence)
+            .finish_non_exhaustive()
     }
 }
 
@@ -198,9 +236,15 @@ impl<E> fmt::Display for PersistedTaskWatchError<E> {
             Self::Resume(error) => error.fmt(f),
             Self::Recovery(error) => error.fmt(f),
             Self::Session(error) => error.fmt(f),
-            Self::Persistence(_) => f.write_str("Task observation persistence was not acknowledged"),
-            Self::CancellationRequested => f.write_str("Task cancellation acknowledged; persisted observation stopped"),
-            Self::TerminalAcknowledgementRequired => f.write_str("acknowledge the delivered terminal before completing observation"),
+            Self::Persistence(_) => {
+                f.write_str("Task observation persistence was not acknowledged")
+            }
+            Self::CancellationRequested => {
+                f.write_str("Task cancellation acknowledged; persisted observation stopped")
+            }
+            Self::TerminalAcknowledgementRequired => {
+                f.write_str("acknowledge the delivered terminal before completing observation")
+            }
             Self::NoTerminal => f.write_str("no terminal Task snapshot has been delivered"),
             Self::Closed => f.write_str("persisted Task watch is closed"),
         }
@@ -213,26 +257,36 @@ impl<E: std::error::Error + 'static> std::error::Error for PersistedTaskWatchErr
             Self::Recovery(error) => Some(error),
             Self::Session(error) => Some(error),
             Self::Persistence(error) => Some(error),
-            Self::CancellationRequested | Self::TerminalAcknowledgementRequired
-            | Self::NoTerminal | Self::Closed => None,
+            Self::CancellationRequested
+            | Self::TerminalAcknowledgementRequired
+            | Self::NoTerminal
+            | Self::Closed => None,
         }
     }
 }
 impl<E> From<TaskResumeError> for PersistedTaskWatchError<E> {
-    fn from(error: TaskResumeError) -> Self { Self::Resume(error) }
+    fn from(error: TaskResumeError) -> Self {
+        Self::Resume(error)
+    }
 }
 impl<E> From<ManagedTaskRecoveryError> for PersistedTaskWatchError<E> {
-    fn from(error: ManagedTaskRecoveryError) -> Self { Self::Recovery(error) }
+    fn from(error: ManagedTaskRecoveryError) -> Self {
+        Self::Recovery(error)
+    }
 }
 impl<E> From<OAuthSessionError> for PersistedTaskWatchError<E> {
-    fn from(error: OAuthSessionError) -> Self { Self::Session(error) }
+    fn from(error: OAuthSessionError) -> Self {
+        Self::Session(error)
+    }
 }
 impl<E> From<CancellableTaskWatchError> for PersistedTaskWatchError<E> {
     fn from(error: CancellableTaskWatchError) -> Self {
         match error {
             CancellableTaskWatchError::CancellationRequested => Self::CancellationRequested,
             CancellableTaskWatchError::Closed => Self::Closed,
-            CancellableTaskWatchError::Watch(error) => Self::Recovery(ManagedTaskRecoveryError::Watch(error)),
+            CancellableTaskWatchError::Watch(error) => {
+                Self::Recovery(ManagedTaskRecoveryError::Watch(error))
+            }
             CancellableTaskWatchError::Recovery(error) => Self::Recovery(error),
             CancellableTaskWatchError::Session(error) => Self::Session(error),
         }
@@ -264,18 +318,30 @@ impl ManagedTasksClient {
     /// the handle performs no request. Failed attempts do not stop observation.
     #[allow(clippy::too_many_arguments)]
     pub async fn resume_task_watch_persisted<P, F, E>(
-        &self, cx: &Cx, current: TaskResumeBinding, record: TaskResumeRecord,
-        id_prefix: String, policy: ManagedTaskWatchPolicy,
-        recovery: ManagedTaskRecoveryPolicy, persist: P,
+        &self,
+        cx: &Cx,
+        current: TaskResumeBinding,
+        record: TaskResumeRecord,
+        id_prefix: String,
+        policy: ManagedTaskWatchPolicy,
+        recovery: ManagedTaskRecoveryPolicy,
+        persist: P,
     ) -> Result<PersistedManagedTaskWatch<P>, PersistedTaskWatchError<E>>
     where
         P: FnMut(TaskResumeChange) -> F,
         F: Future<Output = Result<(), E>>,
     {
         self.resume_task_watch_persisted_with_cancellation(
-            cx, &McpRequestCancellation::new(), current, record,
-            id_prefix, policy, recovery, persist,
-        ).await
+            cx,
+            &McpRequestCancellation::new(),
+            current,
+            record,
+            id_prefix,
+            policy,
+            recovery,
+            persist,
+        )
+        .await
     }
 
     /// One cancellation domain covers admission, recovery and persistence. A
@@ -283,10 +349,15 @@ impl ManagedTasksClient {
     /// and reconcile the provider rather than retrying a change blindly.
     #[allow(clippy::too_many_arguments)]
     pub async fn resume_task_watch_persisted_with_cancellation<P, F, E>(
-        &self, cx: &Cx, cancellation: &McpRequestCancellation,
-        current: TaskResumeBinding, record: TaskResumeRecord,
-        id_prefix: String, policy: ManagedTaskWatchPolicy,
-        recovery: ManagedTaskRecoveryPolicy, persist: P,
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        current: TaskResumeBinding,
+        record: TaskResumeRecord,
+        id_prefix: String,
+        policy: ManagedTaskWatchPolicy,
+        recovery: ManagedTaskRecoveryPolicy,
+        persist: P,
     ) -> Result<PersistedManagedTaskWatch<P>, PersistedTaskWatchError<E>>
     where
         P: FnMut(TaskResumeChange) -> F,
@@ -296,21 +367,50 @@ impl ManagedTasksClient {
         let anchor = cx.now();
         let now = wall_now();
         admit_record(&record, &current, self.session.resource().as_str(), now)?;
-        let remaining = record.retain_until.checked_sub(now).ok_or(TaskResumeError::Unavailable)?;
-        let retention_deadline = anchor.saturating_add_nanos(u64::try_from(remaining).unwrap_or(u64::MAX));
+        let remaining = record
+            .retain_until
+            .checked_sub(now)
+            .ok_or(TaskResumeError::Unavailable)?;
+        let retention_deadline =
+            anchor.saturating_add_nanos(u64::try_from(remaining).unwrap_or(u64::MAX));
         let deadline = retention_deadline.min(deadline_after(cx, policy.timeout)?);
         let remote_cancel = ManagedTaskCancelHandle::for_observation(
-            self, record.task_id().clone(), &id_prefix, cancellation, deadline,
+            self,
+            record.task_id().clone(),
+            &id_prefix,
+            cancellation,
+            deadline,
         )?;
-        let watch = Box::pin(self.session.await_active(cx, cancellation, deadline, None, async {
-            Ok(self.watch_tasks_recovering_with_cancellation(
-                cx, cancellation, vec![record.task_id().clone()], id_prefix, policy, recovery,
-            ).await)
-        })).await??;
+        let watch = Box::pin(
+            self.session
+                .await_active(cx, cancellation, deadline, None, async {
+                    Ok(self
+                        .watch_tasks_recovering_with_cancellation(
+                            cx,
+                            cancellation,
+                            vec![record.task_id().clone()],
+                            id_prefix,
+                            policy,
+                            recovery,
+                        )
+                        .await)
+                }),
+        )
+        .await??;
         let result = PersistedManagedTaskWatch {
-            client: self.clone(), current, record, cancellation: cancellation.clone(),
-            deadline, watch: Some(watch), remote_cancel, persist, pending: None, terminal_cleanup: None,
-            cleanup_state: TaskResumePersistenceState::NotAttempted, closed: false, finished: false,
+            client: self.clone(),
+            current,
+            record,
+            cancellation: cancellation.clone(),
+            deadline,
+            watch: Some(watch),
+            remote_cancel,
+            persist,
+            pending: None,
+            terminal_cleanup: None,
+            cleanup_state: TaskResumePersistenceState::NotAttempted,
+            closed: false,
+            finished: false,
         };
         result.check::<E>(cx)?;
         Ok(result)
@@ -350,19 +450,31 @@ pub struct PersistedManagedTaskWatch<P> {
 impl<P> PersistedManagedTaskWatch<P> {
     /// Initial loaded record, then the record for the last published active
     /// snapshot. A pending acknowledged change may already supersede it in storage.
-    pub fn last_published_record(&self) -> &TaskResumeRecord { &self.record }
-    pub fn pending(&self) -> Option<&PendingTaskResumeSnapshot> { self.pending.as_ref() }
-    pub fn take_pending(&mut self) -> Option<PendingTaskResumeSnapshot> { self.pending.take() }
+    pub fn last_published_record(&self) -> &TaskResumeRecord {
+        &self.record
+    }
+    pub fn pending(&self) -> Option<&PendingTaskResumeSnapshot> {
+        self.pending.as_ref()
+    }
+    pub fn take_pending(&mut self) -> Option<PendingTaskResumeSnapshot> {
+        self.pending.take()
+    }
     /// Conditional cleanup for the terminal already delivered to the caller.
     /// Exposed for diagnostics, never replayed by a failed/abandoned owner.
-    pub fn terminal_cleanup(&self) -> Option<&TaskResumeChange> { self.terminal_cleanup.as_ref() }
-    pub fn cleanup_state(&self) -> TaskResumePersistenceState { self.cleanup_state }
+    pub fn terminal_cleanup(&self) -> Option<&TaskResumeChange> {
+        self.terminal_cleanup.as_ref()
+    }
+    pub fn cleanup_state(&self) -> TaskResumePersistenceState {
+        self.cleanup_state
+    }
 
     /// A separate, cloneable caller-driven handle sharing one cancel attempt.
     /// ACK means CancellationRequested, not Task::Cancelled or record deletion.
     /// It is bound to this owner's original retention/deadline and login; close,
     /// drop, failed observation or terminal delivery retires further admission.
-    pub fn cancel_handle(&self) -> ManagedTaskCancelHandle { self.remote_cancel.clone() }
+    pub fn cancel_handle(&self) -> ManagedTaskCancelHandle {
+        self.remote_cancel.clone()
+    }
 
     pub fn close(&mut self) {
         self.remote_cancel.close_observation();
@@ -376,15 +488,24 @@ impl<P> PersistedManagedTaskWatch<P> {
     ///
     /// Exactly one attempt is allowed. Error/drop can leave a committed write;
     /// inspect cleanup_state and reconcile the provider, never retry blindly.
-    pub async fn acknowledge_terminal<F, E>(&mut self, cx: &Cx)
-        -> Result<(), PersistedTaskWatchError<E>>
+    pub async fn acknowledge_terminal<F, E>(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<(), PersistedTaskWatchError<E>>
     where
         P: FnMut(TaskResumeChange) -> F,
         F: Future<Output = Result<(), E>>,
     {
-        if self.finished { return Ok(()); }
-        if self.closed { return Err(PersistedTaskWatchError::Closed); }
-        let change = self.terminal_cleanup.clone().ok_or(PersistedTaskWatchError::NoTerminal)?;
+        if self.finished {
+            return Ok(());
+        }
+        if self.closed {
+            return Err(PersistedTaskWatchError::Closed);
+        }
+        let change = self
+            .terminal_cleanup
+            .clone()
+            .ok_or(PersistedTaskWatchError::NoTerminal)?;
         // Retire the write opportunity before the first await, even if the
         // lifetime guard refuses it without invoking the host callback.
         self.closed = true;
@@ -393,9 +514,15 @@ impl<P> PersistedManagedTaskWatch<P> {
         let cancellation = self.cancellation.clone();
         let persist = &mut self.persist;
         let state = &mut self.cleanup_state;
-        Box::pin(client.session.await_active(cx, &cancellation, self.deadline, None, async {
-            Ok(persist_change(state, persist, change).await)
-        })).await?.map_err(PersistedTaskWatchError::Persistence)?;
+        Box::pin(
+            client
+                .session
+                .await_active(cx, &cancellation, self.deadline, None, async {
+                    Ok(persist_change(state, persist, change).await)
+                }),
+        )
+        .await?
+        .map_err(PersistedTaskWatchError::Persistence)?;
         // Do not rewrite a successfully acknowledged storage commit as a
         // failure merely because retention expires immediately afterwards.
         // await_active already rechecks cancellation/session/deadline.
@@ -409,23 +536,30 @@ impl<P> PersistedManagedTaskWatch<P> {
         }
         self.client.session.check(cx, &self.cancellation)?;
         self.record.admit(cx, &self.current)?;
-        if cx.now() >= self.deadline { return Err(OAuthSessionError::TimedOut.into()); }
+        if cx.now() >= self.deadline {
+            return Err(OAuthSessionError::TimedOut.into());
+        }
         Ok(())
     }
 
     pub async fn next_snapshot<F, E>(
-        &mut self, cx: &Cx,
+        &mut self,
+        cx: &Cx,
     ) -> Result<Option<ManagedTaskSnapshot>, PersistedTaskWatchError<E>>
     where
         P: FnMut(TaskResumeChange) -> F,
         F: Future<Output = Result<(), E>>,
     {
-        if self.finished { return Ok(None); }
+        if self.finished {
+            return Ok(None);
+        }
         if self.remote_cancel.cancellation_requested() {
             self.close();
             return Err(PersistedTaskWatchError::CancellationRequested);
         }
-        if self.closed { return Err(PersistedTaskWatchError::Closed); }
+        if self.closed {
+            return Err(PersistedTaskWatchError::Closed);
+        }
         if self.terminal_cleanup.is_some() {
             return Err(PersistedTaskWatchError::TerminalAcknowledgementRequired);
         }
@@ -438,12 +572,19 @@ impl<P> PersistedManagedTaskWatch<P> {
         let client = self.client.clone();
         let cancellation = self.cancellation.clone();
         let deadline = self.deadline;
-        let read = Box::pin(client.session.await_active(cx, &cancellation, deadline, None, async {
-            Ok(watch.next_snapshot(cx).await)
-        }));
-        let snapshot = remote_cancel.until_acknowledged(read).await???
+        let read = Box::pin(client.session.await_active(
+            cx,
+            &cancellation,
+            deadline,
+            None,
+            async { Ok(watch.next_snapshot(cx).await) },
+        ));
+        let snapshot = remote_cancel
+            .until_acknowledged(read)
+            .await???
             .ok_or(TaskResumeError::InvalidRecord)?;
-        let change = TaskResumeChange::from_snapshot(cx, &self.current, &self.record, &snapshot.task)?;
+        let change =
+            TaskResumeChange::from_snapshot(cx, &self.current, &self.record, &snapshot.task)?;
         if change.replacement.is_none() {
             self.check::<E>(cx)?;
             // Elect only after validating against the saved controls. A stale
@@ -456,21 +597,37 @@ impl<P> PersistedManagedTaskWatch<P> {
             return Ok(Some(snapshot));
         }
         self.pending = Some(PendingTaskResumeSnapshot {
-            snapshot, change, persistence: TaskResumePersistenceState::NotAttempted,
+            snapshot,
+            change,
+            persistence: TaskResumePersistenceState::NotAttempted,
         });
         self.check::<E>(cx)?;
-        let pending = self.pending.as_mut().ok_or(TaskResumeError::InvalidRecord)?;
+        let pending = self
+            .pending
+            .as_mut()
+            .ok_or(TaskResumeError::InvalidRecord)?;
         let persist = &mut self.persist;
         // Invoke INSIDE both guards. Keep pending in self so cancellation or
         // abandonment cannot discard a committed-but-unacknowledged write.
-        let writing = Box::pin(client.session.await_active(cx, &cancellation, deadline, None, async {
-            Ok(persist_change(&mut pending.persistence, persist, pending.change.clone()).await)
-        }));
-        remote_cancel.until_acknowledged(writing).await??
+        let writing = Box::pin(client.session.await_active(
+            cx,
+            &cancellation,
+            deadline,
+            None,
+            async {
+                Ok(persist_change(&mut pending.persistence, persist, pending.change.clone()).await)
+            },
+        ));
+        remote_cancel
+            .until_acknowledged(writing)
+            .await??
             .map_err(PersistedTaskWatchError::Persistence)?;
         self.check::<E>(cx)?;
         let pending = self.pending.take().ok_or(TaskResumeError::InvalidRecord)?;
-        self.record = pending.change.replacement.ok_or(TaskResumeError::InvalidRecord)?;
+        self.record = pending
+            .change
+            .replacement
+            .ok_or(TaskResumeError::InvalidRecord)?;
         self.watch = Some(watch);
         lease.disarm();
         Ok(Some(pending.snapshot))
@@ -478,14 +635,18 @@ impl<P> PersistedManagedTaskWatch<P> {
 }
 
 impl<P> Drop for PersistedManagedTaskWatch<P> {
-    fn drop(&mut self) { self.remote_cancel.close_observation(); }
+    fn drop(&mut self) {
+        self.remote_cancel.close_observation();
+    }
 }
 
 // Shared by active-record publication and explicit terminal cleanup. Mark the
 // attempt before entering host code and the acknowledgement before returning
 // to a lifetime guard which may itself reject delivery.
 async fn persist_change<P, F, E>(
-    state: &mut TaskResumePersistenceState, persist: &mut P, change: TaskResumeChange,
+    state: &mut TaskResumePersistenceState,
+    persist: &mut P,
+    change: TaskResumeChange,
 ) -> Result<(), E>
 where
     P: FnMut(TaskResumeChange) -> F,
@@ -493,7 +654,9 @@ where
 {
     *state = TaskResumePersistenceState::Unconfirmed;
     let result = persist(change).await;
-    if result.is_ok() { *state = TaskResumePersistenceState::Acknowledged; }
+    if result.is_ok() {
+        *state = TaskResumePersistenceState::Acknowledged;
+    }
     result
 }
 

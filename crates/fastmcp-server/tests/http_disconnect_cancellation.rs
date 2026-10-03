@@ -18,9 +18,13 @@ use fastmcp_core::{AuthContext, McpContext, McpResult};
 use fastmcp_protocol::{Content, FINAL_PROTOCOL_VERSION, Tool, protocol_policy::ProtocolPolicy};
 use fastmcp_server::http_admission::security::HttpSecurityPolicy;
 use fastmcp_server::http_admission::security::scope_policy::request::ScopeRequestPolicy;
-use fastmcp_server::http_admission::security::scope_policy::{RequiredScopes, ScopeImplicationPolicy};
+use fastmcp_server::http_admission::security::scope_policy::{
+    RequiredScopes, ScopeImplicationPolicy,
+};
 use fastmcp_server::http_admission::{HttpAdmissionLimits, HttpEndpointConfig};
-use fastmcp_server::{HttpServerShutdown, Server, StaticTokenVerifier, TokenAuthProvider, ToolHandler};
+use fastmcp_server::{
+    HttpServerShutdown, Server, StaticTokenVerifier, TokenAuthProvider, ToolHandler,
+};
 use serde_json::{Value, json};
 
 const BOUND: Duration = Duration::from_secs(5);
@@ -109,50 +113,95 @@ impl RunningServer {
             asupersync::runtime::RuntimeBuilder::current_thread()
                 .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
                 .blocking_threads(2, 4)
-                .build().unwrap().block_on(async move {
+                .build()
+                .unwrap()
+                .block_on(async move {
                     let cx = Cx::current().unwrap();
-                    let mut serving = cx.spawn(move |server_cx| async move {
-                        {
-                            let mut control = worker_control.lock().unwrap();
-                            control.cx = Some(server_cx.clone());
-                            if control.stopping { return None; }
-                        }
-                        let mut facts = AuthContext::with_subject("disconnect-test");
-                        facts.scopes = vec!["execute".to_owned()];
-                        let verifier = StaticTokenVerifier::new([(TOKEN.to_owned(), facts)]).unwrap();
-                        let server = Server::new("disconnect-regression", "1")
-                            .protocol_policy(ProtocolPolicy::ModernOnly).unwrap()
-                            .request_timeout(SERVER_TIMEOUT_SECS)
-                            .auth_provider(TokenAuthProvider::new(verifier))
-                            .tool(BlockingTool { name: LOST, probe: worker_lost })
-                            .tool(BlockingTool { name: SURVIVOR, probe: worker_survivor })
-                            .build();
-                        let mut policy = HttpSecurityPolicy::new(
-                            HttpEndpointConfig::new("/mcp", HttpAdmissionLimits::new(32, 8192, 65536).unwrap()).unwrap(),
-                            "https://disconnect.example", vec![],
-                        ).unwrap();
-                        if scoped {
-                            let scopes = ScopeRequestPolicy::new(
-                                1, ScopeImplicationPolicy::exact(1).unwrap(),
-                                vec![("tools/call".to_owned(), RequiredScopes::new(vec!["execute".to_owned()]).unwrap())],
-                            ).unwrap();
-                            policy = policy.with_scope_authorization(scopes).unwrap();
-                        }
-                        let bound = Box::pin(server.bind_secured_http(&server_cx, "127.0.0.1:0", policy))
-                            .await.unwrap();
-                        if started.send(bound.local_addr().unwrap()).is_err() { return None; }
-                        Some(Box::pin(bound.serve(&server_cx)).await)
-                    }).unwrap();
+                    let mut serving = cx
+                        .spawn(move |server_cx| async move {
+                            {
+                                let mut control = worker_control.lock().unwrap();
+                                control.cx = Some(server_cx.clone());
+                                if control.stopping {
+                                    return None;
+                                }
+                            }
+                            let mut facts = AuthContext::with_subject("disconnect-test");
+                            facts.scopes = vec!["execute".to_owned()];
+                            let verifier =
+                                StaticTokenVerifier::new([(TOKEN.to_owned(), facts)]).unwrap();
+                            let server = Server::new("disconnect-regression", "1")
+                                .protocol_policy(ProtocolPolicy::ModernOnly)
+                                .unwrap()
+                                .request_timeout(SERVER_TIMEOUT_SECS)
+                                .auth_provider(TokenAuthProvider::new(verifier))
+                                .tool(BlockingTool {
+                                    name: LOST,
+                                    probe: worker_lost,
+                                })
+                                .tool(BlockingTool {
+                                    name: SURVIVOR,
+                                    probe: worker_survivor,
+                                })
+                                .build();
+                            let mut policy = HttpSecurityPolicy::new(
+                                HttpEndpointConfig::new(
+                                    "/mcp",
+                                    HttpAdmissionLimits::new(32, 8192, 65536).unwrap(),
+                                )
+                                .unwrap(),
+                                "https://disconnect.example",
+                                vec![],
+                            )
+                            .unwrap();
+                            if scoped {
+                                let scopes = ScopeRequestPolicy::new(
+                                    1,
+                                    ScopeImplicationPolicy::exact(1).unwrap(),
+                                    vec![(
+                                        "tools/call".to_owned(),
+                                        RequiredScopes::new(vec!["execute".to_owned()]).unwrap(),
+                                    )],
+                                )
+                                .unwrap();
+                                policy = policy.with_scope_authorization(scopes).unwrap();
+                            }
+                            let bound = Box::pin(server.bind_secured_http(
+                                &server_cx,
+                                "127.0.0.1:0",
+                                policy,
+                            ))
+                            .await
+                            .unwrap();
+                            if started.send(bound.local_addr().unwrap()).is_err() {
+                                return None;
+                            }
+                            Some(Box::pin(bound.serve(&server_cx)).await)
+                        })
+                        .unwrap();
                     if let Some(shutdown) = serving.join(&cx).await.unwrap() {
                         if let HttpServerShutdown::Nonquiescent(shutdown) = shutdown.unwrap() {
                             shutdown.settle(&cx).await.unwrap();
                         }
                     }
-                    assert!(cx.checkpoint().is_ok(), "listener shutdown must not cancel its parent");
+                    assert!(
+                        cx.checkpoint().is_ok(),
+                        "listener shutdown must not cancel its parent"
+                    );
                 });
         });
-        let mut server = Self { address: None, control, thread: Some(worker), lost, survivor };
-        server.address = Some(startup.recv_timeout(BOUND).expect("bounded listener startup"));
+        let mut server = Self {
+            address: None,
+            control,
+            thread: Some(worker),
+            lost,
+            survivor,
+        };
+        server.address = Some(
+            startup
+                .recv_timeout(BOUND)
+                .expect("bounded listener startup"),
+        );
         server
     }
 
@@ -166,7 +215,8 @@ impl RunningServer {
                     "io.modelcontextprotocol/clientCapabilities": {},
                 },
             },
-        })).unwrap();
+        }))
+        .unwrap();
         // Both sockets intentionally use the same JSON-RPC ID. Ownership is
         // the admitted request domain, not a global map keyed by that ID.
         let head = format!(
@@ -218,13 +268,18 @@ fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
 }
 
 fn entered(probe: &Probe) -> McpContext {
-    wait_for("synchronous handler entry", || probe.context.lock().unwrap().is_some());
+    wait_for("synchronous handler entry", || {
+        probe.context.lock().unwrap().is_some()
+    });
     probe.context.lock().unwrap().as_ref().unwrap().clone()
 }
 
 fn assert_success(mut peer: TcpStream, name: &str) {
     let mut bytes = Vec::new();
-    Read::by_ref(&mut peer).take(65537).read_to_end(&mut bytes).unwrap();
+    Read::by_ref(&mut peer)
+        .take(65537)
+        .read_to_end(&mut bytes)
+        .unwrap();
     assert!(bytes.len() <= 65536, "bounded response");
     let response = String::from_utf8(bytes).unwrap();
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
@@ -245,13 +300,20 @@ fn raw_tcp_drop_cancels_sync_handler_before_deadline_and_preserves_sibling() {
             assert!(!sibling.is_cancelled());
             let disconnected = Instant::now();
             drop(peer); // Actual socket drop, not an injected cancellation/error.
-            wait_for("handler observing peer disconnect", || server.lost.observed_cancel.load(Ordering::Acquire));
+            wait_for("handler observing peer disconnect", || {
+                server.lost.observed_cancel.load(Ordering::Acquire)
+            });
             assert!(disconnected.elapsed() < Duration::from_secs(SERVER_TIMEOUT_SECS));
             assert!(context.is_cancelled());
-            assert!(context.request_cancellation().is_cancel_requested(), "request-local cancellation, not just a Cx abort");
+            assert!(
+                context.request_cancellation().is_cancel_requested(),
+                "request-local cancellation, not just a Cx abort"
+            );
             assert!(!server.lost.watchdog_expired.load(Ordering::Acquire));
             assert!(!server.lost.release.load(Ordering::Acquire));
-            wait_for("cooperative handler exit", || server.lost.exited.load(Ordering::Acquire));
+            wait_for("cooperative handler exit", || {
+                server.lost.exited.load(Ordering::Acquire)
+            });
             assert!(!sibling.is_cancelled());
             assert!(!server.survivor.exited.load(Ordering::Acquire));
             server.assert_listener_live();
@@ -280,7 +342,9 @@ fn raw_tcp_fin_without_reset_cancels_pending_sync_work() {
         // Keep the receive half alive: the kernel must deliver FIN/EOF rather
         // than a reset caused by closing a socket with unread response bytes.
         peer.shutdown(Shutdown::Write).unwrap();
-        wait_for("handler observing FIN", || server.lost.observed_cancel.load(Ordering::Acquire));
+        wait_for("handler observing FIN", || {
+            server.lost.observed_cancel.load(Ordering::Acquire)
+        });
         assert!(context.is_cancelled());
         assert!(context.request_cancellation().is_cancel_requested());
         assert!(!server.lost.watchdog_expired.load(Ordering::Acquire));

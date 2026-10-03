@@ -788,7 +788,7 @@ mod compile_consumer {
         let _ = fastmcp_rust::legacy_2024::Client::stdio_with_cx(cx.clone(), "server", &[]);
         let _ =
             fastmcp_rust::legacy_2024::connect_http_with_cx(cx, sse.clone(), post.clone()).await;
-        let _ = Client::sse_with_cx(cx, sse, post).await;
+        let _ = Box::pin(Client::sse_with_cx(cx, sse, post)).await;
     }
 
     #[cfg(all(feature = "proxy", feature = "legacy-2024-11-05"))]

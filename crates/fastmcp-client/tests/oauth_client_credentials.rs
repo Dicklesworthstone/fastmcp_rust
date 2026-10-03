@@ -3,17 +3,17 @@
 //! Run this target with native-tls-roots; a feature-filtered zero-test run is not proof.
 #![cfg(feature = "native-tls-roots")]
 
-#[cfg(feature = "tasks")]
-#[path = "oauth_client_credentials/tasks.rs"]
-mod tasks;
 #[cfg(all(not(target_arch = "wasm32"), feature = "builtin-auth-server"))]
 #[path = "oauth_client_credentials/private_key_jwt.rs"]
 mod private_key_jwt;
+#[cfg(feature = "tasks")]
+#[path = "oauth_client_credentials/tasks.rs"]
+mod tasks;
 
-#[path = "oauth_client_credentials/token_admission.rs"]
-mod token_admission;
 #[path = "oauth_client_credentials/advertisement.rs"]
 mod advertisement;
+#[path = "oauth_client_credentials/token_admission.rs"]
+mod token_admission;
 
 use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
@@ -29,16 +29,20 @@ use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener, TcpStream};
 use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
 use asupersync::time::Sleep;
-use asupersync::tls::{Certificate, CertificateChain, PrivateKey, TlsAcceptor, TlsAcceptorBuilder, TlsStream};
-use fastmcp_client::http_auth::discovery::{OAuthDiscoveryError, TrustedOAuthIssuer};
-use fastmcp_client::http_auth::discovery::client_credentials::{
-    ClientCredentialsClient, ClientCredentialsError as Error, ClientCredentialsPlan,
-    CLIENT_CREDENTIALS_EXTENSION,
+use asupersync::tls::{
+    Certificate, CertificateChain, PrivateKey, TlsAcceptor, TlsAcceptorBuilder, TlsStream,
 };
+use fastmcp_client::http_auth::discovery::client_credentials::{
+    CLIENT_CREDENTIALS_EXTENSION, ClientCredentialsClient, ClientCredentialsError as Error,
+    ClientCredentialsPlan,
+};
+use fastmcp_client::http_auth::discovery::{OAuthDiscoveryError, TrustedOAuthIssuer};
 use fastmcp_client::sse::SseLimits;
 use fastmcp_core::{CanonicalHttpUrl, McpRequestCancellation};
-use fastmcp_protocol::{ClientCapabilities, CoreRequest, FinalCoreResult, CoreResult, FinalRequestMeta, RequestId};
 use fastmcp_protocol::protocol_policy::ProtocolEra;
+use fastmcp_protocol::{
+    ClientCapabilities, CoreRequest, CoreResult, FinalCoreResult, FinalRequestMeta, RequestId,
+};
 use serde_json::{Value, json};
 
 const CHILD: &str = "FASTMCP_TEST_CLIENT_CREDENTIALS_CASE";
@@ -54,16 +58,37 @@ const MACHINE_ISSUER_LOCATIONS: [&str; 3] = [
 ];
 
 fn assert_endpoint_exhaustion(error: Error) {
-    use fastmcp_client::http_auth::discovery::issuer::{IssuerMetadataCause, IssuerMetadataFailureClass, IssuerMetadataLocation};
+    use fastmcp_client::http_auth::discovery::issuer::{
+        IssuerMetadataCause, IssuerMetadataFailureClass, IssuerMetadataLocation,
+    };
     let Error::Discovery(OAuthDiscoveryError::IssuerMetadataExhausted(failure)) = error else {
         panic!("all untrusted token locations must retain their refusal causes");
     };
-    assert_eq!(failure.classification(), IssuerMetadataFailureClass::TrustOrIntegrity);
-    assert_eq!(failure.attempts().iter().map(|attempt| (attempt.location(), attempt.cause())).collect::<Vec<_>>(), [
-        (IssuerMetadataLocation::OAuthAuthorizationServer, IssuerMetadataCause::EndpointNotTrusted),
-        (IssuerMetadataLocation::OpenIdInserted, IssuerMetadataCause::EndpointNotTrusted),
-        (IssuerMetadataLocation::OpenIdAppended, IssuerMetadataCause::EndpointNotTrusted),
-    ]);
+    assert_eq!(
+        failure.classification(),
+        IssuerMetadataFailureClass::TrustOrIntegrity
+    );
+    assert_eq!(
+        failure
+            .attempts()
+            .iter()
+            .map(|attempt| (attempt.location(), attempt.cause()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                IssuerMetadataLocation::OAuthAuthorizationServer,
+                IssuerMetadataCause::EndpointNotTrusted
+            ),
+            (
+                IssuerMetadataLocation::OpenIdInserted,
+                IssuerMetadataCause::EndpointNotTrusted
+            ),
+            (
+                IssuerMetadataLocation::OpenIdAppended,
+                IssuerMetadataCause::EndpointNotTrusted
+            ),
+        ]
+    );
 }
 
 // TEST ONLY CA and localhost certificate, valid 2020-2049. Isolated cases use
@@ -75,10 +100,29 @@ const KEY: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM
 
 #[derive(Clone, Copy)]
 enum Case {
-    Complete, Renew, WrongIssuer, WrongEndpoint, UnsupportedAuth, BadToken,
-    TokenRedirect, LostGrant, Negotiation, LostMutation, DeniedMutation,
-    Preflight, CancelGrant, CloseGrant, DropGrant, TimeoutGrant,
-    Streaming, CancelRead, CloseRead, DropRead, ExpireRead, DropOwner, InputRequired,
+    Complete,
+    Renew,
+    WrongIssuer,
+    WrongEndpoint,
+    UnsupportedAuth,
+    BadToken,
+    TokenRedirect,
+    LostGrant,
+    Negotiation,
+    LostMutation,
+    DeniedMutation,
+    Preflight,
+    CancelGrant,
+    CloseGrant,
+    DropGrant,
+    TimeoutGrant,
+    Streaming,
+    CancelRead,
+    CloseRead,
+    DropRead,
+    ExpireRead,
+    DropOwner,
+    InputRequired,
 }
 
 struct RootFile(std::path::PathBuf);
@@ -86,30 +130,69 @@ impl RootFile {
     fn create() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         for _ in 0..64 {
-            let path = std::env::temp_dir().join(format!("fastmcp-service-auth-{}-{}.pem", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut file) => { let owned = Self(path); file.write_all(ROOT).unwrap(); return owned; }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+            let path = std::env::temp_dir().join(format!(
+                "fastmcp-service-auth-{}-{}.pem",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    let owned = Self(path);
+                    file.write_all(ROOT).unwrap();
+                    return owned;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => panic!("cannot create isolated test trust: {error}"),
             }
         }
         panic!("test CA name bound exhausted");
     }
 }
-impl Drop for RootFile { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); } }
+impl Drop for RootFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 struct Child(std::process::Child);
-impl Drop for Child { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+impl Drop for Child {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 fn isolated(name: &str, case: Case) {
-    if let Ok(selected) = std::env::var(CHILD) { assert_eq!(selected, name); run(case); return; }
+    if let Ok(selected) = std::env::var(CHILD) {
+        assert_eq!(selected, name);
+        run(case);
+        return;
+    }
     let roots = RootFile::create();
-    let mut child = Child(Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture", "--test-threads=1"])
-        .env(CHILD, name).env("SSL_CERT_FILE", &roots.0).env_remove("SSL_CERT_DIR")
-        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap());
+    let mut child = Child(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, name)
+            .env("SSL_CERT_FILE", &roots.0)
+            .env_remove("SSL_CERT_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
     let end = Instant::now() + Duration::from_secs(30);
     loop {
-        if let Some(status) = child.0.try_wait().unwrap() { assert!(status.success(), "service-auth TLS case failed"); return; }
-        assert!(Instant::now() < end, "service-auth child exceeded its bound");
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "service-auth TLS case failed");
+            return;
+        }
+        assert!(
+            Instant::now() < end,
+            "service-auth child exceeded its bound"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -119,47 +202,84 @@ async fn pair<L: Future, R: Future>(left: L, right: R) -> (L::Output, R::Output)
     let mut one = None;
     let mut two = None;
     poll_fn(|task| {
-        if one.is_none() { if let Poll::Ready(value) = left.as_mut().poll(task) { one = Some(value); } }
-        if two.is_none() { if let Poll::Ready(value) = right.as_mut().poll(task) { two = Some(value); } }
-        if one.is_some() && two.is_some() { Poll::Ready((one.take().unwrap(), two.take().unwrap())) }
-        else { Poll::Pending }
-    }).await
+        if one.is_none() {
+            if let Poll::Ready(value) = left.as_mut().poll(task) {
+                one = Some(value);
+            }
+        }
+        if two.is_none() {
+            if let Poll::Ready(value) = right.as_mut().poll(task) {
+                two = Some(value);
+            }
+        }
+        if one.is_some() && two.is_some() {
+            Poll::Ready((one.take().unwrap(), two.take().unwrap()))
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
 }
-fn url(text: &str) -> CanonicalHttpUrl { CanonicalHttpUrl::parse(text).unwrap() }
+fn url(text: &str) -> CanonicalHttpUrl {
+    CanonicalHttpUrl::parse(text).unwrap()
+}
 fn core(method: &str) -> CoreRequest {
-    let mut params = if method == "tools/call" { json!({"name":"mutate","arguments":{"delta":1}}) } else { json!({}) };
-    params["_meta"] = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
+    let mut params = if method == "tools/call" {
+        json!({"name":"mutate","arguments":{"delta":1}})
+    } else {
+        json!({})
+    };
+    params["_meta"] =
+        serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
     params["_meta"]["com.example/tenant"] = json!("unchanged");
     CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&params)).unwrap()
 }
 fn form(text: &str) -> BTreeMap<String, String> {
     fn part(text: &str) -> String {
-        let mut out = Vec::new(); let mut bytes = text.bytes();
+        let mut out = Vec::new();
+        let mut bytes = text.bytes();
         while let Some(byte) = bytes.next() {
             out.push(match byte {
                 b'+' => b' ',
-                b'%' => (char::from(bytes.next().unwrap()).to_digit(16).unwrap() * 16 + char::from(bytes.next().unwrap()).to_digit(16).unwrap()) as u8,
+                b'%' => {
+                    (char::from(bytes.next().unwrap()).to_digit(16).unwrap() * 16
+                        + char::from(bytes.next().unwrap()).to_digit(16).unwrap())
+                        as u8
+                }
                 byte => byte,
             });
         }
         String::from_utf8(out).unwrap()
     }
-    text.split('&').map(|field| { let (k,v) = field.split_once('=').unwrap(); (part(k),part(v)) }).collect()
+    text.split('&')
+        .map(|field| {
+            let (k, v) = field.split_once('=').unwrap();
+            (part(k), part(v))
+        })
+        .collect()
 }
 async fn json_reply(socket: &mut TlsStream<TcpStream>, body: &str) {
     socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
     socket.flush().await.unwrap();
 }
-fn terminal(id: i64, result: &str) -> String { format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{result}}}"#) }
+fn terminal(id: i64, result: &str) -> String {
+    format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{result}}}"#)
+}
 async fn event(socket: &mut TlsStream<TcpStream>, payload: &str, last: bool) {
     let data = format!("data: {payload}\n\n");
     let tail = if last { "0\r\n\r\n" } else { "" };
-    socket.write_all(format!("{:X}\r\n{data}\r\n{tail}", data.len()).as_bytes()).await.unwrap();
+    socket
+        .write_all(format!("{:X}\r\n{data}\r\n{tail}", data.len()).as_bytes())
+        .await
+        .unwrap();
     socket.flush().await.unwrap();
 }
 async fn closed(mut socket: TlsStream<TcpStream>) {
     let mut byte = [0];
-    assert!(!matches!(socket.read(&mut byte).await, Ok(count) if count > 0), "interruption must close the owned connection");
+    assert!(
+        !matches!(socket.read(&mut byte).await, Ok(count) if count > 0),
+        "interruption must close the owned connection"
+    );
 }
 
 struct Peer {
@@ -173,69 +293,134 @@ impl Peer {
     async fn new() -> Self {
         Self {
             listener: TcpListener::bind("127.0.0.1:0").await.unwrap(),
-            acceptor: TlsAcceptorBuilder::new(CertificateChain::from_pem(LEAF).unwrap(), PrivateKey::from_pem(KEY).unwrap())
-                .alpn_protocols(vec![b"http/1.1".to_vec()]).build().unwrap(),
-            gets: AtomicUsize::new(0), grants: AtomicUsize::new(0), rpcs: AtomicUsize::new(0),
+            acceptor: TlsAcceptorBuilder::new(
+                CertificateChain::from_pem(LEAF).unwrap(),
+                PrivateKey::from_pem(KEY).unwrap(),
+            )
+            .alpn_protocols(vec![b"http/1.1".to_vec()])
+            .build()
+            .unwrap(),
+            gets: AtomicUsize::new(0),
+            grants: AtomicUsize::new(0),
+            rpcs: AtomicUsize::new(0),
         }
     }
-    fn origin(&self) -> String { format!("https://{}", self.listener.local_addr().unwrap()) }
-    fn issuer(&self) -> String { format!("{}/issuer", self.origin()) }
-    fn resource(&self) -> String { format!("{}/mcp", self.origin()) }
+    fn origin(&self) -> String {
+        format!("https://{}", self.listener.local_addr().unwrap())
+    }
+    fn issuer(&self) -> String {
+        format!("{}/issuer", self.origin())
+    }
+    fn resource(&self) -> String {
+        format!("{}/mcp", self.origin())
+    }
     fn plan(&self, timeout: Duration) -> ClientCredentialsPlan {
         let root = Certificate::from_pem(ROOT).unwrap().remove(0);
-        let issuer = TrustedOAuthIssuer::new(self.issuer()).unwrap().with_root_certificate(root.clone()).unwrap();
-        ClientCredentialsPlan::new(url(&self.resource()), issuer, "service-client", "service-secret", vec!["read".to_owned()]).unwrap()
-            .with_resource_root_certificate(root).unwrap().with_renewal_leeway(Duration::ZERO).unwrap().with_timeout(timeout).unwrap()
+        let issuer = TrustedOAuthIssuer::new(self.issuer())
+            .unwrap()
+            .with_root_certificate(root.clone())
+            .unwrap();
+        ClientCredentialsPlan::new(
+            url(&self.resource()),
+            issuer,
+            "service-client",
+            "service-secret",
+            vec!["read".to_owned()],
+        )
+        .unwrap()
+        .with_resource_root_certificate(root)
+        .unwrap()
+        .with_renewal_leeway(Duration::ZERO)
+        .unwrap()
+        .with_timeout(timeout)
+        .unwrap()
     }
-    async fn request(&self) -> (TlsStream<TcpStream>, String, BTreeMap<String,String>, Vec<u8>) {
+    async fn request(
+        &self,
+    ) -> (
+        TlsStream<TcpStream>,
+        String,
+        BTreeMap<String, String>,
+        Vec<u8>,
+    ) {
         let (socket, _) = self.listener.accept().await.unwrap();
         let mut tls = self.acceptor.accept(socket).await.unwrap();
-        let mut wire = Vec::new(); let mut chunk = [0;2048];
+        let mut wire = Vec::new();
+        let mut chunk = [0; 2048];
         let end = loop {
             let n = tls.read(&mut chunk).await.unwrap();
-            assert!(n > 0 && wire.len()+n <= 32768);
+            assert!(n > 0 && wire.len() + n <= 32768);
             wire.extend_from_slice(&chunk[..n]);
-            if let Some(index) = wire.windows(4).position(|part| part == b"\r\n\r\n") { break index+4; }
+            if let Some(index) = wire.windows(4).position(|part| part == b"\r\n\r\n") {
+                break index + 4;
+            }
         };
         let head = std::str::from_utf8(&wire[..end]).unwrap();
         let start = head.lines().next().unwrap().to_owned();
-        let headers: BTreeMap<String,String> = head.lines().filter_map(|line| line.split_once(':')
-            .map(|(k,v)| (k.to_ascii_lowercase(),v.trim().to_owned()))).collect();
-        let size = headers.get("content-length").map_or(0, |s| s.parse::<usize>().unwrap());
-        assert!(end+size <= 32768 && !headers.contains_key("cookie"));
-        while wire.len() < end+size {
-            let n = tls.read(&mut chunk).await.unwrap(); assert!(n > 0 && wire.len()+n <= 32768);
+        let headers: BTreeMap<String, String> = head
+            .lines()
+            .filter_map(|line| {
+                line.split_once(':')
+                    .map(|(k, v)| (k.to_ascii_lowercase(), v.trim().to_owned()))
+            })
+            .collect();
+        let size = headers
+            .get("content-length")
+            .map_or(0, |s| s.parse::<usize>().unwrap());
+        assert!(end + size <= 32768 && !headers.contains_key("cookie"));
+        while wire.len() < end + size {
+            let n = tls.read(&mut chunk).await.unwrap();
+            assert!(n > 0 && wire.len() + n <= 32768);
             wire.extend_from_slice(&chunk[..n]);
         }
-        assert_eq!(wire.len(), end+size);
-        (tls,start,headers,wire[end..].to_vec())
+        assert_eq!(wire.len(), end + size);
+        (tls, start, headers, wire[end..].to_vec())
     }
     async fn metadata(&self, case: Case) {
-        let (mut tls,start,headers,body) = self.request().await;
-        assert_eq!(start,"GET /.well-known/oauth-protected-resource/mcp HTTP/1.1");
+        let (mut tls, start, headers, body) = self.request().await;
+        assert_eq!(
+            start,
+            "GET /.well-known/oauth-protected-resource/mcp HTTP/1.1"
+        );
         assert!(!headers.contains_key("authorization") && body.is_empty());
-        self.gets.fetch_add(1,Ordering::SeqCst);
-        let issuer = if matches!(case,Case::WrongIssuer) { "https://unknown.example/issuer".to_owned() } else { self.issuer() };
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        let issuer = if matches!(case, Case::WrongIssuer) {
+            "https://unknown.example/issuer".to_owned()
+        } else {
+            self.issuer()
+        };
         json_reply(&mut tls,&json!({"resource":self.resource(),"authorization_servers":[issuer],"scopes_supported":["read"]}).to_string()).await;
         drop(tls);
-        if matches!(case,Case::WrongIssuer) {
+        if matches!(case, Case::WrongIssuer) {
             // The second constructed PRM must be tried, but it must not turn
             // the same untrusted issuer into a token endpoint or a secret sink.
-            let (mut tls,start,headers,body) = self.request().await;
-            assert_eq!(start,"GET /.well-known/oauth-protected-resource HTTP/1.1");
+            let (mut tls, start, headers, body) = self.request().await;
+            assert_eq!(start, "GET /.well-known/oauth-protected-resource HTTP/1.1");
             assert!(!headers.contains_key("authorization") && body.is_empty());
-            self.gets.fetch_add(1,Ordering::SeqCst);
+            self.gets.fetch_add(1, Ordering::SeqCst);
             json_reply(&mut tls,&json!({"resource":self.resource(),"authorization_servers":["https://unknown.example/issuer"],"scopes_supported":["read"]}).to_string()).await;
             return;
         }
-        let token = if matches!(case,Case::WrongEndpoint) { "https://untrusted.example/token".to_owned() } else { format!("{}/token",self.origin()) };
-        let auth = if matches!(case,Case::UnsupportedAuth) { "private_key_jwt" } else { "client_secret_basic" };
-        let count = if matches!(case,Case::WrongEndpoint) { 3 } else { 1 };
+        let token = if matches!(case, Case::WrongEndpoint) {
+            "https://untrusted.example/token".to_owned()
+        } else {
+            format!("{}/token", self.origin())
+        };
+        let auth = if matches!(case, Case::UnsupportedAuth) {
+            "private_key_jwt"
+        } else {
+            "client_secret_basic"
+        };
+        let count = if matches!(case, Case::WrongEndpoint) {
+            3
+        } else {
+            1
+        };
         for path in &MACHINE_ISSUER_LOCATIONS[..count] {
-            let (mut tls,start,headers,body) = self.request().await;
-            assert_eq!(start,format!("GET {path} HTTP/1.1"));
+            let (mut tls, start, headers, body) = self.request().await;
+            assert_eq!(start, format!("GET {path} HTTP/1.1"));
             assert!(!headers.contains_key("authorization") && body.is_empty());
-            self.gets.fetch_add(1,Ordering::SeqCst);
+            self.gets.fetch_add(1, Ordering::SeqCst);
             // Deliberately NO authorization endpoint, response_types, PKCE or DCR.
             json_reply(&mut tls,&json!({"issuer":self.issuer(),"token_endpoint":token,
                 "grant_types_supported":["client_credentials"],"token_endpoint_auth_methods_supported":[auth],
@@ -243,16 +428,20 @@ impl Peer {
         }
     }
     async fn token_request(&self) -> TlsStream<TcpStream> {
-        let (tls,start,headers,body) = self.request().await;
-        assert_eq!(start,"POST /token HTTP/1.1");
-        assert_eq!(headers["authorization"],BASIC);
-        assert_eq!(headers["content-type"],"application/x-www-form-urlencoded");
+        let (tls, start, headers, body) = self.request().await;
+        assert_eq!(start, "POST /token HTTP/1.1");
+        assert_eq!(headers["authorization"], BASIC);
+        assert_eq!(headers["content-type"], "application/x-www-form-urlencoded");
         let fields = form(std::str::from_utf8(&body).unwrap());
-        assert_eq!(fields["grant_type"],"client_credentials");
-        assert_eq!(fields["resource"],self.resource());
-        assert_eq!(fields["scope"],"read");
-        assert_eq!(fields.len(),3,"no client_secret, refresh_token, code, or assertion in the Basic form");
-        self.grants.fetch_add(1,Ordering::SeqCst);
+        assert_eq!(fields["grant_type"], "client_credentials");
+        assert_eq!(fields["resource"], self.resource());
+        assert_eq!(fields["scope"], "read");
+        assert_eq!(
+            fields.len(),
+            3,
+            "no client_secret, refresh_token, code, or assertion in the Basic form"
+        );
+        self.grants.fetch_add(1, Ordering::SeqCst);
         tls
     }
     async fn grant(&self, token: &str, seconds: u64) {
@@ -263,35 +452,60 @@ impl Peer {
         json_reply(&mut tls,&json!({"access_token":token,"token_type":"Bearer","expires_in":seconds,"scope":"read"}).to_string()).await;
     }
     async fn rpc(&self, id: i64, method: &str, token: &str) -> TlsStream<TcpStream> {
-        let (tls,start,headers,body) = self.request().await;
-        assert_eq!(start,"POST /mcp HTTP/1.1");
-        assert_eq!(headers["authorization"],format!("Bearer {token}"));
-        assert!(!headers.values().any(|value| value.contains("service-secret") || value == BASIC));
-        let body:Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["method"],method); assert_eq!(body["id"],id);
-        assert_eq!(headers["mcp-method"],method);
-        assert_eq!(headers["mcp-protocol-version"],"2026-07-28");
+        let (tls, start, headers, body) = self.request().await;
+        assert_eq!(start, "POST /mcp HTTP/1.1");
+        assert_eq!(headers["authorization"], format!("Bearer {token}"));
+        assert!(
+            !headers
+                .values()
+                .any(|value| value.contains("service-secret") || value == BASIC)
+        );
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["method"], method);
+        assert_eq!(body["id"], id);
+        assert_eq!(headers["mcp-method"], method);
+        assert_eq!(headers["mcp-protocol-version"], "2026-07-28");
         assert!(!headers.contains_key("mcp-session-id") && !headers.contains_key("last-event-id"));
-        assert_eq!(body["params"]["_meta"]["com.example/tenant"],"unchanged");
-        assert_eq!(body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"],json!({CLIENT_CREDENTIALS_EXTENSION:{}}));
-        self.rpcs.fetch_add(1,Ordering::SeqCst);
+        assert_eq!(body["params"]["_meta"]["com.example/tenant"], "unchanged");
+        assert_eq!(
+            body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"],
+            json!({CLIENT_CREDENTIALS_EXTENSION:{}})
+        );
+        self.rpcs.fetch_add(1, Ordering::SeqCst);
         tls
     }
-    async fn discovery(&self,id:i64,token:&str,result:&str) {
-        json_reply(&mut self.rpc(id,"server/discover",token).await,&terminal(id,result)).await;
+    async fn discovery(&self, id: i64, token: &str, result: &str) {
+        json_reply(
+            &mut self.rpc(id, "server/discover", token).await,
+            &terminal(id, result),
+        )
+        .await;
     }
-    async fn operation(&self,id:i64,method:&str,token:&str,result:&str) {
-        self.discovery(id,token,DISCOVERY).await;
-        json_reply(&mut self.rpc(id+1,method,token).await,&terminal(id+1,result)).await;
+    async fn operation(&self, id: i64, method: &str, token: &str, result: &str) {
+        self.discovery(id, token, DISCOVERY).await;
+        json_reply(
+            &mut self.rpc(id + 1, method, token).await,
+            &terminal(id + 1, result),
+        )
+        .await;
     }
     fn quiet(&self) {
         let mut task = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(self.listener.poll_accept(&mut task).is_pending(),"no hidden retry, DCR, browser or token exchange");
+        assert!(
+            self.listener.poll_accept(&mut task).is_pending(),
+            "no hidden retry, DCR, browser or token exchange"
+        );
     }
 }
 
-async fn acquire(peer:&Peer,cx:&Cx,client:&ClientCredentialsClient,token:&str,seconds:u64) {
-    let ((),result) = pair(peer.grant(token,seconds),client.credential(cx)).await;
+async fn acquire(
+    peer: &Peer,
+    cx: &Cx,
+    client: &ClientCredentialsClient,
+    token: &str,
+    seconds: u64,
+) {
+    let ((), result) = pair(peer.grant(token, seconds), client.credential(cx)).await;
     assert!(result.is_ok());
 }
 fn run(case: Case) {
@@ -532,51 +746,160 @@ fn run(case: Case) {
 }
 
 #[test]
-fn machine_login_reuses_one_grant_and_executes_typed_core_calls() { isolated("machine_login_reuses_one_grant_and_executes_typed_core_calls",Case::Complete); }
+fn machine_login_reuses_one_grant_and_executes_typed_core_calls() {
+    isolated(
+        "machine_login_reuses_one_grant_and_executes_typed_core_calls",
+        Case::Complete,
+    );
+}
 #[test]
-fn expired_machine_token_uses_a_new_client_credentials_grant_not_refresh() { isolated("expired_machine_token_uses_a_new_client_credentials_grant_not_refresh",Case::Renew); }
+fn expired_machine_token_uses_a_new_client_credentials_grant_not_refresh() {
+    isolated(
+        "expired_machine_token_uses_a_new_client_credentials_grant_not_refresh",
+        Case::Renew,
+    );
+}
 #[test]
-fn untrusted_issuer_never_receives_the_client_secret() { isolated("untrusted_issuer_never_receives_the_client_secret",Case::WrongIssuer); }
+fn untrusted_issuer_never_receives_the_client_secret() {
+    isolated(
+        "untrusted_issuer_never_receives_the_client_secret",
+        Case::WrongIssuer,
+    );
+}
 #[test]
-fn cross_origin_token_endpoint_requires_a_host_grant() { isolated("cross_origin_token_endpoint_requires_a_host_grant",Case::WrongEndpoint); }
+fn cross_origin_token_endpoint_requires_a_host_grant() {
+    isolated(
+        "cross_origin_token_endpoint_requires_a_host_grant",
+        Case::WrongEndpoint,
+    );
+}
 #[test]
-fn jwt_only_metadata_never_triggers_basic_or_browser_fallback() { isolated("jwt_only_metadata_never_triggers_basic_or_browser_fallback",Case::UnsupportedAuth); }
+fn jwt_only_metadata_never_triggers_basic_or_browser_fallback() {
+    isolated(
+        "jwt_only_metadata_never_triggers_basic_or_browser_fallback",
+        Case::UnsupportedAuth,
+    );
+}
 #[test]
-fn rejected_token_cannot_advance_cached_credential_generation() { isolated("rejected_token_cannot_advance_cached_credential_generation",Case::BadToken); }
+fn rejected_token_cannot_advance_cached_credential_generation() {
+    isolated(
+        "rejected_token_cannot_advance_cached_credential_generation",
+        Case::BadToken,
+    );
+}
 #[test]
-fn token_redirect_is_terminal_without_secret_forwarding() { isolated("token_redirect_is_terminal_without_secret_forwarding",Case::TokenRedirect); }
+fn token_redirect_is_terminal_without_secret_forwarding() {
+    isolated(
+        "token_redirect_is_terminal_without_secret_forwarding",
+        Case::TokenRedirect,
+    );
+}
 #[test]
-fn lost_grant_response_is_not_retried() { isolated("lost_grant_response_is_not_retried",Case::LostGrant); }
+fn lost_grant_response_is_not_retried() {
+    isolated("lost_grant_response_is_not_retried", Case::LostGrant);
+}
 #[test]
-fn same_token_discovery_must_admit_the_exact_auth_extension() { isolated("same_token_discovery_must_admit_the_exact_auth_extension",Case::Negotiation); }
+fn same_token_discovery_must_admit_the_exact_auth_extension() {
+    isolated(
+        "same_token_discovery_must_admit_the_exact_auth_extension",
+        Case::Negotiation,
+    );
+}
 #[test]
-fn uncertain_mutation_is_not_replayed_or_followed_by_a_token_grant() { isolated("uncertain_mutation_is_not_replayed_or_followed_by_a_token_grant",Case::LostMutation); }
+fn uncertain_mutation_is_not_replayed_or_followed_by_a_token_grant() {
+    isolated(
+        "uncertain_mutation_is_not_replayed_or_followed_by_a_token_grant",
+        Case::LostMutation,
+    );
+}
 #[test]
-fn denied_mutation_is_not_replayed_with_fresh_credentials() { isolated("denied_mutation_is_not_replayed_with_fresh_credentials",Case::DeniedMutation); }
+fn denied_mutation_is_not_replayed_with_fresh_credentials() {
+    isolated(
+        "denied_mutation_is_not_replayed_with_fresh_credentials",
+        Case::DeniedMutation,
+    );
+}
 #[test]
-fn invalid_request_ids_and_extension_composition_have_no_grant_effect() { isolated("invalid_request_ids_and_extension_composition_have_no_grant_effect",Case::Preflight); }
+fn invalid_request_ids_and_extension_composition_have_no_grant_effect() {
+    isolated(
+        "invalid_request_ids_and_extension_composition_have_no_grant_effect",
+        Case::Preflight,
+    );
+}
 #[test]
-fn request_cancellation_releases_an_idle_token_exchange() { isolated("request_cancellation_releases_an_idle_token_exchange",Case::CancelGrant); }
+fn request_cancellation_releases_an_idle_token_exchange() {
+    isolated(
+        "request_cancellation_releases_an_idle_token_exchange",
+        Case::CancelGrant,
+    );
+}
 #[test]
-fn source_closure_releases_an_idle_token_exchange() { isolated("source_closure_releases_an_idle_token_exchange",Case::CloseGrant); }
+fn source_closure_releases_an_idle_token_exchange() {
+    isolated(
+        "source_closure_releases_an_idle_token_exchange",
+        Case::CloseGrant,
+    );
+}
 #[test]
-fn abandoned_acquisition_releases_its_owned_exchange() { isolated("abandoned_acquisition_releases_its_owned_exchange",Case::DropGrant); }
+fn abandoned_acquisition_releases_its_owned_exchange() {
+    isolated(
+        "abandoned_acquisition_releases_its_owned_exchange",
+        Case::DropGrant,
+    );
+}
 #[test]
-fn acquisition_deadline_does_not_need_peer_traffic_to_fire() { isolated("acquisition_deadline_does_not_need_peer_traffic_to_fire",Case::TimeoutGrant); }
+fn acquisition_deadline_does_not_need_peer_traffic_to_fire() {
+    isolated(
+        "acquisition_deadline_does_not_need_peer_traffic_to_fire",
+        Case::TimeoutGrant,
+    );
+}
 #[test]
-fn service_authenticated_sse_is_delivered_before_terminal_completion() { isolated("service_authenticated_sse_is_delivered_before_terminal_completion",Case::Streaming); }
+fn service_authenticated_sse_is_delivered_before_terminal_completion() {
+    isolated(
+        "service_authenticated_sse_is_delivered_before_terminal_completion",
+        Case::Streaming,
+    );
+}
 #[test]
-fn cancelled_sse_read_cannot_reuse_partial_state() { isolated("cancelled_sse_read_cannot_reuse_partial_state",Case::CancelRead); }
+fn cancelled_sse_read_cannot_reuse_partial_state() {
+    isolated(
+        "cancelled_sse_read_cannot_reuse_partial_state",
+        Case::CancelRead,
+    );
+}
 #[test]
-fn closed_service_owner_interrupts_active_sse_reads() { isolated("closed_service_owner_interrupts_active_sse_reads",Case::CloseRead); }
+fn closed_service_owner_interrupts_active_sse_reads() {
+    isolated(
+        "closed_service_owner_interrupts_active_sse_reads",
+        Case::CloseRead,
+    );
+}
 #[test]
-fn abandoned_sse_read_drops_its_socket() { isolated("abandoned_sse_read_drops_its_socket",Case::DropRead); }
+fn abandoned_sse_read_drops_its_socket() {
+    isolated("abandoned_sse_read_drops_its_socket", Case::DropRead);
+}
 #[test]
-fn live_service_response_cannot_outlive_its_opening_token() { isolated("live_service_response_cannot_outlive_its_opening_token",Case::ExpireRead); }
+fn live_service_response_cannot_outlive_its_opening_token() {
+    isolated(
+        "live_service_response_cannot_outlive_its_opening_token",
+        Case::ExpireRead,
+    );
+}
 #[test]
-fn dropping_last_client_owner_revokes_previously_issued_snapshots() { isolated("dropping_last_client_owner_revokes_previously_issued_snapshots",Case::DropOwner); }
+fn dropping_last_client_owner_revokes_previously_issued_snapshots() {
+    isolated(
+        "dropping_last_client_owner_revokes_previously_issued_snapshots",
+        Case::DropOwner,
+    );
+}
 #[test]
-fn machine_call_input_required_is_typed_without_automatic_resubmission() { isolated("machine_call_input_required_is_typed_without_automatic_resubmission",Case::InputRequired); }
+fn machine_call_input_required_is_typed_without_automatic_resubmission() {
+    isolated(
+        "machine_call_input_required_is_typed_without_automatic_resubmission",
+        Case::InputRequired,
+    );
+}
 
 // New body-password cases deliberately leave the original Basic/JWT fixture
 // assertions intact. A request cannot pass by choosing whichever method arrives.
@@ -585,8 +908,18 @@ use fastmcp_client::http_auth::discovery::client_credentials::ClientSecretAuthen
 const POST_CHILD: &str = "FASTMCP_TEST_CLIENT_SECRET_POST_CASE";
 #[derive(Clone, Copy)]
 enum PostCase {
-    Lifecycle, Encoding, PostAgainstBasic, BasicAgainstPost, BothAdvertised,
-    Denied, Redirect, Lost, Cancel, Drop, InvalidToken, WrongOrigin,
+    Lifecycle,
+    Encoding,
+    PostAgainstBasic,
+    BasicAgainstPost,
+    BothAdvertised,
+    Denied,
+    Redirect,
+    Lost,
+    Cancel,
+    Drop,
+    InvalidToken,
+    WrongOrigin,
 }
 
 fn isolated_post(name: &str, case: PostCase) {
@@ -596,10 +929,18 @@ fn isolated_post(name: &str, case: PostCase) {
         return;
     }
     let roots = RootFile::create();
-    let mut child = Child(Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture", "--test-threads=1"])
-        .env(POST_CHILD, name).env("SSL_CERT_FILE", &roots.0).env_remove("SSL_CERT_DIR")
-        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap());
+    let mut child = Child(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(POST_CHILD, name)
+            .env("SSL_CERT_FILE", &roots.0)
+            .env_remove("SSL_CERT_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
     let end = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.0.try_wait().unwrap() {
@@ -613,43 +954,77 @@ fn isolated_post(name: &str, case: PostCase) {
 
 async fn post_metadata(peer: &Peer, case: PostCase) {
     let (mut tls, start, headers, body) = peer.request().await;
-    assert_eq!(start, "GET /.well-known/oauth-protected-resource/mcp HTTP/1.1");
+    assert_eq!(
+        start,
+        "GET /.well-known/oauth-protected-resource/mcp HTTP/1.1"
+    );
     assert!(!headers.contains_key("authorization") && body.is_empty());
     peer.gets.fetch_add(1, Ordering::SeqCst);
-    json_reply(&mut tls, &json!({"resource":peer.resource(),
-        "authorization_servers":[peer.issuer()],"scopes_supported":["read"]}).to_string()).await;
+    json_reply(
+        &mut tls,
+        &json!({"resource":peer.resource(),
+        "authorization_servers":[peer.issuer()],"scopes_supported":["read"]})
+        .to_string(),
+    )
+    .await;
     drop(tls);
     let methods = match case {
         PostCase::PostAgainstBasic => json!(["client_secret_basic"]),
-        PostCase::BothAdvertised | PostCase::Denied | PostCase::Redirect | PostCase::Lost =>
-            json!(["private_key_jwt", "client_secret_basic", "client_secret_post"]),
+        PostCase::BothAdvertised | PostCase::Denied | PostCase::Redirect | PostCase::Lost => {
+            json!([
+                "private_key_jwt",
+                "client_secret_basic",
+                "client_secret_post"
+            ])
+        }
         _ => json!(["client_secret_post"]),
     };
     let token = if matches!(case, PostCase::WrongOrigin) {
         "https://untrusted.example/token".to_owned()
-    } else { format!("{}/token", peer.origin()) };
-    let count = if matches!(case, PostCase::WrongOrigin) { 3 } else { 1 };
+    } else {
+        format!("{}/token", peer.origin())
+    };
+    let count = if matches!(case, PostCase::WrongOrigin) {
+        3
+    } else {
+        1
+    };
     for path in &MACHINE_ISSUER_LOCATIONS[..count] {
         let (mut tls, start, headers, body) = peer.request().await;
         assert_eq!(start, format!("GET {path} HTTP/1.1"));
         assert!(!headers.contains_key("authorization") && body.is_empty());
         peer.gets.fetch_add(1, Ordering::SeqCst);
-        json_reply(&mut tls, &json!({"issuer":peer.issuer(),"token_endpoint":token,
+        json_reply(
+            &mut tls,
+            &json!({"issuer":peer.issuer(),"token_endpoint":token,
             "grant_types_supported":["client_credentials"],
-            "token_endpoint_auth_methods_supported":methods,"scopes_supported":["read"]}).to_string()).await;
+            "token_endpoint_auth_methods_supported":methods,"scopes_supported":["read"]})
+            .to_string(),
+        )
+        .await;
     }
 }
 
 async fn post_token_request(peer: &Peer, id: &str, secret: &str) -> TlsStream<TcpStream> {
     let (tls, start, headers, body) = peer.request().await;
-    assert_eq!(start, "POST /token HTTP/1.1", "credentials must not enter a query string");
-    assert!(!headers.contains_key("authorization"), "body credentials must not be combined with Basic or bearer auth");
+    assert_eq!(
+        start, "POST /token HTTP/1.1",
+        "credentials must not enter a query string"
+    );
+    assert!(
+        !headers.contains_key("authorization"),
+        "body credentials must not be combined with Basic or bearer auth"
+    );
     assert!(!headers.values().any(|value| value.contains(secret)));
     assert_eq!(headers["content-type"], "application/x-www-form-urlencoded");
     let raw = std::str::from_utf8(&body).unwrap();
     let fields = form(raw);
     assert_eq!(fields.len(), 5);
-    assert_eq!(raw.split('&').count(), 5, "a secret must not inject or duplicate a form field");
+    assert_eq!(
+        raw.split('&').count(),
+        5,
+        "a secret must not inject or duplicate a form field"
+    );
     assert_eq!(fields["grant_type"], "client_credentials");
     assert_eq!(fields["resource"], peer.resource());
     assert_eq!(fields["scope"], "read");
@@ -662,8 +1037,13 @@ async fn post_token_request(peer: &Peer, id: &str, secret: &str) -> TlsStream<Tc
 
 async fn post_grant(peer: &Peer, id: &str, secret: &str, token: &str, seconds: u64) {
     let mut tls = post_token_request(peer, id, secret).await;
-    json_reply(&mut tls, &json!({"access_token":token,"token_type":"Bearer",
-        "expires_in":seconds,"scope":"read"}).to_string()).await;
+    json_reply(
+        &mut tls,
+        &json!({"access_token":token,"token_type":"Bearer",
+        "expires_in":seconds,"scope":"read"})
+        .to_string(),
+    )
+    .await;
 }
 
 fn run_post(case: PostCase) {
@@ -800,84 +1180,140 @@ fn run_post(case: PostCase) {
 
 #[test]
 fn secret_post_login_renewal_and_protected_calls_share_the_selected_method() {
-    isolated_post("secret_post_login_renewal_and_protected_calls_share_the_selected_method", PostCase::Lifecycle);
+    isolated_post(
+        "secret_post_login_renewal_and_protected_calls_share_the_selected_method",
+        PostCase::Lifecycle,
+    );
 }
 #[test]
 fn secret_post_preserves_unicode_and_form_delimiters_without_double_encoding() {
-    isolated_post("secret_post_preserves_unicode_and_form_delimiters_without_double_encoding", PostCase::Encoding);
+    isolated_post(
+        "secret_post_preserves_unicode_and_form_delimiters_without_double_encoding",
+        PostCase::Encoding,
+    );
 }
 #[test]
 fn secret_post_selection_refuses_basic_only_metadata_before_sending_credentials() {
-    isolated_post("secret_post_selection_refuses_basic_only_metadata_before_sending_credentials", PostCase::PostAgainstBasic);
+    isolated_post(
+        "secret_post_selection_refuses_basic_only_metadata_before_sending_credentials",
+        PostCase::PostAgainstBasic,
+    );
 }
 #[test]
 fn default_basic_refuses_post_only_metadata_before_sending_credentials() {
-    isolated_post("default_basic_refuses_post_only_metadata_before_sending_credentials", PostCase::BasicAgainstPost);
+    isolated_post(
+        "default_basic_refuses_post_only_metadata_before_sending_credentials",
+        PostCase::BasicAgainstPost,
+    );
 }
 #[test]
 fn advertised_method_order_cannot_override_explicit_secret_post_selection() {
-    isolated_post("advertised_method_order_cannot_override_explicit_secret_post_selection", PostCase::BothAdvertised);
+    isolated_post(
+        "advertised_method_order_cannot_override_explicit_secret_post_selection",
+        PostCase::BothAdvertised,
+    );
 }
 #[test]
 fn denied_secret_post_does_not_retry_as_basic_or_reflect_credentials() {
-    isolated_post("denied_secret_post_does_not_retry_as_basic_or_reflect_credentials", PostCase::Denied);
+    isolated_post(
+        "denied_secret_post_does_not_retry_as_basic_or_reflect_credentials",
+        PostCase::Denied,
+    );
 }
 #[test]
 fn redirected_secret_post_is_not_forwarded_or_replayed() {
-    isolated_post("redirected_secret_post_is_not_forwarded_or_replayed", PostCase::Redirect);
+    isolated_post(
+        "redirected_secret_post_is_not_forwarded_or_replayed",
+        PostCase::Redirect,
+    );
 }
 #[test]
 fn lost_secret_post_reply_does_not_switch_authentication_methods() {
-    isolated_post("lost_secret_post_reply_does_not_switch_authentication_methods", PostCase::Lost);
+    isolated_post(
+        "lost_secret_post_reply_does_not_switch_authentication_methods",
+        PostCase::Lost,
+    );
 }
 #[test]
 fn cancelled_secret_post_releases_the_pending_exchange() {
-    isolated_post("cancelled_secret_post_releases_the_pending_exchange", PostCase::Cancel);
+    isolated_post(
+        "cancelled_secret_post_releases_the_pending_exchange",
+        PostCase::Cancel,
+    );
 }
 #[test]
 fn abandoned_secret_post_releases_the_pending_exchange() {
-    isolated_post("abandoned_secret_post_releases_the_pending_exchange", PostCase::Drop);
+    isolated_post(
+        "abandoned_secret_post_releases_the_pending_exchange",
+        PostCase::Drop,
+    );
 }
 #[test]
 fn invalid_secret_post_token_does_not_advance_the_cached_generation() {
-    isolated_post("invalid_secret_post_token_does_not_advance_the_cached_generation", PostCase::InvalidToken);
+    isolated_post(
+        "invalid_secret_post_token_does_not_advance_the_cached_generation",
+        PostCase::InvalidToken,
+    );
 }
 #[test]
 fn secret_post_cannot_send_credentials_to_an_unapproved_endpoint_origin() {
-    isolated_post("secret_post_cannot_send_credentials_to_an_unapproved_endpoint_origin", PostCase::WrongOrigin);
+    isolated_post(
+        "secret_post_cannot_send_credentials_to_an_unapproved_endpoint_origin",
+        PostCase::WrongOrigin,
+    );
 }
 
 // These cases run directly, without the isolated() / isolated_post() launchers
 // that add ROOT to native trust. The live rejection probe prevents ambient
 // fixture trust from masking a lost resource policy during MCP dispatch.
 fn assert_fixture_requires_explicit_tls_trust() {
-    use fastmcp_client::http_executor::{ModernHttpExecutor, ModernHttpExecutorError, ModernHttpRequest};
+    use fastmcp_client::http_executor::{
+        ModernHttpExecutor, ModernHttpExecutorError, ModernHttpRequest,
+    };
 
-    RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(Box::pin(async {
-        let cx = Cx::current().unwrap();
-        let scenario = async {
-            let peer = Peer::new().await;
-            let request = ModernHttpRequest::new(
-                peer.resource(), b"{}".to_vec(), "2026-07-28", "tools/list", None,
-            ).unwrap();
-            let server = async {
-                let (socket, _) = peer.listener.accept().await.unwrap();
-                assert!(peer.acceptor.accept(socket).await.is_err(),
-                    "the default executor must reject the private CA before sending HTTP");
+    RuntimeBuilder::current_thread()
+        .with_reactor(create_reactor().unwrap())
+        .build()
+        .unwrap()
+        .block_on(Box::pin(async {
+            let cx = Cx::current().unwrap();
+            let scenario = async {
+                let peer = Peer::new().await;
+                let request = ModernHttpRequest::new(
+                    peer.resource(),
+                    b"{}".to_vec(),
+                    "2026-07-28",
+                    "tools/list",
+                    None,
+                )
+                .unwrap();
+                let server = async {
+                    let (socket, _) = peer.listener.accept().await.unwrap();
+                    assert!(
+                        peer.acceptor.accept(socket).await.is_err(),
+                        "the default executor must reject the private CA before sending HTTP"
+                    );
+                };
+                let executor = ModernHttpExecutor::new();
+                let ((), result) = pair(server, executor.execute(&cx, &request)).await;
+                assert!(
+                    matches!(
+                        result,
+                        Err(ModernHttpExecutorError::Transport(
+                            asupersync::http::h1::ClientError::TlsError(_),
+                        ))
+                    ),
+                    "ambient fixture trust would invalidate explicit resource-CA coverage"
+                );
+                assert_eq!(peer.gets.load(Ordering::SeqCst), 0);
+                assert_eq!(peer.grants.load(Ordering::SeqCst), 0);
+                assert_eq!(peer.rpcs.load(Ordering::SeqCst), 0);
+                peer.quiet();
             };
-            let executor = ModernHttpExecutor::new();
-            let ((), result) = pair(server, executor.execute(&cx, &request)).await;
-            assert!(matches!(result, Err(ModernHttpExecutorError::Transport(
-                asupersync::http::h1::ClientError::TlsError(_),
-            ))), "ambient fixture trust would invalidate explicit resource-CA coverage");
-            assert_eq!(peer.gets.load(Ordering::SeqCst), 0);
-            assert_eq!(peer.grants.load(Ordering::SeqCst), 0);
-            assert_eq!(peer.rpcs.load(Ordering::SeqCst), 0);
-            peer.quiet();
-        };
-        asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), scenario).await
-            .expect("default-trust TLS probe must settle within its bound");
-    }));
+            asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), scenario)
+                .await
+                .expect("default-trust TLS probe must settle within its bound");
+        }));
 }
 
 #[test]
@@ -898,49 +1334,94 @@ fn explicit_resource_ca_survives_secret_post_machine_discovery_grant_and_core_ca
 
 #[test]
 fn machine_resource_ca_cannot_authorize_issuer_metadata_tls() {
-    use fastmcp_client::http_auth::discovery::issuer::{IssuerMetadataCause, IssuerMetadataFailureClass, IssuerMetadataLocation};
+    use fastmcp_client::http_auth::discovery::issuer::{
+        IssuerMetadataCause, IssuerMetadataFailureClass, IssuerMetadataLocation,
+    };
 
-    RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(Box::pin(async {
-        let cx = Cx::current().unwrap();
-        let scenario = async {
-            let peer = Peer::new().await;
-            let root = Certificate::from_pem(ROOT).unwrap().remove(0);
-            let plan = ClientCredentialsPlan::new(
-                url(&peer.resource()), TrustedOAuthIssuer::new(peer.issuer()).unwrap(),
-                "service-client", "service-secret", vec!["read".to_owned()],
-            ).unwrap().with_resource_root_certificate(root).unwrap()
-                .with_timeout(Duration::from_secs(15)).unwrap();
-            let server = async {
-                let (mut tls, start, headers, body) = peer.request().await;
-                assert_eq!(start, "GET /.well-known/oauth-protected-resource/mcp HTTP/1.1");
-                assert!(!headers.contains_key("authorization") && body.is_empty());
-                peer.gets.fetch_add(1, Ordering::SeqCst);
-                json_reply(&mut tls, &json!({"resource":peer.resource(),
-                    "authorization_servers":[peer.issuer()],"scopes_supported":["read"]}).to_string()).await;
-                drop(tls);
-                for _ in MACHINE_ISSUER_LOCATIONS {
-                    let (socket, _) = peer.listener.accept().await.unwrap();
-                    assert!(peer.acceptor.accept(socket).await.is_err(),
-                        "resource trust must not admit even a same-origin issuer TLS handshake");
-                }
+    RuntimeBuilder::current_thread()
+        .with_reactor(create_reactor().unwrap())
+        .build()
+        .unwrap()
+        .block_on(Box::pin(async {
+            let cx = Cx::current().unwrap();
+            let scenario = async {
+                let peer = Peer::new().await;
+                let root = Certificate::from_pem(ROOT).unwrap().remove(0);
+                let plan = ClientCredentialsPlan::new(
+                    url(&peer.resource()),
+                    TrustedOAuthIssuer::new(peer.issuer()).unwrap(),
+                    "service-client",
+                    "service-secret",
+                    vec!["read".to_owned()],
+                )
+                .unwrap()
+                .with_resource_root_certificate(root)
+                .unwrap()
+                .with_timeout(Duration::from_secs(15))
+                .unwrap();
+                let server = async {
+                    let (mut tls, start, headers, body) = peer.request().await;
+                    assert_eq!(
+                        start,
+                        "GET /.well-known/oauth-protected-resource/mcp HTTP/1.1"
+                    );
+                    assert!(!headers.contains_key("authorization") && body.is_empty());
+                    peer.gets.fetch_add(1, Ordering::SeqCst);
+                    json_reply(
+                        &mut tls,
+                        &json!({"resource":peer.resource(),
+                    "authorization_servers":[peer.issuer()],"scopes_supported":["read"]})
+                        .to_string(),
+                    )
+                    .await;
+                    drop(tls);
+                    for _ in MACHINE_ISSUER_LOCATIONS {
+                        let (socket, _) = peer.listener.accept().await.unwrap();
+                        assert!(
+                            peer.acceptor.accept(socket).await.is_err(),
+                            "resource trust must not admit even a same-origin issuer TLS handshake"
+                        );
+                    }
+                };
+                let ((), result) = pair(server, plan.discover(&cx)).await;
+                let Error::Discovery(OAuthDiscoveryError::IssuerMetadataExhausted(failure)) =
+                    result.err().unwrap()
+                else {
+                    panic!("each issuer candidate must retain its TLS refusal");
+                };
+                assert_eq!(
+                    failure.classification(),
+                    IssuerMetadataFailureClass::Transport
+                );
+                assert_eq!(
+                    failure
+                        .attempts()
+                        .iter()
+                        .map(|attempt| (attempt.location(), attempt.cause()))
+                        .collect::<Vec<_>>(),
+                    [
+                        (
+                            IssuerMetadataLocation::OAuthAuthorizationServer,
+                            IssuerMetadataCause::TransportFailed
+                        ),
+                        (
+                            IssuerMetadataLocation::OpenIdInserted,
+                            IssuerMetadataCause::TransportFailed
+                        ),
+                        (
+                            IssuerMetadataLocation::OpenIdAppended,
+                            IssuerMetadataCause::TransportFailed
+                        ),
+                    ]
+                );
+                assert_eq!(peer.gets.load(Ordering::SeqCst), 1);
+                assert_eq!(peer.grants.load(Ordering::SeqCst), 0);
+                assert_eq!(peer.rpcs.load(Ordering::SeqCst), 0);
+                assert!(cx.checkpoint().is_ok());
+                peer.quiet();
             };
-            let ((), result) = pair(server, plan.discover(&cx)).await;
-            let Error::Discovery(OAuthDiscoveryError::IssuerMetadataExhausted(failure)) = result.err().unwrap() else {
-                panic!("each issuer candidate must retain its TLS refusal");
-            };
-            assert_eq!(failure.classification(), IssuerMetadataFailureClass::Transport);
-            assert_eq!(failure.attempts().iter().map(|attempt| (attempt.location(), attempt.cause())).collect::<Vec<_>>(), [
-                (IssuerMetadataLocation::OAuthAuthorizationServer, IssuerMetadataCause::TransportFailed),
-                (IssuerMetadataLocation::OpenIdInserted, IssuerMetadataCause::TransportFailed),
-                (IssuerMetadataLocation::OpenIdAppended, IssuerMetadataCause::TransportFailed),
-            ]);
-            assert_eq!(peer.gets.load(Ordering::SeqCst), 1);
-            assert_eq!(peer.grants.load(Ordering::SeqCst), 0);
-            assert_eq!(peer.rpcs.load(Ordering::SeqCst), 0);
-            assert!(cx.checkpoint().is_ok());
-            peer.quiet();
-        };
-        asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), scenario).await
-            .expect("machine issuer TLS refusal must settle within its bound");
-    }));
+            asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), scenario)
+                .await
+                .expect("machine issuer TLS refusal must settle within its bound");
+        }));
 }

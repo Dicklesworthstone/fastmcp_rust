@@ -14,11 +14,31 @@ const INPUT: &str = r#"{"resultType":"input_required","requestState":"","ttlMs":
 
 #[derive(Clone, Copy)]
 enum ResourceCase {
-    Cached, DefaultUncached, ZeroTtl, TinyCache, Metadata, DifferentUri,
-    Continuation, InputRequired, Clear, ExternalUpdate, ExternalListChange,
-    InlineUpdate, Incremental, HostRefusal, InvalidResult, ContentsLimit,
-    Cancel, Close, Drop, Expire, RevokeBeforePost, ClearBeforePost, RevokedHit,
-    PendingInvalidation, Preflight,
+    Cached,
+    DefaultUncached,
+    ZeroTtl,
+    TinyCache,
+    Metadata,
+    DifferentUri,
+    Continuation,
+    InputRequired,
+    Clear,
+    ExternalUpdate,
+    ExternalListChange,
+    InlineUpdate,
+    Incremental,
+    HostRefusal,
+    InvalidResult,
+    ContentsLimit,
+    Cancel,
+    Close,
+    Drop,
+    Expire,
+    RevokeBeforePost,
+    ClearBeforePost,
+    RevokedHit,
+    PendingInvalidation,
+    Preflight,
 }
 
 fn isolated_resource(name: &str, case: ResourceCase) {
@@ -29,27 +49,48 @@ fn isolated_resource(name: &str, case: ResourceCase) {
     }
     let roots = RootFile::create();
     struct Child(std::process::Child);
-    impl Drop for Child { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
     let exact = format!("driver::resources::{name}");
-    let mut child = Child(Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
-        .env(RESOURCE_CHILD, name).env("SSL_CERT_FILE", &roots.0).env_remove("SSL_CERT_DIR")
-        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap());
+    let mut child = Child(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
+            .env(RESOURCE_CHILD, name)
+            .env("SSL_CERT_FILE", &roots.0)
+            .env_remove("SSL_CERT_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
     let end = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             assert!(status.success(), "resource-read HTTPS case failed");
             return;
         }
-        assert!(Instant::now() < end, "resource-read child exceeded its bound");
+        assert!(
+            Instant::now() < end,
+            "resource-read child exceeded its bound"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
 
 fn read_request(uri: &str) -> CoreRequest {
-    CoreRequest::decode(ProtocolEra::Modern2026, "resources/read", Some(&json!({
-        "uri":uri, "_meta":FinalRequestMeta::new(ClientCapabilities::default()),
-    }))).unwrap()
+    CoreRequest::decode(
+        ProtocolEra::Modern2026,
+        "resources/read",
+        Some(&json!({
+            "uri":uri, "_meta":FinalRequestMeta::new(ClientCapabilities::default()),
+        })),
+    )
+    .unwrap()
 }
 fn changed_request(request: &CoreRequest, key: &str, value: Value) -> CoreRequest {
     let mut params = request.encode_params().unwrap().unwrap();
@@ -57,7 +98,9 @@ fn changed_request(request: &CoreRequest, key: &str, value: Value) -> CoreReques
     CoreRequest::decode(ProtocolEra::Modern2026, "resources/read", Some(&params)).unwrap()
 }
 fn read_result(ttl: u64) -> String {
-    format!(r#"{{"resultType":"complete","contents":[{{"uri":"file:///one","text":"exact first"}},{{"uri":"file:///two","blob":"AAEC"}}],"ttlMs":{ttl},"cacheScope":"public","x-exact":{{"z":900719925474099312345,"a":1.20e+4}}}}"#)
+    format!(
+        r#"{{"resultType":"complete","contents":[{{"uri":"file:///one","text":"exact first"}},{{"uri":"file:///two","blob":"AAEC"}}],"ttlMs":{ttl},"cacheScope":"public","x-exact":{{"z":900719925474099312345,"a":1.20e+4}}}}"#
+    )
 }
 fn next_id(ids: &Cell<i64>) -> RequestId {
     let id = ids.get();
@@ -71,11 +114,17 @@ fn notification(method: &str) -> ServerNotification {
 async fn serve_read(peer: &Peer, id: i64, expected: &CoreRequest, result: &str) {
     let request = peer.response(id, result).await;
     assert_eq!(request["method"], "resources/read");
-    assert_eq!(request["params"], expected.encode_params().unwrap().unwrap());
+    assert_eq!(
+        request["params"],
+        expected.encode_params().unwrap().unwrap()
+    );
 }
 async fn socket_closed(mut tls: TlsStream<TcpStream>) {
     let mut byte = [0];
-    assert!(!matches!(tls.read(&mut byte).await, Ok(count) if count > 0), "retired read must release its socket");
+    assert!(
+        !matches!(tls.read(&mut byte).await, Ok(count) if count > 0),
+        "retired read must release its socket"
+    );
 }
 
 fn run_resource(case: ResourceCase) {
@@ -331,52 +380,174 @@ fn run_resource(case: ResourceCase) {
 }
 
 #[test]
-fn complete_resources_reuse_exact_cached_contents_without_notifications_or_ids() { isolated_resource("complete_resources_reuse_exact_cached_contents_without_notifications_or_ids", ResourceCase::Cached); }
+fn complete_resources_reuse_exact_cached_contents_without_notifications_or_ids() {
+    isolated_resource(
+        "complete_resources_reuse_exact_cached_contents_without_notifications_or_ids",
+        ResourceCase::Cached,
+    );
+}
 #[test]
-fn resource_caching_is_disabled_until_explicitly_enabled() { isolated_resource("resource_caching_is_disabled_until_explicitly_enabled", ResourceCase::DefaultUncached); }
+fn resource_caching_is_disabled_until_explicitly_enabled() {
+    isolated_resource(
+        "resource_caching_is_disabled_until_explicitly_enabled",
+        ResourceCase::DefaultUncached,
+    );
+}
 #[test]
-fn zero_ttl_read_is_never_reused() { isolated_resource("zero_ttl_read_is_never_reused", ResourceCase::ZeroTtl); }
+fn zero_ttl_read_is_never_reused() {
+    isolated_resource("zero_ttl_read_is_never_reused", ResourceCase::ZeroTtl);
+}
 #[test]
-fn oversized_cache_entry_returns_data_without_retention() { isolated_resource("oversized_cache_entry_returns_data_without_retention", ResourceCase::TinyCache); }
+fn oversized_cache_entry_returns_data_without_retention() {
+    isolated_resource(
+        "oversized_cache_entry_returns_data_without_retention",
+        ResourceCase::TinyCache,
+    );
+}
 #[test]
-fn resource_cache_identity_keeps_request_metadata() { isolated_resource("resource_cache_identity_keeps_request_metadata", ResourceCase::Metadata); }
+fn resource_cache_identity_keeps_request_metadata() {
+    isolated_resource(
+        "resource_cache_identity_keeps_request_metadata",
+        ResourceCase::Metadata,
+    );
+}
 #[test]
-fn resource_cache_identity_keeps_exact_read_uri() { isolated_resource("resource_cache_identity_keeps_exact_read_uri", ResourceCase::DifferentUri); }
+fn resource_cache_identity_keeps_exact_read_uri() {
+    isolated_resource(
+        "resource_cache_identity_keeps_exact_read_uri",
+        ResourceCase::DifferentUri,
+    );
+}
 #[test]
-fn present_empty_continuations_always_post_without_replacing_ordinary_cached_read() { isolated_resource("present_empty_continuations_always_post_without_replacing_ordinary_cached_read", ResourceCase::Continuation); }
+fn present_empty_continuations_always_post_without_replacing_ordinary_cached_read() {
+    isolated_resource(
+        "present_empty_continuations_always_post_without_replacing_ordinary_cached_read",
+        ResourceCase::Continuation,
+    );
+}
 #[test]
-fn input_required_is_returned_without_caching_or_automatic_continuation() { isolated_resource("input_required_is_returned_without_caching_or_automatic_continuation", ResourceCase::InputRequired); }
+fn input_required_is_returned_without_caching_or_automatic_continuation() {
+    isolated_resource(
+        "input_required_is_returned_without_caching_or_automatic_continuation",
+        ResourceCase::InputRequired,
+    );
+}
 #[test]
-fn clearing_a_shared_resource_cache_forces_an_explicit_fresh_read() { isolated_resource("clearing_a_shared_resource_cache_forces_an_explicit_fresh_read", ResourceCase::Clear); }
+fn clearing_a_shared_resource_cache_forces_an_explicit_fresh_read() {
+    isolated_resource(
+        "clearing_a_shared_resource_cache_forces_an_explicit_fresh_read",
+        ResourceCase::Clear,
+    );
+}
 #[test]
-fn validated_external_resource_update_invalidates_retained_read() { isolated_resource("validated_external_resource_update_invalidates_retained_read", ResourceCase::ExternalUpdate); }
+fn validated_external_resource_update_invalidates_retained_read() {
+    isolated_resource(
+        "validated_external_resource_update_invalidates_retained_read",
+        ResourceCase::ExternalUpdate,
+    );
+}
 #[test]
-fn resource_catalog_visibility_change_invalidates_retained_read() { isolated_resource("resource_catalog_visibility_change_invalidates_retained_read", ResourceCase::ExternalListChange); }
+fn resource_catalog_visibility_change_invalidates_retained_read() {
+    isolated_resource(
+        "resource_catalog_visibility_change_invalidates_retained_read",
+        ResourceCase::ExternalListChange,
+    );
+}
 #[test]
-fn inline_resource_update_retires_old_read_without_replaying_it() { isolated_resource("inline_resource_update_retires_old_read_without_replaying_it", ResourceCase::InlineUpdate); }
+fn inline_resource_update_retires_old_read_without_replaying_it() {
+    isolated_resource(
+        "inline_resource_update_retires_old_read_without_replaying_it",
+        ResourceCase::InlineUpdate,
+    );
+}
 #[test]
-fn unrelated_notifications_are_delivered_before_resource_terminal() { isolated_resource("unrelated_notifications_are_delivered_before_resource_terminal", ResourceCase::Incremental); }
+fn unrelated_notifications_are_delivered_before_resource_terminal() {
+    isolated_resource(
+        "unrelated_notifications_are_delivered_before_resource_terminal",
+        ResourceCase::Incremental,
+    );
+}
 #[test]
-fn host_refusal_releases_resource_response_without_cache_fill() { isolated_resource("host_refusal_releases_resource_response_without_cache_fill", ResourceCase::HostRefusal); }
+fn host_refusal_releases_resource_response_without_cache_fill() {
+    isolated_resource(
+        "host_refusal_releases_resource_response_without_cache_fill",
+        ResourceCase::HostRefusal,
+    );
+}
 #[test]
-fn malformed_resource_result_cannot_poison_subsequent_reads() { isolated_resource("malformed_resource_result_cannot_poison_subsequent_reads", ResourceCase::InvalidResult); }
+fn malformed_resource_result_cannot_poison_subsequent_reads() {
+    isolated_resource(
+        "malformed_resource_result_cannot_poison_subsequent_reads",
+        ResourceCase::InvalidResult,
+    );
+}
 #[test]
-fn resource_content_count_limit_is_checked_before_cache_fill() { isolated_resource("resource_content_count_limit_is_checked_before_cache_fill", ResourceCase::ContentsLimit); }
+fn resource_content_count_limit_is_checked_before_cache_fill() {
+    isolated_resource(
+        "resource_content_count_limit_is_checked_before_cache_fill",
+        ResourceCase::ContentsLimit,
+    );
+}
 #[test]
-fn cancelled_resource_read_releases_idle_response() { isolated_resource("cancelled_resource_read_releases_idle_response", ResourceCase::Cancel); }
+fn cancelled_resource_read_releases_idle_response() {
+    isolated_resource(
+        "cancelled_resource_read_releases_idle_response",
+        ResourceCase::Cancel,
+    );
+}
 #[test]
-fn closed_login_releases_idle_resource_response() { isolated_resource("closed_login_releases_idle_resource_response", ResourceCase::Close); }
+fn closed_login_releases_idle_resource_response() {
+    isolated_resource(
+        "closed_login_releases_idle_resource_response",
+        ResourceCase::Close,
+    );
+}
 #[test]
-fn abandoned_resource_read_releases_idle_response() { isolated_resource("abandoned_resource_read_releases_idle_response", ResourceCase::Drop); }
+fn abandoned_resource_read_releases_idle_response() {
+    isolated_resource(
+        "abandoned_resource_read_releases_idle_response",
+        ResourceCase::Drop,
+    );
+}
 #[test]
-fn resource_read_cannot_outlive_its_opening_token_or_trigger_renewal() { isolated_resource("resource_read_cannot_outlive_its_opening_token_or_trigger_renewal", ResourceCase::Expire); }
+fn resource_read_cannot_outlive_its_opening_token_or_trigger_renewal() {
+    isolated_resource(
+        "resource_read_cannot_outlive_its_opening_token_or_trigger_renewal",
+        ResourceCase::Expire,
+    );
+}
 #[test]
-fn request_id_callback_revocation_prevents_resource_post() { isolated_resource("request_id_callback_revocation_prevents_resource_post", ResourceCase::RevokeBeforePost); }
+fn request_id_callback_revocation_prevents_resource_post() {
+    isolated_resource(
+        "request_id_callback_revocation_prevents_resource_post",
+        ResourceCase::RevokeBeforePost,
+    );
+}
 #[test]
-fn request_id_callback_clear_prevents_resource_post() { isolated_resource("request_id_callback_clear_prevents_resource_post", ResourceCase::ClearBeforePost); }
+fn request_id_callback_clear_prevents_resource_post() {
+    isolated_resource(
+        "request_id_callback_clear_prevents_resource_post",
+        ResourceCase::ClearBeforePost,
+    );
+}
 #[test]
-fn revoked_credentials_cannot_use_an_already_warm_resource_cache() { isolated_resource("revoked_credentials_cannot_use_an_already_warm_resource_cache", ResourceCase::RevokedHit); }
+fn revoked_credentials_cannot_use_an_already_warm_resource_cache() {
+    isolated_resource(
+        "revoked_credentials_cannot_use_an_already_warm_resource_cache",
+        ResourceCase::RevokedHit,
+    );
+}
 #[test]
-fn external_clear_fences_an_already_pending_resource_fill() { isolated_resource("external_clear_fences_an_already_pending_resource_fill", ResourceCase::PendingInvalidation); }
+fn external_clear_fences_an_already_pending_resource_fill() {
+    isolated_resource(
+        "external_clear_fences_an_already_pending_resource_fill",
+        ResourceCase::PendingInvalidation,
+    );
+}
 #[test]
-fn resource_preflight_failures_have_no_id_or_network_effects() { isolated_resource("resource_preflight_failures_have_no_id_or_network_effects", ResourceCase::Preflight); }
+fn resource_preflight_failures_have_no_id_or_network_effects() {
+    isolated_resource(
+        "resource_preflight_failures_have_no_id_or_network_effects",
+        ResourceCase::Preflight,
+    );
+}

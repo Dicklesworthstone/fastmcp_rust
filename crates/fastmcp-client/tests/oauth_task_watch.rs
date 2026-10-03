@@ -19,16 +19,25 @@ use asupersync::channel::oneshot;
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener, TcpStream};
 use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
-use asupersync::tls::{Certificate, CertificateChain, PrivateKey, TlsAcceptor, TlsAcceptorBuilder, TlsStream};
-use fastmcp_client::http_auth::managed::{ManagedOAuthSession, OAuthSessionError, OAuthSessionPolicy};
-use fastmcp_client::http_auth::managed::tasks::{ManagedTasksClient, ManagedTasksError, ManagedTasksLimits};
+use asupersync::tls::{
+    Certificate, CertificateChain, PrivateKey, TlsAcceptor, TlsAcceptorBuilder, TlsStream,
+};
 use fastmcp_client::http_auth::managed::tasks::watch::{
     ManagedTaskSnapshotCause, ManagedTaskWatchError, ManagedTaskWatchPolicy,
 };
+use fastmcp_client::http_auth::managed::tasks::{
+    ManagedTasksClient, ManagedTasksError, ManagedTasksLimits,
+};
+use fastmcp_client::http_auth::managed::{
+    ManagedOAuthSession, OAuthSessionError, OAuthSessionPolicy,
+};
 use fastmcp_client::http_auth::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError};
 use fastmcp_core::{CanonicalHttpUrl, McpRequestCancellation};
-use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_SUBSCRIPTION_ID_META_KEY};
-use fastmcp_protocol::tasks_extension::{Task, TaskId, TASKS_EXTENSION};
+use fastmcp_protocol::tasks_extension::{TASKS_EXTENSION, Task, TaskId};
+use fastmcp_protocol::{
+    ClientCapabilities, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_SUBSCRIPTION_ID_META_KEY,
+    FinalRequestMeta,
+};
 use serde_json::{Value, json};
 
 #[path = "oauth_task_watch/checkpoint.rs"]
@@ -42,7 +51,19 @@ const LEAF: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBjjCCATSgAwIBAgICA+owCgYIK
 const KEY: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcCe44IBKhbw+D/s7\nBjDHOOV0g+EoxFno7VJGKhJeer2hRANCAATzyspS52vVaVgJabIRwYUrEBzTr9wW\nhBl+B0gYR4gVXpdHHvqnxxdeTtE+t2Zae07cZTHRGPqz6YIqEhQ0FWnY\n-----END PRIVATE KEY-----\n";
 
 #[derive(Clone, Copy)]
-enum Case { Multi, CompletionRace, PartialAck, Interrupted, Cancel, SessionClose, Abandon, SnapshotLimit, WrongResponse, WrongTask, Precancel }
+enum Case {
+    Multi,
+    CompletionRace,
+    PartialAck,
+    Interrupted,
+    Cancel,
+    SessionClose,
+    Abandon,
+    SnapshotLimit,
+    WrongResponse,
+    WrongTask,
+    Precancel,
+}
 
 fn isolated(name: &str, case: Case) {
     isolated_run(name, || run_case(case));
@@ -56,21 +77,39 @@ fn isolated_run(name: &str, run: impl FnOnce()) {
     }
     struct Child(std::process::Child);
     impl Drop for Child {
-        fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
-    let root = std::env::temp_dir().join(format!("fastmcp-task-watch-ca-{}-{}.pem", std::process::id(), name.replace(':', "_")));
+    let root = std::env::temp_dir().join(format!(
+        "fastmcp-task-watch-ca-{}-{}.pem",
+        std::process::id(),
+        name.replace(':', "_")
+    ));
     std::fs::write(&root, ROOT).unwrap();
-    let mut child = Child(Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture", "--test-threads=1"])
-        .env(CHILD_CASE, name).env("SSL_CERT_FILE", root).env_remove("SSL_CERT_DIR")
-        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap());
+    let mut child = Child(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(CHILD_CASE, name)
+            .env("SSL_CERT_FILE", root)
+            .env_remove("SSL_CERT_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             assert!(status.success(), "public Task watch case failed");
             return;
         }
-        assert!(Instant::now() < deadline, "public Task watch exceeded its process bound");
+        assert!(
+            Instant::now() < deadline,
+            "public Task watch exceeded its process bound"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -81,14 +120,28 @@ async fn pair<L: Future, R: Future>(left: L, right: R) -> (L::Output, R::Output)
     let mut one = None;
     let mut two = None;
     poll_fn(|cx| {
-        if one.is_none() { if let Poll::Ready(value) = left.as_mut().poll(cx) { one = Some(value); } }
-        if two.is_none() { if let Poll::Ready(value) = right.as_mut().poll(cx) { two = Some(value); } }
-        if one.is_some() && two.is_some() { Poll::Ready((one.take().unwrap(), two.take().unwrap())) }
-        else { Poll::Pending }
-    }).await
+        if one.is_none() {
+            if let Poll::Ready(value) = left.as_mut().poll(cx) {
+                one = Some(value);
+            }
+        }
+        if two.is_none() {
+            if let Poll::Ready(value) = right.as_mut().poll(cx) {
+                two = Some(value);
+            }
+        }
+        if one.is_some() && two.is_some() {
+            Poll::Ready((one.take().unwrap(), two.take().unwrap()))
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
 }
 
-fn url(value: &str) -> CanonicalHttpUrl { CanonicalHttpUrl::parse(value).unwrap() }
+fn url(value: &str) -> CanonicalHttpUrl {
+    CanonicalHttpUrl::parse(value).unwrap()
+}
 fn component(value: &str) -> String {
     let mut bytes = value.bytes();
     let mut result = Vec::new();
@@ -106,18 +159,29 @@ fn component(value: &str) -> String {
     String::from_utf8(result).unwrap()
 }
 fn form(value: &str) -> BTreeMap<String, String> {
-    value.split('&').map(|field| {
-        let (name, value) = field.split_once('=').unwrap();
-        (component(name), component(value))
-    }).collect()
+    value
+        .split('&')
+        .map(|field| {
+            let (name, value) = field.split_once('=').unwrap();
+            (component(name), component(value))
+        })
+        .collect()
 }
 async fn browser(authorization: CanonicalHttpUrl) -> Result<(), OAuthError> {
     let fields = form(authorization.query().unwrap());
-    let address: SocketAddr = fields["redirect_uri"].strip_prefix("http://").unwrap()
-        .split('/').next().unwrap().parse().unwrap();
+    let address: SocketAddr = fields["redirect_uri"]
+        .strip_prefix("http://")
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
     assert!(address.ip().is_loopback());
     assert_eq!(fields["code_challenge_method"], "S256");
-    let mut socket = TcpStream::connect(address).await.map_err(|_| OAuthError::CallbackRejected)?;
+    let mut socket = TcpStream::connect(address)
+        .await
+        .map_err(|_| OAuthError::CallbackRejected)?;
     socket.write_all(format!(
         "GET /oauth/callback?code=watch-code&iss=https%3A%2F%2Fissuer.example&state={} HTTP/1.1\r\nHost: {address}\r\n\r\n",
         fields["state"],
@@ -132,13 +196,19 @@ async fn read_request<IO: AsyncRead + Unpin>(socket: &mut IO) -> (String, Vec<u8
         let count = socket.read(&mut chunk).await.unwrap();
         assert!(count > 0 && bytes.len() + count <= 64 * 1024);
         bytes.extend_from_slice(&chunk[..count]);
-        if let Some(offset) = bytes.windows(4).position(|value| value == b"\r\n\r\n") { break offset + 4; }
+        if let Some(offset) = bytes.windows(4).position(|value| value == b"\r\n\r\n") {
+            break offset + 4;
+        }
     };
     let head = std::str::from_utf8(&bytes[..end]).unwrap().to_owned();
-    let length = head.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
-    }).unwrap();
+    let length = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().unwrap())
+        })
+        .unwrap();
     assert!(end + length <= 64 * 1024);
     while bytes.len() < end + length {
         let count = socket.read(&mut chunk).await.unwrap();
@@ -157,12 +227,18 @@ async fn reply(socket: &mut TlsStream<TcpStream>, value: Value) {
 }
 async fn event(socket: &mut TlsStream<TcpStream>, value: Value) {
     let body = format!("data: {value}\n\n");
-    socket.write_all(format!("{:X}\r\n{body}\r\n", body.len()).as_bytes()).await.unwrap();
+    socket
+        .write_all(format!("{:X}\r\n{body}\r\n", body.len()).as_bytes())
+        .await
+        .unwrap();
     socket.flush().await.unwrap();
 }
 async fn assert_closed(socket: &mut TlsStream<TcpStream>) {
     let mut byte = [0];
-    assert!(!matches!(socket.read(&mut byte).await, Ok(count) if count > 0), "watch must release its owned subscription socket");
+    assert!(
+        !matches!(socket.read(&mut byte).await, Ok(count) if count > 0),
+        "watch must release its owned subscription socket"
+    );
 }
 fn task(id: &str, status: &str) -> Value {
     json!({"taskId":id, "status":status, "createdAt":"2026-09-17T00:00:00Z",
@@ -186,19 +262,39 @@ impl Peer {
     async fn new() -> Self {
         Self {
             listener: TcpListener::bind("127.0.0.1:0").await.unwrap(),
-            acceptor: TlsAcceptorBuilder::new(CertificateChain::from_pem(LEAF).unwrap(), PrivateKey::from_pem(KEY).unwrap())
-                .alpn_protocols(vec![b"http/1.1".to_vec()]).build().unwrap(),
-            gets: AtomicUsize::new(0), discoveries: AtomicUsize::new(0), listens: AtomicUsize::new(0),
+            acceptor: TlsAcceptorBuilder::new(
+                CertificateChain::from_pem(LEAF).unwrap(),
+                PrivateKey::from_pem(KEY).unwrap(),
+            )
+            .alpn_protocols(vec![b"http/1.1".to_vec()])
+            .build()
+            .unwrap(),
+            gets: AtomicUsize::new(0),
+            discoveries: AtomicUsize::new(0),
+            listens: AtomicUsize::new(0),
             seen: Mutex::new(BTreeSet::new()),
         }
     }
-    fn resource(&self) -> String { format!("https://{}/mcp", self.listener.local_addr().unwrap()) }
+    fn resource(&self) -> String {
+        format!("https://{}/mcp", self.listener.local_addr().unwrap())
+    }
     fn client(&self) -> OAuthClient {
-        OAuthClient::new(OAuthClientConfiguration::from_trusted_endpoints(
-            "https://issuer.example", url("https://issuer.example/authorize"),
-            url(&format!("https://{}/token", self.listener.local_addr().unwrap())),
-            url(&self.resource()), "watch-client", vec!["tools:read".to_owned()],
-        ).unwrap().with_extra_root_certificate(Certificate::from_pem(ROOT).unwrap().remove(0)).unwrap())
+        OAuthClient::new(
+            OAuthClientConfiguration::from_trusted_endpoints(
+                "https://issuer.example",
+                url("https://issuer.example/authorize"),
+                url(&format!(
+                    "https://{}/token",
+                    self.listener.local_addr().unwrap()
+                )),
+                url(&self.resource()),
+                "watch-client",
+                vec!["tools:read".to_owned()],
+            )
+            .unwrap()
+            .with_extra_root_certificate(Certificate::from_pem(ROOT).unwrap().remove(0))
+            .unwrap(),
+        )
     }
     async fn receive(&self) -> (TlsStream<TcpStream>, String, Vec<u8>) {
         let (socket, _) = self.listener.accept().await.unwrap();
@@ -216,7 +312,11 @@ impl Peer {
         assert_eq!(fields["code"], "watch-code");
         assert_eq!(fields["resource"], self.resource());
         assert!((43..=128).contains(&fields["code_verifier"].len()));
-        reply(&mut socket, json!({"access_token":"watch-access", "token_type":"Bearer", "expires_in":300})).await;
+        reply(
+            &mut socket,
+            json!({"access_token":"watch-access", "token_type":"Bearer", "expires_in":300}),
+        )
+        .await;
     }
     async fn request(&self, expected: &str) -> (TlsStream<TcpStream>, Value) {
         let (socket, head, bytes) = self.receive().await;
@@ -225,24 +325,43 @@ impl Peer {
         assert!(headers.contains("authorization: bearer watch-access\r\n"));
         assert!(!headers.contains("mcp-session-id:") && !headers.contains("last-event-id:"));
         let request: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(request["method"], expected, "watch must not poll, replay or mutate tasks");
-        assert_eq!(request["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"], json!({TASKS_EXTENSION:{}}));
-        assert!(self.seen.lock().unwrap().insert(request["id"].as_str().unwrap().to_owned()), "all requests in one watch need fresh IDs");
+        assert_eq!(
+            request["method"], expected,
+            "watch must not poll, replay or mutate tasks"
+        );
+        assert_eq!(
+            request["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"],
+            json!({TASKS_EXTENSION:{}})
+        );
+        assert!(
+            self.seen
+                .lock()
+                .unwrap()
+                .insert(request["id"].as_str().unwrap().to_owned()),
+            "all requests in one watch need fresh IDs"
+        );
         (socket, request)
     }
     async fn discover(&self) {
         let (mut socket, request) = self.request("server/discover").await;
         self.discoveries.fetch_add(1, Ordering::SeqCst);
-        reply(&mut socket, json!({"jsonrpc":"2.0", "id":request["id"], "result":{
-            "resultType":"complete", "supportedVersions":["2026-07-28"], "ttlMs":0,
-            "cacheScope":"private", "capabilities":{"extensions":{TASKS_EXTENSION:{}}},
-        }})).await;
+        reply(
+            &mut socket,
+            json!({"jsonrpc":"2.0", "id":request["id"], "result":{
+                "resultType":"complete", "supportedVersions":["2026-07-28"], "ttlMs":0,
+                "cacheScope":"private", "capabilities":{"extensions":{TASKS_EXTENSION:{}}},
+            }}),
+        )
+        .await;
     }
     async fn listen(&self, selected: Value, partial: bool) -> (TlsStream<TcpStream>, Value) {
         self.discover().await;
         let (mut socket, request) = self.request("subscriptions/listen").await;
         self.listens.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(request["params"]["notifications"], json!({"taskIds":selected}));
+        assert_eq!(
+            request["params"]["notifications"],
+            json!({"taskIds":selected})
+        );
         socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
         let accepted = if partial { json!(["one"]) } else { selected };
         event(&mut socket, json!({"jsonrpc":"2.0", "method":"notifications/subscriptions/acknowledged", "params":{
@@ -255,14 +374,32 @@ impl Peer {
         let (mut socket, request) = self.request("tasks/get").await;
         self.gets.fetch_add(1, Ordering::SeqCst);
         assert_eq!(request["params"]["taskId"], expected);
-        let mut result = task(if matches!(case, Case::WrongTask) { "other" } else { expected }, status);
+        let mut result = task(
+            if matches!(case, Case::WrongTask) {
+                "other"
+            } else {
+                expected
+            },
+            status,
+        );
         result["resultType"] = json!("complete");
-        let id = if matches!(case, Case::WrongResponse) { json!("foreign-response") } else { request["id"].clone() };
-        reply(&mut socket, json!({"jsonrpc":"2.0", "id":id, "result":result})).await;
+        let id = if matches!(case, Case::WrongResponse) {
+            json!("foreign-response")
+        } else {
+            request["id"].clone()
+        };
+        reply(
+            &mut socket,
+            json!({"jsonrpc":"2.0", "id":id, "result":result}),
+        )
+        .await;
     }
     fn no_extra_request(&self) {
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(self.listener.poll_accept(&mut cx).is_pending(), "no hidden polling, replay or cancellation POST");
+        assert!(
+            self.listener.poll_accept(&mut cx).is_pending(),
+            "no hidden polling, replay or cancellation POST"
+        );
     }
 }
 
@@ -405,45 +542,78 @@ fn run_case(case: Case) {
 
 #[test]
 fn watch_reconciles_multiple_tasks_without_polling_or_stale_terminal_regression() {
-    isolated("watch_reconciles_multiple_tasks_without_polling_or_stale_terminal_regression", Case::Multi);
+    isolated(
+        "watch_reconciles_multiple_tasks_without_polling_or_stale_terminal_regression",
+        Case::Multi,
+    );
 }
 #[test]
 fn watch_observes_completion_between_acknowledgement_and_initial_snapshot() {
-    isolated("watch_observes_completion_between_acknowledgement_and_initial_snapshot", Case::CompletionRace);
+    isolated(
+        "watch_observes_completion_between_acknowledgement_and_initial_snapshot",
+        Case::CompletionRace,
+    );
 }
 #[test]
 fn watch_refuses_partial_acknowledgement_before_any_task_get() {
-    isolated("watch_refuses_partial_acknowledgement_before_any_task_get", Case::PartialAck);
+    isolated(
+        "watch_refuses_partial_acknowledgement_before_any_task_get",
+        Case::PartialAck,
+    );
 }
 #[test]
 fn subscription_terminal_is_not_success_for_unfinished_tasks() {
-    isolated("subscription_terminal_is_not_success_for_unfinished_tasks", Case::Interrupted);
+    isolated(
+        "subscription_terminal_is_not_success_for_unfinished_tasks",
+        Case::Interrupted,
+    );
 }
 #[test]
 fn cancelling_an_idle_watch_closes_only_observation_without_remote_cancel() {
-    isolated("cancelling_an_idle_watch_closes_only_observation_without_remote_cancel", Case::Cancel);
+    isolated(
+        "cancelling_an_idle_watch_closes_only_observation_without_remote_cancel",
+        Case::Cancel,
+    );
 }
 #[test]
 fn session_close_wakes_an_idle_watch_without_cancelling_the_caller() {
-    isolated("session_close_wakes_an_idle_watch_without_cancelling_the_caller", Case::SessionClose);
+    isolated(
+        "session_close_wakes_an_idle_watch_without_cancelling_the_caller",
+        Case::SessionClose,
+    );
 }
 #[test]
 fn abandoning_a_polled_watch_read_drops_both_custody_and_reusability() {
-    isolated("abandoning_a_polled_watch_read_drops_both_custody_and_reusability", Case::Abandon);
+    isolated(
+        "abandoning_a_polled_watch_read_drops_both_custody_and_reusability",
+        Case::Abandon,
+    );
 }
 #[test]
 fn watch_snapshot_limit_prevents_an_extra_discovery_or_get() {
-    isolated("watch_snapshot_limit_prevents_an_extra_discovery_or_get", Case::SnapshotLimit);
+    isolated(
+        "watch_snapshot_limit_prevents_an_extra_discovery_or_get",
+        Case::SnapshotLimit,
+    );
 }
 #[test]
 fn watch_rejects_a_foreign_response_identity_without_publishing_state() {
-    isolated("watch_rejects_a_foreign_response_identity_without_publishing_state", Case::WrongResponse);
+    isolated(
+        "watch_rejects_a_foreign_response_identity_without_publishing_state",
+        Case::WrongResponse,
+    );
 }
 #[test]
 fn watch_rejects_a_foreign_task_identity_without_publishing_state() {
-    isolated("watch_rejects_a_foreign_task_identity_without_publishing_state", Case::WrongTask);
+    isolated(
+        "watch_rejects_a_foreign_task_identity_without_publishing_state",
+        Case::WrongTask,
+    );
 }
 #[test]
 fn precancelled_watch_never_discovers_or_subscribes() {
-    isolated("precancelled_watch_never_discovers_or_subscribes", Case::Precancel);
+    isolated(
+        "precancelled_watch_never_discovers_or_subscribes",
+        Case::Precancel,
+    );
 }

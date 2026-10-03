@@ -21,7 +21,9 @@ fn literal_vscode() -> Value {
 #[test]
 fn vscode_stdio_registry_retains_every_launch_field() {
     let config = McpConfig::from_json(&literal_vscode().to_string()).expect("literal stdio config");
-    let server = config.get_server("local").expect("registry must not disappear");
+    let server = config
+        .get_server("local")
+        .expect("registry must not disappear");
     assert_eq!(server.command, "server");
     assert_eq!(server.args, ["--literal", "https://example.test/a//b"]);
     assert_eq!(server.env.get("EXAMPLE").map(String::as_str), Some("value"));
@@ -34,7 +36,10 @@ fn vscode_stdio_registry_retains_every_launch_field() {
 #[test]
 fn vscode_omitted_type_is_stdio_and_empty_inputs_are_inert() {
     let mut value = literal_vscode();
-    value["servers"]["local"].as_object_mut().unwrap().remove("type");
+    value["servers"]["local"]
+        .as_object_mut()
+        .unwrap()
+        .remove("type");
     value["inputs"] = json!([]);
     value["$schema"] = json!("https://example.test/config-schema.json");
     assert!(McpConfig::from_json(&value.to_string()).is_ok());
@@ -63,7 +68,10 @@ fn native_json_and_camel_case_toml_remain_supported() {
     let json = r#"{"mcpServers":{"local":{"command":"server"}}}"#;
     let toml = "[mcpServers.local]\ncommand = \"server\"\n";
     for config in [McpConfig::from_json(json), McpConfig::from_toml(toml)] {
-        assert_eq!(config.unwrap().get_server("local").unwrap().command, "server");
+        assert_eq!(
+            config.unwrap().get_server("local").unwrap().command,
+            "server"
+        );
     }
     assert!(McpConfig::from_json("{}").unwrap().mcp_servers.is_empty());
 }
@@ -110,7 +118,10 @@ fn vscode_security_and_interactive_controls_are_not_silently_dropped() {
     ] {
         let mut config = literal_vscode();
         config[key] = value;
-        assert!(McpConfig::from_json(&config.to_string()).is_err(), "accepted {key}");
+        assert!(
+            McpConfig::from_json(&config.to_string()).is_err(),
+            "accepted {key}"
+        );
         // Direct serde callers must receive the same admission, not a bypass.
         assert!(serde_json::from_value::<McpConfig>(config).is_err());
     }
@@ -131,7 +142,10 @@ fn vscode_remote_and_unknown_execution_fields_are_not_stdio_fallbacks() {
     ] {
         let mut config = literal_vscode();
         config["servers"]["local"][key] = value;
-        assert!(McpConfig::from_json(&config.to_string()).is_err(), "accepted {key}");
+        assert!(
+            McpConfig::from_json(&config.to_string()).is_err(),
+            "accepted {key}"
+        );
     }
 }
 

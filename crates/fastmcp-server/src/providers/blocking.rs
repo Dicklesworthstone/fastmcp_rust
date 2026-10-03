@@ -23,8 +23,8 @@ pub use resource::BlockingResource;
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -33,7 +33,9 @@ use fastmcp_core::runtime::{ProcessBoundToken, ProcessGenerationGuard};
 use fastmcp_core::{McpContext, McpError, McpOutcome, McpResult, Outcome};
 use fastmcp_protocol::common_types::{OpenMetadata, RawIcon};
 use fastmcp_protocol::http_headers::NonSensitiveHeaderExposure;
-use fastmcp_protocol::{CompleteResult, Content, FinalCallToolResult, FinalTool, Icon, Tool, ToolAnnotations};
+use fastmcp_protocol::{
+    CompleteResult, Content, FinalCallToolResult, FinalTool, Icon, Tool, ToolAnnotations,
+};
 use serde_json::Value;
 
 use crate::bidirectional::MrtrCompletedInputs;
@@ -67,33 +69,53 @@ impl BlockingHandlerLane {
     /// domain, so applications should share one rather than make one per call.
     pub fn new(max_in_flight: usize) -> McpResult<Self> {
         if !(1..=1024).contains(&max_in_flight) {
-            return Err(McpError::invalid_params("blocking handler limit must be in 1..=1024"));
+            return Err(McpError::invalid_params(
+                "blocking handler limit must be in 1..=1024",
+            ));
         }
         let guard = ProcessGenerationGuard::install()
             .map_err(|_| unavailable("blocking handler process guard unavailable"))?;
-        guard.verify_current().map_err(|_| unavailable("blocking handler process changed"))?;
-        Ok(Self { inner: Arc::new(LaneInner {
-            process: guard.token(), limit: max_in_flight,
-            state: Mutex::new(LaneState::default()), changed: Notify::new(),
-        }) })
+        guard
+            .verify_current()
+            .map_err(|_| unavailable("blocking handler process changed"))?;
+        Ok(Self {
+            inner: Arc::new(LaneInner {
+                process: guard.token(),
+                limit: max_in_flight,
+                state: Mutex::new(LaneState::default()),
+                changed: Notify::new(),
+            }),
+        })
     }
 
     fn verify(&self) -> McpResult<()> {
-        self.inner.process.verify().map_err(|_| unavailable("blocking handler process changed"))
+        self.inner
+            .process
+            .verify()
+            .map_err(|_| unavailable("blocking handler process changed"))
     }
 
     /// Stops new admission without pretending that running synchronous work
     /// has stopped. Existing calls may complete normally. This is irreversible.
     pub fn close(&self) -> McpResult<()> {
         self.verify()?;
-        self.inner.state.lock().map_err(|_| unavailable("blocking handler lane unavailable"))?.closed = true;
+        self.inner
+            .state
+            .lock()
+            .map_err(|_| unavailable("blocking handler lane unavailable"))?
+            .closed = true;
         Ok(())
     }
 
     /// Reservations include abandoned calls whose synchronous work still runs.
     pub fn in_flight(&self) -> McpResult<usize> {
         self.verify()?;
-        Ok(self.inner.state.lock().map_err(|_| unavailable("blocking handler lane unavailable"))?.in_flight)
+        Ok(self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| unavailable("blocking handler lane unavailable"))?
+            .in_flight)
     }
 
     /// Waits for actual closure/result custody to be released, with the host's
@@ -103,15 +125,25 @@ impl BlockingHandlerLane {
     pub async fn wait_idle(&self, ctx: &McpContext) -> McpResult<()> {
         self.verify()?;
         wait(ctx, async {
-            self.inner.changed.wait_until(|| self.in_flight().map_or(true, |count| count == 0)).await;
+            self.inner
+                .changed
+                .wait_until(|| self.in_flight().map_or(true, |count| count == 0))
+                .await;
             self.in_flight().map(|_| ())
-        }).await
+        })
+        .await
     }
 
     fn reserve(&self) -> McpResult<Arc<Charge>> {
         self.verify()?;
-        let mut state = self.inner.state.lock().map_err(|_| unavailable("blocking handler lane unavailable"))?;
-        if state.closed { return Err(unavailable("blocking handler lane is closed")); }
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| unavailable("blocking handler lane unavailable"))?;
+        if state.closed {
+            return Err(unavailable("blocking handler lane is closed"));
+        }
         if state.in_flight == self.inner.limit {
             return Err(unavailable("blocking handler capacity exhausted"));
         }
@@ -120,16 +152,22 @@ impl BlockingHandlerLane {
     }
 
     async fn execute<T, F>(&self, ctx: &McpContext, request_cx: &Cx, work: F) -> McpResult<T>
-    where T: Send + 'static, F: FnOnce(&McpContext) -> McpResult<T> + Send + 'static,
+    where
+        T: Send + 'static,
+        F: FnOnce(&McpContext) -> McpResult<T> + Send + 'static,
     {
         self.verify()?;
         // Rebind a CLONE: authentication, request lease, operation deadline,
         // cancellation and consumed quota must not become a fresh request.
         let context = ctx.clone().with_request_cx(request_cx.clone());
-        context.checkpoint().map_err(|_| McpError::request_cancelled())?;
+        context
+            .checkpoint()
+            .map_err(|_| McpError::request_cancelled())?;
         let capabilities = request_cx.capabilities();
         if !capabilities.spawn || !capabilities.time || request_cx.timer_driver().is_none() {
-            return Err(unavailable("blocking handlers require caller-owned spawn and timers"));
+            return Err(unavailable(
+                "blocking handlers require caller-owned spawn and timers",
+            ));
         }
         let pool = request_cx.blocking_pool_handle().ok_or_else(|| {
             unavailable("blocking handlers require an installed caller-owned blocking pool")
@@ -137,64 +175,85 @@ impl BlockingHandlerLane {
         let charge = self.reserve()?;
         let worker_charge = Arc::clone(&charge);
         let worker_context = context.clone();
-        let worker = request_cx.spawn(move |worker_cx| async move {
-            let _child_charge = Arc::clone(&worker_charge);
-            let context = worker_context.with_request_cx(worker_cx);
-            context.ensure_live().map_err(|_| McpError::request_cancelled())?;
-            let (sender, mut receiver) = oneshot::channel();
-            let completion = Arc::new(PoolCompletion::default());
-            let job = PoolWork {
-                work: Some(work),
-                context: context.clone(),
-                charge: worker_charge,
-                _completion: PoolCompletionGuard(Arc::clone(&completion)),
-            };
-            // Cx::spawn_blocking runs its closure inline if a present pool
-            // rejects submission or loses its last worker. Submit only through
-            // the raw pool, which drops rejected work without invoking it. Keep
-            // the enclosing Cx task for child identity and region cancellation.
-            let pool_task = pool.spawn(move || job.run(sender));
-            let pool_task = crate::BlockingTaskGuard(pool_task);
-            let received = receiver.recv(context.cx()).await;
-            if matches!(&received, Err(oneshot::RecvError::Cancelled))
-                || context.ensure_live().is_err()
-            {
-                pool_task.0.cancel();
-            }
-            // A cancelled Sleep is immediately ready. Use a completion wake
-            // that ignores cancellation so draining a non-preemptible syscall
-            // neither spins nor declares its region quiescent prematurely.
-            completion.changed.wait_until(|| completion.done.load(Ordering::Acquire)).await;
-            // Cancellation dominates a simultaneous sender-close or result.
-            // Pool rejection alone has its own stable, redacted error.
-            context.ensure_live().map_err(|_| McpError::request_cancelled())?;
-            match received {
-                Ok(result) => result,
-                Err(oneshot::RecvError::Cancelled) => Err(McpError::request_cancelled()),
-                Err(oneshot::RecvError::Closed) => {
-                    Err(unavailable("blocking handler admission to caller blocking pool failed"))
+        let worker = request_cx
+            .spawn(move |worker_cx| async move {
+                let _child_charge = Arc::clone(&worker_charge);
+                let context = worker_context.with_request_cx(worker_cx);
+                context
+                    .ensure_live()
+                    .map_err(|_| McpError::request_cancelled())?;
+                let (sender, mut receiver) = oneshot::channel();
+                let completion = Arc::new(PoolCompletion::default());
+                let job = PoolWork {
+                    work: Some(work),
+                    context: context.clone(),
+                    charge: worker_charge,
+                    _completion: PoolCompletionGuard(Arc::clone(&completion)),
+                };
+                // Cx::spawn_blocking runs its closure inline if a present pool
+                // rejects submission or loses its last worker. Submit only through
+                // the raw pool, which drops rejected work without invoking it. Keep
+                // the enclosing Cx task for child identity and region cancellation.
+                let pool_task = pool.spawn(move || job.run(sender));
+                let pool_task = crate::BlockingTaskGuard(pool_task);
+                let received = receiver.recv(context.cx()).await;
+                if matches!(&received, Err(oneshot::RecvError::Cancelled))
+                    || context.ensure_live().is_err()
+                {
+                    pool_task.0.cancel();
                 }
-                Err(oneshot::RecvError::PolledAfterCompletion) => {
-                    Err(unavailable("blocking handler worker did not complete"))
+                // A cancelled Sleep is immediately ready. Use a completion wake
+                // that ignores cancellation so draining a non-preemptible syscall
+                // neither spins nor declares its region quiescent prematurely.
+                completion
+                    .changed
+                    .wait_until(|| completion.done.load(Ordering::Acquire))
+                    .await;
+                // Cancellation dominates a simultaneous sender-close or result.
+                // Pool rejection alone has its own stable, redacted error.
+                context
+                    .ensure_live()
+                    .map_err(|_| McpError::request_cancelled())?;
+                match received {
+                    Ok(result) => result,
+                    Err(oneshot::RecvError::Cancelled) => Err(McpError::request_cancelled()),
+                    Err(oneshot::RecvError::Closed) => Err(unavailable(
+                        "blocking handler admission to caller blocking pool failed",
+                    )),
+                    Err(oneshot::RecvError::PolledAfterCompletion) => {
+                        Err(unavailable("blocking handler worker did not complete"))
+                    }
                 }
-            }
-        }).map_err(|_| unavailable("blocking handler admission to caller runtime failed"))?;
-        let mut owner = WorkerOwner { worker: Some(worker), charge };
+            })
+            .map_err(|_| unavailable("blocking handler admission to caller runtime failed"))?;
+        let mut owner = WorkerOwner {
+            worker: Some(worker),
+            charge,
+        };
         let result = wait(&context, async {
             // Keep the handle inside its RAII owner while join is suspended.
             // An abandoned join therefore aborts this worker and no sibling.
-            owner.worker.as_mut().expect("worker is present until join completes")
-                .join(request_cx).await
+            owner
+                .worker
+                .as_mut()
+                .expect("worker is present until join completes")
+                .join(request_cx)
+                .await
                 .map_err(|_| unavailable("blocking handler worker did not complete"))?
-        }).await;
-        if result.is_ok() { owner.worker = None; }
+        })
+        .await;
+        if result.is_ok() {
+            owner.worker = None;
+        }
         result
     }
 }
 
 impl fmt::Debug for BlockingHandlerLane {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BlockingHandlerLane").field("limit", &self.inner.limit).finish_non_exhaustive()
+        f.debug_struct("BlockingHandlerLane")
+            .field("limit", &self.inner.limit)
+            .finish_non_exhaustive()
     }
 }
 
@@ -203,8 +262,14 @@ impl Drop for Charge {
     fn drop(&mut self) {
         // Do not touch an inherited mutex after fork. This process cannot
         // settle the original process's work or grant its capacity anew.
-        if self.0.process.verify().is_err() { return; }
-        let mut state = self.0.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.0.process.verify().is_err() {
+            return;
+        }
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.in_flight -= 1;
         drop(state);
         // Wakers are application code; their panic must not escape cleanup.
@@ -219,7 +284,9 @@ struct WorkerOwner<T: Send + 'static> {
 impl<T: Send + 'static> Drop for WorkerOwner<T> {
     fn drop(&mut self) {
         if self.charge.0.process.verify().is_ok() {
-            if let Some(worker) = &self.worker { worker.abort(); }
+            if let Some(worker) = &self.worker {
+                worker.abort();
+            }
         }
     }
 }
@@ -251,25 +318,32 @@ struct PoolWork<F> {
 
 impl<F> PoolWork<F> {
     fn run<T>(mut self, sender: oneshot::Sender<McpResult<T>>)
-    where F: FnOnce(&McpContext) -> McpResult<T>,
+    where
+        F: FnOnce(&McpContext) -> McpResult<T>,
     {
         // Contain every unwind before publication, not only the hook's own: a
         // guard's drop or a discarded result's `Drop` can unwind after the
         // handler ran. An unsent sender reads as `Closed`, which the caller
         // reports as a pool rejection, i.e. "never ran" (bd-dtg73).
         let result = catch_unwind(AssertUnwindSafe(|| {
-            self.charge.0.process.verify()
+            self.charge
+                .0
+                .process
+                .verify()
                 .map_err(|_| unavailable("blocking handler process changed"))?;
             let _blocking_lane = fastmcp_core::runtime::enter_blocking_lane();
             let _current = Cx::set_current(Some(self.context.cx().clone()));
-            let _worker_scope = bridge::WorkerScope::enter(
-                Arc::clone(&self.charge.0), self.context.clone(),
-            );
-            self.context.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            let _worker_scope =
+                bridge::WorkerScope::enter(Arc::clone(&self.charge.0), self.context.clone());
+            self.context
+                .checkpoint()
+                .map_err(|_| McpError::request_cancelled())?;
             let work = self.work.take().expect("pool work is invoked once");
             let result = catch_unwind(AssertUnwindSafe(|| work(&self.context)))
                 .map_err(|_| unavailable("blocking handler panicked; payload redacted"))?;
-            self.context.ensure_live().map_err(|_| McpError::request_cancelled())?;
+            self.context
+                .ensure_live()
+                .map_err(|_| McpError::request_cancelled())?;
             result
         }))
         .unwrap_or_else(|_| Err(unavailable("blocking handler panicked; payload redacted")));
@@ -279,16 +353,21 @@ impl<F> PoolWork<F> {
     }
 }
 
-fn unavailable(message: &'static str) -> McpError { McpError::internal_error(message) }
+fn unavailable(message: &'static str) -> McpError {
+    McpError::internal_error(message)
+}
 
 // One owned wait, not a retry loop. Request-local cancellation and runtime
 // cancellation each register a wake. The periodic check observes lease closure
 // and shared budget tightening even if no worker or socket makes progress.
 async fn wait<T>(ctx: &McpContext, operation: impl Future<Output = McpResult<T>>) -> McpResult<T> {
-    ctx.ensure_live().map_err(|_| McpError::request_cancelled())?;
+    ctx.ensure_live()
+        .map_err(|_| McpError::request_cancelled())?;
     let cx = ctx.cx();
     if !cx.capabilities().time || cx.timer_driver().is_none() {
-        return Err(unavailable("blocking handler wait requires caller-owned timers"));
+        return Err(unavailable(
+            "blocking handler wait requires caller-owned timers",
+        ));
     }
     let mut deadline = ctx.budget().deadline.map(|time| Box::pin(Sleep::new(time)));
     let mut tick = Box::pin(Sleep::new(cx.now().saturating_add_nanos(10_000_000)));
@@ -298,20 +377,29 @@ async fn wait<T>(ctx: &McpContext, operation: impl Future<Output = McpResult<T>>
     let mut operation = std::pin::pin!(operation);
     poll_fn(|task| {
         let _current = Cx::set_current(Some(cx.clone()));
-        ctx.ensure_live().map_err(|_| McpError::request_cancelled())?;
+        ctx.ensure_live()
+            .map_err(|_| McpError::request_cancelled())?;
         if request_cancelled.as_mut().poll(task).is_ready()
             || runtime_cancelled.as_mut().poll(task).is_ready()
-            || deadline.as_mut().is_some_and(|timer| timer.as_mut().poll(task).is_ready())
-        { return Poll::Ready(Err(McpError::request_cancelled())); }
+            || deadline
+                .as_mut()
+                .is_some_and(|timer| timer.as_mut().poll(task).is_ready())
+        {
+            return Poll::Ready(Err(McpError::request_cancelled()));
+        }
         let result = operation.as_mut().poll(task);
-        ctx.ensure_live().map_err(|_| McpError::request_cancelled())?;
-        if result.is_ready() { return result; }
+        ctx.ensure_live()
+            .map_err(|_| McpError::request_cancelled())?;
+        if result.is_ready() {
+            return result;
+        }
         if tick.as_mut().poll(task).is_ready() {
             tick = Box::pin(Sleep::new(cx.now().saturating_add_nanos(10_000_000)));
             let _ = tick.as_mut().poll(task);
         }
         Poll::Pending
-    }).await
+    })
+    .await
 }
 
 /// Opt-in offload for a synchronous `ToolHandler`, including exact final
@@ -331,22 +419,32 @@ pub struct BlockingTool<H> {
     resume_hook: Option<Arc<ToolResumeHook<H>>>,
 }
 
-type ToolResumeHook<H> = dyn Fn(
-    &H, &McpContext, Value, Option<&MrtrCompletedInputs>,
-) -> McpResult<FinalToolOutcome> + Send + Sync;
+type ToolResumeHook<H> = dyn Fn(&H, &McpContext, Value, Option<&MrtrCompletedInputs>) -> McpResult<FinalToolOutcome>
+    + Send
+    + Sync;
 
 impl<H: ToolHandler + 'static> BlockingTool<H> {
     /// Wraps synchronous local execution without changing catalog or schema
     /// admission. The shared lane must be supplied explicitly by the host.
     pub fn new(handler: H, lane: BlockingHandlerLane) -> McpResult<Self> {
-        if handler.execution_mode() != ToolExecutionMode::Blocking || handler.declares_final_mrtr() {
-            return Err(McpError::invalid_params("blocking tool requires synchronous non-resuming hooks"));
+        if handler.execution_mode() != ToolExecutionMode::Blocking || handler.declares_final_mrtr()
+        {
+            return Err(McpError::invalid_params(
+                "blocking tool requires synchronous non-resuming hooks",
+            ));
         }
         if handler.upstream_final_tool_schema_registration().is_some() {
-            return Err(McpError::invalid_params("blocking tool cannot replace an upstream proxy executor"));
+            return Err(McpError::invalid_params(
+                "blocking tool cannot replace an upstream proxy executor",
+            ));
         }
         let tasks = handler.declares_final_tasks();
-        Ok(Self { handler: Arc::new(handler), lane, tasks, resume_hook: None })
+        Ok(Self {
+            handler: Arc::new(handler),
+            lane,
+            tasks,
+            resume_hook: None,
+        })
     }
 
     /// Runs a synchronous, resumable modern tool on the caller's blocking pool.
@@ -366,49 +464,85 @@ impl<H: ToolHandler + 'static> BlockingTool<H> {
     /// Catalog, output-schema, timeout and Tasks declarations remain the original
     /// handler's. Declare Tasks support there before returning `CreateTask`.
     pub fn from_sync_resuming_hook<F>(
-        handler: H, lane: BlockingHandlerLane, hook: F,
+        handler: H,
+        lane: BlockingHandlerLane,
+        hook: F,
     ) -> McpResult<Self>
     where
-        F: Fn(&H, &McpContext, Value, Option<&MrtrCompletedInputs>)
-                -> McpResult<FinalToolOutcome> + Send + Sync + 'static,
+        F: Fn(&H, &McpContext, Value, Option<&MrtrCompletedInputs>) -> McpResult<FinalToolOutcome>
+            + Send
+            + Sync
+            + 'static,
     {
         if handler.execution_mode() != ToolExecutionMode::Blocking {
-            return Err(McpError::invalid_params("resuming blocking tool requires synchronous execution"));
+            return Err(McpError::invalid_params(
+                "resuming blocking tool requires synchronous execution",
+            ));
         }
         if handler.upstream_final_tool_schema_registration().is_some() {
-            return Err(McpError::invalid_params("blocking tool cannot replace an upstream proxy executor"));
+            return Err(McpError::invalid_params(
+                "blocking tool cannot replace an upstream proxy executor",
+            ));
         }
         let tasks = handler.declares_final_tasks();
-        Ok(Self { handler: Arc::new(handler), lane, tasks, resume_hook: Some(Arc::new(hook)) })
+        Ok(Self {
+            handler: Arc::new(handler),
+            lane,
+            tasks,
+            resume_hook: Some(Arc::new(hook)),
+        })
     }
 
-    fn legacy<'a>(&'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: Value)
-        -> BoxFuture<'a, McpOutcome<Vec<Content>>>
-    {
+    fn legacy<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        arguments: Value,
+    ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
         let handler = Arc::clone(&self.handler);
-        Box::pin(async move { outcome(self.lane.execute(ctx, cx, move |ctx| handler.call(ctx, arguments)).await) })
+        Box::pin(async move {
+            outcome(
+                self.lane
+                    .execute(ctx, cx, move |ctx| handler.call(ctx, arguments))
+                    .await,
+            )
+        })
     }
-    fn complete<'a>(&'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: Value)
-        -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCallToolResult>>>
-    {
+    fn complete<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        arguments: Value,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCallToolResult>>> {
         if self.resume_hook.is_some() {
-            return Box::pin(async { Outcome::Err(McpError::invalid_request(
-                "resuming blocking tool requires final outcome dispatch",
-            )) });
+            return Box::pin(async {
+                Outcome::Err(McpError::invalid_request(
+                    "resuming blocking tool requires final outcome dispatch",
+                ))
+            });
         }
         let handler = Arc::clone(&self.handler);
-        Box::pin(async move { outcome(self.lane.execute(ctx, cx, move |ctx| handler.call_final(ctx, arguments)).await) })
+        Box::pin(async move {
+            outcome(
+                self.lane
+                    .execute(ctx, cx, move |ctx| handler.call_final(ctx, arguments))
+                    .await,
+            )
+        })
     }
     fn final_outcome<'a>(
-        &'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: Value,
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        arguments: Value,
         resume: Option<&'a MrtrCompletedInputs>,
-    )
-        -> BoxFuture<'a, McpOutcome<FinalToolOutcome>>
-    {
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
         if resume.is_some() && self.resume_hook.is_none() {
-            return Box::pin(async { Outcome::Err(McpError::invalid_request(
-                "blocking tool has no synchronous resume hook",
-            )) });
+            return Box::pin(async {
+                Outcome::Err(McpError::invalid_request(
+                    "blocking tool has no synchronous resume hook",
+                ))
+            });
         }
         let handler = Arc::clone(&self.handler);
         let hook = self.resume_hook.clone();
@@ -418,73 +552,146 @@ impl<H: ToolHandler + 'static> BlockingTool<H> {
             // The async caller may disappear while its pool job is still on
             // the stack. Retain the admitted inputs, never a borrowed retry.
             let resume = resume.cloned();
-            outcome(self.lane.execute(ctx, cx, move |ctx| {
-                let result = match &hook {
-                    Some(hook) => hook(handler.as_ref(), ctx, arguments, resume.as_ref()),
-                    None => handler.call_final_outcome(ctx, arguments),
-                }?;
-                if hook.is_none() && matches!(&result, FinalToolOutcome::InputRequired(_)) {
-                    return Err(McpError::invalid_request("blocking tool has no synchronous resume hook"));
-                }
-                #[cfg(feature = "tasks")]
-                if matches!(&result, FinalToolOutcome::CreateTask { .. }) && !declares_tasks {
-                    return Err(McpError::invalid_request("blocking tool returned an undeclared Tasks outcome"));
-                }
-                Ok(result)
-            }).await)
+            outcome(
+                self.lane
+                    .execute(ctx, cx, move |ctx| {
+                        let result = match &hook {
+                            Some(hook) => hook(handler.as_ref(), ctx, arguments, resume.as_ref()),
+                            None => handler.call_final_outcome(ctx, arguments),
+                        }?;
+                        if hook.is_none() && matches!(&result, FinalToolOutcome::InputRequired(_)) {
+                            return Err(McpError::invalid_request(
+                                "blocking tool has no synchronous resume hook",
+                            ));
+                        }
+                        #[cfg(feature = "tasks")]
+                        if matches!(&result, FinalToolOutcome::CreateTask { .. }) && !declares_tasks
+                        {
+                            return Err(McpError::invalid_request(
+                                "blocking tool returned an undeclared Tasks outcome",
+                            ));
+                        }
+                        Ok(result)
+                    })
+                    .await,
+            )
         })
     }
 }
 
 fn outcome<T>(result: McpResult<T>) -> McpOutcome<T> {
-    match result { Ok(value) => Outcome::Ok(value), Err(error) => Outcome::Err(error) }
+    match result {
+        Ok(value) => Outcome::Ok(value),
+        Err(error) => Outcome::Err(error),
+    }
 }
 
 impl<H: ToolHandler + 'static> ToolHandler for BlockingTool<H> {
-    fn definition(&self) -> Tool { self.handler.definition() }
-    fn icon(&self) -> Option<&Icon> { self.handler.icon() }
-    fn version(&self) -> Option<&str> { self.handler.version() }
-    fn tags(&self) -> &[String] { self.handler.tags() }
-    fn annotations(&self) -> Option<&ToolAnnotations> { self.handler.annotations() }
-    fn output_schema(&self) -> Option<Value> { self.handler.output_schema() }
-    fn final_title(&self) -> Option<&str> { self.handler.final_title() }
-    fn final_icons(&self) -> Option<&[RawIcon]> { self.handler.final_icons() }
-    fn final_metadata(&self) -> Option<&OpenMetadata> { self.handler.final_metadata() }
-    fn final_definition(&self) -> Option<FinalTool> { self.handler.final_definition() }
+    fn definition(&self) -> Tool {
+        self.handler.definition()
+    }
+    fn icon(&self) -> Option<&Icon> {
+        self.handler.icon()
+    }
+    fn version(&self) -> Option<&str> {
+        self.handler.version()
+    }
+    fn tags(&self) -> &[String] {
+        self.handler.tags()
+    }
+    fn annotations(&self) -> Option<&ToolAnnotations> {
+        self.handler.annotations()
+    }
+    fn output_schema(&self) -> Option<Value> {
+        self.handler.output_schema()
+    }
+    fn final_title(&self) -> Option<&str> {
+        self.handler.final_title()
+    }
+    fn final_icons(&self) -> Option<&[RawIcon]> {
+        self.handler.final_icons()
+    }
+    fn final_metadata(&self) -> Option<&OpenMetadata> {
+        self.handler.final_metadata()
+    }
+    fn final_definition(&self) -> Option<FinalTool> {
+        self.handler.final_definition()
+    }
     fn header_exposure_reviews(&self) -> Vec<NonSensitiveHeaderExposure> {
         self.handler.header_exposure_reviews()
     }
     fn final_tool_error_structured_content(&self, kind: ToolErrorKind) -> Option<Value> {
         self.handler.final_tool_error_structured_content(kind)
     }
-    fn timeout(&self) -> Option<Duration> { self.handler.timeout() }
-    fn execution_mode(&self) -> ToolExecutionMode { ToolExecutionMode::Async }
-    fn declares_final_tasks(&self) -> bool { self.tasks }
-    fn declares_final_mrtr(&self) -> bool { self.resume_hook.is_some() }
+    fn timeout(&self) -> Option<Duration> {
+        self.handler.timeout()
+    }
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Async
+    }
+    fn declares_final_tasks(&self) -> bool {
+        self.tasks
+    }
+    fn declares_final_mrtr(&self) -> bool {
+        self.resume_hook.is_some()
+    }
 
     fn call(&self, _ctx: &McpContext, _arguments: Value) -> McpResult<Vec<Content>> {
-        Err(McpError::invalid_request("blocking tool requires asynchronous caller-owned dispatch"))
+        Err(McpError::invalid_request(
+            "blocking tool requires asynchronous caller-owned dispatch",
+        ))
     }
-    fn call_async<'a>(&'a self, ctx: &'a McpContext, arguments: Value) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
+    fn call_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: Value,
+    ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
         self.legacy(ctx, ctx.cx(), arguments)
     }
-    fn call_async_in_request<'a>(&'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: Value)
-        -> BoxFuture<'a, McpOutcome<Vec<Content>>>
-    { self.legacy(ctx, cx, arguments) }
-    fn call_final_async<'a>(&'a self, ctx: &'a McpContext, arguments: Value)
-        -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCallToolResult>>>
-    { self.complete(ctx, ctx.cx(), arguments) }
-    fn call_final_async_in_request<'a>(&'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: Value)
-        -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCallToolResult>>>
-    { self.complete(ctx, cx, arguments) }
-    fn call_final_outcome_async<'a>(&'a self, ctx: &'a McpContext, arguments: Value)
-        -> BoxFuture<'a, McpOutcome<FinalToolOutcome>>
-    { self.final_outcome(ctx, ctx.cx(), arguments, None) }
-    fn call_final_outcome_async_in_request<'a>(&'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: Value)
-        -> BoxFuture<'a, McpOutcome<FinalToolOutcome>>
-    { self.final_outcome(ctx, cx, arguments, None) }
+    fn call_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        arguments: Value,
+    ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
+        self.legacy(ctx, cx, arguments)
+    }
+    fn call_final_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: Value,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCallToolResult>>> {
+        self.complete(ctx, ctx.cx(), arguments)
+    }
+    fn call_final_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        arguments: Value,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCallToolResult>>> {
+        self.complete(ctx, cx, arguments)
+    }
+    fn call_final_outcome_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: Value,
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+        self.final_outcome(ctx, ctx.cx(), arguments, None)
+    }
+    fn call_final_outcome_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        arguments: Value,
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+        self.final_outcome(ctx, cx, arguments, None)
+    }
     fn call_final_outcome_async_resuming_in_request<'a>(
-        &'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: Value, resume: Option<&'a MrtrCompletedInputs>,
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        arguments: Value,
+        resume: Option<&'a MrtrCompletedInputs>,
     ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
         self.final_outcome(ctx, cx, arguments, resume)
     }
@@ -493,30 +700,50 @@ impl<H: ToolHandler + 'static> ToolHandler for BlockingTool<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use fastmcp_core::{SamplingRequest, SamplingResponse, SamplingSender};
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     mod rejection;
 
-    struct Echo { calls: Arc<AtomicUsize>, poller: std::thread::ThreadId }
+    struct Echo {
+        calls: Arc<AtomicUsize>,
+        poller: std::thread::ThreadId,
+    }
     impl ToolHandler for Echo {
         fn definition(&self) -> Tool {
-            Tool { name: "blocking_echo".into(), description: None,
-                input_schema: json!({"type":"object"}), output_schema: None,
-                icon: None, version: None, tags: vec![], annotations: None }
+            Tool {
+                name: "blocking_echo".into(),
+                description: None,
+                input_schema: json!({"type":"object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            }
         }
         fn call(&self, ctx: &McpContext, arguments: Value) -> McpResult<Vec<Content>> {
-            assert_ne!(std::thread::current().id(), self.poller, "user hook must not run on the poller");
+            assert_ne!(
+                std::thread::current().id(),
+                self.poller,
+                "user hook must not run on the poller"
+            );
             assert_eq!(ctx.request_id(), 7);
             assert_eq!(Cx::current().unwrap().task_id(), ctx.task_id());
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(vec![Content::Text { text: arguments.to_string() }])
+            Ok(vec![Content::Text {
+                text: arguments.to_string(),
+            }])
         }
     }
     fn runtime(pool: bool) -> asupersync::runtime::Runtime {
         let builder = asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap());
-        if pool { builder.blocking_threads(0, 2).build().unwrap() } else { builder.build().unwrap() }
+        if pool {
+            builder.blocking_threads(0, 2).build().unwrap()
+        } else {
+            builder.build().unwrap()
+        }
     }
 
     struct DrivenSampler {
@@ -535,15 +762,20 @@ mod tests {
             let requests = self.requests.lock().unwrap().take().unwrap();
             let mut replies = self.replies.lock().unwrap().take().unwrap();
             Box::pin(async move {
-                requests.send_blocking(request)
+                requests
+                    .send_blocking(request)
                     .map_err(|_| unavailable("test sampling request receiver closed"))?;
-                replies.recv(&self.cx).await
+                replies
+                    .recv(&self.cx)
+                    .await
                     .map_err(|_| unavailable("test sampling reply sender closed"))
             })
         }
     }
 
-    fn sampling_peer(cx: &Cx) -> (
+    fn sampling_peer(
+        cx: &Cx,
+    ) -> (
         Arc<DrivenSampler>,
         oneshot::Receiver<SamplingRequest>,
         oneshot::Sender<SamplingResponse>,
@@ -589,7 +821,9 @@ mod tests {
                 Some(lane) => lane.wait_for(request),
                 None => fastmcp_core::block_on(request),
             }?;
-            Ok(vec![Content::Text { text: response.text }])
+            Ok(vec![Content::Text {
+                text: response.text,
+            }])
         }
     }
 
@@ -615,16 +849,19 @@ mod tests {
                     lane: caller_owned.then(|| lane.clone()),
                 },
                 lane.clone(),
-            ).unwrap();
+            )
+            .unwrap();
             let mut call = Box::pin(tool.call_async(&context, json!({})));
             let mut requested = std::pin::pin!(received.recv(&cx));
             let mut reply = Some(reply);
-            let mut deadline = std::pin::pin!(Sleep::new(
-                cx.now().saturating_add_nanos(5_000_000_000),
-            ));
+            let mut deadline =
+                std::pin::pin!(Sleep::new(cx.now().saturating_add_nanos(5_000_000_000),));
             let result = poll_fn(|task| {
                 if let Poll::Ready(result) = call.as_mut().poll(task) {
-                    assert!(reply.is_none(), "sampling returned before its peer replied: {result:?}");
+                    assert!(
+                        reply.is_none(),
+                        "sampling returned before its peer replied: {result:?}"
+                    );
                     return Poll::Ready(result);
                 }
                 if reply.is_some() {
@@ -632,15 +869,23 @@ mod tests {
                         let request = request.unwrap();
                         assert_eq!(request.messages[0].text, "complete from peer");
                         assert_eq!(request.max_tokens, 17);
-                        reply.take().unwrap()
+                        reply
+                            .take()
+                            .unwrap()
                             .send_blocking(SamplingResponse::new("peer completion", "test-model"))
                             .unwrap();
                     }
                 }
-                assert!(deadline.as_mut().poll(task).is_pending(), "sampling exchange timed out");
+                assert!(
+                    deadline.as_mut().poll(task).is_pending(),
+                    "sampling exchange timed out"
+                );
                 Poll::Pending
-            }).await;
-            let Outcome::Ok(content) = result else { panic!("sampling must complete"); };
+            })
+            .await;
+            let Outcome::Ok(content) = result else {
+                panic!("sampling must complete");
+            };
             assert!(matches!(&content[0], Content::Text { text } if text == "peer completion"));
             assert_eq!(sampler.calls.load(Ordering::SeqCst), 1);
             assert_eq!(lane.in_flight().unwrap(), 0);
@@ -654,9 +899,13 @@ mod tests {
             let cx = Cx::current().unwrap();
             let (sampler, _received, _reply) = sampling_peer(&cx);
             let context = McpContext::new(cx, 7).with_sampling(sampler.clone());
-            let error = fastmcp_core::block_on(context.sample("complete from peer", 17))
-                .unwrap_err();
-            assert!(error.to_string().contains("Sampling cannot complete from here"));
+            let error =
+                fastmcp_core::block_on(context.sample("complete from peer", 17)).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Sampling cannot complete from here")
+            );
             assert_eq!(sampler.calls.load(Ordering::SeqCst), 0);
             assert!(context.ensure_live().is_ok());
         });
@@ -667,28 +916,35 @@ mod tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
             .blocking_threads(1, 1)
-            .build().unwrap();
+            .build()
+            .unwrap();
         runtime.block_on(async {
             let cx = Cx::current().unwrap();
             let context = McpContext::new(cx.clone(), 7);
             let lane = BlockingHandlerLane::new(1).unwrap();
             for panics in [false, true] {
-                let result = lane.execute(&context, &cx, move |_| {
-                    assert!(!fastmcp_core::block_on(async {
-                        fastmcp_core::runtime::bridge_would_starve_its_driver()
-                    }));
-                    if panics { panic!("test blocking lane unwind"); }
-                    Ok(())
-                }).await;
+                let result = lane
+                    .execute(&context, &cx, move |_| {
+                        assert!(!fastmcp_core::block_on(async {
+                            fastmcp_core::runtime::bridge_would_starve_its_driver()
+                        }));
+                        if panics {
+                            panic!("test blocking lane unwind");
+                        }
+                        Ok(())
+                    })
+                    .await;
                 assert_eq!(result.is_err(), panics);
                 // The same one-thread pool now runs unrelated work. A leaked
                 // lane declaration would wrongly authorize a later bridge.
-                let mut probe = cx.spawn_blocking(|worker_cx| {
-                    let _current = Cx::set_current(Some(worker_cx));
-                    fastmcp_core::block_on(async {
-                        fastmcp_core::runtime::bridge_would_starve_its_driver()
+                let mut probe = cx
+                    .spawn_blocking(|worker_cx| {
+                        let _current = Cx::set_current(Some(worker_cx));
+                        fastmcp_core::block_on(async {
+                            fastmcp_core::runtime::bridge_would_starve_its_driver()
+                        })
                     })
-                }).unwrap();
+                    .unwrap();
                 assert!(probe.join(&cx).await.unwrap());
                 assert_eq!(lane.in_flight().unwrap(), 0);
             }
@@ -702,16 +958,32 @@ mod tests {
             let context = McpContext::new(cx.clone(), 7);
             let calls = Arc::new(AtomicUsize::new(0));
             let lane = BlockingHandlerLane::new(2).unwrap();
-            let tool = BlockingTool::new(Echo { calls: Arc::clone(&calls), poller: std::thread::current().id() }, lane.clone()).unwrap();
+            let tool = BlockingTool::new(
+                Echo {
+                    calls: Arc::clone(&calls),
+                    poller: std::thread::current().id(),
+                },
+                lane.clone(),
+            )
+            .unwrap();
             assert_eq!(tool.execution_mode(), ToolExecutionMode::Async);
             assert!(tool.call(&context, json!({})).is_err());
             assert_eq!(calls.load(Ordering::SeqCst), 0);
-            assert!(matches!(tool.call_async(&context, json!({"value":1})).await, Outcome::Ok(_)));
-            let Outcome::Ok(FinalToolOutcome::Complete(result)) = tool.call_final_outcome_async_in_request(
-                &context, &cx, json!({"value":2}),
-            ).await else { panic!("final hook must produce a real complete result"); };
-            let fastmcp_protocol::common_types::ContentBlock::Text { text, .. } = &result.payload.content[0]
-                else { panic!("legacy content must retain its final text form"); };
+            assert!(matches!(
+                tool.call_async(&context, json!({"value":1})).await,
+                Outcome::Ok(_)
+            ));
+            let Outcome::Ok(FinalToolOutcome::Complete(result)) = tool
+                .call_final_outcome_async_in_request(&context, &cx, json!({"value":2}))
+                .await
+            else {
+                panic!("final hook must produce a real complete result");
+            };
+            let fastmcp_protocol::common_types::ContentBlock::Text { text, .. } =
+                &result.payload.content[0]
+            else {
+                panic!("legacy content must retain its final text form");
+            };
             assert_eq!(text, r#"{"value":2}"#);
             assert_eq!(calls.load(Ordering::SeqCst), 2);
             assert_eq!(lane.in_flight().unwrap(), 0);
@@ -726,10 +998,23 @@ mod tests {
                 let context = McpContext::new(cx, 7);
                 let calls = Arc::new(AtomicUsize::new(0));
                 let lane = BlockingHandlerLane::new(1).unwrap();
-                if pool { lane.close().unwrap(); }
-                else { assert!(context.cx().blocking_pool_handle().is_none()); }
-                let tool = BlockingTool::new(Echo { calls: Arc::clone(&calls), poller: std::thread::current().id() }, lane.clone()).unwrap();
-                assert!(matches!(tool.call_async(&context, json!({})).await, Outcome::Err(_)));
+                if pool {
+                    lane.close().unwrap();
+                } else {
+                    assert!(context.cx().blocking_pool_handle().is_none());
+                }
+                let tool = BlockingTool::new(
+                    Echo {
+                        calls: Arc::clone(&calls),
+                        poller: std::thread::current().id(),
+                    },
+                    lane.clone(),
+                )
+                .unwrap();
+                assert!(matches!(
+                    tool.call_async(&context, json!({})).await,
+                    Outcome::Err(_)
+                ));
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
                 assert_eq!(lane.in_flight().unwrap(), 0);
             });
@@ -748,9 +1033,13 @@ mod tests {
 
     fn pool_admission_probe(rejected: bool) {
         let pool = asupersync::runtime::BlockingPool::new(0, 1);
-        if rejected { pool.shutdown(); }
+        if rejected {
+            pool.shutdown();
+        }
         runtime(false).block_on(async {
-            let cx = Cx::current().unwrap().with_blocking_pool_handle(Some(pool.handle()));
+            let cx = Cx::current()
+                .unwrap()
+                .with_blocking_pool_handle(Some(pool.handle()));
             let (sampler, _received, _reply) = sampling_peer(&cx);
             let context = McpContext::new(cx.clone(), 7).with_sampling(sampler.clone());
             let lane = BlockingHandlerLane::new(1).unwrap();
@@ -759,22 +1048,26 @@ mod tests {
             let observed = Arc::clone(&calls);
             let poller = std::thread::current().id();
             let parent_task = cx.task_id();
-            let result = lane.execute(&context, &cx, move |worker_ctx| {
-                observed.fetch_add(1, Ordering::SeqCst);
-                assert_ne!(std::thread::current().id(), poller);
-                assert_ne!(worker_ctx.task_id(), parent_task);
-                assert_eq!(worker_ctx.request_id(), 7);
-                admitted.wait_for(async {
-                    assert_eq!(Cx::current().unwrap().task_id(), worker_ctx.task_id());
-                    Ok(81)
+            let result = lane
+                .execute(&context, &cx, move |worker_ctx| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    assert_ne!(std::thread::current().id(), poller);
+                    assert_ne!(worker_ctx.task_id(), parent_task);
+                    assert_eq!(worker_ctx.request_id(), 7);
+                    admitted.wait_for(async {
+                        assert_eq!(Cx::current().unwrap().task_id(), worker_ctx.task_id());
+                        Ok(81)
+                    })
                 })
-            }).await;
+                .await;
             if rejected {
                 let error = result.unwrap_err();
                 assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
-                assert!(error.to_string().contains(
-                    "blocking handler admission to caller blocking pool failed",
-                ));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("blocking handler admission to caller blocking pool failed",)
+                );
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
             } else {
                 assert_eq!(result.unwrap(), 81);
@@ -784,10 +1077,20 @@ mod tests {
             // Neither outcome grants the driver a worker-only wait bridge or
             // permission to block a sampling request's own response pump.
             let polls = AtomicUsize::new(0);
-            assert!(lane.wait_for(async { polls.fetch_add(1, Ordering::SeqCst); Ok(()) }).is_err());
+            assert!(
+                lane.wait_for(async {
+                    polls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .is_err()
+            );
             assert_eq!(polls.load(Ordering::SeqCst), 0);
             let error = fastmcp_core::block_on(context.sample("must not send", 17)).unwrap_err();
-            assert!(error.to_string().contains("Sampling cannot complete from here"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("Sampling cannot complete from here")
+            );
             assert_eq!(sampler.calls.load(Ordering::SeqCst), 0);
             assert!(context.ensure_live().is_ok());
         });
@@ -801,15 +1104,18 @@ mod tests {
         let (release, blocked) = std::sync::mpsc::sync_channel::<()>(1);
         let occupying = pool.spawn(move || {
             started.send(()).unwrap();
-            blocked.recv_timeout(Duration::from_secs(5)).expect("test releases its occupying worker");
+            blocked
+                .recv_timeout(Duration::from_secs(5))
+                .expect("test releases its occupying worker");
         });
         entered.recv_timeout(Duration::from_secs(5)).unwrap();
         runtime(false).block_on(async {
-            let cx = Cx::current().unwrap().with_blocking_pool_handle(Some(pool.handle()));
+            let cx = Cx::current()
+                .unwrap()
+                .with_blocking_pool_handle(Some(pool.handle()));
             let context = McpContext::new(cx.clone(), 7);
-            let sibling = McpContext::new(cx.clone(), 8).with_operation_deadline(Some(
-                cx.now().saturating_add_nanos(5_000_000_000),
-            ));
+            let sibling = McpContext::new(cx.clone(), 8)
+                .with_operation_deadline(Some(cx.now().saturating_add_nanos(5_000_000_000)));
             let lane = BlockingHandlerLane::new(1).unwrap();
             let calls = Arc::new(AtomicUsize::new(0));
             let observed = Arc::clone(&calls);
@@ -817,30 +1123,38 @@ mod tests {
                 observed.fetch_add(1, Ordering::SeqCst);
                 Ok(21)
             }));
-            let mut deadline = std::pin::pin!(Sleep::new(
-                cx.now().saturating_add_nanos(5_000_000_000),
-            ));
-            let mut admission_tick = Box::pin(Sleep::new(
-                cx.now().saturating_add_nanos(1_000_000),
-            ));
+            let mut deadline =
+                std::pin::pin!(Sleep::new(cx.now().saturating_add_nanos(5_000_000_000),));
+            let mut admission_tick = Box::pin(Sleep::new(cx.now().saturating_add_nanos(1_000_000)));
             poll_fn(|task| {
                 assert!(call.as_mut().poll(task).is_pending());
-                assert!(deadline.as_mut().poll(task).is_pending(), "pool admission timed out");
-                if pool.pending_count() == 1 { return Poll::Ready(()); }
+                assert!(
+                    deadline.as_mut().poll(task).is_pending(),
+                    "pool admission timed out"
+                );
+                if pool.pending_count() == 1 {
+                    return Poll::Ready(());
+                }
                 if admission_tick.as_mut().poll(task).is_ready() {
-                    admission_tick = Box::pin(Sleep::new(
-                        cx.now().saturating_add_nanos(1_000_000),
-                    ));
+                    admission_tick = Box::pin(Sleep::new(cx.now().saturating_add_nanos(1_000_000)));
                     let _ = admission_tick.as_mut().poll(task);
                 }
                 Poll::Pending
-            }).await;
+            })
+            .await;
             context.request_cancellation().cancel();
             let error = call.await.unwrap_err();
             assert_eq!(error.code, fastmcp_core::McpErrorCode::RequestCancelled);
-            assert_eq!(lane.in_flight().unwrap(), 1, "queued work still owns its reservation");
+            assert_eq!(
+                lane.in_flight().unwrap(),
+                1,
+                "queued work still owns its reservation"
+            );
             assert!(lane.execute(&sibling, &cx, |_| Ok(22)).await.is_err());
-            assert!(cx.checkpoint().is_ok(), "cancelling the child must not cancel its caller");
+            assert!(
+                cx.checkpoint().is_ok(),
+                "cancelling the child must not cancel its caller"
+            );
             release.send(()).unwrap();
             lane.wait_idle(&sibling).await.unwrap();
             assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -866,23 +1180,48 @@ mod tests {
             let mut call = Box::pin(lane.execute(&context, context.cx(), move |_| {
                 observed.fetch_add(1, Ordering::SeqCst);
                 let _ = started.send_blocking(());
-                blocked.recv_timeout(Duration::from_secs(5)).expect("test releases its blocking worker");
+                blocked
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("test releases its blocking worker");
                 Ok(41)
             }));
-            poll_fn(|task| { assert!(call.as_mut().poll(task).is_pending()); Poll::Ready(()) }).await;
+            poll_fn(|task| {
+                assert!(call.as_mut().poll(task).is_pending());
+                Poll::Ready(())
+            })
+            .await;
             entered.recv(context.cx()).await.unwrap();
             context.request_cancellation().cancel();
             assert!(call.await.is_err());
-            assert_eq!(lane.in_flight().unwrap(), 1, "cancel does not manufacture free worker capacity");
-            assert!(lane.execute(&sibling, sibling.cx(), |_| Ok(42)).await.is_err());
+            assert_eq!(
+                lane.in_flight().unwrap(),
+                1,
+                "cancel does not manufacture free worker capacity"
+            );
+            assert!(
+                lane.execute(&sibling, sibling.cx(), |_| Ok(42))
+                    .await
+                    .is_err()
+            );
             assert!(sibling.ensure_live().is_ok());
             release.send(()).unwrap();
-            let shutdown = sibling.clone().with_operation_deadline(Some(sibling.cx().now().saturating_add_nanos(5_000_000_000)));
+            let shutdown = sibling.clone().with_operation_deadline(Some(
+                sibling.cx().now().saturating_add_nanos(5_000_000_000),
+            ));
             lane.wait_idle(&shutdown).await.unwrap();
-            assert_eq!(lane.execute(&sibling, sibling.cx(), |_| Ok(42)).await.unwrap(), 42);
+            assert_eq!(
+                lane.execute(&sibling, sibling.cx(), |_| Ok(42))
+                    .await
+                    .unwrap(),
+                42
+            );
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             lane.close().unwrap();
-            assert!(lane.execute(&sibling, sibling.cx(), |_| Ok(43)).await.is_err());
+            assert!(
+                lane.execute(&sibling, sibling.cx(), |_| Ok(43))
+                    .await
+                    .is_err()
+            );
         });
     }
 
@@ -891,17 +1230,29 @@ mod tests {
         runtime(true).block_on(async {
             let context = McpContext::new(Cx::current().unwrap(), 7);
             let lane = BlockingHandlerLane::new(1).unwrap();
-            let error = lane.execute::<(), _>(&context, context.cx(), |_| panic!("private-handler-panic-canary")).await.unwrap_err();
+            let error = lane
+                .execute::<(), _>(&context, context.cx(), |_| {
+                    panic!("private-handler-panic-canary")
+                })
+                .await
+                .unwrap_err();
             assert!(!format!("{error:?}").contains("private-handler-panic-canary"));
             assert_eq!(lane.in_flight().unwrap(), 0);
-            assert_eq!(lane.execute(&context, context.cx(), |_| Ok(9)).await.unwrap(), 9);
+            assert_eq!(
+                lane.execute(&context, context.cx(), |_| Ok(9))
+                    .await
+                    .unwrap(),
+                9
+            );
         });
     }
 
     struct DropCanary(bool);
     impl Drop for DropCanary {
         fn drop(&mut self) {
-            if self.0 { panic!("private-result-drop-canary"); }
+            if self.0 {
+                panic!("private-result-drop-canary");
+            }
         }
     }
 
@@ -921,16 +1272,22 @@ mod tests {
                 charge: lane.reserve().unwrap(),
                 _completion: PoolCompletionGuard(Arc::new(PoolCompletion::default())),
             };
-            assert!(catch_unwind(AssertUnwindSafe(|| job.run(sender))).is_ok(),
-                "an unwind before publication must not escape the pool closure");
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| job.run(sender))).is_ok(),
+                "an unwind before publication must not escape the pool closure"
+            );
             assert_eq!(lane.in_flight().unwrap(), 0);
-            receiver.try_recv().expect("the admitted job must publish a result, not close its sender")
+            receiver
+                .try_recv()
+                .expect("the admitted job must publish a result, not close its sender")
         })
     }
 
     #[test]
     fn unwind_after_the_handler_ran_is_published_as_a_panic_not_a_rejection() {
-        let Err(error) = discarded_result_publication(true) else { panic!("the job was cancelled") };
+        let Err(error) = discarded_result_publication(true) else {
+            panic!("the job was cancelled")
+        };
         assert_eq!(error.message, "blocking handler panicked; payload redacted");
         assert!(!format!("{error:?}").contains("private-result-drop-canary"));
     }
@@ -939,7 +1296,9 @@ mod tests {
     fn quietly_discarded_result_is_published_as_the_cancellation() {
         // Differs from the panic case only in whether the discarded value's
         // Drop unwinds.
-        let Err(error) = discarded_result_publication(false) else { panic!("the job was cancelled") };
+        let Err(error) = discarded_result_publication(false) else {
+            panic!("the job was cancelled")
+        };
         assert_eq!(error.code, fastmcp_core::McpErrorCode::RequestCancelled);
     }
 

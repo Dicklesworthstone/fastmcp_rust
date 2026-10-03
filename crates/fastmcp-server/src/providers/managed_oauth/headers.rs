@@ -23,8 +23,8 @@ use fastmcp_protocol::http_headers::ParameterHeaderBinding;
 use fastmcp_protocol::{CoreRequest, CoreResult, FinalCoreResult, FinalTool, RequestId};
 
 use super::{
-    BoxFuture, CoreBackend, Forwarder, ManagedOAuthProvider, ManagedOAuthTool,
-    UNEXPECTED_RESULT, check_cx, forward_notification, upstream_error,
+    BoxFuture, CoreBackend, Forwarder, ManagedOAuthProvider, ManagedOAuthTool, UNEXPECTED_RESULT,
+    check_cx, forward_notification, upstream_error,
 };
 
 const HEADER_FAILURE: &str = "Managed OAuth tool header review or projection failed";
@@ -64,9 +64,13 @@ fn review_tools(
         let mut upstream = tool.definition.clone();
         upstream.name.clone_from(&tool.upstream_name);
         let reviewed = ReviewedToolHeaders::new(
-            resource.clone(), upstream.name.clone(), upstream.input_schema.clone(),
+            resource.clone(),
+            upstream.name.clone(),
+            upstream.input_schema.clone(),
             |binding| {
-                if check_cx(cx).is_err() { return false; }
+                if check_cx(cx).is_err() {
+                    return false;
+                }
                 let approved = review(&upstream, binding);
                 approved && check_cx(cx).is_ok()
             },
@@ -111,25 +115,42 @@ struct ReviewedNativeBackend {
 
 impl CoreBackend for ReviewedNativeBackend {
     fn execute<'a>(
-        &'a self, ctx: &'a McpContext, cx: &'a Cx, request: CoreRequest,
-        id: RequestId, limits: ManagedCoreLimits,
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        request: CoreRequest,
+        id: RequestId,
+        limits: ManagedCoreLimits,
     ) -> BoxFuture<'a, McpResult<FinalCoreResult>> {
         Box::pin(async move {
             ctx.checkpoint()?;
             check_cx(cx)?;
             let cancellation = ctx.request_cancellation();
-            let mut call = self.session.request_tool_with_headers_and_cancellation(
-                cx, &cancellation, request, id, &self.reviewed, limits,
-            ).await.map_err(header_error)?;
+            let mut call = self
+                .session
+                .request_tool_with_headers_and_cancellation(
+                    cx,
+                    &cancellation,
+                    request,
+                    id,
+                    &self.reviewed,
+                    limits,
+                )
+                .await
+                .map_err(header_error)?;
             while let Some(event) = call.next_event(cx).await.map_err(upstream_error)? {
                 ctx.checkpoint()?;
                 check_cx(cx)?;
                 match event {
-                    ManagedCoreEvent::Result(result) => return match *result {
-                        CoreResult::Final(result) => Ok(result),
-                        _ => Err(McpError::invalid_request(UNEXPECTED_RESULT)),
-                    },
-                    ManagedCoreEvent::Notification(notification) => forward_notification(ctx, *notification)?,
+                    ManagedCoreEvent::Result(result) => {
+                        return match *result {
+                            CoreResult::Final(result) => Ok(result),
+                            _ => Err(McpError::invalid_request(UNEXPECTED_RESULT)),
+                        };
+                    }
+                    ManagedCoreEvent::Notification(notification) => {
+                        forward_notification(ctx, *notification)?
+                    }
                 }
             }
             Err(McpError::invalid_request(UNEXPECTED_RESULT))

@@ -19,13 +19,14 @@ use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::RequestId;
 use fastmcp_protocol::tasks_extension::{Task, TaskId};
 
+use super::recovery::{
+    ManagedTaskRecoveryError, ManagedTaskRecoveryPolicy, RecoveringManagedTaskWatch,
+};
 use super::{
     ManagedTaskEvent, ManagedTaskRequest, ManagedTaskRequestIds, ManagedTaskSnapshot,
     ManagedTaskWatch, ManagedTaskWatchError, ManagedTaskWatchPolicy, ManagedTasksClient,
-    ManagedTasksError, OAuthCredentialSnapshot, OAuthSessionError, WatchIds, deadline_after, prepare,
-};
-use super::recovery::{
-    ManagedTaskRecoveryError, ManagedTaskRecoveryPolicy, RecoveringManagedTaskWatch,
+    ManagedTasksError, OAuthCredentialSnapshot, OAuthSessionError, WatchIds, deadline_after,
+    prepare,
 };
 
 const LIVE: u8 = 0;
@@ -61,9 +62,13 @@ impl fmt::Display for TaskCancellationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Closed => f.write_str("Task cancellation observation owner is closed"),
-            Self::AlreadyAttempted => f.write_str("Task cancellation was already attempted; it will not be replayed"),
+            Self::AlreadyAttempted => {
+                f.write_str("Task cancellation was already attempted; it will not be replayed")
+            }
             Self::NotAttempted(error) => write!(f, "Task cancellation did not start: {error}"),
-            Self::Unconfirmed(error) => write!(f, "Task cancellation acknowledgement is unknown: {error}"),
+            Self::Unconfirmed(error) => {
+                write!(f, "Task cancellation acknowledgement is unknown: {error}")
+            }
         }
     }
 }
@@ -83,7 +88,9 @@ pub enum CancellableTaskWatchError {
 impl fmt::Display for CancellableTaskWatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CancellationRequested => f.write_str("Task cancellation acknowledged; high-level observation stopped"),
+            Self::CancellationRequested => {
+                f.write_str("Task cancellation acknowledged; high-level observation stopped")
+            }
             Self::Closed => f.write_str("cancellable Task watch is closed"),
             Self::Watch(error) => error.fmt(f),
             Self::Recovery(error) => error.fmt(f),
@@ -93,10 +100,14 @@ impl fmt::Display for CancellableTaskWatchError {
 }
 impl std::error::Error for CancellableTaskWatchError {}
 impl From<ManagedTaskWatchError> for CancellableTaskWatchError {
-    fn from(error: ManagedTaskWatchError) -> Self { Self::Watch(error) }
+    fn from(error: ManagedTaskWatchError) -> Self {
+        Self::Watch(error)
+    }
 }
 impl From<ManagedTasksError> for CancellableTaskWatchError {
-    fn from(error: ManagedTasksError) -> Self { Self::Watch(error.into()) }
+    fn from(error: ManagedTasksError) -> Self {
+        Self::Watch(error.into())
+    }
 }
 impl From<ManagedTaskRecoveryError> for CancellableTaskWatchError {
     fn from(error: ManagedTaskRecoveryError) -> Self {
@@ -107,7 +118,9 @@ impl From<ManagedTaskRecoveryError> for CancellableTaskWatchError {
     }
 }
 impl From<OAuthSessionError> for CancellableTaskWatchError {
-    fn from(error: OAuthSessionError) -> Self { Self::Session(error) }
+    fn from(error: OAuthSessionError) -> Self {
+        Self::Session(error)
+    }
 }
 
 struct Control {
@@ -119,8 +132,10 @@ struct Control {
 impl Control {
     fn new() -> Self {
         Self {
-            completion: AtomicU8::new(LIVE), attempt: AtomicU8::new(READY),
-            acknowledged: McpRequestCancellation::new(), closed: McpRequestCancellation::new(),
+            completion: AtomicU8::new(LIVE),
+            attempt: AtomicU8::new(READY),
+            acknowledged: McpRequestCancellation::new(),
+            closed: McpRequestCancellation::new(),
         }
     }
 
@@ -128,7 +143,8 @@ impl Control {
         if self.completion.load(Ordering::Acquire) != LIVE {
             return Err(TaskCancellationError::Closed);
         }
-        self.attempt.compare_exchange(READY, UNCONFIRMED, Ordering::AcqRel, Ordering::Acquire)
+        self.attempt
+            .compare_exchange(READY, UNCONFIRMED, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| TaskCancellationError::AlreadyAttempted)?;
         Ok(())
     }
@@ -146,22 +162,38 @@ impl Control {
         // Retain the receipt even when a previously selected terminal or close
         // wins the observation race. A later lifetime check cannot erase it.
         self.attempt.store(ACKNOWLEDGED, Ordering::Release);
-        if self.completion.compare_exchange(LIVE, CANCEL_REQUESTED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        if self
+            .completion
+            .compare_exchange(LIVE, CANCEL_REQUESTED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
             self.acknowledged.cancel();
         }
     }
 
     fn terminal(&self) -> Result<(), CancellableTaskWatchError> {
-        self.completion.compare_exchange(LIVE, TERMINAL_DELIVERED, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|state| if state == CANCEL_REQUESTED {
-                CancellableTaskWatchError::CancellationRequested
-            } else { CancellableTaskWatchError::Closed })?;
+        self.completion
+            .compare_exchange(
+                LIVE,
+                TERMINAL_DELIVERED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|state| {
+                if state == CANCEL_REQUESTED {
+                    CancellableTaskWatchError::CancellationRequested
+                } else {
+                    CancellableTaskWatchError::Closed
+                }
+            })?;
         self.closed.cancel();
         Ok(())
     }
 
     fn close(&self) {
-        let _ = self.completion.compare_exchange(LIVE, CLOSED, Ordering::AcqRel, Ordering::Acquire);
+        let _ = self
+            .completion
+            .compare_exchange(LIVE, CLOSED, Ordering::AcqRel, Ordering::Acquire);
         self.closed.cancel();
     }
 }
@@ -188,33 +220,53 @@ pub struct ManagedTaskCancelHandle {
 }
 impl fmt::Debug for ManagedTaskCancelHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ManagedTaskCancelHandle").field("state", &self.state()).finish_non_exhaustive()
+        f.debug_struct("ManagedTaskCancelHandle")
+            .field("state", &self.state())
+            .finish_non_exhaustive()
     }
 }
 impl ManagedTaskCancelHandle {
-    pub fn state(&self) -> TaskCancellationState { self.scope.control.state() }
+    pub fn state(&self) -> TaskCancellationState {
+        self.scope.control.state()
+    }
 
     // Shared by plain/recovering and persistence-gated owners. This is local
     // preparation only: callers publish the handle AFTER successful admission.
     // The owner must close this scope on drop and arm a lease for each read.
     pub(super) fn for_observation(
-        client: &ManagedTasksClient, task_id: TaskId, prefix: &str,
-        cancellation: &McpRequestCancellation, deadline: Time,
+        client: &ManagedTasksClient,
+        task_id: TaskId,
+        prefix: &str,
+        cancellation: &McpRequestCancellation,
+        deadline: Time,
     ) -> Result<Self, CancellableTaskWatchError> {
         let ids = cancellation_ids(prefix)?;
-        let prepared = prepare(client.session.resource().as_str(), &client.metadata, &ids.operation,
-            ManagedTaskRequest::Cancel(task_id.clone()), client.limits)?;
+        let prepared = prepare(
+            client.session.resource().as_str(),
+            &client.metadata,
+            &ids.operation,
+            ManagedTaskRequest::Cancel(task_id.clone()),
+            client.limits,
+        )?;
         let _ = client.prepare_round(ids.clone(), prepared)?;
-        Ok(Self { scope: Arc::new(CancelScope {
-            control: Arc::new(Control::new()), client: client.clone(), task_id,
-            ids, cancellation: cancellation.clone(), deadline, pinned_credential: None,
-        }) })
+        Ok(Self {
+            scope: Arc::new(CancelScope {
+                control: Arc::new(Control::new()),
+                client: client.clone(),
+                task_id,
+                ids,
+                cancellation: cancellation.clone(),
+                deadline,
+                pinned_credential: None,
+            }),
+        })
     }
 
     // Install only during admission, before the scope is shared or usable. No
     // public method can swap credentials beneath a pending cancellation.
     pub(super) fn pin_credential(
-        &mut self, credential: Arc<OAuthCredentialSnapshot>,
+        &mut self,
+        credential: Arc<OAuthCredentialSnapshot>,
     ) -> Result<(), CancellableTaskWatchError> {
         let scope = Arc::get_mut(&mut self.scope).ok_or(CancellableTaskWatchError::Closed)?;
         scope.pinned_credential = Some(credential);
@@ -225,7 +277,9 @@ impl ManagedTaskCancelHandle {
         self.scope.control.completion.load(Ordering::Acquire) == CANCEL_REQUESTED
     }
 
-    pub(super) fn close_observation(&self) { self.scope.control.close(); }
+    pub(super) fn close_observation(&self) {
+        self.scope.control.close();
+    }
 
     // Select only after the enclosing owner's complete snapshot admission.
     // Persisted owners validate saved controls BEFORE electing the terminal.
@@ -234,22 +288,28 @@ impl ManagedTaskCancelHandle {
     }
 
     pub(super) fn read_lease(&self) -> ReadLease {
-        ReadLease { control: Arc::clone(&self.scope.control), armed: true }
+        ReadLease {
+            control: Arc::clone(&self.scope.control),
+            armed: true,
+        }
     }
 
     // Also wraps persistence, not just network reads. A dropped/failed save is
     // not a rollback receipt; the enclosing owner retains its pending change.
     pub(super) async fn until_acknowledged<T>(
-        &self, work: impl Future<Output = T>,
+        &self,
+        work: impl Future<Output = T>,
     ) -> Result<T, CancellableTaskWatchError> {
-        until_signal(&self.scope.control.acknowledged, work).await
+        until_signal(&self.scope.control.acknowledged, work)
+            .await
             .map_err(|()| CancellableTaskWatchError::CancellationRequested)
     }
 
     /// Request remote cancellation while another caller polls next_snapshot.
     /// Success records an ACK only. No remote terminal or rollback is implied.
     pub async fn request_cancel(&self, cx: &Cx) -> Result<(), TaskCancellationError> {
-        self.request_cancel_with_cancellation(cx, &McpRequestCancellation::new()).await
+        self.request_cancel_with_cancellation(cx, &McpRequestCancellation::new())
+            .await
     }
 
     /// The supplied token cancels ONLY this attempt's wait; the original watch
@@ -268,7 +328,9 @@ impl ManagedTaskCancelHandle {
     /// An ACK admitted before that wake is returned as acknowledged even if a
     /// final outer lifetime check loses the race; inspect state after any drop.
     pub async fn request_cancel_with_cancellation(
-        &self, cx: &Cx, cancellation: &McpRequestCancellation,
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
     ) -> Result<(), TaskCancellationError> {
         let scope = &self.scope;
         if scope.control.state() != TaskCancellationState::Ready {
@@ -285,37 +347,79 @@ impl ManagedTaskCancelHandle {
                     return Err(OAuthSessionError::LoginRequired);
                 }
             }
-            let deadline = scope.deadline.min(deadline_after(cx, scope.client.limits.timeout)?);
-            if cx.now() >= deadline { return Err(OAuthSessionError::TimedOut); }
+            let deadline = scope
+                .deadline
+                .min(deadline_after(cx, scope.client.limits.timeout)?);
+            if cx.now() >= deadline {
+                return Err(OAuthSessionError::TimedOut);
+            }
             Ok(deadline)
-        })().map_err(|error| TaskCancellationError::NotAttempted(error.into()))?;
+        })()
+        .map_err(|error| TaskCancellationError::NotAttempted(error.into()))?;
         scope.control.claim()?;
-        let expiry = scope.pinned_credential.as_ref().map(|credential| credential.expires_at);
-        let attempted = Box::pin(scope.client.session.await_active(cx, &scope.cancellation, deadline, expiry, async {
-            Ok(async {
-                let mut call = match scope.pinned_credential.as_deref() {
-                    Some(credential) => {
-                        let prepared = prepare(scope.client.session.resource().as_str(), &scope.client.metadata,
-                            &scope.ids.operation, ManagedTaskRequest::Cancel(scope.task_id.clone()), scope.client.limits)?;
-                        let round = scope.client.prepare_round(scope.ids.clone(), prepared)?;
-                        scope.client.execute_round(cx, cancellation, round, credential,
-                            deadline, scope.client.limits.records).await?
+        let expiry = scope
+            .pinned_credential
+            .as_ref()
+            .map(|credential| credential.expires_at);
+        let attempted = Box::pin(scope.client.session.await_active(
+            cx,
+            &scope.cancellation,
+            deadline,
+            expiry,
+            async {
+                Ok(async {
+                    let mut call = match scope.pinned_credential.as_deref() {
+                        Some(credential) => {
+                            let prepared = prepare(
+                                scope.client.session.resource().as_str(),
+                                &scope.client.metadata,
+                                &scope.ids.operation,
+                                ManagedTaskRequest::Cancel(scope.task_id.clone()),
+                                scope.client.limits,
+                            )?;
+                            let round = scope.client.prepare_round(scope.ids.clone(), prepared)?;
+                            scope
+                                .client
+                                .execute_round(
+                                    cx,
+                                    cancellation,
+                                    round,
+                                    credential,
+                                    deadline,
+                                    scope.client.limits.records,
+                                )
+                                .await?
+                        }
+                        None => {
+                            scope
+                                .client
+                                .request_with_cancellation(
+                                    cx,
+                                    cancellation,
+                                    scope.ids.clone(),
+                                    ManagedTaskRequest::Cancel(scope.task_id.clone()),
+                                )
+                                .await?
+                        }
+                    };
+                    if !matches!(
+                        call.next_event(cx).await?,
+                        Some(ManagedTaskEvent::Cancelled(_))
+                    ) {
+                        return Err(ManagedTasksError::InvalidResponse);
                     }
-                    None => scope.client.request_with_cancellation(
-                        cx, cancellation, scope.ids.clone(), ManagedTaskRequest::Cancel(scope.task_id.clone()),
-                    ).await?,
-                };
-                if !matches!(call.next_event(cx).await?, Some(ManagedTaskEvent::Cancelled(_))) {
-                    return Err(ManagedTasksError::InvalidResponse);
+                    // No await separates fully admitted ACK and its shared receipt.
+                    // Only this production boundary can wake high-level observation.
+                    scope.control.acknowledge();
+                    Ok::<(), ManagedTasksError>(())
                 }
-                // No await separates fully admitted ACK and its shared receipt.
-                // Only this production boundary can wake high-level observation.
-                scope.control.acknowledge();
-                Ok::<(), ManagedTasksError>(())
-            }.await)
-        }));
+                .await)
+            },
+        ));
         let result = until_signal(&scope.control.closed, attempted).await;
-        if scope.control.state() == TaskCancellationState::Acknowledged { return Ok(()); }
+        if scope.control.state() == TaskCancellationState::Acknowledged {
+            return Ok(());
+        }
         let error = match result {
             Err(()) => OAuthSessionError::Closed.into(),
             Ok(Err(error)) => error.into(),
@@ -331,7 +435,10 @@ enum Observation {
     Recovering(Box<RecoveringManagedTaskWatch>),
 }
 impl Observation {
-    async fn next(&mut self, cx: &Cx) -> Result<Option<ManagedTaskSnapshot>, CancellableTaskWatchError> {
+    async fn next(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<ManagedTaskSnapshot>, CancellableTaskWatchError> {
         match self {
             Self::Plain(watch) => Ok(watch.next_snapshot(cx).await?),
             Self::Recovering(watch) => Ok(watch.next_snapshot(cx).await?),
@@ -356,7 +463,9 @@ pub struct CancellableManagedTaskWatch {
 }
 impl CancellableManagedTaskWatch {
     pub fn cancel_handle(&self) -> ManagedTaskCancelHandle {
-        ManagedTaskCancelHandle { scope: Arc::clone(&self.scope) }
+        ManagedTaskCancelHandle {
+            scope: Arc::clone(&self.scope),
+        }
     }
 
     pub fn close(&mut self) {
@@ -364,7 +473,10 @@ impl CancellableManagedTaskWatch {
         self.observation = None;
     }
 
-    pub async fn next_snapshot(&mut self, cx: &Cx) -> Result<Option<ManagedTaskSnapshot>, CancellableTaskWatchError> {
+    pub async fn next_snapshot(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<ManagedTaskSnapshot>, CancellableTaskWatchError> {
         match self.scope.control.completion.load(Ordering::Acquire) {
             CANCEL_REQUESTED => {
                 self.close();
@@ -372,17 +484,24 @@ impl CancellableManagedTaskWatch {
             }
             TERMINAL_DELIVERED => return Ok(None),
             CLOSED => return Err(CancellableTaskWatchError::Closed),
-            _ => {},
+            _ => {}
         }
-        let mut observation = self.observation.take().ok_or(CancellableTaskWatchError::Closed)?;
+        let mut observation = self
+            .observation
+            .take()
+            .ok_or(CancellableTaskWatchError::Closed)?;
         // Before the first await, the read owns ALL transport custody and its
         // abandonment closes cancellation admission too. No detached cleanup.
         let handle = self.cancel_handle();
         let mut lease = handle.read_lease();
         let scope = Arc::clone(&self.scope);
-        let read = Box::pin(scope.client.session.await_active(cx, &scope.cancellation, scope.deadline, None, async {
-            Ok(observation.next(cx).await)
-        }));
+        let read = Box::pin(scope.client.session.await_active(
+            cx,
+            &scope.cancellation,
+            scope.deadline,
+            None,
+            async { Ok(observation.next(cx).await) },
+        ));
         let result = handle.until_acknowledged(read).await??;
         let snapshot = result?;
         if handle.cancellation_requested() {
@@ -391,7 +510,10 @@ impl CancellableManagedTaskWatch {
         let Some(snapshot) = snapshot else {
             return Err(ManagedTaskWatchError::UnexpectedEvent.into());
         };
-        if matches!(&*snapshot.task, Task::Completed { .. } | Task::Failed { .. } | Task::Cancelled(_)) {
+        if matches!(
+            &*snapshot.task,
+            Task::Completed { .. } | Task::Failed { .. } | Task::Cancelled(_)
+        ) {
             handle.select_terminal()?;
         } else {
             self.observation = Some(observation);
@@ -401,35 +523,55 @@ impl CancellableManagedTaskWatch {
     }
 }
 impl Drop for CancellableManagedTaskWatch {
-    fn drop(&mut self) { self.scope.control.close(); }
+    fn drop(&mut self) {
+        self.scope.control.close();
+    }
 }
 impl fmt::Debug for CancellableManagedTaskWatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CancellableManagedTaskWatch")
-            .field("cancellation", &self.scope.control.state()).finish_non_exhaustive()
+            .field("cancellation", &self.scope.control.state())
+            .finish_non_exhaustive()
     }
 }
 
-pub(super) struct ReadLease { control: Arc<Control>, armed: bool }
+pub(super) struct ReadLease {
+    control: Arc<Control>,
+    armed: bool,
+}
 impl ReadLease {
-    pub(super) fn disarm(&mut self) { self.armed = false; }
+    pub(super) fn disarm(&mut self) {
+        self.armed = false;
+    }
 }
 impl Drop for ReadLease {
-    fn drop(&mut self) { if self.armed { self.control.close(); } }
+    fn drop(&mut self) {
+        if self.armed {
+            self.control.close();
+        }
+    }
 }
 
 // Race an owned future against a wakeable signal. Observe the signal before
 // AND after polling so a ready result cannot bypass a simultaneously selected
 // stop. Dropping this future drops both the work and wake registration.
-async fn until_signal<T>(signal: &McpRequestCancellation, work: impl Future<Output = T>) -> Result<T, ()> {
+async fn until_signal<T>(
+    signal: &McpRequestCancellation,
+    work: impl Future<Output = T>,
+) -> Result<T, ()> {
     let mut stopped = std::pin::pin!(signal.cancelled());
     let mut work = std::pin::pin!(work);
     poll_fn(|task| {
-        if stopped.as_mut().poll(task).is_ready() { return Poll::Ready(Err(())); }
+        if stopped.as_mut().poll(task).is_ready() {
+            return Poll::Ready(Err(()));
+        }
         let result = work.as_mut().poll(task);
-        if signal.is_cancel_requested() { return Poll::Ready(Err(())); }
+        if signal.is_cancel_requested() {
+            return Poll::Ready(Err(()));
+        }
         result.map(Ok)
-    }).await
+    })
+    .await
 }
 
 fn cancellation_ids(prefix: &str) -> Result<ManagedTaskRequestIds, CancellableTaskWatchError> {
@@ -454,44 +596,86 @@ impl ManagedTasksClient {
     /// Current owner authorization and Tasks support are rediscovered for the
     /// cancellation request; a Task ID or handle alone is not authorization.
     pub async fn watch_task_cancellable(
-        &self, cx: &Cx, task_id: TaskId, id_prefix: String,
-        policy: ManagedTaskWatchPolicy, recovery: Option<ManagedTaskRecoveryPolicy>,
+        &self,
+        cx: &Cx,
+        task_id: TaskId,
+        id_prefix: String,
+        policy: ManagedTaskWatchPolicy,
+        recovery: Option<ManagedTaskRecoveryPolicy>,
     ) -> Result<CancellableManagedTaskWatch, CancellableTaskWatchError> {
         self.watch_task_cancellable_with_cancellation(
-            cx, &McpRequestCancellation::new(), task_id, id_prefix, policy, recovery,
-        ).await
+            cx,
+            &McpRequestCancellation::new(),
+            task_id,
+            id_prefix,
+            policy,
+            recovery,
+        )
+        .await
     }
 
     /// Local cancellation closes observation, not the remote Task. Remote
     /// cancellation happens only when the handle's request_cancel is polled.
     #[allow(clippy::too_many_arguments)]
     pub async fn watch_task_cancellable_with_cancellation(
-        &self, cx: &Cx, cancellation: &McpRequestCancellation, task_id: TaskId,
-        id_prefix: String, policy: ManagedTaskWatchPolicy,
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task_id: TaskId,
+        id_prefix: String,
+        policy: ManagedTaskWatchPolicy,
         recovery: Option<ManagedTaskRecoveryPolicy>,
     ) -> Result<CancellableManagedTaskWatch, CancellableTaskWatchError> {
         self.session.check(cx, cancellation)?;
-        if let Some(recovery) = recovery { recovery.connection_policy(policy)?; }
+        if let Some(recovery) = recovery {
+            recovery.connection_policy(policy)?;
+        }
         // Complete cancellation encoding and limits are checked BEFORE opening
         // observation. No half-admitted owner can later discover invalid IDs.
         let deadline = deadline_after(cx, policy.timeout)?;
         let handle = ManagedTaskCancelHandle::for_observation(
-            self, task_id.clone(), &id_prefix, cancellation, deadline,
+            self,
+            task_id.clone(),
+            &id_prefix,
+            cancellation,
+            deadline,
         )?;
-        let observation = Box::pin(self.session.await_active(cx, cancellation, deadline, None, async {
-            Ok(match recovery {
-                Some(recovery) => self.watch_tasks_recovering_with_cancellation(
-                    cx, cancellation, vec![task_id.clone()], id_prefix, policy, recovery,
-                ).await.map(|watch| Observation::Recovering(Box::new(watch)))
-                    .map_err(CancellableTaskWatchError::from),
-                None => self.watch_tasks_with_cancellation(
-                    cx, cancellation, vec![task_id.clone()], id_prefix, policy,
-                ).await.map(|watch| Observation::Plain(Box::new(watch)))
-                    .map_err(CancellableTaskWatchError::from),
-            })
-        })).await??;
+        let observation =
+            Box::pin(
+                self.session
+                    .await_active(cx, cancellation, deadline, None, async {
+                        Ok(match recovery {
+                            Some(recovery) => self
+                                .watch_tasks_recovering_with_cancellation(
+                                    cx,
+                                    cancellation,
+                                    vec![task_id.clone()],
+                                    id_prefix,
+                                    policy,
+                                    recovery,
+                                )
+                                .await
+                                .map(|watch| Observation::Recovering(Box::new(watch)))
+                                .map_err(CancellableTaskWatchError::from),
+                            None => self
+                                .watch_tasks_with_cancellation(
+                                    cx,
+                                    cancellation,
+                                    vec![task_id.clone()],
+                                    id_prefix,
+                                    policy,
+                                )
+                                .await
+                                .map(|watch| Observation::Plain(Box::new(watch)))
+                                .map_err(CancellableTaskWatchError::from),
+                        })
+                    }),
+            )
+            .await??;
         self.session.check(cx, cancellation)?;
-        if cx.now() >= deadline { return Err(OAuthSessionError::TimedOut.into()); }
+        if cx.now() >= deadline {
+            return Err(OAuthSessionError::TimedOut.into());
+        }
         Ok(CancellableManagedTaskWatch {
             scope: handle.scope,
             observation: Some(observation),
@@ -508,8 +692,12 @@ mod tests {
 
     struct Wakes(AtomicUsize);
     impl Wake for Wakes {
-        fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
-        fn wake_by_ref(self: &Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     #[test]
@@ -518,7 +706,10 @@ mod tests {
         let other = Arc::clone(&control);
         control.claim().unwrap();
         assert_eq!(other.state(), TaskCancellationState::Unconfirmed);
-        assert!(matches!(other.claim(), Err(TaskCancellationError::AlreadyAttempted)));
+        assert!(matches!(
+            other.claim(),
+            Err(TaskCancellationError::AlreadyAttempted)
+        ));
         assert_eq!(control.completion.load(Ordering::Acquire), LIVE);
         assert!(!control.acknowledged.is_cancel_requested());
         other.acknowledge();
@@ -534,15 +725,24 @@ mod tests {
         terminal_first.claim().unwrap();
         terminal_first.terminal().unwrap();
         terminal_first.acknowledge();
-        assert_eq!(terminal_first.completion.load(Ordering::Acquire), TERMINAL_DELIVERED);
+        assert_eq!(
+            terminal_first.completion.load(Ordering::Acquire),
+            TERMINAL_DELIVERED
+        );
         assert_eq!(terminal_first.state(), TaskCancellationState::Acknowledged);
         assert!(!terminal_first.acknowledged.is_cancel_requested());
         let cancel_first = Control::new();
         cancel_first.claim().unwrap();
         cancel_first.acknowledge();
-        assert!(matches!(cancel_first.terminal(), Err(CancellableTaskWatchError::CancellationRequested)));
+        assert!(matches!(
+            cancel_first.terminal(),
+            Err(CancellableTaskWatchError::CancellationRequested)
+        ));
         cancel_first.close();
-        assert_eq!(cancel_first.completion.load(Ordering::Acquire), CANCEL_REQUESTED);
+        assert_eq!(
+            cancel_first.completion.load(Ordering::Acquire),
+            CANCEL_REQUESTED
+        );
         assert_eq!(cancel_first.state(), TaskCancellationState::Acknowledged);
     }
 
@@ -552,7 +752,10 @@ mod tests {
         let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
         let waker = Waker::from(Arc::clone(&wakes));
         let mut cx = Context::from_waker(&waker);
-        let mut read = Box::pin(until_signal(&control.acknowledged, std::future::pending::<()>()));
+        let mut read = Box::pin(until_signal(
+            &control.acknowledged,
+            std::future::pending::<()>(),
+        ));
         assert!(read.as_mut().poll(&mut cx).is_pending());
         let before = wakes.0.load(Ordering::SeqCst);
         control.claim().unwrap();
@@ -565,7 +768,10 @@ mod tests {
 
     #[test]
     fn signal_during_ready_poll_withholds_output_and_releases_work() {
-        struct Work<'a> { signal: &'a McpRequestCancellation, dropped: &'a Cell<bool> }
+        struct Work<'a> {
+            signal: &'a McpRequestCancellation,
+            dropped: &'a Cell<bool>,
+        }
         impl Future for Work<'_> {
             type Output = usize;
             fn poll(self: std::pin::Pin<&mut Self>, _: &mut Context<'_>) -> Poll<usize> {
@@ -573,31 +779,56 @@ mod tests {
                 Poll::Ready(7)
             }
         }
-        impl Drop for Work<'_> { fn drop(&mut self) { self.dropped.set(true); } }
+        impl Drop for Work<'_> {
+            fn drop(&mut self) {
+                self.dropped.set(true);
+            }
+        }
         let signal = McpRequestCancellation::new();
         let dropped = Cell::new(false);
         let mut cx = Context::from_waker(Waker::noop());
-        let mut guarded = Box::pin(until_signal(&signal, Work { signal: &signal, dropped: &dropped }));
-        assert!(matches!(guarded.as_mut().poll(&mut cx), Poll::Ready(Err(()))));
+        let mut guarded = Box::pin(until_signal(
+            &signal,
+            Work {
+                signal: &signal,
+                dropped: &dropped,
+            },
+        ));
+        assert!(matches!(
+            guarded.as_mut().poll(&mut cx),
+            Poll::Ready(Err(()))
+        ));
         drop(guarded);
         assert!(dropped.get());
         let fresh = McpRequestCancellation::new();
         let mut baseline = Box::pin(until_signal(&fresh, std::future::ready(7)));
-        assert!(matches!(baseline.as_mut().poll(&mut cx), Poll::Ready(Ok(7))));
+        assert!(matches!(
+            baseline.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(7))
+        ));
     }
 
     #[test]
     fn abandoned_read_retires_cancel_admission_without_selecting_remote_cancellation() {
         let control = Arc::new(Control::new());
         let unrelated = McpRequestCancellation::new();
-        drop(ReadLease { control: Arc::clone(&control), armed: true });
+        drop(ReadLease {
+            control: Arc::clone(&control),
+            armed: true,
+        });
         assert_eq!(control.completion.load(Ordering::Acquire), CLOSED);
         assert!(control.closed.is_cancel_requested());
         assert!(!control.acknowledged.is_cancel_requested());
-        assert!(matches!(control.claim(), Err(TaskCancellationError::Closed)));
+        assert!(matches!(
+            control.claim(),
+            Err(TaskCancellationError::Closed)
+        ));
         assert!(!unrelated.is_cancel_requested());
         let retained = Arc::new(Control::new());
-        drop(ReadLease { control: Arc::clone(&retained), armed: false });
+        drop(ReadLease {
+            control: Arc::clone(&retained),
+            armed: false,
+        });
         assert!(retained.claim().is_ok());
     }
 

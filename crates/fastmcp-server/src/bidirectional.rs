@@ -1264,7 +1264,12 @@ impl MrtrInputRequest {
         let Some(MrtrInputParams::FinalElicitation(params)) = &self.params else {
             return Ok(());
         };
-        if response.value.get("action").and_then(serde_json::Value::as_str) != Some("accept") {
+        if response
+            .value
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            != Some("accept")
+        {
             // Decline/cancel content is a schema-valid peer SHOULD deviation.
             // It is not accepted form data and must not be checked against the
             // requested schema.
@@ -1463,7 +1468,9 @@ impl MrtrInputResponse {
 
     fn from_wire(kind: MrtrInputKind, value: serde_json::Value) -> McpResult<Self> {
         if kind == MrtrInputKind::Elicitation
-            && value.get("content").is_some_and(|content| !content.is_object())
+            && value
+                .get("content")
+                .is_some_and(|content| !content.is_object())
         {
             // Preserve absent versus explicitly null before the legacy-shaped
             // handler value's Option decoder can collapse those wire states.
@@ -2844,10 +2851,7 @@ mod tests {
         let completed = registry
             .accept_wire(
                 &state,
-                &BTreeMap::from([(
-                    "url".to_owned(),
-                    serde_json::json!({"action": "accept"}),
-                )]),
+                &BTreeMap::from([("url".to_owned(), serde_json::json!({"action": "accept"}))]),
             )
             .expect("content-free URL acceptance uses the original state");
         let MrtrRetry::Complete(completed) = completed else {

@@ -34,7 +34,10 @@ fn readme_code_blocks_are_the_compiled_sources() {
             "Quick Start",
             readme_body(include_str!("readme/quick_start.rs")),
         ),
-        ("FAQ handler test", include_str!("readme/faq_handler_test.rs")),
+        (
+            "FAQ handler test",
+            include_str!("readme/faq_handler_test.rs"),
+        ),
     ] {
         assert!(
             README.contains(&format!("```rust\n{body}```")),
@@ -105,7 +108,9 @@ mod live {
         assert_eq!(texts(&greeting.content), ["Hello, Ada!"]);
         // Near-identical negative: the same call without its required argument.
         assert_schema_refused(client.call_tool("greet", json!({})));
-        client.close().expect("the README TL;DR client closes cleanly");
+        client
+            .close()
+            .expect("the README TL;DR client closes cleanly");
     }
 
     #[test]

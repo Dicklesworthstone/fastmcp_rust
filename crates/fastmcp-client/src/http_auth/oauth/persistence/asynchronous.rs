@@ -5,12 +5,12 @@
 //! still decides transfer, tombstone, quarantine and commit disposition. There
 //! is no split load/decrypt/take sequence between separately admitted workers.
 
-/// Explicit consume/exchange/persist renewal with retained interruption custody.
-pub mod renewal;
-/// Explicit revocation of stored refresh grants and persistent logout custody.
-pub mod logout;
 /// Transfer an existing managed login's refresh ownership into protected storage.
 pub mod capture;
+/// Explicit revocation of stored refresh grants and persistent logout custody.
+pub mod logout;
+/// Explicit consume/exchange/persist renewal with retained interruption custody.
+pub mod renewal;
 
 use std::fmt;
 use std::fs::File;
@@ -19,25 +19,26 @@ use asupersync::Cx;
 use fastmcp_core::partition::{CredentialStoreKey, PartitionAuthorization};
 
 use super::{
-    MAX_CONFIGURATION_BYTES, MAX_ENCODED_REFRESH_GRANT_BYTES,
-    MAX_PROTECTED_REFRESH_GRANT_BYTES, OAuthClient, OAuthCredentials,
-    OAuthGrantProtector, OAuthRefreshGrant, OAuthRefreshStore, OAuthRefreshStoreError,
-    configuration_digest,
+    MAX_CONFIGURATION_BYTES, MAX_ENCODED_REFRESH_GRANT_BYTES, MAX_PROTECTED_REFRESH_GRANT_BYTES,
+    OAuthClient, OAuthCredentials, OAuthGrantProtector, OAuthRefreshGrant, OAuthRefreshStore,
+    OAuthRefreshStoreError, configuration_digest,
 };
 use crate::http_auth::secure_file::SecureAtomicFile;
-use crate::http_auth::secure_file::slot::{CredentialSlotError, SlotRecoveryOutcome, SlotRevision};
-use crate::http_auth::secure_file::slot::coordinator::{CoordinatedSlotError, CredentialCommitAnchor};
 use crate::http_auth::secure_file::slot::coordinator::asynchronous::{
-    CredentialIoError, CredentialIoLane, CredentialSlotTask,
-    composed::ComposedCredentialIo,
+    CredentialIoError, CredentialIoLane, CredentialSlotTask, composed::ComposedCredentialIo,
 };
+use crate::http_auth::secure_file::slot::coordinator::{
+    CoordinatedSlotError, CredentialCommitAnchor,
+};
+use crate::http_auth::secure_file::slot::{CredentialSlotError, SlotRecoveryOutcome, SlotRevision};
 
 // Reserve complete upper bounds, not serialized secret-dependent measurements:
 // store/client/credential/decoded-grant configurations and secret encodings can
 // coexist during handoff. File buffers have their separate operation charge.
 // Provider-internal storage and returned application values are not counted.
 const EXTRA_WORK_BYTES: usize = 4 * MAX_CONFIGURATION_BYTES
-    + 4 * MAX_ENCODED_REFRESH_GRANT_BYTES + 2 * MAX_PROTECTED_REFRESH_GRANT_BYTES;
+    + 4 * MAX_ENCODED_REFRESH_GRANT_BYTES
+    + 2 * MAX_PROTECTED_REFRESH_GRANT_BYTES;
 const MAX_FILE_BYTES: usize = MAX_PROTECTED_REFRESH_GRANT_BYTES + 256;
 
 /// Submission/preflight failures, not a transaction's commit disposition.
@@ -60,10 +61,14 @@ impl fmt::Display for AsyncOAuthRefreshError {
 }
 impl std::error::Error for AsyncOAuthRefreshError {}
 impl From<CredentialIoError> for AsyncOAuthRefreshError {
-    fn from(error: CredentialIoError) -> Self { Self::Io(error) }
+    fn from(error: CredentialIoError) -> Self {
+        Self::Io(error)
+    }
 }
 impl From<OAuthRefreshStoreError> for AsyncOAuthRefreshError {
-    fn from(error: OAuthRefreshStoreError) -> Self { Self::Store(error) }
+    fn from(error: OAuthRefreshStoreError) -> Self {
+        Self::Store(error)
+    }
 }
 
 /// Failed submission with ownership when admission refused before scheduling.
@@ -78,19 +83,30 @@ pub struct OAuthRefreshSubmissionFailure<A, P, I> {
     retained: Option<Box<(AsyncOAuthRefreshStore<A, P>, I)>>,
 }
 impl<A, P, I> OAuthRefreshSubmissionFailure<A, P, I> {
-    pub fn cause(&self) -> &AsyncOAuthRefreshError { &self.cause }
-    pub fn into_parts(self) -> (AsyncOAuthRefreshError, Option<(AsyncOAuthRefreshStore<A, P>, I)>) {
+    pub fn cause(&self) -> &AsyncOAuthRefreshError {
+        &self.cause
+    }
+    pub fn into_parts(
+        self,
+    ) -> (
+        AsyncOAuthRefreshError,
+        Option<(AsyncOAuthRefreshStore<A, P>, I)>,
+    ) {
         (self.cause, self.retained.map(|retained| *retained))
     }
 }
 impl<A, P, I> fmt::Debug for OAuthRefreshSubmissionFailure<A, P, I> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OAuthRefreshSubmissionFailure")
-            .field("cause", &self.cause).field("ownership_retained", &self.retained.is_some()).finish()
+            .field("cause", &self.cause)
+            .field("ownership_retained", &self.retained.is_some())
+            .finish()
     }
 }
 impl<A, P, I> fmt::Display for OAuthRefreshSubmissionFailure<A, P, I> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Display::fmt(&self.cause, f) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.cause, f)
+    }
 }
 impl<A, P, I> std::error::Error for OAuthRefreshSubmissionFailure<A, P, I> {}
 
@@ -110,15 +126,18 @@ impl<A, P, T> OAuthRefreshCompletion<A, P, T> {
     }
 }
 
-pub type OAuthRefreshOpen<A, P> = Result<
-    (AsyncOAuthRefreshStore<A, P>, Option<SlotRecoveryOutcome>), OAuthRefreshStoreError,
->;
+pub type OAuthRefreshOpen<A, P> =
+    Result<(AsyncOAuthRefreshStore<A, P>, Option<SlotRecoveryOutcome>), OAuthRefreshStoreError>;
 pub type OAuthRefreshWrite<A, P> = OAuthRefreshCompletion<
-    A, P, (OAuthCredentials, Result<SlotRevision, OAuthRefreshStoreError>),
+    A,
+    P,
+    (
+        OAuthCredentials,
+        Result<SlotRevision, OAuthRefreshStoreError>,
+    ),
 >;
-pub type OAuthRefreshTake<A, P> = OAuthRefreshCompletion<
-    A, P, Result<Option<OAuthRefreshGrant>, OAuthRefreshStoreError>,
->;
+pub type OAuthRefreshTake<A, P> =
+    OAuthRefreshCompletion<A, P, Result<Option<OAuthRefreshGrant>, OAuthRefreshStoreError>>;
 
 /// Exclusive owner of a Linux persistent OAuth refresh store.
 ///
@@ -147,16 +166,25 @@ pub struct AsyncOAuthRefreshStore<A, P> {
 }
 
 impl<A, P> AsyncOAuthRefreshStore<A, P>
-where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
+where
+    A: CredentialCommitAnchor + 'static,
+    P: OAuthGrantProtector + 'static,
 {
     /// Opens/reconciles custody on a worker using a host-opened directory handle.
     /// All configuration admission is local and precedes filesystem/provider
     /// work. `client` is copied only after its bounded binding is admitted.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
-        cx: &Cx, lane: &CredentialIoLane, directory: File, leaf: String,
-        key: CredentialStoreKey, authorization: PartitionAuthorization,
-        namespace: String, anchor: A, protector: P, client: &OAuthClient,
+        cx: &Cx,
+        lane: &CredentialIoLane,
+        directory: File,
+        leaf: String,
+        key: CredentialStoreKey,
+        authorization: PartitionAuthorization,
+        namespace: String,
+        anchor: A,
+        protector: P,
+        client: &OAuthClient,
     ) -> Result<CredentialSlotTask<OAuthRefreshOpen<A, P>>, AsyncOAuthRefreshError> {
         if leaf.is_empty() || leaf.len() > 96 || namespace.is_empty() || namespace.len() > 128 {
             return Err(CredentialIoError::InvalidSlotConfiguration.into());
@@ -169,27 +197,47 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
         let leaf = leaf.into_boxed_str();
         let namespace = namespace.into_boxed_str();
         Ok(io.submit(cx, move |worker, io| {
-            let file = SecureAtomicFile::open(worker, directory, &leaf, MAX_FILE_BYTES)
-                .map_err(|error| OAuthRefreshStoreError::Storage(CoordinatedSlotError::Slot(CredentialSlotError::Storage(error))))?;
+            let file = SecureAtomicFile::open(worker, directory, &leaf, MAX_FILE_BYTES).map_err(
+                |error| {
+                    OAuthRefreshStoreError::Storage(CoordinatedSlotError::Slot(
+                        CredentialSlotError::Storage(error),
+                    ))
+                },
+            )?;
             let (store, recovery) = OAuthRefreshStore::open(
-                worker, file, &key, &authorization, &namespace, anchor, protector, &client,
+                worker,
+                file,
+                &key,
+                &authorization,
+                &namespace,
+                anchor,
+                protector,
+                &client,
             )?;
             Ok((Self { store, io }, recovery))
         })?)
     }
 
-    pub fn revision(&self) -> Option<SlotRevision> { self.store.revision() }
-    pub fn requires_recovery(&self) -> bool { self.store.requires_recovery() }
+    pub fn revision(&self) -> Option<SlotRevision> {
+        self.store.revision()
+    }
+    pub fn requires_recovery(&self) -> bool {
+        self.store.requires_recovery()
+    }
 
     /// Transfers a native grant into protected custody. Success leaves the
     /// returned credentials' original access token and expiry unchanged, with
     /// refresh ownership removed. Pre-transfer refusal returns it untouched;
     /// uncertain storage failure returns it WITHOUT renewal ownership.
     pub fn store_refresh(
-        self, cx: &Cx, authorization: PartitionAuthorization,
-        expected: Option<SlotRevision>, credentials: OAuthCredentials,
+        self,
+        cx: &Cx,
+        authorization: PartitionAuthorization,
+        expected: Option<SlotRevision>,
+        credentials: OAuthCredentials,
     ) -> Result<CredentialSlotTask<OAuthRefreshWrite<A, P>>, AsyncOAuthRefreshError> {
-        self.try_store_refresh(cx, authorization, expected, credentials).map_err(|failure| failure.cause)
+        self.try_store_refresh(cx, authorization, expected, credentials)
+            .map_err(|failure| failure.cause)
     }
 
     /// Like `store_refresh`, but pre-scheduling refusal returns the original
@@ -198,16 +246,29 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
     /// before explicitly submitting again; do not reconstruct credentials after
     /// a failure with no retained owner or after a transaction error.
     pub fn try_store_refresh(
-        self, cx: &Cx, authorization: PartitionAuthorization,
-        expected: Option<SlotRevision>, mut credentials: OAuthCredentials,
-    ) -> Result<CredentialSlotTask<OAuthRefreshWrite<A, P>>, OAuthRefreshSubmissionFailure<A, P, OAuthCredentials>> {
+        self,
+        cx: &Cx,
+        authorization: PartitionAuthorization,
+        expected: Option<SlotRevision>,
+        mut credentials: OAuthCredentials,
+    ) -> Result<
+        CredentialSlotTask<OAuthRefreshWrite<A, P>>,
+        OAuthRefreshSubmissionFailure<A, P, OAuthCredentials>,
+    > {
         if let Err(error) = configuration_digest(&credentials.configuration) {
-            return Err(OAuthRefreshSubmissionFailure { cause: error.into(), retained: Some(Box::new((self, credentials))) });
+            return Err(OAuthRefreshSubmissionFailure {
+                cause: error.into(),
+                retained: Some(Box::new((self, credentials))),
+            });
         }
         // Credentials are native admitted values, but discard spare capacities
         // before queueing their secret/map buffers under a fixed reservation.
-        if let Some(token) = &mut credentials.refresh_token { token.shrink_to_fit(); }
-        for scope in &mut credentials.scopes { scope.shrink_to_fit(); }
+        if let Some(token) = &mut credentials.refresh_token {
+            token.shrink_to_fit();
+        }
+        for scope in &mut credentials.scopes {
+            scope.shrink_to_fit();
+        }
         credentials.scopes.shrink_to_fit();
         self.try_operate(cx, credentials, move |store, worker, mut credentials| {
             let result = store.store_refresh(worker, &authorization, expected, &mut credentials);
@@ -218,38 +279,70 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
     /// Validates/decrypts and durably tombstones in one admitted worker before
     /// returning a renewal grant. No plaintext/access credential is reconstructed
     /// outside the protection contract, and an uncertain take is not retried.
-    pub fn take_refresh(self, cx: &Cx, authorization: PartitionAuthorization)
-        -> Result<CredentialSlotTask<OAuthRefreshTake<A, P>>, AsyncOAuthRefreshError>
-    {
-        self.try_take_refresh(cx, authorization).map_err(|failure| failure.cause)
+    pub fn take_refresh(
+        self,
+        cx: &Cx,
+        authorization: PartitionAuthorization,
+    ) -> Result<CredentialSlotTask<OAuthRefreshTake<A, P>>, AsyncOAuthRefreshError> {
+        self.try_take_refresh(cx, authorization)
+            .map_err(|failure| failure.cause)
     }
 
     /// Returns the unexecuted command's owner on admission refusal. The retained
     /// unit input carries no grant: no decryption or tombstone has occurred.
-    pub fn try_take_refresh(self, cx: &Cx, authorization: PartitionAuthorization)
-        -> Result<CredentialSlotTask<OAuthRefreshTake<A, P>>, OAuthRefreshSubmissionFailure<A, P, ()>>
+    pub fn try_take_refresh(
+        self,
+        cx: &Cx,
+        authorization: PartitionAuthorization,
+    ) -> Result<CredentialSlotTask<OAuthRefreshTake<A, P>>, OAuthRefreshSubmissionFailure<A, P, ()>>
     {
-        self.try_operate(cx, (), move |store, worker, ()| store.take_refresh(worker, &authorization))
+        self.try_operate(cx, (), move |store, worker, ()| {
+            store.take_refresh(worker, &authorization)
+        })
     }
 
     /// Persistent local invalidation, not issuer-side revocation. Already
     /// handed-out grants and access tokens remain the application's custody.
-    pub fn invalidate(self, cx: &Cx, authorization: PartitionAuthorization)
-        -> Result<CredentialSlotTask<OAuthRefreshCompletion<A, P, Result<SlotRevision, OAuthRefreshStoreError>>>, AsyncOAuthRefreshError>
-    {
-        self.try_invalidate(cx, authorization).map_err(|failure| failure.cause)
+    pub fn invalidate(
+        self,
+        cx: &Cx,
+        authorization: PartitionAuthorization,
+    ) -> Result<
+        CredentialSlotTask<
+            OAuthRefreshCompletion<A, P, Result<SlotRevision, OAuthRefreshStoreError>>,
+        >,
+        AsyncOAuthRefreshError,
+    > {
+        self.try_invalidate(cx, authorization)
+            .map_err(|failure| failure.cause)
     }
 
     /// Like `invalidate`, preserving the unexecuted owner on admission failure.
     /// Lane shutdown is not silently reversed to admit an invalidation.
-    pub fn try_invalidate(self, cx: &Cx, authorization: PartitionAuthorization)
-        -> Result<CredentialSlotTask<OAuthRefreshCompletion<A, P, Result<SlotRevision, OAuthRefreshStoreError>>>, OAuthRefreshSubmissionFailure<A, P, ()>>
-    {
-        self.try_operate(cx, (), move |store, worker, ()| store.invalidate(worker, &authorization))
+    pub fn try_invalidate(
+        self,
+        cx: &Cx,
+        authorization: PartitionAuthorization,
+    ) -> Result<
+        CredentialSlotTask<
+            OAuthRefreshCompletion<A, P, Result<SlotRevision, OAuthRefreshStoreError>>,
+        >,
+        OAuthRefreshSubmissionFailure<A, P, ()>,
+    > {
+        self.try_operate(cx, (), move |store, worker, ()| {
+            store.invalidate(worker, &authorization)
+        })
     }
 
-    fn try_operate<I, T, F>(self, cx: &Cx, input: I, operation: F)
-        -> Result<CredentialSlotTask<OAuthRefreshCompletion<A, P, T>>, OAuthRefreshSubmissionFailure<A, P, I>>
+    fn try_operate<I, T, F>(
+        self,
+        cx: &Cx,
+        input: I,
+        operation: F,
+    ) -> Result<
+        CredentialSlotTask<OAuthRefreshCompletion<A, P, T>>,
+        OAuthRefreshSubmissionFailure<A, P, I>,
+    >
     where
         I: Send + 'static,
         T: Send + 'static,
@@ -262,7 +355,8 @@ where A: CredentialCommitAnchor + 'static, P: OAuthGrantProtector + 'static,
             let mut owner = Self { store, io };
             let outcome = operation(&mut owner.store, worker, input);
             OAuthRefreshCompletion { owner, outcome }
-        }).map_err(|(error, retained)| OAuthRefreshSubmissionFailure {
+        })
+        .map_err(|(error, retained)| OAuthRefreshSubmissionFailure {
             cause: error.into(),
             retained: retained.map(|(io, (store, input))| Box::new((Self { store, io }, input))),
         })

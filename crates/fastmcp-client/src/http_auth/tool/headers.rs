@@ -17,8 +17,8 @@ use std::sync::Arc;
 use fastmcp_core::CanonicalHttpUrl;
 use fastmcp_protocol::http_headers::ParameterHeaderBinding;
 
-use super::{ManagedToolClient, ManagedToolError, ToolContract};
 use super::catalog::{ManagedToolCatalogError, ManagedToolCatalogSnapshot};
+use super::{ManagedToolClient, ManagedToolError, ToolContract};
 use crate::http_executor::parameter_headers::{ReviewedToolHeaders, ToolHeaderDispatchError};
 
 /// Explicit one-shot header repair without dropping schema or invalidation checks.
@@ -37,7 +37,9 @@ impl ManagedToolClient {
         review: impl FnMut(&ParameterHeaderBinding) -> bool,
     ) -> Result<Self, ManagedToolError> {
         self.require_unconfigured_headers()?;
-        let reviewed = self.contract.review_headers(self.session.resource(), review)?;
+        let reviewed = self
+            .contract
+            .review_headers(self.session.resource(), review)?;
         self.with_reviewed_headers(reviewed)
     }
 
@@ -50,7 +52,8 @@ impl ManagedToolClient {
         reviewed: Arc<ReviewedToolHeaders>,
     ) -> Result<Self, ManagedToolError> {
         self.require_unconfigured_headers()?;
-        self.contract.admit_headers(self.session.resource(), &reviewed)?;
+        self.contract
+            .admit_headers(self.session.resource(), &reviewed)?;
         self.header_review = Some(reviewed);
         Ok(self)
     }
@@ -58,7 +61,9 @@ impl ManagedToolClient {
     fn require_unconfigured_headers(&self) -> Result<(), ManagedToolError> {
         self.contract.check()?;
         if self.header_review.is_some() {
-            return Err(ManagedToolError::Headers(ToolHeaderDispatchError::AlreadyProjected));
+            return Err(ManagedToolError::Headers(
+                ToolHeaderDispatchError::AlreadyProjected,
+            ));
         }
         Ok(())
     }
@@ -75,7 +80,10 @@ impl ManagedToolCatalogSnapshot {
         review: impl FnMut(&ParameterHeaderBinding) -> bool,
     ) -> Result<Option<ManagedToolClient>, ManagedToolCatalogError> {
         self.tool(name)?
-            .map(|tool| tool.review_headers(review).map_err(ManagedToolCatalogError::Tool))
+            .map(|tool| {
+                tool.review_headers(review)
+                    .map_err(ManagedToolCatalogError::Tool)
+            })
             .transpose()
     }
 }
@@ -105,9 +113,13 @@ impl ToolContract {
         // Source admission already bounded this clone. The reviewed wrapper
         // repeats syntax admission before any callback and binds the resource.
         let reviewed = ReviewedToolHeaders::new(
-            resource.clone(), self.name.clone(), self.input.schema().clone(),
+            resource.clone(),
+            self.name.clone(),
+            self.input.schema().clone(),
             |binding| {
-                if self.is_invalidated() { return false; }
+                if self.is_invalidated() {
+                    return false;
+                }
                 let approved = review(binding);
                 approved && !self.is_invalidated()
             },

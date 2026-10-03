@@ -32,14 +32,14 @@ use serde::{Deserialize, Deserializer};
 use super::managed::{ManagedOAuthSession, OAuthSessionError, OAuthSessionPolicy};
 use super::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError, endpoint_resource_policy};
 
-/// Explicit RFC 7591 native-public-client registration after trusted discovery.
-pub mod registration;
-/// Preregistered machine-to-machine authentication without browser or DCR fallback.
-pub mod client_credentials;
 /// Resource-bound Bearer challenges and explicitly trusted metadata relocation.
 pub mod challenge;
+/// Preregistered machine-to-machine authentication without browser or DCR fallback.
+pub mod client_credentials;
 /// Ordered same-issuer metadata retrieval and bounded aggregate diagnostics.
 pub mod issuer;
+/// Explicit RFC 7591 native-public-client registration after trusted discovery.
+pub mod registration;
 
 /// Maximum retained bytes in each resource or issuer metadata document.
 pub const MAX_OAUTH_METADATA_BYTES: usize = 64 * 1024;
@@ -55,7 +55,9 @@ pub enum OAuthDiscoveryError {
     Cancelled,
     TimedOut,
     TransportFailed,
-    HttpStatus { status: u16 },
+    HttpStatus {
+        status: u16,
+    },
     MetadataNotFound,
     InvalidRepresentation,
     InvalidMetadata,
@@ -89,12 +91,18 @@ impl fmt::Display for OAuthDiscoveryError {
             Self::ResourceMismatch => "OAuth metadata does not identify the configured resource",
             Self::NoTrustedIssuer => "resource does not advertise an explicitly trusted issuer",
             Self::IssuerMismatch => "OAuth metadata issuer differs from the selected issuer",
-            Self::EndpointNotTrusted => "OAuth endpoint origin is outside the issuer's trust policy",
+            Self::EndpointNotTrusted => {
+                "OAuth endpoint origin is outside the issuer's trust policy"
+            }
             Self::UnsupportedFlow => "issuer does not admit the native S256 code flow",
             Self::UnsupportedScopes => "OAuth metadata does not admit the requested scopes",
             Self::SignedMetadataUnsupported => "signed OAuth metadata requires a separate verifier",
-            Self::ResourceMetadataExhausted(_) => "no constructed resource-metadata location passed admission",
-            Self::IssuerMetadataExhausted(_) => "no permitted issuer-metadata location passed admission",
+            Self::ResourceMetadataExhausted(_) => {
+                "no constructed resource-metadata location passed admission"
+            }
+            Self::IssuerMetadataExhausted(_) => {
+                "no permitted issuer-metadata location passed admission"
+            }
             Self::Login(_) => "login after OAuth discovery failed",
         })
     }
@@ -148,8 +156,12 @@ pub struct ResourceMetadataAttempt {
 }
 
 impl ResourceMetadataAttempt {
-    pub fn location(&self) -> ResourceMetadataLocation { self.location }
-    pub fn cause(&self) -> ResourceMetadataCause { self.cause }
+    pub fn location(&self) -> ResourceMetadataLocation {
+        self.location
+    }
+    pub fn cause(&self) -> ResourceMetadataCause {
+        self.cause
+    }
 }
 
 /// Ordered failure record with exactly one or two attempted constructed URLs.
@@ -163,10 +175,14 @@ pub struct ResourceMetadataFailure {
 }
 
 impl ResourceMetadataFailure {
-    pub fn attempts(&self) -> &[ResourceMetadataAttempt] { &self.attempts }
+    pub fn attempts(&self) -> &[ResourceMetadataAttempt] {
+        &self.attempts
+    }
 
     pub fn classification(&self) -> ResourceMetadataFailureClass {
-        if let Some(interrupted) = self.interrupted { return interrupted; }
+        if let Some(interrupted) = self.interrupted {
+            return interrupted;
+        }
         let mut class = ResourceMetadataFailureClass::NotFound;
         let mut priority = 0;
         for attempt in &self.attempts {
@@ -177,16 +193,25 @@ impl ResourceMetadataFailure {
                 | ResourceMetadataCause::UnsupportedFlow
                 | ResourceMetadataCause::UnsupportedScopes
                 | ResourceMetadataCause::SignedMetadataUnsupported
-                | ResourceMetadataCause::InvalidPolicy => (ResourceMetadataFailureClass::TrustOrIntegrity, 4),
+                | ResourceMetadataCause::InvalidPolicy => {
+                    (ResourceMetadataFailureClass::TrustOrIntegrity, 4)
+                }
                 ResourceMetadataCause::HttpStatus(_)
                 | ResourceMetadataCause::InvalidRepresentation
-                | ResourceMetadataCause::InvalidMetadata => (ResourceMetadataFailureClass::ProtocolOrHttp, 3),
+                | ResourceMetadataCause::InvalidMetadata => {
+                    (ResourceMetadataFailureClass::ProtocolOrHttp, 3)
+                }
                 ResourceMetadataCause::TransportFailed
                 | ResourceMetadataCause::CandidateDeadline
-                | ResourceMetadataCause::RuntimeUnavailable => (ResourceMetadataFailureClass::Transport, 2),
+                | ResourceMetadataCause::RuntimeUnavailable => {
+                    (ResourceMetadataFailureClass::Transport, 2)
+                }
                 ResourceMetadataCause::NotFound => (ResourceMetadataFailureClass::NotFound, 1),
             };
-            if rank > priority { class = candidate; priority = rank; }
+            if rank > priority {
+                class = candidate;
+                priority = rank;
+            }
         }
         class
     }
@@ -202,14 +227,19 @@ fn resource_candidate_cause(error: &OAuthDiscoveryError) -> ResourceMetadataCaus
         OAuthDiscoveryError::NoTrustedIssuer => ResourceMetadataCause::NoTrustedIssuer,
         OAuthDiscoveryError::UnsupportedFlow => ResourceMetadataCause::UnsupportedFlow,
         OAuthDiscoveryError::UnsupportedScopes => ResourceMetadataCause::UnsupportedScopes,
-        OAuthDiscoveryError::SignedMetadataUnsupported => ResourceMetadataCause::SignedMetadataUnsupported,
+        OAuthDiscoveryError::SignedMetadataUnsupported => {
+            ResourceMetadataCause::SignedMetadataUnsupported
+        }
         OAuthDiscoveryError::TransportFailed => ResourceMetadataCause::TransportFailed,
         OAuthDiscoveryError::TimedOut => ResourceMetadataCause::CandidateDeadline,
         OAuthDiscoveryError::Cancelled => ResourceMetadataCause::Cancelled,
         OAuthDiscoveryError::RuntimeUnavailable => ResourceMetadataCause::RuntimeUnavailable,
-        OAuthDiscoveryError::InvalidPolicy | OAuthDiscoveryError::IssuerMismatch
-        | OAuthDiscoveryError::EndpointNotTrusted | OAuthDiscoveryError::ResourceMetadataExhausted(_)
-        | OAuthDiscoveryError::IssuerMetadataExhausted(_) | OAuthDiscoveryError::Login(_) => ResourceMetadataCause::InvalidPolicy,
+        OAuthDiscoveryError::InvalidPolicy
+        | OAuthDiscoveryError::IssuerMismatch
+        | OAuthDiscoveryError::EndpointNotTrusted
+        | OAuthDiscoveryError::ResourceMetadataExhausted(_)
+        | OAuthDiscoveryError::IssuerMetadataExhausted(_)
+        | OAuthDiscoveryError::Login(_) => ResourceMetadataCause::InvalidPolicy,
     }
 }
 
@@ -232,19 +262,31 @@ impl TrustedOAuthIssuer {
     pub fn new(identifier: impl Into<String>) -> Result<Self, OAuthDiscoveryError> {
         let identifier = identifier.into();
         let url = https_url(&identifier).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
-        Ok(Self { identifier, url, endpoint_origins: Vec::new(), roots: Vec::new() })
+        Ok(Self {
+            identifier,
+            url,
+            endpoint_origins: Vec::new(),
+            roots: Vec::new(),
+        })
     }
 
     /// Allows a separately hosted login/token service. Pass an origin URL with
     /// path `/` and no query, fragment or credentials. It is never derived from
     /// the downloaded metadata. At most eight additional origins are admitted.
     /// This does not authorize cross-origin client registration writes.
-    pub fn with_endpoint_origin(mut self, origin: CanonicalHttpUrl) -> Result<Self, OAuthDiscoveryError> {
+    pub fn with_endpoint_origin(
+        mut self,
+        origin: CanonicalHttpUrl,
+    ) -> Result<Self, OAuthDiscoveryError> {
         validate_https(&origin).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
         let origin_text = origin_of(&origin);
-        if origin.path() != "/" || self.endpoint_origins.len() >= 8
+        if origin.path() != "/"
+            || self.endpoint_origins.len() >= 8
             || origin_text == origin_of(&self.url)
-            || self.endpoint_origins.iter().any(|value| value == &origin_text)
+            || self
+                .endpoint_origins
+                .iter()
+                .any(|value| value == &origin_text)
         {
             return Err(OAuthDiscoveryError::InvalidPolicy);
         }
@@ -303,27 +345,35 @@ impl OAuthDiscoveryPlan {
     ) -> Result<Self, OAuthDiscoveryError> {
         validate_https(&resource).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
         CanonicalResourceId::parse_for_endpoint(
-            resource.as_str(), &resource, endpoint_resource_policy(&resource),
-        ).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
+            resource.as_str(),
+            &resource,
+            endpoint_resource_policy(&resource),
+        )
+        .map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
         if issuers.is_empty() || issuers.len() > MAX_ISSUERS {
             return Err(OAuthDiscoveryError::InvalidPolicy);
         }
         for (index, issuer) in issuers.iter().enumerate() {
-            if issuers[..index].iter().any(|other| {
-                other.identifier == issuer.identifier || other.url == issuer.url
-            }) {
+            if issuers[..index]
+                .iter()
+                .any(|other| other.identifier == issuer.identifier || other.url == issuer.url)
+            {
                 return Err(OAuthDiscoveryError::InvalidPolicy);
             }
         }
-        if client_id.as_ref().is_some_and(|id| {
-            id.is_empty() || id.len() > 1024 || id.chars().any(char::is_control)
-        }) || scopes.len() > 32 || scopes.iter().map(String::len).sum::<usize>() > 4096
+        if client_id
+            .as_ref()
+            .is_some_and(|id| id.is_empty() || id.len() > 1024 || id.chars().any(char::is_control))
+            || scopes.len() > 32
+            || scopes.iter().map(String::len).sum::<usize>() > 4096
         {
             return Err(OAuthDiscoveryError::InvalidPolicy);
         }
         let mut seen = BTreeSet::new();
         for scope in &scopes {
-            if scope.is_empty() || scope.len() > 256 || !seen.insert(scope)
+            if scope.is_empty()
+                || scope.len() > 256
+                || !seen.insert(scope)
                 || !scope.bytes().all(|byte| {
                     byte == 0x21 || (0x23..=0x5b).contains(&byte) || (0x5d..=0x7e).contains(&byte)
                 })
@@ -331,7 +381,14 @@ impl OAuthDiscoveryPlan {
                 return Err(OAuthDiscoveryError::InvalidPolicy);
             }
         }
-        Ok(Self { resource, issuers, client_id, scopes, resource_roots: Vec::new(), timeout: Duration::from_secs(30) })
+        Ok(Self {
+            resource,
+            issuers,
+            client_id,
+            scopes,
+            resource_roots: Vec::new(),
+            timeout: Duration::from_secs(30),
+        })
     }
 
     /// One absolute bound across resource discovery and all permitted issuer
@@ -353,7 +410,10 @@ impl OAuthDiscoveryPlan {
     /// Grants a private CA for the configured resource's metadata GET and
     /// subsequent managed MCP POSTs to that exact resource. Issuer metadata
     /// and token exchanges require their own separately configured trust.
-    pub fn with_resource_root_certificate(mut self, root: Certificate) -> Result<Self, OAuthDiscoveryError> {
+    pub fn with_resource_root_certificate(
+        mut self,
+        root: Certificate,
+    ) -> Result<Self, OAuthDiscoveryError> {
         admit_root(&mut self.resource_roots, root)?;
         Ok(self)
     }
@@ -375,21 +435,32 @@ impl OAuthDiscoveryPlan {
     }
 
     async fn discover_selected_issuer(
-        &self, cx: &Cx, deadline: Time, selected: &TrustedOAuthIssuer,
+        &self,
+        cx: &Cx,
+        deadline: Time,
+        selected: &TrustedOAuthIssuer,
     ) -> Result<OAuthClientConfiguration, OAuthDiscoveryError> {
-        issuer::discover(cx, deadline, selected, |body| self.admit_issuer(selected, body)).await
+        issuer::discover(cx, deadline, selected, |body| {
+            self.admit_issuer(selected, body)
+        })
+        .await
     }
 
     // Registration, machine authentication and preregistered native discovery
     // share constructed PRM admission. An explicit challenge URI intentionally
     // bypasses this helper: its rejection never permits constructed fallback.
     async fn discover_resource_issuer(
-        &self, cx: &Cx, deadline: Time,
+        &self,
+        cx: &Cx,
+        deadline: Time,
     ) -> Result<&TrustedOAuthIssuer, OAuthDiscoveryError> {
         check_context(cx, deadline)?;
         let candidates = resource_metadata_urls(&self.resource)?;
         let deadlines = resource_candidate_deadlines(cx.now(), deadline, candidates.len())?;
-        let mut failure = ResourceMetadataFailure { attempts: Vec::with_capacity(2), interrupted: None };
+        let mut failure = ResourceMetadataFailure {
+            attempts: Vec::with_capacity(2),
+            interrupted: None,
+        };
         for ((tag, location), candidate_deadline) in candidates.into_iter().zip(deadlines) {
             // Check the outer budget before opening each candidate. A candidate
             // timeout alone is NOT an outer-budget failure and permits the root.
@@ -401,7 +472,8 @@ impl OAuthDiscoveryPlan {
                 failure.interrupted = Some(ResourceMetadataFailureClass::OverallDeadline);
                 break;
             }
-            let result = fetch_metadata(cx, candidate_deadline, &location, &self.resource_roots).await
+            let result = fetch_metadata(cx, candidate_deadline, &location, &self.resource_roots)
+                .await
                 .and_then(|body| body.ok_or(OAuthDiscoveryError::MetadataNotFound))
                 .and_then(|body| self.select_issuer(&body));
             // Admission is part of the candidate's allowance, not unbounded
@@ -411,11 +483,14 @@ impl OAuthDiscoveryPlan {
                 Err(OAuthDiscoveryError::Cancelled)
             } else if cx.now() >= candidate_deadline {
                 Err(OAuthDiscoveryError::TimedOut)
-            } else { result };
+            } else {
+                result
+            };
             match result {
                 Ok(issuer) => return Ok(issuer),
                 Err(error) => failure.attempts.push(ResourceMetadataAttempt {
-                    location: tag, cause: resource_candidate_cause(&error),
+                    location: tag,
+                    cause: resource_candidate_cause(&error),
                 }),
             }
         }
@@ -437,7 +512,10 @@ impl OAuthDiscoveryPlan {
         deadline: Time,
     ) -> Result<(&TrustedOAuthIssuer, Vec<u8>), OAuthDiscoveryError> {
         let selected = self.discover_resource_issuer(cx, deadline).await?;
-        let body = issuer::discover(cx, deadline, selected, |body| issuer::admit_document(selected, body)).await?;
+        let body = issuer::discover(cx, deadline, selected, |body| {
+            issuer::admit_document(selected, body)
+        })
+        .await?;
         Ok((selected, body))
     }
 
@@ -457,7 +535,8 @@ impl OAuthDiscoveryPlan {
     {
         let configuration = self.discover(cx).await?;
         ManagedOAuthSession::authorize(cx, OAuthClient::new(configuration), policy, launch_browser)
-            .await.map_err(OAuthDiscoveryError::Login)
+            .await
+            .map_err(OAuthDiscoveryError::Login)
     }
     fn select_issuer(&self, body: &[u8]) -> Result<&TrustedOAuthIssuer, OAuthDiscoveryError> {
         let metadata: ResourceMetadata = decode_metadata(body)?;
@@ -469,19 +548,25 @@ impl OAuthDiscoveryPlan {
             return Err(OAuthDiscoveryError::ResourceMismatch);
         }
         validate_optional_array(metadata.bearer_methods_supported.as_deref())?;
-        if metadata.bearer_methods_supported.as_ref().is_some_and(|methods| {
-            !methods.iter().any(|method| method == "header")
-        }) {
+        if metadata
+            .bearer_methods_supported
+            .as_ref()
+            .is_some_and(|methods| !methods.iter().any(|method| method == "header"))
+        {
             return Err(OAuthDiscoveryError::UnsupportedFlow);
         }
         admit_scopes(&self.scopes, metadata.scopes_supported.as_deref())?;
-        let servers = metadata.authorization_servers.ok_or(OAuthDiscoveryError::NoTrustedIssuer)?;
+        let servers = metadata
+            .authorization_servers
+            .ok_or(OAuthDiscoveryError::NoTrustedIssuer)?;
         validate_array(&servers)?;
         if servers.len() > MAX_ISSUERS {
             return Err(OAuthDiscoveryError::InvalidMetadata);
         }
         // Untrusted entries are never followed, even when they precede a match.
-        self.issuers.iter().find(|issuer| servers.contains(&issuer.identifier))
+        self.issuers
+            .iter()
+            .find(|issuer| servers.contains(&issuer.identifier))
             .ok_or(OAuthDiscoveryError::NoTrustedIssuer)
     }
 
@@ -493,8 +578,13 @@ impl OAuthDiscoveryPlan {
         let (authorization, token) = self.admit_issuer_endpoints(issuer, body)?;
         let revocation = self.admit_revocation_endpoint(issuer, body)?;
         self.configure_client(
-            issuer, authorization, token, revocation,
-            self.client_id.as_deref().ok_or(OAuthDiscoveryError::InvalidPolicy)?,
+            issuer,
+            authorization,
+            token,
+            revocation,
+            self.client_id
+                .as_deref()
+                .ok_or(OAuthDiscoveryError::InvalidPolicy)?,
         )
     }
 
@@ -507,19 +597,27 @@ impl OAuthDiscoveryPlan {
         client_id: &str,
     ) -> Result<OAuthClientConfiguration, OAuthDiscoveryError> {
         let mut configuration = OAuthClientConfiguration::from_trusted_endpoints(
-            issuer.identifier.clone(), authorization, token, self.resource.clone(),
-            client_id, self.scopes.clone(),
-        ).map_err(|_| OAuthDiscoveryError::InvalidMetadata)?;
+            issuer.identifier.clone(),
+            authorization,
+            token,
+            self.resource.clone(),
+            client_id,
+            self.scopes.clone(),
+        )
+        .map_err(|_| OAuthDiscoveryError::InvalidMetadata)?;
         if let Some(endpoint) = revocation {
-            configuration = configuration.with_trusted_revocation_endpoint(endpoint)
+            configuration = configuration
+                .with_trusted_revocation_endpoint(endpoint)
                 .map_err(|_| OAuthDiscoveryError::InvalidMetadata)?;
         }
         for root in &issuer.roots {
-            configuration = configuration.with_extra_root_certificate(root.clone())
+            configuration = configuration
+                .with_extra_root_certificate(root.clone())
                 .map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
         }
         for root in &self.resource_roots {
-            configuration = configuration.with_resource_root_certificate(root.clone())
+            configuration = configuration
+                .with_resource_root_certificate(root.clone())
                 .map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
         }
         Ok(configuration)
@@ -549,20 +647,42 @@ impl OAuthDiscoveryPlan {
         ] {
             validate_optional_array(values)?;
         }
-        if !metadata.response_types_supported.iter().any(|value| value == "code")
-            || metadata.grant_types_supported.as_ref().is_some_and(|values| !has(values, "authorization_code"))
-            || metadata.response_modes_supported.as_ref().is_some_and(|values| !has(values, "query"))
-            || !metadata.token_endpoint_auth_methods_supported.as_ref().is_some_and(|values| has(values, "none"))
-            || !metadata.code_challenge_methods_supported.as_ref().is_some_and(|values| has(values, "S256"))
+        if !metadata
+            .response_types_supported
+            .iter()
+            .any(|value| value == "code")
+            || metadata
+                .grant_types_supported
+                .as_ref()
+                .is_some_and(|values| !has(values, "authorization_code"))
+            || metadata
+                .response_modes_supported
+                .as_ref()
+                .is_some_and(|values| !has(values, "query"))
+            || !metadata
+                .token_endpoint_auth_methods_supported
+                .as_ref()
+                .is_some_and(|values| has(values, "none"))
+            || !metadata
+                .code_challenge_methods_supported
+                .as_ref()
+                .is_some_and(|values| has(values, "S256"))
             || metadata.authorization_response_iss_parameter_supported != Some(true)
         {
             return Err(OAuthDiscoveryError::UnsupportedFlow);
         }
-        if metadata.protected_resources.as_ref().is_some_and(|values| !has(values, self.resource.as_str())) {
+        if metadata
+            .protected_resources
+            .as_ref()
+            .is_some_and(|values| !has(values, self.resource.as_str()))
+        {
             return Err(OAuthDiscoveryError::ResourceMismatch);
         }
         admit_scopes(&self.scopes, metadata.scopes_supported.as_deref())?;
-        Ok((issuer.endpoint(&metadata.authorization_endpoint)?, issuer.endpoint(&metadata.token_endpoint)?))
+        Ok((
+            issuer.endpoint(&metadata.authorization_endpoint)?,
+            issuer.endpoint(&metadata.token_endpoint)?,
+        ))
     }
 
     // Revocation is optional for login. Only advertise it to the runtime when
@@ -575,9 +695,17 @@ impl OAuthDiscoveryPlan {
         body: &[u8],
     ) -> Result<Option<CanonicalHttpUrl>, OAuthDiscoveryError> {
         let metadata: IssuerMetadata = decode_metadata(body)?;
-        validate_optional_array(metadata.revocation_endpoint_auth_methods_supported.as_deref())?;
-        let Some(endpoint) = metadata.revocation_endpoint else { return Ok(None); };
-        if !metadata.revocation_endpoint_auth_methods_supported.as_ref()
+        validate_optional_array(
+            metadata
+                .revocation_endpoint_auth_methods_supported
+                .as_deref(),
+        )?;
+        let Some(endpoint) = metadata.revocation_endpoint else {
+            return Ok(None);
+        };
+        if !metadata
+            .revocation_endpoint_auth_methods_supported
+            .as_ref()
             .is_some_and(|methods| has(methods, "none"))
         {
             return Ok(None);
@@ -591,16 +719,24 @@ fn has(values: &[String], expected: &str) -> bool {
 }
 
 fn validate_https(url: &CanonicalHttpUrl) -> Result<(), OAuthDiscoveryError> {
-    if url.scheme() != "https" || url.has_userinfo() || url.query().is_some() || url.fragment().is_some() {
+    if url.scheme() != "https"
+        || url.has_userinfo()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
         return Err(OAuthDiscoveryError::InvalidMetadata);
     }
     Ok(())
 }
 
 fn https_url(text: &str) -> Result<CanonicalHttpUrl, OAuthDiscoveryError> {
-    if text.is_empty() || text.len() > MAX_METADATA_STRING_BYTES
-        || text.chars().any(|character| character.is_whitespace() || character.is_control())
-        || text.contains('\\') || !text.starts_with("https://")
+    if text.is_empty()
+        || text.len() > MAX_METADATA_STRING_BYTES
+        || text
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+        || text.contains('\\')
+        || !text.starts_with("https://")
     {
         return Err(OAuthDiscoveryError::InvalidMetadata);
     }
@@ -615,11 +751,19 @@ fn origin_of(url: &CanonicalHttpUrl) -> String {
     url.as_str()[..url.as_str().len() - url.path().len()].to_owned()
 }
 
-fn resource_metadata_url(resource: &CanonicalHttpUrl) -> Result<CanonicalHttpUrl, OAuthDiscoveryError> {
-    let path = if resource.path() == "/" { "" } else { resource.path() };
+fn resource_metadata_url(
+    resource: &CanonicalHttpUrl,
+) -> Result<CanonicalHttpUrl, OAuthDiscoveryError> {
+    let path = if resource.path() == "/" {
+        ""
+    } else {
+        resource.path()
+    };
     CanonicalHttpUrl::parse(&format!(
-        "{}/.well-known/oauth-protected-resource{path}", origin_of(resource),
-    )).map_err(|_| OAuthDiscoveryError::InvalidPolicy)
+        "{}/.well-known/oauth-protected-resource{path}",
+        origin_of(resource),
+    ))
+    .map_err(|_| OAuthDiscoveryError::InvalidPolicy)
 }
 
 fn resource_metadata_urls(
@@ -628,26 +772,46 @@ fn resource_metadata_urls(
     validate_https(resource).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
     let path = resource_metadata_url(resource)?;
     let root = CanonicalHttpUrl::parse(&format!(
-        "{}/.well-known/oauth-protected-resource", origin_of(resource),
-    )).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
-    if path == root { return Ok(vec![(ResourceMetadataLocation::OriginRoot, root)]); }
-    Ok(vec![(ResourceMetadataLocation::PathSpecific, path), (ResourceMetadataLocation::OriginRoot, root)])
+        "{}/.well-known/oauth-protected-resource",
+        origin_of(resource),
+    ))
+    .map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
+    if path == root {
+        return Ok(vec![(ResourceMetadataLocation::OriginRoot, root)]);
+    }
+    Ok(vec![
+        (ResourceMetadataLocation::PathSpecific, path),
+        (ResourceMetadataLocation::OriginRoot, root),
+    ])
 }
 
 // Allocate the complete schedule before the first fetch. The root has its own
 // time and 64-KiB body allowance, and at least half the original remaining time
 // remains available for the issuer. There are no resets after trickled bytes.
 fn resource_candidate_deadlines(
-    now: Time, deadline: Time, count: usize,
+    now: Time,
+    deadline: Time,
+    count: usize,
 ) -> Result<Vec<Time>, OAuthDiscoveryError> {
-    if !(1..=2).contains(&count) { return Err(OAuthDiscoveryError::InvalidPolicy); }
-    let remaining = deadline.as_nanos().checked_sub(now.as_nanos()).ok_or(OAuthDiscoveryError::TimedOut)?;
+    if !(1..=2).contains(&count) {
+        return Err(OAuthDiscoveryError::InvalidPolicy);
+    }
+    let remaining = deadline
+        .as_nanos()
+        .checked_sub(now.as_nanos())
+        .ok_or(OAuthDiscoveryError::TimedOut)?;
     let share = remaining / 2 / count as u64;
-    if share == 0 { return Err(OAuthDiscoveryError::TimedOut); }
-    Ok((1..=count).map(|index| Time::from_nanos(now.as_nanos() + share * index as u64)).collect())
+    if share == 0 {
+        return Err(OAuthDiscoveryError::TimedOut);
+    }
+    Ok((1..=count)
+        .map(|index| Time::from_nanos(now.as_nanos() + share * index as u64))
+        .collect())
 }
 
-fn issuer_metadata_urls(issuer: &CanonicalHttpUrl) -> Result<Vec<CanonicalHttpUrl>, OAuthDiscoveryError> {
+fn issuer_metadata_urls(
+    issuer: &CanonicalHttpUrl,
+) -> Result<Vec<CanonicalHttpUrl>, OAuthDiscoveryError> {
     let origin = origin_of(issuer);
     let path = issuer.path().trim_end_matches('/');
     let mut locations = Vec::new();
@@ -657,7 +821,8 @@ fn issuer_metadata_urls(issuer: &CanonicalHttpUrl) -> Result<Vec<CanonicalHttpUr
         format!("{origin}/.well-known/openid-configuration{path}"),
         format!("{origin}{path}/.well-known/openid-configuration"),
     ] {
-        let location = CanonicalHttpUrl::parse(&value).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
+        let location =
+            CanonicalHttpUrl::parse(&value).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
         if !locations.contains(&location) {
             locations.push(location);
         }
@@ -666,12 +831,18 @@ fn issuer_metadata_urls(issuer: &CanonicalHttpUrl) -> Result<Vec<CanonicalHttpUr
 }
 
 fn admit_root(roots: &mut Vec<Certificate>, root: Certificate) -> Result<(), OAuthDiscoveryError> {
-    if roots.len() >= 8 || root.as_der().is_empty() || root.as_der().len() > 16 * 1024
-        || roots.iter().any(|existing| existing.as_der() == root.as_der())
+    if roots.len() >= 8
+        || root.as_der().is_empty()
+        || root.as_der().len() > 16 * 1024
+        || roots
+            .iter()
+            .any(|existing| existing.as_der() == root.as_der())
     {
         return Err(OAuthDiscoveryError::InvalidPolicy);
     }
-    RootCertStore::empty().add(&root).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
+    RootCertStore::empty()
+        .add(&root)
+        .map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
     roots.push(root);
     Ok(())
 }
@@ -682,8 +853,10 @@ fn validate_array(values: &[String]) -> Result<(), OAuthDiscoveryError> {
     }
     let mut seen = BTreeSet::new();
     for value in values {
-        if value.is_empty() || value.len() > MAX_METADATA_STRING_BYTES
-            || value.chars().any(char::is_control) || !seen.insert(value)
+        if value.is_empty()
+            || value.len() > MAX_METADATA_STRING_BYTES
+            || value.chars().any(char::is_control)
+            || !seen.insert(value)
         {
             return Err(OAuthDiscoveryError::InvalidMetadata);
         }
@@ -695,7 +868,10 @@ fn validate_optional_array(values: Option<&[String]>) -> Result<(), OAuthDiscove
     values.map_or(Ok(()), validate_array)
 }
 
-fn admit_scopes(requested: &[String], supported: Option<&[String]>) -> Result<(), OAuthDiscoveryError> {
+fn admit_scopes(
+    requested: &[String],
+    supported: Option<&[String]>,
+) -> Result<(), OAuthDiscoveryError> {
     validate_optional_array(supported)?;
     if supported.is_some_and(|supported| requested.iter().any(|scope| !supported.contains(scope))) {
         return Err(OAuthDiscoveryError::UnsupportedScopes);
@@ -755,7 +931,11 @@ struct IssuerMetadata {
 
 fn decode_metadata<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, OAuthDiscoveryError> {
     if body.len() > MAX_OAUTH_METADATA_BYTES
-        || body.iter().copied().find(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n')) != Some(b'{')
+        || body
+            .iter()
+            .copied()
+            .find(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+            != Some(b'{')
     {
         return Err(OAuthDiscoveryError::InvalidMetadata);
     }
@@ -780,12 +960,20 @@ fn validate_headers(headers: &[(String, String)]) -> Result<(), OAuthDiscoveryEr
             encoding_seen = true;
         }
     }
-    let mut parts = media.ok_or(OAuthDiscoveryError::InvalidRepresentation)?.split(';');
-    if !parts.next().is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json")) {
+    let mut parts = media
+        .ok_or(OAuthDiscoveryError::InvalidRepresentation)?
+        .split(';');
+    if !parts
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+    {
         return Err(OAuthDiscoveryError::InvalidRepresentation);
     }
     if let Some(parameter) = parts.next() {
-        let (name, value) = parameter.trim().split_once('=').ok_or(OAuthDiscoveryError::InvalidRepresentation)?;
+        let (name, value) = parameter
+            .trim()
+            .split_once('=')
+            .ok_or(OAuthDiscoveryError::InvalidRepresentation)?;
         let value = value.trim();
         if !name.trim().eq_ignore_ascii_case("charset")
             || !(value.eq_ignore_ascii_case("utf-8") || value.eq_ignore_ascii_case("\"utf-8\""))
@@ -811,9 +999,19 @@ fn discovery_deadline(cx: &Cx, timeout: Duration) -> Result<Time, OAuthDiscovery
     if !cx.capabilities().io || cx.timer_driver().is_none() {
         return Err(OAuthDiscoveryError::RuntimeUnavailable);
     }
-    let nanos = u64::try_from(timeout.as_nanos()).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
-    let end = cx.now().as_nanos().checked_add(nanos).ok_or(OAuthDiscoveryError::InvalidPolicy)?;
-    Ok(cx.budget().deadline.map_or(Time::from_nanos(end), |parent| parent.min(Time::from_nanos(end))))
+    let nanos =
+        u64::try_from(timeout.as_nanos()).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
+    let end = cx
+        .now()
+        .as_nanos()
+        .checked_add(nanos)
+        .ok_or(OAuthDiscoveryError::InvalidPolicy)?;
+    Ok(cx
+        .budget()
+        .deadline
+        .map_or(Time::from_nanos(end), |parent| {
+            parent.min(Time::from_nanos(end))
+        }))
 }
 
 async fn within<T>(
@@ -843,7 +1041,8 @@ async fn within<T>(
         let result = future.as_mut().poll(task);
         check_context(cx, deadline)?;
         result
-    }).await
+    })
+    .await
 }
 
 async fn fetch_metadata(
@@ -865,17 +1064,29 @@ async fn fetch_metadata(
     }
     let client = builder.build();
     let response = within(cx, deadline, async {
-        client.request(cx, Method::Get, url.as_str(), vec![
-            ("Accept".to_owned(), "application/json".to_owned()),
-            ("Accept-Encoding".to_owned(), "identity".to_owned()),
-            ("Connection".to_owned(), "close".to_owned()),
-        ], Vec::new()).await.map_err(|_| OAuthDiscoveryError::TransportFailed)
-    }).await?;
+        client
+            .request(
+                cx,
+                Method::Get,
+                url.as_str(),
+                vec![
+                    ("Accept".to_owned(), "application/json".to_owned()),
+                    ("Accept-Encoding".to_owned(), "identity".to_owned()),
+                    ("Connection".to_owned(), "close".to_owned()),
+                ],
+                Vec::new(),
+            )
+            .await
+            .map_err(|_| OAuthDiscoveryError::TransportFailed)
+    })
+    .await?;
     if matches!(response.status, 404 | 410) {
         return Ok(None);
     }
     if response.status != 200 {
-        return Err(OAuthDiscoveryError::HttpStatus { status: response.status });
+        return Err(OAuthDiscoveryError::HttpStatus {
+            status: response.status,
+        });
     }
     validate_headers(&response.headers)?;
     if response.body.len() > MAX_OAUTH_METADATA_BYTES || !response.trailers.is_empty() {
@@ -889,12 +1100,18 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn url(value: &str) -> CanonicalHttpUrl { CanonicalHttpUrl::parse(value).unwrap() }
+    fn url(value: &str) -> CanonicalHttpUrl {
+        CanonicalHttpUrl::parse(value).unwrap()
+    }
 
     fn plan() -> OAuthDiscoveryPlan {
-        OAuthDiscoveryPlan::new(url("https://resource.example/mcp"), vec![
-            TrustedOAuthIssuer::new("https://issuer.example/tenant").unwrap(),
-        ], "registered-client", vec!["tools:read".to_owned()]).unwrap()
+        OAuthDiscoveryPlan::new(
+            url("https://resource.example/mcp"),
+            vec![TrustedOAuthIssuer::new("https://issuer.example/tenant").unwrap()],
+            "registered-client",
+            vec!["tools:read".to_owned()],
+        )
+        .unwrap()
     }
 
     fn issuer_document() -> serde_json::Value {
@@ -911,34 +1128,60 @@ mod tests {
         })
     }
 
-    fn admit(plan: &OAuthDiscoveryPlan, document: &serde_json::Value) -> Result<OAuthClientConfiguration, OAuthDiscoveryError> {
+    fn admit(
+        plan: &OAuthDiscoveryPlan,
+        document: &serde_json::Value,
+    ) -> Result<OAuthClientConfiguration, OAuthDiscoveryError> {
         plan.admit_issuer(&plan.issuers[0], &serde_json::to_vec(document).unwrap())
     }
 
     #[test]
     fn well_known_paths_preserve_tenant_and_distinguish_rfc_and_oidc_layouts() {
         let paths = issuer_metadata_urls(&url("https://issuer.example:8443/tenant/")).unwrap();
-        assert_eq!(paths.iter().map(CanonicalHttpUrl::as_str).collect::<Vec<_>>(), [
-            "https://issuer.example:8443/.well-known/oauth-authorization-server/tenant",
-            "https://issuer.example:8443/.well-known/openid-configuration/tenant",
-            "https://issuer.example:8443/tenant/.well-known/openid-configuration",
-        ]);
-        assert_eq!(issuer_metadata_urls(&url("https://issuer.example")).unwrap().len(), 2);
-        assert_eq!(resource_metadata_url(&url("https://[::1]:8443/mcp")).unwrap().as_str(),
-            "https://[::1]:8443/.well-known/oauth-protected-resource/mcp");
+        assert_eq!(
+            paths
+                .iter()
+                .map(CanonicalHttpUrl::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "https://issuer.example:8443/.well-known/oauth-authorization-server/tenant",
+                "https://issuer.example:8443/.well-known/openid-configuration/tenant",
+                "https://issuer.example:8443/tenant/.well-known/openid-configuration",
+            ]
+        );
+        assert_eq!(
+            issuer_metadata_urls(&url("https://issuer.example"))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            resource_metadata_url(&url("https://[::1]:8443/mcp"))
+                .unwrap()
+                .as_str(),
+            "https://[::1]:8443/.well-known/oauth-protected-resource/mcp"
+        );
     }
 
     #[test]
     fn local_issuer_order_wins_and_unknown_peer_urls_never_become_fetch_targets() {
         let mut plan = plan();
-        plan.issuers.push(TrustedOAuthIssuer::new("https://second.example").unwrap());
+        plan.issuers
+            .push(TrustedOAuthIssuer::new("https://second.example").unwrap());
         let body = json!({"resource": plan.resource.as_str(), "authorization_servers": [
             "http://127.0.0.1/private", "https://second.example", "https://issuer.example/tenant"
         ]});
-        assert_eq!(plan.select_issuer(&serde_json::to_vec(&body).unwrap()).unwrap().identifier,
-            "https://issuer.example/tenant");
+        assert_eq!(
+            plan.select_issuer(&serde_json::to_vec(&body).unwrap())
+                .unwrap()
+                .identifier,
+            "https://issuer.example/tenant"
+        );
         let unknown = br#"{"resource":"https://resource.example/mcp","authorization_servers":["https://unknown.example"]}"#;
-        assert!(matches!(plan.select_issuer(unknown), Err(OAuthDiscoveryError::NoTrustedIssuer)));
+        assert!(matches!(
+            plan.select_issuer(unknown),
+            Err(OAuthDiscoveryError::NoTrustedIssuer)
+        ));
     }
 
     #[test]
@@ -946,10 +1189,14 @@ mod tests {
         let plan = plan();
         let actual = admit(&plan, &issuer_document()).unwrap();
         let expected = OAuthClientConfiguration::from_trusted_endpoints(
-            "https://issuer.example/tenant", url("https://issuer.example/authorize"),
-            url("https://issuer.example/token"), plan.resource.clone(),
-            "registered-client", vec!["tools:read".to_owned()],
-        ).unwrap();
+            "https://issuer.example/tenant",
+            url("https://issuer.example/authorize"),
+            url("https://issuer.example/token"),
+            plan.resource.clone(),
+            "registered-client",
+            vec!["tools:read".to_owned()],
+        )
+        .unwrap();
         assert_eq!(actual, expected);
     }
 
@@ -957,11 +1204,21 @@ mod tests {
     fn metadata_must_match_exact_resource_and_issuer_not_just_the_origin() {
         let plan = plan();
         let wrong_resource = br#"{"resource":"https://resource.example/","authorization_servers":["https://issuer.example/tenant"]}"#;
-        assert!(matches!(plan.select_issuer(wrong_resource), Err(OAuthDiscoveryError::ResourceMismatch)));
-        for issuer in ["https://issuer.example/tenant/", "https://ISSUER.example/tenant", "https://other.example/tenant"] {
+        assert!(matches!(
+            plan.select_issuer(wrong_resource),
+            Err(OAuthDiscoveryError::ResourceMismatch)
+        ));
+        for issuer in [
+            "https://issuer.example/tenant/",
+            "https://ISSUER.example/tenant",
+            "https://other.example/tenant",
+        ] {
             let mut document = issuer_document();
             document["issuer"] = json!(issuer);
-            assert!(matches!(admit(&plan, &document), Err(OAuthDiscoveryError::IssuerMismatch)));
+            assert!(matches!(
+                admit(&plan, &document),
+                Err(OAuthDiscoveryError::IssuerMismatch)
+            ));
         }
     }
 
@@ -970,20 +1227,36 @@ mod tests {
         let plan = plan();
         for (member, value) in [
             ("code_challenge_methods_supported", json!(["plain"])),
-            ("token_endpoint_auth_methods_supported", json!(["client_secret_basic"])),
-            ("authorization_response_iss_parameter_supported", json!(false)),
+            (
+                "token_endpoint_auth_methods_supported",
+                json!(["client_secret_basic"]),
+            ),
+            (
+                "authorization_response_iss_parameter_supported",
+                json!(false),
+            ),
             ("response_types_supported", json!(["token"])),
             ("grant_types_supported", json!(["client_credentials"])),
             ("response_modes_supported", json!(["fragment"])),
         ] {
             let mut document = issuer_document();
             document[member] = value;
-            assert!(matches!(admit(&plan, &document), Err(OAuthDiscoveryError::UnsupportedFlow)));
+            assert!(matches!(
+                admit(&plan, &document),
+                Err(OAuthDiscoveryError::UnsupportedFlow)
+            ));
         }
-        for member in ["code_challenge_methods_supported", "token_endpoint_auth_methods_supported", "authorization_response_iss_parameter_supported"] {
+        for member in [
+            "code_challenge_methods_supported",
+            "token_endpoint_auth_methods_supported",
+            "authorization_response_iss_parameter_supported",
+        ] {
             let mut document = issuer_document();
             document.as_object_mut().unwrap().remove(member);
-            assert!(matches!(admit(&plan, &document), Err(OAuthDiscoveryError::UnsupportedFlow)));
+            assert!(matches!(
+                admit(&plan, &document),
+                Err(OAuthDiscoveryError::UnsupportedFlow)
+            ));
         }
     }
 
@@ -995,27 +1268,53 @@ mod tests {
         document["revocation_endpoint_auth_methods_supported"] = json!(["none"]);
         let configuration = admit(&plan, &document).unwrap();
         assert_eq!(
-            configuration.revocation_endpoint().map(CanonicalHttpUrl::as_str),
+            configuration
+                .revocation_endpoint()
+                .map(CanonicalHttpUrl::as_str),
             Some("https://issuer.example/revoke"),
         );
 
         document["revocation_endpoint_auth_methods_supported"] = json!(["client_secret_basic"]);
-        assert!(admit(&plan, &document).unwrap().revocation_endpoint().is_none());
-        document.as_object_mut().unwrap().remove("revocation_endpoint_auth_methods_supported");
-        assert!(admit(&plan, &document).unwrap().revocation_endpoint().is_none());
+        assert!(
+            admit(&plan, &document)
+                .unwrap()
+                .revocation_endpoint()
+                .is_none()
+        );
+        document
+            .as_object_mut()
+            .unwrap()
+            .remove("revocation_endpoint_auth_methods_supported");
+        assert!(
+            admit(&plan, &document)
+                .unwrap()
+                .revocation_endpoint()
+                .is_none()
+        );
 
         document["revocation_endpoint_auth_methods_supported"] = json!(["none"]);
         document["revocation_endpoint"] = json!("https://tokens.example/revoke");
-        assert!(matches!(admit(&plan, &document), Err(OAuthDiscoveryError::EndpointNotTrusted)));
-        plan.issuers[0] = plan.issuers[0].clone()
-            .with_endpoint_origin(url("https://tokens.example/")).unwrap();
+        assert!(matches!(
+            admit(&plan, &document),
+            Err(OAuthDiscoveryError::EndpointNotTrusted)
+        ));
+        plan.issuers[0] = plan.issuers[0]
+            .clone()
+            .with_endpoint_origin(url("https://tokens.example/"))
+            .unwrap();
         assert_eq!(
-            admit(&plan, &document).unwrap().revocation_endpoint().map(CanonicalHttpUrl::as_str),
+            admit(&plan, &document)
+                .unwrap()
+                .revocation_endpoint()
+                .map(CanonicalHttpUrl::as_str),
             Some("https://tokens.example/revoke"),
         );
 
         document["revocation_endpoint"] = serde_json::Value::Null;
-        assert!(matches!(admit(&plan, &document), Err(OAuthDiscoveryError::InvalidMetadata)));
+        assert!(matches!(
+            admit(&plan, &document),
+            Err(OAuthDiscoveryError::InvalidMetadata)
+        ));
     }
 
     #[test]
@@ -1023,10 +1322,21 @@ mod tests {
         let mut plan = plan();
         let mut document = issuer_document();
         document["token_endpoint"] = json!("https://tokens.example/exchange");
-        assert!(matches!(admit(&plan, &document), Err(OAuthDiscoveryError::EndpointNotTrusted)));
-        plan.issuers[0] = plan.issuers[0].clone().with_endpoint_origin(url("https://tokens.example/")).unwrap();
+        assert!(matches!(
+            admit(&plan, &document),
+            Err(OAuthDiscoveryError::EndpointNotTrusted)
+        ));
+        plan.issuers[0] = plan.issuers[0]
+            .clone()
+            .with_endpoint_origin(url("https://tokens.example/"))
+            .unwrap();
         assert!(admit(&plan, &document).is_ok());
-        for endpoint in ["http://tokens.example/exchange", "https://user@tokens.example/exchange", "https://tokens.example/exchange?q=1", "https://tokens.example/exchange#x"] {
+        for endpoint in [
+            "http://tokens.example/exchange",
+            "https://user@tokens.example/exchange",
+            "https://tokens.example/exchange?q=1",
+            "https://tokens.example/exchange#x",
+        ] {
             document["token_endpoint"] = json!(endpoint);
             assert!(admit(&plan, &document).is_err());
         }
@@ -1037,30 +1347,54 @@ mod tests {
         let plan = plan();
         let mut document = issuer_document();
         document["scopes_supported"] = json!(["admin"]);
-        assert!(matches!(admit(&plan, &document), Err(OAuthDiscoveryError::UnsupportedScopes)));
+        assert!(matches!(
+            admit(&plan, &document),
+            Err(OAuthDiscoveryError::UnsupportedScopes)
+        ));
         document = issuer_document();
         document["protected_resources"] = json!(["https://other.example/mcp"]);
-        assert!(matches!(admit(&plan, &document), Err(OAuthDiscoveryError::ResourceMismatch)));
+        assert!(matches!(
+            admit(&plan, &document),
+            Err(OAuthDiscoveryError::ResourceMismatch)
+        ));
         let resource = br#"{"resource":"https://resource.example/mcp","authorization_servers":["https://issuer.example/tenant"],"bearer_methods_supported":["body"]}"#;
-        assert!(matches!(plan.select_issuer(resource), Err(OAuthDiscoveryError::UnsupportedFlow)));
+        assert!(matches!(
+            plan.select_issuer(resource),
+            Err(OAuthDiscoveryError::UnsupportedFlow)
+        ));
     }
 
     #[test]
     fn null_duplicate_and_signed_security_metadata_is_not_silently_accepted() {
         let plan = plan();
-        for suffix in [",\"issuer\":\"https://other.example\"", ",\"iss\\u0075er\":\"https://other.example\""] {
+        for suffix in [
+            ",\"issuer\":\"https://other.example\"",
+            ",\"iss\\u0075er\":\"https://other.example\"",
+        ] {
             let encoded = serde_json::to_string(&issuer_document()).unwrap();
             let body = format!("{}{suffix}}}", &encoded[..encoded.len() - 1]);
-            assert!(matches!(plan.admit_issuer(&plan.issuers[0], body.as_bytes()), Err(OAuthDiscoveryError::InvalidMetadata)));
+            assert!(matches!(
+                plan.admit_issuer(&plan.issuers[0], body.as_bytes()),
+                Err(OAuthDiscoveryError::InvalidMetadata)
+            ));
         }
         let mut document = issuer_document();
         document["grant_types_supported"] = serde_json::Value::Null;
-        assert!(matches!(admit(&plan, &document), Err(OAuthDiscoveryError::InvalidMetadata)));
+        assert!(matches!(
+            admit(&plan, &document),
+            Err(OAuthDiscoveryError::InvalidMetadata)
+        ));
         document = issuer_document();
         document["signed_metadata"] = json!("unverified.jwt.claims");
-        assert!(matches!(admit(&plan, &document), Err(OAuthDiscoveryError::SignedMetadataUnsupported)));
+        assert!(matches!(
+            admit(&plan, &document),
+            Err(OAuthDiscoveryError::SignedMetadataUnsupported)
+        ));
         let oversized = vec![b' '; MAX_OAUTH_METADATA_BYTES + 1];
-        assert!(matches!(plan.select_issuer(&oversized), Err(OAuthDiscoveryError::InvalidMetadata)));
+        assert!(matches!(
+            plan.select_issuer(&oversized),
+            Err(OAuthDiscoveryError::InvalidMetadata)
+        ));
     }
 
     #[test]
@@ -1073,33 +1407,73 @@ mod tests {
         let admitted = format!(" \r\n\t{resource}");
         assert!(plan.select_issuer(admitted.as_bytes()).is_ok());
         for body in [
-            json!(["https://resource.example/mcp", ["https://issuer.example/tenant"]]),
-            json!([resource]), json!(null), json!(true), json!("{}"),
+            json!([
+                "https://resource.example/mcp",
+                ["https://issuer.example/tenant"]
+            ]),
+            json!([resource]),
+            json!(null),
+            json!(true),
+            json!("{}"),
         ] {
-            assert!(matches!(plan.select_issuer(body.to_string().as_bytes()), Err(OAuthDiscoveryError::InvalidMetadata)));
+            assert!(matches!(
+                plan.select_issuer(body.to_string().as_bytes()),
+                Err(OAuthDiscoveryError::InvalidMetadata)
+            ));
         }
         let positional = json!([
-            "https://issuer.example/tenant", "https://issuer.example/authorize",
-            "https://issuer.example/token", ["code"], ["authorization_code"],
-            ["query"], ["none"], ["S256"], true, ["tools:read"],
+            "https://issuer.example/tenant",
+            "https://issuer.example/authorize",
+            "https://issuer.example/token",
+            ["code"],
+            ["authorization_code"],
+            ["query"],
+            ["none"],
+            ["S256"],
+            true,
+            ["tools:read"],
             ["https://resource.example/mcp"]
         ]);
-        assert!(matches!(admit(&plan, &positional), Err(OAuthDiscoveryError::InvalidMetadata)));
-        assert!(matches!(admit(&plan, &json!([issuer_document()])), Err(OAuthDiscoveryError::InvalidMetadata)));
+        assert!(matches!(
+            admit(&plan, &positional),
+            Err(OAuthDiscoveryError::InvalidMetadata)
+        ));
+        assert!(matches!(
+            admit(&plan, &json!([issuer_document()])),
+            Err(OAuthDiscoveryError::InvalidMetadata)
+        ));
         assert!(admit(&plan, &issuer_document()).is_ok());
     }
 
     #[test]
     fn representation_requires_single_uncoded_json_content_type() {
-        assert!(validate_headers(&[("Content-Type".into(), "application/json; charset=\"utf-8\"".into())]).is_ok());
+        assert!(
+            validate_headers(&[(
+                "Content-Type".into(),
+                "application/json; charset=\"utf-8\"".into()
+            )])
+            .is_ok()
+        );
         for headers in [
             vec![],
             vec![("Content-Type".into(), "text/html".into())],
-            vec![("Content-Type".into(), "application/json".into()), ("content-type".into(), "application/json".into())],
-            vec![("Content-Type".into(), "application/json".into()), ("Content-Encoding".into(), "gzip".into())],
-            vec![("Content-Type".into(), "application/json; charset=\"utf-8".into())],
+            vec![
+                ("Content-Type".into(), "application/json".into()),
+                ("content-type".into(), "application/json".into()),
+            ],
+            vec![
+                ("Content-Type".into(), "application/json".into()),
+                ("Content-Encoding".into(), "gzip".into()),
+            ],
+            vec![(
+                "Content-Type".into(),
+                "application/json; charset=\"utf-8".into(),
+            )],
         ] {
-            assert!(matches!(validate_headers(&headers), Err(OAuthDiscoveryError::InvalidRepresentation)));
+            assert!(matches!(
+                validate_headers(&headers),
+                Err(OAuthDiscoveryError::InvalidRepresentation)
+            ));
         }
     }
 
@@ -1107,11 +1481,22 @@ mod tests {
     fn trust_policy_rejects_ambiguous_issuers_and_overbroad_origin_grants() {
         assert!(TrustedOAuthIssuer::new("http://localhost/issuer").is_err());
         assert!(TrustedOAuthIssuer::new("https://issuer.example?query").is_err());
-        assert!(TrustedOAuthIssuer::new("https://issuer.example").unwrap()
-            .with_endpoint_origin(url("https://other.example/some-path")).is_err());
+        assert!(
+            TrustedOAuthIssuer::new("https://issuer.example")
+                .unwrap()
+                .with_endpoint_origin(url("https://other.example/some-path"))
+                .is_err()
+        );
         let issuer = TrustedOAuthIssuer::new("https://issuer.example").unwrap();
-        assert!(OAuthDiscoveryPlan::new(url("https://resource.example/mcp"),
-            vec![issuer.clone(), issuer], "client", vec![]).is_err());
+        assert!(
+            OAuthDiscoveryPlan::new(
+                url("https://resource.example/mcp"),
+                vec![issuer.clone(), issuer],
+                "client",
+                vec![]
+            )
+            .is_err()
+        );
         assert!(plan().with_timeout(Duration::ZERO).is_err());
         assert!(plan().with_timeout(Duration::from_secs(121)).is_err());
     }
@@ -1121,8 +1506,15 @@ mod tests {
     #[test]
     fn a_resource_at_the_origin_root_is_a_valid_discovery_plan() {
         let issuer = TrustedOAuthIssuer::new("https://issuer.example/tenant").unwrap();
-        assert!(OAuthDiscoveryPlan::new(url("https://resource.example"), vec![issuer], "client", vec![])
-            .is_ok());
+        assert!(
+            OAuthDiscoveryPlan::new(
+                url("https://resource.example"),
+                vec![issuer],
+                "client",
+                vec![]
+            )
+            .is_ok()
+        );
     }
 
     /// Planted negative: identical except the resource is a non-root path with
@@ -1131,7 +1523,12 @@ mod tests {
     fn a_non_root_resource_with_a_trailing_slash_is_still_refused() {
         let issuer = TrustedOAuthIssuer::new("https://issuer.example/tenant").unwrap();
         assert!(matches!(
-            OAuthDiscoveryPlan::new(url("https://resource.example/mcp/"), vec![issuer], "client", vec![]),
+            OAuthDiscoveryPlan::new(
+                url("https://resource.example/mcp/"),
+                vec![issuer],
+                "client",
+                vec![]
+            ),
             Err(OAuthDiscoveryError::InvalidPolicy)
         ));
     }
@@ -1139,22 +1536,35 @@ mod tests {
     #[test]
     fn constructed_resource_candidates_preserve_path_and_deduplicate_root() {
         let candidates = resource_metadata_urls(&url("https://[::1]:8443/a%2Fb/")).unwrap();
-        assert_eq!(candidates.iter().map(|(_, url)| url.as_str()).collect::<Vec<_>>(), [
-            "https://[::1]:8443/.well-known/oauth-protected-resource/a%2Fb/",
-            "https://[::1]:8443/.well-known/oauth-protected-resource",
-        ]);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|(_, url)| url.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "https://[::1]:8443/.well-known/oauth-protected-resource/a%2Fb/",
+                "https://[::1]:8443/.well-known/oauth-protected-resource",
+            ]
+        );
         assert_eq!(candidates[0].0, ResourceMetadataLocation::PathSpecific);
         assert_eq!(candidates[1].0, ResourceMetadataLocation::OriginRoot);
         let root = resource_metadata_urls(&url("https://resource.example/")).unwrap();
         assert_eq!(root.len(), 1);
         assert_eq!(root[0].0, ResourceMetadataLocation::OriginRoot);
-        assert_eq!(root[0].1.as_str(), "https://resource.example/.well-known/oauth-protected-resource");
+        assert_eq!(
+            root[0].1.as_str(),
+            "https://resource.example/.well-known/oauth-protected-resource"
+        );
     }
 
     #[test]
     fn constructed_resource_candidates_do_not_accept_unadmitted_endpoint_shapes() {
-        for endpoint in ["http://resource.example/mcp", "https://resource.example/mcp?q=1",
-            "https://resource.example/mcp#x", "https://user@resource.example/mcp"] {
+        for endpoint in [
+            "http://resource.example/mcp",
+            "https://resource.example/mcp?q=1",
+            "https://resource.example/mcp#x",
+            "https://user@resource.example/mcp",
+        ] {
             assert!(resource_metadata_urls(&url(endpoint)).is_err());
         }
     }
@@ -1163,24 +1573,61 @@ mod tests {
     fn constructed_schedule_reserves_root_and_issuer_before_first_fetch() {
         let now = Time::from_nanos(100);
         let end = Time::from_nanos(500);
-        assert_eq!(resource_candidate_deadlines(now, end, 2).unwrap(), [Time::from_nanos(200), Time::from_nanos(300)]);
-        assert_eq!(resource_candidate_deadlines(now, end, 1).unwrap(), [Time::from_nanos(300)]);
-        for count in [0, 3, usize::MAX] { assert!(resource_candidate_deadlines(now, end, count).is_err()); }
+        assert_eq!(
+            resource_candidate_deadlines(now, end, 2).unwrap(),
+            [Time::from_nanos(200), Time::from_nanos(300)]
+        );
+        assert_eq!(
+            resource_candidate_deadlines(now, end, 1).unwrap(),
+            [Time::from_nanos(300)]
+        );
+        for count in [0, 3, usize::MAX] {
+            assert!(resource_candidate_deadlines(now, end, count).is_err());
+        }
         assert!(resource_candidate_deadlines(now, now, 2).is_err());
         assert!(resource_candidate_deadlines(now, Time::from_nanos(103), 2).is_err());
-        let near_max = resource_candidate_deadlines(Time::from_nanos(u64::MAX - 40), Time::from_nanos(u64::MAX), 2).unwrap();
-        assert_eq!(near_max, [Time::from_nanos(u64::MAX - 30), Time::from_nanos(u64::MAX - 20)]);
+        let near_max = resource_candidate_deadlines(
+            Time::from_nanos(u64::MAX - 40),
+            Time::from_nanos(u64::MAX),
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            near_max,
+            [
+                Time::from_nanos(u64::MAX - 30),
+                Time::from_nanos(u64::MAX - 20)
+            ]
+        );
     }
 
     #[test]
     fn aggregate_prm_failure_keeps_order_and_integrity_precedes_later_absence() {
-        let failure = ResourceMetadataFailure { attempts: vec![
-            ResourceMetadataAttempt { location: ResourceMetadataLocation::PathSpecific, cause: ResourceMetadataCause::ResourceMismatch },
-            ResourceMetadataAttempt { location: ResourceMetadataLocation::OriginRoot, cause: ResourceMetadataCause::NotFound },
-        ], interrupted: None };
-        assert_eq!(failure.classification(), ResourceMetadataFailureClass::TrustOrIntegrity);
-        assert_eq!(failure.attempts()[0].cause(), ResourceMetadataCause::ResourceMismatch);
-        assert_eq!(failure.attempts()[1].location(), ResourceMetadataLocation::OriginRoot);
+        let failure = ResourceMetadataFailure {
+            attempts: vec![
+                ResourceMetadataAttempt {
+                    location: ResourceMetadataLocation::PathSpecific,
+                    cause: ResourceMetadataCause::ResourceMismatch,
+                },
+                ResourceMetadataAttempt {
+                    location: ResourceMetadataLocation::OriginRoot,
+                    cause: ResourceMetadataCause::NotFound,
+                },
+            ],
+            interrupted: None,
+        };
+        assert_eq!(
+            failure.classification(),
+            ResourceMetadataFailureClass::TrustOrIntegrity
+        );
+        assert_eq!(
+            failure.attempts()[0].cause(),
+            ResourceMetadataCause::ResourceMismatch
+        );
+        assert_eq!(
+            failure.attempts()[1].location(),
+            ResourceMetadataLocation::OriginRoot
+        );
         let error = OAuthDiscoveryError::ResourceMetadataExhausted(failure);
         let diagnostics = format!("{error:?} {error}");
         assert!(!diagnostics.contains("https://"));
@@ -1190,18 +1637,40 @@ mod tests {
     #[test]
     fn aggregate_prm_failure_classification_is_independent_of_candidate_order() {
         let causes = [
-            (ResourceMetadataCause::NotFound, ResourceMetadataFailureClass::NotFound),
-            (ResourceMetadataCause::CandidateDeadline, ResourceMetadataFailureClass::Transport),
-            (ResourceMetadataCause::InvalidMetadata, ResourceMetadataFailureClass::ProtocolOrHttp),
-            (ResourceMetadataCause::NoTrustedIssuer, ResourceMetadataFailureClass::TrustOrIntegrity),
-            (ResourceMetadataCause::Cancelled, ResourceMetadataFailureClass::Cancelled),
+            (
+                ResourceMetadataCause::NotFound,
+                ResourceMetadataFailureClass::NotFound,
+            ),
+            (
+                ResourceMetadataCause::CandidateDeadline,
+                ResourceMetadataFailureClass::Transport,
+            ),
+            (
+                ResourceMetadataCause::InvalidMetadata,
+                ResourceMetadataFailureClass::ProtocolOrHttp,
+            ),
+            (
+                ResourceMetadataCause::NoTrustedIssuer,
+                ResourceMetadataFailureClass::TrustOrIntegrity,
+            ),
+            (
+                ResourceMetadataCause::Cancelled,
+                ResourceMetadataFailureClass::Cancelled,
+            ),
         ];
         for (low_index, (low, _)) in causes.iter().enumerate() {
             for (high, expected) in &causes[low_index..] {
                 for pair in [[*low, *high], [*high, *low]] {
-                    let failure = ResourceMetadataFailure { attempts: pair.into_iter().map(|cause| ResourceMetadataAttempt {
-                        location: ResourceMetadataLocation::PathSpecific, cause,
-                    }).collect(), interrupted: None };
+                    let failure = ResourceMetadataFailure {
+                        attempts: pair
+                            .into_iter()
+                            .map(|cause| ResourceMetadataAttempt {
+                                location: ResourceMetadataLocation::PathSpecific,
+                                cause,
+                            })
+                            .collect(),
+                        interrupted: None,
+                    };
                     assert_eq!(failure.classification(), *expected);
                 }
             }
@@ -1210,13 +1679,23 @@ mod tests {
 
     #[test]
     fn interrupted_prm_failure_retains_attempts_without_inventing_a_root_fetch() {
-        for reason in [ResourceMetadataFailureClass::Cancelled, ResourceMetadataFailureClass::OverallDeadline] {
-            let failure = ResourceMetadataFailure { attempts: vec![ResourceMetadataAttempt {
-                location: ResourceMetadataLocation::PathSpecific, cause: ResourceMetadataCause::ResourceMismatch,
-            }], interrupted: Some(reason) };
+        for reason in [
+            ResourceMetadataFailureClass::Cancelled,
+            ResourceMetadataFailureClass::OverallDeadline,
+        ] {
+            let failure = ResourceMetadataFailure {
+                attempts: vec![ResourceMetadataAttempt {
+                    location: ResourceMetadataLocation::PathSpecific,
+                    cause: ResourceMetadataCause::ResourceMismatch,
+                }],
+                interrupted: Some(reason),
+            };
             assert_eq!(failure.classification(), reason);
             assert_eq!(failure.attempts().len(), 1);
-            assert_eq!(failure.attempts()[0].cause(), ResourceMetadataCause::ResourceMismatch);
+            assert_eq!(
+                failure.attempts()[0].cause(),
+                ResourceMetadataCause::ResourceMismatch
+            );
         }
     }
 }

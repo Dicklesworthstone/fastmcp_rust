@@ -13,8 +13,7 @@ use asupersync::types::Time;
 use fastmcp_core::McpRequestCancellation;
 
 use super::{
-    ManagedOAuthResponse, ManagedOAuthSession, OAuthCredentialSnapshot,
-    OAuthSessionError,
+    ManagedOAuthResponse, ManagedOAuthSession, OAuthCredentialSnapshot, OAuthSessionError,
 };
 use crate::http_executor::ModernHttpResponseStream;
 
@@ -45,8 +44,10 @@ impl ManagedOAuthSession {
                 } else {
                     result
                 }
-            }).await
-        }).await
+            })
+            .await
+        })
+        .await
     }
 }
 
@@ -78,23 +79,27 @@ mod tests {
     use std::task::{Context, Wake, Waker};
     use std::time::Duration;
 
-    use asupersync::io::{AsyncReadExt, AsyncWriteExt};
-    use asupersync::net::TcpListener;
-    use crate::http_auth::{BoundBearerCredential, CanonicalHttpUrl};
+    use super::super::OAuthSessionPolicy;
     use crate::http_auth::oauth::{OAuthClient, OAuthClientConfiguration};
+    use crate::http_auth::{BoundBearerCredential, CanonicalHttpUrl};
     use crate::http_executor::{ModernHttpExecutor, ModernHttpExecutorError, ModernHttpRequest};
     use crate::sse::SseLimits;
-    use super::super::OAuthSessionPolicy;
+    use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+    use asupersync::net::TcpListener;
 
     // Native session/snapshot ownership with no retained session grant.
     // HTTP cases below inject body custody, never cleartext authority.
     fn session() -> ManagedOAuthSession {
         let url = |value| CanonicalHttpUrl::parse(value).unwrap();
         let configuration = OAuthClientConfiguration::from_trusted_endpoints(
-            "https://issuer.example", url("https://issuer.example/authorize"),
-            url("https://issuer.example/token"), url("https://mcp.example/mcp"),
-            "native-client", vec![],
-        ).unwrap();
+            "https://issuer.example",
+            url("https://issuer.example/authorize"),
+            url("https://issuer.example/token"),
+            url("https://mcp.example/mcp"),
+            "native-client",
+            vec![],
+        )
+        .unwrap();
         ManagedOAuthSession {
             inner: Arc::new(super::super::SessionInner {
                 client: OAuthClient::new(configuration),
@@ -110,40 +115,58 @@ mod tests {
 
     fn snapshot(session: &ManagedOAuthSession, token: &str) -> OAuthCredentialSnapshot {
         let expiry = Instant::now() + Duration::from_secs(60);
-        let credential = BoundBearerCredential::bind_with_expiry(
-            session.resource().clone(), token, expiry,
-        ).unwrap();
+        let credential =
+            BoundBearerCredential::bind_with_expiry(session.resource().clone(), token, expiry)
+                .unwrap();
         OAuthCredentialSnapshot::new(&credential, &[], 7, expiry, &session.inner.closed).unwrap()
     }
 
     fn run(future: impl Future<Output = ()>) {
         asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
-            .build().unwrap().block_on(async {
+            .build()
+            .unwrap()
+            .block_on(async {
                 let cx = Cx::current().unwrap();
                 asupersync::time::timeout_at(cx.now().saturating_add_nanos(10_000_000_000), future)
-                    .await.unwrap();
+                    .await
+                    .unwrap();
             });
     }
 
     async fn guarded<T>(
-        cx: &Cx, session: &ManagedOAuthSession, snapshot: &OAuthCredentialSnapshot,
+        cx: &Cx,
+        session: &ManagedOAuthSession,
+        snapshot: &OAuthCredentialSnapshot,
         future: impl Future<Output = Result<T, OAuthSessionError>>,
     ) -> Result<T, OAuthSessionError> {
-        session.await_credential(cx, &McpRequestCancellation::new(),
-            cx.now().saturating_add_nanos(5_000_000_000), snapshot.expires_at,
-            &snapshot.credential.revoked, future).await
+        session
+            .await_credential(
+                cx,
+                &McpRequestCancellation::new(),
+                cx.now().saturating_add_nanos(5_000_000_000),
+                snapshot.expires_at,
+                &snapshot.credential.revoked,
+                future,
+            )
+            .await
     }
 
     #[derive(Default)]
     struct WakeCount(AtomicUsize);
     impl Wake for WakeCount {
-        fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
-        fn wake_by_ref(self: &Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
     }
     struct ResultOwner(Arc<AtomicUsize>);
     impl Drop for ResultOwner {
-        fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     #[test]
@@ -159,7 +182,8 @@ mod tests {
             let result = guarded(&cx, &session, &snapshot, async {
                 polls.fetch_add(1, Ordering::SeqCst);
                 Ok(owner)
-            }).await;
+            })
+            .await;
             assert!(matches!(result, Err(OAuthSessionError::LoginRequired)));
             assert_eq!(polls.load(Ordering::SeqCst), 0);
             assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -176,7 +200,8 @@ mod tests {
             let result = guarded(&cx, &session, &snapshot, async {
                 snapshot.credential.revoke();
                 Ok(ResultOwner(drops.clone()))
-            }).await;
+            })
+            .await;
             assert!(matches!(result, Err(OAuthSessionError::LoginRequired)));
             assert_eq!(drops.load(Ordering::SeqCst), 1);
             assert!(!session.inner.closed.is_cancel_requested());
@@ -193,13 +218,20 @@ mod tests {
             let counter = Arc::new(WakeCount::default());
             let waker = Waker::from(counter.clone());
             let mut context = Context::from_waker(&waker);
-            let mut pending = Box::pin(guarded(&cx, &session, &snapshot,
-                std::future::pending::<Result<(), OAuthSessionError>>()));
+            let mut pending = Box::pin(guarded(
+                &cx,
+                &session,
+                &snapshot,
+                std::future::pending::<Result<(), OAuthSessionError>>(),
+            ));
             assert!(pending.as_mut().poll(&mut context).is_pending());
             let before = counter.0.load(Ordering::SeqCst);
             clone.revoke();
             assert!(counter.0.load(Ordering::SeqCst) > before);
-            assert!(matches!(pending.await, Err(OAuthSessionError::LoginRequired)));
+            assert!(matches!(
+                pending.await,
+                Err(OAuthSessionError::LoginRequired)
+            ));
             assert!(cx.checkpoint().is_ok());
         });
     }
@@ -213,8 +245,12 @@ mod tests {
             let counter = Arc::new(WakeCount::default());
             let waker = Waker::from(counter.clone());
             let mut context = Context::from_waker(&waker);
-            let mut pending = Box::pin(guarded(&cx, &session, &snapshot,
-                std::future::pending::<Result<(), OAuthSessionError>>()));
+            let mut pending = Box::pin(guarded(
+                &cx,
+                &session,
+                &snapshot,
+                std::future::pending::<Result<(), OAuthSessionError>>(),
+            ));
             assert!(pending.as_mut().poll(&mut context).is_pending());
             drop(pending);
             assert!(!snapshot.credential.is_revoked());
@@ -233,12 +269,21 @@ mod tests {
             let first = snapshot(&session, "same-text");
             let second = snapshot(&session, "same-text");
             first.credential.revoke();
-            assert!(matches!(guarded(&cx, &session, &first, std::future::ready(Ok(1))).await,
-                Err(OAuthSessionError::LoginRequired)));
-            assert_eq!(guarded(&cx, &session, &second, std::future::ready(Ok(2))).await.unwrap(), 2);
+            assert!(matches!(
+                guarded(&cx, &session, &first, std::future::ready(Ok(1))).await,
+                Err(OAuthSessionError::LoginRequired)
+            ));
+            assert_eq!(
+                guarded(&cx, &session, &second, std::future::ready(Ok(2)))
+                    .await
+                    .unwrap(),
+                2
+            );
             session.close();
-            assert!(matches!(guarded(&cx, &session, &second, std::future::ready(Ok(3))).await,
-                Err(OAuthSessionError::Closed)));
+            assert!(matches!(
+                guarded(&cx, &session, &second, std::future::ready(Ok(3))).await,
+                Err(OAuthSessionError::Closed)
+            ));
         });
     }
 
@@ -249,14 +294,28 @@ mod tests {
             let session = session();
             let snapshot = snapshot(&session, "private-access");
             let cancellation = McpRequestCancellation::new();
-            let result = session.await_credential(&cx, &cancellation,
-                cx.now().saturating_add_nanos(20_000_000), snapshot.expires_at,
-                &snapshot.credential.revoked, std::future::pending::<Result<(), OAuthSessionError>>()).await;
+            let result = session
+                .await_credential(
+                    &cx,
+                    &cancellation,
+                    cx.now().saturating_add_nanos(20_000_000),
+                    snapshot.expires_at,
+                    &snapshot.credential.revoked,
+                    std::future::pending::<Result<(), OAuthSessionError>>(),
+                )
+                .await;
             assert!(matches!(result, Err(OAuthSessionError::TimedOut)));
             assert!(!snapshot.credential.is_revoked());
-            let result = session.await_credential(&cx, &cancellation,
-                cx.now().saturating_add_nanos(1_000_000_000), Instant::now(),
-                &snapshot.credential.revoked, std::future::ready(Ok(()))).await;
+            let result = session
+                .await_credential(
+                    &cx,
+                    &cancellation,
+                    cx.now().saturating_add_nanos(1_000_000_000),
+                    Instant::now(),
+                    &snapshot.credential.revoked,
+                    std::future::ready(Ok(())),
+                )
+                .await;
             assert!(matches!(result, Err(OAuthSessionError::LoginRequired)));
         });
     }
@@ -266,11 +325,23 @@ mod tests {
         let mut right = std::pin::pin!(right);
         let (mut one, mut two) = (None, None);
         poll_fn(|task| {
-            if one.is_none() { if let Poll::Ready(value) = left.as_mut().poll(task) { one = Some(value); } }
-            if two.is_none() { if let Poll::Ready(value) = right.as_mut().poll(task) { two = Some(value); } }
-            if one.is_some() && two.is_some() { Poll::Ready((one.take().unwrap(), two.take().unwrap())) }
-            else { Poll::Pending }
-        }).await
+            if one.is_none() {
+                if let Poll::Ready(value) = left.as_mut().poll(task) {
+                    one = Some(value);
+                }
+            }
+            if two.is_none() {
+                if let Poll::Ready(value) = right.as_mut().poll(task) {
+                    two = Some(value);
+                }
+            }
+            if one.is_some() && two.is_some() {
+                Poll::Ready((one.take().unwrap(), two.take().unwrap()))
+            } else {
+                Poll::Pending
+            }
+        })
+        .await
     }
 
     async fn peer(listener: &TcpListener, sse: bool) {
@@ -282,19 +353,43 @@ mod tests {
             assert!(count > 0 && bytes.len() + count <= 8192);
             bytes.extend_from_slice(&chunk[..count]);
             if let Some(end) = bytes.windows(4).position(|p| p == b"\r\n\r\n") {
-                if bytes.len() >= end + 6 { break; }
+                if bytes.len() >= end + 6 {
+                    break;
+                }
             }
         }
-        assert!(!String::from_utf8_lossy(&bytes).to_ascii_lowercase().contains("authorization:"));
-        let mime = if sse { "text/event-stream" } else { "application/json" };
-        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nTransfer-Encoding: chunked\r\n\r\n").as_bytes()).await.unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes)
+                .to_ascii_lowercase()
+                .contains("authorization:")
+        );
+        let mime = if sse {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nTransfer-Encoding: chunked\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
         if sse {
             let body = "data: first\n\n";
-            socket.write_all(format!("{:X}\r\n{body}\r\n", body.len()).as_bytes()).await.unwrap();
+            socket
+                .write_all(format!("{:X}\r\n{body}\r\n", body.len()).as_bytes())
+                .await
+                .unwrap();
         }
         socket.flush().await.unwrap();
         let mut one = [0];
-        assert!(!matches!(socket.read(&mut one).await, Ok(n) if n > 0), "revoked read releases its socket");
+        assert!(
+            !matches!(socket.read(&mut one).await, Ok(n) if n > 0),
+            "revoked read releases its socket"
+        );
     }
 
     #[test]
@@ -308,31 +403,69 @@ mod tests {
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let application = async {
                     let request = ModernHttpRequest::new(
-                        format!("http://{}/mcp", listener.local_addr().unwrap()), b"{}".to_vec(),
-                        "2026-07-28", "tools/call", None,
-                    ).unwrap();
-                    let raw = ModernHttpExecutor::new().execute(&cx, &request).await.unwrap();
+                        format!("http://{}/mcp", listener.local_addr().unwrap()),
+                        b"{}".to_vec(),
+                        "2026-07-28",
+                        "tools/call",
+                        None,
+                    )
+                    .unwrap();
+                    let raw = ModernHttpExecutor::new()
+                        .execute(&cx, &request)
+                        .await
+                        .unwrap();
                     // Response custody is deliberately injected after an
                     // unauthenticated loopback exchange, not a TLS login proof.
                     let response = ManagedOAuthResponse::from_snapshot(
-                        raw, session.clone(), McpRequestCancellation::new(), &original,
+                        raw,
+                        session.clone(),
+                        McpRequestCancellation::new(),
+                        &original,
                     );
                     if sse {
-                        let mut stream = response.into_sse_stream(SseLimits::new(4096, 4096, 64).unwrap()).unwrap();
-                        assert_eq!(stream.next_event(&cx).await.unwrap().as_deref(), Some("first"));
+                        let mut stream = response
+                            .into_sse_stream(SseLimits::new(4096, 4096, 64).unwrap())
+                            .unwrap();
+                        assert_eq!(
+                            stream.next_event(&cx).await.unwrap().as_deref(),
+                            Some("first")
+                        );
                         let mut pending = Box::pin(stream.next_event(&cx));
-                        poll_fn(|task| { assert!(pending.as_mut().poll(task).is_pending()); Poll::Ready(()) }).await;
+                        poll_fn(|task| {
+                            assert!(pending.as_mut().poll(task).is_pending());
+                            Poll::Ready(())
+                        })
+                        .await;
                         original.credential.revoke();
-                        assert!(matches!(pending.await, Err(OAuthSessionError::LoginRequired)));
-                        assert!(matches!(stream.next_event(&cx).await,
-                            Err(OAuthSessionError::Http(ModernHttpExecutorError::SseStreamClosed))));
+                        assert!(matches!(
+                            pending.await,
+                            Err(OAuthSessionError::LoginRequired)
+                        ));
+                        assert!(matches!(
+                            stream.next_event(&cx).await,
+                            Err(OAuthSessionError::Http(
+                                ModernHttpExecutorError::SseStreamClosed
+                            ))
+                        ));
                     } else {
                         let mut pending = Box::pin(response.read_to_end(&cx, 4096));
-                        poll_fn(|task| { assert!(pending.as_mut().poll(task).is_pending()); Poll::Ready(()) }).await;
+                        poll_fn(|task| {
+                            assert!(pending.as_mut().poll(task).is_pending());
+                            Poll::Ready(())
+                        })
+                        .await;
                         original.credential.revoke();
-                        assert!(matches!(pending.await, Err(OAuthSessionError::LoginRequired)));
+                        assert!(matches!(
+                            pending.await,
+                            Err(OAuthSessionError::LoginRequired)
+                        ));
                     }
-                    assert_eq!(guarded(&cx, &session, &unrelated, std::future::ready(Ok(7))).await.unwrap(), 7);
+                    assert_eq!(
+                        guarded(&cx, &session, &unrelated, std::future::ready(Ok(7)))
+                            .await
+                            .unwrap(),
+                        7
+                    );
                     assert!(cx.checkpoint().is_ok());
                 };
                 pair(peer(&listener, sse), application).await;

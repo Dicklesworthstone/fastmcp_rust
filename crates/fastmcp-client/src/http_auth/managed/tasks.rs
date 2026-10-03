@@ -17,22 +17,22 @@ use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::common_types::ExactNonNegativeJsonNumber;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::tasks_extension::{
-    CancelTaskParams, CancelTaskResult, GetTaskParams, GetTaskResult, Task,
-    TaskId, TaskInputLedger, TaskInputResponses, TaskMethodRequest, TaskRequestMeta,
-    UpdateTaskParams, UpdateTaskResult, TASK_CANCEL, TASK_GET, TASK_UPDATE, TASKS_EXTENSION,
+    CancelTaskParams, CancelTaskResult, GetTaskParams, GetTaskResult, TASK_CANCEL, TASK_GET,
+    TASK_UPDATE, TASKS_EXTENSION, Task, TaskId, TaskInputLedger, TaskInputResponses,
+    TaskMethodRequest, TaskRequestMeta, UpdateTaskParams, UpdateTaskResult,
 };
 use fastmcp_protocol::{
-    CoreRequest, CoreResult, ExtensionDirection, FinalCoreResult, FinalRequestMeta,
-    JsonInteger, JsonRpcMessage, JsonRpcResponse, ProgressMarker, RequestId, ServerDiscoverResult,
-    ServerNotification, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION,
+    CoreRequest, CoreResult, ExtensionDirection, FINAL_CLIENT_CAPABILITIES_META_KEY,
+    FINAL_PROTOCOL_VERSION, FinalCoreResult, FinalRequestMeta, JsonInteger, JsonRpcMessage,
+    JsonRpcResponse, ProgressMarker, RequestId, ServerDiscoverResult, ServerNotification,
     decode_strict_jsonrpc_message, decode_strict_jsonrpc_response,
 };
 use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    ManagedOAuthResponse, ManagedOAuthSession, ManagedOAuthSseStream,
-    OAuthCredentialSnapshot, OAuthSessionError, deadline_after,
+    ManagedOAuthResponse, ManagedOAuthSession, ManagedOAuthSseStream, OAuthCredentialSnapshot,
+    OAuthSessionError, deadline_after,
 };
 use crate::http_executor::{ModernHttpRequest, ModernHttpResponseKind};
 use crate::sse::SseLimits;
@@ -57,18 +57,36 @@ pub struct ManagedTasksLimits {
 
 impl Default for ManagedTasksLimits {
     fn default() -> Self {
-        Self { request_bytes: 64 * 1024, frame_bytes: 64 * 1024, records: 64, timeout: Duration::from_secs(120) }
+        Self {
+            request_bytes: 64 * 1024,
+            frame_bytes: 64 * 1024,
+            records: 64,
+            timeout: Duration::from_secs(120),
+        }
     }
 }
 
 impl ManagedTasksLimits {
-    pub fn new(request_bytes: usize, frame_bytes: usize, records: usize, timeout: Duration) -> Result<Self, ManagedTasksError> {
+    pub fn new(
+        request_bytes: usize,
+        frame_bytes: usize,
+        records: usize,
+        timeout: Duration,
+    ) -> Result<Self, ManagedTasksError> {
         if !(1..=1024 * 1024).contains(&request_bytes)
             || !(1..=1024 * 1024).contains(&frame_bytes)
             || !(1..=1024).contains(&records)
-            || timeout.is_zero() || timeout > Duration::from_mins(15)
-        { return Err(ManagedTasksError::InvalidLimits); }
-        Ok(Self { request_bytes, frame_bytes, records, timeout })
+            || timeout.is_zero()
+            || timeout > Duration::from_mins(15)
+        {
+            return Err(ManagedTasksError::InvalidLimits);
+        }
+        Ok(Self {
+            request_bytes,
+            frame_bytes,
+            records,
+            timeout,
+        })
     }
 }
 
@@ -82,10 +100,19 @@ pub struct ManagedTaskRequestIds {
 
 impl ManagedTaskRequestIds {
     pub fn new(discovery: RequestId, operation: RequestId) -> Result<Self, ManagedTasksError> {
-        discovery.validate().map_err(|_| ManagedTasksError::InvalidRequest)?;
-        operation.validate().map_err(|_| ManagedTasksError::InvalidRequest)?;
-        if discovery.correlates_with(&operation) { return Err(ManagedTasksError::InvalidRequest); }
-        Ok(Self { discovery, operation })
+        discovery
+            .validate()
+            .map_err(|_| ManagedTasksError::InvalidRequest)?;
+        operation
+            .validate()
+            .map_err(|_| ManagedTasksError::InvalidRequest)?;
+        if discovery.correlates_with(&operation) {
+            return Err(ManagedTasksError::InvalidRequest);
+        }
+        Ok(Self {
+            discovery,
+            operation,
+        })
     }
 }
 
@@ -94,9 +121,15 @@ impl ManagedTaskRequestIds {
 /// A task update takes a previously observed input-required snapshot. The
 /// server remains responsible for current ownership and stale-state checks.
 pub enum ManagedTaskRequest {
-    CallTool { name: String, arguments: Option<Value> },
+    CallTool {
+        name: String,
+        arguments: Option<Value>,
+    },
     Get(TaskId),
-    Update { task: Box<Task>, input_responses: TaskInputResponses },
+    Update {
+        task: Box<Task>,
+        input_responses: TaskInputResponses,
+    },
     Cancel(TaskId),
 }
 
@@ -124,7 +157,9 @@ pub enum ManagedTasksError {
 impl fmt::Display for ManagedTasksError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::HttpStatus { status } => write!(f, "managed Task request rejected with HTTP {status}"),
+            Self::HttpStatus { status } => {
+                write!(f, "managed Task request rejected with HTTP {status}")
+            }
             Self::Remote { code } => write!(f, "managed Task request failed with JSON-RPC {code}"),
             Self::Session(error) => fmt::Display::fmt(error, f),
             other => f.write_str(match other {
@@ -135,7 +170,9 @@ impl fmt::Display for ManagedTasksError {
                 Self::InvalidResponse => "managed Task response failed protocol admission",
                 Self::ResponseIdMismatch => "Task response does not match the request identity",
                 Self::TaskIdMismatch => "Task response identifies a different task",
-                Self::InvalidInputResponses => "Task answers do not match the observed input ledger",
+                Self::InvalidInputResponses => {
+                    "Task answers do not match the observed input ledger"
+                }
                 Self::UpdateRequiresInput => "Task update requires an input-required snapshot",
                 Self::InvalidProgress => "Task progress is uncorrelated or not increasing",
                 Self::MissingTerminal => "Task stream ended without its terminal result",
@@ -149,7 +186,9 @@ impl fmt::Display for ManagedTasksError {
 
 impl std::error::Error for ManagedTasksError {}
 impl From<OAuthSessionError> for ManagedTasksError {
-    fn from(error: OAuthSessionError) -> Self { Self::Session(error) }
+    fn from(error: OAuthSessionError) -> Self {
+        Self::Session(error)
+    }
 }
 
 /// Incremental tool-call activity or the selected method's terminal result.
@@ -173,100 +212,221 @@ pub struct ManagedTasksClient {
 }
 
 impl ManagedTasksClient {
-    pub fn new(session: ManagedOAuthSession, metadata: FinalRequestMeta, limits: ManagedTasksLimits) -> Result<Self, ManagedTasksError> {
+    pub fn new(
+        session: ManagedOAuthSession,
+        metadata: FinalRequestMeta,
+        limits: ManagedTasksLimits,
+    ) -> Result<Self, ManagedTasksError> {
         let metadata = tasks_metadata(metadata)?;
-        Ok(Self { session, metadata, limits })
+        Ok(Self {
+            session,
+            metadata,
+            limits,
+        })
     }
 
-    pub async fn request(&self, cx: &Cx, ids: ManagedTaskRequestIds, request: ManagedTaskRequest) -> Result<ManagedTaskCall, ManagedTasksError> {
-        self.request_with_cancellation(cx, &McpRequestCancellation::new(), ids, request).await
+    pub async fn request(
+        &self,
+        cx: &Cx,
+        ids: ManagedTaskRequestIds,
+        request: ManagedTaskRequest,
+    ) -> Result<ManagedTaskCall, ManagedTasksError> {
+        self.request_with_cancellation(cx, &McpRequestCancellation::new(), ids, request)
+            .await
     }
 
     /// Validates before renewal/discovery, then dispatches one Task operation.
     /// The single deadline includes credential acquisition, discovery, response
     /// reads and caller pauses. No HTTP failure causes a retry or a downgrade.
     pub async fn request_with_cancellation(
-        &self, cx: &Cx, cancellation: &McpRequestCancellation,
-        ids: ManagedTaskRequestIds, request: ManagedTaskRequest,
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        ids: ManagedTaskRequestIds,
+        request: ManagedTaskRequest,
     ) -> Result<ManagedTaskCall, ManagedTasksError> {
         self.session.check(cx, cancellation)?;
         let deadline = deadline_after(cx, self.limits.timeout)?;
-        let prepared = prepare(self.session.resource().as_str(), &self.metadata, &ids.operation, request, self.limits)?;
+        let prepared = prepare(
+            self.session.resource().as_str(),
+            &self.metadata,
+            &ids.operation,
+            request,
+            self.limits,
+        )?;
         let round = self.prepare_round(ids, prepared)?;
-        let credential = self.session.await_active(cx, cancellation, deadline, None, async {
-            self.session.credential_with_cancellation(cx, cancellation).await
-        }).await?;
-        self.execute_round(cx, cancellation, round, &credential, deadline, self.limits.records).await
+        let credential = self
+            .session
+            .await_active(cx, cancellation, deadline, None, async {
+                self.session
+                    .credential_with_cancellation(cx, cancellation)
+                    .await
+            })
+            .await?;
+        self.execute_round(
+            cx,
+            cancellation,
+            round,
+            &credential,
+            deadline,
+            self.limits.records,
+        )
+        .await
     }
 
     // All serialization and local bounds precede renewal or network effects.
     // Continuations use this same preparation without adding prior answers or
     // requestState to discovery, which is not part of the tool continuation.
-    fn prepare_round(&self, ids: ManagedTaskRequestIds, prepared: PreparedTask) -> Result<PreparedTaskRound, ManagedTasksError> {
+    fn prepare_round(
+        &self,
+        ids: ManagedTaskRequestIds,
+        prepared: PreparedTask,
+    ) -> Result<PreparedTaskRound, ManagedTasksError> {
         let discovery = discovery_request(&self.metadata)?;
-        let params = discovery.encode_params().map_err(|_| ManagedTasksError::InvalidRequest)?.ok_or(ManagedTasksError::InvalidRequest)?;
-        let discover_wire = encode_request(self.session.resource().as_str(), "server/discover", &ids.discovery, params, None, self.limits.request_bytes)?;
-        Ok(PreparedTaskRound { ids, prepared, discovery, discover_wire })
+        let params = discovery
+            .encode_params()
+            .map_err(|_| ManagedTasksError::InvalidRequest)?
+            .ok_or(ManagedTasksError::InvalidRequest)?;
+        let discover_wire = encode_request(
+            self.session.resource().as_str(),
+            "server/discover",
+            &ids.discovery,
+            params,
+            None,
+            self.limits.request_bytes,
+        )?;
+        Ok(PreparedTaskRound {
+            ids,
+            prepared,
+            discovery,
+            discover_wire,
+        })
     }
 
     // Every round retains fresh discovery and exact Tasks-surface admission.
     // The credential and absolute deadline belong to the caller: this method
     // cannot silently renew them while replaying a server continuation state.
     async fn execute_round(
-        &self, cx: &Cx, cancellation: &McpRequestCancellation,
-        round: PreparedTaskRound, credential: &OAuthCredentialSnapshot,
-        deadline: Time, records: usize,
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        round: PreparedTaskRound,
+        credential: &OAuthCredentialSnapshot,
+        deadline: Time,
+        records: usize,
     ) -> Result<ManagedTaskCall, ManagedTasksError> {
-        if records == 0 { return Err(ManagedTasksError::RecordLimit); }
-        let PreparedTaskRound { ids, prepared, discovery, discover_wire } = round;
-        let response = self.execute_bound(cx, cancellation, deadline, credential, &discover_wire).await?;
+        if records == 0 {
+            return Err(ManagedTasksError::RecordLimit);
+        }
+        let PreparedTaskRound {
+            ids,
+            prepared,
+            discovery,
+            discover_wire,
+        } = round;
+        let response = self
+            .execute_bound(cx, cancellation, deadline, credential, &discover_wire)
+            .await?;
         require_json(&response)?;
-        let bytes = self.session.await_active(cx, cancellation, deadline, Some(credential.expires_at), async {
-            response.read_to_end(cx, self.limits.frame_bytes).await
-        }).await?;
+        let bytes = self
+            .session
+            .await_active(
+                cx,
+                cancellation,
+                deadline,
+                Some(credential.expires_at),
+                async { response.read_to_end(cx, self.limits.frame_bytes).await },
+            )
+            .await?;
         let (envelope, source) = response_source(&bytes, &ids.discovery, self.limits.frame_bytes)?;
-        let CoreResult::Final(FinalCoreResult::Discover(discovered)) = discovery.decode_response_result(&envelope, &source)
-            .map_err(|_| ManagedTasksError::InvalidResponse)? else { return Err(ManagedTasksError::InvalidResponse) };
+        let CoreResult::Final(FinalCoreResult::Discover(discovered)) = discovery
+            .decode_response_result(&envelope, &source)
+            .map_err(|_| ManagedTasksError::InvalidResponse)?
+        else {
+            return Err(ManagedTasksError::InvalidResponse);
+        };
         admit_discovery(&discovered, &prepared.decoder)?;
         // No credential acquisition occurs between discovery and the operation:
         // a concurrent refresh may create a newer snapshot, never replace this one.
-        let response = self.execute_bound(cx, cancellation, deadline, credential, &prepared.wire).await?;
-        let limits = ManagedTasksLimits { records: records.min(self.limits.records), ..self.limits };
+        let response = self
+            .execute_bound(cx, cancellation, deadline, credential, &prepared.wire)
+            .await?;
+        let limits = ManagedTasksLimits {
+            records: records.min(self.limits.records),
+            ..self.limits
+        };
         ManagedTaskCall::from_response(response, prepared, ids.operation, limits, deadline)
     }
 
     async fn execute_bound(
-        &self, cx: &Cx, cancellation: &McpRequestCancellation, deadline: Time,
-        credential: &OAuthCredentialSnapshot, wire: &ModernHttpRequest,
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Time,
+        credential: &OAuthCredentialSnapshot,
+        wire: &ModernHttpRequest,
     ) -> Result<ManagedOAuthResponse, ManagedTasksError> {
         self.session.check(cx, cancellation)?;
         // Discovery and the subsequent mutation both require this same live
         // snapshot; withholding its header must never become anonymous dispatch.
         let wire = credential.authorize_request(wire)?;
-        let head_deadline = deadline.min(deadline_after(cx, self.session.inner.policy.response_head_timeout)?);
+        let head_deadline = deadline.min(deadline_after(
+            cx,
+            self.session.inner.policy.response_head_timeout,
+        )?);
         let executor = self.session.inner.client.resource_http_executor();
-        let response = self.session.await_credential(cx, cancellation, head_deadline,
-            credential.expires_at, &credential.credential.revoked, async {
-                executor.execute_with_cancellation(cx, cancellation, &wire).await.map_err(OAuthSessionError::Http)
-            },
-        ).await?;
-        if response.metadata().status() != 200 { return Err(ManagedTasksError::HttpStatus { status: response.metadata().status() }); }
+        let response = self
+            .session
+            .await_credential(
+                cx,
+                cancellation,
+                head_deadline,
+                credential.expires_at,
+                &credential.credential.revoked,
+                async {
+                    executor
+                        .execute_with_cancellation(cx, cancellation, &wire)
+                        .await
+                        .map_err(OAuthSessionError::Http)
+                },
+            )
+            .await?;
+        if response.metadata().status() != 200 {
+            return Err(ManagedTasksError::HttpStatus {
+                status: response.metadata().status(),
+            });
+        }
         Ok(ManagedOAuthResponse::from_snapshot(
-            response, self.session.clone(), cancellation.clone(), credential,
+            response,
+            self.session.clone(),
+            cancellation.clone(),
+            credential,
         ))
     }
 }
 
 // Keep large protocol vocabularies and body ownership off the async stack.
-enum TaskDecoder { Tool(Box<CoreRequest>), Get(TaskId), Update, Cancel }
-struct PreparedTask { wire: ModernHttpRequest, decoder: TaskDecoder, progress: Option<ProgressMarker> }
+enum TaskDecoder {
+    Tool(Box<CoreRequest>),
+    Get(TaskId),
+    Update,
+    Cancel,
+}
+struct PreparedTask {
+    wire: ModernHttpRequest,
+    decoder: TaskDecoder,
+    progress: Option<ProgressMarker>,
+}
 struct PreparedTaskRound {
     ids: ManagedTaskRequestIds,
     prepared: PreparedTask,
     discovery: CoreRequest,
     discover_wire: ModernHttpRequest,
 }
-enum TaskBody { Json(Box<ManagedOAuthResponse>), Sse(Box<ManagedOAuthSseStream>) }
+enum TaskBody {
+    Json(Box<ManagedOAuthResponse>),
+    Sse(Box<ManagedOAuthSseStream>),
+}
 
 /// One owned response. Pending reads take socket ownership before suspension;
 /// abandonment, error, cancellation or expiry cannot leave a reusable parser.
@@ -288,7 +448,13 @@ pub struct ManagedTaskCall {
 }
 
 impl ManagedTaskCall {
-    fn from_response(response: ManagedOAuthResponse, prepared: PreparedTask, request_id: RequestId, limits: ManagedTasksLimits, deadline: Time) -> Result<Self, ManagedTasksError> {
+    fn from_response(
+        response: ManagedOAuthResponse,
+        prepared: PreparedTask,
+        request_id: RequestId,
+        limits: ManagedTasksLimits,
+        deadline: Time,
+    ) -> Result<Self, ManagedTasksError> {
         let session = response.session.clone();
         let cancellation = response.cancellation.clone();
         let expires_at = response.expires_at;
@@ -297,63 +463,126 @@ impl ManagedTaskCall {
         let body = match response.metadata().kind() {
             ModernHttpResponseKind::Json => TaskBody::Json(Box::new(response)),
             ModernHttpResponseKind::Sse => {
-                if !matches!(prepared.decoder, TaskDecoder::Tool(_)) { return Err(ManagedTasksError::InvalidResponse); }
-                let framing = SseLimits::new(limits.frame_bytes, limits.frame_bytes, 64).ok_or(ManagedTasksError::InvalidLimits)?;
+                if !matches!(prepared.decoder, TaskDecoder::Tool(_)) {
+                    return Err(ManagedTasksError::InvalidResponse);
+                }
+                let framing = SseLimits::new(limits.frame_bytes, limits.frame_bytes, 64)
+                    .ok_or(ManagedTasksError::InvalidLimits)?;
                 TaskBody::Sse(Box::new(response.into_sse_stream(framing)?))
             }
             _ => return Err(ManagedTasksError::InvalidResponse),
         };
         Ok(Self {
-            body: Some(body), decoder: prepared.decoder, session, cancellation, request_id,
-            progress: prepared.progress, last_progress: None, deadline, expires_at, generation,
-            revocation, limits, records: 0, finished: false,
+            body: Some(body),
+            decoder: prepared.decoder,
+            session,
+            cancellation,
+            request_id,
+            progress: prepared.progress,
+            last_progress: None,
+            deadline,
+            expires_at,
+            generation,
+            revocation,
+            limits,
+            records: 0,
+            finished: false,
         })
     }
 
-    pub fn request_id(&self) -> &RequestId { &self.request_id }
-    pub fn credential_generation(&self) -> u64 { self.generation }
-    pub fn close(&mut self) { self.body = None; }
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+    pub fn credential_generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn close(&mut self) {
+        self.body = None;
+    }
 
     /// Results are delivered once. EOF without a result is an error. Session
     /// renewal never lengthens the credential lifetime of this response.
     /// SSE terminals remain provisional until clean body EOF. Trailing records
     /// or a failed final read withhold the result rather than starting a Task
     /// polling/continuation workflow from an incompletely validated response.
-    pub async fn next_event(&mut self, cx: &Cx) -> Result<Option<ManagedTaskEvent>, ManagedTasksError> {
-        if self.finished { return Ok(None); }
+    pub async fn next_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<ManagedTaskEvent>, ManagedTasksError> {
+        if self.finished {
+            return Ok(None);
+        }
         let body = self.body.take().ok_or(ManagedTasksError::Closed)?;
         self.session.check(cx, &self.cancellation)?;
-        if self.revocation.is_cancel_requested() { return Err(OAuthSessionError::LoginRequired.into()); }
-        if self.records >= self.limits.records { return Err(ManagedTasksError::RecordLimit); }
+        if self.revocation.is_cancel_requested() {
+            return Err(OAuthSessionError::LoginRequired.into());
+        }
+        if self.records >= self.limits.records {
+            return Err(ManagedTasksError::RecordLimit);
+        }
         let (event, remaining) = match body {
             TaskBody::Json(response) => {
-                let bytes = self.session.await_active(cx, &self.cancellation, self.deadline, Some(self.expires_at), async {
-                    (*response).read_to_end(cx, self.limits.frame_bytes).await
-                }).await?;
-                (decode_result(&self.decoder, &bytes, &self.request_id, self.limits.frame_bytes)?, None)
+                let bytes = self
+                    .session
+                    .await_active(
+                        cx,
+                        &self.cancellation,
+                        self.deadline,
+                        Some(self.expires_at),
+                        async { (*response).read_to_end(cx, self.limits.frame_bytes).await },
+                    )
+                    .await?;
+                (
+                    decode_result(
+                        &self.decoder,
+                        &bytes,
+                        &self.request_id,
+                        self.limits.frame_bytes,
+                    )?,
+                    None,
+                )
             }
             TaskBody::Sse(mut stream) => {
-                let payload = self.session.await_active(cx, &self.cancellation, self.deadline, Some(self.expires_at), async {
-                    stream.next_event(cx).await
-                }).await?.ok_or(ManagedTasksError::MissingTerminal)?;
+                let payload = self
+                    .session
+                    .await_active(
+                        cx,
+                        &self.cancellation,
+                        self.deadline,
+                        Some(self.expires_at),
+                        async { stream.next_event(cx).await },
+                    )
+                    .await?
+                    .ok_or(ManagedTasksError::MissingTerminal)?;
                 let event = decode_stream_record(
-                    &self.decoder, payload.as_bytes(), &self.request_id, self.limits.frame_bytes,
-                    self.progress.as_ref(), &mut self.last_progress,
+                    &self.decoder,
+                    payload.as_bytes(),
+                    &self.request_id,
+                    self.limits.frame_bytes,
+                    self.progress.as_ref(),
+                    &mut self.last_progress,
                 )?;
                 (event, Some(TaskBody::Sse(stream)))
             }
         };
         self.session.check(cx, &self.cancellation)?;
-        if self.revocation.is_cancel_requested() { return Err(OAuthSessionError::LoginRequired.into()); }
-        if Instant::now() >= self.expires_at { return Err(OAuthSessionError::LoginRequired.into()); }
-        if cx.now() >= self.deadline { return Err(OAuthSessionError::TimedOut.into()); }
+        if self.revocation.is_cancel_requested() {
+            return Err(OAuthSessionError::LoginRequired.into());
+        }
+        if Instant::now() >= self.expires_at {
+            return Err(OAuthSessionError::LoginRequired.into());
+        }
+        if cx.now() >= self.deadline {
+            return Err(OAuthSessionError::TimedOut.into());
+        }
         let event = if matches!(&event, ManagedTaskEvent::Notification(_)) {
             self.body = remaining;
             event
         } else {
             let event = match remaining {
                 Some(TaskBody::Sse(mut stream)) => {
-                    self.finish_terminal(cx, event, async { stream.next_event(cx).await }).await?
+                    self.finish_terminal(cx, event, async { stream.next_event(cx).await })
+                        .await?
                 }
                 _ => event,
             };
@@ -375,106 +604,274 @@ impl ManagedTaskCall {
         event: ManagedTaskEvent,
         next: impl std::future::Future<Output = Result<Option<String>, OAuthSessionError>>,
     ) -> Result<ManagedTaskEvent, ManagedTasksError> {
-        let trailing = self.session.await_credential(
-            cx, &self.cancellation, self.deadline, self.expires_at, &self.revocation, next,
-        ).await?;
-        if trailing.is_some() { return Err(ManagedTasksError::InvalidResponse); }
+        let trailing = self
+            .session
+            .await_credential(
+                cx,
+                &self.cancellation,
+                self.deadline,
+                self.expires_at,
+                &self.revocation,
+                next,
+            )
+            .await?;
+        if trailing.is_some() {
+            return Err(ManagedTasksError::InvalidResponse);
+        }
         self.session.check(cx, &self.cancellation)?;
-        if self.revocation.is_cancel_requested() { return Err(OAuthSessionError::LoginRequired.into()); }
-        if Instant::now() >= self.expires_at { return Err(OAuthSessionError::LoginRequired.into()); }
-        if cx.now() >= self.deadline { return Err(OAuthSessionError::TimedOut.into()); }
+        if self.revocation.is_cancel_requested() {
+            return Err(OAuthSessionError::LoginRequired.into());
+        }
+        if Instant::now() >= self.expires_at {
+            return Err(OAuthSessionError::LoginRequired.into());
+        }
+        if cx.now() >= self.deadline {
+            return Err(OAuthSessionError::TimedOut.into());
+        }
         Ok(event)
     }
 }
 
 fn tasks_metadata(metadata: FinalRequestMeta) -> Result<Value, ManagedTasksError> {
-    let mut metadata = serde_json::to_value(metadata).map_err(|_| ManagedTasksError::InvalidRequest)?;
+    let mut metadata =
+        serde_json::to_value(metadata).map_err(|_| ManagedTasksError::InvalidRequest)?;
     let _ = discovery_request(&metadata)?;
-    let capabilities = metadata.get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY).and_then(Value::as_object_mut)
+    let capabilities = metadata
+        .get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY)
+        .and_then(Value::as_object_mut)
         .ok_or(ManagedTasksError::InvalidRequest)?;
-    if capabilities.get("extensions").is_some_and(|value| !value.as_object().is_some_and(serde_json::Map::is_empty)) {
+    if capabilities
+        .get("extensions")
+        .is_some_and(|value| !value.as_object().is_some_and(serde_json::Map::is_empty))
+    {
         return Err(ManagedTasksError::Negotiation);
     }
     // Explicit Tasks-client construction establishes the local selection.
     // Advertise it on discovery as well as every subsequent operation POST.
-    capabilities.insert("extensions".to_owned(), serde_json::json!({TASKS_EXTENSION:{}}));
+    capabilities.insert(
+        "extensions".to_owned(),
+        serde_json::json!({TASKS_EXTENSION:{}}),
+    );
     Ok(metadata)
 }
 
 fn discovery_request(metadata: &Value) -> Result<CoreRequest, ManagedTasksError> {
-    CoreRequest::decode(ProtocolEra::Modern2026, "server/discover", Some(&serde_json::json!({"_meta": metadata})))
-        .map_err(|_| ManagedTasksError::InvalidRequest)
+    CoreRequest::decode(
+        ProtocolEra::Modern2026,
+        "server/discover",
+        Some(&serde_json::json!({"_meta": metadata})),
+    )
+    .map_err(|_| ManagedTasksError::InvalidRequest)
 }
 
-fn admit_discovery(discovery: &ServerDiscoverResult, decoder: &TaskDecoder) -> Result<(), ManagedTasksError> {
-    if !discovery.supported_versions().iter().any(|version| version == FINAL_PROTOCOL_VERSION) {
+fn admit_discovery(
+    discovery: &ServerDiscoverResult,
+    decoder: &TaskDecoder,
+) -> Result<(), ManagedTasksError> {
+    if !discovery
+        .supported_versions()
+        .iter()
+        .any(|version| version == FINAL_PROTOCOL_VERSION)
+    {
         return Err(ManagedTasksError::Negotiation);
     }
     match decoder {
         TaskDecoder::Tool(_) => crate::admit_final_tasks_result_discriminator(discovery, "task"),
-        TaskDecoder::Get(_) => crate::admit_final_tasks_discovery_surface(discovery, TASK_GET, ExtensionDirection::ClientToServer),
-        TaskDecoder::Update => crate::admit_final_tasks_discovery_surface(discovery, TASK_UPDATE, ExtensionDirection::ClientToServer),
-        TaskDecoder::Cancel => crate::admit_final_tasks_discovery_surface(discovery, TASK_CANCEL, ExtensionDirection::ClientToServer),
-    }.map_err(|_| ManagedTasksError::Negotiation)
+        TaskDecoder::Get(_) => crate::admit_final_tasks_discovery_surface(
+            discovery,
+            TASK_GET,
+            ExtensionDirection::ClientToServer,
+        ),
+        TaskDecoder::Update => crate::admit_final_tasks_discovery_surface(
+            discovery,
+            TASK_UPDATE,
+            ExtensionDirection::ClientToServer,
+        ),
+        TaskDecoder::Cancel => crate::admit_final_tasks_discovery_surface(
+            discovery,
+            TASK_CANCEL,
+            ExtensionDirection::ClientToServer,
+        ),
+    }
+    .map_err(|_| ManagedTasksError::Negotiation)
 }
 
-fn prepare(target: &str, metadata: &Value, id: &RequestId, request: ManagedTaskRequest, limits: ManagedTasksLimits) -> Result<PreparedTask, ManagedTasksError> {
+fn prepare(
+    target: &str,
+    metadata: &Value,
+    id: &RequestId,
+    request: ManagedTaskRequest,
+    limits: ManagedTasksLimits,
+) -> Result<PreparedTask, ManagedTasksError> {
     let mut metadata = metadata.clone();
-    let capabilities = metadata.get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY).and_then(Value::as_object_mut)
+    let capabilities = metadata
+        .get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY)
+        .and_then(Value::as_object_mut)
         .ok_or(ManagedTasksError::InvalidRequest)?;
-    capabilities.insert("extensions".to_owned(), serde_json::json!({TASKS_EXTENSION: {}}));
-    let request_meta = TaskRequestMeta { meta: serde_json::from_value(metadata.clone()).map_err(|_| ManagedTasksError::InvalidRequest)? };
-    let progress = metadata.get("progressToken").map(|value| serde_json::from_value(value.clone()).map_err(|_| ManagedTasksError::InvalidRequest)).transpose()?;
+    capabilities.insert(
+        "extensions".to_owned(),
+        serde_json::json!({TASKS_EXTENSION: {}}),
+    );
+    let request_meta = TaskRequestMeta {
+        meta: serde_json::from_value(metadata.clone())
+            .map_err(|_| ManagedTasksError::InvalidRequest)?,
+    };
+    let progress = metadata
+        .get("progressToken")
+        .map(|value| {
+            serde_json::from_value(value.clone()).map_err(|_| ManagedTasksError::InvalidRequest)
+        })
+        .transpose()?;
     let (method, parameters, name, decoder) = match request {
         ManagedTaskRequest::CallTool { name, arguments } => {
             let mut params = serde_json::json!({"_meta": metadata, "name": name});
-            if let Some(arguments) = arguments { params["arguments"] = arguments; }
-            let core = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).map_err(|_| ManagedTasksError::InvalidRequest)?;
-            ("tools/call", params, Some(name), TaskDecoder::Tool(Box::new(core)))
+            if let Some(arguments) = arguments {
+                params["arguments"] = arguments;
+            }
+            let core = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params))
+                .map_err(|_| ManagedTasksError::InvalidRequest)?;
+            (
+                "tools/call",
+                params,
+                Some(name),
+                TaskDecoder::Tool(Box::new(core)),
+            )
         }
         ManagedTaskRequest::Get(task_id) => {
-            let wire = TaskMethodRequest::new(id.clone(), TASK_GET, GetTaskParams { request: request_meta, task_id: task_id.clone() });
-            let wire = TaskMethodRequest::decode(serde_json::to_value(wire).map_err(|_| ManagedTasksError::InvalidRequest)?)
-                .map_err(|_| ManagedTasksError::InvalidRequest)?;
-            (TASK_GET, serde_json::to_value(wire.params).map_err(|_| ManagedTasksError::InvalidRequest)?, None, TaskDecoder::Get(task_id))
+            let wire = TaskMethodRequest::new(
+                id.clone(),
+                TASK_GET,
+                GetTaskParams {
+                    request: request_meta,
+                    task_id: task_id.clone(),
+                },
+            );
+            let wire = TaskMethodRequest::decode(
+                serde_json::to_value(wire).map_err(|_| ManagedTasksError::InvalidRequest)?,
+            )
+            .map_err(|_| ManagedTasksError::InvalidRequest)?;
+            (
+                TASK_GET,
+                serde_json::to_value(wire.params).map_err(|_| ManagedTasksError::InvalidRequest)?,
+                None,
+                TaskDecoder::Get(task_id),
+            )
         }
-        ManagedTaskRequest::Update { task, input_responses } => {
-            let Task::InputRequired { base, input_requests } = *task else { return Err(ManagedTasksError::UpdateRequiresInput) };
-            let ledger = TaskInputLedger::from_requests(&input_requests).map_err(|_| ManagedTasksError::InvalidInputResponses)?;
-            ledger.validate_responses(&input_responses).map_err(|_| ManagedTasksError::InvalidInputResponses)?;
-            let wire = TaskMethodRequest::new(id.clone(), TASK_UPDATE, UpdateTaskParams { request: request_meta, task_id: base.task_id, input_responses });
-            let wire = TaskMethodRequest::decode_update(serde_json::to_value(wire).map_err(|_| ManagedTasksError::InvalidRequest)?, &ledger)
+        ManagedTaskRequest::Update {
+            task,
+            input_responses,
+        } => {
+            let Task::InputRequired {
+                base,
+                input_requests,
+            } = *task
+            else {
+                return Err(ManagedTasksError::UpdateRequiresInput);
+            };
+            let ledger = TaskInputLedger::from_requests(&input_requests)
                 .map_err(|_| ManagedTasksError::InvalidInputResponses)?;
-            (TASK_UPDATE, serde_json::to_value(wire.params).map_err(|_| ManagedTasksError::InvalidRequest)?, None, TaskDecoder::Update)
+            ledger
+                .validate_responses(&input_responses)
+                .map_err(|_| ManagedTasksError::InvalidInputResponses)?;
+            let wire = TaskMethodRequest::new(
+                id.clone(),
+                TASK_UPDATE,
+                UpdateTaskParams {
+                    request: request_meta,
+                    task_id: base.task_id,
+                    input_responses,
+                },
+            );
+            let wire = TaskMethodRequest::decode_update(
+                serde_json::to_value(wire).map_err(|_| ManagedTasksError::InvalidRequest)?,
+                &ledger,
+            )
+            .map_err(|_| ManagedTasksError::InvalidInputResponses)?;
+            (
+                TASK_UPDATE,
+                serde_json::to_value(wire.params).map_err(|_| ManagedTasksError::InvalidRequest)?,
+                None,
+                TaskDecoder::Update,
+            )
         }
         ManagedTaskRequest::Cancel(task_id) => {
-            let wire = TaskMethodRequest::new(id.clone(), TASK_CANCEL, CancelTaskParams { request: request_meta, task_id });
-            let wire = TaskMethodRequest::decode_cancel(serde_json::to_value(wire).map_err(|_| ManagedTasksError::InvalidRequest)?)
-                .map_err(|_| ManagedTasksError::InvalidRequest)?;
-            (TASK_CANCEL, serde_json::to_value(wire.params).map_err(|_| ManagedTasksError::InvalidRequest)?, None, TaskDecoder::Cancel)
+            let wire = TaskMethodRequest::new(
+                id.clone(),
+                TASK_CANCEL,
+                CancelTaskParams {
+                    request: request_meta,
+                    task_id,
+                },
+            );
+            let wire = TaskMethodRequest::decode_cancel(
+                serde_json::to_value(wire).map_err(|_| ManagedTasksError::InvalidRequest)?,
+            )
+            .map_err(|_| ManagedTasksError::InvalidRequest)?;
+            (
+                TASK_CANCEL,
+                serde_json::to_value(wire.params).map_err(|_| ManagedTasksError::InvalidRequest)?,
+                None,
+                TaskDecoder::Cancel,
+            )
         }
     };
     let wire = encode_request(target, method, id, parameters, name, limits.request_bytes)?;
-    Ok(PreparedTask { wire, decoder, progress })
+    Ok(PreparedTask {
+        wire,
+        decoder,
+        progress,
+    })
 }
 
-fn encode_request(target: &str, method: &str, id: &RequestId, params: Value, name: Option<String>, maximum: usize) -> Result<ModernHttpRequest, ManagedTasksError> {
-    id.validate().map_err(|_| ManagedTasksError::InvalidRequest)?;
+fn encode_request(
+    target: &str,
+    method: &str,
+    id: &RequestId,
+    params: Value,
+    name: Option<String>,
+    maximum: usize,
+) -> Result<ModernHttpRequest, ManagedTasksError> {
+    id.validate()
+        .map_err(|_| ManagedTasksError::InvalidRequest)?;
     let envelope = serde_json::json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params});
-    let mut writer = BoundedWriter { bytes: Vec::new(), maximum };
-    serde_json::to_writer(&mut writer, &envelope).map_err(|_| ManagedTasksError::RequestTooLarge)?;
-    ModernHttpRequest::new(target, writer.bytes, FINAL_PROTOCOL_VERSION, method, name).map_err(|_| ManagedTasksError::InvalidRequest)
+    let mut writer = BoundedWriter {
+        bytes: Vec::new(),
+        maximum,
+    };
+    serde_json::to_writer(&mut writer, &envelope)
+        .map_err(|_| ManagedTasksError::RequestTooLarge)?;
+    ModernHttpRequest::new(target, writer.bytes, FINAL_PROTOCOL_VERSION, method, name)
+        .map_err(|_| ManagedTasksError::InvalidRequest)
 }
 
 fn require_json(response: &ManagedOAuthResponse) -> Result<(), ManagedTasksError> {
-    if response.metadata().kind() == ModernHttpResponseKind::Json { Ok(()) } else { Err(ManagedTasksError::InvalidResponse) }
+    if response.metadata().kind() == ModernHttpResponseKind::Json {
+        Ok(())
+    } else {
+        Err(ManagedTasksError::InvalidResponse)
+    }
 }
 
-fn response_source(bytes: &[u8], id: &RequestId, maximum: usize) -> Result<(JsonRpcResponse, String), ManagedTasksError> {
-    let admitted = decode_strict_jsonrpc_response(bytes, maximum).map_err(|_| ManagedTasksError::InvalidResponse)?;
+fn response_source(
+    bytes: &[u8],
+    id: &RequestId,
+    maximum: usize,
+) -> Result<(JsonRpcResponse, String), ManagedTasksError> {
+    let admitted = decode_strict_jsonrpc_response(bytes, maximum)
+        .map_err(|_| ManagedTasksError::InvalidResponse)?;
     let (response, source) = admitted.into_parts();
-    if !response.id.as_ref().is_some_and(|actual| actual.correlates_with(id)) { return Err(ManagedTasksError::ResponseIdMismatch); }
-    if let Some(error) = &response.error { return Err(ManagedTasksError::Remote { code: error.code.clone() }); }
+    if !response
+        .id
+        .as_ref()
+        .is_some_and(|actual| actual.correlates_with(id))
+    {
+        return Err(ManagedTasksError::ResponseIdMismatch);
+    }
+    if let Some(error) = &response.error {
+        return Err(ManagedTasksError::Remote {
+            code: error.code.clone(),
+        });
+    }
     Ok((response, source.ok_or(ManagedTasksError::InvalidResponse)?))
 }
 
@@ -483,12 +880,19 @@ fn response_source(bytes: &[u8], id: &RequestId, maximum: usize) -> Result<(Json
 /// JSON admission and correlation checks. The exact result source remains the
 /// input to the existing Task decoder; no number or descriptor is rewritten.
 /// Capability authority is checked separately before host input resolution.
-pub(crate) fn validate_task_input_shapes(response: &JsonRpcResponse) -> Result<(), ManagedTasksError> {
-    let result = response.result.as_ref().ok_or(ManagedTasksError::InvalidResponse)?;
+pub(crate) fn validate_task_input_shapes(
+    response: &JsonRpcResponse,
+) -> Result<(), ManagedTasksError> {
+    let result = response
+        .result
+        .as_ref()
+        .ok_or(ManagedTasksError::InvalidResponse)?;
     if result.get("status").and_then(Value::as_str) != Some("input_required") {
         return Ok(());
     }
-    let requests = result.get("inputRequests").and_then(Value::as_object)
+    let requests = result
+        .get("inputRequests")
+        .and_then(Value::as_object)
         .ok_or(ManagedTasksError::InvalidResponse)?;
     for request in requests.values() {
         crate::http_auth::rpc::interaction::validate_embedded_input_shape(request)
@@ -497,58 +901,95 @@ pub(crate) fn validate_task_input_shapes(response: &JsonRpcResponse) -> Result<(
     Ok(())
 }
 
-fn decode_result(decoder: &TaskDecoder, bytes: &[u8], id: &RequestId, maximum: usize) -> Result<ManagedTaskEvent, ManagedTasksError> {
+fn decode_result(
+    decoder: &TaskDecoder,
+    bytes: &[u8],
+    id: &RequestId,
+    maximum: usize,
+) -> Result<ManagedTaskEvent, ManagedTasksError> {
     let (response, source) = response_source(bytes, id, maximum)?;
     match decoder {
         TaskDecoder::Tool(core) => {
-            if response.result.as_ref().and_then(|result| result.get("resultType"))
-                .and_then(Value::as_str) == Some("task")
+            if response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("resultType"))
+                .and_then(Value::as_str)
+                == Some("task")
             {
                 validate_task_input_shapes(&response)?;
             }
-            let CoreResult::Final(result) = core.decode_response_result(&response, &source).map_err(|_| ManagedTasksError::InvalidResponse)? else { return Err(ManagedTasksError::InvalidResponse) };
+            let CoreResult::Final(result) = core
+                .decode_response_result(&response, &source)
+                .map_err(|_| ManagedTasksError::InvalidResponse)?
+            else {
+                return Err(ManagedTasksError::InvalidResponse);
+            };
             tool_result(result)
         }
         TaskDecoder::Get(expected) => {
             validate_task_input_shapes(&response)?;
-            let result: GetTaskResult = serde_json::from_str(&source).map_err(|_| ManagedTasksError::InvalidResponse)?;
-            if &result.task.base().task_id != expected { return Err(ManagedTasksError::TaskIdMismatch); }
+            let result: GetTaskResult =
+                serde_json::from_str(&source).map_err(|_| ManagedTasksError::InvalidResponse)?;
+            if &result.task.base().task_id != expected {
+                return Err(ManagedTasksError::TaskIdMismatch);
+            }
             Ok(ManagedTaskEvent::Snapshot(Box::new(result)))
         }
-        TaskDecoder::Update => serde_json::from_str(&source).map(ManagedTaskEvent::Updated).map_err(|_| ManagedTasksError::InvalidResponse),
-        TaskDecoder::Cancel => serde_json::from_str(&source).map(ManagedTaskEvent::Cancelled).map_err(|_| ManagedTasksError::InvalidResponse),
+        TaskDecoder::Update => serde_json::from_str(&source)
+            .map(ManagedTaskEvent::Updated)
+            .map_err(|_| ManagedTasksError::InvalidResponse),
+        TaskDecoder::Cancel => serde_json::from_str(&source)
+            .map(ManagedTaskEvent::Cancelled)
+            .map_err(|_| ManagedTasksError::InvalidResponse),
     }
 }
 
 fn decode_stream_record(
-    decoder: &TaskDecoder, bytes: &[u8], id: &RequestId, maximum: usize,
-    progress: Option<&ProgressMarker>, last_progress: &mut Option<ExactNonNegativeJsonNumber>,
+    decoder: &TaskDecoder,
+    bytes: &[u8],
+    id: &RequestId,
+    maximum: usize,
+    progress: Option<&ProgressMarker>,
+    last_progress: &mut Option<ExactNonNegativeJsonNumber>,
 ) -> Result<ManagedTaskEvent, ManagedTasksError> {
-    let message = decode_strict_jsonrpc_message(bytes, maximum).map_err(|_| ManagedTasksError::InvalidResponse)?;
+    let message = decode_strict_jsonrpc_message(bytes, maximum)
+        .map_err(|_| ManagedTasksError::InvalidResponse)?;
     match message {
         JsonRpcMessage::Response(_) => decode_result(decoder, bytes, id, maximum),
         JsonRpcMessage::Request(request) => {
-            if request.id.is_some() { return Err(ManagedTasksError::InvalidResponse); }
+            if request.id.is_some() {
+                return Err(ManagedTasksError::InvalidResponse);
+            }
             // The protocol's notification codec owns field/direction admission;
             // pass the retained params substring to preserve exact progress.
             #[derive(Deserialize)]
-            struct RawParams { params: Option<Box<serde_json::value::RawValue>> }
-            let raw: RawParams = serde_json::from_slice(bytes).map_err(|_| ManagedTasksError::InvalidResponse)?;
+            struct RawParams {
+                params: Option<Box<serde_json::value::RawValue>>,
+            }
+            let raw: RawParams =
+                serde_json::from_slice(bytes).map_err(|_| ManagedTasksError::InvalidResponse)?;
             let notification = match raw.params {
                 Some(raw) => ServerNotification::decode_with_raw_params(&request, raw.get()),
                 None => ServerNotification::decode(&request),
-            }.map_err(|_| ManagedTasksError::InvalidResponse)?;
+            }
+            .map_err(|_| ManagedTasksError::InvalidResponse)?;
             match &notification {
-                ServerNotification::Cancelled(_) | ServerNotification::SubscriptionsAcknowledged(_) => {
+                ServerNotification::Cancelled(_)
+                | ServerNotification::SubscriptionsAcknowledged(_) => {
                     return Err(ManagedTasksError::InvalidResponse);
                 }
                 ServerNotification::Progress(update) => {
                     if progress != Some(&update.progress_token)
-                        || last_progress.as_ref().is_some_and(|last| update.progress.cmp(last).is_le())
-                    { return Err(ManagedTasksError::InvalidProgress); }
+                        || last_progress
+                            .as_ref()
+                            .is_some_and(|last| update.progress.cmp(last).is_le())
+                    {
+                        return Err(ManagedTasksError::InvalidProgress);
+                    }
                     *last_progress = Some(update.progress.clone());
                 }
-                _ => {},
+                _ => {}
             }
             Ok(ManagedTaskEvent::Notification(Box::new(notification)))
         }
@@ -557,19 +998,30 @@ fn decode_stream_record(
 
 fn tool_result(result: FinalCoreResult) -> Result<ManagedTaskEvent, ManagedTasksError> {
     match result {
-        FinalCoreResult::ToolsCall { .. } | FinalCoreResult::ToolsCallTask { .. } | FinalCoreResult::ToolsCallInputRequired { .. } => Ok(ManagedTaskEvent::ToolResult(Box::new(result))),
+        FinalCoreResult::ToolsCall { .. }
+        | FinalCoreResult::ToolsCallTask { .. }
+        | FinalCoreResult::ToolsCallInputRequired { .. } => {
+            Ok(ManagedTaskEvent::ToolResult(Box::new(result)))
+        }
         _ => Err(ManagedTasksError::InvalidResponse),
     }
 }
 
-struct BoundedWriter { bytes: Vec<u8>, maximum: usize }
+struct BoundedWriter {
+    bytes: Vec<u8>,
+    maximum: usize,
+}
 impl Write for BoundedWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > self.maximum.saturating_sub(self.bytes.len()) { return Err(io::Error::other("managed Tasks request limit")); }
+        if bytes.len() > self.maximum.saturating_sub(self.bytes.len()) {
+            return Err(io::Error::other("managed Tasks request limit"));
+        }
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -578,49 +1030,138 @@ mod tests {
     use fastmcp_protocol::ClientCapabilities;
     use serde_json::json;
 
-    fn meta() -> Value { serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap() }
-    fn task_id() -> TaskId { TaskId::parse("task-one").unwrap() }
+    fn meta() -> Value {
+        serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap()
+    }
+    fn task_id() -> TaskId {
+        TaskId::parse("task-one").unwrap()
+    }
     fn input_task() -> Task {
         serde_json::from_value(json!({
             "taskId":"task-one", "status":"input_required", "createdAt":"2026-09-16T00:00:00Z",
             "lastUpdatedAt":"2026-09-16T00:00:00Z", "ttlMs":60000,
             "inputRequests":{"roots":{"method":"roots/list"}}
-        })).unwrap()
+        }))
+        .unwrap()
     }
-    fn envelope(result: &str) -> Vec<u8> { format!(r#"{{"jsonrpc":"2.0","id":2,"result":{result}}}"#).into_bytes() }
+    fn envelope(result: &str) -> Vec<u8> {
+        format!(r#"{{"jsonrpc":"2.0","id":2,"result":{result}}}"#).into_bytes()
+    }
 
     #[test]
     fn task_requests_use_the_shared_codec_and_exact_empty_settings() {
-        for request in [ManagedTaskRequest::Get(task_id()), ManagedTaskRequest::Cancel(task_id()), ManagedTaskRequest::CallTool { name:"echo".to_owned(), arguments:None }] {
-            let prepared = prepare("https://mcp.example/mcp", &meta(), &RequestId::Number(2), request, ManagedTasksLimits::default()).unwrap();
+        for request in [
+            ManagedTaskRequest::Get(task_id()),
+            ManagedTaskRequest::Cancel(task_id()),
+            ManagedTaskRequest::CallTool {
+                name: "echo".to_owned(),
+                arguments: None,
+            },
+        ] {
+            let prepared = prepare(
+                "https://mcp.example/mcp",
+                &meta(),
+                &RequestId::Number(2),
+                request,
+                ManagedTasksLimits::default(),
+            )
+            .unwrap();
             let wire: Value = serde_json::from_slice(prepared.wire.body()).unwrap();
-            assert_eq!(wire["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"], json!({TASKS_EXTENSION:{}}));
+            assert_eq!(
+                wire["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"],
+                json!({TASKS_EXTENSION:{}})
+            );
             assert_eq!(wire["id"], 2);
-            assert!(!prepared.wire.headers().iter().any(|(name, _)| name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("mcp-session-id")));
+            assert!(
+                !prepared
+                    .wire
+                    .headers()
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("authorization")
+                        || name.eq_ignore_ascii_case("mcp-session-id"))
+            );
         }
     }
 
     #[test]
     fn update_requires_the_current_input_ledger_not_a_syntactically_valid_map() {
-        let answers = |key: &str| serde_json::from_value::<TaskInputResponses>(json!({key:{"roots":[]}})).unwrap();
-        assert!(prepare("https://mcp.example/mcp", &meta(), &RequestId::Number(2), ManagedTaskRequest::Update { task:Box::new(input_task()), input_responses:answers("roots") }, ManagedTasksLimits::default()).is_ok());
+        let answers = |key: &str| {
+            serde_json::from_value::<TaskInputResponses>(json!({key:{"roots":[]}})).unwrap()
+        };
+        assert!(
+            prepare(
+                "https://mcp.example/mcp",
+                &meta(),
+                &RequestId::Number(2),
+                ManagedTaskRequest::Update {
+                    task: Box::new(input_task()),
+                    input_responses: answers("roots")
+                },
+                ManagedTasksLimits::default()
+            )
+            .is_ok()
+        );
         let wrong_kind = serde_json::from_value(json!({"roots":{"action":"accept"}})).unwrap();
-        assert!(matches!(prepare("https://mcp.example/mcp", &meta(), &RequestId::Number(2), ManagedTaskRequest::Update { task:Box::new(input_task()), input_responses:wrong_kind }, ManagedTasksLimits::default()), Err(ManagedTasksError::InvalidInputResponses)));
+        assert!(matches!(
+            prepare(
+                "https://mcp.example/mcp",
+                &meta(),
+                &RequestId::Number(2),
+                ManagedTaskRequest::Update {
+                    task: Box::new(input_task()),
+                    input_responses: wrong_kind
+                },
+                ManagedTasksLimits::default()
+            ),
+            Err(ManagedTasksError::InvalidInputResponses)
+        ));
     }
 
     #[test]
     fn response_identity_and_task_identity_are_independently_checked() {
         let task = r#"{"resultType":"complete","taskId":"task-one","status":"working","createdAt":"2026-09-16T00:00:00Z","lastUpdatedAt":"2026-09-16T00:00:00Z","ttlMs":60000}"#;
-        assert!(matches!(decode_result(&TaskDecoder::Get(task_id()), &envelope(task), &RequestId::Number(2), 4096), Ok(ManagedTaskEvent::Snapshot(_))));
-        assert!(matches!(decode_result(&TaskDecoder::Get(task_id()), &envelope(task), &RequestId::String("2".to_owned()), 4096), Err(ManagedTasksError::ResponseIdMismatch)));
-        assert!(matches!(decode_result(&TaskDecoder::Get(TaskId::parse("task-two").unwrap()), &envelope(task), &RequestId::Number(2), 4096), Err(ManagedTasksError::TaskIdMismatch)));
+        assert!(matches!(
+            decode_result(
+                &TaskDecoder::Get(task_id()),
+                &envelope(task),
+                &RequestId::Number(2),
+                4096
+            ),
+            Ok(ManagedTaskEvent::Snapshot(_))
+        ));
+        assert!(matches!(
+            decode_result(
+                &TaskDecoder::Get(task_id()),
+                &envelope(task),
+                &RequestId::String("2".to_owned()),
+                4096
+            ),
+            Err(ManagedTasksError::ResponseIdMismatch)
+        ));
+        assert!(matches!(
+            decode_result(
+                &TaskDecoder::Get(TaskId::parse("task-two").unwrap()),
+                &envelope(task),
+                &RequestId::Number(2),
+                4096
+            ),
+            Err(ManagedTasksError::TaskIdMismatch)
+        ));
     }
 
     #[test]
     fn raw_task_inputs_reject_erased_shapes_in_get_and_tool_results() {
-        let tool = prepare("https://mcp.example/mcp", &meta(), &RequestId::Number(2),
-            ManagedTaskRequest::CallTool { name:"echo".to_owned(), arguments:None },
-            ManagedTasksLimits::default()).unwrap();
+        let tool = prepare(
+            "https://mcp.example/mcp",
+            &meta(),
+            &RequestId::Number(2),
+            ManagedTaskRequest::CallTool {
+                name: "echo".to_owned(),
+                arguments: None,
+            },
+            ManagedTasksLimits::default(),
+        )
+        .unwrap();
         let get = TaskDecoder::Get(task_id());
         let result = |kind: &str, descriptor: &Value| {
             let mut result = serde_json::to_value(input_task()).unwrap();
@@ -635,10 +1176,26 @@ mod tests {
             json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,
                 "tools":[{"name":"echo","inputSchema":{"type":"object"}}],"toolChoice":{},"includeContext":"allServers"}}),
         ] {
-            assert!(matches!(decode_result(&get, &result("complete", &descriptor), &RequestId::Number(2), 4096),
-                Ok(ManagedTaskEvent::Snapshot(_))));
-            assert!(matches!(decode_stream_record(&tool.decoder, &result("task", &descriptor), &RequestId::Number(2), 4096, None, &mut None),
-                Ok(ManagedTaskEvent::ToolResult(_))));
+            assert!(matches!(
+                decode_result(
+                    &get,
+                    &result("complete", &descriptor),
+                    &RequestId::Number(2),
+                    4096
+                ),
+                Ok(ManagedTaskEvent::Snapshot(_))
+            ));
+            assert!(matches!(
+                decode_stream_record(
+                    &tool.decoder,
+                    &result("task", &descriptor),
+                    &RequestId::Number(2),
+                    4096,
+                    None,
+                    &mut None
+                ),
+                Ok(ManagedTaskEvent::ToolResult(_))
+            ));
         }
         for descriptor in [
             json!({"method":"roots/list","params":[]}),
@@ -652,16 +1209,43 @@ mod tests {
             json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,
                 "tools":[["echo",null,null,null,{"type":"object"}]]}}),
         ] {
-            assert!(matches!(decode_result(&get, &result("complete", &descriptor), &RequestId::Number(2), 4096),
-                Err(ManagedTasksError::InvalidResponse)));
-            assert!(matches!(decode_result(&tool.decoder, &result("task", &descriptor), &RequestId::Number(2), 4096),
-                Err(ManagedTasksError::InvalidResponse)));
-            assert!(matches!(decode_stream_record(&tool.decoder, &result("task", &descriptor), &RequestId::Number(2), 4096, None, &mut None),
-                Err(ManagedTasksError::InvalidResponse)));
+            assert!(matches!(
+                decode_result(
+                    &get,
+                    &result("complete", &descriptor),
+                    &RequestId::Number(2),
+                    4096
+                ),
+                Err(ManagedTasksError::InvalidResponse)
+            ));
+            assert!(matches!(
+                decode_result(
+                    &tool.decoder,
+                    &result("task", &descriptor),
+                    &RequestId::Number(2),
+                    4096
+                ),
+                Err(ManagedTasksError::InvalidResponse)
+            ));
+            assert!(matches!(
+                decode_stream_record(
+                    &tool.decoder,
+                    &result("task", &descriptor),
+                    &RequestId::Number(2),
+                    4096,
+                    None,
+                    &mut None
+                ),
+                Err(ManagedTasksError::InvalidResponse)
+            ));
         }
-        let ordinary = envelope(r#"{"resultType":"complete","content":[],"status":"input_required","inputRequests":{"opaque":{"params":[]}}}"#);
-        assert!(matches!(decode_result(&tool.decoder, &ordinary, &RequestId::Number(2), 4096),
-            Ok(ManagedTaskEvent::ToolResult(result)) if matches!(*result, FinalCoreResult::ToolsCall { .. })));
+        let ordinary = envelope(
+            r#"{"resultType":"complete","content":[],"status":"input_required","inputRequests":{"opaque":{"params":[]}}}"#,
+        );
+        assert!(
+            matches!(decode_result(&tool.decoder, &ordinary, &RequestId::Number(2), 4096),
+            Ok(ManagedTaskEvent::ToolResult(result)) if matches!(*result, FinalCoreResult::ToolsCall { .. }))
+        );
     }
 
     #[test]
@@ -673,34 +1257,74 @@ mod tests {
         validate_task_input_shapes(&response).unwrap();
         assert_eq!(retained, source);
         assert_eq!(serde_json::to_value(&response).unwrap(), before);
-        let ManagedTaskEvent::Snapshot(snapshot) = decode_result(&TaskDecoder::Get(task_id()), &bytes, &RequestId::Number(2), 4096).unwrap()
-            else { panic!("expected admitted task snapshot") };
-        let Task::InputRequired { input_requests, .. } = snapshot.task
-            else { panic!("expected input-required task") };
-        let fastmcp_protocol::FinalEmbeddedInputRequest::Sampling(params) = &input_requests["sample"]
-            else { panic!("expected sampling descriptor") };
+        let ManagedTaskEvent::Snapshot(snapshot) = decode_result(
+            &TaskDecoder::Get(task_id()),
+            &bytes,
+            &RequestId::Number(2),
+            4096,
+        )
+        .unwrap() else {
+            panic!("expected admitted task snapshot")
+        };
+        let Task::InputRequired { input_requests, .. } = snapshot.task else {
+            panic!("expected input-required task")
+        };
+        let fastmcp_protocol::FinalEmbeddedInputRequest::Sampling(params) =
+            &input_requests["sample"]
+        else {
+            panic!("expected sampling descriptor")
+        };
         assert_eq!(params.max_tokens.to_string(), "18446744073709551617");
 
         let duplicate = r#"{"resultType":"complete","taskId":"task-one","status":"input_required","createdAt":"2026-09-16T00:00:00Z","lastUpdatedAt":"2026-09-16T00:00:00Z","ttlMs":60000,"inputRequests":{"sample":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,"includeContext":"none","includeContext":"allServers"}}}}"#;
-        assert!(matches!(decode_result(&TaskDecoder::Get(task_id()), &envelope(duplicate), &RequestId::Number(2), 4096),
-            Err(ManagedTasksError::InvalidResponse)));
+        assert!(matches!(
+            decode_result(
+                &TaskDecoder::Get(task_id()),
+                &envelope(duplicate),
+                &RequestId::Number(2),
+                4096
+            ),
+            Err(ManagedTasksError::InvalidResponse)
+        ));
         let invalid_shape = r#"{"resultType":"complete","taskId":"task-one","status":"input_required","createdAt":"2026-09-16T00:00:00Z","lastUpdatedAt":"2026-09-16T00:00:00Z","ttlMs":60000,"inputRequests":{"roots":{"method":"roots/list","params":[]}}}"#;
-        assert!(matches!(decode_result(&TaskDecoder::Get(task_id()), &envelope(invalid_shape), &RequestId::Number(3), 4096),
-            Err(ManagedTasksError::ResponseIdMismatch)));
+        assert!(matches!(
+            decode_result(
+                &TaskDecoder::Get(task_id()),
+                &envelope(invalid_shape),
+                &RequestId::Number(3),
+                4096
+            ),
+            Err(ManagedTasksError::ResponseIdMismatch)
+        ));
     }
 
     #[test]
     fn bounded_requests_and_ambiguous_ids_fail_locally() {
         let tiny = ManagedTasksLimits::new(1, 4096, 1, Duration::from_secs(1)).unwrap();
-        assert!(matches!(prepare("https://mcp.example/mcp", &meta(), &RequestId::Number(2), ManagedTaskRequest::Get(task_id()), tiny), Err(ManagedTasksError::RequestTooLarge)));
+        assert!(matches!(
+            prepare(
+                "https://mcp.example/mcp",
+                &meta(),
+                &RequestId::Number(2),
+                ManagedTaskRequest::Get(task_id()),
+                tiny
+            ),
+            Err(ManagedTasksError::RequestTooLarge)
+        ));
         let equivalent: RequestId = serde_json::from_str("2e0").unwrap();
         assert!(ManagedTaskRequestIds::new(RequestId::Number(2), equivalent).is_err());
-        assert!(ManagedTaskRequestIds::new(RequestId::Number(2), RequestId::String("2".to_owned())).is_ok());
+        assert!(
+            ManagedTaskRequestIds::new(RequestId::Number(2), RequestId::String("2".to_owned()))
+                .is_ok()
+        );
     }
 
     #[test]
     fn raw_task_response_rejects_duplicate_fields_batches_and_secret_diagnostics() {
-        for raw in [br#"{"jsonrpc":"2.0","id":2,"id":2,"result":{"resultType":"complete"}}"#.as_slice(), br#"[{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete"}}]"#.as_slice()] {
+        for raw in [
+            br#"{"jsonrpc":"2.0","id":2,"id":2,"result":{"resultType":"complete"}}"#.as_slice(),
+            br#"[{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete"}}]"#.as_slice(),
+        ] {
             assert!(response_source(raw, &RequestId::Number(2), 4096).is_err());
         }
         let error = response_source(br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"secret-canary","data":"secret-canary"}}"#, &RequestId::Number(2), 4096).err().unwrap();
@@ -710,120 +1334,242 @@ mod tests {
 
     #[test]
     fn explicit_tasks_selection_is_advertised_on_discovery_without_other_extensions() {
-        let metadata = tasks_metadata(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
-        let request = discovery_request(&metadata).unwrap().encode_params().unwrap().unwrap();
-        assert_eq!(request["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"], json!({TASKS_EXTENSION:{}}));
+        let metadata =
+            tasks_metadata(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
+        let request = discovery_request(&metadata)
+            .unwrap()
+            .encode_params()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            request["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"],
+            json!({TASKS_EXTENSION:{}})
+        );
         let mut conflicting = FinalRequestMeta::new(ClientCapabilities::default());
-        conflicting.client_capabilities = serde_json::from_value(json!({"extensions":{"com.example/other":{}}})).unwrap();
-        assert!(matches!(tasks_metadata(conflicting), Err(ManagedTasksError::Negotiation)));
+        conflicting.client_capabilities =
+            serde_json::from_value(json!({"extensions":{"com.example/other":{}}})).unwrap();
+        assert!(matches!(
+            tasks_metadata(conflicting),
+            Err(ManagedTasksError::Negotiation)
+        ));
     }
 
     #[test]
     fn streamed_progress_and_task_terminal_use_the_same_protocol_boundaries() {
-        let prepared = prepare("https://mcp.example/mcp", &meta(), &RequestId::Number(2), ManagedTaskRequest::CallTool { name:"echo".to_owned(), arguments:None }, ManagedTasksLimits::default()).unwrap();
+        let prepared = prepare(
+            "https://mcp.example/mcp",
+            &meta(),
+            &RequestId::Number(2),
+            ManagedTaskRequest::CallTool {
+                name: "echo".to_owned(),
+                arguments: None,
+            },
+            ManagedTasksLimits::default(),
+        )
+        .unwrap();
         let owned = ProgressMarker::String("owned".to_owned());
         let mut last = None;
-        let progress = |token: &str, n: u64| serde_json::to_vec(&json!({"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":token,"progress":n}})).unwrap();
-        assert!(matches!(decode_stream_record(&prepared.decoder, &progress("owned", 1), &RequestId::Number(2), 4096, Some(&owned), &mut last), Ok(ManagedTaskEvent::Notification(_))));
+        let progress = |token: &str, n: u64| {
+            serde_json::to_vec(&json!({"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":token,"progress":n}})).unwrap()
+        };
+        assert!(matches!(
+            decode_stream_record(
+                &prepared.decoder,
+                &progress("owned", 1),
+                &RequestId::Number(2),
+                4096,
+                Some(&owned),
+                &mut last
+            ),
+            Ok(ManagedTaskEvent::Notification(_))
+        ));
         for (token, n) in [("other", 2), ("owned", 1)] {
-            assert!(matches!(decode_stream_record(&prepared.decoder, &progress(token, n), &RequestId::Number(2), 4096, Some(&owned), &mut last), Err(ManagedTasksError::InvalidProgress)));
+            assert!(matches!(
+                decode_stream_record(
+                    &prepared.decoder,
+                    &progress(token, n),
+                    &RequestId::Number(2),
+                    4096,
+                    Some(&owned),
+                    &mut last
+                ),
+                Err(ManagedTasksError::InvalidProgress)
+            ));
         }
-        let result = envelope(r#"{"resultType":"task","taskId":"task-one","status":"working","createdAt":"2026-09-16T00:00:00Z","lastUpdatedAt":"2026-09-16T00:00:00Z","ttlMs":60000}"#);
-        assert!(matches!(decode_stream_record(&prepared.decoder, &result, &RequestId::Number(2), 4096, Some(&owned), &mut last), Ok(ManagedTaskEvent::ToolResult(_))));
+        let result = envelope(
+            r#"{"resultType":"task","taskId":"task-one","status":"working","createdAt":"2026-09-16T00:00:00Z","lastUpdatedAt":"2026-09-16T00:00:00Z","ttlMs":60000}"#,
+        );
+        assert!(matches!(
+            decode_stream_record(
+                &prepared.decoder,
+                &result,
+                &RequestId::Number(2),
+                4096,
+                Some(&owned),
+                &mut last
+            ),
+            Ok(ManagedTaskEvent::ToolResult(_))
+        ));
     }
 
     #[test]
     fn task_dispatch_refuses_revoked_credentials_on_its_first_poll() {
+        use crate::http_auth::managed::{OAuthSessionPolicy, SessionInner};
+        use crate::http_auth::oauth::{OAuthClient, OAuthClientConfiguration};
+        use crate::http_auth::{BoundBearerCredential, CanonicalHttpUrl};
+        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+        use asupersync::sync::Mutex;
         use std::future::{Future, poll_fn};
         use std::sync::{Arc, atomic::AtomicUsize};
         use std::task::Poll;
-        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
-        use asupersync::sync::Mutex;
-        use crate::http_auth::{BoundBearerCredential, CanonicalHttpUrl};
-        use crate::http_auth::managed::{OAuthSessionPolicy, SessionInner};
-        use crate::http_auth::oauth::{OAuthClient, OAuthClientConfiguration};
 
-        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap())
-            .build().unwrap().block_on(async {
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(async {
                 let cx = Cx::current().unwrap();
                 let url = |value| CanonicalHttpUrl::parse(value).unwrap();
                 let resource = url("https://mcp.example/mcp");
                 let config = OAuthClientConfiguration::from_trusted_endpoints(
-                    "https://issuer.example", url("https://issuer.example/authorize"),
-                    url("https://issuer.example/token"), resource.clone(), "native-client", vec![],
-                ).unwrap();
+                    "https://issuer.example",
+                    url("https://issuer.example/authorize"),
+                    url("https://issuer.example/token"),
+                    resource.clone(),
+                    "native-client",
+                    vec![],
+                )
+                .unwrap();
                 let session = ManagedOAuthSession {
                     inner: Arc::new(SessionInner {
-                        client: OAuthClient::new(config), resource: resource.clone(),
-                        policy: OAuthSessionPolicy::default(), state: Arc::new(Mutex::new(None)),
-                        closed: McpRequestCancellation::new(), logout_handoff: std::sync::atomic::AtomicBool::new(false), pending: AtomicUsize::new(0),
+                        client: OAuthClient::new(config),
+                        resource: resource.clone(),
+                        policy: OAuthSessionPolicy::default(),
+                        state: Arc::new(Mutex::new(None)),
+                        closed: McpRequestCancellation::new(),
+                        logout_handoff: std::sync::atomic::AtomicBool::new(false),
+                        pending: AtomicUsize::new(0),
                     }),
                 };
                 let expiry = Instant::now() + Duration::from_secs(60);
-                let bearer = BoundBearerCredential::bind_with_expiry(resource.clone(), "secret", expiry).unwrap();
-                let credential = OAuthCredentialSnapshot::new(&bearer, &[], 1, expiry, &session.inner.closed).unwrap();
-                let client = ManagedTasksClient::new(session, FinalRequestMeta::new(ClientCapabilities::default()), ManagedTasksLimits::default()).unwrap();
-                let wire = ModernHttpRequest::new(resource.as_str(), b"{}".to_vec(), FINAL_PROTOCOL_VERSION, TASK_GET, None).unwrap();
+                let bearer =
+                    BoundBearerCredential::bind_with_expiry(resource.clone(), "secret", expiry)
+                        .unwrap();
+                let credential =
+                    OAuthCredentialSnapshot::new(&bearer, &[], 1, expiry, &session.inner.closed)
+                        .unwrap();
+                let client = ManagedTasksClient::new(
+                    session,
+                    FinalRequestMeta::new(ClientCapabilities::default()),
+                    ManagedTasksLimits::default(),
+                )
+                .unwrap();
+                let wire = ModernHttpRequest::new(
+                    resource.as_str(),
+                    b"{}".to_vec(),
+                    FINAL_PROTOCOL_VERSION,
+                    TASK_GET,
+                    None,
+                )
+                .unwrap();
                 assert!(credential.authorize_request(&wire).is_ok());
                 bearer.revoke();
                 let cancellation = McpRequestCancellation::new();
                 let mut dispatch = std::pin::pin!(client.execute_bound(
-                    &cx, &cancellation, Time::from_nanos(u64::MAX), &credential, &wire,
+                    &cx,
+                    &cancellation,
+                    Time::from_nanos(u64::MAX),
+                    &credential,
+                    &wire,
                 ));
                 poll_fn(|task| match dispatch.as_mut().poll(task) {
-                    Poll::Ready(Err(ManagedTasksError::Session(OAuthSessionError::LoginRequired))) => Poll::Ready(()),
-                    _ => panic!("revoked Tasks credentials must fail locally before any network wait"),
-                }).await;
+                    Poll::Ready(Err(ManagedTasksError::Session(
+                        OAuthSessionError::LoginRequired,
+                    ))) => Poll::Ready(()),
+                    _ => panic!(
+                        "revoked Tasks credentials must fail locally before any network wait"
+                    ),
+                })
+                .await;
                 assert!(cx.checkpoint().is_ok());
                 assert!(!client.session.inner.closed.is_cancel_requested());
             });
     }
 
     fn finite_task_call() -> ManagedTaskCall {
-        use std::sync::{Arc, atomic::AtomicUsize};
-        use asupersync::sync::Mutex;
         use crate::http_auth::CanonicalHttpUrl;
         use crate::http_auth::managed::{OAuthSessionPolicy, SessionInner};
         use crate::http_auth::oauth::{OAuthClient, OAuthClientConfiguration};
+        use asupersync::sync::Mutex;
+        use std::sync::{Arc, atomic::AtomicUsize};
 
         let url = |value| CanonicalHttpUrl::parse(value).unwrap();
         let resource = url("https://mcp.example/mcp");
         let config = OAuthClientConfiguration::from_trusted_endpoints(
-            "https://issuer.example", url("https://issuer.example/authorize"),
-            url("https://issuer.example/token"), resource.clone(), "native-client", vec![],
-        ).unwrap();
+            "https://issuer.example",
+            url("https://issuer.example/authorize"),
+            url("https://issuer.example/token"),
+            resource.clone(),
+            "native-client",
+            vec![],
+        )
+        .unwrap();
         let session = ManagedOAuthSession {
             inner: Arc::new(SessionInner {
-                client: OAuthClient::new(config), resource,
-                policy: OAuthSessionPolicy::default(), state: Arc::new(Mutex::new(None)),
-                closed: McpRequestCancellation::new(), logout_handoff: std::sync::atomic::AtomicBool::new(false), pending: AtomicUsize::new(0),
+                client: OAuthClient::new(config),
+                resource,
+                policy: OAuthSessionPolicy::default(),
+                state: Arc::new(Mutex::new(None)),
+                closed: McpRequestCancellation::new(),
+                logout_handoff: std::sync::atomic::AtomicBool::new(false),
+                pending: AtomicUsize::new(0),
             }),
         };
         let prepared = prepare(
-            session.resource().as_str(), &meta(), &RequestId::Number(2),
-            ManagedTaskRequest::CallTool { name: "echo".to_owned(), arguments: None },
+            session.resource().as_str(),
+            &meta(),
+            &RequestId::Number(2),
+            ManagedTaskRequest::CallTool {
+                name: "echo".to_owned(),
+                arguments: None,
+            },
             ManagedTasksLimits::default(),
-        ).unwrap();
+        )
+        .unwrap();
         ManagedTaskCall {
-            body: None, decoder: prepared.decoder, session,
-            cancellation: McpRequestCancellation::new(), request_id: RequestId::Number(2),
-            progress: None, last_progress: None, deadline: Time::from_nanos(u64::MAX),
-            expires_at: Instant::now() + Duration::from_secs(60), generation: 1,
+            body: None,
+            decoder: prepared.decoder,
+            session,
+            cancellation: McpRequestCancellation::new(),
+            request_id: RequestId::Number(2),
+            progress: None,
+            last_progress: None,
+            deadline: Time::from_nanos(u64::MAX),
+            expires_at: Instant::now() + Duration::from_secs(60),
+            generation: 1,
             revocation: McpRequestCancellation::new(),
-            limits: ManagedTasksLimits::default(), records: 0, finished: false,
+            limits: ManagedTasksLimits::default(),
+            records: 0,
+            finished: false,
         }
     }
 
     fn complete_task_event(call: &ManagedTaskCall) -> ManagedTaskEvent {
-        decode_result(&call.decoder, &envelope(r#"{"resultType":"complete","content":[]}"#), &call.request_id, 4096).unwrap()
+        decode_result(
+            &call.decoder,
+            &envelope(r#"{"resultType":"complete","content":[]}"#),
+            &call.request_id,
+            4096,
+        )
+        .unwrap()
     }
 
     #[test]
     fn finite_task_terminal_withholds_every_result_family_until_eof() {
+        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
         use std::future::{Future, poll_fn};
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::task::Poll;
-        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
 
         RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(async {
             let cx = Cx::current().unwrap();
@@ -854,91 +1600,152 @@ mod tests {
     #[test]
     fn finite_task_terminal_rejects_trailing_records_and_preserves_read_errors() {
         use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
-        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(async {
-            let cx = Cx::current().unwrap();
-            let mut call = finite_task_call();
-            for trailing in [
-                r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[]}}"#,
-                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#,
-                r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32603,"message":"secret-canary"}}"#,
-                "malformed-secret-canary",
-                "",
-            ] {
-                let error = call.finish_terminal(&cx, complete_task_event(&call), async {
-                    Ok(Some(trailing.to_owned()))
-                }).await.err().unwrap();
-                assert!(matches!(error, ManagedTasksError::InvalidResponse));
-                assert!(!format!("{error:?} {error}").contains("secret-canary"));
-            }
-            let failed = call.finish_terminal(&cx, complete_task_event(&call), async {
-                Err(OAuthSessionError::StateUnavailable)
-            }).await;
-            assert!(matches!(failed, Err(ManagedTasksError::Session(OAuthSessionError::StateUnavailable))));
-            assert!(call.finish_terminal(&cx, complete_task_event(&call), async { Ok(None) }).await.is_ok());
-        });
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let mut call = finite_task_call();
+                for trailing in [
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[]}}"#,
+                    r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#,
+                    r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32603,"message":"secret-canary"}}"#,
+                    "malformed-secret-canary",
+                    "",
+                ] {
+                    let error = call
+                        .finish_terminal(&cx, complete_task_event(&call), async {
+                            Ok(Some(trailing.to_owned()))
+                        })
+                        .await
+                        .err()
+                        .unwrap();
+                    assert!(matches!(error, ManagedTasksError::InvalidResponse));
+                    assert!(!format!("{error:?} {error}").contains("secret-canary"));
+                }
+                let failed = call
+                    .finish_terminal(&cx, complete_task_event(&call), async {
+                        Err(OAuthSessionError::StateUnavailable)
+                    })
+                    .await;
+                assert!(matches!(
+                    failed,
+                    Err(ManagedTasksError::Session(
+                        OAuthSessionError::StateUnavailable
+                    ))
+                ));
+                assert!(
+                    call.finish_terminal(&cx, complete_task_event(&call), async { Ok(None) })
+                        .await
+                        .is_ok()
+                );
+            });
     }
 
     #[test]
     fn finite_task_terminal_keeps_expiry_deadline_and_owner_checks_live() {
         use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
-        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(async {
-            let cx = Cx::current().unwrap();
-            let mut expired = finite_task_call();
-            expired.expires_at = Instant::now();
-            assert!(matches!(expired.finish_terminal(&cx, complete_task_event(&expired), async { Ok(None) }).await,
-                Err(ManagedTasksError::Session(OAuthSessionError::LoginRequired))));
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let mut expired = finite_task_call();
+                expired.expires_at = Instant::now();
+                assert!(matches!(
+                    expired
+                        .finish_terminal(&cx, complete_task_event(&expired), async { Ok(None) })
+                        .await,
+                    Err(ManagedTasksError::Session(OAuthSessionError::LoginRequired))
+                ));
 
-            let mut timed = finite_task_call();
-            timed.deadline = deadline_after(&cx, Duration::from_millis(20)).unwrap();
-            assert!(matches!(timed.finish_terminal(&cx, complete_task_event(&timed), std::future::pending()).await,
-                Err(ManagedTasksError::Session(OAuthSessionError::TimedOut))));
+                let mut timed = finite_task_call();
+                timed.deadline = deadline_after(&cx, Duration::from_millis(20)).unwrap();
+                assert!(matches!(
+                    timed
+                        .finish_terminal(&cx, complete_task_event(&timed), std::future::pending())
+                        .await,
+                    Err(ManagedTasksError::Session(OAuthSessionError::TimedOut))
+                ));
 
-            let mut cancelled = finite_task_call();
-            let request_cancel = cancelled.cancellation.clone();
-            assert!(matches!(cancelled.finish_terminal(&cx, complete_task_event(&cancelled), async {
-                request_cancel.cancel();
-                Ok(None)
-            }).await, Err(ManagedTasksError::Session(OAuthSessionError::Cancelled))));
-            assert!(!cancelled.session.inner.closed.is_cancel_requested());
+                let mut cancelled = finite_task_call();
+                let request_cancel = cancelled.cancellation.clone();
+                assert!(matches!(
+                    cancelled
+                        .finish_terminal(&cx, complete_task_event(&cancelled), async {
+                            request_cancel.cancel();
+                            Ok(None)
+                        })
+                        .await,
+                    Err(ManagedTasksError::Session(OAuthSessionError::Cancelled))
+                ));
+                assert!(!cancelled.session.inner.closed.is_cancel_requested());
 
-            let mut closed = finite_task_call();
-            let session_close = closed.session.inner.closed.clone();
-            assert!(matches!(closed.finish_terminal(&cx, complete_task_event(&closed), async {
-                session_close.cancel();
-                Ok(None)
-            }).await, Err(ManagedTasksError::Session(OAuthSessionError::Closed))));
-            assert!(!closed.cancellation.is_cancel_requested());
-            assert!(cx.checkpoint().is_ok());
-        });
+                let mut closed = finite_task_call();
+                let session_close = closed.session.inner.closed.clone();
+                assert!(matches!(
+                    closed
+                        .finish_terminal(&cx, complete_task_event(&closed), async {
+                            session_close.cancel();
+                            Ok(None)
+                        })
+                        .await,
+                    Err(ManagedTasksError::Session(OAuthSessionError::Closed))
+                ));
+                assert!(!closed.cancellation.is_cancel_requested());
+                assert!(cx.checkpoint().is_ok());
+            });
     }
 
     #[test]
     fn dropping_finite_task_terminal_drops_the_owned_read_without_cancelling_siblings() {
-        use std::future::{Future, poll_fn};
-        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-        use std::task::Poll;
         use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+        use std::future::{Future, poll_fn};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::task::Poll;
         struct OwnedRead(Arc<AtomicBool>);
         impl Future for OwnedRead {
             type Output = Result<Option<String>, OAuthSessionError>;
-            fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<Self::Output> { Poll::Pending }
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> Poll<Self::Output> {
+                Poll::Pending
+            }
         }
         impl Drop for OwnedRead {
-            fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
         }
-        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(async {
-            let cx = Cx::current().unwrap();
-            let mut call = finite_task_call();
-            let dropped = Arc::new(AtomicBool::new(false));
-            let mut finishing = Box::pin(call.finish_terminal(
-                &cx, complete_task_event(&call), OwnedRead(Arc::clone(&dropped)),
-            ));
-            poll_fn(|task| { assert!(finishing.as_mut().poll(task).is_pending()); Poll::Ready(()) }).await;
-            drop(finishing);
-            assert!(dropped.load(Ordering::Acquire));
-            assert!(!call.cancellation.is_cancel_requested());
-            assert!(!call.session.inner.closed.is_cancel_requested());
-            assert!(cx.checkpoint().is_ok());
-        });
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let mut call = finite_task_call();
+                let dropped = Arc::new(AtomicBool::new(false));
+                let mut finishing = Box::pin(call.finish_terminal(
+                    &cx,
+                    complete_task_event(&call),
+                    OwnedRead(Arc::clone(&dropped)),
+                ));
+                poll_fn(|task| {
+                    assert!(finishing.as_mut().poll(task).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                drop(finishing);
+                assert!(dropped.load(Ordering::Acquire));
+                assert!(!call.cancellation.is_cancel_requested());
+                assert!(!call.session.inner.closed.is_cancel_requested());
+                assert!(cx.checkpoint().is_ok());
+            });
     }
 }

@@ -373,7 +373,9 @@ fn http_02_b_positive() {
 fn assert_http_01_owner_teardown(terminate: bool) {
     let cx = Cx::for_testing();
     let mut transport = StreamableHttpTransport::new();
-    let (ingress, responses) = transport.split_handles().expect("externalize the HTTP owner");
+    let (ingress, responses) = transport
+        .split_handles()
+        .expect("externalize the HTTP owner");
     let request_id = RequestId::Number(811);
     let body = responses
         .for_request(request_id.clone())
@@ -505,7 +507,10 @@ fn assert_http_01_owner_teardown(terminate: bool) {
             Ok(Some(StreamableHttpRequestResponseMessage::Notification(notification)))
                 if notification.method == changed.method && notification.params == changed.params
         ));
-        assert_eq!(final_body.pop_response().unwrap().unwrap().id, Some(final_id));
+        assert_eq!(
+            final_body.pop_response().unwrap().unwrap().id,
+            Some(final_id)
+        );
         assert_eq!(
             responses.pop_response(Some(&json_id)).unwrap().unwrap().id,
             Some(json_id)

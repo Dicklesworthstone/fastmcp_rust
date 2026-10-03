@@ -1,8 +1,8 @@
-use super::*;
 use super::super::IdLedger;
-use std::time::Duration;
+use super::*;
 use crate::http_auth::rpc::ManagedCoreLimits;
 use crate::http_auth::rpc::interaction::admit_fresh_id;
+use std::time::Duration;
 
 #[test]
 fn interaction_configuration_cannot_reset_repair_transport_budgets() {
@@ -28,21 +28,32 @@ fn zero_rounds_are_explicit_but_hard_interaction_limits_remain_binding() {
     assert!(ToolHeaderInteractionLimits::new(repair, 0, 0).is_ok());
     assert!(ToolHeaderInteractionLimits::new(repair, 64, 1024).is_ok());
     for (rounds, answers) in [(65, 1), (1, 1025)] {
-        assert!(matches!(ToolHeaderInteractionLimits::new(repair, rounds, answers),
-            Err(ManagedInteractionError::InvalidLimits)));
+        assert!(matches!(
+            ToolHeaderInteractionLimits::new(repair, rounds, answers),
+            Err(ManagedInteractionError::InvalidLimits)
+        ));
     }
 }
 
 #[test]
 fn handoff_keeps_every_attempted_id_including_catalog_and_rejection() {
-    let expected = [RequestId::Number(10), RequestId::String("catalog-page".to_owned()),
-        RequestId::Number(12), RequestId::Number(13)];
+    let expected = [
+        RequestId::Number(10),
+        RequestId::String("catalog-page".to_owned()),
+        RequestId::Number(12),
+        RequestId::Number(13),
+    ];
     let mut ledger = IdLedger::default();
-    for id in &expected { ledger.reserve(id).unwrap(); }
+    for id in &expected {
+        ledger.reserve(id).unwrap();
+    }
     let transferred = ledger.ids;
     assert_eq!(transferred, expected);
     for id in &expected {
-        assert!(matches!(admit_fresh_id(&transferred, id), Err(ManagedInteractionError::RepeatedRequestId)));
+        assert!(matches!(
+            admit_fresh_id(&transferred, id),
+            Err(ManagedInteractionError::RepeatedRequestId)
+        ));
     }
     // String and numeric IDs retain the protocol's distinct correlation domains.
     assert!(admit_fresh_id(&transferred, &RequestId::String("10".to_owned())).is_ok());

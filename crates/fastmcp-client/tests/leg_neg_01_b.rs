@@ -729,7 +729,9 @@ fn leg_neg_01_b_planted_negative() {
 
 fn authorize(coordinator: &mut HttpFallbackCoordinator) -> FallbackDecision {
     let observed = observation(coordinator, 1, 404, HttpProbeBody::Unrecognized);
-    coordinator.observe(&observed).expect("eligible observation")
+    coordinator
+        .observe(&observed)
+        .expect("eligible observation")
 }
 
 // These ownership regressions use the shipped public API rather than private
@@ -769,7 +771,10 @@ fn same_bundle_and_attempt_cannot_exchange_permits() {
     assert_eq!(owner.state(), before);
     assert_eq!(owner.advertised_message_post_target(), None);
     // A rejected foreign permit does not consume the legitimate authorization.
-    assert_eq!(owner.open_legacy_get(owner_permit).unwrap(), LEGACY_SSE_TARGET);
+    assert_eq!(
+        owner.open_legacy_get(owner_permit).unwrap(),
+        LEGACY_SSE_TARGET
+    );
 }
 
 #[test]
@@ -780,7 +785,10 @@ fn foreign_permit_cannot_override_a_recognized_modern_response() {
         panic!("legacy candidate must authorize a GET");
     };
     let observed = observation(&modern, 1, 404, RECOGNIZED_MODERN);
-    assert_eq!(modern.observe(&observed).unwrap(), FallbackDecision::ModernRetained);
+    assert_eq!(
+        modern.observe(&observed).unwrap(),
+        FallbackDecision::ModernRetained
+    );
     let before = modern.state();
     assert_eq!(
         modern.open_legacy_get(foreign_permit),
@@ -813,7 +821,10 @@ fn same_target_and_attempt_cannot_cross_security_partitions() {
         Err(HttpFallbackError::CrossBundleObservation)
     );
     assert_eq!(owner.state(), before);
-    assert_eq!(owner.open_legacy_get(owner_permit).unwrap(), LEGACY_SSE_TARGET);
+    assert_eq!(
+        owner.open_legacy_get(owner_permit).unwrap(),
+        LEGACY_SSE_TARGET
+    );
 }
 
 #[test]
@@ -835,7 +846,10 @@ fn retired_coordinator_permit_cannot_authorize_a_replacement_attempt() {
         Err(HttpFallbackError::CrossBundleObservation)
     );
     assert_eq!(replacement.state(), before);
-    assert_eq!(replacement.open_legacy_get(fresh_permit).unwrap(), LEGACY_SSE_TARGET);
+    assert_eq!(
+        replacement.open_legacy_get(fresh_permit).unwrap(),
+        LEGACY_SSE_TARGET
+    );
 }
 
 #[test]
@@ -848,7 +862,10 @@ fn endpoint_event_selects_message_post_not_sse_get() {
         accepted.admit_endpoint_event(LEGACY_MESSAGE_TARGET),
         Ok(ProtocolEra::Legacy2024)
     );
-    assert_eq!(accepted.advertised_message_post_target(), Some(LEGACY_MESSAGE_TARGET));
+    assert_eq!(
+        accepted.advertised_message_post_target(),
+        Some(LEGACY_MESSAGE_TARGET)
+    );
 
     // Only the event's route changes: advertising the GET route is not proof
     // that the configured message POST route exists.
@@ -866,8 +883,14 @@ fn endpoint_event_selects_message_post_not_sse_get() {
 fn admitted_session_target_is_retained_and_cannot_be_replaced() {
     let mut coordinator = authorized_and_opened();
     let first = format!("{LEGACY_MESSAGE_TARGET}?session_id=private-a%2Fb%23c");
-    assert_eq!(coordinator.admit_endpoint_event(&first), Ok(ProtocolEra::Legacy2024));
-    assert_eq!(coordinator.advertised_message_post_target(), Some(first.as_str()));
+    assert_eq!(
+        coordinator.admit_endpoint_event(&first),
+        Ok(ProtocolEra::Legacy2024)
+    );
+    assert_eq!(
+        coordinator.advertised_message_post_target(),
+        Some(first.as_str())
+    );
     let before = coordinator.state();
     let second = format!("{LEGACY_MESSAGE_TARGET}?session_id=private-replacement");
     assert_eq!(
@@ -875,7 +898,10 @@ fn admitted_session_target_is_retained_and_cannot_be_replaced() {
         Err(HttpFallbackError::DuplicateEndpointEvent)
     );
     assert_eq!(coordinator.state(), before);
-    assert_eq!(coordinator.advertised_message_post_target(), Some(first.as_str()));
+    assert_eq!(
+        coordinator.advertised_message_post_target(),
+        Some(first.as_str())
+    );
     assert!(!format!("{coordinator:?}").contains("private-a"));
     assert!(!format!("{coordinator:?}").contains("session_id"));
 }
@@ -962,7 +988,13 @@ fn configured_message_query_is_immutable() {
         );
         assert_eq!(coordinator.state(), before);
         assert_eq!(coordinator.advertised_message_post_target(), None);
-        assert_eq!(coordinator.admit_endpoint_event(&configured), Ok(ProtocolEra::Legacy2024));
-        assert_eq!(coordinator.advertised_message_post_target(), Some(configured.as_str()));
+        assert_eq!(
+            coordinator.admit_endpoint_event(&configured),
+            Ok(ProtocolEra::Legacy2024)
+        );
+        assert_eq!(
+            coordinator.advertised_message_post_target(),
+            Some(configured.as_str())
+        );
     }
 }

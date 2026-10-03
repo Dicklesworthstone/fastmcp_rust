@@ -53,7 +53,6 @@ fn limit_01_a_bound_rows() -> [(fastmcp_core::ProtocolLimit, usize, usize); 6] {
     ]
 }
 
-
 /// LIMIT-01 A positive: six catalog rows, sealed partitions, and N-1/N charges.
 #[test]
 fn limit_01_a_positive() {
@@ -133,7 +132,9 @@ fn limit_01_a_positive() {
     }
 
     assert_eq!(
-        fastmcp_core::ProtocolLimits::hard_ceiling(fastmcp_core::ProtocolLimit::LogicalExchangeWallClock),
+        fastmcp_core::ProtocolLimits::hard_ceiling(
+            fastmcp_core::ProtocolLimit::LogicalExchangeWallClock
+        ),
         Err(fastmcp_core::ProtocolLimitsError::NotCountable {
             limit: fastmcp_core::ProtocolLimit::LogicalExchangeWallClock,
         })
@@ -200,7 +201,11 @@ fn limit_01_a_positive() {
     let bound_rows = limit_01_rows::run_bound_rows();
     assert_eq!(bound_rows.len(), 6, "AC-LIMIT-A-01 numeric floor is 6 rows");
     let bounds = limit_01_rows::bounds_receipt(&bound_rows);
-    assert_eq!(bounds.len(), 1 + 6, "the bounds receipt carries a header and six ordered rows");
+    assert_eq!(
+        bounds.len(),
+        1 + 6,
+        "the bounds receipt carries a header and six ordered rows"
+    );
     assert_eq!(
         bounds[0],
         format!(
@@ -246,7 +251,10 @@ fn limit_01_a_positive() {
     .enumerate()
     {
         let row = &partition_rows[index];
-        assert_eq!(row.id, id, "partition row {index} is out of acceptance order");
+        assert_eq!(
+            row.id, id,
+            "partition row {index} is out of acceptance order"
+        );
         assert_eq!(row.discriminant, discriminant, "{id}: wrong discriminant");
         assert_eq!(
             row.generation,
@@ -326,7 +334,10 @@ fn limit_01_a_positive() {
     ];
     for (index, (id, requested, result, retained)) in expected_arithmetic.into_iter().enumerate() {
         let row = &arithmetic_rows[index];
-        assert_eq!(row.id, id, "arithmetic row {index} is out of acceptance order");
+        assert_eq!(
+            row.id, id,
+            "arithmetic row {index} is out of acceptance order"
+        );
         assert_eq!(row.requested, requested, "{id}: wrong requested units");
         assert_eq!(row.available, available, "{id}: wrong available units");
         assert_eq!(row.result, result, "{id}: wrong public result");
@@ -336,7 +347,6 @@ fn limit_01_a_positive() {
     assert_eq!(arithmetic.len(), 1 + 4);
     assert_eq!(arithmetic[0], "LIMIT01-A-ARITHMETIC-v1 rows=4");
 }
-
 
 /// LIMIT-01 A planted negative: one-row N+1 and raw identifiers leave state unchanged.
 #[test]
@@ -414,8 +424,7 @@ fn limit_01_a_planted_negative() {
     // -----------------------------------------------------------------------
 
     let bounds_before = limit_01_rows::bounds_receipt(&limit_01_rows::run_bound_rows());
-    let partitions_before =
-        limit_01_rows::partitions_receipt(&limit_01_rows::run_partition_rows());
+    let partitions_before = limit_01_rows::partitions_receipt(&limit_01_rows::run_partition_rows());
     let arithmetic_before =
         limit_01_rows::arithmetic_receipt(&limit_01_rows::run_arithmetic_rows());
 

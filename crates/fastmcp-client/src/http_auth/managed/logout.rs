@@ -144,10 +144,7 @@ impl ManagedOAuthSession {
     /// restores the ordinary nonblocking, best-effort closed-session cleanup.
     /// The acquisition timeout bounds the complete logout, including revocation;
     /// obtaining the grant lock does not restart that budget.
-    pub async fn logout(
-        &self,
-        cx: &Cx,
-    ) -> Result<ManagedOAuthLogoutReport, OAuthSessionError> {
+    pub async fn logout(&self, cx: &Cx) -> Result<ManagedOAuthLogoutReport, OAuthSessionError> {
         if self.inner.closed.is_cancel_requested() {
             return Err(OAuthSessionError::Closed);
         }
@@ -532,7 +529,9 @@ mod tests {
                     }
                     (1, Poll::Ready(Err(ManagedOAuthRemoteRevocation::Cancelled)))
                     | (2, Poll::Ready(Err(ManagedOAuthRemoteRevocation::TimedOut))) => {}
-                    _ => panic!("logout must not publish a result after its budget becomes inactive"),
+                    _ => {
+                        panic!("logout must not publish a result after its budget becomes inactive")
+                    }
                 }
                 assert_eq!(dropped.load(Ordering::SeqCst), 1);
             });
@@ -624,7 +623,10 @@ mod tests {
         };
         let mut guarded = Box::pin(session.run_while_open(operation));
         let mut task = Context::from_waker(Waker::noop());
-        assert!(matches!(guarded.as_mut().poll(&mut task), Poll::Ready(Err(OAuthSessionError::Closed))));
+        assert!(matches!(
+            guarded.as_mut().poll(&mut task),
+            Poll::Ready(Err(OAuthSessionError::Closed))
+        ));
         assert_eq!(polls.load(Ordering::SeqCst), 0);
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
@@ -644,7 +646,8 @@ mod tests {
                     poll_fn(|_| {
                         polls.fetch_add(1, Ordering::SeqCst);
                         Poll::<()>::Pending
-                    }).await;
+                    })
+                    .await;
                 };
                 let counter = Arc::new(WakeCount::default());
                 let waker = Waker::from(Arc::clone(&counter));
@@ -655,12 +658,18 @@ mod tests {
                 let before = counter.0.load(Ordering::SeqCst);
                 if logout {
                     let mut closing = Box::pin(closer.logout(cx));
-                    assert!(matches!(closing.as_mut().poll(&mut task), Poll::Ready(Ok(_))));
+                    assert!(matches!(
+                        closing.as_mut().poll(&mut task),
+                        Poll::Ready(Ok(_))
+                    ));
                 } else {
                     closer.close();
                 }
                 assert!(counter.0.load(Ordering::SeqCst) > before);
-                assert!(matches!(guarded.as_mut().poll(&mut task), Poll::Ready(Err(OAuthSessionError::Closed))));
+                assert!(matches!(
+                    guarded.as_mut().poll(&mut task),
+                    Poll::Ready(Err(OAuthSessionError::Closed))
+                ));
                 assert_eq!(polls.load(Ordering::SeqCst), 1);
                 assert_eq!(dropped.load(Ordering::SeqCst), 1);
                 assert!(!sibling.inner.closed.is_cancel_requested());
@@ -675,7 +684,9 @@ mod tests {
             let session = session();
             let dropped = Arc::new(AtomicUsize::new(0));
             let operation = async {
-                if close { session.close(); }
+                if close {
+                    session.close();
+                }
                 Owner(Arc::clone(&dropped))
             };
             let mut guarded = Box::pin(session.run_while_open(operation));
@@ -712,7 +723,10 @@ mod tests {
         assert!(!session.inner.closed.is_cancel_requested());
         assert_eq!(Arc::strong_count(&counter), 2);
         let mut ready = Box::pin(session.run_while_open(std::future::ready(17_u8)));
-        assert!(matches!(ready.as_mut().poll(&mut task), Poll::Ready(Ok(17))));
+        assert!(matches!(
+            ready.as_mut().poll(&mut task),
+            Poll::Ready(Ok(17))
+        ));
         let before = counter.0.load(Ordering::SeqCst);
         session.close();
         assert_eq!(counter.0.load(Ordering::SeqCst), before);

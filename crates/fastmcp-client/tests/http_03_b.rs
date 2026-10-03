@@ -335,7 +335,8 @@ fn assert_shipped_manifest() {
     );
 
     assert_eq!(
-        manifest_digest_hex(text), HTTP_03_B_MANIFEST_DIGEST_HEX,
+        manifest_digest_hex(text),
+        HTTP_03_B_MANIFEST_DIGEST_HEX,
         "the published manifest bytes changed: a reordering, an omitted group, floor or \
          negative, or any other edit fails this slice until the frozen digest is re-approved"
     );
@@ -373,7 +374,10 @@ fn assert_manifest_digest_refuses_perturbation() {
 
     let perturbations = [
         ("reordering two case rows", reordered.join("\n")),
-        ("raising one declared floor", text.replacen("floor=5", "floor=6", 1)),
+        (
+            "raising one declared floor",
+            text.replacen("floor=5", "floor=6", 1),
+        ),
         ("omitting one group row", omitted.join("\n")),
     ];
 
@@ -384,12 +388,12 @@ fn assert_manifest_digest_refuses_perturbation() {
              otherwise this case proves nothing"
         );
         assert_ne!(
-            manifest_digest_hex(&perturbed), HTTP_03_B_MANIFEST_DIGEST_HEX,
+            manifest_digest_hex(&perturbed),
+            HTTP_03_B_MANIFEST_DIGEST_HEX,
             "{dimension}: the frozen anchor must refuse a manifest differing in this dimension"
         );
     }
 }
-
 
 #[test]
 fn http_03_b_positive() {
@@ -1166,8 +1170,8 @@ fn negative_17_header_hostile_token() {
         .expect_err("a header-hostile token must not bind");
     assert_eq!(error, BearerBindingError::InvalidTokenBytes);
 
-    let empty = BoundBearerCredential::bind(resource, "")
-        .expect_err("an empty token must not bind");
+    let empty =
+        BoundBearerCredential::bind(resource, "").expect_err("an empty token must not bind");
     assert_eq!(empty, BearerBindingError::EmptyToken);
 }
 

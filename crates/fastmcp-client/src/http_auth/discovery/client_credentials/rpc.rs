@@ -112,14 +112,26 @@ impl ClientCredentialsClient {
     ) -> Result<ClientCredentialsCoreCall, ClientCredentialsCoreError> {
         let deadline = discovery_deadline(cx, limits.timeout().min(self.inner.timeout))
             .map_err(ClientCredentialsError::from)?;
-        preflight(self.resource(), &request, &discovery_id, &request_id, limits)?;
+        preflight(
+            self.resource(),
+            &request,
+            &discovery_id,
+            &request_id,
+            limits,
+        )?;
         let response = Box::pin(active(
             cx,
             deadline,
             &self.inner.closed,
             cancellation,
             None,
-            self.execute_core_with_cancellation(cx, cancellation, request, discovery_id, request_id),
+            self.execute_core_with_cancellation(
+                cx,
+                cancellation,
+                request,
+                discovery_id,
+                request_id,
+            ),
         ))
         .await?;
         ClientCredentialsCoreCall::from_response(response, limits, deadline)
@@ -135,7 +147,9 @@ fn preflight(
     request_id: &RequestId,
     limits: ManagedCoreLimits,
 ) -> Result<(), ClientCredentialsCoreError> {
-    discovery_id.validate().map_err(|_| ManagedCoreError::InvalidRequest)?;
+    discovery_id
+        .validate()
+        .map_err(|_| ManagedCoreError::InvalidRequest)?;
     if discovery_id.correlates_with(request_id) {
         return Err(ManagedCoreError::InvalidRequest.into());
     }
@@ -143,7 +157,9 @@ fn preflight(
     if wire.body().len() > limits.request_bytes() {
         return Err(ManagedCoreError::RequestTooLarge.into());
     }
-    let params = stamped.encode_params().map_err(|_| ManagedCoreError::InvalidRequest)?
+    let params = stamped
+        .encode_params()
+        .map_err(|_| ManagedCoreError::InvalidRequest)?
         .ok_or(ManagedCoreError::InvalidRequest)?;
     let discovery = CoreRequest::decode(
         ProtocolEra::Modern2026,
@@ -193,10 +209,18 @@ impl ClientCredentialsCoreCall {
         deadline: Time,
     ) -> Result<Self, ClientCredentialsCoreError> {
         if response.metadata().status() != 200 {
-            return Err(ManagedCoreError::HttpStatus { status: response.metadata().status() }.into());
+            return Err(ManagedCoreError::HttpStatus {
+                status: response.metadata().status(),
+            }
+            .into());
         }
         let ClientCredentialsResponse {
-            response, snapshot, owner, cancellation, request, request_id,
+            response,
+            snapshot,
+            owner,
+            cancellation,
+            request,
+            request_id,
             deadline: dispatch_deadline,
         } = response;
         let decoder = CoreDecoder::for_request(request, request_id.clone(), limits)?;
@@ -206,14 +230,24 @@ impl ClientCredentialsCoreCall {
                 let frame = limits.frame_bytes();
                 let framing = SseLimits::new(frame + 16, frame + 64, 64)
                     .ok_or(ManagedCoreError::InvalidLimits)?;
-                Body::Sse(response.into_sse_stream(framing)
-                    .map_err(|_| ManagedCoreError::InvalidResponse)?)
+                Body::Sse(
+                    response
+                        .into_sse_stream(framing)
+                        .map_err(|_| ManagedCoreError::InvalidResponse)?,
+                )
             }
             _ => return Err(ManagedCoreError::InvalidResponse.into()),
         };
         Ok(Self {
-            body: Some(Box::new(body)), decoder, snapshot, owner, cancellation,
-            request_id, deadline: deadline.min(dispatch_deadline), limits, finished: false,
+            body: Some(Box::new(body)),
+            decoder,
+            snapshot,
+            owner,
+            cancellation,
+            request_id,
+            deadline: deadline.min(dispatch_deadline),
+            limits,
+            finished: false,
         })
     }
 
@@ -244,12 +278,16 @@ impl ClientCredentialsCoreCall {
         let read = async {
             let (source, remaining) = match *body {
                 Body::Json(response) => {
-                    let bytes = response.read_to_end_with_cancellation(cx, cancellation, maximum)
-                        .await.map_err(|_| ClientCredentialsError::UnexpectedResponse)?;
+                    let bytes = response
+                        .read_to_end_with_cancellation(cx, cancellation, maximum)
+                        .await
+                        .map_err(|_| ClientCredentialsError::UnexpectedResponse)?;
                     (bytes, None)
                 }
                 Body::Sse(mut stream) => {
-                    let source = stream.next_event(cx).await
+                    let source = stream
+                        .next_event(cx)
+                        .await
                         .map_err(|_| ClientCredentialsError::UnexpectedResponse)?
                         .ok_or(ManagedCoreError::MissingTerminal)?;
                     (source.into_bytes(), Some(Box::new(Body::Sse(stream))))
@@ -271,7 +309,11 @@ impl ClientCredentialsCoreCall {
         // decoding cannot turn into a successfully delivered result. The nested
         // Result retains the shared decoder's typed protocol failures.
         let (event, remaining) = active(
-            cx, self.deadline, &self.owner, cancellation, Some(&self.snapshot),
+            cx,
+            self.deadline,
+            &self.owner,
+            cancellation,
+            Some(&self.snapshot),
             async { Ok(read.await) },
         )
         .await??;
@@ -291,12 +333,19 @@ pub(super) async fn require_finite_sse_eof(
     cx: &Cx,
     stream: &mut ModernHttpSseResponseStream,
 ) -> Result<(), ManagedCoreError> {
-    if stream.next_event(cx).await.map_err(|_| ManagedCoreError::InvalidResponse)?.is_some() {
+    if stream
+        .next_event(cx)
+        .await
+        .map_err(|_| ManagedCoreError::InvalidResponse)?
+        .is_some()
+    {
         return Err(ManagedCoreError::InvalidResponse);
     }
     // None alone is insufficient: WHATWG SSE discards incomplete EOF data.
     // The native parser reports those fragments without synthesizing an event.
-    let framing = stream.end_of_stream().ok_or(ManagedCoreError::MissingTerminal)?;
+    let framing = stream
+        .end_of_stream()
+        .ok_or(ManagedCoreError::MissingTerminal)?;
     if framing.discarded_pending_event || framing.discarded_partial_line {
         return Err(ManagedCoreError::InvalidResponse);
     }
@@ -318,12 +367,14 @@ pub(super) mod tests {
     }
 
     fn request(method: &str, mut params: Value) -> CoreRequest {
-        params["_meta"] = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
+        params["_meta"] =
+            serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
         CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&params)).unwrap()
     }
 
     fn decoder(method: &str, params: Value, limits: ManagedCoreLimits) -> CoreDecoder {
-        let (_, stamped) = prepare(&resource(), &request(method, params), &RequestId::Number(7)).unwrap();
+        let (_, stamped) =
+            prepare(&resource(), &request(method, params), &RequestId::Number(7)).unwrap();
         CoreDecoder::for_request(stamped, RequestId::Number(7), limits).unwrap()
     }
 
@@ -335,35 +386,77 @@ pub(super) mod tests {
     fn preflight_measures_both_stamped_documents_and_rejects_reused_ids() {
         let core = request("tools/list", json!({}));
         let id = RequestId::Number(7);
-        let discovery_id = RequestId::String("discovery-with-a-longer-correlation-identity".to_owned());
+        let discovery_id =
+            RequestId::String("discovery-with-a-longer-correlation-identity".to_owned());
         let (wire, _) = prepare(&resource(), &core, &id).unwrap();
         let body: Value = serde_json::from_slice(wire.body()).unwrap();
-        assert_eq!(body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"],
-            json!({CLIENT_CREDENTIALS_EXTENSION: {}}));
-        assert!(preflight(&resource(), &core, &discovery_id, &id, ManagedCoreLimits::default()).is_ok());
-        let exact_operation_only = ManagedCoreLimits::new(
-            wire.body().len(), 1024, 1024, 1, Duration::from_secs(1),
-        ).unwrap();
-        assert!(matches!(preflight(&resource(), &core, &discovery_id, &id, exact_operation_only),
-            Err(ClientCredentialsCoreError::Protocol(ManagedCoreError::RequestTooLarge))));
-        assert!(matches!(preflight(&resource(), &core, &id, &id, ManagedCoreLimits::default()),
-            Err(ClientCredentialsCoreError::Protocol(ManagedCoreError::InvalidRequest))));
+        assert_eq!(
+            body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"],
+            json!({CLIENT_CREDENTIALS_EXTENSION: {}})
+        );
+        assert!(
+            preflight(
+                &resource(),
+                &core,
+                &discovery_id,
+                &id,
+                ManagedCoreLimits::default()
+            )
+            .is_ok()
+        );
+        let exact_operation_only =
+            ManagedCoreLimits::new(wire.body().len(), 1024, 1024, 1, Duration::from_secs(1))
+                .unwrap();
+        assert!(matches!(
+            preflight(&resource(), &core, &discovery_id, &id, exact_operation_only),
+            Err(ClientCredentialsCoreError::Protocol(
+                ManagedCoreError::RequestTooLarge
+            ))
+        ));
+        assert!(matches!(
+            preflight(&resource(), &core, &id, &id, ManagedCoreLimits::default()),
+            Err(ClientCredentialsCoreError::Protocol(
+                ManagedCoreError::InvalidRequest
+            ))
+        ));
         let tiny = ManagedCoreLimits::new(1, 1024, 1024, 1, Duration::from_secs(1)).unwrap();
-        assert!(matches!(preflight(&resource(), &core, &discovery_id, &id, tiny),
-            Err(ClientCredentialsCoreError::Protocol(ManagedCoreError::RequestTooLarge))));
+        assert!(matches!(
+            preflight(&resource(), &core, &discovery_id, &id, tiny),
+            Err(ClientCredentialsCoreError::Protocol(
+                ManagedCoreError::RequestTooLarge
+            ))
+        ));
     }
 
     #[test]
     fn machine_profile_stays_core_only_even_when_other_extensions_are_compiled() {
-        let mut params = request("tools/call", json!({"name":"echo"})).encode_params().unwrap().unwrap();
+        let mut params = request("tools/call", json!({"name":"echo"}))
+            .encode_params()
+            .unwrap()
+            .unwrap();
         params["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"] =
             json!({"io.modelcontextprotocol/tasks": {}});
-        let core = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).unwrap();
-        assert!(preflight(&resource(), &core, &RequestId::Number(6), &RequestId::Number(7),
-            ManagedCoreLimits::default()).is_err());
-        let mut decoder = decoder("tools/call", json!({"name":"echo"}), ManagedCoreLimits::default());
-        assert!(matches!(decoder.admit(&terminal(r#"{"resultType":"task"}"#), true),
-            Err(ManagedCoreError::UnsupportedResult)));
+        let core =
+            CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).unwrap();
+        assert!(
+            preflight(
+                &resource(),
+                &core,
+                &RequestId::Number(6),
+                &RequestId::Number(7),
+                ManagedCoreLimits::default()
+            )
+            .is_err()
+        );
+        let mut decoder = decoder(
+            "tools/call",
+            json!({"name":"echo"}),
+            ManagedCoreLimits::default(),
+        );
+        assert!(matches!(
+            decoder.admit(&terminal(r#"{"resultType":"task"}"#), true),
+            Err(ManagedCoreError::UnsupportedResult)
+        ));
     }
 
     #[test]
@@ -372,7 +465,9 @@ pub(super) mod tests {
         for sse in [false, true] {
             let mut decoder = decoder("tools/list", json!({}), ManagedCoreLimits::default());
             let ManagedCoreEvent::Result(result) = decoder.admit(&terminal(result), sse).unwrap()
-                else { panic!("expected typed result") };
+            else {
+                panic!("expected typed result")
+            };
             let encoded = result.encode().unwrap();
             assert!(encoded.contains("900719925474099312345"));
             assert!(encoded.contains("1.20e+4"));
@@ -382,29 +477,63 @@ pub(super) mod tests {
 
     #[test]
     fn machine_progress_uses_the_original_request_marker_and_monotonic_order() {
-        let mut params = request("tools/call", json!({"name":"echo"})).encode_params().unwrap().unwrap();
+        let mut params = request("tools/call", json!({"name":"echo"}))
+            .encode_params()
+            .unwrap()
+            .unwrap();
         params["_meta"]["progressToken"] = json!("owned-progress");
-        let core = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).unwrap();
+        let core =
+            CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).unwrap();
         let (_, stamped) = prepare(&resource(), &core, &RequestId::Number(7)).unwrap();
-        let mut decoder = CoreDecoder::for_request(stamped, RequestId::Number(7), ManagedCoreLimits::default()).unwrap();
-        let update = |token: &str, progress: u64| serde_json::to_vec(&json!({
-            "jsonrpc":"2.0", "method":"notifications/progress",
-            "params":{"progressToken":token, "progress":progress},
-        })).unwrap();
-        assert!(matches!(decoder.admit(&update("owned-progress", 1), true), Ok(ManagedCoreEvent::Notification(_))));
-        assert!(matches!(decoder.admit(&update("foreign-progress", 2), true), Err(ManagedCoreError::InvalidProgress)));
-        assert!(matches!(decoder.admit(&update("owned-progress", 1), true), Err(ManagedCoreError::InvalidProgress)));
-        assert!(matches!(decoder.admit(&update("owned-progress", 2), true), Ok(ManagedCoreEvent::Notification(_))));
-        assert!(matches!(decoder.admit(&terminal(r#"{"resultType":"complete","content":[]}"#), true), Ok(ManagedCoreEvent::Result(_))));
+        let mut decoder =
+            CoreDecoder::for_request(stamped, RequestId::Number(7), ManagedCoreLimits::default())
+                .unwrap();
+        let update = |token: &str, progress: u64| {
+            serde_json::to_vec(&json!({
+                "jsonrpc":"2.0", "method":"notifications/progress",
+                "params":{"progressToken":token, "progress":progress},
+            }))
+            .unwrap()
+        };
+        assert!(matches!(
+            decoder.admit(&update("owned-progress", 1), true),
+            Ok(ManagedCoreEvent::Notification(_))
+        ));
+        assert!(matches!(
+            decoder.admit(&update("foreign-progress", 2), true),
+            Err(ManagedCoreError::InvalidProgress)
+        ));
+        assert!(matches!(
+            decoder.admit(&update("owned-progress", 1), true),
+            Err(ManagedCoreError::InvalidProgress)
+        ));
+        assert!(matches!(
+            decoder.admit(&update("owned-progress", 2), true),
+            Ok(ManagedCoreEvent::Notification(_))
+        ));
+        assert!(matches!(
+            decoder.admit(&terminal(r#"{"resultType":"complete","content":[]}"#), true),
+            Ok(ManagedCoreEvent::Result(_))
+        ));
     }
 
     #[test]
     fn machine_input_required_remains_an_explicit_typed_terminal() {
-        let mut decoder = decoder("resources/read", json!({"uri":"file:///sample"}), ManagedCoreLimits::default());
-        let result = terminal(r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"opaque-state"}"#);
-        let ManagedCoreEvent::Result(result) = decoder.admit(&result, true).unwrap()
-            else { panic!("expected input-required result") };
-        assert!(matches!(*result, CoreResult::Final(fastmcp_protocol::FinalCoreResult::ResourcesReadInputRequired { .. })));
+        let mut decoder = decoder(
+            "resources/read",
+            json!({"uri":"file:///sample"}),
+            ManagedCoreLimits::default(),
+        );
+        let result = terminal(
+            r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"opaque-state"}"#,
+        );
+        let ManagedCoreEvent::Result(result) = decoder.admit(&result, true).unwrap() else {
+            panic!("expected input-required result")
+        };
+        assert!(matches!(
+            *result,
+            CoreResult::Final(fastmcp_protocol::FinalCoreResult::ResourcesReadInputRequired { .. })
+        ));
     }
 
     #[test]
@@ -412,12 +541,28 @@ pub(super) mod tests {
         let limits = ManagedCoreLimits::new(1024, 1024, 2048, 1, Duration::from_secs(1)).unwrap();
         let mut decoder = decoder("tools/list", json!({}), limits);
         let notification = br#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
-        assert!(matches!(decoder.admit(notification, true), Ok(ManagedCoreEvent::Notification(_))));
-        assert!(matches!(decoder.admit(notification, true), Err(ManagedCoreError::NotificationLimit)));
-        assert!(matches!(decoder.admit(&terminal(r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}"#), true),
-            Ok(ManagedCoreEvent::Result(_))));
+        assert!(matches!(
+            decoder.admit(notification, true),
+            Ok(ManagedCoreEvent::Notification(_))
+        ));
+        assert!(matches!(
+            decoder.admit(notification, true),
+            Err(ManagedCoreError::NotificationLimit)
+        ));
+        assert!(matches!(
+            decoder.admit(
+                &terminal(
+                    r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}"#
+                ),
+                true
+            ),
+            Ok(ManagedCoreEvent::Result(_))
+        ));
         let mut bounded = self::decoder("tools/list", json!({}), limits);
-        assert!(matches!(bounded.admit(&vec![b' '; 1025], true), Err(ManagedCoreError::ResponseByteLimit)));
+        assert!(matches!(
+            bounded.admit(&vec![b' '; 1025], true),
+            Err(ManagedCoreError::ResponseByteLimit)
+        ));
     }
 
     #[test]
@@ -437,7 +582,8 @@ pub(super) mod tests {
     // These tests isolate the shipped native response pipeline and credential
     // lifetime checks. The loopback peer is not an OAuth issuer: acquisition,
     // HTTPS credential delivery and discovery negotiation are not proved here.
-    pub(in crate::http_auth::discovery::client_credentials) fn runtime() -> asupersync::runtime::Runtime {
+    pub(in crate::http_auth::discovery::client_credentials) fn runtime()
+    -> asupersync::runtime::Runtime {
         asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
             .blocking_threads(0, 2)
@@ -446,7 +592,11 @@ pub(super) mod tests {
     }
 
     #[derive(Clone, Copy)]
-    pub(in crate::http_auth::discovery::client_credentials) enum NativeEnd { Complete, Hold, Truncate }
+    pub(in crate::http_auth::discovery::client_credentials) enum NativeEnd {
+        Complete,
+        Hold,
+        Truncate,
+    }
 
     async fn native_response(
         cx: &Cx,
@@ -484,14 +634,21 @@ pub(super) mod tests {
                 match listener.accept() {
                     Ok((socket, _)) => break socket,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < deadline, "native response peer was never contacted");
+                        assert!(
+                            Instant::now() < deadline,
+                            "native response peer was never contacted"
+                        );
                         std::thread::sleep(Duration::from_millis(1));
                     }
                     Err(error) => panic!("accept failed: {error}"),
                 }
             };
-            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             {
                 let mut reader = std::io::BufReader::new(&mut socket);
                 let mut length = None;
@@ -501,7 +658,9 @@ pub(super) mod tests {
                     assert_ne!(reader.read_line(&mut line).unwrap(), 0);
                     header_bytes += line.len();
                     assert!(header_bytes <= 32 * 1024);
-                    if line == "\r\n" { break; }
+                    if line == "\r\n" {
+                        break;
+                    }
                     if let Some((name, value)) = line.split_once(':')
                         && name.eq_ignore_ascii_case("content-length")
                     {
@@ -513,7 +672,12 @@ pub(super) mod tests {
                 let mut request = vec![0; length];
                 reader.read_exact(&mut request).unwrap();
             }
-            let length = body.len() + if matches!(end, NativeEnd::Complete) { 0 } else { 100 };
+            let length = body.len()
+                + if matches!(end, NativeEnd::Complete) {
+                    0
+                } else {
+                    100
+                };
             write!(socket,
                 "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {length}\r\nMCP-Protocol-Version: 2026-07-28\r\nConnection: close\r\n\r\n{body}"
             ).unwrap();
@@ -523,9 +687,13 @@ pub(super) mod tests {
                 // read timeout makes a missing close a bounded test failure.
                 let mut byte = [0];
                 match socket.read(&mut byte) {
-                    Ok(0) => {},
-                    Err(error) if matches!(error.kind(),
-                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted) => {},
+                    Ok(0) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ) => {}
                     other => panic!("abandoned response did not close its socket: {other:?}"),
                 }
             }
@@ -533,30 +701,58 @@ pub(super) mod tests {
         let request_id = RequestId::Number(7);
         let params = request.encode_params().unwrap().unwrap();
         let name = if matches!(request.method(), "tools/call" | "prompts/get") {
-            params.get("name").and_then(Value::as_str).map(str::to_owned)
-        } else { None };
+            params
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        } else {
+            None
+        };
         let bytes = serde_json::to_vec(&json!({
             "jsonrpc":"2.0", "id":request_id, "method":request.method(), "params":params,
-        })).unwrap();
+        }))
+        .unwrap();
         let loopback = crate::http_executor::ModernHttpRequest::new(
-            &format!("http://{address}/mcp"), bytes,
-            fastmcp_protocol::FINAL_PROTOCOL_VERSION, request.method(), name,
-        ).unwrap();
+            &format!("http://{address}/mcp"),
+            bytes,
+            fastmcp_protocol::FINAL_PROTOCOL_VERSION,
+            request.method(),
+            name,
+        )
+        .unwrap();
         let cancellation = McpRequestCancellation::new();
         let response = crate::http_executor::ModernHttpExecutor::new()
-            .execute_with_cancellation(cx, &cancellation, &loopback).await.unwrap();
+            .execute_with_cancellation(cx, &cancellation, &loopback)
+            .await
+            .unwrap();
         let owner = McpRequestCancellation::new();
         let expires_at = Instant::now() + Duration::from_secs(60);
         let bearer = crate::http_auth::BoundBearerCredential::bind_with_expiry(
-            resource(), "response-lifetime-test-token", expires_at,
-        ).unwrap().for_owner(&owner).unwrap();
+            resource(),
+            "response-lifetime-test-token",
+            expires_at,
+        )
+        .unwrap()
+        .for_owner(&owner)
+        .unwrap();
         let snapshot = ClientCredentialsSnapshot {
-            bearer, scopes: vec![], expires_at, generation: 1,
+            bearer,
+            scopes: vec![],
+            expires_at,
+            generation: 1,
         };
-        (ClientCredentialsResponse {
-            response, snapshot, owner, cancellation, request, request_id,
-            deadline: discovery_deadline(cx, Duration::from_secs(5)).unwrap(),
-        }, peer)
+        (
+            ClientCredentialsResponse {
+                response,
+                snapshot,
+                owner,
+                cancellation,
+                request,
+                request_id,
+                deadline: discovery_deadline(cx, Duration::from_secs(5)).unwrap(),
+            },
+            peer,
+        )
     }
 
     #[test]
@@ -590,16 +786,36 @@ pub(super) mod tests {
     fn native_machine_sse_eof_without_a_terminal_is_not_success() {
         runtime().block_on(async {
             let cx = Cx::current().unwrap();
-            let (response, peer) = native_response(&cx,
+            let (response, peer) = native_response(
+                &cx,
                 "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n",
-                "text/event-stream", NativeEnd::Complete).await;
+                "text/event-stream",
+                NativeEnd::Complete,
+            )
+            .await;
             let deadline = response.deadline;
-            let mut call = ClientCredentialsCoreCall::from_response(response, ManagedCoreLimits::default(), deadline).unwrap();
-            assert!(matches!(call.next_event(&cx).await.unwrap(), Some(ManagedCoreEvent::Notification(_))));
-            assert!(matches!(call.next_event(&cx).await,
-                Err(ClientCredentialsCoreError::Protocol(ManagedCoreError::MissingTerminal))));
-            assert!(matches!(call.next_event(&cx).await,
-                Err(ClientCredentialsCoreError::Protocol(ManagedCoreError::Closed))));
+            let mut call = ClientCredentialsCoreCall::from_response(
+                response,
+                ManagedCoreLimits::default(),
+                deadline,
+            )
+            .unwrap();
+            assert!(matches!(
+                call.next_event(&cx).await.unwrap(),
+                Some(ManagedCoreEvent::Notification(_))
+            ));
+            assert!(matches!(
+                call.next_event(&cx).await,
+                Err(ClientCredentialsCoreError::Protocol(
+                    ManagedCoreError::MissingTerminal
+                ))
+            ));
+            assert!(matches!(
+                call.next_event(&cx).await,
+                Err(ClientCredentialsCoreError::Protocol(
+                    ManagedCoreError::Closed
+                ))
+            ));
             peer.join().unwrap();
         });
     }
@@ -636,18 +852,29 @@ pub(super) mod tests {
 
         runtime().block_on(async {
             let cx = Cx::current().unwrap();
-            let (response, peer) = native_response(&cx, "data: {", "text/event-stream", NativeEnd::Hold).await;
+            let (response, peer) =
+                native_response(&cx, "data: {", "text/event-stream", NativeEnd::Hold).await;
             let deadline = response.deadline;
-            let mut call = ClientCredentialsCoreCall::from_response(response, ManagedCoreLimits::default(), deadline).unwrap();
+            let mut call = ClientCredentialsCoreCall::from_response(
+                response,
+                ManagedCoreLimits::default(),
+                deadline,
+            )
+            .unwrap();
             {
                 let mut pending = std::pin::pin!(call.next_event(&cx));
                 poll_fn(|task| match pending.as_mut().poll(task) {
                     Poll::Pending => Poll::Ready(()),
                     Poll::Ready(_) => panic!("incomplete response should remain pending"),
-                }).await;
+                })
+                .await;
             }
-            assert!(matches!(call.next_event(&cx).await,
-                Err(ClientCredentialsCoreError::Protocol(ManagedCoreError::Closed))));
+            assert!(matches!(
+                call.next_event(&cx).await,
+                Err(ClientCredentialsCoreError::Protocol(
+                    ManagedCoreError::Closed
+                ))
+            ));
             peer.join().unwrap();
         });
     }
@@ -657,13 +884,27 @@ pub(super) mod tests {
         "\"tools\":[],\"ttlMs\":0,\"cacheScope\":\"private\",\"x-exact\":1.20e+4}}\n\n"
     );
 
-    async fn finite_call(cx: &Cx, body: &str, hold: bool)
-        -> (ClientCredentialsCoreCall, std::thread::JoinHandle<()>)
-    {
-        let end = if hold { NativeEnd::Hold } else { NativeEnd::Complete };
+    async fn finite_call(
+        cx: &Cx,
+        body: &str,
+        hold: bool,
+    ) -> (ClientCredentialsCoreCall, std::thread::JoinHandle<()>) {
+        let end = if hold {
+            NativeEnd::Hold
+        } else {
+            NativeEnd::Complete
+        };
         let (response, peer) = native_response(cx, body, "text/event-stream", end).await;
         let deadline = response.deadline;
-        (ClientCredentialsCoreCall::from_response(response, ManagedCoreLimits::default(), deadline).unwrap(), peer)
+        (
+            ClientCredentialsCoreCall::from_response(
+                response,
+                ManagedCoreLimits::default(),
+                deadline,
+            )
+            .unwrap(),
+            peer,
+        )
     }
 
     #[test]
@@ -671,8 +912,10 @@ pub(super) mod tests {
         runtime().block_on(async {
             let cx = Cx::current().unwrap();
             for tail in ["", ": keepalive\n\n", "event: ignored\n\n"] {
-                let (mut call, peer) = finite_call(&cx, &format!("{FINITE_TERMINAL}{tail}"), false).await;
-                let Some(ManagedCoreEvent::Result(result)) = call.next_event(&cx).await.unwrap() else {
+                let (mut call, peer) =
+                    finite_call(&cx, &format!("{FINITE_TERMINAL}{tail}"), false).await;
+                let Some(ManagedCoreEvent::Result(result)) = call.next_event(&cx).await.unwrap()
+                else {
                     panic!("clean finite SSE must deliver its result");
                 };
                 assert!(result.encode().unwrap().contains("1.20e+4"));
@@ -709,10 +952,20 @@ pub(super) mod tests {
     fn native_machine_finite_terminal_rejects_discarded_eof_fragments() {
         runtime().block_on(async {
             let cx = Cx::current().unwrap();
-            for tail in ["data: {", "data: {}\n", ": unterminated-comment", "event: partial"] {
-                let (mut call, peer) = finite_call(&cx, &format!("{FINITE_TERMINAL}{tail}"), false).await;
-                assert!(matches!(call.next_event(&cx).await,
-                    Err(ClientCredentialsCoreError::Protocol(ManagedCoreError::InvalidResponse))));
+            for tail in [
+                "data: {",
+                "data: {}\n",
+                ": unterminated-comment",
+                "event: partial",
+            ] {
+                let (mut call, peer) =
+                    finite_call(&cx, &format!("{FINITE_TERMINAL}{tail}"), false).await;
+                assert!(matches!(
+                    call.next_event(&cx).await,
+                    Err(ClientCredentialsCoreError::Protocol(
+                        ManagedCoreError::InvalidResponse
+                    ))
+                ));
                 assert!(!call.finished && call.body.is_none());
                 peer.join().unwrap();
             }
@@ -723,11 +976,20 @@ pub(super) mod tests {
     fn native_machine_finite_tail_failure_does_not_retract_earlier_notifications() {
         runtime().block_on(async {
             let cx = Cx::current().unwrap();
-            let notice = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n";
-            let (mut call, peer) = finite_call(&cx, &format!("{notice}{FINITE_TERMINAL}{notice}"), false).await;
-            assert!(matches!(call.next_event(&cx).await.unwrap(), Some(ManagedCoreEvent::Notification(_))));
+            let notice =
+                "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n";
+            let (mut call, peer) =
+                finite_call(&cx, &format!("{notice}{FINITE_TERMINAL}{notice}"), false).await;
+            assert!(matches!(
+                call.next_event(&cx).await.unwrap(),
+                Some(ManagedCoreEvent::Notification(_))
+            ));
             assert!(call.next_event(&cx).await.is_err());
-            assert_eq!(call.decoder.usage().1, 1, "trailing notification is never published");
+            assert_eq!(
+                call.decoder.usage().1,
+                1,
+                "trailing notification is never published"
+            );
             assert!(!call.finished);
             peer.join().unwrap();
         });
@@ -761,12 +1023,23 @@ pub(super) mod tests {
             let cx = Cx::current().unwrap();
             let (mut call, peer) = finite_call(&cx, FINITE_TERMINAL, true).await;
             let stop = cx.now().saturating_add_nanos(250_000_000);
-            assert!(asupersync::time::timeout_at(stop, Box::pin(call.next_event(&cx))).await.is_err(),
-                "a decoded terminal cannot escape while HTTP body bytes remain owed");
-            assert!(call.decoder.usage().0 > 0, "the terminal was actually decoded before abandonment");
+            assert!(
+                asupersync::time::timeout_at(stop, Box::pin(call.next_event(&cx)))
+                    .await
+                    .is_err(),
+                "a decoded terminal cannot escape while HTTP body bytes remain owed"
+            );
+            assert!(
+                call.decoder.usage().0 > 0,
+                "the terminal was actually decoded before abandonment"
+            );
             assert!(!call.finished && call.body.is_none());
-            assert!(matches!(call.next_event(&cx).await,
-                Err(ClientCredentialsCoreError::Protocol(ManagedCoreError::Closed))));
+            assert!(matches!(
+                call.next_event(&cx).await,
+                Err(ClientCredentialsCoreError::Protocol(
+                    ManagedCoreError::Closed
+                ))
+            ));
             peer.join().unwrap();
         });
     }
@@ -778,7 +1051,10 @@ pub(super) mod tests {
             let (mut call, peer) = finite_call(&cx, FINITE_TERMINAL, true).await;
             call.deadline = cx.now().saturating_add_nanos(250_000_000);
             let result = call.next_event(&cx).await;
-            assert!(result.is_err(), "HTTP tail cannot reset the operation deadline");
+            assert!(
+                result.is_err(),
+                "HTTP tail cannot reset the operation deadline"
+            );
             assert!(call.decoder.usage().0 > 0);
             assert!(!call.finished && call.body.is_none());
             peer.join().unwrap();
@@ -789,12 +1065,25 @@ pub(super) mod tests {
     fn native_machine_truncated_http_body_discards_an_otherwise_valid_terminal() {
         runtime().block_on(async {
             let cx = Cx::current().unwrap();
-            let (response, peer) = native_response(&cx, FINITE_TERMINAL,
-                "text/event-stream", NativeEnd::Truncate).await;
+            let (response, peer) = native_response(
+                &cx,
+                FINITE_TERMINAL,
+                "text/event-stream",
+                NativeEnd::Truncate,
+            )
+            .await;
             let deadline = response.deadline;
-            let mut call = ClientCredentialsCoreCall::from_response(response, ManagedCoreLimits::default(), deadline).unwrap();
+            let mut call = ClientCredentialsCoreCall::from_response(
+                response,
+                ManagedCoreLimits::default(),
+                deadline,
+            )
+            .unwrap();
             assert!(call.next_event(&cx).await.is_err());
-            assert!(call.decoder.usage().0 > 0, "the response had a valid protocol terminal before HTTP truncation");
+            assert!(
+                call.decoder.usage().0 > 0,
+                "the response had a valid protocol terminal before HTTP truncation"
+            );
             assert!(!call.finished && call.body.is_none());
             peer.join().unwrap();
         });
@@ -811,23 +1100,39 @@ pub(super) mod tests {
                 let caller = call.cancellation.clone();
                 let owner = call.owner.clone();
                 let credential = call.snapshot.bearer.clone();
-                let mut trigger = Box::pin(asupersync::time::sleep(cx.now(), Duration::from_millis(100)));
+                let mut trigger = Box::pin(asupersync::time::sleep(
+                    cx.now(),
+                    Duration::from_millis(100),
+                ));
                 let mut pending = Box::pin(call.next_event(&cx));
                 let mut fired = false;
                 let result = poll_fn(|task| {
                     if !fired && trigger.as_mut().poll(task).is_ready() {
                         fired = true;
                         match kind {
-                            0 => { caller.cancel(); }
-                            1 => { owner.cancel(); }
-                            _ => { credential.revoke(); }
+                            0 => {
+                                caller.cancel();
+                            }
+                            1 => {
+                                owner.cancel();
+                            }
+                            _ => {
+                                credential.revoke();
+                            }
                         }
                     }
                     pending.as_mut().poll(task)
-                }).await;
+                })
+                .await;
                 drop(pending);
-                assert!(fired && result.is_err(), "neither success nor EOF may beat revocation while bytes are owed");
-                assert!(call.decoder.usage().0 > 0, "revocation must exercise the post-terminal wait");
+                assert!(
+                    fired && result.is_err(),
+                    "neither success nor EOF may beat revocation while bytes are owed"
+                );
+                assert!(
+                    call.decoder.usage().0 > 0,
+                    "revocation must exercise the post-terminal wait"
+                );
                 assert!(!call.finished && call.body.is_none());
                 peer.join().unwrap();
             }

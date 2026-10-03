@@ -11,19 +11,19 @@ use asupersync::Cx;
 use fastmcp_client::http_auth::discovery::client_credentials::rpc::interaction::{
     ClientCredentialsInputReply, ClientCredentialsInteraction, ClientCredentialsInteractionError,
 };
-use fastmcp_client::http_auth::rpc::{ManagedCoreError, ManagedCoreEvent};
 use fastmcp_client::http_auth::rpc::interaction::ManagedInteractionError;
+use fastmcp_client::http_auth::rpc::{ManagedCoreError, ManagedCoreEvent};
 use fastmcp_core::{McpContext, McpError, McpResult};
 use fastmcp_protocol::InputRequiredResult;
 
+use super::{
+    BoxFuture, ClientCredentialsCoreError, ClientCredentialsProvider, Forwarder, MACHINE_FAILURE,
+    MachineBackend, MachineResponse, check_cx, forward_notification, machine_error, next_pair,
+    upstream_error,
+};
 use crate::providers::managed_oauth::interaction::{
     HostDisposition, ManagedOAuthInputHandler, ManagedOAuthInputPolicy,
     ManagedOAuthInputResponseMode,
-};
-use super::{
-    BoxFuture, ClientCredentialsCoreError, ClientCredentialsProvider, Forwarder,
-    MACHINE_FAILURE, MachineBackend, MachineResponse, check_cx, forward_notification,
-    machine_error, next_pair, upstream_error,
 };
 
 const HOST_DECLINED: &str = "Machine-authenticated upstream input was declined by the host";
@@ -67,7 +67,9 @@ impl ClientCredentialsProvider {
                 source: Arc::clone(&self.source),
                 next_id: Arc::clone(&next_id),
                 inputs: Some(Arc::new(MachineInputs {
-                    policy, handler, next_id: Arc::clone(&next_id),
+                    policy,
+                    handler,
+                    next_id: Arc::clone(&next_id),
                 })),
             }),
             next_id,
@@ -91,16 +93,23 @@ impl InteractiveMachineResponse {
         context: McpContext,
         inputs: Arc<MachineInputs>,
     ) -> Self {
-        Self { operation: Some(operation), context, inputs }
+        Self {
+            operation: Some(operation),
+            context,
+            inputs,
+        }
     }
 }
 
 impl MachineResponse for InteractiveMachineResponse {
-    fn next_event<'a>(&'a mut self, cx: &'a Cx)
-        -> BoxFuture<'a, McpResult<Option<ManagedCoreEvent>>>
-    {
+    fn next_event<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> BoxFuture<'a, McpResult<Option<ManagedCoreEvent>>> {
         Box::pin(async move {
-            let operation = self.operation.take()
+            let operation = self
+                .operation
+                .take()
                 .ok_or_else(|| McpError::invalid_request(MACHINE_FAILURE))?;
             let ctx = &self.context;
             let inputs = &self.inputs;
@@ -111,19 +120,48 @@ impl MachineResponse for InteractiveMachineResponse {
             // Native drive guards the host callback with its original deadline
             // and machine/request cancellation, even while the callback parks.
             let result = match inputs.policy.response_mode() {
-                ManagedOAuthInputResponseMode::Complete => operation.drive(
-                    cx,
-                    |input| resolve_reply(inputs.handler.as_ref(), ctx, cx, &inputs.next_id, input),
-                    |notification| forward_notification(ctx, *notification)
-                        .map_err(ClientCredentialsInteractionError::host_error),
-                ).await,
-                ManagedOAuthInputResponseMode::Partial => operation.drive_partial(
-                    cx,
-                    |input| resolve_reply(inputs.handler.as_ref(), ctx, cx, &inputs.next_id, input),
-                    |notification| forward_notification(ctx, *notification)
-                        .map_err(ClientCredentialsInteractionError::host_error),
-                ).await,
-            }.map_err(interaction_error)?;
+                ManagedOAuthInputResponseMode::Complete => {
+                    operation
+                        .drive(
+                            cx,
+                            |input| {
+                                resolve_reply(
+                                    inputs.handler.as_ref(),
+                                    ctx,
+                                    cx,
+                                    &inputs.next_id,
+                                    input,
+                                )
+                            },
+                            |notification| {
+                                forward_notification(ctx, *notification)
+                                    .map_err(ClientCredentialsInteractionError::host_error)
+                            },
+                        )
+                        .await
+                }
+                ManagedOAuthInputResponseMode::Partial => {
+                    operation
+                        .drive_partial(
+                            cx,
+                            |input| {
+                                resolve_reply(
+                                    inputs.handler.as_ref(),
+                                    ctx,
+                                    cx,
+                                    &inputs.next_id,
+                                    input,
+                                )
+                            },
+                            |notification| {
+                                forward_notification(ctx, *notification)
+                                    .map_err(ClientCredentialsInteractionError::host_error)
+                            },
+                        )
+                        .await
+                }
+            }
+            .map_err(interaction_error)?;
             ctx.checkpoint()?;
             check_cx(cx)?;
             // Notifications were forwarded once by drive; the outer backend
@@ -144,11 +182,18 @@ async fn resolve_reply(
     // A cancelled request must not even construct an application callback future.
     E::host_checkpoint(ctx)?;
     check_cx(cx).map_err(E::host_error)?;
-    let input_responses = handler.resolve(ctx, cx, input).await.map_err(E::host_error)?;
+    let input_responses = handler
+        .resolve(ctx, cx, input)
+        .await
+        .map_err(E::host_error)?;
     E::host_checkpoint(ctx)?;
     check_cx(cx).map_err(E::host_error)?;
     let (discovery_id, request_id) = next_pair(ids).map_err(E::host_error)?;
-    Ok(ClientCredentialsInputReply { discovery_id, request_id, input_responses })
+    Ok(ClientCredentialsInputReply {
+        discovery_id,
+        request_id,
+        input_responses,
+    })
 }
 
 /// This type's spelling of the shared host dispositions. The cancelled
@@ -156,7 +201,9 @@ async fn resolve_reply(
 /// is why each type names its own variants rather than converting.
 impl HostDisposition for ClientCredentialsInteractionError {
     fn host_cancelled() -> Self {
-        Self::Core(ClientCredentialsCoreError::Protocol(ManagedCoreError::Cancelled))
+        Self::Core(ClientCredentialsCoreError::Protocol(
+            ManagedCoreError::Cancelled,
+        ))
     }
 
     fn aborted_by_host() -> Self {
@@ -173,25 +220,30 @@ pub(super) fn interaction_error(error: ClientCredentialsInteractionError) -> Mcp
         ClientCredentialsInteractionError::Interaction(ManagedInteractionError::AbortedByHost) => {
             McpError::invalid_request(HOST_DECLINED)
         }
-        ClientCredentialsInteractionError::Interaction(_) => McpError::invalid_request(MACHINE_FAILURE),
+        ClientCredentialsInteractionError::Interaction(_) => {
+            McpError::invalid_request(MACHINE_FAILURE)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::managed_oauth::core_request;
     use fastmcp_core::McpErrorCode;
+    use fastmcp_protocol::{CoreResult, FinalCoreResult, FinalInputResponses};
+    use serde_json::json;
     use std::future::{Future, pending};
     use std::pin::pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll, Waker};
-    use fastmcp_protocol::{CoreResult, FinalCoreResult, FinalInputResponses};
-    use serde_json::json;
-    use crate::providers::managed_oauth::core_request;
 
     fn ready<T>(future: impl Future<Output = T>) -> T {
         let mut future = pin!(future);
-        match future.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        match future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
             Poll::Ready(result) => result,
             Poll::Pending => panic!("unexpected fixture suspension"),
         }
@@ -206,7 +258,15 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    enum Action { Answer, Absent, Empty, Decline, CancelRequest, CancelContext, Park }
+    enum Action {
+        Answer,
+        Absent,
+        Empty,
+        Decline,
+        CancelRequest,
+        CancelContext,
+        Park,
+    }
 
     struct Host {
         calls: AtomicUsize,
@@ -216,12 +276,17 @@ mod tests {
 
     struct Dropped(Arc<AtomicUsize>);
     impl Drop for Dropped {
-        fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     impl ManagedOAuthInputHandler for Host {
         fn resolve<'a>(
-            &'a self, ctx: &'a McpContext, cx: &'a Cx, input: Box<InputRequiredResult>,
+            &'a self,
+            ctx: &'a McpContext,
+            cx: &'a Cx,
+            input: Box<InputRequiredResult>,
         ) -> BoxFuture<'a, McpResult<Option<FinalInputResponses>>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let dropped = Dropped(Arc::clone(&self.drops));
@@ -230,11 +295,17 @@ mod tests {
                 assert_eq!(ctx.request_id(), 81);
                 assert_eq!(input.request_state(), Some("opaque-machine-state"));
                 match self.action {
-                    Action::Decline => return Err(McpError::invalid_request("PRIVATE-MACHINE-ANSWER")),
-                    Action::CancelRequest => { ctx.request_cancellation().cancel(); }
-                    Action::CancelContext => { cx.set_cancel_requested(true); }
+                    Action::Decline => {
+                        return Err(McpError::invalid_request("PRIVATE-MACHINE-ANSWER"));
+                    }
+                    Action::CancelRequest => {
+                        ctx.request_cancellation().cancel();
+                    }
+                    Action::CancelContext => {
+                        cx.set_cancel_requested(true);
+                    }
                     Action::Park => pending::<()>().await,
-                    _ => {},
+                    _ => {}
                 }
                 Ok(match self.action {
                     Action::Absent => None,
@@ -246,7 +317,11 @@ mod tests {
     }
 
     fn host(action: Action) -> Host {
-        Host { calls: AtomicUsize::new(0), drops: Arc::new(AtomicUsize::new(0)), action }
+        Host {
+            calls: AtomicUsize::new(0),
+            drops: Arc::new(AtomicUsize::new(0)),
+            action,
+        }
     }
 
     #[test]
@@ -258,7 +333,14 @@ mod tests {
         let (before, previous) = next_pair(&ids).unwrap();
         let reply = ready(resolve_reply(&host, &ctx, &cx, &ids, challenge())).unwrap();
         let (after, following) = next_pair(&ids).unwrap();
-        let all = [before, previous, reply.discovery_id, reply.request_id, after, following];
+        let all = [
+            before,
+            previous,
+            reply.discovery_id,
+            reply.request_id,
+            after,
+            following,
+        ];
         for (index, id) in all.iter().enumerate() {
             assert!(all[..index].iter().all(|other| !id.correlates_with(other)));
         }
@@ -273,11 +355,20 @@ mod tests {
         for cancel_context in [false, true] {
             let ctx = McpContext::new(Cx::for_testing(), 81);
             let cx = Cx::for_testing();
-            if cancel_context { cx.set_cancel_requested(true); } else { ctx.request_cancellation().cancel(); }
+            if cancel_context {
+                cx.set_cancel_requested(true);
+            } else {
+                ctx.request_cancellation().cancel();
+            }
             let ids = AtomicU64::new(1);
             let host = host(Action::Answer);
-            let error = ready(resolve_reply(&host, &ctx, &cx, &ids, challenge())).err().unwrap();
-            assert_eq!(interaction_error(error).code, McpErrorCode::RequestCancelled);
+            let error = ready(resolve_reply(&host, &ctx, &cx, &ids, challenge()))
+                .err()
+                .unwrap();
+            assert_eq!(
+                interaction_error(error).code,
+                McpErrorCode::RequestCancelled
+            );
             assert_eq!(host.calls.load(Ordering::SeqCst), 0);
             assert_eq!(host.drops.load(Ordering::SeqCst), 0);
             assert_eq!(ids.load(Ordering::SeqCst), 1);
@@ -292,8 +383,13 @@ mod tests {
             let sibling = McpContext::new(cx.clone(), 82);
             let ids = AtomicU64::new(1);
             let host = host(action);
-            let error = ready(resolve_reply(&host, &ctx, &cx, &ids, challenge())).err().unwrap();
-            assert_eq!(interaction_error(error).code, McpErrorCode::RequestCancelled);
+            let error = ready(resolve_reply(&host, &ctx, &cx, &ids, challenge()))
+                .err()
+                .unwrap();
+            assert_eq!(
+                interaction_error(error).code,
+                McpErrorCode::RequestCancelled
+            );
             assert_eq!(host.calls.load(Ordering::SeqCst), 1);
             assert_eq!(host.drops.load(Ordering::SeqCst), 1);
             assert_eq!(ids.load(Ordering::SeqCst), 1);
@@ -310,7 +406,9 @@ mod tests {
         let cx = Cx::for_testing();
         let ids = AtomicU64::new(1);
         let host = host(Action::Decline);
-        let error = ready(resolve_reply(&host, &ctx, &cx, &ids, challenge())).err().unwrap();
+        let error = ready(resolve_reply(&host, &ctx, &cx, &ids, challenge()))
+            .err()
+            .unwrap();
         let error = interaction_error(error);
         assert_eq!(error.message, HOST_DECLINED);
         assert!(!error.to_string().contains("PRIVATE-MACHINE-ANSWER"));
@@ -326,7 +424,9 @@ mod tests {
             let ids = AtomicU64::new(1);
             let reply = ready(resolve_reply(&host(action), &ctx, &cx, &ids, challenge())).unwrap();
             assert_eq!(reply.input_responses.is_some(), present);
-            if let Some(responses) = reply.input_responses { assert!(responses.is_empty()); }
+            if let Some(responses) = reply.input_responses {
+                assert!(responses.is_empty());
+            }
             assert!(!reply.discovery_id.correlates_with(&reply.request_id));
             // The native driver, not this adapter, checks the answer shape
             // against its retained challenge before any continuation dispatch.
@@ -341,7 +441,12 @@ mod tests {
         let host = host(Action::Park);
         {
             let mut future = pin!(resolve_reply(&host, &ctx, &cx, &ids, challenge()));
-            assert!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+            assert!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
             assert_eq!(host.calls.load(Ordering::SeqCst), 1);
             assert_eq!(host.drops.load(Ordering::SeqCst), 0);
         }
@@ -377,7 +482,9 @@ mod tests {
         let ids = AtomicU64::new(7);
         let host = host(Action::CancelRequest);
 
-        let error = ready(resolve_reply(&host, &ctx, &cx, &ids, challenge())).err().unwrap();
+        let error = ready(resolve_reply(&host, &ctx, &cx, &ids, challenge()))
+            .err()
+            .unwrap();
 
         assert!(
             matches!(
@@ -416,7 +523,9 @@ mod tests {
         // Only `action` differs from the positive above.
         let host = host(Action::Decline);
 
-        let error = ready(resolve_reply(&host, &ctx, &cx, &ids, challenge())).err().unwrap();
+        let error = ready(resolve_reply(&host, &ctx, &cx, &ids, challenge()))
+            .err()
+            .unwrap();
 
         assert!(
             matches!(

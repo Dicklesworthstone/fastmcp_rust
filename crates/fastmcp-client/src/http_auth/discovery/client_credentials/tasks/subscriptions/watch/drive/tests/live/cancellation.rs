@@ -2,42 +2,72 @@
 //! Only the pre-acquired grant is a fixture; every watch, request, decoder and
 //! host-input transition is the production implementation. No worker is spawned.
 use super::*;
-use std::cell::Cell;
 use crate::http_auth::discovery::client_credentials::tasks::subscriptions::watch::cancellation::{
     ClientCredentialsTaskCancellationError, TaskCancellationState,
 };
+use std::cell::Cell;
 
 const PREFIX: &str = "machine-control";
 #[derive(Clone, Copy)]
 enum ControlCase {
-    BeforeFirst, Resolver, ReadyResolver, UpdatePending, GetPending,
-    WrongAck, LostAck, Refused, DropResolver, DropUpdate, Terminal, Return,
-    LocalCancel, Revoked, Deadline,
+    BeforeFirst,
+    Resolver,
+    ReadyResolver,
+    UpdatePending,
+    GetPending,
+    WrongAck,
+    LostAck,
+    Refused,
+    DropResolver,
+    DropUpdate,
+    Terminal,
+    Return,
+    LocalCancel,
+    Revoked,
+    Deadline,
 }
 fn isolated_control(name: &str, case: ControlCase) {
     isolated_run(&format!("cancellation::{name}"), || run_control(case));
 }
 fn failed_cancel(case: ControlCase) -> bool {
-    matches!(case, ControlCase::WrongAck | ControlCase::LostAck | ControlCase::Refused)
+    matches!(
+        case,
+        ControlCase::WrongAck | ControlCase::LostAck | ControlCase::Refused
+    )
 }
 fn waiting_resolver(case: ControlCase) -> bool {
-    failed_cancel(case) || matches!(case, ControlCase::Resolver | ControlCase::DropResolver | ControlCase::LocalCancel)
+    failed_cancel(case)
+        || matches!(
+            case,
+            ControlCase::Resolver | ControlCase::DropResolver | ControlCase::LocalCancel
+        )
 }
-fn no_resolver(_: TaskInputRequests) -> std::future::Ready<Result<ManagedTaskInputAction, ClientCredentialsTaskWatchDriveError>> {
+fn no_resolver(
+    _: TaskInputRequests,
+) -> std::future::Ready<Result<ManagedTaskInputAction, ClientCredentialsTaskWatchDriveError>> {
     panic!("closed or terminal input owner must not call the resolver")
 }
 fn no_observer(_: &Task) -> Result<(), ClientCredentialsTaskWatchDriveError> {
     panic!("closed input owner must not publish a snapshot")
 }
 struct DropFlag<'a>(&'a Cell<bool>);
-impl Drop for DropFlag<'_> { fn drop(&mut self) { self.0.set(true); } }
+impl Drop for DropFlag<'_> {
+    fn drop(&mut self) {
+        self.0.set(true);
+    }
+}
 
 async fn cancel_reply(peer: &Peer, case: ControlCase) {
     if matches!(case, ControlCase::Refused) {
         let (mut socket, request) = peer.rpc("server/discover").await;
         assert_eq!(request["id"], format!("{PREFIX}:cancel:discovery"));
         assert!(request["params"].get("taskId").is_none());
-        socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        socket
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
         socket.flush().await.unwrap();
         return;
     }
@@ -52,15 +82,26 @@ async fn cancel_reply(peer: &Peer, case: ControlCase) {
         socket.flush().await.unwrap();
         return;
     }
-    let id = if matches!(case, ControlCase::WrongAck) { json!("foreign-response") } else { request["id"].clone() };
-    reply(&mut socket, json!({"jsonrpc":"2.0","id":id,"result":{"resultType":"complete"}})).await;
+    let id = if matches!(case, ControlCase::WrongAck) {
+        json!("foreign-response")
+    } else {
+        request["id"].clone()
+    };
+    reply(
+        &mut socket,
+        json!({"jsonrpc":"2.0","id":id,"result":{"resultType":"complete"}}),
+    )
+    .await;
 }
 async fn update_head(peer: &Peer) -> (TlsStream<TcpStream>, serde_json::Value) {
     peer.discover().await;
     let (socket, request) = peer.rpc("tasks/update").await;
     assert_eq!(request["id"], format!("{PREFIX}:5"));
     assert_eq!(request["params"]["taskId"], "one");
-    assert_eq!(request["params"]["inputResponses"], json!({"one":{"roots":[]}}));
+    assert_eq!(
+        request["params"]["inputResponses"],
+        json!({"one":{"roots":[]}})
+    );
     assert_eq!(request["params"]["_meta"]["com.example/tenant"], "retained");
     assert_eq!(request["params"].as_object().unwrap().len(), 3);
     peer.updates.fetch_add(1, Ordering::SeqCst);
@@ -68,9 +109,17 @@ async fn update_head(peer: &Peer) -> (TlsStream<TcpStream>, serde_json::Value) {
 }
 fn expect_ids(peer: &Peer, numeric: usize, cancel: usize) {
     let mut expected: BTreeSet<String> = (0..numeric).map(|id| format!("{PREFIX}:{id}")).collect();
-    if cancel >= 1 { expected.insert(format!("{PREFIX}:cancel:discovery")); }
-    if cancel == 2 { expected.insert(format!("{PREFIX}:cancel:operation")); }
-    assert_eq!(*peer.seen.lock().unwrap(), expected, "exact wire IDs forbid hidden polling, renewal or replay");
+    if cancel >= 1 {
+        expected.insert(format!("{PREFIX}:cancel:discovery"));
+    }
+    if cancel == 2 {
+        expected.insert(format!("{PREFIX}:cancel:operation"));
+    }
+    assert_eq!(
+        *peer.seen.lock().unwrap(),
+        expected,
+        "exact wire IDs forbid hidden polling, renewal or replay"
+    );
     peer.quiet();
 }
 
@@ -257,65 +306,172 @@ fn run_control(case: ControlCase) {
 }
 
 #[test]
-fn tls_cancel_before_first_snapshot_never_enters_host_code() { isolated_control("tls_cancel_before_first_snapshot_never_enters_host_code", ControlCase::BeforeFirst); }
+fn tls_cancel_before_first_snapshot_never_enters_host_code() {
+    isolated_control(
+        "tls_cancel_before_first_snapshot_never_enters_host_code",
+        ControlCase::BeforeFirst,
+    );
+}
 #[test]
-fn tls_cancel_drops_pending_resolver_without_update() { isolated_control("tls_cancel_drops_pending_resolver_without_update", ControlCase::Resolver); }
+fn tls_cancel_drops_pending_resolver_without_update() {
+    isolated_control(
+        "tls_cancel_drops_pending_resolver_without_update",
+        ControlCase::Resolver,
+    );
+}
 #[test]
-fn tls_ack_in_ready_resolver_poll_prevents_update() { isolated_control("tls_ack_in_ready_resolver_poll_prevents_update", ControlCase::ReadyResolver); }
+fn tls_ack_in_ready_resolver_poll_prevents_update() {
+    isolated_control(
+        "tls_ack_in_ready_resolver_poll_prevents_update",
+        ControlCase::ReadyResolver,
+    );
+}
 #[test]
-fn tls_cancel_retains_uncertainty_for_peer_accepted_update() { isolated_control("tls_cancel_retains_uncertainty_for_peer_accepted_update", ControlCase::UpdatePending); }
+fn tls_cancel_retains_uncertainty_for_peer_accepted_update() {
+    isolated_control(
+        "tls_cancel_retains_uncertainty_for_peer_accepted_update",
+        ControlCase::UpdatePending,
+    );
+}
 #[test]
-fn tls_cancel_during_reconciliation_retains_update_receipt() { isolated_control("tls_cancel_during_reconciliation_retains_update_receipt", ControlCase::GetPending); }
+fn tls_cancel_during_reconciliation_retains_update_receipt() {
+    isolated_control(
+        "tls_cancel_during_reconciliation_retains_update_receipt",
+        ControlCase::GetPending,
+    );
+}
 #[test]
-fn tls_wrong_cancel_ack_does_not_stop_input_execution() { isolated_control("tls_wrong_cancel_ack_does_not_stop_input_execution", ControlCase::WrongAck); }
+fn tls_wrong_cancel_ack_does_not_stop_input_execution() {
+    isolated_control(
+        "tls_wrong_cancel_ack_does_not_stop_input_execution",
+        ControlCase::WrongAck,
+    );
+}
 #[test]
-fn tls_lost_cancel_ack_does_not_stop_input_execution() { isolated_control("tls_lost_cancel_ack_does_not_stop_input_execution", ControlCase::LostAck); }
+fn tls_lost_cancel_ack_does_not_stop_input_execution() {
+    isolated_control(
+        "tls_lost_cancel_ack_does_not_stop_input_execution",
+        ControlCase::LostAck,
+    );
+}
 #[test]
-fn tls_refused_cancel_discovery_sends_no_task_id() { isolated_control("tls_refused_cancel_discovery_sends_no_task_id", ControlCase::Refused); }
+fn tls_refused_cancel_discovery_sends_no_task_id() {
+    isolated_control(
+        "tls_refused_cancel_discovery_sends_no_task_id",
+        ControlCase::Refused,
+    );
+}
 #[test]
-fn tls_abandoned_resolver_closes_cancel_admission() { isolated_control("tls_abandoned_resolver_closes_cancel_admission", ControlCase::DropResolver); }
+fn tls_abandoned_resolver_closes_cancel_admission() {
+    isolated_control(
+        "tls_abandoned_resolver_closes_cancel_admission",
+        ControlCase::DropResolver,
+    );
+}
 #[test]
-fn tls_abandoned_update_retains_uncertainty_without_replay() { isolated_control("tls_abandoned_update_retains_uncertainty_without_replay", ControlCase::DropUpdate); }
+fn tls_abandoned_update_retains_uncertainty_without_replay() {
+    isolated_control(
+        "tls_abandoned_update_retains_uncertainty_without_replay",
+        ControlCase::DropUpdate,
+    );
+}
 #[test]
-fn tls_terminal_retires_remote_cancel_authority() { isolated_control("tls_terminal_retires_remote_cancel_authority", ControlCase::Terminal); }
+fn tls_terminal_retires_remote_cancel_authority() {
+    isolated_control(
+        "tls_terminal_retires_remote_cancel_authority",
+        ControlCase::Terminal,
+    );
+}
 #[test]
-fn tls_host_handoff_is_not_a_reusable_input_challenge() { isolated_control("tls_host_handoff_is_not_a_reusable_input_challenge", ControlCase::Return); }
+fn tls_host_handoff_is_not_a_reusable_input_challenge() {
+    isolated_control(
+        "tls_host_handoff_is_not_a_reusable_input_challenge",
+        ControlCase::Return,
+    );
+}
 #[test]
-fn tls_local_cancel_does_not_send_remote_cancel() { isolated_control("tls_local_cancel_does_not_send_remote_cancel", ControlCase::LocalCancel); }
+fn tls_local_cancel_does_not_send_remote_cancel() {
+    isolated_control(
+        "tls_local_cancel_does_not_send_remote_cancel",
+        ControlCase::LocalCancel,
+    );
+}
 #[test]
-fn tls_revoked_input_authority_cannot_renew_for_cancel() { isolated_control("tls_revoked_input_authority_cannot_renew_for_cancel", ControlCase::Revoked); }
+fn tls_revoked_input_authority_cannot_renew_for_cancel() {
+    isolated_control(
+        "tls_revoked_input_authority_cannot_renew_for_cancel",
+        ControlCase::Revoked,
+    );
+}
 #[test]
-fn tls_unpolled_driver_cannot_extend_original_deadline() { isolated_control("tls_unpolled_driver_cannot_extend_original_deadline", ControlCase::Deadline); }
+fn tls_unpolled_driver_cannot_extend_original_deadline() {
+    isolated_control(
+        "tls_unpolled_driver_cannot_extend_original_deadline",
+        ControlCase::Deadline,
+    );
+}
 
 #[test]
 fn tls_cancellable_watch_ack_interrupts_idle_notification_read() {
-    isolated_run("cancellation::tls_cancellable_watch_ack_interrupts_idle_notification_read", || {
-        runtime().block_on(async {
-            let cx = Cx::current().unwrap();
-            let scenario = async {
-                let peer = Peer::new().await;
-                let client = peer.client();
-                let ((mut stream, _), opened) = Box::pin(pair(peer.listen(json!(["one"]), false),
-                    client.watch_task_cancellable(&cx, TaskId::parse("one").unwrap(), PREFIX.to_owned(),
-                        ClientCredentialsTaskWatchPolicy::new(Duration::from_secs(10), 8, 16).unwrap()))).await;
-                let mut watch = opened.unwrap();
-                let handle = watch.cancel_handle();
-                let ((), initial) = Box::pin(pair(peer.get("one", "working"), watch.next_snapshot(&cx))).await;
-                assert_eq!(initial.unwrap().unwrap().cause, ManagedTaskSnapshotCause::Initial);
-                let application = async {
-                    let (observed, accepted) = Box::pin(pair(watch.next_snapshot(&cx), handle.request_cancel(&cx))).await;
-                    accepted.unwrap();
-                    assert!(matches!(observed, Err(CancellableClientCredentialsTaskWatchError::CancellationRequested)));
-                    assert!(matches!(watch.next_snapshot(&cx).await, Err(CancellableClientCredentialsTaskWatchError::CancellationRequested)));
+    isolated_run(
+        "cancellation::tls_cancellable_watch_ack_interrupts_idle_notification_read",
+        || {
+            runtime().block_on(async {
+                let cx = Cx::current().unwrap();
+                let scenario = async {
+                    let peer = Peer::new().await;
+                    let client = peer.client();
+                    let ((mut stream, _), opened) = Box::pin(pair(
+                        peer.listen(json!(["one"]), false),
+                        client.watch_task_cancellable(
+                            &cx,
+                            TaskId::parse("one").unwrap(),
+                            PREFIX.to_owned(),
+                            ClientCredentialsTaskWatchPolicy::new(Duration::from_secs(10), 8, 16)
+                                .unwrap(),
+                        ),
+                    ))
+                    .await;
+                    let mut watch = opened.unwrap();
+                    let handle = watch.cancel_handle();
+                    let ((), initial) =
+                        Box::pin(pair(peer.get("one", "working"), watch.next_snapshot(&cx))).await;
+                    assert_eq!(
+                        initial.unwrap().unwrap().cause,
+                        ManagedTaskSnapshotCause::Initial
+                    );
+                    let application = async {
+                        let (observed, accepted) =
+                            Box::pin(pair(watch.next_snapshot(&cx), handle.request_cancel(&cx)))
+                                .await;
+                        accepted.unwrap();
+                        assert!(matches!(
+                            observed,
+                            Err(CancellableClientCredentialsTaskWatchError::CancellationRequested)
+                        ));
+                        assert!(matches!(
+                            watch.next_snapshot(&cx).await,
+                            Err(CancellableClientCredentialsTaskWatchError::CancellationRequested)
+                        ));
+                    };
+                    Box::pin(pair(
+                        cancel_reply(&peer, ControlCase::Resolver),
+                        application,
+                    ))
+                    .await;
+                    assert_eq!(handle.state(), TaskCancellationState::Acknowledged);
+                    assert_eq!(peer.updates.load(Ordering::SeqCst), 0);
+                    closed(&mut stream).await;
+                    expect_ids(&peer, 4, 2);
+                    assert!(!client.client.inner.closed.is_cancel_requested());
                 };
-                Box::pin(pair(cancel_reply(&peer, ControlCase::Resolver), application)).await;
-                assert_eq!(handle.state(), TaskCancellationState::Acknowledged);
-                assert_eq!(peer.updates.load(Ordering::SeqCst), 0);
-                closed(&mut stream).await;
-                expect_ids(&peer, 4, 2);
-                assert!(!client.client.inner.closed.is_cancel_requested());
-            };
-            asupersync::time::timeout_at(cx.now().saturating_add_nanos(15_000_000_000), Box::pin(scenario)).await.unwrap();
-        });
-    });
+                asupersync::time::timeout_at(
+                    cx.now().saturating_add_nanos(15_000_000_000),
+                    Box::pin(scenario),
+                )
+                .await
+                .unwrap();
+            });
+        },
+    );
 }

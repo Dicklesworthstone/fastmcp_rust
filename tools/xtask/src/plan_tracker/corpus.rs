@@ -144,8 +144,8 @@ pub fn check_coverage(required: &[CorpusItem], table: &TraceTable) -> Report {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::trace::{TRACE_TABLE_SCHEMA, TraceRow, TraceTable};
+    use super::*;
 
     const SAMPLE: &str = "\
 ---

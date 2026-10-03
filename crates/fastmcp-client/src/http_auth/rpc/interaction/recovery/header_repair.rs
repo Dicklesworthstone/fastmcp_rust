@@ -45,7 +45,9 @@ impl ManagedInteraction {
     ) -> Result<Self, ManagedInteractionError> {
         let limits = ManagedInteractionLimits::new(call.decoder.limits, continuations, responses)?;
         validate_initial(&call.decoder.request)?;
-        if call.decoder.bytes != 0 { return Err(ManagedCoreError::InvalidResponse.into()); }
+        if call.decoder.bytes != 0 {
+            return Err(ManagedCoreError::InvalidResponse.into());
+        }
         let ids = vec![call.request_id().clone()];
         admit_fresh_id(&[], &ids[0])?;
         Self::adopt_header_call(cx, session, call, reviewed, ids, limits)
@@ -59,14 +61,19 @@ impl ManagedInteraction {
         ids: Vec<RequestId>,
         limits: ManagedInteractionLimits,
     ) -> Result<Self, ManagedInteractionError> {
-        if call.finished || call.body.is_none() || call.decoder.notifications != 0
+        if call.finished
+            || call.body.is_none()
+            || call.decoder.notifications != 0
             || call.decoder.last_progress.is_some()
             || call.decoder.request.method() != "tools/call"
             || reviewed.resource() != session.resource()
         {
             return Err(ManagedCoreError::InvalidResponse.into());
         }
-        call.deadline = cx.budget().deadline.map_or(call.deadline, |parent| parent.min(call.deadline));
+        call.deadline = cx
+            .budget()
+            .deadline
+            .map_or(call.deadline, |parent| parent.min(call.deadline));
         check_call(cx, &call.cancellation, call.deadline)?;
         // Reject the impossible internal handoff rather than resetting usage.
         // The repair stage already reserved a complete final frame's capacity.
@@ -74,11 +81,19 @@ impl ManagedInteraction {
             return Err(ManagedCoreError::ResponseByteLimit.into());
         }
         let mut operation = Self {
-            session, original: call.decoder.request.clone(), header_review: Some(reviewed),
-            cancellation: call.cancellation.clone(), deadline: call.deadline, limits,
-            used_ids: ids, continuations: 0, input_responses: 0,
-            response_bytes: call.decoder.bytes, notifications: call.decoder.notifications,
-            generation: call.credential_generation(), step: None,
+            session,
+            original: call.decoder.request.clone(),
+            header_review: Some(reviewed),
+            cancellation: call.cancellation.clone(),
+            deadline: call.deadline,
+            limits,
+            used_ids: ids,
+            continuations: 0,
+            input_responses: 0,
+            response_bytes: call.decoder.bytes,
+            notifications: call.decoder.notifications,
+            generation: call.credential_generation(),
+            step: None,
         };
         // Verify plan, endpoint, name and original parameters through the same
         // local preparation as later continuations, without credential or I/O.
@@ -95,7 +110,9 @@ fn admit_history(ids: &[RequestId], current: &RequestId) -> Result<(), ManagedIn
     if ids.len() < 3 || !ids.last().is_some_and(|id| id.correlates_with(current)) {
         return Err(ManagedCoreError::InvalidResponse.into());
     }
-    for (index, id) in ids.iter().enumerate() { admit_fresh_id(&ids[..index], id)?; }
+    for (index, id) in ids.iter().enumerate() {
+        admit_fresh_id(&ids[..index], id)?;
+    }
     Ok(())
 }
 
@@ -105,31 +122,63 @@ mod tests {
 
     #[test]
     fn handoff_preserves_every_reserved_request_id() {
-        let ids = vec![RequestId::Number(7), RequestId::String("page-one".to_owned()),
-            RequestId::String("page-two".to_owned()), RequestId::Number(8)];
+        let ids = vec![
+            RequestId::Number(7),
+            RequestId::String("page-one".to_owned()),
+            RequestId::String("page-two".to_owned()),
+            RequestId::Number(8),
+        ];
         admit_history(&ids, &RequestId::Number(8)).unwrap();
         for id in &ids {
-            assert!(matches!(admit_fresh_id(&ids, id), Err(ManagedInteractionError::RepeatedRequestId)));
+            assert!(matches!(
+                admit_fresh_id(&ids, id),
+                Err(ManagedInteractionError::RepeatedRequestId)
+            ));
         }
         admit_fresh_id(&ids, &RequestId::Number(9)).unwrap();
     }
 
     #[test]
     fn handoff_rejects_missing_mismatched_or_duplicate_history() {
-        for ids in [vec![], vec![RequestId::Number(1), RequestId::Number(3)],
-            vec![RequestId::Number(1), RequestId::Number(2), RequestId::Number(4)]] {
-            assert!(matches!(admit_history(&ids, &RequestId::Number(3)),
-                Err(ManagedInteractionError::Core(ManagedCoreError::InvalidResponse))));
+        for ids in [
+            vec![],
+            vec![RequestId::Number(1), RequestId::Number(3)],
+            vec![
+                RequestId::Number(1),
+                RequestId::Number(2),
+                RequestId::Number(4),
+            ],
+        ] {
+            assert!(matches!(
+                admit_history(&ids, &RequestId::Number(3)),
+                Err(ManagedInteractionError::Core(
+                    ManagedCoreError::InvalidResponse
+                ))
+            ));
         }
-        assert!(matches!(admit_history(&[RequestId::Number(1), RequestId::Number(1), RequestId::Number(3)],
-            &RequestId::Number(3)), Err(ManagedInteractionError::RepeatedRequestId)));
+        assert!(matches!(
+            admit_history(
+                &[
+                    RequestId::Number(1),
+                    RequestId::Number(1),
+                    RequestId::Number(3)
+                ],
+                &RequestId::Number(3)
+            ),
+            Err(ManagedInteractionError::RepeatedRequestId)
+        ));
     }
 
     #[test]
     fn continuation_limits_do_not_replace_original_core_bounds() {
         let core = super::super::super::super::ManagedCoreLimits::new(
-            1024, 2048, 8192, 3, std::time::Duration::from_secs(7),
-        ).unwrap();
+            1024,
+            2048,
+            8192,
+            3,
+            std::time::Duration::from_secs(7),
+        )
+        .unwrap();
         let limits = ManagedInteractionLimits::new(core, 2, 4).unwrap();
         assert_eq!(limits.core.request_bytes, 1024);
         assert_eq!(limits.core.frame_bytes, 2048);

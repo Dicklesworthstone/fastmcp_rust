@@ -72,10 +72,8 @@ struct Fixture {
 impl Fixture {
     fn new(label: &str) -> Self {
         let unique = SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "fnd-02-i-{label}-{}-{unique}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("fnd-02-i-{label}-{}-{unique}", std::process::id()));
         let source = repo_root();
 
         fs::create_dir_all(root.join(".beads")).expect("scratch is creatable");
@@ -128,7 +126,6 @@ impl Fixture {
         // small one, so the real plan is copied to that bound path instead.
         fs::copy(source.join(PLAN_PATH), root.join("real-plan.md")).expect("plan is copyable");
 
-
         // Every declared workspace member's manifest, because the unsafe-code
         // policy check reads each one. Only the manifests are needed; the
         // crate sources are irrelevant to the policy subcase.
@@ -174,7 +171,10 @@ fn reservation_inputs() -> ReservationInputs {
                 exclusive: true,
                 issue_id: "bd-mcp-fnd-02-integration-8s4k".to_owned(),
                 expires_at: NOW + 7_200,
-                history: vec![Renewal { at: CLAIMED_AT - 60, until: NOW + 7_200 }],
+                history: vec![Renewal {
+                    at: CLAIMED_AT - 60,
+                    until: NOW + 7_200,
+                }],
             }],
         }),
         now: NOW,
@@ -187,12 +187,7 @@ fn reservation_inputs() -> ReservationInputs {
 /// A runs against the real repository, because its authoritative-source
 /// bindings are blob hashes of the real files; B runs against the fixture.
 /// Both are the public entrypoints the binary uses.
-fn slices(
-    fixture: &Fixture,
-) -> (
-    plan_tracker::manifest::AManifest,
-    b_eval::BManifest,
-) {
+fn slices(fixture: &Fixture) -> (plan_tracker::manifest::AManifest, b_eval::BManifest) {
     let a = plan_tracker::run_all(&repo_root()).expect("the A evaluator loads");
     let b = b_eval::run(&fixture.root, &reservation_inputs()).expect("the B evaluator loads");
     (a.manifest, b.manifest)
@@ -250,7 +245,10 @@ fn fnd_02_i_positive() {
     assert_eq!(run.manifest.write_counters, [0; 5]);
 
     // The two inputs are genuinely distinct receipts.
-    assert_ne!(run.manifest.a_manifest_sha256, run.manifest.b_manifest_sha256);
+    assert_ne!(
+        run.manifest.a_manifest_sha256,
+        run.manifest.b_manifest_sha256
+    );
 }
 
 // ---------------------------------------------------------------- negative
@@ -323,7 +321,10 @@ fn fnd_02_i_01_consume_a_manifest() {
         ..honest
     };
     let run = integration::join(&tampered, &ManifestInput::from_b(&b), &a, &b);
-    assert_eq!(run.subcase("FND-02-I-01").expect("I-01").outcome, Outcome::Fail);
+    assert_eq!(
+        run.subcase("FND-02-I-01").expect("I-01").outcome,
+        Outcome::Fail
+    );
     assert!(run.report.has(Code::ManifestBindingMismatch));
 }
 
@@ -343,7 +344,10 @@ fn fnd_02_i_02_consume_b_manifest() {
     };
     assert_ne!(flipped.observed_digest(), flipped.declared_digest);
     let run = integration::join(&ManifestInput::from_a(&a), &flipped, &a, &b);
-    assert_eq!(run.subcase("FND-02-I-02").expect("I-02").outcome, Outcome::Fail);
+    assert_eq!(
+        run.subcase("FND-02-I-02").expect("I-02").outcome,
+        Outcome::Fail
+    );
 }
 
 /// FND-02-I-03: the join refuses slices produced under different
@@ -362,7 +366,10 @@ fn fnd_02_i_03_all_mode_joined_projection() {
         &b,
     );
     assert!(run.report.has(Code::ManifestJoinConflict));
-    assert_eq!(run.subcase("FND-02-I-03").expect("I-03").outcome, Outcome::Fail);
+    assert_eq!(
+        run.subcase("FND-02-I-03").expect("I-03").outcome,
+        Outcome::Fail
+    );
 
     // A failed slice cannot be joined into a passing receipt.
     let (a, mut b) = slices(&fixture);
@@ -401,7 +408,10 @@ fn fnd_02_i_04_exact_receipt_binding() {
     b.canonical_corpus_sha256 = b.canonical_corpus_sha256.to_uppercase();
     let input = ManifestInput::from_b(&b);
     let run = integration::join(&ManifestInput::from_a(&a), &input, &a, &b);
-    assert_eq!(run.subcase("FND-02-I-04").expect("I-04").outcome, Outcome::Fail);
+    assert_eq!(
+        run.subcase("FND-02-I-04").expect("I-04").outcome,
+        Outcome::Fail
+    );
     assert!(
         run.report
             .diagnostics()
@@ -414,5 +424,8 @@ fn fnd_02_i_04_exact_receipt_binding() {
     b.canonical_graph_sha256.truncate(63);
     let input = ManifestInput::from_b(&b);
     let run = integration::join(&ManifestInput::from_a(&a), &input, &a, &b);
-    assert_eq!(run.subcase("FND-02-I-04").expect("I-04").outcome, Outcome::Fail);
+    assert_eq!(
+        run.subcase("FND-02-I-04").expect("I-04").outcome,
+        Outcome::Fail
+    );
 }

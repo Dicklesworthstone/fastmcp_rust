@@ -2186,7 +2186,11 @@ mod tests {
                 let admitted = fastmcp_protocol::admit_final_schema(schema).unwrap();
                 assert_eq!(admitted.validate(&serde_json::json!({})).is_err(), required);
                 assert!(admitted.validate(&serde_json::json!({"query": ""})).is_ok());
-                assert!(admitted.validate(&serde_json::json!({"query": null})).is_err());
+                assert!(
+                    admitted
+                        .validate(&serde_json::json!({"query": null}))
+                        .is_err()
+                );
             }
         }
     }
@@ -2397,7 +2401,10 @@ mod tests {
                     assert_eq!(payload.is_error, rejected);
                     let observed = recorded.lock().unwrap().take();
                     if rejected {
-                        assert!(observed.is_none(), "rejected input must not reach the parent");
+                        assert!(
+                            observed.is_none(),
+                            "rejected input must not reach the parent"
+                        );
                     } else {
                         assert_eq!(observed, Some(expected));
                         assert_eq!(response["content"][0]["text"], "final");

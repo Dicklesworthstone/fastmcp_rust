@@ -4,23 +4,31 @@
 use super::*;
 use fastmcp_client::http_auth::managed::OAuthSessionError;
 use fastmcp_client::http_auth::managed::subscriptions::ManagedSubscriptionError;
-use fastmcp_client::http_auth::managed::tasks::{ManagedTasksClient, ManagedTasksLimits};
-use fastmcp_client::http_auth::managed::tasks::watch::{
-    ManagedTaskSnapshotCause, ManagedTaskWatchError, ManagedTaskWatchPolicy,
-};
 use fastmcp_client::http_auth::managed::tasks::watch::recovery::{
     ManagedTaskRecoveryError, ManagedTaskRecoveryPolicy,
 };
+use fastmcp_client::http_auth::managed::tasks::watch::{
+    ManagedTaskSnapshotCause, ManagedTaskWatchError, ManagedTaskWatchPolicy,
+};
+use fastmcp_client::http_auth::managed::tasks::{ManagedTasksClient, ManagedTasksLimits};
 use fastmcp_protocol::tasks_extension::{Task, TaskId};
-use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta, FINAL_SUBSCRIPTION_ID_META_KEY};
+use fastmcp_protocol::{ClientCapabilities, FINAL_SUBSCRIPTION_ID_META_KEY, FinalRequestMeta};
 
 const RECOVERY_CASE: &str = "FASTMCP_TEST_TASK_WATCH_RECOVERY_CASE";
 const DISCOVER: &str = r#"{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{"listChanged":true},"extensions":{"io.modelcontextprotocol/tasks":{}}},"ttlMs":0,"cacheScope":"private"}"#;
 
 #[derive(Clone, Copy)]
 enum RecoveryCase {
-    Complete, PartialAck, Revoked, TerminalSelection, AttemptLimit,
-    SnapshotLimit, Cancel, DropRead, Deadline, InvalidWire,
+    Complete,
+    PartialAck,
+    Revoked,
+    TerminalSelection,
+    AttemptLimit,
+    SnapshotLimit,
+    Cancel,
+    DropRead,
+    Deadline,
+    InvalidWire,
 }
 
 fn isolated_recovery(name: &str, case: RecoveryCase) {
@@ -33,25 +41,40 @@ fn isolated_recovery(name: &str, case: RecoveryCase) {
     let roots = RootFile::create();
     struct Child(std::process::Child);
     impl Drop for Child {
-        fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
-    let mut child = Child(Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
-        .env(RECOVERY_CASE, &exact).env("SSL_CERT_FILE", &roots.0).env_remove("SSL_CERT_DIR")
-        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit())
-        .spawn().unwrap());
+    let mut child = Child(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
+            .env(RECOVERY_CASE, &exact)
+            .env("SSL_CERT_FILE", &roots.0)
+            .env_remove("SSL_CERT_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
     let end = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             assert!(status.success(), "Task watch recovery HTTPS case failed");
             return;
         }
-        assert!(Instant::now() < end, "Task watch recovery child exceeded its bound");
+        assert!(
+            Instant::now() < end,
+            "Task watch recovery child exceeded its bound"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
 
-fn identifier(number: usize) -> Value { json!(format!("recovery:{number}")) }
+fn identifier(number: usize) -> Value {
+    json!(format!("recovery:{number}"))
+}
 fn reply(number: usize, result: Value) -> String {
     json!({"jsonrpc":"2.0", "id":identifier(number), "result":result}).to_string()
 }
@@ -59,7 +82,8 @@ fn acknowledge(number: usize, accepted: &[&str]) -> String {
     json!({"jsonrpc":"2.0", "method":"notifications/subscriptions/acknowledged", "params":{
         "_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):identifier(number)},
         "notifications":{"taskIds":accepted},
-    }}).to_string()
+    }})
+    .to_string()
 }
 fn snapshot(task: &str, status: &str, hint: u64) -> Value {
     let mut result = json!({
@@ -67,31 +91,55 @@ fn snapshot(task: &str, status: &str, hint: u64) -> Value {
         "createdAt":"2026-09-17T00:00:00Z", "lastUpdatedAt":"2026-09-17T00:00:01Z",
         "ttlMs":null, "pollIntervalMs":hint,
     });
-    if status == "completed" { result["result"] = json!({"content":[]}); }
+    if status == "completed" {
+        result["result"] = json!({"content":[]});
+    }
     result
 }
 
 async fn request(peer: &Peer, number: usize, method: &str) -> (TlsStream<TcpStream>, Value) {
     let (tls, bytes) = peer.request(false).await;
     let value: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(value["id"], identifier(number), "identities must never reset on reconnect");
+    assert_eq!(
+        value["id"],
+        identifier(number),
+        "identities must never reset on reconnect"
+    );
     assert_eq!(value["method"], method);
-    assert!(matches!(method, "server/discover" | "subscriptions/listen" | "tasks/get"));
-    assert_eq!(value["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"],
-        json!({"io.modelcontextprotocol/tasks":{}}));
+    assert!(matches!(
+        method,
+        "server/discover" | "subscriptions/listen" | "tasks/get"
+    ));
+    assert_eq!(
+        value["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"],
+        json!({"io.modelcontextprotocol/tasks":{}})
+    );
     // Peer::request also checks the exact bearer, routing headers, and absence
     // of legacy session IDs and Last-Event-ID on EVERY actual TLS POST.
     (tls, value)
 }
 async fn discover(peer: &Peer, number: usize) -> Value {
     let (mut tls, discovery) = request(peer, number, "server/discover").await;
-    json_reply(&mut tls, &reply(number, serde_json::from_str(DISCOVER).unwrap())).await;
+    json_reply(
+        &mut tls,
+        &reply(number, serde_json::from_str(DISCOVER).unwrap()),
+    )
+    .await;
     discovery
 }
-async fn listen(peer: &Peer, number: usize, selection: &[&str], accepted: &[&str], ended: bool) -> TlsStream<TcpStream> {
+async fn listen(
+    peer: &Peer,
+    number: usize,
+    selection: &[&str],
+    accepted: &[&str],
+    ended: bool,
+) -> TlsStream<TcpStream> {
     let discovery = discover(peer, number).await;
     let (mut tls, listen) = request(peer, number + 1, "subscriptions/listen").await;
-    assert_eq!(listen["params"]["notifications"], json!({"taskIds":selection}));
+    assert_eq!(
+        listen["params"]["notifications"],
+        json!({"taskIds":selection})
+    );
     assert_eq!(listen["params"]["_meta"], discovery["params"]["_meta"]);
     sse_head(&mut tls).await;
     // A well-framed HTTP EOF without a subscription terminal models a lost
@@ -276,43 +324,73 @@ fn run_recovery(case: RecoveryCase) {
 
 #[test]
 fn completion_during_gap_is_reconciled_without_mutation_replay() {
-    isolated_recovery("completion_during_gap_is_reconciled_without_mutation_replay", RecoveryCase::Complete);
+    isolated_recovery(
+        "completion_during_gap_is_reconciled_without_mutation_replay",
+        RecoveryCase::Complete,
+    );
 }
 #[test]
 fn partial_reconnect_acknowledgement_prevents_task_reads() {
-    isolated_recovery("partial_reconnect_acknowledgement_prevents_task_reads", RecoveryCase::PartialAck);
+    isolated_recovery(
+        "partial_reconnect_acknowledgement_prevents_task_reads",
+        RecoveryCase::PartialAck,
+    );
 }
 #[test]
 fn revoked_authority_stops_recovery_before_listen_or_get() {
-    isolated_recovery("revoked_authority_stops_recovery_before_listen_or_get", RecoveryCase::Revoked);
+    isolated_recovery(
+        "revoked_authority_stops_recovery_before_listen_or_get",
+        RecoveryCase::Revoked,
+    );
 }
 #[test]
 fn delivered_terminal_is_excluded_from_reconnected_selection() {
-    isolated_recovery("delivered_terminal_is_excluded_from_reconnected_selection", RecoveryCase::TerminalSelection);
+    isolated_recovery(
+        "delivered_terminal_is_excluded_from_reconnected_selection",
+        RecoveryCase::TerminalSelection,
+    );
 }
 #[test]
 fn successful_connections_do_not_reset_lifetime_attempt_limit() {
-    isolated_recovery("successful_connections_do_not_reset_lifetime_attempt_limit", RecoveryCase::AttemptLimit);
+    isolated_recovery(
+        "successful_connections_do_not_reset_lifetime_attempt_limit",
+        RecoveryCase::AttemptLimit,
+    );
 }
 #[test]
 fn exhausted_snapshot_budget_refuses_recovery_before_any_new_post() {
-    isolated_recovery("exhausted_snapshot_budget_refuses_recovery_before_any_new_post", RecoveryCase::SnapshotLimit);
+    isolated_recovery(
+        "exhausted_snapshot_budget_refuses_recovery_before_any_new_post",
+        RecoveryCase::SnapshotLimit,
+    );
 }
 #[test]
 fn cancellation_interrupts_recovery_without_cancelling_remote_tasks() {
-    isolated_recovery("cancellation_interrupts_recovery_without_cancelling_remote_tasks", RecoveryCase::Cancel);
+    isolated_recovery(
+        "cancellation_interrupts_recovery_without_cancelling_remote_tasks",
+        RecoveryCase::Cancel,
+    );
 }
 #[test]
 fn abandoned_recovery_read_permanently_retires_the_owner() {
-    isolated_recovery("abandoned_recovery_read_permanently_retires_the_owner", RecoveryCase::DropRead);
+    isolated_recovery(
+        "abandoned_recovery_read_permanently_retires_the_owner",
+        RecoveryCase::DropRead,
+    );
 }
 #[test]
 fn recovery_backoff_cannot_renew_the_original_deadline() {
-    isolated_recovery("recovery_backoff_cannot_renew_the_original_deadline", RecoveryCase::Deadline);
+    isolated_recovery(
+        "recovery_backoff_cannot_renew_the_original_deadline",
+        RecoveryCase::Deadline,
+    );
 }
 #[test]
 fn invalid_live_protocol_is_not_reclassified_as_a_recoverable_disconnect() {
-    isolated_recovery("invalid_live_protocol_is_not_reclassified_as_a_recoverable_disconnect", RecoveryCase::InvalidWire);
+    isolated_recovery(
+        "invalid_live_protocol_is_not_reclassified_as_a_recoverable_disconnect",
+        RecoveryCase::InvalidWire,
+    );
 }
 
 // Keep the existing observation-only fixture and its method allowlist intact.
@@ -320,19 +398,29 @@ fn invalid_live_protocol_is_not_reclassified_as_a_recoverable_disconnect() {
 // their own helper; observation-only tests cannot accidentally start mutating.
 mod input_drive {
     use super::*;
-    use std::cell::Cell;
     use fastmcp_client::http_auth::managed::tasks::ManagedTasksError;
     use fastmcp_client::http_auth::managed::tasks::watch::drive::{
         ManagedTaskDriverError, ManagedTaskInputAction, ManagedTaskRunOutcome,
         ManagedTaskWatchDriveError, ManagedTaskWatchDrivePolicy,
     };
     use fastmcp_protocol::tasks_extension::{TaskInputRequests, TaskInputResponses};
+    use std::cell::Cell;
 
     const INPUT_CASE: &str = "FASTMCP_TEST_RECOVERING_TASK_INPUT_CASE";
     #[derive(Clone, Copy)]
     enum Case {
-        LostGet, LostStream, LostUpdate, ChangedDescriptor, UpdateLimit,
-        InputLimit, PartialAck, Cancel, Drop, Deadline, Disabled, PeerFloor,
+        LostGet,
+        LostStream,
+        LostUpdate,
+        ChangedDescriptor,
+        UpdateLimit,
+        InputLimit,
+        PartialAck,
+        Cancel,
+        Drop,
+        Deadline,
+        Disabled,
+        PeerFloor,
     }
 
     fn isolated(name: &str, case: Case) {
@@ -345,20 +433,33 @@ mod input_drive {
         let roots = RootFile::create();
         struct Child(std::process::Child);
         impl Drop for Child {
-            fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
         }
-        let mut child = Child(Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
-            .env(INPUT_CASE, &exact).env("SSL_CERT_FILE", &roots.0).env_remove("SSL_CERT_DIR")
-            .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit())
-            .spawn().unwrap());
+        let mut child = Child(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
+                .env(INPUT_CASE, &exact)
+                .env("SSL_CERT_FILE", &roots.0)
+                .env_remove("SSL_CERT_DIR")
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
         let end = Instant::now() + Duration::from_secs(30);
         loop {
             if let Some(status) = child.0.try_wait().unwrap() {
                 assert!(status.success(), "recovering Task input HTTPS case failed");
                 return;
             }
-            assert!(Instant::now() < end, "recovering Task input child exceeded its bound");
+            assert!(
+                Instant::now() < end,
+                "recovering Task input child exceeded its bound"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -371,7 +472,11 @@ mod input_drive {
     }
 
     fn input_snapshot(case: Case, recovered: bool) -> Value {
-        let hint = if matches!(case, Case::PeerFloor) { 150 } else { 10 };
+        let hint = if matches!(case, Case::PeerFloor) {
+            150
+        } else {
+            10
+        };
         let mut value = snapshot("task-one", "input_required", hint);
         value["inputRequests"] = json!({
             "one":{"method":"roots/list"}, "two":{"method":"roots/list"},
@@ -408,227 +513,414 @@ mod input_drive {
         assert_eq!(update["method"], "tasks/update");
         assert_eq!(update["params"]["taskId"], "task-one");
         assert_eq!(update["params"]["_meta"], discovered["params"]["_meta"]);
-        assert_eq!(update["params"]["inputResponses"], json!({key:{"roots":[]}}));
+        assert_eq!(
+            update["params"]["inputResponses"],
+            json!({key:{"roots":[]}})
+        );
         assert!(update["params"].get("requestState").is_none());
         if acknowledged {
-            json_reply(&mut tls, &reply(number + 1, json!({"resultType":"complete"}))).await;
+            json_reply(
+                &mut tls,
+                &reply(number + 1, json!({"resultType":"complete"})),
+            )
+            .await;
         } else {
             lose_reply(tls).await;
         }
     }
 
     fn run(case: Case) {
-        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(Box::pin(async {
-            let cx = Cx::current().unwrap();
-            let scenario = Box::pin(async {
-                let peer = Peer::new().await;
-                let ((), login) = pair(Box::pin(peer.login()), Box::pin(ManagedOAuthSession::authorize(
-                    &cx, peer.client(), OAuthSessionPolicy::default(), browser,
-                ))).await;
-                let session = login.unwrap();
-                let capabilities: ClientCapabilities = serde_json::from_value(json!({"roots":{}})).unwrap();
-                let client = ManagedTasksClient::new(session.clone(), FinalRequestMeta::new(capabilities), ManagedTasksLimits::default()).unwrap();
-                let cancellation = McpRequestCancellation::new();
-                let timeout = if matches!(case, Case::Deadline) { Duration::from_secs(3) } else { Duration::from_secs(15) };
-                let watch = ManagedTaskWatchPolicy::new(timeout, 16, 60).unwrap();
-                let mut policy = ManagedTaskWatchDrivePolicy::new(watch,
-                    if matches!(case, Case::UpdateLimit) { 1 } else { 4 },
-                    if matches!(case, Case::InputLimit) { 2 } else { 8 }, 65536).unwrap();
-                let delay = if matches!(case, Case::Cancel | Case::Drop | Case::Deadline) {
-                    Duration::from_secs(60)
-                } else { Duration::from_millis(10) };
-                if !matches!(case, Case::Disabled) {
-                    policy = policy.with_recovery(ManagedTaskRecoveryPolicy::new(2, delay, delay).unwrap()).unwrap();
-                }
-                let resolutions = Cell::new(0);
-                let observations = Cell::new(0);
-                let (lost_tx, mut lost_rx) = oneshot::channel::<()>();
-                let server = Box::pin(async {
-                    let mut original = listen(&peer, 0, &["task-one"], &["task-one"], matches!(case, Case::LostStream)).await;
-                    input_get(&peer, 2, Some(input_snapshot(case, false))).await;
-                    update(&peer, 4, "one", !matches!(case, Case::LostUpdate)).await;
-                    if matches!(case, Case::LostUpdate) { return 6; }
-                    if matches!(case, Case::LostStream) {
-                        // The get succeeds, then the listen ends while the task
-                        // is still working. Recovery must retain answer one.
-                        get(&peer, 6, "task-one", "working", 10).await;
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(Box::pin(async {
+                let cx = Cx::current().unwrap();
+                let scenario = Box::pin(async {
+                    let peer = Peer::new().await;
+                    let ((), login) = pair(
+                        Box::pin(peer.login()),
+                        Box::pin(ManagedOAuthSession::authorize(
+                            &cx,
+                            peer.client(),
+                            OAuthSessionPolicy::default(),
+                            browser,
+                        )),
+                    )
+                    .await;
+                    let session = login.unwrap();
+                    let capabilities: ClientCapabilities =
+                        serde_json::from_value(json!({"roots":{}})).unwrap();
+                    let client = ManagedTasksClient::new(
+                        session.clone(),
+                        FinalRequestMeta::new(capabilities),
+                        ManagedTasksLimits::default(),
+                    )
+                    .unwrap();
+                    let cancellation = McpRequestCancellation::new();
+                    let timeout = if matches!(case, Case::Deadline) {
+                        Duration::from_secs(3)
                     } else {
-                        input_get(&peer, 6, None).await;
+                        Duration::from_secs(15)
+                    };
+                    let watch = ManagedTaskWatchPolicy::new(timeout, 16, 60).unwrap();
+                    let mut policy = ManagedTaskWatchDrivePolicy::new(
+                        watch,
+                        if matches!(case, Case::UpdateLimit) {
+                            1
+                        } else {
+                            4
+                        },
+                        if matches!(case, Case::InputLimit) {
+                            2
+                        } else {
+                            8
+                        },
+                        65536,
+                    )
+                    .unwrap();
+                    let delay = if matches!(case, Case::Cancel | Case::Drop | Case::Deadline) {
+                        Duration::from_secs(60)
+                    } else {
+                        Duration::from_millis(10)
+                    };
+                    if !matches!(case, Case::Disabled) {
+                        policy = policy
+                            .with_recovery(ManagedTaskRecoveryPolicy::new(2, delay, delay).unwrap())
+                            .unwrap();
                     }
-                    let lost_at = Instant::now();
-                    if matches!(case, Case::Cancel | Case::Drop) {
-                        lost_tx.send(&cx, ()).unwrap();
-                        return 8;
-                    }
-                    if matches!(case, Case::Deadline | Case::Disabled) { return 8; }
-                    // Keep the old stream peer alive: the client, not this
-                    // fixture dropping its socket, must retire old custody.
-                    let mut byte = [0; 1];
-                    match original.read(&mut byte).await {
-                        Ok(0) | Err(_) => {},
-                        Ok(_) => panic!("old observation connection received unexpected data"),
-                    }
-                    let accepted: &[&str] = if matches!(case, Case::PartialAck) { &[] } else { &["task-one"] };
-                    let stream = listen(&peer, 8, &["task-one"], accepted, false).await;
-                    if matches!(case, Case::PeerFloor) {
-                        assert!(lost_at.elapsed() >= Duration::from_millis(150), "recovery must honor the peer's last polling floor");
-                    }
-                    if matches!(case, Case::PartialAck) { return 10; }
-                    // Re-report the ALREADY acknowledged input alongside the
-                    // unresolved input. Only two may reach the second callback.
-                    input_get(&peer, 10, Some(input_snapshot(case, true))).await;
-                    if matches!(case, Case::ChangedDescriptor | Case::UpdateLimit | Case::InputLimit) { return 12; }
-                    update(&peer, 12, "two", true).await;
-                    get(&peer, 14, "task-one", "completed", 10).await;
-                    drop(stream);
-                    16
-                });
-                let consumer = Box::pin(async {
-                    let mut operation = Box::pin(client.drive_task_watching_with_cancellation(
-                        &cx, &cancellation, TaskId::parse("task-one").unwrap(), "recovery".to_owned(), policy,
-                        |pending: TaskInputRequests| {
-                            let round = resolutions.get();
-                            let actual = pending.keys().map(String::as_str).collect::<Vec<_>>();
-                            let key = match round {
-                                0 => { assert_eq!(actual, ["one", "two"]); "one" }
-                                1 => { assert_eq!(actual, ["two"], "acknowledged answers must survive recovery"); "two" }
-                                _ => panic!("no repeated host resolution is allowed"),
+                    let resolutions = Cell::new(0);
+                    let observations = Cell::new(0);
+                    let (lost_tx, mut lost_rx) = oneshot::channel::<()>();
+                    let server = Box::pin(async {
+                        let mut original = listen(
+                            &peer,
+                            0,
+                            &["task-one"],
+                            &["task-one"],
+                            matches!(case, Case::LostStream),
+                        )
+                        .await;
+                        input_get(&peer, 2, Some(input_snapshot(case, false))).await;
+                        update(&peer, 4, "one", !matches!(case, Case::LostUpdate)).await;
+                        if matches!(case, Case::LostUpdate) {
+                            return 6;
+                        }
+                        if matches!(case, Case::LostStream) {
+                            // The get succeeds, then the listen ends while the task
+                            // is still working. Recovery must retain answer one.
+                            get(&peer, 6, "task-one", "working", 10).await;
+                        } else {
+                            input_get(&peer, 6, None).await;
+                        }
+                        let lost_at = Instant::now();
+                        if matches!(case, Case::Cancel | Case::Drop) {
+                            lost_tx.send(&cx, ()).unwrap();
+                            return 8;
+                        }
+                        if matches!(case, Case::Deadline | Case::Disabled) {
+                            return 8;
+                        }
+                        // Keep the old stream peer alive: the client, not this
+                        // fixture dropping its socket, must retire old custody.
+                        let mut byte = [0; 1];
+                        match original.read(&mut byte).await {
+                            Ok(0) | Err(_) => {}
+                            Ok(_) => panic!("old observation connection received unexpected data"),
+                        }
+                        let accepted: &[&str] = if matches!(case, Case::PartialAck) {
+                            &[]
+                        } else {
+                            &["task-one"]
+                        };
+                        let stream = listen(&peer, 8, &["task-one"], accepted, false).await;
+                        if matches!(case, Case::PeerFloor) {
+                            assert!(
+                                lost_at.elapsed() >= Duration::from_millis(150),
+                                "recovery must honor the peer's last polling floor"
+                            );
+                        }
+                        if matches!(case, Case::PartialAck) {
+                            return 10;
+                        }
+                        // Re-report the ALREADY acknowledged input alongside the
+                        // unresolved input. Only two may reach the second callback.
+                        input_get(&peer, 10, Some(input_snapshot(case, true))).await;
+                        if matches!(
+                            case,
+                            Case::ChangedDescriptor | Case::UpdateLimit | Case::InputLimit
+                        ) {
+                            return 12;
+                        }
+                        update(&peer, 12, "two", true).await;
+                        get(&peer, 14, "task-one", "completed", 10).await;
+                        drop(stream);
+                        16
+                    });
+                    let consumer = Box::pin(async {
+                        let mut operation = Box::pin(client.drive_task_watching_with_cancellation(
+                            &cx,
+                            &cancellation,
+                            TaskId::parse("task-one").unwrap(),
+                            "recovery".to_owned(),
+                            policy,
+                            |pending: TaskInputRequests| {
+                                let round = resolutions.get();
+                                let actual = pending.keys().map(String::as_str).collect::<Vec<_>>();
+                                let key = match round {
+                                    0 => {
+                                        assert_eq!(actual, ["one", "two"]);
+                                        "one"
+                                    }
+                                    1 => {
+                                        assert_eq!(
+                                            actual,
+                                            ["two"],
+                                            "acknowledged answers must survive recovery"
+                                        );
+                                        "two"
+                                    }
+                                    _ => panic!("no repeated host resolution is allowed"),
+                                };
+                                resolutions.set(round + 1);
+                                let response: TaskInputResponses =
+                                    serde_json::from_value(json!({key:{"roots":[]}})).unwrap();
+                                std::future::ready(Ok(ManagedTaskInputAction::Respond(response)))
+                            },
+                            |task| {
+                                assert_eq!(task.base().task_id, TaskId::parse("task-one").unwrap());
+                                observations.set(observations.get() + 1);
+                                Ok(())
+                            },
+                        ));
+                        if matches!(case, Case::Drop) {
+                            let mut until_lost = Box::pin(async {
+                                lost_rx.recv(&cx).await.unwrap();
+                                Sleep::new(cx.now().saturating_add_nanos(50_000_000)).await;
+                            });
+                            poll_fn(|task| {
+                                assert!(operation.as_mut().poll(task).is_pending());
+                                until_lost.as_mut().poll(task)
+                            })
+                            .await;
+                            drop(operation);
+                            return None;
+                        }
+                        if matches!(case, Case::Cancel) {
+                            let cancel = Box::pin(async {
+                                lost_rx.recv(&cx).await.unwrap();
+                                Sleep::new(cx.now().saturating_add_nanos(50_000_000)).await;
+                                cancellation.cancel();
+                            });
+                            let (result, ()) = pair(operation, cancel).await;
+                            Some(result)
+                        } else {
+                            Some(operation.await)
+                        }
+                    });
+                    let (posts, outcome) = pair(server, consumer).await;
+                    match case {
+                        Case::LostGet | Case::LostStream | Case::PeerFloor => {
+                            let ManagedTaskRunOutcome::Terminal(task) = outcome.unwrap().unwrap()
+                            else {
+                                panic!("terminal result required")
                             };
-                            resolutions.set(round + 1);
-                            let response: TaskInputResponses = serde_json::from_value(json!({key:{"roots":[]}})).unwrap();
-                            std::future::ready(Ok(ManagedTaskInputAction::Respond(response)))
-                        },
-                        |task| {
-                            assert_eq!(task.base().task_id, TaskId::parse("task-one").unwrap());
-                            observations.set(observations.get() + 1);
-                            Ok(())
-                        },
-                    ));
-                    if matches!(case, Case::Drop) {
-                        let mut until_lost = Box::pin(async {
-                            lost_rx.recv(&cx).await.unwrap();
-                            Sleep::new(cx.now().saturating_add_nanos(50_000_000)).await;
-                        });
-                        poll_fn(|task| {
-                            assert!(operation.as_mut().poll(task).is_pending());
-                            until_lost.as_mut().poll(task)
-                        }).await;
-                        drop(operation);
-                        return None;
+                            assert!(matches!(*task, Task::Completed { .. }));
+                            assert_eq!(resolutions.get(), 2);
+                            assert_eq!(
+                                observations.get(),
+                                if matches!(case, Case::LostStream) {
+                                    4
+                                } else {
+                                    3
+                                }
+                            );
+                        }
+                        Case::LostUpdate | Case::Disabled => {
+                            assert!(matches!(
+                                outcome.unwrap(),
+                                Err(ManagedTaskWatchDriveError::Watch(
+                                    ManagedTaskWatchError::Task(ManagedTasksError::Session(
+                                        OAuthSessionError::Http(_)
+                                    ))
+                                ))
+                            ));
+                            assert_eq!(resolutions.get(), 1);
+                            assert_eq!(observations.get(), 1);
+                        }
+                        Case::ChangedDescriptor | Case::UpdateLimit | Case::InputLimit => {
+                            let error = outcome.unwrap().err().unwrap();
+                            assert!(matches!(
+                                (case, error),
+                                (
+                                    Case::ChangedDescriptor,
+                                    ManagedTaskWatchDriveError::Input(
+                                        ManagedTaskDriverError::InputKeyReused
+                                    )
+                                ) | (
+                                    Case::UpdateLimit,
+                                    ManagedTaskWatchDriveError::Input(
+                                        ManagedTaskDriverError::UpdateLimit
+                                    )
+                                ) | (
+                                    Case::InputLimit,
+                                    ManagedTaskWatchDriveError::Input(
+                                        ManagedTaskDriverError::InputLimit
+                                    )
+                                )
+                            ));
+                            assert_eq!(
+                                resolutions.get(),
+                                1,
+                                "reconnection cannot reset the input/update limits"
+                            );
+                            assert_eq!(observations.get(), 2);
+                        }
+                        Case::PartialAck => {
+                            assert!(matches!(
+                                outcome.unwrap(),
+                                Err(ManagedTaskWatchDriveError::Watch(
+                                    ManagedTaskWatchError::IncompleteAcknowledgement
+                                ))
+                            ));
+                            assert_eq!(resolutions.get(), 1);
+                            assert_eq!(observations.get(), 1);
+                        }
+                        Case::Cancel | Case::Deadline => {
+                            let error = outcome.unwrap().err().unwrap();
+                            assert!(matches!(
+                                (case, error),
+                                (
+                                    Case::Cancel,
+                                    ManagedTaskWatchDriveError::Watch(
+                                        ManagedTaskWatchError::Session(
+                                            OAuthSessionError::Cancelled
+                                        )
+                                    )
+                                ) | (
+                                    Case::Deadline,
+                                    ManagedTaskWatchDriveError::Watch(
+                                        ManagedTaskWatchError::Session(OAuthSessionError::TimedOut)
+                                    )
+                                )
+                            ));
+                            assert_eq!(resolutions.get(), 1);
+                            assert_eq!(observations.get(), 1);
+                        }
+                        Case::Drop => {
+                            assert!(outcome.is_none());
+                            assert_eq!(resolutions.get(), 1);
+                            assert_eq!(observations.get(), 1);
+                        }
                     }
-                    if matches!(case, Case::Cancel) {
-                        let cancel = Box::pin(async {
-                            lost_rx.recv(&cx).await.unwrap();
-                            Sleep::new(cx.now().saturating_add_nanos(50_000_000)).await;
-                            cancellation.cancel();
-                        });
-                        let (result, ()) = pair(operation, cancel).await;
-                        Some(result)
-                    } else {
-                        Some(operation.await)
-                    }
+                    assert_eq!(
+                        peer.posts.load(Ordering::SeqCst),
+                        posts,
+                        "no unrequested mutation or retry may be emitted"
+                    );
+                    assert_eq!(peer.tokens.load(Ordering::SeqCst), 1);
+                    assert_eq!(
+                        cancellation.is_cancel_requested(),
+                        matches!(case, Case::Cancel)
+                    );
+                    assert!(
+                        cx.checkpoint().is_ok(),
+                        "caller and sibling authority remains live"
+                    );
+                    peer.quiet();
+                    session.close();
                 });
-                let (posts, outcome) = pair(server, consumer).await;
-                match case {
-                    Case::LostGet | Case::LostStream | Case::PeerFloor => {
-                        let ManagedTaskRunOutcome::Terminal(task) = outcome.unwrap().unwrap() else { panic!("terminal result required") };
-                        assert!(matches!(*task, Task::Completed { .. }));
-                        assert_eq!(resolutions.get(), 2);
-                        assert_eq!(observations.get(), if matches!(case, Case::LostStream) { 4 } else { 3 });
-                    }
-                    Case::LostUpdate | Case::Disabled => {
-                        assert!(matches!(outcome.unwrap(), Err(ManagedTaskWatchDriveError::Watch(
-                            ManagedTaskWatchError::Task(ManagedTasksError::Session(OAuthSessionError::Http(_)))
-                        ))));
-                        assert_eq!(resolutions.get(), 1);
-                        assert_eq!(observations.get(), 1);
-                    }
-                    Case::ChangedDescriptor | Case::UpdateLimit | Case::InputLimit => {
-                        let error = outcome.unwrap().err().unwrap();
-                        assert!(matches!((case, error),
-                            (Case::ChangedDescriptor, ManagedTaskWatchDriveError::Input(ManagedTaskDriverError::InputKeyReused))
-                            | (Case::UpdateLimit, ManagedTaskWatchDriveError::Input(ManagedTaskDriverError::UpdateLimit))
-                            | (Case::InputLimit, ManagedTaskWatchDriveError::Input(ManagedTaskDriverError::InputLimit))));
-                        assert_eq!(resolutions.get(), 1, "reconnection cannot reset the input/update limits");
-                        assert_eq!(observations.get(), 2);
-                    }
-                    Case::PartialAck => {
-                        assert!(matches!(outcome.unwrap(), Err(ManagedTaskWatchDriveError::Watch(ManagedTaskWatchError::IncompleteAcknowledgement))));
-                        assert_eq!(resolutions.get(), 1);
-                        assert_eq!(observations.get(), 1);
-                    }
-                    Case::Cancel | Case::Deadline => {
-                        let error = outcome.unwrap().err().unwrap();
-                        assert!(matches!((case, error),
-                            (Case::Cancel, ManagedTaskWatchDriveError::Watch(ManagedTaskWatchError::Session(OAuthSessionError::Cancelled)))
-                            | (Case::Deadline, ManagedTaskWatchDriveError::Watch(ManagedTaskWatchError::Session(OAuthSessionError::TimedOut)))));
-                        assert_eq!(resolutions.get(), 1);
-                        assert_eq!(observations.get(), 1);
-                    }
-                    Case::Drop => {
-                        assert!(outcome.is_none());
-                        assert_eq!(resolutions.get(), 1);
-                        assert_eq!(observations.get(), 1);
-                    }
-                }
-                assert_eq!(peer.posts.load(Ordering::SeqCst), posts, "no unrequested mutation or retry may be emitted");
-                assert_eq!(peer.tokens.load(Ordering::SeqCst), 1);
-                assert_eq!(cancellation.is_cancel_requested(), matches!(case, Case::Cancel));
-                assert!(cx.checkpoint().is_ok(), "caller and sibling authority remains live");
-                peer.quiet();
-                session.close();
-            });
-            Box::pin(asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), scenario)).await
+                Box::pin(asupersync::time::timeout_at(
+                    cx.now().saturating_add_nanos(20_000_000_000),
+                    scenario,
+                ))
+                .await
                 .expect("recovering Task input fixture must settle within its bound");
-        }));
+            }));
     }
 
     #[test]
     fn acknowledged_partial_answer_survives_lost_reconciliation_reply() {
-        isolated("acknowledged_partial_answer_survives_lost_reconciliation_reply", Case::LostGet);
+        isolated(
+            "acknowledged_partial_answer_survives_lost_reconciliation_reply",
+            Case::LostGet,
+        );
     }
     #[test]
     fn acknowledged_partial_answer_survives_lost_subscription() {
-        isolated("acknowledged_partial_answer_survives_lost_subscription", Case::LostStream);
+        isolated(
+            "acknowledged_partial_answer_survives_lost_subscription",
+            Case::LostStream,
+        );
     }
     #[test]
     fn uncertain_update_is_not_replayed_or_followed_by_reconciliation() {
-        isolated("uncertain_update_is_not_replayed_or_followed_by_reconciliation", Case::LostUpdate);
+        isolated(
+            "uncertain_update_is_not_replayed_or_followed_by_reconciliation",
+            Case::LostUpdate,
+        );
     }
     #[test]
     fn changed_unanswered_descriptor_is_rejected_after_reconnect() {
-        isolated("changed_unanswered_descriptor_is_rejected_after_reconnect", Case::ChangedDescriptor);
+        isolated(
+            "changed_unanswered_descriptor_is_rejected_after_reconnect",
+            Case::ChangedDescriptor,
+        );
     }
     #[test]
     fn acknowledged_update_count_is_not_reset_by_recovery() {
-        isolated("acknowledged_update_count_is_not_reset_by_recovery", Case::UpdateLimit);
+        isolated(
+            "acknowledged_update_count_is_not_reset_by_recovery",
+            Case::UpdateLimit,
+        );
     }
     #[test]
     fn input_key_budget_is_not_reset_by_recovery() {
-        isolated("input_key_budget_is_not_reset_by_recovery", Case::InputLimit);
+        isolated(
+            "input_key_budget_is_not_reset_by_recovery",
+            Case::InputLimit,
+        );
     }
     #[test]
     fn partial_reconnect_ack_cannot_restart_host_resolution() {
-        isolated("partial_reconnect_ack_cannot_restart_host_resolution", Case::PartialAck);
+        isolated(
+            "partial_reconnect_ack_cannot_restart_host_resolution",
+            Case::PartialAck,
+        );
     }
     #[test]
     fn cancellation_stops_recovery_after_an_acknowledged_update() {
-        isolated("cancellation_stops_recovery_after_an_acknowledged_update", Case::Cancel);
+        isolated(
+            "cancellation_stops_recovery_after_an_acknowledged_update",
+            Case::Cancel,
+        );
     }
     #[test]
     fn abandoned_input_recovery_releases_work_without_remote_cancellation() {
-        isolated("abandoned_input_recovery_releases_work_without_remote_cancellation", Case::Drop);
+        isolated(
+            "abandoned_input_recovery_releases_work_without_remote_cancellation",
+            Case::Drop,
+        );
     }
     #[test]
     fn original_driver_deadline_bounds_recovery_after_input() {
-        isolated("original_driver_deadline_bounds_recovery_after_input", Case::Deadline);
+        isolated(
+            "original_driver_deadline_bounds_recovery_after_input",
+            Case::Deadline,
+        );
     }
     #[test]
     fn ordinary_driver_does_not_silently_opt_into_recovery() {
-        isolated("ordinary_driver_does_not_silently_opt_into_recovery", Case::Disabled);
+        isolated(
+            "ordinary_driver_does_not_silently_opt_into_recovery",
+            Case::Disabled,
+        );
     }
     #[test]
     fn recovering_input_driver_honors_the_last_peer_polling_floor() {
-        isolated("recovering_input_driver_honors_the_last_peer_polling_floor", Case::PeerFloor);
+        isolated(
+            "recovering_input_driver_honors_the_last_peer_polling_floor",
+            Case::PeerFloor,
+        );
     }
 }

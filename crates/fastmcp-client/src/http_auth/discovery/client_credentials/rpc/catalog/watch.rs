@@ -12,27 +12,32 @@
 
 use std::fmt;
 use std::future::{Future, poll_fn};
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::task::{Poll, Waker};
 use std::time::Duration;
 
 use asupersync::Cx;
 use asupersync::types::Time;
 use fastmcp_core::McpRequestCancellation;
-use fastmcp_protocol::{CoreRequest, FinalRequestMeta, RequestId, ServerNotification, SubscriptionFilter};
+use fastmcp_protocol::{
+    CoreRequest, FinalRequestMeta, RequestId, ServerNotification, SubscriptionFilter,
+};
 
-use super::{
-    CatalogKind, ClientCredentialsCatalogClient, ClientCredentialsCatalogError,
-    CollectedMachineCatalog, ManagedCatalogError, Traversal, list_params,
-};
-use super::super::{ClientCredentialsCoreError, preflight};
-use super::super::super::{
-    ClientCredentialsError, ClientCredentialsSnapshot, OAuthDiscoveryError,
-    active, check_context, check_token, discovery_deadline,
-};
 use super::super::super::subscriptions::{
     ClientCredentialsCoreSubscriptionError, ClientCredentialsCoreSubscriptionLimits,
     ModernHttpSubscriptionListenEvent,
+};
+use super::super::super::{
+    ClientCredentialsError, ClientCredentialsSnapshot, OAuthDiscoveryError, active, check_context,
+    check_token, discovery_deadline,
+};
+use super::super::{ClientCredentialsCoreError, preflight};
+use super::{
+    CatalogKind, ClientCredentialsCatalogClient, ClientCredentialsCatalogError,
+    CollectedMachineCatalog, ManagedCatalogError, Traversal, list_params,
 };
 use crate::cache::FinalResultCache;
 use crate::http_auth::rpc::ManagedCoreError;
@@ -56,24 +61,38 @@ pub struct ClientCredentialsCatalogWatchLimits {
 impl Default for ClientCredentialsCatalogWatchLimits {
     fn default() -> Self {
         Self {
-            timeout: Duration::from_mins(15), maximum_collections: 64,
-            maximum_request_ids: 4096, maximum_state_bytes: 1024 * 1024,
+            timeout: Duration::from_mins(15),
+            maximum_collections: 64,
+            maximum_request_ids: 4096,
+            maximum_state_bytes: 1024 * 1024,
             subscription_records: 4096,
         }
     }
 }
 impl ClientCredentialsCatalogWatchLimits {
     pub fn new(
-        timeout: Duration, maximum_collections: usize, maximum_request_ids: usize,
-        maximum_state_bytes: usize, subscription_records: usize,
+        timeout: Duration,
+        maximum_collections: usize,
+        maximum_request_ids: usize,
+        maximum_state_bytes: usize,
+        subscription_records: usize,
     ) -> Result<Self, ClientCredentialsCatalogWatchError> {
-        if timeout.is_zero() || timeout > Duration::from_secs(3600)
+        if timeout.is_zero()
+            || timeout > Duration::from_secs(3600)
             || !(1..=1024).contains(&maximum_collections)
             || !(4..=4096).contains(&maximum_request_ids)
             || !(1..=8 * 1024 * 1024).contains(&maximum_state_bytes)
             || !(2..=4096).contains(&subscription_records)
-        { return Err(ClientCredentialsCatalogWatchError::InvalidLimits); }
-        Ok(Self { timeout, maximum_collections, maximum_request_ids, maximum_state_bytes, subscription_records })
+        {
+            return Err(ClientCredentialsCatalogWatchError::InvalidLimits);
+        }
+        Ok(Self {
+            timeout,
+            maximum_collections,
+            maximum_request_ids,
+            maximum_state_bytes,
+            subscription_records,
+        })
     }
 }
 
@@ -100,7 +119,9 @@ impl fmt::Display for ClientCredentialsCatalogWatchError {
         match self {
             Self::InvalidLimits => f.write_str("invalid machine catalog watch limits"),
             Self::CursorNotAllowed => f.write_str("machine catalog watch requires the first page"),
-            Self::CoverageRefused => f.write_str("machine subscription omitted the catalog change category"),
+            Self::CoverageRefused => {
+                f.write_str("machine subscription omitted the catalog change category")
+            }
             Self::CollectionLimit => f.write_str("machine catalog reconciliation budget exhausted"),
             Self::UnexpectedEvent => f.write_str("unexpected machine catalog subscription event"),
             Self::Catalog(error) => fmt::Display::fmt(error, f),
@@ -110,22 +131,34 @@ impl fmt::Display for ClientCredentialsCatalogWatchError {
 }
 impl std::error::Error for ClientCredentialsCatalogWatchError {}
 impl From<ClientCredentialsCatalogError> for ClientCredentialsCatalogWatchError {
-    fn from(error: ClientCredentialsCatalogError) -> Self { Self::Catalog(error) }
+    fn from(error: ClientCredentialsCatalogError) -> Self {
+        Self::Catalog(error)
+    }
 }
 impl From<ManagedCatalogError> for ClientCredentialsCatalogWatchError {
-    fn from(error: ManagedCatalogError) -> Self { Self::Catalog(error.into()) }
+    fn from(error: ManagedCatalogError) -> Self {
+        Self::Catalog(error.into())
+    }
 }
 impl From<ManagedCoreError> for ClientCredentialsCatalogWatchError {
-    fn from(error: ManagedCoreError) -> Self { Self::Catalog(error.into()) }
+    fn from(error: ManagedCoreError) -> Self {
+        Self::Catalog(error.into())
+    }
 }
 impl From<ClientCredentialsCoreError> for ClientCredentialsCatalogWatchError {
-    fn from(error: ClientCredentialsCoreError) -> Self { Self::Catalog(error.into()) }
+    fn from(error: ClientCredentialsCoreError) -> Self {
+        Self::Catalog(error.into())
+    }
 }
 impl From<ClientCredentialsError> for ClientCredentialsCatalogWatchError {
-    fn from(error: ClientCredentialsError) -> Self { Self::Catalog(error.into()) }
+    fn from(error: ClientCredentialsError) -> Self {
+        Self::Catalog(error.into())
+    }
 }
 impl From<ClientCredentialsCoreSubscriptionError> for ClientCredentialsCatalogWatchError {
-    fn from(error: ClientCredentialsCoreSubscriptionError) -> Self { Self::Subscription(error) }
+    fn from(error: ClientCredentialsCoreSubscriptionError) -> Self {
+        Self::Subscription(error)
+    }
 }
 
 impl ClientCredentialsCatalogClient {
@@ -139,14 +172,29 @@ impl ClientCredentialsCatalogClient {
     /// invalidation lock. Stop affects this watch, not the machine owner or any
     /// sibling operation. A new watch is explicit and never bridges a stream gap.
     pub async fn watch<I, O>(
-        &self, cx: &Cx, request: CoreRequest, limits: ClientCredentialsCatalogWatchLimits,
-        next_ids: I, observe: O,
+        &self,
+        cx: &Cx,
+        request: CoreRequest,
+        limits: ClientCredentialsCatalogWatchLimits,
+        next_ids: I,
+        observe: O,
     ) -> Result<ClientCredentialsCatalogWatchOutcome, ClientCredentialsCatalogWatchError>
     where
         I: FnMut() -> Result<(RequestId, RequestId), ClientCredentialsCatalogError>,
-        O: FnMut(ClientCredentialsCatalogWatchEvent) -> Result<ClientCredentialsCatalogWatchControl, ClientCredentialsCatalogError>,
+        O: FnMut(
+            ClientCredentialsCatalogWatchEvent,
+        )
+            -> Result<ClientCredentialsCatalogWatchControl, ClientCredentialsCatalogError>,
     {
-        self.watch_with_cancellation(cx, &McpRequestCancellation::new(), request, limits, next_ids, observe).await
+        self.watch_with_cancellation(
+            cx,
+            &McpRequestCancellation::new(),
+            request,
+            limits,
+            next_ids,
+            observe,
+        )
+        .await
     }
 
     /// One deadline and cancellation domain include opening, acknowledgment,
@@ -155,27 +203,54 @@ impl ClientCredentialsCatalogClient {
     /// drop a pending subscription read or leave its parser unusable.
     #[allow(clippy::too_many_arguments)]
     pub async fn watch_with_cancellation<I, O>(
-        &self, cx: &Cx, cancellation: &McpRequestCancellation,
-        request: CoreRequest, limits: ClientCredentialsCatalogWatchLimits, next_ids: I, observe: O,
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        request: CoreRequest,
+        limits: ClientCredentialsCatalogWatchLimits,
+        next_ids: I,
+        observe: O,
     ) -> Result<ClientCredentialsCatalogWatchOutcome, ClientCredentialsCatalogWatchError>
     where
         I: FnMut() -> Result<(RequestId, RequestId), ClientCredentialsCatalogError>,
-        O: FnMut(ClientCredentialsCatalogWatchEvent) -> Result<ClientCredentialsCatalogWatchControl, ClientCredentialsCatalogError>,
+        O: FnMut(
+            ClientCredentialsCatalogWatchEvent,
+        )
+            -> Result<ClientCredentialsCatalogWatchControl, ClientCredentialsCatalogError>,
     {
-        let deadline = discovery_deadline(cx, limits.timeout).map_err(ClientCredentialsError::from)?;
+        let deadline =
+            discovery_deadline(cx, limits.timeout).map_err(ClientCredentialsError::from)?;
         let kind = CatalogKind::of(&request)?;
         let (metadata, filter) = listen_arguments(&request)?;
         // Validate catalog/profile selection before opening a subscription. The
         // provisional IDs never escape; actual pairs are rechecked per request.
-        preflight(self.client.resource(), &request, &RequestId::Number(0), &RequestId::Number(1), self.limits.core)?;
+        preflight(
+            self.client.resource(),
+            &request,
+            &RequestId::Number(0),
+            &RequestId::Number(1),
+            self.limits.core,
+        )?;
         let subscription_limits = ClientCredentialsCoreSubscriptionLimits::new(
             self.limits.core.request_bytes().min(64 * 1024),
-            self.limits.core.frame_bytes().min(64 * 1024), limits.subscription_records, limits.timeout,
+            self.limits.core.frame_bytes().min(64 * 1024),
+            limits.subscription_records,
+            limits.timeout,
         )?;
-        let ids = Mutex::new(WatchIds { next: next_ids, history: Traversal::default(), limits });
-        let observer = Observer { callback: Mutex::new(observe), stopped: AtomicBool::new(false) };
+        let ids = Mutex::new(WatchIds {
+            next: next_ids,
+            history: Traversal::default(),
+            limits,
+        });
+        let observer = Observer {
+            callback: Mutex::new(observe),
+            stopped: AtomicBool::new(false),
+        };
         let owner = &self.client.inner.closed;
-        let _gap = InvalidateOnExit { invalidation: Arc::clone(&self.invalidation), kind };
+        let _gap = InvalidateOnExit {
+            invalidation: Arc::clone(&self.invalidation),
+            kind,
+        };
         self.fences()?.invalidate_result_set(&kind.result_set());
         Box::pin(active(cx, deadline, owner, cancellation, None, async {
             Ok(async {
@@ -184,24 +259,44 @@ impl ClientCredentialsCatalogClient {
                 // subscribe_core measures both actual stamped documents before
                 // credential acquisition. It never uses a replacement token
                 // between the discovery POST and the listen POST.
-                let mut subscription = self.client.subscribe_core_with_cancellation(
-                    cx, cancellation, metadata, discovery_id, listen_id, filter, subscription_limits,
-                ).await?;
-                let binding = self.client.credential_with_cancellation(cx, cancellation).await?;
+                let mut subscription = Box::pin(self.client.subscribe_core_with_cancellation(
+                    cx,
+                    cancellation,
+                    metadata,
+                    discovery_id,
+                    listen_id,
+                    filter,
+                    subscription_limits,
+                ))
+                .await?;
+                let binding = self
+                    .client
+                    .credential_with_cancellation(cx, cancellation)
+                    .await?;
                 if binding.generation() != subscription.credential_generation() {
                     return Err(ManagedCatalogError::CredentialChanged.into());
                 }
                 active(cx, deadline, owner, cancellation, Some(&binding), async {
                     Ok(async {
-                        let Some(ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter }) = subscription.next_event(cx).await? else {
+                        let Some(ModernHttpSubscriptionListenEvent::Acknowledged {
+                            accepted_filter,
+                        }) = subscription.next_event(cx).await?
+                        else {
                             return Err(ClientCredentialsCatalogWatchError::UnexpectedEvent);
                         };
-                        if !covers(kind, &accepted_filter) { return Err(ClientCredentialsCatalogWatchError::CoverageRefused); }
+                        if !covers(kind, &accepted_filter) {
+                            return Err(ClientCredentialsCatalogWatchError::CoverageRefused);
+                        }
                         check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
                         self.fences()?.invalidate_result_set(&kind.result_set());
-                        let continuing = observer.emit(ClientCredentialsCatalogWatchEvent::Acknowledged { accepted_filter })?;
+                        let continuing =
+                            observer.emit(ClientCredentialsCatalogWatchEvent::Acknowledged {
+                                accepted_filter,
+                            })?;
                         check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
-                        if !continuing { return Ok(ClientCredentialsCatalogWatchOutcome::StoppedByHost); }
+                        if !continuing {
+                            return Ok(ClientCredentialsCatalogWatchOutcome::StoppedByHost);
+                        }
                         let signal = ChangeSignal::default();
                         let monitor = async {
                             loop {
@@ -209,17 +304,43 @@ impl ClientCredentialsCatalogClient {
                                 let event = subscription.next_event(cx).await?;
                                 check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
                                 match event {
-                                    Some(ModernHttpSubscriptionListenEvent::Notification(notification)) => {
+                                    Some(ModernHttpSubscriptionListenEvent::Notification(
+                                        notification,
+                                    )) => {
                                         self.invalidate_notification(&notification)?;
-                                        if relevant(kind, &notification) { signal.changed()?; }
-                                        let continuing = observer.emit(ClientCredentialsCatalogWatchEvent::Notification(Box::new(notification)))?;
-                                        check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
-                                        if !continuing { return Ok(ClientCredentialsCatalogWatchOutcome::StoppedByHost); }
+                                        if relevant(kind, &notification) {
+                                            signal.changed()?;
+                                        }
+                                        let continuing = observer.emit(
+                                            ClientCredentialsCatalogWatchEvent::Notification(
+                                                Box::new(notification),
+                                            ),
+                                        )?;
+                                        check_binding(
+                                            cx,
+                                            cancellation,
+                                            deadline,
+                                            owner,
+                                            Some(&binding),
+                                        )?;
+                                        if !continuing {
+                                            return Ok(
+                                                ClientCredentialsCatalogWatchOutcome::StoppedByHost,
+                                            );
+                                        }
                                     }
-                                    Some(ModernHttpSubscriptionListenEvent::Terminal { .. }) => {
-                                        return Ok(ClientCredentialsCatalogWatchOutcome::SubscriptionEnded);
+                                    Some(ModernHttpSubscriptionListenEvent::Terminal {
+                                        ..
+                                    }) => {
+                                        return Ok(
+                                            ClientCredentialsCatalogWatchOutcome::SubscriptionEnded,
+                                        );
                                     }
-                                    _ => return Err(ClientCredentialsCatalogWatchError::UnexpectedEvent),
+                                    _ => {
+                                        return Err(
+                                            ClientCredentialsCatalogWatchError::UnexpectedEvent,
+                                        );
+                                    }
                                 }
                             }
                         };
@@ -229,34 +350,82 @@ impl ClientCredentialsCatalogClient {
                             loop {
                                 let revision = signal.wait_after(published).await?;
                                 check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
-                                if attempts >= limits.maximum_collections { return Err(ClientCredentialsCatalogWatchError::CollectionLimit); }
-                                let Some(local_cancel) = signal.begin(revision)? else { continue };
+                                if attempts >= limits.maximum_collections {
+                                    return Err(
+                                        ClientCredentialsCatalogWatchError::CollectionLimit,
+                                    );
+                                }
+                                let Some(local_cancel) = signal.begin(revision)? else {
+                                    continue;
+                                };
                                 let generation = self.fences()?.begin_fetch(&kind.result_set());
                                 attempts += 1;
                                 let result = Box::pin(self.collect_with_cancellation(
-                                    cx, &local_cancel, request.clone(),
+                                    cx,
+                                    &local_cancel,
+                                    request.clone(),
                                     || {
-                                        check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
+                                        check_binding(
+                                            cx,
+                                            cancellation,
+                                            deadline,
+                                            owner,
+                                            Some(&binding),
+                                        )?;
                                         let pair = issue_pair(&ids)?;
-                                        check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
+                                        check_binding(
+                                            cx,
+                                            cancellation,
+                                            deadline,
+                                            owner,
+                                            Some(&binding),
+                                        )?;
                                         Ok(pair)
                                     },
                                     |notification| {
                                         // collect invalidates before this callback.
-                                        if relevant(kind, &notification) { signal.changed()?; }
-                                        check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
-                                        let continuing = observer.emit(ClientCredentialsCatalogWatchEvent::Notification(notification))?;
-                                        check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
-                                        if continuing { Ok(()) } else { Err(ManagedCatalogError::AbortedByHost.into()) }
+                                        if relevant(kind, &notification) {
+                                            signal.changed()?;
+                                        }
+                                        check_binding(
+                                            cx,
+                                            cancellation,
+                                            deadline,
+                                            owner,
+                                            Some(&binding),
+                                        )?;
+                                        let continuing = observer.emit(
+                                            ClientCredentialsCatalogWatchEvent::Notification(
+                                                notification,
+                                            ),
+                                        )?;
+                                        check_binding(
+                                            cx,
+                                            cancellation,
+                                            deadline,
+                                            owner,
+                                            Some(&binding),
+                                        )?;
+                                        if continuing {
+                                            Ok(())
+                                        } else {
+                                            Err(ManagedCatalogError::AbortedByHost.into())
+                                        }
                                     },
-                                )).await;
+                                ))
+                                .await;
                                 signal.finish()?;
                                 check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
-                                if observer.stopped.load(Ordering::Acquire) { return Ok(ClientCredentialsCatalogWatchOutcome::StoppedByHost); }
+                                if observer.stopped.load(Ordering::Acquire) {
+                                    return Ok(ClientCredentialsCatalogWatchOutcome::StoppedByHost);
+                                }
                                 let changed = signal.revision()? != revision;
                                 let catalog = match result {
                                     Ok(catalog) => catalog,
-                                    Err(error) if changed && is_invalidation_stop(&error, &local_cancel) => {
+                                    Err(error)
+                                        if changed
+                                            && is_invalidation_stop(&error, &local_cancel) =>
+                                    {
                                         yield_once().await;
                                         continue;
                                     }
@@ -269,37 +438,55 @@ impl ClientCredentialsCatalogClient {
                                 // currently-ready changes/gaps before publication.
                                 yield_once().await;
                                 check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
-                                if signal.revision()? != revision { continue; }
+                                if signal.revision()? != revision {
+                                    continue;
+                                }
                                 if self.fences()?.begin_fetch(&kind.result_set()) != generation {
                                     return Err(ManagedCatalogError::Invalidated.into());
                                 }
                                 published = Some(revision);
-                                let continuing = observer.emit(ClientCredentialsCatalogWatchEvent::Snapshot(catalog))?;
+                                let continuing = observer
+                                    .emit(ClientCredentialsCatalogWatchEvent::Snapshot(catalog))?;
                                 check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
-                                if !continuing { return Ok(ClientCredentialsCatalogWatchOutcome::StoppedByHost); }
+                                if !continuing {
+                                    return Ok(ClientCredentialsCatalogWatchOutcome::StoppedByHost);
+                                }
                             }
                         };
                         Box::pin(monitor_first(monitor, reconcile)).await
-                    }.await)
-                }).await?
-            }.await)
-        })).await?
+                    }
+                    .await)
+                })
+                .await?
+            }
+            .await)
+        }))
+        .await?
     }
 }
 
-fn listen_arguments(request: &CoreRequest) -> Result<(FinalRequestMeta, SubscriptionFilter), ClientCredentialsCatalogWatchError> {
+fn listen_arguments(
+    request: &CoreRequest,
+) -> Result<(FinalRequestMeta, SubscriptionFilter), ClientCredentialsCatalogWatchError> {
     let kind = CatalogKind::of(request)?;
-    if list_params(request)?.cursor.is_some() { return Err(ClientCredentialsCatalogWatchError::CursorNotAllowed); }
-    let params = request.encode_params().map_err(|_| ManagedCoreError::InvalidRequest)?
+    if list_params(request)?.cursor.is_some() {
+        return Err(ClientCredentialsCatalogWatchError::CursorNotAllowed);
+    }
+    let params = request
+        .encode_params()
+        .map_err(|_| ManagedCoreError::InvalidRequest)?
         .ok_or(ManagedCoreError::InvalidRequest)?;
-    let metadata = serde_json::from_value(params["_meta"].clone()).map_err(|_| ManagedCoreError::InvalidRequest)?;
+    let metadata = serde_json::from_value(params["_meta"].clone())
+        .map_err(|_| ManagedCoreError::InvalidRequest)?;
     Ok((metadata, requested_filter(kind)))
 }
 fn requested_filter(kind: CatalogKind) -> SubscriptionFilter {
     let mut filter = SubscriptionFilter::default();
     match kind {
         CatalogKind::Tools => filter.tools_list_changed = Some(true),
-        CatalogKind::Resources | CatalogKind::Templates => filter.resources_list_changed = Some(true),
+        CatalogKind::Resources | CatalogKind::Templates => {
+            filter.resources_list_changed = Some(true);
+        }
         CatalogKind::Prompts => filter.prompts_list_changed = Some(true),
     }
     filter
@@ -307,33 +494,69 @@ fn requested_filter(kind: CatalogKind) -> SubscriptionFilter {
 fn covers(kind: CatalogKind, filter: &SubscriptionFilter) -> bool {
     match kind {
         CatalogKind::Tools => filter.tools_list_changed == Some(true),
-        CatalogKind::Resources | CatalogKind::Templates => filter.resources_list_changed == Some(true),
+        CatalogKind::Resources | CatalogKind::Templates => {
+            filter.resources_list_changed == Some(true)
+        }
         CatalogKind::Prompts => filter.prompts_list_changed == Some(true),
     }
 }
 fn relevant(kind: CatalogKind, notification: &ServerNotification) -> bool {
-    matches!((kind, notification),
+    matches!(
+        (kind, notification),
         (CatalogKind::Tools, ServerNotification::ToolsListChanged(_))
-        | (CatalogKind::Resources | CatalogKind::Templates, ServerNotification::ResourcesListChanged(_))
-        | (CatalogKind::Prompts, ServerNotification::PromptsListChanged(_))
+            | (
+                CatalogKind::Resources | CatalogKind::Templates,
+                ServerNotification::ResourcesListChanged(_)
+            )
+            | (
+                CatalogKind::Prompts,
+                ServerNotification::PromptsListChanged(_)
+            )
     )
 }
 fn check_binding(
-    cx: &Cx, cancellation: &McpRequestCancellation, deadline: Time,
-    owner: &McpRequestCancellation, binding: Option<&ClientCredentialsSnapshot>,
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    deadline: Time,
+    owner: &McpRequestCancellation,
+    binding: Option<&ClientCredentialsSnapshot>,
 ) -> Result<(), ClientCredentialsCatalogError> {
-    if owner.is_cancel_requested() { return Err(ClientCredentialsError::Closed.into()); }
-    if cancellation.is_cancel_requested() { return Err(ClientCredentialsError::from(OAuthDiscoveryError::Cancelled).into()); }
-    let deadline = cx.budget().deadline.map_or(deadline, |caller| caller.min(deadline));
+    if owner.is_cancel_requested() {
+        return Err(ClientCredentialsError::Closed.into());
+    }
+    if cancellation.is_cancel_requested() {
+        return Err(ClientCredentialsError::from(OAuthDiscoveryError::Cancelled).into());
+    }
+    let deadline = cx
+        .budget()
+        .deadline
+        .map_or(deadline, |caller| caller.min(deadline));
     check_context(cx, deadline).map_err(ClientCredentialsError::from)?;
-    if let Some(binding) = binding { check_token(&binding.bearer, binding.expires_at)?; }
+    if let Some(binding) = binding {
+        check_token(&binding.bearer, binding.expires_at)?;
+    }
     Ok(())
 }
-struct WatchIds<I> { next: I, history: Traversal, limits: ClientCredentialsCatalogWatchLimits }
-fn issue_pair<I>(ids: &Mutex<WatchIds<I>>) -> Result<(RequestId, RequestId), ClientCredentialsCatalogError>
-where I: FnMut() -> Result<(RequestId, RequestId), ClientCredentialsCatalogError> {
-    let mut ids = ids.lock().map_err(|_| ManagedCatalogError::CacheUnavailable)?;
-    if ids.limits.maximum_request_ids.saturating_sub(ids.history.ids.len()) < 2 {
+struct WatchIds<I> {
+    next: I,
+    history: Traversal,
+    limits: ClientCredentialsCatalogWatchLimits,
+}
+fn issue_pair<I>(
+    ids: &Mutex<WatchIds<I>>,
+) -> Result<(RequestId, RequestId), ClientCredentialsCatalogError>
+where
+    I: FnMut() -> Result<(RequestId, RequestId), ClientCredentialsCatalogError>,
+{
+    let mut ids = ids
+        .lock()
+        .map_err(|_| ManagedCatalogError::CacheUnavailable)?;
+    if ids
+        .limits
+        .maximum_request_ids
+        .saturating_sub(ids.history.ids.len())
+        < 2
+    {
         return Err(ManagedCatalogError::StateLimit.into());
     }
     let pair = (ids.next)()?;
@@ -341,88 +564,152 @@ where I: FnMut() -> Result<(RequestId, RequestId), ClientCredentialsCatalogError
     ids.history.reserve_ids(&pair.0, &pair.1, maximum)?;
     Ok(pair)
 }
-struct Observer<O> { callback: Mutex<O>, stopped: AtomicBool }
+struct Observer<O> {
+    callback: Mutex<O>,
+    stopped: AtomicBool,
+}
 impl<O> Observer<O>
-where O: FnMut(ClientCredentialsCatalogWatchEvent) -> Result<ClientCredentialsCatalogWatchControl, ClientCredentialsCatalogError> {
-    fn emit(&self, event: ClientCredentialsCatalogWatchEvent) -> Result<bool, ClientCredentialsCatalogError> {
-        let control = (self.callback.lock().map_err(|_| ManagedCatalogError::CacheUnavailable)?)(event)?;
+where
+    O: FnMut(
+        ClientCredentialsCatalogWatchEvent,
+    ) -> Result<ClientCredentialsCatalogWatchControl, ClientCredentialsCatalogError>,
+{
+    fn emit(
+        &self,
+        event: ClientCredentialsCatalogWatchEvent,
+    ) -> Result<bool, ClientCredentialsCatalogError> {
+        let control = (self
+            .callback
+            .lock()
+            .map_err(|_| ManagedCatalogError::CacheUnavailable)?)(event)?;
         let continuing = control == ClientCredentialsCatalogWatchControl::Continue;
-        if !continuing { self.stopped.store(true, Ordering::Release); }
+        if !continuing {
+            self.stopped.store(true, Ordering::Release);
+        }
         Ok(continuing)
     }
 }
 #[derive(Default)]
-struct ChangeState { revision: u64, active: Option<McpRequestCancellation>, waiter: Option<Waker> }
+struct ChangeState {
+    revision: u64,
+    active: Option<McpRequestCancellation>,
+    waiter: Option<Waker>,
+}
 #[derive(Default)]
 struct ChangeSignal(Mutex<ChangeState>);
 impl ChangeSignal {
     fn revision(&self) -> Result<u64, ManagedCatalogError> {
-        Ok(self.0.lock().map_err(|_| ManagedCatalogError::CacheUnavailable)?.revision)
+        Ok(self
+            .0
+            .lock()
+            .map_err(|_| ManagedCatalogError::CacheUnavailable)?
+            .revision)
     }
     fn changed(&self) -> Result<(), ManagedCatalogError> {
         let (active, waiter) = {
-            let mut state = self.0.lock().map_err(|_| ManagedCatalogError::CacheUnavailable)?;
-            state.revision = state.revision.checked_add(1).ok_or(ManagedCatalogError::StateLimit)?;
+            let mut state = self
+                .0
+                .lock()
+                .map_err(|_| ManagedCatalogError::CacheUnavailable)?;
+            state.revision = state
+                .revision
+                .checked_add(1)
+                .ok_or(ManagedCatalogError::StateLimit)?;
             (state.active.take(), state.waiter.take())
         };
-        if let Some(active) = active { active.cancel(); }
-        if let Some(waiter) = waiter { waiter.wake(); }
+        if let Some(active) = active {
+            active.cancel();
+        }
+        if let Some(waiter) = waiter {
+            waiter.wake();
+        }
         Ok(())
     }
     fn begin(&self, revision: u64) -> Result<Option<McpRequestCancellation>, ManagedCatalogError> {
-        let mut state = self.0.lock().map_err(|_| ManagedCatalogError::CacheUnavailable)?;
-        if state.revision != revision { return Ok(None); }
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| ManagedCatalogError::CacheUnavailable)?;
+        if state.revision != revision {
+            return Ok(None);
+        }
         let cancel = McpRequestCancellation::new();
         state.active = Some(cancel.clone());
         Ok(Some(cancel))
     }
     fn finish(&self) -> Result<(), ManagedCatalogError> {
-        self.0.lock().map_err(|_| ManagedCatalogError::CacheUnavailable)?.active = None;
+        self.0
+            .lock()
+            .map_err(|_| ManagedCatalogError::CacheUnavailable)?
+            .active = None;
         Ok(())
     }
     async fn wait_after(&self, previous: Option<u64>) -> Result<u64, ManagedCatalogError> {
         poll_fn(|task| {
-            let mut state = self.0.lock().map_err(|_| ManagedCatalogError::CacheUnavailable)?;
-            if previous != Some(state.revision) { return Poll::Ready(Ok(state.revision)); }
+            let mut state = self
+                .0
+                .lock()
+                .map_err(|_| ManagedCatalogError::CacheUnavailable)?;
+            if previous != Some(state.revision) {
+                return Poll::Ready(Ok(state.revision));
+            }
             state.waiter = Some(task.waker().clone());
             Poll::Pending
-        }).await
+        })
+        .await
     }
 }
-fn is_invalidation_stop(error: &ClientCredentialsCatalogError, local: &McpRequestCancellation) -> bool {
-    matches!(error, ClientCredentialsCatalogError::Catalog(ManagedCatalogError::Invalidated))
-        || (local.is_cancel_requested() && matches!(error,
+fn is_invalidation_stop(
+    error: &ClientCredentialsCatalogError,
+    local: &McpRequestCancellation,
+) -> bool {
+    matches!(
+        error,
+        ClientCredentialsCatalogError::Catalog(ManagedCatalogError::Invalidated)
+    ) || (local.is_cancel_requested()
+        && matches!(
+            error,
             ClientCredentialsCatalogError::Core(
                 ClientCredentialsCoreError::Protocol(ManagedCoreError::Cancelled)
-                | ClientCredentialsCoreError::Authentication(
-                    ClientCredentialsError::Discovery(OAuthDiscoveryError::Cancelled)
-                )
+                    | ClientCredentialsCoreError::Authentication(
+                        ClientCredentialsError::Discovery(OAuthDiscoveryError::Cancelled)
+                    )
             )
         ))
 }
 async fn yield_once() {
     let mut yielded = false;
     poll_fn(|task| {
-        if yielded { Poll::Ready(()) } else {
+        if yielded {
+            Poll::Ready(())
+        } else {
             yielded = true;
             task.waker().wake_by_ref();
             Poll::Pending
         }
-    }).await;
+    })
+    .await;
 }
 async fn monitor_first<T, E>(
-    monitor: impl Future<Output = Result<T, E>>, reconcile: impl Future<Output = Result<T, E>>,
+    monitor: impl Future<Output = Result<T, E>>,
+    reconcile: impl Future<Output = Result<T, E>>,
 ) -> Result<T, E> {
     // Retain both futures across every page/publication. In particular, never
     // drop a pending subscription read merely because a list became ready.
     let mut monitor = Box::pin(monitor);
     let mut reconcile = Box::pin(reconcile);
     poll_fn(|task| {
-        if let Poll::Ready(result) = monitor.as_mut().poll(task) { return Poll::Ready(result); }
+        if let Poll::Ready(result) = monitor.as_mut().poll(task) {
+            return Poll::Ready(result);
+        }
         reconcile.as_mut().poll(task)
-    }).await
+    })
+    .await
 }
-struct InvalidateOnExit { invalidation: Arc<Mutex<FinalResultCache>>, kind: CatalogKind }
+struct InvalidateOnExit {
+    invalidation: Arc<Mutex<FinalResultCache>>,
+    kind: CatalogKind,
+}
 impl Drop for InvalidateOnExit {
     fn drop(&mut self) {
         if let Ok(mut fences) = self.invalidation.lock() {
@@ -434,15 +721,21 @@ impl Drop for InvalidateOnExit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fastmcp_protocol::protocol_policy::ProtocolEra;
+    use fastmcp_protocol::{ClientCapabilities, JsonRpcRequest};
+    use serde_json::json;
     use std::sync::atomic::AtomicUsize;
     use std::task::Wake;
-    use fastmcp_protocol::{ClientCapabilities, JsonRpcRequest};
-    use fastmcp_protocol::protocol_policy::ProtocolEra;
-    use serde_json::json;
 
     struct Flag(AtomicBool);
-    impl Wake for Flag { fn wake(self: Arc<Self>) { self.0.store(true, Ordering::Release); } }
-    fn waker() -> Waker { Waker::from(Arc::new(Flag(AtomicBool::new(false)))) }
+    impl Wake for Flag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    fn waker() -> Waker {
+        Waker::from(Arc::new(Flag(AtomicBool::new(false))))
+    }
     fn request(method: &str) -> CoreRequest {
         CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&json!({
             "_meta":FinalRequestMeta::new(ClientCapabilities::default()), "includeTags":["selected"],
@@ -451,12 +744,18 @@ mod tests {
 
     #[test]
     fn machine_watch_requires_its_own_accepted_change_category() {
-        for (method, key) in [("tools/list","toolsListChanged"),("resources/list","resourcesListChanged"),
-            ("resources/templates/list","resourcesListChanged"),("prompts/list","promptsListChanged")]
-        {
+        for (method, key) in [
+            ("tools/list", "toolsListChanged"),
+            ("resources/list", "resourcesListChanged"),
+            ("resources/templates/list", "resourcesListChanged"),
+            ("prompts/list", "promptsListChanged"),
+        ] {
             let request = request(method);
             let (metadata, filter) = listen_arguments(&request).unwrap();
-            assert_eq!(serde_json::to_value(metadata).unwrap(), request.encode_params().unwrap().unwrap()["_meta"]);
+            assert_eq!(
+                serde_json::to_value(metadata).unwrap(),
+                request.encode_params().unwrap().unwrap()["_meta"]
+            );
             assert_eq!(serde_json::to_value(&filter).unwrap(), json!({key:true}));
             let kind = CatalogKind::of(&request).unwrap();
             assert!(covers(kind, &filter));
@@ -469,7 +768,10 @@ mod tests {
         for cursor in ["", "opaque"] {
             let mut request = request("tools/list");
             super::super::list_params_mut(&mut request).unwrap().cursor = Some(cursor.to_owned());
-            assert!(matches!(listen_arguments(&request), Err(ClientCredentialsCatalogWatchError::CursorNotAllowed)));
+            assert!(matches!(
+                listen_arguments(&request),
+                Err(ClientCredentialsCatalogWatchError::CursorNotAllowed)
+            ));
         }
     }
 
@@ -500,7 +802,10 @@ mod tests {
         assert!(waiting.as_mut().poll(&mut context).is_pending());
         signal.changed().unwrap();
         assert!(flag.0.load(Ordering::Acquire));
-        assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Ready(Ok(1))));
+        assert!(matches!(
+            waiting.as_mut().poll(&mut context),
+            Poll::Ready(Ok(1))
+        ));
     }
 
     #[test]
@@ -512,7 +817,10 @@ mod tests {
         }));
         let waker = waker();
         let mut context = std::task::Context::from_waker(&waker);
-        assert!(matches!(race.as_mut().poll(&mut context), Poll::Ready(Ok(1))));
+        assert!(matches!(
+            race.as_mut().poll(&mut context),
+            Poll::Ready(Ok(1))
+        ));
         assert!(!published.load(Ordering::Acquire));
     }
 
@@ -521,15 +829,27 @@ mod tests {
         struct PendingBody(Arc<AtomicBool>);
         impl Future for PendingBody {
             type Output = Result<(), ()>;
-            fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<Self::Output> { Poll::Pending }
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> Poll<Self::Output> {
+                Poll::Pending
+            }
         }
-        impl Drop for PendingBody { fn drop(&mut self) { self.0.store(true, Ordering::Release); } }
+        impl Drop for PendingBody {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
         let closed = Arc::new(AtomicBool::new(false));
         let progress = AtomicUsize::new(0);
-        let mut watch = Box::pin(monitor_first(PendingBody(closed.clone()), poll_fn(|_| {
-            progress.fetch_add(1, Ordering::AcqRel);
-            Poll::Pending::<Result<(), ()>>
-        })));
+        let mut watch = Box::pin(monitor_first(
+            PendingBody(closed.clone()),
+            poll_fn(|_| {
+                progress.fetch_add(1, Ordering::AcqRel);
+                Poll::Pending::<Result<(), ()>>
+            }),
+        ));
         let waker = waker();
         let mut context = std::task::Context::from_waker(&waker);
         assert!(watch.as_mut().poll(&mut context).is_pending());
@@ -543,27 +863,44 @@ mod tests {
     #[test]
     fn machine_watch_never_retries_unrelated_failures_as_invalidation() {
         let cancel = McpRequestCancellation::new();
-        let cancelled: ClientCredentialsCatalogError = ClientCredentialsError::from(OAuthDiscoveryError::Cancelled).into();
+        let cancelled: ClientCredentialsCatalogError =
+            ClientCredentialsError::from(OAuthDiscoveryError::Cancelled).into();
         assert!(!is_invalidation_stop(&cancelled, &cancel));
         cancel.cancel();
         assert!(is_invalidation_stop(&cancelled, &cancel));
-        for error in [ManagedCatalogError::InvalidPage.into(), ManagedCatalogError::AbortedByHost.into(),
-            ManagedCatalogError::CredentialChanged.into(), ClientCredentialsError::Transport.into(),
-            ManagedCoreError::HttpStatus { status: 503 }.into()]
-        { assert!(!is_invalidation_stop(&error, &cancel)); }
+        for error in [
+            ManagedCatalogError::InvalidPage.into(),
+            ManagedCatalogError::AbortedByHost.into(),
+            ManagedCatalogError::CredentialChanged.into(),
+            ClientCredentialsError::Transport.into(),
+            ManagedCoreError::HttpStatus { status: 503 }.into(),
+        ] {
+            assert!(!is_invalidation_stop(&error, &cancel));
+        }
     }
 
     #[test]
     fn machine_watch_id_budget_covers_listen_and_every_discovery_pair() {
         let mut next = 0;
-        let limits = ClientCredentialsCatalogWatchLimits::new(Duration::from_secs(1), 2, 4, 4096, 2).unwrap();
-        let ids = Mutex::new(WatchIds { next: || {
-            next += 2;
-            Ok((RequestId::Number(next - 1), RequestId::Number(next)))
-        }, history: Traversal::default(), limits });
+        let limits =
+            ClientCredentialsCatalogWatchLimits::new(Duration::from_secs(1), 2, 4, 4096, 2)
+                .unwrap();
+        let ids = Mutex::new(WatchIds {
+            next: || {
+                next += 2;
+                Ok((RequestId::Number(next - 1), RequestId::Number(next)))
+            },
+            history: Traversal::default(),
+            limits,
+        });
         issue_pair(&ids).unwrap();
         issue_pair(&ids).unwrap();
-        assert!(matches!(issue_pair(&ids), Err(ClientCredentialsCatalogError::Catalog(ManagedCatalogError::StateLimit))));
+        assert!(matches!(
+            issue_pair(&ids),
+            Err(ClientCredentialsCatalogError::Catalog(
+                ManagedCatalogError::StateLimit
+            ))
+        ));
         assert_eq!(ids.lock().unwrap().history.ids.len(), 4);
         drop(ids);
         assert_eq!(next, 4);
@@ -576,21 +913,43 @@ mod tests {
         let prompts = CatalogKind::Prompts.result_set();
         let before_tools = fences.lock().unwrap().begin_fetch(&tools);
         let before_prompts = fences.lock().unwrap().begin_fetch(&prompts);
-        drop(InvalidateOnExit { invalidation: fences.clone(), kind: CatalogKind::Tools });
+        drop(InvalidateOnExit {
+            invalidation: fences.clone(),
+            kind: CatalogKind::Tools,
+        });
         assert_ne!(before_tools, fences.lock().unwrap().begin_fetch(&tools));
         assert_eq!(before_prompts, fences.lock().unwrap().begin_fetch(&prompts));
     }
 
     #[test]
     fn machine_watch_classifies_changes_and_rejects_unbounded_policies() {
-        let tools = ServerNotification::decode(&JsonRpcRequest::notification("notifications/tools/list_changed", None)).unwrap();
+        let tools = ServerNotification::decode(&JsonRpcRequest::notification(
+            "notifications/tools/list_changed",
+            None,
+        ))
+        .unwrap();
         assert!(relevant(CatalogKind::Tools, &tools));
         assert!(!relevant(CatalogKind::Resources, &tools));
         for (timeout, collections, ids, bytes, records) in [
-            (0,1,4,1,2),(3601,1,4,1,2),(1,0,4,1,2),(1,1025,4,1,2),
-            (1,1,3,1,2),(1,1,4097,1,2),(1,1,4,0,2),(1,1,4,1,1),
+            (0, 1, 4, 1, 2),
+            (3601, 1, 4, 1, 2),
+            (1, 0, 4, 1, 2),
+            (1, 1025, 4, 1, 2),
+            (1, 1, 3, 1, 2),
+            (1, 1, 4097, 1, 2),
+            (1, 1, 4, 0, 2),
+            (1, 1, 4, 1, 1),
         ] {
-            assert!(ClientCredentialsCatalogWatchLimits::new(Duration::from_secs(timeout), collections, ids, bytes, records).is_err());
+            assert!(
+                ClientCredentialsCatalogWatchLimits::new(
+                    Duration::from_secs(timeout),
+                    collections,
+                    ids,
+                    bytes,
+                    records
+                )
+                .is_err()
+            );
         }
     }
 }

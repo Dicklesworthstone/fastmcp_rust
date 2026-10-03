@@ -402,7 +402,10 @@ mod tests {
             exclusive: true,
             issue_id: "bd-x".to_owned(),
             expires_at: NOW + 7200,
-            history: vec![Renewal { at: CLAIMED - 10, until: NOW + 7200 }],
+            history: vec![Renewal {
+                at: CLAIMED - 10,
+                until: NOW + 7200,
+            }],
         }
     }
 
@@ -504,8 +507,14 @@ mod tests {
         let mut short_close = snapshot();
         short_close.leases[0].expires_at = NOW + 60;
         assert!(
-            !validate(&declaration(), Some(&short_close), Pass::Close, NOW, CLAIMED)
-                .has(Code::ReservationInsufficientRemaining)
+            !validate(
+                &declaration(),
+                Some(&short_close),
+                Pass::Close,
+                NOW,
+                CLAIMED
+            )
+            .has(Code::ReservationInsufficientRemaining)
         );
     }
 
@@ -542,8 +551,14 @@ mod tests {
         let mut glob = declaration();
         glob.paths = vec!["**".to_owned()];
         assert!(
-            validate(&glob, Some(&snapshot()), Pass::DeclarationOnly, NOW, CLAIMED)
-                .has(Code::ReservationPathTooBroad)
+            validate(
+                &glob,
+                Some(&snapshot()),
+                Pass::DeclarationOnly,
+                NOW,
+                CLAIMED
+            )
+            .has(Code::ReservationPathTooBroad)
         );
     }
 
@@ -583,27 +598,40 @@ mod tests {
     fn close_rejects_a_renewal_gap_and_accepts_contiguous_coverage() {
         let mut gapped = snapshot();
         gapped.leases[0].history = vec![
-            Renewal { at: CLAIMED - 10, until: CLAIMED + 100 },
+            Renewal {
+                at: CLAIMED - 10,
+                until: CLAIMED + 100,
+            },
             // Reacquired after a lapse.
-            Renewal { at: CLAIMED + 500, until: NOW + 7200 },
+            Renewal {
+                at: CLAIMED + 500,
+                until: NOW + 7200,
+            },
         ];
         let report = validate(&declaration(), Some(&gapped), Pass::Close, NOW, CLAIMED);
         assert!(report.has(Code::ReservationRenewalGap));
 
         let mut contiguous = snapshot();
         contiguous.leases[0].history = vec![
-            Renewal { at: CLAIMED - 10, until: CLAIMED + 600 },
-            Renewal { at: CLAIMED + 500, until: NOW + 7200 },
+            Renewal {
+                at: CLAIMED - 10,
+                until: CLAIMED + 600,
+            },
+            Renewal {
+                at: CLAIMED + 500,
+                until: NOW + 7200,
+            },
         ];
-        assert!(
-            validate(&declaration(), Some(&contiguous), Pass::Close, NOW, CLAIMED).is_clean()
-        );
+        assert!(validate(&declaration(), Some(&contiguous), Pass::Close, NOW, CLAIMED).is_clean());
     }
 
     #[test]
     fn close_rejects_a_history_that_starts_after_the_claim() {
         let mut late = snapshot();
-        late.leases[0].history = vec![Renewal { at: CLAIMED + 1, until: NOW + 7200 }];
+        late.leases[0].history = vec![Renewal {
+            at: CLAIMED + 1,
+            until: NOW + 7200,
+        }];
         assert!(
             validate(&declaration(), Some(&late), Pass::Close, NOW, CLAIMED)
                 .has(Code::ReservationRenewalGap)

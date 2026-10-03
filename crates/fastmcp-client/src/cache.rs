@@ -1437,8 +1437,15 @@ mod tests {
         let FinalCacheLookup::Fresh(retained) = cache.lookup_at(&cache_key, receipt) else {
             panic!("re-enabling must make the original entry available");
         };
-        assert_eq!(retained.encode().expect("retained result encodes"), expected);
-        assert_eq!(cache.stats().fills, 1, "late fills did not mutate the cache");
+        assert_eq!(
+            retained.encode().expect("retained result encodes"),
+            expected
+        );
+        assert_eq!(
+            cache.stats().fills,
+            1,
+            "late fills did not mutate the cache"
+        );
 
         let current = cache.begin_fetch(cache_key.result_set());
         assert_eq!(

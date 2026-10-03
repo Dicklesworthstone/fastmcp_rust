@@ -9,7 +9,9 @@ use std::task::Poll;
 
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener, TcpStream};
-use asupersync::tls::{Certificate, CertificateChain, PrivateKey, TlsAcceptor, TlsAcceptorBuilder, TlsStream};
+use asupersync::tls::{
+    Certificate, CertificateChain, PrivateKey, TlsAcceptor, TlsAcceptorBuilder, TlsStream,
+};
 use fastmcp_client::http_auth::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError};
 use fastmcp_core::CanonicalHttpUrl;
 use serde_json::{Value, json};
@@ -24,15 +26,28 @@ pub async fn pair<L: Future, R: Future>(left: L, right: R) -> (L::Output, R::Out
     let mut one = None;
     let mut two = None;
     poll_fn(|cx| {
-        if one.is_none() && let Poll::Ready(value) = left.as_mut().poll(cx) { one = Some(value); }
-        if two.is_none() && let Poll::Ready(value) = right.as_mut().poll(cx) { two = Some(value); }
+        if one.is_none()
+            && let Poll::Ready(value) = left.as_mut().poll(cx)
+        {
+            one = Some(value);
+        }
+        if two.is_none()
+            && let Poll::Ready(value) = right.as_mut().poll(cx)
+        {
+            two = Some(value);
+        }
         if one.is_some() && two.is_some() {
             Poll::Ready((one.take().unwrap(), two.take().unwrap()))
-        } else { Poll::Pending }
-    }).await
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
 }
 
-fn url(value: &str) -> CanonicalHttpUrl { CanonicalHttpUrl::parse(value).unwrap() }
+fn url(value: &str) -> CanonicalHttpUrl {
+    CanonicalHttpUrl::parse(value).unwrap()
+}
 
 fn decode_component(value: &str) -> String {
     let mut decoded = Vec::new();
@@ -52,22 +67,39 @@ fn decode_component(value: &str) -> String {
 }
 
 fn form(value: &str) -> BTreeMap<String, String> {
-    value.split('&').map(|field| {
-        let (key, value) = field.split_once('=').unwrap();
-        (decode_component(key), decode_component(value))
-    }).collect()
+    value
+        .split('&')
+        .map(|field| {
+            let (key, value) = field.split_once('=').unwrap();
+            (decode_component(key), decode_component(value))
+        })
+        .collect()
 }
 
 pub async fn browser(authorization: CanonicalHttpUrl) -> Result<(), OAuthError> {
     let params = form(authorization.query().unwrap());
     assert_eq!(params["client_id"], "typed-client");
     assert_eq!(params["code_challenge_method"], "S256");
-    let address: SocketAddr = params["redirect_uri"].strip_prefix("http://").unwrap()
-        .split('/').next().unwrap().parse().unwrap();
+    let address: SocketAddr = params["redirect_uri"]
+        .strip_prefix("http://")
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
     assert!(address.ip().is_loopback());
-    let request = format!("GET /oauth/callback?code=typed-code&iss=https%3A%2F%2Fissuer.example&state={} HTTP/1.1\r\nHost: {address}\r\n\r\n", params["state"]);
-    let mut socket = TcpStream::connect(address).await.map_err(|_| OAuthError::CallbackRejected)?;
-    socket.write_all(request.as_bytes()).await.map_err(|_| OAuthError::CallbackRejected)
+    let request = format!(
+        "GET /oauth/callback?code=typed-code&iss=https%3A%2F%2Fissuer.example&state={} HTTP/1.1\r\nHost: {address}\r\n\r\n",
+        params["state"]
+    );
+    let mut socket = TcpStream::connect(address)
+        .await
+        .map_err(|_| OAuthError::CallbackRejected)?;
+    socket
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|_| OAuthError::CallbackRejected)
 }
 
 pub struct Peer {
@@ -81,18 +113,37 @@ impl Peer {
     pub async fn new() -> Self {
         Self {
             listener: TcpListener::bind("127.0.0.1:0").await.unwrap(),
-            acceptor: TlsAcceptorBuilder::new(CertificateChain::from_pem(LEAF).unwrap(), PrivateKey::from_pem(KEY).unwrap())
-                .alpn_protocols(vec![b"http/1.1".to_vec()]).build().unwrap(),
-            token_posts: AtomicUsize::new(0), mcp_posts: AtomicUsize::new(0),
+            acceptor: TlsAcceptorBuilder::new(
+                CertificateChain::from_pem(LEAF).unwrap(),
+                PrivateKey::from_pem(KEY).unwrap(),
+            )
+            .alpn_protocols(vec![b"http/1.1".to_vec()])
+            .build()
+            .unwrap(),
+            token_posts: AtomicUsize::new(0),
+            mcp_posts: AtomicUsize::new(0),
         }
     }
-    fn resource(&self) -> String { format!("https://{}/mcp", self.listener.local_addr().unwrap()) }
+    fn resource(&self) -> String {
+        format!("https://{}/mcp", self.listener.local_addr().unwrap())
+    }
     pub fn client(&self) -> OAuthClient {
-        OAuthClient::new(OAuthClientConfiguration::from_trusted_endpoints(
-            "https://issuer.example", url("https://issuer.example/authorize"),
-            url(&format!("https://{}/token", self.listener.local_addr().unwrap())),
-            url(&self.resource()), "typed-client", vec!["tools:read".to_owned()],
-        ).unwrap().with_extra_root_certificate(Certificate::from_pem(ROOT).unwrap().remove(0)).unwrap())
+        OAuthClient::new(
+            OAuthClientConfiguration::from_trusted_endpoints(
+                "https://issuer.example",
+                url("https://issuer.example/authorize"),
+                url(&format!(
+                    "https://{}/token",
+                    self.listener.local_addr().unwrap()
+                )),
+                url(&self.resource()),
+                "typed-client",
+                vec!["tools:read".to_owned()],
+            )
+            .unwrap()
+            .with_extra_root_certificate(Certificate::from_pem(ROOT).unwrap().remove(0))
+            .unwrap(),
+        )
     }
     async fn request(&self, path: &str) -> (TlsStream<TcpStream>, Vec<u8>) {
         let (socket, _) = self.listener.accept().await.unwrap();
@@ -103,13 +154,20 @@ impl Peer {
             let count = tls.read(&mut buffer).await.unwrap();
             assert!(count > 0 && bytes.len() + count <= 16 * 1024);
             bytes.extend_from_slice(&buffer[..count]);
-            if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") { break index + 4; }
+            if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                break index + 4;
+            }
         };
         let head = std::str::from_utf8(&bytes[..end]).unwrap().to_owned();
         assert!(head.starts_with(&format!("POST {path} HTTP/1.1\r\n")));
-        let headers: BTreeMap<String, String> = head.lines().skip(1).filter_map(|line| {
-            line.split_once(':').map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
-        }).collect();
+        let headers: BTreeMap<String, String> = head
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                line.split_once(':')
+                    .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+            })
+            .collect();
         let length: usize = headers["content-length"].parse().unwrap();
         assert!(end + length <= 16 * 1024);
         while bytes.len() < end + length {
@@ -130,11 +188,18 @@ impl Peer {
         } else {
             assert_eq!(headers["authorization"], "Bearer typed-access");
             assert_eq!(headers["mcp-protocol-version"], "2026-07-28");
-            for forbidden in ["mcp-session-id", "last-event-id", "cookie"] { assert!(!headers.contains_key(forbidden)); }
-            assert!(!headers.keys().any(|name| name.starts_with("mcp-param-")), "annotations are not disclosure consent");
+            for forbidden in ["mcp-session-id", "last-event-id", "cookie"] {
+                assert!(!headers.contains_key(forbidden));
+            }
+            assert!(
+                !headers.keys().any(|name| name.starts_with("mcp-param-")),
+                "annotations are not disclosure consent"
+            );
             let envelope: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(headers["mcp-method"], envelope["method"].as_str().unwrap());
-            if envelope["method"] == "tools/call" { assert_eq!(headers["mcp-name"], "calculate"); }
+            if envelope["method"] == "tools/call" {
+                assert_eq!(headers["mcp-name"], "calculate");
+            }
             self.mcp_posts.fetch_add(1, Ordering::SeqCst);
         }
         (tls, body)
@@ -148,7 +213,10 @@ impl Peer {
         let request: Value = serde_json::from_slice(&request).unwrap();
         assert_eq!(request["id"], id);
         assert_eq!(request["method"], "subscriptions/listen");
-        assert_eq!(request["params"]["notifications"], json!({"toolsListChanged":true}));
+        assert_eq!(
+            request["params"]["notifications"],
+            json!({"toolsListChanged":true})
+        );
         tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
         chunk(&mut tls, &json!({"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged",
             "params":{"_meta":{"io.modelcontextprotocol/subscriptionId":id},"notifications":{"toolsListChanged":true}}
@@ -166,11 +234,17 @@ impl Peer {
         // schema-shaped values inside it cannot create validators or headers.
         input["x-ui"] = json!({"type":42,"$ref":"https://unregistered.example/schema",
             "properties":{"hidden":{"x-mcp-header":"Invalid\r\nHeader"}}});
-        if invalid { input["properties"]["count"]["minimum"] = json!("not-a-number"); }
+        if invalid {
+            input["properties"]["count"]["minimum"] = json!("not-a-number");
+        }
         let result = json!({"resultType":"complete","tools":[{"name":"calculate","inputSchema":input,
             "outputSchema":{"type":"object","properties":{"total":{"type":"integer"}},"required":["total"]}
         }],"ttlMs":0,"cacheScope":"private"});
-        json_reply(&mut tls, &json!({"jsonrpc":"2.0","id":id,"result":result}).to_string()).await;
+        json_reply(
+            &mut tls,
+            &json!({"jsonrpc":"2.0","id":id,"result":result}).to_string(),
+        )
+        .await;
     }
     pub async fn call(&self, id: i64, count: i64) {
         let (mut tls, request) = self.request("/mcp").await;
@@ -183,12 +257,18 @@ impl Peer {
     }
     pub fn no_extra_connections(&self) {
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(self.listener.poll_accept(&mut cx).is_pending(), "no implicit replay, reconnect or stale-handle POST");
+        assert!(
+            self.listener.poll_accept(&mut cx).is_pending(),
+            "no implicit replay, reconnect or stale-handle POST"
+        );
     }
 }
 
 async fn json_reply(tls: &mut TlsStream<TcpStream>, body: &str) {
-    let wire = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+    let wire = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
     tls.write_all(wire.as_bytes()).await.unwrap();
     tls.flush().await.unwrap();
 }
@@ -196,11 +276,16 @@ async fn json_reply(tls: &mut TlsStream<TcpStream>, body: &str) {
 pub async fn chunk(tls: &mut TlsStream<TcpStream>, payload: &str, terminal: bool) {
     let body = format!("data: {payload}\n\n");
     let end = if terminal { "0\r\n\r\n" } else { "" };
-    tls.write_all(format!("{:X}\r\n{body}\r\n{end}", body.len()).as_bytes()).await.unwrap();
+    tls.write_all(format!("{:X}\r\n{body}\r\n{end}", body.len()).as_bytes())
+        .await
+        .unwrap();
     tls.flush().await.unwrap();
 }
 
 pub async fn closed(tls: &mut TlsStream<TcpStream>) {
     let mut byte = [0];
-    assert!(!matches!(tls.read(&mut byte).await, Ok(count) if count > 0), "the watch must close its owned stream");
+    assert!(
+        !matches!(tls.read(&mut byte).await, Ok(count) if count > 0),
+        "the watch must close its owned stream"
+    );
 }

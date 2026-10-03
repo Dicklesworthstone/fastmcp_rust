@@ -408,8 +408,7 @@ fn skip_raw_string(bytes: &[u8], start: usize) -> usize {
             let run = &bytes[closing..closing + hashes.min(bytes.len() - closing)];
             // The slice is capped at `hashes`, so "all hashes" is exactly the old
             // `count() >= hashes`: it can only hold when the run is full length.
-            if run.len() == hashes && run.iter().all(|byte| *byte == b'#')
-            {
+            if run.len() == hashes && run.iter().all(|byte| *byte == b'#') {
                 return closing + hashes;
             }
         }
@@ -3061,10 +3060,7 @@ fn fnd_04_b_planted_negative() {
 /// is the whole point of these two tests — they run identically on a worker with
 /// no repository, which is where the FND-04 conformance target actually executes.
 fn fnd_04_packed_ref_fixture_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "fnd04-packed-ref-{tag}-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("fnd04-packed-ref-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("packed-refs fixture directory is creatable");
     dir

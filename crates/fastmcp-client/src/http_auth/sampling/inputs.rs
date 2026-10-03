@@ -24,9 +24,9 @@ use fastmcp_protocol::{
 };
 
 use super::{
-    SamplingContentBlock, SamplingHost, SamplingHostError, SamplingHostFuture,
-    SamplingRunError, SamplingRunLimits, SamplingToolLoop, check, deadline,
-    encoded_size, run_sampling_tool_loop, within,
+    SamplingContentBlock, SamplingHost, SamplingHostError, SamplingHostFuture, SamplingRunError,
+    SamplingRunLimits, SamplingToolLoop, check, deadline, encoded_size, run_sampling_tool_loop,
+    within,
 };
 use crate::http_auth::rpc::interaction::{
     ManagedInputReply, ManagedInteractionError, admit_embedded_input, validate_initial,
@@ -56,21 +56,34 @@ impl SamplingInputLimits {
         input_bytes: usize,
         reply_bytes: usize,
     ) -> Result<Self, SamplingInputError> {
-        if inputs > 128 || model_rounds > 1024 || tool_calls > 4096
+        if inputs > 128
+            || model_rounds > 1024
+            || tool_calls > 4096
             || !(2..=MAX_BATCH_BYTES).contains(&input_bytes)
             || !(2..=MAX_BATCH_BYTES).contains(&reply_bytes)
         {
             return Err(SamplingInputError::InvalidLimits);
         }
-        Ok(Self { run, inputs, model_rounds, tool_calls, input_bytes, reply_bytes })
+        Ok(Self {
+            run,
+            inputs,
+            model_rounds,
+            tool_calls,
+            input_bytes,
+            reply_bytes,
+        })
     }
 }
 
 impl Default for SamplingInputLimits {
     fn default() -> Self {
         Self {
-            run: SamplingRunLimits::default(), inputs: 8, model_rounds: 64,
-            tool_calls: 256, input_bytes: 4 * 1024 * 1024, reply_bytes: 4 * 1024 * 1024,
+            run: SamplingRunLimits::default(),
+            inputs: 8,
+            model_rounds: 64,
+            tool_calls: 256,
+            input_bytes: 4 * 1024 * 1024,
+            reply_bytes: 4 * 1024 * 1024,
         }
     }
 }
@@ -101,7 +114,9 @@ impl fmt::Display for SamplingInputError {
 }
 impl std::error::Error for SamplingInputError {}
 impl From<SamplingRunError> for SamplingInputError {
-    fn from(error: SamplingRunError) -> Self { Self::Run(error) }
+    fn from(error: SamplingRunError) -> Self {
+        Self::Run(error)
+    }
 }
 
 /// Resolves all sampling descriptors in one consumed input-required result.
@@ -140,21 +155,33 @@ pub async fn resolve_sampling_inputs<H: SamplingHost + ?Sized>(
     limits: SamplingInputLimits,
     host: &mut H,
 ) -> Result<ManagedInputReply, SamplingInputError> {
-    request_id.validate().map_err(|_| SamplingInputError::InvalidRequestId)?;
+    request_id
+        .validate()
+        .map_err(|_| SamplingInputError::InvalidRequestId)?;
     validate_initial(original).map_err(|_| SamplingInputError::InvalidRequest)?;
-    let original_params = original.encode_params().map_err(|_| SamplingInputError::InvalidRequest)?
+    let original_params = original
+        .encode_params()
+        .map_err(|_| SamplingInputError::InvalidRequest)?
         .ok_or(SamplingInputError::InvalidRequest)?;
     let capabilities = &original_params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY];
-    let context_advertised = capabilities["sampling"].get("context")
+    let context_advertised = capabilities["sampling"]
+        .get("context")
         .is_some_and(serde_json::Value::is_object);
     let end = deadline(cx, cancellation, limits.run.timeout)?;
     let Some(map) = input.input_requests() else {
         check(cx, cancellation, end)?;
-        return Ok(ManagedInputReply { request_id, input_responses: None });
+        return Ok(ManagedInputReply {
+            request_id,
+            input_responses: None,
+        });
     };
-    if map.members().len() > limits.inputs { return Err(SamplingInputError::InputLimit); }
+    if map.members().len() > limits.inputs {
+        return Err(SamplingInputError::InputLimit);
+    }
     // At least one model call is necessary for every nonempty conversation.
-    if map.members().len() > limits.model_rounds { return Err(SamplingInputError::ModelRoundLimit); }
+    if map.members().len() > limits.model_rounds {
+        return Err(SamplingInputError::ModelRoundLimit);
+    }
     let mut requests = Vec::with_capacity(map.members().len());
     let mut input_bytes = 2_usize; // Braces, including the present-empty case.
     let mut context_ignored = false;
@@ -163,20 +190,29 @@ pub async fn resolve_sampling_inputs<H: SamplingHost + ?Sized>(
         // ExactJsonObject is the protocol's bounded, duplicate-aware input
         // boundary. Conversion of one descriptor is therefore independently
         // bounded even before this smaller aggregate policy is enforced.
-        let value = exact_json_to_serde(&member.value).map_err(|_| SamplingInputError::InvalidInput)?;
+        let value =
+            exact_json_to_serde(&member.value).map_err(|_| SamplingInputError::InvalidInput)?;
         let key_bytes = encoded_size(&member.name, limits.input_bytes - input_bytes)
             .map_err(|_| SamplingInputError::InputByteLimit)?;
         let value_bytes = encoded_size(&value, limits.input_bytes - input_bytes)
             .map_err(|_| SamplingInputError::InputByteLimit)?;
-        input_bytes = input_bytes.checked_add(key_bytes).and_then(|n| n.checked_add(value_bytes))
+        input_bytes = input_bytes
+            .checked_add(key_bytes)
+            .and_then(|n| n.checked_add(value_bytes))
             .and_then(|n| n.checked_add(1 + usize::from(index != 0)))
-            .filter(|n| *n <= limits.input_bytes).ok_or(SamplingInputError::InputByteLimit)?;
+            .filter(|n| *n <= limits.input_bytes)
+            .ok_or(SamplingInputError::InputByteLimit)?;
         let ignore_context = !context_advertised
-            && value["params"].get("includeContext").is_some_and(|context| context != "none");
-        let descriptor = admit_embedded_input(capabilities, value).map_err(|error| match error {
-            ManagedInteractionError::CapabilityNotAdvertised => SamplingInputError::CapabilityNotAdvertised,
-            _ => SamplingInputError::InvalidInput,
-        })?;
+            && value["params"]
+                .get("includeContext")
+                .is_some_and(|context| context != "none");
+        let descriptor =
+            admit_embedded_input(capabilities, value).map_err(|error| match error {
+                ManagedInteractionError::CapabilityNotAdvertised => {
+                    SamplingInputError::CapabilityNotAdvertised
+                }
+                _ => SamplingInputError::InvalidInput,
+            })?;
         let FinalEmbeddedInputRequest::Sampling(mut request) = descriptor else {
             return Err(SamplingInputError::UnsupportedInput);
         };
@@ -195,8 +231,11 @@ pub async fn resolve_sampling_inputs<H: SamplingHost + ?Sized>(
         log::warn!("Ignoring sampling includeContext because sampling.context was not advertised");
     }
     let mut budgeted = BatchHost {
-        host, models: limits.model_rounds, tools: limits.tool_calls,
-        result_bytes: limits.run.tool_result_bytes, refusal: None,
+        host,
+        models: limits.model_rounds,
+        tools: limits.tool_calls,
+        result_bytes: limits.run.tool_result_bytes,
+        refusal: None,
     };
     // An outer guarded wait caps all nested runs at the original deadline.
     // The inner runner's per-conversation deadline can never extend this one.
@@ -204,28 +243,38 @@ pub async fn resolve_sampling_inputs<H: SamplingHost + ?Sized>(
         let mut entries = Vec::with_capacity(requests.len());
         let mut reply_bytes = 2_usize;
         for (index, (key, request)) in requests.into_iter().enumerate() {
-            let run = run_sampling_tool_loop(cx, cancellation, request, limits.run, &mut budgeted).await?;
+            let run = run_sampling_tool_loop(cx, cancellation, request, limits.run, &mut budgeted)
+                .await?;
             let key_bytes = encoded_size(&key, limits.reply_bytes - reply_bytes)?;
             let value_bytes = encoded_size(&run.response, limits.reply_bytes - reply_bytes)?;
-            let Some(total) = reply_bytes.checked_add(key_bytes).and_then(|n| n.checked_add(value_bytes))
+            let Some(total) = reply_bytes
+                .checked_add(key_bytes)
+                .and_then(|n| n.checked_add(value_bytes))
                 .and_then(|n| n.checked_add(1 + usize::from(index != 0)))
-                .filter(|n| *n <= limits.reply_bytes) else {
+                .filter(|n| *n <= limits.reply_bytes)
+            else {
                 return Err(SamplingRunError::ToolResultByteLimit);
             };
             reply_bytes = total;
             entries.push((key, FinalEmbeddedInputResponse::Sampling(run.response)));
         }
         Ok(entries)
-    }).await;
+    })
+    .await;
     let entries = match outcome {
         Ok(entries) => entries,
         Err(error) => {
             // Host-budget refusals do not masquerade as provider failures. A
             // simultaneous timeout/cancellation still takes precedence.
-            if matches!(error, SamplingRunError::Cancelled | SamplingRunError::TimedOut) {
+            if matches!(
+                error,
+                SamplingRunError::Cancelled | SamplingRunError::TimedOut
+            ) {
                 return Err(error.into());
             }
-            if let Some(refusal) = budgeted.refusal { return Err(refusal); }
+            if let Some(refusal) = budgeted.refusal {
+                return Err(refusal);
+            }
             if error == SamplingRunError::ToolResultByteLimit {
                 return Err(SamplingInputError::ReplyByteLimit);
             }
@@ -234,9 +283,14 @@ pub async fn resolve_sampling_inputs<H: SamplingHost + ?Sized>(
     };
     let responses = FinalInputResponses::try_from_entries(entries)
         .map_err(|_| SamplingInputError::InvalidInput)?;
-    responses.validate_against_input_required(&input).map_err(|_| SamplingInputError::InvalidInput)?;
+    responses
+        .validate_against_input_required(&input)
+        .map_err(|_| SamplingInputError::InvalidInput)?;
     check(cx, cancellation, end)?;
-    Ok(ManagedInputReply { request_id, input_responses: Some(responses) })
+    Ok(ManagedInputReply {
+        request_id,
+        input_responses: Some(responses),
+    })
 }
 
 struct BatchHost<'a, H: ?Sized> {
@@ -249,7 +303,9 @@ struct BatchHost<'a, H: ?Sized> {
 
 impl<H: SamplingHost + ?Sized> SamplingHost for BatchHost<'_, H> {
     fn sample<'a>(
-        &'a mut self, cx: &'a Cx, cancellation: &'a McpRequestCancellation,
+        &'a mut self,
+        cx: &'a Cx,
+        cancellation: &'a McpRequestCancellation,
         request: &'a FinalEmbeddedCreateMessageParams,
     ) -> SamplingHostFuture<'a, FinalCreateMessageResult> {
         if self.models == 0 {
@@ -261,14 +317,20 @@ impl<H: SamplingHost + ?Sized> SamplingHost for BatchHost<'_, H> {
     }
 
     fn approve_tools<'a>(
-        &'a mut self, cx: &'a Cx, cancellation: &'a McpRequestCancellation,
+        &'a mut self,
+        cx: &'a Cx,
+        cancellation: &'a McpRequestCancellation,
         calls: &'a [SamplingContentBlock],
     ) -> SamplingHostFuture<'a, ()> {
         // A tool batch must fit in full and leave a model round to consume its
         // results before even the host approval callback can run.
-        let refusal = if self.models == 0 { Some(SamplingInputError::ModelRoundLimit) }
-            else if calls.len() > self.tools { Some(SamplingInputError::ToolCallLimit) }
-            else { None };
+        let refusal = if self.models == 0 {
+            Some(SamplingInputError::ModelRoundLimit)
+        } else if calls.len() > self.tools {
+            Some(SamplingInputError::ToolCallLimit)
+        } else {
+            None
+        };
         if let Some(refusal) = refusal {
             self.refusal = Some(refusal);
             return Box::pin(std::future::ready(Err(SamplingHostError::Failed)));
@@ -277,7 +339,9 @@ impl<H: SamplingHost + ?Sized> SamplingHost for BatchHost<'_, H> {
     }
 
     fn execute_tool<'a>(
-        &'a mut self, cx: &'a Cx, cancellation: &'a McpRequestCancellation,
+        &'a mut self,
+        cx: &'a Cx,
+        cancellation: &'a McpRequestCancellation,
         call: &'a SamplingContentBlock,
     ) -> SamplingHostFuture<'a, SamplingContentBlock> {
         if self.tools == 0 {

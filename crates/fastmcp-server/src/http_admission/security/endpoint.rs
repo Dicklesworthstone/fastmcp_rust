@@ -22,11 +22,16 @@ use std::task::Poll;
 use std::time::Duration;
 
 use asupersync::{Cx, channel::oneshot, time::Sleep};
-use fastmcp_transport::{http::{HttpRequest, HttpResponse}, sse::SseEvent};
+use fastmcp_transport::{
+    http::{HttpRequest, HttpResponse},
+    sse::SseEvent,
+};
 
-use revalidation::{SseAuthorizationError, SseAuthorizationLease};
 use super::{CorsResponseHeaders, HttpSecurityError, HttpSecurityHead, HttpSecurityPolicy};
-use crate::{ServerHttpEndpoint, ServerHttpEndpointResponse, ServerHttpSession, ServerHttpSseResponse};
+use crate::{
+    ServerHttpEndpoint, ServerHttpEndpointResponse, ServerHttpSession, ServerHttpSseResponse,
+};
+use revalidation::{SseAuthorizationError, SseAuthorizationLease};
 
 /// Response bytes/head plus an optional native SSE body with its owning session.
 /// An immediate response carries its buffered body; a stream carries it in the
@@ -38,8 +43,12 @@ pub struct SecuredHttpEndpointResponse {
 }
 
 impl SecuredHttpEndpointResponse {
-    pub fn response(&self) -> &HttpResponse { &self.response }
-    pub fn is_streaming(&self) -> bool { self.stream.is_some() }
+    pub fn response(&self) -> &HttpResponse {
+        &self.response
+    }
+    pub fn is_streaming(&self) -> bool {
+        self.stream.is_some()
+    }
 
     /// Write this head before driving the stream on the caller's Cx. Its CORS
     /// headers are authoritative; the native body's old response head is not.
@@ -47,7 +56,12 @@ impl SecuredHttpEndpointResponse {
         (self.response, self.stream)
     }
 
-    fn immediate(response: HttpResponse) -> Self { Self { response, stream: None } }
+    fn immediate(response: HttpResponse) -> Self {
+        Self {
+            response,
+            stream: None,
+        }
+    }
 }
 
 /// A native SSE response and the session owning its dispatch. Call `close`
@@ -69,7 +83,9 @@ impl SecuredHttpSseResponse {
     /// Revalidating or already-closed responses return None; use `next_event`
     /// instead. This prevents a host from accidentally bypassing the guard.
     pub fn stream(&mut self) -> Option<&mut ServerHttpSseResponse> {
-        if self.authorization.is_some() { return None; }
+        if self.authorization.is_some() {
+            return None;
+        }
         self.stream.as_deref_mut()
     }
 
@@ -79,23 +95,34 @@ impl SecuredHttpSseResponse {
     /// Only a delivered terminal response permits a later successful None.
     /// The host must close on error; an already-written 200 head cannot become
     /// a new authentication challenge, and no success terminal is fabricated.
-    pub async fn next_event(&mut self, cx: &Cx) -> Result<Option<SseEvent>, SecuredHttpEndpointError> {
-        if self.finished { return Ok(None); }
-        let stream = self.stream.take().ok_or(SecuredHttpEndpointError::BodyClosed)?;
+    pub async fn next_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<SseEvent>, SecuredHttpEndpointError> {
+        if self.finished {
+            return Ok(None);
+        }
+        let stream = self
+            .stream
+            .take()
+            .ok_or(SecuredHttpEndpointError::BodyClosed)?;
         let mut authorization = self.authorization.take();
         let event = guard_response(cx, &mut authorization, async {
             loop {
                 checkpoint(cx)?;
                 match stream.pop_event() {
                     Ok(Some(event)) => return Ok::<_, SecuredHttpEndpointError>(event),
-                    Ok(None) if !stream.is_finished() => {},
+                    Ok(None) if !stream.is_finished() => {}
                     Ok(None) => return Err(SecuredHttpEndpointError::BodyClosed),
                     Err(_) => return Err(SecuredHttpEndpointError::BodyFailed),
                 }
-                if cx.timer_driver().is_none() { return Err(SecuredHttpEndpointError::TimerUnavailable); }
+                if cx.timer_driver().is_none() {
+                    return Err(SecuredHttpEndpointError::TimerUnavailable);
+                }
                 asupersync::time::sleep(cx.now(), Duration::from_millis(10)).await;
             }
-        }).await??;
+        })
+        .await??;
         self.finished = crate::final_subscription_terminal_response_event(&event);
         self.stream = Some(stream);
         self.authorization = authorization;
@@ -107,7 +134,9 @@ impl SecuredHttpSseResponse {
     pub async fn close(&mut self, cx: &Cx) {
         self.stream = None;
         self.authorization = None;
-        if let Some(mut session) = self.session.take() { session.close(cx).await; }
+        if let Some(mut session) = self.session.take() {
+            session.close(cx).await;
+        }
     }
 }
 
@@ -168,20 +197,41 @@ impl ServerHttpEndpoint {
         request: HttpRequest,
     ) -> Result<SecuredHttpEndpointResponse, SecuredHttpEndpointError> {
         checkpoint(cx)?;
-        if self.server.configured_http_request_handler().config().base_path != policy.endpoint().path() {
+        if self
+            .server
+            .configured_http_request_handler()
+            .config()
+            .base_path
+            != policy.endpoint().path()
+        {
             return Err(SecuredHttpEndpointError::PolicyRouteMismatch);
         }
         let prepared = prepare_request(policy, &request);
         checkpoint(cx)?;
         let cors = match prepared {
-            PreparedRequest::Immediate(response) => return Ok(SecuredHttpEndpointResponse::immediate(response)),
+            PreparedRequest::Immediate(response) => {
+                return Ok(SecuredHttpEndpointResponse::immediate(response));
+            }
             PreparedRequest::Post(cors) => cors,
         };
         let ((response, authorization), mut session) = Box::pin(await_dispatch(cx, async {
-            let mut session = self.open_session(cx).map_err(|_| SecuredHttpEndpointError::SessionUnavailable)?;
+            let mut session = self
+                .open_session(cx)
+                .map_err(|_| SecuredHttpEndpointError::SessionUnavailable)?;
             let dispatched = match &policy.scope_authorization {
-                Some(scopes) => Box::pin(scope::dispatch(&mut session, cx, scopes, request, policy.sse_revalidation)).await,
-                None => session.handle_async(cx, request).await
+                Some(scopes) => {
+                    Box::pin(scope::dispatch(
+                        &mut session,
+                        cx,
+                        scopes,
+                        request,
+                        policy.sse_revalidation,
+                    ))
+                    .await
+                }
+                None => session
+                    .handle_async(cx, request)
+                    .await
                     .map(|response| (response, None))
                     .map_err(|_| SecuredHttpEndpointError::DispatchFailed),
             };
@@ -192,11 +242,16 @@ impl ServerHttpEndpoint {
                     Err(error)
                 }
             }
-        })).await?;
+        }))
+        .await?;
         let response = match response {
             ServerHttpEndpointResponse::Immediate(mut response) => {
                 drop(authorization);
-                await_dispatch(cx, async { session.close(cx).await; Ok(()) }).await?;
+                await_dispatch(cx, async {
+                    session.close(cx).await;
+                    Ok(())
+                })
+                .await?;
                 cors.apply_to(&mut response);
                 SecuredHttpEndpointResponse::immediate(response)
             }
@@ -206,7 +261,10 @@ impl ServerHttpEndpoint {
                 SecuredHttpEndpointResponse {
                     response,
                     stream: Some(SecuredHttpSseResponse {
-                        stream: Some(Box::new(stream)), session: Some(session), authorization, finished: false,
+                        stream: Some(Box::new(stream)),
+                        session: Some(session),
+                        authorization,
+                        finished: false,
                     }),
                 }
             }
@@ -214,7 +272,11 @@ impl ServerHttpEndpoint {
             other => {
                 drop(other);
                 drop(authorization);
-                await_dispatch(cx, async { session.close(cx).await; Ok(()) }).await?;
+                await_dispatch(cx, async {
+                    session.close(cx).await;
+                    Ok(())
+                })
+                .await?;
                 return Err(SecuredHttpEndpointError::UnexpectedLegacyStream);
             }
         };
@@ -238,21 +300,30 @@ async fn guard_response<T>(
         // is idle, and refuse a result that becomes ready during cancellation.
         return await_dispatch(cx, async { Ok(future.await) }).await;
     };
-    if cx.timer_driver().is_none() { return Err(SecuredHttpEndpointError::TimerUnavailable); }
+    if cx.timer_driver().is_none() {
+        return Err(SecuredHttpEndpointError::TimerUnavailable);
+    }
     let mut wake = Box::pin(Sleep::new(cx.now().saturating_add_nanos(10_000_000)));
     let mut future = std::pin::pin!(future);
     poll_fn(|task| {
         let _current = Cx::set_current(Some(cx.clone()));
-        lease.check(cx).map_err(SecuredHttpEndpointError::Revalidation)?;
+        lease
+            .check(cx)
+            .map_err(SecuredHttpEndpointError::Revalidation)?;
         let result = future.as_mut().poll(task);
-        lease.check(cx).map_err(SecuredHttpEndpointError::Revalidation)?;
-        if let Poll::Ready(value) = result { return Poll::Ready(Ok(value)); }
+        lease
+            .check(cx)
+            .map_err(SecuredHttpEndpointError::Revalidation)?;
+        if let Poll::Ready(value) = result {
+            return Poll::Ready(Ok(value));
+        }
         if wake.as_mut().poll(task).is_ready() {
             wake = Box::pin(Sleep::new(cx.now().saturating_add_nanos(10_000_000)));
             let _ = wake.as_mut().poll(task);
         }
         Poll::Pending
-    }).await
+    })
+    .await
 }
 
 enum PreparedRequest {
@@ -269,31 +340,53 @@ fn prepare_request(policy: &HttpSecurityPolicy, request: &HttpRequest) -> Prepar
     } else if policy.is_metadata_path(&request.path) && !request.query.is_empty() {
         Some(HttpSecurityError::EndpointMismatch)
     } else if request.headers.len() > limits.max_header_count()
-        || request.headers.iter().fold(0_usize, |size, (name, value)|
-            size.saturating_add(name.len()).saturating_add(value.len())) > limits.max_header_block_bytes()
+        || request.headers.iter().fold(0_usize, |size, (name, value)| {
+            size.saturating_add(name.len()).saturating_add(value.len())
+        }) > limits.max_header_block_bytes()
     {
         Some(HttpSecurityError::HeaderLimit)
-    } else { None };
-    if let Some(rejection) = rejection { return PreparedRequest::Immediate(rejection.response()); }
-    let headers: Vec<_> = request.headers.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+    } else {
+        None
+    };
+    if let Some(rejection) = rejection {
+        return PreparedRequest::Immediate(rejection.response());
+    }
+    let headers: Vec<_> = request
+        .headers
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
     let head = match policy.admit_head(request.method.as_str(), &request.path, &headers) {
         Ok(head) => head,
         Err(error) => return PreparedRequest::Immediate(error.response()),
     };
-    if let Err(error) = policy.validate_body(!matches!(&head, HttpSecurityHead::Post(_)), &headers, &request.body) {
+    if let Err(error) = policy.validate_body(
+        !matches!(&head, HttpSecurityHead::Post(_)),
+        &headers,
+        &request.body,
+    ) {
         let mut response = error.response();
-        if let HttpSecurityHead::Post(cors) = head { cors.apply_to(&mut response); }
+        if let HttpSecurityHead::Post(cors) = head {
+            cors.apply_to(&mut response);
+        }
         return PreparedRequest::Immediate(response);
     }
     match head {
-        HttpSecurityHead::Preflight(response) | HttpSecurityHead::Metadata(response) => PreparedRequest::Immediate(response),
+        HttpSecurityHead::Preflight(response) | HttpSecurityHead::Metadata(response) => {
+            PreparedRequest::Immediate(response)
+        }
         HttpSecurityHead::Post(cors) => PreparedRequest::Post(cors),
     }
 }
 
 fn checkpoint(cx: &Cx) -> Result<(), SecuredHttpEndpointError> {
-    cx.checkpoint().map_err(|_| SecuredHttpEndpointError::Cancelled)?;
-    if cx.budget().deadline.is_some_and(|deadline| cx.now() >= deadline) {
+    cx.checkpoint()
+        .map_err(|_| SecuredHttpEndpointError::Cancelled)?;
+    if cx
+        .budget()
+        .deadline
+        .is_some_and(|deadline| cx.now() >= deadline)
+    {
         return Err(SecuredHttpEndpointError::TimedOut);
     }
     Ok(())
@@ -304,7 +397,9 @@ async fn await_dispatch<T>(
     future: impl Future<Output = Result<T, SecuredHttpEndpointError>>,
 ) -> Result<T, SecuredHttpEndpointError> {
     let deadline = cx.budget().deadline;
-    if deadline.is_some() && cx.timer_driver().is_none() { return Err(SecuredHttpEndpointError::TimerUnavailable); }
+    if deadline.is_some() && cx.timer_driver().is_none() {
+        return Err(SecuredHttpEndpointError::TimerUnavailable);
+    }
     let mut timeout = deadline.map(|deadline| Box::pin(Sleep::new(deadline)));
     let (_sender, mut receiver) = oneshot::channel::<()>();
     let mut cancelled = std::pin::pin!(receiver.recv(cx));
@@ -312,14 +407,20 @@ async fn await_dispatch<T>(
     poll_fn(|task| {
         checkpoint(cx)?;
         let _current = Cx::set_current(Some(cx.clone()));
-        if cancelled.as_mut().poll(task).is_ready() { return Poll::Ready(Err(SecuredHttpEndpointError::Cancelled)); }
-        if timeout.as_mut().is_some_and(|timeout| timeout.as_mut().poll(task).is_ready()) {
+        if cancelled.as_mut().poll(task).is_ready() {
+            return Poll::Ready(Err(SecuredHttpEndpointError::Cancelled));
+        }
+        if timeout
+            .as_mut()
+            .is_some_and(|timeout| timeout.as_mut().poll(task).is_ready())
+        {
             return Poll::Ready(Err(SecuredHttpEndpointError::TimedOut));
         }
         let result = future.as_mut().poll(task);
         checkpoint(cx)?;
         result
-    }).await
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -330,9 +431,12 @@ mod tests {
 
     fn policy() -> HttpSecurityPolicy {
         HttpSecurityPolicy::new(
-            HttpEndpointConfig::new("/mcp", HttpAdmissionLimits::new(32, 8192, 4096).unwrap()).unwrap(),
-            "https://service.example", vec!["https://app.example".to_owned()],
-        ).unwrap()
+            HttpEndpointConfig::new("/mcp", HttpAdmissionLimits::new(32, 8192, 4096).unwrap())
+                .unwrap(),
+            "https://service.example",
+            vec!["https://app.example".to_owned()],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -341,14 +445,19 @@ mod tests {
             .with_header("host", "service.example")
             .with_header("origin", "https://app.example")
             .with_header("access-control-request-method", "POST")
-            .with_header("access-control-request-headers", "mcp-method, authorization");
-        let PreparedRequest::Immediate(response) = prepare_request(&policy(), &request)
-            else { panic!("preflight must never dispatch") };
+            .with_header(
+                "access-control-request-headers",
+                "mcp-method, authorization",
+            );
+        let PreparedRequest::Immediate(response) = prepare_request(&policy(), &request) else {
+            panic!("preflight must never dispatch")
+        };
         assert_eq!(response.status.0, 204);
         assert!(response.body.is_empty());
         let request = request.with_body(b"not empty".to_vec());
-        let PreparedRequest::Immediate(response) = prepare_request(&policy(), &request)
-            else { panic!("body must not dispatch") };
+        let PreparedRequest::Immediate(response) = prepare_request(&policy(), &request) else {
+            panic!("body must not dispatch")
+        };
         assert_eq!(response.status.0, 400);
     }
 
@@ -358,44 +467,73 @@ mod tests {
             .with_header("host", "service.example")
             .with_header("origin", "https://app.example")
             .with_body(b"malformed JSON".to_vec());
-        assert!(matches!(prepare_request(&policy(), &request), PreparedRequest::Post(_)));
-        request.headers.insert("origin".to_owned(), "https://attacker.example".to_owned());
-        let PreparedRequest::Immediate(response) = prepare_request(&policy(), &request)
-            else { panic!("origin must not dispatch") };
+        assert!(matches!(
+            prepare_request(&policy(), &request),
+            PreparedRequest::Post(_)
+        ));
+        request
+            .headers
+            .insert("origin".to_owned(), "https://attacker.example".to_owned());
+        let PreparedRequest::Immediate(response) = prepare_request(&policy(), &request) else {
+            panic!("origin must not dispatch")
+        };
         assert_eq!(response.status.0, 403);
         assert!(!response.headers.contains_key("access-control-allow-origin"));
     }
 
     #[test]
     fn map_bounds_duplicate_casing_and_body_bounds_do_not_allocate_a_session() {
-        let request = HttpRequest::new(HttpMethod::Post, "/mcp").with_header("host", "service.example");
+        let request =
+            HttpRequest::new(HttpMethod::Post, "/mcp").with_header("host", "service.example");
         let mut duplicate = request.clone();
-        duplicate.headers.insert("HOST".to_owned(), "service.example".to_owned());
-        let PreparedRequest::Immediate(response) = prepare_request(&policy(), &duplicate)
-            else { panic!("duplicate must not dispatch") };
+        duplicate
+            .headers
+            .insert("HOST".to_owned(), "service.example".to_owned());
+        let PreparedRequest::Immediate(response) = prepare_request(&policy(), &duplicate) else {
+            panic!("duplicate must not dispatch")
+        };
         assert_eq!(response.status.0, 400);
         let oversized = request.with_body(vec![b'x'; 4097]);
-        let PreparedRequest::Immediate(response) = prepare_request(&policy(), &oversized)
-            else { panic!("oversized body must not dispatch") };
+        let PreparedRequest::Immediate(response) = prepare_request(&policy(), &oversized) else {
+            panic!("oversized body must not dispatch")
+        };
         assert_eq!(response.status.0, 413);
     }
 
     #[test]
     fn abandoning_a_polled_guard_releases_the_owned_dispatch_future() {
-        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
         struct Pending(Arc<AtomicBool>);
         impl Future for Pending {
             type Output = Result<(), SecuredHttpEndpointError>;
-            fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<Self::Output> { Poll::Pending }
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> Poll<Self::Output> {
+                Poll::Pending
+            }
         }
-        impl Drop for Pending { fn drop(&mut self) { self.0.store(true, Ordering::Release); } }
+        impl Drop for Pending {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
         asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
-            .build().unwrap().block_on(async {
+            .build()
+            .unwrap()
+            .block_on(async {
                 let cx = Cx::current().unwrap();
                 let dropped = Arc::new(AtomicBool::new(false));
                 let mut waiting = Box::pin(await_dispatch(&cx, Pending(Arc::clone(&dropped))));
-                poll_fn(|task| { assert!(waiting.as_mut().poll(task).is_pending()); Poll::Ready(()) }).await;
+                poll_fn(|task| {
+                    assert!(waiting.as_mut().poll(task).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
                 drop(waiting);
                 assert!(dropped.load(Ordering::Acquire));
                 assert!(cx.checkpoint().is_ok());
@@ -405,22 +543,34 @@ mod tests {
     #[test]
     fn buffered_metadata_is_immediate_and_cannot_select_a_resource_by_query() {
         use super::super::resource_metadata::ProtectedResourceMetadata;
-        let policy = policy().with_resource_metadata(ProtectedResourceMetadata::new(
-            vec!["https://issuer.example".to_owned()],
-        ).unwrap()).unwrap();
+        let policy = policy()
+            .with_resource_metadata(
+                ProtectedResourceMetadata::new(vec!["https://issuer.example".to_owned()]).unwrap(),
+            )
+            .unwrap();
         let request = HttpRequest::new(HttpMethod::Get, policy.resource_metadata_path().unwrap())
             .with_header("host", "service.example");
-        let PreparedRequest::Immediate(response) = prepare_request(&policy, &request)
-            else { panic!("metadata must never dispatch") };
+        let PreparedRequest::Immediate(response) = prepare_request(&policy, &request) else {
+            panic!("metadata must never dispatch")
+        };
         assert_eq!(response.status.0, 200);
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["resource"], "https://service.example/mcp");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["resource"],
+            "https://service.example/mcp"
+        );
         let mut with_query = request.clone();
-        with_query.query.insert("resource".to_owned(), "https://attacker.example".to_owned());
-        let PreparedRequest::Immediate(response) = prepare_request(&policy, &with_query)
-            else { panic!("query must never dispatch") };
+        with_query
+            .query
+            .insert("resource".to_owned(), "https://attacker.example".to_owned());
+        let PreparedRequest::Immediate(response) = prepare_request(&policy, &with_query) else {
+            panic!("query must never dispatch")
+        };
         assert_eq!(response.status.0, 404);
-        let PreparedRequest::Immediate(response) = prepare_request(&policy, &request.with_body(b"x".to_vec()))
-            else { panic!("body must never dispatch") };
+        let PreparedRequest::Immediate(response) =
+            prepare_request(&policy, &request.with_body(b"x".to_vec()))
+        else {
+            panic!("body must never dispatch")
+        };
         assert_eq!(response.status.0, 400);
     }
     #[test]
@@ -445,16 +595,22 @@ mod tests {
         });
         let mut guarded = Box::pin(guard_response(&cx, &mut authorization, operation));
         let mut task = std::task::Context::from_waker(std::task::Waker::noop());
-        assert_eq!(guarded.as_mut().poll(&mut task), Poll::Ready(Err(SecuredHttpEndpointError::Cancelled)));
-        assert_eq!(polls.get(), 0, "cancelled response must not consume an event or write bytes");
+        assert_eq!(
+            guarded.as_mut().poll(&mut task),
+            Poll::Ready(Err(SecuredHttpEndpointError::Cancelled))
+        );
+        assert_eq!(
+            polls.get(),
+            0,
+            "cancelled response must not consume an event or write bytes"
+        );
     }
 
     #[test]
     fn response_guard_without_revalidation_refuses_an_unserviceable_deadline() {
         let cx = Cx::for_testing_with_budget(
-            asupersync::Budget::INFINITE.with_deadline(
-                asupersync::Time::ZERO.saturating_add_nanos(u64::MAX),
-            ),
+            asupersync::Budget::INFINITE
+                .with_deadline(asupersync::Time::ZERO.saturating_add_nanos(u64::MAX)),
         );
         assert!(cx.timer_driver().is_none());
         let polls = std::cell::Cell::new(0);
@@ -465,16 +621,28 @@ mod tests {
         });
         let mut guarded = Box::pin(guard_response(&cx, &mut authorization, operation));
         let mut task = std::task::Context::from_waker(std::task::Waker::noop());
-        assert_eq!(guarded.as_mut().poll(&mut task), Poll::Ready(Err(SecuredHttpEndpointError::TimerUnavailable)));
-        assert_eq!(polls.get(), 0, "an unenforceable deadline must not start response work");
+        assert_eq!(
+            guarded.as_mut().poll(&mut task),
+            Poll::Ready(Err(SecuredHttpEndpointError::TimerUnavailable))
+        );
+        assert_eq!(
+            polls.get(),
+            0,
+            "an unenforceable deadline must not start response work"
+        );
     }
 
     #[test]
     fn response_guard_without_revalidation_withholds_a_ready_result_on_cancel() {
-        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
         struct ResultOwner(Arc<AtomicBool>);
         impl Drop for ResultOwner {
-            fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
         }
         let cx = Cx::for_testing();
         let dropped = Arc::new(AtomicBool::new(false));
@@ -485,25 +653,42 @@ mod tests {
         });
         let mut guarded = Box::pin(guard_response(&cx, &mut authorization, operation));
         let mut task = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(matches!(guarded.as_mut().poll(&mut task), Poll::Ready(Err(SecuredHttpEndpointError::Cancelled))));
-        assert!(dropped.load(Ordering::Acquire), "withheld result must release its owned resources");
+        assert!(matches!(
+            guarded.as_mut().poll(&mut task),
+            Poll::Ready(Err(SecuredHttpEndpointError::Cancelled))
+        ));
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "withheld result must release its owned resources"
+        );
     }
 
     #[test]
     fn response_guard_without_revalidation_wakes_an_idle_operation_on_cancel() {
-        use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
         struct WakeCount(AtomicUsize);
         impl std::task::Wake for WakeCount {
-            fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::Relaxed); }
-            fn wake_by_ref(self: &Arc<Self>) { self.0.fetch_add(1, Ordering::Relaxed); }
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
         }
         struct Idle(Arc<AtomicBool>);
         impl Future for Idle {
             type Output = ();
-            fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<()> { Poll::Pending }
+            fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<()> {
+                Poll::Pending
+            }
         }
         impl Drop for Idle {
-            fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
         }
         let cx = Cx::for_testing();
         let counter = Arc::new(WakeCount(AtomicUsize::new(0)));
@@ -511,38 +696,58 @@ mod tests {
         let mut task = std::task::Context::from_waker(&waker);
         let dropped = Arc::new(AtomicBool::new(false));
         let mut authorization = None;
-        let mut guarded = Box::pin(guard_response(&cx, &mut authorization, Idle(Arc::clone(&dropped))));
+        let mut guarded = Box::pin(guard_response(
+            &cx,
+            &mut authorization,
+            Idle(Arc::clone(&dropped)),
+        ));
         assert!(guarded.as_mut().poll(&mut task).is_pending());
         assert_eq!(counter.0.load(Ordering::Relaxed), 0);
         cx.set_cancel_requested(true);
         // Check the wake before repolling: a checkpoint-only implementation
         // would strand this operation when the socket/event source is idle.
         assert!(counter.0.load(Ordering::Relaxed) > 0);
-        assert_eq!(guarded.as_mut().poll(&mut task), Poll::Ready(Err(SecuredHttpEndpointError::Cancelled)));
+        assert_eq!(
+            guarded.as_mut().poll(&mut task),
+            Poll::Ready(Err(SecuredHttpEndpointError::Cancelled))
+        );
         drop(guarded);
         assert!(dropped.load(Ordering::Acquire));
     }
 
     #[test]
     fn abandoning_response_guard_without_revalidation_drops_the_operation() {
-        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
         struct Idle(Arc<AtomicBool>);
         impl Future for Idle {
             type Output = ();
-            fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<()> { Poll::Pending }
+            fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<()> {
+                Poll::Pending
+            }
         }
         impl Drop for Idle {
-            fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
         }
         let cx = Cx::for_testing();
         let dropped = Arc::new(AtomicBool::new(false));
         let mut authorization = None;
-        let mut guarded = Box::pin(guard_response(&cx, &mut authorization, Idle(Arc::clone(&dropped))));
+        let mut guarded = Box::pin(guard_response(
+            &cx,
+            &mut authorization,
+            Idle(Arc::clone(&dropped)),
+        ));
         let mut task = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(guarded.as_mut().poll(&mut task).is_pending());
         drop(guarded);
         assert!(dropped.load(Ordering::Acquire));
-        assert!(cx.checkpoint().is_ok(), "dropping a response must not cancel its caller");
+        assert!(
+            cx.checkpoint().is_ok(),
+            "dropping a response must not cancel its caller"
+        );
     }
-
 }

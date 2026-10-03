@@ -5,7 +5,9 @@
 use asupersync::Cx;
 
 use super::admission::{SlotLease, operation_bytes};
-use super::{CredentialIoError, CredentialIoLane, CredentialSlotTask, check_submission, spawn, submit};
+use super::{
+    CredentialIoError, CredentialIoLane, CredentialSlotTask, check_submission, spawn, submit,
+};
 
 // Kept crate-private: this is not an arbitrary public blocking-work escape.
 // A consumer must bound every captured framework buffer before submission.
@@ -29,32 +31,45 @@ impl ComposedCredentialIo {
             .checked_add(extra_bytes)
             .ok_or(CredentialIoError::InvalidLimits)?;
         let lease = lane.reserve_slot()?;
-        Ok(Self { lane: lane.clone(), working_bytes, lease })
+        Ok(Self {
+            lane: lane.clone(),
+            working_bytes,
+            lease,
+        })
     }
 
-    pub(crate) fn submit<T, F>(self, cx: &Cx, work: F)
-        -> Result<CredentialSlotTask<T>, CredentialIoError>
+    pub(crate) fn submit<T, F>(
+        self,
+        cx: &Cx,
+        work: F,
+    ) -> Result<CredentialSlotTask<T>, CredentialIoError>
     where
         T: Send + 'static,
         F: FnOnce(&Cx, Self) -> T + Send + 'static,
     {
         let lane = self.lane.clone();
-        submit(cx, &lane, self.working_bytes, move |worker| work(worker, self))
+        submit(cx, &lane, self.working_bytes, move |worker| {
+            work(worker, self)
+        })
     }
 
     // Retain the consumer and input through every refusal before handing them
     // to the runtime. A runtime spawn failure cannot return the consumed
     // closure; distinguish that terminal loss from a retained admission refusal.
-    pub(crate) fn try_submit<I, T, F>(self, cx: &Cx, input: I, work: F)
-        -> Result<CredentialSlotTask<T>, (CredentialIoError, Option<(Self, I)>)>
+    pub(crate) fn try_submit<I, T, F>(
+        self,
+        cx: &Cx,
+        input: I,
+        work: F,
+    ) -> Result<CredentialSlotTask<T>, (CredentialIoError, Option<(Self, I)>)>
     where
         I: Send + 'static,
         T: Send + 'static,
         F: FnOnce(&Cx, Self, I) -> T + Send + 'static,
     {
         let process = self.lane.process();
-        let admission = check_submission(cx, &process)
-            .and_then(|()| self.lane.reserve_job(self.working_bytes));
+        let admission =
+            check_submission(cx, &process).and_then(|()| self.lane.reserve_job(self.working_bytes));
         let lease = match admission {
             Ok(lease) => lease,
             Err(error) => return Err((error, Some((self, input)))),
@@ -65,9 +80,11 @@ impl ComposedCredentialIo {
 
     // Permit teardown after shutdown and while ordinary work is saturated.
     // No second cancellation domain or cleanup executor is created.
-    pub(crate) fn close<T: Send + 'static>(self, cx: &Cx, value: T)
-        -> Result<CredentialSlotTask<()>, CredentialIoError>
-    {
+    pub(crate) fn close<T: Send + 'static>(
+        self,
+        cx: &Cx,
+        value: T,
+    ) -> Result<CredentialSlotTask<()>, CredentialIoError> {
         let process = self.lane.process();
         check_submission(cx, &process)?;
         let lease = self.lease.reserve_close()?;

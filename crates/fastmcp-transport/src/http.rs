@@ -827,9 +827,8 @@ fn legacy_sse_http_post_requires_accepted(
             });
             if version == Some("HTTP/1.1")
                 && status == Some("202")
-                && reason.is_some_and(|reason| {
-                    !reason.is_empty() && is_valid_http_header_value(reason)
-                })
+                && reason
+                    .is_some_and(|reason| !reason.is_empty() && is_valid_http_header_value(reason))
                 && headers_are_well_formed
             {
                 return Ok(());
@@ -13077,7 +13076,9 @@ Content-Length: {}\r\n\
                 ),
             )
             .expect("the selected SSE body accepts its terminal result");
-        let event = response.recv_event(&cx).expect("terminal result is emitted");
+        let event = response
+            .recv_event(&cx)
+            .expect("terminal result is emitted");
         assert!(matches!(
             Codec::new().decode_complete_message(event.data.as_bytes()),
             Ok(JsonRpcMessage::Response(message)) if message.id == Some(271_i64.into())

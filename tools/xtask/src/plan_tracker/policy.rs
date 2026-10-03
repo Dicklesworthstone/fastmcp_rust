@@ -164,7 +164,12 @@ pub const WORKSPACE_UNSAFE_LINT: &str = "unsafe_code = \"forbid\"";
 /// lint policy.
 pub fn workspace_members(root: &Path) -> Result<Vec<String>, Diagnostic> {
     let text = fs::read_to_string(root.join("Cargo.toml")).map_err(|error| {
-        Diagnostic::new(Code::SourceUnreadable, "Cargo.toml", "path", error.to_string())
+        Diagnostic::new(
+            Code::SourceUnreadable,
+            "Cargo.toml",
+            "path",
+            error.to_string(),
+        )
     })?;
 
     let mut members = Vec::new();
@@ -261,7 +266,9 @@ pub fn check_workspace_unsafe_policy(root: &Path) -> Report {
                  inherit the unsafe-code policy",
             ));
         }
-        if manifest.contains("unsafe_code = \"allow\"") || manifest.contains("unsafe_code = \"warn\"") {
+        if manifest.contains("unsafe_code = \"allow\"")
+            || manifest.contains("unsafe_code = \"warn\"")
+        {
             report.push(Diagnostic::new(
                 Code::WorkspacePolicy,
                 member,
@@ -354,7 +361,10 @@ pub fn check_module_inventory(root: &Path) -> (Vec<ModuleSize>, Report) {
             Code::ModuleInventory,
             "src/plan_tracker",
             "modules",
-            format!("{} modules is below the {MIN_MODULES} required", modules.len()),
+            format!(
+                "{} modules is below the {MIN_MODULES} required",
+                modules.len()
+            ),
         ));
     }
 
@@ -439,11 +449,8 @@ mod tests {
     fn a_member_that_omits_lint_inheritance_is_detected() {
         // The predicate must be able to fail. Build a workspace whose single
         // member has no [lints] table and require the omission to be named.
-        let root = std::env::temp_dir().join(format!(
-            "fnd-02-lints-{}-{}",
-            std::process::id(),
-            line!()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("fnd-02-lints-{}-{}", std::process::id(), line!()));
         let member = root.join("crates/opted-out");
         fs::create_dir_all(&member).expect("scratch");
         fs::write(
@@ -452,8 +459,11 @@ mod tests {
              [workspace.lints.rust]\nunsafe_code = \"forbid\"\n",
         )
         .expect("root manifest");
-        fs::write(member.join("Cargo.toml"), "[package]\nname = \"opted-out\"\n")
-            .expect("member manifest");
+        fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"opted-out\"\n",
+        )
+        .expect("member manifest");
 
         let report = check_workspace_unsafe_policy(&root);
         assert!(report.has(Code::WorkspacePolicy));

@@ -18,11 +18,10 @@
 
 use fastmcp_protocol::protocol_version::{
     FINAL_ADMISSION_PRECEDENCE, FINAL_PROTOCOL_VERSION, FinalAdmissionRule,
-    FinalHttpRequestMetadata, HEADER_MISMATCH_ERROR_CODE, HeaderMismatchReason,
-    MCP_METHOD_HEADER, MCP_NAME_HEADER, MCP_PROTOCOL_VERSION_HEADER,
-    MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE, MissingRequiredClientCapabilityError,
-    RequestAdmissionError, UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE,
-    admit_final_http_request,
+    FinalHttpRequestMetadata, HEADER_MISMATCH_ERROR_CODE, HeaderMismatchReason, MCP_METHOD_HEADER,
+    MCP_NAME_HEADER, MCP_PROTOCOL_VERSION_HEADER, MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE,
+    MissingRequiredClientCapabilityError, RequestAdmissionError,
+    UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE, admit_final_http_request,
 };
 use fastmcp_protocol::{
     ClientCapabilities, FinalRequestMeta, RootsCapability, SERVER_DISCOVER,

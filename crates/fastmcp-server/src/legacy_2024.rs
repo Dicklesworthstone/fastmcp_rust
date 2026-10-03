@@ -751,11 +751,9 @@ where
         match self.prepare_receive(binding, wire)? {
             PreparedReceive::Outbound(outbound) => Ok(outbound),
             PreparedReceive::Dispatch { id, method, params } => {
-                let result = self.handler.handle_legacy_2024_with_request_id(
-                    &id,
-                    method,
-                    params.as_ref(),
-                );
+                let result =
+                    self.handler
+                        .handle_legacy_2024_with_request_id(&id, method, params.as_ref());
                 Ok(self.finish_receive(id, method, params.as_ref(), result))
             }
         }
@@ -772,11 +770,10 @@ where
         match self.prepare_receive(binding, wire)? {
             PreparedReceive::Outbound(outbound) => Ok(outbound),
             PreparedReceive::Dispatch { id, method, params } => {
-                let result = self.handler.handle_legacy_2024_with_request_id_async(
-                    &id,
-                    method,
-                    params.as_ref(),
-                ).await;
+                let result = self
+                    .handler
+                    .handle_legacy_2024_with_request_id_async(&id, method, params.as_ref())
+                    .await;
                 Ok(self.finish_receive(id, method, params.as_ref(), result))
             }
         }

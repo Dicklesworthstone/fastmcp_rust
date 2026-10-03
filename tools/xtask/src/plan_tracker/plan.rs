@@ -115,10 +115,7 @@ fn fence_marker(line: &str) -> Option<(u8, usize, &str)> {
         Some(b'~') => b'~',
         _ => return None,
     };
-    let run_length = rest
-        .bytes()
-        .take_while(|byte| *byte == character)
-        .count();
+    let run_length = rest.bytes().take_while(|byte| *byte == character).count();
     if run_length < 3 {
         return None;
     }
@@ -162,7 +159,10 @@ impl FenceScanner {
                 if character == b'`' && info.contains('`') {
                     return true;
                 }
-                self.open = Some(Fence { character, run_length });
+                self.open = Some(Fence {
+                    character,
+                    run_length,
+                });
                 false
             }
             Some(fence) => {
@@ -484,8 +484,10 @@ pub fn parse(bytes: &[u8], limits: &Limits) -> Result<Plan, Diagnostic> {
                 Code::InterstitialProse,
                 &id,
                 "interstitial",
-                format!("{:?} is neither blank, a separator, nor a phase heading",
-                    line.chars().take(64).collect::<String>()),
+                format!(
+                    "{:?} is neither blank, a separator, nor a phase heading",
+                    line.chars().take(64).collect::<String>()
+                ),
             ));
         }
 
@@ -564,7 +566,14 @@ mod tests {
 
     #[test]
     fn package_id_grammar_accepts_canonical_forms() {
-        for id in ["A", "FND-01", "REL-QUAR-00", "GATE-ALL-MCP-READY", "A2", "AA"] {
+        for id in [
+            "A",
+            "FND-01",
+            "REL-QUAR-00",
+            "GATE-ALL-MCP-READY",
+            "A2",
+            "AA",
+        ] {
             assert!(is_package_id(id, 64), "{id} must be valid");
         }
     }
@@ -572,17 +581,17 @@ mod tests {
     #[test]
     fn package_id_grammar_rejects_every_boundary_mutation() {
         for id in [
-            "",            // empty
-            "a",           // lowercase
-            "1A",          // leading digit
-            "-A",          // leading hyphen
-            "A-",          // trailing hyphen
-            "A--B",        // doubled hyphen
-            "A_B",         // underscore
-            "A B",         // whitespace
-            "A\tB",        // control
-            "Á",           // non-ASCII
-            "A.",          // punctuation
+            "",     // empty
+            "a",    // lowercase
+            "1A",   // leading digit
+            "-A",   // leading hyphen
+            "A-",   // trailing hyphen
+            "A--B", // doubled hyphen
+            "A_B",  // underscore
+            "A B",  // whitespace
+            "A\tB", // control
+            "Á",    // non-ASCII
+            "A.",   // punctuation
         ] {
             assert!(!is_package_id(id, 64), "{id:?} must be rejected");
         }
@@ -635,7 +644,10 @@ mod tests {
         scanner.accept("~~~");
         assert!(scanner.is_open());
         scanner.accept("```");
-        assert!(scanner.is_open(), "a backtick run cannot close a tilde fence");
+        assert!(
+            scanner.is_open(),
+            "a backtick run cannot close a tilde fence"
+        );
         scanner.accept("~~~");
         assert!(!scanner.is_open());
     }
@@ -674,7 +686,9 @@ mod tests {
     // ----------------------------------------------------- admissibility
 
     fn minimal_plan(body: &str) -> String {
-        format!("### FND-01 \u{2014} Freeze\n\n{body}\n\n## 24. Dependency graph and critical path\n")
+        format!(
+            "### FND-01 \u{2014} Freeze\n\n{body}\n\n## 24. Dependency graph and critical path\n"
+        )
     }
 
     #[test]
@@ -715,7 +729,10 @@ mod tests {
         let from_lf = parse(lf.as_bytes(), &limits()).expect("LF parses");
         let from_crlf = parse(crlf.as_bytes(), &limits()).expect("CRLF parses");
 
-        assert_eq!(from_lf, from_crlf, "line endings must not change the corpus");
+        assert_eq!(
+            from_lf, from_crlf,
+            "line endings must not change the corpus"
+        );
         assert_eq!(from_crlf.ids(), ["FND-01", "FND-02"]);
         for package in &from_crlf.packages {
             assert!(
@@ -739,7 +756,10 @@ mod tests {
 
     #[test]
     fn an_over_limit_plan_is_rejected_before_parsing() {
-        let small = Limits { max_plan_bytes: 8, ..Limits::default() };
+        let small = Limits {
+            max_plan_bytes: 8,
+            ..Limits::default()
+        };
         let error = parse(minimal_plan("Dependencies:\n\n- None.").as_bytes(), &small)
             .expect_err("must reject");
         assert_eq!(error.code, Code::PlanLimitExceeded);
@@ -839,7 +859,13 @@ Dependencies:
 
     #[test]
     fn bullet_spacing_indentation_and_terminator_are_exact() {
-        for bad in ["-FND-01.", "  - FND-01.", "- FND-01", "- FND-01..", "- FND-01. "] {
+        for bad in [
+            "-FND-01.",
+            "  - FND-01.",
+            "- FND-01",
+            "- FND-01..",
+            "- FND-01. ",
+        ] {
             let text = TWO_PACKAGES.replace("- FND-01.", bad);
             let result = parse(text.as_bytes(), &limits());
             assert!(result.is_err(), "{bad:?} must be rejected");
@@ -872,7 +898,10 @@ Dependencies:
 
     #[test]
     fn a_duplicate_package_identifier_is_rejected() {
-        let text = TWO_PACKAGES.replace("### FND-02 \u{2014} Build normative traceability", "### FND-01 \u{2014} Duplicate");
+        let text = TWO_PACKAGES.replace(
+            "### FND-02 \u{2014} Build normative traceability",
+            "### FND-01 \u{2014} Duplicate",
+        );
         assert_eq!(
             parse(text.as_bytes(), &limits()).unwrap_err().code,
             Code::PackageDuplicate
@@ -886,14 +915,18 @@ Dependencies:
             "### FND-02\u{2014}No spaces",
             "### FND-02  \u{2014}  Two spaces",
         ] {
-            let text = TWO_PACKAGES.replace("### FND-02 \u{2014} Build normative traceability", bad);
+            let text =
+                TWO_PACKAGES.replace("### FND-02 \u{2014} Build normative traceability", bad);
             assert!(parse(text.as_bytes(), &limits()).is_err(), "{bad:?}");
         }
     }
 
     #[test]
     fn an_over_limit_package_body_is_rejected() {
-        let tight = Limits { max_body_bytes: 16, ..Limits::default() };
+        let tight = Limits {
+            max_body_bytes: 16,
+            ..Limits::default()
+        };
         assert_eq!(
             parse(TWO_PACKAGES.as_bytes(), &tight).unwrap_err().code,
             Code::PackageBodyTooLarge
@@ -902,7 +935,10 @@ Dependencies:
 
     #[test]
     fn an_over_limit_package_count_is_rejected() {
-        let tight = Limits { max_packages: 1, ..Limits::default() };
+        let tight = Limits {
+            max_packages: 1,
+            ..Limits::default()
+        };
         assert_eq!(
             parse(TWO_PACKAGES.as_bytes(), &tight).unwrap_err().field,
             "max_packages"

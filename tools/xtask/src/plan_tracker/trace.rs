@@ -137,11 +137,7 @@ impl TraceRow {
     /// bare name literals would read as derived and would not be: it would
     /// still compile with the field gone.
     fn additional_observed_fields(&self) -> [&dyn fmt::Debug; 3] {
-        [
-            &self.unobservable_prose,
-            &self.ambiguity,
-            &self.covers_item,
-        ]
+        [&self.unobservable_prose, &self.ambiguity, &self.covers_item]
     }
 
     /// Count of observed fields, derived from the fields themselves.
@@ -170,8 +166,9 @@ pub const TRACE_TABLE_SCHEMA: &str = "fnd-02-trace-table-v1";
 
 /// Parse the trace table. The schema tag must match exactly.
 pub fn parse_table(text: &str, subject: &str) -> Result<TraceTable, Diagnostic> {
-    let table: TraceTable = toml::from_str(text)
-        .map_err(|error| Diagnostic::new(Code::SchemaInvalid, subject, "toml", error.to_string()))?;
+    let table: TraceTable = toml::from_str(text).map_err(|error| {
+        Diagnostic::new(Code::SchemaInvalid, subject, "toml", error.to_string())
+    })?;
     if table.schema != TRACE_TABLE_SCHEMA {
         return Err(Diagnostic::new(
             Code::SchemaInvalid,

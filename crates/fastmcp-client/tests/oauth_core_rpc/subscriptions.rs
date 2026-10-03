@@ -12,8 +12,18 @@ use fastmcp_protocol::{FINAL_SUBSCRIPTION_ID_META_KEY, SubscriptionFilter};
 
 #[derive(Clone, Copy)]
 enum SubscriptionCase {
-    Live, BadAcknowledgement, BadEvent, Truncated, Cancel, SessionClose,
-    AbandonRead, Expiry, Deadline, RecordLimit, Preflight, HttpFailure,
+    Live,
+    BadAcknowledgement,
+    BadEvent,
+    Truncated,
+    Cancel,
+    SessionClose,
+    AbandonRead,
+    Expiry,
+    Deadline,
+    RecordLimit,
+    Preflight,
+    HttpFailure,
 }
 
 fn isolated_subscription(name: &str, case: SubscriptionCase) {
@@ -33,20 +43,33 @@ fn isolated_subscription(name: &str, case: SubscriptionCase) {
     // Materialized from the parent target's inlined TEST ONLY root: the remote
     // build worker never receives `*.pem`, so reading it from `tests/fixtures/`
     // failed every case here with "public subscription case failed".
-    let roots = std::env::temp_dir().join(format!("fastmcp-oauth-core-ca-{}.pem", name.replace("::", "_")));
+    let roots = std::env::temp_dir().join(format!(
+        "fastmcp-oauth-core-ca-{}.pem",
+        name.replace("::", "_")
+    ));
     std::fs::write(&roots, ROOT).expect("materialize the TEST ONLY root for the child trust store");
-    let mut child = Child(Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture", "--test-threads=1"])
-        .env(CHILD_CASE, name).env("SSL_CERT_FILE", roots).env_remove("SSL_CERT_DIR")
-        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit())
-        .spawn().unwrap());
+    let mut child = Child(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(CHILD_CASE, name)
+            .env("SSL_CERT_FILE", roots)
+            .env_remove("SSL_CERT_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             assert!(status.success(), "public subscription case failed");
             return;
         }
-        assert!(Instant::now() < deadline, "public subscription exceeded its process bound");
+        assert!(
+            Instant::now() < deadline,
+            "public subscription exceeded its process bound"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -54,27 +77,37 @@ fn isolated_subscription(name: &str, case: SubscriptionCase) {
 fn selected_filter() -> SubscriptionFilter {
     let mut filter = SubscriptionFilter::default();
     filter.tools_list_changed = Some(true);
-    filter.resource_subscriptions = Some(serde_json::from_value(json!(["file:///watched"])).unwrap());
+    filter.resource_subscriptions =
+        Some(serde_json::from_value(json!(["file:///watched"])).unwrap());
     filter
 }
 
 fn listen_request() -> CoreRequest {
-    core("subscriptions/listen", json!({"notifications": selected_filter()}))
+    core(
+        "subscriptions/listen",
+        json!({"notifications": selected_filter()}),
+    )
 }
 
 fn acknowledged(id: i64, filter: SubscriptionFilter) -> String {
     json!({
         "jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged",
         "params": {"_meta": {(FINAL_SUBSCRIPTION_ID_META_KEY): id}, "notifications": filter},
-    }).to_string()
+    })
+    .to_string()
 }
 
 fn subscription_terminal(id: i64) -> String {
-    terminal(id, &json!({"resultType": "complete", "_meta": {(FINAL_SUBSCRIPTION_ID_META_KEY): id}}).to_string())
+    terminal(
+        id,
+        &json!({"resultType": "complete", "_meta": {(FINAL_SUBSCRIPTION_ID_META_KEY): id}})
+            .to_string(),
+    )
 }
 
 fn resource_updated(uri: &str) -> String {
-    json!({"jsonrpc": "2.0", "method": "notifications/resources/updated", "params": {"uri": uri}}).to_string()
+    json!({"jsonrpc": "2.0", "method": "notifications/resources/updated", "params": {"uri": uri}})
+        .to_string()
 }
 
 async fn subscription_stream(peer: &Peer, id: i64) -> TlsStream<TcpStream> {
@@ -82,14 +115,23 @@ async fn subscription_stream(peer: &Peer, id: i64) -> TlsStream<TcpStream> {
     let request: Value = serde_json::from_slice(&request).unwrap();
     assert_eq!(request["id"], id);
     assert_eq!(request["method"], "subscriptions/listen");
-    assert_eq!(request["params"]["notifications"], serde_json::to_value(selected_filter()).unwrap());
-    tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+    assert_eq!(
+        request["params"]["notifications"],
+        serde_json::to_value(selected_filter()).unwrap()
+    );
+    tls.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+    )
+    .await
+    .unwrap();
     tls.flush().await.unwrap();
     tls
 }
 
 async fn consume_ack(listener: &mut ManagedSubscription, cx: &Cx) {
-    let Some(ManagedSubscriptionEvent::Acknowledged { accepted_filter }) = listener.next_event(cx).await.unwrap() else {
+    let Some(ManagedSubscriptionEvent::Acknowledged { accepted_filter }) =
+        listener.next_event(cx).await.unwrap()
+    else {
         panic!("the first delivered record must be an acknowledgement");
     };
     assert_eq!(accepted_filter.tools_list_changed, Some(true));
@@ -98,7 +140,10 @@ async fn consume_ack(listener: &mut ManagedSubscription, cx: &Cx) {
 }
 
 async fn consume_terminal(listener: &mut ManagedSubscription, cx: &Cx, id: i64) {
-    let Some(ManagedSubscriptionEvent::Terminal { subscription_id, .. }) = listener.next_event(cx).await.unwrap() else {
+    let Some(ManagedSubscriptionEvent::Terminal {
+        subscription_id, ..
+    }) = listener.next_event(cx).await.unwrap()
+    else {
         panic!("the stream must deliver its correlated terminal");
     };
     assert!(subscription_id.correlates_with(&RequestId::Number(id)));
@@ -108,10 +153,26 @@ async fn consume_terminal(listener: &mut ManagedSubscription, cx: &Cx, id: i64) 
 async fn fresh_listen_after_gap(peer: &Peer, session: &ManagedOAuthSession, cx: &Cx) {
     let server = async {
         let mut tls = subscription_stream(peer, 42).await;
-        chunk(&mut tls, &[acknowledged(42, selected_filter()), subscription_terminal(42)], true).await;
+        chunk(
+            &mut tls,
+            &[
+                acknowledged(42, selected_filter()),
+                subscription_terminal(42),
+            ],
+            true,
+        )
+        .await;
     };
     let application = async {
-        let mut listener = session.subscribe_core(cx, listen_request(), RequestId::Number(42), ManagedSubscriptionLimits::default()).await.unwrap();
+        let mut listener = session
+            .subscribe_core(
+                cx,
+                listen_request(),
+                RequestId::Number(42),
+                ManagedSubscriptionLimits::default(),
+            )
+            .await
+            .unwrap();
         consume_ack(&mut listener, cx).await;
         consume_terminal(&mut listener, cx, 42).await;
     };
@@ -363,26 +424,86 @@ fn run_subscription(case: SubscriptionCase) {
 }
 
 #[test]
-fn managed_subscription_delivers_incrementally() { isolated_subscription("subscriptions::managed_subscription_delivers_incrementally", SubscriptionCase::Live); }
+fn managed_subscription_delivers_incrementally() {
+    isolated_subscription(
+        "subscriptions::managed_subscription_delivers_incrementally",
+        SubscriptionCase::Live,
+    );
+}
 #[test]
-fn managed_subscription_acknowledgement_is_bound() { isolated_subscription("subscriptions::managed_subscription_acknowledgement_is_bound", SubscriptionCase::BadAcknowledgement); }
+fn managed_subscription_acknowledgement_is_bound() {
+    isolated_subscription(
+        "subscriptions::managed_subscription_acknowledgement_is_bound",
+        SubscriptionCase::BadAcknowledgement,
+    );
+}
 #[test]
-fn managed_subscription_events_stay_in_the_accepted_filter() { isolated_subscription("subscriptions::managed_subscription_events_stay_in_the_accepted_filter", SubscriptionCase::BadEvent); }
+fn managed_subscription_events_stay_in_the_accepted_filter() {
+    isolated_subscription(
+        "subscriptions::managed_subscription_events_stay_in_the_accepted_filter",
+        SubscriptionCase::BadEvent,
+    );
+}
 #[test]
-fn managed_subscription_gap_requires_a_fresh_explicit_listen() { isolated_subscription("subscriptions::managed_subscription_gap_requires_a_fresh_explicit_listen", SubscriptionCase::Truncated); }
+fn managed_subscription_gap_requires_a_fresh_explicit_listen() {
+    isolated_subscription(
+        "subscriptions::managed_subscription_gap_requires_a_fresh_explicit_listen",
+        SubscriptionCase::Truncated,
+    );
+}
 #[test]
-fn managed_subscription_cancellation_leaves_sibling_calls_usable() { isolated_subscription("subscriptions::managed_subscription_cancellation_leaves_sibling_calls_usable", SubscriptionCase::Cancel); }
+fn managed_subscription_cancellation_leaves_sibling_calls_usable() {
+    isolated_subscription(
+        "subscriptions::managed_subscription_cancellation_leaves_sibling_calls_usable",
+        SubscriptionCase::Cancel,
+    );
+}
 #[test]
-fn managed_subscription_session_close_releases_idle_read() { isolated_subscription("subscriptions::managed_subscription_session_close_releases_idle_read", SubscriptionCase::SessionClose); }
+fn managed_subscription_session_close_releases_idle_read() {
+    isolated_subscription(
+        "subscriptions::managed_subscription_session_close_releases_idle_read",
+        SubscriptionCase::SessionClose,
+    );
+}
 #[test]
-fn managed_subscription_abandoned_read_cannot_be_reused() { isolated_subscription("subscriptions::managed_subscription_abandoned_read_cannot_be_reused", SubscriptionCase::AbandonRead); }
+fn managed_subscription_abandoned_read_cannot_be_reused() {
+    isolated_subscription(
+        "subscriptions::managed_subscription_abandoned_read_cannot_be_reused",
+        SubscriptionCase::AbandonRead,
+    );
+}
 #[test]
-fn managed_subscription_original_token_expiry_closes_idle_read() { isolated_subscription("subscriptions::managed_subscription_original_token_expiry_closes_idle_read", SubscriptionCase::Expiry); }
+fn managed_subscription_original_token_expiry_closes_idle_read() {
+    isolated_subscription(
+        "subscriptions::managed_subscription_original_token_expiry_closes_idle_read",
+        SubscriptionCase::Expiry,
+    );
+}
 #[test]
-fn managed_subscription_deadline_includes_paused_consumption() { isolated_subscription("subscriptions::managed_subscription_deadline_includes_paused_consumption", SubscriptionCase::Deadline); }
+fn managed_subscription_deadline_includes_paused_consumption() {
+    isolated_subscription(
+        "subscriptions::managed_subscription_deadline_includes_paused_consumption",
+        SubscriptionCase::Deadline,
+    );
+}
 #[test]
-fn managed_subscription_record_limit_is_terminal() { isolated_subscription("subscriptions::managed_subscription_record_limit_is_terminal", SubscriptionCase::RecordLimit); }
+fn managed_subscription_record_limit_is_terminal() {
+    isolated_subscription(
+        "subscriptions::managed_subscription_record_limit_is_terminal",
+        SubscriptionCase::RecordLimit,
+    );
+}
 #[test]
-fn managed_subscription_preflight_has_no_peer_effect() { isolated_subscription("subscriptions::managed_subscription_preflight_has_no_peer_effect", SubscriptionCase::Preflight); }
+fn managed_subscription_preflight_has_no_peer_effect() {
+    isolated_subscription(
+        "subscriptions::managed_subscription_preflight_has_no_peer_effect",
+        SubscriptionCase::Preflight,
+    );
+}
 #[test]
-fn managed_subscription_failures_never_replay_or_expose_peer_errors() { isolated_subscription("subscriptions::managed_subscription_failures_never_replay_or_expose_peer_errors", SubscriptionCase::HttpFailure); }
+fn managed_subscription_failures_never_replay_or_expose_peer_errors() {
+    isolated_subscription(
+        "subscriptions::managed_subscription_failures_never_replay_or_expose_peer_errors",
+        SubscriptionCase::HttpFailure,
+    );
+}

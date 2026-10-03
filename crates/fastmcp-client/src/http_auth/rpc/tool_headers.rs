@@ -15,13 +15,13 @@ use asupersync::Cx;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::{CoreRequest, RequestId};
 
+use super::interaction::{ManagedInteraction, ManagedInteractionError, ManagedInteractionLimits};
 use super::{
-    CoreDecoder, ManagedCoreCall, ManagedCoreError, ManagedCoreLimits,
-    ManagedOAuthSession, bounded_wait, call_deadline, prepare,
+    CoreDecoder, ManagedCoreCall, ManagedCoreError, ManagedCoreLimits, ManagedOAuthSession,
+    bounded_wait, call_deadline, prepare,
 };
 use crate::http_executor::ModernHttpRequest;
 use crate::http_executor::parameter_headers::{ReviewedToolHeaders, ToolHeaderDispatchError};
-use super::interaction::{ManagedInteraction, ManagedInteractionError, ManagedInteractionLimits};
 
 /// Header admission and core transport errors contain no disclosed values.
 #[derive(Debug)]
@@ -41,10 +41,14 @@ impl fmt::Display for ManagedToolHeaderError {
 
 impl std::error::Error for ManagedToolHeaderError {}
 impl From<ToolHeaderDispatchError> for ManagedToolHeaderError {
-    fn from(error: ToolHeaderDispatchError) -> Self { Self::Headers(error) }
+    fn from(error: ToolHeaderDispatchError) -> Self {
+        Self::Headers(error)
+    }
 }
 impl From<ManagedCoreError> for ManagedToolHeaderError {
-    fn from(error: ManagedCoreError) -> Self { Self::Core(error) }
+    fn from(error: ManagedCoreError) -> Self {
+        Self::Core(error)
+    }
 }
 
 // One preparation path is shared by initial calls and explicit continuations.
@@ -78,8 +82,14 @@ impl ManagedOAuthSession {
         limits: ManagedInteractionLimits,
     ) -> Result<ManagedInteraction, ManagedInteractionError> {
         self.start_tool_interaction_with_headers_and_cancellation(
-            cx, &McpRequestCancellation::new(), request, request_id, reviewed, limits,
-        ).await
+            cx,
+            &McpRequestCancellation::new(),
+            request,
+            request_id,
+            reviewed,
+            limits,
+        )
+        .await
     }
 
     /// Retains the original cancellation domain, deadline and review across
@@ -96,8 +106,14 @@ impl ManagedOAuthSession {
         limits: ManagedInteractionLimits,
     ) -> Result<ManagedInteraction, ManagedInteractionError> {
         self.start_core_interaction_configured(
-            cx, cancellation, request, request_id, limits, Some(reviewed),
-        ).await
+            cx,
+            cancellation,
+            request,
+            request_id,
+            limits,
+            Some(reviewed),
+        )
+        .await
     }
 
     /// Sends one tools/call with explicitly reviewed schema-derived headers.
@@ -113,8 +129,14 @@ impl ManagedOAuthSession {
         limits: ManagedCoreLimits,
     ) -> Result<ManagedCoreCall, ManagedToolHeaderError> {
         self.request_tool_with_headers_and_cancellation(
-            cx, &McpRequestCancellation::new(), request, request_id, reviewed, limits,
-        ).await
+            cx,
+            &McpRequestCancellation::new(),
+            request,
+            request_id,
+            reviewed,
+            limits,
+        )
+        .await
     }
 
     /// Retains one cancellation domain and absolute deadline through preparation,
@@ -132,12 +154,18 @@ impl ManagedOAuthSession {
     ) -> Result<ManagedCoreCall, ManagedToolHeaderError> {
         let deadline = call_deadline(cx, cancellation, limits.timeout)?;
         let (wire, decoder) = prepare_optional(
-            self.resource().as_str(), request, request_id, limits, Some(reviewed),
+            self.resource().as_str(),
+            request,
+            request_id,
+            limits,
+            Some(reviewed),
         )?;
         let response = bounded_wait(cx, cancellation, deadline, async {
             self.execute_with_cancellation(cx, cancellation, &wire)
-                .await.map_err(ManagedCoreError::from)
-        }).await?;
+                .await
+                .map_err(ManagedCoreError::from)
+        })
+        .await?;
         ManagedCoreCall::from_response(response, decoder, cancellation.clone(), deadline)
             .map_err(ManagedToolHeaderError::from)
     }
@@ -154,70 +182,169 @@ mod tests {
     const TARGET: &str = "https://tools.example/mcp";
 
     fn review() -> ReviewedToolHeaders {
-        ReviewedToolHeaders::new(CanonicalHttpUrl::parse(TARGET).unwrap(), "lookup", json!({
-            "type":"object", "properties":{"region":{"type":"string","x-mcp-header":"Region"}},
-        }), |binding| binding.property_path() == ["region".to_owned()]
-            && binding.header_name() == "Mcp-Param-Region").unwrap()
+        ReviewedToolHeaders::new(
+            CanonicalHttpUrl::parse(TARGET).unwrap(),
+            "lookup",
+            json!({
+                "type":"object", "properties":{"region":{"type":"string","x-mcp-header":"Region"}},
+            }),
+            |binding| {
+                binding.property_path() == ["region".to_owned()]
+                    && binding.header_name() == "Mcp-Param-Region"
+            },
+        )
+        .unwrap()
     }
 
     fn request(method: &str, mut params: Value) -> CoreRequest {
-        params["_meta"] = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
+        params["_meta"] =
+            serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
         CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&params)).unwrap()
     }
 
     #[test]
     fn managed_preparation_retains_the_core_decoder_and_exact_parameters() {
-        let request = request("tools/call", json!({"name":"lookup","arguments":{"region":"eu","private":"body-only"}}));
+        let request = request(
+            "tools/call",
+            json!({"name":"lookup","arguments":{"region":"eu","private":"body-only"}}),
+        );
         let before = request.encode_params().unwrap().unwrap();
-        let (wire, decoder) = prepare_optional(TARGET, request, RequestId::Number(17), ManagedCoreLimits::default(), Some(&review())).unwrap();
+        let (wire, decoder) = prepare_optional(
+            TARGET,
+            request,
+            RequestId::Number(17),
+            ManagedCoreLimits::default(),
+            Some(&review()),
+        )
+        .unwrap();
         let body: Value = serde_json::from_slice(wire.body()).unwrap();
         assert_eq!(body["params"], before);
         assert_eq!(body["id"], 17);
         assert_eq!(decoder.request_id, RequestId::Number(17));
-        assert!(wire.headers().iter().any(|(name, value)| name == "Mcp-Param-Region" && value == "eu"));
-        assert!(!wire.headers().iter().any(|(_, value)| value.contains("body-only")));
-        assert!(!wire.headers().iter().any(|(name, _)| name == "Authorization"));
+        assert!(
+            wire.headers()
+                .iter()
+                .any(|(name, value)| name == "Mcp-Param-Region" && value == "eu")
+        );
+        assert!(
+            !wire
+                .headers()
+                .iter()
+                .any(|(_, value)| value.contains("body-only"))
+        );
+        assert!(
+            !wire
+                .headers()
+                .iter()
+                .any(|(name, _)| name == "Authorization")
+        );
     }
 
     #[test]
     fn invalid_binding_type_or_size_fails_during_local_preparation() {
         let review = review();
         for (target, request) in [
-            ("https://tools.example/other", request("tools/call", json!({"name":"lookup"}))),
+            (
+                "https://tools.example/other",
+                request("tools/call", json!({"name":"lookup"})),
+            ),
             (TARGET, request("tools/call", json!({"name":"other"}))),
-            (TARGET, request("tools/call", json!({"name":"lookup","arguments":{"region":42}}))),
+            (
+                TARGET,
+                request(
+                    "tools/call",
+                    json!({"name":"lookup","arguments":{"region":42}}),
+                ),
+            ),
             (TARGET, request("tools/list", json!({}))),
         ] {
-            assert!(prepare_optional(target, request, RequestId::Number(17), ManagedCoreLimits::default(), Some(&review)).is_err());
+            assert!(
+                prepare_optional(
+                    target,
+                    request,
+                    RequestId::Number(17),
+                    ManagedCoreLimits::default(),
+                    Some(&review)
+                )
+                .is_err()
+            );
         }
-        let tiny = ManagedCoreLimits::new(1, 1024, 1024, 1, std::time::Duration::from_secs(1)).unwrap();
-        assert!(matches!(prepare_optional(TARGET, request("tools/call", json!({"name":"lookup"})), RequestId::Number(17), tiny, Some(&review)),
-            Err(ManagedToolHeaderError::Core(ManagedCoreError::RequestTooLarge))));
+        let tiny =
+            ManagedCoreLimits::new(1, 1024, 1024, 1, std::time::Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            prepare_optional(
+                TARGET,
+                request("tools/call", json!({"name":"lookup"})),
+                RequestId::Number(17),
+                tiny,
+                Some(&review)
+            ),
+            Err(ManagedToolHeaderError::Core(
+                ManagedCoreError::RequestTooLarge
+            ))
+        ));
     }
 
     #[test]
     fn header_opt_in_does_not_activate_extensions_or_change_ordinary_calls() {
-        let core = request("tools/call", json!({"name":"lookup","arguments":{"region":"eu"}}));
-        let (ordinary, _) = prepare_optional(TARGET, core.clone(), RequestId::Number(17), ManagedCoreLimits::default(), None).unwrap();
-        assert!(!ordinary.headers().iter().any(|(name, _)| name.starts_with("Mcp-Param-")));
+        let core = request(
+            "tools/call",
+            json!({"name":"lookup","arguments":{"region":"eu"}}),
+        );
+        let (ordinary, _) = prepare_optional(
+            TARGET,
+            core.clone(),
+            RequestId::Number(17),
+            ManagedCoreLimits::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            !ordinary
+                .headers()
+                .iter()
+                .any(|(name, _)| name.starts_with("Mcp-Param-"))
+        );
         let mut params = core.encode_params().unwrap().unwrap();
-        params["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"] = json!({"io.modelcontextprotocol/tasks":{}});
-        let core = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).unwrap();
-        assert!(matches!(prepare_optional(TARGET, core, RequestId::Number(17), ManagedCoreLimits::default(), Some(&review())),
-            Err(ManagedToolHeaderError::Core(ManagedCoreError::UnsupportedRequest))));
+        params["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"] =
+            json!({"io.modelcontextprotocol/tasks":{}});
+        let core =
+            CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).unwrap();
+        assert!(matches!(
+            prepare_optional(
+                TARGET,
+                core,
+                RequestId::Number(17),
+                ManagedCoreLimits::default(),
+                Some(&review())
+            ),
+            Err(ManagedToolHeaderError::Core(
+                ManagedCoreError::UnsupportedRequest
+            ))
+        ));
     }
 
-    fn challenge(original: &CoreRequest, state: Option<&str>) -> fastmcp_protocol::InputRequiredResult {
+    fn challenge(
+        original: &CoreRequest,
+        state: Option<&str>,
+    ) -> fastmcp_protocol::InputRequiredResult {
         let mut value = json!({"resultType":"input_required", "inputRequests":{
             "one":{"method":"roots/list"}, "two":{"method":"roots/list"}
         }});
-        if let Some(state) = state { value["requestState"] = json!(state); }
+        if let Some(state) = state {
+            value["requestState"] = json!(state);
+        }
         let result = original.decode_result(&value.to_string()).unwrap();
-        super::super::interaction::input_required(&result).unwrap().clone()
+        super::super::interaction::input_required(&result)
+            .unwrap()
+            .clone()
     }
 
     fn continuation_source() -> CoreRequest {
-        let original = request("tools/call", json!({"name":"lookup", "arguments":{"region":"eu", "private":"body-only"}}));
+        let original = request(
+            "tools/call",
+            json!({"name":"lookup", "arguments":{"region":"eu", "private":"body-only"}}),
+        );
         let mut params = original.encode_params().unwrap().unwrap();
         params["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!({"roots":{}});
         CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).unwrap()
@@ -231,19 +358,41 @@ mod tests {
         let input = challenge(&original, Some("  opaque\0  "));
         let review = review();
         for (selection, answers) in [
-            (InputSelection::Complete, json!({"one":{"roots":[]},"two":{"roots":[]}})),
+            (
+                InputSelection::Complete,
+                json!({"one":{"roots":[]},"two":{"roots":[]}}),
+            ),
             (InputSelection::Partial, json!({"two":{"roots":[]}})),
         ] {
-            let next = continuation_request_selected(&original, &input,
-                Some(serde_json::from_value(answers.clone()).unwrap()), selection).unwrap();
-            let (wire, _) = prepare_optional(TARGET, next, RequestId::Number(18), ManagedCoreLimits::default(), Some(&review)).unwrap();
+            let next = continuation_request_selected(
+                &original,
+                &input,
+                Some(serde_json::from_value(answers.clone()).unwrap()),
+                selection,
+            )
+            .unwrap();
+            let (wire, _) = prepare_optional(
+                TARGET,
+                next,
+                RequestId::Number(18),
+                ManagedCoreLimits::default(),
+                Some(&review),
+            )
+            .unwrap();
             let encoded: Value = serde_json::from_slice(wire.body()).unwrap();
             assert_eq!(encoded["params"]["arguments"], before["arguments"]);
             assert_eq!(encoded["params"]["_meta"], before["_meta"]);
             assert_eq!(encoded["params"]["inputResponses"], answers);
             assert_eq!(encoded["params"]["requestState"], "  opaque\0  ");
-            let fields: Vec<_> = wire.headers().into_iter().filter(|(name, _)| name.starts_with("Mcp-Param-")).collect();
-            assert_eq!(fields, vec![("Mcp-Param-Region".to_owned(), "eu".to_owned())]);
+            let fields: Vec<_> = wire
+                .headers()
+                .into_iter()
+                .filter(|(name, _)| name.starts_with("Mcp-Param-"))
+                .collect();
+            assert_eq!(
+                fields,
+                vec![("Mcp-Param-Region".to_owned(), "eu".to_owned())]
+            );
         }
         assert_eq!(original.encode_params().unwrap().unwrap(), before);
     }
@@ -255,11 +404,21 @@ mod tests {
         let before = original.encode_params().unwrap().unwrap();
         for (input, answers) in [
             (challenge(&original, None), json!({"one":{"roots":[]}})),
-            (challenge(&original, Some("state")), json!({"foreign":{"roots":[]}})),
+            (
+                challenge(&original, Some("state")),
+                json!({"foreign":{"roots":[]}}),
+            ),
             (challenge(&original, Some("state")), json!({})),
         ] {
-            assert!(continuation_request_selected(&original, &input,
-                Some(serde_json::from_value(answers).unwrap()), InputSelection::Partial).is_err());
+            assert!(
+                continuation_request_selected(
+                    &original,
+                    &input,
+                    Some(serde_json::from_value(answers).unwrap()),
+                    InputSelection::Partial
+                )
+                .is_err()
+            );
         }
         assert_eq!(original.encode_params().unwrap().unwrap(), before);
     }
@@ -269,11 +428,26 @@ mod tests {
         use super::super::interaction::continuation_request;
         let original = continuation_source();
         let input = challenge(&original, Some("journal-state"));
-        let answers = serde_json::from_value(json!({"one":{"roots":[]},"two":{"roots":[]}})).unwrap();
+        let answers =
+            serde_json::from_value(json!({"one":{"roots":[]},"two":{"roots":[]}})).unwrap();
         let request = continuation_request(&original, &input, Some(answers)).unwrap();
         let review = review();
-        let (first, _) = prepare_optional(TARGET, request.clone(), RequestId::Number(18), ManagedCoreLimits::default(), Some(&review)).unwrap();
-        let (next, _) = prepare_optional(TARGET, request, RequestId::Number(19), ManagedCoreLimits::default(), Some(&review)).unwrap();
+        let (first, _) = prepare_optional(
+            TARGET,
+            request.clone(),
+            RequestId::Number(18),
+            ManagedCoreLimits::default(),
+            Some(&review),
+        )
+        .unwrap();
+        let (next, _) = prepare_optional(
+            TARGET,
+            request,
+            RequestId::Number(19),
+            ManagedCoreLimits::default(),
+            Some(&review),
+        )
+        .unwrap();
         let first_body: Value = serde_json::from_slice(first.body()).unwrap();
         let next_body: Value = serde_json::from_slice(next.body()).unwrap();
         assert_ne!(first_body["id"], next_body["id"]);
@@ -285,12 +459,25 @@ mod tests {
     fn state_only_continuation_keeps_absence_and_still_projects_the_original_input() {
         use super::super::interaction::{continuation_request, input_required};
         let original = continuation_source();
-        let result = original.decode_result(r#"{"resultType":"input_required","requestState":""}"#).unwrap();
+        let result = original
+            .decode_result(r#"{"resultType":"input_required","requestState":""}"#)
+            .unwrap();
         let next = continuation_request(&original, input_required(&result).unwrap(), None).unwrap();
-        let (wire, _) = prepare_optional(TARGET, next, RequestId::Number(18), ManagedCoreLimits::default(), Some(&review())).unwrap();
+        let (wire, _) = prepare_optional(
+            TARGET,
+            next,
+            RequestId::Number(18),
+            ManagedCoreLimits::default(),
+            Some(&review()),
+        )
+        .unwrap();
         let value: Value = serde_json::from_slice(wire.body()).unwrap();
         assert_eq!(value["params"]["requestState"], "");
         assert!(value["params"].get("inputResponses").is_none());
-        assert!(wire.headers().iter().any(|(name, value)| name == "Mcp-Param-Region" && value == "eu"));
+        assert!(
+            wire.headers()
+                .iter()
+                .any(|(name, value)| name == "Mcp-Param-Region" && value == "eu")
+        );
     }
 }

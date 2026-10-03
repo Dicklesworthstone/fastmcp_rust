@@ -233,7 +233,11 @@ pub fn join(
         ("b_manifest_sha256", &b_input.declared_digest, 64),
         ("joined_graph_sha256", &b.canonical_graph_sha256, 64),
         ("joined_corpus_sha256", &b.canonical_corpus_sha256, 64),
-        ("joined_trace_table_sha256", &a.canonical_trace_table_sha256, 64),
+        (
+            "joined_trace_table_sha256",
+            &a.canonical_trace_table_sha256,
+            64,
+        ),
         ("source_tree_sha256", &a.source_tree_sha256, 64),
         ("plan_blob_sha1", &b.plan_blob_sha1, 40),
         ("beads_blob_sha1", &b.beads_blob_sha1, 40),

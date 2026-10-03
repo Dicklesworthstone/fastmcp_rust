@@ -6,7 +6,9 @@ use fastmcp_client::http_auth::managed::tasks::{
     ManagedTaskCall, ManagedTaskEvent, ManagedTaskRequest, ManagedTaskRequestIds,
     ManagedTasksClient, ManagedTasksError, ManagedTasksLimits,
 };
-use fastmcp_protocol::tasks_extension::{GetTaskResult, Task, TaskId, TaskInputResponses, TASKS_EXTENSION};
+use fastmcp_protocol::tasks_extension::{
+    GetTaskResult, TASKS_EXTENSION, Task, TaskId, TaskInputResponses,
+};
 use fastmcp_protocol::{ClientCapabilities, FinalCoreResult, FinalRequestMeta, ServerNotification};
 
 const TASK_CASE: &str = "FASTMCP_TEST_MANAGED_TASK_CASE";
@@ -17,7 +19,19 @@ const INPUT: &str = r#"{"resultType":"complete","taskId":"task-one","status":"in
 const COMPLETED: &str = r#"{"resultType":"complete","taskId":"task-one","status":"completed","createdAt":"2026-09-16T00:00:00Z","lastUpdatedAt":"2026-09-16T00:00:02Z","ttlMs":60000,"result":{"content":[{"type":"text","text":"done"}],"x-exact":{"z":900719925474099312345,"a":1.20e+4}}}"#;
 
 #[derive(Clone, Copy)]
-enum TaskCase { Lifecycle, Discovery, Preflight, Streaming, InvalidResult, NoReplay, Cancel, Close, DropRead, Expiry, Deadline }
+enum TaskCase {
+    Lifecycle,
+    Discovery,
+    Preflight,
+    Streaming,
+    InvalidResult,
+    NoReplay,
+    Cancel,
+    Close,
+    DropRead,
+    Expiry,
+    Deadline,
+}
 
 fn isolated_task(name: &str, case: TaskCase) {
     if let Ok(selected) = std::env::var(TASK_CASE) {
@@ -28,29 +42,59 @@ fn isolated_task(name: &str, case: TaskCase) {
     let roots = RootFile::create();
     struct Child(std::process::Child);
     impl Drop for Child {
-        fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
     // This module is included by the shared driver's module, not at crate
     // root. Keep the executable selection exact rather than silently running
     // zero tests under an unmatched short name.
     let exact_name = format!("driver::{name}");
-    let mut child = Child(Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", &exact_name, "--nocapture", "--test-threads=1"])
-        .env(TASK_CASE, name).env("SSL_CERT_FILE", &roots.0).env_remove("SSL_CERT_DIR")
-        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap());
+    let mut child = Child(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &exact_name, "--nocapture", "--test-threads=1"])
+            .env(TASK_CASE, name)
+            .env("SSL_CERT_FILE", &roots.0)
+            .env_remove("SSL_CERT_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
     let end = Instant::now() + Duration::from_secs(30);
     loop {
-        if let Some(status) = child.0.try_wait().unwrap() { assert!(status.success(), "managed Tasks HTTPS case failed"); return; }
-        assert!(Instant::now() < end, "managed Tasks child exceeded its bound");
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "managed Tasks HTTPS case failed");
+            return;
+        }
+        assert!(
+            Instant::now() < end,
+            "managed Tasks child exceeded its bound"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
 
-fn task_id() -> TaskId { TaskId::parse("task-one").unwrap() }
-fn ids(number: i64) -> ManagedTaskRequestIds { ManagedTaskRequestIds::new(RequestId::Number(number), RequestId::Number(number + 1)).unwrap() }
-fn tool() -> ManagedTaskRequest { ManagedTaskRequest::CallTool { name: "echo".to_owned(), arguments: Some(json!({"subject":"work"})) } }
-fn task_answers(key: &str) -> TaskInputResponses { serde_json::from_value(json!({key:{"roots":[]}})).unwrap() }
-fn input_task() -> Task { serde_json::from_str::<GetTaskResult>(INPUT).unwrap().task }
+fn task_id() -> TaskId {
+    TaskId::parse("task-one").unwrap()
+}
+fn ids(number: i64) -> ManagedTaskRequestIds {
+    ManagedTaskRequestIds::new(RequestId::Number(number), RequestId::Number(number + 1)).unwrap()
+}
+fn tool() -> ManagedTaskRequest {
+    ManagedTaskRequest::CallTool {
+        name: "echo".to_owned(),
+        arguments: Some(json!({"subject":"work"})),
+    }
+}
+fn task_answers(key: &str) -> TaskInputResponses {
+    serde_json::from_value(json!({key:{"roots":[]}})).unwrap()
+}
+fn input_task() -> Task {
+    serde_json::from_str::<GetTaskResult>(INPUT).unwrap().task
+}
 
 async fn discovery(peer: &Peer, number: i64, result: &str) {
     let request = peer.response(number, result).await;
@@ -60,11 +104,17 @@ async fn operation(peer: &Peer, number: i64, method: &str, result: &str) -> Valu
     discovery(peer, number, DISCOVERY).await;
     let request = peer.response(number + 1, result).await;
     assert_eq!(request["method"], method);
-    assert_eq!(request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"], json!({TASKS_EXTENSION:{}}));
+    assert_eq!(
+        request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"],
+        json!({TASKS_EXTENSION:{}})
+    );
     request
 }
 async fn first_progress(call: &mut ManagedTaskCall, cx: &Cx) {
-    let Some(ManagedTaskEvent::Notification(notification)) = call.next_event(cx).await.unwrap() else { panic!("progress expected before terminal") };
+    let Some(ManagedTaskEvent::Notification(notification)) = call.next_event(cx).await.unwrap()
+    else {
+        panic!("progress expected before terminal")
+    };
     assert!(matches!(*notification, ServerNotification::Progress(_)));
 }
 async fn begin_task_stream(peer: &Peer) -> TlsStream<TcpStream> {
@@ -73,7 +123,10 @@ async fn begin_task_stream(peer: &Peer) -> TlsStream<TcpStream> {
     let request: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(request["id"], 2);
     assert_eq!(request["method"], "tools/call");
-    assert_eq!(request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"], json!({TASKS_EXTENSION:{}}));
+    assert_eq!(
+        request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"],
+        json!({TASKS_EXTENSION:{}})
+    );
     sse_head(&mut tls).await;
     event(&mut tls, r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"owned","progress":1}}"#, false).await;
     tls
@@ -272,24 +325,79 @@ fn run_tasks(case: TaskCase) {
 }
 
 #[test]
-fn managed_tasks_complete_create_get_input_update_get_cancel() { isolated_task("tasks::managed_tasks_complete_create_get_input_update_get_cancel", TaskCase::Lifecycle); }
+fn managed_tasks_complete_create_get_input_update_get_cancel() {
+    isolated_task(
+        "tasks::managed_tasks_complete_create_get_input_update_get_cancel",
+        TaskCase::Lifecycle,
+    );
+}
 #[test]
-fn managed_tasks_require_fresh_exact_discovery_before_each_post() { isolated_task("tasks::managed_tasks_require_fresh_exact_discovery_before_each_post", TaskCase::Discovery); }
+fn managed_tasks_require_fresh_exact_discovery_before_each_post() {
+    isolated_task(
+        "tasks::managed_tasks_require_fresh_exact_discovery_before_each_post",
+        TaskCase::Discovery,
+    );
+}
 #[test]
-fn managed_tasks_invalid_input_has_no_discovery_or_mutation_effect() { isolated_task("tasks::managed_tasks_invalid_input_has_no_discovery_or_mutation_effect", TaskCase::Preflight); }
+fn managed_tasks_invalid_input_has_no_discovery_or_mutation_effect() {
+    isolated_task(
+        "tasks::managed_tasks_invalid_input_has_no_discovery_or_mutation_effect",
+        TaskCase::Preflight,
+    );
+}
 #[test]
-fn managed_tasks_stream_progress_before_the_created_task() { isolated_task("tasks::managed_tasks_stream_progress_before_the_created_task", TaskCase::Streaming); }
+fn managed_tasks_stream_progress_before_the_created_task() {
+    isolated_task(
+        "tasks::managed_tasks_stream_progress_before_the_created_task",
+        TaskCase::Streaming,
+    );
+}
 #[test]
-fn managed_tasks_reject_foreign_ids_and_malformed_results() { isolated_task("tasks::managed_tasks_reject_foreign_ids_and_malformed_results", TaskCase::InvalidResult); }
+fn managed_tasks_reject_foreign_ids_and_malformed_results() {
+    isolated_task(
+        "tasks::managed_tasks_reject_foreign_ids_and_malformed_results",
+        TaskCase::InvalidResult,
+    );
+}
 #[test]
-fn managed_tasks_never_retry_uncertain_or_rejected_mutations() { isolated_task("tasks::managed_tasks_never_retry_uncertain_or_rejected_mutations", TaskCase::NoReplay); }
+fn managed_tasks_never_retry_uncertain_or_rejected_mutations() {
+    isolated_task(
+        "tasks::managed_tasks_never_retry_uncertain_or_rejected_mutations",
+        TaskCase::NoReplay,
+    );
+}
 #[test]
-fn managed_tasks_cancellation_closes_only_the_owned_read() { isolated_task("tasks::managed_tasks_cancellation_closes_only_the_owned_read", TaskCase::Cancel); }
+fn managed_tasks_cancellation_closes_only_the_owned_read() {
+    isolated_task(
+        "tasks::managed_tasks_cancellation_closes_only_the_owned_read",
+        TaskCase::Cancel,
+    );
+}
 #[test]
-fn managed_tasks_session_closure_wakes_the_owned_read() { isolated_task("tasks::managed_tasks_session_closure_wakes_the_owned_read", TaskCase::Close); }
+fn managed_tasks_session_closure_wakes_the_owned_read() {
+    isolated_task(
+        "tasks::managed_tasks_session_closure_wakes_the_owned_read",
+        TaskCase::Close,
+    );
+}
 #[test]
-fn managed_tasks_abandoned_read_cannot_resume() { isolated_task("tasks::managed_tasks_abandoned_read_cannot_resume", TaskCase::DropRead); }
+fn managed_tasks_abandoned_read_cannot_resume() {
+    isolated_task(
+        "tasks::managed_tasks_abandoned_read_cannot_resume",
+        TaskCase::DropRead,
+    );
+}
 #[test]
-fn managed_tasks_original_credential_expiry_is_terminal() { isolated_task("tasks::managed_tasks_original_credential_expiry_is_terminal", TaskCase::Expiry); }
+fn managed_tasks_original_credential_expiry_is_terminal() {
+    isolated_task(
+        "tasks::managed_tasks_original_credential_expiry_is_terminal",
+        TaskCase::Expiry,
+    );
+}
 #[test]
-fn managed_tasks_deadline_includes_consumer_pauses() { isolated_task("tasks::managed_tasks_deadline_includes_consumer_pauses", TaskCase::Deadline); }
+fn managed_tasks_deadline_includes_consumer_pauses() {
+    isolated_task(
+        "tasks::managed_tasks_deadline_includes_consumer_pauses",
+        TaskCase::Deadline,
+    );
+}

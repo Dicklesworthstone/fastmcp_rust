@@ -4,8 +4,8 @@ use fastmcp_core::CanonicalHttpUrl;
 use fastmcp_protocol::protocol_policy::{
     HttpEndpointBundle, HttpEndpointBundleError, HttpEraCache, HttpEraDecision, HttpModernProbe,
     HttpProbeBody, ModernVersionSupport, ProtocolEra, ProtocolPolicy, ProtocolVersion,
-    ProtocolVersionError, StdioEraClassifier, StdioEraDecision, StdioEraRejection,
-    StdioEraState, StdioOpeningFrame,
+    ProtocolVersionError, StdioEraClassifier, StdioEraDecision, StdioEraRejection, StdioEraState,
+    StdioOpeningFrame,
 };
 
 fn auto_bundle(security_partition: &str, policy_generation: u64) -> HttpEndpointBundle {
@@ -308,9 +308,18 @@ fn fnd_03_b_fixed_policies_never_fall_back() {
 
     let mut cache = HttpEraCache::default();
     for probe in [
-        HttpModernProbe { status: 404, body: HttpProbeBody::Empty },
-        HttpModernProbe { status: 405, body: HttpProbeBody::Unrecognized },
-        HttpModernProbe { status: 200, body: HttpProbeBody::TransportFailure },
+        HttpModernProbe {
+            status: 404,
+            body: HttpProbeBody::Empty,
+        },
+        HttpModernProbe {
+            status: 405,
+            body: HttpProbeBody::Unrecognized,
+        },
+        HttpModernProbe {
+            status: 200,
+            body: HttpProbeBody::TransportFailure,
+        },
     ] {
         assert_eq!(
             cache.classify_or_cached(&modern_bundle, probe),
@@ -486,46 +495,146 @@ fn fnd_03_b_bundle_key_binds_every_dimension() {
     const SSE: &str = "https://api.example.test/sse?tenant=alpha";
     const MESSAGE: &str = "https://api.example.test/messages?tenant=alpha";
 
-    let baseline = bundle(MODERN, SSE, MESSAGE, "cred-a", "sec-a", "http-sse-v2", 3, 7, 11);
+    let baseline = bundle(
+        MODERN,
+        SSE,
+        MESSAGE,
+        "cred-a",
+        "sec-a",
+        "http-sse-v2",
+        3,
+        7,
+        11,
+    );
 
     // One variant per key dimension, each differing from the baseline in
     // exactly that dimension and nothing else.
     let variants: [(&str, HttpEndpointBundle); 9] = [
         (
             "modern_post_target",
-            bundle("https://api.example.test/mcp2?tenant=alpha", SSE, MESSAGE, "cred-a", "sec-a", "http-sse-v2", 3, 7, 11),
+            bundle(
+                "https://api.example.test/mcp2?tenant=alpha",
+                SSE,
+                MESSAGE,
+                "cred-a",
+                "sec-a",
+                "http-sse-v2",
+                3,
+                7,
+                11,
+            ),
         ),
         (
             "legacy_sse_target",
-            bundle(MODERN, "https://api.example.test/sse2?tenant=alpha", MESSAGE, "cred-a", "sec-a", "http-sse-v2", 3, 7, 11),
+            bundle(
+                MODERN,
+                "https://api.example.test/sse2?tenant=alpha",
+                MESSAGE,
+                "cred-a",
+                "sec-a",
+                "http-sse-v2",
+                3,
+                7,
+                11,
+            ),
         ),
         (
             "legacy_message_post_target",
-            bundle(MODERN, SSE, "https://api.example.test/messages2?tenant=alpha", "cred-a", "sec-a", "http-sse-v2", 3, 7, 11),
+            bundle(
+                MODERN,
+                SSE,
+                "https://api.example.test/messages2?tenant=alpha",
+                "cred-a",
+                "sec-a",
+                "http-sse-v2",
+                3,
+                7,
+                11,
+            ),
         ),
         (
             "credential_partition",
-            bundle(MODERN, SSE, MESSAGE, "cred-b", "sec-a", "http-sse-v2", 3, 7, 11),
+            bundle(
+                MODERN,
+                SSE,
+                MESSAGE,
+                "cred-b",
+                "sec-a",
+                "http-sse-v2",
+                3,
+                7,
+                11,
+            ),
         ),
         (
             "security_partition",
-            bundle(MODERN, SSE, MESSAGE, "cred-a", "sec-b", "http-sse-v2", 3, 7, 11),
+            bundle(
+                MODERN,
+                SSE,
+                MESSAGE,
+                "cred-a",
+                "sec-b",
+                "http-sse-v2",
+                3,
+                7,
+                11,
+            ),
         ),
         (
             "transport_profile",
-            bundle(MODERN, SSE, MESSAGE, "cred-a", "sec-a", "http-sse-v3", 3, 7, 11),
+            bundle(
+                MODERN,
+                SSE,
+                MESSAGE,
+                "cred-a",
+                "sec-a",
+                "http-sse-v3",
+                3,
+                7,
+                11,
+            ),
         ),
         (
             "policy_generation",
-            bundle(MODERN, SSE, MESSAGE, "cred-a", "sec-a", "http-sse-v2", 4, 7, 11),
+            bundle(
+                MODERN,
+                SSE,
+                MESSAGE,
+                "cred-a",
+                "sec-a",
+                "http-sse-v2",
+                4,
+                7,
+                11,
+            ),
         ),
         (
             "configuration_generation",
-            bundle(MODERN, SSE, MESSAGE, "cred-a", "sec-a", "http-sse-v2", 3, 8, 11),
+            bundle(
+                MODERN,
+                SSE,
+                MESSAGE,
+                "cred-a",
+                "sec-a",
+                "http-sse-v2",
+                3,
+                8,
+                11,
+            ),
         ),
         (
             "legacy_receipt_generation",
-            bundle(MODERN, SSE, MESSAGE, "cred-a", "sec-a", "http-sse-v2", 3, 7, 12),
+            bundle(
+                MODERN,
+                SSE,
+                MESSAGE,
+                "cred-a",
+                "sec-a",
+                "http-sse-v2",
+                3,
+                7,
+                12,
+            ),
         ),
     ];
 
@@ -567,7 +676,11 @@ fn fnd_03_b_bundle_key_binds_every_dimension() {
     keys.push(modern_only.key());
     let total = keys.len();
     let unique: std::collections::HashSet<_> = keys.into_iter().collect();
-    assert_eq!(unique.len(), total, "two key dimensions alias onto one another");
+    assert_eq!(
+        unique.len(),
+        total,
+        "two key dimensions alias onto one another"
+    );
 
     // Origin equality alone is never bundle identity: same scheme, host and
     // port, differing only in path, then only in query.
@@ -604,7 +717,17 @@ fn fnd_03_b_bundle_key_binds_every_dimension() {
     // function of its inputs, not of construction identity. Without this the
     // inequality assertions above would pass for a key that is simply always
     // unique, which would cache nothing and prove nothing.
-    let rebuilt = bundle(MODERN, SSE, MESSAGE, "cred-a", "sec-a", "http-sse-v2", 3, 7, 11);
+    let rebuilt = bundle(
+        MODERN,
+        SSE,
+        MESSAGE,
+        "cred-a",
+        "sec-a",
+        "http-sse-v2",
+        3,
+        7,
+        11,
+    );
     assert_eq!(baseline.key(), rebuilt.key());
 }
 
@@ -628,7 +751,10 @@ fn fnd_03_b_cache_does_not_leak_across_partitions() {
 
     // Partition B has negotiated nothing, so it must classify on its own
     // probe rather than inherit A's selection.
-    assert_eq!(cache.selected_era(&partition_a.key()), Some(ProtocolEra::Modern2026));
+    assert_eq!(
+        cache.selected_era(&partition_a.key()),
+        Some(ProtocolEra::Modern2026)
+    );
     assert_eq!(cache.selected_era(&partition_b.key()), None);
     assert_eq!(
         cache.classify_or_cached(

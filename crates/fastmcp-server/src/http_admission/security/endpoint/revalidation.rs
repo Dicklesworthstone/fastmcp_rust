@@ -57,12 +57,22 @@ impl SseRevalidationPolicy {
         {
             return Err(SseAuthorizationError::InvalidPolicy);
         }
-        Ok(Self { interval, check_timeout, max_checks })
+        Ok(Self {
+            interval,
+            check_timeout,
+            max_checks,
+        })
     }
 
-    pub fn interval(self) -> Duration { self.interval }
-    pub fn check_timeout(self) -> Duration { self.check_timeout }
-    pub fn max_checks(self) -> usize { self.max_checks }
+    pub fn interval(self) -> Duration {
+        self.interval
+    }
+    pub fn check_timeout(self) -> Duration {
+        self.check_timeout
+    }
+    pub fn max_checks(self) -> usize {
+        self.max_checks
+    }
 }
 
 /// Fixed local diagnostics. No token, provider error, original request, claim,
@@ -130,11 +140,13 @@ impl SseAuthorizationLease {
         if receipt.method != request.method || receipt.request_id != request.id {
             return Err(SseAuthorizationError::Rejected);
         }
-        scopes.authorize_request_verified(request, receipt.authenticated.as_ref())
+        scopes
+            .authorize_request_verified(request, receipt.authenticated.as_ref())
             .map_err(|_| SseAuthorizationError::Rejected)?;
         let started = Instant::now();
         let next_check = fresh_until(cx, cx.now(), config.interval)?;
-        let wall_expiry = started.checked_add(config.interval)
+        let wall_expiry = started
+            .checked_add(config.interval)
             .ok_or(SseAuthorizationError::InvalidPolicy)?;
         Ok(Self {
             server,
@@ -156,7 +168,9 @@ impl SseAuthorizationLease {
     /// bound and never bypasses the current caller's cancellation or deadline.
     /// Failure is irreversible even if the host later restores a token.
     pub(super) fn check(&mut self, cx: &Cx) -> Result<(), SseAuthorizationError> {
-        if self.closed { return Err(SseAuthorizationError::Closed); }
+        if self.closed {
+            return Err(SseAuthorizationError::Closed);
+        }
         // Credential freshness and execution liveness are independent. In
         // particular, a cached success cannot authorize a write after caller
         // cancellation, or when a later read supplies a shorter deadline.
@@ -188,30 +202,44 @@ impl SseAuthorizationLease {
         let caller_started = cx.now();
         let next_check = fresh_until(cx, caller_started, self.config.interval)?;
         let provider_deadline = fresh_until(cx, caller_started, self.config.check_timeout)?;
-        let receipt = self.server.preauthenticate_http_request(
-            cx, &self.request, &self.authorization,
-        );
+        let receipt =
+            self.server
+                .preauthenticate_http_request(cx, &self.request, &self.authorization);
         // Local cancellation/deadlines and work bounds win over either a late
         // success or a provider refusal. Neither can extend the freshness window.
         check_context(cx)?;
-        admit_verdict_time(cx.now(), provider_deadline, started.elapsed(), self.config.check_timeout)?;
+        admit_verdict_time(
+            cx.now(),
+            provider_deadline,
+            started.elapsed(),
+            self.config.check_timeout,
+        )?;
         let receipt = receipt.map_err(|_| SseAuthorizationError::Rejected)?;
         if receipt.fingerprint != self.principal
             || !same_facts(self.facts.as_ref(), receipt.authenticated.as_ref())
         {
             return Err(SseAuthorizationError::FactsChanged);
         }
-        self.scopes.authorize_request_verified(&self.request, receipt.authenticated.as_ref())
+        self.scopes
+            .authorize_request_verified(&self.request, receipt.authenticated.as_ref())
             .map_err(|_| SseAuthorizationError::Rejected)?;
         self.next_check = next_check;
-        self.wall_expiry = started.checked_add(self.config.interval)
+        self.wall_expiry = started
+            .checked_add(self.config.interval)
             .ok_or(SseAuthorizationError::InvalidPolicy)?;
         Ok(())
     }
 }
 
-fn admit_verdict_time(now: Time, deadline: Time, elapsed: Duration, timeout: Duration) -> Result<(), SseAuthorizationError> {
-    if now >= deadline || elapsed >= timeout { return Err(SseAuthorizationError::TimedOut); }
+fn admit_verdict_time(
+    now: Time,
+    deadline: Time,
+    elapsed: Duration,
+    timeout: Duration,
+) -> Result<(), SseAuthorizationError> {
+    if now >= deadline || elapsed >= timeout {
+        return Err(SseAuthorizationError::TimedOut);
+    }
     Ok(())
 }
 
@@ -229,28 +257,44 @@ fn same_facts(left: Option<&AuthContext>, right: Option<&AuthContext>) -> bool {
 }
 
 fn check_context(cx: &Cx) -> Result<(), SseAuthorizationError> {
-    if cx.checkpoint().is_err() { return Err(SseAuthorizationError::Cancelled); }
-    if cx.budget().deadline.is_some_and(|deadline| cx.now() >= deadline) {
+    if cx.checkpoint().is_err() {
+        return Err(SseAuthorizationError::Cancelled);
+    }
+    if cx
+        .budget()
+        .deadline
+        .is_some_and(|deadline| cx.now() >= deadline)
+    {
         return Err(SseAuthorizationError::TimedOut);
     }
     Ok(())
 }
 
 fn fresh_until(cx: &Cx, now: Time, interval: Duration) -> Result<Time, SseAuthorizationError> {
-    let nanos = u64::try_from(interval.as_nanos()).map_err(|_| SseAuthorizationError::InvalidPolicy)?;
-    let end = now.as_nanos().checked_add(nanos).ok_or(SseAuthorizationError::InvalidPolicy)?;
+    let nanos =
+        u64::try_from(interval.as_nanos()).map_err(|_| SseAuthorizationError::InvalidPolicy)?;
+    let end = now
+        .as_nanos()
+        .checked_add(nanos)
+        .ok_or(SseAuthorizationError::InvalidPolicy)?;
     let end = Time::from_nanos(end);
-    Ok(cx.budget().deadline.map_or(end, |deadline| deadline.min(end)))
+    Ok(cx
+        .budget()
+        .deadline
+        .map_or(end, |deadline| deadline.min(end)))
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::scope_policy::{RequiredScopes, ScopeImplicationPolicy};
     use super::*;
-    use std::sync::{Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}};
+    use crate::{AuthProvider, AuthRequest};
     use fastmcp_core::{McpContext, McpError, McpResult};
     use fastmcp_protocol::{RequestId, protocol_policy::ProtocolPolicy};
-    use crate::{AuthProvider, AuthRequest};
-    use super::super::super::scope_policy::{RequiredScopes, ScopeImplicationPolicy};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
 
     #[derive(Clone)]
     struct Provider {
@@ -317,26 +361,58 @@ mod tests {
         facts.claims = Some(serde_json::json!({"tenant":"original"}));
         let provider = Provider {
             facts: Arc::new(Mutex::new(facts)),
-            calls: Arc::new(AtomicUsize::new(0)), denied: Arc::new(AtomicBool::new(false)),
+            calls: Arc::new(AtomicUsize::new(0)),
+            denied: Arc::new(AtomicBool::new(false)),
         };
-        let server = Arc::new(Server::new("lease-tests", "1")
-            .protocol_policy(ProtocolPolicy::ModernOnly).unwrap()
-            .auth_provider(provider.clone()).build());
+        let server = Arc::new(
+            Server::new("lease-tests", "1")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .unwrap()
+                .auth_provider(provider.clone())
+                .build(),
+        );
         let request = JsonRpcRequest::new("tools/list", None, RequestId::Number(7));
-        let authorization = TransportAuthorization::from_singleton_header(Some("Bearer lease-test-token"));
-        let receipt = server.preauthenticate_http_request(cx, &request, &authorization).unwrap();
-        let scopes = ScopeRequestPolicy::new(1, ScopeImplicationPolicy::exact(1).unwrap(), vec![
-            ("tools/list".to_owned(), RequiredScopes::new(vec!["read".to_owned()]).unwrap()),
-        ]).unwrap();
-        let lease = SseAuthorizationLease::new(cx, server, &request, &authorization, &receipt, scopes, config).unwrap();
+        let authorization =
+            TransportAuthorization::from_singleton_header(Some("Bearer lease-test-token"));
+        let receipt = server
+            .preauthenticate_http_request(cx, &request, &authorization)
+            .unwrap();
+        let scopes = ScopeRequestPolicy::new(
+            1,
+            ScopeImplicationPolicy::exact(1).unwrap(),
+            vec![(
+                "tools/list".to_owned(),
+                RequiredScopes::new(vec!["read".to_owned()]).unwrap(),
+            )],
+        )
+        .unwrap();
+        let lease = SseAuthorizationLease::new(
+            cx,
+            server,
+            &request,
+            &authorization,
+            &receipt,
+            scopes,
+            config,
+        )
+        .unwrap();
         (provider, lease)
     }
-    fn due(lease: &mut SseAuthorizationLease, cx: &Cx) { lease.next_check = cx.now(); }
+    fn due(lease: &mut SseAuthorizationLease, cx: &Cx) {
+        lease.next_check = cx.now();
+    }
 
     #[test]
     fn revalidation_policy_has_finite_interval_timeout_and_work_bounds() {
         let default = SseRevalidationPolicy::default();
-        assert!(SseRevalidationPolicy::new(default.interval(), default.check_timeout(), default.max_checks()).is_ok());
+        assert!(
+            SseRevalidationPolicy::new(
+                default.interval(),
+                default.check_timeout(),
+                default.max_checks()
+            )
+            .is_ok()
+        );
         for (interval, timeout, checks) in [
             (Duration::ZERO, Duration::from_millis(1), 1),
             (Duration::from_secs(61), Duration::from_secs(1), 1),
@@ -347,14 +423,19 @@ mod tests {
         ] {
             assert!(SseRevalidationPolicy::new(interval, timeout, checks).is_err());
         }
-        assert!(SseRevalidationPolicy::new(Duration::from_millis(10), Duration::from_millis(10), 4096).is_ok());
+        assert!(
+            SseRevalidationPolicy::new(Duration::from_millis(10), Duration::from_millis(10), 4096)
+                .is_ok()
+        );
     }
 
     #[test]
     fn fresh_verdict_is_reused_but_a_due_check_calls_the_real_provider_once() {
         let (cx, provider, mut lease) = fixture(SseRevalidationPolicy::default());
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-        for _ in 0..3 { lease.check(&cx).unwrap(); }
+        for _ in 0..3 {
+            lease.check(&cx).unwrap();
+        }
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         due(&mut lease, &cx);
         lease.check(&cx).unwrap();
@@ -406,10 +487,16 @@ mod tests {
                 assert!(cx.now() < lease.next_check && Instant::now() < lease.wall_expiry);
                 let result = lease.check(&cx);
                 if expired {
-                    assert!(matches!(result, Err(SseAuthorizationError::TimedOut | SseAuthorizationError::Cancelled)));
+                    assert!(matches!(
+                        result,
+                        Err(SseAuthorizationError::TimedOut | SseAuthorizationError::Cancelled)
+                    ));
                     assert!(lease.closed);
                     assert!(lease.facts.is_none());
-                    assert_eq!(lease.check(&Cx::for_testing()), Err(SseAuthorizationError::Closed));
+                    assert_eq!(
+                        lease.check(&Cx::for_testing()),
+                        Err(SseAuthorizationError::Closed)
+                    );
                 } else {
                     assert_eq!(result, Ok(()));
                     assert!(!lease.closed);
@@ -455,7 +542,8 @@ mod tests {
 
     #[test]
     fn work_exhaustion_does_not_turn_a_stream_into_an_unchecked_stream() {
-        let config = SseRevalidationPolicy::new(Duration::from_secs(5), Duration::from_secs(1), 1).unwrap();
+        let config =
+            SseRevalidationPolicy::new(Duration::from_secs(5), Duration::from_secs(1), 1).unwrap();
         let (cx, provider, mut lease) = fixture(config);
         due(&mut lease, &cx);
         lease.check(&cx).unwrap();
@@ -484,7 +572,9 @@ mod tests {
     fn exact_fact_comparison_includes_session_owner_even_when_subject_is_equal() {
         let mut left = AuthContext::with_subject("same-subject");
         left.scopes = vec!["read".to_owned()];
-        let right = left.clone().with_session_owner(Sha256Digest::from_bytes([8; 32]));
+        let right = left
+            .clone()
+            .with_session_owner(Sha256Digest::from_bytes([8; 32]));
         assert!(!same_facts(Some(&left), Some(&right)));
         assert!(same_facts(Some(&left), Some(&left.clone())));
         assert!(!same_facts(None, Some(&AuthContext::anonymous())));
@@ -494,10 +584,20 @@ mod tests {
     fn changed_request_cannot_borrow_another_opening_receipt() {
         let (cx, _, lease) = fixture(SseRevalidationPolicy::default());
         let mut request = lease.request.clone();
-        let receipt = lease.server.preauthenticate_http_request(&cx, &request, &lease.authorization).unwrap();
+        let receipt = lease
+            .server
+            .preauthenticate_http_request(&cx, &request, &lease.authorization)
+            .unwrap();
         request.id = Some(RequestId::Number(8));
-        let result = SseAuthorizationLease::new(&cx, Arc::clone(&lease.server), &request,
-            &lease.authorization, &receipt, lease.scopes.clone(), lease.config);
+        let result = SseAuthorizationLease::new(
+            &cx,
+            Arc::clone(&lease.server),
+            &request,
+            &lease.authorization,
+            &receipt,
+            lease.scopes.clone(),
+            lease.config,
+        );
         assert!(matches!(result, Err(SseAuthorizationError::Rejected)));
     }
 
@@ -536,40 +636,106 @@ mod tests {
         assert!(deadline < freshness);
         let before = Time::from_nanos(deadline.as_nanos() - 1);
         let just_before = config.check_timeout() - Duration::from_nanos(1);
-        assert_eq!(admit_verdict_time(before, deadline, just_before, config.check_timeout()), Ok(()));
-        assert_eq!(admit_verdict_time(deadline, deadline, Duration::ZERO, config.check_timeout()), Err(SseAuthorizationError::TimedOut));
-        assert_eq!(admit_verdict_time(started, deadline, config.check_timeout(), config.check_timeout()), Err(SseAuthorizationError::TimedOut));
+        assert_eq!(
+            admit_verdict_time(before, deadline, just_before, config.check_timeout()),
+            Ok(())
+        );
+        assert_eq!(
+            admit_verdict_time(deadline, deadline, Duration::ZERO, config.check_timeout()),
+            Err(SseAuthorizationError::TimedOut)
+        );
+        assert_eq!(
+            admit_verdict_time(
+                started,
+                deadline,
+                config.check_timeout(),
+                config.check_timeout()
+            ),
+            Err(SseAuthorizationError::TimedOut)
+        );
     }
 
     #[test]
     fn named_operation_lease_rechecks_the_exact_request_not_only_its_method() {
-        use super::super::super::scope_policy::request::operation::{OperationScopePolicy, ScopedOperation};
+        use super::super::super::scope_policy::request::operation::{
+            OperationScopePolicy, ScopedOperation,
+        };
         let cx = Cx::for_testing();
         let mut facts = AuthContext::with_subject("named-lease-owner");
         facts.scopes = vec!["read".into()];
-        let verifier = crate::StaticTokenVerifier::new([("named-lease-token".to_owned(), facts)]).unwrap();
-        let server = Arc::new(Server::new("named-lease", "1")
-            .protocol_policy(ProtocolPolicy::ModernOnly).unwrap()
-            .auth_provider(crate::TokenAuthProvider::new(verifier.clone())).build());
-        let authorization = TransportAuthorization::from_singleton_header(Some("Bearer named-lease-token"));
-        let methods = ScopeRequestPolicy::new(1, ScopeImplicationPolicy::exact(1).unwrap(), vec![
-            ("tools/call".into(), RequiredScopes::new(vec!["read".into()]).unwrap()),
-        ]).unwrap();
-        let scopes = ScopeRequestPolicy::for_operations(OperationScopePolicy::new(1, methods, vec![
-            (ScopedOperation::ToolCall("allowed".into()), RequiredScopes::new(vec!["read".into()]).unwrap()),
-        ]).unwrap()).unwrap();
-        let mut request = JsonRpcRequest::new("tools/call", Some(serde_json::json!({"name":"allowed"})), RequestId::Number(9));
-        let receipt = server.preauthenticate_http_request(&cx, &request, &authorization).unwrap();
-        let mut lease = SseAuthorizationLease::new(&cx, Arc::clone(&server), &request,
-            &authorization, &receipt, scopes.clone(), SseRevalidationPolicy::default()).unwrap();
+        let verifier =
+            crate::StaticTokenVerifier::new([("named-lease-token".to_owned(), facts)]).unwrap();
+        let server = Arc::new(
+            Server::new("named-lease", "1")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .unwrap()
+                .auth_provider(crate::TokenAuthProvider::new(verifier.clone()))
+                .build(),
+        );
+        let authorization =
+            TransportAuthorization::from_singleton_header(Some("Bearer named-lease-token"));
+        let methods = ScopeRequestPolicy::new(
+            1,
+            ScopeImplicationPolicy::exact(1).unwrap(),
+            vec![(
+                "tools/call".into(),
+                RequiredScopes::new(vec!["read".into()]).unwrap(),
+            )],
+        )
+        .unwrap();
+        let scopes = ScopeRequestPolicy::for_operations(
+            OperationScopePolicy::new(
+                1,
+                methods,
+                vec![(
+                    ScopedOperation::ToolCall("allowed".into()),
+                    RequiredScopes::new(vec!["read".into()]).unwrap(),
+                )],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({"name":"allowed"})),
+            RequestId::Number(9),
+        );
+        let receipt = server
+            .preauthenticate_http_request(&cx, &request, &authorization)
+            .unwrap();
+        let mut lease = SseAuthorizationLease::new(
+            &cx,
+            Arc::clone(&server),
+            &request,
+            &authorization,
+            &receipt,
+            scopes.clone(),
+            SseRevalidationPolicy::default(),
+        )
+        .unwrap();
         due(&mut lease, &cx);
         assert_eq!(lease.check(&cx), Ok(()));
         assert_eq!(lease.checks, 1);
         request.params = Some(serde_json::json!({"name":"forbidden"}));
-        let receipt = server.preauthenticate_http_request(&cx, &request, &authorization).unwrap();
-        assert!(matches!(SseAuthorizationLease::new(&cx, server, &request, &authorization,
-            &receipt, scopes, SseRevalidationPolicy::default()), Err(SseAuthorizationError::Rejected)));
-        assert!(!lease.closed, "a refused new target cannot close the admitted sibling");
+        let receipt = server
+            .preauthenticate_http_request(&cx, &request, &authorization)
+            .unwrap();
+        assert!(matches!(
+            SseAuthorizationLease::new(
+                &cx,
+                server,
+                &request,
+                &authorization,
+                &receipt,
+                scopes,
+                SseRevalidationPolicy::default()
+            ),
+            Err(SseAuthorizationError::Rejected)
+        ));
+        assert!(
+            !lease.closed,
+            "a refused new target cannot close the admitted sibling"
+        );
         assert!(verifier.revoke_token("named-lease-token").unwrap());
         due(&mut lease, &cx);
         assert_eq!(lease.check(&cx), Err(SseAuthorizationError::Rejected));

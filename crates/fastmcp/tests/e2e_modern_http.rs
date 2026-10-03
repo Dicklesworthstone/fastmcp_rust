@@ -5612,7 +5612,11 @@ fn e2e_public_http_prefixed_as_proxy_controls_its_issued_task_handle_case() {
         );
     };
     let task_id = created.task.base().task_id.clone();
-    assert_eq!(task_id.as_str().len(), 43, "the relay issues an opaque downstream handle");
+    assert_eq!(
+        task_id.as_str().len(),
+        43,
+        "the relay issues an opaque downstream handle"
+    );
     drop(creator);
 
     let mut gateway_client = runtime_block_on_bounded(
@@ -5836,11 +5840,19 @@ fn e2e_public_http_as_proxy_refuses_unissued_upstream_task_ids_case() {
         modern::ClientBuilder::new()
             .client_info("e2e-http-raw-task-creator", "1.0.0")
             .connect_http_with_cx(&cx, public_http_target(upstream.address(), "/mcp")),
-    ).expect("the direct client connects to the real Task upstream");
+    )
+    .expect("the direct client connects to the real Task upstream");
     let created = runtime_block_on_bounded(
         &cx,
-        creator.call_tool_outcome(&cx, RequestId::Number(2), PUBLIC_HTTP_TASK_TOOL_NAME, json!({}), 1 << 20),
-    ).expect("the direct upstream call creates a Task outside the gateway registry");
+        creator.call_tool_outcome(
+            &cx,
+            RequestId::Number(2),
+            PUBLIC_HTTP_TASK_TOOL_NAME,
+            json!({}),
+            1 << 20,
+        ),
+    )
+    .expect("the direct upstream call creates a Task outside the gateway registry");
     let FinalToolCallOutcome::Task(created) = created else {
         panic!("the real upstream returns its Task result: {created:?}");
     };
@@ -5850,27 +5862,42 @@ fn e2e_public_http_as_proxy_refuses_unissued_upstream_task_ids_case() {
         gateway
             .owner("e2e-http-unissued-task-client")
             .connect_http_with_cx(&cx, gateway.target()),
-    ).expect("the fixed-owner client connects to the gateway");
+    )
+    .expect("the fixed-owner client connects to the gateway");
     let get_error = runtime_block_on_bounded(
-        &cx, client.get_task(&cx, RequestId::Number(2), raw_id.clone(), 1 << 20),
-    ).expect_err("a valid raw upstream ID is not an issued downstream handle");
-    assert!(matches!(get_error,
+        &cx,
+        client.get_task(&cx, RequestId::Number(2), raw_id.clone(), 1 << 20),
+    )
+    .expect_err("a valid raw upstream ID is not an issued downstream handle");
+    assert!(
+        matches!(get_error,
         modern::HttpClientError::Connection(ClientHttpConnectionError::Modern(
             modern::ModernHttpClientError::TasksRemoteError { code, .. }
-        )) if code.as_i32() == Some(-32602)), "raw-ID lookup must be InvalidParams");
+        )) if code.as_i32() == Some(-32602)),
+        "raw-ID lookup must be InvalidParams"
+    );
     let cancel_error = runtime_block_on_bounded(
-        &cx, client.cancel_task(&cx, RequestId::Number(3), raw_id.clone(), 1 << 20),
-    ).expect_err("the gateway cannot cancel a Task for which it issued no handle");
-    assert!(matches!(cancel_error,
+        &cx,
+        client.cancel_task(&cx, RequestId::Number(3), raw_id.clone(), 1 << 20),
+    )
+    .expect_err("the gateway cannot cancel a Task for which it issued no handle");
+    assert!(
+        matches!(cancel_error,
         modern::HttpClientError::Connection(ClientHttpConnectionError::Modern(
             modern::ModernHttpClientError::TasksRemoteError { code, .. }
-        )) if code.as_i32() == Some(-32602)), "raw-ID cancellation must be InvalidParams");
+        )) if code.as_i32() == Some(-32602)),
+        "raw-ID cancellation must be InvalidParams"
+    );
     let retained = runtime_block_on_bounded(
-        &cx, creator.get_task(&cx, RequestId::Number(3), raw_id.clone(), 1 << 20),
-    ).expect("the direct creator still owns the real upstream Task");
+        &cx,
+        creator.get_task(&cx, RequestId::Number(3), raw_id.clone(), 1 << 20),
+    )
+    .expect("the direct creator still owns the real upstream Task");
     assert_eq!(retained.task.base().task_id, raw_id);
-    assert!(!matches!(retained.task, FinalTask::Cancelled(_)),
-        "the refused downstream cancel must not mutate the upstream Task");
+    assert!(
+        !matches!(retained.task, FinalTask::Cancelled(_)),
+        "the refused downstream cancel must not mutate the upstream Task"
+    );
     drop(client);
     drop(creator);
     gateway.shutdown();
@@ -9120,11 +9147,8 @@ fn e2e_public_http_auto_selects_modern_on_the_shipped_facade_server() {
         "the public HTTP connection reports the exact modern negotiated version"
     );
 
-    let response = runtime_block_on_bounded(
-        &cx,
-        client.request(&cx, "tools/list", json!({})),
-    )
-    .expect("the Auto-selected modern connection serves requests");
+    let response = runtime_block_on_bounded(&cx, client.request(&cx, "tools/list", json!({})))
+        .expect("the Auto-selected modern connection serves requests");
     let ClientHttpResponse::Modern(response) = response else {
         panic!("the selected modern HTTP client must retain the modern response lane");
     };
@@ -9162,11 +9186,8 @@ fn e2e_public_http_modern_only_selects_modern_and_refuses_legacy_only() {
         client.server_discovery().is_some(),
         "the positive ModernOnly connection retains modern discovery"
     );
-    let response = runtime_block_on_bounded(
-        &cx,
-        client.request(&cx, "tools/list", json!({})),
-    )
-    .expect("the selected ModernOnly connection serves tools/list");
+    let response = runtime_block_on_bounded(&cx, client.request(&cx, "tools/list", json!({})))
+        .expect("the selected ModernOnly connection serves tools/list");
     let ClientHttpResponse::Modern(response) = response else {
         panic!("the ModernOnly connection must retain the modern response lane");
     };
@@ -9377,12 +9398,9 @@ fn e2e_public_http_auto_isolates_live_modern_and_legacy_clients() {
                     &cx,
                     "overlapping modern tools/list response",
                     async {
-                        let response = client
-                            .request(&cx, "tools/list", json!({}))
-                            .await
-                            .map_err(|error| {
-                                format!("the modern tools/list request failed: {error}")
-                            })?;
+                        let response = client.request(&cx, "tools/list", json!({})).await.map_err(
+                            |error| format!("the modern tools/list request failed: {error}"),
+                        )?;
                         let ClientHttpResponse::Modern(response) = response else {
                             return Err("the first client did not retain its modern response lane"
                                 .to_owned());
