@@ -74,8 +74,9 @@ while IFS= read -r request; do
             printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"no-catalogs","version":"1"}},"ttlMs":0,"cacheScope":"private"}}\n' "$id"
             state=ping
             ;;
-        ping:*'"method":"ping"'*)
-            printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+        ping:*'"method":"server/discover"'*)
+            # The modern liveness probe: MCP 2026-07-28 removed `ping`.
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"no-catalogs","version":"1"}},"ttlMs":0,"cacheScope":"private"}}\n' "$id"
             state=done
             ;;
         *) exit 1 ;;
@@ -1867,17 +1868,19 @@ fn modern_test_skips_an_unadvertised_tools_catalog_without_sending_tools_list() 
     assert_eq!(list_tools["details"], "server did not advertise tools");
 
     let wire = observed_protocol_wire(&output);
+    // Discovery, then the modern liveness probe: `server/discover` again,
+    // never the `ping` that MCP 2026-07-28 removed.
     assert_eq!(
         wire.iter()
             .filter(|request| request_method(request) == "server/discover")
             .count(),
-        1
+        2
     );
     assert_eq!(
         wire.iter()
             .filter(|request| request_method(request) == "ping")
             .count(),
-        1
+        0
     );
     assert!(
         wire.iter()

@@ -12185,25 +12185,29 @@ fn validate_install_registry_counts(
     Ok(())
 }
 
-fn install_json_registry(
+/// Outcome of applying one server entry to an installation config document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallDocumentChange {
+    /// The entry is already configured with semantically equal settings; the
+    /// document was not modified.
+    AlreadyConfigured,
+    /// The document now carries the entry; `entry_existed` says whether an
+    /// earlier entry with the same name was merged.
+    Updated { entry_existed: bool },
+}
+
+/// Applies `config` to an installation config document under
+/// `registry_name`, validating every existing structure it touches.
+///
+/// Pure JSON transformation shared by every publication strategy: it reads
+/// and writes no files.
+fn apply_install_entry(
+    document: &mut serde_json::Value,
     config_path: &Path,
     registry_name: &str,
     config: &(String, McpServerConfig),
     target: InstallTarget,
-) -> McpResult<()> {
-    validate_atomic_destination_name(config_path, "installation target config")?;
-    ensure_atomic_replace_supported()?;
-    let parent = usable_parent(config_path);
-    let secured_parent =
-        SecuredParentDirectory::open(parent, config_path, "installation target config")?;
-    let config_name = config_path.file_name().ok_or_else(|| {
-        fastmcp_core::McpError::invalid_params(format!(
-            "Cannot update installation config at {}: destination has no relative file name",
-            sanitize_config_path(config_path)
-        ))
-    })?;
-    let (mut document, original) =
-        read_json_config_or_empty_at(&secured_parent, config_name, config_path)?;
+) -> McpResult<InstallDocumentChange> {
     let root = document.as_object_mut().ok_or_else(|| {
         fastmcp_core::McpError::invalid_params(format!(
             "Config root at {} must be a JSON object",
@@ -12240,6 +12244,428 @@ fn install_json_registry(
             server_configs_semantically_equal(&existing, &desired)
         });
     if semantic_noop {
+        return Ok(InstallDocumentChange::AlreadyConfigured);
+    }
+    validate_install_registry_counts(config_path, registry_name, registry, &config.0)?;
+    let server = shape_install_server_entry(target, serialize_server_config_object(&config.1)?);
+    if let Some(existing) = registry.get_mut(&config.0) {
+        let existing = existing.as_object_mut().ok_or_else(|| {
+            fastmcp_core::McpError::invalid_params(format!(
+                "Existing server entry '{name}' in {registry_name} at {config_path_display} must be a JSON object; refusing to replace it"
+            ))
+        })?;
+        merge_install_server_entry(target, existing, server);
+    } else {
+        registry.insert(config.0.clone(), serde_json::Value::Object(server));
+    }
+    Ok(InstallDocumentChange::Updated { entry_existed })
+}
+
+/// Portable installation-config publication for Unix platforms other than
+/// Linux (macOS, the BSDs), where Claude Desktop and Cursor run.
+///
+/// The Linux path proves descriptor identity and preserves xattrs/ACLs across
+/// a no-clobber rename using Linux-only interfaces. This path keeps the
+/// properties that protect a user's config without those interfaces:
+///
+/// - the update is computed from a bounded read and refused if the file
+///   changed before publication (re-read immediately before the rename);
+/// - the previous file is preserved as a backup by HARD LINK, so the backup
+///   keeps the original inode with every byte of metadata (mode, owner,
+///   xattrs, ACLs);
+/// - the new content is staged in an exclusively created sibling with the
+///   previous file's permission bits, fsynced, atomically renamed over the
+///   config, and the directory is fsynced so the rename survives a crash.
+///
+/// The new file does not inherit the previous file's extended attributes; when
+/// any were present the command says so and points at the backup that keeps
+/// them.
+#[cfg(unix)]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+mod portable_install {
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{self, Read, Write};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use fastmcp_core::{McpError, McpResult};
+
+    use super::{
+        CONFIG_INPUT_MAX_BYTES, InstallDocumentChange, InstallTarget, McpServerConfig,
+        PEER_FIELD_LIMIT, apply_install_entry, json_parse_error, prepare_json_config,
+        sanitize_config_path, sanitize_peer_text, usable_parent, validate_atomic_destination_name,
+        write_cli_warning, write_install_stdout,
+    };
+
+    /// What a successful publication did beyond writing the new content.
+    #[derive(Debug, Default)]
+    pub(super) struct Publication {
+        /// The hard-linked backup of the previous file, when one existed.
+        pub(super) backup: Option<PathBuf>,
+        /// Whether the previous file carried extended attributes that the new
+        /// file does not inherit (the backup keeps them).
+        pub(super) dropped_extended_attributes: bool,
+    }
+
+    pub(super) fn install_json_registry(
+        config_path: &Path,
+        registry_name: &str,
+        config: &(String, McpServerConfig),
+        target: InstallTarget,
+    ) -> McpResult<()> {
+        validate_atomic_destination_name(config_path, "installation target config")?;
+        let original = read_bounded(config_path, CONFIG_INPUT_MAX_BYTES)?;
+        let mut document = match &original {
+            None => serde_json::json!({}),
+            Some(bytes) => serde_json::from_slice(bytes)
+                .map_err(|error| json_parse_error(config_path, "installation target", &error))?,
+        };
+        let name = sanitize_peer_text(&config.0, PEER_FIELD_LIMIT);
+        let display = sanitize_config_path(config_path);
+        let unchanged = || {
+            write_install_stdout(&format!(
+                "'{name}' is already configured in {display}; no changes or backup were needed"
+            ))
+        };
+        let entry_existed =
+            match apply_install_entry(&mut document, config_path, registry_name, config, target)? {
+                InstallDocumentChange::AlreadyConfigured => return unchanged(),
+                InstallDocumentChange::Updated { entry_existed } => entry_existed,
+            };
+        let prepared = prepare_json_config(&document)?;
+        if original.as_deref() == Some(prepared.as_slice()) {
+            return unchanged();
+        }
+        let publication = publish(config_path, original.as_deref(), &prepared)?;
+        if publication.dropped_extended_attributes
+            && let Some(backup) = &publication.backup
+        {
+            write_cli_warning(&format!(
+                "The previous {display} carried extended attributes; they remain on the backup at {} and were not copied to the new file",
+                sanitize_config_path(backup)
+            ));
+        }
+        let action = if entry_existed { "Updated" } else { "Added" };
+        let message = match &publication.backup {
+            Some(backup) => format!(
+                "{action} '{name}' in {display} (backup: {})",
+                sanitize_config_path(backup)
+            ),
+            None => format!("{action} '{name}' in {display}"),
+        };
+        write_install_stdout(&message).map_err(|error| {
+            McpError::internal_error(format!(
+                "Installation config at {display} was already committed, but reporting success failed: {} Do not retry blindly.",
+                error.message
+            ))
+        })
+    }
+
+    /// Reads a regular file of at most `max` bytes; `None` when absent. A
+    /// larger file is refused rather than truncated.
+    pub(super) fn read_bounded(path: &Path, max: usize) -> McpResult<Option<Vec<u8>>> {
+        let display = sanitize_config_path(path);
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(McpError::internal_error(format!(
+                    "Failed to open installation config at {display} (I/O kind: {:?})",
+                    error.kind()
+                )));
+            }
+        };
+        let is_file = file
+            .metadata()
+            .map(|metadata| metadata.is_file())
+            .map_err(|error| {
+                McpError::internal_error(format!(
+                    "Failed to inspect installation config at {display} (I/O kind: {:?})",
+                    error.kind()
+                ))
+            })?;
+        if !is_file {
+            return Err(McpError::invalid_params(format!(
+                "Installation config at {display} is not a regular file"
+            )));
+        }
+        let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
+        let mut bytes = Vec::new();
+        file.take(limit).read_to_end(&mut bytes).map_err(|error| {
+            McpError::internal_error(format!(
+                "Failed to read installation config at {display} (I/O kind: {:?})",
+                error.kind()
+            ))
+        })?;
+        if bytes.len() > max {
+            return Err(McpError::invalid_params(format!(
+                "Refusing to update installation config at {display}: it exceeds {max} bytes"
+            )));
+        }
+        Ok(Some(bytes))
+    }
+
+    /// Writes `contents` to a freshly created (never pre-existing) file with
+    /// exactly `mode`, then makes it durable.
+    fn write_staged(path: &Path, mode: u32, contents: &[u8]) -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(path)?;
+        // The creation mode is filtered by the umask; set the exact bits.
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.write_all(contents)?;
+        file.sync_all()
+    }
+
+    /// Atomically replaces `path` with `contents`, given the exact bytes the
+    /// update was computed from (`None` when the file did not exist).
+    pub(super) fn publish(
+        path: &Path,
+        original: Option<&[u8]>,
+        contents: &[u8],
+    ) -> McpResult<Publication> {
+        let display = sanitize_config_path(path);
+        let io_error = |action: &str, error: &io::Error| {
+            McpError::internal_error(format!(
+                "Failed to {action} for installation config at {display} (I/O kind: {:?})",
+                error.kind()
+            ))
+        };
+        let file_name = path.file_name().ok_or_else(|| {
+            McpError::invalid_params(format!("Installation config at {display} has no file name"))
+        })?;
+        let parent = usable_parent(path);
+        if original.is_none() && !parent.exists() {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .map_err(|error| io_error("create the config directory", &error))?;
+        }
+        let refuse_changed = || {
+            McpError::invalid_params(format!(
+                "Installation config at {display} changed while the update was being prepared; nothing was written. Retry the command."
+            ))
+        };
+        if read_bounded(path, CONFIG_INPUT_MAX_BYTES)?.as_deref() != original {
+            return Err(refuse_changed());
+        }
+
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        );
+        let sibling = |prefix: &str| {
+            let mut name = std::ffi::OsString::from(prefix);
+            name.push(file_name);
+            name.push(format!(".{nonce}"));
+            parent.join(name)
+        };
+
+        let mut publication = Publication::default();
+        let mode = if original.is_some() {
+            let metadata = fs::metadata(path).map_err(|error| io_error("inspect", &error))?;
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if let Ok(file) = File::open(path) {
+                let mut empty = [0_u8; 0];
+                publication.dropped_extended_attributes =
+                    rustix::fs::flistxattr(&file, &mut empty).is_ok_and(|length| length > 0);
+            }
+            let backup = sibling(".fastmcp-backup.");
+            fs::hard_link(path, &backup).map_err(|error| io_error("link a backup", &error))?;
+            publication.backup = Some(backup);
+            metadata.permissions().mode() & 0o7777
+        } else {
+            0o600
+        };
+
+        let stage = sibling(".fastmcp-stage.");
+        if let Err(error) = write_staged(&stage, mode, contents) {
+            let _ = fs::remove_file(&stage);
+            return Err(io_error("stage the new config", &error));
+        }
+        if read_bounded(path, CONFIG_INPUT_MAX_BYTES)?.as_deref() != original {
+            let _ = fs::remove_file(&stage);
+            return Err(refuse_changed());
+        }
+        if let Err(error) = fs::rename(&stage, path) {
+            let _ = fs::remove_file(&stage);
+            return Err(io_error("publish the new config", &error));
+        }
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| io_error("sync the config directory", &error))?;
+        Ok(publication)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::os::unix::fs::MetadataExt;
+
+        use fastmcp_core::McpErrorCode;
+
+        use super::*;
+
+        fn scratch(label: &str) -> PathBuf {
+            let directory = std::env::temp_dir().join(format!(
+                "fastmcp-portable-install-{label}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("clock after epoch")
+                    .as_nanos()
+            ));
+            fs::create_dir(&directory).expect("create scratch directory");
+            directory
+        }
+
+        fn mode(path: &Path) -> u32 {
+            fs::metadata(path).expect("metadata").permissions().mode() & 0o7777
+        }
+
+        #[test]
+        fn publish_creates_a_missing_config_privately_without_backup() {
+            let directory = scratch("create");
+            let path = directory.join("Claude").join("claude_desktop_config.json");
+            let publication = publish(&path, None, br#"{"mcpServers":{}}"#).expect("publish");
+            assert!(publication.backup.is_none());
+            assert_eq!(fs::read(&path).expect("read"), br#"{"mcpServers":{}}"#);
+            assert_eq!(mode(&path), 0o600);
+            fs::remove_dir_all(&directory).expect("remove scratch directory");
+        }
+
+        #[test]
+        fn publish_replaces_atomically_and_keeps_the_original_inode_as_backup() {
+            let directory = scratch("replace");
+            let path = directory.join("config.json");
+            fs::write(&path, b"old").expect("seed");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).expect("chmod");
+            let original_inode = fs::metadata(&path).expect("metadata").ino();
+
+            let publication = publish(&path, Some(b"old"), b"new").expect("publish");
+
+            let backup = publication.backup.expect("a previous file is backed up");
+            assert_eq!(fs::read(&path).expect("read"), b"new");
+            assert_eq!(fs::read(&backup).expect("read backup"), b"old");
+            assert_eq!(
+                fs::metadata(&backup).expect("backup metadata").ino(),
+                original_inode,
+                "the backup IS the original inode, so it keeps all of its metadata"
+            );
+            assert_ne!(fs::metadata(&path).expect("metadata").ino(), original_inode);
+            assert_eq!(mode(&path), 0o640, "permission bits are preserved");
+            let staged = fs::read_dir(&directory)
+                .expect("list")
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .contains("fastmcp-stage")
+                })
+                .count();
+            assert_eq!(staged, 0, "no staging file is left behind");
+            fs::remove_dir_all(&directory).expect("remove scratch directory");
+        }
+
+        #[test]
+        fn publish_refuses_when_the_config_changed_since_it_was_read() {
+            let directory = scratch("changed");
+            let path = directory.join("config.json");
+            fs::write(&path, b"edited-elsewhere").expect("seed");
+
+            let error = publish(&path, Some(b"what-we-read"), b"new")
+                .expect_err("a concurrent edit must be refused");
+
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert_eq!(fs::read(&path).expect("read"), b"edited-elsewhere");
+            assert_eq!(
+                fs::read_dir(&directory).expect("list").count(),
+                1,
+                "no backup or staging file was created"
+            );
+            fs::remove_dir_all(&directory).expect("remove scratch directory");
+        }
+
+        #[test]
+        fn read_bounded_refuses_oversized_and_non_regular_files() {
+            let directory = scratch("bounded");
+            let path = directory.join("config.json");
+            fs::write(&path, b"12345").expect("seed");
+            assert_eq!(
+                read_bounded(&path, 5).expect("within bound").as_deref(),
+                Some(&b"12345"[..])
+            );
+            assert!(
+                read_bounded(&path, 4).is_err(),
+                "an oversized file is refused"
+            );
+            assert!(
+                read_bounded(&directory.join("missing.json"), 5)
+                    .expect("absent is not an error")
+                    .is_none()
+            );
+            assert!(
+                read_bounded(&directory, 5).is_err(),
+                "a directory is refused"
+            );
+            fs::remove_dir_all(&directory).expect("remove scratch directory");
+        }
+    }
+}
+
+/// Publishes one installation config update.
+///
+/// Linux uses the proof-grade publication (descriptor-relative snapshots,
+/// xattr/ACL preservation, no-clobber rename, fsync proofs). Other Unix
+/// platforms, where Claude Desktop and Cursor actually run, use the portable
+/// atomic replacement in [`portable_install`]. Non-Unix platforms still
+/// refuse in [`ensure_atomic_replace_supported`].
+fn install_json_registry(
+    config_path: &Path,
+    registry_name: &str,
+    config: &(String, McpServerConfig),
+    target: InstallTarget,
+) -> McpResult<()> {
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let install = portable_install::install_json_registry;
+    #[cfg(any(target_os = "linux", not(unix)))]
+    let install = install_json_registry_proven;
+    install(config_path, registry_name, config, target)
+}
+
+// Compiled everywhere so its helpers keep one definition of "used"; only the
+// portable path runs on non-Linux Unix.
+#[cfg_attr(all(unix, not(target_os = "linux")), allow(dead_code))]
+fn install_json_registry_proven(
+    config_path: &Path,
+    registry_name: &str,
+    config: &(String, McpServerConfig),
+    target: InstallTarget,
+) -> McpResult<()> {
+    validate_atomic_destination_name(config_path, "installation target config")?;
+    ensure_atomic_replace_supported()?;
+    let parent = usable_parent(config_path);
+    let secured_parent =
+        SecuredParentDirectory::open(parent, config_path, "installation target config")?;
+    let config_name = config_path.file_name().ok_or_else(|| {
+        fastmcp_core::McpError::invalid_params(format!(
+            "Cannot update installation config at {}: destination has no relative file name",
+            sanitize_config_path(config_path)
+        ))
+    })?;
+    let (mut document, original) =
+        read_json_config_or_empty_at(&secured_parent, config_name, config_path)?;
+    let name = sanitize_peer_text(&config.0, PEER_FIELD_LIMIT);
+    let config_path_display = sanitize_config_path(config_path);
+    let change = apply_install_entry(&mut document, config_path, registry_name, config, target)?;
+    if let InstallDocumentChange::AlreadyConfigured = change {
         let current = read_destination_snapshot_at(
             &secured_parent,
             config_name,
@@ -12270,19 +12696,9 @@ fn install_json_registry(
             "'{name}' is already configured in {config_path_display}; no changes or backup were needed"
         ));
     }
-    validate_install_registry_counts(config_path, registry_name, registry, &config.0)?;
-    let server = shape_install_server_entry(target, serialize_server_config_object(&config.1)?);
-    if let Some(existing) = registry.get_mut(&config.0) {
-        let existing = existing.as_object_mut().ok_or_else(|| {
-            fastmcp_core::McpError::invalid_params(format!(
-                "Existing server entry '{}' in {registry_name} at {config_path_display} must be a JSON object; refusing to replace it",
-                sanitize_peer_text(&config.0, PEER_FIELD_LIMIT)
-            ))
-        })?;
-        merge_install_server_entry(target, existing, server);
-    } else {
-        registry.insert(config.0.clone(), serde_json::Value::Object(server));
-    }
+    let InstallDocumentChange::Updated { entry_existed } = change else {
+        unreachable!("the already-configured outcome returned above");
+    };
 
     // Finish serialization and enforce the output cap before creating a
     // backup/staging inode or mutating the config file.
