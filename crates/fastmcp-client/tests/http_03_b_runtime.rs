@@ -693,13 +693,13 @@ fn run_modern_async_reverse_callback_case(case: AsyncReverseCallbackCase) {
         let runtime_cx = Cx::current().expect("caller runtime must install a current Cx");
         let request_cx =
             runtime.request_cx_with_budget(runtime_cx.budget_for_timeout(Duration::from_secs(2)));
-        let mut client = public_modern_builder(
+        let mut client = Box::pin(public_modern_builder(
             &target,
             RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(2))
                 .expect("async callback request timeout policy must be valid"),
         )
         .reverse_request_handlers(handlers)
-        .connect_http_client_with_cx(&request_cx)
+        .connect_http_client_with_cx(&request_cx))
         .await
         .expect("modern public HTTP client must connect");
         let result = client
@@ -1475,11 +1475,13 @@ fn run_aborted_notification_cache_case(catalog_changed: bool, drop_request: bool
         let timeout_policy =
             RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(2))
                 .expect("aborted-response timeout policy must be valid");
-        let mut client = public_modern_builder(&target, timeout_policy)
-            .reverse_request_handlers(handlers)
-            .connect_http_client_with_cx(&cx)
-            .await
-            .expect("public HTTP client must connect through server/discover");
+        let mut client = Box::pin(
+            public_modern_builder(&target, timeout_policy)
+                .reverse_request_handlers(handlers)
+                .connect_http_client_with_cx(&cx),
+        )
+        .await
+        .expect("public HTTP client must connect through server/discover");
 
         let seeded = client
             .request_final_core(&cx, "tools/list", serde_json::json!({}))

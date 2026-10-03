@@ -883,8 +883,8 @@ fn create_task(descriptor: serde_json::Value) -> McpResult<fastmcp_rust::FinalTo
 }
 
 #[tool(name = "greet", description = "Greets someone synchronously")]
-fn greet(name: String) -> McpResult<String> {
-    Ok(format!("Hello, {name}!"))
+fn greet(name: String) -> String {
+    format!("Hello, {name}!")
 }
 
 #[tool(

@@ -4337,7 +4337,7 @@ pub(crate) enum AutoStdioFallbackSignal {
 /// implementation-defined error, so the fallback must not be keyed to
 /// `-32601` alone.
 fn authorizes_auto_legacy_fallback(error: &JsonRpcError) -> bool {
-    !matches!(error.code.as_i32(), Some(-32_020 | -32_021 | -32_022))
+    !matches!(error.code.as_i32(), Some(-32_022..=-32_020))
 }
 
 /// Rechecks the caller-owned context at Auto's one allowed downgrade boundary.
@@ -15749,10 +15749,12 @@ impl Client {
         cx: &Cx,
         protocol_plan: ClientProtocolPlan,
     ) -> Result<HttpClient, HttpClientError> {
-        ClientBuilder::new()
-            .protocol_plan(protocol_plan)
-            .connect_http_client_with_cx(cx)
-            .await
+        Box::pin(
+            ClientBuilder::new()
+                .protocol_plan(protocol_plan)
+                .connect_http_client_with_cx(cx),
+        )
+        .await
     }
 
     /// Connects one exact MCP 2024-11-05 HTTP+SSE client with an explicit
@@ -15777,10 +15779,10 @@ impl Client {
         sse_endpoint: CanonicalHttpUrl,
         message_post_endpoint: CanonicalHttpUrl,
     ) -> Result<HttpClient, HttpClientError> {
-        Self::http_with_cx(
+        Box::pin(Self::http_with_cx(
             cx,
             Self::legacy_sse_plan(sse_endpoint, message_post_endpoint)?,
-        )
+        ))
         .await
     }
 
@@ -31440,9 +31442,9 @@ mod tests {
                     }
                     _ => unreachable!(),
                 };
-                let mut client = ClientBuilder::new()
+                let mut client = Box::pin(ClientBuilder::new()
                     .protocol_plan(http_cache_test_plan(&format!("http://{address}/mcp")))
-                    .reverse_request_handlers(handlers).connect_http_client_with_cx(&cx).await.unwrap();
+                    .reverse_request_handlers(handlers).connect_http_client_with_cx(&cx)).await.unwrap();
                 for attempt in 0..if mode == 0 { 1 } else { 2 } {
                     let current = if attempt == 0 { mode } else { 0 };
                     state.mode.store(current, Ordering::Release);

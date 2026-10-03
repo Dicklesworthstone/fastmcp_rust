@@ -7434,14 +7434,15 @@ async fn cmd_inspect_http(
     bearer_token_file: Option<&Path>,
 ) -> McpResult<()> {
     validate_cli_protocol_policy(protocol_policy)?;
-    let mut client = http_client_builder(protocol_plan, bearer_token_file)?
-        .connect_http_client_with_cx(cx)
-        .await
-        .map_err(|error| {
-            fastmcp_core::McpError::internal_error(format!(
-                "inspect could not connect to the configured HTTP endpoint bundle: {error}"
-            ))
-        })?;
+    let mut client = Box::pin(
+        http_client_builder(protocol_plan, bearer_token_file)?.connect_http_client_with_cx(cx),
+    )
+    .await
+    .map_err(|error| {
+        fastmcp_core::McpError::internal_error(format!(
+            "inspect could not connect to the configured HTTP endpoint bundle: {error}"
+        ))
+    })?;
 
     let negotiated_version = client.connection().protocol_version().ok_or_else(|| {
         fastmcp_core::McpError::internal_error(

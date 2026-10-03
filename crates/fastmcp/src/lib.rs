@@ -1879,7 +1879,7 @@ pub mod auto {
             self,
             cx: &Cx,
         ) -> Result<HttpClient, HttpClientError> {
-            self.inner.connect_http_client_with_cx(cx).await
+            Box::pin(self.inner.connect_http_client_with_cx(cx)).await
         }
     }
 
@@ -3219,12 +3219,14 @@ pub mod modern {
             endpoint: CanonicalHttpUrl,
         ) -> Result<HttpClient, HttpClientConnectError> {
             let plan = modern_http_plan(endpoint).map_err(HttpClientConnectError::Plan)?;
-            self.inner
-                .protocol_plan(plan)
-                .connect_http_client_with_cx(cx)
-                .await
-                .map_err(HttpClientConnectError::Connect)
-                .and_then(HttpClient::from_inner)
+            Box::pin(
+                self.inner
+                    .protocol_plan(plan)
+                    .connect_http_client_with_cx(cx),
+            )
+            .await
+            .map_err(HttpClientConnectError::Connect)
+            .and_then(HttpClient::from_inner)
         }
     }
 
@@ -8998,8 +9000,7 @@ pub mod legacy_2024 {
         /// let _client = legacy_2024::ClientBuilder::new().connect_http();
         /// ```
         pub async fn connect_http_with_cx(self, cx: &Cx) -> Result<HttpClient, HttpClientError> {
-            self.inner
-                .connect_http_client_with_cx(cx)
+            Box::pin(self.inner.connect_http_client_with_cx(cx))
                 .await
                 .map(HttpClient::from_inner)
         }
@@ -9009,8 +9010,7 @@ pub mod legacy_2024 {
             self,
             cx: &Cx,
         ) -> Result<HttpClient, HttpClientError> {
-            self.inner
-                .connect_http_client_with_cx(cx)
+            Box::pin(self.inner.connect_http_client_with_cx(cx))
                 .await
                 .map(HttpClient::from_inner)
         }

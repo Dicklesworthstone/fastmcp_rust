@@ -226,7 +226,7 @@ fn context_tool_calls() -> Vec<(String, Value)> {
 
 fn main() -> ExitCode {
     let Some(url) = std::env::args()
-        .last()
+        .next_back()
         .filter(|arg| arg.starts_with("http"))
     else {
         eprintln!("usage: conformance_client <server-url>");

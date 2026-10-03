@@ -812,12 +812,14 @@ impl McpConfig {
             .ok_or_else(|| ConfigError::HttpNotConfigured(name.to_owned()))?;
         let protocol_plan = http.protocol_plan().map_err(ConfigError::HttpPlanError)?;
 
-        ClientBuilder::new()
-            .client_info(format!("fastmcp-client:{name}"), env!("CARGO_PKG_VERSION"))
-            .protocol_plan(protocol_plan)
-            .connect_http_client_with_cx(cx)
-            .await
-            .map_err(ConfigError::HttpClientError)
+        Box::pin(
+            ClientBuilder::new()
+                .client_info(format!("fastmcp-client:{name}"), env!("CARGO_PKG_VERSION"))
+                .protocol_plan(protocol_plan)
+                .connect_http_client_with_cx(cx),
+        )
+        .await
+        .map_err(ConfigError::HttpClientError)
     }
 
     fn enabled_server(&self, name: &str) -> Result<&ServerConfig, ConfigError> {
