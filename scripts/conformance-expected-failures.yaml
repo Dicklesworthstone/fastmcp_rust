@@ -1,0 +1,38 @@
+# Baseline of KNOWN official-conformance failures, for
+# `scripts/run_official_conformance.sh --baseline <this file>`, which forwards
+# it to the suite's own `--expected-failures`.
+#
+# Measured 2026-10-03 on worker hz3 against revision 6b54e023, with
+# `@modelcontextprotocol/conformance@0.2.0-alpha.10`,
+# `--spec-version 2026-07-28 --suite all`:
+#
+#   40 scenarios, 114 checks: SUCCESS=108, FAILURE=1, WARNING=4, INFO=1
+#
+# (The immediately preceding committed revision, bba5a09f, scored 54 of 92
+# checks. The denominator moved because scenarios that used to fail early now
+# reach their later checks, so compare SETS of failures, never the two counts.)
+#
+# This file lists only FAILURE-level entries, because a WARNING is a SHOULD miss
+# and does not fail the suite. The four current warnings are recorded below as
+# comments so they are not mistaken for passes:
+#
+#   server-stateless:sep-2575-server-sends-tools-list-changed-on-subscription
+#   server-stateless:sep-2575-server-sends-prompts-list-changed-on-subscription
+#       The server has no runtime catalog-mutation API, so it never emits a
+#       list-changed notification. Deliberate and documented in the adapter.
+#   input-required-result-missing-input-response:sep-2322-missing-response-rerequests
+#   input-required-result-ignore-extra-params:sep-2322-ignore-unexpected-params
+#       Same MRTR partial-response path as the failure below.
+#
+# Entries are `<scenario>` or `<scenario>:<check-id>`. Do NOT paste the suite's
+# result DIRECTORY names here: those carry a run timestamp and would never match
+# a later run, leaving a gate that passes unconditionally.
+#
+# Shrinking this list is the goal. Adding to it requires a reason in the commit
+# message.
+
+server:
+  # A client that answers only SOME of several simultaneously pending input
+  # requests is rejected with "Invalid MRTR input request or response map"
+  # instead of having the still-unanswered keys re-requested.
+  - input-required-result-multiple-input-requests:sep-2322-multiple-inputs-incomplete

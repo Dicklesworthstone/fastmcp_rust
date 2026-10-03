@@ -153,7 +153,7 @@ printf '\n== tally ==\n'
 # The suite writes machine-readable results into --output-dir. Prefer those over
 # scraping the pretty printer, whose wording is not a contract.
 python3 - "$OUT" <<'PY'
-import json, pathlib, sys
+import json, pathlib, re, sys
 
 # The suite writes one `<output-dir>/<scenario>/checks.json` per scenario, each
 # a FLAT array of check objects carrying id/name/status/errorMessage. Statuses
@@ -161,6 +161,20 @@ import json, pathlib, sys
 # miss and is deliberately counted separately from FAILURE, because a SHOULD
 # does not move the pass/fail tally the suite reports.
 root = pathlib.Path(sys.argv[1])
+
+
+def scenario_name(directory):
+    """Recover the suite's scenario id from its result directory name.
+
+    The suite names each directory `<mode>-<scenario>-<ISO timestamp>Z`. Both
+    affixes have to come off, because `--expected-failures` matches on the
+    scenario id alone: a baseline that kept the timestamp would never match a
+    later run, which is exactly the kind of gate that silently passes forever.
+    """
+    name = re.sub(r'-\d{4}-\d{2}-\d{2}T[\d-]+Z$', '', directory)
+    return re.sub(r'^(?:server|client)-', '', name)
+
+
 tally, scenarios, failures, warnings = {}, 0, [], []
 for path in sorted(root.rglob('checks.json')):
     try:
@@ -169,7 +183,7 @@ for path in sorted(root.rglob('checks.json')):
         continue
     if not isinstance(checks, list):
         continue
-    scenario = path.parent.name
+    scenario = scenario_name(path.parent.name)
     scenarios += 1
     for check in checks:
         if not isinstance(check, dict):
