@@ -155,42 +155,53 @@ printf '\n== tally ==\n'
 python3 - "$OUT" <<'PY'
 import json, pathlib, sys
 
+# The suite writes one `<output-dir>/<scenario>/checks.json` per scenario, each
+# a FLAT array of check objects carrying id/name/status/errorMessage. Statuses
+# seen in 0.2.0-alpha.10: SUCCESS, FAILURE, WARNING, INFO. WARNING is a SHOULD
+# miss and is deliberately counted separately from FAILURE, because a SHOULD
+# does not move the pass/fail tally the suite reports.
 root = pathlib.Path(sys.argv[1])
-files = sorted(p for p in root.rglob('*.json'))
-tally, scenarios, failures = {}, 0, []
-for path in files:
+tally, scenarios, failures, warnings = {}, 0, [], []
+for path in sorted(root.rglob('checks.json')):
     try:
-        doc = json.loads(path.read_text())
+        checks = json.loads(path.read_text())
     except (ValueError, OSError):
         continue
-    for scenario in (doc if isinstance(doc, list) else [doc]):
-        if not isinstance(scenario, dict):
+    if not isinstance(checks, list):
+        continue
+    scenario = path.parent.name
+    scenarios += 1
+    for check in checks:
+        if not isinstance(check, dict):
             continue
-        checks = scenario.get('checks')
-        if not isinstance(checks, list):
-            continue
-        scenarios += 1
-        for check in checks:
-            if not isinstance(check, dict):
-                continue
-            status = str(check.get('status', 'UNKNOWN'))
-            tally[status] = tally.get(status, 0) + 1
-            if status.upper() == 'FAILURE':
-                failures.append(f"{scenario.get('scenarioId') or scenario.get('id') or path.stem}:"
-                                f"{check.get('id') or check.get('name')}")
+        status = str(check.get('status', 'UNKNOWN')).upper()
+        tally[status] = tally.get(status, 0) + 1
+        label = f"{scenario}:{check.get('id') or check.get('name')}"
+        if status == 'FAILURE':
+            failures.append((label, check.get('errorMessage') or ''))
+        elif status == 'WARNING':
+            warnings.append(label)
 
 if not tally:
-    print('no machine-readable results found; read suite.log above')
+    print('no checks.json found under the output dir; read suite.log above')
 else:
     total = sum(tally.values())
-    ordered = ', '.join(f'{k}={v}' for k, v in sorted(tally.items()))
-    print(f'scenarios={scenarios} checks={total} {ordered}')
+    print(f'scenarios={scenarios} checks={total} '
+          + ', '.join(f'{k}={v}' for k, v in sorted(tally.items())))
+    if warnings:
+        print(f'\nSHOULD misses reported as WARNING ({len(warnings)}):')
+        for label in warnings:
+            print(f'  {label}')
     if failures:
         print(f'\nfailing checks ({len(failures)}):')
-        for name in failures:
-            print(f'  {name}')
-        print('\nTo adopt these as a baseline, write them under a `server:` key in a YAML')
-        print('file and pass it as --baseline.')
+        for label, why in failures:
+            first = why.splitlines()[0] if why else ''
+            print(f'  {label}' + (f' -- {first[:140]}' if first else ''))
+        print('\nTo adopt these as a baseline, put the labels under a `server:` key')
+        print('in a YAML file and pass it as --baseline:')
+        print('\nserver:')
+        for label, _ in failures:
+            print(f'  - {label}')
 PY
 
 printf '\n== adapter stderr (tail) ==\n'
