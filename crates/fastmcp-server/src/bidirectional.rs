@@ -1830,12 +1830,6 @@ impl ExpectedInputLedger {
     fn is_empty(&self) -> bool {
         self.kinds.is_empty()
     }
-
-    fn has_elicitation(&self) -> bool {
-        self.kinds
-            .values()
-            .any(|kind| *kind == MrtrInputKind::Elicitation)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -2140,13 +2134,6 @@ impl MrtrExchangeRegistry {
                     Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR))
                 };
             }
-            if binding.is_some_and(MrtrExchangeBinding::is_stateless)
-                && exchange.expected.has_elicitation()
-            {
-                return Err(McpError::invalid_request(
-                    "stateless HTTP cannot resume elicitation requestState; a durable MCP transport connection is required",
-                ));
-            }
             Self::purge_stale(&mut state, now);
             exchange.expected
         };
@@ -2307,13 +2294,6 @@ impl MrtrExchangeRegistry {
             } else {
                 Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR))
             };
-        }
-        if binding.is_some_and(MrtrExchangeBinding::is_stateless)
-            && exchange.expected.has_elicitation()
-        {
-            return Err(McpError::invalid_request(
-                "stateless HTTP cannot resume elicitation requestState; a durable MCP transport connection is required",
-            ));
         }
         if state_only_retry && (!exchange.expected.is_empty() || !exchange.requests.is_empty()) {
             return Err(McpError::invalid_params(MRTR_INPUT_MAP_ERROR));

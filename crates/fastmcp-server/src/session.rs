@@ -725,7 +725,7 @@ mod tests {
     fn initialize_stores_client_capabilities() {
         let mut session = make_session();
         let caps = ClientCapabilities {
-            sampling: Some(SamplingCapability {}),
+            sampling: Some(SamplingCapability::default()),
             elicitation: None,
             roots: None,
             ..Default::default()
@@ -1155,7 +1155,7 @@ mod tests {
                 version: "1.0".to_string(),
             },
             ClientCapabilities {
-                sampling: Some(SamplingCapability {}),
+                sampling: Some(SamplingCapability::default()),
                 elicitation: None,
                 roots: None,
                 ..Default::default()
@@ -1242,7 +1242,7 @@ mod tests {
                 version: "1.0".to_string(),
             },
             ClientCapabilities {
-                sampling: Some(SamplingCapability {}),
+                sampling: Some(SamplingCapability::default()),
                 elicitation: Some(ElicitationCapability::both()),
                 roots: Some(RootsCapability {
                     list_changed: false,
@@ -1297,7 +1297,7 @@ mod tests {
                 version: "2.0".to_string(),
             },
             ClientCapabilities {
-                sampling: Some(SamplingCapability {}),
+                sampling: Some(SamplingCapability::default()),
                 elicitation: None,
                 roots: None,
                 ..Default::default()

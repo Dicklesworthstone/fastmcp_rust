@@ -441,28 +441,15 @@ fn prepare_request(
             .enqueue(error_response(request.id, -32600, "Invalid Request"), None);
         return Ok(None);
     }
-    if request.method != "initialize"
-        && modern_protocol_version(&request) != Some(MODERN_PROTOCOL_VERSION)
-    {
-        if let Some(id) = request.id.clone() {
-            let response = match modern_protocol_version(&request) {
-                Some(version) => JsonRpcMessage::Response(JsonRpcResponse::error(
-                    Some(id),
-                    JsonRpcError {
-                        code: fastmcp_protocol::UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE.into(),
-                        message: "Unsupported MCP protocol version".to_owned(),
-                        data: Some(
-                            serde_json::json!({"supported": [MODERN_PROTOCOL_VERSION], "requested": version}),
-                        ),
-                    },
-                )),
-                None => error_response(
-                    Some(id),
-                    -32600,
-                    "Modern connection requires protocol version metadata",
-                ),
-            };
-            lifetime.output.enqueue(response, None);
+    // Version admission applies to requests. Client notifications carry a
+    // `NotificationMetaObject` with no protocol version (the official
+    // `notifications/cancelled` example has no `_meta` at all), so they must
+    // reach their handlers below instead of being dropped here.
+    if request.id.is_some() && modern_protocol_version(&request) != Some(MODERN_PROTOCOL_VERSION) {
+        if let Some(response) = modern_request_version_refusal(&request) {
+            lifetime
+                .output
+                .enqueue(JsonRpcMessage::Response(response), None);
         }
         return Ok(None);
     }

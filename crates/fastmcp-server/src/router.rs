@@ -4695,11 +4695,12 @@ impl Router {
         }
 
         let params = request.params.as_ref();
+        // `ping` is deliberately absent: MCP 2026-07-28 removed it, so a modern
+        // `ping` falls through to Method not found like every other removed or
+        // unknown method (HTTP 404 on the modern endpoint). Exact-2024 session
+        // dispatch still answers it. Modern clients probe liveness with
+        // `server/discover`.
         let result = match request.method.as_str() {
-            // Connection health-check. Session dispatch already answers `{}`.
-            // Stateless HTTP needs the same check without adding ping to
-            // FINAL_2026_07_28_METHODS / FinalCoreRequest.
-            "ping" => serde_json::json!({}),
             COMPLETION_COMPLETE => {
                 let request =
                     CoreRequest::decode(ProtocolEra::Modern2026, COMPLETION_COMPLETE, params)

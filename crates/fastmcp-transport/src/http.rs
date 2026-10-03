@@ -2827,6 +2827,51 @@ fn is_origin_allowed(config: &HttpHandlerConfig, origin: &str) -> bool {
         && config.cors_origins.iter().any(|allowed| allowed == origin)
 }
 
+/// Whether `origin` names a loopback host (`localhost`, `127.0.0.0/8`, or
+/// `[::1]`) over `http`/`https`, with any port.
+///
+/// A browser sets `Origin` itself, so remote web content cannot claim a
+/// loopback origin, and a DNS-rebinding attacker's pages carry the attacker's
+/// own hostname. Admitting loopback origins therefore keeps rebinding
+/// protection while letting local browser tools (for example MCP Inspector)
+/// reach a local server.
+fn is_loopback_origin(origin: &str) -> bool {
+    let Some(authority) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    if authority.is_empty() || authority.contains(['/', '@', '?', '#']) {
+        return false;
+    }
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        let Some((host, after)) = rest.split_once(']') else {
+            return false;
+        };
+        if !(after.is_empty() || after.starts_with(':')) {
+            return false;
+        }
+        host
+    } else {
+        authority
+            .split_once(':')
+            .map_or(authority, |(host, _port)| host)
+    };
+    if host.eq_ignore_ascii_case("localhost") || host == "::1" {
+        return true;
+    }
+    host.parse::<std::net::Ipv4Addr>()
+        .is_ok_and(|address| address.is_loopback())
+}
+
+/// Request-admission Origin policy: an explicitly allowed CORS origin or a
+/// loopback origin. CORS *response* headers stay restricted to the explicit
+/// allowlist ([`is_origin_allowed`]).
+fn is_origin_admitted(config: &HttpHandlerConfig, origin: &str) -> bool {
+    is_loopback_origin(origin) || is_origin_allowed(config, origin)
+}
+
 fn validate_mcp_request_policy(
     request: &HttpRequest,
     config: &HttpHandlerConfig,
@@ -2836,7 +2881,7 @@ fn validate_mcp_request_policy(
         return Err(HttpError::InvalidPath(request.path.clone()));
     }
     if let Some(origin) = request.header("origin") {
-        if !is_origin_allowed(config, origin) {
+        if !is_origin_admitted(config, origin) {
             return Err(HttpError::OriginNotAllowed(origin.to_string()));
         }
     }
@@ -3250,6 +3295,20 @@ impl ModernHttpRequestAdmission {
             ))
         })?;
         responses.for_request(request_id)
+    }
+}
+
+impl HttpHandlerConfig {
+    /// Request-admission `Origin` policy shared by every HTTP route.
+    ///
+    /// Admits an explicitly allowed CORS origin or a loopback origin
+    /// (`localhost`, `127.0.0.0/8`, `[::1]`). Anything else must be refused
+    /// before dispatch (DNS-rebinding protection). This decides admission
+    /// only; CORS response headers remain restricted to the explicit
+    /// allowlist.
+    #[must_use]
+    pub fn admits_origin(&self, origin: &str) -> bool {
+        is_origin_admitted(self, origin)
     }
 }
 
@@ -10029,6 +10088,64 @@ Content-Length: {}\r\n\
             wildcard,
         );
         assert!(wildcard_transport.recv(&Cx::for_testing()).is_err());
+    }
+
+    #[test]
+    fn loopback_origins_are_admitted_without_widening_cors() {
+        let default = HttpHandlerConfig::default();
+        for origin in [
+            "http://localhost",
+            "http://localhost:6274",
+            "http://LocalHost:1",
+            "http://127.0.0.1:39172",
+            "https://127.0.0.1",
+            "http://127.5.6.7:80",
+            "http://[::1]:3000",
+            "http://[::1]",
+        ] {
+            assert!(
+                default.admits_origin(origin),
+                "loopback origin {origin} must be admitted"
+            );
+            // Admission never widens CORS: response headers stay allowlist-only.
+            assert!(
+                !is_origin_allowed(&default, origin),
+                "loopback admission must not add CORS headers for {origin}"
+            );
+        }
+        // Near-identical negatives: lookalike hosts, embedded userinfo/paths,
+        // opaque origins, other schemes, and non-loopback addresses.
+        for origin in [
+            "http://evil.example",
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example",
+            "http://user@localhost",
+            "http://localhost/path",
+            "http://localhost?x",
+            "null",
+            "",
+            "file://localhost",
+            "http://",
+            "http://[::2]:3000",
+            "http://[::1]x",
+            "http://0.0.0.0",
+            "http://192.168.1.10:3000",
+        ] {
+            assert!(
+                !default.admits_origin(origin),
+                "origin {origin:?} must be refused"
+            );
+        }
+
+        // An explicit allowlist entry is still admitted (and still gets CORS).
+        let configured = HttpHandlerConfig {
+            allow_cors: true,
+            cors_origins: vec!["https://trusted.example".to_string()],
+            ..HttpHandlerConfig::default()
+        };
+        assert!(configured.admits_origin("https://trusted.example"));
+        assert!(is_origin_allowed(&configured, "https://trusted.example"));
+        assert!(!configured.admits_origin("https://untrusted.example"));
     }
 
     #[test]

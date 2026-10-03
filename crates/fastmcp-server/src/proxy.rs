@@ -24244,7 +24244,7 @@ expect_request notifications/initialized ''
             &legacy_sse_target,
             &legacy_message_target,
             ClientCapabilities {
-                sampling: Some(fastmcp_protocol::SamplingCapability {}),
+                sampling: Some(fastmcp_protocol::SamplingCapability::default()),
                 elicitation: None,
                 roots: Some(fastmcp_protocol::RootsCapability {
                     list_changed: false,
@@ -24445,7 +24445,7 @@ expect_request notifications/initialized ''
             &legacy_sse_target,
             &legacy_message_target,
             ClientCapabilities {
-                sampling: Some(fastmcp_protocol::SamplingCapability {}),
+                sampling: Some(fastmcp_protocol::SamplingCapability::default()),
                 elicitation: None,
                 roots: Some(fastmcp_protocol::RootsCapability {
                     list_changed: false,

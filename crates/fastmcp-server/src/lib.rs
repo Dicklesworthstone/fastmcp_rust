@@ -628,6 +628,10 @@ const HTTP_TERMINAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// listens otherwise keep their writers parked until fixture teardown
 /// burns `HTTP_TERMINAL_DRAIN_TIMEOUT`.
 const HTTP_ACCEPT_CANCEL_POLL: Duration = Duration::from_millis(20);
+/// Default bound on receiving one complete HTTP request (head and body). A
+/// peer that connects and then sends nothing, or trickles bytes, would
+/// otherwise hold one of the listener's `max_connections` slots forever.
+const DEFAULT_HTTP_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound the public HTTP lifecycle's cooperative connection drain.  A
 /// synchronous handler which ignores cancellation cannot be preempted, so a
 /// timeout returns a caller-owned handle retaining its still-live child.
@@ -2374,6 +2378,73 @@ fn protocol_era_refusal(request: &JsonRpcRequest) -> Option<JsonRpcResponse> {
     })
 }
 
+/// Methods MCP 2026-07-28 removed. On a modern connection they are unknown
+/// methods (`-32601`), never era-selection signals.
+fn is_removed_legacy_method(method: &str) -> bool {
+    matches!(
+        method,
+        "initialize"
+            | "ping"
+            | "logging/setLevel"
+            | "resources/subscribe"
+            | "resources/unsubscribe"
+    )
+}
+
+/// Stateless per-request refusal for a request on a modern stdio connection
+/// that does not carry exact MCP 2026-07-28 metadata.
+///
+/// Every modern request is admitted on its own `_meta` (SEP-2575), so one
+/// invalid request is answered and the connection keeps serving: an
+/// unsupported version is `-32022` with the supported list, a removed method
+/// is `-32601`, and a request missing the required protocol version is
+/// `-32602`. Notifications receive no response.
+fn modern_request_version_refusal(request: &JsonRpcRequest) -> Option<JsonRpcResponse> {
+    let id = request.id.clone()?;
+    let error = match modern_protocol_version(request) {
+        Some(requested) => JsonRpcError {
+            code: fastmcp_protocol::UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE.into(),
+            message: "Unsupported MCP protocol version".to_owned(),
+            data: Some(serde_json::json!({
+                "supported": fastmcp_protocol::SUPPORTED_FINAL_PROTOCOL_VERSIONS,
+                "requested": requested,
+            })),
+        },
+        None if is_removed_legacy_method(&request.method) => JsonRpcError {
+            code: McpErrorCode::MethodNotFound.into(),
+            message: "Method not found".to_owned(),
+            data: None,
+        },
+        None => JsonRpcError {
+            code: McpErrorCode::InvalidParams.into(),
+            message: format!(
+                "Invalid params: request _meta must carry {MODERN_PROTOCOL_VERSION_METADATA_KEY}"
+            ),
+            data: None,
+        },
+    };
+    Some(JsonRpcResponse::error(Some(id), error))
+}
+
+/// Whether an opening-frame rejection left the connection in the modern era.
+///
+/// `ModernOnly` fixes the era before the first frame, and `Auto` selects it
+/// from a modern request even when that request names an unsupported
+/// version. In both cases the rejected frame is answered statelessly instead
+/// of ending the connection.
+fn opening_rejection_selected_modern(decision: &StdioEraDecision) -> bool {
+    matches!(
+        decision,
+        StdioEraDecision::Selected {
+            era: ProtocolEra::Modern2026,
+            modern_version: Some(ModernVersionSupport::Unsupported { .. }),
+        } | StdioEraDecision::RejectedUnderSelectedEra {
+            era: ProtocolEra::Modern2026,
+            ..
+        }
+    )
+}
+
 /// `-32601` refusal for a modern request that reaches a `LegacyOnly` policy.
 fn legacy_only_modern_refusal(request: &JsonRpcRequest) -> Option<JsonRpcResponse> {
     request.id.clone().map(|id| {
@@ -2483,6 +2554,119 @@ mod era_admission_refusal_tests {
         let mut request = modern_discover();
         request.id = None;
         assert!(era_admission_refusal(ProtocolPolicy::LegacyOnly, &request).is_none());
+    }
+}
+
+#[cfg(test)]
+mod modern_request_version_refusal_tests {
+    use super::*;
+
+    fn request(method: &str, meta: Option<serde_json::Value>) -> JsonRpcRequest {
+        let mut params = serde_json::json!({});
+        if let Some(meta) = meta {
+            params["_meta"] = meta;
+        }
+        JsonRpcRequest::new(method, Some(params), 7_i64)
+    }
+
+    fn meta(version: &str) -> serde_json::Value {
+        serde_json::json!({
+            MODERN_PROTOCOL_VERSION_METADATA_KEY: version,
+            "io.modelcontextprotocol/clientCapabilities": {},
+        })
+    }
+
+    fn refusal_error(request: &JsonRpcRequest) -> JsonRpcError {
+        let response =
+            modern_request_version_refusal(request).expect("a request receives a refusal");
+        assert_eq!(response.id, request.id, "a refusal echoes the request id");
+        response.error.expect("a refusal is a JSON-RPC error")
+    }
+
+    #[test]
+    fn unsupported_version_gets_the_official_unsupported_version_shape() {
+        let error = refusal_error(&request("tools/list", Some(meta("2099-01-01"))));
+        assert_eq!(error.code, fastmcp_protocol::JsonInteger::from(-32022));
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({
+                "supported": [MODERN_PROTOCOL_VERSION],
+                "requested": "2099-01-01",
+            }))
+        );
+    }
+
+    #[test]
+    fn missing_protocol_version_is_invalid_params() {
+        let without_meta = request("tools/list", None);
+        let without_version = request(
+            "tools/list",
+            Some(serde_json::json!({"io.modelcontextprotocol/clientCapabilities": {}})),
+        );
+        for request in [without_meta, without_version] {
+            assert_eq!(
+                refusal_error(&request).code,
+                fastmcp_protocol::JsonInteger::from(-32602)
+            );
+        }
+    }
+
+    #[test]
+    fn removed_methods_are_method_not_found_not_invalid_params() {
+        for method in [
+            "initialize",
+            "ping",
+            "logging/setLevel",
+            "resources/subscribe",
+            "resources/unsubscribe",
+        ] {
+            assert_eq!(
+                refusal_error(&request(method, None)).code,
+                fastmcp_protocol::JsonInteger::from(-32601),
+                "{method} was removed in MCP 2026-07-28"
+            );
+        }
+        // Planted negative: a current method without metadata stays -32602.
+        assert_eq!(
+            refusal_error(&request("server/discover", None)).code,
+            fastmcp_protocol::JsonInteger::from(-32602)
+        );
+    }
+
+    #[test]
+    fn notifications_receive_no_response() {
+        let mut notification = request("notifications/cancelled", None);
+        notification.id = None;
+        assert!(modern_request_version_refusal(&notification).is_none());
+    }
+
+    #[test]
+    fn only_modern_selecting_opening_rejections_keep_the_connection() {
+        let mut modern_only = StdioEraClassifier::new(ProtocolPolicy::ModernOnly);
+        let missing = modern_only.classify_opening(StdioOpeningFrame::RequestWithoutModernMetadata);
+        assert!(opening_rejection_selected_modern(&missing));
+
+        let mut auto = StdioEraClassifier::new(ProtocolPolicy::Auto);
+        let unsupported = auto.classify_opening(StdioOpeningFrame::ModernRequest {
+            protocol_version: "2099-01-01".to_owned(),
+        });
+        assert!(opening_rejection_selected_modern(&unsupported));
+        assert_eq!(
+            auto.state(),
+            &fastmcp_protocol::protocol_policy::StdioEraState::Selected(ProtocolEra::Modern2026),
+            "the unsupported modern opening still selects the modern era"
+        );
+
+        // Planted negatives: ambiguous Auto openings select no era and still
+        // close, and a supported opening is not a rejection at all.
+        let mut auto = StdioEraClassifier::new(ProtocolPolicy::Auto);
+        let notification = auto.classify_opening(StdioOpeningFrame::Notification);
+        assert!(!opening_rejection_selected_modern(&notification));
+        let mut auto = StdioEraClassifier::new(ProtocolPolicy::Auto);
+        let supported = auto.classify_opening(StdioOpeningFrame::ModernRequest {
+            protocol_version: MODERN_PROTOCOL_VERSION.to_owned(),
+        });
+        assert!(!opening_rejection_selected_modern(&supported));
     }
 }
 
@@ -3391,13 +3575,29 @@ fn is_parameter_header_mismatch_response(response: &JsonRpcResponse) -> bool {
     })
 }
 
-/// Final outcomes whose canonical modern HTTP status is 400: a missing
-/// required client capability (-32021) or a parameter-header mismatch
-/// (-32020), each carried as the JSON-RPC error body.
-fn canonical_http_bad_request_response(response: &JsonRpcResponse) -> Option<HttpResponse> {
-    (is_canonical_missing_required_client_capability_response(response)
-        || is_parameter_header_mismatch_response(response))
-    .then(|| HttpResponse::new(HttpStatus::BAD_REQUEST).with_json(response))
+/// Whether a final outcome is JSON-RPC Method not found (`-32601`).
+fn is_method_not_found_response(response: &JsonRpcResponse) -> bool {
+    response
+        .error
+        .as_ref()
+        .is_some_and(|error| error.code.as_i32() == Some(-32_601))
+}
+
+/// Final outcomes whose canonical modern HTTP status is not 200, each carried
+/// as the JSON-RPC error body:
+///
+/// - 400 for a missing required client capability (`-32021`) or a
+///   parameter-header mismatch (`-32020`);
+/// - 404 for a method the server does not implement (`-32601`), including
+///   methods MCP 2026-07-28 removed such as `initialize` and `ping`.
+fn canonical_http_error_status_response(response: &JsonRpcResponse) -> Option<HttpResponse> {
+    if is_canonical_missing_required_client_capability_response(response)
+        || is_parameter_header_mismatch_response(response)
+    {
+        return Some(HttpResponse::new(HttpStatus::BAD_REQUEST).with_json(response));
+    }
+    is_method_not_found_response(response)
+        .then(|| HttpResponse::new(HttpStatus::NOT_FOUND).with_json(response))
 }
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_transport::sse::SseServerTransport;
@@ -3750,6 +3950,9 @@ pub struct HttpServerConfig {
     pub health_path: String,
     /// Maximum number of concurrent connections (default: 64).
     pub max_connections: usize,
+    /// Time allowed to receive one complete request on an accepted
+    /// connection before it is closed (default: 30 seconds).
+    pub request_read_timeout: Duration,
     /// Inner HTTP handler configuration (endpoint path, CORS, and body size).
     pub handler_config: HttpHandlerConfig,
     /// Maximum requests buffered for one live HTTP session.
@@ -3780,14 +3983,30 @@ fn modern_post_rejection_response(
         ModernPostRejection::FinalAdmission(admission) => {
             protocol_admission_error_response(body, admission, max_body_size)
         }
+        ModernPostRejection::InvalidRequestMeta { issue } => {
+            let response = JsonRpcResponse::error(
+                admitted_request_id(body, max_body_size),
+                JsonRpcError {
+                    code: McpErrorCode::InvalidParams.into(),
+                    message: format!("Invalid params: {issue}"),
+                    data: None,
+                },
+            );
+            HttpResponse::new(HttpStatus::BAD_REQUEST).with_json(&response)
+        }
+        // A strictly decoded JSON-RPC notification is accepted with 202 and no
+        // body (plan HTTP-02 "successful notification acceptance"). Modern
+        // HTTP is stateless per POST: a request is cancelled by closing its
+        // own response stream, so a separately POSTed notification carries no
+        // authority over another connection's request and has no effect.
+        ModernPostRejection::NotARequest => HttpResponse::new(HttpStatus::ACCEPTED),
         ModernPostRejection::TooManyHeaders { .. }
         | ModernPostRejection::HeaderBlockTooLarge { .. }
         | ModernPostRejection::DuplicateSingletonHeader { .. }
         | ModernPostRejection::UnsupportedMediaType
         | ModernPostRejection::UnsupportedContentCoding
         | ModernPostRejection::Raw(_)
-        | ModernPostRejection::InvalidEnvelope
-        | ModernPostRejection::NotARequest => HttpResponse::bad_request(),
+        | ModernPostRejection::InvalidEnvelope => HttpResponse::bad_request(),
     }
 }
 
@@ -3817,6 +4036,7 @@ impl Default for HttpServerConfig {
         Self {
             health_path: "/health".to_string(),
             max_connections: 64,
+            request_read_timeout: DEFAULT_HTTP_REQUEST_READ_TIMEOUT,
             handler_config: HttpHandlerConfig {
                 base_path: "/mcp".to_string(),
                 ..HttpHandlerConfig::default()
@@ -3855,6 +4075,14 @@ impl HttpServerConfig {
     #[must_use]
     pub fn max_connections(mut self, max: usize) -> Self {
         self.max_connections = max;
+        self
+    }
+
+    /// Sets the time allowed to receive one complete request before the
+    /// connection is closed and its slot released.
+    #[must_use]
+    pub fn request_read_timeout(mut self, timeout: Duration) -> Self {
+        self.request_read_timeout = timeout;
         self
     }
 
@@ -7756,7 +7984,8 @@ async fn serve_websocket_connection(
     server: Arc<Server>,
     expected_path: &str,
 ) -> McpResult<()> {
-    let (request, trailing) = match read_websocket_handshake(cx, &mut stream).await {
+    let read_timeout = server.http_config.request_read_timeout;
+    let (request, trailing) = match read_websocket_handshake(cx, &mut stream, read_timeout).await {
         Ok(handshake) => handshake,
         Err(error) => {
             let rejection = if error.message == "WebSocket Authorization admission failed" {
@@ -7861,16 +8090,30 @@ async fn serve_websocket_connection(
 async fn read_websocket_handshake(
     cx: &Cx,
     stream: &mut AsyncTcpStream,
+    read_timeout: Duration,
 ) -> McpResult<(asupersync::net::websocket::HttpRequest, Vec<u8>)> {
     let mut bytes = Vec::with_capacity(1024);
     let mut chunk = [0_u8; 1024];
+    // The upgrade is an HTTP request: the listener's request-read deadline
+    // keeps an idle or trickling peer from holding a connection slot.
+    let deadline = cx
+        .now()
+        .saturating_add_nanos(u64::try_from(read_timeout.as_nanos()).unwrap_or(u64::MAX));
     loop {
         cx.checkpoint()
             .map_err(|_| McpError::internal_error("WebSocket handshake cancelled"))?;
-        let read = stream
-            .read(&mut chunk)
-            .await
-            .map_err(|_| McpError::invalid_request("WebSocket handshake could not be read"))?;
+        let now = cx.now();
+        if now >= deadline {
+            return Err(McpError::invalid_request(
+                "WebSocket handshake was not received in time",
+            ));
+        }
+        let wait = HTTP_ACCEPT_CANCEL_POLL.min(Duration::from_nanos(deadline.duration_since(now)));
+        let Ok(read) = asupersync::time::timeout(now, wait, stream.read(&mut chunk)).await else {
+            continue;
+        };
+        let read =
+            read.map_err(|_| McpError::invalid_request("WebSocket handshake could not be read"))?;
         if read == 0 {
             return Err(McpError::invalid_request(
                 "WebSocket handshake ended before completion",
@@ -7895,6 +8138,9 @@ async fn read_websocket_handshake(
             }
             if raw_websocket_upgrade_headers_are_well_formed(header_block).is_err() {
                 return Err(McpError::invalid_request("WebSocket handshake is invalid"));
+            }
+            if !raw_websocket_upgrade_origin_is_admissible(header_block) {
+                return Err(McpError::invalid_request("WebSocket Origin is not allowed"));
             }
         }
         match asupersync::net::websocket::HttpRequest::parse_with_trailing(&bytes) {
@@ -7923,6 +8169,30 @@ fn raw_websocket_upgrade_headers_are_well_formed(head: &[u8]) -> Result<(), ()> 
         }
     }
     Ok(())
+}
+
+/// Cross-site WebSocket hijacking protection: a browser always sends
+/// `Origin` on a WebSocket upgrade, and the server-side transport has no CORS
+/// allowlist, so a present `Origin` must be a loopback origin (the same
+/// admission policy the HTTP routes apply by default). Non-browser clients
+/// that send no `Origin` are unaffected.
+#[cfg(feature = "websocket")]
+fn raw_websocket_upgrade_origin_is_admissible(head: &[u8]) -> bool {
+    let Ok(head) = std::str::from_utf8(head) else {
+        // Left to the handshake parser's generic bounded 400 path.
+        return true;
+    };
+    let mut origins = head.split("\r\n").skip(1).filter_map(|line| {
+        line.split_once(':')
+            .filter(|(name, _)| name.eq_ignore_ascii_case("origin"))
+            .map(|(_, value)| value.trim())
+    });
+    match (origins.next(), origins.next()) {
+        (None, _) => true,
+        (Some(origin), None) => HttpHandlerConfig::default().admits_origin(origin),
+        // A repeated Origin is ambiguous; refuse rather than pick one.
+        (Some(_), Some(_)) => false,
+    }
 }
 
 #[cfg(feature = "websocket")]
@@ -8625,6 +8895,17 @@ impl ServerHttpSession {
             ));
         }
 
+        // DNS-rebinding protection for every MCP route, modern and exact-2024
+        // alike: a present `Origin` must be loopback or explicitly allowed,
+        // otherwise HTTP 403 before any parsing, authentication, or dispatch.
+        if let Some(origin) = request.header("origin")
+            && !self.server.http_config.handler_config.admits_origin(origin)
+        {
+            return Ok(ServerHttpEndpointResponse::Immediate(HttpResponse::new(
+                HttpStatus::FORBIDDEN,
+            )));
+        }
+
         let is_modern = request.method == HttpMethod::Post
             && request.path == self.server.http_config.handler_config.base_path;
         let mut raw_params = None;
@@ -9231,7 +9512,7 @@ impl ServerHttpSession {
                     )
                     .await;
                 if let Some(response) = response {
-                    if let Some(rejection) = canonical_http_bad_request_response(&response) {
+                    if let Some(rejection) = canonical_http_error_status_response(&response) {
                         return Ok(ServerHttpEndpointResponse::Immediate(rejection));
                     }
                     self.endpoint_session
@@ -9340,7 +9621,7 @@ impl ServerHttpSession {
                     .await;
                 if let Some(rejection) = response
                     .as_ref()
-                    .and_then(canonical_http_bad_request_response)
+                    .and_then(canonical_http_error_status_response)
                 {
                     return Ok(ServerHttpEndpointResponse::Immediate(rejection));
                 }
@@ -10589,14 +10870,23 @@ async fn next_native_http1_request(
     cx: &Cx,
     listener_shutdown: &HttpListenerShutdown,
     framed: &mut Framed<AsyncTcpStream, NativeHttp1Codec>,
+    read_timeout: Duration,
 ) -> Option<Result<asupersync::http::h1::Request, Http1DecodeError>> {
+    // Every wait below is bounded by this one deadline, so an idle or
+    // trickling peer is closed and its connection slot released.
+    let deadline = cx
+        .now()
+        .saturating_add_nanos(u64::try_from(read_timeout.as_nanos()).unwrap_or(u64::MAX));
     loop {
         if listener_shutdown.is_requested() || cx.checkpoint().is_err() {
             return None;
         }
-        if let Ok(request) =
-            asupersync::time::timeout(cx.now(), HTTP_ACCEPT_CANCEL_POLL, framed.next()).await
-        {
+        let now = cx.now();
+        if now >= deadline {
+            return None;
+        }
+        let wait = HTTP_ACCEPT_CANCEL_POLL.min(Duration::from_nanos(deadline.duration_since(now)));
+        if let Ok(request) = asupersync::time::timeout(now, wait, framed.next()).await {
             return request;
         }
     }
@@ -11212,7 +11502,7 @@ fn spawn_modern_sse_dispatch(
             outcome_gate.as_ref(),
             response
                 .as_ref()
-                .and_then(canonical_http_bad_request_response),
+                .and_then(canonical_http_error_status_response),
         ) {
             if outcome_gate.elect(ModernSseDispatchElection::Immediate(rejection)) {
                 return;
@@ -11692,24 +11982,31 @@ fn admit_live_http_legacy_request(
     })
 }
 
-fn protocol_admission_error_response(
-    body: &[u8],
-    admission: fastmcp_protocol::RequestAdmissionError,
-    max_body_size: usize,
-) -> HttpResponse {
-    // `ProtocolAdmission` is returned only after the transport's strict,
-    // bounded JSON-RPC request decode has succeeded. Re-decode with the same
-    // configured bound so the error response retains the admitted request ID
-    // without widening the listener's parsing surface.
+/// Re-decodes an already-admitted body to recover its request ID for an
+/// admission error response.
+///
+/// Admission rejections after envelope decode are returned only once the
+/// strict, bounded JSON-RPC request decode has succeeded. Re-decoding with the
+/// same configured bound retains the admitted request ID without widening the
+/// listener's parsing surface.
+fn admitted_request_id(body: &[u8], max_body_size: usize) -> Option<RequestId> {
     let mut codec = Codec::new();
     codec.set_max_message_size(max_body_size);
-    let id = codec
+    codec
         .decode_complete_message(body)
         .ok()
         .and_then(|message| match message {
             JsonRpcMessage::Request(request) => request.id,
             JsonRpcMessage::Response(_) => None,
-        });
+        })
+}
+
+fn protocol_admission_error_response(
+    body: &[u8],
+    admission: fastmcp_protocol::RequestAdmissionError,
+    max_body_size: usize,
+) -> HttpResponse {
+    let id = admitted_request_id(body, max_body_size);
     let (message, data) = match &admission {
         fastmcp_protocol::RequestAdmissionError::HeaderMismatch(error) => (
             http_admission::HEADER_MISMATCH_MESSAGE,
@@ -12089,7 +12386,10 @@ async fn serve_http_connection(
     let mut framed = Framed::new(stream, native_http1_codec(&endpoint));
     #[cfg(test)]
     lib_unit_tests::record_live_http_connection_read_wait();
-    let Some(request) = next_native_http1_request(cx, &listener_shutdown, &mut framed).await else {
+    let read_timeout = endpoint.server.http_config.request_read_timeout;
+    let Some(request) =
+        next_native_http1_request(cx, &listener_shutdown, &mut framed, read_timeout).await
+    else {
         return;
     };
     let request = match request {
@@ -12482,7 +12782,10 @@ async fn serve_modern_http_connection(
     let mut framed = Framed::new(stream, native_http1_codec(&endpoint));
     #[cfg(test)]
     lib_unit_tests::record_live_http_connection_read_wait();
-    let Some(request) = next_native_http1_request(cx, &listener_shutdown, &mut framed).await else {
+    let read_timeout = endpoint.server.http_config.request_read_timeout;
+    let Some(request) =
+        next_native_http1_request(cx, &listener_shutdown, &mut framed, read_timeout).await
+    else {
         return;
     };
     let request = match request {
@@ -15352,6 +15655,9 @@ impl Server {
             {
                 HttpResponse::new(HttpStatus::BAD_REQUEST).with_json(&response)
             }
+            Some(response) if is_modern_http_request && is_method_not_found_response(&response) => {
+                HttpResponse::new(HttpStatus::NOT_FOUND).with_json(&response)
+            }
             Some(response) => HttpResponse::ok().with_json(&response),
             None => HttpResponse::new(HttpStatus::ACCEPTED),
         }
@@ -16316,6 +16622,9 @@ impl Server {
                     &JsonRpcMessage::Request(request.clone()),
                 ) {
                     Ok(ProtocolEra::Modern2026) => negotiated_era = Some(ProtocolEra::Modern2026),
+                    Err(decision) if opening_rejection_selected_modern(&decision) => {
+                        negotiated_era = Some(ProtocolEra::Modern2026);
+                    }
                     Ok(ProtocolEra::Legacy2024) | Err(_) => {
                         if let Some(response) = protocol_era_refusal(&request) {
                             let _ = send
@@ -16331,9 +16640,26 @@ impl Server {
                     }
                 }
             }
-            if negotiated_era != Some(ProtocolEra::Modern2026)
-                || modern_protocol_version(&request) != Some(MODERN_PROTOCOL_VERSION)
+            if negotiated_era == Some(ProtocolEra::Modern2026)
+                && modern_protocol_version(&request) != Some(MODERN_PROTOCOL_VERSION)
             {
+                // Stateless per-request admission: answer this request and
+                // keep serving the stream.
+                if let Some(response) = modern_request_version_refusal(&request)
+                    && send
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                        cx,
+                        &JsonRpcMessage::Response(response),
+                    )
+                    .is_err()
+                {
+                    exit_code = 1;
+                    break;
+                }
+                continue;
+            }
+            if negotiated_era != Some(ProtocolEra::Modern2026) {
                 if let Some(response) = protocol_era_refusal(&request) {
                     let _ = send
                         .lock()
@@ -17139,6 +17465,27 @@ impl Server {
             if enforce_runtime_era && negotiated_era.is_none() {
                 match classify_initial_stdio_envelope(&mut era_classifier, &message) {
                     Ok(era) => negotiated_era = Some(era),
+                    Err(decision) if opening_rejection_selected_modern(&decision) => {
+                        negotiated_era = Some(ProtocolEra::Modern2026);
+                        if let JsonRpcMessage::Request(request) = &message {
+                            let sent = if request.validate().is_err() {
+                                send_invalid_request(&send, cx, request.id.clone())
+                            } else if let Some(response) = modern_request_version_refusal(request) {
+                                send.lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                                    cx,
+                                    &JsonRpcMessage::Response(response),
+                                )
+                            } else {
+                                Ok(())
+                            };
+                            if sent.is_err() {
+                                exit_code = 1;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
                     Err(_) => {
                         if let JsonRpcMessage::Request(request) = &message {
                             let _ = if request.validate().is_err() {
@@ -17317,16 +17664,21 @@ impl Server {
                                 {
                                     ProtocolEra::Modern2026
                                 } else {
-                                    if let Some(response) = protocol_era_refusal(&request) {
-                                        let _ = send
+                                    // Stateless per-request admission: answer
+                                    // this request and keep serving the stream.
+                                    if let Some(response) = modern_request_version_refusal(&request)
+                                        && send
                                             .lock()
                                             .unwrap_or_else(std::sync::PoisonError::into_inner)(
                                             cx,
                                             &JsonRpcMessage::Response(response),
-                                        );
+                                        )
+                                        .is_err()
+                                    {
+                                        exit_code = 1;
+                                        break 'receive;
                                     }
-                                    exit_code = i32::from(owns_server_lifecycle);
-                                    break 'receive;
+                                    continue;
                                 }
                             }
                             Some(ProtocolEra::Legacy2024) => {
@@ -17360,6 +17712,22 @@ impl Server {
                                 } => {
                                     negotiated_era = Some(ProtocolEra::Legacy2024);
                                     ProtocolEra::Legacy2024
+                                }
+                                decision if opening_rejection_selected_modern(&decision) => {
+                                    negotiated_era = Some(ProtocolEra::Modern2026);
+                                    if let Some(response) = modern_request_version_refusal(&request)
+                                        && send
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                                            cx,
+                                            &JsonRpcMessage::Response(response),
+                                        )
+                                        .is_err()
+                                    {
+                                        exit_code = 1;
+                                        break 'receive;
+                                    }
+                                    continue;
                                 }
                                 _ => {
                                     if let Some(response) = protocol_era_refusal(&request) {
@@ -18258,6 +18626,24 @@ impl Server {
                             {
                                 ProtocolEra::Legacy2024
                             }
+                            Some(ProtocolEra::Modern2026) => {
+                                // Stateless per-request admission: answer this
+                                // request and keep serving the stream.
+                                if let Some(response) = modern_request_version_refusal(&request)
+                                    && let Err(send_error) = send
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                                        cx,
+                                        &JsonRpcMessage::Response(response),
+                                    )
+                                {
+                                    return returning_send_result_with_connection_failure(
+                                        &send_error,
+                                        &connection_failure,
+                                    );
+                                }
+                                continue;
+                            }
                             Some(_) => {
                                 if let Some(response) = protocol_era_refusal(&request)
                                     && let Err(send_error) = send
@@ -18295,6 +18681,24 @@ impl Server {
                                     } => {
                                         negotiated_era = Some(ProtocolEra::Legacy2024);
                                         ProtocolEra::Legacy2024
+                                    }
+                                    decision if opening_rejection_selected_modern(&decision) => {
+                                        negotiated_era = Some(ProtocolEra::Modern2026);
+                                        if let Some(response) =
+                                            modern_request_version_refusal(&request)
+                                            && let Err(send_error) = send
+                                                .lock()
+                                                .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                                                cx,
+                                                &JsonRpcMessage::Response(response),
+                                            )
+                                        {
+                                            return returning_send_result_with_connection_failure(
+                                                &send_error,
+                                                &connection_failure,
+                                            );
+                                        }
+                                        continue;
                                     }
                                     _ => {
                                         if let Some(response) = protocol_era_refusal(&request)
@@ -30929,7 +31333,7 @@ mod lib_unit_tests {
                 version: "0.9.0".to_string(),
             },
             fastmcp_protocol::ClientCapabilities {
-                sampling: Some(fastmcp_protocol::SamplingCapability {}),
+                sampling: Some(fastmcp_protocol::SamplingCapability::default()),
                 elicitation: None,
                 roots: None,
                 ..Default::default()
@@ -44600,6 +45004,121 @@ mod lib_unit_tests {
         });
     }
 
+    /// An idle peer and a byte-trickling peer each lose their connection at
+    /// the request-read deadline, releasing the listener's only slot; a peer
+    /// that sends a complete request on that same slot is served.
+    #[test]
+    fn live_http_request_read_timeout_releases_idle_and_trickling_connections() {
+        const READ_TIMEOUT: Duration = Duration::from_millis(300);
+        run_live_http_test(|cx| async move {
+            let bound = Server::new("live-http-request-read-timeout", "1.0.0")
+                .http_config(
+                    HttpServerConfig::new()
+                        .max_connections(1)
+                        .request_read_timeout(READ_TIMEOUT),
+                )
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("read-timeout bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("read-timeout address failed: {error}"))?;
+            let caller_cx = cx.clone();
+            let controller = thread::spawn(move || -> Result<Vec<u8>, String> {
+                struct CancelServerOnDrop(Cx);
+
+                impl Drop for CancelServerOnDrop {
+                    fn drop(&mut self) {
+                        self.0.cancel_with(
+                            CancelKind::User,
+                            Some("request read timeout controller finished"),
+                        );
+                    }
+                }
+
+                let _server_cancellation = CancelServerOnDrop(caller_cx);
+                let connect = || -> Result<std::net::TcpStream, String> {
+                    let stream = std::net::TcpStream::connect(address)
+                        .map_err(|error| format!("read-timeout connect failed: {error}"))?;
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .map_err(|error| format!("read-timeout setup failed: {error}"))?;
+                    Ok(stream)
+                };
+                // Each stalled peer must be closed by the server (EOF, no
+                // response bytes), and not before the deadline.
+                let closed_at_deadline = |stream: &mut std::net::TcpStream,
+                                          started: std::time::Instant,
+                                          peer: &str|
+                 -> Result<(), String> {
+                    let mut received = Vec::new();
+                    match std::io::Read::read_to_end(stream, &mut received) {
+                        Ok(_) => {}
+                        // Bytes written after the server's close draw a reset.
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::BrokenPipe
+                            ) => {}
+                        Err(error) => return Err(format!("{peer} peer was not closed: {error}")),
+                    }
+                    let elapsed = started.elapsed();
+                    if !received.is_empty() || elapsed < READ_TIMEOUT {
+                        return Err(format!(
+                            "{peer} peer closed after {elapsed:?} with {received:?}"
+                        ));
+                    }
+                    Ok(())
+                };
+
+                let started = std::time::Instant::now();
+                let mut idle = connect()?;
+                closed_at_deadline(&mut idle, started, "idle")?;
+
+                let started = std::time::Instant::now();
+                let mut trickling = connect()?;
+                for byte in b"GET /health HTTP/1.1\r\nHost: loop" {
+                    if std::io::Write::write_all(&mut trickling, &[*byte]).is_err() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
+                closed_at_deadline(&mut trickling, started, "trickling")?;
+
+                // Near-identical positive on the same single slot: the
+                // complete request is answered.
+                let mut complete = connect()?;
+                std::io::Write::write_all(
+                    &mut complete,
+                    b"GET /health HTTP/1.1\r\nHost: loopback\r\nConnection: close\r\n\r\n",
+                )
+                .map_err(|error| format!("complete request write failed: {error}"))?;
+                let mut response = Vec::new();
+                std::io::Read::read_to_end(&mut complete, &mut response)
+                    .map_err(|error| format!("complete request read failed: {error}"))?;
+                Ok(response)
+            });
+
+            let shutdown = bound
+                .serve(&cx)
+                .await
+                .map_err(|error| format!("read-timeout server failed: {error}"))?;
+            let response = controller
+                .join()
+                .map_err(|_| "read-timeout controller panicked".to_owned())??;
+            require_quiescent_http_shutdown(shutdown, "request read timeout").await?;
+            if !response.starts_with(b"HTTP/1.1 200") {
+                return Err(format!(
+                    "a complete request on the released slot was not served: {:?}",
+                    String::from_utf8_lossy(&response)
+                ));
+            }
+            Ok(())
+        });
+    }
+
     // Exact-2024 era: legacy HTTP SSE endpoint event.
     #[cfg(feature = "legacy-2024-11-05")]
     #[test]
@@ -55098,7 +55617,7 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn public_http_stateless_elicitation_retry_rejects_without_reentry_or_consumption() {
+    fn public_http_stateless_elicitation_retry_resumes_once_across_sessions() {
         let cx = Cx::for_testing();
         let calls = Arc::new(AtomicUsize::new(0));
         let endpoint = Server::new("modern-http-stateless-elicitation", "1.0.0")
@@ -55169,32 +55688,58 @@ mod lib_unit_tests {
         assert_eq!(calls.load(Ordering::Acquire), 1);
         assert_eq!(endpoint.server.router.test_active_mrtr_exchange_count(), 1);
 
-        let rejected =
+        // MCP 2026-07-28 MRTR: an elicitation answer is ordinary input data, so
+        // a stateless retry from an independent HTTP session resumes the
+        // operation exactly like sampling or roots input does.
+        let resumed =
             block_on(retrying_client.handle_async(&cx, request(Some(request_state), 913)))
-                .expect("stateless elicitation retry must receive a JSON-RPC rejection");
-        let ServerHttpEndpointResponse::Immediate(rejected) = rejected else {
-            panic!("stateless elicitation retry rejection must use the JSON response lane");
+                .expect("stateless elicitation retry must receive a JSON-RPC response");
+        let ServerHttpEndpointResponse::Immediate(resumed) = resumed else {
+            panic!("stateless elicitation retry must use the JSON response lane");
         };
-        let rejected: JsonRpcResponse =
-            serde_json::from_slice(&rejected.body).expect("retry rejection must be JSON-RPC");
-        assert_eq!(rejected.id, Some(913_i64.into()));
-        let error = rejected
-            .error
-            .expect("stateless elicitation retry must fail");
-        assert_eq!(error.code, McpErrorCode::InvalidRequest.into());
-        assert_eq!(
-            error.message,
-            "stateless HTTP cannot resume elicitation requestState; a durable MCP transport connection is required"
+        let resumed: JsonRpcResponse =
+            serde_json::from_slice(&resumed.body).expect("retry response must be JSON-RPC");
+        assert_eq!(resumed.id, Some(913_i64.into()));
+        assert!(
+            resumed.error.is_none(),
+            "stateless elicitation retry must resume, got {:?}",
+            resumed.error
         );
         assert_eq!(
             calls.load(Ordering::Acquire),
-            1,
-            "retry rejection must happen before handler reentry"
+            2,
+            "an admitted retry re-enters the handler exactly once"
         );
+        // This fixture asks again on every call, so the resumed round mints a
+        // fresh state; the consumed one must not be reusable.
+        let reissued_state = resumed
+            .result
+            .as_ref()
+            .and_then(|result| result.get("requestState"))
+            .and_then(serde_json::Value::as_str)
+            .expect("the resumed round's input_required result carries a fresh requestState");
+        assert_ne!(reissued_state, request_state);
+
+        // Planted negative: replaying the consumed state is rejected before the
+        // handler runs.
+        let replayed =
+            block_on(retrying_client.handle_async(&cx, request(Some(request_state), 914)))
+                .expect("replayed elicitation retry must receive a JSON-RPC response");
+        let ServerHttpEndpointResponse::Immediate(replayed) = replayed else {
+            panic!("replayed elicitation retry must use the JSON response lane");
+        };
+        let replayed: JsonRpcResponse =
+            serde_json::from_slice(&replayed.body).expect("replay response must be JSON-RPC");
+        assert_eq!(replayed.id, Some(914_i64.into()));
+        let error = replayed
+            .error
+            .expect("a consumed elicitation requestState must not resume twice");
+        assert_eq!(error.code, McpErrorCode::InvalidParams.into());
+        assert_eq!(error.message, "Invalid or expired MRTR request state");
         assert_eq!(
-            endpoint.server.router.test_active_mrtr_exchange_count(),
-            1,
-            "a terminal policy rejection must not silently consume requestState"
+            calls.load(Ordering::Acquire),
+            2,
+            "a replay rejection must happen before handler reentry"
         );
     }
 
@@ -56512,7 +57057,9 @@ mod lib_unit_tests {
                     "HTTP cancellation notification was not rejected immediately".to_owned(),
                 );
             };
-            if rejected.status != HttpStatus::BAD_REQUEST
+            // Accepted with 202 (a notification), yet it carries no authority
+            // over either in-flight response body.
+            if rejected.status != HttpStatus::ACCEPTED
                 || first_guard.checkpoint(&cx).is_err()
                 || second_guard.checkpoint(&cx).is_err()
             {
@@ -56543,7 +57090,7 @@ mod lib_unit_tests {
             else {
                 return Err("live SSE cancellation POST was not rejected immediately".to_owned());
             };
-            if streaming_rejected.status != HttpStatus::BAD_REQUEST {
+            if streaming_rejected.status != HttpStatus::ACCEPTED {
                 return Err("live SSE cancellation POST used the wrong status".to_owned());
             }
             streaming_rejected_session.close(&cx).await;

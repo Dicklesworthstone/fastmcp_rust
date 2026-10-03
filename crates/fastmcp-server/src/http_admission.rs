@@ -18,7 +18,9 @@
 //!    arrays rejected — a batch is never iterated or partially dispatched,
 //!    even an array of one valid request),
 //! 9. strict envelope decode, 10. request-shape (a response or notification
-//!    is not admissible here), 11. final protocol-version and
+//!    is not admissible here), 11. required `params._meta` structure
+//!    (`-32602`: a body missing a required member is malformed params, not a
+//!    header mismatch), 12. final protocol-version and
 //!    `Mcp-Method`/`Mcp-Name` header-body mirror admission.
 //!
 //! Every rejection is side-effect free: no authentication, no dispatch, no
@@ -43,10 +45,10 @@ use std::sync::Arc;
 
 use fastmcp_protocol::http_headers::AdmittedToolHeaderSchema;
 use fastmcp_protocol::{
-    FINAL_PROTOCOL_VERSION_META_KEY, FinalHttpRequestMetadata, FinalProtocolVersion,
-    HEADER_MISMATCH_ERROR_CODE, JsonRpcAdmissionError, JsonRpcRequest, MCP_METHOD_HEADER,
-    MCP_NAME_HEADER, MCP_PROTOCOL_VERSION_HEADER, RawJsonAdmissionError, RequestAdmissionError,
-    RequestVersionMetadata, admit_final_http_request,
+    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY, FinalHttpRequestMetadata,
+    FinalProtocolVersion, HEADER_MISMATCH_ERROR_CODE, JsonRpcAdmissionError, JsonRpcRequest,
+    MCP_METHOD_HEADER, MCP_NAME_HEADER, MCP_PROTOCOL_VERSION_HEADER, RawJsonAdmissionError,
+    RequestAdmissionError, RequestVersionMetadata, admit_final_http_request,
 };
 use serde_json::Value;
 
@@ -260,6 +262,15 @@ pub enum ModernPostRejection {
     /// The strict envelope is a response or notification, which this
     /// request-admission boundary does not accept.
     NotARequest,
+    /// The request's `params._meta` is missing or lacks a structurally valid
+    /// required member (`protocolVersion` string, `clientCapabilities`
+    /// object). This is invalid params (`-32602`, HTTP 400), evaluated
+    /// before the header/body mirrors: a body that omits a required field is
+    /// malformed, not a header mismatch.
+    InvalidRequestMeta {
+        /// Which required structure is absent or malformed.
+        issue: &'static str,
+    },
     /// Final protocol-version or header/body mirror admission refused the
     /// request.
     FinalAdmission(RequestAdmissionError),
@@ -291,6 +302,9 @@ impl fmt::Display for ModernPostRejection {
             Self::Raw(error) => write!(formatter, "raw JSON-RPC admission refused: {error:?}"),
             Self::InvalidEnvelope => formatter.write_str("body is not a strict JSON-RPC envelope"),
             Self::NotARequest => formatter.write_str("body is not a JSON-RPC request with an id"),
+            Self::InvalidRequestMeta { issue } => {
+                write!(formatter, "invalid request _meta: {issue}")
+            }
             Self::FinalAdmission(error) => {
                 write!(formatter, "final request admission refused: {error:?}")
             }
@@ -375,6 +389,12 @@ pub fn admit_modern_post(
                 Err(ModernPostRejection::NotARequest)
             }
         })
+        .and_then(
+            |(request, raw_params)| match request_meta_structure_issue(&request) {
+                Some(issue) => Err(ModernPostRejection::InvalidRequestMeta { issue }),
+                None => Ok((request, raw_params)),
+            },
+        )
         .and_then(|(request, raw_params)| {
             let protocol_version = {
                 let metadata = FinalHttpRequestMetadata {
@@ -467,6 +487,34 @@ fn negotiate_representation(
     headers: &[(String, String)],
 ) -> Result<ResponseRepresentation, ModernPostRejection> {
     accept::negotiate_representation(headers)
+}
+
+/// Returns the first missing or malformed required `RequestMetaObject`
+/// member. Every MCP 2026-07-28 request's params require `_meta` carrying a
+/// `protocolVersion` string and a `clientCapabilities` object; `clientInfo`
+/// is optional.
+fn request_meta_structure_issue(request: &JsonRpcRequest) -> Option<&'static str> {
+    let Some(params) = request.params.as_ref().and_then(Value::as_object) else {
+        return Some("request params must be an object carrying _meta");
+    };
+    let Some(meta) = params.get("_meta").and_then(Value::as_object) else {
+        return Some("request params must carry an _meta object");
+    };
+    if !meta
+        .get(FINAL_PROTOCOL_VERSION_META_KEY)
+        .is_some_and(Value::is_string)
+    {
+        return Some("request _meta must carry an io.modelcontextprotocol/protocolVersion string");
+    }
+    if !meta
+        .get(FINAL_CLIENT_CAPABILITIES_META_KEY)
+        .is_some_and(Value::is_object)
+    {
+        return Some(
+            "request _meta must carry an io.modelcontextprotocol/clientCapabilities object",
+        );
+    }
+    None
 }
 
 fn body_protocol_version(request: &JsonRpcRequest) -> Option<&str> {
@@ -876,6 +924,55 @@ mod tests {
             matches!(result, Err(ModernPostRejection::FinalAdmission(_))),
             "a mismatched version mirror must be refused, got {result:?}"
         );
+    }
+
+    #[test]
+    fn missing_request_meta_is_invalid_params_before_the_version_mirror() {
+        // CONTROL: the canonical body is admitted with these exact headers.
+        assert!(admit(&canonical_headers(), &canonical_body()).is_ok());
+
+        // Each body differs from the canonical one in exactly one member. The
+        // headers stay canonical, so the header/body mirror would have
+        // misreported every case as a header mismatch (-32020); the official
+        // suite and schema require invalid params (-32602, HTTP 400).
+        let canonical: serde_json::Value =
+            serde_json::from_slice(&canonical_body()).expect("canonical body is JSON");
+        let mut no_meta = canonical.clone();
+        no_meta["params"]
+            .as_object_mut()
+            .expect("params object")
+            .remove("_meta");
+        let mut no_version = canonical.clone();
+        no_version["params"]["_meta"]
+            .as_object_mut()
+            .expect("_meta object")
+            .remove("io.modelcontextprotocol/protocolVersion");
+        let mut no_capabilities = canonical.clone();
+        no_capabilities["params"]["_meta"]
+            .as_object_mut()
+            .expect("_meta object")
+            .remove("io.modelcontextprotocol/clientCapabilities");
+        let mut array_capabilities = canonical.clone();
+        array_capabilities["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"] =
+            json!([]);
+        let mut numeric_version = canonical;
+        numeric_version["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
+            json!(20_260_728);
+
+        for (label, body) in [
+            ("no _meta", no_meta),
+            ("no protocolVersion", no_version),
+            ("no clientCapabilities", no_capabilities),
+            ("array clientCapabilities", array_capabilities),
+            ("numeric protocolVersion", numeric_version),
+        ] {
+            let body = serde_json::to_vec(&body).expect("mutated body serializes");
+            let result = admit(&canonical_headers(), &body);
+            assert!(
+                matches!(result, Err(ModernPostRejection::InvalidRequestMeta { .. })),
+                "{label}: expected InvalidRequestMeta, got {result:?}"
+            );
+        }
     }
 
     #[test]
