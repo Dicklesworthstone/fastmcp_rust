@@ -1812,7 +1812,7 @@ mod tests {
             case "$discover" in *fastmcp-client:modern*) ;; *) exit 95 ;; esac;
             printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"configured-modern","version":"1.0.0"}}}}';
             IFS= read -r ping || exit 96;
-            case "$ping" in *'"method":"ping"'*) ;; *) exit 97 ;; esac;
+            case "$ping" in *'"method":"server/discover"'*) ;; *) exit 97 ;; esac;
             case "$ping" in *'"id":2}'*|*'"id":2,'*) ;; *) exit 98 ;; esac;
             case "$ping" in *2026-07-28*) ;; *) exit 99 ;; esac;
             printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete"}}';

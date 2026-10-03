@@ -17275,7 +17275,7 @@ mod tests {
         });
 
         let capabilities = ClientCapabilities {
-            sampling: Some(fastmcp_protocol::SamplingCapability {}),
+            sampling: Some(fastmcp_protocol::SamplingCapability::default()),
             roots: Some(fastmcp_protocol::RootsCapability {
                 list_changed: false,
             }),
@@ -19351,7 +19351,9 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
             let stalled_body = serde_json::from_slice::<serde_json::Value>(&stalled_request.body)
                 .expect("stalled ping is JSON-RPC");
             assert_eq!(stalled_body["id"], 2);
-            assert_eq!(stalled_body["method"], "ping");
+            // MCP 2026-07-28 removed `ping`; the modern liveness probe is the
+            // stateless `server/discover` round-trip.
+            assert_eq!(stalled_body["method"], "server/discover");
             begin_chunked_sse(&mut stalled);
             ready_sender
                 .send(())
@@ -19363,12 +19365,12 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
             let sibling_body = serde_json::from_slice::<serde_json::Value>(&sibling_request.body)
                 .expect("sibling ping is JSON-RPC");
             assert_eq!(sibling_body["id"], 3);
-            assert_eq!(sibling_body["method"], "ping");
+            assert_eq!(sibling_body["method"], "server/discover");
             write_response(
                 &mut sibling,
                 200,
                 "application/json",
-                br#"{"jsonrpc":"2.0","id":3,"result":{}}"#,
+                br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"cancellation-peer","version":"1"}},"ttlMs":0,"cacheScope":"private"}}"#,
             );
         });
 
@@ -19457,12 +19459,13 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
             let terminal_body = serde_json::from_slice::<serde_json::Value>(&terminal_request.body)
                 .expect("terminal ping is JSON-RPC");
             assert_eq!(terminal_body["id"], 2);
-            assert_eq!(terminal_body["method"], "ping");
+            // The modern liveness probe is `server/discover`, not the removed `ping`.
+            assert_eq!(terminal_body["method"], "server/discover");
             write_response(
                 &mut terminal,
                 200,
                 "text/event-stream",
-                br#"data: {"jsonrpc":"2.0","id":2,"result":{}}
+                br#"data: {"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"terminal-peer","version":"1"}},"ttlMs":0,"cacheScope":"private"}}
 
 "#,
             );

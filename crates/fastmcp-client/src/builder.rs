@@ -1944,10 +1944,12 @@ mod tests {
         } else {
             r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"builder-modern-apps","version":"1.0.0"}}}}"#
         };
+        // The modern liveness probe is `server/discover` (MCP 2026-07-28
+        // removed `ping`); it carries the same per-request `_meta`.
         let ping_case = if server_advertises_apps {
-            "*ping*io.modelcontextprotocol/ui*)"
+            "*server/discover*io.modelcontextprotocol/ui*)"
         } else {
-            "*ping*io.modelcontextprotocol/ui*) exit 1 ;; *ping*)"
+            "*server/discover*io.modelcontextprotocol/ui*) exit 1 ;; *server/discover*)"
         };
         format!(
             "IFS= read -r discover || exit 1; \\
@@ -2043,7 +2045,9 @@ else
 fi
 IFS= read -r ping || exit 95
 case "$ping" in *'"id":2'*) ;; *) exit 96;; esac
-case "$ping" in *'"method":"ping"'*) ;; *) exit 97;; esac
+# MCP 2026-07-28 removed `ping`; a modern session probes with server/discover.
+if [ "$era" = modern ]; then liveness='"method":"server/discover"'; else liveness='"method":"ping"'; fi
+case "$ping" in *"$liveness"*) ;; *) exit 97;; esac
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
 exec sleep 5
 "#;
@@ -4519,29 +4523,34 @@ exit 73
     #[cfg(unix)]
     #[cfg(all(feature = "apps", feature = "legacy-2024-11-05"))]
     #[test]
-    fn default_builder_auto_rejects_invalid_params_discovery_without_legacy_fallback() {
-        // This differs from the accepted default-Auto fallback fixture only in
-        // the discovery error code. If Auto starts a legacy child for -32602,
-        // the fixture's initialize branch succeeds and this test incorrectly
-        // receives a live legacy client.
+    fn default_builder_auto_falls_back_on_an_invalid_params_discovery_refusal() {
+        // Plan 0.3 / CLT-02: under Auto, ANY well-formed non-modern JSON-RPC
+        // error to the first `server/discover` is the legacy branch. Exact
+        // 2024-11-05 servers answer an unknown pre-initialize request with
+        // -32601, -32602, or an implementation-defined error, so keying the
+        // fallback to -32601 alone strands Auto against real legacy peers.
+        // This differs from the -32601 fallback fixture only in the code; the
+        // recognized-modern -32022 sibling below is the planted negative.
         let script = auto_legacy_lifecycle_script(-32602);
-        let builder = ClientBuilder::new().mcp_apps(
-            McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
-                .expect("valid Apps MIME settings"),
+        let mut client = block_on(
+            ClientBuilder::new()
+                .mcp_apps(
+                    McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
+                        .expect("valid Apps MIME settings"),
+                )
+                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script.as_str()]),
+        )
+        .expect("a non-modern discovery refusal starts a fresh exact legacy client");
+
+        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024)
         );
-        let state_before_connect = builder.selected_protocol_plan().clone();
-
-        let error = match block_on(builder.clone().connect_stdio_with_cx(
-            &Cx::for_request(),
-            "sh",
-            &["-c", script.as_str()],
-        )) {
-            Ok(_) => panic!("invalid discovery parameters must not authorize legacy fallback"),
-            Err(error) => error,
-        };
-
-        assert_eq!(error.code, McpErrorCode::InvalidParams);
-        assert_eq!(builder.selected_protocol_plan(), &state_before_connect);
+        client
+            .ping()
+            .expect("the Auto-selected legacy client is usable");
+        client.close().expect("Auto-selected legacy client cleanup");
     }
 
     #[cfg(unix)]
@@ -4680,7 +4689,7 @@ exit 73
     #[test]
     fn builder_capabilities_replaces_the_advertised_set() {
         let capabilities = ClientCapabilities {
-            sampling: Some(fastmcp_protocol::SamplingCapability {}),
+            sampling: Some(fastmcp_protocol::SamplingCapability::default()),
             elicitation: None,
             roots: None,
             ..Default::default()

@@ -1064,7 +1064,7 @@ mod tests {
                 version: "0.1.0".to_string(),
             },
             ClientCapabilities {
-                sampling: Some(fastmcp_protocol::SamplingCapability {}),
+                sampling: Some(fastmcp_protocol::SamplingCapability::default()),
                 elicitation: None,
                 roots: None,
                 ..Default::default()

@@ -3569,7 +3569,7 @@ for method in resources/list resources/templates/list prompts/list; do
     done
 done
 IFS= read -r ping || exit 100
-case "$ping" in *'"method":"ping"'*'"id":8'*|*'"id":8'*'"method":"ping"'*) ;; *) exit 101 ;; esac
+case "$ping" in *'"method":"server/discover"'*'"id":8'*|*'"id":8'*'"method":"server/discover"'*) ;; *) exit 101 ;; esac
 printf '%s\n' '{"jsonrpc":"2.0","id":8,"result":{}}'
 exec sleep 10
 "#;
@@ -3782,7 +3782,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","conten
         };
         let ending = r#"
 IFS= read -r ping || exit 104
-case "$ping" in *'"method":"ping"'*) ;; *) exit 105 ;; esac
+case "$ping" in *'"method":"server/discover"'*) ;; *) exit 105 ;; esac
 case "$ping" in *'"id":3'*) ;; *) exit 106 ;; esac
 printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
 exec sleep 10

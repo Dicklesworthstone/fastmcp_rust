@@ -2250,14 +2250,23 @@ fn assert_subscription_request_id(request: &CapturedHttpRequest, request_id: i64
     assert_eq!(body["id"], request_id);
 }
 
+/// Answers the retained client's liveness probe. MCP 2026-07-28 removed
+/// `ping`, so a modern session probes with the stateless `server/discover`.
 fn respond_listener_cancellation_ping(stream: &mut TcpStream, request_id: i64) {
     let request = read_request(stream);
-    assert_final_metadata(&request, "ping");
+    assert_final_metadata(&request, "server/discover");
     assert_subscription_request_id(&request, request_id);
     let response = serde_json::json!({
         "jsonrpc": "2.0",
         "id": request_id,
-        "result": {"resultType": "complete"},
+        "result": {
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {},
+            "ttlMs": 0,
+            "cacheScope": "private",
+            "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "listener-peer", "version": "1"}},
+        },
     });
     write_response(
         stream,
@@ -3932,7 +3941,8 @@ mod authenticated_tls {
                 let mut client =
                     connect(target, token).expect("credential must reach HTTPS discovery");
                 let cx = Cx::for_request();
-                runtime_block_on(client.ping(&cx)).expect("credential must reach ordinary POST");
+                runtime_block_on(client.list_tools(&cx, None))
+                    .expect("credential must reach ordinary POST");
                 let filter = fastmcp_protocol::SubscriptionFilter::default();
                 let mut listener = runtime_block_on(client.open_subscriptions_listener(
                     &cx,
@@ -3955,7 +3965,7 @@ mod authenticated_tls {
                     rows.iter()
                         .map(|row| row["method"].as_str().unwrap())
                         .collect::<Vec<_>>(),
-                    ["server/discover", "ping", "subscriptions/listen"]
+                    ["server/discover", "tools/list", "subscriptions/listen"]
                 );
                 assert!(
                     rows.iter()
@@ -4096,7 +4106,7 @@ mod authenticated_tls {
                 assert_eq!(rejected[0]["authorized"], false);
                 assert_eq!(rejected[0]["method"], "server/discover");
                 let mut client = connect(target, token).expect("change only the token to valid");
-                runtime_block_on(client.ping(&Cx::for_request())).unwrap();
+                runtime_block_on(client.list_tools(&Cx::for_request(), None)).unwrap();
                 let rows = observations(log);
                 assert_eq!(rows.len(), 3);
                 assert_eq!(
@@ -4104,7 +4114,7 @@ mod authenticated_tls {
                     "only Authorization changes between discovery attempts"
                 );
                 assert_eq!(rows[1]["authorized"], true);
-                assert_eq!(rows[2]["method"], "ping");
+                assert_eq!(rows[2]["method"], "tools/list");
                 assert_eq!(rows[2]["authorized"], true);
             },
         );
@@ -4119,7 +4129,9 @@ mod authenticated_tls {
                 let mode = log.parent().unwrap().join("error-mode.json");
                 let mut client = connect(target, token).unwrap();
                 runtime_block_on(client.ping(&Cx::for_request())).unwrap();
-                for stage in ["server/discover", "ping", "subscriptions/listen"] {
+                // The ordinary-POST stage is `tools/list`: MCP 2026-07-28 removed
+                // `ping`, and the modern liveness probe is `server/discover`.
+                for stage in ["server/discover", "tools/list", "subscriptions/listen"] {
                     for location in ["safe", "message", "data", "key", "escaped"] {
                         std::fs::write(
                             &mode,
@@ -4164,8 +4176,9 @@ mod authenticated_tls {
         }
         let mut client = connected.expect("discovery remains successful");
         let cx = Cx::for_request();
-        if stage == "ping" {
-            let error = runtime_block_on(client.ping(&cx)).expect_err("peer rejects ping");
+        if stage == "tools/list" {
+            let error =
+                runtime_block_on(client.list_tools(&cx, None)).expect_err("peer rejects tools/list");
             format!("{error:?} {error}")
         } else {
             let mut stream = runtime_block_on(client.open_subscriptions_listener(

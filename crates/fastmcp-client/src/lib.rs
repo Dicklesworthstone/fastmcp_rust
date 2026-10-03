@@ -89,8 +89,12 @@ let _ = Client::sse_with_cx;
 "
 )]
 pub mod http_executor;
+// Process evidence evaluators consumed by this crate's own contract tests,
+// not application API: kept out of the published documentation.
+#[doc(hidden)]
 pub mod leg_http_01;
 pub mod leg_neg;
+#[doc(hidden)]
 pub mod leg_neg_stdio;
 #[cfg(feature = "apps")]
 pub mod mcp_apps;
@@ -177,6 +181,7 @@ pub use mcp_apps::{
     McpAppsWireHostConfiguration, McpAppsWireHostEffects, McpAppsWireHostPolicy,
     McpAppsWireHostWithEffects, mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
 };
+#[doc(hidden)]
 pub use leg_http_01::{
     FrozenLimit, LEG_HTTP_01_B_EVALUATOR_MANIFEST_V1, LimitConflict, ObservedLimit, frozen_limits,
     leg_http_01_b_manifest_digest, ordered_rows,
@@ -185,6 +190,7 @@ pub use leg_neg::{
     FallbackDecision, FallbackState, HttpFallbackCoordinator, HttpFallbackError, LegacyGetPermit,
     ModernProbeObservation,
 };
+#[doc(hidden)]
 pub use leg_neg_stdio::{
     CredentialBoundary, LEG_NEG_01_A_EVALUATOR_MANIFEST_V1, StdioClassificationCase,
     StdioClassificationRecord, StdioFirstWireSignal, TraceOutcome, case_input_digest,
@@ -706,7 +712,9 @@ impl ReverseRequestHandlers {
     /// roots handler does not authorize the client to originate change events.
     pub(crate) fn derive_modern_capabilities(&self, capabilities: &mut ClientCapabilities) {
         if self.modern_sampling_create_message.is_some() {
-            capabilities.sampling.get_or_insert(SamplingCapability {});
+            capabilities
+                .sampling
+                .get_or_insert(SamplingCapability::default());
         }
         if self.modern_roots_list.is_some() {
             capabilities.roots.get_or_insert(RootsCapability {
@@ -722,7 +730,9 @@ impl ReverseRequestHandlers {
 
     pub(crate) fn derive_legacy_capabilities(&self, capabilities: &mut ClientCapabilities) {
         if self.sampling_create_message.is_some() {
-            capabilities.sampling.get_or_insert(SamplingCapability {});
+            capabilities
+                .sampling
+                .get_or_insert(SamplingCapability::default());
         }
         if self.roots_list.is_some() {
             capabilities.roots.get_or_insert(RootsCapability {
@@ -4305,15 +4315,31 @@ fn validate_initialize_result(result: &InitializeResult) -> McpResult<()> {
 /// The only probe outcomes that may authorize one fresh exact-2024 child.
 ///
 /// This is deliberately not derived from a flattened [`McpError`]: the
-/// classifier retains whether `MethodNotFound` was correlated to the committed
-/// first `server/discover` request, and whether a timeout occurred before any
-/// child ingress was admitted.
+/// classifier retains whether the error was correlated to the committed first
+/// `server/discover` request, and whether a timeout occurred before any child
+/// ingress was admitted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AutoStdioFallbackSignal {
-    /// The first, correlated discovery response was JSON-RPC MethodNotFound.
-    CorrelatedDiscoverMethodNotFound,
+    /// The first, correlated discovery response was a well-formed JSON-RPC
+    /// error that is not a recognized modern error (see
+    /// [`authorizes_auto_legacy_fallback`]).
+    CorrelatedDiscoverNonModernError,
     /// The committed first discovery request reached a clean receive deadline.
     CleanFirstProbeTimeout { source: RequestTimeoutSource },
+}
+
+/// Whether an error answering the first Auto `server/discover` authorizes the
+/// exact-2024 branch.
+///
+/// Plan 0.3 / CLT-02: a recognized modern error (`-32020` header mismatch,
+/// `-32021` missing client capability, `-32022` unsupported protocol version)
+/// proves a modern peer and fixes the modern era. Any other well-formed error
+/// is the legacy branch: exact 2024-11-05 servers answer an unknown
+/// pre-initialize request with `-32601`, `-32602`, or an
+/// implementation-defined error, so the fallback must not be keyed to
+/// `-32601` alone.
+fn authorizes_auto_legacy_fallback(error: &JsonRpcError) -> bool {
+    !matches!(error.code.as_i32(), Some(-32_020 | -32_021 | -32_022))
 }
 
 /// Rechecks the caller-owned context at Auto's one allowed downgrade boundary.
@@ -6401,7 +6427,9 @@ where
         self.request_core_verb(cx, method, parameters).await
     }
 
-    /// Sends `ping` through the negotiated WebSocket era.
+    /// Proves the peer is answering through the negotiated WebSocket era:
+    /// `ping` for exact-2024, the stateless `server/discover` round-trip for
+    /// MCP 2026-07-28 (which removed `ping`).
     pub async fn ping(&mut self, cx: &Cx) -> McpResult<()>
     where
         IO: Send + 'static,
@@ -6438,16 +6466,21 @@ where
         if self.closed {
             return Err(McpError::internal_error("WebSocket client is closed"));
         }
-        let parameters = if self.selected_protocol_era() == ProtocolEra::Modern2026 {
-            self.with_modern_request_metadata(serde_json::json!({}))?
+        // MCP 2026-07-28 removed `ping`; a modern session proves liveness with
+        // the stateless `server/discover` round-trip.
+        let (method, parameters) = if self.selected_protocol_era() == ProtocolEra::Modern2026 {
+            (
+                "server/discover",
+                self.with_modern_request_metadata(serde_json::json!({}))?,
+            )
         } else {
-            serde_json::json!({})
+            ("ping", serde_json::json!({}))
         };
         let request_id = self.allocate_request_id()?;
         let received = self
             .request_admitted_with_raw_result(
                 cx,
-                JsonRpcRequest::new("ping", Some(parameters), request_id),
+                JsonRpcRequest::new(method, Some(parameters), request_id),
                 cancellation,
             )
             .await?;
@@ -13101,7 +13134,9 @@ impl HttpClient {
         }
     }
 
-    /// Sends `ping` through the negotiated HTTP era.
+    /// Proves the peer is answering through the negotiated HTTP era: `ping`
+    /// for exact-2024, the stateless `server/discover` round-trip for MCP
+    /// 2026-07-28 (which removed `ping`).
     pub async fn ping(&mut self, cx: &Cx) -> Result<(), HttpClientError> {
         self.ping_with_optional_cancellation(cx, None).await
     }
@@ -13127,6 +13162,14 @@ impl HttpClient {
             return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
         }
         let parameters = self.core_request_parameters(&serde_json::json!({}))?;
+        // MCP 2026-07-28 removed `ping` (a conforming modern endpoint answers
+        // it with HTTP 404 / Method not found); a modern session proves
+        // liveness with the stateless `server/discover` round-trip.
+        let method = if self.selected_protocol_era() == ProtocolEra::Modern2026 {
+            "server/discover"
+        } else {
+            "ping"
+        };
         let request_id = self.next_request_id()?;
         let client_extensions = self.final_core_client_extensions();
         let response = {
@@ -13141,7 +13184,7 @@ impl HttpClient {
                         .request_json_with_result_source_at_with_cancellation(
                             cx,
                             cancellation,
-                            "ping",
+                            method,
                             parameters,
                             request_id,
                             DEFAULT_FINAL_CACHE_MAX_BYTES,
@@ -13154,7 +13197,7 @@ impl HttpClient {
                     self.connection
                         .request_json_with_result_source_at(
                             cx,
-                            "ping",
+                            method,
                             parameters,
                             request_id,
                             DEFAULT_FINAL_CACHE_MAX_BYTES,
@@ -16102,9 +16145,9 @@ impl Client {
         };
         let mut response = received.response;
         if let Some(error) = response.error.take() {
-            if auto_probe && error.code.as_i32() == Some(-32_601) {
+            if auto_probe && authorizes_auto_legacy_fallback(&error) {
                 return Ok(std::task::Poll::Ready(Some(
-                    AutoStdioFallbackSignal::CorrelatedDiscoverMethodNotFound,
+                    AutoStdioFallbackSignal::CorrelatedDiscoverNonModernError,
                 )));
             }
             return Err(json_rpc_error_to_mcp(error));
@@ -17540,23 +17583,41 @@ impl Client {
             .map_err(|error| self.terminate_connection(error))
     }
 
-    /// Verifies that the initialized server can answer an MCP ping request.
+    /// The request that proves the selected peer is answering.
     ///
-    /// A modern session stamps the same `_meta` protocol version the typed
-    /// verbs send. Exact-2024 keeps the empty-object ping body.
+    /// MCP 2026-07-28 removed `ping`; a conforming modern server answers it
+    /// with Method not found. A modern session therefore probes liveness with
+    /// the stateless `server/discover` round-trip, while exact-2024 keeps
+    /// `ping`.
+    fn liveness_probe_method(&self) -> &'static str {
+        if self.session.selected_era() == Some(ProtocolEra::Modern2026) {
+            "server/discover"
+        } else {
+            "ping"
+        }
+    }
+
+    /// Verifies that the initialized server is answering requests.
+    ///
+    /// Exact-2024 sends `ping` with its empty-object body. A modern session
+    /// sends the stateless `server/discover` round-trip instead, stamped with
+    /// the same `_meta` the typed verbs send, because MCP 2026-07-28 removed
+    /// `ping`.
     ///
     /// # Errors
     ///
     /// Returns an error when initialization, transport, envelope validation,
-    /// or the server's ping response fails.
+    /// or the server's response fails.
     pub fn ping(&mut self) -> McpResult<()> {
         self.ensure_initialized()?;
         let params = self.prepare_request_parameters(serde_json::json!({}))?;
-        let _: serde_json::Value = self.send_prepared_request("ping", params)?.result;
+        let method = self.liveness_probe_method();
+        let _: serde_json::Value = self.send_prepared_request(method, params)?.result;
         Ok(())
     }
 
-    /// Sends `ping` under a request-local cancellation domain.
+    /// Sends the era's liveness probe (see [`Self::ping`]) under a
+    /// request-local cancellation domain.
     ///
     /// A cancellation observed before send makes no transport contact.
     pub fn ping_with_cancellation(
@@ -17569,11 +17630,12 @@ impl Client {
         }
         self.ensure_initialized()?;
         let params = self.prepare_request_parameters(serde_json::json!({}))?;
+        let method = self.liveness_probe_method();
         let _: serde_json::Value = self
             .send_prepared_request_with_request_cancellation(
                 cx,
                 cancellation,
-                "ping",
+                method,
                 params,
                 RequestCancellationTerminalElection::CancelFirst,
                 |_| {},
@@ -18526,9 +18588,9 @@ impl Client {
         let receipt = Instant::now();
         let mut response = received.response;
         if let Some(error) = response.error.take() {
-            if error.code.as_i32() == Some(-32_601) {
+            if authorizes_auto_legacy_fallback(&error) {
                 return Ok(Err(
-                    AutoStdioFallbackSignal::CorrelatedDiscoverMethodNotFound,
+                    AutoStdioFallbackSignal::CorrelatedDiscoverNonModernError,
                 ));
             }
             return Err(json_rpc_error_to_mcp(error));
@@ -23614,7 +23676,8 @@ impl Client {
         self.ensure_initialized_with_cancellation(cx, Some(cancellation))
             .await?;
         let parameters = self.prepare_request_parameters(serde_json::json!({}))?;
-        self.send_yielding_prepared_request(cx, cancellation, "ping", Some(parameters))
+        let method = self.liveness_probe_method();
+        self.send_yielding_prepared_request(cx, cancellation, method, Some(parameters))
             .await?;
         Ok(())
     }
@@ -28911,8 +28974,8 @@ mod tests {
     #[test]
     fn auto_stdio_fallback_signals_are_explicit_and_bounded() {
         assert_eq!(
-            AutoStdioFallbackSignal::CorrelatedDiscoverMethodNotFound,
-            AutoStdioFallbackSignal::CorrelatedDiscoverMethodNotFound
+            AutoStdioFallbackSignal::CorrelatedDiscoverNonModernError,
+            AutoStdioFallbackSignal::CorrelatedDiscoverNonModernError
         );
         assert_eq!(
             AutoStdioFallbackSignal::CleanFirstProbeTimeout {
@@ -37868,7 +37931,7 @@ exec sleep 30
                 case "$request" in *'"cursor":" opaque token "'*) ;; *) exit 1 ;; esac
                 printf '%s\n' '{{"jsonrpc":"2.0","id":5,"result":{{"resultType":"complete","{field}":[{last}],"ttlMs":0,"cacheScope":"private"}}}}'
                 IFS= read -r request || exit 1
-                case "$request" in *'"method":"ping"'*) ;; *) exit 1 ;; esac
+                case "$request" in *'"method":"server/discover"'*) ;; *) exit 1 ;; esac
                 printf '%s\n' '{{"jsonrpc":"2.0","id":6,"result":{{"resultType":"complete"}}}}'
                 exec sleep 2
             "#);
@@ -37948,7 +38011,7 @@ exec sleep 30
                 {stall_until_cancelled}
                 printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"resultType":"complete","{field}":[],"ttlMs":0,"cacheScope":"private"}}}}'
                 IFS= read -r request || exit 1
-                case "$request" in *'"method":"ping"'*) ;; *) exit 1 ;; esac
+                case "$request" in *'"method":"server/discover"'*) ;; *) exit 1 ;; esac
                 printf '%s\n' '{{"jsonrpc":"2.0","id":4,"result":{{"resultType":"complete"}}}}'
                 exec sleep 2
             "#);
@@ -38001,7 +38064,7 @@ exec sleep 30
             case "$control" in *'"requestId":3'*) ;; *) exit 1 ;; esac
             printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}'
             IFS= read -r request || exit 1
-            case "$request" in *'"method":"ping"'*) ;; *) exit 1 ;; esac
+            case "$request" in *'"method":"server/discover"'*) ;; *) exit 1 ;; esac
             printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete"}}'
             exec sleep 2
         "#;
@@ -38150,7 +38213,7 @@ exec sleep 30
             printf '%s\n' '{{"jsonrpc":"2.0","id":4,"result":{{"resultType":"complete","tools":[{{"name":"fresh","inputSchema":{{"type":"object"}}}}],"ttlMs":0,"cacheScope":"private"}}}}'
             {cancellation_read}
             IFS= read -r request || exit 1
-            case "$request" in *'"method":"ping"'*) ;; *) exit 1 ;; esac
+            case "$request" in *'"method":"server/discover"'*) ;; *) exit 1 ;; esac
             printf '%s\n' '{{"jsonrpc":"2.0","id":5,"result":{{"resultType":"complete"}}}}'
             exec sleep 2
         "#);
@@ -39414,37 +39477,51 @@ exec sleep 30
     #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn clt_02_public_stdio_auto_reopens_one_fresh_exact_legacy_child() {
-        let script = auto_discovery_refusal_client_script(-32_601);
-        let mut client = Client::stdio_with_cx(Cx::for_testing(), "sh", &["-c", script.as_str()])
-            .expect("only a discovery MethodNotFound authorizes the fresh legacy child");
+        // Plan 5.10: any well-formed error to the first discovery that is not
+        // a recognized modern error is the legacy branch; exact 2024 servers
+        // answer it with -32601, -32602, or an application-defined code.
+        for refusal in [-32_601, -32_602, -32_000] {
+            let script = auto_discovery_refusal_client_script(refusal);
+            let mut client =
+                Client::stdio_with_cx(Cx::for_testing(), "sh", &["-c", script.as_str()])
+                    .unwrap_or_else(|error| {
+                        panic!("a non-modern {refusal} refusal reopens a legacy child: {error}")
+                    });
 
-        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
-        assert_eq!(
-            client.selected_protocol_era(),
-            Some(ProtocolEra::Legacy2024)
-        );
-        assert!(client.server_discovery().is_none());
-        client
-            .ping()
-            .expect("the fresh exact legacy child receives the historical request shape");
-        client
-            .close()
-            .expect("public legacy fallback client cleanup");
+            assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+            assert_eq!(
+                client.selected_protocol_era(),
+                Some(ProtocolEra::Legacy2024)
+            );
+            assert!(client.server_discovery().is_none());
+            client
+                .ping()
+                .expect("the fresh exact legacy child receives the historical request shape");
+            client
+                .close()
+                .expect("public legacy fallback client cleanup");
+        }
     }
 
     #[cfg(unix)]
     #[cfg(feature = "legacy-2024-11-05")]
     #[test]
-    fn clt_02_public_stdio_auto_rejects_one_non_method_not_found_refusal() {
+    fn clt_02_public_stdio_auto_keeps_the_modern_era_on_a_recognized_modern_refusal() {
         // Only the discovery refusal code differs from the paired fallback
-        // positive. No second process may be used as a legacy replay path.
-        let script = auto_discovery_refusal_client_script(-32_602);
-        let error = match Client::stdio_with_cx(Cx::for_testing(), "sh", &["-c", script.as_str()]) {
-            Ok(_) => panic!("InvalidParams discovery refusal cannot authorize legacy fallback"),
-            Err(error) => error,
-        };
-
-        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        // positive: a recognized modern error proves a modern peer, so no
+        // second process may be used as a legacy replay path.
+        for refusal in [-32_020, -32_021, -32_022] {
+            let script = auto_discovery_refusal_client_script(refusal);
+            let error =
+                match Client::stdio_with_cx(Cx::for_testing(), "sh", &["-c", script.as_str()]) {
+                    Ok(_) => panic!("a recognized modern {refusal} refusal cannot fall back"),
+                    Err(error) => error,
+                };
+            assert!(
+                error.message.contains("discovery refusal"),
+                "{refusal}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -39907,17 +39984,31 @@ exec sleep 30
         )
     }
 
+    /// A modern peer whose second request must be the liveness probe. With
+    /// `answers_discover`, that probe must be a `_meta`-stamped
+    /// `server/discover` and is answered; otherwise the peer answers only the
+    /// `ping` that MCP 2026-07-28 removed, and exits on anything else.
     #[cfg(unix)]
-    fn modern_ping_client_script() -> String {
+    fn modern_liveness_client_script(answers_discover: bool) -> String {
         let discovery_response =
-            modern_discovery_response("ping-modern-server", &[MODERN_PROTOCOL_VERSION]);
+            modern_discovery_response("liveness-modern-server", &[MODERN_PROTOCOL_VERSION]);
+        let liveness = if answers_discover {
+            format!(
+                "*'\"method\":\"server/discover\"'*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+                 printf '%s\\n' '{}'",
+                discovery_response.replacen("\"id\":1", "\"id\":2", 1)
+            )
+        } else {
+            "*'\"method\":\"ping\"'*) \
+             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}'"
+                .to_owned()
+        };
         format!(
             "IFS= read -r first || exit 1; \
              case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
-             IFS= read -r ping || exit 1; \
-             case \"$ping\" in *'\"method\":\"ping\"'*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r probe || exit 1; \
+             case \"$probe\" in {liveness} ;; *) exit 1 ;; esac; \
              exec sleep 2"
         )
     }
@@ -40760,23 +40851,35 @@ exec sleep 30
 
     #[cfg(unix)]
     #[test]
-    fn clt_01_modern_ping_is_a_dual_era_connection_health_check() {
-        let script = modern_ping_client_script();
-        let mut client = Client::stdio_with_protocol_plan_with_cx(
-            Cx::for_request(),
-            "sh",
-            &["-c", script.as_str()],
-            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-        )
-        .expect("modern discovery initializes the client");
+    fn clt_01_modern_liveness_probe_is_server_discover_not_the_removed_ping() {
+        let connect = |answers_discover: bool| {
+            let script = modern_liveness_client_script(answers_discover);
+            Client::stdio_with_protocol_plan_with_cx(
+                Cx::for_request(),
+                "sh",
+                &["-c", script.as_str()],
+                ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            )
+            .expect("modern discovery initializes the client")
+        };
 
+        let mut client = connect(true);
         assert_eq!(client.next_id.load(Ordering::SeqCst), 2);
         client
             .ping()
-            .expect("modern ping remains a connection health-check outside the core method union");
+            .expect("a modern session proves liveness with a server/discover round-trip");
         assert_eq!(client.next_id.load(Ordering::SeqCst), 3);
         assert!(client.is_initialized());
         client.close().expect("modern client cleanup");
+
+        // Near-identical negative: a peer that answers only the removed
+        // `ping` never sees one, so the modern liveness probe goes unanswered.
+        let mut client = connect(false);
+        assert!(
+            client.ping().is_err(),
+            "a modern session must not send the removed ping"
+        );
+        let _ = client.close();
     }
 
     #[cfg(unix)]
@@ -41701,11 +41804,18 @@ IFS= read -r end
                 } else {
                     ""
                 };
+                // MCP 2026-07-28 removed `ping`: the modern liveness probe is
+                // the stateless `server/discover` round-trip.
+                let wire_method = if modern && method == "ping" {
+                    "server/discover"
+                } else {
+                    method
+                };
                 let script = format!(
                     r#"
 {handshake}
 IFS= read -r first || exit 92
-case "$first" in *'"method":"{method}"'*'"id":2'*) ;; *) exit 93 ;; esac
+case "$first" in *'"method":"{wire_method}"'*'"id":2'*) ;; *) exit 93 ;; esac
 {no_tasks}
 IFS= read -r sibling || exit 94
 case "$sibling" in *'"method":"ping"'*'"id":3'*) ;; *) exit 95 ;; esac
@@ -42315,7 +42425,7 @@ if [ "$4" != pre-cancel ]; then
     esac
 fi
 IFS= read -r ping || exit 0
-case "$ping" in *'"method":"ping"'*'"id":'"$next"*) ;; *) exit 114;; esac
+case "$ping" in *'"method":"server/discover"'*'"id":'"$next"*) ;; *) exit 114;; esac
 printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$next"
 exec sleep 5
 "#;
@@ -42598,7 +42708,9 @@ if [ "$5" = legacy ]; then
 fi
 IFS= read -r call || exit 94
 case "$5" in pre-*|missing-extension|legacy)
-    case "$call" in *'"method":"ping"'*'"id":2'*) ;; *) exit 95;; esac
+    # The liveness probe is `ping` only on exact 2024; modern removed it.
+    case "$5" in legacy) liveness='"method":"ping"';; *) liveness='"method":"server/discover"';; esac
+    case "$call" in *"$liveness"*'"id":2'*) ;; *) exit 95;; esac
     printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
     exec sleep 5;;
 esac
@@ -44055,7 +44167,7 @@ IFS= read -r cancel || exit 95
 case "$cancel" in *notifications/cancelled*'"requestId":2'*) ;; *) exit 96;; esac
 printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"type":"text","text":"sibling-completed"}],"isError":false}}'
 IFS= read -r ping || exit 97
-case "$ping" in *ping*) ;; *) exit 98;; esac
+case "$ping" in *'"method":"server/discover"'*) ;; *) exit 98;; esac
 printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete"}}'
 exec sleep 2
 "#;

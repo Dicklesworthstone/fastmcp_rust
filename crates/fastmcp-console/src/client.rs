@@ -315,7 +315,7 @@ mod tests {
 
     fn sample_capabilities() -> ClientCapabilities {
         ClientCapabilities {
-            sampling: Some(fastmcp_protocol::SamplingCapability {}),
+            sampling: Some(fastmcp_protocol::SamplingCapability::default()),
             elicitation: None,
             roots: Some(RootsCapability { list_changed: true }),
             ..Default::default()
@@ -394,7 +394,7 @@ mod tests {
     fn test_format_capabilities_sampling_only() {
         let renderer = ClientInfoRenderer::new(DisplayContext::new_agent());
         let caps = ClientCapabilities {
-            sampling: Some(fastmcp_protocol::SamplingCapability {}),
+            sampling: Some(fastmcp_protocol::SamplingCapability::default()),
             elicitation: None,
             roots: None,
             ..Default::default()
@@ -440,7 +440,7 @@ mod tests {
     fn test_format_capabilities_includes_all_supported_families() {
         let renderer = ClientInfoRenderer::new(DisplayContext::new_agent());
         let caps = ClientCapabilities {
-            sampling: Some(fastmcp_protocol::SamplingCapability {}),
+            sampling: Some(fastmcp_protocol::SamplingCapability::default()),
             elicitation: Some(ElicitationCapability::both()),
             roots: Some(RootsCapability { list_changed: true }),
             ..Default::default()
