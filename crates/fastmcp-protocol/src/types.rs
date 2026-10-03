@@ -143,8 +143,36 @@ pub struct ClientCapabilities {
 }
 
 /// Sampling capability.
+///
+/// MCP 2026-07-28 lets a client declare two optional sub-capabilities,
+/// `context` (supports `includeContext`) and `tools` (supports `tools` /
+/// `toolChoice`). Both are retained so a decoded capability re-encodes without
+/// silently dropping what the peer declared.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SamplingCapability {}
+pub struct SamplingCapability {
+    /// Present if the client supports context inclusion via `includeContext`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Present if the client supports tool use via `tools` and `toolChoice`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl SamplingCapability {
+    /// Declares sampling with tool-use support (`sampling.tools`).
+    #[must_use]
+    pub fn with_tools(mut self) -> Self {
+        self.tools = Some(serde_json::Map::new());
+        self
+    }
+
+    /// Declares sampling with context-inclusion support (`sampling.context`).
+    #[must_use]
+    pub fn with_context(mut self) -> Self {
+        self.context = Some(serde_json::Map::new());
+        self
+    }
+}
 
 /// Capability for form mode elicitation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2477,7 +2505,7 @@ mod tests {
     #[test]
     fn client_capabilities_full_serialization() {
         let caps = ClientCapabilities {
-            sampling: Some(SamplingCapability {}),
+            sampling: Some(SamplingCapability::default()),
             elicitation: Some(ElicitationCapability::both()),
             roots: Some(RootsCapability { list_changed: true }),
             ..Default::default()
@@ -2491,7 +2519,7 @@ mod tests {
     #[test]
     fn client_capabilities_round_trip() {
         let caps = ClientCapabilities {
-            sampling: Some(SamplingCapability {}),
+            sampling: Some(SamplingCapability::default()),
             elicitation: None,
             roots: Some(RootsCapability {
                 list_changed: false,
@@ -4343,6 +4371,45 @@ mod tests {
             serde_json::to_value(&baseline).expect("baseline result re-encodes"),
             accepted,
             "the rejected Tasks-shaped member cannot mutate the complete Apps result"
+        );
+    }
+
+    #[test]
+    fn sampling_capability_round_trips_tools_and_context() {
+        // Official MCP 2026-07-28 ClientCapabilities.sampling carries optional
+        // `context` and `tools` objects; decoding must not drop them.
+        let wire = json!({"sampling": {"tools": {}, "context": {"note": "kept"}}});
+        let capabilities: ClientCapabilities =
+            serde_json::from_value(wire.clone()).expect("decode official sampling capability");
+        let sampling = capabilities.sampling.as_ref().expect("sampling present");
+        assert!(sampling.tools.is_some());
+        assert_eq!(
+            sampling
+                .context
+                .as_ref()
+                .and_then(|context| context.get("note")),
+            Some(&json!("kept"))
+        );
+        assert_eq!(
+            serde_json::to_value(&capabilities).expect("encode"),
+            wire,
+            "a decoded sampling capability must re-encode without loss"
+        );
+
+        // Near-identical negative: plain sampling stays exactly `{}`; the new
+        // members never appear unless declared.
+        let plain = ClientCapabilities {
+            sampling: Some(SamplingCapability::default()),
+            ..ClientCapabilities::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&plain).expect("encode")["sampling"],
+            json!({})
+        );
+        let builder = SamplingCapability::default().with_tools().with_context();
+        assert_eq!(
+            serde_json::to_value(&builder).expect("encode"),
+            json!({"tools": {}, "context": {}})
         );
     }
 }

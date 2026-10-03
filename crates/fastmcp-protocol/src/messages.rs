@@ -2322,13 +2322,30 @@ impl<'de> Deserialize<'de> for FinalEmbeddedElicitationParams {
     where
         D: Deserializer<'de>,
     {
-        let value = Value::deserialize(deserializer)?;
-        let mode = value
-            .as_object()
-            .and_then(|members| members.get("mode"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| serde::de::Error::custom("elicitation descriptor requires mode"))?;
-        match mode {
+        let mut value = Value::deserialize(deserializer)?;
+        // The official `ElicitRequestFormParams` requires only `message` and
+        // `requestedSchema`: an absent `mode` means form. Normalize it so the
+        // typed form shape (which carries an explicit discriminator) decodes.
+        let mode = match value.as_object_mut() {
+            Some(members) => match members.get("mode") {
+                None => {
+                    members.insert("mode".to_owned(), Value::String("form".to_owned()));
+                    "form".to_owned()
+                }
+                Some(Value::String(mode)) => mode.clone(),
+                Some(_) => {
+                    return Err(serde::de::Error::custom(
+                        "elicitation descriptor mode must be a string",
+                    ));
+                }
+            },
+            None => {
+                return Err(serde::de::Error::custom(
+                    "elicitation descriptor must be an object",
+                ));
+            }
+        };
+        match mode.as_str() {
             "form" => serde_json::from_value(value)
                 .map(Self::Form)
                 .map_err(serde::de::Error::custom),
@@ -6002,7 +6019,10 @@ pub type ElicitRequestedSchema = serde_json::Value;
 /// rendered by the client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ElicitRequestFormParams {
-    /// The elicitation mode (always "form" for this type).
+    /// The elicitation mode (always "form" for this type). The official
+    /// schema makes `mode` optional on form requests, so an absent value
+    /// decodes as form.
+    #[serde(default = "ElicitMode::form")]
     pub mode: ElicitMode,
     /// The message to present to the user describing what information is being requested.
     pub message: String,
@@ -6067,6 +6087,14 @@ pub enum ElicitMode {
     Form,
     /// URL mode - redirect user to external URL.
     Url,
+}
+
+impl ElicitMode {
+    /// The mode an elicitation request has when it omits `mode`.
+    #[must_use]
+    pub const fn form() -> Self {
+        Self::Form
+    }
 }
 
 /// Parameters for elicitation requests (either form or URL mode).

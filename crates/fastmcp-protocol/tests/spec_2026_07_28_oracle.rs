@@ -473,3 +473,80 @@ fn near_identical_mutations_of_an_official_envelope_are_refused() {
          era vocabularies are deliberately disjoint"
     );
 }
+
+/// Every `inputRequests` entry of every official `InputRequiredResult` example
+/// decodes through the typed embedded-request vocabulary.
+///
+/// `official_modern_results_decode_through_their_selecting_request` admits
+/// those results with `inputRequests` as an opaque object, so it could not
+/// see that the typed elicitation decoder wrongly required `mode`: the
+/// official `ElicitRequestFormParams` requires only `message` and
+/// `requestedSchema`, and the official example omits `mode`. This test takes
+/// both halves from the specification, so a failure means the implementation
+/// disagrees with it.
+#[test]
+fn official_input_requests_decode_through_the_typed_vocabulary() {
+    use fastmcp_protocol::{FinalEmbeddedElicitationParams, FinalEmbeddedInputRequest};
+
+    let mut examined = 0_usize;
+    let mut elicitations = 0_usize;
+    for path in example_files()
+        .into_iter()
+        .filter(|path| relative(path).contains("examples/InputRequiredResult/"))
+    {
+        let bytes = fs::read(&path).expect("official example must be readable");
+        let result: Value = serde_json::from_slice(&bytes).expect("official example must be JSON");
+        let Some(requests) = result.get("inputRequests").and_then(Value::as_object) else {
+            continue;
+        };
+        for (key, request) in requests {
+            let decoded: FinalEmbeddedInputRequest = serde_json::from_value(request.clone())
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{}: inputRequests.{key} must decode through the typed vocabulary: {error}",
+                        relative(&path)
+                    )
+                });
+            if let FinalEmbeddedInputRequest::Elicitation(params) = decoded {
+                assert!(
+                    matches!(params, FinalEmbeddedElicitationParams::Form(_)),
+                    "{}: inputRequests.{key} without `mode` must decode as form elicitation",
+                    relative(&path)
+                );
+                elicitations += 1;
+            }
+            examined += 1;
+        }
+    }
+    // Floors keep a shrinking corpus from silently narrowing the oracle. The
+    // pinned corpus carries two: one elicitation and one sampling request.
+    assert!(
+        examined >= 2,
+        "expected at least 2 official input requests, examined {examined}"
+    );
+    assert!(
+        elicitations >= 1,
+        "expected at least one official elicitation input request, examined {elicitations}"
+    );
+
+    // Planted negatives (RH-5): only an ABSENT mode defaults to form. A present
+    // mode that is not a string, or an unknown mode, is still refused.
+    for mode in [serde_json::json!(7), serde_json::json!("telepathy")] {
+        let mutated = serde_json::json!({
+            "method": "elicitation/create",
+            "params": {
+                "mode": mode,
+                "message": "What is your name?",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"],
+                },
+            },
+        });
+        assert!(
+            serde_json::from_value::<FinalEmbeddedInputRequest>(mutated).is_err(),
+            "an invalid present elicitation mode ({mode}) must be refused"
+        );
+    }
+}
