@@ -28,9 +28,13 @@
 //!
 //! # Quick Start
 //!
+//! `auto::ServerBuilder` serves MCP 2026-07-28 clients and the exact
+//! 2024-11-05 `initialize` handshake today's hosts open with;
+//! `modern::ServerBuilder` pins the 2026-07-28 era alone.
+//!
 //! ```ignore
 //! use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
-//! use fastmcp_rust::{modern::ServerBuilder, prelude::*};
+//! use fastmcp_rust::{auto::ServerBuilder, prelude::*};
 //!
 //! #[tool]
 //! async fn greet(ctx: &McpContext, name: String) -> McpResult<String> {
@@ -1071,7 +1075,9 @@ pub mod auto {
             self.inner.request_with_raw_result(cx, method, params).await
         }
 
-        /// Sends `ping` through the era selected by Auto negotiation.
+        /// Proves the peer is answering in the era Auto negotiation selected:
+        /// `ping` on exact 2024-11-05, the stateless `server/discover`
+        /// round-trip on MCP 2026-07-28 (which removed `ping`).
         pub async fn ping(&mut self, cx: &Cx) -> McpResult<()>
         where
             IO: Send + 'static,
@@ -3348,7 +3354,8 @@ pub mod modern {
             }
         }
 
-        /// Sends `ping` on this modern WebSocket session.
+        /// Proves this modern WebSocket peer is answering with a stateless
+        /// `server/discover` round-trip (MCP 2026-07-28 removed `ping`).
         pub async fn ping(&mut self, cx: &Cx) -> McpResult<()>
         where
             IO: Send + 'static,
@@ -4336,8 +4343,8 @@ pub mod modern {
             self.inner.mcp_apps_wire_host_with_policy(transport, configuration, policy)
         }
 
-        /// Lists one exact final page of tools without a legacy projection.
-        /// Sends `ping` on this modern stdio session.
+        /// Proves this modern stdio peer is answering with a stateless
+        /// `server/discover` round-trip (MCP 2026-07-28 removed `ping`).
         pub fn ping(&mut self) -> McpResult<()> {
             self.inner.ping()
         }
@@ -5720,7 +5727,8 @@ pub mod modern {
             }
         }
 
-        /// Sends `ping` through the policy-bound HTTP client.
+        /// Proves this modern HTTP peer is answering with a stateless
+        /// `server/discover` round-trip (MCP 2026-07-28 removed `ping`).
         pub async fn ping(&mut self, cx: &Cx) -> Result<(), HttpClientError> {
             self.inner.ping(cx).await
         }
@@ -10563,11 +10571,17 @@ pub mod legacy_2024 {
     }
 }
 
-// REL-QUAR-00 release-quarantine evidence surface
+// REL-QUAR-00 release-quarantine evidence surface. These are project process
+// artifacts consumed by this crate's own contract tests, not application API,
+// so they stay out of the published documentation.
 /// FND-01 A closed-child source-freeze enforcement.
+#[doc(hidden)]
 pub mod evidence_binding;
+#[doc(hidden)]
 pub mod release_quarantine;
+#[doc(hidden)]
 pub mod release_quarantine_reachability;
+#[doc(hidden)]
 pub mod release_quarantine_integration;
 
 // Testing helpers are opt-in and do not widen the production facade.

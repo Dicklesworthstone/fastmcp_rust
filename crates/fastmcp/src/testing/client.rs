@@ -560,7 +560,7 @@ mod tests {
     fn with_capabilities_sets_capabilities() {
         let (ct, _st) = create_memory_transport_pair();
         let caps = ClientCapabilities {
-            sampling: Some(fastmcp_protocol::SamplingCapability {}),
+            sampling: Some(fastmcp_protocol::SamplingCapability::default()),
             ..Default::default()
         };
         let client = TestClient::new(ct, Cx::for_testing()).with_capabilities(caps);
