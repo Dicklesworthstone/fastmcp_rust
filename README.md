@@ -136,7 +136,7 @@ MCP server implementations need to solve several recurring problems:
 
 ```rust
 use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
-use fastmcp_rust::{modern::ServerBuilder, prelude::*};
+use fastmcp_rust::{auto::ServerBuilder, prelude::*};
 
 #[tool]
 async fn greet(ctx: &McpContext, name: String) -> McpResult<String> {
@@ -165,6 +165,11 @@ fn main() {
 The application creates the runtime once and supplies its context. Stdio needs
 a blocking pool for its receive pump; FastMCP does not create a runtime at this
 entry point. See Quick Start below for the dependency declarations.
+
+`auto::ServerBuilder` serves MCP 2026-07-28 clients and also the exact
+2024-11-05 `initialize` handshake that today's desktop clients and the MCP
+Inspector open with. `modern::ServerBuilder` pins a server to 2026-07-28 alone,
+so it refuses those clients.
 
 ### Why FastMCP Rust?
 
@@ -197,7 +202,7 @@ This project includes an [`AGENTS.md`](AGENTS.md) file with guidelines for AI co
 
 ```rust
 use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
-use fastmcp_rust::{modern::ServerBuilder, prelude::*};
+use fastmcp_rust::{auto::ServerBuilder, prelude::*};
 
 // Define a tool with automatic JSON schema generation
 #[tool(description = "Calculate the sum of two numbers")]
@@ -678,7 +683,7 @@ asupersync = "=0.5.0"
 ```rust
 // src/main.rs
 use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
-use fastmcp_rust::{modern::ServerBuilder, prelude::*};
+use fastmcp_rust::{auto::ServerBuilder, prelude::*};
 
 #[tool(description = "Echo the input message")]
 async fn echo(ctx: &McpContext, message: String) -> McpResult<String> {
@@ -892,7 +897,7 @@ fn commit_revision(
 | **Protocol Modernization** | The root compatibility `PROTOCOL_VERSION` remains `2024-11-05`; the modern facade's `modern::PROTOCOL_VERSION` is `2026-07-28`. MCP 2026-07-28 implementation and verification are incomplete |
 | **Runtime-context migration** | Library client constructors and returning/custom transport runners require a caller-owned `Cx`. The process-owning CLI and `Server::run_stdio` install the ambient context at their top-level runtime boundary; `test-internals` is confined to test-only dependencies and the facade's opt-in `testing-lab` feature |
 | **Network Transports** | The turnkey `run_http*` entry points provide a caller-owned dual-era HTTP listener and dispatch lifecycle. The experimental `websocket-experimental` facade profile also provides native async `bind_websocket` and `serve_websocket` listener lifecycles, plus caller-driven client connection. These surfaces do not establish aggregate conformance or complete lifecycle qualification |
-| **Client Transport Coverage** | The `fastmcp-client::Client` type drives a subprocess over stdio. Its `Client::http_with_cx` and (exact-2024) `Client::sse_with_cx` constructors return a separate `HttpClient`, and `WebSocketClient` requires `websocket-experimental`. Public `ClientHttpConnection` and `HttpClient` provide modern HTTP and exact legacy SSE integration with typed `list_tools`/`call_tool`/`read_resource`/`get_prompt` verbs. Modern HTTP answers typed reverse `sampling/createMessage`, `roots/list`, and `elicitation/create` requests that arrive on a request-owned SSE body by POSTing the JSON-RPC response. Public `HttpClient::call_tool` and `WebSocketClient::call_tool` also follow modern server `input_required` by invoking those same installed handlers locally and retrying with `inputResponses`. Live `bind_http` JSON `tools/call` returns `ctx.final_sampling` and `ctx.final_roots` as `input_required`; a write-half EOF after the request is ordinary H1 completion and does not cancel that result. Public `modern::Client` stdio `call_tool_result` / `read_resource_result` / `get_prompt_result` keep the same live `input_required` branch. A Modern2026 stdio session stamps the same `_meta` protocol version and client capabilities on `start_multiplexed_request` that the typed verbs already send. Public stdio `read_resource` / `get_prompt` follow installed modern reverse handlers the same way `call_tool` does. Eligible stateless HTTP MRTR retries use framework-issued opaque, single-use `requestState` and may resume on a later POST only when the method, target, arguments, and admitted principal still match; forged or replayed state is rejected, and elicitation cannot resume over stateless HTTP because it requires a durable MCP transport connection. With `websocket-experimental`, the facade exposes `WebSocketClient` with incremental catalog listen, the same typed verbs, and the same modern reverse handlers: ModernOnly and LegacyOnly builders accept an owned async WebSocket transport, while Auto accepts a caller-owned factory that yields a fresh upgraded transport for initial modern discovery and its sole permitted exact-2024 retry |
+| **Client Transport Coverage** | The `fastmcp-client::Client` type drives a subprocess over stdio. Its `Client::http_with_cx` and (exact-2024) `Client::sse_with_cx` constructors return a separate `HttpClient`, and `WebSocketClient` requires `websocket-experimental`. Public `ClientHttpConnection` and `HttpClient` provide modern HTTP and exact legacy SSE integration with typed `list_tools`/`call_tool`/`read_resource`/`get_prompt` verbs. Modern HTTP answers typed reverse `sampling/createMessage`, `roots/list`, and `elicitation/create` requests that arrive on a request-owned SSE body by POSTing the JSON-RPC response. Public `HttpClient::call_tool` and `WebSocketClient::call_tool` also follow modern server `input_required` by invoking those same installed handlers locally and retrying with `inputResponses`. Live `bind_http` JSON `tools/call` returns `ctx.final_sampling` and `ctx.final_roots` as `input_required`; a write-half EOF after the request is ordinary H1 completion and does not cancel that result. Public `modern::Client` stdio `call_tool_result` / `read_resource_result` / `get_prompt_result` keep the same live `input_required` branch. A Modern2026 stdio session stamps the same `_meta` protocol version and client capabilities on `start_multiplexed_request` that the typed verbs already send. Public stdio `read_resource` / `get_prompt` follow installed modern reverse handlers the same way `call_tool` does. Eligible stateless HTTP MRTR retries use framework-issued opaque, single-use `requestState` and may resume on a later POST only when the method, target, arguments, and admitted principal still match; forged or replayed state is rejected. Elicitation resumes the same way: the client's answer travels in `inputResponses` on the retry POST, bound to the original request by that single-use state. With `websocket-experimental`, the facade exposes `WebSocketClient` with incremental catalog listen, the same typed verbs, and the same modern reverse handlers: ModernOnly and LegacyOnly builders accept an owned async WebSocket transport, while Auto accepts a caller-owned factory that yields a fresh upgraded transport for initial modern discovery and its sole permitted exact-2024 retry |
 | **Experimental WebSocket TLS** | The experimental async transport supports `ws://` and `wss://`. `wss://` can use the built-in WebPKI-rooted connector or a caller-supplied TLS connector for private roots, pinning, or client certificates; this connection support does not imply complete TLS, lifecycle, or MCP conformance qualification |
 | **HTTP Dispatch Qualification** | Public `run_http*` binds and serves the caller-owned dual-era HTTP lifecycle. `ModernOnly` selects the exact MCP 2026-07-28 era and `LegacyOnly` selects the exact MCP 2024-11-05 era; MCP 2025-11-25 is not an adapter or supported policy. This executable surface does not establish aggregate MCP conformance or complete lifecycle qualification |
 | **Wire Cancellation** | The modern-only split receive pump, including Unix stdio, admits bounded concurrent requests on the caller's dispatch runtime, including `subscriptions/listen`. It authenticates cancellation against the existing connection owner and serializes cancellation, response, and notification commits at the writer. Synchronous split runners use the bounded asupersync blocking bridge. Unsplit custom transports dispatch ordinary requests serially because receive and send share one handle; a `subscriptions/listen` runs off the receive loop, and output produced while `recv` blocks is queued and written as soon as `recv` returns. Transport reads and writes can still block. The dual-era Unix stdio pump retains its concurrent modern children and serialized exact MCP 2024-11-05 worker. A non-cooperative handler can exceed the bounded process-exit drain, and reliable `awaitCleanup` semantics remain unverified |

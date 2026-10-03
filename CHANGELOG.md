@@ -8,6 +8,38 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ## Unreleased
 
+### MCP 2026-07-28 wire behaviour (official conformance suite findings)
+
+- A modern request without `_meta` is answered `-32602` (HTTP 400), and a
+  modern request naming an unsupported protocol version is answered `-32022`
+  with `{supported, requested}`. A stdio server keeps serving after either,
+  instead of exiting.
+- Removed and unknown methods are HTTP 404 with `-32601`. Modern `ping` is
+  gone (it is legacy-only); the clients' `ping()` probes a modern peer with a
+  stateless `server/discover` round-trip.
+- A POSTed JSON-RPC notification is accepted with HTTP 202.
+- The default HTTP listener admits loopback `Origin` values
+  (`localhost`, `127.0.0.0/8`, `[::1]`) without adding CORS headers. Every
+  route and the WebSocket upgrade refuse a non-admitted `Origin` with 403.
+- The default HTTP listener closes a connection that has not delivered a
+  complete request within `HttpServerConfig::request_read_timeout` (30 s by
+  default), so idle or byte-trickling peers no longer hold connection slots.
+  The WebSocket upgrade handshake shares the same bound.
+- Elicitation resumes over stateless HTTP through `inputResponses` and
+  single-use `requestState`, like sampling and roots.
+- Elicitation `mode` defaults to `form` when absent. `SamplingCapability`
+  carries `tools` and `context`.
+- Under `Auto`, a stdio client falls back to exact 2024-11-05 on any
+  well-formed non-modern error to its first discovery (`-32601`, `-32602`, or
+  an application code). The recognized modern errors `-32020`, `-32021` and
+  `-32022` keep the modern era.
+- `fastmcp install` works on macOS and other non-Linux Unix. It replaces the
+  config atomically and keeps a hard-linked backup of the previous file.
+- The README server snippets use `auto::ServerBuilder`, so they also serve the
+  pre-2026 `initialize` that the MCP Inspector and desktop hosts open with.
+- `conformance_server` and `conformance_client` binaries drive the official
+  `@modelcontextprotocol/conformance` suite in server and client mode.
+
 ### Schemas
 
 - `#[derive(JsonSchema)]` describes Serde's externally tagged enum payloads,
