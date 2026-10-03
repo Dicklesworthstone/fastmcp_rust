@@ -13021,7 +13021,7 @@ mod tests {
                 std::fs::File::create_new(&release).unwrap();
                 let quote =
                     |path: &Path| format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"));
-                let handshake = if modern {
+                let (handshake, modern_discovery) = if modern {
                     let capabilities = fastmcp_protocol::ServerDiscoverCapabilities::from_registry(
                         &fastmcp_protocol::ServerBehaviorRegistry::default(),
                         std::collections::BTreeMap::new(),
@@ -13042,10 +13042,18 @@ mod tests {
                     );
                     let response =
                         serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": discovery});
-                    format!("IFS= read -r init || fail 90 init-eof\nprintf '%s\\n' '{response}'")
+                    (
+                        format!(
+                            "IFS= read -r init || fail 90 init-eof\nprintf '%s\\n' '{response}'"
+                        ),
+                        Some(serde_json::to_value(&discovery).unwrap()),
+                    )
                 } else {
-                    format!(
-                        "IFS= read -r init || fail 90 init-eof\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{\"tools\":{{}},\"resources\":{{}},\"prompts\":{{}}}},\"serverInfo\":{{\"name\":\"{subject}\",\"version\":\"1\"}}}}}}'\nIFS= read -r initialized || fail 91 initialized-eof"
+                    (
+                        format!(
+                            "IFS= read -r init || fail 90 init-eof\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{\"tools\":{{}},\"resources\":{{}},\"prompts\":{{}}}},\"serverInfo\":{{\"name\":\"{subject}\",\"version\":\"1\"}}}}}}'\nIFS= read -r initialized || fail 91 initialized-eof"
+                        ),
+                        None,
                     )
                 };
                 let methods = if inspect {
@@ -13066,7 +13074,18 @@ mod tests {
                 script.push_str(&handshake);
                 for (index, method) in methods.into_iter().enumerate() {
                     let id = index + 2;
+                    // A modern client pings with a stateless `server/discover`
+                    // round-trip (115c7252); the peer answers with discovery.
+                    let modern_ping = modern && method == "ping";
+                    let wire_method = if modern_ping {
+                        "server/discover"
+                    } else {
+                        method
+                    };
                     let mut result = match method {
+                        "ping" if modern_ping => modern_discovery
+                            .clone()
+                            .expect("modern handshake builds a discovery result"),
                         "tools/list" => {
                             serde_json::json!({"tools": [{"name": subject, "inputSchema": {"type": "object"}}]})
                         }
@@ -13080,7 +13099,7 @@ mod tests {
                         "ping" => serde_json::json!({}),
                         _ => unreachable!(),
                     };
-                    if modern {
+                    if modern && !modern_ping {
                         result["resultType"] = serde_json::json!("complete");
                         if method != "ping" {
                             result["ttlMs"] = serde_json::json!(0);
@@ -13092,7 +13111,7 @@ mod tests {
 IFS= read -r request || fail 92 request-eof
 case "$request" in
     *'"method":"notifications/cancelled"'*) fail 0 "$request" ;;
-    *'"method":"{method}"'*'"id":{id}'*) ;;
+    *'"method":"{wire_method}"'*'"id":{id}'*) ;;
     *) fail 93 "$request" ;;
 esac
 printf '%s' '{id}' > {ready} || fail 95 ready-write
@@ -13663,7 +13682,13 @@ IFS= read -r end
             assert_eq!(production.matches(".block_on(").count(), 1);
             assert!(!production.contains("fastmcp_core::runtime::block_on"));
 
-            let wrong_boundary = source.replacen("mod tests {", "mod other_tests {", 1);
+            // Rename the top-level test module itself: an earlier nested
+            // `mod tests {` must not satisfy the boundary check.
+            let wrong_boundary = source.replace("\r\n", "\n").replacen(
+                "\n#[cfg(test)]\nmod tests {",
+                "\n#[cfg(test)]\nmod other_tests {",
+                1,
+            );
             assert!(production_source(&wrong_boundary).is_none());
 
             let duplicate_runtime = format!("runtime.block_on(async {{}});\n{source}");
