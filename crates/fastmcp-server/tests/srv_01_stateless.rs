@@ -694,12 +694,13 @@ fn srv_01_a_planted_negative() {
         serde_json::to_vec(&planted).expect("planted request must serialize");
     let (transport, probe) = RuntimeTransport::single_request(planted.clone());
 
-    let error = Server::new("stateless-runtime-version-refusal", "1.0.0")
+    // MCP 2026-07-28 (c7f4717b): an unsupported version is a per-request
+    // -32022 refusal; the runtime keeps serving and ends cleanly at EOF.
+    Server::new("stateless-runtime-version-refusal", "1.0.0")
         .tool(Greet)
         .build()
         .run_transport_returning_with_cx(&Cx::for_testing(), transport)
-        .expect_err("a one-field unsupported version is refused by the public runtime");
-    assert_eq!(error.code, McpErrorCode::InternalError);
+        .expect("a one-field unsupported version is refused per request, not fatally");
     let outgoing = probe.outgoing();
     assert_eq!(outgoing.len(), 1, "the runtime emits one typed refusal");
     let JsonRpcMessage::Response(planted_response) = &outgoing[0] else {
@@ -710,7 +711,7 @@ fn srv_01_a_planted_negative() {
             .error
             .as_ref()
             .map(|error| error.code.clone()),
-        Some(McpErrorCode::InvalidRequest.into())
+        Some(fastmcp_protocol::protocol_version::UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE.into())
     );
     assert_eq!(
         serde_json::to_vec(&planted).expect("planted request remains serializable"),
@@ -1293,12 +1294,13 @@ fn srv_01_i_planted_negative() {
     });
 
     let (transport, probe) = RuntimeTransport::single_request(planted.clone());
-    let error = Server::new("stateless-integration-refusal-rt", "1.0.0")
+    // MCP 2026-07-28 (c7f4717b): unsupported 2025-11-25 is refused at the
+    // runtime version admission boundary with -32022, without ending the run.
+    Server::new("stateless-integration-refusal-rt", "1.0.0")
         .tool(Greet)
         .build()
         .run_transport_returning_with_cx(&Cx::for_testing(), transport)
-        .expect_err("unsupported 2025-11-25 must fail at runtime version admission boundary");
-    assert_eq!(error.code, McpErrorCode::InternalError);
+        .expect("unsupported 2025-11-25 is refused per request, not fatally");
     let outgoing = probe.outgoing();
     assert_eq!(outgoing.len(), 1);
     let JsonRpcMessage::Response(refusal) = &outgoing[0] else {
@@ -1306,7 +1308,7 @@ fn srv_01_i_planted_negative() {
     };
     assert_eq!(
         refusal.error.as_ref().map(|err| err.code.clone()),
-        Some(McpErrorCode::InvalidRequest.into())
+        Some(fastmcp_protocol::protocol_version::UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE.into())
     );
     assert_eq!(
         serde_json::to_vec(&planted).expect("planted request remains serializable"),

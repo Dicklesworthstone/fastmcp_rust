@@ -2592,6 +2592,11 @@ printf 'request:%s\n' "$request" >> "$1"
 case "$request" in *'"id":2'*) ;; *) exit 96;; esac
 case "$request" in
     *'"method":"ping"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}';;
+    *'"method":"server/discover"'*)
+        # A modern client's liveness probe is server/discover (MCP 2026-07-28
+        # removed ping); only a modern session may send it.
+        [ "$era" = modern ] || exit 97
+        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"extensions":{"io.modelcontextprotocol/tasks":{}}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"deferred-peer","version":"1"}}}}';;
     *'"method":"tasks/get"'*)
         case "$request" in *'"taskId":"task-1"'*'"id":2'*) ;; *) exit 98;; esac
         case "$request" in *'"extensions":{"io.modelcontextprotocol/tasks":{}}'*) ;; *) exit 99;; esac

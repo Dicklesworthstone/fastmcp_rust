@@ -38895,13 +38895,24 @@ mod lib_unit_tests {
                         modern_discovery_opening_request(),
                         JsonRpcMessage::Request(wrong_version),
                     ]),
-                    sent,
+                    sent: Arc::clone(&sent),
                     receive_calls: Arc::new(AtomicUsize::new(0)),
                 },
             )
-            .expect_err("only the extension protocol version differs from the admitted positive");
+            // MCP 2026-07-28 (c7f4717b): a wrong version is a per-request
+            // -32022 refusal and the stdio runtime keeps serving to EOF.
+            .expect("only the extension protocol version differs from the admitted positive");
 
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "the handler never runs");
+        let refused = sent.lock().unwrap().iter().any(|message| {
+            matches!(message, JsonRpcMessage::Response(response)
+                if response.error.as_ref().map(|error| error.code.clone())
+                    == Some(fastmcp_protocol::UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE.into()))
+        });
+        assert!(
+            refused,
+            "the wrong version receives the typed -32022 refusal"
+        );
     }
 
     // Exact-2024 era: selects LegacyOnly, which a no-legacy build refuses.
