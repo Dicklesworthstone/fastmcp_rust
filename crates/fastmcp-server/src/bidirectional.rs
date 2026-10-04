@@ -1329,7 +1329,27 @@ impl MrtrInputRequest {
                         .map_err(|_| McpError::invalid_params(MRTR_INPUT_MAP_ERROR))?,
                 )
             }
-            "roots/list" if params.is_none() => Ok(Self::roots()),
+            // `roots/list` carries no inputs of its own, so the 2026-07-28
+            // schema makes `params` an optional object whose only member is
+            // the common `_meta`. Both the absent and the empty-object form
+            // are therefore on the wire -- the vendored
+            // examples/ListRootsRequest omits `params` while the official
+            // conformance suite sends `"params": {}` -- and both normalize to
+            // the same parameterless descriptor. Requiring absence rejected
+            // every mixed-method input map the suite builds.
+            //
+            // A PRESENT, NON-EMPTY `params` stays refused, including one
+            // carrying only `_meta`: this match is the boundary that stops a
+            // handler smuggling an arbitrary request or outer metadata through
+            // a framework-minted input-required result, and nothing on the
+            // wire needs it to be looser than this.
+            "roots/list"
+                if params.is_none_or(|params| {
+                    params.as_object().is_some_and(serde_json::Map::is_empty)
+                }) =>
+            {
+                Ok(Self::roots())
+            }
             _ => Err(McpError::invalid_params(MRTR_INPUT_MAP_ERROR)),
         }
     }
@@ -4166,6 +4186,69 @@ mod tests {
                 .map(MrtrInputResponse::kind),
             Some(MrtrInputKind::Elicitation),
         );
+    }
+
+    #[test]
+    fn roots_list_descriptor_admits_absent_and_empty_params_only() {
+        // POSITIVE, the form the vendored spec example uses.
+        let absent = serde_json::json!({"method": "roots/list"});
+        assert_eq!(
+            MrtrInputRequest::from_wire(&absent)
+                .expect("roots/list without params is the spec example form")
+                .kind(),
+            MrtrInputKind::Roots,
+        );
+
+        // POSITIVE, the form the official conformance suite sends. Requiring
+        // `params` to be absent rejected this, which failed every mixed-method
+        // input map the suite builds (sep-2322-multiple-inputs-incomplete).
+        let empty = serde_json::json!({"method": "roots/list", "params": {}});
+        assert_eq!(
+            MrtrInputRequest::from_wire(&empty)
+                .expect("roots/list with an empty params object is admitted")
+                .kind(),
+            MrtrInputKind::Roots,
+        );
+
+        // Both forms must normalize to the SAME descriptor, so admitting the
+        // empty object cannot introduce a second internal representation.
+        assert_eq!(
+            serde_json::to_value(
+                MrtrInputRequest::from_wire(&absent).expect("absent params admitted")
+            )
+            .expect("descriptor serializes"),
+            serde_json::to_value(
+                MrtrInputRequest::from_wire(&empty).expect("empty params admitted")
+            )
+            .expect("descriptor serializes"),
+        );
+
+        // PLANTED NEGATIVES. Each differs from the admitted `empty` case only
+        // in the contents of `params`, which is the forbidden dimension: this
+        // match is what stops a handler smuggling an arbitrary request or
+        // outer metadata through a framework-minted input-required result.
+        for (label, descriptor) in [
+            (
+                "params carrying only _meta",
+                serde_json::json!({"method": "roots/list", "params": {"_meta": {}}}),
+            ),
+            (
+                "params carrying a foreign member",
+                serde_json::json!({"method": "roots/list", "params": {"extra": 1}}),
+            ),
+            (
+                "params that is not an object",
+                serde_json::json!({"method": "roots/list", "params": []}),
+            ),
+            (
+                "params that is null",
+                serde_json::json!({"method": "roots/list", "params": null}),
+            ),
+        ] {
+            let error = MrtrInputRequest::from_wire(&descriptor)
+                .expect_err(&format!("{label} must stay refused"));
+            assert_eq!(error.message, MRTR_INPUT_MAP_ERROR, "{label}");
+        }
     }
 
     #[test]
