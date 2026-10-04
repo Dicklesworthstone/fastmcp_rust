@@ -11957,9 +11957,23 @@ impl HttpClient {
             match connection.selected_protocol_era() {
                 ProtocolEra::Modern2026 => {
                     let discovery = connection.server_discovery();
+                    // Prefer the final `_meta` position, then fall back to the
+                    // pre-2026 top-level `serverInfo` sibling, which the
+                    // official conformance harness sends and which discovery
+                    // now retains inertly instead of refusing. Identity is
+                    // still REQUIRED to be somewhere: the 2026-07-28 schema
+                    // makes `_meta` optional, so a peer that supplies no
+                    // identity at all remains stricter here than the schema,
+                    // and that residual is tracked rather than papered over
+                    // by inventing a name.
                     let server_info = discovery
                         .as_ref()
-                        .and_then(|discovery| discovery.server_info().cloned())
+                        .and_then(|discovery| {
+                            discovery
+                                .server_info()
+                                .cloned()
+                                .or_else(|| discovery.compatibility_server_info())
+                        })
                         .ok_or(HttpClientError::ModernDiscoveryMissingServerInfo)?;
                     let instructions = discovery.and_then(|discovery| {
                         discovery
