@@ -270,8 +270,19 @@ const COMPLETE_DISCOVERY_RESULT_TYPE: &str = "complete";
 /// Discovery retains schema-open extension members, but it must never treat a
 /// continuation, task, or generic result envelope as discovery merely because
 /// it also carries the required discovery fields.
-const DISCOVERY_CONTRADICTORY_RESULT_MEMBERS: [&str; 13] = [
-    "serverInfo",
+///
+/// `serverInfo` is deliberately NOT in this list. It is the pre-2026 placement
+/// of peer identity, not a result-branch discriminator: a top-level
+/// `serverInfo` says nothing about whether the result is a task or a
+/// continuation, so treating it as contradictory was a category error. The
+/// 2026-07-28 schema leaves `DiscoverResult` open (`additionalProperties` is
+/// absent) and does not list `serverInfo`, which makes it an unrecognized
+/// sibling that an open object must tolerate; the official conformance
+/// harness sends exactly that shape, and refusing it killed every client-mode
+/// scenario at discovery. It is retained in `extras`, and
+/// `decode_result_meta` keeps its own rejection for the genuinely ambiguous
+/// case where `_meta` ALSO carries a final identity.
+const DISCOVERY_CONTRADICTORY_RESULT_MEMBERS: [&str; 12] = [
     "input",
     "inputRequests",
     "request",

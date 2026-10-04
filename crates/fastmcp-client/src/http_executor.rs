@@ -3715,8 +3715,6 @@ pub enum ModernHttpExecutorError {
     UnsupportedContentEncoding,
     /// A response repeated a header whose cardinality is fixed for MCP.
     DuplicateResponseHeader { name: &'static str },
-    /// Modern stateless HTTP forbids server-issued session state.
-    ForbiddenResponseSessionHeader,
     /// A successful response did not select JSON or SSE exactly.
     UnsupportedSuccessContentType,
     /// An API requiring a modern SSE response received another admitted kind.
@@ -3786,9 +3784,6 @@ impl fmt::Display for ModernHttpExecutorError {
             }
             Self::DuplicateResponseHeader { name } => {
                 write!(formatter, "modern MCP response repeats {name}")
-            }
-            Self::ForbiddenResponseSessionHeader => {
-                formatter.write_str("modern stateless HTTP response included MCP-Session-Id")
             }
             Self::UnsupportedSuccessContentType => {
                 formatter.write_str("modern MCP success response has unsupported content type")
@@ -11300,12 +11295,21 @@ pub fn validate_response_head(
     headers: &[(String, String)],
 ) -> Result<ModernHttpResponseMetadata, ModernHttpExecutorError> {
     validate_content_encoding(headers)?;
-    if headers
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case("mcp-session-id"))
-    {
-        return Err(ModernHttpExecutorError::ForbiddenResponseSessionHeader);
-    }
+    // A response `Mcp-Session-Id` is IGNORED on modern paths, not refused.
+    //
+    // Nothing in the 2026-07-28 schema mentions sessions at all, so a client
+    // has no warrant to treat the header as fatal, and the official
+    // conformance harness's scenario servers set it on essentially every
+    // response -- which made every client-mode scenario die at discovery
+    // before sending one MCP request.
+    //
+    // Ignoring it costs no security. "Never adopt server-issued session
+    // state" is a property of the REQUEST path, where this client simply
+    // never emits the header, and that is asserted independently by the
+    // `!head.contains("MCP-Session-Id:")` checks on outgoing discovery,
+    // JSON, and SSE requests. The legacy HTTP+SSE path keeps rejecting it
+    // (`reject_legacy_response_session_header`): in the exact 2024-11-05 era
+    // a session header is meaningful, so injecting one there is an attack.
     if (300..400).contains(&status) {
         return Err(ModernHttpExecutorError::Redirect { status });
     }
@@ -18922,18 +18926,26 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
     }
 
     #[test]
-    fn modern_http_client_rejects_mcp_session_id_response_header() {
+    fn modern_http_client_ignores_an_mcp_session_id_response_header() {
+        // POSITIVE. A modern discovery response carrying `Mcp-Session-Id`
+        // connects. This replaces a test that pinned the opposite: nothing in
+        // the 2026-07-28 schema mentions sessions, and the official
+        // conformance harness sets the header on nearly every response, so
+        // refusing it killed every client-mode scenario at discovery.
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind session-header listener");
         let address = listener.local_addr().expect("read session-header address");
         let modern_target = format!("http://{address}/mcp");
         let server = thread::spawn(move || {
             let (mut discovery, _) = listener.accept().expect("accept session-header discovery");
             let discovery_request = read_request(&mut discovery);
+            // The security property lives HERE, on the request: the client
+            // never emits a session header, so tolerating one on the response
+            // cannot cause it to adopt server-issued session state.
             assert!(!discovery_request.head.contains("MCP-Session-Id:"));
             let body = modern_discovery_body();
             write!(
                 discovery,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMCP-Session-Id: forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMCP-Session-Id: tolerated\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             )
             .expect("write session-header response head");
@@ -18944,7 +18956,7 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
         });
 
         let cx = Cx::for_request();
-        let result = runtime_block_on(ModernHttpClient::connect(
+        runtime_block_on(ModernHttpClient::connect(
             &cx,
             plan(
                 &modern_target,
@@ -18957,14 +18969,33 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
                 version: "1.0.0".to_owned(),
             },
             ClientCapabilities::default(),
-        ));
-        assert!(matches!(
-            result,
-            Err(ModernHttpClientError::Executor(
-                ModernHttpExecutorError::ForbiddenResponseSessionHeader
-            ))
-        ));
+        ))
+        .expect("a modern response carrying Mcp-Session-Id is tolerated");
         server.join().expect("session-header server joins");
+    }
+
+    #[test]
+    fn an_mcp_session_id_response_header_does_not_rescue_an_invalid_response_head() {
+        // PLANTED NEGATIVE. The admitted case above and this one differ only
+        // in one other field of the same head, so tolerating the session
+        // header must not have become blanket acceptance of a response head.
+        let tolerated = vec![
+            ("Content-Type".to_owned(), "application/json".to_owned()),
+            ("Mcp-Session-Id".to_owned(), "tolerated".to_owned()),
+        ];
+        assert_eq!(
+            validate_response_head(200, &tolerated)
+                .expect("a session header alone does not invalidate a head")
+                .kind(),
+            ModernHttpResponseKind::Json,
+        );
+
+        let mut refused = tolerated;
+        refused.push(("Content-Encoding".to_owned(), "gzip".to_owned()));
+        assert!(matches!(
+            validate_response_head(200, &refused),
+            Err(ModernHttpExecutorError::UnsupportedContentEncoding)
+        ));
     }
 
     #[test]
