@@ -2,37 +2,50 @@
 # `scripts/run_official_conformance.sh --baseline <this file>`, which forwards
 # it to the suite's own `--expected-failures`.
 #
-# Measured 2026-10-03 on worker hz3 against revision 6b54e023, with
+# Measured 2026-10-04 on worker hz3 with
 # `@modelcontextprotocol/conformance@0.2.0-alpha.10`,
 # `--spec-version 2026-07-28 --suite all`:
 #
-#   40 scenarios, 114 checks: SUCCESS=108, FAILURE=1, WARNING=4, INFO=1
+#   40 scenarios, 115 checks: SUCCESS=110, FAILURE=0, WARNING=4, INFO=1
 #
-# (The immediately preceding committed revision, bba5a09f, scored 54 of 92
-# checks. The denominator moved because scenarios that used to fail early now
-# reach their later checks, so compare SETS of failures, never the two counts.)
+# History (do NOT read these as a ratio; the denominator moves because a
+# scenario that fails an early check never runs its later ones):
 #
-# This file lists only FAILURE-level entries, because a WARNING is a SHOULD miss
-# and does not fail the suite. The four current warnings are recorded below as
-# comments so they are not mistaken for passes:
+#   bba5a09f  2026-10-01   40 scenarios,  92 checks,  54 SUCCESS, 38 FAILURE
+#   6b54e023  2026-10-03   40 scenarios, 114 checks, 108 SUCCESS,  1 FAILURE
+#   (this)    2026-10-04   40 scenarios, 115 checks, 110 SUCCESS,  0 FAILURE
 #
-#   server-stateless:sep-2575-server-sends-tools-list-changed-on-subscription
-#   server-stateless:sep-2575-server-sends-prompts-list-changed-on-subscription
-#       The server has no runtime catalog-mutation API, so it never emits a
-#       list-changed notification. Deliberate and documented in the adapter.
-#   input-required-result-missing-input-response:sep-2322-missing-response-rerequests
-#   input-required-result-ignore-extra-params:sep-2322-ignore-unexpected-params
-#       Same MRTR partial-response path as the failure below.
+# THE LIST IS EMPTY ON PURPOSE. Every FAILURE-level check passes, so any new
+# entry appearing in a run is a regression. Keep it empty: adding an entry
+# requires a reason in the commit message, and `--baseline` exists so that a
+# newly broken check cannot be cancelled out by a newly fixed one in a count.
 #
 # Entries are `<scenario>` or `<scenario>:<check-id>`. Do NOT paste the suite's
 # result DIRECTORY names here: those carry a run timestamp and would never match
 # a later run, leaving a gate that passes unconditionally.
-#
-# Shrinking this list is the goal. Adding to it requires a reason in the commit
-# message.
 
-server:
-  # A client that answers only SOME of several simultaneously pending input
-  # requests is rejected with "Invalid MRTR input request or response map"
-  # instead of having the still-unanswered keys re-requested.
-  - input-required-result-multiple-input-requests:sep-2322-multiple-inputs-incomplete
+server: []
+
+# ---------------------------------------------------------------------------
+# SHOULD-level misses. The suite records these as WARNING, so they do not fail
+# a run and do not belong in the list above. They are recorded here so they are
+# never mistaken for passes.
+#
+# server-stateless:sep-2575-server-sends-tools-list-changed-on-subscription
+# server-stateless:sep-2575-server-sends-prompts-list-changed-on-subscription
+#     The server has no runtime catalog-mutation API, so it never emits a
+#     list-changed notification. Deliberate; documented in the adapter, which
+#     also declines to serve the test_trigger_* fixtures for the same reason.
+#
+# input-required-result-missing-input-response:sep-2322-missing-response-rerequests
+# input-required-result-ignore-extra-params:sep-2322-ignore-unexpected-params
+#     A deliberate fail-closed choice, not an oversight. An MRTR response map
+#     naming NONE of the outstanding inputs is refused with
+#     "Invalid MRTR input request or response map" rather than treated as a
+#     no-op retry, because rotating the request state would burn a valid
+#     continuation without making progress. The suite would prefer the server
+#     re-request instead. An in-tree e2e test pins the current refusal, so
+#     changing it is a reviewed semantic decision, not a fix. Tracked
+#     separately; measured 2026-10-04 to be INDEPENDENT of the roots/list
+#     descriptor defect that produced the last FAILURE (both warnings survived
+#     that fix unchanged).

@@ -31,22 +31,29 @@
 ### Measured official-conformance standing
 
 Run it yourself with `scripts/run_official_conformance.sh`; it owns the suite
-pin and the result tally. Most recent measurement, revision `6b54e023` on
-2026-10-03, with `@modelcontextprotocol/conformance@0.2.0-alpha.10`,
+pin and the result tally. Measurements use
+`@modelcontextprotocol/conformance@0.2.0-alpha.10`,
 `--spec-version 2026-07-28 --suite all`, server mode against the in-tree
 `conformance_server` adapter:
 
-| | scenarios | checks | SUCCESS | FAILURE | WARNING | INFO |
-|---|---|---|---|---|---|---|
-| `6b54e023` (2026-10-03) | 40 | 114 | 108 | 1 | 4 | 1 |
-| `bba5a09f` (2026-10-01) | 40 | 92 | 54 | 38 | 0 | 0 |
+| revision | date | scenarios | checks | SUCCESS | FAILURE | WARNING | INFO |
+|---|---|---|---|---|---|---|---|
+| working tree | 2026-10-04 | 40 | 115 | 110 | **0** | 4 | 1 |
+| `6b54e023` | 2026-10-03 | 40 | 114 | 108 | 1 | 4 | 1 |
+| `bba5a09f` | 2026-10-01 | 40 | 92 | 54 | 38 | 0 | 0 |
 
-**The two rows are not a ratio.** The check denominator rose from 92 to 114
-because scenarios that previously failed early now reach their later checks, so
-compare the *sets* of failing checks, never the counts. The current failure and
-the four SHOULD-level warnings are enumerated in
-`scripts/conformance-expected-failures.yaml`, which doubles as the regression
-baseline.
+**These rows are not a ratio, and the denominator is not fixed.** It rose 92 →
+114 → 115 because a scenario that fails an early check never runs its later
+ones, so fixing one check can *add* checks to the run. The corollary is a trap:
+a regression that makes a scenario abort earlier shrinks the denominator and can
+push a percentage *up*. Compare the *sets* of failing check ids, which is what
+`scripts/conformance-expected-failures.yaml` records and what the suite's own
+`--expected-failures` gates on.
+
+No FAILURE-level check remains. The four SHOULD-level warnings are enumerated in
+that same file; two are the absent runtime catalog-mutation API, and two are a
+deliberate fail-closed choice about empty MRTR response maps that the suite
+would prefer we relax.
 
 **What this is not.** It is a count of named checks at one revision, under one
 adapter, over HTTP. It is not aggregate MCP 2026-07-28 conformance, and it says
