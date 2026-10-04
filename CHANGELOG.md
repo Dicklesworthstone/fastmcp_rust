@@ -74,7 +74,8 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 - A POSTed JSON-RPC notification is accepted with HTTP 202.
 - The default HTTP listener admits loopback `Origin` values
   (`localhost`, `127.0.0.0/8`, `[::1]`) without adding CORS headers. Every
-  route and the WebSocket upgrade refuse a non-admitted `Origin` with 403.
+  HTTP route refuses a non-admitted `Origin` with 403, and the WebSocket
+  upgrade refuses it with 400.
 - The default HTTP listener closes a connection that has not delivered a
   complete request within `HttpServerConfig::request_read_timeout` (30 s by
   default), so idle or byte-trickling peers no longer hold connection slots.
