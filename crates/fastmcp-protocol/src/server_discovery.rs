@@ -279,9 +279,11 @@ const COMPLETE_DISCOVERY_RESULT_TYPE: &str = "complete";
 /// absent) and does not list `serverInfo`, which makes it an unrecognized
 /// sibling that an open object must tolerate; the official conformance
 /// harness sends exactly that shape, and refusing it killed every client-mode
-/// scenario at discovery. It is retained in `extras`, and
-/// `decode_result_meta` keeps its own rejection for the genuinely ambiguous
-/// case where `_meta` ALSO carries a final identity.
+/// scenario at discovery. It is retained in `extras`. The genuinely ambiguous
+/// case — a top-level `serverInfo` alongside a final `_meta` identity — is
+/// refused by an explicit check in [`ServerDiscoverResult`]'s deserializer,
+/// which is where discovery's ONLY ambiguity guard lives: discovery decodes
+/// through `ServerDiscoverResultWire` and never reaches `decode_result_meta`.
 const DISCOVERY_CONTRADICTORY_RESULT_MEMBERS: [&str; 12] = [
     "input",
     "inputRequests",
@@ -872,6 +874,18 @@ impl<'de> Deserialize<'de> for ServerDiscoverResult {
                 "server/discover result contains a contradictory final result member",
             ));
         }
+        // A LONE pre-2026 top-level `serverInfo` is retained inertly, but one
+        // alongside a final `_meta` identity is refused: two divergent
+        // identities in a single result cannot be resolved, and silently
+        // preferring either would let a peer shadow its own advertised
+        // identity. `decode_result_meta` enforces the same rule for generic
+        // results, but discovery decodes through `ServerDiscoverResultWire`
+        // and never reaches it, so the rule has to be stated here too.
+        if wire.extras.contains_key("serverInfo") && wire.metadata.server_info.is_some() {
+            return Err(D::Error::custom(
+                "server/discover result carries divergent top-level and _meta server identities",
+            ));
+        }
         Ok(Self {
             result_type: COMPLETE_DISCOVERY_RESULT_TYPE.to_owned(),
             peer_missing_result_type,
@@ -1279,7 +1293,8 @@ mod tests {
             .as_object_mut()
             .expect("the discovery wire is an object")
             .remove("_meta");
-        legacy_identity_only["serverInfo"] = json!({"name": "mrtr-mock-server", "version": "1.0.0"});
+        legacy_identity_only["serverInfo"] =
+            json!({"name": "mrtr-mock-server", "version": "1.0.0"});
         let admitted_sibling = serde_json::from_value::<ServerDiscoverResult>(legacy_identity_only)
             .expect("a lone top-level serverInfo sibling is admitted by open discovery");
         assert!(
