@@ -50,32 +50,32 @@ push a percentage *up*. Compare the *sets* of failing check ids, which is what
 `scripts/conformance-expected-failures.yaml` records and what the suite's own
 `--expected-failures` gates on.
 
-**Client mode is a different and much worse story, and the plan requires both.**
-The gate is the harness passing in *both* modes. Client mode was first measured
-on 2026-10-04 and stands at 32 scenarios / 143 checks: SUCCESS=21, FAILURE=59,
-SKIPPED=11, WARNING=1, INFO=51. That headline is misleading without its
-decomposition, so do not quote it alone:
+**Client mode.** The gate is the harness passing in *both* modes. Client mode
+first measured 2026-10-04; most recent run, 32 scenarios / 155 checks:
+SUCCESS=40, FAILURE=61, SKIPPED=2, WARNING=1, INFO=51. Split it before quoting
+it, because the two halves measure different things:
 
-- **44 of the 59** are the authorization suite (`iss-*`, `metadata-*`,
-  `scope-*`, `token-endpoint-auth-*`, registration and migration). The
-  client adapter supplies no interactive OAuth driver and says so in its own
-  module docs, so these measure the *adapter's* absence, not the library's
-  behaviour. They are consistent with OAuth/OIDC being unpromoted below.
-- **13** never send a single MCP request, because the modern client refuses the
-  connection at discovery. Two fail-closed validator choices account for all of
-  them: **7** because a server returned `Mcp-Session-Id` (which the harness's
-  scenario servers always send), and **6** because the discovery result carried
-  a top-level `serverInfo` sibling — fatal even when the authoritative
-  `_meta.io.modelcontextprotocol/serverInfo` is also present and valid, and the
-  schema leaves `DiscoverResult` open to unrecognized siblings.
+| | checks | SUCCESS | FAILURE |
+|---|---|---|---|
+| non-authorization | 53 | **38** | 15 |
+| authorization | 97 | 2 | 46 |
 
-Every non-auth client-mode failure is therefore a connect-time refusal, not a
-behavioural defect: no request is ever sent. Both refusals are deliberate and
-pinned by passing tests, so relaxing either is a reviewed decision rather than a
-fix.
+- **Non-auth: every scenario passes except one.** `sep-2322-client-request-state`
+  5/5, `http-standard-headers` 9/9, `http-invalid-tool-headers` 11/11,
+  `json-schema-ref-no-deref` 1/1, `request-metadata`, `resource-mismatch` and
+  `tools_call` clean. All 15 remaining failures are a single cause:
+  `http-custom-headers` requires the client to mirror designated tool
+  parameters into `Mcp-Param-*` headers (SEP-2243). The library implements that
+  fully — `HttpClient::call_tool_with_parameter_headers` plus
+  `ReviewedToolHeaders` — but `ReviewedToolHeaders::new` requires an `https`
+  resource and the harness serves `http://127.0.0.1:<port>/mcp`, so the plan
+  cannot be constructed in the scenario.
+- **Authorization: the adapter, not the library.** `conformance_client`
+  supplies no interactive OAuth driver and says so in its own module docs, so
+  these measure adapter completeness. They are consistent with OAuth/OIDC being
+  unpromoted below.
 
-So server-mode conformance is measured and clean; client-mode conformance is
-measured and **not** claimed.
+Client-mode conformance is measured and still **not** claimed.
 
 No server-mode FAILURE-level check remains. The four SHOULD-level warnings are enumerated in
 that same file; two are the absent runtime catalog-mutation API, and two are a

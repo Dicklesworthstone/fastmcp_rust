@@ -270,8 +270,21 @@ const COMPLETE_DISCOVERY_RESULT_TYPE: &str = "complete";
 /// Discovery retains schema-open extension members, but it must never treat a
 /// continuation, task, or generic result envelope as discovery merely because
 /// it also carries the required discovery fields.
-const DISCOVERY_CONTRADICTORY_RESULT_MEMBERS: [&str; 13] = [
-    "serverInfo",
+///
+/// `serverInfo` is deliberately NOT in this list. It is the pre-2026 placement
+/// of peer identity, not a result-branch discriminator: a top-level
+/// `serverInfo` says nothing about whether the result is a task or a
+/// continuation, so treating it as contradictory was a category error. The
+/// 2026-07-28 schema leaves `DiscoverResult` open (`additionalProperties` is
+/// absent) and does not list `serverInfo`, which makes it an unrecognized
+/// sibling that an open object must tolerate; the official conformance
+/// harness sends exactly that shape, and refusing it killed every client-mode
+/// scenario at discovery. It is retained in `extras`. The genuinely ambiguous
+/// case — a top-level `serverInfo` alongside a final `_meta` identity — is
+/// refused by an explicit check in [`ServerDiscoverResult`]'s deserializer,
+/// which is where discovery's ONLY ambiguity guard lives: discovery decodes
+/// through `ServerDiscoverResultWire` and never reaches `decode_result_meta`.
+const DISCOVERY_CONTRADICTORY_RESULT_MEMBERS: [&str; 12] = [
     "input",
     "inputRequests",
     "request",
@@ -708,9 +721,32 @@ impl ServerDiscoverResult {
     }
 
     /// Returns the self-reported server identity when the peer supplied one.
+    ///
+    /// This reads only the final `_meta.io.modelcontextprotocol/serverInfo`
+    /// position. A peer that put its identity in the pre-2026 top-level
+    /// `serverInfo` sibling is reported by
+    /// [`Self::compatibility_server_info`] instead, so the two placements can
+    /// never be confused for one another.
     #[must_use]
     pub fn server_info(&self) -> Option<&ServerInfo> {
         self.metadata.server_info.as_ref()
+    }
+
+    /// Returns the peer identity carried in the pre-2026 top-level
+    /// `serverInfo` sibling, if it is present and well-formed.
+    ///
+    /// Discovery retains that sibling inertly rather than refusing it, because
+    /// the 2026-07-28 schema leaves `DiscoverResult` open and does not list
+    /// `serverInfo`. This accessor is the only way to read it, and it is
+    /// deliberately separate from [`Self::server_info`]: a caller that wants
+    /// the final position must ask for the final position. A result carrying
+    /// identity in BOTH placements never reaches here, since two divergent
+    /// identities in one result are refused during decoding.
+    #[must_use]
+    pub fn compatibility_server_info(&self) -> Option<ServerInfo> {
+        self.extras
+            .get("serverInfo")
+            .and_then(|value| serde_json::from_value::<ServerInfo>(value.clone()).ok())
     }
 
     /// Returns optional server guidance without assigning it any authority.
@@ -836,6 +872,18 @@ impl<'de> Deserialize<'de> for ServerDiscoverResult {
         }) {
             return Err(D::Error::custom(
                 "server/discover result contains a contradictory final result member",
+            ));
+        }
+        // A LONE pre-2026 top-level `serverInfo` is retained inertly, but one
+        // alongside a final `_meta` identity is refused: two divergent
+        // identities in a single result cannot be resolved, and silently
+        // preferring either would let a peer shadow its own advertised
+        // identity. `decode_result_meta` enforces the same rule for generic
+        // results, but discovery decodes through `ServerDiscoverResultWire`
+        // and never reaches it, so the rule has to be stated here too.
+        if wire.extras.contains_key("serverInfo") && wire.metadata.server_info.is_some() {
+            return Err(D::Error::custom(
+                "server/discover result carries divergent top-level and _meta server identities",
             ));
         }
         Ok(Self {
@@ -1226,10 +1274,6 @@ mod tests {
             ("inputRequests", json!({"roots": {"method": "roots/list"}})),
             ("requestState", json!("retry-1")),
             ("taskId", json!("task-1")),
-            (
-                "serverInfo",
-                json!({"name": "wrong-location", "version": "1.0"}),
-            ),
         ] {
             let mut planted = peer_wire.clone();
             planted[name] = value;
@@ -1238,6 +1282,36 @@ mod tests {
                 "complete discovery cannot carry the {name} result branch member"
             );
         }
+
+        // POSITIVE: a top-level `serverInfo` is the pre-2026 placement of peer
+        // identity, not a result-branch discriminator, and the 2026-07-28
+        // schema leaves `DiscoverResult` open. The official conformance
+        // harness sends exactly this shape, so it must be admitted rather
+        // than refused as contradictory.
+        let mut legacy_identity_only = peer_wire.clone();
+        legacy_identity_only
+            .as_object_mut()
+            .expect("the discovery wire is an object")
+            .remove("_meta");
+        legacy_identity_only["serverInfo"] =
+            json!({"name": "mrtr-mock-server", "version": "1.0.0"});
+        let admitted_sibling = serde_json::from_value::<ServerDiscoverResult>(legacy_identity_only)
+            .expect("a lone top-level serverInfo sibling is admitted by open discovery");
+        assert!(
+            admitted_sibling.server_info().is_none(),
+            "the legacy position is retained as an inert sibling, never adopted as final identity"
+        );
+
+        // PLANTED NEGATIVE, one field from the admitted case: the SAME sibling
+        // alongside a final `_meta` identity stays refused, because two
+        // divergent identities in one result are ambiguous. Tolerating the
+        // sibling must not have disabled that rule.
+        let mut both_identities = peer_wire.clone();
+        both_identities["serverInfo"] = json!({"name": "mrtr-mock-server", "version": "1.0.0"});
+        assert!(
+            serde_json::from_value::<ServerDiscoverResult>(both_identities).is_err(),
+            "a top-level serverInfo cannot coexist with a final _meta identity"
+        );
         assert_eq!(
             serde_json::to_vec(&admitted).expect("the admitted result still encodes"),
             unchanged_before,
