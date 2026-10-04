@@ -50,7 +50,29 @@ push a percentage *up*. Compare the *sets* of failing check ids, which is what
 `scripts/conformance-expected-failures.yaml` records and what the suite's own
 `--expected-failures` gates on.
 
-No FAILURE-level check remains. The four SHOULD-level warnings are enumerated in
+**Client mode is a different and much worse story, and the plan requires both.**
+The gate is the harness passing in *both* modes. Client mode was first measured
+on 2026-10-04 and stands at 32 scenarios / 143 checks: SUCCESS=21, FAILURE=59,
+SKIPPED=11, WARNING=1, INFO=51. That headline is misleading without its
+decomposition, so do not quote it alone:
+
+- **44 of the 59** are the authorization suite (`iss-*`, `metadata-*`,
+  `scope-*`, `token-endpoint-auth-*`, registration and migration). The
+  client adapter supplies no interactive OAuth driver and says so in its own
+  module docs, so these measure the *adapter's* absence, not the library's
+  behaviour. They are consistent with OAuth/OIDC being unpromoted below.
+- **7** never send a single MCP request: the modern client refuses to connect
+  to any server that returns `Mcp-Session-Id`, and the harness's scenario
+  servers always send it.
+- **1** is a discovery response rejected over a tool schema carrying a network
+  `$ref`.
+- **5** are `sep-2322-client-request-state` checks whose artifacts carry no
+  error message and which have not yet been diagnosed.
+
+So server-mode conformance is measured and clean; client-mode conformance is
+measured and **not** claimed.
+
+No server-mode FAILURE-level check remains. The four SHOULD-level warnings are enumerated in
 that same file; two are the absent runtime catalog-mutation API, and two are a
 deliberate fail-closed choice about empty MRTR response maps that the suite
 would prefer we relax.
