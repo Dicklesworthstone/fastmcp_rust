@@ -4528,34 +4528,30 @@ exit 73
     #[cfg(unix)]
     #[cfg(all(feature = "apps", feature = "legacy-2024-11-05"))]
     #[test]
-    fn default_builder_auto_falls_back_on_an_invalid_params_discovery_refusal() {
-        // Plan 0.3 / CLT-02: under Auto, ANY well-formed non-modern JSON-RPC
-        // error to the first `server/discover` is the legacy branch. Exact
-        // 2024-11-05 servers answer an unknown pre-initialize request with
-        // -32601, -32602, or an implementation-defined error, so keying the
-        // fallback to -32601 alone strands Auto against real legacy peers.
-        // This differs from the -32601 fallback fixture only in the code; the
-        // recognized-modern -32022 sibling below is the planted negative.
+    fn default_builder_auto_rejects_invalid_params_discovery_without_legacy_fallback() {
+        // This differs from the accepted default-Auto fallback fixture only in
+        // the discovery error code. If Auto starts a legacy child for -32602,
+        // the fixture's initialize branch succeeds and this test incorrectly
+        // receives a live legacy client. -32602 means the peer knows
+        // server/discover, so it proves the modern era (#80).
         let script = auto_legacy_lifecycle_script(-32602);
-        let mut client = block_on(
-            ClientBuilder::new()
-                .mcp_apps(
-                    McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
-                        .expect("valid Apps MIME settings"),
-                )
-                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script.as_str()]),
-        )
-        .expect("a non-modern discovery refusal starts a fresh exact legacy client");
-
-        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
-        assert_eq!(
-            client.selected_protocol_era(),
-            Some(fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024)
+        let builder = ClientBuilder::new().mcp_apps(
+            McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
+                .expect("valid Apps MIME settings"),
         );
-        client
-            .ping()
-            .expect("the Auto-selected legacy client is usable");
-        client.close().expect("Auto-selected legacy client cleanup");
+        let state_before_connect = builder.selected_protocol_plan().clone();
+
+        let error = match block_on(builder.clone().connect_stdio_with_cx(
+            &Cx::for_request(),
+            "sh",
+            &["-c", script.as_str()],
+        )) {
+            Ok(_) => panic!("invalid discovery parameters must not authorize legacy fallback"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(builder.selected_protocol_plan(), &state_before_connect);
     }
 
     #[cfg(unix)]
