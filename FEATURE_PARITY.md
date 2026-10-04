@@ -14,7 +14,7 @@
 Toolchain: pinned `nightly-2026-08-25` / rustc 1.100.0-nightly (`rust-version = "1.100"`).  
 The current public `PROTOCOL_VERSION` remains `2024-11-05`. Newer protocol types and method handlers present in the tree do not, by themselves, establish negotiated MCP 2026-07-28 support. Production JWT (`jsonwebtoken`), Docket/Redis, Apps media rendering, and aggregate release-gate claims are **not** FND-01 deliverables.
 
-The workspace version is `0.10.0`; versions through `0.10.0` have been published (crates.io, 2026-09-13; tag `v0.10.0`). Publication does not resolve the open release-qualification and license-representation findings, and this document supplies neither aggregate conformance evidence nor proof that historical workflows, queued runs, and credentials are inert.
+The workspace version is `0.11.0`; versions through `0.11.0` have been published (crates.io, 2026-10-04; tag `v0.11.0`). Publication does not resolve the open release-qualification and license-representation findings, and this document supplies neither aggregate conformance evidence nor proof that historical workflows, queued runs, and credentials are inert.
 
 ### Current qualification snapshot
 

@@ -6,7 +6,18 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ---
 
-## Unreleased
+## [v0.11.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.11.0) -- 2026-10-04 (GitHub Release)
+
+### Auto protocol fallback (#80)
+
+- Under `ProtocolPolicy::Auto`, a stdio client falls back to exact 2024-11-05
+  only when the first `server/discover` is answered with `-32601` Method not
+  found (or a clean first-probe timeout, as before). `-32602`, application
+  errors and the recognized modern errors (`-32020`..=`-32022`) prove a modern
+  peer and are never a downgrade signal. This reverts a pre-release change
+  that would have let a misbehaving or hostile server force the legacy
+  protocol.
+
 
 ### HTTP disconnect cancellation (#76)
 
@@ -72,10 +83,8 @@ Format: version timeline, organized by landed capabilities. Commit links point t
   single-use `requestState`, like sampling and roots.
 - Elicitation `mode` defaults to `form` when absent. `SamplingCapability`
   carries `tools` and `context`.
-- Under `Auto`, a stdio client falls back to exact 2024-11-05 on any
-  well-formed non-modern error to its first discovery (`-32601`, `-32602`, or
-  an application code). The recognized modern errors `-32020`, `-32021` and
-  `-32022` keep the modern era.
+- Under `Auto`, only `-32601` to the first discovery falls back to exact
+  2024-11-05; see "Auto protocol fallback" above.
 - `fastmcp install` works on macOS and other non-Linux Unix. It replaces the
   config atomically and keeps a hard-linked backup of the previous file.
 - The README server snippets use `auto::ServerBuilder`, so they also serve the

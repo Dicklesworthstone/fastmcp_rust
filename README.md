@@ -24,7 +24,7 @@
 > `PROTOCOL_VERSION` is `2024-11-05`; the modern facade's
 > `modern::PROTOCOL_VERSION` is `2026-07-28`. Source presence, examples, and
 > historical parity rows are not conformance or release evidence. Versions
-> through 0.10.0 have been published, but publication and source edits alone do
+> through 0.11.0 have been published, but publication and source edits alone do
 > not prove historical workflow identities, queued runs, or credentials inert;
 > provider-side release-safety evidence is still required.
 
@@ -139,7 +139,7 @@ scenarios, including every input-required one, so a measurement taken without
 
 ```bash
 # Current published package; publication is not aggregate conformance evidence
-cargo add fastmcp-rust@0.10.0
+cargo add fastmcp-rust@0.11.0
 
 # Or use the git dependency for bleeding-edge changes
 cargo add fastmcp-rust --git https://github.com/Dicklesworthstone/fastmcp_rust
@@ -407,15 +407,15 @@ These are FastMCP Rust design surfaces, not benchmark results or an MCP 2026-07-
 
 ## Installation
 
-### From crates.io (current 0.10.0 package)
+### From crates.io (current 0.11.0 package)
 
-The `0.10.0` package was published on 2026-09-13. Publication does
+The `0.11.0` package was published on 2026-10-04. Publication does
 not establish aggregate MCP 2026-07-28 conformance, production readiness, or
 qualification of every in-tree feature.
 
 ```toml
 [dependencies]
-fastmcp-rust = "0.10.0"
+fastmcp-rust = "0.11.0"
 ```
 
 ### As a Git Dependency
@@ -436,7 +436,7 @@ cargo build --release
 
 ### CLI binaries (GitHub Releases)
 
-The latest published release, v0.10.0, provides prebuilt `fastmcp` binaries on
+The latest published release, v0.11.0, provides prebuilt `fastmcp` binaries on
 GitHub Releases. The `fastmcp-cli` source package is also available from
 crates.io for Cargo-based installation. Archives follow a `fastmcp-<os>-<arch>`
 pattern (`.tar.xz` on Unix, `.zip` on Windows).
@@ -444,23 +444,24 @@ pattern (`.tar.xz` on Unix, `.zip` on Windows).
 **This repository does not establish what the published archives are named.**
 The checked-in release workflow is a quarantined verification surface and does
 not publish new GitHub Releases: it has held `contents: read` since 2026-08-02,
-and that permission cannot create a Release. The v0.10.0 tag postdates it
-(tagged 2026-09-13 on a commit dated 2026-09-12), so this repository does not establish whether those archives are
-downloadable either, and nothing in it can. That workflow's build matrix — the
+and that permission cannot create a Release. v0.11.0 was built and published
+with the maintainer's local release tooling, not this workflow, so this
+repository does not establish whether those archives are downloadable either,
+and nothing in it can. That workflow's build matrix — the
 `SURF-RELEASE-ASSET-CLOSURE` rows in
 `evidence/fnd-01/dependency-verification.toml` — describes what the quarantined
 workflow *would* produce, which is not evidence of what the release contains;
 do not read it as the published filenames.
 
-Take the exact filename from the v0.10.0 release page. The command below pins
+Take the exact filename from the v0.11.0 release page. The command below pins
 the tag rather than `releases/latest` — under a workflow that does not publish,
 `latest` is a moving pointer whose meaning is not stated anywhere.
 **If the download does not resolve, build from source as shown above; that path
 is verified by this repository and the download is not.**
 
 ```bash
-# Replace <asset> with the exact filename listed on the v0.10.0 release page.
-curl -fsSL -O https://github.com/Dicklesworthstone/fastmcp_rust/releases/download/v0.10.0/<asset>
+# Replace <asset> with the exact filename listed on the v0.11.0 release page.
+curl -fsSL -O https://github.com/Dicklesworthstone/fastmcp_rust/releases/download/v0.11.0/<asset>
 tar -xJf <asset>
 ./fastmcp --version
 ```
@@ -469,7 +470,7 @@ tar -xJf <asset>
 
 ```bash
 rustup toolchain install nightly-2026-08-25
-cargo +nightly-2026-08-25 install fastmcp-cli --version 0.10.0 --locked
+cargo +nightly-2026-08-25 install fastmcp-cli --version 0.11.0 --locked
 ```
 
 ### Client request deadlines (current source tree)
@@ -589,7 +590,7 @@ same client. An already-admitted valid task result survives caller cancellation;
 other results remain cancellation-first. Input-required results are returned
 without automatic continuation. Pipe writes remain synchronous.
 
-The published 0.10.0 CLI includes these flags. From a current source checkout,
+The published 0.11.0 CLI includes these flags. From a current source checkout,
 run the CLI through the workspace to configure the two limits independently:
 
 ```bash
@@ -611,8 +612,8 @@ portable process-tree containment or a substitute for Windows Job Objects.
 Build the CLI with `--features tasks` to expose `tasks get`, `watch`, `update`,
 and `cancel`. These commands require modern MCP and bilateral
 `io.modelcontextprotocol/tasks` support. The pinned extension is experimental;
-this source implementation remains provisional. The published 0.10.0 binary
-does not include these commands.
+this source implementation remains provisional. The published default
+binaries do not include these commands.
 
 ```bash
 cargo run -p fastmcp-cli --features tasks -- tasks get TASK_ID --http-url http://127.0.0.1:8000/mcp --json
