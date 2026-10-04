@@ -61,13 +61,18 @@ decomposition, so do not quote it alone:
   client adapter supplies no interactive OAuth driver and says so in its own
   module docs, so these measure the *adapter's* absence, not the library's
   behaviour. They are consistent with OAuth/OIDC being unpromoted below.
-- **7** never send a single MCP request: the modern client refuses to connect
-  to any server that returns `Mcp-Session-Id`, and the harness's scenario
-  servers always send it.
-- **1** is a discovery response rejected over a tool schema carrying a network
-  `$ref`.
-- **5** are `sep-2322-client-request-state` checks whose artifacts carry no
-  error message and which have not yet been diagnosed.
+- **13** never send a single MCP request, because the modern client refuses the
+  connection at discovery. Two fail-closed validator choices account for all of
+  them: **7** because a server returned `Mcp-Session-Id` (which the harness's
+  scenario servers always send), and **6** because the discovery result carried
+  a top-level `serverInfo` sibling — fatal even when the authoritative
+  `_meta.io.modelcontextprotocol/serverInfo` is also present and valid, and the
+  schema leaves `DiscoverResult` open to unrecognized siblings.
+
+Every non-auth client-mode failure is therefore a connect-time refusal, not a
+behavioural defect: no request is ever sent. Both refusals are deliberate and
+pinned by passing tests, so relaxing either is a reviewed decision rather than a
+fix.
 
 So server-mode conformance is measured and clean; client-mode conformance is
 measured and **not** claimed.
