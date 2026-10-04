@@ -25,12 +25,27 @@
 //! The adapter never branches on the scenario name: what the suite measures
 //! is the library's behaviour, not fixture-specific code.
 //!
+//! A listed tool whose `x-mcp-header` annotations are invalid is EXCLUDED
+//! rather than called, which SEP-2243 requires of a client. The decision is
+//! the library's: `admit_final_tool_input_schema` enforces the header rules
+//! only when the schema carries annotations.
+//!
 //! Not covered: the authorization scenarios (`auth/*`), which need an
 //! interactive OAuth driver configuration this adapter does not supply.
+//!
+//! Also not covered: EMITTING `Mcp-Param-*` mirrors. The library implements
+//! this fully (`HttpClient::call_tool_with_parameter_headers` plus
+//! `ReviewedToolHeaders`), but `ReviewedToolHeaders::new` requires an `https`
+//! resource and the harness serves `http://127.0.0.1:<port>/mcp`, so the plan
+//! cannot be constructed in the scenario at all. That is a library-side
+//! decision (loopback HTTP is not the confidentiality risk that cleartext
+//! HTTPS-substitute traffic is, and the server already admits loopback for
+//! DNS-rebinding purposes), so it is tracked rather than worked around here.
 
 use std::collections::HashMap;
 use std::process::ExitCode;
 
+use fastmcp_protocol::http_headers::admit_final_tool_input_schema;
 use fastmcp_protocol::{ElicitContentValue, ElicitRequestParams, ElicitResult};
 use fastmcp_rust::modern::{
     CanonicalHttpUrl, ClientBuilder, ClientCapabilities, Cx, McpError, ReverseRequestHandlers,
@@ -133,9 +148,21 @@ async fn run(cx: &Cx, url: &str) -> Result<(), String> {
         let Some(name) = tool.get("name").and_then(Value::as_str) else {
             continue;
         };
-        let arguments = tool
-            .get("inputSchema")
-            .map_or_else(|| json!({}), arguments_for);
+        let schema = tool.get("inputSchema");
+        // SEP-2243: a tool whose `x-mcp-header` annotations are invalid MUST be
+        // EXCLUDED rather than called -- an empty or non-ASCII header name, a
+        // name carrying a space, colon or control character, a duplicate name
+        // (in any case), or an annotation on a non-primitive location. The
+        // library already decides this; admission enforces the header rules
+        // only when the schema actually carries annotations, so a tool with no
+        // `x-mcp-header` is unaffected and still called.
+        if let Some(schema) = schema
+            && let Err(error) = admit_final_tool_input_schema(schema.clone())
+        {
+            eprintln!("tools/list {name} excluded: invalid parameter-header schema: {error}");
+            continue;
+        }
+        let arguments = schema.map_or_else(|| json!({}), arguments_for);
         calls.push((name.to_owned(), arguments));
     }
     // The harness may name exact arguments for a listed tool; a call it names
