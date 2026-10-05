@@ -269,8 +269,12 @@ echo "RECEIPT_DISCOVERED=\$(wc -l < \$RUNTMP/vb_discovered.txt | tr -d ' ')"
 cargo +$TOOLCHAIN test --locked $SCOPE $feature_args -- $thread_args "\$@" > \$RUNTMP/vb_run.log 2>&1
 run_rc=\$?
 echo "RECEIPT_RUN_RC=\$run_rc"
-grep -oE '^test [^ ]+ \.\.\. ' \$RUNTMP/vb_run.log \
-    | sed 's/^test //; s/ \.\.\. \$//' | sort -u > \$RUNTMP/vb_executed.txt
+grep -oE '^test [^ ]+ \.\.\. (ok|FAILED)' \$RUNTMP/vb_run.log \
+    | sed 's/^test //; s/ \.\.\. .*\$//' | sort -u > \$RUNTMP/vb_executed.txt
+grep -oE '^test [^ ]+ \.\.\. ignored' \$RUNTMP/vb_run.log \
+    | sed 's/^test //; s/ \.\.\. ignored\$//' | sort -u > \$RUNTMP/vb_ignored.txt
+echo "RECEIPT_IGNORED_IDS=\$(wc -l < \$RUNTMP/vb_ignored.txt | tr -d ' ')"
+grep -E '^test .* \.\.\. ignored' \$RUNTMP/vb_run.log | head -20 | sed 's/^/RECEIPT_IGNORED /'
 echo "RECEIPT_EXECUTED=\$(wc -l < \$RUNTMP/vb_executed.txt | tr -d ' ')"
 grep -E '^test result' \$RUNTMP/vb_run.log | sed 's/^/RECEIPT_RESULT /'
 grep -E '^test .* FAILED' \$RUNTMP/vb_run.log | head -40 | sed 's/^/RECEIPT_FAILED /'
@@ -288,6 +292,7 @@ printf '== run ==\ncargo test --locked %s %s -- %s %s\n\n' \
 remote_rc=$?
 "${SSH[@]}" "cat '$remote_dir/.vb-run/vb_discovered.txt'" > "$OUT/discovered.txt" 2>/dev/null || :
 "${SSH[@]}" "cat '$remote_dir/.vb-run/vb_executed.txt'"   > "$OUT/executed.txt"   2>/dev/null || :
+"${SSH[@]}" "cat '$remote_dir/.vb-run/vb_ignored.txt'"    > "$OUT/ignored.txt"    2>/dev/null || :
 
 # Subject identity AFTER the run. Movement invalidates the receipt.
 git status --porcelain --untracked-files=no > "$OUT/dirty-after.txt"
@@ -369,8 +374,10 @@ if not still_current:
                     'manifest digest above, NOT the current working tree')
 if not check_only and field('RUN_RC') not in (None, '0') and not failed:
     reasons.append(f'runner exited {field("RUN_RC")} without reporting any failure: early abort')
+ignored_ids = ids('ignored.txt')
 if ignored:
-    warnings.append(f'{ignored} test(s) ignored: an #[ignore] body is not evidence')
+    warnings.append(f'{ignored} test(s) ignored and therefore NOT executed: '
+                    f'an #[ignore] body is not evidence. {ignored_ids[:5]}')
 if filtered and not filters.strip():
     warnings.append(f'{filtered} test(s) filtered out with no --filter requested')
 elif filtered:
@@ -423,7 +430,8 @@ receipt = {
         'discovered_listed': field('DISCOVERED'), 'executed_named': field('EXECUTED'),
         'passed': passed, 'failed': failed, 'ignored': ignored, 'filtered_out': filtered,
     },
-    'test_ids': {'discovered': discovered, 'executed': executed},
+    'test_ids': {'discovered': discovered, 'executed': executed,
+                 'ignored': ignored_ids},
     'beads': [b for b in beads.split(',') if b],
     'mode': 'check-only (compile gate)' if check_only else 'test run',
     'verdict': 'INVALID' if reasons else 'GREEN',
