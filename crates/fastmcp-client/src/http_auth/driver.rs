@@ -27,6 +27,9 @@ use super::CanonicalHttpUrl;
 use super::managed::{ManagedOAuthSession, OAuthSessionError, OAuthSessionPolicy};
 use super::oauth::{OAuthClient, OAuthCredentials, OAuthError};
 
+/// Direct-redirect driving for explicitly pre-authorized HTTPS issuers.
+pub mod redirect;
+
 /// The operation's original error or a sanitized driver/lifetime failure.
 /// Diagnostic formatting deliberately does not print the operation's error.
 pub enum AuthorizationDriverError<E> {
