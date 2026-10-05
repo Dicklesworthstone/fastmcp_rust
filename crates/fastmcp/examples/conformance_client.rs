@@ -136,8 +136,21 @@ fn prepare_tool_call(
                 approve_fixture_header,
             )
         }
-        .map_err(|error| format!("parameter-header disclosure refused: {error}"))?;
-        Some(reviewed)
+        .map_err(|error| format!("parameter-header disclosure refused: {error}"));
+        // A refused DISCLOSURE PLAN must not exclude the tool. Only an invalid
+        // `x-mcp-header` schema may, and that was decided above. SEP-2243 is
+        // explicit that one malformed tool definition must not prevent other
+        // valid tools from being used, and the harness fails
+        // `sep-2243-client-reject-invalid-tool` when a valid tool goes
+        // uncalled. So a plan failure degrades to an ordinary unmirrored call
+        // and says so, rather than silently dropping the tool.
+        match reviewed {
+            Ok(reviewed) => Some(reviewed),
+            Err(error) => {
+                eprintln!("tools/call {name}: {error}; calling without header mirrors");
+                None
+            }
+        }
     } else {
         None
     };
@@ -195,9 +208,42 @@ fn handlers() -> ReverseRequestHandlers {
         })
 }
 
+/// Rewrites an `http://localhost[:port]` target to its IPv4 loopback literal.
+///
+/// `ReviewedToolHeaders::new_for_loopback_http` admits only canonical loopback
+/// LITERALS and deliberately refuses DNS names, `localhost` included, because a
+/// name can be rebound and is therefore not proof of a loopback peer. The
+/// official harness hands every scenario URL out as
+/// `http://localhost:<port>/mcp`, so without this the library's rule makes
+/// parameter-header mirroring unreachable in conformance.
+///
+/// Resolving the name is the HOST's decision to make, not the library's, which
+/// is exactly why it happens here: this adapter asserts that it trusts
+/// `localhost` on the machine running the harness, and the library's literal
+/// -only boundary stays intact. The rewrite is applied ONCE, before connecting,
+/// so the connection and the plan are bound to the same canonical URL -- a plan
+/// built for a different authority than the connection would be refused at
+/// dispatch.
+fn normalize_loopback_target(url: &str) -> String {
+    for prefix in ["http://localhost:", "http://localhost/"] {
+        if let Some(rest) = url.strip_prefix(prefix) {
+            let separator = &prefix["http://localhost".len()..];
+            return format!("http://127.0.0.1{separator}{rest}");
+        }
+    }
+    if url == "http://localhost" {
+        return "http://127.0.0.1".to_owned();
+    }
+    url.to_owned()
+}
+
 async fn run(cx: &Cx, url: &str) -> Result<(), String> {
+    let target = normalize_loopback_target(url);
+    if target != url {
+        eprintln!("normalized loopback target {url} -> {target}");
+    }
     let endpoint =
-        CanonicalHttpUrl::parse(url).map_err(|error| format!("bad URL {url}: {error}"))?;
+        CanonicalHttpUrl::parse(&target).map_err(|error| format!("bad URL {target}: {error}"))?;
     let capabilities: ClientCapabilities = serde_json::from_value(json!({
         "sampling": {},
         "roots": {},
@@ -240,12 +286,19 @@ async fn run(cx: &Cx, url: &str) -> Result<(), String> {
             Ok(call) => calls.push(call),
             Err(error) => eprintln!(
                 "tools/list {} excluded: {error}",
-                tool.get("name").and_then(Value::as_str).unwrap_or("<unnamed>")
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unnamed>")
             ),
         }
     }
     apply_context_tool_calls(&mut calls, context_tool_calls());
-    for PreparedToolCall { name, arguments, headers } in calls {
+    for PreparedToolCall {
+        name,
+        arguments,
+        headers,
+    } in calls
+    {
         let outcome = match headers {
             Some(reviewed) => {
                 client
@@ -480,9 +533,17 @@ mod tests {
             .collect();
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].0, "Mcp-Param-Region");
-        assert_eq!(decode_mcp_header_value(fields[0].1.as_bytes()).unwrap(), "雪\r\n");
+        assert_eq!(
+            decode_mcp_header_value(fields[0].1.as_bytes()).unwrap(),
+            "雪\r\n"
+        );
         assert!(!fields[0].1.contains(['\r', '\n']));
-        assert!(!request.headers().iter().any(|(_, value)| value.contains("body-only-canary")));
+        assert!(
+            !request
+                .headers()
+                .iter()
+                .any(|(_, value)| value.contains("body-only-canary"))
+        );
     }
 
     #[test]
@@ -497,8 +558,11 @@ mod tests {
         }}});
         let call = prepare_tool_call(&endpoint, &tool).unwrap();
         assert!(call.headers.is_none());
-        assert_eq!(call.arguments, json!({
-            "constant":"fixed", "enum":"first", "nested":{"flag":true,"number":1}
-        }));
+        assert_eq!(
+            call.arguments,
+            json!({
+                "constant":"fixed", "enum":"first", "nested":{"flag":true,"number":1}
+            })
+        );
     }
 }
