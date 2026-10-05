@@ -31,6 +31,9 @@ use super::{
     validate_headers, validate_https, within,
 };
 
+/// Native Client ID Metadata Documents without dynamic registration writes.
+pub mod metadata_document;
+
 /// Exact loopback URI templates used by the existing native OAuth driver.
 /// RFC 8252 section 7.3 requires the authorization server to permit the actual
 /// ephemeral port at authorization time. Both address families are registered
