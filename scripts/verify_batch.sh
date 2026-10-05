@@ -114,6 +114,12 @@ SSH=(ssh -i "$KEY" -o BatchMode=yes -o ConnectTimeout=25 "$WORKER")
 # The path set is recorded in the receipt so the scope of the claim is explicit.
 # ---------------------------------------------------------------------------
 MANIFEST_PATHS='Cargo.toml Cargo.lock rust-toolchain.toml crates'
+# NOTE: the manifest deliberately excludes evidence/ and .github/, which ARE
+# synced because test targets read them at compile time. So a run whose subject
+# is an evidence file (FND-01 probes, dependency-verification.toml) is NOT bound
+# by the manifest digest: that digest can be identical across two different
+# evidence trees. Bind such a claim to the evidence file's own sha256 instead --
+# the dependency-verification.toml [[source_input]] rows already carry one.
 
 # `.github` and `evidence` are here because test targets read them at COMPILE
 # time via include_str!/include_bytes! (fnd_01_dependency_evidence.rs :19048,
