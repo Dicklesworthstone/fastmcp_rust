@@ -71,13 +71,23 @@
 //!
 //! The issuer must already permit this fixture's authorization; login pages
 //! and consent forms are refused. After login, the same generic MCP flow uses
-//! the admitted credential. Traffic ends at the configured limit or access
-//! expiry; dropping the run revokes local credential clones. Protected names,
-//! payloads and error details are not included in adapter diagnostics.
+//! the admitted credential. By default, traffic ends at the configured limit
+//! or original access expiry; dropping the run revokes local credential clones.
+//! Protected names, payloads and error details are omitted from diagnostics.
+//!
+//! Set `FASTMCP_CONFORMANCE_MANAGED_REFRESH=1` (or `true`) alongside the OAuth
+//! configuration to retain the refresh grant in a `ManagedOAuthSession` and
+//! drive these same operations through `ManagedHttpClient`. Renewal happens
+//! before a new operation, never as replay of a failed request or silent login.
+//! Credential changes discard old discovery/cache state and cursor custody.
+//! Every active operation stays bound to its original token's lifetime; the
+//! overall traffic timeout never restarts when a token rotates. The run owner
+//! closes every generation on drop. `0`, `false` and absence keep the original
+//! fixed-token mode; other flag values or enabling without OAuth are errors.
 //!
 //! This is NOT a complete auth-suite driver: HTTP-only authorization fixtures,
-//! managed refresh, consent UI and other authorization profiles remain outside
-//! this executable. Source wiring and local tests are not conformance results.
+//! consent UI and other authorization profiles remain outside this executable.
+//! Source wiring and local tests are not official-conformance results.
 
 use std::collections::HashMap;
 use std::process::ExitCode;
@@ -95,6 +105,7 @@ use fastmcp_protocol::{
 use serde_json::{Value, json};
 
 mod conformance_oauth;
+use conformance_oauth::managed::{self, ClientError, FixtureClient};
 
 /// A schema-shaped placeholder for one property.
 fn placeholder(schema: &Value) -> Value {
@@ -291,15 +302,10 @@ fn failure(operation: &str, error: &impl std::fmt::Debug, protected: bool) -> St
 
 fn optional_catalog_failure(
     operation: &str,
-    error: &fastmcp_client::HttpClientError,
+    error: &ClientError,
     protected: bool,
 ) -> Result<(), String> {
-    let unsupported = matches!(
-        error,
-        fastmcp_client::HttpClientError::CoreResult(error)
-            if error.code == fastmcp_core::McpErrorCode::MethodNotFound
-    );
-    if protected && !unsupported {
+    if protected && !error.is_method_not_found() {
         return Err(failure(operation, error, true));
     }
     eprintln!("{}", failure(operation, error, protected));
@@ -318,6 +324,12 @@ async fn run(cx: &Cx, url: &str) -> Result<(), String> {
         Err(std::env::VarError::NotPresent) => None,
         Err(_) => return Err("OAuth fixture configuration is not UTF-8".to_owned()),
     };
+    let refresh_flag = match std::env::var(managed::ENVIRONMENT) {
+        Ok(flag) => Some(flag),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => return Err("managed-refresh flag is not UTF-8".to_owned()),
+    };
+    let managed_refresh = managed::selected(refresh_flag.as_deref(), oauth.is_some())?;
     let capabilities: ClientCapabilities = serde_json::from_value(json!({
         "sampling": {},
         "roots": {},
@@ -347,9 +359,21 @@ async fn run(cx: &Cx, url: &str) -> Result<(), String> {
         .client_info("fastmcp-rust-conformance-client", "0.10.0")
         .capabilities(capabilities)
         .reverse_request_handlers(handlers());
+    if managed_refresh {
+        let raw = oauth.as_deref().ok_or_else(|| "managed refresh requires OAuth".to_owned())?;
+        let grant = managed::configure(cx, &endpoint, builder, raw).await?;
+        let mut client = grant.client()?;
+        return grant.run(cx, exercise(cx, &endpoint, &mut client, true)).await;
+    }
     let (builder, authorization) =
         conformance_oauth::configure(cx, &endpoint, builder, oauth.as_deref()).await?;
-    let flow = exercise(cx, &endpoint, builder, authorization.is_some());
+    let protected = authorization.is_some();
+    // Keep connection/discovery inside the fixed lease's lifetime too.
+    let flow = async {
+        let mut client = FixtureClient::ordinary(cx, builder).await
+            .map_err(|error| failure("connect", &error, protected))?;
+        exercise(cx, &endpoint, &mut client, protected).await
+    };
     match authorization {
         Some(grant) => grant.run(cx, flow).await,
         None => flow.await,
@@ -359,13 +383,9 @@ async fn run(cx: &Cx, url: &str) -> Result<(), String> {
 async fn exercise(
     cx: &Cx,
     endpoint: &CanonicalHttpUrl,
-    builder: ClientBuilder,
+    client: &mut FixtureClient,
     protected: bool,
 ) -> Result<(), String> {
-    let mut client = builder
-        .connect_http_client_with_cx(cx)
-        .await
-        .map_err(|error| failure("connect", &error, protected))?;
     let listed = client
         .list_tools(cx, None)
         .await
@@ -705,15 +725,15 @@ mod tests {
         );
         assert!(!failure("connect", &secret, true).contains(secret));
         assert!(failure("connect", &secret, false).contains(secret));
-        let denied = fastmcp_client::HttpClientError::CoreResult(McpError::invalid_request(secret));
+        let denied: ClientError = fastmcp_client::HttpClientError::CoreResult(McpError::invalid_request(secret)).into();
         assert!(
             !optional_catalog_failure("resources/list", &denied, true)
                 .unwrap_err()
                 .contains(secret)
         );
-        let unsupported = fastmcp_client::HttpClientError::CoreResult(McpError::method_not_found(
+        let unsupported: ClientError = fastmcp_client::HttpClientError::CoreResult(McpError::method_not_found(
             "resources/list",
-        ));
+        )).into();
         assert!(optional_catalog_failure("resources/list", &unsupported, true).is_ok());
     }
 }

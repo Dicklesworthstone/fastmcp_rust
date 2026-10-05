@@ -26,7 +26,9 @@
 //! The existing short-lived grant lease separately bounds authenticated traffic.
 //!
 //! This is a native public-client, pre-authorized direct-redirect profile, not
-//! a browser/consent agent, managed-refresh adapter, or complete auth-suite claim.
+//! a browser/consent agent or complete auth-suite claim. The fixed-credential
+//! entry point below does not renew; `managed` composes the same login policy
+//! with the library's shared refresh-grant owner and high-level HTTP client.
 
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -45,6 +47,9 @@ use fastmcp_client::http_auth::oauth::{OAuthClient, OAuthClientConfiguration};
 use fastmcp_client::{ClientBuilder, ProtocolPolicy};
 use fastmcp_core::{CanonicalHttpUrl, Cx};
 use serde::{Deserialize, Deserializer};
+
+/// Opt-in managed renewal using the same local configuration and login policy.
+pub(super) mod managed;
 
 pub(super) const ENVIRONMENT: &str = "FASTMCP_CONFORMANCE_OAUTH";
 const INVALID: &str = "invalid explicit HTTPS OAuth fixture configuration";
