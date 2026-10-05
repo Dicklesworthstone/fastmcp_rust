@@ -407,7 +407,10 @@ mod tests {
                 let mut future = Box::pin(guarded(&cx, &cancellation, cx.now().saturating_add_nanos(60_000_000_000), Some(&credential), std::future::pending::<Result<(), ManagedHttpClientError>>()));
                 assert!(future.as_mut().poll(&mut task).is_pending());
                 let before = wakes.0.load(Ordering::SeqCst);
-                match kind { 0 => credential.revoke(), 1 => owner.cancel(), _ => cancellation.cancel() }
+                // `revoke` returns (), both `cancel`s return bool, so the arms
+                // need unifying; neither cancel is #[must_use] and the wake is
+                // asserted below rather than taken from the return value.
+                match kind { 0 => credential.revoke(), 1 => { owner.cancel(); }, _ => { cancellation.cancel(); } }
                 assert!(wakes.0.load(Ordering::SeqCst) > before);
                 let result = future.await;
                 match kind {
