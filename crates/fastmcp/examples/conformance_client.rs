@@ -23,11 +23,12 @@
 //! a different implementation, and no private/raw transport bypass is used.
 //!
 //! Invalid `x-mcp-header` annotations exclude a tool through the library's
-//! schema admission. Valid annotated tools get an explicitly reviewed plan
-//! bound to the configured HTTPS or numeric-loopback HTTP endpoint. Calls use
-//! `HttpClient::call_tool_with_reviewed_headers`, including its bounded schema
-//! repair and MRTR handling. Unannotated tools retain ordinary tool calls.
-//! Projection reads the actual outgoing body, including harness overrides.
+//! schema admission. Valid annotated tools request an explicitly reviewed plan
+//! bound to the configured HTTPS or numeric-loopback HTTP endpoint. Accepted
+//! plans use `HttpClient::call_tool_with_reviewed_headers`, including bounded
+//! schema repair and MRTR handling. A refused disclosure plan preserves the
+//! valid tool as an ordinary unmirrored call; it never installs refused fields.
+//! Unannotated tools retain ordinary calls. Projection reads the actual body.
 //!
 //! This executable explicitly approves disclosure of its synthetic fixture
 //! arguments (including harness-supplied test values); that is an adapter
@@ -40,24 +41,43 @@
 //!
 //! Set `FASTMCP_CONFORMANCE_OAUTH` to a JSON object with
 //! `preauthorized_redirect: true`, `issuer`, `authorization_endpoint`,
-//! `token_endpoint`, `resource`, `client_id`, and optional `scopes` and
-//! `timeout_seconds` (1..=900, default 60). The configured resource must equal
-//! the command-line HTTPS endpoint. Optional `authorization_root_pem`,
-//! `token_root_pem`, and `resource_root_pem` each contain one explicitly trusted
-//! CA certificate for that endpoint only. No key or bearer-token input exists.
+//! `resource`, and optional `scopes` and `timeout_seconds` (1..=900, default 60).
+//! The resource must equal the command-line HTTPS endpoint. The authorization
+//! endpoint is a local front-channel pin, not a URL selected from a challenge.
 //!
-//! This opts into the native public-client S256 authorization-code flow and
-//! its bounded direct-redirect browser driver. The issuer must already permit
-//! this fixture's authorization; login pages and consent forms are refused.
-//! A malformed config or failed login never falls back to anonymous traffic.
-//! Discovery and the same generic operations then use the admitted credential.
-//! Traffic ends at the earlier configured limit or access expiry; dropping the
-//! run revokes local credential clones. Protected results/errors are not logged.
+//! Without `discovery`, supply `client_id` and `token_endpoint` as before.
+//! Optional `authorization_root_pem`, `token_root_pem`, and `resource_root_pem`
+//! each contain one CA certificate for that endpoint's role only.
+//!
+//! With `discovery`, omit `token_endpoint` and `token_root_pem`. The configured
+//! issuer is the sole trusted issuer for PRM and issuer-metadata discovery.
+//! `discovery: {}` with `client_id` selects preregistered discovery. To use a
+//! published CIMD identity, supply `discovery.client_metadata` with `url` and
+//! `document_json` strings and omit `client_id`. The exact JSON bytes go through
+//! native metadata admission; this executable never publishes the document.
+//! A supplied preregistered ID takes precedence over a supplied CIMD identity.
+//!
+//! DCR fallback requires BOTH `discovery.allow_dynamic_registration: true` and
+//! `discovery.client_name`. Without that explicit permission, unsupported CIMD
+//! never causes a registration write. With permission, the library selects
+//! preregistration, supported CIMD, or one DCR attempt before login. Failed
+//! registration or login never selects another identity or anonymous access.
+//! A registration may already exist remotely when a later step fails.
+//!
+//! Optional `discovery.issuer_root_pem` trusts issuer metadata and token/DCR
+//! endpoints. Authorization trust remains separate; resource trust covers PRM
+//! and MCP POSTs. No key or bearer-token input or peer-derived trust is accepted.
+//! Discovery, registration, callbacks and redemption share an absolute deadline.
+//!
+//! The issuer must already permit this fixture's authorization; login pages
+//! and consent forms are refused. After login, the same generic MCP flow uses
+//! the admitted credential. Traffic ends at the configured limit or access
+//! expiry; dropping the run revokes local credential clones. Protected names,
+//! payloads and error details are not included in adapter diagnostics.
 //!
 //! This is NOT a complete auth-suite driver: HTTP-only authorization fixtures,
-//! DCR/discovery policy, managed refresh, consent UI, and other authorization
-//! profiles remain outside this executable's configured flow. Source wiring
-//! and local regression tests do not establish official conformance results.
+//! managed refresh, consent UI and other authorization profiles remain outside
+//! this executable. Source wiring and local tests are not conformance results.
 
 use std::collections::HashMap;
 use std::process::ExitCode;
@@ -112,6 +132,7 @@ struct PreparedToolCall {
     name: String,
     arguments: Value,
     headers: Option<ReviewedToolHeaders>,
+    header_review_refused: bool,
 }
 
 /// The operator runs this adapter against synthetic conformance fixtures.
@@ -141,7 +162,7 @@ fn prepare_tool_call(
     // broader generic admission route; they do not authorize any headers.
     let annotated = AdmittedToolHeaderSchema::admit(schema.clone())
         .is_ok_and(|admitted| !admitted.header_plan().bindings().is_empty());
-    let headers = if annotated {
+    let (headers, header_review_refused) = if annotated {
         let reviewed = if endpoint.scheme() == "https" {
             ReviewedToolHeaders::new(
                 endpoint.clone(),
@@ -156,30 +177,32 @@ fn prepare_tool_call(
                 schema.clone(),
                 approve_fixture_header,
             )
-        }
-        .map_err(|error| format!("parameter-header disclosure refused: {error}"));
-        // A refused DISCLOSURE PLAN must not exclude the tool. Only an invalid
-        // `x-mcp-header` schema may, and that was decided above. SEP-2243 is
-        // explicit that one malformed tool definition must not prevent other
-        // valid tools from being used, and the harness fails
-        // `sep-2243-client-reject-invalid-tool` when a valid tool goes
-        // uncalled. So a plan failure degrades to an ordinary unmirrored call
-        // and says so, rather than silently dropping the tool.
+        };
+        // The fixture's execution permission is independent of permission to
+        // disclose arguments through headers. Preserve the existing ordinary
+        // fallback for a valid tool, but do not log here: only the caller knows
+        // whether the peer-controlled name is protected information.
         match reviewed {
-            Ok(reviewed) => Some(reviewed),
-            Err(error) => {
-                eprintln!("tools/call {name}: {error}; calling without header mirrors");
-                None
-            }
+            Ok(reviewed) => (Some(reviewed), false),
+            Err(_) => (None, true),
         }
     } else {
-        None
+        (None, false)
     };
     Ok(PreparedToolCall {
         name: name.to_owned(),
         arguments: arguments_for(&schema),
         headers,
+        header_review_refused,
     })
+}
+
+fn header_review_notice(name: &str, protected: bool) -> String {
+    if protected {
+        "tools/call: parameter-header review refused; calling without header mirrors".to_owned()
+    } else {
+        format!("tools/call {name}: parameter-header review refused; calling without header mirrors")
+    }
 }
 
 fn apply_context_tool_calls(calls: &mut [PreparedToolCall], overrides: Vec<(String, Value)>) {
@@ -355,7 +378,12 @@ async fn exercise(
     let mut calls = Vec::new();
     for tool in tools.as_array().into_iter().flatten() {
         match prepare_tool_call(endpoint, tool) {
-            Ok(call) => calls.push(call),
+            Ok(call) => {
+                if call.header_review_refused {
+                    eprintln!("{}", header_review_notice(&call.name, protected));
+                }
+                calls.push(call);
+            }
             Err(_) if protected => eprintln!("tools/list excluded an inadmissible tool"),
             Err(error) => eprintln!(
                 "tools/list {} excluded: {error}",
@@ -370,6 +398,7 @@ async fn exercise(
         name,
         arguments,
         headers,
+        ..
     } in calls
     {
         let outcome = match headers {
@@ -536,6 +565,7 @@ mod tests {
         ] {
             let endpoint = CanonicalHttpUrl::parse(target).unwrap();
             let call = prepare_tool_call(&endpoint, &annotated_tool()).unwrap();
+            assert!(!call.header_review_refused);
             let reviewed = call.headers.unwrap();
             assert_eq!(reviewed.resource(), &endpoint);
             assert_eq!(reviewed.tool_name(), "lookup");
@@ -545,19 +575,34 @@ mod tests {
     }
 
     #[test]
-    fn denied_cleartext_review_never_falls_back_to_an_unmirrored_call() {
+    fn refused_header_review_preserves_valid_tools_without_installing_mirrors() {
         for target in ["http://192.0.2.1/mcp", "http://localhost/mcp"] {
             let endpoint = CanonicalHttpUrl::parse(target).unwrap();
-            assert!(prepare_tool_call(&endpoint, &annotated_tool()).is_err());
-            // No annotation means no disclosure plan is required. Do not make
-            // the explicit header constructor a new general transport rule.
+            let call = prepare_tool_call(&endpoint, &annotated_tool()).unwrap();
+            assert_eq!(call.name, "lookup");
+            assert!(call.headers.is_none());
+            assert!(call.header_review_refused);
+            assert_eq!(call.arguments, json!({"region":"conformance","private":"conformance"}));
+            // No annotation means no disclosure review was attempted. These
+            // ordinary tools must not acquire either a plan or a refusal notice.
             let ordinary = json!({"name":"plain","inputSchema":{
                 "type":"object","properties":{"value":{"type":"string"}}
             }});
             let call = prepare_tool_call(&endpoint, &ordinary).unwrap();
             assert!(call.headers.is_none());
+            assert!(!call.header_review_refused);
             assert_eq!(call.arguments, json!({"value":"conformance"}));
         }
+    }
+
+    #[test]
+    fn header_review_notice_redacts_protected_names_and_preserves_the_refusal() {
+        let name = "private-tool-and-token-canary";
+        let protected = header_review_notice(name, true);
+        assert!(!protected.contains(name));
+        assert!(protected.contains("review refused"));
+        assert!(protected.contains("without header mirrors"));
+        assert!(header_review_notice(name, false).contains(name));
     }
 
     #[test]
