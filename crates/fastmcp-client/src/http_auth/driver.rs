@@ -151,7 +151,7 @@ where
     if cx.checkpoint().is_err() {
         return Err(AuthorizationDriverError::Driver(OAuthError::Cancelled));
     }
-    if timeout.is_zero() || timeout > Duration::from_secs(15 * 60) {
+    if timeout.is_zero() || timeout > Duration::from_mins(15) {
         return Err(AuthorizationDriverError::Driver(
             OAuthError::InvalidConfiguration,
         ));

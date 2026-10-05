@@ -440,7 +440,7 @@ mod tests {
             let worker_stop = stop.clone();
             let capabilities = ServerDiscoverCapabilities::from_registry(
                 &ServerBehaviorRegistry::from_behaviors([ServerBehavior::ToolsList]),
-                Default::default(),
+                std::collections::BTreeMap::new(),
             )
             .unwrap();
             let discovery = ServerDiscoverResult::new(
@@ -515,8 +515,7 @@ mod tests {
         fn finish(mut self) -> Vec<Captured> {
             self.stop.store(true, Ordering::SeqCst);
             self.join.take().unwrap().join().unwrap();
-            let captured = self.captured.lock().unwrap().clone();
-            captured
+            self.captured.lock().unwrap().clone()
         }
     }
 

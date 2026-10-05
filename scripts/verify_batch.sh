@@ -72,6 +72,7 @@ BEADS=''
 OUT=''
 THREADS=''
 CHECK_ONLY=0
+CLIPPY=0
 FILTERS=()
 
 die() { printf 'verify_batch: %s\n' "$*" >&2; exit 2; }
@@ -88,6 +89,7 @@ while [ $# -gt 0 ]; do
         --toolchain)    TOOLCHAIN="${2:?}"; shift 2 ;;
         --test-threads) THREADS="${2:?}"; shift 2 ;;
         --check-only)   CHECK_ONLY=1; shift ;;
+        --clippy)       CHECK_ONLY=1; CLIPPY=1; shift ;;
         --filter)       FILTERS+=("${2:?}"); shift 2 ;;
         -h|--help)      sed -n '2,70p' "$0"; exit 0 ;;
         *)              die "unknown argument: $1" ;;
@@ -238,12 +240,21 @@ echo "RECEIPT_COMMIT_HASH=\$(rustc +$TOOLCHAIN -vV 2>/dev/null | sed -n 's/^comm
 echo "RECEIPT_TARGET=\$(rustc +$TOOLCHAIN -vV 2>/dev/null | sed -n 's/^host: //p')"
 
 if [ '$CHECK_ONLY' = 1 ]; then
-    cargo +$TOOLCHAIN check --locked $SCOPE $feature_args > \$RUNTMP/vb_build.log 2>&1
+    if [ '$CLIPPY' = 1 ]; then
+        cargo +$TOOLCHAIN clippy --locked $SCOPE $feature_args -- -D warnings \
+            > \$RUNTMP/vb_build.log 2>&1
+    else
+        cargo +$TOOLCHAIN check --locked $SCOPE $feature_args > \$RUNTMP/vb_build.log 2>&1
+    fi
     check_rc=\$?
     echo "RECEIPT_CHECK_RC=\$check_rc"
     echo "RECEIPT_BUILD_RC=\$check_rc"
     echo "RECEIPT_ERRORS=\$(grep -cE '^error(\[|:)' \$RUNTMP/vb_build.log)"
     echo "RECEIPT_WARNINGS=\$(grep -cE '^warning(\[|:)' \$RUNTMP/vb_build.log)"
+    grep -oE 'clippy::[a-z_]+' \$RUNTMP/vb_build.log | sort | uniq -c | sort -rn \
+        | sed 's/^/RECEIPT_LINT /'
+    grep -E '^(error|warning)(\[|:)' -A3 \$RUNTMP/vb_build.log \
+        | grep -E '^\s*-->' | sed 's/^ *--> */RECEIPT_SITE /' | head -60
     grep -E '^error' -A6 \$RUNTMP/vb_build.log | head -150
     echo "RECEIPT_END"
     exit \$check_rc

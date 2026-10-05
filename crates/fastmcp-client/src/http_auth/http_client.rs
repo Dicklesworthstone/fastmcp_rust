@@ -162,7 +162,7 @@ impl ManagedHttpClient {
     /// Sets one bound for acquisition, discovery, callbacks and result delivery.
     /// The caller's earlier deadline and original token expiry still win.
     pub fn with_request_timeout(mut self, timeout: Duration) -> Result<Self, ManagedHttpClientError> {
-        if timeout.is_zero() || timeout > Duration::from_secs(900) {
+        if timeout.is_zero() || timeout > Duration::from_mins(15) {
             return Err(ManagedHttpClientError::InvalidPolicy);
         }
         self.timeout = timeout;

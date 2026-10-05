@@ -72,7 +72,7 @@ impl RedirectAuthorizationDriver {
 
     /// Bounds both front-channel requests under one absolute deadline.
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self, OAuthError> {
-        if timeout.is_zero() || timeout > Duration::from_secs(15 * 60) {
+        if timeout.is_zero() || timeout > Duration::from_mins(15) {
             return Err(OAuthError::InvalidConfiguration);
         }
         self.timeout = timeout;
