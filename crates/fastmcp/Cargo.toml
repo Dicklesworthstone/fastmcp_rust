@@ -225,7 +225,8 @@ doc = false
 [[bin]]
 name = "conformance_client"
 path = "examples/conformance_client.rs"
-test = false
+# Exercise catalog admission and real-body header projection in the adapter.
+test = true
 bench = false
 doc = false
 
