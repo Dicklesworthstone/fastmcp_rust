@@ -1,0 +1,20 @@
+{
+  "archive_sha256": "f34b1a19ffd6b74570339a156912436335bb09c594c675c62ea164b19a1f2511",
+  "candidate_above_pin": "none available; crates.io max_version = 0.5.0 at census 2026-10-05",
+  "crate_download_url": "https://static.crates.io/crates/asupersync/asupersync-0.5.0.crate",
+  "crate_sha256": "f34b1a19ffd6b74570339a156912436335bb09c594c675c62ea164b19a1f2511",
+  "description": "Spec-first, cancel-correct, capability-secure async runtime for Rust.",
+  "edition": "2024",
+  "license": "LicenseRef-MIT-OpenAI-Anthropic-Rider",
+  "max_version_at_census": "0.5.0",
+  "package": "asupersync",
+  "published_at_utc": "2026-09-12T06:22:53.641405Z",
+  "purpose": "Registry identity for the asupersync 0.5.0 release pin under the operator ruling of 2026-09-28 (\"And yes you can do asupersync 0.5.0\", bd-o590u).",
+  "recorded_at_utc": "2026-10-05T07:45:00Z",
+  "recorded_by": "RealityCheck-Opus5",
+  "retrieval_user_agent": "OpenAI File Downloader, XaiImageApiFetch/1.0",
+  "rust_version_declared": null,
+  "schema_version": 1,
+  "version": "0.5.0",
+  "yanked": false
+}

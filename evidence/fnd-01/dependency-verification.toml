@@ -7458,6 +7458,36 @@ claim_ceiling = "local-byte-proof"
 required = true
 source_tree_member = true
 
+[[source_input]]
+id = "s72"
+family = "toolchain"
+owner_bead = "bd-mcp-2026-07-28-support-ahet.1.6"
+path = "evidence/fnd-01/probes/asupersync/features-0.5.0.json"
+byte_length = 13077
+sha256 = "36cdacaf2998e41456ee762857b6e3149f90d99a48b164b695049739a1fcffc6"
+parse_kind = "json"
+observation_kind = "local_file"
+bytes_available = true
+rehash_mode = "exact_local"
+claim_ceiling = "local-byte-proof"
+required = true
+source_tree_member = true
+
+[[source_input]]
+id = "s73"
+family = "toolchain"
+owner_bead = "bd-mcp-2026-07-28-support-ahet.1.6"
+path = "evidence/fnd-01/probes/asupersync/registry-0.5.0.json"
+byte_length = 1065
+sha256 = "13a0bb974586ec002254e7bcf0eb9169021e4e92f0480f5f3440a97785616e6d"
+parse_kind = "json"
+observation_kind = "local_file"
+bytes_available = true
+rehash_mode = "exact_local"
+claim_ceiling = "local-byte-proof"
+required = true
+source_tree_member = true
+
 [[negative_case]]
 family = "state"
 id = "NEG-ENVELOPE-RNG"
