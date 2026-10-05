@@ -270,7 +270,7 @@ echo "RECEIPT_DISCOVERED=\$(wc -l < \$RUNTMP/vb_discovered.txt | tr -d ' ')"
 # writes straight to stderr, bypassing libtest's capture, and lands ON the
 # progress line --
 #   test tests::panicked_progress_callback_... ... fastmcp client callback panicked
-# so the `ok` never appears where a line anchor can see it, and four outcomes
+# so the ok token never appears where a line anchor can see it, and four
 # went unmatched that way. libtest's JSON events are one object per line and
 # are immune to interleaved output.
 cargo +$TOOLCHAIN test --locked $SCOPE $feature_args \
