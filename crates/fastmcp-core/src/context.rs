@@ -23,6 +23,7 @@ const REQUEST_LEASE_CLOSED: u8 = 2;
 const REQUEST_CANCELLATION_ACTIVE: u8 = 0;
 const REQUEST_CANCELLATION_CANCELLED: u8 = 1;
 const REQUEST_CANCELLATION_FINALIZING: u8 = 2;
+const REQUEST_CANCELLATION_PEER_CANCELLED: u8 = 3;
 const REQUEST_AUTH_UNCOMMITTED: u8 = 0;
 const REQUEST_AUTH_ANONYMOUS: u8 = 1;
 const REQUEST_AUTH_AUTHENTICATED: u8 = 2;
@@ -36,14 +37,6 @@ const REQUEST_AUTH_AUTHENTICATED: u8 = 2;
 #[derive(Debug, Default)]
 struct McpRequestCancellationInner {
     state: AtomicU8,
-    /// Whether the cancellation that is being requested came from the PEER.
-    ///
-    /// The cancellation state alone cannot distinguish a peer
-    /// `notifications/cancelled` from the server's own request deadline or a
-    /// shutdown, and the three require different terminal behaviour: MCP says a
-    /// receiver SHOULD NOT respond to a request the peer cancelled, while a
-    /// deadline or shutdown MUST still produce a terminal response.
-    peer_requested: AtomicBool,
     notify: Notify,
 }
 
@@ -84,23 +77,32 @@ impl McpRequestCancellation {
     /// response path can stay silent as MCP requires for a peer-cancelled
     /// request without also silencing a deadline or shutdown.
     ///
-    /// The cause is published BEFORE the state transition. `cancel` releases
-    /// the `CANCELLED` store, and every reader acquires it, so a thread that
-    /// observes cancellation is guaranteed to observe this flag too. Setting it
-    /// afterwards would let the response path see `CANCELLED` with the cause
-    /// still unset and wrongly answer a peer-cancelled request.
+    /// Cause and ownership are published by the same atomic transition. A late
+    /// peer cannot relabel a deadline, shutdown, or finalized response that
+    /// already won, and readers cannot observe cancellation without its cause.
     pub fn cancel_by_peer(&self) -> bool {
-        self.inner.peer_requested.store(true, Ordering::Release);
-        self.cancel()
+        let cancelled = self
+            .inner
+            .state
+            .compare_exchange(
+                REQUEST_CANCELLATION_ACTIVE,
+                REQUEST_CANCELLATION_PEER_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if cancelled {
+            self.notify_terminal_waiters();
+        }
+        cancelled
     }
 
     /// Returns whether the peer requested this request's cancellation.
     ///
-    /// Only meaningful once cancellation has won the terminal race; before
-    /// that it reports whether a peer cancellation has been published at all.
+    /// False when a server cancellation or finalization won before the peer.
     #[must_use]
     pub fn is_peer_cancel_requested(&self) -> bool {
-        self.inner.peer_requested.load(Ordering::Acquire)
+        self.inner.state.load(Ordering::Acquire) == REQUEST_CANCELLATION_PEER_CANCELLED
     }
 
     fn notify_terminal_waiters(&self) {
@@ -115,7 +117,10 @@ impl McpRequestCancellation {
     /// Returns whether cooperative request cancellation has been requested.
     #[must_use]
     pub fn is_cancel_requested(&self) -> bool {
-        self.inner.state.load(Ordering::Acquire) == REQUEST_CANCELLATION_CANCELLED
+        matches!(
+            self.inner.state.load(Ordering::Acquire),
+            REQUEST_CANCELLATION_CANCELLED | REQUEST_CANCELLATION_PEER_CANCELLED
+        )
     }
 
     /// Returns whether cancellation or response finalization owns the request.
@@ -173,7 +178,9 @@ impl McpRequestCancellation {
                         return true;
                     }
                 }
-                REQUEST_CANCELLATION_CANCELLED => return false,
+                REQUEST_CANCELLATION_CANCELLED | REQUEST_CANCELLATION_PEER_CANCELLED => {
+                    return false;
+                }
                 REQUEST_CANCELLATION_FINALIZING => return true,
                 _ => return false,
             }
@@ -6804,5 +6811,15 @@ mod tests {
         assert!(finalized.begin_finalization());
         assert!(!finalized.is_peer_cancel_requested());
         assert!(!finalized.cancel_by_peer(), "finalization already owns it");
+        assert!(!finalized.is_peer_cancel_requested());
+
+        // A losing peer notification must not relabel the server's winner.
+        assert!(!local.cancel_by_peer());
+        assert!(local.is_cancel_requested());
+        assert!(!local.is_peer_cancel_requested());
+        assert!(!local.begin_finalization());
+        assert!(!peer.cancel());
+        assert!(peer.is_peer_cancel_requested());
+        assert!(!peer.begin_finalization());
     }
 }

@@ -344,7 +344,8 @@ impl ToolHandler for HoldEcho {
         }
     }
 
-    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+    fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        ctx.report_progress(0.0, Some("hold_echo started"));
         std::thread::sleep(Duration::from_millis(1500));
         Ok(vec![Content::text("held")])
     }
