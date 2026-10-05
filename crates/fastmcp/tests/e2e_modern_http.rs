@@ -9323,8 +9323,10 @@ fn e2e_public_http_auto_falls_back_to_exact_legacy_on_live_eligible_refusal() {
         "the public HTTP connection retains the exact validated legacy initialize wire version"
     );
     assert_eq!(
-        client.server_info().name,
-        "facade-http-example",
+        // Exact 2024-11-05 `initialize` requires `serverInfo`, so this legacy
+        // fallback must carry identity; `Some` is part of the bar.
+        client.server_info().map(|peer| peer.name.as_str()),
+        Some("facade-http-example"),
         "the legacy initialization result comes from the shipped facade server composition"
     );
     let ping = runtime_block_on_bounded(&cx, client.request(&cx, "ping", json!({})))

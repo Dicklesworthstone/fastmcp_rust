@@ -148,6 +148,32 @@ stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 remote_dir="$REMOTE_BASE/run-${head_sha:0:8}-$stamp"
 target_dir="$REMOTE_BASE/.target-pool"
 
+# Any include_str!/include_bytes! target that is NOT under a synced path makes
+# cargo emit "couldn't read ... No such file or directory", which reads as a
+# repository defect and is purely this script's doing. Refuse to run instead.
+missing_includes="$(python3 - "${SYNC_PATHS[@]}" <<'SCAN'
+import os, re, sys, pathlib
+synced = set(sys.argv[1:])
+pat = re.compile(r'include_(?:str|bytes)!\s*\(\s*"([^"]+)"')
+cwd = pathlib.Path.cwd()
+missing = set()
+for p in pathlib.Path('crates').rglob('*.rs'):
+    try: txt = p.read_text(errors='replace')
+    except OSError: continue
+    for m in pat.finditer(txt):
+        target = (p.parent / m.group(1)).resolve()
+        try: rel = target.relative_to(cwd)
+        except ValueError: continue
+        root = str(rel).split(os.sep)[0]
+        if root not in synced:
+            missing.add(root)
+print(' '.join(sorted(missing)))
+SCAN
+)"
+if [ -n "$missing_includes" ]; then
+    die "compile-time include roots are not in SYNC_PATHS: $missing_includes"
+fi
+
 printf '== sync ==\nworker    %s\nremote    %s\n' "$WORKER" "$remote_dir"
 "${SSH[@]}" "mkdir -p '$remote_dir' '$target_dir'" || die 'cannot create the remote directories'
 
@@ -160,7 +186,7 @@ printf '== sync ==\nworker    %s\nremote    %s\n' "$WORKER" "$remote_dir"
 # purely this script's doing. Syncing them is READ-ONLY; RULE 0.5 forbids
 # modifying anything under .github/workflows, not compiling against it.
 SYNC_PATHS=(Cargo.toml Cargo.lock rust-toolchain.toml crates spec scripts tools
-            .github evidence)
+            .github evidence README.md)
 [ -d .cargo ] && SYNC_PATHS+=(.cargo)
 rsync -az --no-perms --omit-dir-times \
     --exclude 'target/' --exclude '.rch-target-*' --exclude '*.log' \
