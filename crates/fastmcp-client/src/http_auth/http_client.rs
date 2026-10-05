@@ -79,10 +79,10 @@ impl ManagedHttpOperation<'_> {
         -> Result<CoreResult, HttpClientError>
     {
         match self {
-            Self::ListTools { cursor } => client.list_tools(cx, cursor).await,
-            Self::ListResources { cursor } => client.list_resources(cx, cursor).await,
-            Self::ListResourceTemplates { cursor } => client.list_resource_templates(cx, cursor).await,
-            Self::ListPrompts { cursor } => client.list_prompts(cx, cursor).await,
+            Self::ListTools { cursor } => client.list_tools(cx, cursor.as_deref()).await,
+            Self::ListResources { cursor } => client.list_resources(cx, cursor.as_deref()).await,
+            Self::ListResourceTemplates { cursor } => client.list_resource_templates(cx, cursor.as_deref()).await,
+            Self::ListPrompts { cursor } => client.list_prompts(cx, cursor.as_deref()).await,
             Self::CallTool { name, arguments } => client.call_tool(cx, name, arguments).await,
             Self::ReadResource { uri } => client.read_resource(cx, uri).await,
             Self::GetPrompt { name, arguments } => client.get_prompt(cx, name, arguments).await,
