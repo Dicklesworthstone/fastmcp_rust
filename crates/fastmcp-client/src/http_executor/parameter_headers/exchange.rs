@@ -553,7 +553,7 @@ mod tests {
         } else {
             ReverseRequestHandlers::new()
         };
-        let mut runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
             .blocking_threads(0, 2)
             .build()
