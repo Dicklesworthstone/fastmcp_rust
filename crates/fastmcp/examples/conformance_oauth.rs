@@ -57,11 +57,14 @@ fn parse_url(text: &str) -> Result<CanonicalHttpUrl, String> {
 }
 
 fn root(source: Option<&str>) -> Result<Option<Certificate>, String> {
-    let Some(source) = source else { return Ok(None) };
+    let Some(source) = source else {
+        return Ok(None);
+    };
     if source.is_empty() || source.len() > MAX_ROOT_PEM_BYTES {
         return Err(INVALID.to_owned());
     }
-    let mut certificates = Certificate::from_pem(source.as_bytes()).map_err(|_| INVALID.to_owned())?;
+    let mut certificates =
+        Certificate::from_pem(source.as_bytes()).map_err(|_| INVALID.to_owned())?;
     if certificates.len() != 1 {
         return Err(INVALID.to_owned());
     }
@@ -69,7 +72,9 @@ fn root(source: Option<&str>) -> Result<Option<Certificate>, String> {
     if certificate.as_der().is_empty() || certificate.as_der().len() > 16 * 1024 {
         return Err(INVALID.to_owned());
     }
-    RootCertStore::empty().add(&certificate).map_err(|_| INVALID.to_owned())?;
+    RootCertStore::empty()
+        .add(&certificate)
+        .map_err(|_| INVALID.to_owned())?;
     Ok(Some(certificate))
 }
 
@@ -106,10 +111,14 @@ impl PreparedOAuth {
             .with_timeout(timeout)
             .map_err(|_| INVALID.to_owned())?;
         if let Some(certificate) = root(config.authorization_root_pem.as_deref())? {
-            driver = driver.with_extra_root_certificate(certificate).map_err(|_| INVALID.to_owned())?;
+            driver = driver
+                .with_extra_root_certificate(certificate)
+                .map_err(|_| INVALID.to_owned())?;
         }
         if let Some(certificate) = root(config.token_root_pem.as_deref())? {
-            native = native.with_extra_root_certificate(certificate).map_err(|_| INVALID.to_owned())?;
+            native = native
+                .with_extra_root_certificate(certificate)
+                .map_err(|_| INVALID.to_owned())?;
         }
         let resource_root = root(config.resource_root_pem.as_deref())?;
         Ok(Self {
@@ -137,7 +146,9 @@ impl Drop for GrantLease {
 
 impl GrantLease {
     fn remaining(&self) -> Result<Duration, String> {
-        let remaining = self.credential.expires_at()
+        let remaining = self
+            .credential
+            .expires_at()
             .ok_or_else(|| "OAuth credential has no expiry".to_owned())?
             .saturating_duration_since(Instant::now());
         if self.credential.is_revoked() || remaining.is_zero() {
@@ -163,7 +174,10 @@ impl GrantLease {
         let nanos = u64::try_from(remaining.as_nanos())
             .map_err(|_| "authenticated MCP deadline is invalid".to_owned())?;
         let deadline = cx.now().saturating_add_nanos(nanos);
-        let deadline = cx.budget().deadline.map_or(deadline, |parent| parent.min(deadline));
+        let deadline = cx
+            .budget()
+            .deadline
+            .map_or(deadline, |parent| parent.min(deadline));
         let result = asupersync::time::timeout_at(deadline, future)
             .await
             .map_err(|_| "authenticated MCP run reached its deadline".to_owned())?;
@@ -181,7 +195,9 @@ pub(super) async fn configure(
     mut builder: ClientBuilder,
     raw: Option<&str>,
 ) -> Result<(ClientBuilder, Option<GrantLease>), String> {
-    let Some(raw) = raw else { return Ok((builder, None)) };
+    let Some(raw) = raw else {
+        return Ok((builder, None));
+    };
     let prepared = PreparedOAuth::parse(raw, endpoint)?;
     // Validate the consumer before spending the authorization code. This
     // cannot add a credential to Auto fallback or to a different resource.
@@ -191,16 +207,15 @@ pub(super) async fn configure(
         return Err(INVALID.to_owned());
     }
     if let Some(certificate) = prepared.resource_root {
-        builder = builder.http_resource_root_certificate(prepared.resource, certificate)
+        builder = builder
+            .http_resource_root_certificate(prepared.resource, certificate)
             .map_err(|_| INVALID.to_owned())?;
     }
-    let grant = prepared.client.authorize_with_browser_driver(
-        cx,
-        prepared.timeout,
-        |url| prepared.driver.drive(cx, url),
-    )
-    .await
-    .map_err(|_| "explicit OAuth authorization failed".to_owned())?;
+    let grant = prepared
+        .client
+        .authorize_with_browser_driver(cx, prepared.timeout, |url| prepared.driver.drive(cx, url))
+        .await
+        .map_err(|_| "explicit OAuth authorization failed".to_owned())?;
     let lease = GrantLease {
         credential: grant.bearer_credential().clone(),
         timeout: prepared.timeout,
@@ -241,7 +256,10 @@ mod tests {
             ("preauthorized_redirect", json!(false)),
             ("resource", json!("https://resource.example/other")),
             ("resource", json!("https://resource.example/mcp?other=1")),
-            ("authorization_endpoint", json!("http://127.0.0.1:8080/authorize")),
+            (
+                "authorization_endpoint",
+                json!("http://127.0.0.1:8080/authorize"),
+            ),
             ("token_endpoint", json!("http://127.0.0.1:8080/token")),
             ("timeout_seconds", json!(0)),
             ("timeout_seconds", json!(901)),
@@ -253,18 +271,30 @@ mod tests {
         }
         let mut cleartext = positive;
         cleartext["resource"] = json!("http://127.0.0.1:8080/mcp");
-        assert!(PreparedOAuth::parse(&cleartext.to_string(), &parse_url("http://127.0.0.1:8080/mcp").unwrap()).is_err());
+        assert!(
+            PreparedOAuth::parse(
+                &cleartext.to_string(),
+                &parse_url("http://127.0.0.1:8080/mcp").unwrap()
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn duplicate_unknown_and_oversized_configuration_is_not_silently_accepted() {
         let source = configuration().to_string();
-        let duplicate = source.replacen("\"client_id\":", "\"client_id\":\"other\",\"client_id\":", 1);
+        let duplicate = source.replacen(
+            "\"client_id\":",
+            "\"client_id\":\"other\",\"client_id\":",
+            1,
+        );
         assert_ne!(source, duplicate);
         assert!(PreparedOAuth::parse(&duplicate, &endpoint()).is_err());
         let mut unknown = configuration();
         unknown["access_token"] = json!("secret-canary");
-        let error = PreparedOAuth::parse(&unknown.to_string(), &endpoint()).err().unwrap();
+        let error = PreparedOAuth::parse(&unknown.to_string(), &endpoint())
+            .err()
+            .unwrap();
         assert!(!error.contains("secret-canary"));
         assert!(PreparedOAuth::parse(&" ".repeat(MAX_CONFIG_BYTES + 1), &endpoint()).is_err());
         assert!(PreparedOAuth::parse("{}", &endpoint()).is_err());
@@ -273,10 +303,16 @@ mod tests {
     #[test]
     fn malformed_private_roots_fail_during_preflight() {
         assert!(root(None).unwrap().is_none());
-        for field in ["authorization_root_pem", "token_root_pem", "resource_root_pem"] {
+        for field in [
+            "authorization_root_pem",
+            "token_root_pem",
+            "resource_root_pem",
+        ] {
             let mut config = configuration();
             config[field] = json!("not a certificate, secret-canary");
-            let error = PreparedOAuth::parse(&config.to_string(), &endpoint()).err().unwrap();
+            let error = PreparedOAuth::parse(&config.to_string(), &endpoint())
+                .err()
+                .unwrap();
             assert_eq!(error, INVALID);
             assert!(!error.contains("secret-canary"));
         }
@@ -285,11 +321,17 @@ mod tests {
     #[test]
     fn grant_lifetime_caps_traffic_and_revokes_installed_clones_on_drop() {
         let credential = BoundBearerCredential::bind_with_expiry(
-            endpoint(), "test-access", Instant::now() + Duration::from_secs(300),
-        ).unwrap();
+            endpoint(),
+            "test-access",
+            Instant::now() + Duration::from_secs(300),
+        )
+        .unwrap();
         let installed = credential.clone();
         let independent = BoundBearerCredential::bind(endpoint(), "independent").unwrap();
-        let lease = GrantLease { credential, timeout: Duration::from_secs(30) };
+        let lease = GrantLease {
+            credential,
+            timeout: Duration::from_secs(30),
+        };
         assert_eq!(lease.remaining().unwrap(), Duration::from_secs(30));
         assert!(installed.authorization_for_target(&endpoint()).is_some());
         drop(lease);
@@ -297,7 +339,12 @@ mod tests {
         assert!(installed.authorization_for_target(&endpoint()).is_none());
         assert!(!independent.is_revoked());
         let expired = GrantLease {
-            credential: BoundBearerCredential::bind_with_expiry(endpoint(), "expired", Instant::now()).unwrap(),
+            credential: BoundBearerCredential::bind_with_expiry(
+                endpoint(),
+                "expired",
+                Instant::now(),
+            )
+            .unwrap(),
             timeout: Duration::from_secs(30),
         };
         assert!(expired.remaining().is_err());
@@ -308,9 +355,7 @@ mod tests {
         let cx = Cx::for_testing();
         let target = endpoint();
         let raw = configuration().to_string();
-        let mut operation = Box::pin(configure(
-            &cx, &target, ClientBuilder::new(), Some(&raw),
-        ));
+        let mut operation = Box::pin(configure(&cx, &target, ClientBuilder::new(), Some(&raw)));
         let mut task = std::task::Context::from_waker(std::task::Waker::noop());
         match operation.as_mut().poll(&mut task) {
             std::task::Poll::Ready(Err(error)) => assert_eq!(error, INVALID),
