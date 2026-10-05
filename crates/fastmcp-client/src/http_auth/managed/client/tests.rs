@@ -340,9 +340,13 @@ fn stale_catalog_cursor_cannot_cross_a_credential_generation() {
             peer.discovery("access-one").await;
             peer.mcp("tools/list", "access-one", page).await;
         }).await;
-        assert!(listed.is_ok());
+        let CoreResult::Final(FinalCoreResult::ToolsList { result: page, .. }) = listed.unwrap() else {
+            panic!("expected a tools catalog");
+        };
+        let cursor = page.payload.next_cursor.unwrap();
+        assert_ne!(cursor, "generation-one-page");
         force_renewal(&session);
-        let (result, ()) = pair(client.list_tools(&cx, Some("generation-one-page")),
+        let (result, ()) = pair(client.list_tools(&cx, Some(&cursor)),
             peer.token("refresh_token", true)).await;
         assert!(matches!(result, Err(ManagedHttpClientError::CatalogGenerationChanged)));
         assert_eq!(client.cached_credential_generation(), None);
@@ -352,6 +356,66 @@ fn stale_catalog_cursor_cannot_cross_a_credential_generation() {
             peer.catalog("access-two", "fresh").await;
         }).await;
         assert_catalog(fresh.unwrap(), "fresh");
+    });
+}
+
+#[test]
+fn unrelated_renewal_and_reissued_wire_cursors_do_not_revive_old_handles() {
+    run(async {
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
+        let session = peer.login(&cx).await;
+        let mut client = ManagedHttpClient::new(session.clone(), peer.client_builder(), Duration::from_secs(30)).unwrap();
+        let first_page = || {
+            let mut page = catalog("lookup");
+            page["nextCursor"] = json!("same-wire-cursor");
+            page
+        };
+        let (first, ()) = pair(client.list_tools(&cx, None), async {
+            peer.discovery("access-one").await;
+            peer.mcp("tools/list", "access-one", first_page()).await;
+        }).await;
+        let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = first.unwrap() else {
+            panic!("expected first page");
+        };
+        let old = result.payload.next_cursor.unwrap();
+        force_renewal(&session);
+        let (called, ()) = pair(client.call_tool(&cx, "lookup", json!({})), async {
+            peer.token("refresh_token", true).await;
+            peer.discovery("access-two").await;
+            peer.mcp("tools/call", "access-two", complete()).await;
+        }).await;
+        assert!(called.is_ok());
+        assert_eq!(client.cached_credential_generation(), Some(2));
+        // This was the bypass: current connection == current token generation,
+        // but this cursor came from the connection that renewal discarded.
+        assert!(matches!(client.list_tools(&cx, Some(&old)).await,
+            Err(ManagedHttpClientError::InvalidCatalogCursor)));
+        peer.no_more(&cx).await;
+
+        let (next, ()) = pair(client.list_tools(&cx, None),
+            peer.mcp("tools/list", "access-two", first_page())).await;
+        let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = next.unwrap() else {
+            panic!("expected renewed first page");
+        };
+        let current = result.payload.next_cursor.unwrap();
+        assert_ne!(old, current);
+        for rejected in [old.as_str(), "same-wire-cursor"] {
+            assert!(matches!(client.list_tools(&cx, Some(rejected)).await,
+                Err(ManagedHttpClientError::InvalidCatalogCursor)));
+        }
+        assert!(matches!(client.list_prompts(&cx, Some(&current)).await,
+            Err(ManagedHttpClientError::InvalidCatalogCursor)));
+        peer.no_more(&cx).await;
+        let (last, ()) = pair(client.list_tools(&cx, Some(&current)), async {
+            let (mut stream, body, _) = peer.mcp_request("tools/list", "access-two").await;
+            assert_eq!(body["params"]["cursor"], "same-wire-cursor");
+            reply(&mut stream, 200, json!({"jsonrpc":"2.0","id":body["id"],"result":catalog("last")})).await;
+        }).await;
+        assert_catalog(last.unwrap(), "last");
+        assert!(matches!(client.list_tools(&cx, Some(&current)).await,
+            Err(ManagedHttpClientError::InvalidCatalogCursor)));
+        peer.no_more(&cx).await;
     });
 }
 

@@ -25,6 +25,9 @@ use super::{ManagedOAuthSession, OAuthSessionError, deadline_after};
 use crate::http_executor::parameter_headers::ReviewedToolHeaders;
 use crate::{ClientBuilder, HttpClient, HttpClientError, ProtocolPolicy};
 
+mod cursors;
+use cursors::{CatalogKind, CursorLedger};
+
 /// Sanitized high-level failures. The original session error remains available
 /// for typed handling, but formatting never includes transport or peer data.
 pub enum ManagedHttpClientError {
@@ -35,6 +38,10 @@ pub enum ManagedHttpClientError {
     Request { code: Option<McpErrorCode> },
     /// A cursor cannot cross a reconnect or a credential-generation change.
     CatalogGenerationChanged,
+    /// The cursor was not issued by this client's current catalog traversal.
+    InvalidCatalogCursor,
+    /// A peer cursor exceeded the local retention bound or fresh custody failed.
+    CatalogCursorUnavailable,
 }
 
 impl fmt::Debug for ManagedHttpClientError {
@@ -49,6 +56,8 @@ impl fmt::Debug for ManagedHttpClientError {
             Self::CatalogGenerationChanged => {
                 f.write_str("ManagedHttpClientError::CatalogGenerationChanged")
             }
+            Self::InvalidCatalogCursor => f.write_str("ManagedHttpClientError::InvalidCatalogCursor"),
+            Self::CatalogCursorUnavailable => f.write_str("ManagedHttpClientError::CatalogCursorUnavailable"),
         }
     }
 }
@@ -64,6 +73,8 @@ impl fmt::Display for ManagedHttpClientError {
             Self::CatalogGenerationChanged => {
                 "catalog credential generation changed; restart listing without a cursor"
             }
+            Self::InvalidCatalogCursor => "catalog cursor is stale, unissued, or belongs to another catalog",
+            Self::CatalogCursorUnavailable => "catalog continuation could not be retained within local bounds",
         })
     }
 }
@@ -89,6 +100,7 @@ fn request_error(error: HttpClientError) -> ManagedHttpClientError {
 struct Connection {
     client: HttpClient,
     generation: u64,
+    cursors: CursorLedger,
 }
 
 /// A reusable high-level HTTP client whose authentication is caller-owned.
@@ -107,6 +119,13 @@ struct Connection {
 /// The wrapper accepts completed core calls only. Subscription streams, Tasks
 /// response owners, and arbitrary callbacks into a raw `HttpClient` are not
 /// exposed, because those could escape the credential lifetime guard.
+///
+/// Returned catalog cursors are opaque, single-use LOCAL handles, not the
+/// upstream cursor bytes. Pass them back only to the same client's same list
+/// method. One pending continuation is retained per catalog kind; starting or
+/// advancing that list supersedes its previous handle. Renewal, disconnection,
+/// and failed or abandoned operations retire all handles. An unrelated call
+/// cannot make an old cursor valid again, even if a peer reuses its cursor text.
 pub struct ManagedHttpClient {
     session: ManagedOAuthSession,
     builder: ClientBuilder,
@@ -305,9 +324,16 @@ impl ManagedHttpClient {
         }
         self.session.check(cx, cancellation)?;
         let deadline = deadline_after(cx, self.operation_timeout)?;
-        let continuation = call.has_cursor();
-        if continuation && self.connection.is_none() {
-            return Err(ManagedHttpClientError::CatalogGenerationChanged);
+        let catalog = call.catalog();
+        let continuation = catalog.is_some_and(|(_, cursor)| cursor.is_some());
+        if let Some((kind, Some(cursor))) = catalog {
+            let previous = self.connection.as_ref()
+                .ok_or(ManagedHttpClientError::CatalogGenerationChanged)?;
+            // Refuse unknown/cross-catalog handles before acquiring a token.
+            // A newer connection alone cannot establish a cursor's provenance.
+            if !previous.cursors.admits(kind, cursor) {
+                return Err(ManagedHttpClientError::InvalidCatalogCursor);
+            }
         }
 
         // Taking custody before the first await makes abandonment terminal for
@@ -330,21 +356,35 @@ impl ManagedHttpClient {
                 cx, cancellation, deadline, snapshot.expires_at(),
                 &snapshot.credential.revoked,
                 Box::pin(async {
-                    let mut client = match reusable {
-                        Some(connection) => connection.client,
+                    let (mut client, mut cursors) = match reusable {
+                        Some(connection) => (connection.client, connection.cursors),
                         None => match builder
                             .http_bearer_credential(snapshot.credential().clone())
                             .connect_http_client_with_cx(cx)
                             .await
                         {
-                            Ok(client) => client,
+                            Ok(client) => (client, CursorLedger::default()),
                             Err(_) => return Ok(Err(ManagedHttpClientError::Connection)),
                         },
                     };
-                    let result = call.dispatch(cx, cancellation, &mut client).await;
-                    Ok(result
-                        .map(|value| (value, Connection { client, generation }))
-                        .map_err(request_error))
+                    let wire_cursor = match catalog {
+                        Some((kind, cursor)) => match cursors.take(kind, cursor) {
+                            Ok(cursor) => cursor,
+                            Err(error) => return Ok(Err(error)),
+                        },
+                        None => None,
+                    };
+                    let result = call.dispatch(cx, cancellation, &mut client, wire_cursor.as_deref()).await;
+                    let mut value = match result {
+                        Ok(value) => value,
+                        Err(error) => return Ok(Err(request_error(error))),
+                    };
+                    if let Some((kind, _)) = catalog {
+                        if let Err(error) = cursors.publish(kind, &mut value) {
+                            return Ok(Err(error));
+                        }
+                    }
+                    Ok(Ok((value, Connection { client, generation, cursors })))
                 }),
             ).await
         })).await?;
@@ -371,20 +411,26 @@ enum Call<'a> {
     Prompt { name: &'a str, arguments: HashMap<String, String> },
 }
 
-impl Call<'_> {
-    fn has_cursor(&self) -> bool {
-        matches!(self, Self::Tools(Some(_)) | Self::Resources(Some(_))
-            | Self::Templates(Some(_)) | Self::Prompts(Some(_)))
+impl<'a> Call<'a> {
+    fn catalog(&self) -> Option<(CatalogKind, Option<&'a str>)> {
+        match self {
+            Self::Tools(cursor) => Some((CatalogKind::Tools, *cursor)),
+            Self::Resources(cursor) => Some((CatalogKind::Resources, *cursor)),
+            Self::Templates(cursor) => Some((CatalogKind::Templates, *cursor)),
+            Self::Prompts(cursor) => Some((CatalogKind::Prompts, *cursor)),
+            _ => None,
+        }
     }
 
     async fn dispatch(
         self, cx: &Cx, cancellation: &McpRequestCancellation, client: &mut HttpClient,
+        wire_cursor: Option<&str>,
     ) -> Result<CoreResult, HttpClientError> {
         match self {
-            Self::Tools(cursor) => client.list_tools(cx, cursor).await,
-            Self::Resources(cursor) => client.list_resources(cx, cursor).await,
-            Self::Templates(cursor) => client.list_resource_templates(cx, cursor).await,
-            Self::Prompts(cursor) => client.list_prompts(cx, cursor).await,
+            Self::Tools(_) => client.list_tools(cx, wire_cursor).await,
+            Self::Resources(_) => client.list_resources(cx, wire_cursor).await,
+            Self::Templates(_) => client.list_resource_templates(cx, wire_cursor).await,
+            Self::Prompts(_) => client.list_prompts(cx, wire_cursor).await,
             Self::Tool { name, arguments } => {
                 client.call_tool_with_cancellation(cx, cancellation, name, arguments).await
             }
