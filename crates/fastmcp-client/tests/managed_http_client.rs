@@ -386,7 +386,10 @@ fn live_quiet_calls_wake_on_request_cancel_owner_close_and_token_revocation() {
             let serving = async {
                 let (stream, _, body) = peer.expect("tools/call", "access-one").await;
                 assert_eq!(body["params"]["name"], "echo");
-                match kind { 0 => cancellation.cancel(), 1 => session.close(), _ => snapshot.credential().revoke() }
+                // `cancel` returns bool while `close` and `revoke` return (),
+                // so the arms need unifying; the outcome is asserted on
+                // `result` below rather than taken from the return value.
+                match kind { 0 => { cancellation.cancel(); }, 1 => session.close(), _ => snapshot.credential().revoke() }
                 stream // pair retains the socket: no EOF can cause the terminal.
             };
             let (result, held_socket) = pair(client.execute_with_cancellation(&cx, &cancellation,
