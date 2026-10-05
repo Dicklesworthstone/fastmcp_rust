@@ -80,5 +80,63 @@ name = "leg_http_01_b"
 path = "tests/leg_http_01_b.rs"
 required-features = ["legacy-2024-11-05"]
 
+# --- Loud refusal for feature-gated targets (bd-ufj6r) ---------------------
+# Each target below starts with a file-scope `#![cfg(...)]`. Without a stanza
+# here, a build whose features do not satisfy that cfg compiles the target to
+# an EMPTY BINARY and libtest prints `ok. 0 passed` with exit status 0, which is
+# indistinguishable from a real pass. With the stanza, naming the target
+# explicitly (`--test <name>`) makes cargo refuse and say which feature is
+# missing.
+#
+# This is belt-and-braces, not a cure: `required-features` ALSO makes a bulk
+# `cargo test` exclude the target silently, so a runner card must still declare
+# its expected discovered count and treat `0 passed` as RED. The
+# `required-features` values below mirror each target's own cfg exactly.
+
+[[test]]
+name = "oauth_challenge"
+path = "tests/oauth_challenge.rs"
+required-features = ["native-tls-roots"]
+
+[[test]]
+name = "oauth_client_credentials"
+path = "tests/oauth_client_credentials.rs"
+required-features = ["native-tls-roots"]
+
+[[test]]
+name = "oauth_core_rpc"
+path = "tests/oauth_core_rpc.rs"
+required-features = ["native-tls-roots"]
+
+[[test]]
+name = "oauth_interaction"
+path = "tests/oauth_interaction.rs"
+required-features = ["native-tls-roots"]
+
+[[test]]
+name = "oauth_machine_revocation"
+path = "tests/oauth_machine_revocation.rs"
+required-features = ["native-tls-roots"]
+
+[[test]]
+name = "oauth_tool_catalog"
+path = "tests/oauth_tool_catalog.rs"
+required-features = ["native-tls-roots"]
+
+[[test]]
+name = "oauth_tool_header_repair"
+path = "tests/oauth_tool_header_repair.rs"
+required-features = ["native-tls-roots"]
+
+[[test]]
+name = "oauth_task_watch"
+path = "tests/oauth_task_watch.rs"
+required-features = ["tasks", "native-tls-roots"]
+
+[[test]]
+name = "oauth_task_watch_drive"
+path = "tests/oauth_task_watch_drive.rs"
+required-features = ["tasks", "native-tls-roots"]
+
 [lints]
 workspace = true
