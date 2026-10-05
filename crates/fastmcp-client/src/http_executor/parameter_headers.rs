@@ -3,7 +3,9 @@
 //! A schema describes projection, never permission to disclose arguments. The
 //! host must approve every compiled binding before this module will retain a
 //! plan. Projection reads the immutable outgoing JSON-RPC bytes, not a separate
-//! argument map. No schema lookup, credential acquisition, retry or I/O occurs.
+//! argument map. No schema lookup, credential acquisition, retry or I/O occurs
+//! during plan construction or projection. The explicit high-level client
+//! exchange APIs compose these plans with bounded catalog repair and MRTR.
 //!
 //! The host owns catalog freshness and disclosure policy. A changed definition
 //! or policy requires a new review; retaining a plan does not make it current.
@@ -26,6 +28,8 @@ use fastmcp_protocol::{
 use serde_json::Value;
 
 use super::ModernHttpRequest;
+
+mod exchange;
 
 /// Hard ceiling for duplicate-aware admission of the exact outgoing body.
 pub const MAX_TOOL_HEADER_REQUEST_BYTES: usize = 8 * 1024 * 1024;
@@ -416,8 +420,16 @@ mod loopback_tests {
                 .into_iter()
                 .filter(|(name, _)| name.starts_with("Mcp-Param-"))
                 .collect();
-            assert_eq!(parameters, vec![("Mcp-Param-Region".to_owned(), "eu".to_owned())]);
-            assert!(!projected.headers().iter().any(|(_, value)| value.contains("body-only")));
+            assert_eq!(
+                parameters,
+                vec![("Mcp-Param-Region".to_owned(), "eu".to_owned())]
+            );
+            assert!(
+                !projected
+                    .headers()
+                    .iter()
+                    .any(|(_, value)| value.contains("body-only"))
+            );
             assert!(matches!(
                 projected.with_reviewed_tool_headers(&plan),
                 Err(ToolHeaderDispatchError::AlreadyProjected)
@@ -442,18 +454,21 @@ mod loopback_tests {
             "https://127.0.0.1:8123/mcp",
         ] {
             let mut calls = 0;
-            assert!(matches!(
-                ReviewedToolHeaders::new_for_loopback_http(
-                    CanonicalHttpUrl::parse(target).unwrap(),
-                    "lookup",
-                    schema(),
-                    |_| {
-                        calls += 1;
-                        true
-                    }
+            assert!(
+                matches!(
+                    ReviewedToolHeaders::new_for_loopback_http(
+                        CanonicalHttpUrl::parse(target).unwrap(),
+                        "lookup",
+                        schema(),
+                        |_| {
+                            calls += 1;
+                            true
+                        }
+                    ),
+                    Err(ToolHeaderDispatchError::InvalidBinding)
                 ),
-                Err(ToolHeaderDispatchError::InvalidBinding)
-            ), "{target}");
+                "{target}"
+            );
             assert_eq!(calls, 0, "{target}");
         }
     }
@@ -463,7 +478,10 @@ mod loopback_tests {
         let resource = CanonicalHttpUrl::parse("http://127.0.0.1:8123/mcp").unwrap();
         assert!(matches!(
             ReviewedToolHeaders::new_for_loopback_http(
-                resource.clone(), "lookup", schema(), |_| false
+                resource.clone(),
+                "lookup",
+                schema(),
+                |_| false
             ),
             Err(ToolHeaderDispatchError::DisclosureDenied)
         ));
@@ -478,12 +496,18 @@ mod loopback_tests {
             }}),
         ] {
             let mut calls = 0;
-            assert!(ReviewedToolHeaders::new_for_loopback_http(
-                resource.clone(), "lookup", source, |_| {
-                    calls += 1;
-                    true
-                }
-            ).is_err());
+            assert!(
+                ReviewedToolHeaders::new_for_loopback_http(
+                    resource.clone(),
+                    "lookup",
+                    source,
+                    |_| {
+                        calls += 1;
+                        true
+                    }
+                )
+                .is_err()
+            );
             assert_eq!(calls, 0);
         }
     }
@@ -492,8 +516,12 @@ mod loopback_tests {
     fn loopback_plan_cannot_cross_port_path_query_address_or_scheme() {
         let target = "http://127.0.0.1:8123/mcp";
         let plan = ReviewedToolHeaders::new_for_loopback_http(
-            CanonicalHttpUrl::parse(target).unwrap(), "lookup", schema(), |_| true
-        ).unwrap();
+            CanonicalHttpUrl::parse(target).unwrap(),
+            "lookup",
+            schema(),
+            |_| true,
+        )
+        .unwrap();
         assert!(request(target).with_reviewed_tool_headers(&plan).is_ok());
         for other in [
             "http://127.0.0.1:8124/mcp",
@@ -508,7 +536,12 @@ mod loopback_tests {
                 original.clone().with_reviewed_tool_headers(&plan),
                 Err(ToolHeaderDispatchError::TargetMismatch)
             ));
-            assert!(!original.headers().iter().any(|(name, _)| name.starts_with("Mcp-Param-")));
+            assert!(
+                !original
+                    .headers()
+                    .iter()
+                    .any(|(name, _)| name.starts_with("Mcp-Param-"))
+            );
         }
     }
 }
