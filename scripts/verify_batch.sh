@@ -371,12 +371,34 @@ if not check_only and field('RUN_RC') not in (None, '0') and not failed:
     reasons.append(f'runner exited {field("RUN_RC")} without reporting any failure: early abort')
 if ignored:
     warnings.append(f'{ignored} test(s) ignored: an #[ignore] body is not evidence')
-if filtered and not filters:
+if filtered and not filters.strip():
     warnings.append(f'{filtered} test(s) filtered out with no --filter requested')
-if not check_only and discovered and executed and set(discovered) != set(executed):
-    missing = sorted(set(discovered) - set(executed))
-    reasons.append(f'discovered != executed ({len(discovered)} vs {len(executed)}); '
-                   f'{len(missing)} never ran, e.g. {missing[:3]}')
+elif filtered:
+    warnings.append(f'{filtered} test(s) filtered out by the requested --filter; '
+                    f'this receipt covers the selected subset only, not a full batch')
+# PL-1 exact test-set equality, scoped to what was actually REQUESTED. An
+# unfiltered run must execute everything it discovered. A --filter run must
+# execute every discovered test the filter selects -- comparing against the
+# whole discovered set would make every targeted run INVALID and teach the
+# reader to ignore the verdict, which is worse than not checking.
+if not check_only and discovered and executed:
+    wanted = [f for f in filters.split() if f]
+    if wanted:
+        expected = [d for d in discovered if any(f in d for f in wanted)]
+        label = f'selected by {wanted}'
+    else:
+        expected = discovered
+        label = 'discovered'
+    missing = sorted(set(expected) - set(executed))
+    unexpected = sorted(set(executed) - set(expected))
+    if missing:
+        reasons.append(f'{len(missing)} test(s) {label} never ran, e.g. {missing[:3]}')
+    if unexpected:
+        reasons.append(f'{len(unexpected)} test(s) ran that were not {label}, '
+                       f'e.g. {unexpected[:3]}')
+    if not expected:
+        reasons.append(f'no discovered test matched {wanted}: a filter that selects '
+                       f'nothing is a zero-run green (PL-1)')
 
 receipt = {
     'subject': {
