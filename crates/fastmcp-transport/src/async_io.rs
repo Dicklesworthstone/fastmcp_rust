@@ -3,22 +3,32 @@
 //! This module provides async wrappers for stdin/stdout that implement
 //! asupersync's `AsyncRead` and `AsyncWrite` traits.
 //!
-//! # Phase 0 Implementation
+//! # Native Unix pipe I/O
 //!
-//! In Phase 0, these wrappers perform blocking I/O internally but present
-//! an async API. This allows the codebase to use async patterns that will
-//! benefit from true async I/O when the runtime is upgraded.
+//! On Unix, `create_native_pipe`, `NativePipeReader`, and `NativePipeWriter`
+//! provide caller-owned, nonblocking pipe I/O backed by the caller's reactor.
+//! Use these with `AsyncStdioTransport::from_io` or `Server::serve_stdio_io`
+//! when ingress and egress must progress without a blocking pool or thread.
+//! They do not change process stdin/stdout or silently alter supplied flags.
 //!
-//! # Cancellation limitations
+//! # Legacy standard-stream wrappers
+//!
+//! `AsyncStdin`, `AsyncStdout`, and `AsyncLineReader` retain their Phase 0
+//! behavior: they perform blocking I/O internally. An async trait alone does
+//! not make those standard-stream operations nonblocking.
+//!
+//! # Legacy cancellation limitations
 //!
 //! Capability-accepting convenience methods run `Cx::checkpoint()` before
 //! entering synchronous I/O and between bounded line-buffer fills. This
 //! observes cancellation masking as well as deadline, poll-quota, and
-//! cost-quota exhaustion. The `AsyncRead`/`AsyncWrite` poll methods themselves
-//! have no `Cx` and perform blocking standard-library I/O. None of these
-//! checkpoints can interrupt an operation once the underlying read, write,
-//! flush, or stdout lock blocks. Unix stdio server entrypoints use the separate
-//! bounded nonblocking stdout commit method instead of these legacy writes.
+//! cost-quota exhaustion. The legacy `AsyncRead`/`AsyncWrite` poll methods
+//! themselves have no `Cx` and perform blocking standard-library I/O. None of
+//! these checkpoints can interrupt an operation once the underlying read,
+//! write, flush, or stdout lock blocks. Unix stdio server entrypoints use the
+//! separate bounded nonblocking stdout commit method instead of these legacy
+//! writes. The native pipe adapters instead register I/O, cancellation, and
+//! finite-deadline wakeups with their explicitly supplied caller.
 
 use asupersync::Cx;
 use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -28,6 +38,11 @@ use std::sync::Mutex;
 use std::task::{Context, Poll};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+mod native_pipe;
+#[cfg(unix)]
+pub use native_pipe::{NativePipeReader, NativePipeWriter, native_pipe as create_native_pipe};
 
 fn io_checkpoint(cx: &Cx) -> io::Result<()> {
     cx.checkpoint().map_err(|error| {
