@@ -80,6 +80,36 @@ pub struct ReviewedToolHeaders {
     schema: AdmittedToolHeaderSchema,
 }
 
+/// Whether a resource may carry `Mcp-Param-*` mirrors of tool parameters.
+///
+/// Mirroring a parameter into a header exposes its value to every
+/// intermediary on the path, so TLS is required in general. A loopback
+/// authority has no intermediary, and refusing it made the shipped capability
+/// unreachable over `http://127.0.0.1`, which is what local tooling and the
+/// official conformance harness use. The loopback set matches the one the HTTP
+/// transport already admits for a request `Origin`, so the two sides of this
+/// workspace draw the same line: `localhost`, `127.0.0.0/8`, or `::1`.
+///
+/// Every other `http` authority stays refused. This is not "http is allowed".
+fn is_parameter_header_resource_admitted(resource: &CanonicalHttpUrl) -> bool {
+    match resource.scheme() {
+        "https" => true,
+        "http" => {
+            let host = resource.host();
+            let host = host
+                .strip_prefix('[')
+                .and_then(|rest| rest.strip_suffix(']'))
+                .unwrap_or(host);
+            host.eq_ignore_ascii_case("localhost")
+                || host == "::1"
+                || host
+                    .parse::<std::net::Ipv4Addr>()
+                    .is_ok_and(|address| address.is_loopback())
+        }
+        _ => false,
+    }
+}
+
 impl ReviewedToolHeaders {
     /// The callback reviews an exact property path, field name and primitive
     /// type. It receives no invocation values and must apply the host's local
@@ -91,7 +121,7 @@ impl ReviewedToolHeaders {
         mut review: impl FnMut(&ParameterHeaderBinding) -> bool,
     ) -> Result<Self, ToolHeaderDispatchError> {
         let tool_name = tool_name.into();
-        if resource.scheme() != "https"
+        if !is_parameter_header_resource_admitted(&resource)
             || resource.has_userinfo()
             || resource.fragment().is_some()
             || resource.as_str().len() > MAX_MCP_HEADER_VALUE_BYTES

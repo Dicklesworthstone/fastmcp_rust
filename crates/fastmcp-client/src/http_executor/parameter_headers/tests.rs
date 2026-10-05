@@ -559,3 +559,56 @@ fn gateway_refuses_a_projection_the_body_cannot_support_and_never_merges_a_revie
         Err(ToolHeaderDispatchError::AlreadyProjected)
     ));
 }
+
+#[test]
+fn parameter_header_plans_admit_https_and_loopback_http_only() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"region": {"type": "string", "x-mcp-header": "Region"}},
+    });
+    let plan_for = |resource: &str| {
+        ReviewedToolHeaders::new(
+            CanonicalHttpUrl::parse(resource).expect("probe resource parses"),
+            "test_custom_headers",
+            schema.clone(),
+            |_binding| true,
+        )
+    };
+
+    // POSITIVE: TLS anywhere, and loopback without it. Mirroring a parameter
+    // into a header exposes it to intermediaries, and a loopback authority has
+    // none. Refusing these made `call_tool_with_parameter_headers` unreachable
+    // over the `http://127.0.0.1` that local tooling and the official
+    // conformance harness use.
+    for admitted in [
+        "https://tools.example/mcp",
+        "http://127.0.0.1:8931/mcp",
+        "http://127.0.0.53:8931/mcp",
+        "http://localhost:8931/mcp",
+        "http://LocalHost:8931/mcp",
+        "http://[::1]:8931/mcp",
+    ] {
+        assert!(
+            plan_for(admitted).is_ok(),
+            "{admitted} must admit a parameter-header plan"
+        );
+    }
+
+    // PLANTED NEGATIVES, each one dimension from an admitted case. The point
+    // of the change is that loopback became admissible, NOT that `http` did:
+    // a non-loopback `http` authority is still refused, and so is every other
+    // disqualifier on an otherwise-admitted resource.
+    for (label, refused) in [
+        ("non-loopback http host", "http://tools.example/mcp"),
+        ("http host merely named like loopback", "http://localhost.evil.example/mcp"),
+        ("public IPv4 over http", "http://93.184.216.34/mcp"),
+        ("non-loopback IPv6 over http", "http://[2606:2800:220:1:248:1893:25c8:1946]/mcp"),
+        ("userinfo on a loopback resource", "http://user@127.0.0.1:8931/mcp"),
+        ("fragment on a loopback resource", "http://127.0.0.1:8931/mcp#frag"),
+    ] {
+        assert!(
+            plan_for(refused).is_err(),
+            "{label} must still be refused: {refused}"
+        );
+    }
+}

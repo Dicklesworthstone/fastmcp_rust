@@ -33,20 +33,20 @@
 //! Not covered: the authorization scenarios (`auth/*`), which need an
 //! interactive OAuth driver configuration this adapter does not supply.
 //!
-//! Also not covered: EMITTING `Mcp-Param-*` mirrors. The library implements
-//! this fully (`HttpClient::call_tool_with_parameter_headers` plus
-//! `ReviewedToolHeaders`), but `ReviewedToolHeaders::new` requires an `https`
-//! resource and the harness serves `http://127.0.0.1:<port>/mcp`, so the plan
-//! cannot be constructed in the scenario at all. That is a library-side
-//! decision (loopback HTTP is not the confidentiality risk that cleartext
-//! HTTPS-substitute traffic is, and the server already admits loopback for
-//! DNS-rebinding purposes), so it is tracked rather than worked around here.
+//! Parameters a tool designates with `x-mcp-header` are mirrored into
+//! `Mcp-Param-*` request headers through
+//! `HttpClient::call_tool_with_parameter_headers`. The plan comes from the
+//! tool's own schema and every projected binding is reviewed, because a server
+//! annotation is not consent to disclose a value; this adapter approves all of
+//! them, which is a conformance-harness policy and not a sane default for a
+//! real host.
 
 use std::collections::HashMap;
 use std::process::ExitCode;
 
 use fastmcp_protocol::http_headers::admit_final_tool_input_schema;
 use fastmcp_protocol::{ElicitContentValue, ElicitRequestParams, ElicitResult};
+use fastmcp_client::http_executor::parameter_headers::ReviewedToolHeaders;
 use fastmcp_rust::modern::{
     CanonicalHttpUrl, ClientBuilder, ClientCapabilities, Cx, McpError, ReverseRequestHandlers,
 };
@@ -121,6 +121,22 @@ fn handlers() -> ReverseRequestHandlers {
         })
 }
 
+/// Whether a tool input schema designates any parameter for an `Mcp-Param-*`
+/// header mirror. A plain substring test is enough here: the annotation key is
+/// reserved, and the library re-admits the schema before building a plan.
+fn declares_parameter_header(schema: &Value) -> bool {
+    fn walk(value: &Value) -> bool {
+        match value {
+            Value::Object(members) => members
+                .iter()
+                .any(|(name, nested)| name == "x-mcp-header" || walk(nested)),
+            Value::Array(items) => items.iter().any(walk),
+            _ => false,
+        }
+    }
+    walk(schema)
+}
+
 async fn run(cx: &Cx, url: &str) -> Result<(), String> {
     let endpoint =
         CanonicalHttpUrl::parse(url).map_err(|error| format!("bad URL {url}: {error}"))?;
@@ -134,7 +150,7 @@ async fn run(cx: &Cx, url: &str) -> Result<(), String> {
         .client_info("fastmcp-rust-conformance-client", "0.10.0")
         .capabilities(capabilities)
         .modern_reverse_request_handlers(handlers())
-        .connect_http_with_cx(cx, endpoint)
+        .connect_http_with_cx(cx, endpoint.clone())
         .await
         .map_err(|error| format!("connect: {error:?}"))?;
 
@@ -143,7 +159,7 @@ async fn run(cx: &Cx, url: &str) -> Result<(), String> {
         .await
         .map_err(|error| format!("tools/list: {error:?}"))?;
     let tools = serde_json::to_value(&listed.tools).map_err(|error| error.to_string())?;
-    let mut calls: Vec<(String, Value)> = Vec::new();
+    let mut calls: Vec<(String, Value, Option<ReviewedToolHeaders>)> = Vec::new();
     for tool in tools.as_array().into_iter().flatten() {
         let Some(name) = tool.get("name").and_then(Value::as_str) else {
             continue;
@@ -163,24 +179,50 @@ async fn run(cx: &Cx, url: &str) -> Result<(), String> {
             continue;
         }
         let arguments = schema.map_or_else(|| json!({}), arguments_for);
-        calls.push((name.to_owned(), arguments));
+        // SEP-2243: parameters the tool designates with `x-mcp-header` are
+        // MIRRORED into `Mcp-Param-*` request headers. The plan is built from
+        // the tool's own schema and every projected binding is reviewed here,
+        // because a server annotation is not consent to disclose a value.
+        //
+        // Only a tool that actually carries an annotation takes this path; a
+        // plan for an unannotated schema would be admitted with zero bindings
+        // and would needlessly give up the typed result for every other tool.
+        let plan = schema
+            .filter(|schema| declares_parameter_header(schema))
+            .and_then(|schema| {
+                ReviewedToolHeaders::new(endpoint.clone(), name, schema.clone(), |_binding| true)
+                    .ok()
+            });
+        calls.push((name.to_owned(), arguments, plan));
     }
     // The harness may name exact arguments for a listed tool; a call it names
     // for a tool the library did not list is never made.
     for (name, arguments) in context_tool_calls() {
-        if let Some(call) = calls.iter_mut().find(|(listed, _)| *listed == name) {
+        if let Some(call) = calls.iter_mut().find(|(listed, ..)| *listed == name) {
             call.1 = arguments;
         }
     }
-    for (name, arguments) in calls {
-        match client.call_tool(cx, &name, arguments).await {
-            Ok(result) => println!(
-                "tools/call {name}: {}",
-                serde_json::to_string(&result.content).unwrap_or_default()
-            ),
-            // A refused tool is reported, not fatal: scenarios may advertise
-            // tools the client must decline to call.
-            Err(error) => eprintln!("tools/call {name} refused: {error:?}"),
+    for (name, arguments, plan) in calls {
+        // The two call paths return different result types -- the
+        // parameter-header path yields the raw core result -- so each branch
+        // reports its own outcome. A refused tool is reported, not fatal:
+        // scenarios may advertise tools the client must decline to call.
+        if let Some(reviewed) = plan.as_ref() {
+            match client
+                .call_tool_with_parameter_headers(cx, &name, arguments, reviewed, &|_| true)
+                .await
+            {
+                Ok(_) => println!("tools/call {name}: ok, with Mcp-Param-* mirrors"),
+                Err(error) => eprintln!("tools/call {name} refused: {error:?}"),
+            }
+        } else {
+            match client.call_tool(cx, &name, arguments).await {
+                Ok(result) => println!(
+                    "tools/call {name}: {}",
+                    serde_json::to_string(&result.content).unwrap_or_default()
+                ),
+                Err(error) => eprintln!("tools/call {name} refused: {error:?}"),
+            }
         }
     }
 

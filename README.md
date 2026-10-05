@@ -50,32 +50,33 @@ push a percentage *up*. Compare the *sets* of failing check ids, which is what
 `scripts/conformance-expected-failures.yaml` records and what the suite's own
 `--expected-failures` gates on.
 
-**Client mode.** The gate is the harness passing in *both* modes. Client mode
-first measured 2026-10-04; most recent run, 32 scenarios / 155 checks:
-SUCCESS=40, FAILURE=61, SKIPPED=2, WARNING=1, INFO=51. Split it before quoting
-it, because the two halves measure different things:
+**Client mode.** The gate is the harness passing in *both* modes. Most recent
+run, 32 scenarios / 155 checks: SUCCESS=55, FAILURE=46, SKIPPED=2, WARNING=1,
+INFO=51. Split it before quoting it, because the halves measure different
+things:
 
 | | checks | SUCCESS | FAILURE |
 |---|---|---|---|
-| non-authorization | 53 | **38** | 15 |
-| authorization | 97 | 2 | 46 |
+| non-authorization | 55 | 52 | **0** |
+| authorization | 100 | 3 | 46 |
 
-- **Non-auth: every scenario passes except one.** `sep-2322-client-request-state`
-  5/5, `http-standard-headers` 9/9, `http-invalid-tool-headers` 11/11,
-  `json-schema-ref-no-deref` 1/1, `request-metadata`, `resource-mismatch` and
-  `tools_call` clean. All 15 remaining failures are a single cause:
-  `http-custom-headers` requires the client to mirror designated tool
-  parameters into `Mcp-Param-*` headers (SEP-2243). The library implements that
-  fully — `HttpClient::call_tool_with_parameter_headers` plus
-  `ReviewedToolHeaders` — but `ReviewedToolHeaders::new` requires an `https`
-  resource and the harness serves `http://127.0.0.1:<port>/mcp`, so the plan
-  cannot be constructed in the scenario.
+- **Non-authorization: no FAILURE-level check remains.** `http-custom-headers`
+  18/18, `http-invalid-tool-headers` 11/11, `http-standard-headers` 9/9 (2
+  skipped), `sep-2322-client-request-state` 5/5, `json-schema-ref-no-deref`,
+  `request-metadata` (1 SHOULD warning) and `tools_call` clean. SEP-2243
+  parameter-header mirroring is exercised end to end: designated parameters are
+  sent as `Mcp-Param-*`, encoded where the value is header-unsafe, omitted when
+  null, and never added for an undesignated parameter — and a tool whose
+  `x-mcp-header` annotations are invalid is excluded rather than called.
 - **Authorization: the adapter, not the library.** `conformance_client`
-  supplies no interactive OAuth driver and says so in its own module docs, so
-  these measure adapter completeness. They are consistent with OAuth/OIDC being
-  unpromoted below.
+  supplies no interactive OAuth driver, so these measure adapter completeness.
+  Closing them needs a non-interactive authorization-code driver; the nine
+  in-tree `oauth_*` test targets are gated on `native-tls-roots` with no
+  `required-features` stanza, so their green is vacuous today and is not
+  evidence those flows work.
 
-Client-mode conformance is measured and still **not** claimed.
+Client-mode conformance is measured; aggregate conformance is still **not**
+claimed, in either mode.
 
 No server-mode FAILURE-level check remains. The four SHOULD-level warnings are enumerated in
 that same file; two are the absent runtime catalog-mutation API, and two are a
