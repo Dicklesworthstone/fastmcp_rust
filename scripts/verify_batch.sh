@@ -113,6 +113,16 @@ SSH=(ssh -i "$KEY" -o BatchMode=yes -o ConnectTimeout=25 "$WORKER")
 # ---------------------------------------------------------------------------
 MANIFEST_PATHS='Cargo.toml Cargo.lock rust-toolchain.toml crates'
 
+# `.github` and `evidence` are here because test targets read them at COMPILE
+# time via include_str!/include_bytes! (fnd_01_dependency_evidence.rs :19048,
+# :51973, :51987). Omitting them made cargo report 5 "couldn't read ... No such
+# file or directory" errors that looked exactly like project defects and were
+# purely this script's doing. Syncing them is READ-ONLY; RULE 0.5 forbids
+# modifying anything under .github/workflows, not compiling against it.
+SYNC_PATHS=(Cargo.toml Cargo.lock rust-toolchain.toml crates spec scripts tools
+            .github evidence README.md)
+[ -d .cargo ] && SYNC_PATHS+=(.cargo)
+
 head_sha="$(git rev-parse HEAD)" || die 'not a git repository'
 tree_sha="$(git rev-parse 'HEAD^{tree}')"
 git status --porcelain --untracked-files=no > "$OUT/dirty-before.txt"
@@ -179,15 +189,6 @@ printf '== sync ==\nworker    %s\nremote    %s\n' "$WORKER" "$remote_dir"
 
 # Everything a build or a test fixture can read, and nothing else. Anything
 # added here must also be considered for MANIFEST_PATHS above.
-# `.github` and `evidence` are here because test targets read them at COMPILE
-# time via include_str!/include_bytes! (fnd_01_dependency_evidence.rs :19048,
-# :51973, :51987). Omitting them made cargo report 5 "couldn't read ... No such
-# file or directory" errors that looked exactly like project defects and were
-# purely this script's doing. Syncing them is READ-ONLY; RULE 0.5 forbids
-# modifying anything under .github/workflows, not compiling against it.
-SYNC_PATHS=(Cargo.toml Cargo.lock rust-toolchain.toml crates spec scripts tools
-            .github evidence README.md)
-[ -d .cargo ] && SYNC_PATHS+=(.cargo)
 rsync -az --no-perms --omit-dir-times \
     --exclude 'target/' --exclude '.rch-target-*' --exclude '*.log' \
     -e "ssh -i $KEY -o BatchMode=yes -o ConnectTimeout=25" \
