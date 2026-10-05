@@ -6291,7 +6291,7 @@ impl HttpLegacyRequestAdmissions {
         if entry.peer_cancellation_protected {
             return HttpLegacyAdmissionCancellationDisposition::Protected;
         }
-        if entry.cancellation.cancel() {
+        if entry.cancellation.cancel_by_peer() {
             HttpLegacyAdmissionCancellationDisposition::Accepted
         } else {
             HttpLegacyAdmissionCancellationDisposition::AlreadySettled
@@ -16885,9 +16885,17 @@ impl Server {
                     let mut writer = request_send
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if !(subscription_request && final_subscription_completion_response(&response)
-                        || cancellation.begin_finalization())
-                    {
+                    let finalized = subscription_request
+                        && final_subscription_completion_response(&response)
+                        || cancellation.begin_finalization();
+                    // MCP says a receiver SHOULD NOT respond to a request the
+                    // PEER cancelled. A server deadline and a shutdown reach
+                    // this same losing branch and MUST still answer, so the
+                    // CAUSE decides here, not the lost race. Exact-2024 does
+                    // the equivalent through `suppress_cancelled_response`.
+                    let suppress_peer_cancelled =
+                        !finalized && cancellation.is_peer_cancel_requested();
+                    if !finalized && !suppress_peer_cancelled {
                         response = JsonRpcResponse::error(
                             response.id,
                             JsonRpcError {
@@ -16898,7 +16906,9 @@ impl Server {
                             },
                         );
                     }
-                    if writer(&request_cx, &JsonRpcMessage::Response(response)).is_err() {
+                    if !suppress_peer_cancelled
+                        && writer(&request_cx, &JsonRpcMessage::Response(response)).is_err()
+                    {
                         return;
                     }
                 }
@@ -18050,9 +18060,17 @@ impl Server {
                                                 // the stdio writer fence.
                                                 let graceful_subscription_completion =
                                                     final_subscription_completion_response(&response);
-                                                if !graceful_subscription_completion
-                                                    && !request_cancellation.begin_finalization()
-                                                {
+                                                let finalized = graceful_subscription_completion
+                                                    || request_cancellation.begin_finalization();
+                                                // See the dual-era worker: a
+                                                // PEER-cancelled request gets
+                                                // no response at all, while a
+                                                // deadline or shutdown still
+                                                // answers -32004.
+                                                let suppress_peer_cancelled = !finalized
+                                                    && request_cancellation
+                                                        .is_peer_cancel_requested();
+                                                if !finalized && !suppress_peer_cancelled {
                                                     response = JsonRpcResponse::error(
                                                         response.id.clone(),
                                                         JsonRpcError {
@@ -18063,6 +18081,9 @@ impl Server {
                                                             data: None,
                                                         },
                                                     );
+                                                }
+                                                if suppress_peer_cancelled {
+                                                    return Ok(());
                                                 }
                                                 send_guard(
                                                     &request_cx,
@@ -20536,7 +20557,12 @@ impl Server {
             });
             guard
                 .get(&active_key)
-                .map(|entry| entry.cancellation.cancel())
+                // The PEER asked for this. Recording the cause here is what
+                // lets the response path stay silent, as MCP requires, without
+                // also silencing a deadline or a shutdown -- both of which must
+                // still produce a terminal response and both of which reach the
+                // same cancellation domain through plain `cancel`.
+                .map(|entry| entry.cancellation.cancel_by_peer())
         };
         let Some(accepted) = accepted else {
             debug!(

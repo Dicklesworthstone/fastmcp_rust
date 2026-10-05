@@ -36,6 +36,14 @@ const REQUEST_AUTH_AUTHENTICATED: u8 = 2;
 #[derive(Debug, Default)]
 struct McpRequestCancellationInner {
     state: AtomicU8,
+    /// Whether the cancellation that is being requested came from the PEER.
+    ///
+    /// The cancellation state alone cannot distinguish a peer
+    /// `notifications/cancelled` from the server's own request deadline or a
+    /// shutdown, and the three require different terminal behaviour: MCP says a
+    /// receiver SHOULD NOT respond to a request the peer cancelled, while a
+    /// deadline or shutdown MUST still produce a terminal response.
+    peer_requested: AtomicBool,
     notify: Notify,
 }
 
@@ -68,6 +76,31 @@ impl McpRequestCancellation {
             self.notify_terminal_waiters();
         }
         cancelled
+    }
+
+    /// Requests cancellation on behalf of the PEER.
+    ///
+    /// Identical to [`Self::cancel`] except that it records the cause, so the
+    /// response path can stay silent as MCP requires for a peer-cancelled
+    /// request without also silencing a deadline or shutdown.
+    ///
+    /// The cause is published BEFORE the state transition. `cancel` releases
+    /// the `CANCELLED` store, and every reader acquires it, so a thread that
+    /// observes cancellation is guaranteed to observe this flag too. Setting it
+    /// afterwards would let the response path see `CANCELLED` with the cause
+    /// still unset and wrongly answer a peer-cancelled request.
+    pub fn cancel_by_peer(&self) -> bool {
+        self.inner.peer_requested.store(true, Ordering::Release);
+        self.cancel()
+    }
+
+    /// Returns whether the peer requested this request's cancellation.
+    ///
+    /// Only meaningful once cancellation has won the terminal race; before
+    /// that it reports whether a peer cancellation has been published at all.
+    #[must_use]
+    pub fn is_peer_cancel_requested(&self) -> bool {
+        self.inner.peer_requested.load(Ordering::Acquire)
     }
 
     fn notify_terminal_waiters(&self) {
@@ -6738,5 +6771,38 @@ mod tests {
             panic!("changing only the source terminal state to panic preserves panic");
         };
         assert_eq!(actual, payload);
+    }
+
+    #[test]
+    fn peer_cancellation_is_distinguishable_from_a_local_cancellation() {
+        // POSITIVE: a peer cancellation records its cause, which is what lets
+        // the response path stay silent as MCP requires.
+        let peer = McpRequestCancellation::new();
+        assert!(!peer.is_peer_cancel_requested());
+        assert!(peer.cancel_by_peer());
+        assert!(peer.is_cancel_requested());
+        assert!(peer.is_peer_cancel_requested());
+        // The cause must be visible to anyone who can see the cancellation, so
+        // a response path that observes CANCELLED never has to guess.
+        assert!(peer.is_terminal() && peer.is_peer_cancel_requested());
+
+        // PLANTED NEGATIVE, differing only in which constructor cancelled it.
+        // A deadline or shutdown uses plain `cancel`, and those MUST still
+        // produce a terminal -32004 response; if this reported true the server
+        // would silently drop a timed-out request's answer.
+        let local = McpRequestCancellation::new();
+        assert!(local.cancel());
+        assert!(local.is_cancel_requested());
+        assert!(
+            !local.is_peer_cancel_requested(),
+            "a local cancellation must never be mistaken for a peer cancellation"
+        );
+
+        // Finalization still wins a clean race, and winning it leaves the
+        // cause unset so no suppression can be inferred from it.
+        let finalized = McpRequestCancellation::new();
+        assert!(finalized.begin_finalization());
+        assert!(!finalized.is_peer_cancel_requested());
+        assert!(!finalized.cancel_by_peer(), "finalization already owns it");
     }
 }
