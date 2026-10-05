@@ -29,10 +29,25 @@
 #
 # USAGE
 #
-#   scripts/run_official_conformance.sh [--bin PATH] [--port N]
+#   scripts/run_official_conformance.sh [--mode server|client] [--bin PATH]
+#                                       [--port N]
 #                                       [--suite all|active|core|draft|pending]
 #                                       [--baseline PATH] [--scenario NAME]
 #                                       [--out DIR]
+#
+# --mode server (the default) runs OUR server against the harness: this script
+# owns the adapter's lifecycle, binds it, waits for the port and reaps it.
+#
+# --mode client runs OUR client against the harness. There the suite owns every
+# server -- one per scenario, with the URL passed to our binary as its last
+# argument -- so nothing of ours is spawned and --port is meaningless. A
+# consequence worth knowing: in client mode a stale binary CANNOT hide behind an
+# already-running server, which it can in server mode.
+#
+# Client-mode suites are a different set: all, core, extensions, backcompat,
+# auth, metadata, draft, sep-835. In client mode the authorization scenarios
+# measure whether the ADAPTER supplies an OAuth driver, not whether the library
+# conforms, so never quote a client-mode total without splitting auth out.
 #
 # With no --bin it builds the adapter through cargo (which this repo routes to
 # RCH). On a machine whose architecture differs from the build worker's, build
@@ -55,6 +70,7 @@ set -u -o pipefail
 SUITE_PIN='@modelcontextprotocol/conformance@0.2.0-alpha.10'
 SPEC_VERSION='2026-07-28'
 
+MODE='server'
 BIN=''
 PORT=0
 SUITE='all'
@@ -66,6 +82,7 @@ die() { printf '%s\n' "$*" >&2; exit 2; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --mode)     MODE="${2:?--mode needs server or client}"; shift 2 ;;
         --bin)      BIN="${2:?--bin needs a path}"; shift 2 ;;
         --port)     PORT="${2:?--port needs a number}"; shift 2 ;;
         --suite)    SUITE="${2:?--suite needs a name}"; shift 2 ;;
@@ -77,6 +94,11 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+case "$MODE" in
+    server|client) ;;
+    *) die "--mode must be server or client, got: $MODE" ;;
+esac
+
 command -v npx >/dev/null 2>&1 || die 'npx is required to run the official suite'
 
 if [ -z "$OUT" ]; then
@@ -84,75 +106,10 @@ if [ -z "$OUT" ]; then
 fi
 mkdir -p "$OUT" || die "cannot create $OUT"
 
-# A port of 0 means "pick one that is free right now". The adapter takes an
-# explicit host:port, so resolve it here rather than asking the kernel twice.
-if [ "$PORT" = 0 ]; then
-    PORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')" \
-        || die 'cannot pick a free port'
-fi
-
-if [ -z "$BIN" ]; then
-    printf '== building conformance_server ==\n'
-    cargo build --locked -p fastmcp-rust --features tasks --bin conformance_server \
-        || die 'adapter build failed'
-    BIN="$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
-        | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/debug/conformance_server"
-fi
-
-[ -x "$BIN" ] || die "adapter binary is not executable: $BIN"
-
-printf '== adapter: %s\n== endpoint: http://127.0.0.1:%s/mcp\n== suite: %s @ %s\n' \
-    "$BIN" "$PORT" "$SUITE" "$SPEC_VERSION"
-
-"$BIN" "127.0.0.1:$PORT" > "$OUT/adapter.log" 2>&1 &
-ADAPTER=$!
-cleanup() {
-    if kill -0 "$ADAPTER" 2>/dev/null; then
-        kill -TERM "$ADAPTER" 2>/dev/null
-        for _ in 1 2 3 4 5 6 7 8 9 10; do
-            kill -0 "$ADAPTER" 2>/dev/null || break
-            sleep 0.2
-        done
-        kill -KILL "$ADAPTER" 2>/dev/null
-    fi
-}
-trap cleanup EXIT INT TERM
-
-# Wait for the listener, bounded, and treat an early exit as fatal rather than
-# letting the suite report every scenario as a connection failure.
-bound=0
-for _ in $(seq 1 120); do
-    if python3 -c "
-import socket,sys
-s=socket.socket(); s.settimeout(0.4)
-sys.exit(0 if s.connect_ex(('127.0.0.1',$PORT))==0 else 1)
-" 2>/dev/null; then bound=1; break; fi
-    if ! kill -0 "$ADAPTER" 2>/dev/null; then
-        printf '!! adapter exited before binding (status %s). Last log lines:\n' "$(wait "$ADAPTER" 2>/dev/null; echo $?)" >&2
-        tail -40 "$OUT/adapter.log" >&2
-        exit 2
-    fi
-    sleep 0.25
-done
-[ "$bound" = 1 ] || { printf '!! adapter never bound port %s\n' "$PORT" >&2; tail -40 "$OUT/adapter.log" >&2; exit 2; }
-
-printf '== adapter listening (pid %s) ==\n' "$ADAPTER"
-
-set -- server --url "http://127.0.0.1:$PORT/mcp" --spec-version "$SPEC_VERSION" --output-dir "$OUT"
-if [ -n "$SCENARIO" ]; then
-    set -- "$@" --scenario "$SCENARIO"
-else
-    set -- "$@" --suite "$SUITE"
-fi
-[ -n "$BASELINE" ] && set -- "$@" --expected-failures "$BASELINE"
-
-npx -y "$SUITE_PIN" "$@" 2>&1 | tee "$OUT/suite.log"
-STATUS=${PIPESTATUS[0]}
-
-printf '\n== tally ==\n'
-# The suite writes machine-readable results into --output-dir. Prefer those over
-# scraping the pretty printer, whose wording is not a contract.
-python3 - "$OUT" <<'PY'
+# One tally program, shared by both modes. Written to a temp file rather than
+# inlined twice so the two modes can never drift into reporting differently.
+TALLY="$(mktemp "${TMPDIR:-/tmp}/fastmcp-tally.XXXXXX.py")" || die 'cannot create tally program'
+cat > "$TALLY" <<'TALLY_PY'
 import json, pathlib, re, sys
 
 # The suite writes one `<output-dir>/<scenario>/checks.json` per scenario, each
@@ -216,7 +173,107 @@ else:
         print('\nserver:')
         for label, _ in failures:
             print(f'  - {label}')
-PY
+TALLY_PY
+
+# A port of 0 means "pick one that is free right now". The adapter takes an
+# explicit host:port, so resolve it here rather than asking the kernel twice.
+if [ "$PORT" = 0 ]; then
+    PORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')" \
+        || die 'cannot pick a free port'
+fi
+
+TARGET_BIN="conformance_server"
+[ "$MODE" = client ] && TARGET_BIN="conformance_client"
+
+if [ -z "$BIN" ]; then
+    printf '== building %s ==\n' "$TARGET_BIN"
+    cargo build --locked -p fastmcp-rust --features tasks --bin "$TARGET_BIN" \
+        || die 'adapter build failed'
+    BIN="$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+        | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/debug/$TARGET_BIN"
+fi
+
+[ -x "$BIN" ] || die "adapter binary is not executable: $BIN"
+
+# CLIENT MODE. The suite owns every server here: it starts one scenario server
+# per scenario and runs our binary against it, passing the URL as the last
+# argument. So there is no listener of ours to spawn, bind-wait on, or reap --
+# which also means --port is meaningless and a stale binary cannot hide behind
+# a running server, as it can in server mode.
+if [ "$MODE" = client ]; then
+    printf '== adapter: %s\n== mode: client\n== suite: %s @ %s\n' \
+        "$BIN" "$SUITE" "$SPEC_VERSION"
+    set -- client --command "$BIN" --spec-version "$SPEC_VERSION" --output-dir "$OUT"
+    if [ -n "$SCENARIO" ]; then
+        set -- "$@" --scenario "$SCENARIO"
+    else
+        set -- "$@" --suite "$SUITE"
+    fi
+    [ -n "$BASELINE" ] && set -- "$@" --expected-failures "$BASELINE"
+
+    npx -y "$SUITE_PIN" "$@" 2>&1 | tee "$OUT/suite.log"
+    STATUS=${PIPESTATUS[0]}
+    printf '\n== tally ==\n'
+    python3 "$TALLY" "$OUT"
+    printf '\n== artifacts: %s ==\nsuite exit status: %s\n' "$OUT" "$STATUS"
+    printf '\nA pass count here is not an aggregate MCP %s conformance claim. In client\n' "$SPEC_VERSION"
+    printf 'mode the authorization scenarios additionally measure whether the ADAPTER\n'
+    printf 'supplies an OAuth driver, not whether the library conforms.\n'
+    exit "$STATUS"
+fi
+
+printf '== adapter: %s\n== endpoint: http://127.0.0.1:%s/mcp\n== suite: %s @ %s\n' \
+    "$BIN" "$PORT" "$SUITE" "$SPEC_VERSION"
+
+"$BIN" "127.0.0.1:$PORT" > "$OUT/adapter.log" 2>&1 &
+ADAPTER=$!
+cleanup() {
+    if kill -0 "$ADAPTER" 2>/dev/null; then
+        kill -TERM "$ADAPTER" 2>/dev/null
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            kill -0 "$ADAPTER" 2>/dev/null || break
+            sleep 0.2
+        done
+        kill -KILL "$ADAPTER" 2>/dev/null
+    fi
+}
+trap cleanup EXIT INT TERM
+
+# Wait for the listener, bounded, and treat an early exit as fatal rather than
+# letting the suite report every scenario as a connection failure.
+bound=0
+for _ in $(seq 1 120); do
+    if python3 -c "
+import socket,sys
+s=socket.socket(); s.settimeout(0.4)
+sys.exit(0 if s.connect_ex(('127.0.0.1',$PORT))==0 else 1)
+" 2>/dev/null; then bound=1; break; fi
+    if ! kill -0 "$ADAPTER" 2>/dev/null; then
+        printf '!! adapter exited before binding (status %s). Last log lines:\n' "$(wait "$ADAPTER" 2>/dev/null; echo $?)" >&2
+        tail -40 "$OUT/adapter.log" >&2
+        exit 2
+    fi
+    sleep 0.25
+done
+[ "$bound" = 1 ] || { printf '!! adapter never bound port %s\n' "$PORT" >&2; tail -40 "$OUT/adapter.log" >&2; exit 2; }
+
+printf '== adapter listening (pid %s) ==\n' "$ADAPTER"
+
+set -- server --url "http://127.0.0.1:$PORT/mcp" --spec-version "$SPEC_VERSION" --output-dir "$OUT"
+if [ -n "$SCENARIO" ]; then
+    set -- "$@" --scenario "$SCENARIO"
+else
+    set -- "$@" --suite "$SUITE"
+fi
+[ -n "$BASELINE" ] && set -- "$@" --expected-failures "$BASELINE"
+
+npx -y "$SUITE_PIN" "$@" 2>&1 | tee "$OUT/suite.log"
+STATUS=${PIPESTATUS[0]}
+
+printf '\n== tally ==\n'
+# The suite writes machine-readable results into --output-dir. Prefer those over
+# scraping the pretty printer, whose wording is not a contract.
+python3 "$TALLY" "$OUT"
 
 printf '\n== adapter stderr (tail) ==\n'
 tail -15 "$OUT/adapter.log"
