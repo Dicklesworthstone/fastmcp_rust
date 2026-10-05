@@ -36,9 +36,28 @@
 //! cleartext endpoints cannot acquire a reviewed plan, and the library's
 //! ordinary constructor remains HTTPS-only.
 //!
-//! Not covered: authorization scenarios (`auth/*`), which need an interactive
-//! OAuth driver configuration this adapter does not supply. Source wiring and
-//! local regression tests do not establish official conformance results.
+//! # Explicit HTTPS OAuth fixtures
+//!
+//! Set `FASTMCP_CONFORMANCE_OAUTH` to a JSON object with
+//! `preauthorized_redirect: true`, `issuer`, `authorization_endpoint`,
+//! `token_endpoint`, `resource`, `client_id`, and optional `scopes` and
+//! `timeout_seconds` (1..=900, default 60). The configured resource must equal
+//! the command-line HTTPS endpoint. Optional `authorization_root_pem`,
+//! `token_root_pem`, and `resource_root_pem` each contain one explicitly trusted
+//! CA certificate for that endpoint only. No key or bearer-token input exists.
+//!
+//! This opts into the native public-client S256 authorization-code flow and
+//! its bounded direct-redirect browser driver. The issuer must already permit
+//! this fixture's authorization; login pages and consent forms are refused.
+//! A malformed config or failed login never falls back to anonymous traffic.
+//! Discovery and the same generic operations then use the admitted credential.
+//! Traffic ends at the earlier configured limit or access expiry; dropping the
+//! run revokes local credential clones. Protected results/errors are not logged.
+//!
+//! This is NOT a complete auth-suite driver: HTTP-only authorization fixtures,
+//! DCR/discovery policy, managed refresh, consent UI, and other authorization
+//! profiles remain outside this executable's configured flow. Source wiring
+//! and local regression tests do not establish official conformance results.
 
 use std::collections::HashMap;
 use std::process::ExitCode;
@@ -54,6 +73,8 @@ use fastmcp_protocol::{
     FinalCoreResult,
 };
 use serde_json::{Value, json};
+
+mod conformance_oauth;
 
 /// A schema-shaped placeholder for one property.
 fn placeholder(schema: &Value) -> Value {
@@ -195,9 +216,39 @@ fn handlers() -> ReverseRequestHandlers {
         })
 }
 
+fn failure(operation: &str, error: &impl std::fmt::Debug, protected: bool) -> String {
+    if protected {
+        format!("{operation} failed during authenticated MCP traffic")
+    } else {
+        format!("{operation}: {error:?}")
+    }
+}
+
+fn optional_catalog_failure(
+    operation: &str,
+    error: &fastmcp_client::HttpClientError,
+    protected: bool,
+) -> Result<(), String> {
+    let unsupported = matches!(
+        error,
+        fastmcp_client::HttpClientError::CoreResult(error)
+            if error.code == fastmcp_core::McpErrorCode::MethodNotFound
+    );
+    if protected && !unsupported {
+        return Err(failure(operation, error, true));
+    }
+    eprintln!("{}", failure(operation, error, protected));
+    Ok(())
+}
+
 async fn run(cx: &Cx, url: &str) -> Result<(), String> {
     let endpoint =
         CanonicalHttpUrl::parse(url).map_err(|error| format!("bad URL {url}: {error}"))?;
+    let oauth = match std::env::var(conformance_oauth::ENVIRONMENT) {
+        Ok(raw) => Some(raw),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => return Err("OAuth fixture configuration is not UTF-8".to_owned()),
+    };
     let capabilities: ClientCapabilities = serde_json::from_value(json!({
         "sampling": {},
         "roots": {},
@@ -209,7 +260,7 @@ async fn run(cx: &Cx, url: &str) -> Result<(), String> {
         Some(endpoint.clone()),
         None,
         None,
-        "conformance-anonymous".to_owned(),
+        if oauth.is_some() { "conformance-oauth" } else { "conformance-anonymous" }.to_owned(),
         "conformance-fixture".to_owned(),
         "native-http".to_owned(),
         0,
@@ -217,27 +268,44 @@ async fn run(cx: &Cx, url: &str) -> Result<(), String> {
         0,
     )
     .map_err(|error| format!("HTTP protocol plan: {error}"))?;
-    let mut client = ClientBuilder::new()
+    let builder = ClientBuilder::new()
         .protocol_plan(plan)
         .client_info("fastmcp-rust-conformance-client", "0.10.0")
         .capabilities(capabilities)
-        .reverse_request_handlers(handlers())
+        .reverse_request_handlers(handlers());
+    let (builder, authorization) =
+        conformance_oauth::configure(cx, &endpoint, builder, oauth.as_deref()).await?;
+    let flow = exercise(cx, &endpoint, builder, authorization.is_some());
+    match authorization {
+        Some(grant) => grant.run(cx, flow).await,
+        None => flow.await,
+    }
+}
+
+async fn exercise(
+    cx: &Cx,
+    endpoint: &CanonicalHttpUrl,
+    builder: ClientBuilder,
+    protected: bool,
+) -> Result<(), String> {
+    let mut client = builder
         .connect_http_client_with_cx(cx)
         .await
-        .map_err(|error| format!("connect: {error:?}"))?;
-
+        .map_err(|error| failure("connect", &error, protected))?;
     let listed = client
         .list_tools(cx, None)
         .await
-        .map_err(|error| format!("tools/list: {error:?}"))?;
+        .map_err(|error| failure("tools/list", &error, protected))?;
     let CoreResult::Final(FinalCoreResult::ToolsList { result: listed, .. }) = listed else {
         return Err("tools/list did not return a final tools catalog".to_owned());
     };
-    let tools = serde_json::to_value(&listed.payload.tools).map_err(|error| error.to_string())?;
+    let tools = serde_json::to_value(&listed.payload.tools)
+        .map_err(|error| failure("tools catalog encoding", &error, protected))?;
     let mut calls = Vec::new();
     for tool in tools.as_array().into_iter().flatten() {
-        match prepare_tool_call(&endpoint, tool) {
+        match prepare_tool_call(endpoint, tool) {
             Ok(call) => calls.push(call),
+            Err(_) if protected => eprintln!("tools/list excluded an inadmissible tool"),
             Err(error) => eprintln!(
                 "tools/list {} excluded: {error}",
                 tool.get("name").and_then(Value::as_str).unwrap_or("<unnamed>")
@@ -260,15 +328,16 @@ async fn run(cx: &Cx, url: &str) -> Result<(), String> {
             None => client.call_tool(cx, &name, arguments).await,
         };
         match outcome {
+            Ok(_) if protected => println!("tools/call: ok"),
             Ok(result) => println!("tools/call {name}: {result:?}"),
-            // A refused tool is reported, not fatal: scenarios may advertise
-            // tools the client must decline to call.
+            Err(error) if protected => return Err(failure("tools/call", &error, true)),
+            // Ordinary fixtures may advertise tools the client must decline.
             Err(error) => eprintln!("tools/call {name} refused: {error:?}"),
         }
     }
 
-    // Resources and prompts are optional server features: a refusal is
-    // reported and the run continues.
+    // Resources and prompts are optional server features. Never include
+    // protected peer-controlled identities, payloads, or errors in diagnostics.
     match client.list_resources(cx, None).await {
         Ok(CoreResult::Final(FinalCoreResult::ResourcesList { result: listed, .. })) => {
             let resources = serde_json::to_value(&listed.payload.resources).unwrap_or_default();
@@ -279,13 +348,16 @@ async fn run(cx: &Cx, url: &str) -> Result<(), String> {
                 .filter_map(|resource| resource.get("uri").and_then(Value::as_str))
             {
                 match client.read_resource(cx, uri).await {
+                    Ok(_) if protected => println!("resources/read: ok"),
                     Ok(_) => println!("resources/read {uri}: ok"),
+                    Err(error) if protected => return Err(failure("resources/read", &error, true)),
                     Err(error) => eprintln!("resources/read {uri} refused: {error:?}"),
                 }
             }
         }
+        Ok(_) if protected => return Err("resources/list returned an unexpected result type".to_owned()),
         Ok(_) => eprintln!("resources/list refused: unexpected result type"),
-        Err(error) => eprintln!("resources/list refused: {error:?}"),
+        Err(error) => optional_catalog_failure("resources/list", &error, protected)?,
     }
     match client.list_prompts(cx, None).await {
         Ok(CoreResult::Final(FinalCoreResult::PromptsList { result: listed, .. })) => {
@@ -303,15 +375,19 @@ async fn run(cx: &Cx, url: &str) -> Result<(), String> {
                     .map(|argument| (argument.to_owned(), "conformance".to_owned()))
                     .collect();
                 match client.get_prompt(cx, name, arguments).await {
+                    Ok(_) if protected => println!("prompts/get: ok"),
                     Ok(_) => println!("prompts/get {name}: ok"),
+                    Err(error) if protected => return Err(failure("prompts/get", &error, true)),
                     Err(error) => eprintln!("prompts/get {name} refused: {error:?}"),
                 }
             }
         }
+        Ok(_) if protected => return Err("prompts/list returned an unexpected result type".to_owned()),
         Ok(_) => eprintln!("prompts/list refused: unexpected result type"),
-        Err(error) => eprintln!("prompts/list refused: {error:?}"),
+        Err(error) => optional_catalog_failure("prompts/list", &error, protected)?,
     }
-    // Stateless HTTP holds no session, so there is nothing to close.
+    // Stateless HTTP has no session. The outer OAuth lease, when configured,
+    // revokes installed local credential clones on every return/drop path.
     Ok(())
 }
 
@@ -500,5 +576,17 @@ mod tests {
         assert_eq!(call.arguments, json!({
             "constant":"fixed", "enum":"first", "nested":{"flag":true,"number":1}
         }));
+    }
+
+    #[test]
+    fn authenticated_diagnostics_do_not_include_reflected_credentials() {
+        let secret = "reflected-code-and-token";
+        assert_eq!(failure("tools/call", &secret, true), "tools/call failed during authenticated MCP traffic");
+        assert!(!failure("connect", &secret, true).contains(secret));
+        assert!(failure("connect", &secret, false).contains(secret));
+        let denied = fastmcp_client::HttpClientError::CoreResult(McpError::invalid_request(secret));
+        assert!(!optional_catalog_failure("resources/list", &denied, true).unwrap_err().contains(secret));
+        let unsupported = fastmcp_client::HttpClientError::CoreResult(McpError::method_not_found("resources/list"));
+        assert!(optional_catalog_failure("resources/list", &unsupported, true).is_ok());
     }
 }
