@@ -1851,7 +1851,11 @@ fn e2e_public_stdio_auto_selects_modern_on_the_shipped_facade_server() {
         client.protocol_version(),
         fastmcp_rust::modern::PROTOCOL_VERSION
     );
-    assert_eq!(client.server_info().name, "echo-server");
+    // The shipped echo server advertises identity, so `Some` is part of the bar.
+    assert_eq!(
+        client.server_info().map(|peer| peer.name.as_str()),
+        Some("echo-server")
+    );
     assert!(
         client.server_discovery().is_some(),
         "a modern selection retains its public discovery observable"
@@ -1895,7 +1899,11 @@ fn e2e_public_stdio_auto_falls_back_to_exact_legacy_on_the_shipped_facade_server
         client.protocol_version(),
         fastmcp_rust::legacy_2024::PROTOCOL_VERSION
     );
-    assert_eq!(client.server_info().name, "echo-server");
+    // The shipped echo server advertises identity, so `Some` is part of the bar.
+    assert_eq!(
+        client.server_info().map(|peer| peer.name.as_str()),
+        Some("echo-server")
+    );
     assert!(
         client.server_discovery().is_none(),
         "an exact legacy session cannot inherit modern discovery state"
