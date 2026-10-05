@@ -14,41 +14,44 @@
 //!
 //! # Behaviour
 //!
-//! One generic, scenario-agnostic flow drives the public modern HTTP client:
-//! connect (stateless `server/discover`), list every tool, and call each one
-//! with arguments synthesized from its input schema (or the exact arguments
-//! the harness names in `MCP_CONFORMANCE_CONTEXT`), then read every listed
-//! resource and get every listed prompt. Installed reverse
-//! handlers answer any `input_required` round (sampling, roots, form or URL
-//! elicitation), so the client's MRTR loop, per-request `_meta`, routing and
-//! parameter headers, and schema handling are all exercised by real traffic.
-//! The adapter never branches on the scenario name: what the suite measures
-//! is the library's behaviour, not fixture-specific code.
+//! One generic, scenario-agnostic flow drives the published high-level HTTP
+//! client with an explicit ModernOnly plan: connect (`server/discover`), list
+//! tools, and call each listed tool with schema-shaped arguments or the exact
+//! arguments named in `MCP_CONFORMANCE_CONTEXT`. Then read listed resources
+//! and get listed prompts. Installed reverse handlers answer `input_required`
+//! rounds (sampling, roots, form or URL elicitation). No scenario name selects
+//! a different implementation, and no private/raw transport bypass is used.
 //!
-//! A listed tool whose `x-mcp-header` annotations are invalid is EXCLUDED
-//! rather than called, which SEP-2243 requires of a client. The decision is
-//! the library's: `admit_final_tool_input_schema` enforces the header rules
-//! only when the schema carries annotations.
+//! Invalid `x-mcp-header` annotations exclude a tool through the library's
+//! schema admission. Valid annotated tools get an explicitly reviewed plan
+//! bound to the configured HTTPS or numeric-loopback HTTP endpoint. Calls use
+//! `HttpClient::call_tool_with_reviewed_headers`, including its bounded schema
+//! repair and MRTR handling. Unannotated tools retain ordinary tool calls.
+//! Projection reads the actual outgoing body, including harness overrides.
 //!
-//! Not covered: the authorization scenarios (`auth/*`), which need an
-//! interactive OAuth driver configuration this adapter does not supply.
+//! This executable explicitly approves disclosure of its synthetic fixture
+//! arguments (including harness-supplied test values); that is an adapter
+//! policy, NOT a production recommendation to trust server annotations. A
+//! loopback HTTP endpoint must be controlled by the harness operator. Remote
+//! cleartext endpoints cannot acquire a reviewed plan, and the library's
+//! ordinary constructor remains HTTPS-only.
 //!
-//! Parameters a tool designates with `x-mcp-header` are mirrored into
-//! `Mcp-Param-*` request headers through
-//! `HttpClient::call_tool_with_parameter_headers`. The plan comes from the
-//! tool's own schema and every projected binding is reviewed, because a server
-//! annotation is not consent to disclose a value; this adapter approves all of
-//! them, which is a conformance-harness policy and not a sane default for a
-//! real host.
+//! Not covered: authorization scenarios (`auth/*`), which need an interactive
+//! OAuth driver configuration this adapter does not supply. Source wiring and
+//! local regression tests do not establish official conformance results.
 
 use std::collections::HashMap;
 use std::process::ExitCode;
 
 use fastmcp_client::http_executor::parameter_headers::ReviewedToolHeaders;
-use fastmcp_protocol::http_headers::admit_final_tool_input_schema;
-use fastmcp_protocol::{ElicitContentValue, ElicitRequestParams, ElicitResult};
-use fastmcp_rust::modern::{
-    CanonicalHttpUrl, ClientBuilder, ClientCapabilities, Cx, McpError, ReverseRequestHandlers,
+use fastmcp_client::{ClientBuilder, ClientProtocolPlan, ProtocolPolicy, ReverseRequestHandlers};
+use fastmcp_core::{CanonicalHttpUrl, Cx, McpError};
+use fastmcp_protocol::http_headers::{
+    AdmittedToolHeaderSchema, ParameterHeaderBinding, admit_final_tool_input_schema,
+};
+use fastmcp_protocol::{
+    ClientCapabilities, CoreResult, ElicitContentValue, ElicitRequestParams, ElicitResult,
+    FinalCoreResult,
 };
 use serde_json::{Value, json};
 
@@ -82,6 +85,77 @@ fn arguments_for(schema: &Value) -> Value {
         }
     }
     Value::Object(arguments)
+}
+
+struct PreparedToolCall {
+    name: String,
+    arguments: Value,
+    headers: Option<ReviewedToolHeaders>,
+}
+
+/// The operator runs this adapter against synthetic conformance fixtures.
+/// Production hosts must substitute their own per-binding disclosure policy.
+fn approve_fixture_header(_binding: &ParameterHeaderBinding) -> bool {
+    true
+}
+
+fn prepare_tool_call(
+    endpoint: &CanonicalHttpUrl,
+    tool: &Value,
+) -> Result<PreparedToolCall, String> {
+    let name = tool
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "listed tool has no name".to_owned())?;
+    let schema = tool
+        .get("inputSchema")
+        .cloned()
+        .unwrap_or_else(|| json!({"type":"object"}));
+    // Keep exclusion before argument synthesis or invocation. In particular,
+    // invalid annotations cannot fall back to an unmirrored ordinary call.
+    admit_final_tool_input_schema(schema.clone())
+        .map_err(|error| format!("invalid parameter-header schema: {error}"))?;
+    // Annotation-aware admission above has already checked every annotated
+    // schema through this compiler. Ordinary unannotated schemas may use the
+    // broader generic admission route; they do not authorize any headers.
+    let annotated = AdmittedToolHeaderSchema::admit(schema.clone())
+        .is_ok_and(|admitted| !admitted.header_plan().bindings().is_empty());
+    let headers = if annotated {
+        let reviewed = if endpoint.scheme() == "https" {
+            ReviewedToolHeaders::new(
+                endpoint.clone(),
+                name,
+                schema.clone(),
+                approve_fixture_header,
+            )
+        } else {
+            ReviewedToolHeaders::new_for_loopback_http(
+                endpoint.clone(),
+                name,
+                schema.clone(),
+                approve_fixture_header,
+            )
+        }
+        .map_err(|error| format!("parameter-header disclosure refused: {error}"))?;
+        Some(reviewed)
+    } else {
+        None
+    };
+    Ok(PreparedToolCall {
+        name: name.to_owned(),
+        arguments: arguments_for(&schema),
+        headers,
+    })
+}
+
+fn apply_context_tool_calls(calls: &mut [PreparedToolCall], overrides: Vec<(String, Value)>) {
+    // A name absent from the admitted catalog cannot introduce a new call.
+    // Overrides change only the body arguments, never the reviewed schema.
+    for (name, arguments) in overrides {
+        if let Some(call) = calls.iter_mut().find(|call| call.name == name) {
+            call.arguments = arguments;
+        }
+    }
 }
 
 fn handlers() -> ReverseRequestHandlers {
@@ -121,22 +195,6 @@ fn handlers() -> ReverseRequestHandlers {
         })
 }
 
-/// Whether a tool input schema designates any parameter for an `Mcp-Param-*`
-/// header mirror. A plain substring test is enough here: the annotation key is
-/// reserved, and the library re-admits the schema before building a plan.
-fn declares_parameter_header(schema: &Value) -> bool {
-    fn walk(value: &Value) -> bool {
-        match value {
-            Value::Object(members) => members
-                .iter()
-                .any(|(name, nested)| name == "x-mcp-header" || walk(nested)),
-            Value::Array(items) => items.iter().any(walk),
-            _ => false,
-        }
-    }
-    walk(schema)
-}
-
 async fn run(cx: &Cx, url: &str) -> Result<(), String> {
     let endpoint =
         CanonicalHttpUrl::parse(url).map_err(|error| format!("bad URL {url}: {error}"))?;
@@ -146,11 +204,25 @@ async fn run(cx: &Cx, url: &str) -> Result<(), String> {
         "elicitation": {"form": {}, "url": {}},
     }))
     .map_err(|error| format!("client capabilities: {error}"))?;
+    let plan = ClientProtocolPlan::http(
+        ProtocolPolicy::ModernOnly,
+        Some(endpoint.clone()),
+        None,
+        None,
+        "conformance-anonymous".to_owned(),
+        "conformance-fixture".to_owned(),
+        "native-http".to_owned(),
+        0,
+        0,
+        0,
+    )
+    .map_err(|error| format!("HTTP protocol plan: {error}"))?;
     let mut client = ClientBuilder::new()
+        .protocol_plan(plan)
         .client_info("fastmcp-rust-conformance-client", "0.10.0")
         .capabilities(capabilities)
         .modern_reverse_request_handlers(handlers())
-        .connect_http_with_cx(cx, endpoint.clone())
+        .connect_http_client_with_cx(cx)
         .await
         .map_err(|error| format!("connect: {error:?}"))?;
 
@@ -158,79 +230,48 @@ async fn run(cx: &Cx, url: &str) -> Result<(), String> {
         .list_tools(cx, None)
         .await
         .map_err(|error| format!("tools/list: {error:?}"))?;
-    let tools = serde_json::to_value(&listed.tools).map_err(|error| error.to_string())?;
-    let mut calls: Vec<(String, Value, Option<ReviewedToolHeaders>)> = Vec::new();
+    let CoreResult::Final(FinalCoreResult::ToolsList { result: listed, .. }) = listed else {
+        return Err("tools/list did not return a final tools catalog".to_owned());
+    };
+    let tools = serde_json::to_value(&listed.payload.tools).map_err(|error| error.to_string())?;
+    let mut calls = Vec::new();
     for tool in tools.as_array().into_iter().flatten() {
-        let Some(name) = tool.get("name").and_then(Value::as_str) else {
-            continue;
+        match prepare_tool_call(&endpoint, tool) {
+            Ok(call) => calls.push(call),
+            Err(error) => eprintln!(
+                "tools/list {} excluded: {error}",
+                tool.get("name").and_then(Value::as_str).unwrap_or("<unnamed>")
+            ),
+        }
+    }
+    apply_context_tool_calls(&mut calls, context_tool_calls());
+    for PreparedToolCall { name, arguments, headers } in calls {
+        let outcome = match headers {
+            Some(reviewed) => {
+                client
+                    .call_tool_with_reviewed_headers(
+                        cx,
+                        arguments,
+                        &reviewed,
+                        &approve_fixture_header,
+                    )
+                    .await
+            }
+            None => client.call_tool(cx, &name, arguments).await,
         };
-        let schema = tool.get("inputSchema");
-        // SEP-2243: a tool whose `x-mcp-header` annotations are invalid MUST be
-        // EXCLUDED rather than called -- an empty or non-ASCII header name, a
-        // name carrying a space, colon or control character, a duplicate name
-        // (in any case), or an annotation on a non-primitive location. The
-        // library already decides this; admission enforces the header rules
-        // only when the schema actually carries annotations, so a tool with no
-        // `x-mcp-header` is unaffected and still called.
-        if let Some(schema) = schema
-            && let Err(error) = admit_final_tool_input_schema(schema.clone())
-        {
-            eprintln!("tools/list {name} excluded: invalid parameter-header schema: {error}");
-            continue;
-        }
-        let arguments = schema.map_or_else(|| json!({}), arguments_for);
-        // SEP-2243: parameters the tool designates with `x-mcp-header` are
-        // MIRRORED into `Mcp-Param-*` request headers. The plan is built from
-        // the tool's own schema and every projected binding is reviewed here,
-        // because a server annotation is not consent to disclose a value.
-        //
-        // Only a tool that actually carries an annotation takes this path; a
-        // plan for an unannotated schema would be admitted with zero bindings
-        // and would needlessly give up the typed result for every other tool.
-        let plan = schema
-            .filter(|schema| declares_parameter_header(schema))
-            .and_then(|schema| {
-                ReviewedToolHeaders::new(endpoint.clone(), name, schema.clone(), |_binding| true)
-                    .ok()
-            });
-        calls.push((name.to_owned(), arguments, plan));
-    }
-    // The harness may name exact arguments for a listed tool; a call it names
-    // for a tool the library did not list is never made.
-    for (name, arguments) in context_tool_calls() {
-        if let Some(call) = calls.iter_mut().find(|(listed, ..)| *listed == name) {
-            call.1 = arguments;
-        }
-    }
-    for (name, arguments, plan) in calls {
-        // The two call paths return different result types -- the
-        // parameter-header path yields the raw core result -- so each branch
-        // reports its own outcome. A refused tool is reported, not fatal:
-        // scenarios may advertise tools the client must decline to call.
-        if let Some(reviewed) = plan.as_ref() {
-            match client
-                .call_tool_with_parameter_headers(cx, &name, arguments, reviewed, &|_| true)
-                .await
-            {
-                Ok(_) => println!("tools/call {name}: ok, with Mcp-Param-* mirrors"),
-                Err(error) => eprintln!("tools/call {name} refused: {error:?}"),
-            }
-        } else {
-            match client.call_tool(cx, &name, arguments).await {
-                Ok(result) => println!(
-                    "tools/call {name}: {}",
-                    serde_json::to_string(&result.content).unwrap_or_default()
-                ),
-                Err(error) => eprintln!("tools/call {name} refused: {error:?}"),
-            }
+        match outcome {
+            Ok(result) => println!("tools/call {name}: {result:?}"),
+            // A refused tool is reported, not fatal: scenarios may advertise
+            // tools the client must decline to call.
+            Err(error) => eprintln!("tools/call {name} refused: {error:?}"),
         }
     }
 
     // Resources and prompts are optional server features: a refusal is
     // reported and the run continues.
     match client.list_resources(cx, None).await {
-        Ok(listed) => {
-            let resources = serde_json::to_value(&listed.resources).unwrap_or_default();
+        Ok(CoreResult::Final(FinalCoreResult::ResourcesList { result: listed, .. })) => {
+            let resources = serde_json::to_value(&listed.payload.resources).unwrap_or_default();
             for uri in resources
                 .as_array()
                 .into_iter()
@@ -243,11 +284,12 @@ async fn run(cx: &Cx, url: &str) -> Result<(), String> {
                 }
             }
         }
+        Ok(_) => eprintln!("resources/list refused: unexpected result type"),
         Err(error) => eprintln!("resources/list refused: {error:?}"),
     }
     match client.list_prompts(cx, None).await {
-        Ok(listed) => {
-            let prompts = serde_json::to_value(&listed.prompts).unwrap_or_default();
+        Ok(CoreResult::Final(FinalCoreResult::PromptsList { result: listed, .. })) => {
+            let prompts = serde_json::to_value(&listed.payload.prompts).unwrap_or_default();
             for prompt in prompts.as_array().into_iter().flatten() {
                 let Some(name) = prompt.get("name").and_then(Value::as_str) else {
                     continue;
@@ -266,6 +308,7 @@ async fn run(cx: &Cx, url: &str) -> Result<(), String> {
                 }
             }
         }
+        Ok(_) => eprintln!("prompts/list refused: unexpected result type"),
         Err(error) => eprintln!("prompts/list refused: {error:?}"),
     }
     // Stateless HTTP holds no session, so there is nothing to close.
@@ -328,5 +371,134 @@ fn main() -> ExitCode {
             eprintln!("conformance client: {message}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fastmcp_client::http_executor::ModernHttpRequest;
+    use fastmcp_protocol::http_headers::decode_mcp_header_value;
+    use fastmcp_protocol::{FINAL_PROTOCOL_VERSION, FinalRequestMeta};
+
+    use super::*;
+
+    fn annotated_tool() -> Value {
+        json!({"name":"lookup","inputSchema":{"type":"object","properties":{
+            "region":{"type":"string","x-mcp-header":"Region"},
+            "private":{"type":"string"}
+        }}})
+    }
+
+    #[test]
+    fn annotated_catalog_tools_receive_exact_https_or_loopback_plans() {
+        for target in [
+            "https://tools.example/mcp",
+            "http://127.0.0.1:8123/mcp",
+            "http://[::1]:8123/mcp",
+        ] {
+            let endpoint = CanonicalHttpUrl::parse(target).unwrap();
+            let call = prepare_tool_call(&endpoint, &annotated_tool()).unwrap();
+            let reviewed = call.headers.unwrap();
+            assert_eq!(reviewed.resource(), &endpoint);
+            assert_eq!(reviewed.tool_name(), "lookup");
+            assert_eq!(reviewed.bindings().len(), 1);
+            assert_eq!(reviewed.bindings()[0].header_name(), "Mcp-Param-Region");
+        }
+    }
+
+    #[test]
+    fn denied_cleartext_review_never_falls_back_to_an_unmirrored_call() {
+        for target in ["http://192.0.2.1/mcp", "http://localhost/mcp"] {
+            let endpoint = CanonicalHttpUrl::parse(target).unwrap();
+            assert!(prepare_tool_call(&endpoint, &annotated_tool()).is_err());
+            // No annotation means no disclosure plan is required. Do not make
+            // the explicit header constructor a new general transport rule.
+            let ordinary = json!({"name":"plain","inputSchema":{
+                "type":"object","properties":{"value":{"type":"string"}}
+            }});
+            let call = prepare_tool_call(&endpoint, &ordinary).unwrap();
+            assert!(call.headers.is_none());
+            assert_eq!(call.arguments, json!({"value":"conformance"}));
+        }
+    }
+
+    #[test]
+    fn invalid_header_annotations_stay_excluded_before_invocation() {
+        let endpoint = CanonicalHttpUrl::parse("http://127.0.0.1:8123/mcp").unwrap();
+        for annotation in ["", "bad name", "bad:name", "bad\r\nname", "雪"] {
+            let mut tool = annotated_tool();
+            tool["inputSchema"]["properties"]["region"]["x-mcp-header"] = json!(annotation);
+            assert!(prepare_tool_call(&endpoint, &tool).is_err());
+        }
+        let mut duplicate = annotated_tool();
+        duplicate["inputSchema"]["properties"]["private"]["x-mcp-header"] = json!("region");
+        assert!(prepare_tool_call(&endpoint, &duplicate).is_err());
+        let mut nonprimitive = annotated_tool();
+        nonprimitive["inputSchema"]["properties"]["region"]["type"] = json!("object");
+        assert!(prepare_tool_call(&endpoint, &nonprimitive).is_err());
+    }
+
+    #[test]
+    fn context_override_is_projected_from_actual_body_without_changing_review() {
+        let endpoint = CanonicalHttpUrl::parse("http://127.0.0.1:8123/mcp").unwrap();
+        let mut calls = vec![prepare_tool_call(&endpoint, &annotated_tool()).unwrap()];
+        let arguments = json!({"region":"雪\r\n", "private":"body-only-canary"});
+        apply_context_tool_calls(
+            &mut calls,
+            vec![
+                ("unlisted".to_owned(), json!({"region":"must-not-run"})),
+                ("lookup".to_owned(), arguments.clone()),
+            ],
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments, arguments);
+        let call = calls.pop().unwrap();
+        let reviewed = call.headers.unwrap();
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{
+                "name":call.name, "arguments":call.arguments,
+                "_meta":FinalRequestMeta::new(ClientCapabilities::default())
+            }
+        }))
+        .unwrap();
+        let request = ModernHttpRequest::new(
+            endpoint.as_str(),
+            body.clone(),
+            FINAL_PROTOCOL_VERSION,
+            "tools/call",
+            Some("lookup".to_owned()),
+        )
+        .unwrap()
+        .with_reviewed_tool_headers(&reviewed)
+        .unwrap();
+        assert_eq!(request.body(), body);
+        let fields: Vec<_> = request
+            .headers()
+            .into_iter()
+            .filter(|(name, _)| name.starts_with("Mcp-Param-"))
+            .collect();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].0, "Mcp-Param-Region");
+        assert_eq!(decode_mcp_header_value(fields[0].1.as_bytes()).unwrap(), "雪\r\n");
+        assert!(!fields[0].1.contains(['\r', '\n']));
+        assert!(!request.headers().iter().any(|(_, value)| value.contains("body-only-canary")));
+    }
+
+    #[test]
+    fn ordinary_argument_synthesis_keeps_constants_enums_and_nested_types() {
+        let endpoint = CanonicalHttpUrl::parse("http://127.0.0.1:8123/mcp").unwrap();
+        let tool = json!({"name":"plain","inputSchema":{"type":"object","properties":{
+            "constant":{"type":"string","const":"fixed"},
+            "enum":{"type":"string","enum":["first","second"]},
+            "nested":{"type":"object","properties":{
+                "flag":{"type":"boolean"},"number":{"type":"integer"}
+            }}
+        }}});
+        let call = prepare_tool_call(&endpoint, &tool).unwrap();
+        assert!(call.headers.is_none());
+        assert_eq!(call.arguments, json!({
+            "constant":"fixed", "enum":"first", "nested":{"flag":true,"number":1}
+        }));
     }
 }
