@@ -266,18 +266,20 @@ cargo +$TOOLCHAIN test --locked $SCOPE $feature_args -- --list > \$RUNTMP/vb_lis
 grep -E ': test\$' \$RUNTMP/vb_list.log | sed 's/: test\$//' | sort -u > \$RUNTMP/vb_discovered.txt
 echo "RECEIPT_DISCOVERED=\$(wc -l < \$RUNTMP/vb_discovered.txt | tr -d ' ')"
 
-cargo +$TOOLCHAIN test --locked $SCOPE $feature_args -- $thread_args "\$@" > \$RUNTMP/vb_run.log 2>&1
+# Text parsing of libtest progress lines is NOT reliable here: product code
+# writes straight to stderr, bypassing libtest's capture, and lands ON the
+# progress line --
+#   test tests::panicked_progress_callback_... ... fastmcp client callback panicked
+# so the `ok` never appears where a line anchor can see it, and four outcomes
+# went unmatched that way. libtest's JSON events are one object per line and
+# are immune to interleaved output.
+cargo +$TOOLCHAIN test --locked $SCOPE $feature_args \
+    -- -Z unstable-options --format json $thread_args "\$@" > \$RUNTMP/vb_run.log 2>&1
 run_rc=\$?
 echo "RECEIPT_RUN_RC=\$run_rc"
-grep -oE '^test [^ ]+ \.\.\. (ok|FAILED)' \$RUNTMP/vb_run.log \
-    | sed 's/^test //; s/ \.\.\. .*\$//' | sort -u > \$RUNTMP/vb_executed.txt
-grep -oE '^test [^ ]+ \.\.\. ignored' \$RUNTMP/vb_run.log \
-    | sed 's/^test //; s/ \.\.\. ignored\$//' | sort -u > \$RUNTMP/vb_ignored.txt
-echo "RECEIPT_IGNORED_IDS=\$(wc -l < \$RUNTMP/vb_ignored.txt | tr -d ' ')"
-grep -E '^test .* \.\.\. ignored' \$RUNTMP/vb_run.log | head -20 | sed 's/^/RECEIPT_IGNORED /'
-echo "RECEIPT_EXECUTED=\$(wc -l < \$RUNTMP/vb_executed.txt | tr -d ' ')"
-grep -E '^test result' \$RUNTMP/vb_run.log | sed 's/^/RECEIPT_RESULT /'
-grep -E '^test .* FAILED' \$RUNTMP/vb_run.log | head -40 | sed 's/^/RECEIPT_FAILED /'
+echo "RECEIPT_JSON_EVENTS=\$(grep -c '^{"type":"test"' \$RUNTMP/vb_run.log)"
+# The whole log is returned and parsed locally, so there is ONE parser and the
+# worker needs no python.
 echo "RECEIPT_END"
 REMOTE
 
@@ -291,8 +293,7 @@ printf '== run ==\ncargo test --locked %s %s -- %s %s\n\n' \
     > "$OUT/remote.out" 2>&1
 remote_rc=$?
 "${SSH[@]}" "cat '$remote_dir/.vb-run/vb_discovered.txt'" > "$OUT/discovered.txt" 2>/dev/null || :
-"${SSH[@]}" "cat '$remote_dir/.vb-run/vb_executed.txt'"   > "$OUT/executed.txt"   2>/dev/null || :
-"${SSH[@]}" "cat '$remote_dir/.vb-run/vb_ignored.txt'"    > "$OUT/ignored.txt"    2>/dev/null || :
+"${SSH[@]}" "cat '$remote_dir/.vb-run/vb_run.log'"        > "$OUT/run.log"       2>/dev/null || :
 
 # Subject identity AFTER the run. Movement invalidates the receipt.
 git status --porcelain --untracked-files=no > "$OUT/dirty-after.txt"
@@ -315,19 +316,39 @@ def field(name):
     m = re.search(rf'^RECEIPT_{name}=(.*)$', raw, re.M)
     return m.group(1).strip() if m else None
 
-results = re.findall(
-    r'^RECEIPT_RESULT test result: (\w+)\. (\d+) passed; (\d+) failed; '
-    r'(\d+) ignored; \d+ measured; (\d+) filtered out', raw, re.M)
-passed   = sum(int(r[1]) for r in results)
-failed   = sum(int(r[2]) for r in results)
-ignored  = sum(int(r[3]) for r in results)
-filtered = sum(int(r[4]) for r in results)
+# libtest JSON events: one object per line, so interleaved product stderr
+# cannot corrupt an outcome the way it corrupted the text progress lines.
+# Non-JSON lines are skipped rather than guessed at.
+events, suites = [], []
+run_log = root / 'run.log'
+if run_log.exists():
+    for line in run_log.read_text(errors='replace').splitlines():
+        line = line.strip()
+        if not line.startswith('{'):
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get('type') == 'test' and event.get('event') in ('ok', 'failed', 'ignored'):
+            events.append(event)
+        elif event.get('type') == 'suite' and event.get('event') in ('ok', 'failed'):
+            suites.append(event)
+
+results  = suites
+passed   = sum(s.get('passed', 0) for s in suites)
+failed   = sum(s.get('failed', 0) for s in suites)
+ignored  = sum(s.get('ignored', 0) for s in suites)
+filtered = sum(s.get('filtered_out', 0) for s in suites)
+executed_ids = sorted({e['name'] for e in events if e['event'] in ('ok', 'failed')})
+ignored_ids  = sorted({e['name'] for e in events if e['event'] == 'ignored'})
+failed_ids   = sorted({e['name'] for e in events if e['event'] == 'failed'})
 
 def ids(name):
     p = root / name
     return sorted(set(p.read_text(errors='replace').split())) if p.exists() else []
 
-discovered, executed = ids('discovered.txt'), ids('executed.txt')
+discovered, executed = ids('discovered.txt'), executed_ids
 manifest_remote = field('MANIFEST_DIGEST')
 
 # Every condition below has turned a green-looking run into a false claim here
@@ -355,8 +376,11 @@ if check_only:
     if field('WARNINGS') not in (None, '0'):
         warnings.append(f'{field("WARNINGS")} warning(s); this workspace lints at -D warnings')
 else:
-    if not results:
-        reasons.append('no "test result" line: nothing reported a count')
+    if not suites:
+        reasons.append('no libtest suite event: nothing reported a count')
+    if events and passed + failed + ignored != len(events):
+        reasons.append(f'suite totals ({passed + failed + ignored}) disagree with '
+                       f'{len(events)} per-test events: the parse is incomplete')
     if passed == 0:
         reasons.append('passed==0: a zero-run green is RED (PL-1)')
     if failed:
@@ -374,7 +398,6 @@ if not still_current:
                     'manifest digest above, NOT the current working tree')
 if not check_only and field('RUN_RC') not in (None, '0') and not failed:
     reasons.append(f'runner exited {field("RUN_RC")} without reporting any failure: early abort')
-ignored_ids = ids('ignored.txt')
 if ignored:
     warnings.append(f'{ignored} test(s) ignored and therefore NOT executed: '
                     f'an #[ignore] body is not evidence. {ignored_ids[:5]}')
@@ -427,11 +450,12 @@ receipt = {
         'scheduler': 'none: direct ssh, bypassing the RCH queue',
     },
     'counts': {
-        'discovered_listed': field('DISCOVERED'), 'executed_named': field('EXECUTED'),
+        'discovered_listed': field('DISCOVERED'),
+        'executed_named': len(executed), 'json_events': field('JSON_EVENTS'),
         'passed': passed, 'failed': failed, 'ignored': ignored, 'filtered_out': filtered,
     },
     'test_ids': {'discovered': discovered, 'executed': executed,
-                 'ignored': ignored_ids},
+                 'ignored': ignored_ids, 'failed': failed_ids},
     'beads': [b for b in beads.split(',') if b],
     'mode': 'check-only (compile gate)' if check_only else 'test run',
     'verdict': 'INVALID' if reasons else 'GREEN',
@@ -447,14 +471,14 @@ receipt = {
 print('== receipt ==')
 print(f'verdict             {receipt["verdict"]}')
 print(f'manifest agrees     {receipt["subject"]["manifest_agrees"]}')
-print(f'discovered/executed {field("DISCOVERED")}/{field("EXECUTED")}')
+print(f'discovered/executed {field("DISCOVERED")}/{len(executed)}')
 print(f'passed/failed/ignored/filtered  {passed}/{failed}/{ignored}/{filtered}')
 for r in reasons:
     print(f'  INVALID: {r}')
 for w in warnings:
     print(f'  warn:    {w}')
-for line in re.findall(r'^RECEIPT_FAILED test (.*) \.\.\. FAILED', raw, re.M)[:15]:
-    print(f'  FAILED: {line}')
+for name in failed_ids[:15]:
+    print(f'  FAILED: {name}')
 if check_only and field('CHECK_RC') != '0':
     print('\n-- first diagnostics --')
     for line in [l for l in raw.split('\n') if l.startswith(('error', '  -->'))][:40]:
