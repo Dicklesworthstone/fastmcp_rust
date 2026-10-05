@@ -8,10 +8,12 @@
 //! to reuse that uncertain lineage.
 
 use std::future::{Future, poll_fn};
+use std::pin::Pin;
 use std::task::Poll;
 
 use asupersync::Cx;
 use asupersync::channel::oneshot;
+use asupersync::time::Sleep;
 use fastmcp_core::McpRequestCancellation;
 
 use super::{ManagedCoreError, ManagedToolError, ToolContract, check_tool_call};
@@ -34,9 +36,29 @@ pub(super) async fn await_validity<T>(
     // refusal can complete this receive. Drop unregisters this waiter alone.
     let (_keep_open, mut context_receiver) = oneshot::channel::<()>();
     let mut context_cancelled = std::pin::pin!(context_receiver.recv(cx));
+    // Capture one absolute caller deadline; repeated polls never replenish it.
+    // The transport may impose an even earlier operation-specific deadline.
+    let deadline = cx.budget().deadline;
+    let mut deadline_timer = deadline.map(Sleep::new);
     let mut future = std::pin::pin!(future);
     poll_fn(|task| {
+        // Native timers and callbacks must use the supplied caller's authority,
+        // not another task's ambient context. This guard ends before Pending.
+        let _caller = Cx::set_current(Some(cx.clone()));
         check_tool_call(cx, cancellation, contract)?;
+        if deadline.is_some_and(|deadline| cx.now() >= deadline) {
+            return Poll::Ready(Err(ManagedCoreError::TimedOut.into()));
+        }
+        if let Some(timer) = deadline_timer.as_mut() {
+            // Sleep resolves its driver on poll in asupersync 0.5. Never borrow
+            // an unrelated ambient driver or silently omit a caller deadline.
+            if cx.timer_driver().is_none() {
+                return Poll::Ready(Err(ManagedCoreError::RuntimeUnavailable.into()));
+            }
+            if Pin::new(timer).poll(task).is_ready() {
+                return Poll::Ready(Err(ManagedCoreError::TimedOut.into()));
+            }
+        }
         if invalidated.as_mut().poll(task).is_ready() {
             return Poll::Ready(Err(ManagedToolError::Invalidated));
         }
@@ -49,6 +71,9 @@ pub(super) async fn await_validity<T>(
         // Refuse even a simultaneously ready result. Owned response state is
         // dropped on this error; partially read work cannot become reusable.
         check_tool_call(cx, cancellation, contract)?;
+        if deadline.is_some_and(|deadline| cx.now() >= deadline) {
+            return Poll::Ready(Err(ManagedCoreError::TimedOut.into()));
+        }
         outcome.map(Ok)
     })
     .await
@@ -275,5 +300,226 @@ mod context_cancellation_tests {
         ));
         assert!(sibling_cx.checkpoint().is_ok());
         contract.check().unwrap();
+    }
+
+    fn clocked_runtime() -> (
+        asupersync::runtime::Runtime,
+        asupersync::time::TimerDriverHandle,
+        Arc<asupersync::time::VirtualClock>,
+    ) {
+        use asupersync::runtime::RuntimeBuilder;
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+
+        let clock = Arc::new(VirtualClock::new());
+        let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(timer.clone())
+            .build()
+            .unwrap();
+        (runtime, timer, clock)
+    }
+
+    #[test]
+    fn callbacks_use_the_caller_context_and_restore_the_ambient_context() {
+        let ambient = Cx::for_testing();
+        let _ambient = Cx::set_current(Some(ambient.clone()));
+        let cx = Cx::for_testing();
+        let contract = contract();
+        let cancellation = McpRequestCancellation::new();
+        let inner = async {
+            Cx::current().unwrap().cancel_fast(CancelKind::User);
+            42
+        };
+        let mut future = Box::pin(await_validity(&cx, &cancellation, &contract, inner));
+        assert!(matches!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(ManagedToolError::Core(ManagedCoreError::Cancelled)))
+        ));
+        assert!(cx.is_cancel_requested());
+        assert!(!ambient.is_cancel_requested());
+        Cx::current().unwrap().cancel_fast(CancelKind::User);
+        assert!(ambient.is_cancel_requested());
+    }
+
+    #[test]
+    fn pending_callbacks_restore_the_ambient_context_without_widening_authority() {
+        let ambient = Cx::for_testing();
+        let _ambient = Cx::set_current(Some(ambient.clone()));
+        let cx = Cx::detached_cancel_context();
+        let observed = std::cell::RefCell::new(None);
+        let contract = contract();
+        let cancellation = McpRequestCancellation::new();
+        let inner = poll_fn(|_| {
+            let current = Cx::current().unwrap();
+            assert!(!current.capabilities().io);
+            assert!(!current.capabilities().spawn);
+            assert!(!current.capabilities().time);
+            *observed.borrow_mut() = Some(current);
+            Poll::<()>::Pending
+        });
+        let mut future = Box::pin(await_validity(&cx, &cancellation, &contract, inner));
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        observed.borrow().as_ref().unwrap().cancel_fast(CancelKind::User);
+        assert!(cx.is_cancel_requested());
+        assert!(!ambient.is_cancel_requested());
+        Cx::current().unwrap().cancel_fast(CancelKind::User);
+        assert!(ambient.is_cancel_requested());
+    }
+
+    #[test]
+    fn caller_deadline_wakes_stalled_work_on_its_own_clock_not_the_ambient_clock() {
+        use asupersync::{Budget, Time};
+        use std::time::Duration;
+
+        let (runtime, timer, clock) = clocked_runtime();
+        let cx = runtime.request_cx_with_budget(
+            Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
+        );
+        let (foreign_runtime, foreign_timer, foreign_clock) = clocked_runtime();
+        foreign_clock.advance(1_000_000_000);
+        let foreign_cx = foreign_runtime.request_cx_with_budget(Budget::INFINITE);
+        let ambient = Cx::set_current(Some(foreign_cx.clone()));
+        let contract = contract();
+        let cancellation = McpRequestCancellation::new();
+        let state = Arc::new(State::default());
+        let wakes = Arc::new(Wakes::default());
+        let waker = Waker::from(wakes.clone());
+        let mut task = Context::from_waker(&waker);
+        let mut future = Box::pin(await_validity(
+            &cx,
+            &cancellation,
+            &contract,
+            Waiting(state.clone()),
+        ));
+        assert!(future.as_mut().poll(&mut task).is_pending());
+        assert!(timer.pending_count() > 0);
+        assert_eq!(foreign_timer.pending_count(), 0);
+        assert_eq!(Cx::current().unwrap().now(), foreign_cx.now());
+        clock.advance(10_000_000);
+        assert!(timer.process_timers() > 0);
+        assert!(wakes.0.load(Ordering::SeqCst) > 0);
+        assert!(matches!(
+            future.as_mut().poll(&mut task),
+            Poll::Ready(Err(ManagedToolError::Core(ManagedCoreError::TimedOut)))
+        ));
+        assert_eq!(state.polls.load(Ordering::SeqCst), 1);
+        assert!(state.dropped.load(Ordering::SeqCst));
+        assert_eq!(timer.pending_count(), 0);
+        assert_eq!(foreign_timer.pending_count(), 0);
+        assert_eq!(Cx::current().unwrap().now(), foreign_cx.now());
+        assert!(!cancellation.is_cancel_requested());
+        assert!(!foreign_cx.is_cancel_requested());
+        contract.check().unwrap();
+        drop(future);
+        drop(ambient);
+        drop(foreign_cx);
+        drop(cx);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        assert!(foreign_runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn bounded_callers_without_a_driver_refuse_before_owned_work() {
+        use asupersync::{Budget, Time};
+
+        let cx = Cx::for_testing_with_budget(
+            Budget::INFINITE.with_deadline(Time::from_nanos(u64::MAX)),
+        );
+        let contract = contract();
+        let cancellation = McpRequestCancellation::new();
+        let state = Arc::new(State::default());
+        let mut future = Box::pin(await_validity(
+            &cx,
+            &cancellation,
+            &contract,
+            Waiting(state.clone()),
+        ));
+        assert!(matches!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(ManagedToolError::Core(ManagedCoreError::RuntimeUnavailable)))
+        ));
+        assert_eq!(state.polls.load(Ordering::SeqCst), 0);
+        assert!(state.dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn deadline_expiring_inside_a_ready_callback_withholds_its_output() {
+        use asupersync::{Budget, Time};
+        use std::time::Duration;
+
+        let (runtime, timer, clock) = clocked_runtime();
+        let cx = runtime.request_cx_with_budget(
+            Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
+        );
+        let contract = contract();
+        let cancellation = McpRequestCancellation::new();
+        let state = Arc::new(State::default());
+        let inner = async {
+            clock.advance(10_000_000);
+            Waiting(state.clone())
+        };
+        let mut future = Box::pin(await_validity(&cx, &cancellation, &contract, inner));
+        assert!(matches!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(ManagedToolError::Core(ManagedCoreError::TimedOut)))
+        ));
+        assert!(state.dropped.load(Ordering::SeqCst));
+        assert_eq!(timer.pending_count(), 0);
+        drop(future);
+        drop(cx);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn abandoned_bounded_work_retires_its_timer_and_all_cancellation_waiters() {
+        use asupersync::{Budget, Time};
+        use std::time::Duration;
+
+        let (runtime, timer, clock) = clocked_runtime();
+        let cx = runtime.request_cx_with_budget(
+            Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
+        );
+        let contract = contract();
+        let cancellation = McpRequestCancellation::new();
+        let state = Arc::new(State::default());
+        let wakes = Arc::new(Wakes::default());
+        let waker = Waker::from(wakes.clone());
+        let mut future = Box::pin(await_validity(
+            &cx,
+            &cancellation,
+            &contract,
+            Waiting(state.clone()),
+        ));
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        assert!(timer.pending_count() > 0);
+        drop(future);
+        assert!(state.dropped.load(Ordering::SeqCst));
+        assert_eq!(timer.pending_count(), 0);
+        assert_eq!(Arc::strong_count(&wakes), 2);
+        clock.advance(10_000_000);
+        assert_eq!(timer.process_timers(), 0);
+        cx.cancel_fast(CancelKind::User);
+        cancellation.cancel();
+        contract.invalidate();
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        drop(cx);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
     }
 }
