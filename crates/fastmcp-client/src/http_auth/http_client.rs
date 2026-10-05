@@ -280,11 +280,24 @@ fn checkpoint(
     Ok(())
 }
 
-async fn guarded<T>(
-    cx: &Cx, cancellation: &McpRequestCancellation, deadline: Time,
-    credential: Option<&BoundBearerCredential>,
-    operation: impl Future<Output = Result<T, ManagedHttpClientError>>,
-) -> Result<T, ManagedHttpClientError> {
+/// Returns a BOXED future deliberately.
+///
+/// This helper holds the caller's `operation` future inline alongside a pinned
+/// `Sleep` and four pinned cancellation futures, so its state is 42-46 KB. Every
+/// public method on the managed client awaits it, which made one inner future
+/// surface as fifteen `clippy::large_futures` errors across three files and left
+/// the crate's `-D warnings` gate closed for every dependent. Boxing here, at
+/// the single inner step, collapses all of those call sites at once; boxing at
+/// each await point instead would be fifteen edits that only move the bytes.
+///
+/// Do not turn this back into a plain `async fn` without re-measuring the
+/// caller future sizes.
+fn guarded<'a, T: 'a>(
+    cx: &'a Cx, cancellation: &'a McpRequestCancellation, deadline: Time,
+    credential: Option<&'a BoundBearerCredential>,
+    operation: impl Future<Output = Result<T, ManagedHttpClientError>> + 'a,
+) -> std::pin::Pin<Box<dyn Future<Output = Result<T, ManagedHttpClientError>> + 'a>> {
+    Box::pin(async move {
     let deadline = cx.budget().deadline.map_or(deadline, |parent| parent.min(deadline));
     checkpoint(cx, cancellation, deadline, credential)?;
     if cx.timer_driver().is_none() { return Err(ManagedHttpClientError::RuntimeTimerUnavailable); }
@@ -324,6 +337,7 @@ async fn guarded<T>(
         if let Err(error) = checkpoint(cx, cancellation, deadline, credential) { return Poll::Ready(Err(error)); }
         result
     }).await
+    })
 }
 
 #[cfg(test)]
