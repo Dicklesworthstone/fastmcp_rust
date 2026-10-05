@@ -40789,6 +40789,170 @@ exec sleep 30
             .expect("typed modern discovery response serializes deterministically")
     }
 
+    /// Builds a schema-valid `server/discover` result and places the server
+    /// identity where the caller asks, so one fixture covers all three
+    /// placements the client must distinguish.
+    ///
+    /// `META_KEY` is the final 2026-07-28 position; a top-level `serverInfo`
+    /// sibling is the pre-2026 placement the official conformance harness
+    /// sends and which discovery retains inertly.
+    fn discovery_result_with_identity_placement(
+        in_meta: Option<&str>,
+        in_sibling: Option<&str>,
+    ) -> serde_json::Value {
+        const META_KEY: &str = "io.modelcontextprotocol/serverInfo";
+        let capabilities = fastmcp_protocol::ServerDiscoverCapabilities::from_registry(
+            &fastmcp_protocol::ServerBehaviorRegistry::default(),
+            std::collections::BTreeMap::new(),
+        )
+        .expect("an empty installed behavior registry is discoverable");
+        let typed = ServerDiscoverResult::new(
+            capabilities,
+            ServerInfo {
+                name: "placeholder".to_owned(),
+                version: "0.0.0".to_owned(),
+            },
+            None,
+            fastmcp_protocol::DiscoveryCacheHints::private_ttl_ms(0),
+        );
+        let mut result =
+            serde_json::to_value(&typed).expect("the typed discovery result serializes");
+        result["supportedVersions"] = serde_json::json!([MODERN_PROTOCOL_VERSION]);
+
+        // Start from no identity anywhere, then add back only what was asked
+        // for. `ServerDiscoverResult::new` always writes the `_meta` position,
+        // so the absent cases must remove it explicitly.
+        let object = result
+            .as_object_mut()
+            .expect("a discovery result is a JSON object");
+        if let Some(meta) = object.get_mut("_meta").and_then(serde_json::Value::as_object_mut) {
+            meta.remove(META_KEY);
+        }
+        if let Some(name) = in_meta {
+            // `entry` rather than indexing: indexing a serde_json `Map` panics
+            // on an absent key, and whether `_meta` survives serialization
+            // once its only member is removed is the serializer's choice, not
+            // something this fixture should assume.
+            object
+                .entry("_meta")
+                .or_insert_with(|| serde_json::json!({}))[META_KEY] =
+                serde_json::json!({ "name": name, "version": "1.0.0" });
+        }
+        if let Some(name) = in_sibling {
+            object.insert(
+                "serverInfo".to_owned(),
+                serde_json::json!({ "name": name, "version": "1.0.0" }),
+            );
+        }
+        result
+    }
+
+    fn decode_identity_placement(
+        in_meta: Option<&str>,
+        in_sibling: Option<&str>,
+    ) -> McpResult<ClientInitialization> {
+        let result = discovery_result_with_identity_placement(in_meta, in_sibling);
+        let raw = serde_json::to_string(&result).expect("the crafted result serializes");
+        let mut client = make_closed_client(true);
+        client.decode_modern_discovery_initialization(ReceivedPreparedResult {
+            result,
+            raw_result: Some(raw),
+            receipt: Instant::now(),
+        })
+    }
+
+    fn decoded_identity(initialization: &ClientInitialization) -> Option<&ServerInfo> {
+        match initialization {
+            ClientInitialization::Modern { server_info, .. } => server_info.as_ref(),
+            ClientInitialization::Legacy(_) => {
+                panic!("a modern discovery result must not decode as legacy initialization")
+            }
+        }
+    }
+
+    /// Positive: identity in the final `_meta` position is admitted.
+    ///
+    /// This is the control for the two cases below. Without it, a green
+    /// "sibling is admitted" row could not be distinguished from a decoder
+    /// that ignores placement entirely.
+    #[test]
+    fn modern_discovery_admits_identity_in_the_final_meta_position() {
+        let initialization = decode_identity_placement(Some("meta-peer"), None)
+            .expect("identity in the final position is admitted");
+        assert_eq!(
+            decoded_identity(&initialization).map(|peer| peer.name.as_str()),
+            Some("meta-peer")
+        );
+    }
+
+    /// Positive: identity in the pre-2026 top-level sibling is admitted.
+    ///
+    /// Before this was wired here, the sibling placement was accepted on the
+    /// modern HTTP path and REFUSED on this one, so a peer the official
+    /// harness emits connected over one transport and not the other.
+    #[test]
+    fn modern_discovery_admits_identity_in_the_pre_2026_sibling_position() {
+        let initialization = decode_identity_placement(None, Some("sibling-peer"))
+            .expect("identity in the pre-2026 sibling position is admitted");
+        assert_eq!(
+            decoded_identity(&initialization).map(|peer| peer.name.as_str()),
+            Some("sibling-peer")
+        );
+    }
+
+    /// Positive: a peer that supplies identity in NEITHER position connects,
+    /// and reports absence rather than acquiring an invented name.
+    ///
+    /// `$defs.DiscoverResult.required` is
+    /// `[cacheScope, capabilities, resultType, supportedVersions, ttlMs]` —
+    /// `_meta` is absent from it and `serverInfo` is not a property at all —
+    /// and `ResultMetaObject` documents that servers SHOULD send identity
+    /// "unless specifically configured not to do so". So this result is
+    /// schema-valid and refusing it was our deviation.
+    #[test]
+    fn modern_discovery_admits_a_peer_that_supplies_no_identity() {
+        let initialization = decode_identity_placement(None, None)
+            .expect("a schema-valid result with no identity must not be refused");
+        assert!(
+            decoded_identity(&initialization).is_none(),
+            "a peer that sent no identity must not acquire one"
+        );
+    }
+
+    /// RH-5 negative, differing from the two positives only in the forbidden
+    /// dimension: identity in BOTH positions is refused, because the decoder
+    /// cannot know which identity the peer meant and silently preferring one
+    /// would admit two divergent identities as if they agreed.
+    #[test]
+    fn modern_discovery_refuses_identity_in_both_positions() {
+        let ambiguous = discovery_result_with_identity_placement(
+            Some("meta-peer"),
+            Some("sibling-peer"),
+        );
+
+        // Layer 1, the cause. The client collapses every deserialization
+        // failure into one opaque message, so the ONLY place the specific
+        // divergent-identity reason is observable is the protocol decoder
+        // itself. Asserting it at the client layer would have passed for any
+        // malformed payload and proved nothing about ambiguity.
+        let decode_error = serde_json::from_value::<ServerDiscoverResult>(ambiguous.clone())
+            .expect_err("identity in two positions at once must not deserialize");
+        assert!(
+            decode_error.to_string().contains("divergent"),
+            "the decoder must name the divergent-identity cause; got {decode_error}"
+        );
+
+        // Layer 2, the consequence. The client refuses rather than silently
+        // preferring one of the two identities.
+        let error = decode_identity_placement(Some("meta-peer"), Some("sibling-peer"))
+            .expect_err("two placements at once is ambiguous and must be refused");
+        assert!(
+            format!("{error:?}").contains(INVALID_RESPONSE_PAYLOAD_ERROR),
+            "the client maps an undecodable discovery result to the invalid-payload \
+             class; got {error:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[cfg(feature = "tasks")]
     fn modern_tasks_discovery_response(server_name: &str, settings: serde_json::Value) -> String {
