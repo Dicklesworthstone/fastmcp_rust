@@ -3,7 +3,9 @@
 //! A schema describes projection, never permission to disclose arguments. The
 //! host must approve every compiled binding before this module will retain a
 //! plan. Projection reads the immutable outgoing JSON-RPC bytes, not a separate
-//! argument map. No schema lookup, credential acquisition, retry or I/O occurs.
+//! argument map. No schema lookup, credential acquisition, retry or I/O occurs
+//! during plan construction or projection. The explicit high-level client
+//! exchange APIs compose these plans with bounded catalog repair and MRTR.
 //!
 //! The host owns catalog freshness and disclosure policy. A changed definition
 //! or policy requires a new review; retaining a plan does not make it current.
@@ -11,6 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::{Arc, PoisonError, RwLock};
 
 use fastmcp_core::CanonicalHttpUrl;
@@ -25,6 +28,8 @@ use fastmcp_protocol::{
 use serde_json::Value;
 
 use super::ModernHttpRequest;
+
+mod exchange;
 
 /// Hard ceiling for duplicate-aware admission of the exact outgoing body.
 pub const MAX_TOOL_HEADER_REQUEST_BYTES: usize = 8 * 1024 * 1024;
@@ -47,7 +52,7 @@ impl fmt::Display for ToolHeaderDispatchError {
         f.write_str(match self {
             Self::InvalidBinding => "invalid tool-header resource or name binding",
             Self::DisclosureDenied => "tool parameter-header disclosure was not approved",
-            Self::TargetMismatch => "tool-header plan belongs to a different HTTPS resource",
+            Self::TargetMismatch => "tool-header plan belongs to a different resource",
             Self::OperationMismatch => "tool-header plan does not match the request operation",
             Self::AlreadyProjected => "tool parameter headers were already installed",
             Self::InvalidRequest => {
@@ -67,8 +72,10 @@ impl From<McpHeaderError> for ToolHeaderDispatchError {
     }
 }
 
-/// Immutable approval of one exact tool schema at one canonical HTTPS resource.
+/// Immutable approval of one exact tool schema at one canonical resource.
 ///
+/// [`Self::new`] requires HTTPS. Local applications can explicitly select
+/// [`Self::new_for_loopback_http`] for a numeric loopback HTTP endpoint.
 /// No arbitrary header map can be installed. The complete source is admitted
 /// before the first review callback. Rejecting any binding rejects the plan,
 /// including previously approved siblings. Unannotated arguments remain body
@@ -81,6 +88,9 @@ pub struct ReviewedToolHeaders {
 }
 
 impl ReviewedToolHeaders {
+    /// Reviews a tool at an HTTPS resource. Cleartext targets, including
+    /// loopback, are refused by this constructor.
+    ///
     /// The callback reviews an exact property path, field name and primitive
     /// type. It receives no invocation values and must apply the host's local
     /// disclosure policy rather than trusting server annotations as consent.
@@ -88,11 +98,53 @@ impl ReviewedToolHeaders {
         resource: CanonicalHttpUrl,
         tool_name: impl Into<String>,
         schema: Value,
+        review: impl FnMut(&ParameterHeaderBinding) -> bool,
+    ) -> Result<Self, ToolHeaderDispatchError> {
+        if resource.scheme() != "https" {
+            return Err(ToolHeaderDispatchError::InvalidBinding);
+        }
+        Self::review_resource(resource, tool_name.into(), schema, review)
+    }
+
+    /// Explicitly reviews a tool at a numeric loopback HTTP resource.
+    ///
+    /// This is intended for a host-controlled local server. It is not a TLS
+    /// substitute: loopback provides neither peer authentication nor secrecy
+    /// from other local processes. The caller must trust that local endpoint
+    /// and approve each disclosed binding just as for [`Self::new`].
+    ///
+    /// Only canonical IPv4/IPv6 loopback literals are admitted. DNS names
+    /// (including `localhost`), unspecified, private and public non-loopback
+    /// addresses, and IPv4-mapped IPv6 addresses are refused before review.
+    /// No DNS lookup or change to transport/credential policy occurs. A plan
+    /// remains bound to the entire canonical URL, including port/path/query;
+    /// it cannot be reused for another endpoint or an HTTPS-to-HTTP downgrade.
+    pub fn new_for_loopback_http(
+        resource: CanonicalHttpUrl,
+        tool_name: impl Into<String>,
+        schema: Value,
+        review: impl FnMut(&ParameterHeaderBinding) -> bool,
+    ) -> Result<Self, ToolHeaderDispatchError> {
+        let host = resource.host();
+        let literal = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
+        if resource.scheme() != "http"
+            || !literal.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        {
+            return Err(ToolHeaderDispatchError::InvalidBinding);
+        }
+        Self::review_resource(resource, tool_name.into(), schema, review)
+    }
+
+    fn review_resource(
+        resource: CanonicalHttpUrl,
+        tool_name: String,
+        schema: Value,
         mut review: impl FnMut(&ParameterHeaderBinding) -> bool,
     ) -> Result<Self, ToolHeaderDispatchError> {
-        let tool_name = tool_name.into();
-        if resource.scheme() != "https"
-            || resource.has_userinfo()
+        if resource.has_userinfo()
             || resource.fragment().is_some()
             || resource.as_str().len() > MAX_MCP_HEADER_VALUE_BYTES
             || tool_name.is_empty()
@@ -304,3 +356,192 @@ impl ModernHttpRequest {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod loopback_tests {
+    use super::*;
+    use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta};
+    use serde_json::json;
+
+    fn schema() -> Value {
+        json!({"type":"object","properties":{
+            "region":{"type":"string","x-mcp-header":"Region"}
+        }})
+    }
+
+    fn request(target: &str) -> ModernHttpRequest {
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{
+                "name":"lookup", "arguments":{"region":"eu", "private":"body-only"},
+                "_meta":FinalRequestMeta::new(ClientCapabilities::default())
+            }
+        }))
+        .unwrap();
+        ModernHttpRequest::new(
+            target,
+            body,
+            FINAL_PROTOCOL_VERSION,
+            "tools/call",
+            Some("lookup".to_owned()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn explicit_loopback_projection_preserves_body_and_https_only_default() {
+        for target in ["http://127.0.0.1:8123/mcp", "http://[::1]:8123/mcp"] {
+            let resource = CanonicalHttpUrl::parse(target).unwrap();
+            let mut calls = 0;
+            assert!(matches!(
+                ReviewedToolHeaders::new(resource.clone(), "lookup", schema(), |_| {
+                    calls += 1;
+                    true
+                }),
+                Err(ToolHeaderDispatchError::InvalidBinding)
+            ));
+            assert_eq!(calls, 0);
+            let plan = ReviewedToolHeaders::new_for_loopback_http(
+                resource,
+                "lookup",
+                schema(),
+                |binding| {
+                    calls += 1;
+                    binding.header_name() == "Mcp-Param-Region"
+                },
+            )
+            .unwrap();
+            assert_eq!(calls, 1);
+            let original = request(target);
+            let projected = original.clone().with_reviewed_tool_headers(&plan).unwrap();
+            assert_eq!(projected.body(), original.body());
+            let parameters: Vec<_> = projected
+                .headers()
+                .into_iter()
+                .filter(|(name, _)| name.starts_with("Mcp-Param-"))
+                .collect();
+            assert_eq!(
+                parameters,
+                vec![("Mcp-Param-Region".to_owned(), "eu".to_owned())]
+            );
+            assert!(
+                !projected
+                    .headers()
+                    .iter()
+                    .any(|(_, value)| value.contains("body-only"))
+            );
+            assert!(matches!(
+                projected.with_reviewed_tool_headers(&plan),
+                Err(ToolHeaderDispatchError::AlreadyProjected)
+            ));
+        }
+    }
+
+    #[test]
+    fn loopback_constructor_rejects_untrusted_targets_before_review() {
+        for target in [
+            "http://localhost:8123/mcp",
+            "http://localhost.example:8123/mcp",
+            "http://127.0.0.1.example:8123/mcp",
+            "http://0.0.0.0:8123/mcp",
+            "http://192.168.1.1:8123/mcp",
+            "http://192.0.2.1:8123/mcp",
+            "http://[::]:8123/mcp",
+            "http://[2001:db8::1]:8123/mcp",
+            "http://[::ffff:127.0.0.1]:8123/mcp",
+            "http://user@127.0.0.1:8123/mcp",
+            "http://127.0.0.1:8123/mcp#",
+            "https://127.0.0.1:8123/mcp",
+        ] {
+            let mut calls = 0;
+            assert!(
+                matches!(
+                    ReviewedToolHeaders::new_for_loopback_http(
+                        CanonicalHttpUrl::parse(target).unwrap(),
+                        "lookup",
+                        schema(),
+                        |_| {
+                            calls += 1;
+                            true
+                        }
+                    ),
+                    Err(ToolHeaderDispatchError::InvalidBinding)
+                ),
+                "{target}"
+            );
+            assert_eq!(calls, 0, "{target}");
+        }
+    }
+
+    #[test]
+    fn loopback_review_keeps_schema_and_disclosure_gates() {
+        let resource = CanonicalHttpUrl::parse("http://127.0.0.1:8123/mcp").unwrap();
+        assert!(matches!(
+            ReviewedToolHeaders::new_for_loopback_http(
+                resource.clone(),
+                "lookup",
+                schema(),
+                |_| false
+            ),
+            Err(ToolHeaderDispatchError::DisclosureDenied)
+        ));
+        for source in [
+            json!({"type":"string"}),
+            json!({"type":"object","properties":{
+                "region":{"type":"object","x-mcp-header":"Region"}
+            }}),
+            json!({"type":"object","properties":{
+                "region":{"type":"string","x-mcp-header":"Region"},
+                "other":{"type":"string","x-mcp-header":"region"}
+            }}),
+        ] {
+            let mut calls = 0;
+            assert!(
+                ReviewedToolHeaders::new_for_loopback_http(
+                    resource.clone(),
+                    "lookup",
+                    source,
+                    |_| {
+                        calls += 1;
+                        true
+                    }
+                )
+                .is_err()
+            );
+            assert_eq!(calls, 0);
+        }
+    }
+
+    #[test]
+    fn loopback_plan_cannot_cross_port_path_query_address_or_scheme() {
+        let target = "http://127.0.0.1:8123/mcp";
+        let plan = ReviewedToolHeaders::new_for_loopback_http(
+            CanonicalHttpUrl::parse(target).unwrap(),
+            "lookup",
+            schema(),
+            |_| true,
+        )
+        .unwrap();
+        assert!(request(target).with_reviewed_tool_headers(&plan).is_ok());
+        for other in [
+            "http://127.0.0.1:8124/mcp",
+            "http://127.0.0.1:8123/other",
+            "http://127.0.0.1:8123/mcp?tenant=other",
+            "http://127.0.0.2:8123/mcp",
+            "http://[::1]:8123/mcp",
+            "https://127.0.0.1:8123/mcp",
+        ] {
+            let original = request(other);
+            assert!(matches!(
+                original.clone().with_reviewed_tool_headers(&plan),
+                Err(ToolHeaderDispatchError::TargetMismatch)
+            ));
+            assert!(
+                !original
+                    .headers()
+                    .iter()
+                    .any(|(name, _)| name.starts_with("Mcp-Param-"))
+            );
+        }
+    }
+}

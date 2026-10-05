@@ -40,5 +40,28 @@ rustix = { workspace = true, features = ["event", "fs", "std"] }
 # Test-only context construction; transport production APIs receive `&Cx`.
 asupersync = { workspace = true, features = ["test-internals"] }
 
+# --- Loud refusal for feature-gated targets (bd-ufj6r) ---------------------
+# Each target below starts with a file-scope `#![cfg(...)]`. Without a stanza
+# here, a build whose features do not satisfy that cfg compiles the target to
+# an EMPTY BINARY and libtest prints `ok. 0 passed` with exit status 0, which is
+# indistinguishable from a real pass. With the stanza, naming the target
+# explicitly (`--test <name>`) makes cargo refuse and say which feature is
+# missing.
+#
+# This is belt-and-braces, not a cure: `required-features` ALSO makes a bulk
+# `cargo test` exclude the target silently, so a runner card must still declare
+# its expected discovered count and treat `0 passed` as RED. The
+# `required-features` values below mirror each target's own cfg exactly.
+
+[[test]]
+name = "leg_http_01_a"
+path = "tests/leg_http_01_a.rs"
+required-features = ["legacy-2024-11-05"]
+
+[[test]]
+name = "sse_close_budget"
+path = "tests/sse_close_budget.rs"
+required-features = ["legacy-2024-11-05"]
+
 [lints]
 workspace = true

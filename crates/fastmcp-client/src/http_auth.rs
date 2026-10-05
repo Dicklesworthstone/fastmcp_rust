@@ -28,6 +28,8 @@ use fastmcp_core::{AccessToken, McpRequestCancellation};
 
 /// Protected-resource and issuer discovery for preregistered native clients.
 pub mod discovery;
+/// Jointly-polled, caller-owned browser driving for native authorization.
+pub mod driver;
 /// Shared OAuth renewal and authenticated modern HTTP dispatch.
 pub mod managed;
 /// Interactive native-public-client authorization with a caller-owned runtime.
