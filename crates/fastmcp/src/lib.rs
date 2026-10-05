@@ -8108,9 +8108,16 @@ pub mod legacy_2024 {
         }
 
         /// Returns the initialized server identity.
+        ///
+        /// This wrapper is reachable only for an exact 2024-11-05 connection,
+        /// whose `initialize` result requires `serverInfo`, so the identity is
+        /// always present here even though the modern surface makes it
+        /// optional.
         #[must_use]
         pub fn server_info(&self) -> &ServerInfo {
-            self.inner.server_info()
+            self.inner
+                .server_info()
+                .expect("exact 2024-11-05 initialize requires serverInfo")
         }
 
         /// Returns the initialized exact-2024 server capabilities.
@@ -9998,9 +10005,16 @@ pub mod legacy_2024 {
         }
 
         /// Returns the exact legacy server identity admitted at initialization.
+        ///
+        /// This wrapper is reachable only for an exact 2024-11-05 connection,
+        /// whose `initialize` result requires `serverInfo`, so the identity is
+        /// always present here even though the modern surface makes it
+        /// optional.
         #[must_use]
         pub fn server_info(&self) -> &ServerInfo {
-            self.inner.server_info()
+            self.inner
+                .server_info()
+                .expect("exact 2024-11-05 initialize requires serverInfo")
         }
 
         /// Returns the exact-2024 initialize instructions, if the peer advertised them.

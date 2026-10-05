@@ -7074,7 +7074,7 @@ async fn cmd_inspect(
     // open final model, so rendering it through the legacy capability struct
     // would silently discard advertised final members.
     let inspection = async {
-        let server_info = client.server_info().clone();
+        let server_info = client.server_info().cloned();
         let capabilities = stdio_inspect_capabilities(&client)?;
 
         // Acquire one typed page per category. MCP's list requests have no item
@@ -7146,7 +7146,7 @@ async fn cmd_inspect(
         InspectProtocolStatus::new(protocol_policy, &negotiated_protocol_version)?;
 
     write_inspect_report(
-        &server_info,
+        server_info.as_ref(),
         &capabilities,
         &tools,
         &resources,
@@ -7450,13 +7450,13 @@ async fn cmd_inspect_http(
         )
     })?;
     let protocol_status = InspectProtocolStatus::new(protocol_policy, negotiated_version)?;
-    let server_info = client.server_info().clone();
+    let server_info = client.server_info().cloned();
     let capabilities = http_inspect_capabilities(&client)?;
     let (acquisition_truncated, tools, resources, resource_templates, prompts) =
         http_inspect_catalogs(cx, &mut client, &capabilities).await?;
 
     write_inspect_report(
-        &server_info,
+        server_info.as_ref(),
         &capabilities,
         &tools,
         &resources,
@@ -7816,7 +7816,7 @@ fn inspect_prompt_from_final(prompt: fastmcp_protocol::FinalPrompt) -> fastmcp_p
 
 #[allow(clippy::too_many_arguments)]
 fn write_inspect_report(
-    server_info: &fastmcp_protocol::ServerInfo,
+    server_info: Option<&fastmcp_protocol::ServerInfo>,
     capabilities: &InspectCapabilities,
     tools: &[fastmcp_protocol::Tool],
     resources: &[fastmcp_protocol::Resource],
@@ -7868,7 +7868,7 @@ fn write_inspect_report(
 
 #[cfg(test)]
 fn format_inspect_text(
-    server_info: &fastmcp_protocol::ServerInfo,
+    server_info: Option<&fastmcp_protocol::ServerInfo>,
     capabilities: &fastmcp_protocol::ServerCapabilities,
     tools: &[fastmcp_protocol::Tool],
     resources: &[fastmcp_protocol::Resource],
@@ -7889,7 +7889,7 @@ fn format_inspect_text(
 }
 
 fn format_inspect_text_for_capabilities_with_truncation(
-    server_info: &fastmcp_protocol::ServerInfo,
+    server_info: Option<&fastmcp_protocol::ServerInfo>,
     capabilities: &InspectCapabilities,
     tools: &[fastmcp_protocol::Tool],
     resources: &[fastmcp_protocol::Resource],
@@ -7902,10 +7902,18 @@ fn format_inspect_text_for_capabilities_with_truncation(
 
     let _ = push_output_line(
         &mut out,
-        &format!(
-            "Server: {} v{}",
-            sanitize_peer_text(&server_info.name, PEER_FIELD_LIMIT),
-            sanitize_peer_text(&server_info.version, PEER_FIELD_LIMIT)
+        // A modern peer may legitimately advertise no identity: the 2026-07-28
+        // schema requires none on a discovery result. Report that plainly
+        // rather than printing an invented name.
+        &server_info.map_or_else(
+            || "Server: (identity not advertised)".to_owned(),
+            |server_info| {
+                format!(
+                    "Server: {} v{}",
+                    sanitize_peer_text(&server_info.name, PEER_FIELD_LIMIT),
+                    sanitize_peer_text(&server_info.version, PEER_FIELD_LIMIT)
+                )
+            },
         ),
     );
     let _ = push_output_line(
@@ -8242,7 +8250,7 @@ fn bounded_prompt_value(
 
 #[cfg(test)]
 fn format_inspect_json(
-    server_info: &fastmcp_protocol::ServerInfo,
+    server_info: Option<&fastmcp_protocol::ServerInfo>,
     capabilities: &fastmcp_protocol::ServerCapabilities,
     tools: &[fastmcp_protocol::Tool],
     resources: &[fastmcp_protocol::Resource],
@@ -8263,7 +8271,7 @@ fn format_inspect_json(
 }
 
 fn format_inspect_json_for_capabilities_with_truncation(
-    server_info: &fastmcp_protocol::ServerInfo,
+    server_info: Option<&fastmcp_protocol::ServerInfo>,
     capabilities: &InspectCapabilities,
     tools: &[fastmcp_protocol::Tool],
     resources: &[fastmcp_protocol::Resource],
@@ -8273,8 +8281,14 @@ fn format_inspect_json_for_capabilities_with_truncation(
     protocol_status: InspectProtocolStatus,
 ) -> McpResult<String> {
     let mut budget = JsonPreviewBudget::default();
-    let server_name = bounded_json_string(&server_info.name, &mut budget);
-    let server_version = bounded_json_string(&server_info.version, &mut budget);
+    // `null` when a modern peer advertised no identity, which the 2026-07-28
+    // schema permits. Emitting an invented name would be worse than absent.
+    let server = server_info.map(|server_info| {
+        serde_json::json!({
+            "name": bounded_json_string(&server_info.name, &mut budget),
+            "version": bounded_json_string(&server_info.version, &mut budget),
+        })
+    });
     let tool_values = tools
         .iter()
         .take(CLI_OUTPUT_MAX_ITEMS)
@@ -8304,10 +8318,7 @@ fn format_inspect_json_for_capabilities_with_truncation(
         || budget.mutation.truncated;
     budget.mutation.truncated = truncated;
     let output = serde_json::json!({
-        "server": {
-            "name": server_name,
-            "version": server_version,
-        },
+        "server": server,
         "protocol": {
             "policy": protocol_status.policy.server_launch_value(),
             "version": protocol_status.version.as_str(),
@@ -13995,14 +14006,14 @@ IFS= read -r end
                 let status = InspectProtocolStatus::new(policy, version)
                     .expect("each policy must report its exact admitted protocol version");
                 let text =
-                    format_inspect_text(&server_info, &capabilities, &[], &[], &[], &[], status);
+                    format_inspect_text(Some(&server_info), &capabilities, &[], &[], &[], &[], status);
                 assert!(text.contains(&format!(
                     "Protocol: policy={} version={version} era={era}",
                     policy.server_launch_value()
                 )));
 
                 let json =
-                    format_inspect_json(&server_info, &capabilities, &[], &[], &[], &[], status)
+                    format_inspect_json(Some(&server_info), &capabilities, &[], &[], &[], &[], status)
                         .expect("inspect status serializes");
                 let value: serde_json::Value =
                     serde_json::from_str(&json).expect("inspect status is JSON");
@@ -16867,7 +16878,7 @@ IFS= read -r end
             let capabilities = make_test_capabilities(true, true, true);
 
             let output = format_inspect_text(
-                &server_info,
+                Some(&server_info),
                 &capabilities,
                 &[],
                 &[],
@@ -16891,7 +16902,7 @@ IFS= read -r end
             let tools = vec![make_test_tool("my_tool", Some("A test tool"))];
 
             let output = format_inspect_text(
-                &server_info,
+                Some(&server_info),
                 &capabilities,
                 &tools,
                 &[],
@@ -16913,7 +16924,7 @@ IFS= read -r end
             let resources = vec![make_test_resource("file:///test.txt", "test file")];
 
             let output = format_inspect_text(
-                &server_info,
+                Some(&server_info),
                 &capabilities,
                 &[],
                 &resources,
@@ -16935,7 +16946,7 @@ IFS= read -r end
             let prompts = vec![make_test_prompt("greeting", Some("A greeting prompt"))];
 
             let output = format_inspect_text(
-                &server_info,
+                Some(&server_info),
                 &capabilities,
                 &[],
                 &[],
@@ -16963,7 +16974,7 @@ IFS= read -r end
             )];
 
             let output = format_inspect_text(
-                &server_info,
+                Some(&server_info),
                 &capabilities,
                 &tools,
                 &[],
@@ -16988,7 +16999,7 @@ IFS= read -r end
             let capabilities = make_test_capabilities(true, true, false);
 
             let result = format_inspect_json(
-                &server_info,
+                Some(&server_info),
                 &capabilities,
                 &[],
                 &[],
@@ -17043,7 +17054,7 @@ IFS= read -r end
             ];
 
             let result = format_inspect_json(
-                &server_info,
+                Some(&server_info),
                 &capabilities,
                 &tools,
                 &resources,
@@ -17094,7 +17105,7 @@ IFS= read -r end
             let tools = std::iter::repeat_n(tool, CLI_OUTPUT_MAX_ITEMS + 5).collect::<Vec<_>>();
 
             let output = format_inspect_json(
-                &server_info,
+                Some(&server_info),
                 &capabilities,
                 &tools,
                 &[],
@@ -17137,7 +17148,7 @@ IFS= read -r end
             ];
 
             let output = format_inspect_json(
-                &server_info,
+                Some(&server_info),
                 &capabilities,
                 &[tool],
                 &[],
@@ -17165,7 +17176,7 @@ IFS= read -r end
             let capabilities = make_test_capabilities(true, false, false);
             let capabilities = InspectCapabilities::Legacy(capabilities);
             let complete_text = format_inspect_text_for_capabilities_with_truncation(
-                &server_info,
+                Some(&server_info),
                 &capabilities,
                 &[],
                 &[],
@@ -17175,7 +17186,7 @@ IFS= read -r end
                 make_test_protocol_status(),
             );
             let complete_json = format_inspect_json_for_capabilities_with_truncation(
-                &server_info,
+                Some(&server_info),
                 &capabilities,
                 &[],
                 &[],
@@ -17186,7 +17197,7 @@ IFS= read -r end
             )
             .expect("inspect JSON");
             let truncated_text = format_inspect_text_for_capabilities_with_truncation(
-                &server_info,
+                Some(&server_info),
                 &capabilities,
                 &[],
                 &[],
@@ -17196,7 +17207,7 @@ IFS= read -r end
                 make_test_protocol_status(),
             );
             let truncated_json = format_inspect_json_for_capabilities_with_truncation(
-                &server_info,
+                Some(&server_info),
                 &capabilities,
                 &[],
                 &[],

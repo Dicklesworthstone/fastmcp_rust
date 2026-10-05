@@ -423,8 +423,16 @@ pub struct ClientSession {
     client_implementation: Option<Implementation>,
     /// Client capabilities sent during initialization.
     client_capabilities: ClientCapabilities,
-    /// Server info received during initialization.
-    server_info: ServerInfo,
+    /// Server identity received during initialization, when the peer sent one.
+    ///
+    /// `None` is reachable only on a modern connection. The 2026-07-28 schema
+    /// lists no required members on `DiscoverResult._meta` and documents that
+    /// servers SHOULD send `serverInfo` "unless specifically configured not to
+    /// do so", so a discovery result carrying identity in neither the final
+    /// `_meta` position nor the pre-2026 top-level sibling is schema-valid.
+    /// Exact 2024-11-05 `initialize` requires `serverInfo`, so a legacy session
+    /// always stores `Some`.
+    server_info: Option<ServerInfo>,
     /// Server capabilities received during initialization.
     server_capabilities: ServerCapabilities,
     /// Exact final discovery state when the modern handshake succeeded.
@@ -464,7 +472,7 @@ impl ClientSession {
     pub fn try_new(
         client_info: ClientInfo,
         client_capabilities: ClientCapabilities,
-        server_info: ServerInfo,
+        server_info: Option<ServerInfo>,
         server_capabilities: ServerCapabilities,
         protocol_version: String,
     ) -> Result<Self, ProtocolVersionError> {
@@ -490,7 +498,7 @@ impl ClientSession {
         Self::from_parts(
             client_info,
             client_capabilities,
-            server_info,
+            Some(server_info),
             server_capabilities,
             String::new(),
             None,
@@ -500,7 +508,7 @@ impl ClientSession {
     fn from_parts(
         client_info: ClientInfo,
         client_capabilities: ClientCapabilities,
-        server_info: ServerInfo,
+        server_info: Option<ServerInfo>,
         server_capabilities: ServerCapabilities,
         protocol_version: String,
         selected_era: Option<ProtocolEra>,
@@ -733,10 +741,15 @@ impl ClientSession {
         &self.client_capabilities
     }
 
-    /// Returns the server info.
+    /// Returns the server identity, when the peer supplied one.
+    ///
+    /// `None` means a modern peer sent a `server/discover` result carrying
+    /// identity in neither the final `_meta` position nor the pre-2026
+    /// top-level sibling. That is schema-valid and is reported rather than
+    /// refused or papered over with an invented name.
     #[must_use]
-    pub fn server_info(&self) -> &ServerInfo {
-        &self.server_info
+    pub fn server_info(&self) -> Option<&ServerInfo> {
+        self.server_info.as_ref()
     }
 
     /// Returns the server capabilities.
@@ -927,10 +940,10 @@ mod tests {
                 version: "1.0.0".to_string(),
             },
             ClientCapabilities::default(),
-            ServerInfo {
+            Some(ServerInfo {
                 name: "test-server".to_string(),
                 version: "2.0.0".to_string(),
-            },
+            }),
             ServerCapabilities {
                 tools: Some(ToolsCapability { list_changed: true }),
                 resources: Some(ResourcesCapability {
@@ -972,8 +985,35 @@ mod tests {
     #[test]
     fn session_server_info() {
         let session = test_session();
-        assert_eq!(session.server_info().name, "test-server");
-        assert_eq!(session.server_info().version, "2.0.0");
+        let server_info = session.server_info().expect("test session has identity");
+        assert_eq!(server_info.name, "test-server");
+        assert_eq!(server_info.version, "2.0.0");
+    }
+
+    /// RH-5 negative, near-identical to `session_server_info`: the only
+    /// difference is that the peer supplied no identity. A session must then
+    /// report `None` rather than refuse construction or invent a name.
+    #[test]
+    fn session_without_peer_identity_reports_none() {
+        let session = ClientSession::try_new(
+            ClientInfo {
+                name: "test-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+            None,
+            ServerCapabilities::default(),
+            MODERN_PROTOCOL_VERSION.to_owned(),
+        )
+        .expect("the modern version is supported");
+        assert!(
+            session.server_info().is_none(),
+            "a peer that sent no identity must not acquire one"
+        );
+        // Unchanged-state proof: absent identity does not disturb the rest of
+        // the negotiated session.
+        assert_eq!(session.protocol_version(), MODERN_PROTOCOL_VERSION);
+        assert_eq!(session.selected_era(), Some(ProtocolEra::Modern2026));
     }
 
     #[test]

@@ -80,10 +80,10 @@ fn clt_02_a_positive() {
             version: "1.0.0".to_owned(),
         },
         ClientCapabilities::default(),
-        ServerInfo {
+        Some(ServerInfo {
             name: "test-server".to_owned(),
             version: "1.0.0".to_owned(),
-        },
+        }),
         ServerCapabilities::default(),
         "2024-11-05".to_owned(),
     )

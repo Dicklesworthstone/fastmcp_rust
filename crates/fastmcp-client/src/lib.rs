@@ -4523,7 +4523,8 @@ where
             WebSocketInitialization::Legacy(result) => ClientSession::try_new(
                 client_info,
                 client_capabilities,
-                result.server_info,
+                // Exact 2024-11-05 requires `serverInfo` on the result.
+                Some(result.server_info),
                 result.capabilities,
                 result.protocol_version,
             )
@@ -4677,8 +4678,11 @@ where
 #[allow(clippy::large_enum_variant)]
 enum WebSocketInitialization {
     Legacy(InitializeResult),
+    /// `server_info` is `None` when a modern peer supplied identity in neither
+    /// the final `_meta` position nor the pre-2026 top-level sibling, which
+    /// the 2026-07-28 schema permits.
     Modern {
-        server_info: ServerInfo,
+        server_info: Option<ServerInfo>,
         discovery: ServerDiscoverResult,
     },
 }
@@ -4754,11 +4758,14 @@ where
             UNSUPPORTED_PROTOCOL_VERSION_ERROR,
         )));
     }
-    let server_info = discovery.server_info().cloned().ok_or_else(|| {
-        WebSocketHandshakeError::Mcp(McpError::invalid_request(
-            "Modern WebSocket discovery response has no server identity",
-        ))
-    })?;
+    // Identity may sit in the final `_meta` position or in the pre-2026
+    // top-level `serverInfo` sibling, which the official conformance harness
+    // sends and which discovery retains inertly. Accept either, so WebSocket
+    // is no stricter than the HTTP path.
+    let server_info = discovery
+        .server_info()
+        .cloned()
+        .or_else(|| discovery.compatibility_server_info());
     Ok(WebSocketInitialization::Modern {
         server_info,
         discovery,
@@ -5529,7 +5536,8 @@ where
                 WebSocketInitialization::Legacy(result) => ClientSession::try_new(
                     client_info,
                     client_capabilities,
-                    result.server_info,
+                    // Exact 2024-11-05 requires `serverInfo` on the result.
+                    Some(result.server_info),
                     result.capabilities,
                     result.protocol_version,
                 )
@@ -9623,11 +9631,14 @@ where
             UNSUPPORTED_PROTOCOL_VERSION_ERROR,
         )));
     }
-    let server_info = discovery.server_info().cloned().ok_or_else(|| {
-        WebSocketHandshakeError::Mcp(McpError::invalid_request(
-            "Modern WebSocket discovery response has no server identity",
-        ))
-    })?;
+    // Identity may sit in the final `_meta` position or in the pre-2026
+    // top-level `serverInfo` sibling, which the official conformance harness
+    // sends and which discovery retains inertly. Accept either, so WebSocket
+    // is no stricter than the HTTP path.
+    let server_info = discovery
+        .server_info()
+        .cloned()
+        .or_else(|| discovery.compatibility_server_info());
     Ok(WebSocketInitialization::Modern {
         server_info,
         discovery,
@@ -11455,7 +11466,10 @@ pub struct HttpClient {
     connection: ClientHttpConnection,
     client_info: ClientInfo,
     client_capabilities: ClientCapabilities,
-    server_info: ServerInfo,
+    /// Peer identity admitted at connect. `None` only on a modern connection
+    /// whose discovery result supplied identity in neither position, which the
+    /// 2026-07-28 schema permits. Exact 2024-11-05 always stores `Some`.
+    server_info: Option<ServerInfo>,
     #[cfg(feature = "legacy-2024-11-05")]
     legacy_server_capabilities: Option<ServerCapabilities>,
     /// Handshake instructions retained from modern discovery or exact-2024
@@ -11491,8 +11505,6 @@ pub struct HttpClient {
 pub enum HttpClientError {
     /// The policy-bound HTTP connection could not be established or used.
     Connection(ClientHttpConnectionError),
-    /// A modern discovery response omitted its required server identity.
-    ModernDiscoveryMissingServerInfo,
     /// The legacy initialization response carried a JSON-RPC error.
     LegacyInitializationRejected,
     /// The legacy initialization response had no result payload.
@@ -11517,9 +11529,6 @@ impl std::fmt::Display for HttpClientError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Connection(error) => error.fmt(formatter),
-            Self::ModernDiscoveryMissingServerInfo => {
-                formatter.write_str("modern server/discover response has no server identity")
-            }
             Self::LegacyInitializationRejected => {
                 formatter.write_str("legacy initialize request was rejected")
             }
@@ -11545,8 +11554,7 @@ impl std::error::Error for HttpClientError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Connection(error) => Some(error),
-            Self::ModernDiscoveryMissingServerInfo
-            | Self::LegacyInitializationRejected
+            Self::LegacyInitializationRejected
             | Self::LegacyInitializationMissingResult
             | Self::LegacyInitializationInvalidResult
             | Self::LegacyInitializationUnsupportedProtocolVersion { .. }
@@ -11960,21 +11968,18 @@ impl HttpClient {
                     // Prefer the final `_meta` position, then fall back to the
                     // pre-2026 top-level `serverInfo` sibling, which the
                     // official conformance harness sends and which discovery
-                    // now retains inertly instead of refusing. Identity is
-                    // still REQUIRED to be somewhere: the 2026-07-28 schema
-                    // makes `_meta` optional, so a peer that supplies no
-                    // identity at all remains stricter here than the schema,
-                    // and that residual is tracked rather than papered over
-                    // by inventing a name.
-                    let server_info = discovery
-                        .as_ref()
-                        .and_then(|discovery| {
-                            discovery
-                                .server_info()
-                                .cloned()
-                                .or_else(|| discovery.compatibility_server_info())
-                        })
-                        .ok_or(HttpClientError::ModernDiscoveryMissingServerInfo)?;
+                    // retains inertly instead of refusing. Identity is NOT
+                    // required in either position: `DiscoverResult` lists no
+                    // required `_meta`, and the schema documents that servers
+                    // SHOULD send `serverInfo` "unless specifically configured
+                    // not to do so". A peer that sends none is reported as
+                    // absent rather than refused or given an invented name.
+                    let server_info = discovery.as_ref().and_then(|discovery| {
+                        discovery
+                            .server_info()
+                            .cloned()
+                            .or_else(|| discovery.compatibility_server_info())
+                    });
                     let instructions = discovery.and_then(|discovery| {
                         discovery
                             .instructions()
@@ -12021,7 +12026,9 @@ impl HttpClient {
                         .await
                         .map_err(HttpClientError::Connection)?;
                     (
-                        initialization.server_info,
+                        // Exact 2024-11-05 `initialize` requires `serverInfo`,
+                        // so the legacy arm always yields an identity.
+                        Some(initialization.server_info),
                         Some(initialization.capabilities),
                         initialization.instructions,
                     )
@@ -12249,9 +12256,14 @@ impl HttpClient {
     }
 
     /// Returns the server identity admitted by discovery or initialization.
+    ///
+    /// `None` means a modern peer supplied identity in neither the final
+    /// `_meta` position nor the pre-2026 top-level sibling. Exact 2024-11-05
+    /// `initialize` requires `serverInfo`, so a legacy connection always
+    /// returns `Some`.
     #[must_use]
-    pub const fn server_info(&self) -> &ServerInfo {
-        &self.server_info
+    pub const fn server_info(&self) -> Option<&ServerInfo> {
+        self.server_info.as_ref()
     }
 
     /// Returns server instructions retained from the successful handshake.
@@ -15257,9 +15269,11 @@ pub struct Client {
 enum ClientInitialization {
     /// Exact 2024-11-05 initialization response.
     Legacy(InitializeResult),
-    /// Final `server/discover` response plus its required server identity.
+    /// Final `server/discover` response plus the server identity it supplied,
+    /// if any. The 2026-07-28 schema requires no identity on a discovery
+    /// result, so `None` is a schema-valid peer rather than a protocol error.
     Modern {
-        server_info: ServerInfo,
+        server_info: Option<ServerInfo>,
         discovery: ServerDiscoverResult,
     },
 }
@@ -16414,9 +16428,13 @@ impl Client {
         self.next_id.load(Ordering::SeqCst)
     }
 
-    /// Returns the server info after initialization.
+    /// Returns the server identity after initialization, when the peer sent one.
+    ///
+    /// `None` means a modern peer supplied identity in neither the final
+    /// `_meta` position nor the pre-2026 top-level sibling, which the
+    /// 2026-07-28 schema permits. Exact 2024-11-05 always returns `Some`.
     #[must_use]
-    pub fn server_info(&self) -> &ServerInfo {
+    pub fn server_info(&self) -> Option<&ServerInfo> {
         self.session.server_info()
     }
 
@@ -20351,7 +20369,8 @@ impl Client {
             ClientInitialization::Legacy(result) => ClientSession::try_new(
                 client_info,
                 client_capabilities,
-                result.server_info,
+                // Exact 2024-11-05 requires `serverInfo` on the result.
+                Some(result.server_info),
                 result.capabilities,
                 result.protocol_version,
             )
@@ -20463,9 +20482,13 @@ impl Client {
         {
             return Err(McpError::internal_error(UNSUPPORTED_PROTOCOL_VERSION_ERROR));
         }
-        let server_info = result.server_info().cloned().ok_or_else(|| {
-            McpError::internal_error("Modern server/discover response has no _meta server info")
-        })?;
+        // Identity may sit in the final `_meta` position or in the pre-2026
+        // top-level `serverInfo` sibling, which the official conformance
+        // harness sends. Accept either, so this path is no stricter than HTTP.
+        let server_info = result
+            .server_info()
+            .cloned()
+            .or_else(|| result.compatibility_server_info());
         Ok(ClientInitialization::Modern {
             server_info,
             discovery: result,
@@ -33535,10 +33558,10 @@ mod tests {
                 version: "0.1.0".to_string(),
             },
             ClientCapabilities::default(),
-            ServerInfo {
+            Some(ServerInfo {
                 name: "test-server".to_string(),
                 version: "1.0.0".to_string(),
-            },
+            }),
             ServerCapabilities::default(),
             PROTOCOL_VERSION.to_string(),
         )
@@ -33618,10 +33641,10 @@ mod tests {
                 version: "0.1.0".to_string(),
             },
             capabilities,
-            ServerInfo {
+            Some(ServerInfo {
                 name: "scripted-server".to_string(),
                 version: "1.0.0".to_string(),
-            },
+            }),
             ServerCapabilities::default(),
             PROTOCOL_VERSION.to_string(),
         )
@@ -33662,10 +33685,10 @@ mod tests {
                 version: "0.1.0".to_string(),
             },
             ClientCapabilities::default(),
-            ServerInfo {
+            Some(ServerInfo {
                 name: "scripted-server".to_string(),
                 version: "1.0.0".to_string(),
-            },
+            }),
             ServerCapabilities::default(),
             protocol_version.to_string(),
         )
@@ -39780,7 +39803,10 @@ exec sleep 30
     fn client_from_parts_accessors_and_request_counter() {
         let client = make_closed_client(true);
         assert!(client.is_initialized());
-        assert_eq!(client.server_info().name, "test-server");
+        assert_eq!(
+            client.server_info().expect("test client has identity").name,
+            "test-server"
+        );
         let caps_json = serde_json::to_value(client.server_capabilities()).expect("caps json");
         assert_eq!(caps_json, serde_json::json!({}));
         assert_eq!(client.protocol_version(), PROTOCOL_VERSION);
@@ -40051,8 +40077,9 @@ exec sleep 30
     #[test]
     fn uninitialized_client_server_info_is_empty() {
         let client = make_closed_client(false);
-        assert_eq!(client.server_info().name, "test-server");
-        assert_eq!(client.server_info().version, "1.0.0");
+        let server_info = client.server_info().expect("test client has identity");
+        assert_eq!(server_info.name, "test-server");
+        assert_eq!(server_info.version, "1.0.0");
     }
 
     #[test]
@@ -46398,8 +46425,11 @@ exec sleep 2
         let discovered_server = discovery
             .server_info()
             .expect("modern discovery retains server identity");
-        assert_eq!(discovered_server.name, client.server_info().name);
-        assert_eq!(discovered_server.version, client.server_info().version);
+        let session_server = client
+            .server_info()
+            .expect("the harness peer sends identity, so the session retains it");
+        assert_eq!(discovered_server.name, session_server.name);
+        assert_eq!(discovered_server.version, session_server.version);
         assert_eq!(
             discovery
                 .instructions()
@@ -47067,10 +47097,10 @@ exec sleep 2
                 version: "1.0.0".to_string(),
             },
             ClientCapabilities::default(),
-            ServerInfo {
+            Some(ServerInfo {
                 name: "direct-child".to_string(),
                 version: "1.0.0".to_string(),
-            },
+            }),
             ServerCapabilities::default(),
             PROTOCOL_VERSION.to_string(),
         )
@@ -47098,10 +47128,10 @@ exec sleep 2
                 version: "1.0.0".to_string(),
             },
             ClientCapabilities::default(),
-            ServerInfo {
+            Some(ServerInfo {
                 name: "live-direct-child".to_string(),
                 version: "1.0.0".to_string(),
-            },
+            }),
             ServerCapabilities::default(),
             PROTOCOL_VERSION.to_string(),
         )
