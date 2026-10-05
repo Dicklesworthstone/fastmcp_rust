@@ -177,6 +177,10 @@ cat > "$OUT/remote.sh" <<REMOTE
 #!/usr/bin/env bash
 set -u
 cd '$remote_dir' || { echo "RECEIPT_VERDICT=NO_REMOTE_DIR"; exit 9; }
+# Per-run scratch. Concurrent runs previously shared /tmp/vb_* and one
+# reported the other's diagnostics as its own.
+RUNTMP='$remote_dir/.vb-run'
+mkdir -p "\$RUNTMP"
 export CARGO_TARGET_DIR='$target_dir'
 export RCH_CARGO_WRAPPER_BYPASS=1
 export CARGO_TERM_COLOR=never
@@ -190,9 +194,9 @@ find $MANIFEST_PATHS -type f \\
     \\( -name '*.rs' -o -name '*.toml' -o -name '*.lock' -o -name '*.json' \\
        -o -name '*.yaml' -o -name '*.txt' \\) -print0 2>/dev/null \\
     | sort -z | xargs -0 sha256sum \
-    | awk '{ print \$1 " " \$2 }' > /tmp/vb_manifest.txt
-echo "RECEIPT_MANIFEST_FILES=\$(wc -l < /tmp/vb_manifest.txt | tr -d ' ')"
-echo "RECEIPT_MANIFEST_DIGEST=\$(sha256sum < /tmp/vb_manifest.txt | cut -d' ' -f1)"
+    | awk '{ print \$1 " " \$2 }' > \$RUNTMP/vb_manifest.txt
+echo "RECEIPT_MANIFEST_FILES=\$(wc -l < \$RUNTMP/vb_manifest.txt | tr -d ' ')"
+echo "RECEIPT_MANIFEST_DIGEST=\$(sha256sum < \$RUNTMP/vb_manifest.txt | cut -d' ' -f1)"
 
 echo "RECEIPT_HOST=\$(hostname -s)"
 echo "RECEIPT_RUSTC=\$(rustc +$TOOLCHAIN -vV 2>/dev/null | sed -n 's/^release: //p')"
@@ -200,13 +204,13 @@ echo "RECEIPT_COMMIT_HASH=\$(rustc +$TOOLCHAIN -vV 2>/dev/null | sed -n 's/^comm
 echo "RECEIPT_TARGET=\$(rustc +$TOOLCHAIN -vV 2>/dev/null | sed -n 's/^host: //p')"
 
 if [ '$CHECK_ONLY' = 1 ]; then
-    cargo +$TOOLCHAIN check --locked $SCOPE $feature_args > /tmp/vb_build.log 2>&1
+    cargo +$TOOLCHAIN check --locked $SCOPE $feature_args > \$RUNTMP/vb_build.log 2>&1
     check_rc=\$?
     echo "RECEIPT_CHECK_RC=\$check_rc"
     echo "RECEIPT_BUILD_RC=\$check_rc"
-    echo "RECEIPT_ERRORS=\$(grep -cE '^error(\[|:)' /tmp/vb_build.log)"
-    echo "RECEIPT_WARNINGS=\$(grep -cE '^warning(\[|:)' /tmp/vb_build.log)"
-    grep -E '^error' -A6 /tmp/vb_build.log | head -150
+    echo "RECEIPT_ERRORS=\$(grep -cE '^error(\[|:)' \$RUNTMP/vb_build.log)"
+    echo "RECEIPT_WARNINGS=\$(grep -cE '^warning(\[|:)' \$RUNTMP/vb_build.log)"
+    grep -E '^error' -A6 \$RUNTMP/vb_build.log | head -150
     echo "RECEIPT_END"
     exit \$check_rc
 fi
@@ -214,42 +218,42 @@ fi
 # COMPILE IS A HARD GATE WITH ITS OWN CAPTURED STATUS. The assignment is on its
 # own line because \${PIPESTATUS[0]} read after an intervening command reports
 # that command's status, not the build's.
-cargo +$TOOLCHAIN test --locked $SCOPE $feature_args --no-run > /tmp/vb_build.log 2>&1
+cargo +$TOOLCHAIN test --locked $SCOPE $feature_args --no-run > \$RUNTMP/vb_build.log 2>&1
 build_rc=\$?
 echo "RECEIPT_BUILD_RC=\$build_rc"
 if [ "\$build_rc" != 0 ]; then
     echo "RECEIPT_VERDICT=BUILD_FAILED"
-    grep -E '^error(\[|:)' /tmp/vb_build.log | head -25
+    grep -E '^error(\[|:)' \$RUNTMP/vb_build.log | head -25
     exit 1
 fi
 
 # DISCOVERED set, independent of the run. PL-1 compares this against EXECUTED.
-cargo +$TOOLCHAIN test --locked $SCOPE $feature_args -- --list > /tmp/vb_list.log 2>&1
-grep -E ': test\$' /tmp/vb_list.log | sed 's/: test\$//' | sort -u > /tmp/vb_discovered.txt
-echo "RECEIPT_DISCOVERED=\$(wc -l < /tmp/vb_discovered.txt | tr -d ' ')"
+cargo +$TOOLCHAIN test --locked $SCOPE $feature_args -- --list > \$RUNTMP/vb_list.log 2>&1
+grep -E ': test\$' \$RUNTMP/vb_list.log | sed 's/: test\$//' | sort -u > \$RUNTMP/vb_discovered.txt
+echo "RECEIPT_DISCOVERED=\$(wc -l < \$RUNTMP/vb_discovered.txt | tr -d ' ')"
 
-cargo +$TOOLCHAIN test --locked $SCOPE $feature_args -- $thread_args "\$@" > /tmp/vb_run.log 2>&1
+cargo +$TOOLCHAIN test --locked $SCOPE $feature_args -- $thread_args "\$@" > \$RUNTMP/vb_run.log 2>&1
 run_rc=\$?
 echo "RECEIPT_RUN_RC=\$run_rc"
-grep -oE '^test [^ ]+ \.\.\. ' /tmp/vb_run.log \
-    | sed 's/^test //; s/ \.\.\. \$//' | sort -u > /tmp/vb_executed.txt
-echo "RECEIPT_EXECUTED=\$(wc -l < /tmp/vb_executed.txt | tr -d ' ')"
-grep -E '^test result' /tmp/vb_run.log | sed 's/^/RECEIPT_RESULT /'
-grep -E '^test .* FAILED' /tmp/vb_run.log | head -40 | sed 's/^/RECEIPT_FAILED /'
+grep -oE '^test [^ ]+ \.\.\. ' \$RUNTMP/vb_run.log \
+    | sed 's/^test //; s/ \.\.\. \$//' | sort -u > \$RUNTMP/vb_executed.txt
+echo "RECEIPT_EXECUTED=\$(wc -l < \$RUNTMP/vb_executed.txt | tr -d ' ')"
+grep -E '^test result' \$RUNTMP/vb_run.log | sed 's/^/RECEIPT_RESULT /'
+grep -E '^test .* FAILED' \$RUNTMP/vb_run.log | head -40 | sed 's/^/RECEIPT_FAILED /'
 echo "RECEIPT_END"
 REMOTE
 
-scp -i "$KEY" -o BatchMode=yes -q "$OUT/remote.sh" "$WORKER:/tmp/vb_remote.sh" \
+scp -i "$KEY" -o BatchMode=yes -q "$OUT/remote.sh" "$WORKER:$remote_dir/vb_remote.sh" \
     || die 'cannot stage the remote script'
 
 printf '== run ==\ncargo test --locked %s %s -- %s %s\n\n' \
     "$SCOPE" "$feature_args" "$thread_args" "${FILTERS[*]-}"
 
-"${SSH[@]}" "chmod +x /tmp/vb_remote.sh && /tmp/vb_remote.sh ${FILTERS[*]-}" \
+"${SSH[@]}" "chmod +x '$remote_dir/vb_remote.sh' && '$remote_dir/vb_remote.sh' ${FILTERS[*]-}" \
     > "$OUT/remote.out" 2>&1
 remote_rc=$?
-"${SSH[@]}" 'cat /tmp/vb_discovered.txt' > "$OUT/discovered.txt" 2>/dev/null || :
-"${SSH[@]}" 'cat /tmp/vb_executed.txt'   > "$OUT/executed.txt"   2>/dev/null || :
+"${SSH[@]}" "cat '$remote_dir/.vb-run/vb_discovered.txt'" > "$OUT/discovered.txt" 2>/dev/null || :
+"${SSH[@]}" "cat '$remote_dir/.vb-run/vb_executed.txt'"   > "$OUT/executed.txt"   2>/dev/null || :
 
 # Subject identity AFTER the run. Movement invalidates the receipt.
 git status --porcelain --untracked-files=no > "$OUT/dirty-after.txt"

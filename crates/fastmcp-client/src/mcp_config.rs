@@ -1557,7 +1557,7 @@ mod tests {
                 "http plan",
             ),
             (
-                ConfigError::HttpClientError(HttpClientError::ModernDiscoveryMissingServerInfo),
+                ConfigError::HttpClientError(HttpClientError::RequestIdExhausted),
                 "http mcp client lifecycle",
             ),
             (ConfigError::ParseError("msg".into()), "parse"),
@@ -1599,7 +1599,7 @@ mod tests {
         assert!(std::error::Error::source(&http_plan_err).is_some());
 
         let http_client_err =
-            ConfigError::HttpClientError(HttpClientError::ModernDiscoveryMissingServerInfo);
+            ConfigError::HttpClientError(HttpClientError::RequestIdExhausted);
         assert!(std::error::Error::source(&http_client_err).is_some());
     }
 

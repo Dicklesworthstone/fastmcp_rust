@@ -1109,10 +1109,10 @@ mod tests {
                 roots: None,
                 ..Default::default()
             },
-            ServerInfo {
+            Some(ServerInfo {
                 name: "srv".to_string(),
                 version: "1.0.0".to_string(),
-            },
+            }),
             ServerCapabilities::default(),
             "2024-11-05".to_string(),
         )
