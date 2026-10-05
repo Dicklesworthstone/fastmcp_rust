@@ -18,6 +18,7 @@ use asupersync::time::Sleep;
 use fastmcp_transport::{
     AsyncStdioRecvHalf, AsyncStdioSendHalf, AsyncStdioTransport, ReceivedTransportFrame,
 };
+use fastmcp_transport::memory::{MemoryRecvHalf, MemorySendHalf, MemoryTransport};
 
 // This module is split out of lib.rs and shares its private items. The set
 // it uses differs per feature profile, so an explicit list computed for one
@@ -38,7 +39,7 @@ type ReadWork<R> =
     Pin<Box<dyn Future<Output = (R, Result<ReceivedTransportFrame, TransportError>)> + Send>>;
 type WriteWork<W> = Pin<Box<dyn Future<Output = (W, Result<(), TransportError>, usize)> + Send>>;
 
-/// Internal framing seam shared by native stdio and WebSocket connections.
+/// Internal framing seam shared by native stdio, memory and WebSocket connections.
 /// The read future remains owned until it completes or the connection stops.
 trait ConnectionReader: Send + 'static {
     fn receive(
@@ -71,6 +72,30 @@ impl<W: AsyncWrite + Unpin + Send + 'static> ConnectionWriter for AsyncStdioSend
     }
     async fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         self.close_async(cx).await
+    }
+    fn is_closed(&self) -> bool {
+        Self::is_closed(self)
+    }
+}
+
+impl ConnectionReader for MemoryRecvHalf {
+    async fn receive(&mut self, cx: &Cx) -> Result<ReceivedTransportFrame, TransportError> {
+        // Keep the committed source, including raw parameter lexemes. A typed
+        // receive followed by reserialization would bypass source accounting.
+        self.recv_with_source_async(cx).await
+    }
+}
+
+impl ConnectionWriter for MemorySendHalf {
+    async fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        // A full bounded channel yields while ingress continues routing
+        // cancellation. Publication is atomic; abandoning a pending send
+        // neither publishes a partial frame nor poisons the next reservation.
+        self.send_async(cx, message).await
+    }
+    async fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+        // Memory close only releases the sender; it performs no blocking I/O.
+        fastmcp_transport::TransportSendHalf::close(self, cx)
     }
     fn is_closed(&self) -> bool {
         Self::is_closed(self)
@@ -798,6 +823,96 @@ impl Server {
         result
     }
 
+    /// Serves one bounded in-process connection on the caller's async runtime.
+    ///
+    /// Unlike a synchronous transport loop, a pending memory receive or a full
+    /// response queue never blocks the executor. Independent request regions,
+    /// wire cancellation, subscriptions, authentication, raw-source admission,
+    /// and output bounds use the same native dispatcher as [`Self::serve_stdio_io`].
+    /// The inbound transport remains `Memory`; this does not impersonate stdio
+    /// or skip authentication because the peer happens to be in-process.
+    ///
+    /// Select [`ProtocolPolicy::ModernOnly`] before building. The caller must
+    /// supply an asupersync runtime context with a timer driver. No reactor,
+    /// helper thread, or blocking pool is needed for asynchronous handlers.
+    /// A pending output send has the native finite commit deadline. Successful
+    /// channel publication is final and is never retroactively cancelled.
+    ///
+    /// Dropping or closing the peer's send half starts a five-second response
+    /// drain, so the peer may continue receiving accepted results. Keeping its
+    /// receive half alive until EOF avoids turning that drain into a delivery
+    /// failure. Caller cancellation stops ingress and cancels request regions.
+    /// Startup precedes a configured Task supervisor; that service and request
+    /// regions settle before shutdown. Dropping this future leaves structured
+    /// region cleanup to the caller runtime rather than invoking shutdown early.
+    ///
+    /// # Errors
+    ///
+    /// Returns policy, missing-timer, startup, protocol-direction, transport,
+    /// output-capacity, task-service, or graceful-drain failures to the caller.
+    pub async fn serve_memory(self, cx: &Cx, transport: MemoryTransport) -> McpResult<()> {
+        if self.protocol_policy != ProtocolPolicy::ModernOnly {
+            return Err(server_run_error(
+                "startup",
+                "protocol_policy",
+                "Async memory serving requires ModernOnly policy",
+            ));
+        }
+        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+        if cx.timer_driver().is_none() {
+            return Err(server_run_error(
+                "startup",
+                "timer",
+                "Async memory serving requires the caller's timer driver",
+            ));
+        }
+        self.init_rich_logging();
+        let server = Arc::new(self);
+        if !server.run_startup_hook() {
+            return Err(server_run_error(
+                "startup",
+                "hook",
+                "Server startup hook failed",
+            ));
+        }
+        #[cfg(feature = "tasks")]
+        let hosted_tasks = match server.task_service_host.as_ref() {
+            Some(host) => match host.start_ready(cx).await {
+                Ok(hosted) => Some(hosted),
+                Err(failure) => {
+                    server.run_shutdown_hook();
+                    return Err(failure);
+                }
+            },
+            None => None,
+        };
+        let (reader, writer) = transport.into_split();
+        let (result, request_regions_quiescent) = Self::serve_modern_connection(
+            Arc::clone(&server),
+            cx,
+            reader,
+            writer,
+            ConnectionBinding {
+                transport: InboundRequestTransport::Memory,
+                authorization: TransportAuthorization::default(),
+                auth_custody: None,
+                auth_generation: None,
+            },
+            #[cfg(feature = "tasks")]
+            hosted_tasks.as_ref(),
+        )
+        .await;
+        #[cfg(feature = "tasks")]
+        let result = match hosted_tasks {
+            Some(hosted_tasks) => result.and(hosted_tasks.settle(cx).await),
+            None => result,
+        };
+        if request_regions_quiescent {
+            server.run_shutdown_hook();
+        }
+        result
+    }
+
     /// The listener owns startup, the shared Task service, and shutdown.
     /// Each upgraded modern connection owns only its native I/O, requests,
     /// and output; closing it cannot terminate a sibling's subscriptions.
@@ -977,7 +1092,13 @@ impl Server {
                             }
                         },
                         Err(TransportError::Closed) => {
-                            if lifetime.binding.transport == InboundRequestTransport::Stdio {
+                            if matches!(
+                                lifetime.binding.transport,
+                                InboundRequestTransport::Stdio | InboundRequestTransport::Memory
+                            ) {
+                                // Both are owned single connections with independent
+                                // receive/send halves. Input EOF must not discard
+                                // responses the peer is still waiting to receive.
                                 let _ = server.terminate_subscription_streams_for_shutdown();
                                 lifetime.admission.cancel_uncorrelated_modern_children();
                                 drain = Some(Box::pin(asupersync::time::sleep(
@@ -2727,6 +2848,198 @@ mod tests {
                 assert_eq!(state.writes, 0);
                 assert!(state.reader_dropped && state.writer_dropped);
             });
+        }
+    }
+
+    mod native_memory_tests {
+        use super::*;
+        use fastmcp_transport::memory::create_memory_transport_pair_with_capacity;
+
+        type Serving = asupersync::runtime::TaskHandle<McpResult<()>>;
+
+        fn run_native<F, Fut>(test: F)
+        where
+            F: FnOnce(Cx) -> Fut,
+            Fut: Future<Output = ()>,
+        {
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let cx = Cx::current().unwrap();
+                assert!(cx.blocking_pool_handle().is_none());
+                asupersync::time::timeout(cx.now(), Duration::from_secs(8), test(cx.clone()))
+                    .await
+                    .expect("native memory serving must make bounded runtime progress");
+            });
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+
+        fn connect(cx: &Cx, service: Server) -> (MemoryTransport, Serving) {
+            let (peer, transport) = create_memory_transport_pair_with_capacity(1);
+            let serving = cx
+                .spawn(move |serve_cx| async move { service.serve_memory(&serve_cx, transport).await })
+                .unwrap();
+            (peer, serving)
+        }
+
+        async fn response(cx: &Cx, peer: &mut MemoryTransport, id: i64) -> JsonRpcResponse {
+            let JsonRpcMessage::Response(response) = peer.recv_async(cx).await.unwrap() else {
+                panic!("expected the response to {id}");
+            };
+            assert_eq!(response.id, Some(RequestId::Number(id)));
+            response
+        }
+
+        async fn stop(cx: &Cx, peer: MemoryTransport, mut serving: Serving) {
+            let (mut input, output) = peer.into_split();
+            drop(output);
+            assert!(matches!(input.recv_async(cx).await, Err(TransportError::Closed)));
+            serving.join(cx).await.unwrap().unwrap();
+        }
+
+        #[test]
+        fn memory_server_multiplexes_pending_and_ready_calls_without_blocking_pool() {
+            run_native(|cx| async move {
+                let gate = Arc::new(Gate::default());
+                let (mut peer, serving) = connect(&cx, server(&gate));
+                peer.send_async(&cx, &discover(1)).await.unwrap();
+                assert!(response(&cx, &mut peer, 1).await.error.is_none());
+                peer.send_async(&cx, &call(2, true)).await.unwrap();
+                until(&cx, || gate.entered.load(Ordering::Acquire) == 1).await;
+                peer.send_async(&cx, &call(3, false)).await.unwrap();
+                assert!(response(&cx, &mut peer, 3).await.error.is_none());
+                assert_eq!(gate.dropped.load(Ordering::Acquire), 1);
+                gate.release();
+                assert!(response(&cx, &mut peer, 2).await.error.is_none());
+                stop(&cx, peer, serving).await;
+                assert_eq!(gate.dropped.load(Ordering::Acquire), 2);
+                assert!(cx.checkpoint().is_ok());
+            });
+        }
+
+        #[test]
+        fn memory_server_routes_cancellation_while_a_handler_is_pending() {
+            run_native(|cx| async move {
+                let gate = Arc::new(Gate::default());
+                let (mut peer, serving) = connect(&cx, server(&gate));
+                peer.send_async(&cx, &call(10, true)).await.unwrap();
+                until(&cx, || gate.entered.load(Ordering::Acquire) == 1).await;
+                peer.send_async(&cx, &cancel(10)).await.unwrap();
+                until(&cx, || gate.dropped.load(Ordering::Acquire) == 1).await;
+                peer.send_async(&cx, &call(11, false)).await.unwrap();
+                // A late response for 10 fails this exact-id assertion.
+                assert!(response(&cx, &mut peer, 11).await.error.is_none());
+                stop(&cx, peer, serving).await;
+                assert_eq!(gate.dropped.load(Ordering::Acquire), 2);
+            });
+        }
+
+        #[test]
+        fn memory_server_input_half_close_drains_accepted_responses() {
+            run_native(|cx| async move {
+                let gate = Arc::new(Gate::default());
+                let (peer, mut serving) = connect(&cx, server(&gate));
+                let (mut input, mut output) = peer.into_split();
+                output.send_async(&cx, &call(20, true)).await.unwrap();
+                until(&cx, || gate.entered.load(Ordering::Acquire) == 1).await;
+                // The result does not exist when input EOF arrives. The old
+                // non-stdio EOF branch would cancel it instead of draining.
+                drop(output);
+                gate.release();
+                let JsonRpcMessage::Response(result) = input.recv_async(&cx).await.unwrap() else {
+                    panic!("half-close discarded an accepted request");
+                };
+                assert_eq!(result.id, Some(RequestId::Number(20)));
+                assert!(result.error.is_none());
+                assert!(matches!(input.recv_async(&cx).await, Err(TransportError::Closed)));
+                serving.join(&cx).await.unwrap().unwrap();
+                assert_eq!(gate.dropped.load(Ordering::Acquire), 1);
+            });
+        }
+
+        #[test]
+        fn memory_server_subscriptions_and_calls_share_the_native_connection() {
+            run_native(|cx| async move {
+                let gate = Arc::new(Gate::default());
+                let service = server(&gate);
+                let subscriptions = Arc::clone(&service.final_subscriptions);
+                let (mut peer, serving) = connect(&cx, service);
+                peer.send_async(
+                    &cx,
+                    &request(30, SUBSCRIPTIONS_LISTEN, serde_json::json!({
+                        "notifications": {"toolsListChanged": true}
+                    })),
+                ).await.unwrap();
+                let JsonRpcMessage::Request(ack) = peer.recv_async(&cx).await.unwrap() else {
+                    panic!("subscription acknowledgement must precede completion");
+                };
+                assert_eq!(ack.method, fastmcp_protocol::methods::NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED);
+                assert_eq!(ack.params.unwrap()["_meta"]["io.modelcontextprotocol/subscriptionId"], 30);
+                assert_eq!(subscriptions.publish(ServerNotification::ToolsListChanged(None)).unwrap(), 1);
+                let JsonRpcMessage::Request(event) = peer.recv_async(&cx).await.unwrap() else {
+                    panic!("expected the live subscription event");
+                };
+                assert_eq!(event.method, "notifications/tools/list_changed");
+                peer.send_async(&cx, &call(31, false)).await.unwrap();
+                assert!(response(&cx, &mut peer, 31).await.error.is_none());
+                peer.send_async(&cx, &cancel(30)).await.unwrap();
+                peer.send_async(&cx, &discover(32)).await.unwrap();
+                assert!(response(&cx, &mut peer, 32).await.error.is_none());
+                stop(&cx, peer, serving).await;
+                assert!(subscriptions.inner.lock().unwrap().entries.is_empty());
+            });
+        }
+
+        #[test]
+        fn memory_connection_writer_backpressure_does_not_block_ingress_or_leak_capacity() {
+            run_native(|cx| async move {
+                let (peer, transport) = create_memory_transport_pair_with_capacity(1);
+                let (mut peer_input, mut peer_output) = peer.into_split();
+                let (mut input, mut output) = transport.into_split();
+                ConnectionWriter::send(&mut output, &cx, &discover(40)).await.unwrap();
+                let second = discover(41);
+                {
+                    let mut sending = pin!(ConnectionWriter::send(&mut output, &cx, &second));
+                    assert!(sending.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+                    peer_output.send_async(&cx, &cancel(41)).await.unwrap();
+                    let frame = ConnectionReader::receive(&mut input, &cx).await.unwrap();
+                    assert!(matches!(frame.into_message(), JsonRpcMessage::Request(request) if request.method == "notifications/cancelled"));
+                    // Abandon the uncommitted frame while capacity is exhausted.
+                }
+                let first = peer_input.recv_async(&cx).await.unwrap();
+                assert_eq!(serde_json::to_value(first).unwrap(), serde_json::to_value(discover(40)).unwrap());
+                ConnectionWriter::send(&mut output, &cx, &discover(42)).await.unwrap();
+                let next = peer_input.recv_async(&cx).await.unwrap();
+                assert_eq!(serde_json::to_value(next).unwrap(), serde_json::to_value(discover(42)).unwrap());
+                ConnectionWriter::close(&mut output, &cx).await.unwrap();
+                assert!(matches!(peer_input.recv_async(&cx).await, Err(TransportError::Closed)));
+            });
+        }
+
+        #[test]
+        fn memory_server_rejects_driverless_context_before_startup_or_dispatch() {
+            let gate = Arc::new(Gate::default());
+            let started = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&started);
+            let service = Server::new("memory-driverless", "1")
+                .protocol_policy(ProtocolPolicy::ModernOnly).unwrap()
+                .tool(ProbeTool(Arc::clone(&gate)))
+                .on_startup(move || {
+                    flag.store(true, Ordering::Release);
+                    Ok::<(), io::Error>(())
+                })
+                .build();
+            let (_peer, transport) = create_memory_transport_pair_with_capacity(1);
+            let cx = Cx::for_testing();
+            let mut serving = pin!(service.serve_memory(&cx, transport));
+            let Poll::Ready(Err(error)) = serving.as_mut().poll(&mut Context::from_waker(Waker::noop())) else {
+                panic!("driverless serving must fail before parking");
+            };
+            assert!(error.message.contains("timer driver"));
+            assert!(!started.load(Ordering::Acquire));
+            assert_eq!(gate.entered.load(Ordering::Acquire), 0);
         }
     }
 }
