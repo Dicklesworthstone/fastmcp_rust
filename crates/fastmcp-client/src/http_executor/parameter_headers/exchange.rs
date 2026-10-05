@@ -529,7 +529,7 @@ mod tests {
             let mut client = ClientBuilder::new()
                 .protocol_plan(plan)
                 .capabilities(capabilities)
-                .modern_reverse_request_handlers(handlers)
+                .reverse_request_handlers(handlers)
                 .connect_http_client_with_cx(&cx)
                 .await
                 .unwrap();
