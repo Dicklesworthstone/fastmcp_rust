@@ -16418,7 +16418,12 @@ mod tests {
             Some(LEGACY_PROTOCOL_VERSION),
             "the public client retains the exact validated legacy initialize wire version"
         );
-        assert_eq!(client.server_info().name, "legacy-server");
+        // Exact 2024-11-05 `initialize` requires `serverInfo`, so a legacy
+        // connection always carries identity; `Some` is part of the assertion.
+        assert_eq!(
+            client.server_info().map(|peer| peer.name.as_str()),
+            Some("legacy-server")
+        );
         assert!(client.legacy_server_capabilities().is_some());
         assert!(client.server_discovery().is_none());
         server.join().expect("Auto fallback server must join");
@@ -16531,7 +16536,12 @@ mod tests {
             Some(LEGACY_PROTOCOL_VERSION),
             "the public client retains the exact validated legacy initialize wire version"
         );
-        assert_eq!(client.server_info().name, "legacy-only-server");
+        // Exact 2024-11-05 `initialize` requires `serverInfo`, so a legacy
+        // connection always carries identity; `Some` is part of the assertion.
+        assert_eq!(
+            client.server_info().map(|peer| peer.name.as_str()),
+            Some("legacy-only-server")
+        );
         assert!(client.legacy_server_capabilities().is_some());
         assert!(client.server_discovery().is_none());
         assert!(!client.mcp_apps_active());

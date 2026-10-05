@@ -2111,7 +2111,7 @@ exec sleep 5
                             panic!("startup {policy:?}/{mode} failed after {:?}: {error}; child events: {:?}", started.elapsed(), events.lines())
                         });
                         assert!(client.is_initialized());
-                        assert_eq!(client.session.server_info().name, "yielding-startup-peer");
+                        assert_eq!(client.session.server_info().map(|peer| peer.name.as_str()), Some("yielding-startup-peer"));
                         assert_eq!(client.protocol_policy(), policy);
                         let legacy = policy == ProtocolPolicy::LegacyOnly || mode.starts_with("auto-");
                         assert_eq!(client.selected_protocol_era(), Some(if legacy {
@@ -2292,7 +2292,11 @@ exec sleep 5
                 let mut client =
                     result.unwrap_or_else(|error| panic!("{path} with {foreign:?}: {error}"));
                 assert_eq!(
-                    client.session.server_info().name,
+                    client
+                        .session
+                        .server_info()
+                        .expect("the fixture peer advertises identity")
+                        .name,
                     "exact-id-server",
                     "{path} with {foreign:?}"
                 );
@@ -2322,7 +2326,14 @@ exec sleep 5
             if exact_follows {
                 let mut client =
                     yielding.expect("the exact reply behind the canary ID initializes");
-                assert_eq!(client.session.server_info().name, "exact-id-server");
+                assert_eq!(
+                    client
+                        .session
+                        .server_info()
+                        .expect("the fixture peer advertises identity")
+                        .name,
+                    "exact-id-server"
+                );
                 client.close().expect("legacy canary control cleanup");
                 continue;
             }
@@ -2391,7 +2402,11 @@ exec sleep 5
                 panic!("{path}: a ping during legacy initialize must get {{}}: {error}")
             });
             assert_eq!(
-                client.session.server_info().name,
+                client
+                    .session
+                    .server_info()
+                    .expect("the fixture peer advertises identity")
+                    .name,
                 "initializing-request-server"
             );
             client
@@ -2429,7 +2444,11 @@ exec sleep 5
                 panic!("{path}: a ping during server/discover must be refused: {error}")
             });
             assert_eq!(
-                client.session.server_info().name,
+                client
+                    .session
+                    .server_info()
+                    .expect("the fixture peer advertises identity")
+                    .name,
                 "initializing-request-server"
             );
             client
@@ -2453,7 +2472,11 @@ exec sleep 5
             panic!("roots/list during initialize must be refused: {error}")
         });
         assert_eq!(
-            client.session.server_info().name,
+            client
+                .session
+                .server_info()
+                .expect("the fixture peer advertises identity")
+                .name,
             "initializing-request-server"
         );
         client
@@ -2481,7 +2504,11 @@ exec sleep 5
             panic!("sampling/createMessage during initialize must be refused: {error}")
         });
         assert_eq!(
-            client.session.server_info().name,
+            client
+                .session
+                .server_info()
+                .expect("the fixture peer advertises identity")
+                .name,
             "initializing-request-server"
         );
         client
@@ -2713,7 +2740,7 @@ exec sleep 5
                     result.unwrap();
                     assert!(client.is_initialized());
                     assert!(client.pending_initialization.is_none());
-                    assert_eq!(client.session.server_info().name, "deferred-peer");
+                    assert_eq!(client.session.server_info().map(|peer| peer.name.as_str()), Some("deferred-peer"));
                     assert_eq!(client.next_id.load(std::sync::atomic::Ordering::SeqCst), 3);
                     assert_eq!(events.lines().iter().filter(|line| line.starts_with("request:")).count(), 1);
                 }
@@ -3891,7 +3918,7 @@ IFS= read -r remaining
                 .connect_stdio_with_cx(&cx, "sh", &["-c", script])
                 .await
                 .expect("large local settings must not reject a successful first child");
-            assert_eq!(client.server_info().name, "application-policy-peer");
+            assert_eq!(client.server_info().map(|peer| peer.name.as_str()), Some("application-policy-peer"));
             assert_eq!(client.request_timeout_policy(), timeout);
             let pid = i32::try_from(client.child.as_ref().unwrap().id()).unwrap();
             let response = client.request_with_cx(&cx, "ping", None).await.unwrap();
