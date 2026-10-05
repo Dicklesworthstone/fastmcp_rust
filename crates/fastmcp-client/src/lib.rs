@@ -40944,8 +40944,13 @@ exec sleep 30
 
         // Layer 2, the consequence. The client refuses rather than silently
         // preferring one of the two identities.
-        let error = decode_identity_placement(Some("meta-peer"), Some("sibling-peer"))
-            .expect_err("two placements at once is ambiguous and must be refused");
+        // `expect_err` would require `ClientInitialization: Debug`, which it
+        // deliberately is not; match instead of widening a product type to
+        // suit a test.
+        let error = match decode_identity_placement(Some("meta-peer"), Some("sibling-peer")) {
+            Ok(_) => panic!("two placements at once is ambiguous and must be refused"),
+            Err(error) => error,
+        };
         assert!(
             format!("{error:?}").contains(INVALID_RESPONSE_PAYLOAD_ERROR),
             "the client maps an undecodable discovery result to the invalid-payload \
