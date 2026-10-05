@@ -17,7 +17,6 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
-use asupersync::http::h1::{HttpClient, Method, RedirectPolicy, RetryPolicy};
 use asupersync::tls::Certificate;
 use fastmcp_core::{AccessToken, CanonicalHttpUrl};
 use serde::Deserialize;
@@ -27,12 +26,13 @@ use super::super::managed::{ManagedOAuthSession, OAuthSessionError, OAuthSession
 use super::super::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError};
 use super::{
     MAX_OAUTH_METADATA_BYTES, OAuthDiscoveryError, OAuthDiscoveryPlan, TrustedOAuthIssuer,
-    check_context, decode_metadata, discovery_deadline, has, https_url, origin_of, present,
-    validate_headers, validate_https, within,
+    decode_metadata, discovery_deadline, has, https_url, origin_of, present, validate_https,
 };
 
 /// Native Client ID Metadata Documents without dynamic registration writes.
 pub mod metadata_document;
+/// Explicit preregistration/CIMD priority with a separately authorized DCR fallback.
+pub mod selection;
 
 /// Exact loopback URI templates used by the existing native OAuth driver.
 /// RFC 8252 section 7.3 requires the authorization server to permit the actual
@@ -213,54 +213,7 @@ impl NativeClientRegistration {
             .discovery
             .discover_issuer_document(cx, deadline)
             .await?;
-        let (authorization, token) = self.discovery.admit_issuer_endpoints(issuer, &body)?;
-        let revocation = self.discovery.admit_revocation_endpoint(issuer, &body)?;
-        let (endpoint, grants) = self.registration_endpoint(issuer, &body)?;
-        let payload = self.request_body(&grants)?;
-        let headers = self.request_headers(&endpoint)?;
-        check_context(cx, deadline)?;
-
-        let mut builder = HttpClient::builder()
-            .redirect_policy(RedirectPolicy::None)
-            .retry_policy(RetryPolicy::None)
-            .no_proxy()
-            .no_cookie_store()
-            .max_body_size(MAX_OAUTH_METADATA_BYTES)
-            .max_total_connections(1);
-        for root in &issuer.roots {
-            builder = builder.add_root_certificate(root.clone());
-        }
-        let client = builder.build();
-        let response = within(cx, deadline, async {
-            client
-                .request(cx, Method::Post, endpoint.as_str(), headers, payload)
-                .await
-                .map_err(|_| OAuthDiscoveryError::TransportFailed)
-        })
-        .await?;
-        if response.status != 201 {
-            return Err(OAuthRegistrationError::HttpStatus {
-                status: response.status,
-            });
-        }
-        validate_headers(&response.headers)
-            .map_err(|_| OAuthRegistrationError::ResponseRejected)?;
-        if !response.trailers.is_empty() {
-            return Err(OAuthRegistrationError::ResponseRejected);
-        }
-        let client_id = self.admit_response(&response.body, &grants)?;
-        let configuration = self.discovery.configure_client(
-            issuer,
-            authorization,
-            token,
-            revocation,
-            &client_id,
-        )?;
-        check_context(cx, deadline)?;
-        Ok(RegisteredNativeClient {
-            client_id,
-            configuration,
-        })
+        self.register_from_discovery(cx, deadline, issuer, &body).await
     }
 
     fn registration_endpoint(
