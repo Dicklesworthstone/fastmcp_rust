@@ -201,14 +201,10 @@ where
         }
         let _caller = Cx::set_current(Some(cx.clone()));
         if cancelled.as_mut().poll(task).is_ready() {
-            return Poll::Ready(Err(AuthorizationDriverError::Driver(
-                OAuthError::Cancelled,
-            )));
+            return Poll::Ready(Err(AuthorizationDriverError::Driver(OAuthError::Cancelled)));
         }
         if sleep.as_mut().poll(task).is_ready() {
-            return Poll::Ready(Err(AuthorizationDriverError::Driver(
-                OAuthError::TimedOut,
-            )));
+            return Poll::Ready(Err(AuthorizationDriverError::Driver(OAuthError::TimedOut)));
         }
         // A known driver failure wins before any further authorization work.
         if let Some(future) = driving.as_mut() {
@@ -413,7 +409,9 @@ mod tests {
             .await;
             assert!(matches!(
                 result,
-                Err(AuthorizationDriverError::Driver(OAuthError::BrowserLaunchFailed))
+                Err(AuthorizationDriverError::Driver(
+                    OAuthError::BrowserLaunchFailed
+                ))
             ));
             assert!(dropped.load(Ordering::SeqCst));
         });
@@ -458,7 +456,9 @@ mod tests {
                 } else {
                     assert!(matches!(
                         result,
-                        Err(AuthorizationDriverError::Operation(OAuthError::AuthorizationDenied))
+                        Err(AuthorizationDriverError::Operation(
+                            OAuthError::AuthorizationDenied
+                        ))
                     ));
                 }
                 assert!(dropped.load(Ordering::SeqCst));
@@ -483,7 +483,9 @@ mod tests {
             .await;
             assert!(matches!(
                 result,
-                Err(AuthorizationDriverError::Operation(OAuthError::InvalidConfiguration))
+                Err(AuthorizationDriverError::Operation(
+                    OAuthError::InvalidConfiguration
+                ))
             ));
             assert_eq!(calls.load(Ordering::SeqCst), 0);
         });
@@ -542,7 +544,9 @@ mod tests {
                 .await;
                 assert!(matches!(
                     result,
-                    Err(AuthorizationDriverError::Driver(OAuthError::InvalidConfiguration))
+                    Err(AuthorizationDriverError::Driver(
+                        OAuthError::InvalidConfiguration
+                    ))
                 ));
             }
             assert_eq!(operations.load(Ordering::SeqCst), 0);
@@ -573,7 +577,10 @@ mod tests {
             .await;
             drop(future);
             let launcher = retained.lock().unwrap().take().unwrap();
-            assert_eq!(launcher.launch(url()).await, Err(OAuthError::BrowserLaunchFailed));
+            assert_eq!(
+                launcher.launch(url()).await,
+                Err(OAuthError::BrowserLaunchFailed)
+            );
         });
     }
 
@@ -591,7 +598,9 @@ mod tests {
                     &cx,
                     Duration::from_secs(1),
                     |launcher| async {
-                        launcher.launch(CanonicalHttpUrl::parse(target).unwrap()).await
+                        launcher
+                            .launch(CanonicalHttpUrl::parse(target).unwrap())
+                            .await
                     },
                     |_| {
                         calls.fetch_add(1, Ordering::SeqCst);
@@ -601,7 +610,9 @@ mod tests {
                 .await;
                 assert!(matches!(
                     result,
-                    Err(AuthorizationDriverError::Operation(OAuthError::BrowserLaunchFailed))
+                    Err(AuthorizationDriverError::Operation(
+                        OAuthError::BrowserLaunchFailed
+                    ))
                 ));
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
             });

@@ -3097,7 +3097,15 @@ impl DispatchQueueState {
             if !inner.dispatching.contains(&key) {
                 inner.cancelled.insert(key);
             }
-            return if cancellation.cancel() {
+            // `cancel_reserved` exists only to service a peer
+            // `notifications/cancelled`: every production caller passes
+            // `cancellation_wire_request_id(&cancellation)`. Recording the
+            // cause here is what makes the response path stay silent for an
+            // IN-FLIGHT request, which is the common case -- a request already
+            // admitted to the dispatch queue never reaches
+            // `handle_request_cancellation`, so marking only that path left
+            // the live behaviour unchanged.
+            return if cancellation.cancel_by_peer() {
                 DispatchCancellationDisposition::Accepted
             } else {
                 DispatchCancellationDisposition::AlreadySettled

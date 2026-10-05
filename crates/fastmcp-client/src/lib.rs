@@ -31354,9 +31354,25 @@ mod tests {
         let peer_subject = subject.clone();
         let peer_target = target.clone();
         let peer = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(15);
+            // RUNAWAY GUARD, not a property bound. Nothing this probe asserts
+            // depends on how long the accept takes; the property lives in the
+            // caller's ordering assertion. The guard only stops the fixture
+            // thread looping forever if the client never connects.
+            //
+            // It was 15s and fired on a loaded worker (bd-kp4td: the same
+            // client --lib suite took 53s on hz3 against ~17s on hz4). When it
+            // fires the listener is gone, so the client's next connect gets
+            // ECONNREFUSED and the planted negative fails its ordering check
+            // with an error that names neither the property nor the cause. A
+            // wall-clock ceiling under contention is not an assertion.
+            let deadline = Instant::now() + Duration::from_secs(120);
             let accept = || loop {
-                assert!(Instant::now() < deadline, "native MRTR peer is bounded");
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture runaway guard expired: the native MRTR peer never \
+                     accepted a connection. This is a FIXTURE fault, not a \
+                     product result."
+                );
                 match listener.accept() {
                     Ok((stream, _)) => {
                         // BSD accepted sockets inherit the listener's nonblocking mode.
@@ -31487,7 +31503,10 @@ mod tests {
                     let cancellation = if attempt == 0 { state.request_cancellation.clone() } else { McpRequestCancellation::new() };
                     let operation_cx = if current == 2 { &limited } else { &cx };
                     let mut operation = Box::pin(invoke_http_mrtr_callback_probe(&mut client, operation_cx, &cancellation, verb, &target));
-                    let deadline = Instant::now() + Duration::from_secs(5);
+                    // Sibling runaway guard, raised with the accept guard
+                    // above. Fixing only one of a pair leaves the other to
+                    // fire on the next loaded run.
+                    let deadline = Instant::now() + Duration::from_secs(60);
                     let mut early = None;
                     loop {
                         let polled = std::future::poll_fn(|cx| Poll::Ready(operation.as_mut().poll(cx))).await;

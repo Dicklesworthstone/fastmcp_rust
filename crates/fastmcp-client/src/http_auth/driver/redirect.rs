@@ -116,8 +116,8 @@ impl RedirectAuthorizationDriver {
             return Err(OAuthError::RuntimeCapabilityUnavailable);
         }
         let binding = CallbackBinding::new(&self.endpoint, &authorization)?;
-        let nanos = u64::try_from(self.timeout.as_nanos())
-            .map_err(|_| OAuthError::InvalidConfiguration)?;
+        let nanos =
+            u64::try_from(self.timeout.as_nanos()).map_err(|_| OAuthError::InvalidConfiguration)?;
         let deadline = cx.now().saturating_add_nanos(nanos);
         let deadline = cx
             .budget()
@@ -355,13 +355,20 @@ async fn bounded<T>(
 mod tests {
     use super::*;
 
-    fn url(value: &str) -> CanonicalHttpUrl { CanonicalHttpUrl::parse(value).unwrap() }
+    fn url(value: &str) -> CanonicalHttpUrl {
+        CanonicalHttpUrl::parse(value).unwrap()
+    }
 
     pub(super) fn encode(value: &str) -> String {
-        value.bytes().map(|byte| match byte {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => char::from(byte).to_string(),
-            byte => format!("%{byte:02X}"),
-        }).collect()
+        value
+            .bytes()
+            .map(|byte| match byte {
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    char::from(byte).to_string()
+                }
+                byte => format!("%{byte:02X}"),
+            })
+            .collect()
     }
 
     fn authorization(callback: &str) -> CanonicalHttpUrl {
@@ -373,11 +380,22 @@ mod tests {
 
     #[test]
     fn exact_ipv4_and_ipv6_callbacks_accept_code_and_denial() {
-        for callback in ["http://127.0.0.1:12345/oauth/callback", "http://[::1]:12345/oauth/callback"] {
-            let binding = CallbackBinding::new(&url("https://issuer.example/authorize"), &authorization(callback)).unwrap();
+        for callback in [
+            "http://127.0.0.1:12345/oauth/callback",
+            "http://[::1]:12345/oauth/callback",
+        ] {
+            let binding = CallbackBinding::new(
+                &url("https://issuer.example/authorize"),
+                &authorization(callback),
+            )
+            .unwrap();
             for outcome in ["code=code", "error=access_denied"] {
-                let location = format!("{callback}?{outcome}&state=state%2Bbound&iss=https%3A%2F%2Fissuer.example");
-                let admitted = binding.location(&[("Location".to_owned(), location.clone())]).unwrap();
+                let location = format!(
+                    "{callback}?{outcome}&state=state%2Bbound&iss=https%3A%2F%2Fissuer.example"
+                );
+                let admitted = binding
+                    .location(&[("Location".to_owned(), location.clone())])
+                    .unwrap();
                 assert_eq!(admitted.as_str(), location);
             }
         }
@@ -386,20 +404,35 @@ mod tests {
     #[test]
     fn callback_binding_refuses_names_nonloopback_and_ambiguous_routes() {
         for callback in [
-            "http://localhost:12345/oauth/callback", "http://192.168.1.2:12345/oauth/callback",
-            "http://0.0.0.0:12345/oauth/callback", "http://[::ffff:127.0.0.1]:12345/oauth/callback",
-            "http://127.0.0.1:0/oauth/callback", "https://127.0.0.1:12345/oauth/callback",
-            "http://user@127.0.0.1:12345/oauth/callback", "http://127.0.0.1:12345/other",
-            "http://127.0.0.1:12345/oauth/callback?x=1", "http://127.0.0.1:12345/oauth/callback#",
+            "http://localhost:12345/oauth/callback",
+            "http://192.168.1.2:12345/oauth/callback",
+            "http://0.0.0.0:12345/oauth/callback",
+            "http://[::ffff:127.0.0.1]:12345/oauth/callback",
+            "http://127.0.0.1:0/oauth/callback",
+            "https://127.0.0.1:12345/oauth/callback",
+            "http://user@127.0.0.1:12345/oauth/callback",
+            "http://127.0.0.1:12345/other",
+            "http://127.0.0.1:12345/oauth/callback?x=1",
+            "http://127.0.0.1:12345/oauth/callback#",
         ] {
-            assert!(CallbackBinding::new(&url("https://issuer.example/authorize"), &authorization(callback)).is_err());
+            assert!(
+                CallbackBinding::new(
+                    &url("https://issuer.example/authorize"),
+                    &authorization(callback)
+                )
+                .is_err()
+            );
         }
     }
 
     #[test]
     fn redirects_cannot_change_endpoint_state_or_callback_outcome_cardinality() {
         let callback = "http://127.0.0.1:12345/oauth/callback";
-        let binding = CallbackBinding::new(&url("https://issuer.example/authorize"), &authorization(callback)).unwrap();
+        let binding = CallbackBinding::new(
+            &url("https://issuer.example/authorize"),
+            &authorization(callback),
+        )
+        .unwrap();
         for location in [
             "http://127.0.0.1:12346/oauth/callback?code=c&state=state%2Bbound",
             "http://127.0.0.1:12345/other?code=c&state=state%2Bbound",
@@ -411,10 +444,21 @@ mod tests {
             "http://127.0.0.1:12345/oauth/callback?state=state%2Bbound",
             "http://127.0.0.1:12345/oauth/callback?code=c&state=state%2Bbound#",
         ] {
-            assert!(binding.location(&[("Location".to_owned(), location.to_owned())]).is_err());
+            assert!(
+                binding
+                    .location(&[("Location".to_owned(), location.to_owned())])
+                    .is_err()
+            );
         }
         let valid = format!("{callback}?code=c&state=state%2Bbound");
-        assert!(binding.location(&[("Location".into(), valid.clone()), ("location".into(), valid)]).is_err());
+        assert!(
+            binding
+                .location(&[
+                    ("Location".into(), valid.clone()),
+                    ("location".into(), valid)
+                ])
+                .is_err()
+        );
         assert!(binding.location(&[]).is_err());
     }
 
@@ -426,24 +470,45 @@ mod tests {
         assert!(CallbackBinding::new(&url("https://other.example/authorize"), &good).is_err());
         assert!(CallbackBinding::new(&url("https://issuer.example/other"), &good).is_err());
         for suffix in ["&state=x", "&%73tate=x"] {
-            assert!(CallbackBinding::new(&endpoint, &url(&format!("{}{suffix}", good.as_str()))).is_err());
+            assert!(
+                CallbackBinding::new(&endpoint, &url(&format!("{}{suffix}", good.as_str())))
+                    .is_err()
+            );
         }
         for invalid in ["%", "%GG", "%ff"] {
             assert!(decode(invalid).is_err());
         }
-        let overflow = (0..33).map(|n| format!("k{n}=v")).collect::<Vec<_>>().join("&");
+        let overflow = (0..33)
+            .map(|n| format!("k{n}=v"))
+            .collect::<Vec<_>>()
+            .join("&");
         assert!(query(&url(&format!("https://issuer.example/?{overflow}"))).is_err());
     }
 
     #[test]
     fn issuer_configuration_and_front_channel_headers_do_not_relax_bearer_policy() {
-        for endpoint in ["http://127.0.0.1/authorize", "https://user@issuer.example/authorize", "https://issuer.example/authorize?", "https://issuer.example/authorize#"] {
+        for endpoint in [
+            "http://127.0.0.1/authorize",
+            "https://user@issuer.example/authorize",
+            "https://issuer.example/authorize?",
+            "https://issuer.example/authorize#",
+        ] {
             assert!(RedirectAuthorizationDriver::new(url(endpoint)).is_err());
         }
-        let driver = RedirectAuthorizationDriver::new(url("https://issuer.example/authorize")).unwrap();
+        let driver =
+            RedirectAuthorizationDriver::new(url("https://issuer.example/authorize")).unwrap();
         assert!(!format!("{driver:?}").contains("issuer.example"));
-        assert!(request_headers().iter().all(|(name, _)| !matches!(name.to_ascii_lowercase().as_str(), "authorization" | "cookie" | "referer")));
-        assert!(crate::http_auth::BoundBearerCredential::bind(url("http://127.0.0.1:12345/mcp"), "secret").is_err());
+        assert!(request_headers().iter().all(|(name, _)| !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "authorization" | "cookie" | "referer"
+        )));
+        assert!(
+            crate::http_auth::BoundBearerCredential::bind(
+                url("http://127.0.0.1:12345/mcp"),
+                "secret"
+            )
+            .is_err()
+        );
     }
 }
 
@@ -451,12 +516,12 @@ mod tests {
 mod live_tests {
     use super::tests::encode;
     use super::*;
+    use crate::http_auth::managed::{ManagedOAuthSession, OAuthSessionPolicy};
+    use crate::http_auth::oauth::{OAuthClient, OAuthClientConfiguration};
     use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
     use asupersync::net::{TcpListener, TcpStream};
     use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
     use asupersync::tls::{CertificateChain, PrivateKey, TlsAcceptor, TlsAcceptorBuilder};
-    use crate::http_auth::managed::{ManagedOAuthSession, OAuthSessionPolicy};
-    use crate::http_auth::oauth::{OAuthClient, OAuthClientConfiguration};
 
     // TEST ONLY, the same 2020-2049 private CA used by oauth_managed.rs.
     // Inline because remote build transfer excludes standalone PEM files.
@@ -480,12 +545,9 @@ mod live_tests {
             .unwrap()
             .block_on(async {
                 let cx = Cx::current().unwrap();
-                asupersync::time::timeout_at(
-                    cx.now().saturating_add_nanos(20_000_000_000),
-                    future,
-                )
-                .await
-                .expect("complete TLS test must settle, not hang on a callback");
+                asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), future)
+                    .await
+                    .expect("complete TLS test must settle, not hang on a callback");
             });
     }
 
@@ -523,9 +585,13 @@ mod live_tests {
             let second = chunk.get(1).copied().unwrap_or(0);
             let third = chunk.get(2).copied().unwrap_or(0);
             encoded.push(char::from(ALPHABET[usize::from(first >> 2)]));
-            encoded.push(char::from(ALPHABET[usize::from((first & 3) << 4 | second >> 4)]));
+            encoded.push(char::from(
+                ALPHABET[usize::from((first & 3) << 4 | second >> 4)],
+            ));
             if chunk.len() > 1 {
-                encoded.push(char::from(ALPHABET[usize::from((second & 15) << 2 | third >> 6)]));
+                encoded.push(char::from(
+                    ALPHABET[usize::from((second & 15) << 2 | third >> 6)],
+                ));
             }
             if chunk.len() > 2 {
                 encoded.push(char::from(ALPHABET[usize::from(third & 63)]));
@@ -534,7 +600,9 @@ mod live_tests {
         encoded
     }
 
-    async fn read_http<IO: AsyncRead + Unpin>(io: &mut IO) -> (String, BTreeMap<String, String>, String) {
+    async fn read_http<IO: AsyncRead + Unpin>(
+        io: &mut IO,
+    ) -> (String, BTreeMap<String, String>, String) {
         let mut wire = Vec::new();
         let mut buffer = [0_u8; 2048];
         let end = loop {
@@ -553,7 +621,10 @@ mod live_tests {
             .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
             .collect();
         for forbidden in ["authorization", "cookie", "referer"] {
-            assert!(!headers.contains_key(forbidden), "front channel leaked {forbidden}");
+            assert!(
+                !headers.contains_key(forbidden),
+                "front channel leaked {forbidden}"
+            );
         }
         let length = headers
             .get("content-length")
@@ -565,7 +636,11 @@ mod live_tests {
             wire.extend_from_slice(&buffer[..count]);
         }
         assert_eq!(wire.len(), end + length);
-        (line, headers, String::from_utf8(wire[end..].to_vec()).unwrap())
+        (
+            line,
+            headers,
+            String::from_utf8(wire[end..].to_vec()).unwrap(),
+        )
     }
 
     #[derive(Clone, Copy)]
@@ -642,7 +717,11 @@ mod live_tests {
             assert_eq!(fields["resource"], "https://resource.example/mcp");
             assert_eq!(fields["scope"], "tools:read");
             assert!(!fields.contains_key("code_verifier"));
-            let state = if matches!(mode, Mode::WrongState) { "changed" } else { &fields["state"] };
+            let state = if matches!(mode, Mode::WrongState) {
+                "changed"
+            } else {
+                &fields["state"]
+            };
             let issuer = if matches!(mode, Mode::WrongIssuer) {
                 "https://different.example".to_owned()
             } else {
@@ -655,9 +734,18 @@ mod live_tests {
             };
             let location = if matches!(mode, Mode::ForeignRedirect) {
                 // A real listening forbidden sink; never contact it.
-                format!("{}/other?code=wire-code&state={}", self.issuer(), encode(state))
+                format!(
+                    "{}/other?code=wire-code&state={}",
+                    self.issuer(),
+                    encode(state)
+                )
             } else {
-                format!("{}?{outcome}&state={}&iss={}", fields["redirect_uri"], encode(state), encode(&issuer))
+                format!(
+                    "{}?{outcome}&state={}&iss={}",
+                    fields["redirect_uri"],
+                    encode(state),
+                    encode(&issuer)
+                )
             };
             let status = match mode {
                 Mode::Success(status) => status,
@@ -682,7 +770,8 @@ mod live_tests {
             assert_eq!(token["redirect_uri"], fields["redirect_uri"]);
             assert_eq!(token["resource"], fields["resource"]);
             assert_eq!(token["client_id"], fields["client_id"]);
-            let digest = fastmcp_core::sha256_bounded(token["code_verifier"].as_bytes(), 128).unwrap();
+            let digest =
+                fastmcp_core::sha256_bounded(token["code_verifier"].as_bytes(), 128).unwrap();
             assert_eq!(base64url(digest.as_bytes()), fields["code_challenge"]);
             let body = r#"{"access_token":"wire-access","token_type":"Bearer","expires_in":300,"refresh_token":"wire-refresh","scope":"tools:read"}"#;
             tls.write_all(format!(
@@ -698,7 +787,10 @@ mod live_tests {
                 self.listener.accept(),
             )
             .await;
-            assert!(result.is_err(), "an extra request was sent after terminal authorization");
+            assert!(
+                result.is_err(),
+                "an extra request was sent after terminal authorization"
+            );
         }
     }
 
@@ -727,7 +819,11 @@ mod live_tests {
                     credential.authorization_for_target(&url("https://resource.example/mcp")),
                     Some("Bearer wire-access".to_owned()),
                 );
-                assert!(credential.authorization_for_target(&url("https://resource.example/other")).is_none());
+                assert!(
+                    credential
+                        .authorization_for_target(&url("https://resource.example/other"))
+                        .is_none()
+                );
                 peer.assert_no_more_connections(&cx).await;
             });
         }
@@ -754,10 +850,20 @@ mod live_tests {
             assert_eq!(requests, 2);
             let snapshot = session.credential(&cx).await.unwrap();
             assert_eq!(snapshot.generation(), 1);
-            assert!(snapshot.credential().authorization_for_target(session.resource()).is_some());
+            assert!(
+                snapshot
+                    .credential()
+                    .authorization_for_target(session.resource())
+                    .is_some()
+            );
             session.close();
             assert!(snapshot.credential().is_revoked());
-            assert!(snapshot.credential().authorization_for_target(session.resource()).is_none());
+            assert!(
+                snapshot
+                    .credential()
+                    .authorization_for_target(session.resource())
+                    .is_none()
+            );
             peer.assert_no_more_connections(&cx).await;
         });
     }

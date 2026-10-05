@@ -12224,6 +12224,42 @@ mod tests {
             .expect("flush finished chunked legacy SSE response");
     }
 
+    /// Finishes a chunked SSE response for a fixture whose client is EXPECTED
+    /// to reject and close before the terminator is written.
+    ///
+    /// In a rejection test the client closing early is the property under
+    /// test, not a fault, so the terminating chunk races that close and the
+    /// write fails with `BrokenPipe` (or `ConnectionReset`/`ConnectionAborted`,
+    /// which are the same condition on other platforms). The strict
+    /// [`finish_chunked_sse`] then panics on the peer thread and the test fails
+    /// at its `join`, naming neither the property nor the cause -- the
+    /// signature recorded on bd-1l88q.
+    ///
+    /// Only a closed peer is tolerated, and only here. Every other write
+    /// failure still panics, and each caller asserts its specific rejection
+    /// BEFORE joining, so no assertion is weakened by this: the join exists to
+    /// surface genuine fixture faults, which it still does.
+    fn finish_chunked_sse_allowing_closed_peer(stream: &mut TcpStream) {
+        fn peer_already_closed(error: &std::io::Error) -> bool {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+            )
+        }
+        match stream.write_all(b"0\r\n\r\n") {
+            Ok(()) => {}
+            Err(error) if peer_already_closed(&error) => return,
+            Err(error) => panic!("finish chunked legacy SSE response: {error:?}"),
+        }
+        match stream.flush() {
+            Ok(()) => {}
+            Err(error) if peer_already_closed(&error) => {}
+            Err(error) => panic!("flush finished chunked legacy SSE response: {error:?}"),
+        }
+    }
+
     fn assert_sse_peer_closed(stream: &mut TcpStream) {
         // A terminal event makes the client release this still-open response.
         // Writing a final HTTP chunk races that close, particularly on Windows.
@@ -15385,7 +15421,7 @@ mod tests {
                 &mut stream,
                 "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":2}}\n\n",
             );
-            finish_chunked_sse(&mut stream);
+            finish_chunked_sse_allowing_closed_peer(&mut stream);
             sent.send(())
                 .expect("report complete cancellation response");
         });
@@ -15636,7 +15672,7 @@ mod tests {
                 .is_none(),
                 "final Tasks lifecycle must not open the legacy message endpoint"
             );
-            finish_chunked_sse(&mut sse);
+            finish_chunked_sse_allowing_closed_peer(&mut sse);
         });
 
         let cx = Cx::for_request();
@@ -15702,7 +15738,7 @@ mod tests {
             for event in subscriptions_listen_sse_events("3") {
                 write_chunked_sse_event(&mut stream, &event);
             }
-            finish_chunked_sse(&mut stream);
+            finish_chunked_sse_allowing_closed_peer(&mut stream);
         });
 
         let cx = Cx::for_request();
@@ -16565,7 +16601,7 @@ mod tests {
                 &mut sse,
                 "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2026-07-28\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-server\",\"version\":\"1.0.0\"}}}\n\n",
             );
-            finish_chunked_sse(&mut sse);
+            finish_chunked_sse_allowing_closed_peer(&mut sse);
             Ok(true)
         });
 
@@ -17222,7 +17258,7 @@ mod tests {
                     Err(error) => panic!("accept unexpected N+1 reply: {error}"),
                 }
             }
-            finish_chunked_sse(&mut sse);
+            finish_chunked_sse_allowing_closed_peer(&mut sse);
         });
 
         let cx = Cx::for_request();
@@ -17377,7 +17413,7 @@ mod tests {
                 &mut sse,
                 "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":72,\"result\":{\"followUp\":true}}\n\n",
             );
-            finish_chunked_sse(&mut sse);
+            finish_chunked_sse_allowing_closed_peer(&mut sse);
             Ok(true)
         });
 
@@ -18621,7 +18657,7 @@ mod tests {
                 &mut sse,
                 "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":42,\"result\":{\"ok\":true}}\n\n",
             );
-            finish_chunked_sse(&mut sse);
+            finish_chunked_sse_allowing_closed_peer(&mut sse);
         });
 
         let cx = Cx::for_request();
@@ -18697,7 +18733,7 @@ mod tests {
             assert_eq!(notification["params"]["requestId"], 42);
             assert!(notification["params"].get("_meta").is_none());
             write_response(&mut notification_post, 202, "application/json", b"");
-            finish_chunked_sse(&mut sse);
+            finish_chunked_sse_allowing_closed_peer(&mut sse);
         });
 
         let cx = Cx::for_request();
