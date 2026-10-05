@@ -38,6 +38,9 @@ use crate::http_executor::ModernHttpExecutor;
 // Shared dispatch/body guard for the original token's local revocation.
 mod credential_lifetime;
 
+/// High-level HTTP calls retaining shared OAuth renewal and credential lifetime.
+pub mod client;
+
 /// Explicit logout with remote issuer revocation and local session closure.
 pub mod logout;
 /// Typed core subscriptions retaining managed cancellation and token lifetime.
