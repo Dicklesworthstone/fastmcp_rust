@@ -40844,6 +40844,29 @@ exec sleep 30
                 serde_json::json!({ "name": name, "version": "1.0.0" }),
             );
         }
+
+        // Prove the fixture actually built the placement that was asked for.
+        // Without this the two positives are interchangeable: the assertions
+        // downstream check the NAME, and both placements are admitted, so
+        // swapping these two same-typed Option<&str> arguments would leave
+        // "sibling is admitted" silently exercising `_meta` and still green.
+        let placed_in_meta = result
+            .get("_meta")
+            .and_then(|meta| meta.get(META_KEY))
+            .and_then(|peer| peer.get("name"))
+            .and_then(serde_json::Value::as_str);
+        let placed_in_sibling = result
+            .get("serverInfo")
+            .and_then(|peer| peer.get("name"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(
+            placed_in_meta, in_meta,
+            "fixture must place identity in the final `_meta` position exactly as requested"
+        );
+        assert_eq!(
+            placed_in_sibling, in_sibling,
+            "fixture must place identity in the top-level sibling position exactly as requested"
+        );
         result
     }
 
