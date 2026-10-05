@@ -1369,6 +1369,202 @@ fn shipped_echo_server_executable() -> &'static str {
 }
 
 #[cfg(unix)]
+struct RawEchoServer {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    stdout: fastmcp_rust::StdioTransport<std::process::ChildStdout, std::io::Sink>,
+}
+
+#[cfg(unix)]
+impl RawEchoServer {
+    fn spawn(policy: &str) -> Self {
+        let mut child = std::process::Command::new(shipped_echo_server_executable())
+            .env("FASTMCP_PROTOCOL_POLICY", policy)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("spawn the shipped echo server");
+        let stdin = child.stdin.take().expect("owned child stdin");
+        let stdout = child.stdout.take().expect("owned child stdout");
+        Self {
+            child,
+            stdin: Some(stdin),
+            stdout: fastmcp_rust::StdioTransport::new(stdout, std::io::sink()),
+        }
+    }
+
+    fn send(&mut self, frame: serde_json::Value) {
+        use std::io::Write;
+        let stdin = self.stdin.as_mut().expect("stdin remains open");
+        serde_json::to_writer(&mut *stdin, &frame).expect("encode raw request");
+        stdin.write_all(b"\n").expect("delimit raw request");
+        stdin.flush().expect("flush raw request");
+    }
+
+    fn request(&mut self, id: i64, method: &str, mut params: serde_json::Value) {
+        params["_meta"] = json!({
+            "io.modelcontextprotocol/protocolVersion": fastmcp_rust::MODERN_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "progressToken": format!("bd-xy7t5-{id}"),
+        });
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+    }
+
+    fn recv(&mut self) -> Option<serde_json::Value> {
+        match self.stdout.recv_until(
+            &Cx::for_request(),
+            Some(Instant::now() + STDIO_COMPLETION_ABSOLUTE_TIMEOUT),
+        ) {
+            Ok(frame) => Some(serde_json::to_value(frame).expect("inspect raw server frame")),
+            Err(fastmcp_rust::TransportError::Closed) => None,
+            Err(error) => panic!("raw server must make progress or close: {error:?}"),
+        }
+    }
+
+    fn wait_for_response(&mut self, id: i64, frames: &mut Vec<serde_json::Value>) {
+        loop {
+            let frame = self.recv().expect("live sibling reply before input closes");
+            let received = frame.get("id") == Some(&json!(id));
+            frames.push(frame);
+            if received {
+                break;
+            }
+        }
+    }
+
+    fn finish(mut self, mut frames: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+        self.stdin.take();
+        while let Some(frame) = self.recv() {
+            frames.push(frame);
+        }
+        assert!(self.child.wait().expect("reap owned server").success());
+        frames
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawEchoServer {
+    fn drop(&mut self) {
+        // Also reap the exact owned subprocess when an assertion unwinds.
+        match self.child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(error) => eprintln!("cannot inspect owned echo server during cleanup: {error}"),
+        }
+        if let Err(error) = self.child.kill() {
+            eprintln!("cannot stop owned echo server during cleanup: {error}");
+        }
+        if let Err(error) = self.child.wait() {
+            eprintln!("cannot reap owned echo server during cleanup: {error}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_raw_stdio_peer_cancellation_suppresses_only_its_response() {
+    for policy in ["auto", "modern-only"] {
+        let mut server = RawEchoServer::spawn(policy);
+        server.request(900, "server/discover", json!({}));
+        let opening = server.recv().expect("discovery reply");
+        assert_eq!(opening["id"], 900);
+        assert!(opening.get("error").is_none(), "{opening}");
+
+        server.request(
+            901,
+            "tools/call",
+            json!({"name": "hold_echo", "arguments": {}}),
+        );
+        let mut frames = vec![opening];
+        loop {
+            let frame = server.recv().expect("hold_echo starts before cancellation");
+            let started = frame["method"] == "notifications/progress"
+                && frame["params"]["progressToken"] == "bd-xy7t5-901"
+                && frame["params"]["message"] == "hold_echo started";
+            assert_ne!(
+                frame.get("id"),
+                Some(&json!(901)),
+                "handler completed before cancellation: {frame}"
+            );
+            frames.push(frame);
+            if started {
+                break;
+            }
+        }
+        server.send(json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 901}}));
+        server.request(
+            902,
+            "tools/call",
+            json!({"name": "fast_echo", "arguments": {}}),
+        );
+        server.wait_for_response(902, &mut frames);
+        // Closing input and consuming output through EOF makes absence a terminal
+        // observation, rather than a sleep that could miss a delayed reply.
+        let frames = server.finish(frames);
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.get("id") != Some(&json!(901))),
+            "peer-cancelled response escaped: {frames:?}"
+        );
+        let sibling: Vec<_> = frames
+            .iter()
+            .filter(|frame| frame.get("id") == Some(&json!(902)))
+            .collect();
+        assert_eq!(sibling.len(), 1, "one sibling response: {frames:?}");
+        assert!(sibling[0].get("error").is_none(), "{sibling:?}");
+        assert_eq!(sibling[0]["result"]["resultType"], "complete");
+        assert_eq!(sibling[0]["result"]["content"][0]["text"], "fast");
+        assert_ne!(sibling[0]["result"]["isError"], true);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_raw_stdio_deadline_preserves_terminal_response() {
+    for policy in ["auto", "modern-only"] {
+        let mut server = RawEchoServer::spawn(policy);
+        server.request(910, "server/discover", json!({}));
+        let opening = server.recv().expect("discovery reply");
+        assert_eq!(opening["id"], 910);
+        assert!(opening.get("error").is_none(), "{opening}");
+        server.request(
+            911,
+            "tools/call",
+            json!({"name": "slow_echo", "arguments": {}}),
+        );
+        let refusal = server.recv().expect("deadline retains its terminal reply");
+        assert_eq!(refusal["id"], 911);
+        assert_eq!(refusal["error"]["code"], -32004, "{refusal}");
+        server.request(
+            912,
+            "tools/call",
+            json!({"name": "fast_echo", "arguments": {}}),
+        );
+        let mut frames = vec![opening, refusal];
+        server.wait_for_response(912, &mut frames);
+        let frames = server.finish(frames);
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame.get("id") == Some(&json!(911)))
+                .count(),
+            1
+        );
+        let sibling: Vec<_> = frames
+            .iter()
+            .filter(|frame| frame.get("id") == Some(&json!(912)))
+            .collect();
+        assert_eq!(sibling.len(), 1, "{frames:?}");
+        assert!(sibling[0].get("error").is_none(), "{sibling:?}");
+        assert_eq!(sibling[0]["result"]["resultType"], "complete");
+        assert_eq!(sibling[0]["result"]["content"][0]["text"], "fast");
+        assert_ne!(sibling[0]["result"]["isError"], true);
+    }
+}
+
+#[cfg(unix)]
 fn connect_auto_stdio_to_shipped_echo_server(server_policy: &str) -> Client {
     let command = shipped_echo_server_executable();
     let builder = auto::client_builder().env("FASTMCP_PROTOCOL_POLICY", server_policy);
@@ -5548,9 +5744,16 @@ fn e2e_public_stdio_modern_sliding_window_refuses_second_same_method_and_admits_
         "the refused second modern stdio tools/call must keep the sliding-window error: {limited}"
     );
 
-    client
-        .ping()
+    let listed = client
+        .list_resources(None)
         .expect("changing only the method must still be admitted by the live sliding window");
+    assert!(
+        listed
+            .resources
+            .iter()
+            .any(|resource| resource.uri.as_str() == "info://server"),
+        "resources/list must reach the catalog after tools/call is sliding-window limited: {listed:?}"
+    );
 
     client
         .close()
@@ -5832,9 +6035,16 @@ fn e2e_public_stdio_modern_rate_limit_refuses_second_same_method_and_admits_anot
         "the refused second modern stdio tools/call must keep the token-bucket error: {limited}"
     );
 
-    client
-        .ping()
+    let listed = client
+        .list_resources(None)
         .expect("changing only the method must still be admitted by the live token bucket");
+    assert!(
+        listed
+            .resources
+            .iter()
+            .any(|resource| resource.uri.as_str() == "info://server"),
+        "resources/list must reach the catalog after tools/call is token-bucket limited: {listed:?}"
+    );
 
     client
         .close()

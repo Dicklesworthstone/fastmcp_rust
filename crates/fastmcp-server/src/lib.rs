@@ -2830,6 +2830,11 @@ struct DispatchQueueStateInner {
     /// Reserved requests that a worker has begun dispatching.
     dispatching: HashSet<CorrelationKey>,
     cancelled: HashSet<CorrelationKey>,
+    /// Only a peer that wins the request token's terminal race may suppress
+    /// its response. Deadline, shutdown, and failed-output cancellation must
+    /// retain their terminal replies. This ownership ends with the reservation
+    /// so reuse of an ID cannot inherit an earlier request's cancellation.
+    peer_cancelled: HashSet<CorrelationKey>,
     modern_cancellations: HashMap<u64, McpRequestCancellation>,
     /// The subset of [`Self::modern_cancellations`] belonging to id-less
     /// (notification) children. These have no response to commit, so shutdown
@@ -2910,6 +2915,7 @@ impl DispatchQueueState {
         inner.admitted_cancellations.remove(&key);
         inner.dispatching.remove(&key);
         inner.cancelled.remove(&key);
+        inner.peer_cancelled.remove(&key);
         if removed && inner.reserved.is_empty() {
             self.drained.notify_all();
         }
@@ -3095,9 +3101,10 @@ impl DispatchQueueState {
         }
         if let Some(cancellation) = inner.admitted_cancellations.get(&key).cloned() {
             if !inner.dispatching.contains(&key) {
-                inner.cancelled.insert(key);
+                inner.cancelled.insert(key.clone());
             }
             return if cancellation.cancel() {
+                inner.peer_cancelled.insert(key);
                 DispatchCancellationDisposition::Accepted
             } else {
                 DispatchCancellationDisposition::AlreadySettled
@@ -3106,11 +3113,40 @@ impl DispatchQueueState {
         if inner.dispatching.contains(&key) {
             return DispatchCancellationDisposition::NotOwned;
         }
-        if inner.cancelled.insert(key) {
+        if inner.cancelled.insert(key.clone()) {
+            inner.peer_cancelled.insert(key);
             DispatchCancellationDisposition::Accepted
         } else {
             DispatchCancellationDisposition::AlreadySettled
         }
+    }
+
+    /// Called under the same writer fence as peer cancellation, immediately
+    /// before response publication. A peer arriving after finalization loses
+    /// the token race and cannot turn a committed server outcome into silence.
+    fn peer_cancellation_won(&self, id: &RequestId) -> bool {
+        let Ok(key) = id.correlation_key() else {
+            return false;
+        };
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .peer_cancelled
+            .contains(&key)
+    }
+
+    fn suppress_peer_cancelled_response(
+        &self,
+        response: &JsonRpcResponse,
+        subscription_request: bool,
+    ) -> bool {
+        // A server-elected subscription completion owns its terminal response
+        // even if a peer wins the subsequent cancellation that wakes the worker.
+        !(subscription_request && final_subscription_completion_response(response))
+            && response
+                .id
+                .as_ref()
+                .is_some_and(|id| self.peer_cancellation_won(id))
     }
 
     fn begin_dispatch(&self, id: &RequestId) -> bool {
@@ -16885,6 +16921,13 @@ impl Server {
                     let mut writer = request_send
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if reservation
+                        .queue
+                        .suppress_peer_cancelled_response(&response, subscription_request)
+                    {
+                        reservation.disarm_failure();
+                        return;
+                    }
                     if !(subscription_request && final_subscription_completion_response(&response)
                         || cancellation.begin_finalization())
                     {
@@ -17949,6 +17992,9 @@ impl Server {
                                             let Some(id) = request.id.clone() else {
                                                 return Ok(());
                                             };
+                                            if reservation.queue.peer_cancellation_won(&id) {
+                                                return Ok(());
+                                            }
                                             let response = JsonRpcResponse::error(
                                                 Some(id),
                                                 JsonRpcError {
@@ -17967,6 +18013,7 @@ impl Server {
                                             )
                                         }
                                         ModernDispatchStart::Ready => {
+                                            let subscription_request = request.method == SUBSCRIPTIONS_LISTEN;
                                             let inbound = InboundRequestContext::with_modern_connection_context(
                                                 request_cx.clone(),
                                                 request_id_to_u64(request.id.as_ref()),
@@ -18042,6 +18089,9 @@ impl Server {
                                                     .unwrap_or_else(
                                                         std::sync::PoisonError::into_inner,
                                                     );
+                                                if reservation.queue.suppress_peer_cancelled_response(&response, subscription_request) {
+                                                    return Ok(());
+                                                }
                                                 // Server shutdown elects a final subscription
                                                 // completion before cancelling its request to
                                                 // wake this worker. That completion is the
@@ -30678,6 +30728,109 @@ mod lib_unit_tests {
             queue.wait_for_correlated_response_drain(Duration::ZERO),
             "discarding the response reservation completes the drain"
         );
+    }
+
+    #[test]
+    fn dispatch_queue_peer_cancellation_origin_preserves_server_terminal_outcomes() {
+        for server_cancelled_first in [false, true] {
+            let queue = DispatchQueueState::default();
+            let request_id = RequestId::Integer("7e0".to_owned());
+            let sibling_id = RequestId::Number(8);
+            assert!(queue.admit(&request_id, true));
+            assert!(queue.admit(&sibling_id, true));
+            let token = queue
+                .admitted_request_cancellation(&request_id)
+                .expect("admitted request token");
+            if server_cancelled_first {
+                assert!(token.cancel());
+            }
+            assert_eq!(
+                queue.cancel_reserved(&RequestId::Number(7)),
+                if server_cancelled_first {
+                    DispatchCancellationDisposition::AlreadySettled
+                } else {
+                    DispatchCancellationDisposition::Accepted
+                }
+            );
+            assert_eq!(
+                queue.peer_cancellation_won(&request_id),
+                !server_cancelled_first,
+                "a late peer cannot suppress an already-elected server cancellation"
+            );
+            assert!(!queue.peer_cancellation_won(&sibling_id));
+            assert!(
+                !queue
+                    .admitted_request_cancellation(&sibling_id)
+                    .expect("sibling token")
+                    .is_cancel_requested()
+            );
+            queue.discard(&request_id);
+            assert!(queue.admit(&RequestId::Number(7), true));
+            assert!(
+                !queue.peer_cancellation_won(&request_id),
+                "ID reuse must retire the prior cancellation origin"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_queue_elected_subscription_completion_survives_late_peer_cancellation() {
+        let queue = DispatchQueueState::default();
+        let request_id = RequestId::Number(7);
+        assert!(queue.admit(&request_id, true));
+        assert_eq!(
+            queue.cancel_reserved(&request_id),
+            DispatchCancellationDisposition::Accepted
+        );
+        let completion = JsonRpcResponse::success(
+            request_id.clone(),
+            serde_json::json!({
+                "resultType": "complete",
+                "_meta": {FINAL_SUBSCRIPTION_ID_META_KEY: request_id},
+            }),
+        );
+        assert!(!queue.suppress_peer_cancelled_response(&completion, true));
+        assert!(queue.suppress_peer_cancelled_response(&completion, false));
+        let ordinary_completion = JsonRpcResponse::success(
+            RequestId::Number(7),
+            serde_json::json!({"resultType": "complete"}),
+        );
+        assert!(queue.suppress_peer_cancelled_response(&ordinary_completion, true));
+    }
+
+    #[test]
+    fn dispatch_queue_shutdown_does_not_become_peer_cancellation() {
+        let queue = DispatchQueueState::default();
+        let request_id = RequestId::Number(7);
+        assert!(queue.admit(&request_id, true));
+        let token = queue
+            .admitted_request_cancellation(&request_id)
+            .expect("admitted request token");
+        queue.stop();
+        assert!(token.is_cancel_requested());
+        assert!(!queue.peer_cancellation_won(&request_id));
+        assert_eq!(
+            queue.cancel_reserved(&request_id),
+            DispatchCancellationDisposition::AlreadySettled
+        );
+        assert!(!queue.peer_cancellation_won(&request_id));
+    }
+
+    #[test]
+    fn dispatch_queue_finalization_wins_over_late_peer_cancellation() {
+        let queue = DispatchQueueState::default();
+        let request_id = RequestId::Number(7);
+        assert!(queue.admit(&request_id, true));
+        let token = queue
+            .admitted_request_cancellation(&request_id)
+            .expect("admitted request token");
+        assert!(token.begin_finalization());
+        assert_eq!(
+            queue.cancel_reserved(&request_id),
+            DispatchCancellationDisposition::AlreadySettled
+        );
+        assert!(!queue.peer_cancellation_won(&request_id));
+        assert!(!token.is_cancel_requested());
     }
 
     #[test]
@@ -49357,8 +49510,7 @@ mod lib_unit_tests {
                         return Err(TransportError::Timeout);
                     }
                     control_for_receive.release(201);
-                    if responses_for_receive.wait_for_responses(&[200, 201], Duration::from_secs(2))
-                    {
+                    if responses_for_receive.wait_for_responses(&[201], Duration::from_secs(2)) {
                         Err(TransportError::Closed)
                     } else {
                         Err(TransportError::Timeout)
@@ -49394,15 +49546,8 @@ mod lib_unit_tests {
             0,
             "all controlled calls must finish cleanup before the pump returns"
         );
-        assert_eq!(responses.response_count(200), 1);
+        assert_eq!(responses.response_count(200), 0);
         assert_eq!(responses.response_count(201), 1);
-        assert_eq!(
-            responses
-                .response(200)
-                .and_then(|response| response.error)
-                .and_then(|error| error.code.as_i32()),
-            Some(i32::from(McpErrorCode::RequestCancelled))
-        );
         assert!(
             responses
                 .response(201)
@@ -49557,13 +49702,7 @@ mod lib_unit_tests {
                     {
                         return Err(TransportError::Timeout);
                     }
-                    if responses_for_receive
-                        .wait_for_responses(&[REQUEST_ID], Duration::from_secs(2))
-                    {
-                        Err(TransportError::Closed)
-                    } else {
-                        Err(TransportError::Timeout)
-                    }
+                    Err(TransportError::Closed)
                 }
                 _ => Err(TransportError::Closed),
             },
@@ -49579,13 +49718,7 @@ mod lib_unit_tests {
                 matches!(message, JsonRpcMessage::Request(notification) if notification.method == "notifications/progress")
             })
             .expect("the rate timer must flush progress before the one-variable cancellation");
-        assert_eq!(
-            responses
-                .response(REQUEST_ID)
-                .and_then(|response| response.error)
-                .and_then(|error| error.code.as_i32()),
-            Some(i32::from(McpErrorCode::RequestCancelled))
-        );
+        assert_eq!(responses.response_count(REQUEST_ID), 0);
         assert!(
             !messages[progress_index.saturating_add(1)..]
                 .iter()
@@ -49606,7 +49739,6 @@ mod lib_unit_tests {
         let responses = Arc::new(LiveModernResponses::default());
         let interlock = install_stdio_progress_commit_interlock(REQUEST_ID as u64);
         let control_for_receive = Arc::clone(&control);
-        let responses_for_receive = Arc::clone(&responses);
         let interlock_for_receive = Arc::clone(&interlock);
         let phase = Arc::new(AtomicUsize::new(0));
         let phase_for_receive = Arc::clone(&phase);
@@ -49640,13 +49772,7 @@ mod lib_unit_tests {
                     {
                         return Err(TransportError::Timeout);
                     }
-                    if responses_for_receive
-                        .wait_for_responses(&[REQUEST_ID], Duration::from_secs(2))
-                    {
-                        Err(TransportError::Closed)
-                    } else {
-                        Err(TransportError::Timeout)
-                    }
+                    Err(TransportError::Closed)
                 }
                 _ => Err(TransportError::Closed),
             },
@@ -49656,13 +49782,7 @@ mod lib_unit_tests {
 
         assert_eq!(exit_code, 0);
         assert!(control.was_cancelled(REQUEST_ID as u64));
-        assert_eq!(
-            responses
-                .response(REQUEST_ID)
-                .and_then(|response| response.error)
-                .and_then(|error| error.code.as_i32()),
-            Some(i32::from(McpErrorCode::RequestCancelled))
-        );
+        assert_eq!(responses.response_count(REQUEST_ID), 0);
         assert!(
             !responses.messages().iter().any(|message| matches!(
                 message,
