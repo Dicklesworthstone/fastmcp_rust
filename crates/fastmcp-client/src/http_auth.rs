@@ -30,6 +30,8 @@ use fastmcp_core::{AccessToken, McpRequestCancellation};
 pub mod discovery;
 /// Jointly-polled, caller-owned browser driving for native authorization.
 pub mod driver;
+/// High-level HTTP calls with shared OAuth renewal and generation-local caches.
+pub mod http_client;
 /// Shared OAuth renewal and authenticated modern HTTP dispatch.
 pub mod managed;
 /// Interactive native-public-client authorization with a caller-owned runtime.
@@ -311,7 +313,7 @@ mod tests {
 
         assert_eq!(
             credential.authorization_for_target(&url("https://mcp.example/api")),
-            Some("Bearer token-1".to_owned())
+            Some("Bearer token-1".to_owned()),
         );
 
         // One changed dimension per case: path, authority, scheme-equivalent
