@@ -600,11 +600,23 @@ fn parameter_header_plans_admit_https_and_loopback_http_only() {
     // disqualifier on an otherwise-admitted resource.
     for (label, refused) in [
         ("non-loopback http host", "http://tools.example/mcp"),
-        ("http host merely named like loopback", "http://localhost.evil.example/mcp"),
+        (
+            "http host merely named like loopback",
+            "http://localhost.evil.example/mcp",
+        ),
         ("public IPv4 over http", "http://93.184.216.34/mcp"),
-        ("non-loopback IPv6 over http", "http://[2606:2800:220:1:248:1893:25c8:1946]/mcp"),
-        ("userinfo on a loopback resource", "http://user@127.0.0.1:8931/mcp"),
-        ("fragment on a loopback resource", "http://127.0.0.1:8931/mcp#frag"),
+        (
+            "non-loopback IPv6 over http",
+            "http://[2606:2800:220:1:248:1893:25c8:1946]/mcp",
+        ),
+        (
+            "userinfo on a loopback resource",
+            "http://user@127.0.0.1:8931/mcp",
+        ),
+        (
+            "fragment on a loopback resource",
+            "http://127.0.0.1:8931/mcp#frag",
+        ),
     ] {
         assert!(
             plan_for(refused).is_err(),

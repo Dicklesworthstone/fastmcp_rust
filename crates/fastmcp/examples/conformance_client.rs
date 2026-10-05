@@ -44,9 +44,9 @@
 use std::collections::HashMap;
 use std::process::ExitCode;
 
+use fastmcp_client::http_executor::parameter_headers::ReviewedToolHeaders;
 use fastmcp_protocol::http_headers::admit_final_tool_input_schema;
 use fastmcp_protocol::{ElicitContentValue, ElicitRequestParams, ElicitResult};
-use fastmcp_client::http_executor::parameter_headers::ReviewedToolHeaders;
 use fastmcp_rust::modern::{
     CanonicalHttpUrl, ClientBuilder, ClientCapabilities, Cx, McpError, ReverseRequestHandlers,
 };
