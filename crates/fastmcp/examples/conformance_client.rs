@@ -221,7 +221,7 @@ async fn run(cx: &Cx, url: &str) -> Result<(), String> {
         .protocol_plan(plan)
         .client_info("fastmcp-rust-conformance-client", "0.10.0")
         .capabilities(capabilities)
-        .modern_reverse_request_handlers(handlers())
+        .reverse_request_handlers(handlers())
         .connect_http_client_with_cx(cx)
         .await
         .map_err(|error| format!("connect: {error:?}"))?;
