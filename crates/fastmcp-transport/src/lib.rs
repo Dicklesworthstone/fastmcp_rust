@@ -53,6 +53,19 @@ mod stdio;
 pub mod websocket;
 
 pub use async_io::{AsyncLineReader, AsyncStdin, AsyncStdout};
+/// Caller-owned, reactor-driven Unix pipe I/O.
+///
+/// `async_io` stays private and this crate publishes its types from the root,
+/// which is the same shape as the `AsyncLineReader`/`AsyncStdin`/`AsyncStdout`
+/// line above. The alternative -- `pub mod async_io` -- would publish the
+/// module's whole interior, which carries no stability intent.
+///
+/// These are pipe primitives, not a `Transport`: they admit an owned
+/// descriptor and provide readiness-aware reads and writes against the
+/// caller's reactor. The shipped server stdio path reaches the wire through
+/// `fastmcp_server::async_stdio` and does not use them.
+#[cfg(unix)]
+pub use async_io::{NativePipeReader, NativePipeWriter, create_native_pipe};
 
 pub use codec::{Codec, CodecError, InvalidMessageKind};
 /// Public modern per-request HTTP admission and response-stream primitives.

@@ -29,7 +29,7 @@ mod unix {
     use fastmcp_protocol::protocol_policy::ProtocolPolicy;
     use fastmcp_protocol::{CompleteResult, Content, FinalCallToolResult, ResultMeta, Tool};
     use fastmcp_server::{FinalToolOutcome, Server, ToolExecutionMode, ToolHandler};
-    use fastmcp_transport::async_io::{NativePipeReader, NativePipeWriter};
+    use fastmcp_transport::{NativePipeReader, NativePipeWriter};
 
     struct Echo;
 
@@ -69,8 +69,12 @@ mod unix {
             arguments: serde_json::Value,
         ) -> Pin<Box<dyn Future<Output = McpOutcome<FinalToolOutcome>> + Send + 'a>> {
             Box::pin(async move {
+                // `McpContext::checkpoint` yields `CancelledError`, not
+                // `McpError`. Without the conversion the first arm fixes this
+                // block's error type to `CancelledError` and every later
+                // `McpError` arm fails to unify.
                 if let Err(error) = ctx.checkpoint() {
-                    return Outcome::Err(error);
+                    return Outcome::Err(error.into());
                 }
                 let Some(text) = arguments.get("text").and_then(serde_json::Value::as_str) else {
                     return Outcome::Err(McpError::invalid_params("text must be a string"));
@@ -88,8 +92,12 @@ mod unix {
                 if delay != 0 {
                     asupersync::time::sleep(ctx.cx().now(), Duration::from_millis(delay)).await;
                 }
+                // `McpContext::checkpoint` yields `CancelledError`, not
+                // `McpError`. Without the conversion the first arm fixes this
+                // block's error type to `CancelledError` and every later
+                // `McpError` arm fails to unify.
                 if let Err(error) = ctx.checkpoint() {
-                    return Outcome::Err(error);
+                    return Outcome::Err(error.into());
                 }
                 let payload: FinalCallToolResult = match serde_json::from_value(serde_json::json!({
                     "content": [{"type": "text", "text": text}],
@@ -98,9 +106,12 @@ mod unix {
                     Ok(payload) => payload,
                     Err(_) => return Outcome::Err(McpError::internal_error("echo result encoding failed")),
                 };
+                // `ResultMeta` derives only (Debug, Clone); `empty()` is its
+                // constructor and is what preserves the absence of the
+                // optional `_meta` member on the wire.
                 Outcome::Ok(FinalToolOutcome::Complete(CompleteResult::new(
                     payload,
-                    ResultMeta::default(),
+                    ResultMeta::empty(),
                 )))
             })
         }
