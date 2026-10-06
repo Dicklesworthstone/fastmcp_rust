@@ -135,7 +135,7 @@ impl NativeClientRegistrationChoice {
         match selected {
             Selection::Configured { method, client_id, configuration } => Ok(ResolvedNativeClient {
                 method,
-                client: RegisteredNativeClient { client_id, configuration },
+                client: RegisteredNativeClient { client_id, configuration: *configuration },
             }),
             Selection::Dynamic(body) => {
                 let client = self.registration.register_from_discovery(cx, deadline, issuer, &body)
@@ -161,7 +161,11 @@ impl NativeClientRegistrationChoice {
         };
         if let Some((method, client_id)) = selected {
             let configuration = discovery.configure_client(issuer, authorization, token, revocation, client_id)?;
-            return Ok(Selection::Configured { method, client_id: client_id.to_owned(), configuration });
+            return Ok(Selection::Configured {
+                method,
+                client_id: client_id.to_owned(),
+                configuration: Box::new(configuration),
+            });
         }
         // Admission is candidate-local, including the separate DCR write grant.
         // A valid HTTPS token endpoint alone cannot authorize registration.
@@ -178,7 +182,9 @@ enum Selection {
     Configured {
         method: NativeClientRegistrationMethod,
         client_id: String,
-        configuration: OAuthClientConfiguration,
+        // Boxed so `Configured` does not set this enum's size for the
+        // 24-byte `Dynamic` arm as well (bd-y2xoc, large_enum_variant).
+        configuration: Box<OAuthClientConfiguration>,
     },
     Dynamic(Vec<u8>),
 }

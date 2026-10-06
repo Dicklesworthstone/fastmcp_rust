@@ -928,7 +928,11 @@ impl ClientBuilder {
             reverse_request_handlers.derive_modern_capabilities(&mut client_capabilities);
         }
         let client_implementation = builder.client_implementation_for_session();
-        let mut client = HttpClient::connect_with_settings(
+        // Heap the connect step rather than awaiting it inline. It is the whole
+        // discovery-or-initialize flow and dominated this future's 16 KB, which
+        // every caller of this public method paid at its own `.await`
+        // (bd-y2xoc). Boxing the inner step keeps the public signature intact.
+        let mut client = Box::pin(HttpClient::connect_with_settings(
             cx,
             builder.protocol_plan,
             builder.client_info,
@@ -942,7 +946,7 @@ impl ClientBuilder {
                 subscription_timeout_policy: builder.subscription_timeout_policy,
             },
             reverse_request_handlers,
-        )
+        ))
         .await?;
         if let Some(implementation) = client_implementation {
             client.set_client_implementation(implementation);

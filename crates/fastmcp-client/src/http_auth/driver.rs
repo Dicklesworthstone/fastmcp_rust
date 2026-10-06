@@ -185,7 +185,12 @@ where
         let _caller = Cx::set_current(Some(cx.clone()));
         operation(launcher)
     };
-    let mut operation = std::pin::pin!(operation);
+    // Heap the caller's operation future rather than storing `OF` by value in
+    // this one. `OF` is the whole authorization flow, so holding it inline here
+    // made every `.await` of a public wrapper carry 16-23 KB (bd-y2xoc). The
+    // driver future beside it is already boxed below, so this makes the pair
+    // consistent and keeps the public signatures untouched.
+    let mut operation = Box::pin(operation);
     let mut driver_factory = Some(driver);
     let mut driving: Option<std::pin::Pin<Box<DF>>> = None;
     let sleep = {

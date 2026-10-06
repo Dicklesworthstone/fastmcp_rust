@@ -6,7 +6,11 @@
 //! - DisplayContext affecting multiple components
 //! - Config affecting all subsystems
 
-#![cfg(any(feature = "legacy-2024-11-05", feature = "tasks", feature = "apps"))]
+// `renderers` is implied by `legacy-2024-11-05`, `tasks` and `apps`. The gate
+// is mirrored by a `required-features` stanza in Cargo.toml, so a run whose
+// features do not satisfy it SKIPS this target loudly instead of compiling it
+// to an empty binary that prints `ok. 0 passed` (bd-ufj6r).
+#![cfg(feature = "renderers")]
 
 use std::time::Duration;
 

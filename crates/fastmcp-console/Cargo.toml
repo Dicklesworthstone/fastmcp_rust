@@ -42,9 +42,19 @@ full = ["rich_rust/full"]
 syntax = ["rich_rust/syntax"]
 markdown = ["rich_rust/markdown"]
 json = ["rich_rust/json"]
-legacy-2024-11-05 = ["fastmcp-protocol/legacy-2024-11-05"]
-tasks = ["fastmcp-protocol/tasks"]
-apps = ["fastmcp-protocol/apps"]
+# `client`, `handlers` and `tables` render protocol catalogs, so they exist
+# whenever ANY protocol-carrying feature is on. That three-way condition used
+# to be spelled `cfg(any(legacy-2024-11-05, tasks, apps))` at six sites in
+# lib.rs and once more in tests/integration.rs. Naming it does two things:
+# it keeps the six sites from drifting apart, and it makes the condition
+# expressible as `required-features`, which is an AND and therefore cannot
+# represent an `any(..)`. Without a name, tests/integration.rs had no stanza it
+# could carry and compiled to an empty binary that printed `ok. 0 passed`
+# under default features (bd-ufj6r). Do not set this directly; it is implied.
+renderers = []
+legacy-2024-11-05 = ["fastmcp-protocol/legacy-2024-11-05", "renderers"]
+tasks = ["fastmcp-protocol/tasks", "renderers"]
+apps = ["fastmcp-protocol/apps", "renderers"]
 enterprise-auth = []
 oauth-client-credentials = []
 builtin-auth-server = []
@@ -58,6 +68,23 @@ jwt-resource-auth = []
 name = "tables"
 path = "examples/tables.rs"
 required-features = ["legacy-2024-11-05"]
+
+# --- Loud refusal for the feature-gated test target (bd-ufj6r) --------------
+# tests/integration.rs opens with `#![cfg(feature = "renderers")]`. Without
+# this stanza a run whose features do not satisfy that cfg compiled it to an
+# EMPTY BINARY and libtest printed `ok. 0 passed` with exit status 0 — 29 tests
+# vanishing indistinguishably from a real pass. This crate's `default = []`, so
+# that was every `cargo test -p fastmcp-console`. With the stanza such a run
+# excludes the target, and `--test integration` makes cargo refuse and name the
+# missing feature.
+#
+# Note the asymmetry this closes: under a WORKSPACE-wide run, feature
+# unification from fastmcp-server/fastmcp turns `renderers` on and the target
+# did compile, so the per-package and workspace runs silently disagreed.
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+required-features = ["renderers"]
 
 [lints]
 workspace = true

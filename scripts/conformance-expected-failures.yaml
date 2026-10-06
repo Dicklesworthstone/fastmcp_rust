@@ -13,7 +13,14 @@
 #
 #   bba5a09f  2026-10-01   40 scenarios,  92 checks,  54 SUCCESS, 38 FAILURE
 #   6b54e023  2026-10-03   40 scenarios, 114 checks, 108 SUCCESS,  1 FAILURE
-#   (this)    2026-10-04   40 scenarios, 115 checks, 110 SUCCESS,  0 FAILURE
+#   (unanchored) 2026-10-04 40 scenarios, 115 checks, 110 SUCCESS,  0 FAILURE
+#   99a3b4e8  2026-10-05   40 scenarios, 115 checks, 110 SUCCESS,  0 FAILURE
+#
+# The 2026-10-04 row carries a date and no revision, and 98 commits touching
+# 388 lines of server-mode source landed after it. 99a3b4e8 re-measures it and
+# reproduces it exactly, bound to: adapter blob 0b887aed, adapter sha256
+# a66f0bee...e149b4, conformance_server binary sha256 74c18713...e54a1a,
+# rustc 1.100.0-nightly (e7769602a 2026-08-24), host hz3, build rc 0 in 32m24s.
 #
 # THE LIST IS EMPTY ON PURPOSE. Every FAILURE-level check passes, so any new
 # entry appearing in a run is a regression. Keep it empty: adding an entry
@@ -27,9 +34,27 @@
 server: []
 
 # ---------------------------------------------------------------------------
-# SHOULD-level misses. The suite records these as WARNING, so they do not fail
-# a run and do not belong in the list above. They are recorded here so they are
-# never mistaken for passes.
+# SHOULD-level misses, recorded here so they are never mistaken for passes.
+#
+# MEASURED CORRECTION, 2026-10-05 at 99a3b4e8 on hz3, same pin and
+# `--suite all`: the sentence that used to stand here -- "the suite records
+# these as WARNING, so they do not fail a run" -- is FALSE when `--baseline`
+# is supplied. The suite's `--expected-failures` keys on SCENARIO-level
+# non-success and counts a SHOULD-level WARNING as a scenario failure. The run
+# printed its own tally as `110 passed, 0 failed` and then exited 1 with:
+#
+#     Unexpected failures (not in baseline):
+#       server-stateless
+#       input-required-result-missing-input-response
+#       input-required-result-ignore-extra-params
+#
+# So `--baseline <this file>` cannot pass as written, and a gate built on it is
+# permanently red rather than permanently green. The two ways out are to list
+# those three scenarios here, or to gate on the tally instead of on
+# `--expected-failures`. Both are expected-failures policy and this file
+# reserves that to its owner (see "adding an entry requires a reason" above),
+# so the list below is left EMPTY and the defect is recorded instead of
+# papered over. Tracked on bd-conformance-row-unanchored-jw3pb.
 #
 # server-stateless:sep-2575-server-sends-tools-list-changed-on-subscription
 # server-stateless:sep-2575-server-sends-prompts-list-changed-on-subscription

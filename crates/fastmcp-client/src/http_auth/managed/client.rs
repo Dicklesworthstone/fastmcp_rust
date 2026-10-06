@@ -151,7 +151,7 @@ fn admit_builder(
 ) -> Result<(), ManagedHttpClientError> {
     let plan = builder.selected_protocol_plan();
     if timeout.is_zero()
-        || timeout > Duration::from_secs(15 * 60)
+        || timeout > Duration::from_mins(15)
         || resource.scheme() != "https"
         || plan.policy() != ProtocolPolicy::ModernOnly
         || plan.modern_post_target() != Some(resource.as_str())

@@ -104,9 +104,11 @@ async fn callback(authorization: CanonicalHttpUrl, issuer: String) -> Result<(),
     let fields = form(authorization.query().unwrap());
     assert_eq!(fields["code_challenge_method"], "S256");
     let redirect = url(&fields["redirect_uri"]);
+    // Owned: TcpStream::connect is `A: ToSocketAddrs + Send + 'static`, so a
+    // borrow of the local `redirect` cannot satisfy it (E0597).
     let authority = redirect.as_str().strip_prefix("http://").unwrap()
-        .split('/').next().unwrap();
-    let mut stream = TcpStream::connect(authority).await.map_err(|_| OAuthError::TransportFailed)?;
+        .split('/').next().unwrap().to_owned();
+    let mut stream = TcpStream::connect(authority.clone()).await.map_err(|_| OAuthError::TransportFailed)?;
     stream.write_all(format!(
         "GET /oauth/callback?code=fixture-code&state={}&iss={} HTTP/1.1\r\nHost: {authority}\r\n\r\n",
         encode(&fields["state"]), encode(&issuer),

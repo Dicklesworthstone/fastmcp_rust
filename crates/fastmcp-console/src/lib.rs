@@ -6,16 +6,18 @@ pub mod detection;
 pub mod theme;
 
 pub mod banner;
-#[cfg(any(feature = "legacy-2024-11-05", feature = "tasks", feature = "apps"))]
+// `renderers` is implied by `legacy-2024-11-05`, `tasks` and `apps`; see the
+// feature's comment in Cargo.toml for why the three-way `any(..)` was named.
+#[cfg(feature = "renderers")]
 pub mod client;
 pub mod diagnostics;
 pub mod error;
-#[cfg(any(feature = "legacy-2024-11-05", feature = "tasks", feature = "apps"))]
+#[cfg(feature = "renderers")]
 pub mod handlers;
 pub mod logging;
 pub mod stats;
 pub mod status;
-#[cfg(any(feature = "legacy-2024-11-05", feature = "tasks", feature = "apps"))]
+#[cfg(feature = "renderers")]
 pub mod tables;
 pub mod testing;
 #[path = "client/traffic.rs"]
@@ -27,7 +29,7 @@ pub mod config;
 pub use config::ConsoleConfig;
 pub use detection::{DisplayContext, is_agent_context, should_enable_rich};
 pub use error::ErrorBoundary;
-#[cfg(any(feature = "legacy-2024-11-05", feature = "tasks", feature = "apps"))]
+#[cfg(feature = "renderers")]
 pub use handlers::{HandlerRegistryRenderer, ServerCapabilities};
 pub use rich_rust;
 pub use theme::theme;
@@ -35,7 +37,7 @@ pub use traffic::RequestResponseRenderer;
 
 #[cfg(test)]
 mod feature_surface_tests {
-    #[cfg(not(any(feature = "legacy-2024-11-05", feature = "tasks", feature = "apps")))]
+    #[cfg(not(feature = "renderers"))]
     #[test]
     fn empty_graph_exposes_only_generic_console_surface() {
         let console = super::console::FastMcpConsole::with_enabled(false);
@@ -45,7 +47,7 @@ mod feature_surface_tests {
         let _ = super::RequestResponseRenderer::new(super::DisplayContext::new_agent());
     }
 
-    #[cfg(any(feature = "legacy-2024-11-05", feature = "tasks", feature = "apps"))]
+    #[cfg(feature = "renderers")]
     #[test]
     fn protocol_rendering_surface_is_enabled_with_a_protocol_feature() {
         let context = super::DisplayContext::new_agent();

@@ -138,5 +138,16 @@ name = "oauth_task_watch_drive"
 path = "tests/oauth_task_watch_drive.rs"
 required-features = ["tasks", "native-tls-roots"]
 
+# The residual d0993fb0 did not cover (bd-ufj6r). Its cfg is
+# `all(target_os = "linux", feature = "tasks")`; `required-features` cannot
+# express the target_os half, so the stanza mirrors the feature half only —
+# which is the half that was silently failing. `tasks` is not in this crate's
+# default set, so before this stanza the target compiled to an empty binary and
+# printed `ok. 0 passed` on EVERY platform, Linux included, hiding 12 tests.
+[[test]]
+name = "task_resume_store"
+path = "tests/task_resume_store.rs"
+required-features = ["tasks"]
+
 [lints]
 workspace = true
