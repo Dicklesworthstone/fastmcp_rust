@@ -3544,6 +3544,17 @@ impl Default for HttpRequestHandler {
 /// `R: Read` boundary cannot preempt an underlying synchronous read that is
 /// already blocked; callers requiring bounded cancellation while a peer is
 /// silent must supply a readiness-aware or asynchronous host boundary.
+///
+/// **Unclaimed production surface: no shipped request path uses this type.**
+/// The live listener reaches the wire through
+/// `asupersync::http::h1::Http1Codec` (wrapped by `fastmcp-server`'s
+/// `NativeHttp1Codec`), not through this synchronous `Read`/`Write` adapter. Its
+/// only out-of-crate consumer is a `#[cfg(test)]` fixture in `fastmcp-server`'s
+/// `auth.rs`, which uses it as a convenient HTTP request parser — so in practice
+/// this is a cross-crate test utility living in a production namespace, and its
+/// 168 tests are not coverage of the serving HTTP path. Read them as proof about
+/// this parser, not about what the server does on the wire. Tracked on
+/// bd-unconsumed-production-modules-hwr45.
 pub struct HttpTransport<R, W> {
     reader: R,
     writer: W,

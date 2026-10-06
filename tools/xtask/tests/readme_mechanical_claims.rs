@@ -377,8 +377,37 @@ fn readme_prose_names_only_methods_that_exist() {
 // Claim 4: the README's "ship with tests but no consumer" row stays true.
 // ---------------------------------------------------------------------------
 
+/// Whether `text` contains `token` as a whole identifier.
+///
+/// The boundary check on BOTH sides is load-bearing: a plain
+/// `contains("HttpTransport")` also matches `StreamableHttpTransport`, which is
+/// a live and unrelated type, and that would have made the consumer census
+/// below report three extra files.
+fn mentions_token(text: &str, token: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut from = 0usize;
+    while let Some(at) = text[from..].find(token) {
+        let start = from + at;
+        let end = start + token.len();
+        let before_ok = start == 0 || {
+            let c = bytes[start - 1];
+            !c.is_ascii_alphanumeric() && c != b'_'
+        };
+        let after_ok = end >= bytes.len() || {
+            let c = bytes[end];
+            !c.is_ascii_alphanumeric() && c != b'_'
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
 /// Member-relative paths of files under any member's `src/` that mention
-/// `needle`, excluding `owner`, which is the module's own definition.
+/// `needle` as a whole identifier, excluding `owner`, which is the module's own
+/// definition.
 fn mentioning_sources(root: &Path, needle: &str, owner: &str) -> BTreeSet<String> {
     let mut hits = BTreeSet::new();
     for member in workspace_members(root) {
@@ -391,7 +420,7 @@ fn mentioning_sources(root: &Path, needle: &str, owner: &str) -> BTreeSet<String
             if relative == owner {
                 continue;
             }
-            if read(&source_path).contains(needle) {
+            if mentions_token(&read(&source_path), needle) {
                 hits.insert(relative);
             }
         }
@@ -424,6 +453,35 @@ fn event_store_is_still_unconsumed_as_the_readme_says() {
          landed, update the README's \"Two modules ship with tests but no \
          consumer\" row and revisit the deliberate Last-Event-ID refusal in the \
          same change; do not just widen this list"
+    );
+}
+
+/// `HttpTransport` is documented as unclaimed production surface whose only
+/// out-of-crate consumer is a `#[cfg(test)]` fixture. If a *non-test* consumer
+/// appears, the README row and the type's own doc comment both become wrong, so
+/// this pins the consumer set rather than the mere count.
+///
+/// Unlike `event_store`, this type IS referenced from another crate, so the
+/// assertion names the file instead of requiring emptiness. The point is that
+/// the set cannot grow unnoticed.
+#[test]
+fn http_transport_has_no_shipped_consumer_as_the_readme_says() {
+    let root = repo_root();
+    let hits = mentioning_sources(
+        &root,
+        "HttpTransport",
+        "crates/fastmcp-transport/src/http.rs",
+    );
+    // `StreamableHttpTransport` and `ManagedHttpClient*` contain this substring
+    // and are unrelated live types, so only exact-token files are expected.
+    let expected = BTreeSet::from(["crates/fastmcp-server/src/auth.rs".to_owned()]);
+    assert_eq!(
+        hits, expected,
+        "the set of files referencing `HttpTransport` changed. Its one expected \
+         consumer is a #[cfg(test)] fixture in fastmcp-server's auth.rs. If a \
+         shipped path now uses it, update the README's \"Two modules ship with \
+         tests but no consumer\" row and the type's doc comment in the same \
+         change; do not just widen this list"
     );
 }
 
@@ -517,6 +575,30 @@ fn planted_readme_method_extraction_is_selective() {
     assert!(
         readme_method_paths("unbackticked Server::run_stdio must not be collected").is_empty(),
         "only backticked spans count"
+    );
+}
+
+#[test]
+fn planted_token_match_excludes_a_longer_identifier() {
+    // The positive.
+    assert!(mentions_token("use crate::http::HttpTransport;", "HttpTransport"));
+    assert!(mentions_token("let t: HttpTransport<R, W>", "HttpTransport"));
+    assert!(mentions_token("pub mod event_store;", "event_store"));
+    assert!(mentions_token("fastmcp_transport::event_store::EventStore", "event_store"));
+
+    // The planted negative, differing only by surrounding identifier chars.
+    // This exact case would have added three files to the HttpTransport census.
+    assert!(
+        !mentions_token("impl Transport for StreamableHttpTransport {", "HttpTransport"),
+        "a longer identifier ENDING with the token must not match"
+    );
+    assert!(
+        !mentions_token("let x = HttpTransportBuilder::new();", "HttpTransport"),
+        "a longer identifier STARTING with the token must not match"
+    );
+    assert!(
+        !mentions_token("my_event_store_helper()", "event_store"),
+        "same, for a snake_case token embedded in a longer one"
     );
 }
 

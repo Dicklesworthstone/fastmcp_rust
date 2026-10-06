@@ -1,5 +1,20 @@
 //! Event store for SSE resumability.
 //!
+//! **Unclaimed library surface: this module has no consumer.** Its only
+//! references anywhere in the workspace are its own `pub mod` declaration in
+//! `lib.rs` and the facade re-export; no shipped request path reaches it, so its
+//! 45 tests are not coverage of the SSE path. SSE resumption is deliberately not
+//! wired: exact 2024-11-05 reconnects establish a fresh stream and
+//! `Last-Event-ID` is intentionally ignored (see the comment at `http.rs`'s
+//! legacy GET handling, pinned by
+//! `dual_era_endpoint_ignores_last_event_id_and_starts_a_fresh_legacy_stream`).
+//! Wiring this module therefore reverses a reviewed decision and must revisit
+//! that test and the README's "Two modules ship with tests but no consumer" row
+//! in the same change rather than regenerating around them. The disposition is
+//! held by `tools/xtask/tests/readme_mechanical_claims.rs`, which goes red if a
+//! third referencing file appears. Tracked on
+//! bd-unconsumed-production-modules-hwr45.
+//!
 //! This module provides an [`EventStore`] that enables SSE polling and
 //! resumability by storing events that can be replayed when clients reconnect.
 //!
