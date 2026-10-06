@@ -266,7 +266,11 @@ impl Peer {
             // Native authorize polls its listener after this launcher returns.
             Ok(())
         });
-        let (session, ()) = pair(authorizing, self.token("authorization_code", Some(token("access-one", lifetime, "refresh-one", "read write")))).await;
+        // Boxed here, in the fixture that owns it. This `pair` IS the root for
+        // every `peer.login(..)` await site below, so this is an at-source fix
+        // rather than the relocate-the-bytes pattern bd-y2xoc warns about --
+        // that warning is about boxing at await sites whose root is elsewhere.
+        let (session, ()) = Box::pin(pair(authorizing, self.token("authorization_code", Some(token("access-one", lifetime, "refresh-one", "read write"))))).await;
         session.unwrap()
     }
     async fn expect(&self, method: &str, access: &str) -> (Stream, Request, Value) {
@@ -288,7 +292,8 @@ impl Peer {
             self.rpc("server/discover", "access-one", discovery()).await;
             self.rpc("tools/list", "access-one", catalog("echo")).await;
         };
-        let (result, ()) = pair(client.list_tools(cx, None), serving).await;
+        // Root for every `peer.warm(..)` await site; boxed in the fixture.
+        let (result, ()) = Box::pin(pair(client.list_tools(cx, None), serving)).await;
         assert_eq!(tool_name(result.unwrap()), "echo");
         assert_eq!(client.connected_generation(), Some(1));
     }

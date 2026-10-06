@@ -387,7 +387,18 @@ impl ManagedHttpClient {
                     Ok(Ok((value, Connection { client, generation, cursors })))
                 }),
             ).await
-        })).await?;
+        }));
+        // Heap the outer guard rather than awaiting it inline. `await_active`
+        // wraps the whole two-layer credential guard, and `perform` holds its
+        // frame inline -- which every one of the fourteen public verbs then
+        // paid at its own `.await` (bd-y2xoc). Boxing here keeps both this fn
+        // and those verbs private/unchanged in signature.
+        //
+        // Note for anyone tempted to box `Call::dispatch` instead: that was
+        // measured and is a NO-OP, because dispatch already runs inside the
+        // `Box::pin(async { .. })` closures above, so boxing it just nests one
+        // allocation inside another. Every future size came back byte-identical.
+        let guarded = Box::pin(guarded).await?;
         let (value, connection) = guarded?;
         // Both managed guards have made their final cancellation/expiry checks.
         // Failed or abandoned requests never restore their connection or cache.

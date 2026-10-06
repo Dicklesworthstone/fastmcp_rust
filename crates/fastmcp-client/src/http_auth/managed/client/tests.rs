@@ -212,11 +212,15 @@ impl Peer {
             "native-client", vec!["read".into(), "write".into()],
         ).unwrap().with_extra_root_certificate(root()).unwrap()
             .with_authorization_timeout(Duration::from_secs(90)).unwrap());
-        let (session, ()) = pair(
+        // Boxed in the fixture that owns it: this `pair` is the root for all
+        // thirteen `peer.login(&cx)` await sites in this module, so one box
+        // here removes the bytes instead of relocating them thirteen times.
+        // Same fix as the sibling fixture in tests/managed_http_client.rs.
+        let (session, ()) = Box::pin(pair(
             ManagedOAuthSession::authorize(cx, client, OAuthSessionPolicy::default(),
                 |authorization| callback(authorization, self.origin())),
             self.token("authorization_code", false),
-        ).await;
+        )).await;
         session.unwrap()
     }
     async fn mcp_request(&self, method: &str, token: &str) -> (TlsStream, Value, BTreeMap<String, String>) {
