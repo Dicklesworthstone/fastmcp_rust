@@ -243,7 +243,14 @@ impl OutputQueue {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.stopped || state.failure.is_some() {
+        // Cancellation can win while serialization is running or this
+        // producer is waiting for the queue lock. Recheck inside the same
+        // critical section as insertion: a completed cancellation sweep must
+        // never be followed by this producer retaining another dead frame.
+        if state.stopped
+            || state.failure.is_some()
+            || owner.as_ref().is_some_and(|owner| owner.cancelled())
+        {
             return;
         }
         if !Self::log_has_owner(&state, &message, owner.as_ref()) {
@@ -330,6 +337,43 @@ impl OutputQueue {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.retained_frames = state.retained_frames.saturating_sub(1);
         state.retained_bytes = state.retained_bytes.saturating_sub(bytes);
+    }
+
+    /// Release uncommitted frames whose request cancellation has won, even
+    /// when a different request has the output writer parked on backpressure.
+    /// The frame already owned by the writer is deliberately not here: that
+    /// writer alone decides whether suppression is safe or partial output
+    /// requires terminating the connection.
+    fn discard_cancelled(&self) -> usize {
+        let discarded = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut discarded = Vec::new();
+            // Rotate the original queue once. Live frames retain their FIFO
+            // order and existing allocation; no payload is cloned. The only
+            // additional storage is a bounded list of frames being retired.
+            for _ in 0..state.frames.len() {
+                let frame = state.frames.pop_front().expect("counted queued frame");
+                if frame.owner.as_ref().is_some_and(|owner| owner.cancelled()) {
+                    state.retained_frames = state.retained_frames.saturating_sub(1);
+                    state.retained_bytes = state.retained_bytes.saturating_sub(frame.bytes);
+                    discarded.push(frame);
+                } else {
+                    state.frames.push_back(frame);
+                }
+            }
+            discarded
+        };
+        let count = discarded.len();
+        // A frame may own the last request reservation. Its destructor can
+        // acquire the admission mutex, so it must run AFTER the queue unlocks.
+        drop(discarded);
+        if count != 0 {
+            self.changed.notify_waiters();
+        }
+        count
     }
 
     fn has_frames(&self) -> bool {
@@ -518,6 +562,10 @@ fn prepare_request(
             lifetime
                 .admission
                 .cancel_reserved(Server::cancellation_wire_request_id(&cancellation));
+            // Authentication and the request's cancellation election precede
+            // reclamation. Do not wait for a blocked writer to discover these
+            // dead frames or let them consume a later live request's capacity.
+            lifetime.output.discard_cancelled();
         }
         return Ok(None);
     }
@@ -1568,6 +1616,237 @@ mod tests {
     use fastmcp_protocol::{Content, Tool};
     use std::sync::atomic::AtomicUsize;
     use std::task::{Context, Waker};
+
+    mod output_cancellation {
+        use super::*;
+        use std::task::Wake;
+
+        fn owner(admission: &Arc<DispatchQueueState>, id: i64) -> Arc<OutputOwner> {
+            let JsonRpcMessage::Request(request) = discover(id) else {
+                unreachable!()
+            };
+            Arc::new(OutputOwner {
+                reservation: admission
+                    .admit_modern_request(&request, Arc::new(AtomicBool::new(false)))
+                    .expect("one bounded request reservation"),
+                log_level: None,
+            })
+        }
+
+        fn response(id: i64) -> JsonRpcMessage {
+            JsonRpcMessage::Response(JsonRpcResponse::success(
+                RequestId::Number(id),
+                serde_json::json!({"resultType": "complete"}),
+            ))
+        }
+
+        fn progress(value: usize) -> JsonRpcMessage {
+            JsonRpcMessage::Request(JsonRpcRequest::notification(
+                "notifications/progress",
+                Some(serde_json::json!({"progressToken": 7, "progress": value})),
+            ))
+        }
+
+        fn retained(queue: &OutputQueue) -> (usize, usize, usize) {
+            let state = queue.state.lock().unwrap();
+            (state.frames.len(), state.retained_frames, state.retained_bytes)
+        }
+
+        #[test]
+        fn cancellation_reclaims_capacity_behind_an_unrelated_blocked_write() {
+            for cancelled in [false, true] {
+                let admission = Arc::new(DispatchQueueState::default());
+                let pending = owner(&admission, 7);
+                let queue = OutputQueue::default();
+                queue.enqueue(response(1), None);
+                let writing = queue.pop().unwrap();
+                for value in 0..MAX_DISPATCH_QUEUE_DEPTH - 1 {
+                    queue.enqueue(progress(value), Some(Arc::clone(&pending)));
+                }
+                assert!(queue.failure().is_none());
+                assert_eq!(retained(&queue).1, MAX_DISPATCH_QUEUE_DEPTH);
+                if cancelled {
+                    pending.reservation.cancellation.cancel();
+                }
+                let reclaimed = queue.discard_cancelled();
+                if cancelled {
+                    assert_eq!(reclaimed, MAX_DISPATCH_QUEUE_DEPTH - 1);
+                    assert_eq!(retained(&queue), (0, 1, writing.bytes));
+                } else {
+                    assert_eq!(reclaimed, 0);
+                }
+                // Only the cancellation bit differs. No peer drain, output
+                // completion, or increased limit creates capacity here.
+                queue.enqueue(response(9), None);
+                assert_eq!(queue.failure().is_none(), cancelled);
+                if cancelled {
+                    let next = queue.pop().unwrap();
+                    assert!(matches!(next.message, JsonRpcMessage::Response(ref result)
+                        if result.id == Some(RequestId::Number(9))));
+                    queue.finish(next.bytes);
+                    assert_eq!(retained(&queue), (0, 1, writing.bytes));
+                } else {
+                    assert_eq!(queue.failure(), Some("output_capacity"));
+                }
+                queue.finish(writing.bytes);
+            }
+        }
+
+        #[test]
+        fn reclamation_preserves_live_and_ownerless_fifo_and_exact_byte_charges() {
+            let admission = Arc::new(DispatchQueueState::default());
+            let cancelled = owner(&admission, 1);
+            let live = owner(&admission, 3);
+            let queue = OutputQueue::default();
+            queue.enqueue(progress(1), Some(Arc::clone(&cancelled)));
+            queue.enqueue(response(2), None);
+            queue.enqueue(response(3), Some(Arc::clone(&live)));
+            queue.enqueue(progress(4), Some(Arc::clone(&cancelled)));
+            queue.enqueue(response(5), None);
+            let expected_bytes = {
+                let state = queue.state.lock().unwrap();
+                state.frames.iter().enumerate()
+                    .filter(|(index, _)| matches!(*index, 1 | 2 | 4))
+                    .map(|(_, frame)| frame.bytes)
+                    .sum::<usize>()
+            };
+            cancelled.reservation.cancellation.cancel();
+            assert_eq!(queue.discard_cancelled(), 2);
+            assert_eq!(retained(&queue), (3, 3, expected_bytes));
+            assert!(!live.cancelled());
+            for id in [2, 3, 5] {
+                let frame = queue.pop().unwrap();
+                assert!(matches!(frame.message, JsonRpcMessage::Response(ref result)
+                    if result.id == Some(RequestId::Number(id))));
+                queue.finish(frame.bytes);
+            }
+            assert_eq!(retained(&queue), (0, 0, 0));
+            assert_eq!(queue.discard_cancelled(), 0);
+        }
+
+        #[test]
+        fn reclamation_does_not_release_or_reclassify_the_in_flight_frame() {
+            let admission = Arc::new(DispatchQueueState::default());
+            let pending = owner(&admission, 7);
+            let queue = OutputQueue::default();
+            queue.enqueue(progress(1), Some(Arc::clone(&pending)));
+            queue.enqueue(progress(2), Some(Arc::clone(&pending)));
+            let writing = queue.pop().unwrap();
+            pending.reservation.cancellation.cancel();
+            assert_eq!(queue.discard_cancelled(), 1);
+            assert_eq!(retained(&queue), (0, 1, writing.bytes));
+            assert!(writing.owner.as_ref().unwrap().cancelled());
+            // The existing writer still owns cancellation/partial-write
+            // handling and must perform its one final capacity release.
+            queue.finish(writing.bytes);
+            assert_eq!(retained(&queue), (0, 0, 0));
+            assert_eq!(queue.discard_cancelled(), 0);
+        }
+
+        #[derive(Default)]
+        struct Wakes(AtomicUsize);
+
+        impl Wake for Wakes {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[test]
+        fn reclamation_drops_the_last_reservation_and_wakes_the_queue_observer() {
+            let admission = Arc::new(DispatchQueueState::default());
+            let pending = owner(&admission, 7);
+            let weak = Arc::downgrade(&pending);
+            let queue = OutputQueue::default();
+            queue.enqueue(progress(1), Some(Arc::clone(&pending)));
+            pending.reservation.cancellation.cancel();
+            drop(pending);
+            assert!(weak.upgrade().is_some());
+            let wakes = Arc::new(Wakes::default());
+            let waker = Waker::from(Arc::clone(&wakes));
+            let mut task = Context::from_waker(&waker);
+            let mut changed = pin!(queue.changed.notified());
+            assert!(changed.as_mut().poll(&mut task).is_pending());
+            assert_eq!(queue.discard_cancelled(), 1);
+            assert!(weak.upgrade().is_none(), "queued ownership was retained");
+            assert_eq!(retained(&queue), (0, 0, 0));
+            assert!(wakes.0.load(Ordering::SeqCst) > 0);
+            assert!(changed.as_mut().poll(&mut task).is_ready());
+            // Retirement really releases admission, not merely its displayed
+            // byte count. The same ID can now acquire a fresh reservation.
+            let replacement = owner(&admission, 7);
+            assert!(!replacement.cancelled());
+        }
+
+        #[test]
+        fn reclamation_cannot_revive_a_terminal_output_failure() {
+            let admission = Arc::new(DispatchQueueState::default());
+            let pending = owner(&admission, 7);
+            let queue = OutputQueue::default();
+            for value in 0..=MAX_DISPATCH_QUEUE_DEPTH {
+                queue.enqueue(progress(value), Some(Arc::clone(&pending)));
+            }
+            assert_eq!(queue.failure(), Some("output_capacity"));
+            pending.reservation.cancellation.cancel();
+            assert_eq!(queue.discard_cancelled(), MAX_DISPATCH_QUEUE_DEPTH);
+            assert_eq!(retained(&queue), (0, 0, 0));
+            queue.enqueue(response(9), None);
+            assert_eq!(queue.failure(), Some("output_capacity"));
+            assert_eq!(retained(&queue), (0, 0, 0));
+        }
+
+        fn admitted(message: &JsonRpcMessage) -> ReceivedTransportFrame {
+            ReceivedTransportFrame::admit(
+                serde_json::to_vec(message).unwrap().into_boxed_slice(),
+            ).unwrap()
+        }
+
+        #[test]
+        fn cancellation_ingress_reclaims_only_the_matching_request_and_preserves_siblings() {
+            let cx = Cx::for_testing();
+            let lifetime = ConnectionLifetime {
+                server: Arc::new(Server::new("output-cancel", "1")
+                    .protocol_policy(ProtocolPolicy::ModernOnly).unwrap().build()),
+                connection: ModernConnection::new(),
+                admission: Arc::new(DispatchQueueState::default()),
+                output: Arc::new(OutputQueue::default()),
+                binding: ConnectionBinding::stdio(),
+            };
+            // Authentication and reservation take place before any handler
+            // poll. Keep both real request futures owned while routing controls.
+            let first = prepare_request(&lifetime, &cx, admitted(&discover(41)))
+                .unwrap().unwrap();
+            let second = prepare_request(&lifetime, &cx, admitted(&discover(42)))
+                .unwrap().unwrap();
+            let find_owner = |id: i64| {
+                lifetime.output.state.lock().unwrap().candidates.values()
+                    .filter_map(Weak::upgrade)
+                    .find(|owner| owner.reservation.request_id.as_ref()
+                        == Some(&RequestId::Number(id)))
+                    .expect("admitted request has an output owner")
+            };
+            let first_owner = find_owner(41);
+            let second_owner = find_owner(42);
+            lifetime.output.enqueue(response(41), Some(Arc::clone(&first_owner)));
+            lifetime.output.enqueue(response(42), Some(Arc::clone(&second_owner)));
+            assert_eq!(retained(&lifetime.output).0, 2);
+            assert!(prepare_request(&lifetime, &cx, admitted(&cancel(999)))
+                .unwrap().is_none());
+            assert_eq!(retained(&lifetime.output).0, 2);
+            assert!(!first_owner.cancelled() && !second_owner.cancelled());
+            assert!(prepare_request(&lifetime, &cx, admitted(&cancel(41)))
+                .unwrap().is_none());
+            assert!(first_owner.cancelled());
+            assert!(!second_owner.cancelled());
+            assert_eq!(retained(&lifetime.output).0, 1);
+            let survivor = lifetime.output.pop().unwrap();
+            assert!(matches!(survivor.message, JsonRpcMessage::Response(ref result)
+                if result.id == Some(RequestId::Number(42))));
+            lifetime.output.finish(survivor.bytes);
+            assert_eq!(retained(&lifetime.output), (0, 0, 0));
+            drop((first, second));
+        }
+    }
 
     #[derive(Default)]
     struct Gate {
