@@ -693,6 +693,348 @@ enum Event<R, W> {
     DrainExpired,
 }
 
+/// Rotate the first eligible work lane after every selected event. Merely
+/// alternating ingress-first and ingress-last leaves requests ahead of egress
+/// in both orders: a replenished set of ready handlers can then starve the
+/// writer until an otherwise writable connection exhausts its output queue.
+#[derive(Clone, Copy, Default)]
+enum ConnectionLane {
+    #[default]
+    Ingress,
+    Requests,
+    Egress,
+}
+
+impl ConnectionLane {
+    const fn next(self) -> Self {
+        match self {
+            Self::Ingress => Self::Requests,
+            Self::Requests => Self::Egress,
+            Self::Egress => Self::Ingress,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ConnectionSchedule {
+    next_lane: ConnectionLane,
+    next_request: usize,
+}
+
+impl ConnectionSchedule {
+    /// Select one ready event without polling a completed future twice.
+    /// A pending lane never prevents another lane from progressing. When all
+    /// lanes are pending, every owned future is polled to register its waker.
+    /// Connection stop, deadline, and service-health checks run before this
+    /// selector; fairness must never postpone those control-plane decisions.
+    fn poll<R, W>(
+        &mut self,
+        task: &mut std::task::Context<'_>,
+        reading: &mut Option<ReadWork<R>>,
+        writing: &mut Option<WriteWork<W>>,
+        requests: &mut [RequestWork],
+        stopping: bool,
+    ) -> Poll<Event<R, W>> {
+        let mut lane = self.next_lane;
+        for _ in 0..3 {
+            let event = match lane {
+                ConnectionLane::Ingress if !stopping => reading.as_mut().and_then(|reading| {
+                    match reading.as_mut().poll(task) {
+                        Poll::Ready((reader, result)) => Some(Event::Read(reader, result)),
+                        Poll::Pending => None,
+                    }
+                }),
+                ConnectionLane::Requests => self.poll_request(task, requests),
+                ConnectionLane::Egress => writing.as_mut().and_then(|writing| {
+                    match writing.as_mut().poll(task) {
+                        Poll::Ready((writer, result, bytes)) => {
+                            Some(Event::Written(writer, result, bytes))
+                        }
+                        Poll::Pending => None,
+                    }
+                }),
+                ConnectionLane::Ingress => None,
+            };
+            if let Some(event) = event {
+                self.next_lane = lane.next();
+                return Poll::Ready(event);
+            }
+            lane = lane.next();
+        }
+        Poll::Pending
+    }
+
+    fn poll_request<R, W>(
+        &mut self,
+        task: &mut std::task::Context<'_>,
+        requests: &mut [RequestWork],
+    ) -> Option<Event<R, W>> {
+        if requests.is_empty() {
+            self.next_request = 0;
+            return None;
+        }
+        // swap_remove and subsequent admission can change the length between
+        // selections. Normalize before indexing, including after tail removal.
+        let start = self.next_request % requests.len();
+        for offset in 0..requests.len() {
+            let index = (start + offset) % requests.len();
+            if let Poll::Ready(result) = requests[index].as_mut().poll(task) {
+                // Advance past the selected index even when swap_remove moves
+                // another ready future into it. Restarting at that same index
+                // would starve pending siblings under completion/admission churn.
+                self.next_request = (index + 1) % requests.len();
+                return Some(Event::Completed(index, result));
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::{ConnectionSchedule, Event, ReadWork, RequestWork, WriteWork};
+    use fastmcp_transport::TransportError;
+    use std::future::{Future, poll_fn};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Wake, Waker};
+
+    fn read_ready() -> ReadWork<()> {
+        Box::pin(async { ((), Err(TransportError::Closed)) })
+    }
+
+    fn write_ready() -> WriteWork<()> {
+        Box::pin(async { ((), Ok(()), 7) })
+    }
+
+    fn request_ready() -> RequestWork {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn selected(event: Poll<Event<(), ()>>) -> (usize, Option<usize>) {
+        match event {
+            Poll::Ready(Event::Read((), Err(TransportError::Closed))) => (0, None),
+            Poll::Ready(Event::Completed(index, Ok(()))) => (1, Some(index)),
+            Poll::Ready(Event::Written((), Ok(()), 7)) => (2, None),
+            _ => panic!("expected exactly one ready work event"),
+        }
+    }
+
+    fn replenish(
+        lane: usize,
+        request_index: Option<usize>,
+        reading: &mut Option<ReadWork<()>>,
+        writing: &mut Option<WriteWork<()>>,
+        requests: &mut Vec<RequestWork>,
+    ) {
+        match lane {
+            0 => *reading = Some(read_ready()),
+            1 => {
+                drop(requests.swap_remove(request_index.unwrap()));
+                requests.push(request_ready());
+            }
+            2 => *writing = Some(write_ready()),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn continuously_ready_ingress_and_requests_cannot_starve_egress() {
+        let mut schedule = ConnectionSchedule::default();
+        let mut reading = Some(read_ready());
+        let mut writing = Some(write_ready());
+        let mut requests = vec![request_ready()];
+        let mut task = Context::from_waker(Waker::noop());
+        let mut counts = [0; 3];
+        for turn in 0..3_000 {
+            let (lane, index) = selected(schedule.poll(
+                &mut task,
+                &mut reading,
+                &mut writing,
+                &mut requests,
+                false,
+            ));
+            // The original ingress-first/ingress-last alternation selected
+            // only ingress and requests. It never reached a writable egress.
+            assert_eq!(lane, turn % 3);
+            counts[lane] += 1;
+            replenish(lane, index, &mut reading, &mut writing, &mut requests);
+        }
+        assert_eq!(counts, [1_000; 3]);
+    }
+
+    #[test]
+    fn each_pending_lane_yields_to_both_other_ready_lanes() {
+        for blocked in 0..3 {
+            let mut schedule = ConnectionSchedule::default();
+            let mut reading = Some(read_ready());
+            let mut writing = Some(write_ready());
+            let mut requests = vec![request_ready()];
+            match blocked {
+                0 => reading = Some(Box::pin(std::future::pending())),
+                1 => requests[0] = Box::pin(std::future::pending()),
+                2 => writing = Some(Box::pin(std::future::pending())),
+                _ => unreachable!(),
+            }
+            let mut task = Context::from_waker(Waker::noop());
+            let mut counts = [0; 3];
+            for _ in 0..600 {
+                let (lane, index) = selected(schedule.poll(
+                    &mut task,
+                    &mut reading,
+                    &mut writing,
+                    &mut requests,
+                    false,
+                ));
+                assert_ne!(lane, blocked);
+                counts[lane] += 1;
+                replenish(lane, index, &mut reading, &mut writing, &mut requests);
+            }
+            for (lane, count) in counts.into_iter().enumerate() {
+                assert_eq!(count, if lane == blocked { 0 } else { 300 });
+            }
+        }
+    }
+
+    #[test]
+    fn ready_request_churn_does_not_starve_a_pending_sibling() {
+        let mut schedule = ConnectionSchedule::default();
+        let mut reading: Option<ReadWork<()>> = None;
+        let mut writing: Option<WriteWork<()>> = None;
+        let mut requests = (0..31).map(|_| request_ready()).collect::<Vec<_>>();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&polls);
+        requests.push(Box::pin(poll_fn(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Poll::Pending
+        })));
+        let mut task = Context::from_waker(Waker::noop());
+        for _ in 0..8 {
+            let before = polls.load(Ordering::SeqCst);
+            // Completion removes a slot with swap_remove and admission puts
+            // another ready request at the tail, exactly as the serving loop.
+            for _ in 0..64 {
+                let (lane, index) = selected(schedule.poll(
+                    &mut task,
+                    &mut reading,
+                    &mut writing,
+                    &mut requests,
+                    false,
+                ));
+                assert_eq!(lane, 1);
+                replenish(lane, index, &mut reading, &mut writing, &mut requests);
+            }
+            assert!(polls.load(Ordering::SeqCst) > before);
+        }
+    }
+
+    #[test]
+    fn request_cursor_survives_shrink_empty_and_readmission() {
+        let mut schedule = ConnectionSchedule::default();
+        let mut reading: Option<ReadWork<()>> = None;
+        let mut writing: Option<WriteWork<()>> = None;
+        let mut requests = (0..9).map(|_| request_ready()).collect::<Vec<_>>();
+        let mut task = Context::from_waker(Waker::noop());
+        while !requests.is_empty() {
+            let (lane, index) = selected(schedule.poll(
+                &mut task,
+                &mut reading,
+                &mut writing,
+                &mut requests,
+                false,
+            ));
+            assert_eq!(lane, 1);
+            drop(requests.swap_remove(index.unwrap()));
+        }
+        assert!(schedule
+            .poll(&mut task, &mut reading, &mut writing, &mut requests, false)
+            .is_pending());
+        requests.push(request_ready());
+        let (lane, index) = selected(schedule.poll(
+            &mut task,
+            &mut reading,
+            &mut writing,
+            &mut requests,
+            false,
+        ));
+        assert_eq!((lane, index), (1, Some(0)));
+    }
+
+    #[test]
+    fn stopping_suppresses_ingress_but_keeps_request_cleanup_runnable() {
+        let mut schedule = ConnectionSchedule::default();
+        let mut reading: Option<ReadWork<()>> = Some(Box::pin(poll_fn(|_| {
+            panic!("stopping must not poll the inbound transport")
+        })));
+        let mut writing: Option<WriteWork<()>> = None;
+        let mut requests = vec![request_ready()];
+        let mut task = Context::from_waker(Waker::noop());
+        assert_eq!(
+            selected(schedule.poll(
+                &mut task,
+                &mut reading,
+                &mut writing,
+                &mut requests,
+                true,
+            )),
+            (1, Some(0)),
+        );
+    }
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    type WakerSlot = Arc<Mutex<Option<Waker>>>;
+
+    fn pending_with_waker<T: 'static>(slot: &WakerSlot) -> Pin<Box<dyn Future<Output = T> + Send>> {
+        let slot = Arc::clone(slot);
+        Box::pin(poll_fn(move |task| {
+            *slot.lock().unwrap() = Some(task.waker().clone());
+            Poll::Pending
+        }))
+    }
+
+    #[test]
+    fn all_pending_lanes_register_and_replace_the_current_task_waker() {
+        let mut schedule = ConnectionSchedule::default();
+        let slots: [WakerSlot; 4] = std::array::from_fn(|_| Arc::new(Mutex::new(None)));
+        let mut reading: Option<ReadWork<()>> = Some(pending_with_waker(&slots[0]));
+        let mut writing: Option<WriteWork<()>> = Some(pending_with_waker(&slots[1]));
+        let mut requests: Vec<RequestWork> = vec![
+            pending_with_waker(&slots[2]),
+            pending_with_waker(&slots[3]),
+        ];
+        let old = Arc::new(WakeCount::default());
+        let current = Arc::new(WakeCount::default());
+        for counter in [&old, &current] {
+            let waker = Waker::from(Arc::clone(counter));
+            assert!(schedule
+                .poll(
+                    &mut Context::from_waker(&waker),
+                    &mut reading,
+                    &mut writing,
+                    &mut requests,
+                    false,
+                )
+                .is_pending());
+            assert!(slots.iter().all(|slot| slot.lock().unwrap().is_some()));
+        }
+        for slot in &slots {
+            let waker = slot.lock().unwrap().take().unwrap();
+            waker.wake();
+        }
+        assert_eq!(old.0.load(Ordering::SeqCst), 0);
+        assert_eq!(current.0.load(Ordering::SeqCst), 4);
+    }
+}
+
 impl Server {
     /// A listen retains connection work and has its own finite lifetime. The
     /// ordinary handler timeout must not silently turn a subscription into a
@@ -988,7 +1330,7 @@ impl Server {
         let mut stopping = false;
         let mut error = None;
         let mut request_regions_quiescent = true;
-        let mut ingress_first = true;
+        let mut schedule = ConnectionSchedule::default();
         loop {
             if !stopping && writing.is_none() && lifetime.output.has_frames() {
                 if let Some(frame) = lifetime.output.pop() {
@@ -1043,29 +1385,15 @@ impl Server {
                     {
                         return Poll::Ready(Event::DrainExpired);
                     }
-                    if ingress_first
-                        && let Some(reading) = reading.as_mut()
-                        && let Poll::Ready((reader, result)) = reading.as_mut().poll(task)
-                    {
-                        return Poll::Ready(Event::Read(reader, result));
-                    }
                 }
-                for (index, request) in requests.iter_mut().enumerate() {
-                    if let Poll::Ready(result) = request.as_mut().poll(task) {
-                        return Poll::Ready(Event::Completed(index, result));
-                    }
-                }
-                if let Some(writing) = writing.as_mut()
-                    && let Poll::Ready((writer, result, bytes)) = writing.as_mut().poll(task)
-                {
-                    return Poll::Ready(Event::Written(writer, result, bytes));
-                }
-                if !stopping
-                    && !ingress_first
-                    && let Some(reading) = reading.as_mut()
-                    && let Poll::Ready((reader, result)) = reading.as_mut().poll(task)
-                {
-                    return Poll::Ready(Event::Read(reader, result));
+                if let Poll::Ready(event) = schedule.poll(
+                    task,
+                    &mut reading,
+                    &mut writing,
+                    &mut requests,
+                    stopping,
+                ) {
+                    return Poll::Ready(event);
                 }
                 if !stopping && writing.is_none() && lifetime.output.has_frames() {
                     return Poll::Ready(Event::Output);
@@ -1073,7 +1401,6 @@ impl Server {
                 Poll::Pending
             })
             .await;
-            ingress_first = !ingress_first;
             let mut stop = false;
             match event {
                 Event::Read(reader, result) => {
