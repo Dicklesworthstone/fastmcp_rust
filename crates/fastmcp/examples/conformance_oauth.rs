@@ -49,6 +49,9 @@ use fastmcp_core::{CanonicalHttpUrl, Cx};
 use serde::{Deserialize, Deserializer};
 
 /// Opt-in managed renewal using the same local configuration and login policy.
+// Explicit path: tests/conformance_oauth_discovery.rs includes this file with
+// #[path], which resolves an unannotated child module beside it, not here.
+#[path = "conformance_oauth/managed.rs"]
 pub(super) mod managed;
 
 pub(super) const ENVIRONMENT: &str = "FASTMCP_CONFORMANCE_OAUTH";
