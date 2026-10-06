@@ -49,6 +49,21 @@ use fastmcp_core::{CanonicalHttpUrl, Cx};
 use serde::{Deserialize, Deserializer};
 
 /// Opt-in managed renewal using the same local configuration and login policy.
+///
+/// The explicit `#[path]` is load-bearing, because this file is compiled in two
+/// configurations whose inherited directory ownership disagrees:
+///
+///   * as `mod conformance_oauth;` from the `conformance_client` bin, where
+///     this is a non-mod-rs file and children are sought in
+///     `examples/conformance_oauth/`;
+///   * as `#[path = "../examples/conformance_oauth.rs"] mod conformance_oauth;`
+///     from `tests/conformance_oauth_discovery.rs`, where loading through
+///     `#[path]` from a crate root makes children siblings in `examples/`.
+///
+/// Without the attribute the second configuration looks for
+/// `examples/managed.rs` and fails E0583, which is what it did between
+/// commit:4789d737 (this module's introduction) and this line.
+#[path = "conformance_oauth/managed.rs"]
 pub(super) mod managed;
 
 pub(super) const ENVIRONMENT: &str = "FASTMCP_CONFORMANCE_OAUTH";

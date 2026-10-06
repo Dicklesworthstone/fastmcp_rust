@@ -94,9 +94,30 @@ impl ConnectionWriter for MemorySendHalf {
         // neither publishes a partial frame nor poisons the next reservation.
         self.send_async(cx, message).await
     }
-    async fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
-        // Memory close only releases the sender; it performs no blocking I/O.
-        fastmcp_transport::TransportSendHalf::close(self, cx)
+    // `TransportSendHalf::close` is genuinely synchronous (lib.rs:285), so this
+    // impl has nothing to await, and the two clippy lints that notice that are
+    // in direct conflict: as an `async fn` it draws `unused_async`, and in this
+    // block form it draws `manual_async_fn`. One of them has to be allowed.
+    // Allowing `manual_async_fn` is the one that works -- an item-level
+    // `#[allow(clippy::unused_async)]` does NOT suppress the other direction on
+    // a trait impl method (measured: clippy still reported it at this site with
+    // the attribute directly above).
+    //
+    // Both forms are lazy, which is the property that actually matters here.
+    // What is NOT acceptable is `std::future::ready(..)`, which the RPITIT
+    // trait signature would also accept: that evaluates the close when the
+    // future is CONSTRUCTED, so building one and dropping it without awaiting
+    // would already have released the sender. Every other effect on this
+    // transport is drop-safe by design and this one stays that way.
+    #[allow(clippy::manual_async_fn)]
+    fn close(
+        &mut self,
+        cx: &Cx,
+    ) -> impl Future<Output = Result<(), TransportError>> + Send {
+        async move {
+            // Memory close only releases the sender; no blocking I/O.
+            fastmcp_transport::TransportSendHalf::close(self, cx)
+        }
     }
     fn is_closed(&self) -> bool {
         Self::is_closed(self)

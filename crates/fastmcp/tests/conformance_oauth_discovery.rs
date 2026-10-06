@@ -12,7 +12,6 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
 use std::task::Poll;
-use std::time::Duration;
 
 use asupersync::Cx;
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};

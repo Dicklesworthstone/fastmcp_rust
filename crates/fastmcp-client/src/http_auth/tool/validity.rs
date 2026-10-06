@@ -214,6 +214,13 @@ mod context_cancellation_tests {
         let contract = contract();
         let cancellation = McpRequestCancellation::new();
         let state = Arc::new(State::default());
+        // `Waiting` is an always-Pending future used here only as a
+        // drop-observable PAYLOAD, so this block is deliberately Ready with an
+        // awaitable value. Taking clippy's suggestion and awaiting it would
+        // make the block Pending forever, there would be no "ready poll" left
+        // to cancel during, and the property in this test's name would no
+        // longer be exercised at all.
+        #[allow(clippy::async_yields_async)]
         let inner = async {
             cx.cancel_fast(CancelKind::User);
             Waiting(state.clone())
@@ -490,6 +497,11 @@ mod context_cancellation_tests {
         let contract = contract();
         let cancellation = McpRequestCancellation::new();
         let state = Arc::new(State::default());
+        // Ready-with-an-awaitable on purpose; see the note on
+        // `caller_cancellation_during_a_ready_poll_withholds_and_drops_the_value`.
+        // Awaiting `Waiting` would remove the ready callback this test needs the
+        // expiring deadline to land inside.
+        #[allow(clippy::async_yields_async)]
         let inner = async {
             clock.advance(10_000_000);
             Waiting(state.clone())

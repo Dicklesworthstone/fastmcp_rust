@@ -5,6 +5,15 @@
 //! New operations may renew, but failed operations are never replayed. The run
 //! owner closes all generations on drop, including clients retained by a caller.
 
+// This module is compiled into two targets. The `conformance_client` bin drives
+// every item below; the `conformance_oauth_discovery` test target reuses the
+// parent module only for its `configure`/`ENVIRONMENT` surface and drives none
+// of the managed-renewal path, which made all five of its items read as dead
+// there. The allowance is scoped to that configuration on purpose: a blanket
+// `#![allow(dead_code)]` would also switch the analysis off for the bin, which
+// is the consumer that keeps these items honest.
+#![cfg_attr(test, allow(dead_code))]
+
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
 use std::task::Poll;
@@ -113,7 +122,7 @@ async fn bounded_run<T>(
     if cx.checkpoint().is_err() {
         return Err("authenticated MCP run cancelled".to_owned());
     }
-    if cx.timer_driver().is_none() || timeout.is_zero() || timeout > Duration::from_secs(900) {
+    if cx.timer_driver().is_none() || timeout.is_zero() || timeout > Duration::from_mins(15) {
         return Err("invalid authenticated MCP runtime or deadline".to_owned());
     }
     let nanos = u64::try_from(timeout.as_nanos())
