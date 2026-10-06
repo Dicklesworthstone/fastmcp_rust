@@ -4,6 +4,8 @@
 //! receive thread, blocking-pool pump, or nested runtime participates. Explicit
 //! blocking handlers still require the caller's admitted blocking facility.
 
+mod region;
+
 use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
 use std::io::{self, Write};
@@ -11,7 +13,6 @@ use std::pin::{Pin, pin};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::Poll;
 
-use asupersync::cx::ChildRegionSpec;
 use asupersync::io::{AsyncRead, AsyncWrite};
 use asupersync::sync::Notify;
 use asupersync::time::Sleep;
@@ -578,19 +579,11 @@ fn prepare_request(
         if owner.cancelled() {
             return Ok(());
         }
-        let region =
-            caller
-                .open_child_region(ChildRegionSpec::inherit().with_budget(
-                    server.create_owned_modern_request_budget(&caller, &request.method),
-                ))
-                .await
-                .map_err(|_| {
-                    server_run_error(
-                        "dispatch",
-                        "region_open",
-                        "Request region could not be opened",
-                    )
-                })?;
+        let region = region::open(
+            &caller,
+            server.create_owned_modern_request_budget(&caller, &request.method),
+        )?
+        .await?;
         let request_cx = region.cx().clone();
         let inbound = inbound.with_cx(request_cx.clone());
         let dispatch_cancellation = McpRequestCancellation::new();
