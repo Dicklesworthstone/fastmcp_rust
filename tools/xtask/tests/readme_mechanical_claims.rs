@@ -82,6 +82,34 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// Every workspace-member `src/` file as (repository-relative path, contents),
+/// read exactly once for the whole test binary.
+///
+/// This cache is not premature optimisation; it was measured. Without it the
+/// five tree-reading checks each re-walked all member sources — 344 files and
+/// roughly 25 MB — and because libtest runs them concurrently the target took
+/// **128 s** instead of under 2 s. A gate that slow gets skipped or times out,
+/// which would defeat its purpose, and the cost grows with the tree.
+fn source_corpus() -> &'static [(String, String)] {
+    static CORPUS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    CORPUS.get_or_init(|| {
+        let root = repo_root();
+        let mut files = Vec::new();
+        for member in workspace_members(&root) {
+            for path in rust_sources(&root.join(&member).join("src")) {
+                let relative = path
+                    .strip_prefix(&root)
+                    .expect("a member source sits under the repository root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                files.push((relative, read(&path)));
+            }
+        }
+        files.sort();
+        files
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Claim 1: features the README calls inert really do gate nothing.
 // ---------------------------------------------------------------------------
@@ -91,11 +119,13 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
 /// Counting mentions rather than parsing `cfg` trees is deliberate: it
 /// over-counts (a mention inside a doc comment counts) and never under-counts,
 /// so a zero is a strong claim and that is the direction this check needs.
-fn feature_mentions(root: &Path, krate: &str, feature: &str) -> usize {
+fn feature_mentions(krate: &str, feature: &str) -> usize {
     let needle = format!("feature = \"{feature}\"");
-    rust_sources(&root.join("crates").join(krate).join("src"))
+    let prefix = format!("crates/{krate}/src/");
+    source_corpus()
         .iter()
-        .map(|path| read(path).matches(needle.as_str()).count())
+        .filter(|(path, _)| path.starts_with(prefix.as_str()))
+        .map(|(_, text)| text.matches(needle.as_str()).count())
         .sum()
 }
 
@@ -124,10 +154,9 @@ const README_NOT_INERT: &[(&str, &str)] = &[
 
 #[test]
 fn readme_inert_feature_claims_hold() {
-    let root = repo_root();
     let mut wrong = Vec::new();
     for (krate, feature) in README_INERT {
-        let seen = feature_mentions(&root, krate, feature);
+        let seen = feature_mentions(krate, feature);
         if seen != 0 {
             wrong.push(format!(
                 "{krate}/{feature}: README says it gates nothing, found {seen} mention(s) in src/"
@@ -135,7 +164,7 @@ fn readme_inert_feature_claims_hold() {
         }
     }
     for (krate, feature) in README_NOT_INERT {
-        if feature_mentions(&root, krate, feature) == 0 {
+        if feature_mentions(krate, feature) == 0 {
             wrong.push(format!(
                 "{krate}/{feature}: README says it gates code, found 0 mentions in src/"
             ));
@@ -339,13 +368,9 @@ fn declares_item(corpus: &str, keyword: &str, name: &str) -> bool {
 fn readme_prose_names_only_methods_that_exist() {
     let root = repo_root();
     let readme = read(&root.join("README.md"));
-    let mut corpus = String::new();
-    for member in workspace_members(&root) {
-        for source_path in rust_sources(&root.join(&member).join("src")) {
-            corpus.push_str(&read(&source_path));
-            corpus.push('\n');
-        }
-    }
+    // Search the shared corpus file by file and short-circuit, rather than
+    // concatenating 25 MB into one string per test run.
+    let corpus = source_corpus();
 
     let mut missing = Vec::new();
     for (ty, method) in readme_method_paths(&readme) {
@@ -353,15 +378,18 @@ fn readme_prose_names_only_methods_that_exist() {
         // dependency (`Cx::current`, `RuntimeBuilder::current_thread`) is
         // skipped rather than guessed at, which keeps the check self-maintaining
         // as dependencies move.
-        let defines_type = ["struct", "enum", "trait", "type"]
-            .iter()
-            .any(|keyword| declares_item(&corpus, keyword, &ty));
+        let defines_type = ["struct", "enum", "trait", "type"].iter().any(|keyword| {
+            corpus
+                .iter()
+                .any(|(_, text)| declares_item(text, keyword, &ty))
+        });
         if !defines_type {
             continue;
         }
-        let defines_method = [format!("fn {method}("), format!("fn {method}<")]
+        let needles = [format!("fn {method}("), format!("fn {method}<")];
+        let defines_method = corpus
             .iter()
-            .any(|needle| corpus.contains(needle.as_str()));
+            .any(|(_, text)| needles.iter().any(|n| text.contains(n.as_str())));
         if !defines_method {
             missing.push(format!("{ty}::{method}"));
         }
@@ -408,24 +436,12 @@ fn mentions_token(text: &str, token: &str) -> bool {
 /// Member-relative paths of files under any member's `src/` that mention
 /// `needle` as a whole identifier, excluding `owner`, which is the module's own
 /// definition.
-fn mentioning_sources(root: &Path, needle: &str, owner: &str) -> BTreeSet<String> {
-    let mut hits = BTreeSet::new();
-    for member in workspace_members(root) {
-        for source_path in rust_sources(&root.join(&member).join("src")) {
-            let relative = source_path
-                .strip_prefix(root)
-                .expect("a member source sits under the repository root")
-                .to_string_lossy()
-                .replace('\\', "/");
-            if relative == owner {
-                continue;
-            }
-            if mentions_token(&read(&source_path), needle) {
-                hits.insert(relative);
-            }
-        }
-    }
-    hits
+fn mentioning_sources(needle: &str, owner: &str) -> BTreeSet<String> {
+    source_corpus()
+        .iter()
+        .filter(|(path, text)| path != owner && mentions_token(text, needle))
+        .map(|(path, _)| path.clone())
+        .collect()
 }
 
 /// `event_store` is documented as unclaimed library surface. Its only
@@ -437,12 +453,7 @@ fn mentioning_sources(root: &Path, needle: &str, owner: &str) -> BTreeSet<String
 /// pinned test instead would be RH-3.
 #[test]
 fn event_store_is_still_unconsumed_as_the_readme_says() {
-    let root = repo_root();
-    let hits = mentioning_sources(
-        &root,
-        "event_store",
-        "crates/fastmcp-transport/src/event_store.rs",
-    );
+    let hits = mentioning_sources("event_store", "crates/fastmcp-transport/src/event_store.rs");
     let expected = BTreeSet::from([
         "crates/fastmcp-transport/src/lib.rs".to_owned(),
         "crates/fastmcp/src/lib.rs".to_owned(),
@@ -466,12 +477,7 @@ fn event_store_is_still_unconsumed_as_the_readme_says() {
 /// the set cannot grow unnoticed.
 #[test]
 fn http_transport_has_no_shipped_consumer_as_the_readme_says() {
-    let root = repo_root();
-    let hits = mentioning_sources(
-        &root,
-        "HttpTransport",
-        "crates/fastmcp-transport/src/http.rs",
-    );
+    let hits = mentioning_sources("HttpTransport", "crates/fastmcp-transport/src/http.rs");
     // `StreamableHttpTransport` and `ManagedHttpClient*` contain this substring
     // and are unrelated live types, so only exact-token files are expected.
     let expected = BTreeSet::from(["crates/fastmcp-server/src/auth.rs".to_owned()]);
@@ -604,14 +610,10 @@ fn planted_token_match_excludes_a_longer_identifier() {
 
 #[test]
 fn planted_consumer_census_distinguishes_owner_from_consumer() {
-    let root = repo_root();
     // The owner file is excluded, so naming a file that does mention the needle
     // as the owner must drop it from the set.
-    let with_owner_excluded = mentioning_sources(
-        &root,
-        "event_store",
-        "crates/fastmcp-transport/src/lib.rs",
-    );
+    let with_owner_excluded =
+        mentioning_sources("event_store", "crates/fastmcp-transport/src/lib.rs");
     assert!(
         !with_owner_excluded.contains("crates/fastmcp-transport/src/lib.rs"),
         "the owner exclusion must apply to whatever path is passed"
@@ -624,7 +626,7 @@ fn planted_consumer_census_distinguishes_owner_from_consumer() {
     // A needle no source mentions must produce an empty set rather than a
     // silently-passing match, which is how a census goes vacuous.
     assert!(
-        mentioning_sources(&root, "ThisIdentifierAppearsInNoSource", "nowhere.rs").is_empty(),
+        mentioning_sources("ThisIdentifierAppearsInNoSource", "nowhere.rs").is_empty(),
         "an absent needle must yield no hits"
     );
 }
