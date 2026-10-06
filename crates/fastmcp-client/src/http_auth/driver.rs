@@ -275,12 +275,18 @@ impl OAuthClient {
         D: FnOnce(CanonicalHttpUrl) -> F,
         F: Future<Output = Result<(), OAuthError>>,
     {
-        with_authorization_driver(
+        // Heap the driver step rather than awaiting it inline. It holds the
+        // whole authorization flow plus the driver future, and dominated this
+        // future's 18 KB, which every caller of this public method paid at its
+        // own `.await` (bd-y2xoc). Boxing the inner step keeps the public
+        // signature intact -- same remedy already applied to
+        // `ClientBuilder::connect_http_client_with_cx` in commit 0d3c51e6.
+        Box::pin(with_authorization_driver(
             cx,
             timeout,
             |launcher| self.authorize(cx, move |url| launcher.launch(url)),
             driver,
-        )
+        ))
         .await
         .map_err(|error| match error {
             AuthorizationDriverError::Operation(error)
@@ -304,12 +310,15 @@ impl ManagedOAuthSession {
         D: FnOnce(CanonicalHttpUrl) -> F,
         F: Future<Output = Result<(), OAuthError>>,
     {
-        with_authorization_driver(
+        // Boxed for the same reason as the `OAuthClient` method above: this is
+        // the 23 KB root, and the cost landed on every caller's `.await`
+        // instead of here (bd-y2xoc). Public signature unchanged.
+        Box::pin(with_authorization_driver(
             cx,
             timeout,
             |launcher| Self::authorize(cx, client, policy, move |url| launcher.launch(url)),
             driver,
-        )
+        ))
         .await
         .map_err(|error| match error {
             AuthorizationDriverError::Operation(error) => error,
