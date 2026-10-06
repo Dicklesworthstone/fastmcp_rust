@@ -22,6 +22,8 @@ use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 
 use super::io_checkpoint;
 
+mod stdio;
+
 struct PipeWait {
     registration: IoRegistration,
     cancelled: Pin<Box<dyn Future<Output = ()> + Send>>,
@@ -53,6 +55,8 @@ struct PipeIo {
     file: Option<File>,
     cx: Cx,
     interest: Interest,
+    // Restore process-stream flags only after registration and endpoint drop.
+    process_stream: Option<stdio::ProcessStreamLease>,
 }
 
 impl std::fmt::Debug for PipeIo {
@@ -123,6 +127,7 @@ impl PipeIo {
             file: Some(file),
             cx: caller,
             interest,
+            process_stream: None,
         })
     }
 
@@ -136,6 +141,9 @@ impl PipeIo {
             let caller = Cx::current()
                 .ok_or_else(|| io::Error::other("caller context unavailable"))?;
             admit_context(&caller)?;
+            if let Some(stream) = &self.process_stream {
+                stream.verify_io()?;
+            }
             let file = self.file.as_ref().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "native pipe is closed")
             })?;
@@ -201,7 +209,8 @@ impl PipeIo {
         // Close even if deregistration reports a failure. Close is cleanup,
         // not new work, and must remain possible on a cancelled caller.
         self.file = None;
-        result
+        let restored = self.process_stream.take().map_or(Ok(()), stdio::ProcessStreamLease::finish);
+        result.and(restored)
     }
 }
 
@@ -247,7 +256,7 @@ impl AsyncRead for NativePipeReader {
             Poll::Ready(Ok(read)) => {
                 output.advance(read);
                 if read == 0 {
-                    self.0.file = None;
+                    self.0.close()?;
                 }
                 Poll::Ready(Ok(()))
             }
