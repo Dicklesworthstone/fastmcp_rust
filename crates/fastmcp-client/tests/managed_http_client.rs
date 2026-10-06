@@ -50,7 +50,23 @@ fn run(future: impl Future<Output = ()>) {
         });
 }
 
-async fn pair<L: Future, R: Future>(left: L, right: R) -> (L::Output, R::Output) {
+// Returns a BOXED future rather than being an `async fn`. As an async fn its
+// generator holds both input futures inline, so every one of the `pair(..)`
+// await sites in this file paid their combined size -- 14 of this crate's
+// residual `large_futures` were exactly that, up to ~25 KB, and the nested
+// `pair(pair(..), ..)` site paid it twice. `pair` is the composition helper
+// that OWNS those bytes, so boxing here is the at-source fix for all of them
+// at once; boxing at the await sites instead would be the relocate-the-bytes
+// pattern bd-y2xoc warns about. Call sites are unchanged: `pair(a, b).await`
+// still works, because the box is what gets awaited.
+fn pair<'a, L: Future + 'a, R: Future + 'a>(
+    left: L,
+    right: R,
+) -> std::pin::Pin<Box<dyn Future<Output = (L::Output, R::Output)> + 'a>> {
+    Box::pin(pair_inner(left, right))
+}
+
+async fn pair_inner<L: Future, R: Future>(left: L, right: R) -> (L::Output, R::Output) {
     let mut left = std::pin::pin!(left);
     let mut right = std::pin::pin!(right);
     let mut l = None;
