@@ -90,6 +90,7 @@
 //! Source wiring and local tests are not official-conformance results.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::process::ExitCode;
 
 use fastmcp_client::http_executor::parameter_headers::ReviewedToolHeaders;
@@ -380,7 +381,22 @@ async fn run(cx: &Cx, url: &str) -> Result<(), String> {
     }
 }
 
-async fn exercise(
+// Boxed return, not an `async fn`. This is the whole MCP exercise flow and was
+// the last `large_future` in the workspace at ~27 KB: both of its callers
+// materialised it on their own frame, and at the `grant.run(cx, exercise(..))`
+// site that happened even though `run` now boxes internally, because the
+// ARGUMENT is built on the caller's stack before being moved into the box.
+// Boxing here fixes both call sites at source (bd-y2xoc).
+fn exercise<'a>(
+    cx: &'a Cx,
+    endpoint: &'a CanonicalHttpUrl,
+    client: &'a mut FixtureClient,
+    protected: bool,
+) -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + 'a>> {
+    Box::pin(exercise_inner(cx, endpoint, client, protected))
+}
+
+async fn exercise_inner(
     cx: &Cx,
     endpoint: &CanonicalHttpUrl,
     client: &mut FixtureClient,
@@ -550,7 +566,10 @@ fn main() -> ExitCode {
     };
     let outcome = runtime.block_on(async {
         let cx = Cx::current().ok_or_else(|| "no ambient context".to_owned())?;
-        run(&cx, &url).await
+        // Boxed at the single site that owns it. `run` is this binary's whole
+        // entry flow and has exactly one caller, so there is no root further
+        // in to box and nothing is relocated by doing it here (bd-y2xoc).
+        Box::pin(run(&cx, &url)).await
     });
     match outcome {
         Ok(()) => ExitCode::SUCCESS,

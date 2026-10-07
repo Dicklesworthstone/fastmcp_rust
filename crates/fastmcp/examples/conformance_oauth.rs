@@ -390,7 +390,21 @@ impl GrantLease {
 
     /// The adapter exercises one short-lived grant. It does not claim managed
     /// refresh: stop at expiry rather than silently starting a new login.
-    pub(super) async fn run<T>(
+    /// Returns a BOXED future rather than being an `async fn`. The caller
+    /// passes the whole MCP exercise future in, so as an `async fn` this
+    /// generator held it inline and both call sites in `conformance_client`
+    /// paid ~20-27 KB at their own `.await` (bd-y2xoc). `pub(super)` keeps
+    /// this internal to the conformance adapter, and both callers already just
+    /// `.await` the result, so nothing about their syntax changes.
+    pub(super) fn run<'a, T: 'a>(
+        &'a self,
+        cx: &'a Cx,
+        future: impl Future<Output = Result<T, String>> + 'a,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<T, String>> + 'a>> {
+        Box::pin(self.run_inner(cx, future))
+    }
+
+    async fn run_inner<T>(
         &self,
         cx: &Cx,
         future: impl Future<Output = Result<T, String>>,

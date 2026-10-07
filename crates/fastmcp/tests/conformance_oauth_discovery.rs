@@ -57,7 +57,21 @@ fn run(future: impl Future<Output = ()>) {
         });
 }
 
-async fn pair<L: Future, R: Future>(left: L, right: R) -> (L::Output, R::Output) {
+// Boxed return, not an `async fn`: as an async fn this generator holds both
+// input futures inline, so every `pair(..)` await site paid their combined
+// size -- the `pair(exercise(..), peer.discovery(..))` sites in this file were
+// the largest futures anywhere in the workspace at ~59 KB. Boxing the
+// composition helper is the at-source fix for all of them at once, and call
+// sites stay `pair(a, b).await`. Same change as the two identical helpers in
+// fastmcp-client's integration tests (bd-y2xoc).
+fn pair<'a, L: Future + 'a, R: Future + 'a>(
+    left: L,
+    right: R,
+) -> std::pin::Pin<Box<dyn Future<Output = (L::Output, R::Output)> + 'a>> {
+    Box::pin(pair_inner(left, right))
+}
+
+async fn pair_inner<L: Future, R: Future>(left: L, right: R) -> (L::Output, R::Output) {
     let mut left = std::pin::pin!(left);
     let mut right = std::pin::pin!(right);
     let mut left_result = None;
