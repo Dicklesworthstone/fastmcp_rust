@@ -1937,7 +1937,14 @@ where
 
     fn drive_for_owner(&self, cx: &Cx, waiting_owner: Option<(&RequestId, u64)>) -> McpResult<()> {
         let mut state = self.state.borrow_mut();
-        self.claim_ingress_owner_locked(&mut state, IngressOwner::SelfReader)?;
+        // Refuse mixed ingress before maintenance can perform transport
+        // effects, but do not claim an unowned reader for a stale waiter or
+        // an execution whose terminal is already available without a read.
+        if state.ingress_owner == IngressOwner::ExternalDriver {
+            return Err(McpError::invalid_request(
+                "Client request executor is driven by external admitted frames",
+            ));
+        }
         self.prepare_drive_locked(cx, &mut state)?;
         if waiting_owner.is_some_and(|(request_id, generation)| {
             state
@@ -1947,6 +1954,21 @@ where
             // Expiry may have just elected this waiter's outcome while a
             // sibling remains live. No further peer read belongs to this wait.
             return Ok(());
+        }
+        if let Some((request_id, generation)) = waiting_owner {
+            let key = request_id.correlation_key().map_err(|_| {
+                McpError::invalid_params("Request execution owns an invalid JSON-RPC request ID")
+            })?;
+            if state.pending.get(&key).is_none_or(|pending| {
+                pending.record.execution_generation != generation
+            }) {
+                // The handle may have lost its terminal receipt while another
+                // thread reused the wire ID. Neither a new read nor local
+                // cancellation below belongs to that replacement execution.
+                return Err(McpError::internal_error(
+                    "Request execution terminal result expired before it was consumed",
+                ));
+            }
         }
         // Maintenance may consume the last poll while deferring a control.
         // A stopped caller cannot read past it or poison unrelated waiters.
@@ -1961,6 +1983,9 @@ where
             }
             return Err(McpError::request_cancelled());
         }
+        // The mode election belongs to this admitted read, not to an
+        // observation that returned above without touching the transport.
+        self.claim_ingress_owner_locked(&mut state, IngressOwner::SelfReader)?;
         let (received, source) = match state.receive_frame {
             Some(receive_frame) => match receive_frame(&mut state.transport, cx) {
                 Ok(frame) => {
@@ -2383,6 +2408,7 @@ where
         &self,
         execution: &RequestExecution<T>,
     ) -> McpResult<Vec<TaskStatusNotification>> {
+        execution.ensure_owner(&self.state)?;
         execution.ensure_task_operation(|operation| {
             matches!(operation, TaskExecutionOperation::Subscription)
         })?;
@@ -2404,6 +2430,7 @@ where
         &self,
         execution: &RequestExecution<T>,
     ) -> McpResult<Option<SubscriptionFilter>> {
+        execution.ensure_owner(&self.state)?;
         execution.ensure_task_operation(|operation| {
             matches!(operation, TaskExecutionOperation::Subscription)
         })?;
@@ -2426,6 +2453,7 @@ where
         &self,
         execution: &mut RequestExecution<T>,
     ) -> McpResult<Option<SubscriptionFilter>> {
+        execution.ensure_owner(&self.state)?;
         self.require_modern_tasks_era()?;
         execution.ensure_task_operation(|operation| {
             matches!(operation, TaskExecutionOperation::Subscription)
@@ -2459,6 +2487,10 @@ where
         cx: &Cx,
         execution: &mut RequestExecution<T>,
     ) -> McpResult<(SubscriptionFilter, Vec<TaskStatusNotification>)> {
+        // Reject a foreign handle BEFORE the error-cleanup path below can
+        // remove a local subscription with the same numeric ID/generation.
+        // The operation tag alone proves neither executor nor connection.
+        execution.ensure_owner(&self.state)?;
         self.require_modern_tasks_era()?;
         execution.ensure_task_operation(|operation| {
             matches!(operation, TaskExecutionOperation::Subscription)
@@ -2627,6 +2659,17 @@ where
     pub fn cancel(&self, cx: &Cx, execution: &mut RequestExecution<T>) -> McpResult<()> {
         execution.ensure_owner(&self.state)?;
         let mut state = self.state.borrow_mut();
+        let key = execution.request_id.correlation_key().map_err(|_| {
+            McpError::invalid_params("Request execution owns an invalid JSON-RPC request ID")
+        })?;
+        if state.pending.get(&key).is_none_or(|pending| {
+            pending.record.execution_generation != execution.generation
+        }) {
+            // A retained handle is authority for one generation, not for
+            // every future use of its wire ID. Treat a retired generation
+            // like an already-elected terminal: no new control or mutation.
+            return Ok(());
+        }
         self.cancel_pending_locked(
             cx,
             &mut state,
@@ -2654,7 +2697,10 @@ where
                         "Request execution owns an invalid JSON-RPC request ID",
                     )
                 })?)
-                .is_some_and(|pending| pending.method == SUBSCRIPTIONS_LISTEN);
+                .is_some_and(|pending| {
+                    pending.record.execution_generation == execution.generation
+                        && pending.method == SUBSCRIPTIONS_LISTEN
+                });
         if !is_active_modern_subscription {
             return Err(McpError::invalid_request(
                 "Peer cancellation is only valid for an active modern subscriptions/listen request",
@@ -4554,6 +4600,380 @@ mod tests {
             .received_frames
             .pop_front()
             .unwrap_or(Err(TransportError::Closed))
+    }
+
+    mod execution_identity {
+        use super::*;
+
+        type Executor = RequestExecutor<ScriptedTransport>;
+        type Execution = RequestExecution<ScriptedTransport>;
+
+        fn executor(era: ProtocolEra) -> Executor {
+            RequestExecutor::with_protocol_era(ScriptedTransport::new([]), era)
+        }
+
+        fn request_with_id(id: RequestId) -> Request {
+            let mut value = request(7);
+            value.id = Some(id);
+            value
+        }
+
+        fn retired_response(id: RequestId) -> JsonRpcResponse {
+            // An error envelope is valid in both eras, independently of the
+            // method-specific success schema. This test concerns ownership.
+            JsonRpcResponse::error(
+                Some(id),
+                fastmcp_protocol::JsonRpcError {
+                    code: (-32603).into(),
+                    message: "retired execution".to_owned(),
+                    data: None,
+                },
+            )
+        }
+
+        fn retire_and_expire(executor: &Executor, cx: &Cx, old: &Execution) {
+            executor
+                .route_response_with_raw_result(cx, retired_response(old.request_id.clone()), None)
+                .unwrap();
+            let now = Instant::now();
+            let mut state = executor.state.borrow_mut();
+            let key = old.request_id.correlation_key().unwrap();
+            // Simulate the retention deadline, not a different ID allocator:
+            // run the real pruning paths while keeping the old handle alive.
+            state.tombstones.get_mut(&key).unwrap().expires_at = now;
+            *state
+                .terminal_expirations
+                .get_mut(&(old.request_id.clone(), old.generation))
+                .unwrap() = now;
+            state.prune_tombstones(now);
+            state.prune_retained_terminals(now);
+            assert!(!state.tombstones.contains_key(&key));
+            assert!(!state.completed.contains_key(&(old.request_id.clone(), old.generation)));
+        }
+
+        fn cancellation_ids(executor: &Executor) -> Vec<RequestId> {
+            executor
+                .state
+                .borrow()
+                .transport
+                .sent
+                .iter()
+                .filter_map(|message| {
+                    let JsonRpcMessage::Request(request) = message else {
+                        return None;
+                    };
+                    if request.method != "notifications/cancelled" {
+                        return None;
+                    }
+                    assert!(request.id.is_none());
+                    Some(
+                        serde_json::from_value(
+                            request.params.as_ref().unwrap()["requestId"].clone(),
+                        )
+                        .unwrap(),
+                    )
+                })
+                .collect()+        }
+
+        #[test]
+        fn retired_cancel_cannot_target_a_reused_id_or_numeric_alias() {
+            for era in [ProtocolEra::Legacy2024, ProtocolEra::Modern2026] {
+                for (old_id, new_id) in [
+                    (RequestId::Number(7), RequestId::Number(7)),
+                    (RequestId::Number(7), RequestId::Integer("7e0".to_owned())),
+                    (
+                        RequestId::String("same-id".to_owned()),
+                        RequestId::String("same-id".to_owned()),
+                    ),
+                ] {
+                    for stopped_service in [false, true] {
+                        let executor = executor(era);
+                        let cx = Cx::for_testing();
+                        let service = Cx::for_testing();
+                        let mut old = executor.execute(&cx, request_with_id(old_id.clone())).unwrap();
+                        retire_and_expire(&executor, &cx, &old);
+                        let mut current = executor.execute(&cx, request_with_id(new_id.clone())).unwrap();
+                        assert_ne!(old.generation(), current.generation());
+                        if stopped_service {
+                            service.set_cancel_requested(true);
+                        }
+                        executor.clone().cancel(&service, &mut old).unwrap();
+                        assert!(executor.try_take_response(&mut current).unwrap().is_none());
+                        assert_eq!(executor.pending_records().len(), 1);
+                        assert_eq!(executor.pending_records()[0].execution_generation, current.generation());
+                        assert!(cancellation_ids(&executor).is_empty());
+                        assert!(executor.take_cancellation_events().is_empty());
+                        assert!(executor.state.borrow().deferred_cancellations.is_empty());
+                        // The exact current handle still has its authority,
+                        // including when its ID is a numeric spelling alias.
+                        executor.clone().cancel(&cx, &mut current).unwrap();
+                        let controls = cancellation_ids(&executor);
+                        assert_eq!(controls.len(), 1);
+                        assert!(controls[0].correlates_with(&new_id));
+                        assert_eq!(executor.try_take_response(&mut current).unwrap_err().code,
+                            McpErrorCode::RequestCancelled);
+                    }
+                }
+            }
+        }
+
+        fn listen(id: RequestId) -> Request {
+            JsonRpcRequest::new(
+                SUBSCRIPTIONS_LISTEN,
+                Some(serde_json::json!({
+                    "_meta": fastmcp_protocol::FinalRequestMeta::new(
+                        fastmcp_protocol::ClientCapabilities::default()
+                    ),
+                    "notifications": {"toolsListChanged": true},
+                })),
+                id,
+            )
+        }
+
+        #[test]
+        fn retired_teardown_cannot_cancel_a_new_subscription_with_the_same_id() {
+            for old_was_subscription in [false, true] {
+                let executor = executor(ProtocolEra::Modern2026);
+                let cx = Cx::for_testing();
+                let id = RequestId::Number(17);
+                let prior = if old_was_subscription {
+                    listen(id.clone())
+                } else {
+                    request_with_id(id.clone())
+                };
+                let mut old = executor.execute(&cx, prior).unwrap();
+                retire_and_expire(&executor, &cx, &old);
+                let mut current = executor
+                    .execute_subscription_with_timeout_policy(
+                        &cx,
+                        listen(id),
+                        SubscriptionTimeoutPolicy::default(),
+                    )
+                    .unwrap();
+                assert_eq!(executor.accept_subscription_teardown(&cx, &mut old).unwrap_err().code,
+                    McpErrorCode::InvalidRequest);
+                assert!(executor.try_take_response(&mut current).unwrap().is_none());
+                assert_eq!(executor.pending_records()[0].execution_generation, current.generation());
+                assert!(executor.take_cancellation_events().is_empty());
+                executor.accept_subscription_teardown(&cx, &mut current).unwrap();
+                assert_eq!(executor.try_take_response(&mut current).unwrap_err().code,
+                    McpErrorCode::RequestCancelled);
+                assert!(cancellation_ids(&executor).is_empty(), "peer teardown must not echo a control");
+            }
+        }
+
+        #[test]
+        fn stale_wait_turn_cannot_read_or_cancel_the_replacement_execution() {
+            for stopped_service in [false, true] {
+                let executor = executor(ProtocolEra::Legacy2024);
+                let cx = Cx::for_testing();
+                let service = Cx::for_testing();
+                let old = executor.execute(&cx, request(27)).unwrap();
+                retire_and_expire(&executor, &cx, &old);
+                let mut current = executor.execute(&cx, request(27)).unwrap();
+                let response = retired_response(current.request_id.clone());
+                executor.state.borrow_mut().transport.received.push_back(
+                    Ok(JsonRpcMessage::Response(response.clone())),
+                );
+                if stopped_service {
+                    service.set_cancel_requested(true);
+                }
+                // Model the unlock/relock boundary inside wait_for_terminal:
+                // its remembered owner was retired before this drive acquired
+                // the shared state. No ten-minute sleep or unsafe race needed.
+                assert!(executor.drive_for_owner(
+                    &service,
+                    Some((&old.request_id, old.generation)),
+                ).is_err());
+                assert_eq!(executor.state.borrow().transport.received.len(), 1);
+                assert!(cancellation_ids(&executor).is_empty());
+                assert!(executor.state.borrow().deferred_cancellations.is_empty());
+                assert!(executor.terminal_error().is_none());
+                assert_eq!(executor.clone().wait(&cx, &mut current).unwrap(), response);
+            }
+        }
+
+        fn response_frame(response: &JsonRpcResponse) -> ReceivedTransportFrame {
+            ReceivedTransportFrame::admit(serde_json::to_vec(response).unwrap()).unwrap()
+        }
+
+        #[test]
+        fn stale_waiter_refusal_does_not_claim_the_external_drivers_ingress() {
+            for era in [ProtocolEra::Legacy2024, ProtocolEra::Modern2026] {
+                for stopped_service in [false, true] {
+                    let executor = executor(era);
+                    let cx = Cx::for_testing();
+                    let service = Cx::for_testing();
+                    let old = executor.execute(&cx, request(37)).unwrap();
+                    retire_and_expire(&executor, &cx, &old);
+                    let mut current = executor.execute(&cx, request(37)).unwrap();
+                    let response = retired_response(current.request_id.clone());
+                    executor.state.borrow_mut().transport.received.push_back(
+                        Ok(JsonRpcMessage::Response(response.clone())),
+                    );
+                    if stopped_service {
+                        service.set_cancel_requested(true);
+                    }
+                    assert!(executor.drive_for_owner(
+                        &service,
+                        Some((&old.request_id, old.generation)),
+                    ).is_err());
+                    assert_eq!(executor.state.borrow().ingress_owner, IngressOwner::Unclaimed);
+                    assert_eq!(executor.state.borrow().transport.received.len(), 1);
+                    assert!(cancellation_ids(&executor).is_empty());
+                    // No reset, fresh executor or replacement connection is
+                    // used: the actual external driver must still be able to
+                    // claim ingress and complete this replacement request.
+                    executor.drive_frame(&cx, response_frame(&response)).unwrap();
+                    assert_eq!(executor.state.borrow().ingress_owner, IngressOwner::ExternalDriver);
+                    assert_eq!(executor.try_take_response(&mut current).unwrap(), Some(response));
+                    assert_eq!(executor.state.borrow().transport.received.len(), 1);
+                }
+            }
+        }
+
+        #[test]
+        fn timeout_reconciliation_without_a_read_preserves_unclaimed_ingress() {
+            let executor = executor(ProtocolEra::Modern2026);
+            let cx = Cx::for_testing();
+            let mut expired = executor.execute(&cx, request(47)).unwrap();
+            let mut sibling = executor.execute(&cx, request(48)).unwrap();
+            let response = retired_response(sibling.request_id.clone());
+            {
+                let mut state = executor.state.borrow_mut();
+                state.pending.get_mut(&expired.request_id.correlation_key().unwrap())
+                    .unwrap().record.idle_deadline = Instant::now();
+                state.transport.received.push_back(Ok(JsonRpcMessage::Response(response.clone())));
+            }
+            executor.drive_for_owner(&cx, Some((&expired.request_id, expired.generation))).unwrap();
+            assert_eq!(executor.state.borrow().ingress_owner, IngressOwner::Unclaimed);
+            assert_eq!(executor.state.borrow().transport.received.len(), 1);
+            assert_eq!(executor.try_take_response(&mut expired).unwrap_err().code,
+                McpErrorCode::RequestCancelled);
+            assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(47)]);
+            executor.drive_frame(&cx, response_frame(&response)).unwrap();
+            assert_eq!(executor.try_take_response(&mut sibling).unwrap(), Some(response));
+            assert!(executor.terminal_error().is_none());
+        }
+
+        #[test]
+        fn existing_external_mode_refuses_self_reader_before_deferred_control_effects() {
+            let executor = executor(ProtocolEra::Modern2026);
+            let cx = Cx::for_testing();
+            let mut completed = executor.execute(&cx, request(57)).unwrap();
+            let response = retired_response(completed.request_id.clone());
+            executor.drive_frame(&cx, response_frame(&response)).unwrap();
+            assert_eq!(executor.try_take_response(&mut completed).unwrap(), Some(response));
+            let mut active = executor.execute(&cx, request(58)).unwrap();
+            let abandoned = executor.execute(&cx, request(59)).unwrap();
+            drop(abandoned);
+            let sent = executor.state.borrow().transport.sent.len();
+            assert_eq!(executor.state.borrow().deferred_cancellations.len(), 1);
+            assert_eq!(executor.drive_for_owner(
+                &cx,
+                Some((&active.request_id, active.generation)),
+            ).unwrap_err().code, McpErrorCode::InvalidRequest);+            // Moving the mutating claim later must not move the incompatible
+            // mode refusal after a maintenance write. The original external
+            // driver retains sole authority to service these queued controls.
+            assert_eq!(executor.state.borrow().transport.sent.len(), sent);
+            assert_eq!(executor.state.borrow().deferred_cancellations.len(), 1);
+            assert_eq!(executor.state.borrow().ingress_owner, IngressOwner::ExternalDriver);
+            assert!(executor.try_take_response(&mut active).unwrap().is_none());
+            let response = retired_response(active.request_id.clone());
+            executor.drive_frame(&cx, response_frame(&response)).unwrap();
+            assert_eq!(executor.try_take_response(&mut active).unwrap(), Some(response));
+            assert!(executor.state.borrow().deferred_cancellations.is_empty());
+            assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(59)]);
+        }
+
+        #[cfg(feature = "tasks")]
+        mod foreign_subscription {
+            use super::*;
+
+            fn subscribed(cx: &Cx, task: &str) -> (Executor, Execution) {
+                let executor = executor(ProtocolEra::Modern2026);
+                let task_id = TaskId::parse(task).unwrap();
+                let execution = executor
+                    .execute_tasks_subscription(cx, tasks_subscription_request(73, &task_id))
+                    .unwrap();
+                executor.drive_frame(cx, source_frame(tasks_subscription_acknowledgement(73, &task_id)))
+                    .unwrap();
+                executor.drive_frame(cx, source_frame(tasks_status_notification(73, &task_id)))
+                    .unwrap();
+                (executor, execution)
+            }
+
+            fn assert_live_subscription(executor: &Executor, execution: &Execution, task: &str) {
+                let filter = executor.clone().tasks_subscription_acknowledgement(execution)
+                    .unwrap().unwrap();
+                assert_eq!(task_subscription_ids(&filter).unwrap().unwrap(),
+                    vec![TaskId::parse(task).unwrap()]);
+                let events = executor.clone().take_tasks_subscription_notifications(execution).unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(serde_json::to_value(&events[0]).unwrap()["params"]["taskId"], task);
+                assert!(executor.take_tasks_subscription_notifications(execution).unwrap().is_empty());
+                assert_eq!(executor.pending_records().len(), 1);
+            }
+
+            fn same_wire_identity(left: &Execution, right: &Execution) {
+                assert_eq!(left.request_id(), right.request_id());
+                assert_eq!(left.generation(), right.generation());
+                assert!(!SharedExecutorState::ptr_eq(&left.state, &right.state));
+            }
+
+            #[test]
+            fn foreign_handle_cannot_observe_another_executors_acknowledgement() {
+                let cx = Cx::for_testing();
+                let (first, foreign) = subscribed(&cx, "task-first");
+                let (second, local) = subscribed(&cx, "task-second");
+                same_wire_identity(&foreign, &local);
+                assert_eq!(second.tasks_subscription_acknowledgement(&foreign).unwrap_err().code,
+                    McpErrorCode::InvalidParams);
+                assert_live_subscription(&second, &local, "task-second");
+                assert_live_subscription(&first, &foreign, "task-first");
+            }
+
+            #[test]
+            fn foreign_handle_cannot_drain_another_executors_notifications() {
+                let cx = Cx::for_testing();
+                let (first, foreign) = subscribed(&cx, "task-first");
+                let (second, local) = subscribed(&cx, "task-second");
+                same_wire_identity(&foreign, &local);
+                assert_eq!(second.take_tasks_subscription_notifications(&foreign).unwrap_err().code,
+                    McpErrorCode::InvalidParams);
+                assert_live_subscription(&second, &local, "task-second");
+                assert_live_subscription(&first, &foreign, "task-first");
+            }
+
+            #[test]
+            fn foreign_wait_refusal_cannot_remove_local_subscription_state() {
+                let cx = Cx::for_testing();
+                let (first, mut foreign) = subscribed(&cx, "task-first");
+                let (second, local) = subscribed(&cx, "task-second");
+                same_wire_identity(&foreign, &local);
+                assert_eq!(second.wait_tasks_subscription(&cx, &mut foreign).unwrap_err().code,
+                    McpErrorCode::InvalidParams);
+                // The original error path already returned InvalidParams,
+                // but removed the local entry with this same (ID, generation).
+                // Retained accepted filters AND events prove absence of that
+                // destructive side effect; the error code alone cannot.
+                assert_live_subscription(&second, &local, "task-second");
+                assert_live_subscription(&first, &foreign, "task-first");
+                assert!(second.terminal_error().is_none());
+            }
+
+            #[test]
+            fn foreign_terminal_poll_leaves_both_subscription_owners_live() {
+                let cx = Cx::for_testing();
+                let (first, mut foreign) = subscribed(&cx, "task-first");
+                let (second, local) = subscribed(&cx, "task-second");
+                same_wire_identity(&foreign, &local);
+                assert_eq!(second.try_take_tasks_subscription_terminal(&mut foreign).unwrap_err().code,
+                    McpErrorCode::InvalidParams);
+                assert_live_subscription(&second, &local, "task-second");
+                assert_live_subscription(&first, &foreign, "task-first");
+            }
+        }
     }
 
     fn request(id: i64) -> JsonRpcRequest {
