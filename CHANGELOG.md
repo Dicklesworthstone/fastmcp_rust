@@ -6,6 +6,108 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ---
 
+## [v0.12.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.12.0) -- 2026-10-07 (GitHub Release)
+
+154 commits since v0.11.0. Pre-1.0 minor release: new native pipe/stdio and
+OAuth surfaces, plus one source-incompatible client change (below).
+
+### Breaking change: optional server identity on modern connections
+
+- `ClientSession` now holds `Option<ServerInfo>`: a modern (2026-07-28)
+  `server/discover` result that carries no server identity is accepted and
+  reported as `None` instead of refusing the connection
+  ([25519c88](https://github.com/Dicklesworthstone/fastmcp_rust/commit/25519c88)).
+  Code that read the server identity unconditionally must handle `None`.
+
+### Native pipe and process-stdio transport
+
+- Caller-owned, reactor-driven Unix pipe I/O for `AsyncStdioTransport` and
+  `serve_stdio_io`: no helper threads, cancellation and caller deadlines
+  observed, blocking descriptors refused without changing shared flags
+  ([199b1369](https://github.com/Dicklesworthstone/fastmcp_rust/commit/199b1369)).
+- `NativePipeReader::from_stdin` / `NativePipeWriter::from_stdout` claim the
+  real process stdio, excluding competing native owners and restoring the
+  original descriptor flags on release
+  ([fcbd7c21](https://github.com/Dicklesworthstone/fastmcp_rust/commit/fcbd7c21)),
+  with a native stdio example executable and a subprocess smoke driver
+  ([cc453797](https://github.com/Dicklesworthstone/fastmcp_rust/commit/cc453797)).
+- Bounded memory transports are served on the native request runtime
+  ([0a116a20](https://github.com/Dicklesworthstone/fastmcp_rust/commit/0a116a20)).
+- An ambient capability restriction is no longer laundered through the native
+  pipe constructors (2 of 3 cases fixed,
+  [e36eb6dc](https://github.com/Dicklesworthstone/fastmcp_rust/commit/e36eb6dc);
+  see Known issues).
+
+### OAuth and managed HTTP clients
+
+- Native Client ID Metadata Document (CIMD) discovery and login
+  ([d26372d2](https://github.com/Dicklesworthstone/fastmcp_rust/commit/d26372d2)),
+  and a fixed registration order: issuer-bound preregistered ID, then an
+  admitted CIMD document, then explicitly authorized one-shot DCR
+  ([1d6bfa8b](https://github.com/Dicklesworthstone/fastmcp_rust/commit/1d6bfa8b)).
+- A bounded HTTPS redirect authorization driver for one pre-authorized front
+  channel and its exact loopback callback; no cookies, retries or general
+  redirect following
+  ([d01b675e](https://github.com/Dicklesworthstone/fastmcp_rust/commit/d01b675e)).
+- `http_auth::http_client::ManagedHttpClient`: catalogs, tools, resources and
+  prompts acquire each call's credential through the shared single-flight
+  managed OAuth renewal, rebuild connection state on credential-generation
+  changes, and never replay a failed MCP request
+  ([4d4db054](https://github.com/Dicklesworthstone/fastmcp_rust/commit/4d4db054),
+  [1e27506d](https://github.com/Dicklesworthstone/fastmcp_rust/commit/1e27506d)).
+- Reviewed `Mcp-Param-*` header plans: bounded repair with MRTR, and loopback
+  `http` admitted for them
+  ([1f91f2d2](https://github.com/Dicklesworthstone/fastmcp_rust/commit/1f91f2d2),
+  [4642a9a0](https://github.com/Dicklesworthstone/fastmcp_rust/commit/4642a9a0)).
+- The official-conformance runner gained a client mode
+  ([065fbe75](https://github.com/Dicklesworthstone/fastmcp_rust/commit/065fbe75)).
+
+### Cancellation
+
+- `McpRequestCancellation::cancel_by_peer` / `is_peer_cancel_requested`
+  distinguish a peer's `notifications/cancelled` from deadlines and shutdown,
+  and the server no longer answers a request the peer cancelled
+  ([0fa93022](https://github.com/Dicklesworthstone/fastmcp_rust/commit/0fa93022),
+  [6afb8d18](https://github.com/Dicklesworthstone/fastmcp_rust/commit/6afb8d18),
+  [55bee3f1](https://github.com/Dicklesworthstone/fastmcp_rust/commit/55bee3f1)).
+
+### Fixed
+
+- Server: cancelled queued output is reclaimed instead of holding frame/byte
+  charges behind backpressure
+  ([282f3a71](https://github.com/Dicklesworthstone/fastmcp_rust/commit/282f3a71));
+  continuously ready requests can no longer starve the native output writer
+  ([c2196ea8](https://github.com/Dicklesworthstone/fastmcp_rust/commit/c2196ea8));
+  request-region admission is retained across a connection drop, so an
+  abandoned connection cannot leave an unclaimed child region open
+  ([b5b87ba4](https://github.com/Dicklesworthstone/fastmcp_rust/commit/b5b87ba4)).
+- Client: tool callbacks are bounded by the caller's deadline and
+  capabilities, schema-bound operations wake on caller cancellation, memory
+  transport operations wake at caller deadlines, and managed catalog cursors
+  are bound to the connection and catalog that issued them.
+- CLI (macOS/BSD `fastmcp install`, #81): a symlinked config is refused, as on
+  Linux, instead of being replaced by a regular file, and a refused or failed
+  publication no longer leaves a `.fastmcp-backup.*` link behind.
+- `clippy --workspace --all-targets -D warnings` is clean again (large-future
+  boxing, mechanical lints), and required-features are declared for
+  feature-gated test targets.
+
+### Dependencies
+
+- Lockfile refresh (80 transitive packages) and `zeroize` 1.9.1; see
+  `UPGRADE_LOG.md`. `asupersync =0.5.0` and `rich_rust =0.2.3` unchanged.
+
+### Known issues
+
+- One native-pipe capability case remains open (bd-8n2is): an independent
+  registration defect behind
+  `native_pipe_registers_only_with_its_bound_runtime_under_foreign_ambient_context`.
+- The client deferred-control maintenance-budget test stays ignored (#79).
+- `fastmcp-server` test targets do not build from a cold worker inside a
+  30-minute budget (bd-8d61j); they were run from a warmed build.
+- Remaining #81 follow-ups (loopback Origin opt-out, WebSocket `cors_origins`,
+  `request_read_timeout` scope) are open.
+
 ## [v0.11.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.11.0) -- 2026-10-04 (GitHub Release)
 
 ### Auto protocol fallback (#80)
