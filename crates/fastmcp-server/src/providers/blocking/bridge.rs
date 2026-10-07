@@ -160,6 +160,9 @@ impl BlockingHandlerLane {
     ///
     /// Request/runtime cancellation, deadline expiry, and lease closure are
     /// observed before and after polling, even when the operation never wakes.
+    /// Each application poll also consumes one checkpoint from the retained,
+    /// clone-shared request budget. Exhaustion refuses the next poll, not the
+    /// result of the last admitted poll; later waits cannot replenish quota.
     /// Cancellation drops the operation on this worker; the lane remains
     /// charged until the enclosing handler and result custody actually end.
     /// The future's poll and drop implementations must not block. Neither this
@@ -173,8 +176,9 @@ impl BlockingHandlerLane {
     ///
     /// Rejects use outside this lane's admitted worker, from a different lane,
     /// or recursively inside another wait, without polling the supplied future.
-    /// Returns request cancellation if its retained context is no longer live,
-    /// and otherwise preserves the operation's exact result or error.
+    /// Returns request cancellation if its retained context is no longer live
+    /// or cannot admit another poll, and otherwise preserves the operation's
+    /// exact result or error.
     pub fn wait_for<T>(&self, operation: impl Future<Output = McpResult<T>>) -> McpResult<T> {
         let entry = WaitEntry::enter(self)?;
         let ctx = &entry.context;
@@ -198,6 +202,11 @@ impl BlockingHandlerLane {
             {
                 return Err(McpError::request_cancelled());
             }
+            // Liveness alone deliberately does not consume poll quota. Admit
+            // this application poll through the request ledger, never through
+            // Cx::checkpoint, which can cancel a clone-shared runtime context.
+            ctx.checkpoint()
+                .map_err(|_| McpError::request_cancelled())?;
             let result = operation.as_mut().poll(&mut task);
             ctx.ensure_live()
                 .map_err(|_| McpError::request_cancelled())?;
@@ -523,6 +532,136 @@ mod tests {
             assert_eq!(value, 19);
             assert!(lane.execute(&ctx, &cx, |_| Ok(20)).await.is_err());
             assert_eq!(lane.in_flight().unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn wait_charges_each_application_poll_and_refuses_only_unadmitted_work() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let lane = BlockingHandlerLane::new(1).unwrap();
+            for (quota, needed, expected_polls, succeeds) in
+                [(0, 1, 0, false), (1, 1, 1, true), (1, 2, 1, false), (2, 2, 2, true)]
+            {
+                let ctx = cleanup_context(&cx);
+                let admitted = lane.clone();
+                let (result, polls, remaining) = lane
+                    .execute(&ctx, &cx, move |worker_ctx| {
+                        // Tighten AFTER pool admission so the case measures
+                        // application polling rather than spawn bookkeeping.
+                        let bounded = worker_ctx.clone().with_budget_ceiling(
+                            asupersync::Budget::new().with_poll_quota(quota),
+                        );
+                        let mut polls = 0;
+                        let result = admitted.wait_for(poll_fn(|task| {
+                            polls += 1;
+                            if polls < needed {
+                                task.waker().wake_by_ref();
+                                Poll::Pending
+                            } else {
+                                Poll::Ready(Ok(41))
+                            }
+                        }));
+                        Ok((result, polls, bounded.budget().poll_quota))
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(polls, expected_polls, "quota={quota}, needed={needed}");
+                assert_eq!(remaining, quota - expected_polls);
+                assert_eq!(ctx.budget().poll_quota, remaining);
+                if succeeds {
+                    assert_eq!(result.unwrap(), 41);
+                } else {
+                    assert_eq!(
+                        result.unwrap_err().code,
+                        fastmcp_core::McpErrorCode::RequestCancelled
+                    );
+                }
+                assert!(!cx.is_cancel_requested());
+                assert_eq!(lane.in_flight().unwrap(), 0);
+                let sibling = cleanup_context(&cx);
+                assert_eq!(lane.execute(&sibling, &cx, |_| Ok(42)).await.unwrap(), 42);
+            }
+        });
+    }
+
+    #[test]
+    fn sequential_waits_cannot_replenish_the_shared_request_poll_budget() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let ctx = cleanup_context(&cx);
+            let lane = BlockingHandlerLane::new(1).unwrap();
+            let admitted = lane.clone();
+            let values = lane
+                .execute(&ctx, &cx, move |worker_ctx| {
+                    let bounded = worker_ctx.clone().with_budget_ceiling(
+                        asupersync::Budget::new().with_poll_quota(2),
+                    );
+                    let first = admitted.wait_for(async { Ok(11) })?;
+                    assert_eq!(bounded.budget().poll_quota, 1);
+                    let second = admitted.wait_for(async { Ok(31) })?;
+                    assert_eq!(bounded.budget().poll_quota, 0);
+                    let mut forbidden_polls = 0;
+                    let error = admitted
+                        .wait_for(async {
+                            forbidden_polls += 1;
+                            Ok(99)
+                        })
+                        .unwrap_err();
+                    assert_eq!(error.code, fastmcp_core::McpErrorCode::RequestCancelled);
+                    assert_eq!(forbidden_polls, 0);
+                    Ok(first + second)
+                })
+                .await
+                .unwrap();
+            assert_eq!(values, 42);
+            assert_eq!(ctx.budget().poll_quota, 0);
+            assert!(!cx.is_cancel_requested());
+            assert_eq!(lane.in_flight().unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn poll_exhaustion_drops_the_future_while_the_worker_still_owns_capacity() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let ctx = cleanup_context(&cx);
+            let lane = BlockingHandlerLane::new(1).unwrap();
+            let admitted = lane.clone();
+            let drops = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&drops);
+            lane.execute(&ctx, &cx, move |worker_ctx| {
+                let _bounded = worker_ctx.clone().with_budget_ceiling(
+                    asupersync::Budget::new().with_poll_quota(1),
+                );
+                let guard = DropObserved(Arc::clone(&observed));
+                let mut polls = 0;
+                let error = admitted
+                    .wait_for(async {
+                        let _guard = guard;
+                        poll_fn(|task| {
+                            polls += 1;
+                            if polls == 1 {
+                                task.waker().wake_by_ref();
+                                Poll::Pending
+                            } else {
+                                Poll::Ready(Ok(()))
+                            }
+                        })
+                        .await
+                    })
+                    .unwrap_err();
+                assert_eq!(error.code, fastmcp_core::McpErrorCode::RequestCancelled);
+                assert_eq!(polls, 1);
+                assert_eq!(observed.load(Ordering::SeqCst), 1);
+                assert_eq!(admitted.in_flight().unwrap(), 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(lane.in_flight().unwrap(), 0);
+            assert!(!cx.is_cancel_requested());
         });
     }
 }
