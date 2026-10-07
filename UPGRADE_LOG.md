@@ -1,8 +1,23 @@
 # Dependency Upgrade Log
 
-**Date:** 2026-09-15 | **Project:** fastmcp_rust | **Language:** Rust
+**Date:** 2026-10-07 | **Project:** fastmcp_rust | **Language:** Rust
 
-## Current upgrade run
+## Current upgrade run (v0.12.0 release)
+
+A currency sweep of every exact direct registry pin (root and member
+manifests) against the crates.io API found all of them at latest stable except
+`zeroize`. `asupersync =0.5.0` and `rich_rust =0.2.3` are constellation pins and
+are also the latest published versions.
+
+| Dependency | Current | Target | Status |
+|---|---|---|---|
+| zeroize | 1.9.0 | 1.9.1 | Patch release (2026-10-06). Gated by the v0.12.0 release lanes (workspace clippy and per-crate tests on RCH) |
+| lockfile | - | - | `cargo update` within existing requirements: 80 transitive packages advanced (cc 1.6.0, mio 1.2.4, libc 0.2.190, rustls-webpki 0.103.15, quick-xml 0.42.0, smallvec 1.16.2, icu_* 2.3, futures-* 0.3.34, ...); `base64 0.22.1` dropped out of the graph and `synstructure 0.14.0` entered it |
+
+
+## 2026-09-15 upgrade run
+
+**Date:** 2026-09-15 | **Project:** fastmcp_rust | **Language:** Rust
 
 A fresh currency sweep of all 29 exact direct registry pins (root and member
 manifests) against the crates.io API found 27 already at latest stable and
