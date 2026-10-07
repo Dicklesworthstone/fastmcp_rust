@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
@@ -147,6 +148,42 @@ impl Wake for WakeSignal {
     }
 }
 
+// A cancellation wake or a periodic liveness check does not make application
+// work ready. Keep that distinction even when wake notifications coalesce.
+// Clear readiness BEFORE polling so a wake from inside poll remains pending.
+struct OperationWake {
+    ready: AtomicBool,
+    signal: Arc<WakeSignal>,
+}
+
+impl OperationWake {
+    fn new(signal: Arc<WakeSignal>) -> Self {
+        Self {
+            ready: AtomicBool::new(true),
+            signal,
+        }
+    }
+
+    fn take_ready(&self) -> bool {
+        self.ready.swap(false, Ordering::AcqRel)
+    }
+
+    fn notify(&self) {
+        self.ready.store(true, Ordering::Release);
+        self.signal.notify();
+    }
+}
+
+impl Wake for OperationWake {
+    fn wake(self: Arc<Self>) {
+        self.notify();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.notify();
+    }
+}
+
 impl BlockingHandlerLane {
     /// Waits for one asynchronous operation inside a handler admitted to this
     /// lane. For example, a synchronous tool can call
@@ -163,6 +200,8 @@ impl BlockingHandlerLane {
     /// Each application poll also consumes one checkpoint from the retained,
     /// clone-shared request budget. Exhaustion refuses the next poll, not the
     /// result of the last admitted poll; later waits cannot replenish quota.
+    /// After the first poll, only the operation's own waker makes it ready to
+    /// poll again. Maintenance checks do not spend application poll quota.
     /// Cancellation drops the operation on this worker; the lane remains
     /// charged until the enclosing handler and result custody actually end.
     /// The future's poll and drop implementations must not block. Neither this
@@ -190,28 +229,33 @@ impl BlockingHandlerLane {
         let (_sender, mut receiver) = oneshot::channel::<()>();
         let mut runtime_cancelled = std::pin::pin!(receiver.recv(ctx.cx()));
         let signal = Arc::new(WakeSignal::default());
-        let waker = Waker::from(Arc::clone(&signal));
-        let mut task = Context::from_waker(&waker);
+        let control_waker = Waker::from(Arc::clone(&signal));
+        let mut control_task = Context::from_waker(&control_waker);
+        let operation_wake = Arc::new(OperationWake::new(Arc::clone(&signal)));
+        let operation_waker = Waker::from(Arc::clone(&operation_wake));
+        let mut operation_task = Context::from_waker(&operation_waker);
 
         loop {
             self.verify()?;
             ctx.ensure_live()
                 .map_err(|_| McpError::request_cancelled())?;
-            if request_cancelled.as_mut().poll(&mut task).is_ready()
-                || runtime_cancelled.as_mut().poll(&mut task).is_ready()
+            if request_cancelled.as_mut().poll(&mut control_task).is_ready()
+                || runtime_cancelled.as_mut().poll(&mut control_task).is_ready()
             {
                 return Err(McpError::request_cancelled());
             }
-            // Liveness alone deliberately does not consume poll quota. Admit
-            // this application poll through the request ledger, never through
-            // Cx::checkpoint, which can cancel a clone-shared runtime context.
-            ctx.checkpoint()
-                .map_err(|_| McpError::request_cancelled())?;
-            let result = operation.as_mut().poll(&mut task);
-            ctx.ensure_live()
-                .map_err(|_| McpError::request_cancelled())?;
-            if let Poll::Ready(result) = result {
-                return result;
+            if operation_wake.take_ready() {
+                // Liveness alone deliberately does not consume poll quota.
+                // Admit application work through the request ledger, not
+                // Cx::checkpoint, which can cancel a shared runtime context.
+                ctx.checkpoint()
+                    .map_err(|_| McpError::request_cancelled())?;
+                let result = operation.as_mut().poll(&mut operation_task);
+                ctx.ensure_live()
+                    .map_err(|_| McpError::request_cancelled())?;
+                if let Poll::Ready(result) = result {
+                    return result;
+                }
             }
             // A private condition variable avoids consuming another bridge's
             // thread::park token. Its retained bit also covers wake-before-wait.
@@ -540,9 +584,12 @@ mod tests {
         runtime().block_on(async {
             let cx = Cx::current().unwrap();
             let lane = BlockingHandlerLane::new(1).unwrap();
-            for (quota, needed, expected_polls, succeeds) in
-                [(0, 1, 0, false), (1, 1, 1, true), (1, 2, 1, false), (2, 2, 2, true)]
-            {
+            for (quota, needed, expected_polls, succeeds) in [
+                (0, 1, 0, false),
+                (1, 1, 1, true),
+                (1, 2, 1, false),
+                (2, 2, 2, true),
+            ] {
                 let ctx = cleanup_context(&cx);
                 let admitted = lane.clone();
                 let (result, polls, remaining) = lane
@@ -662,6 +709,114 @@ mod tests {
             assert_eq!(drops.load(Ordering::SeqCst), 1);
             assert_eq!(lane.in_flight().unwrap(), 0);
             assert!(!cx.is_cancel_requested());
+        });
+    }
+
+    #[test]
+    fn control_wakes_do_not_spend_operation_readiness_or_lose_real_wakes() {
+        let signal = Arc::new(WakeSignal::default());
+        let operation = Arc::new(OperationWake::new(Arc::clone(&signal)));
+        let control_waker = Waker::from(Arc::clone(&signal));
+        let operation_waker = Waker::from(Arc::clone(&operation));
+        assert!(operation.take_ready(), "the initial poll is admitted");
+        assert!(!operation.take_ready());
+
+        control_waker.wake_by_ref();
+        signal.wait();
+        assert!(!operation.take_ready(), "control activity is not application work");
+
+        // Several wakes coalesce into one ready poll, including a control wake.
+        operation_waker.wake_by_ref();
+        control_waker.wake_by_ref();
+        operation_waker.wake_by_ref();
+        signal.wait();
+        assert!(operation.take_ready());
+        assert!(!operation.take_ready());
+
+        // Once readiness is taken, a wake from inside poll must survive until
+        // the next iteration rather than being cleared after poll returns.
+        operation_waker.wake_by_ref();
+        assert!(operation.take_ready());
+        operation_waker.clone().wake();
+        signal.wait();
+        assert!(operation.take_ready());
+        assert!(!operation.take_ready());
+    }
+
+    #[test]
+    fn idle_maintenance_preserves_poll_quota_and_tightening_precedes_woken_work() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let lane = BlockingHandlerLane::new(1).unwrap();
+            for tighten_before_wake in [false, true] {
+                let ctx = cleanup_context(&cx);
+                let admitted = lane.clone();
+                let polls = Arc::new(AtomicUsize::new(0));
+                let observed_polls = Arc::clone(&polls);
+                let drops = Arc::new(AtomicUsize::new(0));
+                let observed_drops = Arc::clone(&drops);
+                let released = Arc::new(AtomicBool::new(false));
+                let worker_released = Arc::clone(&released);
+                let (started, mut entered) = oneshot::channel::<Waker>();
+                let mut call = Box::pin(lane.execute(&ctx, &cx, move |worker_ctx| {
+                    let _bounded = worker_ctx.clone().with_budget_ceiling(
+                        asupersync::Budget::new().with_poll_quota(2),
+                    );
+                    let guard = DropObserved(observed_drops);
+                    let mut started = Some(started);
+                    admitted.wait_for(async {
+                        let _guard = guard;
+                        poll_fn(|task| {
+                            observed_polls.fetch_add(1, Ordering::SeqCst);
+                            if let Some(started) = started.take() {
+                                started.send_blocking(task.waker().clone()).unwrap();
+                            }
+                            if worker_released.load(Ordering::Acquire) {
+                                Poll::Ready(Ok(41))
+                            } else {
+                                Poll::Pending
+                            }
+                        })
+                        .await
+                    })
+                }));
+                poll_fn(|task| {
+                    assert!(call.as_mut().poll(task).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                let operation_waker = entered.recv(&cx).await.unwrap();
+                // The handshake, not a sleep, establishes the first poll.
+                // Leave the operation asleep across several maintenance ticks.
+                Sleep::new(cx.now().saturating_add_nanos(100_000_000)).await;
+                assert_eq!(polls.load(Ordering::SeqCst), 1);
+                assert_eq!(ctx.budget().poll_quota, 1);
+                assert_eq!(drops.load(Ordering::SeqCst), 0);
+                if tighten_before_wake {
+                    let _tightened = ctx.clone().with_budget_ceiling(
+                        asupersync::Budget::new().with_poll_quota(0),
+                    );
+                }
+                released.store(true, Ordering::Release);
+                operation_waker.wake();
+                let result = call.await;
+                if tighten_before_wake {
+                    assert_eq!(
+                        result.unwrap_err().code,
+                        fastmcp_core::McpErrorCode::RequestCancelled
+                    );
+                    assert_eq!(polls.load(Ordering::SeqCst), 1);
+                } else {
+                    assert_eq!(result.unwrap(), 41);
+                    assert_eq!(polls.load(Ordering::SeqCst), 2);
+                }
+                let sibling = cleanup_context(&cx);
+                lane.wait_idle(&sibling).await.unwrap();
+                assert_eq!(drops.load(Ordering::SeqCst), 1);
+                assert_eq!(lane.in_flight().unwrap(), 0);
+                assert!(!cx.is_cancel_requested());
+                assert_eq!(lane.execute(&sibling, &cx, |_| Ok(42)).await.unwrap(), 42);
+            }
         });
     }
 }
