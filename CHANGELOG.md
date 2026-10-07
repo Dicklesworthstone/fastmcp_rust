@@ -9,7 +9,7 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 ## [v0.12.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.12.0) -- 2026-10-07 (GitHub Release)
 
 154 commits since v0.11.0. Pre-1.0 minor release: new native pipe/stdio and
-OAuth surfaces, plus one source-incompatible client change (below).
+OAuth surfaces, plus source-incompatible fastmcp-client changes (below).
 
 ### Breaking changes (fastmcp-client, re-exported by fastmcp-rust)
 
