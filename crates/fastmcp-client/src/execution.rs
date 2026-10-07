@@ -852,6 +852,11 @@ impl OpaquePagination {
 #[derive(Debug)]
 struct PendingExecution {
     record: PendingRequestRecord,
+    /// The execution's originating lifetime, not whichever sibling or
+    /// connection driver happens to service the shared transport next.
+    /// Retain the real context so its clock, masks and cancellation state
+    /// cannot be replaced by a later observer's more permissive context.
+    caller: Cx,
     owner_dropped: OwnerDropped,
     timeout_policy: ExecutionTimeoutPolicy,
     /// Canonical identity of the optional marker advertised in `_meta`.
@@ -1313,22 +1318,47 @@ impl<T> ExecutorState<T> {
         let pending = std::mem::take(&mut self.pending);
         for (_, pending) in pending {
             let request_id = pending.record.request_id.clone();
+            // A connection-owned reader may report failure without another
+            // ordinary service turn. Do not let that path replace a stopped
+            // origin's local cancellation with its live sibling's I/O error.
+            // Observe the retained origin's clock and mask, not an ambient Cx.
+            let caller_stopped = pending.caller.checkpoint().is_err();
+            let (terminal_state, terminal_reason, outcome_error) = if caller_stopped {
+                (
+                    ExecutionTerminalState::Cancelled,
+                    ExecutionTerminalReason::CallerCancelled,
+                    McpError::request_cancelled(),
+                )
+            } else {
+                (ExecutionTerminalState::Failed, reason, error.clone())
+            };
             self.stream_notifications
                 .remove(&(request_id.clone(), pending.record.execution_generation));
             self.retain_terminal(
                 (request_id.clone(), pending.record.execution_generation),
                 ExecutionTerminalRecord {
-                    terminal_state: ExecutionTerminalState::Failed,
-                    terminal_reason: reason,
+                    terminal_state,
+                    terminal_reason,
                     final_delivered: false,
-                    cancellation_committed: false,
+                    cancellation_committed: caller_stopped,
                     cancellation_transport_attempts: 0,
-                    local_cancellation_event: false,
+                    local_cancellation_event: caller_stopped,
                     waiter_release: true,
+                    // The connection is terminal: neither late-frame
+                    // correlation nor a deferred control may survive it.
                     tombstone: false,
                 },
-                ExecutionOutcome::Failure(error.clone()),
+                ExecutionOutcome::Failure(outcome_error),
             );
+            if caller_stopped {
+                if self.cancellation_events.len() >= MAX_RETAINED_PEER_ACTIVITY {
+                    let _ = self.cancellation_events.pop_front();
+                }
+                self.cancellation_events.push_back(CancellationRequested {
+                    request_id,
+                    reason: ExecutionTerminalReason::CallerCancelled,
+                });
+            }
         }
     }
 }
@@ -1537,6 +1567,11 @@ where
     ///
     /// `request` must be a JSON-RPC request with an ID. Notifications have no
     /// final result slot and are intentionally rejected by this surface.
+    /// The originating `cx` remains binding until the terminal election.
+    /// Service turns observe its cancellation and budget exhaustion even when
+    /// driven through another caller or a cloned executor. This synchronous
+    /// API installs no background observer and cannot preempt a blocking
+    /// transport read; callers must continue servicing the executor.
     pub fn execute(&self, cx: &Cx, request: Request) -> McpResult<RequestExecution<T>> {
         self.execute_with_timeout_policy(cx, request, RequestTimeoutPolicy::default())
     }
@@ -1607,6 +1642,10 @@ where
 
         let mut state = self.state.borrow_mut();
         self.drain_abandoned_locked(cx, &mut state)?;
+        // Retire stopped request owners before a live sibling sends new
+        // application work. Its fresh Cx is transport authority, not a way
+        // to extend another execution's original lifetime.
+        self.expire_timeouts_locked(cx, &mut state, Instant::now())?;
         // Servicing a deferred control can exhaust this caller's remaining
         // budget. Do not admit another application write after that local
         // stop, even when a custom transport omits its own checkpoint.
@@ -1700,6 +1739,7 @@ where
         state.pending.insert(
             correlation_key.clone(),
             PendingExecution {
+                caller: cx.clone(),
                 record: PendingRequestRecord {
                     correlation_key,
                     request_id: request_id.clone(),
@@ -2630,6 +2670,10 @@ where
 
     /// Expires committed request deadlines at a runtime-supplied monotonic instant.
     ///
+    /// Also observes each pending execution's original caller, using that
+    /// context's own clock and cancellation-mask semantics. `cx` authorizes
+    /// only this service turn's transport effects; it never replaces a
+    /// request's originating lifetime or revives an elected terminal.
     /// The connection owner may also use this non-reading service turn with a
     /// live context to flush controls queued by dropped or cancelled request
     /// owners. A stopped context preserves those controls for later service.
@@ -3439,7 +3483,12 @@ where
             .pending
             .values()
             .filter_map(|pending| {
-                let reason = if observed_at >= pending.record.absolute_deadline {
+                // A frame may be driven by a sibling or by connection-owned
+                // ingress. Always reconcile the original caller before that
+                // frame can extend progress or win this request's terminal.
+                let reason = if pending.caller.checkpoint().is_err() {
+                    Some(ExecutionTerminalReason::CallerCancelled)
+                } else if observed_at >= pending.record.absolute_deadline {
                     Some(ExecutionTerminalReason::AbsoluteTimeout)
                 } else if observed_at >= pending.record.idle_deadline {
                     Some(ExecutionTerminalReason::IdleTimeout)
@@ -3450,9 +3499,10 @@ where
             })
             .collect::<Vec<_>>();
         let mut controls = Vec::with_capacity(expired.len());
-        // Every timeout observed in this pass wins its local terminal before
-        // any fallible I/O. HashMap iteration order must not turn a sibling's
-        // already-expired deadline into connection loss on the first failure.
+        // Every observed caller stop or timeout wins its local terminal
+        // before any fallible I/O. HashMap iteration order must not turn a
+        // sibling's already-stopped lifetime into connection loss on the
+        // first failed control write.
         for (request_id, reason) in expired {
             if let Some(control) =
                 self.select_pending_cancellation_locked(state, &request_id, reason, true)?
@@ -3997,6 +4047,454 @@ mod tests {
     use super::*;
     use fastmcp_protocol::ExactJsonValue;
     use fastmcp_transport::CodecError;
+
+    mod originating_caller {
+        use super::*;
+
+        fn executor(era: ProtocolEra) -> RequestExecutor<ScriptedTransport> {
+            RequestExecutor::with_protocol_era(ScriptedTransport::new([]), era)
+        }
+
+        fn call(id: i64) -> Request {
+            JsonRpcRequest::new(
+                TOOLS_CALL,
+                Some(serde_json::json!({
+                    "name": "caller_probe", "arguments": {},
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": fastmcp_protocol::FINAL_PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                })),
+                id,
+            )
+        }
+
+        fn final_response(id: i64) -> JsonRpcResponse {
+            JsonRpcResponse::success(
+                RequestId::Number(id),
+                serde_json::json!({
+                    "resultType": "complete",
+                    "content": [{"type": "text", "text": "survived"}],
+                    "isError": false,
+                }),
+            )
+        }
+
+        fn frame(response: JsonRpcResponse) -> ReceivedTransportFrame {
+            ReceivedTransportFrame::admit(serde_json::to_vec(&response).unwrap()).unwrap()
+        }
+
+        fn cancellation_ids(executor: &RequestExecutor<ScriptedTransport>) -> Vec<RequestId> {
+            executor.state.borrow().transport.sent.iter().filter_map(|message| {
+                let JsonRpcMessage::Request(request) = message else {
+                    return None;
+                };
+                if request.method != "notifications/cancelled" {
+                    return None;
+                }
+                assert!(request.id.is_none());
+                Some(serde_json::from_value(request.params.as_ref().unwrap()["requestId"].clone()).unwrap())
+            }).collect()
+        }
+
+        #[test]
+        fn fresh_ingress_driver_cannot_override_a_cancelled_origin() {
+            for era in [ProtocolEra::Legacy2024, ProtocolEra::Modern2026] {
+                for raw_result_route in [false, true] {
+                    let executor = executor(era);
+                    let originating = Cx::for_testing();
+                    let live = Cx::for_testing();
+                    let mut cancelled = executor.execute(&originating, call(1)).unwrap();
+                    let mut sibling = executor.execute(&live, call(2)).unwrap();
+                    originating.set_cancel_requested(true);
+                    let driver = executor.clone();
+                    // Use both external ingress surfaces. Neither is passed
+                    // the stopped context, and no explicit cancel() is called.
+                    if raw_result_route {
+                        driver.route_response_with_raw_result(&live, final_response(1), None).unwrap();
+                        driver.route_response_with_raw_result(&live, final_response(2), None).unwrap();
+                    } else {
+                        driver.drive_frame(&live, frame(final_response(1))).unwrap();
+                        driver.drive_frame(&live, frame(final_response(2))).unwrap();+                    }
+                    assert_eq!(executor.try_take_response(&mut cancelled).unwrap_err().code,
+                        McpErrorCode::RequestCancelled);
+                    assert_eq!(executor.try_take_response(&mut sibling).unwrap(), Some(final_response(2)));
+                    assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(1)]);
+                    assert!(executor.take_uncorrelated_responses().is_empty(), "late cancelled final escaped its tombstone");
+                    assert!(executor.terminal_error().is_none());
+                    assert!(live.checkpoint().is_ok());
+                }
+            }
+        }
+
+        #[test]
+        fn fresh_waiter_observes_origin_cancellation_without_another_peer_read() {
+            let executor = RequestExecutor::new(ScriptedTransport::new([
+                Ok(JsonRpcMessage::Response(final_response(11))),
+            ]));
+            let originating = Cx::for_testing();
+            let live = Cx::for_testing();
+            let mut execution = executor.execute(&originating, call(11)).unwrap();
+            originating.set_cancel_requested(true);
+            assert_eq!(executor.clone().wait(&live, &mut execution).unwrap_err().code,
+                McpErrorCode::RequestCancelled);
+            // A returned cancellation alone would not prove pre-read refusal.
+            assert_eq!(executor.state.borrow().transport.received.len(), 1);
+            assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(11)]);
+        }
+
+        #[derive(Debug)]
+        struct CancelDuringReceive {
+            inner: ScriptedTransport,
+            originating: Cx,
+        }
+
+        impl Transport for CancelDuringReceive {
+            fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+                self.inner.send(cx, message)
+            }
+            fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+                self.originating.set_cancel_requested(true);
+                self.inner.recv(cx)
+            }
+            fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+                self.inner.close(cx)
+            }
+        }
+
+        #[test]
+        fn origin_cancellation_during_receive_preserves_the_sibling_frame() {
+            let originating = Cx::for_testing();
+            let live = Cx::for_testing();
+            let executor = RequestExecutor::new(CancelDuringReceive {
+                inner: ScriptedTransport::new([Ok(JsonRpcMessage::Response(final_response(22)))]),
+                originating: originating.clone(),
+            });
+            let mut cancelled = executor.execute(&originating, call(21)).unwrap();
+            let mut sibling = executor.execute(&live, call(22)).unwrap();
+            assert!(originating.checkpoint().is_ok());
+            executor.drive(&live).unwrap();
+            assert_eq!(executor.try_take_response(&mut cancelled).unwrap_err().code,
+                McpErrorCode::RequestCancelled);
+            assert_eq!(executor.try_take_response(&mut sibling).unwrap(), Some(final_response(22)));
+            assert!(executor.terminal_error().is_none());
+            assert!(live.checkpoint().is_ok());
+        }
+
+        #[test]
+        fn originating_deadline_uses_its_own_clock_not_the_service_callers_budget() {
+            use asupersync::runtime::RuntimeBuilder;
+            use asupersync::time::{TimerDriverHandle, VirtualClock};
+            use asupersync::{Budget, Time};
+
+            let clock = Arc::new(VirtualClock::new());
+            let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(timer)
+                .build().unwrap();
+            let originating = runtime.request_cx_with_budget(
+                Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
+            );
+            let live = Cx::for_testing();
+            let executor = executor(ProtocolEra::Modern2026);
+            let mut execution = executor.execute(&originating, call(31)).unwrap();
+            let observed_at = Instant::now();
+            clock.advance(9_999_999);
+            executor.poll_timeouts_at(&live, observed_at).unwrap();
+            assert_eq!(executor.pending_records().len(), 1);
+            assert!(cancellation_ids(&executor).is_empty());
+            clock.advance(1);
+            executor.poll_timeouts_at(&live, observed_at).unwrap();
+            // Neither response-wait timeout nor the live service caller's
+            // budget changed; only the origin's virtual deadline elapsed.
+            assert!(executor.pending_records().is_empty());
+            assert_eq!(executor.try_take_response(&mut execution).unwrap_err().code,
+                McpErrorCode::RequestCancelled);
+            assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(31)]);
+            assert!(live.checkpoint().is_ok());
+            drop(execution);
+            drop(executor);
+            drop(originating);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn final_response_elected_before_origin_cancellation_stays_final() {
+            let executor = executor(ProtocolEra::Modern2026);
+            let originating = Cx::for_testing();
+            let live = Cx::for_testing();
+            let mut execution = executor.execute(&originating, call(41)).unwrap();
+            executor.drive_frame(&live, frame(final_response(41))).unwrap();
+            originating.set_cancel_requested(true);
+            executor.poll_timeouts_at(&live, Instant::now()).unwrap();
+            assert_eq!(executor.try_take_response(&mut execution).unwrap(), Some(final_response(41)));
+            assert!(cancellation_ids(&executor).is_empty());
+            assert!(executor.take_cancellation_events().is_empty());
+        }
+
+        #[test]
+        fn origin_mask_defers_only_its_own_cancellation_until_next_service_turn() {
+            let executor = executor(ProtocolEra::Modern2026);
+            let originating = Cx::for_testing();
+            let live = Cx::for_testing();
+            let mut execution = executor.execute(&originating, call(51)).unwrap();
+            originating.set_cancel_requested(true);
+            originating.masked(|| executor.poll_timeouts_at(&live, Instant::now())).unwrap();
+            assert_eq!(executor.pending_records().len(), 1);
+            assert!(cancellation_ids(&executor).is_empty());
+            executor.poll_timeouts_at(&live, Instant::now()).unwrap();
+            assert_eq!(executor.try_take_response(&mut execution).unwrap_err().code,
+                McpErrorCode::RequestCancelled);
+            assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(51)]);
+        }
+
+        #[test]
+        fn new_execution_services_origin_cancellation_before_application_send() {
+            let executor = executor(ProtocolEra::Modern2026);
+            let originating = Cx::for_testing();
+            let live = Cx::for_testing();
+            let mut first = executor.execute(&originating, call(61)).unwrap();
+            originating.set_cancel_requested(true);
+            let second = executor.clone().execute(&live, call(62)).unwrap();
+            {
+                let state = executor.state.borrow();
+                let methods = state.transport.sent.iter().map(|message| match message {
+                    JsonRpcMessage::Request(request) => request.method.as_str(),
+                    _ => panic!("client must not send a response here"),
+                }).collect::<Vec<_>>();
+                assert_eq!(methods, [TOOLS_CALL, "notifications/cancelled", TOOLS_CALL]);
+            }
+            assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(61)]);
+            assert_eq!(executor.try_take_response(&mut first).unwrap_err().code,
+                McpErrorCode::RequestCancelled);
+            assert_eq!(executor.pending_records()[0].request_id, *second.request_id());
+        }
+
+        #[test]
+        fn stopped_service_defers_controls_without_deferring_origin_terminals() {
+            let executor = executor(ProtocolEra::Modern2026);
+            let originating = Cx::for_testing();
+            let stopped = Cx::for_testing();
+            let live = Cx::for_testing();
+            let mut execution = executor.execute(&originating, call(71)).unwrap();
+            originating.set_cancel_requested(true);
+            stopped.set_cancel_requested(true);
+            executor.poll_timeouts_at(&stopped, Instant::now()).unwrap();
+            assert!(executor.pending_records().is_empty());
+            assert!(cancellation_ids(&executor).is_empty());
+            assert_eq!(executor.try_take_response(&mut execution).unwrap_err().code,
+                McpErrorCode::RequestCancelled);
+            executor.poll_timeouts_at(&live, Instant::now()).unwrap();
+            executor.poll_timeouts_at(&live, Instant::now()).unwrap();
+            assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(71)]);
+        }
+
+        #[test]
+        fn all_observed_origin_cancellations_win_before_a_control_send_fails() {
+            let executor = executor(ProtocolEra::Modern2026);
+            let originating = Cx::for_testing();
+            let live = Cx::for_testing();
+            let first = executor.execute(&originating, call(81)).unwrap();
+            let second = executor.execute(&originating, call(82)).unwrap();
+            let sibling = executor.execute(&live, call(83)).unwrap();
+            originating.set_cancel_requested(true);
+            executor.state.borrow_mut().transport.send_error = Some(std::io::ErrorKind::BrokenPipe);
+            assert!(executor.poll_timeouts_at(&live, Instant::now()).is_err());
+            let state = executor.state.borrow();
+            for execution in [&first, &second] {
+                let key = (execution.request_id.clone(), execution.generation);
+                assert_eq!(state.terminal_records[&key].terminal_reason,
+                    ExecutionTerminalReason::CallerCancelled);
+            }
+            let key = (sibling.request_id.clone(), sibling.generation);
+            assert_eq!(state.terminal_records[&key].terminal_reason,
+                ExecutionTerminalReason::ConnectionLost);
+        }
+
+        #[test]
+        fn connection_failure_preserves_stopped_origins_without_wire_effects() {
+            for era in [ProtocolEra::Legacy2024, ProtocolEra::Modern2026] {+                let executor = executor(era);
+                let originating = Cx::for_testing();
+                let live = Cx::for_testing();
+                let mut first = executor.execute(&originating, call(101)).unwrap();
+                let mut second = executor.execute(&originating, call(102)).unwrap();
+                let mut sibling = executor.execute(&live, call(103)).unwrap();
+                originating.set_cancel_requested(true);
+                let failure = McpError::internal_error("reader disconnected");
+                // This is the connection-owned reader's actual terminal entry
+                // point. Do not service timeouts/cancellation first: that
+                // would hide the failure fanout's missing origin observation.
+                executor.fail_connection(failure.clone());
+                executor.fail_connection(McpError::internal_error("duplicate failure"));
+                {
+                    let state = executor.state.borrow();
+                    assert_eq!(state.transport.sent.len(), 3);
+                    assert!(state.pending.is_empty());
+                    assert!(state.deferred_cancellations.is_empty());
+                    assert!(state.tombstones.is_empty());
+                    for execution in [&first, &second] {
+                        let record = &state.terminal_records[
+                            &(execution.request_id.clone(), execution.generation)
+                        ];
+                        assert_eq!(record.terminal_state, ExecutionTerminalState::Cancelled);
+                        assert_eq!(record.terminal_reason, ExecutionTerminalReason::CallerCancelled);
+                        assert!(record.cancellation_committed && record.local_cancellation_event);
+                        assert!(record.waiter_release);
+                        assert_eq!(record.cancellation_transport_attempts, 0);
+                        assert!(!record.final_delivered && !record.tombstone);
+                    }
+                    let sibling_record = &state.terminal_records[
+                        &(sibling.request_id.clone(), sibling.generation)
+                    ];
+                    assert_eq!(sibling_record.terminal_state, ExecutionTerminalState::Failed);
+                    assert_eq!(sibling_record.terminal_reason, ExecutionTerminalReason::ConnectionLost);
+                    assert!(!sibling_record.local_cancellation_event);
+                }
+                let events = executor.take_cancellation_events();
+                assert_eq!(events.len(), 2);
+                for id in [101, 102] {
+                    assert!(events.iter().any(|event| {
+                        event.request_id == RequestId::Number(id)
+                            && event.reason == ExecutionTerminalReason::CallerCancelled
+                    }));
+                }
+                assert!(cancellation_ids(&executor).is_empty());
+                assert_eq!(executor.try_take_response(&mut first).unwrap_err().code,
+                    McpErrorCode::RequestCancelled);
+                assert_eq!(executor.try_take_response(&mut second).unwrap_err().code,
+                    McpErrorCode::RequestCancelled);
+                assert_eq!(executor.try_take_response(&mut sibling).unwrap_err().message,
+                    failure.message);
+                // Request-local cancellation must not erase the connection's
+                // real failure or allow another application write through it.
+                assert_eq!(executor.execute(&live, call(104)).unwrap_err().message,
+                    failure.message);
+                assert_eq!(executor.state.borrow().transport.sent.len(), 3);
+                assert!(live.checkpoint().is_ok());
+            }
+        }
+
+        #[test]
+        fn connection_failure_never_rewrites_already_elected_terminals() {
+            let executor = executor(ProtocolEra::Modern2026);
+            let originating = Cx::for_testing();
+            let live = Cx::for_testing();
+            let stopped_service = Cx::for_testing();
+            let mut completed = executor.execute(&originating, call(111)).unwrap();
+            let mut cancelled = executor.execute(&originating, call(112)).unwrap();
+            let mut sibling = executor.execute(&live, call(113)).unwrap();
+            executor.drive_frame(&live, frame(final_response(111))).unwrap();
+            stopped_service.set_cancel_requested(true);
+            executor.cancel(&stopped_service, &mut cancelled).unwrap();
+            let cancellation_key = (cancelled.request_id.clone(), cancelled.generation);
+            let cancellation_record = executor.state.borrow().terminal_records[
+                &cancellation_key
+            ].clone();
+            assert_eq!(executor.state.borrow().deferred_cancellations.len(), 1);
+            originating.set_cancel_requested(true);
+            let failure = McpError::internal_error("terminal transport loss");
+            executor.fail_connection(failure.clone());
+            assert_eq!(executor.state.borrow().terminal_records[&cancellation_key],
+                cancellation_record);
+            assert_eq!(executor.try_take_response(&mut completed).unwrap(),
+                Some(final_response(111)));
+            assert_eq!(executor.try_take_response(&mut cancelled).unwrap_err().code,
+                McpErrorCode::RequestCancelled);
+            assert_eq!(executor.try_take_response(&mut sibling).unwrap_err().message,
+                failure.message);
+            assert!(executor.state.borrow().deferred_cancellations.is_empty());
+            assert_eq!(executor.take_cancellation_events().len(), 1);
+            assert!(cancellation_ids(&executor).is_empty());
+            assert_eq!(executor.state.borrow().transport.sent.len(), 3);
+        }
+
+        #[test]
+        fn connection_failure_respects_origin_mask_but_remains_terminal() {
+            let executor = executor(ProtocolEra::Modern2026);
+            let originating = Cx::for_testing();
+            let mut execution = executor.execute(&originating, call(121)).unwrap();
+            originating.set_cancel_requested(true);
+            let failure = McpError::internal_error("lost while origin was masked");
+            originating.masked(|| executor.fail_connection(failure.clone()));
+            // The mask defers local cancellation, not transport failure.
+            // Unmasking cannot revise the already-elected failure afterward.
+            executor.fail_connection(McpError::internal_error("later observation"));
+            let records = executor.terminal_records();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].terminal_state, ExecutionTerminalState::Failed);
+            assert_eq!(records[0].terminal_reason, ExecutionTerminalReason::ConnectionLost);
+            assert!(!records[0].cancellation_committed);
+            assert_eq!(executor.try_take_response(&mut execution).unwrap_err().message,
+                failure.message);
+            assert!(executor.take_cancellation_events().is_empty());
+            assert!(cancellation_ids(&executor).is_empty());
+        }
+
+        #[test]
+        fn connection_failure_observes_origin_deadline_without_a_service_turn() {
+            use asupersync::runtime::RuntimeBuilder;
+            use asupersync::time::{TimerDriverHandle, VirtualClock};
+            use asupersync::{Budget, Time};
+
+            for elapsed in [9_999_999, 10_000_000] {
+                let clock = Arc::new(VirtualClock::new());
+                let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+                let runtime = RuntimeBuilder::current_thread()
+                    .blocking_threads(0, 0)
+                    .with_timer_driver(timer)
+                    .build().unwrap();
+                let originating = runtime.request_cx_with_budget(
+                    Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
+                );
+                let live = Cx::for_testing();
+                let executor = executor(ProtocolEra::Modern2026);
+                let mut execution = executor.execute(&originating, call(131)).unwrap();
+                let mut sibling = executor.execute(&live, call(132)).unwrap();
+                clock.advance(elapsed);
+                let failure = McpError::internal_error("failure at virtual deadline");
+                executor.fail_connection(failure.clone());
+                let stopped = elapsed == 10_000_000;
+                let error = executor.try_take_response(&mut execution).unwrap_err();
+                assert_eq!(error.code, if stopped {
+                    McpErrorCode::RequestCancelled
+                } else {
+                    failure.code
+                });
+                assert_eq!(executor.try_take_response(&mut sibling).unwrap_err().message,
+                    failure.message);
+                assert_eq!(executor.take_cancellation_events().len(), usize::from(stopped));
+                assert!(cancellation_ids(&executor).is_empty());
+                assert_eq!(executor.state.borrow().transport.sent.len(), 2);
+                drop(execution);
+                drop(sibling);
+                drop(executor);
+                drop(originating);
+                assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+            }
+        }
+
+        #[test]
+        fn cancelled_initialize_owner_never_emits_forbidden_wire_cancellation() {
+            let executor = executor(ProtocolEra::Legacy2024);
+            let originating = Cx::for_testing();
+            let live = Cx::for_testing();
+            let mut execution = executor.execute(&originating, JsonRpcRequest::new(
+                INITIALIZE,
+                Some(serde_json::json!({
+                    "protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "origin", "version": "1"},
+                })),
+                91_i64,
+            )).unwrap();
+            originating.set_cancel_requested(true);
+            executor.poll_timeouts_at(&live, Instant::now()).unwrap();
+            assert_eq!(executor.try_take_response(&mut execution).unwrap_err().code,
+                McpErrorCode::RequestCancelled);
+            assert!(cancellation_ids(&executor).is_empty());
+            assert_eq!(executor.state.borrow().transport.sent.len(), 1);
+        }
+    }
 
     #[derive(Debug)]
     struct ScriptedTransport {
@@ -4944,7 +5442,7 @@ mod tests {
             let connection_cx = Cx::for_testing();
             let executor = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
             let mut execution = executor.execute(&cx, request(41)).unwrap();
-            let mut sibling = executor.execute(&cx, request(42)).unwrap();
+            let mut sibling = executor.execute(&connection_cx, request(42)).unwrap();
             executor.state.borrow_mut().transport.send_error = Some(std::io::ErrorKind::BrokenPipe);
             if caller_cancelled {
                 cx.set_cancel_requested(true);
