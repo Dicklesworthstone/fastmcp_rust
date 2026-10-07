@@ -12375,9 +12375,28 @@ mod portable_install {
     }
 
     /// Reads a regular file of at most `max` bytes; `None` when absent. A
-    /// larger file is refused rather than truncated.
+    /// larger file is refused rather than truncated. A symbolic link is
+    /// refused, as on Linux: replacing it by rename would turn a managed link
+    /// (dotfiles, for example) into a detached regular file.
     pub(super) fn read_bounded(path: &Path, max: usize) -> McpResult<Option<Vec<u8>>> {
+        use std::os::unix::fs::MetadataExt as _;
+
         let display = sanitize_config_path(path);
+        let linked = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(McpError::internal_error(format!(
+                    "Failed to inspect installation config at {display} (I/O kind: {:?})",
+                    error.kind()
+                )));
+            }
+        };
+        if linked.file_type().is_symlink() {
+            return Err(McpError::invalid_params(format!(
+                "Installation config at {display} is a symbolic link; symbolic links are not accepted. Pass the link's target path instead"
+            )));
+        }
         let file = match File::open(path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -12388,18 +12407,22 @@ mod portable_install {
                 )));
             }
         };
-        let is_file = file
-            .metadata()
-            .map(|metadata| metadata.is_file())
-            .map_err(|error| {
-                McpError::internal_error(format!(
-                    "Failed to inspect installation config at {display} (I/O kind: {:?})",
-                    error.kind()
-                ))
-            })?;
-        if !is_file {
+        let opened = file.metadata().map_err(|error| {
+            McpError::internal_error(format!(
+                "Failed to inspect installation config at {display} (I/O kind: {:?})",
+                error.kind()
+            ))
+        })?;
+        if !opened.is_file() {
             return Err(McpError::invalid_params(format!(
                 "Installation config at {display} is not a regular file"
+            )));
+        }
+        // The path checked above must be the file that was opened; a swap to
+        // a symbolic link in between opens a different inode.
+        if (opened.dev(), opened.ino()) != (linked.dev(), linked.ino()) {
+            return Err(McpError::invalid_params(format!(
+                "Installation config at {display} was replaced while it was being opened; nothing was written. Retry the command."
             )));
         }
         let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
@@ -12438,6 +12461,18 @@ mod portable_install {
         path: &Path,
         original: Option<&[u8]>,
         contents: &[u8],
+    ) -> McpResult<Publication> {
+        publish_staged_then(path, original, contents, || {})
+    }
+
+    /// [`publish`], with `after_stage` run once the new content is staged and
+    /// before the final unchanged-check (a test seam for edits racing that
+    /// window).
+    fn publish_staged_then(
+        path: &Path,
+        original: Option<&[u8]>,
+        contents: &[u8],
+        after_stage: impl FnOnce(),
     ) -> McpResult<Publication> {
         let display = sanitize_config_path(path);
         let io_error = |action: &str, error: &io::Error| {
@@ -12498,16 +12533,32 @@ mod portable_install {
         };
 
         let stage = sibling(".fastmcp-stage.");
-        if let Err(error) = write_staged(&stage, mode, contents) {
+        // Until the rename succeeds nothing was published, so a failure also
+        // removes this call's backup link; the original file is untouched.
+        let abandon = |publication: &Publication| {
             let _ = fs::remove_file(&stage);
+            if let Some(backup) = &publication.backup {
+                let _ = fs::remove_file(backup);
+            }
+        };
+        if let Err(error) = write_staged(&stage, mode, contents) {
+            abandon(&publication);
             return Err(io_error("stage the new config", &error));
         }
-        if read_bounded(path, CONFIG_INPUT_MAX_BYTES)?.as_deref() != original {
-            let _ = fs::remove_file(&stage);
-            return Err(refuse_changed());
+        after_stage();
+        match read_bounded(path, CONFIG_INPUT_MAX_BYTES) {
+            Ok(current) if current.as_deref() == original => {}
+            Ok(_) => {
+                abandon(&publication);
+                return Err(refuse_changed());
+            }
+            Err(error) => {
+                abandon(&publication);
+                return Err(error);
+            }
         }
         if let Err(error) = fs::rename(&stage, path) {
-            let _ = fs::remove_file(&stage);
+            abandon(&publication);
             return Err(io_error("publish the new config", &error));
         }
         File::open(parent)
@@ -12626,6 +12677,62 @@ mod portable_install {
             assert!(
                 read_bounded(&directory, 5).is_err(),
                 "a directory is refused"
+            );
+            fs::remove_dir_all(&directory).expect("remove scratch directory");
+        }
+
+        #[test]
+        fn a_symlinked_config_is_refused_and_the_link_is_kept() {
+            let directory = scratch("symlink");
+            let target = directory.join("managed.json");
+            let path = directory.join("config.json");
+            fs::write(&target, b"old").expect("seed target");
+            std::os::unix::fs::symlink(&target, &path).expect("link config to target");
+
+            let read = read_bounded(&path, 64).expect_err("a symbolic link is refused");
+            assert_eq!(read.code, McpErrorCode::InvalidParams);
+            let published =
+                publish(&path, Some(b"old"), b"new").expect_err("a symbolic link is not replaced");
+            assert_eq!(published.code, McpErrorCode::InvalidParams);
+
+            assert!(
+                fs::symlink_metadata(&path)
+                    .expect("link metadata")
+                    .file_type()
+                    .is_symlink(),
+                "the managed link is still a link"
+            );
+            assert_eq!(fs::read(&target).expect("read target"), b"old");
+            assert_eq!(
+                fs::read_dir(&directory).expect("list").count(),
+                2,
+                "no backup or staging file was created"
+            );
+            fs::remove_dir_all(&directory).expect("remove scratch directory");
+        }
+
+        #[test]
+        fn an_edit_after_staging_is_refused_without_leaving_a_backup() {
+            let directory = scratch("late-edit");
+            let path = directory.join("config.json");
+            fs::write(&path, b"what-we-read").expect("seed");
+
+            let error = publish_staged_then(&path, Some(b"what-we-read"), b"new", || {
+                fs::write(&path, b"edited-elsewhere").expect("concurrent edit");
+            })
+            .expect_err("an edit racing the publication must be refused");
+
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert_eq!(fs::read(&path).expect("read"), b"edited-elsewhere");
+            let names: Vec<_> = fs::read_dir(&directory)
+                .expect("list")
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name())
+                .collect();
+            assert_eq!(
+                names,
+                [std::ffi::OsString::from("config.json")],
+                "the refused publication removed its staging file and its backup link"
             );
             fs::remove_dir_all(&directory).expect("remove scratch directory");
         }
