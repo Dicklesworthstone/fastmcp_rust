@@ -69,6 +69,36 @@ impl std::fmt::Debug for PipeIo {
     }
 }
 
+/// Refuses native pipe I/O while an ambient capability restriction excludes it.
+///
+/// THIS MUST RUN BEFORE `Cx::set_current(Some(cx.clone()))`, and the ordering is
+/// the entire point. `set_current` publishes a frame carrying the supplied cx's
+/// OWN `runtime_mask` (asupersync 0.5.0 cx.rs:824), so republishing a fully
+/// capable caller cx on top of a narrowed ambient view SILENTLY WIDENS it: a
+/// host that wrapped this call in `Cx::push_restriction(CapMask::none())` would
+/// have its restriction laundered away, and the `Cx::current()` lookup that
+/// follows would hand back full I/O authority. `set_current_restricted` does not
+/// help here either -- it intersects the type-level caps with the cx's own
+/// runtime mask, not with the frame currently in force.
+///
+/// Checking the active view first makes admission the INTERSECTION of the
+/// explicitly passed authority and any ambient restriction, which fails closed.
+/// Only the I/O dimension is examined: the ambient view is not the caller's
+/// cancellation or deadline domain, so running the full `admit_context` against
+/// it could refuse for reasons that have nothing to do with authority.
+pub(super) fn admit_ambient_io_restriction() -> io::Result<()> {
+    if let Some(active) = Cx::current() {
+        if !active.capabilities().io {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "native pipe I/O is refused while an ambient restriction excludes \
+                 the I/O capability",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn admit_context(cx: &Cx) -> io::Result<()> {
     io_checkpoint(cx)?;
     if !cx.capabilities().io {
@@ -88,6 +118,7 @@ fn admit_context(cx: &Cx) -> io::Result<()> {
 
 impl PipeIo {
     fn new(cx: &Cx, fd: OwnedFd, writable: bool) -> io::Result<Self> {
+        admit_ambient_io_restriction()?;
         let _caller = Cx::set_current(Some(cx.clone()));
         let caller = Cx::current().ok_or_else(|| io::Error::other("caller context unavailable"))?;
         admit_context(&caller)?;
@@ -136,6 +167,9 @@ impl PipeIo {
         task: &mut Context<'_>,
         operation: impl FnOnce(&File) -> io::Result<T>,
     ) -> Poll<io::Result<T>> {
+        if let Err(error) = admit_ambient_io_restriction() {
+            return Poll::Ready(Err(error));
+        }
         let _caller = Cx::set_current(Some(self.cx.clone()));
         let admission = (|| {
             let caller = Cx::current()

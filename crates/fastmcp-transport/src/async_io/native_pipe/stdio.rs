@@ -118,6 +118,11 @@ impl Drop for ProcessStreamLease {
 }
 
 fn claim(cx: &Cx, source: &impl AsFd, writable: bool, state: Arc<AtomicU8>) -> io::Result<PipeIo> {
+    // Before any republish, and before the lease is reserved or a descriptor
+    // flag is touched: an ambient restriction must refuse the claim outright.
+    // See `admit_ambient_io_restriction` for why the republish below would
+    // otherwise widen a narrowed ambient view back out.
+    super::admit_ambient_io_restriction()?;
     let _caller = Cx::set_current(Some(cx.clone()));
     let caller = Cx::current().ok_or_else(|| io::Error::other("caller context unavailable"))?;
     admit_context(&caller)?;
