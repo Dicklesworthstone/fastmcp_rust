@@ -126,7 +126,8 @@ impl AsyncRead for ObservedReader {
         let before = output.filled().len();
         let had_capacity = output.remaining() > 0;
         let result = Pin::new(&mut this.pipe).poll_read(task, output);
-        if had_capacity && matches!(result, Poll::Ready(Ok(()))) && output.filled().len() == before {
+        if had_capacity && matches!(result, Poll::Ready(Ok(()))) && output.filled().len() == before
+        {
             this.probe.input_eof.store(true, Ordering::Release);
             this.probe.changed.notify_waiters();
         }
@@ -207,7 +208,10 @@ impl Peer {
             .await
             .unwrap();
             if count == 0 {
-                assert!(self.buffered.is_empty(), "server closed after a partial frame");
+                assert!(
+                    self.buffered.is_empty(),
+                    "server closed after a partial frame"
+                );
                 return None;
             }
             assert!(self.buffered.len() + count <= 2 * 1024 * 1024);
@@ -240,10 +244,14 @@ fn request(id: i64, method: &str, mut params: serde_json::Value) -> JsonRpcMessa
 }
 
 fn call(id: i64, hold: bool, value: &str, repeat: usize) -> JsonRpcMessage {
-    request(id, "tools/call", serde_json::json!({
-        "name": "pipe_probe",
-        "arguments": {"hold": hold, "value": value, "repeat": repeat},
-    }))
+    request(
+        id,
+        "tools/call",
+        serde_json::json!({
+            "name": "pipe_probe",
+            "arguments": {"hold": hold, "value": value, "repeat": repeat},
+        }),
+    )
 }
 
 fn cancel(id: i64) -> JsonRpcMessage {
@@ -270,14 +278,27 @@ fn connect(cx: &Cx, probe: &Arc<Probe>) -> (Peer, TaskHandle<McpResult<()>>) {
             shutdown.shutdown.store(true, Ordering::Release);
         })
         .build();
-    let reader = ObservedReader { pipe: server_input, probe: Arc::clone(probe) };
-    let writer = ObservedWriter { pipe: server_output, probe: Arc::clone(probe) };
+    let reader = ObservedReader {
+        pipe: server_input,
+        probe: Arc::clone(probe),
+    };
+    let writer = ObservedWriter {
+        pipe: server_output,
+        probe: Arc::clone(probe),
+    };
     let serving = cx
-        .spawn(move |server_cx| async move {
-            server.serve_stdio_io(&server_cx, reader, writer).await
-        })
+        .spawn(
+            move |server_cx| async move { server.serve_stdio_io(&server_cx, reader, writer).await },
+        )
         .unwrap();
-    (Peer { input: peer_input, output: peer_output, buffered: Vec::new() }, serving)
+    (
+        Peer {
+            input: peer_input,
+            output: peer_output,
+            buffered: Vec::new(),
+        },
+        serving,
+    )
 }
 
 fn run<F, Fut>(test: F)
@@ -302,7 +323,10 @@ where
 
 async fn stop(cx: &Cx, mut peer: Peer, mut serving: TaskHandle<McpResult<()>>, probe: &Probe) {
     peer.half_close().await;
-    assert!(peer.receive().await.is_none(), "unexpected late response during drain");
+    assert!(
+        peer.receive().await.is_none(),
+        "unexpected late response during drain"
+    );
     serving.join(cx).await.unwrap().unwrap();
     assert!(probe.shutdown.load(Ordering::Acquire));
 }
@@ -312,10 +336,14 @@ fn real_pipe_server_multiplexes_pending_and_ready_requests_without_blocking_work
     run(|cx| async move {
         let probe = Arc::new(Probe::default());
         let (mut peer, serving) = connect(&cx, &probe);
-        peer.send(&request(1, "server/discover", serde_json::json!({}))).await;
+        peer.send(&request(1, "server/discover", serde_json::json!({})))
+            .await;
         peer.response(1).await;
         peer.send(&call(2, true, "slow", 1)).await;
-        probe.changed.wait_until(|| probe.started.load(Ordering::Acquire) == 1).await;
+        probe
+            .changed
+            .wait_until(|| probe.started.load(Ordering::Acquire) == 1)
+            .await;
         peer.send(&call(3, false, "fast", 1)).await;
         let fast = peer.response(3).await.result.unwrap();
         assert_eq!(fast["content"][0]["text"], "fast");
@@ -337,20 +365,29 @@ fn real_pipe_server_cancellation_targets_only_the_matching_pending_request() {
             let probe = Arc::new(Probe::default());
             let (mut peer, serving) = connect(&cx, &probe);
             peer.send(&call(10, true, "held", 1)).await;
-            probe.changed.wait_until(|| probe.started.load(Ordering::Acquire) == 1).await;
+            probe
+                .changed
+                .wait_until(|| probe.started.load(Ordering::Acquire) == 1)
+                .await;
             // Positive and negative differ only in this wire cancellation ID.
             peer.send(&cancel(if matching { 10 } else { 999 })).await;
             peer.send(&call(11, false, "sibling", 1)).await;
             peer.response(11).await;
             if matching {
-                probe.changed.wait_until(|| probe.dropped.load(Ordering::Acquire) == 2).await;
+                probe
+                    .changed
+                    .wait_until(|| probe.dropped.load(Ordering::Acquire) == 2)
+                    .await;
             } else {
                 assert_eq!(probe.dropped.load(Ordering::Acquire), 1);
             }
             probe.released.store(true, Ordering::Release);
             probe.changed.notify_waiters();
             if !matching {
-                assert_eq!(peer.response(10).await.result.unwrap()["content"][0]["text"], "held");
+                assert_eq!(
+                    peer.response(10).await.result.unwrap()["content"][0]["text"],
+                    "held"
+                );
             }
             // For the matching ID, both the next-response check above and
             // the EOF check below reject a leaked cancelled result.
@@ -366,9 +403,15 @@ fn real_pipe_server_drains_a_result_created_after_observed_input_eof() {
         let probe = Arc::new(Probe::default());
         let (mut peer, mut serving) = connect(&cx, &probe);
         peer.send(&call(20, true, "after-half-close", 1)).await;
-        probe.changed.wait_until(|| probe.started.load(Ordering::Acquire) == 1).await;
+        probe
+            .changed
+            .wait_until(|| probe.started.load(Ordering::Acquire) == 1)
+            .await;
         peer.half_close().await;
-        probe.changed.wait_until(|| probe.input_eof.load(Ordering::Acquire)).await;
+        probe
+            .changed
+            .wait_until(|| probe.input_eof.load(Ordering::Acquire))
+            .await;
         assert_eq!(probe.dropped.load(Ordering::Acquire), 0);
         assert!(!probe.shutdown.load(Ordering::Acquire));
         probe.released.store(true, Ordering::Release);
@@ -391,17 +434,32 @@ fn real_pipe_server_routes_cancellation_while_response_output_is_backpressured()
         peer.send(&call(30, false, "abcdefgh", 131072)).await;
         // This barrier observes a real Pending pipe write, not just handler
         // completion or a sleep that hopes output has filled by now.
-        probe.changed.wait_until(|| probe.output_blocked.load(Ordering::Acquire)).await;
+        probe
+            .changed
+            .wait_until(|| probe.output_blocked.load(Ordering::Acquire))
+            .await;
         peer.send(&call(31, true, "cancel-behind-output", 1)).await;
-        probe.changed.wait_until(|| probe.started.load(Ordering::Acquire) == 2).await;
+        probe
+            .changed
+            .wait_until(|| probe.started.load(Ordering::Acquire) == 2)
+            .await;
         peer.send(&cancel(31)).await;
-        probe.changed.wait_until(|| probe.dropped.load(Ordering::Acquire) == 2).await;
+        probe
+            .changed
+            .wait_until(|| probe.dropped.load(Ordering::Acquire) == 2)
+            .await;
         assert!(!probe.shutdown.load(Ordering::Acquire));
         // No response bytes have been drained by the peer until this point.
         let large = peer.response(30).await.result.unwrap();
-        assert_eq!(large["content"][0]["text"].as_str().unwrap(), "abcdefgh".repeat(131072));
+        assert_eq!(
+            large["content"][0]["text"].as_str().unwrap(),
+            "abcdefgh".repeat(131072)
+        );
         peer.send(&call(32, false, "still-live", 1)).await;
-        assert_eq!(peer.response(32).await.result.unwrap()["content"][0]["text"], "still-live");
+        assert_eq!(
+            peer.response(32).await.result.unwrap()["content"][0]["text"],
+            "still-live"
+        );
         stop(&cx, peer, serving, &probe).await;
         assert_eq!(probe.dropped.load(Ordering::Acquire), 3);
     });

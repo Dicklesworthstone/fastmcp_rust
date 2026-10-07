@@ -38,12 +38,17 @@ impl ProcessStreamLease {
     fn reserve(state: Arc<AtomicU8>) -> io::Result<Self> {
         let guard = ProcessGenerationGuard::install()
             .map_err(|_| io::Error::other("native stdio process guard unavailable"))?;
-        guard.verify_current()
+        guard
+            .verify_current()
             .map_err(|_| io::Error::other("native stdio process changed"))?;
-        state.compare_exchange(FREE, HELD, Ordering::AcqRel, Ordering::Acquire)
+        state
+            .compare_exchange(FREE, HELD, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|state| {
                 if state == HELD {
-                    io::Error::new(io::ErrorKind::AlreadyExists, "process stream already has a native owner")
+                    io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "process stream already has a native owner",
+                    )
                 } else {
                     io::Error::other("previous native process-stream cleanup could not be verified")
                 }
@@ -58,9 +63,12 @@ impl ProcessStreamLease {
     }
 
     pub(super) fn verify_io(&self) -> io::Result<()> {
-        self.process.verify()
+        self.process
+            .verify()
             .map_err(|_| io::Error::other("native stdio process changed"))?;
-        let descriptor = self.descriptor.as_ref()
+        let descriptor = self
+            .descriptor
+            .as_ref()
             .ok_or_else(|| io::Error::other("native stdio descriptor custody unavailable"))?;
         let current = fcntl_getfl(descriptor).map_err(io::Error::from)?;
         // An alias clearing NONBLOCK must not send this poll into a blocking
@@ -78,10 +86,15 @@ impl ProcessStreamLease {
     fn restore(&self) -> io::Result<()> {
         // A forked child must not restore flags on the parent's shared open-
         // file description. Verification comes before any descriptor syscall.
-        self.process.verify()
+        self.process
+            .verify()
             .map_err(|_| io::Error::other("native stdio process changed before cleanup"))?;
-        let Some((original, enabled)) = self.flags else { return Ok(()); };
-        let descriptor = self.descriptor.as_ref()
+        let Some((original, enabled)) = self.flags else {
+            return Ok(());
+        };
+        let descriptor = self
+            .descriptor
+            .as_ref()
             .ok_or_else(|| io::Error::other("native stdio restoration descriptor unavailable"))?;
         let current = fcntl_getfl(descriptor).map_err(io::Error::from)?;
         if current == original {
@@ -89,18 +102,25 @@ impl ProcessStreamLease {
         }
         if current != enabled {
             // Do not overwrite an unrelated owner's later flag changes.
-            return Err(io::Error::other("native process-stream flags changed outside their owner"));
+            return Err(io::Error::other(
+                "native process-stream flags changed outside their owner",
+            ));
         }
         fcntl_setfl(descriptor, original).map_err(io::Error::from)
     }
 
     fn finish_once(&mut self) -> io::Result<()> {
-        if self.finished { return Ok(()); }
+        if self.finished {
+            return Ok(());
+        }
         let result = self.restore();
         self.finished = true;
         // Once cleanup is uncertain, a new constructor must not reinterpret
         // the currently observed flags as the original, known-good state.
-        self.state.store(if result.is_ok() { FREE } else { POISONED }, Ordering::Release);
+        self.state.store(
+            if result.is_ok() { FREE } else { POISONED },
+            Ordering::Release,
+        );
         result
     }
 
@@ -141,7 +161,10 @@ fn claim(cx: &Cx, source: &impl AsFd, writable: bool, state: Arc<AtomicU8>) -> i
     let can_write = original.intersects(OFlags::WRONLY | OFlags::RDWR);
     let can_read = !original.contains(OFlags::WRONLY);
     if (writable && !can_write) || (!writable && !can_read) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "process stream has the wrong access direction"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process stream has the wrong access direction",
+        ));
     }
     let enabled = original | OFlags::NONBLOCK;
     lease.descriptor = Some(file.as_fd().try_clone_to_owned()?);
@@ -211,9 +234,9 @@ impl NativePipeWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::Budget;
     use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
     use asupersync::runtime::{Runtime, RuntimeBuilder, reactor::create_reactor};
-    use asupersync::Budget;
     use std::pin::Pin;
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
@@ -222,10 +245,13 @@ mod tests {
         RuntimeBuilder::current_thread()
             .with_reactor(create_reactor().unwrap())
             .blocking_threads(0, 0)
-            .build().unwrap()
+            .build()
+            .unwrap()
     }
 
-    fn owner() -> Arc<AtomicU8> { Arc::new(AtomicU8::new(FREE)) }
+    fn owner() -> Arc<AtomicU8> {
+        Arc::new(AtomicU8::new(FREE))
+    }
 
     fn read(reader: &mut NativePipeReader, bytes: &mut [u8]) -> Poll<io::Result<usize>> {
         let mut buffer = ReadBuf::new(bytes);
@@ -255,7 +281,12 @@ mod tests {
         assert!(fcntl_getfl(&input).unwrap().contains(OFlags::NONBLOCK));
         assert!(read(&mut reader, &mut [0; 1]).is_pending());
         assert_eq!(driver.waker_count(), 1);
-        assert_eq!(claim(&cx, &input, false, Arc::clone(&owner)).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            claim(&cx, &input, false, Arc::clone(&owner))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
         drop(reader);
         assert_eq!(driver.waker_count(), 0);
         assert_eq!(fcntl_getfl(&input).unwrap(), original);
@@ -290,13 +321,28 @@ mod tests {
         let input_flags = fcntl_getfl(&input).unwrap();
         let output_flags = fcntl_getfl(&output).unwrap();
         let owner = owner();
-        assert_eq!(claim(&cx, &input, true, Arc::clone(&owner)).unwrap_err().kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(claim(&cx, &output, false, Arc::clone(&owner)).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            claim(&cx, &input, true, Arc::clone(&owner))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            claim(&cx, &output, false, Arc::clone(&owner))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
         assert_eq!(fcntl_getfl(&input).unwrap(), input_flags);
         assert_eq!(fcntl_getfl(&output).unwrap(), output_flags);
         let regular = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
         let regular_flags = fcntl_getfl(&regular).unwrap();
-        assert_eq!(claim(&cx, &regular, false, Arc::clone(&owner)).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            claim(&cx, &regular, false, Arc::clone(&owner))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
         assert_eq!(fcntl_getfl(&regular).unwrap(), regular_flags);
         assert_eq!(owner.load(Ordering::Acquire), FREE);
         drop((input, output, regular, cx));
@@ -379,7 +425,9 @@ mod tests {
         fcntl_setfl(&input, original).unwrap();
         assert_eq!(rustix::io::write(&output, b"kept").unwrap(), 4);
         let mut bytes = [0; 4];
-        assert!(matches!(read(&mut reader, &mut bytes), Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::InvalidInput));
+        assert!(
+            matches!(read(&mut reader, &mut bytes), Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::InvalidInput)
+        );
         assert_eq!(bytes, [0; 4]);
         fcntl_setfl(&input, original | OFlags::NONBLOCK).unwrap();
         assert!(matches!(read(&mut reader, &mut bytes), Poll::Ready(Ok(4))));
@@ -400,7 +448,12 @@ mod tests {
         {
             let _ambient = Cx::set_current(Some(cx.clone()));
             let _restricted = Cx::push_restriction(asupersync::cx::cap::CapMask::none());
-            assert_eq!(claim(&cx, &input, false, Arc::clone(&owner)).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                claim(&cx, &input, false, Arc::clone(&owner))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::PermissionDenied
+            );
         }
         assert_eq!(fcntl_getfl(&input).unwrap(), original);
         assert_eq!(owner.load(Ordering::Acquire), FREE);

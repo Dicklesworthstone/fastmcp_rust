@@ -172,8 +172,8 @@ impl PipeIo {
         }
         let _caller = Cx::set_current(Some(self.cx.clone()));
         let admission = (|| {
-            let caller = Cx::current()
-                .ok_or_else(|| io::Error::other("caller context unavailable"))?;
+            let caller =
+                Cx::current().ok_or_else(|| io::Error::other("caller context unavailable"))?;
             admit_context(&caller)?;
             if let Some(stream) = &self.process_stream {
                 stream.verify_io()?;
@@ -243,7 +243,10 @@ impl PipeIo {
         // Close even if deregistration reports a failure. Close is cleanup,
         // not new work, and must remain possible on a cancelled caller.
         self.file = None;
-        let restored = self.process_stream.take().map_or(Ok(()), stdio::ProcessStreamLease::finish);
+        let restored = self
+            .process_stream
+            .take()
+            .map_or(Ok(()), stdio::ProcessStreamLease::finish);
         result.and(restored)
     }
 }
@@ -391,8 +394,8 @@ mod tests {
     use std::task::{Wake, Waker};
     use std::time::Duration;
 
-    use asupersync::runtime::{IoDriverHandle, Runtime, RuntimeBuilder};
     use asupersync::runtime::reactor::create_reactor;
+    use asupersync::runtime::{IoDriverHandle, Runtime, RuntimeBuilder};
     use asupersync::time::{TimerDriverHandle, VirtualClock};
     use asupersync::{Budget, Time};
 
@@ -424,14 +427,22 @@ mod tests {
         }
     }
 
-    fn read(reader: &mut NativePipeReader, waker: &Waker, bytes: &mut [u8]) -> Poll<io::Result<usize>> {
+    fn read(
+        reader: &mut NativePipeReader,
+        waker: &Waker,
+        bytes: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
         let mut output = ReadBuf::new(bytes);
         Pin::new(reader)
             .poll_read(&mut Context::from_waker(waker), &mut output)
             .map(|result| result.map(|()| output.filled().len()))
     }
 
-    fn write(writer: &mut NativePipeWriter, waker: &Waker, bytes: &[u8]) -> Poll<io::Result<usize>> {
+    fn write(
+        writer: &mut NativePipeWriter,
+        waker: &Waker,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
         Pin::new(writer).poll_write(&mut Context::from_waker(waker), bytes)
     }
 
@@ -555,7 +566,10 @@ mod tests {
         assert_eq!(ready(write(&mut writer, Waker::noop(), b"late")), 4);
         // Masked cleanup may consume the same committed bytes. The cancelled
         // attempt above did not consume them or latch the endpoint closed.
-        assert_eq!(cx.masked(|| ready(read(&mut reader, &waker, &mut bytes))), 4);
+        assert_eq!(
+            cx.masked(|| ready(read(&mut reader, &waker, &mut bytes))),
+            4
+        );
         assert_eq!(&bytes, b"late");
         close(&mut writer);
         drop((reader, writer, cx, live));
@@ -663,16 +677,22 @@ mod tests {
         drop((alias, output));
         let (input, output) = fresh_descriptors().unwrap();
         assert_eq!(
-            NativePipeWriter::from_owned_fd(&cx, input).unwrap_err().kind(),
+            NativePipeWriter::from_owned_fd(&cx, input)
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidInput
         );
         assert_eq!(
-            NativePipeReader::from_owned_fd(&cx, output).unwrap_err().kind(),
+            NativePipeReader::from_owned_fd(&cx, output)
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidInput
         );
         let regular = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
         assert_eq!(
-            NativePipeReader::from_owned_fd(&cx, regular.into()).unwrap_err().kind(),
+            NativePipeReader::from_owned_fd(&cx, regular.into())
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidInput
         );
         assert_eq!(cx.io_driver_handle().unwrap().waker_count(), 0);
@@ -685,7 +705,9 @@ mod tests {
         let detached = Cx::for_testing();
         let (input, output) = fresh_descriptors().unwrap();
         assert_eq!(
-            NativePipeReader::from_owned_fd(&detached, input).unwrap_err().kind(),
+            NativePipeReader::from_owned_fd(&detached, input)
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::NotConnected
         );
         drop(output);
@@ -704,7 +726,9 @@ mod tests {
             assert_eq!(bytes, [0; 4]);
             let (input, output) = fresh_descriptors().unwrap();
             assert_eq!(
-                NativePipeReader::from_owned_fd(&cx, input).unwrap_err().kind(),
+                NativePipeReader::from_owned_fd(&cx, input)
+                    .unwrap_err()
+                    .kind(),
                 io::ErrorKind::PermissionDenied
             );
             drop(output);

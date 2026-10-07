@@ -251,7 +251,10 @@ mod tests {
             let mut opening = Box::pin(RequestRegionOpening { admission });
             assert!(poll_once(opening.as_mut()).await.is_pending());
             started_rx.recv(&cx).await.unwrap();
-            until(&cx, || children(&diagnostics, parent.region_id()).len() == 1).await;
+            until(&cx, || {
+                children(&diagnostics, parent.region_id()).len() == 1
+            })
+            .await;
             assert!(!opening.admission.is_finished());
             drop(opening);
             // The raw outcome is already published in the runtime slot. The
@@ -259,7 +262,10 @@ mod tests {
             released.store(true, Ordering::Release);
             release.notify_waiters();
             consumed_rx.recv(&cx).await.unwrap();
-            until(&cx, || children(&diagnostics, parent.region_id()).is_empty()).await;
+            until(&cx, || {
+                children(&diagnostics, parent.region_id()).is_empty()
+            })
+            .await;
             parent_is_live(&diagnostics, &parent);
             parent.close().await.unwrap();
         });
@@ -382,7 +388,10 @@ mod tests {
             drop(serving);
             assert!(input_dropped.load(Ordering::Acquire));
             assert!(output_dropped.load(Ordering::Acquire));
-            until(&cx, || children(&diagnostics, parent.region_id()).is_empty()).await;
+            until(&cx, || {
+                children(&diagnostics, parent.region_id()).is_empty()
+            })
+            .await;
             // The old direct ChildRegionOpening await leaves the mint open
             // here. Closing the parent before this assertion would hide it.
             parent_is_live(&diagnostics, &parent);

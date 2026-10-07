@@ -16,10 +16,10 @@ use std::task::Poll;
 use asupersync::io::{AsyncRead, AsyncWrite};
 use asupersync::sync::Notify;
 use asupersync::time::Sleep;
+use fastmcp_transport::memory::{MemoryRecvHalf, MemorySendHalf, MemoryTransport};
 use fastmcp_transport::{
     AsyncStdioRecvHalf, AsyncStdioSendHalf, AsyncStdioTransport, ReceivedTransportFrame,
 };
-use fastmcp_transport::memory::{MemoryRecvHalf, MemorySendHalf, MemoryTransport};
 
 // This module is split out of lib.rs and shares its private items. The set
 // it uses differs per feature profile, so an explicit list computed for one
@@ -110,10 +110,7 @@ impl ConnectionWriter for MemorySendHalf {
     // would already have released the sender. Every other effect on this
     // transport is drop-safe by design and this one stays that way.
     #[allow(clippy::manual_async_fn)]
-    fn close(
-        &mut self,
-        cx: &Cx,
-    ) -> impl Future<Output = Result<(), TransportError>> + Send {
+    fn close(&mut self, cx: &Cx) -> impl Future<Output = Result<(), TransportError>> + Send {
         async move {
             // Memory close only releases the sender; no blocking I/O.
             fastmcp_transport::TransportSendHalf::close(self, cx)
@@ -800,21 +797,25 @@ impl ConnectionSchedule {
         let mut lane = self.next_lane;
         for _ in 0..3 {
             let event = match lane {
-                ConnectionLane::Ingress if !stopping => reading.as_mut().and_then(|reading| {
-                    match reading.as_mut().poll(task) {
-                        Poll::Ready((reader, result)) => Some(Event::Read(reader, result)),
-                        Poll::Pending => None,
-                    }
-                }),
+                ConnectionLane::Ingress if !stopping => {
+                    reading
+                        .as_mut()
+                        .and_then(|reading| match reading.as_mut().poll(task) {
+                            Poll::Ready((reader, result)) => Some(Event::Read(reader, result)),
+                            Poll::Pending => None,
+                        })
+                }
                 ConnectionLane::Requests => self.poll_request(task, requests),
-                ConnectionLane::Egress => writing.as_mut().and_then(|writing| {
-                    match writing.as_mut().poll(task) {
-                        Poll::Ready((writer, result, bytes)) => {
-                            Some(Event::Written(writer, result, bytes))
-                        }
-                        Poll::Pending => None,
-                    }
-                }),
+                ConnectionLane::Egress => {
+                    writing
+                        .as_mut()
+                        .and_then(|writing| match writing.as_mut().poll(task) {
+                            Poll::Ready((writer, result, bytes)) => {
+                                Some(Event::Written(writer, result, bytes))
+                            }
+                            Poll::Pending => None,
+                        })
+                }
                 ConnectionLane::Ingress => None,
             };
             if let Some(event) = event {
@@ -1009,17 +1010,14 @@ mod schedule_tests {
             assert_eq!(lane, 1);
             drop(requests.swap_remove(index.unwrap()));
         }
-        assert!(schedule
-            .poll(&mut task, &mut reading, &mut writing, &mut requests, false)
-            .is_pending());
+        assert!(
+            schedule
+                .poll(&mut task, &mut reading, &mut writing, &mut requests, false)
+                .is_pending()
+        );
         requests.push(request_ready());
-        let (lane, index) = selected(schedule.poll(
-            &mut task,
-            &mut reading,
-            &mut writing,
-            &mut requests,
-            false,
-        ));
+        let (lane, index) =
+            selected(schedule.poll(&mut task, &mut reading, &mut writing, &mut requests, false));
         assert_eq!((lane, index), (1, Some(0)));
     }
 
@@ -1033,13 +1031,7 @@ mod schedule_tests {
         let mut requests = vec![request_ready()];
         let mut task = Context::from_waker(Waker::noop());
         assert_eq!(
-            selected(schedule.poll(
-                &mut task,
-                &mut reading,
-                &mut writing,
-                &mut requests,
-                true,
-            )),
+            selected(schedule.poll(&mut task, &mut reading, &mut writing, &mut requests, true,)),
             (1, Some(0)),
         );
     }
@@ -1069,23 +1061,23 @@ mod schedule_tests {
         let slots: [WakerSlot; 4] = std::array::from_fn(|_| Arc::new(Mutex::new(None)));
         let mut reading: Option<ReadWork<()>> = Some(pending_with_waker(&slots[0]));
         let mut writing: Option<WriteWork<()>> = Some(pending_with_waker(&slots[1]));
-        let mut requests: Vec<RequestWork> = vec![
-            pending_with_waker(&slots[2]),
-            pending_with_waker(&slots[3]),
-        ];
+        let mut requests: Vec<RequestWork> =
+            vec![pending_with_waker(&slots[2]), pending_with_waker(&slots[3])];
         let old = Arc::new(WakeCount::default());
         let current = Arc::new(WakeCount::default());
         for counter in [&old, &current] {
             let waker = Waker::from(Arc::clone(counter));
-            assert!(schedule
-                .poll(
-                    &mut Context::from_waker(&waker),
-                    &mut reading,
-                    &mut writing,
-                    &mut requests,
-                    false,
-                )
-                .is_pending());
+            assert!(
+                schedule
+                    .poll(
+                        &mut Context::from_waker(&waker),
+                        &mut reading,
+                        &mut writing,
+                        &mut requests,
+                        false,
+                    )
+                    .is_pending()
+            );
             assert!(slots.iter().all(|slot| slot.lock().unwrap().is_some()));
         }
         for slot in &slots {
@@ -1448,13 +1440,9 @@ impl Server {
                         return Poll::Ready(Event::DrainExpired);
                     }
                 }
-                if let Poll::Ready(event) = schedule.poll(
-                    task,
-                    &mut reading,
-                    &mut writing,
-                    &mut requests,
-                    stopping,
-                ) {
+                if let Poll::Ready(event) =
+                    schedule.poll(task, &mut reading, &mut writing, &mut requests, stopping)
+                {
                     return Poll::Ready(event);
                 }
                 if !stopping && writing.is_none() && lifetime.output.has_frames() {
@@ -1649,7 +1637,11 @@ mod tests {
 
         fn retained(queue: &OutputQueue) -> (usize, usize, usize) {
             let state = queue.state.lock().unwrap();
-            (state.frames.len(), state.retained_frames, state.retained_bytes)
+            (
+                state.frames.len(),
+                state.retained_frames,
+                state.retained_bytes,
+            )
         }
 
         #[test]
@@ -1705,7 +1697,10 @@ mod tests {
             queue.enqueue(response(5), None);
             let expected_bytes = {
                 let state = queue.state.lock().unwrap();
-                state.frames.iter().enumerate()
+                state
+                    .frames
+                    .iter()
+                    .enumerate()
                     .filter(|(index, _)| matches!(*index, 1 | 2 | 4))
                     .map(|(_, frame)| frame.bytes)
                     .sum::<usize>()
@@ -1796,17 +1791,20 @@ mod tests {
         }
 
         fn admitted(message: &JsonRpcMessage) -> ReceivedTransportFrame {
-            ReceivedTransportFrame::admit(
-                serde_json::to_vec(message).unwrap().into_boxed_slice(),
-            ).unwrap()
+            ReceivedTransportFrame::admit(serde_json::to_vec(message).unwrap().into_boxed_slice())
+                .unwrap()
         }
 
         #[test]
         fn cancellation_ingress_reclaims_only_the_matching_request_and_preserves_siblings() {
             let cx = Cx::for_testing();
             let lifetime = ConnectionLifetime {
-                server: Arc::new(Server::new("output-cancel", "1")
-                    .protocol_policy(ProtocolPolicy::ModernOnly).unwrap().build()),
+                server: Arc::new(
+                    Server::new("output-cancel", "1")
+                        .protocol_policy(ProtocolPolicy::ModernOnly)
+                        .unwrap()
+                        .build(),
+                ),
                 connection: ModernConnection::new(),
                 admission: Arc::new(DispatchQueueState::default()),
                 output: Arc::new(OutputQueue::default()),
@@ -1815,33 +1813,54 @@ mod tests {
             // Authentication and reservation take place before any handler
             // poll. Keep both real request futures owned while routing controls.
             let first = prepare_request(&lifetime, &cx, admitted(&discover(41)))
-                .unwrap().unwrap();
+                .unwrap()
+                .unwrap();
             let second = prepare_request(&lifetime, &cx, admitted(&discover(42)))
-                .unwrap().unwrap();
+                .unwrap()
+                .unwrap();
             let find_owner = |id: i64| {
-                lifetime.output.state.lock().unwrap().candidates.values()
+                lifetime
+                    .output
+                    .state
+                    .lock()
+                    .unwrap()
+                    .candidates
+                    .values()
                     .filter_map(Weak::upgrade)
-                    .find(|owner| owner.reservation.request_id.as_ref()
-                        == Some(&RequestId::Number(id)))
+                    .find(|owner| {
+                        owner.reservation.request_id.as_ref() == Some(&RequestId::Number(id))
+                    })
                     .expect("admitted request has an output owner")
             };
             let first_owner = find_owner(41);
             let second_owner = find_owner(42);
-            lifetime.output.enqueue(response(41), Some(Arc::clone(&first_owner)));
-            lifetime.output.enqueue(response(42), Some(Arc::clone(&second_owner)));
+            lifetime
+                .output
+                .enqueue(response(41), Some(Arc::clone(&first_owner)));
+            lifetime
+                .output
+                .enqueue(response(42), Some(Arc::clone(&second_owner)));
             assert_eq!(retained(&lifetime.output).0, 2);
-            assert!(prepare_request(&lifetime, &cx, admitted(&cancel(999)))
-                .unwrap().is_none());
+            assert!(
+                prepare_request(&lifetime, &cx, admitted(&cancel(999)))
+                    .unwrap()
+                    .is_none()
+            );
             assert_eq!(retained(&lifetime.output).0, 2);
             assert!(!first_owner.cancelled() && !second_owner.cancelled());
-            assert!(prepare_request(&lifetime, &cx, admitted(&cancel(41)))
-                .unwrap().is_none());
+            assert!(
+                prepare_request(&lifetime, &cx, admitted(&cancel(41)))
+                    .unwrap()
+                    .is_none()
+            );
             assert!(first_owner.cancelled());
             assert!(!second_owner.cancelled());
             assert_eq!(retained(&lifetime.output).0, 1);
             let survivor = lifetime.output.pop().unwrap();
-            assert!(matches!(survivor.message, JsonRpcMessage::Response(ref result)
-                if result.id == Some(RequestId::Number(42))));
+            assert!(
+                matches!(survivor.message, JsonRpcMessage::Response(ref result)
+                if result.id == Some(RequestId::Number(42)))
+            );
             lifetime.output.finish(survivor.bytes);
             assert_eq!(retained(&lifetime.output), (0, 0, 0));
             drop((first, second));
@@ -3499,7 +3518,9 @@ mod tests {
         fn connect(cx: &Cx, service: Server) -> (MemoryTransport, Serving) {
             let (peer, transport) = create_memory_transport_pair_with_capacity(1);
             let serving = cx
-                .spawn(move |serve_cx| async move { service.serve_memory(&serve_cx, transport).await })
+                .spawn(
+                    move |serve_cx| async move { service.serve_memory(&serve_cx, transport).await },
+                )
                 .unwrap();
             (peer, serving)
         }
@@ -3515,7 +3536,10 @@ mod tests {
         async fn stop(cx: &Cx, peer: MemoryTransport, mut serving: Serving) {
             let (mut input, output) = peer.into_split();
             drop(output);
-            assert!(matches!(input.recv_async(cx).await, Err(TransportError::Closed)));
+            assert!(matches!(
+                input.recv_async(cx).await,
+                Err(TransportError::Closed)
+            ));
             serving.join(cx).await.unwrap().unwrap();
         }
 
@@ -3573,7 +3597,10 @@ mod tests {
                 };
                 assert_eq!(result.id, Some(RequestId::Number(20)));
                 assert!(result.error.is_none());
-                assert!(matches!(input.recv_async(&cx).await, Err(TransportError::Closed)));
+                assert!(matches!(
+                    input.recv_async(&cx).await,
+                    Err(TransportError::Closed)
+                ));
                 serving.join(&cx).await.unwrap().unwrap();
                 assert_eq!(gate.dropped.load(Ordering::Acquire), 1);
             });
@@ -3588,16 +3615,33 @@ mod tests {
                 let (mut peer, serving) = connect(&cx, service);
                 peer.send_async(
                     &cx,
-                    &request(30, SUBSCRIPTIONS_LISTEN, serde_json::json!({
-                        "notifications": {"toolsListChanged": true}
-                    })),
-                ).await.unwrap();
+                    &request(
+                        30,
+                        SUBSCRIPTIONS_LISTEN,
+                        serde_json::json!({
+                            "notifications": {"toolsListChanged": true}
+                        }),
+                    ),
+                )
+                .await
+                .unwrap();
                 let JsonRpcMessage::Request(ack) = peer.recv_async(&cx).await.unwrap() else {
                     panic!("subscription acknowledgement must precede completion");
                 };
-                assert_eq!(ack.method, fastmcp_protocol::methods::NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED);
-                assert_eq!(ack.params.unwrap()["_meta"]["io.modelcontextprotocol/subscriptionId"], 30);
-                assert_eq!(subscriptions.publish(ServerNotification::ToolsListChanged(None)).unwrap(), 1);
+                assert_eq!(
+                    ack.method,
+                    fastmcp_protocol::methods::NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED
+                );
+                assert_eq!(
+                    ack.params.unwrap()["_meta"]["io.modelcontextprotocol/subscriptionId"],
+                    30
+                );
+                assert_eq!(
+                    subscriptions
+                        .publish(ServerNotification::ToolsListChanged(None))
+                        .unwrap(),
+                    1
+                );
                 let JsonRpcMessage::Request(event) = peer.recv_async(&cx).await.unwrap() else {
                     panic!("expected the live subscription event");
                 };
@@ -3618,23 +3662,43 @@ mod tests {
                 let (peer, transport) = create_memory_transport_pair_with_capacity(1);
                 let (mut peer_input, mut peer_output) = peer.into_split();
                 let (mut input, mut output) = transport.into_split();
-                ConnectionWriter::send(&mut output, &cx, &discover(40)).await.unwrap();
+                ConnectionWriter::send(&mut output, &cx, &discover(40))
+                    .await
+                    .unwrap();
                 let second = discover(41);
                 {
                     let mut sending = pin!(ConnectionWriter::send(&mut output, &cx, &second));
-                    assert!(sending.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+                    assert!(
+                        sending
+                            .as_mut()
+                            .poll(&mut Context::from_waker(Waker::noop()))
+                            .is_pending()
+                    );
                     peer_output.send_async(&cx, &cancel(41)).await.unwrap();
                     let frame = ConnectionReader::receive(&mut input, &cx).await.unwrap();
-                    assert!(matches!(frame.into_message(), JsonRpcMessage::Request(request) if request.method == "notifications/cancelled"));
+                    assert!(
+                        matches!(frame.into_message(), JsonRpcMessage::Request(request) if request.method == "notifications/cancelled")
+                    );
                     // Abandon the uncommitted frame while capacity is exhausted.
                 }
                 let first = peer_input.recv_async(&cx).await.unwrap();
-                assert_eq!(serde_json::to_value(first).unwrap(), serde_json::to_value(discover(40)).unwrap());
-                ConnectionWriter::send(&mut output, &cx, &discover(42)).await.unwrap();
+                assert_eq!(
+                    serde_json::to_value(first).unwrap(),
+                    serde_json::to_value(discover(40)).unwrap()
+                );
+                ConnectionWriter::send(&mut output, &cx, &discover(42))
+                    .await
+                    .unwrap();
                 let next = peer_input.recv_async(&cx).await.unwrap();
-                assert_eq!(serde_json::to_value(next).unwrap(), serde_json::to_value(discover(42)).unwrap());
+                assert_eq!(
+                    serde_json::to_value(next).unwrap(),
+                    serde_json::to_value(discover(42)).unwrap()
+                );
                 ConnectionWriter::close(&mut output, &cx).await.unwrap();
-                assert!(matches!(peer_input.recv_async(&cx).await, Err(TransportError::Closed)));
+                assert!(matches!(
+                    peer_input.recv_async(&cx).await,
+                    Err(TransportError::Closed)
+                ));
             });
         }
 
@@ -3644,7 +3708,8 @@ mod tests {
             let started = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&started);
             let service = Server::new("memory-driverless", "1")
-                .protocol_policy(ProtocolPolicy::ModernOnly).unwrap()
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .unwrap()
                 .tool(ProbeTool(Arc::clone(&gate)))
                 .on_startup(move || {
                     flag.store(true, Ordering::Release);
@@ -3654,7 +3719,10 @@ mod tests {
             let (_peer, transport) = create_memory_transport_pair_with_capacity(1);
             let cx = Cx::for_testing();
             let mut serving = pin!(service.serve_memory(&cx, transport));
-            let Poll::Ready(Err(error)) = serving.as_mut().poll(&mut Context::from_waker(Waker::noop())) else {
+            let Poll::Ready(Err(error)) = serving
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            else {
                 panic!("driverless serving must fail before parking");
             };
             assert!(error.message.contains("timer driver"));

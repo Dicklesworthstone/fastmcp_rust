@@ -276,7 +276,9 @@ fn every_feature_gated_test_target_declares_required_features() {
             // Only a target root can be emptied by a file-scope cfg; a module
             // file included by one cannot be named in a `[[test]]` stanza.
             let is_target_root = source_path.parent() == Some(tests_dir.as_path())
-                || source_path.file_name().is_some_and(|name| name == "main.rs");
+                || source_path
+                    .file_name()
+                    .is_some_and(|name| name == "main.rs");
             if !is_target_root {
                 continue;
             }
@@ -540,7 +542,10 @@ fn planted_missing_stanza_is_detected() {
     let with = declared_required_features(
         "[[test]]\nname = \"t\"\npath = \"tests/t.rs\"\nrequired-features = [\"tasks\"]\n",
     );
-    assert_eq!(with.get("tests/t.rs"), Some(&BTreeSet::from(["tasks".to_owned()])));
+    assert_eq!(
+        with.get("tests/t.rs"),
+        Some(&BTreeSet::from(["tasks".to_owned()]))
+    );
 
     // The planted negative differs only in the stanza's presence.
     let without = declared_required_features("[[test]]\nname = \"t\"\npath = \"tests/t.rs\"\n");
@@ -587,15 +592,27 @@ fn planted_readme_method_extraction_is_selective() {
 #[test]
 fn planted_token_match_excludes_a_longer_identifier() {
     // The positive.
-    assert!(mentions_token("use crate::http::HttpTransport;", "HttpTransport"));
-    assert!(mentions_token("let t: HttpTransport<R, W>", "HttpTransport"));
+    assert!(mentions_token(
+        "use crate::http::HttpTransport;",
+        "HttpTransport"
+    ));
+    assert!(mentions_token(
+        "let t: HttpTransport<R, W>",
+        "HttpTransport"
+    ));
     assert!(mentions_token("pub mod event_store;", "event_store"));
-    assert!(mentions_token("fastmcp_transport::event_store::EventStore", "event_store"));
+    assert!(mentions_token(
+        "fastmcp_transport::event_store::EventStore",
+        "event_store"
+    ));
 
     // The planted negative, differing only by surrounding identifier chars.
     // This exact case would have added three files to the HttpTransport census.
     assert!(
-        !mentions_token("impl Transport for StreamableHttpTransport {", "HttpTransport"),
+        !mentions_token(
+            "impl Transport for StreamableHttpTransport {",
+            "HttpTransport"
+        ),
         "a longer identifier ENDING with the token must not match"
     );
     assert!(
@@ -634,7 +651,11 @@ fn planted_consumer_census_distinguishes_owner_from_consumer() {
 #[test]
 fn planted_item_declaration_requires_an_identifier_boundary() {
     // The positive.
-    assert!(declares_item("pub struct Budget { poll: u64 }", "struct", "Budget"));
+    assert!(declares_item(
+        "pub struct Budget { poll: u64 }",
+        "struct",
+        "Budget"
+    ));
     assert!(declares_item("enum Selection {", "enum", "Selection"));
     assert!(declares_item("pub struct Tool;", "struct", "Tool"));
     assert!(declares_item("struct Wrapper<T>(T);", "struct", "Wrapper"));

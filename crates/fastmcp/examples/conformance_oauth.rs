@@ -35,12 +35,12 @@ use std::time::{Duration, Instant};
 
 use asupersync::tls::{Certificate, RootCertStore};
 use fastmcp_client::http_auth::BoundBearerCredential;
-use fastmcp_client::http_auth::discovery::{OAuthDiscoveryPlan, TrustedOAuthIssuer};
 use fastmcp_client::http_auth::discovery::registration::NativeClientRegistration;
 use fastmcp_client::http_auth::discovery::registration::metadata_document::{
     MetadataDocumentDiscovery, NativeClientMetadata,
 };
 use fastmcp_client::http_auth::discovery::registration::selection::NativeClientRegistrationChoice;
+use fastmcp_client::http_auth::discovery::{OAuthDiscoveryPlan, TrustedOAuthIssuer};
 use fastmcp_client::http_auth::driver::redirect::RedirectAuthorizationDriver;
 use fastmcp_client::http_auth::driver::with_authorization_driver;
 use fastmcp_client::http_auth::oauth::{OAuthClient, OAuthClientConfiguration};
@@ -265,15 +265,11 @@ impl DiscoveryConfiguration {
             return Ok(LoginPlan::RegistrationChoice(Box::new(choice)));
         }
         if let Some(client_id) = client_id {
-            let mut plan = OAuthDiscoveryPlan::new(
-                resource.clone(),
-                vec![issuer],
-                client_id,
-                scopes,
-            )
-            .map_err(|_| INVALID.to_owned())?
-            .with_timeout(discovery_timeout)
-            .map_err(|_| INVALID.to_owned())?;
+            let mut plan =
+                OAuthDiscoveryPlan::new(resource.clone(), vec![issuer], client_id, scopes)
+                    .map_err(|_| INVALID.to_owned())?
+                    .with_timeout(discovery_timeout)
+                    .map_err(|_| INVALID.to_owned())?;
             if let Some(certificate) = resource_root {
                 plan = plan
                     .with_resource_root_certificate(certificate.clone())
@@ -358,7 +354,13 @@ impl PreparedOAuth {
                 LoginPlan::TrustedEndpoints(Box::new(native))
             }
         };
-        Ok(Self { login, driver, resource, resource_root, timeout })
+        Ok(Self {
+            login,
+            driver,
+            resource,
+            resource_root,
+            timeout,
+        })
     }
 }
 
@@ -443,8 +445,13 @@ pub(super) async fn configure(
     let Some(raw) = raw else {
         return Ok((builder, None));
     };
-    let PreparedOAuth { login, driver, resource, resource_root, timeout } =
-        PreparedOAuth::parse(raw, endpoint)?;
+    let PreparedOAuth {
+        login,
+        driver,
+        resource,
+        resource_root,
+        timeout,
+    } = PreparedOAuth::parse(raw, endpoint)?;
     // Validate the consumer before discovery or a registration write, not only
     // before redemption. Auto and a different protected resource are refused.
     if builder.selected_protocol_plan().policy() != ProtocolPolicy::ModernOnly
@@ -510,9 +517,9 @@ mod tests {
     }
 
     fn metadata() -> Value {
-        let document = NativeClientMetadata::new(
-            "https://CLIENT.example:443/metadata%2ejson", "Fixture",
-        ).unwrap();
+        let document =
+            NativeClientMetadata::new("https://CLIENT.example:443/metadata%2ejson", "Fixture")
+                .unwrap();
         json!({
             "url": document.client_id(),
             "document_json": std::str::from_utf8(document.document_json()).unwrap(),
@@ -529,7 +536,10 @@ mod tests {
             ("preauthorized_redirect", json!(false)),
             ("resource", json!("https://resource.example/other")),
             ("resource", json!("https://resource.example/mcp?other=1")),
-            ("authorization_endpoint", json!("http://127.0.0.1:8080/authorize")),
+            (
+                "authorization_endpoint",
+                json!("http://127.0.0.1:8080/authorize"),
+            ),
             ("token_endpoint", json!("http://127.0.0.1:8080/token")),
             ("timeout_seconds", json!(0)),
             ("timeout_seconds", json!(901)),
@@ -541,22 +551,30 @@ mod tests {
         }
         let mut cleartext = positive;
         cleartext["resource"] = json!("http://127.0.0.1:8080/mcp");
-        assert!(PreparedOAuth::parse(
-            &cleartext.to_string(), &parse_url("http://127.0.0.1:8080/mcp").unwrap(),
-        ).is_err());
+        assert!(
+            PreparedOAuth::parse(
+                &cleartext.to_string(),
+                &parse_url("http://127.0.0.1:8080/mcp").unwrap(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn duplicate_unknown_and_oversized_configuration_is_not_silently_accepted() {
         let source = configuration().to_string();
         let duplicate = source.replacen(
-            "\"client_id\":", "\"client_id\":\"other\",\"client_id\":", 1,
+            "\"client_id\":",
+            "\"client_id\":\"other\",\"client_id\":",
+            1,
         );
         assert_ne!(source, duplicate);
         assert!(PreparedOAuth::parse(&duplicate, &endpoint()).is_err());
         let mut unknown = configuration();
         unknown["access_token"] = json!("secret-canary");
-        let error = PreparedOAuth::parse(&unknown.to_string(), &endpoint()).err().unwrap();
+        let error = PreparedOAuth::parse(&unknown.to_string(), &endpoint())
+            .err()
+            .unwrap();
         assert!(!error.contains("secret-canary"));
         assert!(PreparedOAuth::parse(&" ".repeat(MAX_CONFIG_BYTES + 1), &endpoint()).is_err());
         assert!(PreparedOAuth::parse("{}", &endpoint()).is_err());
@@ -565,16 +583,27 @@ mod tests {
     #[test]
     fn malformed_private_roots_fail_during_preflight() {
         assert!(root(None).unwrap().is_none());
-        for field in ["authorization_root_pem", "token_root_pem", "resource_root_pem"] {
+        for field in [
+            "authorization_root_pem",
+            "token_root_pem",
+            "resource_root_pem",
+        ] {
             let mut config = configuration();
             config[field] = json!("not a certificate, secret-canary");
-            let error = PreparedOAuth::parse(&config.to_string(), &endpoint()).err().unwrap();
+            let error = PreparedOAuth::parse(&config.to_string(), &endpoint())
+                .err()
+                .unwrap();
             assert_eq!(error, INVALID);
             assert!(!error.contains("secret-canary"));
         }
         let mut config = discovered();
         config["discovery"]["issuer_root_pem"] = json!("invalid secret-canary");
-        assert_eq!(PreparedOAuth::parse(&config.to_string(), &endpoint()).err().unwrap(), INVALID);
+        assert_eq!(
+            PreparedOAuth::parse(&config.to_string(), &endpoint())
+                .err()
+                .unwrap(),
+            INVALID
+        );
     }
 
     #[test]
@@ -583,29 +612,42 @@ mod tests {
         assert!(matches!(direct.login, LoginPlan::TrustedEndpoints(_)));
         let mut config = discovered();
         assert!(matches!(
-            PreparedOAuth::parse(&config.to_string(), &endpoint()).unwrap().login,
+            PreparedOAuth::parse(&config.to_string(), &endpoint())
+                .unwrap()
+                .login,
             LoginPlan::PreregisteredDiscovery(_)
         ));
         config["discovery"]["client_metadata"] = metadata();
         assert!(matches!(
-            PreparedOAuth::parse(&config.to_string(), &endpoint()).unwrap().login,
+            PreparedOAuth::parse(&config.to_string(), &endpoint())
+                .unwrap()
+                .login,
             LoginPlan::PreregisteredDiscovery(_)
         ));
         config.as_object_mut().unwrap().remove("client_id");
         assert!(matches!(
-            PreparedOAuth::parse(&config.to_string(), &endpoint()).unwrap().login,
+            PreparedOAuth::parse(&config.to_string(), &endpoint())
+                .unwrap()
+                .login,
             LoginPlan::MetadataDocument(_)
         ));
         config["discovery"]["allow_dynamic_registration"] = json!(true);
         assert!(PreparedOAuth::parse(&config.to_string(), &endpoint()).is_err());
         config["discovery"]["client_name"] = json!("Fixture");
         assert!(matches!(
-            PreparedOAuth::parse(&config.to_string(), &endpoint()).unwrap().login,
+            PreparedOAuth::parse(&config.to_string(), &endpoint())
+                .unwrap()
+                .login,
             LoginPlan::RegistrationChoice(_)
         ));
-        config["discovery"].as_object_mut().unwrap().remove("client_metadata");
+        config["discovery"]
+            .as_object_mut()
+            .unwrap()
+            .remove("client_metadata");
         assert!(matches!(
-            PreparedOAuth::parse(&config.to_string(), &endpoint()).unwrap().login,
+            PreparedOAuth::parse(&config.to_string(), &endpoint())
+                .unwrap()
+                .login,
             LoginPlan::RegistrationChoice(_)
         ));
         config["discovery"]["allow_dynamic_registration"] = json!(false);
@@ -645,7 +687,8 @@ mod tests {
             r#"{"issuer_root_pem":null}"#,
             r#"{"unknown_grant":true}"#,
         ] {
-            let negative = source.replacen("\"discovery\":{}", &format!("\"discovery\":{discovery}"), 1);
+            let negative =
+                source.replacen("\"discovery\":{}", &format!("\"discovery\":{discovery}"), 1);
             assert_ne!(negative, source);
             assert!(PreparedOAuth::parse(&negative, &endpoint()).is_err());
         }
@@ -656,12 +699,19 @@ mod tests {
         let mut config = discovered();
         config["discovery"]["client_metadata"] = metadata();
         assert!(PreparedOAuth::parse(&config.to_string(), &endpoint()).is_ok());
-        let original = config["discovery"]["client_metadata"]["document_json"].as_str().unwrap().to_owned();
-        let duplicate = format!("{},\"client_id\":\"https://other.example/client\"}}", &original[..original.len()-1]);
+        let original = config["discovery"]["client_metadata"]["document_json"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let duplicate = format!(
+            "{},\"client_id\":\"https://other.example/client\"}}",
+            &original[..original.len() - 1]
+        );
         config["discovery"]["client_metadata"]["document_json"] = json!(duplicate);
         assert!(PreparedOAuth::parse(&config.to_string(), &endpoint()).is_err());
         config["discovery"]["client_metadata"] = metadata();
-        config["discovery"]["client_metadata"]["url"] = json!("https://client.example/metadata%2ejson");
+        config["discovery"]["client_metadata"]["url"] =
+            json!("https://client.example/metadata%2ejson");
         assert!(PreparedOAuth::parse(&config.to_string(), &endpoint()).is_err());
         config["discovery"]["client_metadata"] = metadata();
         let mut document: Value = serde_json::from_str(&original).unwrap();
@@ -673,11 +723,17 @@ mod tests {
     #[test]
     fn grant_lifetime_caps_traffic_and_revokes_installed_clones_on_drop() {
         let credential = BoundBearerCredential::bind_with_expiry(
-            endpoint(), "test-access", Instant::now() + Duration::from_secs(300),
-        ).unwrap();
+            endpoint(),
+            "test-access",
+            Instant::now() + Duration::from_secs(300),
+        )
+        .unwrap();
         let installed = credential.clone();
         let independent = BoundBearerCredential::bind(endpoint(), "independent").unwrap();
-        let lease = GrantLease { credential, timeout: Duration::from_secs(30) };
+        let lease = GrantLease {
+            credential,
+            timeout: Duration::from_secs(30),
+        };
         assert_eq!(lease.remaining().unwrap(), Duration::from_secs(30));
         assert!(installed.authorization_for_target(&endpoint()).is_some());
         drop(lease);
@@ -685,7 +741,12 @@ mod tests {
         assert!(installed.authorization_for_target(&endpoint()).is_none());
         assert!(!independent.is_revoked());
         let expired = GrantLease {
-            credential: BoundBearerCredential::bind_with_expiry(endpoint(), "expired", Instant::now()).unwrap(),
+            credential: BoundBearerCredential::bind_with_expiry(
+                endpoint(),
+                "expired",
+                Instant::now(),
+            )
+            .unwrap(),
             timeout: Duration::from_secs(30),
         };
         assert!(expired.remaining().is_err());

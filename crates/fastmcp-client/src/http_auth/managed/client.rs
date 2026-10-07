@@ -35,7 +35,9 @@ pub enum ManagedHttpClientError {
     Closed,
     Session(OAuthSessionError),
     Connection,
-    Request { code: Option<McpErrorCode> },
+    Request {
+        code: Option<McpErrorCode>,
+    },
     /// A cursor cannot cross a reconnect or a credential-generation change.
     CatalogGenerationChanged,
     /// The cursor was not issued by this client's current catalog traversal.
@@ -51,13 +53,19 @@ impl fmt::Debug for ManagedHttpClientError {
             Self::Closed => f.write_str("ManagedHttpClientError::Closed"),
             Self::Session(_) => f.write_str("ManagedHttpClientError::Session(..)"),
             Self::Connection => f.write_str("ManagedHttpClientError::Connection"),
-            Self::Request { code } => f.debug_struct("ManagedHttpClientError::Request")
-                .field("code", code).finish(),
+            Self::Request { code } => f
+                .debug_struct("ManagedHttpClientError::Request")
+                .field("code", code)
+                .finish(),
             Self::CatalogGenerationChanged => {
                 f.write_str("ManagedHttpClientError::CatalogGenerationChanged")
             }
-            Self::InvalidCatalogCursor => f.write_str("ManagedHttpClientError::InvalidCatalogCursor"),
-            Self::CatalogCursorUnavailable => f.write_str("ManagedHttpClientError::CatalogCursorUnavailable"),
+            Self::InvalidCatalogCursor => {
+                f.write_str("ManagedHttpClientError::InvalidCatalogCursor")
+            }
+            Self::CatalogCursorUnavailable => {
+                f.write_str("ManagedHttpClientError::CatalogCursorUnavailable")
+            }
         }
     }
 }
@@ -73,8 +81,12 @@ impl fmt::Display for ManagedHttpClientError {
             Self::CatalogGenerationChanged => {
                 "catalog credential generation changed; restart listing without a cursor"
             }
-            Self::InvalidCatalogCursor => "catalog cursor is stale, unissued, or belongs to another catalog",
-            Self::CatalogCursorUnavailable => "catalog continuation could not be retained within local bounds",
+            Self::InvalidCatalogCursor => {
+                "catalog cursor is stale, unissued, or belongs to another catalog"
+            }
+            Self::CatalogCursorUnavailable => {
+                "catalog continuation could not be retained within local bounds"
+            }
         })
     }
 }
@@ -160,7 +172,9 @@ fn admit_builder(
     }
     // The public side-effect-free admission path also checks the compiled
     // protocol feature surface. No discovery, refresh, or callback runs here.
-    builder.http_negotiation().map_err(|_| ManagedHttpClientError::InvalidPolicy)?;
+    builder
+        .http_negotiation()
+        .map_err(|_| ManagedHttpClientError::InvalidPolicy)?;
     Ok(())
 }
 
@@ -189,7 +203,9 @@ impl ManagedHttpClient {
 
     /// Introspection only: generation is local to the selected OAuth session.
     pub fn cached_credential_generation(&self) -> Option<u64> {
-        self.connection.as_ref().map(|connection| connection.generation)
+        self.connection
+            .as_ref()
+            .map(|connection| connection.generation)
     }
 
     /// Permanently closes this client, not sibling clients sharing its login.
@@ -200,82 +216,123 @@ impl ManagedHttpClient {
     }
 
     pub async fn list_tools(
-        &mut self, cx: &Cx, cursor: Option<&str>,
+        &mut self,
+        cx: &Cx,
+        cursor: Option<&str>,
     ) -> Result<CoreResult, ManagedHttpClientError> {
-        self.list_tools_with_cancellation(cx, &McpRequestCancellation::new(), cursor).await
+        self.list_tools_with_cancellation(cx, &McpRequestCancellation::new(), cursor)
+            .await
     }
 
     pub async fn list_tools_with_cancellation(
-        &mut self, cx: &Cx, cancellation: &McpRequestCancellation, cursor: Option<&str>,
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        cursor: Option<&str>,
     ) -> Result<CoreResult, ManagedHttpClientError> {
         self.perform(cx, cancellation, Call::Tools(cursor)).await
     }
 
     pub async fn list_resources(
-        &mut self, cx: &Cx, cursor: Option<&str>,
+        &mut self,
+        cx: &Cx,
+        cursor: Option<&str>,
     ) -> Result<CoreResult, ManagedHttpClientError> {
-        self.list_resources_with_cancellation(cx, &McpRequestCancellation::new(), cursor).await
+        self.list_resources_with_cancellation(cx, &McpRequestCancellation::new(), cursor)
+            .await
     }
 
     pub async fn list_resources_with_cancellation(
-        &mut self, cx: &Cx, cancellation: &McpRequestCancellation, cursor: Option<&str>,
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        cursor: Option<&str>,
     ) -> Result<CoreResult, ManagedHttpClientError> {
-        self.perform(cx, cancellation, Call::Resources(cursor)).await
+        self.perform(cx, cancellation, Call::Resources(cursor))
+            .await
     }
 
     pub async fn list_resource_templates(
-        &mut self, cx: &Cx, cursor: Option<&str>,
+        &mut self,
+        cx: &Cx,
+        cursor: Option<&str>,
     ) -> Result<CoreResult, ManagedHttpClientError> {
-        self.list_resource_templates_with_cancellation(
-            cx, &McpRequestCancellation::new(), cursor,
-        ).await
+        self.list_resource_templates_with_cancellation(cx, &McpRequestCancellation::new(), cursor)
+            .await
     }
 
     pub async fn list_resource_templates_with_cancellation(
-        &mut self, cx: &Cx, cancellation: &McpRequestCancellation, cursor: Option<&str>,
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        cursor: Option<&str>,
     ) -> Result<CoreResult, ManagedHttpClientError> {
-        self.perform(cx, cancellation, Call::Templates(cursor)).await
+        self.perform(cx, cancellation, Call::Templates(cursor))
+            .await
     }
 
     pub async fn list_prompts(
-        &mut self, cx: &Cx, cursor: Option<&str>,
+        &mut self,
+        cx: &Cx,
+        cursor: Option<&str>,
     ) -> Result<CoreResult, ManagedHttpClientError> {
-        self.list_prompts_with_cancellation(cx, &McpRequestCancellation::new(), cursor).await
+        self.list_prompts_with_cancellation(cx, &McpRequestCancellation::new(), cursor)
+            .await
     }
 
     pub async fn list_prompts_with_cancellation(
-        &mut self, cx: &Cx, cancellation: &McpRequestCancellation, cursor: Option<&str>,
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        cursor: Option<&str>,
     ) -> Result<CoreResult, ManagedHttpClientError> {
         self.perform(cx, cancellation, Call::Prompts(cursor)).await
     }
 
     pub async fn call_tool(
-        &mut self, cx: &Cx, name: &str, arguments: Value,
+        &mut self,
+        cx: &Cx,
+        name: &str,
+        arguments: Value,
     ) -> Result<CoreResult, ManagedHttpClientError> {
-        self.call_tool_with_cancellation(
-            cx, &McpRequestCancellation::new(), name, arguments,
-        ).await
+        self.call_tool_with_cancellation(cx, &McpRequestCancellation::new(), name, arguments)
+            .await
     }
 
     pub async fn call_tool_with_cancellation(
-        &mut self, cx: &Cx, cancellation: &McpRequestCancellation,
-        name: &str, arguments: Value,
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        name: &str,
+        arguments: Value,
     ) -> Result<CoreResult, ManagedHttpClientError> {
-        self.perform(cx, cancellation, Call::Tool { name, arguments }).await
+        self.perform(cx, cancellation, Call::Tool { name, arguments })
+            .await
     }
 
     pub async fn call_tool_with_reviewed_headers(
-        &mut self, cx: &Cx, arguments: Value, reviewed: &ReviewedToolHeaders,
+        &mut self,
+        cx: &Cx,
+        arguments: Value,
+        reviewed: &ReviewedToolHeaders,
         review: &(dyn Fn(&ParameterHeaderBinding) -> bool + Send + Sync),
     ) -> Result<CoreResult, ManagedHttpClientError> {
         self.call_tool_with_reviewed_headers_and_cancellation(
-            cx, &McpRequestCancellation::new(), arguments, reviewed, review,
-        ).await
+            cx,
+            &McpRequestCancellation::new(),
+            arguments,
+            reviewed,
+            review,
+        )
+        .await
     }
 
     pub async fn call_tool_with_reviewed_headers_and_cancellation(
-        &mut self, cx: &Cx, cancellation: &McpRequestCancellation,
-        arguments: Value, reviewed: &ReviewedToolHeaders,
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        arguments: Value,
+        reviewed: &ReviewedToolHeaders,
         review: &(dyn Fn(&ParameterHeaderBinding) -> bool + Send + Sync),
     ) -> Result<CoreResult, ManagedHttpClientError> {
         // A mismatching disclosure plan is not a reason to spend a refresh
@@ -283,34 +340,55 @@ impl ManagedHttpClient {
         if reviewed.resource() != self.session.resource() {
             return Err(ManagedHttpClientError::InvalidPolicy);
         }
-        self.perform(cx, cancellation, Call::Reviewed { arguments, reviewed, review }).await
+        self.perform(
+            cx,
+            cancellation,
+            Call::Reviewed {
+                arguments,
+                reviewed,
+                review,
+            },
+        )
+        .await
     }
 
     pub async fn read_resource(
-        &mut self, cx: &Cx, uri: &str,
+        &mut self,
+        cx: &Cx,
+        uri: &str,
     ) -> Result<CoreResult, ManagedHttpClientError> {
-        self.read_resource_with_cancellation(cx, &McpRequestCancellation::new(), uri).await
+        self.read_resource_with_cancellation(cx, &McpRequestCancellation::new(), uri)
+            .await
     }
 
     pub async fn read_resource_with_cancellation(
-        &mut self, cx: &Cx, cancellation: &McpRequestCancellation, uri: &str,
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        uri: &str,
     ) -> Result<CoreResult, ManagedHttpClientError> {
         self.perform(cx, cancellation, Call::Read(uri)).await
     }
 
     pub async fn get_prompt(
-        &mut self, cx: &Cx, name: &str, arguments: HashMap<String, String>,
+        &mut self,
+        cx: &Cx,
+        name: &str,
+        arguments: HashMap<String, String>,
     ) -> Result<CoreResult, ManagedHttpClientError> {
-        self.get_prompt_with_cancellation(
-            cx, &McpRequestCancellation::new(), name, arguments,
-        ).await
+        self.get_prompt_with_cancellation(cx, &McpRequestCancellation::new(), name, arguments)
+            .await
     }
 
     pub async fn get_prompt_with_cancellation(
-        &mut self, cx: &Cx, cancellation: &McpRequestCancellation,
-        name: &str, arguments: HashMap<String, String>,
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        name: &str,
+        arguments: HashMap<String, String>,
     ) -> Result<CoreResult, ManagedHttpClientError> {
-        self.perform(cx, cancellation, Call::Prompt { name, arguments }).await
+        self.perform(cx, cancellation, Call::Prompt { name, arguments })
+            .await
     }
 
     async fn perform(
@@ -327,7 +405,9 @@ impl ManagedHttpClient {
         let catalog = call.catalog();
         let continuation = catalog.is_some_and(|(_, cursor)| cursor.is_some());
         if let Some((kind, Some(cursor))) = catalog {
-            let previous = self.connection.as_ref()
+            let previous = self
+                .connection
+                .as_ref()
                 .ok_or(ManagedHttpClientError::CatalogGenerationChanged)?;
             // Refuse unknown/cross-catalog handles before acquiring a token.
             // A newer connection alone cannot establish a cursor's provenance.
@@ -341,53 +421,77 @@ impl ManagedHttpClient {
         let previous = self.connection.take();
         let session = self.session.clone();
         let builder = self.builder.clone();
-        let guarded = session.await_active(cx, cancellation, deadline, None, Box::pin(async {
-            let snapshot = session.credential_with_cancellation(cx, cancellation).await?;
-            let generation = snapshot.generation();
-            if continuation
-                && previous.as_ref().is_none_or(|old| old.generation != generation)
-            {
-                return Ok(Err(ManagedHttpClientError::CatalogGenerationChanged));
-            }
-            // Scope/credential changes invalidate the entire ordinary client,
-            // including its discovery capabilities and response/catalog caches.
-            let reusable = previous.filter(|old| old.generation == generation);
-            session.await_credential(
-                cx, cancellation, deadline, snapshot.expires_at(),
-                &snapshot.credential.revoked,
-                Box::pin(async {
-                    let (mut client, mut cursors) = match reusable {
-                        Some(connection) => (connection.client, connection.cursors),
-                        None => match builder
-                            .http_bearer_credential(snapshot.credential().clone())
-                            .connect_http_client_with_cx(cx)
-                            .await
-                        {
-                            Ok(client) => (client, CursorLedger::default()),
-                            Err(_) => return Ok(Err(ManagedHttpClientError::Connection)),
-                        },
-                    };
-                    let wire_cursor = match catalog {
-                        Some((kind, cursor)) => match cursors.take(kind, cursor) {
-                            Ok(cursor) => cursor,
-                            Err(error) => return Ok(Err(error)),
-                        },
-                        None => None,
-                    };
-                    let result = call.dispatch(cx, cancellation, &mut client, wire_cursor.as_deref()).await;
-                    let mut value = match result {
-                        Ok(value) => value,
-                        Err(error) => return Ok(Err(request_error(error))),
-                    };
-                    if let Some((kind, _)) = catalog {
-                        if let Err(error) = cursors.publish(kind, &mut value) {
-                            return Ok(Err(error));
-                        }
-                    }
-                    Ok(Ok((value, Connection { client, generation, cursors })))
-                }),
-            ).await
-        }));
+        let guarded = session.await_active(
+            cx,
+            cancellation,
+            deadline,
+            None,
+            Box::pin(async {
+                let snapshot = session
+                    .credential_with_cancellation(cx, cancellation)
+                    .await?;
+                let generation = snapshot.generation();
+                if continuation
+                    && previous
+                        .as_ref()
+                        .is_none_or(|old| old.generation != generation)
+                {
+                    return Ok(Err(ManagedHttpClientError::CatalogGenerationChanged));
+                }
+                // Scope/credential changes invalidate the entire ordinary client,
+                // including its discovery capabilities and response/catalog caches.
+                let reusable = previous.filter(|old| old.generation == generation);
+                session
+                    .await_credential(
+                        cx,
+                        cancellation,
+                        deadline,
+                        snapshot.expires_at(),
+                        &snapshot.credential.revoked,
+                        Box::pin(async {
+                            let (mut client, mut cursors) = match reusable {
+                                Some(connection) => (connection.client, connection.cursors),
+                                None => match builder
+                                    .http_bearer_credential(snapshot.credential().clone())
+                                    .connect_http_client_with_cx(cx)
+                                    .await
+                                {
+                                    Ok(client) => (client, CursorLedger::default()),
+                                    Err(_) => return Ok(Err(ManagedHttpClientError::Connection)),
+                                },
+                            };
+                            let wire_cursor = match catalog {
+                                Some((kind, cursor)) => match cursors.take(kind, cursor) {
+                                    Ok(cursor) => cursor,
+                                    Err(error) => return Ok(Err(error)),
+                                },
+                                None => None,
+                            };
+                            let result = call
+                                .dispatch(cx, cancellation, &mut client, wire_cursor.as_deref())
+                                .await;
+                            let mut value = match result {
+                                Ok(value) => value,
+                                Err(error) => return Ok(Err(request_error(error))),
+                            };
+                            if let Some((kind, _)) = catalog {
+                                if let Err(error) = cursors.publish(kind, &mut value) {
+                                    return Ok(Err(error));
+                                }
+                            }
+                            Ok(Ok((
+                                value,
+                                Connection {
+                                    client,
+                                    generation,
+                                    cursors,
+                                },
+                            )))
+                        }),
+                    )
+                    .await
+            }),
+        );
         // Heap the outer guard rather than awaiting it inline. `await_active`
         // wraps the whole two-layer credential guard, and `perform` holds its
         // frame inline -- which every one of the fourteen public verbs then
@@ -412,14 +516,20 @@ enum Call<'a> {
     Resources(Option<&'a str>),
     Templates(Option<&'a str>),
     Prompts(Option<&'a str>),
-    Tool { name: &'a str, arguments: Value },
+    Tool {
+        name: &'a str,
+        arguments: Value,
+    },
     Reviewed {
         arguments: Value,
         reviewed: &'a ReviewedToolHeaders,
         review: &'a (dyn Fn(&ParameterHeaderBinding) -> bool + Send + Sync),
     },
     Read(&'a str),
-    Prompt { name: &'a str, arguments: HashMap<String, String> },
+    Prompt {
+        name: &'a str,
+        arguments: HashMap<String, String>,
+    },
 }
 
 impl<'a> Call<'a> {
@@ -434,7 +544,10 @@ impl<'a> Call<'a> {
     }
 
     async fn dispatch(
-        self, cx: &Cx, cancellation: &McpRequestCancellation, client: &mut HttpClient,
+        self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        client: &mut HttpClient,
         wire_cursor: Option<&str>,
     ) -> Result<CoreResult, HttpClientError> {
         match self {
@@ -443,12 +556,25 @@ impl<'a> Call<'a> {
             Self::Templates(_) => client.list_resource_templates(cx, wire_cursor).await,
             Self::Prompts(_) => client.list_prompts(cx, wire_cursor).await,
             Self::Tool { name, arguments } => {
-                client.call_tool_with_cancellation(cx, cancellation, name, arguments).await
+                client
+                    .call_tool_with_cancellation(cx, cancellation, name, arguments)
+                    .await
             }
-            Self::Reviewed { arguments, reviewed, review } => client
-                .call_tool_with_reviewed_headers_and_cancellation(
-                    cx, cancellation, arguments, reviewed, review,
-                ).await,
+            Self::Reviewed {
+                arguments,
+                reviewed,
+                review,
+            } => {
+                client
+                    .call_tool_with_reviewed_headers_and_cancellation(
+                        cx,
+                        cancellation,
+                        arguments,
+                        reviewed,
+                        review,
+                    )
+                    .await
+            }
             Self::Read(uri) => client.read_resource(cx, uri).await,
             Self::Prompt { name, arguments } => client.get_prompt(cx, name, arguments).await,
         }

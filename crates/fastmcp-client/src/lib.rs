@@ -40825,7 +40825,10 @@ exec sleep 30
         let object = result
             .as_object_mut()
             .expect("a discovery result is a JSON object");
-        if let Some(meta) = object.get_mut("_meta").and_then(serde_json::Value::as_object_mut) {
+        if let Some(meta) = object
+            .get_mut("_meta")
+            .and_then(serde_json::Value::as_object_mut)
+        {
             meta.remove(META_KEY);
         }
         if let Some(name) = in_meta {
@@ -40948,10 +40951,8 @@ exec sleep 30
     /// would admit two divergent identities as if they agreed.
     #[test]
     fn modern_discovery_refuses_identity_in_both_positions() {
-        let ambiguous = discovery_result_with_identity_placement(
-            Some("meta-peer"),
-            Some("sibling-peer"),
-        );
+        let ambiguous =
+            discovery_result_with_identity_placement(Some("meta-peer"), Some("sibling-peer"));
 
         // Layer 1, the cause. The client collapses every deserialization
         // failure into one opaque message, so the ONLY place the specific

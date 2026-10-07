@@ -15,14 +15,14 @@ use asupersync::net::{TcpListener, TcpStream};
 use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
 use asupersync::tls::{Certificate, CertificateChain, PrivateKey, TlsAcceptor, TlsAcceptorBuilder};
 use fastmcp_client::http_auth::discovery::TrustedOAuthIssuer;
-use fastmcp_client::http_auth::discovery::registration::{
-    NATIVE_REGISTRATION_REDIRECT_URIS, NativeClientRegistration,
-};
 use fastmcp_client::http_auth::discovery::registration::metadata_document::{
     MetadataDocumentDiscovery, MetadataDocumentError, NativeClientMetadata,
 };
 use fastmcp_client::http_auth::discovery::registration::selection::{
     NativeClientRegistrationChoice, NativeClientRegistrationMethod, NativeClientSelectionError,
+};
+use fastmcp_client::http_auth::discovery::registration::{
+    NATIVE_REGISTRATION_REDIRECT_URIS, NativeClientRegistration,
 };
 use fastmcp_client::http_auth::driver::redirect::RedirectAuthorizationDriver;
 use fastmcp_client::http_auth::managed::{OAuthSessionError, OAuthSessionPolicy};
@@ -64,7 +64,8 @@ fn run(future: impl Future<Output = ()>) {
         .block_on(async {
             let cx = Cx::current().unwrap();
             asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), future)
-                .await.expect("the complete public-API TLS exchange must settle");
+                .await
+                .expect("the complete public-API TLS exchange must settle");
         });
 }
 
@@ -87,22 +88,34 @@ async fn pair_inner<L: Future, R: Future>(left: L, right: R) -> (L::Output, R::O
     let mut right_result = None;
     poll_fn(|task| {
         if left_result.is_none() {
-            if let Poll::Ready(result) = left.as_mut().poll(task) { left_result = Some(result); }
+            if let Poll::Ready(result) = left.as_mut().poll(task) {
+                left_result = Some(result);
+            }
         }
         if right_result.is_none() {
-            if let Poll::Ready(result) = right.as_mut().poll(task) { right_result = Some(result); }
+            if let Poll::Ready(result) = right.as_mut().poll(task) {
+                right_result = Some(result);
+            }
         }
         if left_result.is_some() && right_result.is_some() {
             Poll::Ready((left_result.take().unwrap(), right_result.take().unwrap()))
-        } else { Poll::Pending }
-    }).await
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 fn encode(value: &str) -> String {
-    value.bytes().map(|byte| match byte {
-        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => char::from(byte).to_string(),
-        byte => format!("%{byte:02X}"),
-    }).collect()
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                char::from(byte).to_string()
+            }
+            byte => format!("%{byte:02X}"),
+        })
+        .collect()
 }
 
 fn decode(value: &str) -> String {
@@ -139,9 +152,17 @@ fn base64url(bytes: &[u8]) -> String {
         let second = chunk.get(1).copied().unwrap_or(0);
         let third = chunk.get(2).copied().unwrap_or(0);
         encoded.push(char::from(ALPHABET[usize::from(first >> 2)]));
-        encoded.push(char::from(ALPHABET[usize::from((first & 3) << 4 | second >> 4)]));
-        if chunk.len() > 1 { encoded.push(char::from(ALPHABET[usize::from((second & 15) << 2 | third >> 6)])); }
-        if chunk.len() > 2 { encoded.push(char::from(ALPHABET[usize::from(third & 63)])); }
+        encoded.push(char::from(
+            ALPHABET[usize::from((first & 3) << 4 | second >> 4)],
+        ));
+        if chunk.len() > 1 {
+            encoded.push(char::from(
+                ALPHABET[usize::from((second & 15) << 2 | third >> 6)],
+            ));
+        }
+        if chunk.len() > 2 {
+            encoded.push(char::from(ALPHABET[usize::from(third & 63)]));
+        }
     }
     encoded
 }
@@ -160,7 +181,9 @@ async fn read_request<IO: AsyncRead + Unpin>(io: &mut IO) -> Request {
         let count = io.read(&mut buffer).await.unwrap();
         assert!(count > 0 && wire.len() + count <= 128 * 1024);
         wire.extend_from_slice(&buffer[..count]);
-        if let Some(index) = wire.windows(4).position(|bytes| bytes == b"\r\n\r\n") { break index + 4; }
+        if let Some(index) = wire.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+            break index + 4;
+        }
     };
     let head = std::str::from_utf8(&wire[..end]).unwrap();
     let mut lines = head.split("\r\n");
@@ -172,9 +195,15 @@ async fn read_request<IO: AsyncRead + Unpin>(io: &mut IO) -> Request {
     let mut headers = BTreeMap::new();
     for line in lines.filter(|line| !line.is_empty()) {
         let (key, value) = line.split_once(':').unwrap();
-        assert!(headers.insert(key.to_ascii_lowercase(), value.trim().to_owned()).is_none());
+        assert!(
+            headers
+                .insert(key.to_ascii_lowercase(), value.trim().to_owned())
+                .is_none()
+        );
     }
-    let length = headers.get("content-length").map_or(0, |value| value.parse::<usize>().unwrap());
+    let length = headers
+        .get("content-length")
+        .map_or(0, |value| value.parse::<usize>().unwrap());
     assert!(end + length <= 128 * 1024);
     while wire.len() < end + length {
         let count = io.read(&mut buffer).await.unwrap();
@@ -182,12 +211,20 @@ async fn read_request<IO: AsyncRead + Unpin>(io: &mut IO) -> Request {
         wire.extend_from_slice(&buffer[..count]);
     }
     assert_eq!(wire.len(), end + length);
-    Request { method, target, headers, body: wire[end..].to_vec() }
+    Request {
+        method,
+        target,
+        headers,
+        body: wire[end..].to_vec(),
+    }
 }
 
 fn public_request(request: &Request) {
     for forbidden in ["authorization", "cookie", "referer"] {
-        assert!(!request.headers.contains_key(forbidden), "unexpected front-channel credential");
+        assert!(
+            !request.headers.contains_key(forbidden),
+            "unexpected front-channel credential"
+        );
     }
 }
 
@@ -211,31 +248,60 @@ impl Peer {
         Self {
             listener: TcpListener::bind("127.0.0.1:0").await.unwrap(),
             acceptor: TlsAcceptorBuilder::new(
-                CertificateChain::from_pem(LEAF).unwrap(), PrivateKey::from_pem(KEY).unwrap(),
-            ).alpn_protocols(vec![b"http/1.1".to_vec()]).build().unwrap(),
+                CertificateChain::from_pem(LEAF).unwrap(),
+                PrivateKey::from_pem(KEY).unwrap(),
+            )
+            .alpn_protocols(vec![b"http/1.1".to_vec()])
+            .build()
+            .unwrap(),
         }
     }
 
-    fn origin(&self) -> String { format!("https://{}", self.listener.local_addr().unwrap()) }
-    fn resource(&self) -> CanonicalHttpUrl { url(&format!("{}/mcp", self.origin())) }
-    fn issuer(&self) -> String { format!("{}/tenant", self.origin()) }
+    fn origin(&self) -> String {
+        format!("https://{}", self.listener.local_addr().unwrap())
+    }
+    fn resource(&self) -> CanonicalHttpUrl {
+        url(&format!("{}/mcp", self.origin()))
+    }
+    fn issuer(&self) -> String {
+        format!("{}/tenant", self.origin())
+    }
     fn trusted(&self) -> TrustedOAuthIssuer {
-        TrustedOAuthIssuer::new(self.issuer()).unwrap().with_root_certificate(root()).unwrap()
+        TrustedOAuthIssuer::new(self.issuer())
+            .unwrap()
+            .with_root_certificate(root())
+            .unwrap()
     }
     fn metadata() -> NativeClientMetadata {
         NativeClientMetadata::new(EXACT_CLIENT_ID, "Native CIMD test").unwrap()
     }
     fn cimd(&self) -> MetadataDocumentDiscovery {
-        MetadataDocumentDiscovery::new(self.resource(), vec![self.trusted()], Self::metadata(), vec!["read".to_owned()])
-            .unwrap().with_resource_root_certificate(root()).unwrap()
+        MetadataDocumentDiscovery::new(
+            self.resource(),
+            vec![self.trusted()],
+            Self::metadata(),
+            vec!["read".to_owned()],
+        )
+        .unwrap()
+        .with_resource_root_certificate(root())
+        .unwrap()
     }
     fn registration(&self) -> NativeClientRegistration {
-        NativeClientRegistration::new(self.resource(), vec![self.trusted()], "Native CIMD test", vec!["read".to_owned()])
-            .unwrap().with_resource_root_certificate(root()).unwrap()
+        NativeClientRegistration::new(
+            self.resource(),
+            vec![self.trusted()],
+            "Native CIMD test",
+            vec!["read".to_owned()],
+        )
+        .unwrap()
+        .with_resource_root_certificate(root())
+        .unwrap()
     }
     fn driver(&self) -> RedirectAuthorizationDriver {
         RedirectAuthorizationDriver::new(url(&format!("{}/authorize", self.origin())))
-            .unwrap().with_extra_root_certificate(root()).unwrap()
+            .unwrap()
+            .with_extra_root_certificate(root())
+            .unwrap()
     }
     fn issuer_document(&self, supports: Value) -> Value {
         json!({
@@ -260,44 +326,62 @@ impl Peer {
     }
     async fn discovery(&self, issuer_documents: Vec<Value>) {
         let (mut stream, request) = self.next().await;
-        assert_eq!(request.method, "GET"); assert_eq!(request.target, PRM);
-        assert!(request.body.is_empty()); public_request(&request);
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.target, PRM);
+        assert!(request.body.is_empty());
+        public_request(&request);
         let body = json!({"resource":self.resource().as_str(), "authorization_servers":[self.issuer()], "scopes_supported":["read"], "bearer_methods_supported":["header"]});
         reply(&mut stream, 200, "", &serde_json::to_vec(&body).unwrap()).await;
         for (index, body) in issuer_documents.into_iter().enumerate() {
             let (mut stream, request) = self.next().await;
-            assert_eq!(request.method, "GET"); assert_eq!(request.target, AS_LOCATIONS[index]);
-            assert!(request.body.is_empty()); public_request(&request);
+            assert_eq!(request.method, "GET");
+            assert_eq!(request.target, AS_LOCATIONS[index]);
+            assert!(request.body.is_empty());
+            public_request(&request);
             reply(&mut stream, 200, "", &serde_json::to_vec(&body).unwrap()).await;
         }
     }
     async fn register(&self, status: u16, corrupt: bool) {
         let (mut stream, request) = self.next().await;
-        assert_eq!(request.method, "POST"); assert_eq!(request.target, "/register");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, "/register");
         public_request(&request);
         let mut body: Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(body["application_type"], "native");
         assert_eq!(body["token_endpoint_auth_method"], "none");
-        assert_eq!(body["redirect_uris"], json!(NATIVE_REGISTRATION_REDIRECT_URIS));
+        assert_eq!(
+            body["redirect_uris"],
+            json!(NATIVE_REGISTRATION_REDIRECT_URIS)
+        );
         assert_eq!(body["scope"], "read");
-        assert!(body.get("client_id").is_none()); assert!(body.get("client_secret").is_none());
+        assert!(body.get("client_id").is_none());
+        assert!(body.get("client_secret").is_none());
         body["client_id"] = json!("created-client");
-        if corrupt { body["redirect_uris"] = json!(["https://wrong.example/callback"]); }
+        if corrupt {
+            body["redirect_uris"] = json!(["https://wrong.example/callback"]);
+        }
         reply(&mut stream, status, "", &serde_json::to_vec(&body).unwrap()).await;
     }
     async fn login(&self, expected_id: &str, accepted: bool) {
         let (mut stream, request) = self.next().await;
-        assert_eq!(request.method, "GET"); public_request(&request);
+        assert_eq!(request.method, "GET");
+        public_request(&request);
         let fields = form(request.target.strip_prefix("/authorize?").unwrap());
         assert_eq!(fields["client_id"], expected_id);
         assert_eq!(fields["resource"], self.resource().as_str());
         assert_eq!(fields["scope"], "read");
         assert_eq!(fields["code_challenge_method"], "S256");
         assert!(!fields.contains_key("code_verifier"));
-        let callback = format!("{}?code=issued-code&state={}&iss={}", fields["redirect_uri"], encode(&fields["state"]), encode(&self.issuer()));
+        let callback = format!(
+            "{}?code=issued-code&state={}&iss={}",
+            fields["redirect_uri"],
+            encode(&fields["state"]),
+            encode(&self.issuer())
+        );
         reply(&mut stream, 302, &format!("Location: {callback}\r\n"), b"").await;
         let (mut stream, request) = self.next().await;
-        assert_eq!(request.method, "POST"); assert_eq!(request.target, "/token");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, "/token");
         public_request(&request);
         let token = form(std::str::from_utf8(&request.body).unwrap());
         assert_eq!(token["client_id"], expected_id);
@@ -316,23 +400,40 @@ impl Peer {
     async fn protected_catalog(&self) {
         for method in ["server/discover", "tools/list"] {
             let (mut stream, request) = self.next().await;
-            assert_eq!(request.method, "POST"); assert_eq!(request.target, "/mcp");
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.target, "/mcp");
             assert_eq!(request.headers["authorization"], "Bearer cimd-access");
             let body: Value = serde_json::from_slice(&request.body).unwrap();
             assert_eq!(body["method"], method);
-            assert_eq!(body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"], FINAL_PROTOCOL_VERSION);
+            assert_eq!(
+                body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+                FINAL_PROTOCOL_VERSION
+            );
             let result = if method == "server/discover" {
                 json!({"resultType":"complete", "supportedVersions":[FINAL_PROTOCOL_VERSION], "capabilities":{"tools":{}}, "_meta":{"io.modelcontextprotocol/serverInfo":{"name":"cimd-peer","version":"1"}}, "ttlMs":0, "cacheScope":"private"})
             } else {
                 json!({"resultType":"complete", "tools":[{"name":"listed-through-oauth","inputSchema":{"type":"object"}}], "ttlMs":0, "cacheScope":"private"})
             };
             let response = json!({"jsonrpc":"2.0", "id":body["id"], "result":result});
-            reply(&mut stream, 200, "", &serde_json::to_vec(&response).unwrap()).await;
+            reply(
+                &mut stream,
+                200,
+                "",
+                &serde_json::to_vec(&response).unwrap(),
+            )
+            .await;
         }
     }
     async fn no_more_requests(&self, cx: &Cx) {
-        let result = asupersync::time::timeout_at(cx.now().saturating_add_nanos(100_000_000), self.listener.accept()).await;
-        assert!(result.is_err(), "unexpected retry, registration, metadata fetch, or login");
+        let result = asupersync::time::timeout_at(
+            cx.now().saturating_add_nanos(100_000_000),
+            self.listener.accept(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "unexpected retry, registration, metadata fetch, or login"
+        );
     }
 }
 
@@ -340,52 +441,98 @@ impl Peer {
 fn cimd_candidate_admission_then_pkce_login_reaches_authenticated_public_mcp_client() {
     assert_eq!(base64url(b"foo"), "Zm9v");
     run(async {
-        let cx = Cx::current().unwrap(); let peer = Peer::new().await;
-        let plan = peer.cimd(); let driver = peer.driver();
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
+        let plan = peer.cimd();
+        let driver = peer.driver();
         let serving = async {
             // A generic first-200 selector would stop at this non-CIMD document.
-            peer.discovery(vec![peer.issuer_document(json!(false)), peer.issuer_document(json!(true))]).await;
+            peer.discovery(vec![
+                peer.issuer_document(json!(false)),
+                peer.issuer_document(json!(true)),
+            ])
+            .await;
             peer.login(EXACT_CLIENT_ID, true).await;
         };
-        let (session, ()) = pair(plan.authorize_managed_with_browser_driver(
-            &cx, OAuthSessionPolicy::default(), Duration::from_secs(10), |url| driver.drive(&cx, url),
-        ), serving).await;
-        let session = session.unwrap(); let snapshot = session.credential(&cx).await.unwrap();
-        assert_eq!(snapshot.generation(), 1); assert_eq!(snapshot.scopes(), &["read".to_owned()]);
-        let protocol = ClientProtocolPlan::http(ProtocolPolicy::ModernOnly, Some(peer.resource()), None, None,
-            "cimd-principal".to_owned(), "private-test-ca".to_owned(), "native-http".to_owned(), 0, 0, 0).unwrap();
+        let (session, ()) = pair(
+            plan.authorize_managed_with_browser_driver(
+                &cx,
+                OAuthSessionPolicy::default(),
+                Duration::from_secs(10),
+                |url| driver.drive(&cx, url),
+            ),
+            serving,
+        )
+        .await;
+        let session = session.unwrap();
+        let snapshot = session.credential(&cx).await.unwrap();
+        assert_eq!(snapshot.generation(), 1);
+        assert_eq!(snapshot.scopes(), &["read".to_owned()]);
+        let protocol = ClientProtocolPlan::http(
+            ProtocolPolicy::ModernOnly,
+            Some(peer.resource()),
+            None,
+            None,
+            "cimd-principal".to_owned(),
+            "private-test-ca".to_owned(),
+            "native-http".to_owned(),
+            0,
+            0,
+            0,
+        )
+        .unwrap();
         let exercise = async {
-            let mut client = ClientBuilder::new().protocol_plan(protocol)
+            let mut client = ClientBuilder::new()
+                .protocol_plan(protocol)
                 .http_bearer_credential(snapshot.credential().clone())
-                .http_resource_root_certificate(peer.resource(), root()).unwrap()
-                .connect_http_client_with_cx(&cx).await.unwrap();
+                .http_resource_root_certificate(peer.resource(), root())
+                .unwrap()
+                .connect_http_client_with_cx(&cx)
+                .await
+                .unwrap();
             let result = client.list_tools(&cx, None).await.unwrap();
-            let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = result else { panic!("expected final tools catalog"); };
+            let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = result else {
+                panic!("expected final tools catalog");
+            };
             assert_eq!(result.payload.tools.len(), 1);
             assert_eq!(result.payload.tools[0].name, "listed-through-oauth");
         };
         pair(exercise, peer.protected_catalog()).await;
-        session.close(); assert!(snapshot.credential().is_revoked());
+        session.close();
+        assert!(snapshot.credential().is_revoked());
         peer.no_more_requests(&cx).await;
     });
 }
 
 #[test]
 fn selection_priority_changes_only_whether_the_single_registration_post_occurs() {
-    for method in [NativeClientRegistrationMethod::Preregistered, NativeClientRegistrationMethod::MetadataDocument, NativeClientRegistrationMethod::DynamicRegistration] {
+    for method in [
+        NativeClientRegistrationMethod::Preregistered,
+        NativeClientRegistrationMethod::MetadataDocument,
+        NativeClientRegistrationMethod::DynamicRegistration,
+    ] {
         run(async {
-            let cx = Cx::current().unwrap(); let peer = Peer::new().await;
-            let mut choice = NativeClientRegistrationChoice::new(peer.registration()).with_metadata_document(Peer::metadata()).unwrap();
+            let cx = Cx::current().unwrap();
+            let peer = Peer::new().await;
+            let mut choice = NativeClientRegistrationChoice::new(peer.registration())
+                .with_metadata_document(Peer::metadata())
+                .unwrap();
             if method == NativeClientRegistrationMethod::Preregistered {
-                choice = choice.with_preregistered_client_id("configured-client").unwrap();
+                choice = choice
+                    .with_preregistered_client_id("configured-client")
+                    .unwrap();
             }
             let dcr = method == NativeClientRegistrationMethod::DynamicRegistration;
             let serving = async {
-                peer.discovery(vec![peer.issuer_document(json!(!dcr))]).await;
-                if dcr { peer.register(201, false).await; }
+                peer.discovery(vec![peer.issuer_document(json!(!dcr))])
+                    .await;
+                if dcr {
+                    peer.register(201, false).await;
+                }
             };
             let (identity, ()) = pair(choice.resolve(&cx), serving).await;
-            let identity = identity.unwrap(); assert_eq!(identity.registration_method(), method);
+            let identity = identity.unwrap();
+            assert_eq!(identity.registration_method(), method);
             let expected_id = match method {
                 NativeClientRegistrationMethod::Preregistered => "configured-client",
                 NativeClientRegistrationMethod::MetadataDocument => EXACT_CLIENT_ID,
@@ -393,10 +540,19 @@ fn selection_priority_changes_only_whether_the_single_registration_post_occurs()
             };
             assert_eq!(identity.client().client_id(), expected_id);
             let driver = peer.driver();
-            let (session, ()) = pair(identity.authorize_managed_with_browser_driver(
-                &cx, OAuthSessionPolicy::default(), Duration::from_secs(5), |url| driver.drive(&cx, url),
-            ), peer.login(expected_id, true)).await;
-            let session = session.unwrap(); assert!(session.credential(&cx).await.is_ok()); session.close();
+            let (session, ()) = pair(
+                identity.authorize_managed_with_browser_driver(
+                    &cx,
+                    OAuthSessionPolicy::default(),
+                    Duration::from_secs(5),
+                    |url| driver.drive(&cx, url),
+                ),
+                peer.login(expected_id, true),
+            )
+            .await;
+            let session = session.unwrap();
+            assert!(session.credential(&cx).await.is_ok());
+            session.close();
             peer.no_more_requests(&cx).await;
         });
     }
@@ -405,9 +561,11 @@ fn selection_priority_changes_only_whether_the_single_registration_post_occurs()
 #[test]
 fn standalone_registration_uses_the_same_single_post_and_response_admission() {
     run(async {
-        let cx = Cx::current().unwrap(); let peer = Peer::new().await;
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
         let serving = async {
-            peer.discovery(vec![peer.issuer_document(json!(false))]).await;
+            peer.discovery(vec![peer.issuer_document(json!(false))])
+                .await;
             peer.register(201, false).await;
         };
         let (registered, ()) = pair(peer.registration().register(&cx), serving).await;
@@ -420,11 +578,18 @@ fn standalone_registration_uses_the_same_single_post_and_response_admission() {
 fn cimd_only_refuses_unsupported_malformed_and_wrong_issuer_metadata_without_dcr() {
     for variant in [json!(false), Value::Null, json!("true"), json!(true)] {
         run(async {
-            let cx = Cx::current().unwrap(); let peer = Peer::new().await;
+            let cx = Cx::current().unwrap();
+            let peer = Peer::new().await;
             let mut body = peer.issuer_document(variant.clone());
-            if variant == json!(true) { body["issuer"] = json!("https://wrong.example/tenant"); }
+            if variant == json!(true) {
+                body["issuer"] = json!("https://wrong.example/tenant");
+            }
             let plan = peer.cimd();
-            let (result, ()) = pair(plan.discover(&cx), peer.discovery(vec![body.clone(), body.clone(), body])).await;
+            let (result, ()) = pair(
+                plan.discover(&cx),
+                peer.discovery(vec![body.clone(), body.clone(), body]),
+            )
+            .await;
             assert!(matches!(result, Err(MetadataDocumentError::Discovery(_))));
             peer.no_more_requests(&cx).await;
         });
@@ -435,14 +600,21 @@ fn cimd_only_refuses_unsupported_malformed_and_wrong_issuer_metadata_without_dcr
 fn dcr_rejection_and_changed_redirects_do_not_repeat_registration_or_start_login() {
     for (status, corrupt) in [(400, false), (201, true)] {
         run(async {
-            let cx = Cx::current().unwrap(); let peer = Peer::new().await;
-            let choice = NativeClientRegistrationChoice::new(peer.registration()).with_metadata_document(Peer::metadata()).unwrap();
+            let cx = Cx::current().unwrap();
+            let peer = Peer::new().await;
+            let choice = NativeClientRegistrationChoice::new(peer.registration())
+                .with_metadata_document(Peer::metadata())
+                .unwrap();
             let serving = async {
-                peer.discovery(vec![peer.issuer_document(json!(false))]).await;
+                peer.discovery(vec![peer.issuer_document(json!(false))])
+                    .await;
                 peer.register(status, corrupt).await;
             };
             let (result, ()) = pair(choice.resolve(&cx), serving).await;
-            assert!(matches!(result, Err(NativeClientSelectionError::Registration(_))));
+            assert!(matches!(
+                result,
+                Err(NativeClientSelectionError::Registration(_))
+            ));
             peer.no_more_requests(&cx).await;
         });
     }
@@ -451,15 +623,36 @@ fn dcr_rejection_and_changed_redirects_do_not_repeat_registration_or_start_login
 #[test]
 fn login_refusal_keeps_the_selected_identity_without_fallback_registration() {
     run(async {
-        let cx = Cx::current().unwrap(); let peer = Peer::new().await;
-        let choice = NativeClientRegistrationChoice::new(peer.registration()).with_metadata_document(Peer::metadata()).unwrap();
-        let (identity, ()) = pair(choice.resolve(&cx), peer.discovery(vec![peer.issuer_document(json!(true))])).await;
-        let identity = identity.unwrap(); let driver = peer.driver();
-        let (result, ()) = pair(identity.authorize_managed_with_browser_driver(
-            &cx, OAuthSessionPolicy::default(), Duration::from_secs(5), |url| driver.drive(&cx, url),
-        ), peer.login(EXACT_CLIENT_ID, false)).await;
-        assert!(matches!(result, Err(OAuthSessionError::OAuth(OAuthError::TokenEndpointRejected))));
-        assert_eq!(identity.registration_method(), NativeClientRegistrationMethod::MetadataDocument);
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
+        let choice = NativeClientRegistrationChoice::new(peer.registration())
+            .with_metadata_document(Peer::metadata())
+            .unwrap();
+        let (identity, ()) = pair(
+            choice.resolve(&cx),
+            peer.discovery(vec![peer.issuer_document(json!(true))]),
+        )
+        .await;
+        let identity = identity.unwrap();
+        let driver = peer.driver();
+        let (result, ()) = pair(
+            identity.authorize_managed_with_browser_driver(
+                &cx,
+                OAuthSessionPolicy::default(),
+                Duration::from_secs(5),
+                |url| driver.drive(&cx, url),
+            ),
+            peer.login(EXACT_CLIENT_ID, false),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(OAuthSessionError::OAuth(OAuthError::TokenEndpointRejected))
+        ));
+        assert_eq!(
+            identity.registration_method(),
+            NativeClientRegistrationMethod::MetadataDocument
+        );
         assert_eq!(identity.client().client_id(), EXACT_CLIENT_ID);
         peer.no_more_requests(&cx).await;
     });

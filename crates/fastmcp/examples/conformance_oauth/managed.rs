@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use asupersync::channel::oneshot;
 use asupersync::time::Sleep;
-use fastmcp_client::http_auth::managed::{ManagedOAuthSession, OAuthSessionPolicy};
 use fastmcp_client::http_auth::managed::client::{ManagedHttpClient, ManagedHttpClientError};
+use fastmcp_client::http_auth::managed::{ManagedOAuthSession, OAuthSessionPolicy};
 use fastmcp_client::http_executor::parameter_headers::ReviewedToolHeaders;
 use fastmcp_client::{ClientBuilder, HttpClient, HttpClientError, ProtocolPolicy};
 use fastmcp_core::{CanonicalHttpUrl, Cx, McpErrorCode};
@@ -39,7 +39,9 @@ pub(crate) fn selected(flag: Option<&str>, oauth_present: bool) -> Result<bool, 
     match flag {
         None | Some("0" | "false") => Ok(false),
         Some("1" | "true") if oauth_present => Ok(true),
-        _ => Err("managed refresh requires a valid flag and explicit OAuth configuration".to_owned()),
+        _ => {
+            Err("managed refresh requires a valid flag and explicit OAuth configuration".to_owned())
+        }
     }
 }
 
@@ -81,15 +83,21 @@ pub(crate) async fn configure(
     mut builder: ClientBuilder,
     raw: &str,
 ) -> Result<ManagedGrant, String> {
-    let PreparedOAuth { login, driver, resource, resource_root, timeout } =
-        PreparedOAuth::parse(raw, endpoint)?;
+    let PreparedOAuth {
+        login,
+        driver,
+        resource,
+        resource_root,
+        timeout,
+    } = PreparedOAuth::parse(raw, endpoint)?;
     if builder.selected_protocol_plan().policy() != ProtocolPolicy::ModernOnly
         || builder.selected_protocol_plan().modern_post_target() != Some(endpoint.as_str())
     {
         return Err(INVALID.to_owned());
     }
     if let Some(certificate) = resource_root {
-        builder = builder.http_resource_root_certificate(resource, certificate)
+        builder = builder
+            .http_resource_root_certificate(resource, certificate)
             .map_err(|_| INVALID.to_owned())?;
     }
     builder.http_negotiation().map_err(|_| INVALID.to_owned())?;
@@ -105,13 +113,21 @@ pub(crate) async fn configure(
                 OAuthClient::new(configuration),
                 OAuthSessionPolicy::default(),
                 move |url| launcher.launch(url),
-            ).await.map_err(|_| "managed OAuth login failed".to_owned())?;
+            )
+            .await
+            .map_err(|_| "managed OAuth login failed".to_owned())?;
             // Construct the drop guard before returning through the outer
             // lifetime checks, so late cancellation also closes the new grant.
-            Ok::<ManagedGrant, String>(ManagedGrant { session, builder, timeout })
+            Ok::<ManagedGrant, String>(ManagedGrant {
+                session,
+                builder,
+                timeout,
+            })
         },
         |url| driver.drive(cx, url),
-    ).await.map_err(|_| "explicit managed OAuth authorization failed".to_owned())
+    )
+    .await
+    .map_err(|_| "explicit managed OAuth authorization failed".to_owned())
 }
 
 async fn bounded_run<T>(
@@ -128,7 +144,10 @@ async fn bounded_run<T>(
     let nanos = u64::try_from(timeout.as_nanos())
         .map_err(|_| "invalid authenticated MCP deadline".to_owned())?;
     let deadline = cx.now().saturating_add_nanos(nanos);
-    let deadline = cx.budget().deadline.map_or(deadline, |parent| parent.min(deadline));
+    let deadline = cx
+        .budget()
+        .deadline
+        .map_or(deadline, |parent| parent.min(deadline));
     let sleep = {
         let _caller = Cx::set_current(Some(cx.clone()));
         Sleep::new(deadline)
@@ -153,7 +172,8 @@ async fn bounded_run<T>(
             return Poll::Ready(Err("authenticated MCP run reached its deadline".to_owned()));
         }
         result
-    }).await
+    })
+    .await
 }
 
 /// Both profiles use the same generic fixture sequence, not scenario branches.
@@ -169,16 +189,24 @@ pub(crate) enum ClientError {
 }
 
 impl From<HttpClientError> for ClientError {
-    fn from(error: HttpClientError) -> Self { Self::Ordinary(error) }
+    fn from(error: HttpClientError) -> Self {
+        Self::Ordinary(error)
+    }
 }
 impl From<ManagedHttpClientError> for ClientError {
-    fn from(error: ManagedHttpClientError) -> Self { Self::Managed(error) }
+    fn from(error: ManagedHttpClientError) -> Self {
+        Self::Managed(error)
+    }
 }
 impl ClientError {
     pub(crate) fn is_method_not_found(&self) -> bool {
         match self {
-            Self::Ordinary(HttpClientError::CoreResult(error)) => error.code == McpErrorCode::MethodNotFound,
-            Self::Managed(ManagedHttpClientError::Request { code }) => *code == Some(McpErrorCode::MethodNotFound),
+            Self::Ordinary(HttpClientError::CoreResult(error)) => {
+                error.code == McpErrorCode::MethodNotFound
+            }
+            Self::Managed(ManagedHttpClientError::Request { code }) => {
+                *code == Some(McpErrorCode::MethodNotFound)
+            }
             _ => false,
         }
     }
@@ -186,52 +214,101 @@ impl ClientError {
 
 impl FixtureClient {
     pub(crate) async fn ordinary(cx: &Cx, builder: ClientBuilder) -> Result<Self, ClientError> {
-        Ok(Self::Ordinary(Box::new(builder.connect_http_client_with_cx(cx).await?)))
+        Ok(Self::Ordinary(Box::new(
+            builder.connect_http_client_with_cx(cx).await?,
+        )))
     }
 
-    pub(crate) async fn list_tools(&mut self, cx: &Cx, cursor: Option<&str>) -> Result<CoreResult, ClientError> {
+    pub(crate) async fn list_tools(
+        &mut self,
+        cx: &Cx,
+        cursor: Option<&str>,
+    ) -> Result<CoreResult, ClientError> {
         match self {
             Self::Ordinary(client) => client.list_tools(cx, cursor).await.map_err(Into::into),
             Self::Managed(client) => client.list_tools(cx, cursor).await.map_err(Into::into),
         }
     }
-    pub(crate) async fn list_resources(&mut self, cx: &Cx, cursor: Option<&str>) -> Result<CoreResult, ClientError> {
+    pub(crate) async fn list_resources(
+        &mut self,
+        cx: &Cx,
+        cursor: Option<&str>,
+    ) -> Result<CoreResult, ClientError> {
         match self {
             Self::Ordinary(client) => client.list_resources(cx, cursor).await.map_err(Into::into),
             Self::Managed(client) => client.list_resources(cx, cursor).await.map_err(Into::into),
         }
     }
-    pub(crate) async fn list_prompts(&mut self, cx: &Cx, cursor: Option<&str>) -> Result<CoreResult, ClientError> {
+    pub(crate) async fn list_prompts(
+        &mut self,
+        cx: &Cx,
+        cursor: Option<&str>,
+    ) -> Result<CoreResult, ClientError> {
         match self {
             Self::Ordinary(client) => client.list_prompts(cx, cursor).await.map_err(Into::into),
             Self::Managed(client) => client.list_prompts(cx, cursor).await.map_err(Into::into),
         }
     }
-    pub(crate) async fn call_tool(&mut self, cx: &Cx, name: &str, arguments: Value) -> Result<CoreResult, ClientError> {
+    pub(crate) async fn call_tool(
+        &mut self,
+        cx: &Cx,
+        name: &str,
+        arguments: Value,
+    ) -> Result<CoreResult, ClientError> {
         match self {
-            Self::Ordinary(client) => client.call_tool(cx, name, arguments).await.map_err(Into::into),
-            Self::Managed(client) => client.call_tool(cx, name, arguments).await.map_err(Into::into),
+            Self::Ordinary(client) => client
+                .call_tool(cx, name, arguments)
+                .await
+                .map_err(Into::into),
+            Self::Managed(client) => client
+                .call_tool(cx, name, arguments)
+                .await
+                .map_err(Into::into),
         }
     }
     pub(crate) async fn call_tool_with_reviewed_headers(
-        &mut self, cx: &Cx, arguments: Value, reviewed: &ReviewedToolHeaders,
+        &mut self,
+        cx: &Cx,
+        arguments: Value,
+        reviewed: &ReviewedToolHeaders,
         review: &(dyn Fn(&ParameterHeaderBinding) -> bool + Send + Sync),
     ) -> Result<CoreResult, ClientError> {
         match self {
-            Self::Ordinary(client) => client.call_tool_with_reviewed_headers(cx, arguments, reviewed, review).await.map_err(Into::into),
-            Self::Managed(client) => client.call_tool_with_reviewed_headers(cx, arguments, reviewed, review).await.map_err(Into::into),
+            Self::Ordinary(client) => client
+                .call_tool_with_reviewed_headers(cx, arguments, reviewed, review)
+                .await
+                .map_err(Into::into),
+            Self::Managed(client) => client
+                .call_tool_with_reviewed_headers(cx, arguments, reviewed, review)
+                .await
+                .map_err(Into::into),
         }
     }
-    pub(crate) async fn read_resource(&mut self, cx: &Cx, uri: &str) -> Result<CoreResult, ClientError> {
+    pub(crate) async fn read_resource(
+        &mut self,
+        cx: &Cx,
+        uri: &str,
+    ) -> Result<CoreResult, ClientError> {
         match self {
             Self::Ordinary(client) => client.read_resource(cx, uri).await.map_err(Into::into),
             Self::Managed(client) => client.read_resource(cx, uri).await.map_err(Into::into),
         }
     }
-    pub(crate) async fn get_prompt(&mut self, cx: &Cx, name: &str, arguments: HashMap<String, String>) -> Result<CoreResult, ClientError> {
+    pub(crate) async fn get_prompt(
+        &mut self,
+        cx: &Cx,
+        name: &str,
+        arguments: HashMap<String, String>,
+    ) -> Result<CoreResult, ClientError> {
         match self {
-            Self::Ordinary(client) => client.get_prompt(cx, name, arguments).await.map_err(Into::into),
-            Self::Managed(client) => client.get_prompt(cx, name, arguments).await.map_err(Into::into),
+            Self::Ordinary(client) => client
+                .get_prompt(cx, name, arguments)
+                .await
+                .map_err(Into::into),
+            Self::Managed(client) => client
+                .get_prompt(cx, name, arguments)
+                .await
+                .map_err(Into::into),
         }
     }
 }
@@ -239,17 +316,20 @@ impl FixtureClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use fastmcp_core::McpError;
     use fastmcp_client::http_auth::managed::OAuthSessionError;
+    use fastmcp_core::McpError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn invalid_consumer_is_rejected_before_discovery_or_registration() {
         let cx = Cx::for_testing();
         let endpoint = CanonicalHttpUrl::parse("https://resource.example/mcp").unwrap();
-        for discovery in [serde_json::json!({}), serde_json::json!({
-            "allow_dynamic_registration":true, "client_name":"Fixture"
-        })] {
+        for discovery in [
+            serde_json::json!({}),
+            serde_json::json!({
+                "allow_dynamic_registration":true, "client_name":"Fixture"
+            }),
+        ] {
             let raw = serde_json::json!({
                 "preauthorized_redirect":true,
                 "resource":endpoint.as_str(),
@@ -257,7 +337,8 @@ mod tests {
                 "authorization_endpoint":"https://issuer.example/authorize",
                 "client_id":"native-client",
                 "discovery":discovery
-            }).to_string();
+            })
+            .to_string();
             let mut future = Box::pin(configure(&cx, &endpoint, ClientBuilder::new(), &raw));
             let mut task = std::task::Context::from_waker(std::task::Waker::noop());
             match future.as_mut().poll(&mut task) {
@@ -286,13 +367,21 @@ mod tests {
 
     #[test]
     fn only_protocol_method_not_found_can_skip_an_optional_managed_catalog() {
-        let plain = ClientError::from(HttpClientError::CoreResult(McpError::method_not_found("tools/list")));
-        let managed = ClientError::from(ManagedHttpClientError::Request { code: Some(McpErrorCode::MethodNotFound) });
+        let plain = ClientError::from(HttpClientError::CoreResult(McpError::method_not_found(
+            "tools/list",
+        )));
+        let managed = ClientError::from(ManagedHttpClientError::Request {
+            code: Some(McpErrorCode::MethodNotFound),
+        });
         assert!(plain.is_method_not_found() && managed.is_method_not_found());
         for error in [
-            ManagedHttpClientError::Request { code: Some(McpErrorCode::InvalidRequest) },
+            ManagedHttpClientError::Request {
+                code: Some(McpErrorCode::InvalidRequest),
+            },
             ManagedHttpClientError::Request { code: None },
-            ManagedHttpClientError::Session(OAuthSessionError::AuthorizationRejected { status: 403 }),
+            ManagedHttpClientError::Session(OAuthSessionError::AuthorizationRejected {
+                status: 403,
+            }),
             ManagedHttpClientError::CatalogGenerationChanged,
         ] {
             assert!(!ClientError::from(error).is_method_not_found());
@@ -301,23 +390,37 @@ mod tests {
 
     #[test]
     fn managed_diagnostics_do_not_print_nested_peer_errors() {
-        let error = ClientError::from(ManagedHttpClientError::Session(OAuthSessionError::LoginRequired));
-        assert_eq!(format!("{error:?}"), "Managed(ManagedHttpClientError::Session(..))");
+        let error = ClientError::from(ManagedHttpClientError::Session(
+            OAuthSessionError::LoginRequired,
+        ));
+        assert_eq!(
+            format!("{error:?}"),
+            "Managed(ManagedHttpClientError::Session(..))"
+        );
     }
 
     fn run(future: impl Future<Output = ()>) {
         asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
-            .build().unwrap().block_on(future);
+            .build()
+            .unwrap()
+            .block_on(future);
     }
 
     #[test]
     fn run_deadline_ends_a_quiet_future_without_an_expired_access_token() {
         run(async {
             let cx = Cx::current().unwrap();
-            let result = bounded_run(&cx, Duration::from_millis(100),
-                std::future::pending::<Result<(), String>>()).await;
-            assert_eq!(result.unwrap_err(), "authenticated MCP run reached its deadline");
+            let result = bounded_run(
+                &cx,
+                Duration::from_millis(100),
+                std::future::pending::<Result<(), String>>(),
+            )
+            .await;
+            assert_eq!(
+                result.unwrap_err(),
+                "authenticated MCP run reached its deadline"
+            );
         });
     }
 
@@ -330,13 +433,15 @@ mod tests {
                 polls.fetch_add(1, Ordering::SeqCst);
                 cx.set_cancel_requested(true);
                 Ok(42)
-            }).await;
+            })
+            .await;
             assert_eq!(result.unwrap_err(), "authenticated MCP run cancelled");
             assert_eq!(polls.load(Ordering::SeqCst), 1);
             let result = bounded_run(&cx, Duration::from_secs(5), async {
                 polls.fetch_add(1, Ordering::SeqCst);
                 Ok(43)
-            }).await;
+            })
+            .await;
             assert!(result.is_err());
             assert_eq!(polls.load(Ordering::SeqCst), 1);
         });

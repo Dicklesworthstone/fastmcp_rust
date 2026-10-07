@@ -125,9 +125,8 @@ mod tests {
             .with_timer_driver(timer.clone())
             .build()
             .unwrap();
-        let cx = runtime.request_cx_with_budget(
-            Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
-        );
+        let cx = runtime
+            .request_cx_with_budget(Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)));
         test(&cx, &clock, &timer);
         assert_eq!(timer.pending_count(), 0);
         drop(cx);
@@ -377,14 +376,17 @@ mod tests {
             );
             assert!(cx.timer_driver().is_none());
             let polls = AtomicUsize::new(0);
-            let result = ready(await_channel(&cx, poll_fn(|_| {
-                polls.fetch_add(1, Ordering::SeqCst);
-                if pending {
-                    Poll::Pending
-                } else {
-                    Poll::Ready(Ok(42))
-                }
-            })));
+            let result = ready(await_channel(
+                &cx,
+                poll_fn(|_| {
+                    polls.fetch_add(1, Ordering::SeqCst);
+                    if pending {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(Ok(42))
+                    }
+                }),
+            ));
             if pending {
                 let Err(TransportError::Io(error)) = result else {
                     panic!("a driverless deadline must not park a pending wait");

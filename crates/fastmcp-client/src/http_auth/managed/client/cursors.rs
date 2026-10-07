@@ -44,7 +44,9 @@ pub(super) struct CursorLedger([Option<Binding>; 4]);
 
 impl CursorLedger {
     pub(super) fn admits(&self, kind: CatalogKind, handle: &str) -> bool {
-        self.0[kind.index()].as_ref().is_some_and(|binding| binding.handle == handle)
+        self.0[kind.index()]
+            .as_ref()
+            .is_some_and(|binding| binding.handle == handle)
     }
 
     pub(super) fn take(
@@ -73,19 +75,24 @@ impl CursorLedger {
             (CatalogKind::Tools, CoreResult::Final(FinalCoreResult::ToolsList { result, .. })) => {
                 &mut result.payload.next_cursor
             }
-            (CatalogKind::Resources, CoreResult::Final(FinalCoreResult::ResourcesList { result, .. })) => {
-                &mut result.payload.next_cursor
-            }
-            (CatalogKind::Templates, CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, .. })) => {
-                &mut result.payload.next_cursor
-            }
-            (CatalogKind::Prompts, CoreResult::Final(FinalCoreResult::PromptsList { result, .. })) => {
-                &mut result.payload.next_cursor
-            }
+            (
+                CatalogKind::Resources,
+                CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }),
+            ) => &mut result.payload.next_cursor,
+            (
+                CatalogKind::Templates,
+                CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, .. }),
+            ) => &mut result.payload.next_cursor,
+            (
+                CatalogKind::Prompts,
+                CoreResult::Final(FinalCoreResult::PromptsList { result, .. }),
+            ) => &mut result.payload.next_cursor,
             _ => return Err(ManagedHttpClientError::Request { code: None }),
         };
         self.publish_cursor(kind, cursor, || {
-            draw_security_identifier().map(|id| *id.as_bytes()).map_err(|_| ())
+            draw_security_identifier()
+                .map(|id| *id.as_bytes())
+                .map_err(|_| ())
         })
     }
 
@@ -110,7 +117,10 @@ impl CursorLedger {
             handle.push(char::from(HEX[usize::from(byte >> 4)]));
             handle.push(char::from(HEX[usize::from(byte & 15)]));
         }
-        let binding = Binding { handle: handle.clone(), wire: wire.clone() };
+        let binding = Binding {
+            handle: handle.clone(),
+            wire: wire.clone(),
+        };
         self.0[kind.index()] = Some(binding);
         *cursor = Some(handle);
         Ok(())
@@ -123,7 +133,9 @@ mod tests {
 
     fn publish(ledger: &mut CursorLedger, kind: CatalogKind, wire: &str, nonce: u8) -> String {
         let mut cursor = Some(wire.to_owned());
-        ledger.publish_cursor(kind, &mut cursor, || Ok([nonce; 32])).unwrap();
+        ledger
+            .publish_cursor(kind, &mut cursor, || Ok([nonce; 32]))
+            .unwrap();
         cursor.unwrap()
     }
 
@@ -134,17 +146,29 @@ mod tests {
             let handle = publish(&mut ledger, CatalogKind::Tools, wire, 1);
             assert_ne!(handle, wire);
             assert!(!ledger.admits(CatalogKind::Tools, wire));
-            assert_eq!(ledger.take(CatalogKind::Tools, Some(&handle)).unwrap(), Some(wire.to_owned()));
-            assert!(matches!(ledger.take(CatalogKind::Tools, Some(&handle)),
-                Err(ManagedHttpClientError::InvalidCatalogCursor)));
+            assert_eq!(
+                ledger.take(CatalogKind::Tools, Some(&handle)).unwrap(),
+                Some(wire.to_owned())
+            );
+            assert!(matches!(
+                ledger.take(CatalogKind::Tools, Some(&handle)),
+                Err(ManagedHttpClientError::InvalidCatalogCursor)
+            ));
         }
     }
 
     #[test]
     fn handle_is_bound_to_its_catalog_and_a_fresh_connection_cannot_adopt_it() {
-        let kinds = [CatalogKind::Tools, CatalogKind::Resources, CatalogKind::Templates, CatalogKind::Prompts];
+        let kinds = [
+            CatalogKind::Tools,
+            CatalogKind::Resources,
+            CatalogKind::Templates,
+            CatalogKind::Prompts,
+        ];
         let mut ledger = CursorLedger::default();
-        let handles: Vec<_> = kinds.iter().enumerate()
+        let handles: Vec<_> = kinds
+            .iter()
+            .enumerate()
             .map(|(index, kind)| publish(&mut ledger, *kind, "same-peer-text", index as u8))
             .collect();
         for (index, handle) in handles.iter().enumerate() {
@@ -177,19 +201,34 @@ mod tests {
         ledger.take(CatalogKind::Tools, None).unwrap();
         assert!(!ledger.admits(CatalogKind::Tools, &tools));
         assert!(ledger.admits(CatalogKind::Prompts, &prompts));
-        ledger.publish_cursor(CatalogKind::Prompts, &mut None, || panic!("terminal page needs no entropy")).unwrap();
+        ledger
+            .publish_cursor(CatalogKind::Prompts, &mut None, || {
+                panic!("terminal page needs no entropy")
+            })
+            .unwrap();
         assert!(!ledger.admits(CatalogKind::Prompts, &prompts));
     }
 
     #[test]
     fn size_and_entropy_failures_cannot_publish_or_replace_a_binding() {
         let mut ledger = CursorLedger::default();
-        let old = publish(&mut ledger, CatalogKind::Tools, &"x".repeat(MAX_CURSOR_BYTES), 1);
+        let old = publish(
+            &mut ledger,
+            CatalogKind::Tools,
+            &"x".repeat(MAX_CURSOR_BYTES),
+            1,
+        );
         let mut oversized = Some("x".repeat(MAX_CURSOR_BYTES + 1));
-        assert!(matches!(ledger.publish_cursor(CatalogKind::Tools, &mut oversized,
-            || panic!("check size before entropy")), Err(ManagedHttpClientError::CatalogCursorUnavailable)));
+        assert!(matches!(
+            ledger.publish_cursor(CatalogKind::Tools, &mut oversized, || panic!(
+                "check size before entropy"
+            )),
+            Err(ManagedHttpClientError::CatalogCursorUnavailable)
+        ));
         let mut cursor = Some("private-cursor".to_owned());
-        let error = ledger.publish_cursor(CatalogKind::Tools, &mut cursor, || Err(())).unwrap_err();
+        let error = ledger
+            .publish_cursor(CatalogKind::Tools, &mut cursor, || Err(()))
+            .unwrap_err();
         assert!(ledger.admits(CatalogKind::Tools, &old));
         assert_eq!(cursor.as_deref(), Some("private-cursor"));
         assert!(!format!("{error:?} {error}").contains("private-cursor"));

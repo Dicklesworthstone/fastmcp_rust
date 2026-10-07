@@ -60,7 +60,9 @@ mod unix {
         }
 
         fn call(&self, _: &McpContext, _: serde_json::Value) -> McpResult<Vec<Content>> {
-            Err(McpError::invalid_request("native echo requires asynchronous final dispatch"))
+            Err(McpError::invalid_request(
+                "native echo requires asynchronous final dispatch",
+            ))
         }
 
         fn call_final_outcome_async<'a>(
@@ -104,7 +106,11 @@ mod unix {
                     "isError": false,
                 })) {
                     Ok(payload) => payload,
-                    Err(_) => return Outcome::Err(McpError::internal_error("echo result encoding failed")),
+                    Err(_) => {
+                        return Outcome::Err(McpError::internal_error(
+                            "echo result encoding failed",
+                        ));
+                    }
                 };
                 // `ResultMeta` derives only (Debug, Clone); `empty()` is its
                 // constructor and is what preserves the absence of the
@@ -140,13 +146,17 @@ mod unix {
                     return Err(error);
                 }
             };
-            server.serve_stdio_io(&cx, input, output).await
+            server
+                .serve_stdio_io(&cx, input, output)
+                .await
                 .map_err(|error| io::Error::other(error.to_string()))
         });
         // The runtime is owned by this executable, not hidden in the library.
         // Even an admission/serve error must settle it before process exit.
         if !runtime.shutdown_timeout(Duration::from_secs(6)) {
-            return Err(io::Error::other("native stdio runtime shutdown did not settle"));
+            return Err(io::Error::other(
+                "native stdio runtime shutdown did not settle",
+            ));
         }
         result
     }

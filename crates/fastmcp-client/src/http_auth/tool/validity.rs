@@ -277,7 +277,9 @@ mod context_cancellation_tests {
         assert_eq!(abandoned_wakes.0.load(Ordering::SeqCst), retired_wakes);
         assert!(sibling_wakes.0.load(Ordering::SeqCst) > 0);
         assert!(matches!(
-            sibling.as_mut().poll(&mut Context::from_waker(&sibling_waker)),
+            sibling
+                .as_mut()
+                .poll(&mut Context::from_waker(&sibling_waker)),
             Poll::Ready(Err(ManagedToolError::Core(ManagedCoreError::Cancelled)))
         ));
     }
@@ -400,7 +402,11 @@ mod context_cancellation_tests {
                 .poll(&mut Context::from_waker(Waker::noop()))
                 .is_pending()
         );
-        observed.borrow().as_ref().unwrap().cancel_fast(CancelKind::User);
+        observed
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .cancel_fast(CancelKind::User);
         assert!(cx.is_cancel_requested());
         assert!(!ambient.is_cancel_requested());
         Cx::current().unwrap().cancel_fast(CancelKind::User);
@@ -413,9 +419,8 @@ mod context_cancellation_tests {
         use std::time::Duration;
 
         let (runtime, timer, clock) = clocked_runtime();
-        let cx = runtime.request_cx_with_budget(
-            Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
-        );
+        let cx = runtime
+            .request_cx_with_budget(Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)));
         let (foreign_runtime, foreign_timer, foreign_clock) = clocked_runtime();
         foreign_clock.advance(1_000_000_000);
         let foreign_cx = foreign_runtime.request_cx_with_budget(Budget::INFINITE);
@@ -463,9 +468,8 @@ mod context_cancellation_tests {
     fn bounded_callers_without_a_driver_refuse_before_owned_work() {
         use asupersync::{Budget, Time};
 
-        let cx = Cx::for_testing_with_budget(
-            Budget::INFINITE.with_deadline(Time::from_nanos(u64::MAX)),
-        );
+        let cx =
+            Cx::for_testing_with_budget(Budget::INFINITE.with_deadline(Time::from_nanos(u64::MAX)));
         let contract = contract();
         let cancellation = McpRequestCancellation::new();
         let state = Arc::new(State::default());
@@ -479,7 +483,9 @@ mod context_cancellation_tests {
             future
                 .as_mut()
                 .poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(Err(ManagedToolError::Core(ManagedCoreError::RuntimeUnavailable)))
+            Poll::Ready(Err(ManagedToolError::Core(
+                ManagedCoreError::RuntimeUnavailable
+            )))
         ));
         assert_eq!(state.polls.load(Ordering::SeqCst), 0);
         assert!(state.dropped.load(Ordering::SeqCst));
@@ -491,9 +497,8 @@ mod context_cancellation_tests {
         use std::time::Duration;
 
         let (runtime, timer, clock) = clocked_runtime();
-        let cx = runtime.request_cx_with_budget(
-            Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
-        );
+        let cx = runtime
+            .request_cx_with_budget(Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)));
         let contract = contract();
         let cancellation = McpRequestCancellation::new();
         let state = Arc::new(State::default());
@@ -526,9 +531,8 @@ mod context_cancellation_tests {
         use std::time::Duration;
 
         let (runtime, timer, clock) = clocked_runtime();
-        let cx = runtime.request_cx_with_budget(
-            Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
-        );
+        let cx = runtime
+            .request_cx_with_budget(Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)));
         let contract = contract();
         let cancellation = McpRequestCancellation::new();
         let state = Arc::new(State::default());

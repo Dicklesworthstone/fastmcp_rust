@@ -213,7 +213,9 @@ fn header_review_notice(name: &str, protected: bool) -> String {
     if protected {
         "tools/call: parameter-header review refused; calling without header mirrors".to_owned()
     } else {
-        format!("tools/call {name}: parameter-header review refused; calling without header mirrors")
+        format!(
+            "tools/call {name}: parameter-header review refused; calling without header mirrors"
+        )
     }
 }
 
@@ -361,17 +363,22 @@ async fn run(cx: &Cx, url: &str) -> Result<(), String> {
         .capabilities(capabilities)
         .reverse_request_handlers(handlers());
     if managed_refresh {
-        let raw = oauth.as_deref().ok_or_else(|| "managed refresh requires OAuth".to_owned())?;
+        let raw = oauth
+            .as_deref()
+            .ok_or_else(|| "managed refresh requires OAuth".to_owned())?;
         let grant = managed::configure(cx, &endpoint, builder, raw).await?;
         let mut client = grant.client()?;
-        return grant.run(cx, exercise(cx, &endpoint, &mut client, true)).await;
+        return grant
+            .run(cx, exercise(cx, &endpoint, &mut client, true))
+            .await;
     }
     let (builder, authorization) =
         conformance_oauth::configure(cx, &endpoint, builder, oauth.as_deref()).await?;
     let protected = authorization.is_some();
     // Keep connection/discovery inside the fixed lease's lifetime too.
     let flow = async {
-        let mut client = FixtureClient::ordinary(cx, builder).await
+        let mut client = FixtureClient::ordinary(cx, builder)
+            .await
             .map_err(|error| failure("connect", &error, protected))?;
         exercise(cx, &endpoint, &mut client, protected).await
     };
@@ -621,7 +628,10 @@ mod tests {
             assert_eq!(call.name, "lookup");
             assert!(call.headers.is_none());
             assert!(call.header_review_refused);
-            assert_eq!(call.arguments, json!({"region":"conformance","private":"conformance"}));
+            assert_eq!(
+                call.arguments,
+                json!({"region":"conformance","private":"conformance"})
+            );
             // No annotation means no disclosure review was attempted. These
             // ordinary tools must not acquire either a plan or a refusal notice.
             let ordinary = json!({"name":"plain","inputSchema":{
@@ -744,15 +754,17 @@ mod tests {
         );
         assert!(!failure("connect", &secret, true).contains(secret));
         assert!(failure("connect", &secret, false).contains(secret));
-        let denied: ClientError = fastmcp_client::HttpClientError::CoreResult(McpError::invalid_request(secret)).into();
+        let denied: ClientError =
+            fastmcp_client::HttpClientError::CoreResult(McpError::invalid_request(secret)).into();
         assert!(
             !optional_catalog_failure("resources/list", &denied, true)
                 .unwrap_err()
                 .contains(secret)
         );
-        let unsupported: ClientError = fastmcp_client::HttpClientError::CoreResult(McpError::method_not_found(
-            "resources/list",
-        )).into();
+        let unsupported: ClientError = fastmcp_client::HttpClientError::CoreResult(
+            McpError::method_not_found("resources/list"),
+        )
+        .into();
         assert!(optional_catalog_failure("resources/list", &unsupported, true).is_ok());
     }
 }

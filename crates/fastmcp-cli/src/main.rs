@@ -14112,16 +14112,30 @@ IFS= read -r end
             ] {
                 let status = InspectProtocolStatus::new(policy, version)
                     .expect("each policy must report its exact admitted protocol version");
-                let text =
-                    format_inspect_text(Some(&server_info), &capabilities, &[], &[], &[], &[], status);
+                let text = format_inspect_text(
+                    Some(&server_info),
+                    &capabilities,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    status,
+                );
                 assert!(text.contains(&format!(
                     "Protocol: policy={} version={version} era={era}",
                     policy.server_launch_value()
                 )));
 
-                let json =
-                    format_inspect_json(Some(&server_info), &capabilities, &[], &[], &[], &[], status)
-                        .expect("inspect status serializes");
+                let json = format_inspect_json(
+                    Some(&server_info),
+                    &capabilities,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    status,
+                )
+                .expect("inspect status serializes");
                 let value: serde_json::Value =
                     serde_json::from_str(&json).expect("inspect status is JSON");
                 assert_eq!(value["protocol"]["policy"], policy.server_launch_value());
