@@ -11,13 +11,27 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 154 commits since v0.11.0. Pre-1.0 minor release: new native pipe/stdio and
 OAuth surfaces, plus one source-incompatible client change (below).
 
-### Breaking change: optional server identity on modern connections
+### Breaking changes (fastmcp-client, re-exported by fastmcp-rust)
 
-- `ClientSession` now holds `Option<ServerInfo>`: a modern (2026-07-28)
-  `server/discover` result that carries no server identity is accepted and
-  reported as `None` instead of refusing the connection
+- **Optional server identity on modern connections**
   ([25519c88](https://github.com/Dicklesworthstone/fastmcp_rust/commit/25519c88)).
-  Code that read the server identity unconditionally must handle `None`.
+  A modern (2026-07-28) `server/discover` result that carries no server
+  identity is accepted instead of refusing the connection:
+  - `ClientSession` holds `Option<ServerInfo>`, and `ClientSession::try_new`
+    takes one.
+  - `Client::server_info()` and `HttpClient::server_info()` return
+    `Option<&ServerInfo>`.
+  - `HttpClientError::ModernDiscoveryMissingServerInfo` is removed.
+- **Modern HTTP responses may carry `Mcp-Session-Id`**
+  ([d8aa4d41](https://github.com/Dicklesworthstone/fastmcp_rust/commit/d8aa4d41)).
+  The modern stateless HTTP client now ignores a response `Mcp-Session-Id`
+  header (official conformance servers send one) instead of refusing the
+  response, and `ModernHttpExecutorError::ForbiddenResponseSessionHeader` is
+  removed. The client still never sends the header. Legacy 2024-11-05 SSE
+  responses keep refusing it.
+
+Neither error enum is `#[non_exhaustive]`, so an exhaustive `match` on it needs
+updating.
 
 ### Native pipe and process-stdio transport
 
@@ -85,6 +99,9 @@ OAuth surfaces, plus one source-incompatible client change (below).
   capabilities, schema-bound operations wake on caller cancellation, memory
   transport operations wake at caller deadlines, and managed catalog cursors
   are bound to the connection and catalog that issued them.
+- Memory transport: a pending operation whose `Cx` has a deadline but no
+  timer driver now fails at once with an I/O error instead of waiting forever
+  (runtimes built normally always have a timer).
 - CLI (macOS/BSD `fastmcp install`, #81): a symlinked config is refused, as on
   Linux, instead of being replaced by a regular file, and a refused or failed
   publication no longer leaves a `.fastmcp-backup.*` link behind.
@@ -102,6 +119,11 @@ OAuth surfaces, plus one source-incompatible client change (below).
 - One native-pipe capability case remains open (bd-8n2is): an independent
   registration defect behind
   `native_pipe_registers_only_with_its_bound_runtime_under_foreign_ambient_context`.
+- Opt-in native pipes: a pipe whose own `Cx` is cancelled or past its deadline
+  keeps returning `Interrupted`, which the stdio transport retries while its
+  serving `Cx` is live, so the task spins
+  ([#84](https://github.com/Dicklesworthstone/fastmcp_rust/issues/84)). Bind a
+  native pipe to the same `Cx` that serves it.
 - The client deferred-control maintenance-budget test stays ignored (#79).
 - `fastmcp-server` test targets do not build from a cold worker inside a
   30-minute budget (bd-8d61j); they were run from a warmed build.
