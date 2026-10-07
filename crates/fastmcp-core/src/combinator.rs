@@ -232,6 +232,22 @@ fn timeout_sleep(cx: &Cx, requested: Duration) -> Sleep {
 /// ];
 /// let users = join_all(ctx.cx(), futures).await;
 /// ```
+/// # The unused `_cx` is deliberate, not an oversight
+///
+/// This is the one combinator here that does NOT observe the supplied context,
+/// and that is its documented contract: see "Cancellation behavior" in the
+/// module header -- `join_all` and `join_all_results` keep a wait-for-all
+/// contract, while only the result-returning `race`/`quorum`/`first_ok` family
+/// admits cancellation mid-poll through `wait::cancellable` and
+/// `wait::poll_active`. Returning `Vec<T>` rather than `McpResult<Vec<T>>` is
+/// what makes that contract expressible.
+///
+/// So do not "wire this up" to the `wait` helpers to match its siblings. Doing
+/// so changes a reviewed semantic and a public signature, and the correct
+/// cancellation surface for a handler already exists one layer up:
+/// `McpContext::join_all` returns `McpResult<Vec<T>>` and checks `ensure_live`
+/// before and after the join. The parameter is retained for signature symmetry
+/// across the family.
 pub async fn join_all<T: Send + 'static>(_cx: &Cx, futures: Vec<BoxFuture<'_, T>>) -> Vec<T> {
     let len = futures.len();
     if len == 0 {
