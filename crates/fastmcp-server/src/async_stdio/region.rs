@@ -27,6 +27,30 @@ pub(super) struct RequestRegionOpening {
 pub(super) fn open(cx: &Cx, budget: Budget) -> McpResult<RequestRegionOpening> {
     // Preserve a caller's ambient capability restriction as well as its
     // explicit identity. Never obtain a spawn gateway from a foreign runtime.
+    //
+    // THE ORDER BELOW IS LOAD-BEARING AND THIS CHECK CANNOT MOVE AFTER IT.
+    // `Cx::set_current` publishes a frame carrying the supplied cx's OWN
+    // runtime_mask (asupersync 0.5.0 cx.rs:824), so republishing this caller on
+    // top of a narrower ambient view DISCARDS that view -- the exact opposite
+    // of what the promise above says -- and `caller.spawn` below then succeeds
+    // for a caller the host had restricted. Checking the active view first
+    // makes admission the INTERSECTION of the explicit authority and any
+    // ambient restriction, and fails closed.
+    //
+    // Only SPAWN is examined: that is the capability this function goes on to
+    // use, and the ambient view is not the caller's cancellation or budget
+    // domain, so a fuller check could refuse for unrelated reasons.
+    //
+    // Pinned by `native_admission_refuses_missing_runtime_and_restricted_spawn`
+    // below, which pushes `CapMask::none()` and requires this refusal.
+    if Cx::current().is_some_and(|active| !active.capabilities().spawn) {
+        return Err(server_run_error(
+            "dispatch",
+            "region_open",
+            "Request region admission is refused while an ambient restriction \
+             excludes the spawn capability",
+        ));
+    }
     let _caller = Cx::set_current(Some(cx.clone()));
     let caller = Cx::current().ok_or_else(|| {
         server_run_error(
