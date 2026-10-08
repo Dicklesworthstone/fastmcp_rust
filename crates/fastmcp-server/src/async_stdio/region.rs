@@ -9,6 +9,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
 use asupersync::cx::{ChildRegion, ChildRegionError, ChildRegionSpec};
 use asupersync::runtime::TaskHandle;
 use asupersync::{Budget, Cx};
@@ -25,25 +26,12 @@ pub(super) struct RequestRegionOpening {
 }
 
 pub(super) fn open(cx: &Cx, budget: Budget) -> McpResult<RequestRegionOpening> {
-    // Preserve a caller's ambient capability restriction as well as its
-    // explicit identity. Never obtain a spawn gateway from a foreign runtime.
-    //
-    // THE ORDER BELOW IS LOAD-BEARING AND THIS CHECK CANNOT MOVE AFTER IT.
-    // `Cx::set_current` publishes a frame carrying the supplied cx's OWN
-    // runtime_mask (asupersync 0.5.0 cx.rs:824), so republishing this caller on
-    // top of a narrower ambient view DISCARDS that view -- the exact opposite
-    // of what the promise above says -- and `caller.spawn` below then succeeds
-    // for a caller the host had restricted. Checking the active view first
-    // makes admission the INTERSECTION of the explicit authority and any
-    // ambient restriction, and fails closed.
-    //
-    // Only SPAWN is examined: that is the capability this function goes on to
-    // use, and the ambient view is not the caller's cancellation or budget
-    // domain, so a fuller check could refuse for unrelated reasons.
-    //
-    // Pinned by `native_admission_refuses_missing_runtime_and_restricted_spawn`
-    // below, which pushes `CapMask::none()` and requires this refusal.
-    if Cx::current().is_some_and(|active| !active.capabilities().spawn) {
+    // Snapshot BEFORE installing the explicit caller: set_current preserves
+    // the held context's mask, not the ambient mask it temporarily replaces.
+    // Carry every relinquished effect through the admission task into the
+    // request region and its handler tasks, not just the SPAWN admission bit.
+    let ceiling = ambient_capability_ceiling();
+    if !ceiling.contains(CapSet::<true, false, false, false, false>::MASK) {
         return Err(server_run_error(
             "dispatch",
             "region_open",
@@ -51,7 +39,11 @@ pub(super) fn open(cx: &Cx, budget: Budget) -> McpResult<RequestRegionOpening> {
              excludes the spawn capability",
         ));
     }
+    // Retain the explicit caller's identity, runtime, cancellation and budget.
+    // The ambient context contributes only a capability ceiling; it must not
+    // become the request's parent just because it happens to be installed.
     let _caller = Cx::set_current(Some(cx.clone()));
+    let _restriction = Cx::push_restriction(ceiling);
     let caller = Cx::current().ok_or_else(|| {
         server_run_error(
             "dispatch",
@@ -76,6 +68,30 @@ pub(super) fn open(cx: &Cx, budget: Budget) -> McpResult<RequestRegionOpening> {
             )
         })?;
     Ok(RequestRegionOpening { admission })
+}
+
+// asupersync 0.5 exposes the effective capability row, but not a public mask
+// constructor from that row. Start at the identity ceiling and intersect the
+// sealed type-level masks for each denied effect. No raw bits, unsafe access,
+// new authority, or dependency-version change is needed.
+fn ambient_capability_ceiling() -> CapMask {
+    let Some(active) = Cx::current() else {
+        return CapMask::all();
+    };
+    let capabilities = active.capabilities();
+    let mut ceiling = CapMask::all();
+    for (allowed, without_effect) in [
+        (capabilities.spawn, CapSet::<false, true, true, true, true>::MASK),
+        (capabilities.time, CapSet::<true, false, true, true, true>::MASK),
+        (capabilities.entropy, CapSet::<true, true, false, true, true>::MASK),
+        (capabilities.io, CapSet::<true, true, true, false, true>::MASK),
+        (capabilities.remote, CapSet::<true, true, true, true, false>::MASK),
+    ] {
+        if !allowed {
+            ceiling = ceiling.intersect(without_effect);
+        }
+    }
+    ceiling
 }
 
 impl Future for RequestRegionOpening {
@@ -108,6 +124,8 @@ impl Future for RequestRegionOpening {
 
 #[cfg(test)]
 mod tests {
+    mod authority;
+
     use super::*;
     use std::io;
     use std::sync::Arc;
