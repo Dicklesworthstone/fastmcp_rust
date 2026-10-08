@@ -27,6 +27,8 @@ use std::{
     marker::PhantomData,
 };
 
+mod unique_items;
+
 /// The sole JSON Schema dialect accepted by the final core schema-admission
 /// boundary.
 pub const FINAL_JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
@@ -4258,11 +4260,13 @@ fn validate_array(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
     {
-        if context.enforce_unevaluated_properties {
-            // Final JSON Schema equality treats numerically equal spellings
-            // (for example `1` and `1.0`) as one value. Charge every pairwise
-            // comparison because recursive structural equality is not constant
-            // time and must remain within the final validation work budget.
+        if context.enforce_unevaluated_properties && arr.len() > unique_items::PAIRWISE_LIMIT {
+            if !unique_items::validate(arr, path, errors, context) {
+                return;
+            }
+        } else if context.enforce_unevaluated_properties {
+            // Small arrays avoid an index allocation and retain their existing
+            // pairwise work accounting. Final equality compares numbers exactly.
             for (index, item) in arr.iter().enumerate() {
                 for previous in &arr[..index] {
                     if !consume_validation_work(context, path, errors) {
@@ -4910,8 +4914,12 @@ fn subtract_decimal_integers(left: &mut String, right: &str) {
     let mut borrow = 0_i16;
     for offset in 0..digits.len() {
         let left_index = digits.len() - 1 - offset;
+        // A missing high-order subtrahend digit is zero. Saturating the
+        // index repeats its leading digit instead and corrupts the remainder.
         let right_digit = right
-            .get(right.len().saturating_sub(offset + 1))
+            .len()
+            .checked_sub(offset + 1)
+            .and_then(|index| right.get(index))
             .map_or(0, |digit| i16::from(*digit - b'0'));
         let mut digit = i16::from(digits[left_index] - b'0') - right_digit - borrow;
         if digit < 0 {
