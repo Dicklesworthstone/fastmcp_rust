@@ -126,6 +126,20 @@ updating.
   serving `Cx` is live, so the task spins
   ([#84](https://github.com/Dicklesworthstone/fastmcp_rust/issues/84)). Bind a
   native pipe to the same `Cx` that serves it.
+- Three new `fastmcp-client` tests fail deterministically, all on opt-in
+  surfaces new in this release
+  ([#85](https://github.com/Dicklesworthstone/fastmcp_rust/issues/85)):
+  - `ManagedHttpClient` makes one more request after the shared session is
+    closed from a reverse handler.
+  - `await_validity` misses the caller's deadline in two clock-driven tests.
+- A second native-pipe test,
+  `native_pipe_readiness_updates_waker_and_preserves_data_through_eof`, failed
+  in the release gate alongside the bd-8n2is case.
+- Repository meta-gates in the `fastmcp-rust` facade crate remain red: FND-01
+  evidence binding and FND-04-B plan qualification (as in v0.11.0), and
+  REL-QUAR-00-A, whose frozen workflow identity predates the 2026-10-05 action
+  pin bumps and needs a deliberate re-freeze. These check repository evidence,
+  not runtime behavior.
 - The client deferred-control maintenance-budget test stays ignored (#79).
 - `fastmcp-server` test targets do not build from a cold worker inside a
   30-minute budget (bd-8d61j); they were run from a warmed build.
