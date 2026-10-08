@@ -59,10 +59,20 @@ where
         // wider ambient authority through `Cx::current()`. Intersecting both
         // layers is what makes the caller's bound actually bind.
         let _caller = cx.clone().set_current_restricted();
-        check_tool_call(cx, cancellation, contract)?;
+        // The deadline is tested BEFORE `check_tool_call`, and the order is the
+        // whole point. `Cx::checkpoint` itself reports an expired deadline as a
+        // cancellation -- it detects `budget.is_past_deadline(now)` and fails
+        // with `CancelKind::Deadline` (asupersync 0.5.0 cx.rs:2881) -- and
+        // `check_tool_call` maps ANY checkpoint error to
+        // `ManagedCoreError::Cancelled`. With the old order, the first poll
+        // after expiry returned Cancelled and the TimedOut arm below was
+        // unreachable dead code, so every deadline was misreported as a
+        // cancellation. A timeout and an interruption are different diagnoses
+        // and the caller can act on them differently.
         if deadline.is_some_and(|deadline| cx.now() >= deadline) {
             return Poll::Ready(Err(ManagedCoreError::TimedOut.into()));
         }
+        check_tool_call(cx, cancellation, contract)?;
         if let Some(timer) = deadline_timer.as_mut() {
             // Sleep resolves its driver on poll in asupersync 0.5. Never borrow
             // an unrelated ambient driver or silently omit a caller deadline.
@@ -84,10 +94,13 @@ where
         let outcome = future.as_mut().poll(task);
         // Refuse even a simultaneously ready result. Owned response state is
         // dropped on this error; partially read work cannot become reusable.
-        check_tool_call(cx, cancellation, contract)?;
+        // Deadline first here for the same reason as the pre-poll pair above:
+        // otherwise a result that became ready in the same poll as the deadline
+        // expiring is withheld as Cancelled rather than TimedOut.
         if deadline.is_some_and(|deadline| cx.now() >= deadline) {
             return Poll::Ready(Err(ManagedCoreError::TimedOut.into()));
         }
+        check_tool_call(cx, cancellation, contract)?;
         outcome.map(Ok)
     })
     .await
