@@ -459,7 +459,30 @@ mod tests {
                 return;
             }
         }
-        panic!("pipe readiness did not wake its registered task");
+        // Name the state rather than only the symptom. "did not wake" has two
+        // very different causes and the counters separate them:
+        //   events_received == 0  -> the reactor saw no readiness at all, so
+        //                            the fd is not actually armed even though a
+        //                            waker slot exists (waker_count > 0).
+        //   unknown_tokens > 0    -> readiness DID arrive but its token had no
+        //                            waker, i.e. the registration and the
+        //                            turned driver disagree.
+        // `polls` confirms the eight turns really happened; a total elapsed
+        // time near zero with polls == 8 means the reactor returned instantly
+        // every time rather than waiting out its timeout.
+        let stats = driver.stats();
+        panic!(
+            "pipe readiness did not wake its registered task \
+             (wakers={} polls={} events_received={} wakers_dispatched={} \
+             unknown_tokens={} registrations={} deregistrations={})",
+            driver.waker_count(),
+            stats.polls,
+            stats.events_received,
+            stats.wakers_dispatched,
+            stats.unknown_tokens,
+            stats.registrations,
+            stats.deregistrations,
+        );
     }
 
     fn fill(file: &File) -> usize {
