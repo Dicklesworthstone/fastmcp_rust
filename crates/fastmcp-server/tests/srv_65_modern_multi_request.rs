@@ -1058,14 +1058,21 @@ fn srv_65_modern_cancellation_preserves_unrelated_request() {
         "unknown ID must not cancel the active request"
     );
     wire.cancel(20);
-    let response = wire.response(20);
-    assert_eq!(
-        response.error.unwrap().code,
-        fastmcp_core::McpErrorCode::RequestCancelled.into()
-    );
-    assert_eq!(wire.control.active.load(Ordering::Acquire), 0);
+    // A peer-cancelled in-flight request gets no response: the receiver
+    // SHOULD NOT answer a request its peer cancelled (bd-xy7t5, 6afb8d18).
+    // `response` checks the correlated ID, so a late reply for 20 arriving
+    // ahead of the follow-up fails here.
     wire.send(modern_request("tools/list", 22, None));
     assert_ok_response(&wire.response(22), "catalog after target cancellation");
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while wire.control.active.load(Ordering::Acquire) != 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        wire.control.active.load(Ordering::Acquire),
+        0,
+        "the cancelled handler must leave"
+    );
     wire.finish();
 }
 
