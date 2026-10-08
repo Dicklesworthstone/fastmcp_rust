@@ -111,8 +111,10 @@ updating.
 
 ### Dependencies
 
-- Lockfile refresh (80 transitive packages) and `zeroize` 1.9.1; see
-  `UPGRADE_LOG.md`. `asupersync =0.5.0` and `rich_rust =0.2.3` unchanged.
+- Lockfile refresh (80 transitive packages); see `UPGRADE_LOG.md`. Direct
+  pins are unchanged: `zeroize` stays `=1.9.0` because the FND-01 declaration
+  ratchet freezes it, and `asupersync =0.5.0` / `rich_rust =0.2.3` are
+  constellation pins.
 
 ### Known issues
 
