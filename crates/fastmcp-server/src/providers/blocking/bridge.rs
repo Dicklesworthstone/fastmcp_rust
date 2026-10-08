@@ -737,7 +737,7 @@ mod tests {
         // the next iteration rather than being cleared after poll returns.
         operation_waker.wake_by_ref();
         assert!(operation.take_ready());
-        operation_waker.clone().wake();
+        operation_waker.wake_by_ref();
         signal.wait();
         assert!(operation.take_ready());
         assert!(!operation.take_ready());

@@ -4161,7 +4161,8 @@ mod tests {
                         driver.route_response_with_raw_result(&live, final_response(2), None).unwrap();
                     } else {
                         driver.drive_frame(&live, frame(final_response(1))).unwrap();
-                        driver.drive_frame(&live, frame(final_response(2))).unwrap();+                    }
+                        driver.drive_frame(&live, frame(final_response(2))).unwrap();
+                    }
                     assert_eq!(executor.try_take_response(&mut cancelled).unwrap_err().code,
                         McpErrorCode::RequestCancelled);
                     assert_eq!(executor.try_take_response(&mut sibling).unwrap(), Some(final_response(2)));
@@ -4360,7 +4361,8 @@ mod tests {
 
         #[test]
         fn connection_failure_preserves_stopped_origins_without_wire_effects() {
-            for era in [ProtocolEra::Legacy2024, ProtocolEra::Modern2026] {+                let executor = executor(era);
+            for era in [ProtocolEra::Legacy2024, ProtocolEra::Modern2026] {
+                let executor = executor(era);
                 let originating = Cx::for_testing();
                 let live = Cx::for_testing();
                 let mut first = executor.execute(&originating, call(101)).unwrap();
@@ -4673,7 +4675,8 @@ mod tests {
                         .unwrap(),
                     )
                 })
-                .collect()+        }
+                .collect()
+        }
 
         #[test]
         fn retired_cancel_cannot_target_a_reused_id_or_numeric_alias() {
@@ -4872,7 +4875,8 @@ mod tests {
             assert_eq!(executor.drive_for_owner(
                 &cx,
                 Some((&active.request_id, active.generation)),
-            ).unwrap_err().code, McpErrorCode::InvalidRequest);+            // Moving the mutating claim later must not move the incompatible
+            ).unwrap_err().code, McpErrorCode::InvalidRequest);
+            // Moving the mutating claim later must not move the incompatible
             // mode refusal after a maintenance write. The original external
             // driver retains sole authority to service these queued controls.
             assert_eq!(executor.state.borrow().transport.sent.len(), sent);
