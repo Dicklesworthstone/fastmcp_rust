@@ -501,6 +501,8 @@ if check_only and field('CHECK_RC') != '0':
     for line in [l for l in raw.split('\n') if l.startswith(('error', '  -->'))][:40]:
         print(f'  {line}')
 print(f'\nreceipt.json -> {root}/receipt.json')
+# Retain and print the complete receipt before propagating its rejection.
+sys.exit(1 if reasons else 0)
 PY
 status=$?
 printf '\nartifacts: %s\n' "$OUT"
