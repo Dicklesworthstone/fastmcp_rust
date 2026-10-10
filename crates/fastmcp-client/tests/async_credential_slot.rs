@@ -364,6 +364,65 @@ where
 }
 
 #[test]
+fn credential_slot_open_rejected_pool_has_no_filesystem_or_anchor_effects() {
+    credential_slot_pool_admission(true);
+}
+
+#[test]
+fn credential_slot_open_accepting_pool_uses_a_worker() {
+    credential_slot_pool_admission(false);
+}
+
+fn credential_slot_pool_admission(rejected: bool) {
+    let pool = asupersync::runtime::BlockingPool::new(0, 1);
+    if rejected {
+        pool.shutdown();
+    }
+    let probe_calls = Arc::new(AtomicU64::new(0));
+    let observed = Arc::clone(&probe_calls);
+    let probe = pool.spawn(move || {
+        observed.fetch_add(1, Ordering::SeqCst);
+    });
+    assert!(probe.wait_timeout(Duration::from_secs(5)));
+    assert_eq!(probe.is_cancelled(), rejected);
+    assert_eq!(probe_calls.load(Ordering::SeqCst), u64::from(!rejected));
+    run(false, |cx| async {
+        let cx = cx.with_blocking_pool_handle(Some(pool.handle()));
+        let fixture = Fixture::new();
+        let poller = std::thread::current().id();
+        let mut opening = fixture.start_open(&cx).unwrap();
+        let result = opening.wait(&cx).await;
+        if rejected {
+            assert!(matches!(result, Err(CredentialIoError::WorkerStopped)));
+            assert_eq!(fixture.anchor.counts(), (0, 0));
+            assert_eq!(fs::read_dir(&fixture.directory.0).unwrap().count(), 0);
+        } else {
+            let (owner, recovery) = result.unwrap().unwrap();
+            assert_eq!(recovery, None);
+            assert_eq!(fixture.anchor.counts(), (1, 0));
+            assert!(
+                fixture
+                    .anchor
+                    .0
+                    .lock()
+                    .unwrap()
+                    .threads
+                    .iter()
+                    .all(|thread| *thread != poller)
+            );
+            done(&cx, owner.close(&cx)).await;
+        }
+        wait_jobs(&cx, &fixture.lane).await;
+        assert_eq!(
+            fixture.lane.snapshot().unwrap(),
+            CredentialIoSnapshot::default()
+        );
+        assert!(cx.checkpoint().is_ok());
+    });
+    assert!(pool.shutdown_and_wait(Duration::from_secs(5)));
+}
+
+#[test]
 fn async_slot_persists_reopens_and_tombstones_before_payload_delivery() {
     run(true, |cx| async move {
         let f = Fixture::new();

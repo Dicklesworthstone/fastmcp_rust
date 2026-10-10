@@ -18,12 +18,15 @@
 
 use std::fmt;
 use std::fs::File;
+use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use asupersync::Cx;
 use asupersync::channel::oneshot;
-use asupersync::runtime::TaskHandle;
+use asupersync::runtime::{BlockingTaskHandle, TaskHandle};
+use asupersync::sync::Notify;
 use fastmcp_core::partition::{CredentialStoreKey, PartitionAuthorization};
 use fastmcp_core::runtime::ProcessBoundToken;
 
@@ -449,8 +452,8 @@ fn check_submission(cx: &Cx, process: &ProcessBoundToken) -> Result<(), Credenti
     if !capabilities.spawn || !capabilities.io || !capabilities.time {
         return Err(CredentialIoError::CapabilityUnavailable);
     }
-    // Cx::spawn_blocking otherwise has an inline fallback. Never let that
-    // fallback perform disk/provider work on an asynchronous polling thread.
+    // Require the caller's pool here; spawn below uses its raw non-fallback
+    // submission API even when a present pool rejects work during shutdown.
     if cx.blocking_pool_handle().is_none() {
         return Err(CredentialIoError::BlockingPoolUnavailable);
     }
@@ -506,25 +509,57 @@ where
     T: Send + 'static,
     F: FnOnce(&Cx) -> T + Send + 'static,
 {
+    let pool = cx
+        .blocking_pool_handle()
+        .ok_or(CredentialIoError::BlockingPoolUnavailable)?;
     let worker_process = Arc::clone(&process);
     let worker_lease = Arc::clone(&lease);
     let (sender, receiver) = oneshot::channel();
     let worker = cx
-        .spawn_blocking(move |worker_cx| {
-            // Declared first so this charge outlives work, provider unwinding and
-            // disposal of an undeliverable result. Task drop alone cannot release it.
-            let _worker_lease = worker_lease;
-            let result = if worker_process.verify().is_err() {
-                Err(CredentialIoError::ProcessChanged)
-            } else {
-                // Provider panic hooks are host-owned. No panic text is retained in
-                // our diagnostics, nor is a possibly-mutated owner returned on panic.
-                catch_unwind(AssertUnwindSafe(|| work(&worker_cx)))
-                    .map_err(|_| CredentialIoError::WorkerPanicked)
+        .spawn(move |worker_cx| async move {
+            let _child_lease = Arc::clone(&worker_lease);
+            let completion = Arc::new(CredentialPoolCompletion::default());
+            let context = worker_cx.clone();
+            let job = CredentialPoolWork {
+                work: Some(move || {
+                    let result = if worker_process.verify().is_err() {
+                        Err(CredentialIoError::ProcessChanged)
+                    } else {
+                        // Preserve the transaction disposition outside the
+                        // runtime join's cancellation result and redact panics.
+                        catch_unwind(AssertUnwindSafe(|| work(&context)))
+                            .map_err(|_| CredentialIoError::WorkerPanicked)
+                    };
+                    // Publication is not another credential effect. A committed
+                    // result remains deliverable after worker cancellation.
+                    let _ = sender.send_blocking(result);
+                }),
+                _lease: worker_lease,
+                _completion: CredentialPoolCompletionGuard(Arc::clone(&completion)),
             };
-            // Publishing a disposition is not another credential effect. This send
-            // deliberately does not consult the now-possibly-cancelled worker Cx.
-            let _ = sender.send_blocking(result);
+            // Cx::spawn_blocking can execute inline after pool rejection. Raw
+            // pool submission instead drops rejected work without invoking it.
+            let pool_task = CredentialPoolTask(pool.spawn(move || job.run()));
+            let (_cancel_guard, mut cancellation) = oneshot::channel::<()>();
+            let mut cancelled = std::pin::pin!(cancellation.recv(&worker_cx));
+            let mut finished = std::pin::pin!(
+                completion
+                    .changed
+                    .wait_until(|| completion.done.load(Ordering::Acquire))
+            );
+            let mut cancellation_forwarded = false;
+            poll_fn(|task| {
+                if !cancellation_forwarded && cancelled.as_mut().poll(task).is_ready() {
+                    pool_task.0.cancel();
+                    cancellation_forwarded = true;
+                }
+                // Retain region ownership until the actual closure and captured
+                // slot are disposed, including a non-preemptible running call.
+                // This wake is cancellation-independent and cannot busy-spin on
+                // an already-cancelled runtime timer or receiver.
+                finished.as_mut().poll(task)
+            })
+            .await;
         })
         .map_err(|_| CredentialIoError::RuntimeUnavailable)?;
     Ok(CredentialSlotTask {
@@ -534,6 +569,44 @@ where
         lease: Some(lease),
         received: false,
     })
+}
+
+#[derive(Default)]
+struct CredentialPoolCompletion {
+    done: AtomicBool,
+    changed: Notify,
+}
+
+struct CredentialPoolCompletionGuard(Arc<CredentialPoolCompletion>);
+
+impl Drop for CredentialPoolCompletionGuard {
+    fn drop(&mut self) {
+        self.0.done.store(true, Ordering::Release);
+        let _ = catch_unwind(AssertUnwindSafe(|| self.0.changed.notify_waiters()));
+    }
+}
+
+// Fields drop in declaration order even when a queued job is never invoked.
+// Signal completion only after disposing its captured slot/result sender and
+// the worker's reservation; the supervisor then releases its remaining charge.
+struct CredentialPoolWork<F> {
+    work: Option<F>,
+    _lease: Arc<JobLease>,
+    _completion: CredentialPoolCompletionGuard,
+}
+
+impl<F: FnOnce()> CredentialPoolWork<F> {
+    fn run(mut self) {
+        self.work.take().expect("credential pool work runs once")();
+    }
+}
+
+struct CredentialPoolTask(BlockingTaskHandle);
+
+impl Drop for CredentialPoolTask {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 #[cfg(test)]
