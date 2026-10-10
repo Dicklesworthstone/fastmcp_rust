@@ -748,6 +748,9 @@ impl ClientBuilder {
     /// POSTs use that binding. Authentication never follows a redirect or
     /// falls back to a legacy endpoint; this setter does not acquire or refresh
     /// credentials. The token is never included in builder diagnostics.
+    /// An expired or revoked credential refuses each new POST before contact;
+    /// loss during connection setup also refuses the POST before writing it.
+    /// Authenticated intent never falls back to an anonymous request.
     #[must_use]
     pub fn http_bearer_credential(
         mut self,

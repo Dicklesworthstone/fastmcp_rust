@@ -565,6 +565,8 @@ pub enum ExecutionTerminalReason {
     ConnectionLost,
     /// The exact owner received an invalid final MCP result envelope.
     PeerProtocol,
+    /// The configured HTTP credential could no longer authorize dispatch.
+    CredentialUnavailable,
     /// Local executor shutdown selected the terminal transition.
     Shutdown,
 }

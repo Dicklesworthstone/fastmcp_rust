@@ -2020,6 +2020,9 @@ fn modern_http_execution_error_reason(
     };
     match executor_error {
         ModernHttpExecutorError::Cancelled => ExecutionTerminalReason::CallerCancelled,
+        ModernHttpExecutorError::CredentialUnavailable => {
+            ExecutionTerminalReason::CredentialUnavailable
+        }
         ModernHttpExecutorError::Timeout(RequestTimeoutSource::Idle) => {
             ExecutionTerminalReason::IdleTimeout
         }
@@ -3694,6 +3697,9 @@ pub enum ModernHttpExecutorError {
     InvalidRequestMetadata,
     /// Caller cancellation was observed before dispatching the POST.
     Cancelled,
+    /// A configured bearer credential cannot authorize this request anymore.
+    /// Authenticated dispatch never falls back to an anonymous POST.
+    CredentialUnavailable,
     /// A post-commit response deadline expired; the owned exchange is closed.
     Timeout(RequestTimeoutSource),
     /// The caller's response policy cannot be represented by the runtime clock.
@@ -3755,6 +3761,9 @@ impl fmt::Display for ModernHttpExecutorError {
                 formatter.write_str("invalid modern MCP request metadata")
             }
             Self::Cancelled => formatter.write_str("modern MCP request was cancelled"),
+            Self::CredentialUnavailable => {
+                formatter.write_str("modern MCP bearer credential is unavailable")
+            }
             Self::Timeout(source) => write!(
                 formatter,
                 "modern MCP request timed out at the {source:?} deadline"
@@ -4094,8 +4103,7 @@ impl ModernHttpExecutor {
                     deadline.poll(task_cx)?;
                     response.map(Ok)
                 })
-                .await?
-                .map_err(|error| map_modern_exchange_error(error, &request_bytes_sent))?
+                .await??
             }
             None => {
                 let mut ambient_cancelled = std::pin::pin!(ambient_cancellation_signal.recv(cx));
@@ -4113,8 +4121,7 @@ impl ModernHttpExecutor {
                     deadline.poll(task_cx)?;
                     response.map(Ok)
                 })
-                .await?
-                .map_err(|error| map_modern_exchange_error(error, &request_bytes_sent))?
+                .await??
             }
         };
         if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
@@ -4151,21 +4158,38 @@ async fn execute_native_modern_request(
     resource_tls: Option<&ResourceTlsTrust>,
     committed_at: Arc<OnceLock<Time>>,
     request_bytes_sent: Arc<AtomicBool>,
-) -> Result<ClientStreamingResponse<ModernHttpIo>, ClientError> {
+) -> Result<ClientStreamingResponse<ModernHttpIo>, ModernHttpExecutorError> {
+    let map_error = |error| map_modern_exchange_error(error, &request_bytes_sent);
+    let unavailable = |credential: &crate::http_auth::BoundBearerCredential| {
+        credential.is_revoked()
+            || credential
+                .expires_at()
+                .is_some_and(|expiry| std::time::Instant::now() >= expiry)
+    };
+    // The managed session's outer guard cannot interpose when an immediately
+    // ready reverse callback closes its owner and starts the next POST within
+    // the same future poll. Its credential already carries that owner's signal.
+    // Check it at the actual network admission boundary, before opening a socket.
+    if credential.is_some_and(unavailable) {
+        return Err(ModernHttpExecutorError::CredentialUnavailable);
+    }
     // Admission compares canonical resources. Use that same spelling on the
     // wire: native ParsedUrl deliberately preserves raw paths, including dot
     // segments that must not select a different route under private trust.
     let target = resource_tls.map_or(request.target(), |trust| trust.resource.as_str());
-    let parsed = ParsedUrl::parse(target)?;
-    cx.checkpoint().map_err(|_| ClientError::Cancelled)?;
+    let parsed = ParsedUrl::parse(target).map_err(map_error)?;
+    cx.checkpoint()
+        .map_err(|_| ModernHttpExecutorError::Cancelled)?;
     let host = parsed.host.trim_start_matches('[').trim_end_matches(']');
     let stream = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         TcpStream::connect(std::net::SocketAddr::new(ip, parsed.port)).await
     } else {
         TcpStream::connect(parsed.connect_authority()).await
     }
-    .map_err(ClientError::ConnectError)?;
-    cx.checkpoint().map_err(|_| ClientError::Cancelled)?;
+    .map_err(ClientError::ConnectError)
+    .map_err(map_error)?;
+    cx.checkpoint()
+        .map_err(|_| ModernHttpExecutorError::Cancelled)?;
     let inner = match parsed.scheme {
         Scheme::Http => ClientIo::Plain(stream),
         Scheme::Https => {
@@ -4174,7 +4198,7 @@ async fn execute_native_modern_request(
             #[cfg(feature = "native-tls-roots")]
             let builder = builder
                 .with_native_roots()
-                .map_err(|error| ClientError::TlsError(error.to_string()))?;
+                .map_err(|error| map_error(ClientError::TlsError(error.to_string())))?;
             #[cfg(not(feature = "native-tls-roots"))]
             let builder = builder.with_webpki_roots();
             let builder = if let Some(trust) = resource_tls {
@@ -4190,21 +4214,31 @@ async fn execute_native_modern_request(
             };
             let connector = builder
                 .build()
-                .map_err(|error| ClientError::TlsError(error.to_string()))?;
+                .map_err(|error| map_error(ClientError::TlsError(error.to_string())))?;
             let tls = connector
                 .connect(host, stream)
                 .await
-                .map_err(|error| ClientError::TlsError(error.to_string()))?;
-            cx.checkpoint().map_err(|_| ClientError::Cancelled)?;
+                .map_err(|error| map_error(ClientError::TlsError(error.to_string())))?;
+            cx.checkpoint()
+                .map_err(|_| ModernHttpExecutorError::Cancelled)?;
             ClientIo::Tls(tls)
         }
     };
     // Preserve the native streaming client's wire defaults without introducing
     // pooling, cookies, proxy routing, redirects, or request replay.
+    let headers = request.headers_with_credential(credential);
+    // Connection/TLS setup can yield while the credential expires or its owner
+    // closes. Refuse a withheld header rather than downgrade authenticated intent.
+    // A live credential withheld only because the low-level request targets a
+    // different resource retains that API's optional-auth behavior. The public
+    // configured client separately binds its exact resource before connecting.
+    if credential.is_some_and(unavailable) {
+        return Err(ModernHttpExecutorError::CredentialUnavailable);
+    }
     let native_request = Request::builder(Method::Post, parsed.path.clone())
         .header("Host", parsed.authority())
         .header("User-Agent", "asupersync/0.1")
-        .headers(request.headers_with_credential(credential))
+        .headers(headers)
         .body(request.body().to_vec())
         .build();
     Http1Client::request_streaming(
@@ -4212,12 +4246,13 @@ async fn execute_native_modern_request(
             inner,
             cx: cx.clone(),
             committed_at,
-            request_bytes_sent,
+            request_bytes_sent: Arc::clone(&request_bytes_sent),
         },
         native_request,
     )
     .await
     .map_err(ClientError::from)
+    .map_err(map_error)
 }
 
 #[cfg(feature = "legacy-2024-11-05")]

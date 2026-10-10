@@ -671,6 +671,196 @@ fn unauthorized_response_never_refreshes_or_replays_the_failed_tool() {
 }
 
 #[test]
+fn credential_revoked_during_tls_setup_cannot_become_an_anonymous_post() {
+    for revoke in [false, true] {
+        run(async {
+            use crate::http_executor::{
+                ClientHttpConnectionError, ModernHttpClientError, ModernHttpExecutorError,
+            };
+
+            let cx = Cx::current().unwrap();
+            let peer = Peer::new().await;
+            let credential =
+                crate::http_auth::BoundBearerCredential::bind(peer.resource(), "setup-token")
+                    .unwrap();
+            let (result, ()) = Box::pin(pair(
+                peer.client_builder()
+                    .http_bearer_credential(credential.clone())
+                    .connect_http_with_cx(&cx),
+                async {
+                    let (tcp, _) = peer.listener.accept().await.unwrap();
+                    if revoke {
+                        credential.revoke();
+                    }
+                    let mut tls = peer.tls.accept(tcp).await.unwrap();
+                    if revoke {
+                        let mut byte = [0_u8; 1];
+                        match tls.read(&mut byte).await {
+                            Ok(0) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {}
+                            other => panic!("revoked setup must write no HTTP byte: {other:?}"),
+                        }
+                    } else {
+                        let request = read(&mut tls).await;
+                        assert_eq!(request.headers["authorization"], "Bearer setup-token");
+                        let body: Value = serde_json::from_slice(&request.body).unwrap();
+                        assert_eq!(body["method"], "server/discover");
+                        reply(
+                            &mut tls,
+                            200,
+                            json!({"jsonrpc":"2.0","id":body["id"],"result":discovery()}),
+                        )
+                        .await;
+                    }
+                },
+            ))
+            .await;
+            if revoke {
+                assert!(matches!(
+                    result,
+                    Err(ClientHttpConnectionError::Modern(
+                        ModernHttpClientError::Executor(
+                            ModernHttpExecutorError::CredentialUnavailable
+                        )
+                    ))
+                ));
+            } else {
+                assert!(result.is_ok());
+            }
+            assert!(cx.checkpoint().is_ok());
+            peer.no_more(&cx).await;
+        });
+    }
+}
+
+#[test]
+fn owned_http_dispatch_retains_the_local_credential_terminal_reason() {
+    for revoke in [false, true] {
+        run(async {
+            use crate::http_executor::{
+                ClientHttpConnection, ModernHttpExecutorError, ModernHttpFinalCoreEvent,
+                ModernHttpFinalCoreListenError,
+            };
+            use crate::{ExecutionTerminalReason, RequestTimeoutPolicy};
+            use fastmcp_protocol::RequestId;
+
+            let cx = Cx::current().unwrap();
+            let peer = Peer::new().await;
+            let session = peer.login(&cx).await;
+            let credential = session.credential(&cx).await.unwrap().credential().clone();
+            let (connected, ()) = Box::pin(pair(
+                peer.client_builder()
+                    .http_bearer_credential(credential.clone())
+                    .connect_http_with_cx(&cx),
+                peer.discovery("access-one"),
+            ))
+            .await;
+            let ClientHttpConnection::Modern(client) = connected.unwrap() else {
+                panic!("the authenticated client must select modern HTTP");
+            };
+            let mut execution = client
+                .execute_core(
+                    &cx,
+                    "tools/call",
+                    json!({"name":"lookup","arguments":{}}),
+                    RequestId::Number(41),
+                    crate::sse::SseLimits::new(4096, 16384, 16).unwrap(),
+                    RequestTimeoutPolicy::default(),
+                )
+                .unwrap();
+            let control = execution.control();
+            if revoke {
+                credential.revoke();
+                assert!(matches!(
+                    execution.next_event(&cx).await,
+                    Err(ModernHttpFinalCoreListenError::Executor(
+                        ModernHttpExecutorError::CredentialUnavailable
+                    ))
+                ));
+                assert_eq!(
+                    control.terminal_reason(),
+                    Some(ExecutionTerminalReason::CredentialUnavailable)
+                );
+            } else {
+                let (event, ()) = pair(
+                    execution.next_event(&cx),
+                    peer.mcp("tools/call", "access-one", complete()),
+                )
+                .await;
+                assert!(matches!(
+                    event,
+                    Ok(Some(ModernHttpFinalCoreEvent::Terminal(_)))
+                ));
+                assert_eq!(
+                    control.terminal_reason(),
+                    Some(ExecutionTerminalReason::FinalResponse)
+                );
+            }
+            assert!(control.is_terminal_nonblocking());
+            assert!(control.take_cancellation_event().is_none());
+            assert!(!session.inner.closed.is_cancel_requested());
+            assert!(cx.checkpoint().is_ok());
+            peer.no_more(&cx).await;
+        });
+    }
+}
+
+#[test]
+fn keeping_the_shared_session_open_in_a_reverse_handler_allows_a_continuation() {
+    run(async {
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
+        let session = peer.login(&cx).await;
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let called = callbacks.clone();
+        let owner = session.clone();
+        let handlers = ReverseRequestHandlers::new().with_modern_roots_list(move |_, _, _| {
+            called.fetch_add(1, Ordering::SeqCst);
+            assert!(!owner.inner.closed.is_cancel_requested());
+            Box::pin(async { Ok(serde_json::from_value(json!({"roots":[]})).unwrap()) })
+        });
+        let mut client = ManagedHttpClient::new(
+            session.clone(),
+            peer.client_builder().reverse_request_handlers(handlers),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let (result, ()) = pair(client.call_tool(&cx, "lookup", json!({})), async {
+            peer.discovery("access-one").await;
+            peer.mcp("tools/call", "access-one", input_required()).await;
+            let (mut stream, body, _) = peer.mcp_request("tools/call", "access-one").await;
+            assert_eq!(body["params"]["requestState"], "bound-state");
+            assert_eq!(
+                body["params"]["inputResponses"],
+                json!({"roots":{"roots":[]}})
+            );
+            reply(
+                &mut stream,
+                200,
+                json!({"jsonrpc":"2.0","id":body["id"],"result":complete()}),
+            )
+            .await;
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(client.cached_credential_generation(), Some(1));
+        assert!(!session.inner.closed.is_cancel_requested());
+        let mut sibling =
+            ManagedHttpClient::new(session, peer.client_builder(), Duration::from_secs(30))
+                .unwrap();
+        let (result, ()) = pair(sibling.call_tool(&cx, "lookup", json!({})), async {
+            peer.discovery("access-one").await;
+            peer.mcp("tools/call", "access-one", complete()).await;
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(sibling.cached_credential_generation(), Some(1));
+        peer.no_more(&cx).await;
+    });
+}
+
+#[test]
 fn closing_the_shared_session_in_a_reverse_handler_prevents_a_continuation() {
     run(async {
         let cx = Cx::current().unwrap();
