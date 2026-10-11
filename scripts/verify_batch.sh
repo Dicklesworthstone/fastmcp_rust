@@ -103,7 +103,15 @@ command -v rsync >/dev/null || die 'rsync not found locally'
 OUT="${OUT:-$(mktemp -d "${TMPDIR:-/tmp}/fastmcp-verify.XXXXXX")}" || die 'cannot create output dir'
 mkdir -p "$OUT" || die "cannot create $OUT"
 
-SSH=(ssh -i "$KEY" -o BatchMode=yes -o ConnectTimeout=25 "$WORKER")
+# ServerAliveInterval is load-bearing, not hygiene. The remote script redirects
+# every phase to a file on the worker, so this channel carries NO bytes for the
+# whole build -- 10 to 30 minutes for a cold fastmcp-server test target. Without
+# keepalives an idle NAT or firewall drop closes the channel, the remote process
+# group takes SIGHUP, and the run dies with no receipt and no log, which reads
+# exactly like a build failure. 60s x 30 tolerates a half-hour silent link and
+# still gives up within ~30 minutes of a genuinely dead peer.
+SSH=(ssh -i "$KEY" -o BatchMode=yes -o ConnectTimeout=25 \
+     -o ServerAliveInterval=60 -o ServerAliveCountMax=30 "$WORKER")
 
 # ---------------------------------------------------------------------------
 # Subject identity, captured BEFORE the run.
@@ -199,7 +207,7 @@ printf '== sync ==\nworker    %s\nremote    %s\n' "$WORKER" "$remote_dir"
 # added here must also be considered for MANIFEST_PATHS above.
 rsync -az --no-perms --omit-dir-times \
     --exclude 'target/' --exclude '.rch-target-*' --exclude '*.log' \
-    -e "ssh -i $KEY -o BatchMode=yes -o ConnectTimeout=25" \
+    -e "ssh -i $KEY -o BatchMode=yes -o ConnectTimeout=25 -o ServerAliveInterval=60 -o ServerAliveCountMax=30" \
     "${SYNC_PATHS[@]}" "$WORKER:$remote_dir/" > "$OUT/rsync.log" 2>&1
 rsync_rc=$?
 printf 'rsync     rc=%s\n\n' "$rsync_rc"
@@ -294,7 +302,10 @@ cargo +$TOOLCHAIN test --locked $SCOPE $feature_args \
     -- -Z unstable-options --format json $thread_args "\$@" > \$RUNTMP/vb_run.log 2>&1
 run_rc=\$?
 echo "RECEIPT_RUN_RC=\$run_rc"
-echo "RECEIPT_JSON_EVENTS=\$(grep -c '^{"type":"test"' \$RUNTMP/vb_run.log)"
+# Not anchored and tolerant of the space libtest actually emits
+# ({ "type": "test", ...}); the anchored no-space form matched nothing at all
+# and reported 0 events for a run that emitted 4,722 of them.
+echo "RECEIPT_JSON_EVENTS=\$(grep -c '\"type\": *\"test\"' \$RUNTMP/vb_run.log)"
 # The whole log is returned and parsed locally, so there is ONE parser and the
 # worker needs no python.
 echo "RECEIPT_END"
@@ -347,24 +358,38 @@ def field(name):
     m = re.search(rf'^RECEIPT_{name}=(.*)$', raw, re.M)
     return m.group(1).strip() if m else None
 
-# libtest JSON events: one object per line, so interleaved product stderr
-# cannot corrupt an outcome the way it corrupted the text progress lines.
-# Non-JSON lines are skipped rather than guessed at.
+# libtest JSON events, extracted from ANYWHERE in the line rather than anchored
+# at its start.
+#
+# The anchored form read 2361 of 2365 outcomes on fastmcp-server --lib and
+# reported the other 4 as "discovered but never ran". They had all run and
+# passed; product code had written to stderr WITHOUT a trailing newline, so the
+# event arrived as a suffix:
+#   Note: Rich logging not initialized (logger already set){ "type": "test", ... }
+#   Server ready.{ "type": "test", ... }
+# This is the same defect that made the text progress lines unreadable, and
+# moving to JSON events did not cure it, because the corruption is in the byte
+# stream, not the format. raw_decode also lets several objects share one line.
+#
+# This widens only WHERE an event may be found. It does not infer an outcome
+# from a corrupt object, and a name with no decodable outcome event stays
+# missing, which is what keeps the PL-1 comparison below honest.
 events, suites = [], []
+decoder = json.JSONDecoder()
 run_log = root / 'run.log'
 if run_log.exists():
     for line in run_log.read_text(errors='replace').splitlines():
-        line = line.strip()
-        if not line.startswith('{'):
-            continue
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        if event.get('type') == 'test' and event.get('event') in ('ok', 'failed', 'ignored'):
-            events.append(event)
-        elif event.get('type') == 'suite' and event.get('event') in ('ok', 'failed'):
-            suites.append(event)
+        for start in (i for i, ch in enumerate(line) if ch == '{'):
+            try:
+                event, _ = decoder.raw_decode(line, start)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            if event.get('type') == 'test' and event.get('event') in ('ok', 'failed', 'ignored'):
+                events.append(event)
+            elif event.get('type') == 'suite' and event.get('event') in ('ok', 'failed'):
+                suites.append(event)
 
 results  = suites
 passed   = sum(s.get('passed', 0) for s in suites)
