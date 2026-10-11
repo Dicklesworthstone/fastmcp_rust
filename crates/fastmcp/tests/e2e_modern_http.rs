@@ -8476,10 +8476,33 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
         1,
         "page size creates a real continuation"
     );
+    // A PAGINATED catalog is deliberately no-cache, and this is the only place
+    // that contract is exercised end to end. `final_catalog_cache_hints`
+    // (fastmcp-server/src/router.rs:2487) zeroes list ttlMs and forces Private
+    // scope on every page whenever `list_page_size.is_some()`, because a cached
+    // copy cannot decrement an expiring cursor's remaining validity and the
+    // cursor is caller-bound even when its rows are public. That landed in
+    // 756719c3 inside the cursor-authentication fix; the fixture here is
+    // `spawn_modern_with_page_size(1)`, so the branch always fires. ttlMs 0 is
+    // the fail-CLOSED value this test's name promises.
+    //
+    // RH-5: the opposite contract is proven against a NON-paginated shipped
+    // server by `evaluate_modern_facade_final_cache_controls` (:8309, driven by
+    // the pair at :8411/:8415), which reaches fills == 1 and hits == 1 with a
+    // wire-request counter showing zero I/O on the replay. Those two tests
+    // differ in exactly one dimension, whether the server paginates, so neither
+    // one alone can be mistaken for "caching works" or "caching is broken".
+    // fills == 1 there is itself only reachable with a nonzero server hint,
+    // because fastmcp-client/src/cache.rs:475 refuses admission outright when
+    // ttl_ms == 0.
+    //
+    // These expectations CHANGE when bd-rzm5d lands age/remaining-validity
+    // propagation and retires the stopgap. Treat this test as that bead's
+    // canary; do not relax it to accommodate a partial implementation.
     assert_eq!(
         first.ttl_ms,
-        CacheTtl::milliseconds(5 * 60 * 1_000),
-        "the typed first page retains its exact final ttlMs"
+        CacheTtl::milliseconds(0),
+        "a paginated first page must advertise the fail-closed zero final ttlMs"
     );
     assert_eq!(
         first.cache_scope,
@@ -8491,26 +8514,50 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
         .next_cursor
         .clone()
         .expect("the first filtered page carries an opaque cursor");
-    assert_eq!(client.final_result_cache_stats().fills, 1);
+    // Never admitted, so never a hit. `misses` is the counter-observable that
+    // separates "the server declared ttlMs 0" from "the cache was never
+    // consulted at all": the lookup ran and declined.
+    assert_eq!(
+        client.final_result_cache_stats().fills,
+        0,
+        "a zero-ttl paginated page must not be admitted to the final cache"
+    );
     assert_eq!(client.final_result_cache_stats().hits, 0);
+    assert_eq!(
+        client.final_result_cache_stats().misses,
+        1,
+        "the first paginated page must be looked up and missed, not skipped"
+    );
 
     let replay = tools_page(
         runtime_block_on_bounded(
             &cx,
             client.request_final_core(&cx, "tools/list", json!({ "includeTags": ["cursor"] })),
         )
-        .expect("the identical public list request uses its local final cache"),
+        .expect("the identical public list request goes back to the live server"),
     );
+    // The replay still returns the same page, which is what proves it reached
+    // the wire rather than failing: an identical request to an unchanged server
+    // yields an identical page. The cache contributed nothing.
     assert_eq!(
         typed_page_identity(&replay),
         first_identity,
-        "the cache replay retains the complete typed first-page identity"
+        "the uncached replay retains the complete typed first-page identity"
     );
-    assert_eq!(client.final_result_cache_stats().fills, 1);
+    assert_eq!(
+        client.final_result_cache_stats().fills,
+        0,
+        "replaying a zero-ttl paginated page must not admit it either"
+    );
     assert_eq!(
         client.final_result_cache_stats().hits,
-        1,
-        "an identical final request is a public cache hit"
+        0,
+        "an identical paginated request can never be a cache hit"
+    );
+    assert_eq!(
+        client.final_result_cache_stats().misses,
+        2,
+        "every identical paginated replay is a fresh miss, so each one is live"
     );
 
     let second = tools_page(
@@ -8530,10 +8577,17 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
         "the sole valid continuation retains the exact cursor-secondary tool identity"
     );
     assert!(second.next_cursor.is_none());
+    // The LAST page carries no cursor at all, so it has no lifetime to renew,
+    // and it is still zeroed: the rule keys off whether the SERVER paginates,
+    // not whether this RESPONSE carries a cursor. That is deliberately pinned
+    // here rather than left implicit, because it is the single observable that
+    // distinguishes the shipped rule from the narrower cursor-presence rule
+    // recorded as disposition (b) on bd-hq26f. If anyone narrows the rule, this
+    // assertion is the one that must fail first and name the change.
     assert_eq!(
         second.ttl_ms,
-        CacheTtl::milliseconds(5 * 60 * 1_000),
-        "the typed continuation page retains its exact final ttlMs"
+        CacheTtl::milliseconds(0),
+        "a cursorless final page of a paginated catalog is still fail-closed"
     );
     assert_eq!(
         second.cache_scope,
@@ -8564,7 +8618,8 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
     ));
 
     // RH-5: only the catalog method changes. A tools cursor cannot select a
-    // resources page, and this rejection must not flush the cached tools page.
+    // resources page, and this rejection must leave the tools request
+    // serviceable (no cached page exists to flush under this contract).
     let kind_rejection = runtime_block_on_bounded(
         &cx,
         client.request_final_core(
@@ -8581,7 +8636,8 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
     ));
 
     // RH-5: only wire presence changes from an absent cursor to the explicitly
-    // present empty cursor. The cache must not replay the absent-cursor page.
+    // present empty cursor. An empty cursor is a distinct request identity and
+    // is rejected, not silently treated as the absent-cursor request.
     let empty_cursor_rejection = runtime_block_on_bounded(
         &cx,
         client.request_final_core(
@@ -8603,22 +8659,34 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
             &cx,
             client.request_final_core(&cx, "tools/list", json!({ "includeTags": ["cursor"] })),
         )
-        .expect("cursor rejections leave the already-cached first page unchanged"),
+        .expect("cursor rejections leave the unchanged original request serviceable"),
     );
+    // The property here is unchanged state after three rejections, and it does
+    // not depend on caching: the unchanged original request must still return
+    // the identical page. Under the fail-closed paginated contract it resolves
+    // live rather than from an entry, so the counters below are stated
+    // RELATIVE to the pre-retry snapshot. That avoids predicting whether a
+    // rejected request performs a lookup before failing, which is not this
+    // test's subject.
     assert_eq!(
         typed_page_identity(&unchanged_retry),
         first_identity,
-        "cursor rejections leave the complete cached typed first-page identity unchanged"
+        "cursor rejections leave the complete typed first-page identity unchanged"
     );
     assert_eq!(
         client.final_result_cache_stats().fills,
         before_unchanged_retry.fills,
-        "rejected cursor variations cannot overwrite the admitted cached page"
+        "rejected cursor variations cannot admit a page the policy refused"
     );
     assert_eq!(
         client.final_result_cache_stats().hits,
-        before_unchanged_retry.hits + 1,
-        "the unchanged original request still resolves from its prior cache entry"
+        before_unchanged_retry.hits,
+        "no request in this test may ever resolve from the final cache"
+    );
+    assert_eq!(
+        client.final_result_cache_stats().misses,
+        before_unchanged_retry.misses + 1,
+        "the unchanged original request is served live, exactly once more"
     );
 
     drop(client);
