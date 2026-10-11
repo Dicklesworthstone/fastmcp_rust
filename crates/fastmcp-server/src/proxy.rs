@@ -5945,12 +5945,34 @@ impl ProxyHttpClient {
                     .and_then(|value| serde_json::from_value(value.clone()).ok())
             })
         });
-        // The gateway leg is transparent for the three reverse-direction
-        // capabilities and for the per-request identity: the upstream calls
-        // BACK through this proxy for sampling, elicitation and roots, so the
-        // set it reads must describe the inbound caller that will service
-        // those calls. Every other advertised capability, and the identity
-        // when no inbound one exists, stays locally configured.
+        // IDENTITY AND THE THREE REVERSE-DIRECTION CAPABILITIES NEED THE SAME
+        // `existing_meta` FALLBACK THE LOG LEVEL ABOVE ALREADY HAS. This whole
+        // function rebuilds `_meta` from scratch after removing the incoming
+        // one, so anything it does not explicitly carry over is dropped. The
+        // log level survived a missing ctx argument only because it is re-read
+        // from the removed metadata; identity and capabilities had no such
+        // fallback and were replaced by the locally configured set, which is
+        // what made the HTTP-upstream as_proxy identity and sampling tests
+        // report the gateway's own name back to the caller.
+        //
+        // Precedence: the explicit inbound argument, then the identity and
+        // capabilities already stamped on the incoming request, then this
+        // proxy's locally configured values. The upstream calls BACK through
+        // this proxy for sampling, elicitation and roots, so the set it reads
+        // must describe the inbound caller that will service those calls;
+        // every other advertised capability stays locally configured.
+        //
+        // Custom `ProxyAsyncRequest` backends are deliberately NOT covered:
+        // they declare their own upstream identity through the trait and must
+        // never admit a downstream substitution.
+        let inbound_capabilities = inbound_capabilities.or_else(|| {
+            existing_meta.and_then(|meta| {
+                meta.get(FINAL_CLIENT_CAPABILITIES_META_KEY)
+                    .and_then(|value| {
+                        serde_json::from_value::<ClientCapabilities>(value.clone()).ok()
+                    })
+            })
+        });
         let mut capabilities = self.client_capabilities.clone();
         if let Some(inbound) = &inbound_capabilities {
             capabilities.sampling = inbound.sampling.clone();
@@ -5961,6 +5983,13 @@ impl ProxyHttpClient {
         metadata.client_info = Some(
             inbound_identity
                 .and_then(implementation_from_request_identity)
+                .or_else(|| {
+                    existing_meta.and_then(|meta| {
+                        meta.get(FINAL_CLIENT_INFO_META_KEY).and_then(|value| {
+                            serde_json::from_value::<Implementation>(value.clone()).ok()
+                        })
+                    })
+                })
                 .unwrap_or_else(|| self.client_info.to_implementation()),
         );
         if let Some(progress_marker) = progress_marker {
