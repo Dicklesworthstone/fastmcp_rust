@@ -47595,11 +47595,20 @@ mod lib_unit_tests {
         });
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[derive(Clone, Copy)]
+    enum LiveHttpShutdownSettlement {
+        Join,
+        Poll,
+        Bounded,
+    }
+
     // Exact-2024 era: hosts its child in a legacy HTTP SSE session.
     #[cfg(feature = "legacy-2024-11-05")]
     async fn live_http_shutdown_ownership_probe(
         cx: &Cx,
         cooperate_with_cancellation: bool,
+        settlement: LiveHttpShutdownSettlement,
     ) -> Result<(), String> {
         struct ReleaseOnExit(Arc<AtomicBool>);
 
@@ -47616,12 +47625,17 @@ mod lib_unit_tests {
         // before runtime teardown joins its blocking thread.
         let _release_on_exit = ReleaseOnExit(Arc::clone(&release));
         let finished = Arc::new(AtomicBool::new(false));
+        let shutdown_calls = Arc::new(AtomicUsize::new(0));
+        let shutdown_observer = Arc::clone(&shutdown_calls);
         let tool_name = if cooperate_with_cancellation {
             "live_http_cooperative_shutdown_tool"
         } else {
             "live_http_noncooperative_shutdown_tool"
         };
         let bound = Server::new("live-http-shutdown-ownership", "1.0.0")
+            .on_shutdown(move || {
+                shutdown_observer.fetch_add(1, Ordering::SeqCst);
+            })
             .tool(LiveHttpShutdownTool {
                 name: tool_name,
                 cooperate_with_cancellation,
@@ -47724,7 +47738,14 @@ mod lib_unit_tests {
         }
 
         match (cooperate_with_cancellation, shutdown) {
-            (true, HttpServerShutdown::Quiescent) if finished.load(Ordering::Acquire) => Ok(()),
+            (true, HttpServerShutdown::Quiescent) if finished.load(Ordering::Acquire) => {
+                if shutdown_calls.load(Ordering::SeqCst) != 1 {
+                    return Err(
+                        "cooperative HTTP shutdown must run its hook exactly once".to_owned()
+                    );
+                }
+                Ok(())
+            }
             (true, HttpServerShutdown::Quiescent) => {
                 Err("cooperative HTTP handler was joined before recording completion".to_owned())
             }
@@ -47754,6 +47775,11 @@ mod lib_unit_tests {
                             .to_owned(),
                     );
                 }
+                if shutdown_calls.load(Ordering::SeqCst) != 0 {
+                    return Err(
+                        "HTTP shutdown hook ran while its handler was still live".to_owned()
+                    );
+                }
                 release.store(true, Ordering::Release);
                 let deadline = Instant::now() + Duration::from_secs(1);
                 while !finished.load(Ordering::Acquire) {
@@ -47764,10 +47790,59 @@ mod lib_unit_tests {
                     }
                     asupersync::runtime::yield_now().await;
                 }
-                shutdown
-                    .settle(cx)
-                    .await
-                    .map_err(|error| format!("caller-owned HTTP child join failed: {error}"))
+                match settlement {
+                    LiveHttpShutdownSettlement::Join => {
+                        shutdown.settle(cx).await.map_err(|error| {
+                            format!("caller-owned HTTP child join failed: {error}")
+                        })?;
+                    }
+                    LiveHttpShutdownSettlement::Poll => {
+                        let deadline = Instant::now() + Duration::from_secs(1);
+                        loop {
+                            match shutdown.poll_settlement() {
+                                HttpShutdownSettlement::Settled => break,
+                                HttpShutdownSettlement::Pending { .. }
+                                    if Instant::now() < deadline =>
+                                {
+                                    asupersync::runtime::yield_now().await;
+                                }
+                                observed => {
+                                    return Err(format!(
+                                        "released HTTP child did not settle by polling: {observed:?}"
+                                    ));
+                                }
+                            }
+                        }
+                        for _ in 0..2 {
+                            if !matches!(
+                                shutdown.poll_settlement(),
+                                HttpShutdownSettlement::Settled
+                            ) {
+                                return Err("settled HTTP shutdown changed its outcome".to_owned());
+                            }
+                        }
+                    }
+                    LiveHttpShutdownSettlement::Bounded => {
+                        let observed = shutdown.settle_for(Duration::from_secs(1)).await;
+                        if !matches!(observed, HttpShutdownSettlement::Settled) {
+                            return Err(format!(
+                                "released HTTP child did not settle: {observed:?}"
+                            ));
+                        }
+                        for _ in 0..2 {
+                            if !matches!(
+                                shutdown.settle_for(Duration::ZERO).await,
+                                HttpShutdownSettlement::Settled
+                            ) {
+                                return Err("settled HTTP shutdown changed its outcome".to_owned());
+                            }
+                        }
+                    }
+                }
+                if shutdown_calls.load(Ordering::SeqCst) != 1 {
+                    return Err("settled HTTP shutdown must run its hook exactly once".to_owned());
+                }
+                Ok(())
             }
         }
     }
@@ -47776,7 +47851,9 @@ mod lib_unit_tests {
     #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_shutdown_joins_a_cooperative_child() {
-        run_live_http_test(|cx| async move { live_http_shutdown_ownership_probe(&cx, true).await });
+        run_live_http_test(|cx| async move {
+            live_http_shutdown_ownership_probe(&cx, true, LiveHttpShutdownSettlement::Join).await
+        });
     }
 
     // Exact-2024 era: hosts its child in a legacy HTTP SSE session.
@@ -47786,7 +47863,24 @@ mod lib_unit_tests {
         run_live_http_test(|cx| async move {
             // This differs from the positive only in the handler's
             // cancellation cooperation, preserving the same live HTTP path.
-            live_http_shutdown_ownership_probe(&cx, false).await
+            live_http_shutdown_ownership_probe(&cx, false, LiveHttpShutdownSettlement::Join).await
+        });
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn live_http_shutdown_polled_settlement_finishes_lifecycle_once() {
+        run_live_http_test(|cx| async move {
+            live_http_shutdown_ownership_probe(&cx, false, LiveHttpShutdownSettlement::Poll).await
+        });
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn live_http_shutdown_bounded_settlement_finishes_lifecycle_once() {
+        run_live_http_test(|cx| async move {
+            live_http_shutdown_ownership_probe(&cx, false, LiveHttpShutdownSettlement::Bounded)
+                .await
         });
     }
 
