@@ -537,6 +537,32 @@ if not check_only and discovered and executed:
         reasons.append(f'no discovered test matched {wanted}: a filter that selects '
                        f'nothing is a zero-run green (PL-1)')
 
+# --scope is handed to cargo verbatim, so it may legitimately carry its own
+# feature flags. When it does, reporting features as "(default)" is a FALSE
+# provenance field on an otherwise honest receipt: PL-3 binds a claim to the
+# feature set, and this one would have under-recorded it.
+#
+# Observed 2026-10-11: a sweep passing --all-features inside --scope recorded
+# features "(default)" while discovering 516 tests in a target that yields 322
+# under legacy-2024-11-05,tasks,proxy. The flag had plainly taken effect. The
+# scope string preserved the truth, but the field a reader checks did not.
+#
+# This only widens what the field REPORTS. It does not change what cargo runs,
+# and it never invents a feature that is not in one of the two places a feature
+# can be selected.
+scope_feature_flags = [
+    flag for flag in ('--all-features', '--no-default-features')
+    if flag in scope.split()
+]
+if '--features' in scope.split():
+    scope_feature_flags.append('--features (see scope)')
+if features and scope_feature_flags:
+    effective_features = f'{features} + in scope: {" ".join(scope_feature_flags)}'
+elif scope_feature_flags:
+    effective_features = f'in scope: {" ".join(scope_feature_flags)}'
+else:
+    effective_features = features or '(default)'
+
 receipt = {
     'subject': {
         'head_before': head_before, 'head_after': head_after, 'tree': tree,
@@ -552,7 +578,7 @@ receipt = {
         'worker': worker, 'worker_host': field('HOST'), 'remote_dir': remote_dir,
         'toolchain': toolchain, 'rustc': field('RUSTC'),
         'rustc_commit': field('COMMIT_HASH'), 'host_target': field('TARGET'),
-        'profile': profile, 'scope': scope, 'features': features or '(default)',
+        'profile': profile, 'scope': scope, 'features': effective_features,
         'test_threads': threads or '(default)', 'filters': filters or '(none)',
         'scheduler': 'none: direct ssh, bypassing the RCH queue',
         # Capacity belongs on every receipt, green ones included: it is how a
