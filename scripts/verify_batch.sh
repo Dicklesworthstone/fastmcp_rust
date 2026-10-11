@@ -253,6 +253,24 @@ echo "RECEIPT_RUSTC=\$(rustc +$TOOLCHAIN -vV 2>/dev/null | sed -n 's/^release: /
 echo "RECEIPT_COMMIT_HASH=\$(rustc +$TOOLCHAIN -vV 2>/dev/null | sed -n 's/^commit-hash: //p')"
 echo "RECEIPT_TARGET=\$(rustc +$TOOLCHAIN -vV 2>/dev/null | sed -n 's/^host: //p')"
 
+# FREE SPACE ON THE TARGET-POOL FILESYSTEM, captured BEFORE the build and
+# therefore present even on a receipt whose build died.
+#
+# This is a diagnosis field, not hygiene. A worker that runs out of disk does
+# not report "out of disk": the link step dies as
+#   collect2: fatal error: ld terminated with signal 7 [Bus error]
+# because ld writes its output through mmap, and the surrounding cargo text is
+# an ordinary "error: could not compile". The receipt then says compile FAILED,
+# which reads exactly like a code defect in the subject under test. Observed
+# 2026-10-11 on hz3 at 50MB free of 906GB, where a 2365-test lib target had
+# compiled green on the same pool twenty minutes earlier.
+#
+# Reported unconditionally so a GREEN receipt also records how much headroom it
+# had. A run that finished with almost nothing left is a run whose next sibling
+# will fail for reasons that have nothing to do with the code.
+echo "RECEIPT_DISK_AVAIL_KB=\$(df -Pk '$target_dir' 2>/dev/null | awk 'NR==2 { print \$4 }')"
+echo "RECEIPT_DISK_PCT_USED=\$(df -Pk '$target_dir' 2>/dev/null | awk 'NR==2 { gsub(/%/, "", \$5); print \$5 }')"
+
 if [ '$CHECK_ONLY' = 1 ]; then
     if [ '$CLIPPY' = 1 ]; then
         cargo +$TOOLCHAIN clippy --locked $SCOPE $feature_args -- -D warnings \
@@ -417,10 +435,43 @@ if manifest_remote != manifest_local:
                    f'{(manifest_remote or "<none>")[:16]} - a stale or partial mirror was measured')
 if field('MANIFEST_FILES') != manifest_files:
     reasons.append(f'manifest file count differs: local {manifest_files} vs worker {field("MANIFEST_FILES")}')
+# Worker capacity is read BEFORE the compile verdict, because an exhausted
+# filesystem makes the compile verdict mean something different. ld dies of
+# SIGBUS on a full disk and cargo reports it as "could not compile", so a
+# receipt that says only "compile FAILED" sends the reader looking for a defect
+# in the subject. Naming the capacity failure separately is the whole point:
+# the subject was never evaluated, so this receipt is void rather than red.
+disk_avail_kb = None
+try:
+    disk_avail_kb = int(field('DISK_AVAIL_KB'))
+except (TypeError, ValueError):
+    pass
+# 2 GiB. A single fastmcp-server test binary and its incremental artifacts do
+# not fit below this, so a run starting here is untrustworthy whatever it
+# reports. The bound is deliberately generous: it is cheaper to re-run on
+# another worker than to debug a phantom link error.
+disk_exhausted = disk_avail_kb is not None and disk_avail_kb < 2 * 1024 * 1024
+
 if field('BUILD_RC') is None:
     reasons.append('no build status reported: the remote script did not reach the compile step')
 elif field('BUILD_RC') != '0':
-    reasons.append('compile FAILED: a test count taken after a failed build measures a stale binary')
+    if disk_exhausted:
+        reasons.append(
+            f'WORKER OUT OF DISK, not a subject failure: {disk_avail_kb} KiB free on the '
+            f'target-pool filesystem ({field("DISK_PCT_USED")}% used). A full disk kills ld '
+            'with SIGBUS and cargo reports it as "could not compile". This receipt is VOID, '
+            'not red: re-run on a worker with free space before reading anything into it.'
+        )
+    else:
+        reasons.append('compile FAILED: a test count taken after a failed build measures a stale binary')
+elif disk_exhausted:
+    # The build survived, but with no headroom left. Say so on the receipt
+    # rather than letting the next lane discover it as a mystery link error.
+    reasons.append(
+        f'worker disk is effectively full ({disk_avail_kb} KiB free, '
+        f'{field("DISK_PCT_USED")}% used): this run finished, but its result is not '
+        'reproducible on this worker and a sibling run will likely fail in the linker'
+    )
 if 'RECEIPT_END' not in raw:
     reasons.append('remote script did not reach its end marker: early abort')
 # In check-only mode there is no test count to judge, so PL-1's zero-run rule
@@ -504,6 +555,10 @@ receipt = {
         'profile': profile, 'scope': scope, 'features': features or '(default)',
         'test_threads': threads or '(default)', 'filters': filters or '(none)',
         'scheduler': 'none: direct ssh, bypassing the RCH queue',
+        # Capacity belongs on every receipt, green ones included: it is how a
+        # later reader tells a subject failure from a worker that ran out of room.
+        'disk_avail_kb': field('DISK_AVAIL_KB'),
+        'disk_pct_used': field('DISK_PCT_USED'),
     },
     'counts': {
         'discovered_listed': field('DISCOVERED'),
