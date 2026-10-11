@@ -8428,6 +8428,32 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
         serde_json::to_value(page).expect("a typed final tools page retains an exact JSON identity")
     }
 
+    /// The same identity with `nextCursor` removed.
+    ///
+    /// A live server mints a fresh cursor on every request, so two separate
+    /// live responses to the identical request are equal in every field EXCEPT
+    /// that one. Comparing the full identity across a wire replay would
+    /// therefore always fail; comparing it was only ever sound while the replay
+    /// was served from the local cache, which the paginated no-cache contract
+    /// has withdrawn. Dropping the one varying field keeps the real property,
+    /// that the page CONTENT is unchanged, and the cursor is asserted
+    /// separately for presence.
+    fn typed_page_identity_without_cursor(
+        page: &fastmcp_rust::FinalListToolsResult,
+    ) -> serde_json::Value {
+        let mut identity = typed_page_identity(page);
+        let removed = identity
+            .as_object_mut()
+            .expect("a typed final tools page serializes as a JSON object")
+            .remove("nextCursor");
+        assert!(
+            removed.is_some(),
+            "this helper exists to drop nextCursor; a page without one means \
+             the field was renamed and every comparison below silently widened"
+        );
+        identity
+    }
+
     let cx = Cx::for_request();
     let server = HttpServerFixture::spawn_modern_with_page_size(1);
 
@@ -8536,13 +8562,25 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
         )
         .expect("the identical public list request goes back to the live server"),
     );
-    // The replay still returns the same page, which is what proves it reached
-    // the wire rather than failing: an identical request to an unchanged server
-    // yields an identical page. The cache contributed nothing.
+    // The replay's CONTENT is unchanged, which is what proves it reached the
+    // wire and succeeded rather than erroring. Its cursor is necessarily a new
+    // one, because the server mints a cursor per request, so this compares
+    // every field except that one and then requires the cursor to be present.
+    //
+    // Deliberately NOT asserting that the two cursors differ. They did differ
+    // in the run that caught this, but the varying component is opaque and its
+    // resolution is not specified here, so an inequality assertion could pass
+    // for a reason this test does not control. The affirmative wire evidence is
+    // the `misses` counter below: a miss means the cache was consulted and
+    // declined, so the response came from the server.
     assert_eq!(
-        typed_page_identity(&replay),
-        first_identity,
-        "the uncached replay retains the complete typed first-page identity"
+        typed_page_identity_without_cursor(&replay),
+        typed_page_identity_without_cursor(&first),
+        "the uncached replay retains the typed first-page content"
+    );
+    assert!(
+        replay.next_cursor.is_some(),
+        "a freshly served paginated first page still carries a continuation"
     );
     assert_eq!(
         client.final_result_cache_stats().fills,
@@ -8663,15 +8701,20 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
     );
     // The property here is unchanged state after three rejections, and it does
     // not depend on caching: the unchanged original request must still return
-    // the identical page. Under the fail-closed paginated contract it resolves
-    // live rather than from an entry, so the counters below are stated
-    // RELATIVE to the pre-retry snapshot. That avoids predicting whether a
-    // rejected request performs a lookup before failing, which is not this
-    // test's subject.
+    // the same page content. Under the fail-closed paginated contract it
+    // resolves live rather than from an entry, so this compares content
+    // without the per-request cursor, exactly as the replay above does, and
+    // the counters below are stated RELATIVE to the pre-retry snapshot. The
+    // relative form avoids predicting whether a rejected request performs a
+    // lookup before failing, which is not this test's subject.
     assert_eq!(
-        typed_page_identity(&unchanged_retry),
-        first_identity,
-        "cursor rejections leave the complete typed first-page identity unchanged"
+        typed_page_identity_without_cursor(&unchanged_retry),
+        typed_page_identity_without_cursor(&first),
+        "cursor rejections leave the typed first-page content unchanged"
+    );
+    assert!(
+        unchanged_retry.next_cursor.is_some(),
+        "the post-rejection page still carries a continuation"
     );
     assert_eq!(
         client.final_result_cache_stats().fills,
