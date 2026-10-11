@@ -121,7 +121,8 @@ fn incompatible_machine_grants_stop_dispatch_without_installing_a_generation() {
             // This is an explicit new acquisition after rejection, not an
             // automatic retry. Every failed candidate left generation zero.
             let body = ordinary_token().to_string();
-            let ((), admitted) = pair(reply(&peer, post, &body), client.credential(&cx)).await;
+            let ((), admitted) =
+                Box::pin(pair(reply(&peer, post, &body), client.credential(&cx))).await;
             let admitted = admitted.unwrap();
             assert_eq!(admitted.generation(), 1);
             assert_eq!(admitted.scopes(), ["read"]);
@@ -148,7 +149,8 @@ fn ignored_machine_metadata_is_not_mistaken_for_top_level_token_authority() {
             document["token_endpoint"] = json!("https://untrusted.example/alternate");
             document["registration_client_uri"] = json!("https://untrusted.example/registration");
             let body = document.to_string();
-            let ((), admitted) = pair(reply(&peer, post, &body), client.credential(&cx)).await;
+            let ((), admitted) =
+                Box::pin(pair(reply(&peer, post, &body), client.credential(&cx))).await;
             let admitted = admitted.unwrap();
             assert_eq!(admitted.generation(), 1);
             assert_eq!(admitted.scopes(), ["read"]);
@@ -179,7 +181,8 @@ fn rejected_machine_renewal_preserves_the_original_lineage_and_generation() {
                 let mut first = ordinary_token();
                 first["expires_in"] = json!(1);
                 let body = first.to_string();
-                let ((), old) = pair(reply(&peer, post, &body), client.credential(&cx)).await;
+                let ((), old) =
+                    Box::pin(pair(reply(&peer, post, &body), client.credential(&cx))).await;
                 let old = old.unwrap();
                 let expiry = old.expires_at();
                 assert_eq!(old.generation(), 1);
@@ -197,7 +200,8 @@ fn rejected_machine_renewal_preserves_the_original_lineage_and_generation() {
                 invalid["access_token"] = json!("must-not-install");
                 invalid["cnf"] = json!({"x5t#S256":"certificate-bound"});
                 let body = invalid.to_string();
-                let ((), refused) = pair(reply(&peer, post, &body), client.credential(&cx)).await;
+                let ((), refused) =
+                    Box::pin(pair(reply(&peer, post, &body), client.credential(&cx))).await;
                 assert!(matches!(refused, Err(Error::InvalidToken)));
                 assert_eq!(peer.grants.load(Ordering::SeqCst), 2);
                 assert_eq!(old.expires_at(), expiry);
@@ -208,7 +212,8 @@ fn rejected_machine_renewal_preserves_the_original_lineage_and_generation() {
                     let mut replacement = ordinary_token();
                     replacement["access_token"] = json!("replacement-access");
                     let body = replacement.to_string();
-                    let ((), new) = pair(reply(&peer, post, &body), client.credential(&cx)).await;
+                    let ((), new) =
+                        Box::pin(pair(reply(&peer, post, &body), client.credential(&cx))).await;
                     let new = new.unwrap();
                     assert_eq!(
                         new.generation(),
@@ -266,13 +271,13 @@ fn a_complete_json_token_prefix_is_not_a_complete_http_token_response() {
                     socket.flush().await.unwrap();
                     socket.shutdown().await.unwrap();
                 };
-                let ((), result) = pair(server, client.credential(&cx)).await;
+                let ((), result) = Box::pin(pair(server, client.credential(&cx))).await;
                 if truncated {
                     assert!(matches!(result, Err(Error::Transport)));
                     assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
                     peer.quiet();
                     let ((), result) =
-                        pair(reply(&peer, post, &body), client.credential(&cx)).await;
+                        Box::pin(pair(reply(&peer, post, &body), client.credential(&cx))).await;
                     assert_eq!(result.unwrap().generation(), 1);
                 } else {
                     assert_eq!(result.unwrap().generation(), 1);
@@ -309,10 +314,9 @@ fn escaped_duplicate_and_null_authority_fields_fail_on_the_real_token_path() {
                 let body = format!(
                     r#"{{"access_token":"admitted-access","token_type":"Bearer","expires_in":300,"scope":"read",{field}}}"#
                 );
-                let ((), result) = pair(reply(&peer, post, &body), client.credential(&cx)).await;
-                let error = result
-                    .err()
-                    .expect("wire spelling cannot erase incompatible authority");
+                let ((), result) =
+                    Box::pin(pair(reply(&peer, post, &body), client.credential(&cx))).await;
+                let error = result.expect_err("wire spelling cannot erase incompatible authority");
                 assert!(matches!(error, Error::InvalidToken));
                 assert!(!format!("{error:?} {error}").contains("private-token"));
                 assert_eq!(peer.grants.load(Ordering::SeqCst), index + 1);
@@ -320,7 +324,8 @@ fn escaped_duplicate_and_null_authority_fields_fail_on_the_real_token_path() {
                 peer.quiet();
             }
             let body = ordinary_token().to_string();
-            let ((), result) = pair(reply(&peer, post, &body), client.credential(&cx)).await;
+            let ((), result) =
+                Box::pin(pair(reply(&peer, post, &body), client.credential(&cx))).await;
             assert_eq!(result.unwrap().generation(), 1);
             core_succeeds(&peer, &cx, &client, "admitted-access").await;
             assert_eq!(peer.grants.load(Ordering::SeqCst), 7);
@@ -372,7 +377,8 @@ fn cancelling_after_token_json_before_http_completion_cannot_seed_the_cache() {
             peer.quiet();
             // A fresh explicit caller can acquire, but cannot observe the
             // cancelled candidate as cached generation one and skip its POST.
-            let ((), admitted) = pair(reply(&peer, post, &body), client.credential(&cx)).await;
+            let ((), admitted) =
+                Box::pin(pair(reply(&peer, post, &body), client.credential(&cx))).await;
             assert_eq!(admitted.unwrap().generation(), 1);
             assert_eq!(peer.grants.load(Ordering::SeqCst), 2);
             core_succeeds(&peer, &cx, &client, "admitted-access").await;
