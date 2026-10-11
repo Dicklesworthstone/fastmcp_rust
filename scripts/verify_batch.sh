@@ -303,8 +303,22 @@ REMOTE
 scp -i "$KEY" -o BatchMode=yes -q "$OUT/remote.sh" "$WORKER:$remote_dir/vb_remote.sh" \
     || die 'cannot stage the remote script'
 
-printf '== run ==\ncargo test --locked %s %s -- %s %s\n\n' \
-    "$SCOPE" "$feature_args" "$thread_args" "${FILTERS[*]-}"
+# The header must name the command that ACTUALLY runs. It previously printed
+# the `cargo test` form unconditionally, so a --check-only log read as if a
+# test run had happened. receipt.json's `mode` was honest; the human-facing
+# header was not, and a misread log is exactly the evidence defect this script
+# exists to prevent.
+if [ "$CHECK_ONLY" = 1 ]; then
+    if [ "$CLIPPY" = 1 ]; then
+        printf '== run ==\ncargo clippy --locked %s %s -- -D warnings\n\n' \
+            "$SCOPE" "$feature_args"
+    else
+        printf '== run ==\ncargo check --locked %s %s\n\n' "$SCOPE" "$feature_args"
+    fi
+else
+    printf '== run ==\ncargo test --locked %s %s -- %s %s\n\n' \
+        "$SCOPE" "$feature_args" "$thread_args" "${FILTERS[*]-}"
+fi
 
 "${SSH[@]}" "chmod +x '$remote_dir/vb_remote.sh' && '$remote_dir/vb_remote.sh' ${FILTERS[*]-}" \
     > "$OUT/remote.out" 2>&1
