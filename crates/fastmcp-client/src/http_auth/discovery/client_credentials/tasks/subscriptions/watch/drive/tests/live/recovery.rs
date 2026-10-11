@@ -440,7 +440,7 @@ mod input_driver {
 
     fn isolated_input(name: &str, case: InputCase) {
         isolated_run(&format!("recovery::input_driver::{name}"), || {
-            run_input(case)
+            run_input(case);
         });
     }
     fn no_resolver(
@@ -1448,7 +1448,7 @@ mod observation_control {
     }
     fn isolated_control(name: &str, case: Case) {
         isolated_run(&format!("recovery::observation_control::{name}"), || {
-            run_control(case)
+            run_control(case);
         });
     }
 

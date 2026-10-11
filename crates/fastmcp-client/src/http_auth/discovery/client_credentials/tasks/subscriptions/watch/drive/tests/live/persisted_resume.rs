@@ -101,10 +101,10 @@ fn snapshot(status: &str, second: u8) -> serde_json::Value {
         "ttlMs":null, "pollIntervalMs":20});
     match status {
         "input_required" => {
-            value["inputRequests"] = json!({"PRIVATE-INPUT":{"method":"roots/list"}})
+            value["inputRequests"] = json!({"PRIVATE-INPUT":{"method":"roots/list"}});
         }
         "completed" => {
-            value["result"] = json!({"content":[{"type":"text","text":"PRIVATE-RESULT"}]})
+            value["result"] = json!({"content":[{"type":"text","text":"PRIVATE-RESULT"}]});
         }
         _ => {}
     }

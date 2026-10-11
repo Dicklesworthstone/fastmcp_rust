@@ -713,10 +713,10 @@ async fn scenario(cx: &Cx, case: Case) {
                     );
                 }
                 peer.quiet();
-                let ((), resumed) = pair(
+                let ((), resumed) = Box::pin(pair(
                     peer.continuation(),
                     operation.resume(cx, RequestId::Number(14), None),
-                )
+                ))
                 .await;
                 resumed.unwrap();
                 expected_posts += 1;
@@ -836,14 +836,14 @@ async fn scenario(cx: &Cx, case: Case) {
                         ))
                     )),
                     Case::DuplicateTool => {
-                        assert!(matches!(result, Err(ToolHeaderRepairError::DuplicateTool)))
+                        assert!(matches!(result, Err(ToolHeaderRepairError::DuplicateTool)));
                     }
                     Case::MissingTool => assert!(matches!(
                         result,
                         Err(ToolHeaderRepairError::ToolUnavailable)
                     )),
                     Case::WrongProjection => {
-                        assert!(matches!(result, Err(ToolHeaderRepairError::Headers(_))))
+                        assert!(matches!(result, Err(ToolHeaderRepairError::Headers(_))));
                     }
                     _ => panic!("unexpected repair eligibility: {case:?}"),
                 }
@@ -899,7 +899,7 @@ async fn scenario(cx: &Cx, case: Case) {
             Some(ManagedCoreEvent::Result(_))
         ));
     };
-    pair(peer.sibling(), sibling).await;
+    Box::pin(pair(peer.sibling(), sibling)).await;
     assert_eq!(peer.requests.lock().unwrap().len(), expected_posts + 1);
     assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
     peer.quiet();

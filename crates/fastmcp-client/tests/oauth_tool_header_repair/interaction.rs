@@ -471,7 +471,7 @@ async fn scenario(cx: &Cx, case: InteractionCase) {
                 Err(ManagedInteractionError::ContinuationLimit)
             )),
             InteractionCase::InputLimit => {
-                assert!(matches!(first, Err(ManagedInteractionError::InputLimit)))
+                assert!(matches!(first, Err(ManagedInteractionError::InputLimit)));
             }
             InteractionCase::Unadvertised => assert!(matches!(
                 first,
@@ -564,7 +564,8 @@ async fn scenario(cx: &Cx, case: InteractionCase) {
                             }
                         };
                         let (mut stalled, sent) =
-                            pair(continuation(&peer, &original, case, round), resume).await;
+                            Box::pin(pair(continuation(&peer, &original, case, round), resume))
+                                .await;
                         expected_posts += 1;
                         if case == InteractionCase::LostContinuation {
                             assert!(sent.is_err());
@@ -680,7 +681,7 @@ async fn scenario(cx: &Cx, case: InteractionCase) {
             Some(ManagedCoreEvent::Result(_))
         ));
     };
-    pair(server, sibling).await;
+    Box::pin(pair(server, sibling)).await;
     assert_eq!(peer.requests.lock().unwrap().len(), expected_posts + 1);
     assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
     peer.quiet();

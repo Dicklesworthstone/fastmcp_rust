@@ -64,7 +64,7 @@ fn isolated_checkpoint(name: &str, case: CheckpointCase) {
                                 &cx,
                                 matches!(case, CheckpointCase::Recovering),
                             ))
-                            .await
+                            .await;
                         }
                         _ => Box::pin(refusals(&peer, &cx, case)).await,
                     }

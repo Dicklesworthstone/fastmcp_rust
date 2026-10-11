@@ -113,10 +113,10 @@ fn result(case: Case) -> serde_json::Value {
         "ttlMs":null,"statusMessage":"PRIVATE-STATUS"});
     match case {
         Case::TaskInput => {
-            value["inputRequests"] = json!({"PRIVATE-INPUT":{"method":"roots/list"}})
+            value["inputRequests"] = json!({"PRIVATE-INPUT":{"method":"roots/list"}});
         }
         Case::Completed => {
-            value["result"] = json!({"content":[{"type":"text","text":"PRIVATE-RESULT"}]})
+            value["result"] = json!({"content":[{"type":"text","text":"PRIVATE-RESULT"}]});
         }
         Case::Failed => value["error"] = json!({"code":-32603,"message":"PRIVATE-ERROR"}),
         Case::ExpiredTask => value["ttlMs"] = json!(1),

@@ -436,7 +436,7 @@ async fn scenario(cx: &Cx, case: SchemaCase) {
                         assert!(!format!("{error:?} {error}").contains("private-output-canary"));
                     }
                     SchemaCase::BufferedInvalidation | SchemaCase::PendingResult => {
-                        assert!(matches!(read_result, Err(ManagedToolError::Invalidated)))
+                        assert!(matches!(read_result, Err(ManagedToolError::Invalidated)));
                     }
                     SchemaCase::CancelRead => assert!(matches!(
                         read_result,
@@ -549,7 +549,7 @@ async fn scenario(cx: &Cx, case: SchemaCase) {
             Some(ManagedCoreEvent::Result(_))
         ));
     };
-    pair(peer.sibling(), sibling).await;
+    Box::pin(pair(peer.sibling(), sibling)).await;
     assert_eq!(peer.requests.lock().unwrap().len(), expected + 1);
     assert_eq!(
         peer.grants.load(Ordering::SeqCst),
