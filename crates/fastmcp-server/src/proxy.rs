@@ -65,8 +65,9 @@ use fastmcp_protocol::protocol_policy::{
 use fastmcp_protocol::{
     CacheScope, CacheTtl, CallToolResult, ClientCapabilities, ClientInfo, CompleteResult,
     CompletionValues, Content, CoreRequest, CoreResult, ElicitationCapability,
-    FINAL_LOG_LEVEL_META_KEY, FinalCallToolResult, FinalCompletionParams, FinalCompletionValues,
-    FinalCoreResult, FinalGetPromptResult, FinalLogMessageParams, FinalProgressNotificationParams,
+    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY, FINAL_LOG_LEVEL_META_KEY,
+    FinalCallToolResult, FinalCompletionParams, FinalCompletionValues, FinalCoreResult,
+    FinalGetPromptResult, FinalLogMessageParams, FinalProgressNotificationParams,
     FinalReadResourceResult, FinalRequestMeta, FormElicitationCapability, GetPromptResult,
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyCompletionParams,
     LegacyCompletionReference, LegacyContent, LegacyCoreResult, LegacyPromptMessage,
