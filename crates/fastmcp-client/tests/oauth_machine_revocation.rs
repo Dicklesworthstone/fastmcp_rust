@@ -390,7 +390,7 @@ impl Peer {
             let snapshot = client.credential(cx).await.unwrap();
             (client, snapshot)
         };
-        pair(server, application).await.1
+        Box::pin(pair(server, application)).await.1
     }
     async fn rpc(&self, method: &str, token: &str, tasks: bool) -> (TlsStream<TcpStream>, Value) {
         let (socket, head, headers, body) = self.request().await;
@@ -734,13 +734,12 @@ async fn interrupted(
 fn scenario(case: Case) {
     run(|cx| async move {
         let peer = Peer::new().await;
-        let (client, snapshot) = peer
-            .connect(
-                &cx,
-                Duration::from_secs(60),
-                ClientSecretAuthenticationMethod::Basic,
-            )
-            .await;
+        let (client, snapshot) = Box::pin(peer.connect(
+            &cx,
+            Duration::from_secs(60),
+            ClientSecretAuthenticationMethod::Basic,
+        ))
+        .await;
         let (ready, entered) = oneshot::channel();
         pair(
             stalled(&peer, case, ready),
@@ -758,13 +757,12 @@ fn scenario(case: Case) {
         peer.quiet();
         // Identical token text in a separately acquired client is not a global
         // revocation identity. It must remain capable of a distinct MCP call.
-        let (independent, other) = peer
-            .connect(
-                &cx,
-                Duration::from_secs(60),
-                ClientSecretAuthenticationMethod::Basic,
-            )
-            .await;
+        let (independent, other) = Box::pin(peer.connect(
+            &cx,
+            Duration::from_secs(60),
+            ClientSecretAuthenticationMethod::Basic,
+        ))
+        .await;
         assert!(!other.credential().is_revoked());
         peer.successful_call(&cx, &independent, ACCESS).await;
         assert_eq!(peer.grants.load(Ordering::SeqCst), 2);
@@ -822,7 +820,8 @@ fn revoking_old_machine_access_interrupts_a_pending_replacement_grant() {
     ] {
         run(|cx| async move {
             let peer = Peer::new().await;
-            let (client, original) = peer.connect(&cx, Duration::from_secs(2), method).await;
+            let (client, original) =
+                Box::pin(peer.connect(&cx, Duration::from_secs(2), method)).await;
             asupersync::time::sleep(
                 cx.now(),
                 original
@@ -838,17 +837,17 @@ fn revoking_old_machine_access_interrupts_a_pending_replacement_grant() {
                 closed(socket).await;
             };
             let application = async {
-                let (result, queued) = pair(
+                let (result, queued) = Box::pin(pair(
                     revoke_pending(&cx, original.credential(), entered, client.credential(&cx)),
                     client.credential(&cx),
-                )
+                ))
                 .await;
                 assert!(matches!(result, Err(Error::Expired)));
                 assert!(matches!(queued, Err(Error::Expired)));
                 assert!(matches!(client.credential(&cx).await, Err(Error::Expired)));
                 assert_eq!(original.generation(), 1);
             };
-            pair(server, application).await;
+            Box::pin(pair(server, application)).await;
             assert_eq!(
                 peer.grants.load(Ordering::SeqCst),
                 2,
@@ -867,7 +866,7 @@ fn ordinary_machine_expiry_still_renews_and_old_revocation_does_not_cancel_the_n
     run(|cx| async move {
         let peer = Peer::new().await;
         let method = ClientSecretAuthenticationMethod::Basic;
-        let (client, original) = peer.connect(&cx, Duration::from_secs(2), method).await;
+        let (client, original) = Box::pin(peer.connect(&cx, Duration::from_secs(2), method)).await;
         asupersync::time::sleep(
             cx.now(),
             original
@@ -876,10 +875,10 @@ fn ordinary_machine_expiry_still_renews_and_old_revocation_does_not_cancel_the_n
                 + Duration::from_millis(10),
         )
         .await;
-        let (_, replacement) = pair(
+        let ((), replacement) = Box::pin(pair(
             peer.grant(method, "replacement-access"),
             client.credential(&cx),
-        )
+        ))
         .await;
         let replacement = replacement.unwrap();
         assert_eq!(replacement.generation(), 2);
