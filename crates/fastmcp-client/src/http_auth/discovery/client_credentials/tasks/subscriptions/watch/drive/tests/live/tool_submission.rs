@@ -239,6 +239,8 @@ async fn server(peer: &Peer, metadata: &serde_json::Value, case: SubmissionCase)
                 json!({"jsonrpc":"2.0","id":request["id"],"result":input(false)}),
             )
             .await;
+            socket.write_all(b"0\r\n\r\n").await.unwrap();
+            socket.flush().await.unwrap();
         }
         closed(&mut socket).await;
         if !matches!(case, SubmissionCase::Stream) {

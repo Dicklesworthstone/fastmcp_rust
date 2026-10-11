@@ -300,6 +300,8 @@ async fn server(peer: &Peer, store: &Store, metadata: &serde_json::Value, case: 
             json!({"jsonrpc":"2.0","id":request["id"],"result":input(case)}),
         )
         .await;
+        socket.write_all(b"0\r\n\r\n").await.unwrap();
+        socket.flush().await.unwrap();
         closed(&mut socket).await;
     } else {
         result_reply(&mut socket, &request, input(case)).await;

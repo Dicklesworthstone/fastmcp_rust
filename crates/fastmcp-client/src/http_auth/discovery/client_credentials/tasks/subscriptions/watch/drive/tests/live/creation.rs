@@ -192,8 +192,10 @@ fn run_creation(case: Case) {
                     event(&mut socket, json!({"jsonrpc":"2.0","method":"notifications/progress",
                         "params":{"progressToken":"creation-progress","progress":1}})).await;
                     event(&mut socket, envelope).await;
-                    // Do not emit EOF: the correlated terminal must release this
-                    // response instead of waiting for an unrelated later event.
+                    // Finish the HTTP body so the client can validate the finite
+                    // SSE tail before publishing the correlated terminal.
+                    socket.write_all(b"0\r\n\r\n").await.unwrap();
+                    socket.flush().await.unwrap();
                     closed(&mut socket).await;
                 } else { reply(&mut socket, envelope).await; }
             };
