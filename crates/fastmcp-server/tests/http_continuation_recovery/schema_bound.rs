@@ -418,7 +418,7 @@ pub(super) async fn scenario(cx: Cx, case: Case) {
     let params = json!({"_meta":{"io.modelcontextprotocol/protocolVersion":FINAL_PROTOCOL_VERSION,
         "io.modelcontextprotocol/clientCapabilities":{}}});
     let list = CoreRequest::decode(ProtocolEra::Modern2026, "tools/list", Some(&params)).unwrap();
-    let (wire, ()) = pair(peer.dispatch(&cx, Delivery::Complete), async {
+    let (wire, ()) = Box::pin(pair(peer.dispatch(&cx, Delivery::Complete), async {
         let mut call = session
             .request_core(
                 &cx,
@@ -432,7 +432,7 @@ pub(super) async fn scenario(cx: Cx, case: Case) {
             call.next_event(&cx).await.unwrap(),
             Some(fastmcp_client::http_auth::rpc::ManagedCoreEvent::Result(_))
         ));
-    })
+    }))
     .await;
     assert!(wire.get("error").is_none());
     assert_eq!(peer.seen.lock().unwrap().len(), expected_posts + 1);
