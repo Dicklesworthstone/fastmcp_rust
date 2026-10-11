@@ -834,7 +834,7 @@ impl CoreBackend for NativeBackend {
                         };
                     }
                     ManagedCoreEvent::Notification(notification) => {
-                        forward_notification(ctx, *notification)?
+                        forward_notification(ctx, *notification)?;
                     }
                 }
             }
