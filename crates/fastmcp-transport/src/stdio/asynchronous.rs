@@ -27,6 +27,27 @@ use crate::{
 const READ_CHUNK_SIZE: usize = 4096;
 const READ_TURN_CHUNKS: usize = 16;
 
+/// Consecutive `Interrupted` results, with no readiness and no transferred
+/// bytes between them, that one `await_io` retries before it stops believing
+/// the source was transiently interrupted.
+///
+/// `Interrupted` is this layer's single representation for *every* cooperative
+/// stop (see `async_io::io_checkpoint`), so it conflates two conditions that
+/// need opposite handling. A real `EINTR` consumes nothing and is resolved by
+/// the next syscall, which is why the retry exists. But a source whose *own*
+/// `Cx` is cancelled or past its deadline reports the same kind on every poll
+/// for as long as this caller's context stays live, and retrying that is a
+/// busy spin: each turn self-wakes immediately, and a native pipe additionally
+/// tears down and rebuilds its reactor registration every turn.
+///
+/// A run this long is therefore not transient. Stopping is also the
+/// fail-closed direction, because `receive` and the send paths pass anything
+/// that is neither `Cancelled` nor `Timeout` to `fail_read` / the commit
+/// guard, which latches the endpoint closed instead of letting a caller retry
+/// into the same spin. The bound is deliberately far above any plausible
+/// signal burst and far below the point where a spin would cost real time.
+const INTERRUPTED_RETRY_LIMIT: u32 = 64;
+
 #[derive(Default)]
 pub(super) struct ReadState {
     buffer: Vec<u8>,
@@ -83,6 +104,7 @@ async fn await_io<T>(
     let (_sender, mut receiver) = oneshot::channel::<()>();
     let mut cancelled = pin!(receiver.recv(cx));
     let mut stopped = pin!(terminal.changed.notified());
+    let mut interrupted = 0_u32;
     poll_fn(|task| {
         if !closing && terminal.is_closed() {
             return Poll::Ready(Err(TransportError::Closed));
@@ -121,13 +143,32 @@ async fn await_io<T>(
                 if let Err(error) = stdio_checkpoint(cx) {
                     return Poll::Ready(Err(error));
                 }
+                interrupted += 1;
+                if interrupted > INTERRUPTED_RETRY_LIMIT {
+                    // Not transient: this caller's context is live, so only the
+                    // source's own cooperative stop can repeat without end.
+                    return Poll::Ready(Err(TransportError::Io(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        format!(
+                            "async stdio source reported a cooperative stop \
+                             {INTERRUPTED_RETRY_LIMIT} consecutive times while this \
+                             caller's context stayed live; bind the source to the same \
+                             Cx that serves it (last reason: {error})"
+                        ),
+                    ))));
+                }
                 // A transient OS interruption consumes no bytes. Retry in a
                 // later turn, with another checkpoint, instead of losing a
                 // retained prefix or spinning inside this executor poll.
                 task.waker().wake_by_ref();
                 Poll::Pending
             }
-            result => result.map(|result| result.map_err(|error| native_io_error(cx, error))),
+            result => {
+                // Readiness or a committed transfer ends the run: a later
+                // interruption is a fresh one, not a continuation of this one.
+                interrupted = 0;
+                result.map(|result| result.map_err(|error| native_io_error(cx, error)))
+            }
         }
     })
     .await
@@ -1406,5 +1447,141 @@ mod tests {
                 source
             );
         });
+    }
+
+    /// Reports a cooperative stop for a bounded or unbounded number of polls.
+    ///
+    /// `remaining: None` never stops interrupting, which is the shape of a
+    /// source whose own `Cx` is cancelled or past its deadline while the
+    /// context serving the transport stays live (#84).
+    struct Interrupting {
+        remaining: Mutex<Option<u32>>,
+        polls: AtomicUsize,
+        rest: Mutex<VecDeque<u8>>,
+    }
+
+    struct InterruptingReader(Arc<Interrupting>);
+
+    impl AsyncRead for InterruptingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _task: &mut Context<'_>,
+            output: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.0.polls.fetch_add(1, Ordering::SeqCst);
+            {
+                let mut remaining = self.0.remaining.lock().unwrap();
+                match remaining.as_mut() {
+                    Some(0) => {}
+                    Some(count) => {
+                        *count -= 1;
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "test source cooperative stop",
+                        )));
+                    }
+                    None => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "test source cooperative stop",
+                        )));
+                    }
+                }
+            }
+            let mut bytes = self.0.rest.lock().unwrap();
+            while output.remaining() > 0 {
+                let Some(byte) = bytes.pop_front() else {
+                    break;
+                };
+                output.put_slice(&[byte]);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn interrupting(
+        remaining: Option<u32>,
+        rest: &[u8],
+    ) -> (
+        Arc<Interrupting>,
+        AsyncStdioTransport<InterruptingReader, Vec<u8>>,
+    ) {
+        let inner = Arc::new(Interrupting {
+            remaining: Mutex::new(remaining),
+            polls: AtomicUsize::new(0),
+            rest: Mutex::new(rest.iter().copied().collect()),
+        });
+        let transport =
+            AsyncStdioTransport::from_io(InterruptingReader(Arc::clone(&inner)), Vec::<u8>::new());
+        (inner, transport)
+    }
+
+    /// Drives one receive to completion, failing instead of spinning forever.
+    ///
+    /// The ceiling is far above `INTERRUPTED_RETRY_LIMIT`, so a regression that
+    /// restored the unbounded retry fails this assertion rather than hanging
+    /// the whole test binary.
+    fn drive_receive<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+        transport: &mut AsyncStdioTransport<R, W>,
+        cx: &Cx,
+        waker: &Waker,
+    ) -> Result<ReceivedTransportFrame, TransportError> {
+        let mut receive = pin!(transport.recv_with_source_async(cx));
+        for _ in 0..4096 {
+            if let Poll::Ready(result) = poll(receive.as_mut(), waker) {
+                return result;
+            }
+        }
+        panic!("a bounded cooperative stop must settle, not spin");
+    }
+
+    #[test]
+    fn async_stdio_retries_a_bounded_cooperative_stop_and_still_delivers_the_frame() {
+        let source = br#"{"jsonrpc":"2.0","method":"test/async-stdio","id":7}"#;
+        let wire = [&source[..], b"\n"].concat();
+        // Exactly at the bound: the last retry is still allowed.
+        let (inner, mut transport) = interrupting(Some(INTERRUPTED_RETRY_LIMIT), &wire);
+        let count = Arc::new(WakeCount::default());
+        let waker = Waker::from(Arc::clone(&count));
+        let frame = drive_receive(&mut transport, &Cx::for_testing(), &waker)
+            .expect("a bounded cooperative stop is retried, not fatal");
+        assert_eq!(frame.source(), source);
+        assert_eq!(
+            inner.polls.load(Ordering::SeqCst),
+            usize::try_from(INTERRUPTED_RETRY_LIMIT).unwrap() + 1,
+            "each interruption is retried once and the next poll delivers"
+        );
+        assert!(!transport.is_closed());
+    }
+
+    #[test]
+    fn async_stdio_stops_an_endless_cooperative_stop_instead_of_spinning() {
+        // Differs from the positive case in exactly one dimension: the source
+        // never stops reporting its cooperative stop.
+        let (inner, mut transport) = interrupting(None, b"");
+        let count = Arc::new(WakeCount::default());
+        let waker = Waker::from(Arc::clone(&count));
+        let error = drive_receive(&mut transport, &Cx::for_testing(), &waker)
+            .expect_err("an endless cooperative stop is fatal");
+        let TransportError::Io(error) = error else {
+            panic!("expected a terminal I/O diagnostic, got {error:?}");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(
+            error.to_string().contains("bind the source to the same"),
+            "the diagnostic must name the cause: {error}"
+        );
+        assert_eq!(
+            inner.polls.load(Ordering::SeqCst),
+            usize::try_from(INTERRUPTED_RETRY_LIMIT).unwrap() + 1,
+            "the guard stops at its bound rather than retrying without end"
+        );
+        // Not `TransportError::Cancelled`: `await_io` checkpoints the serving
+        // context on every poll, so reaching the I/O diagnostic proves that
+        // context stayed live and only the source was stopping.
+        assert!(
+            transport.is_closed(),
+            "the endpoint latches closed so a retry cannot re-enter the spin"
+        );
     }
 }

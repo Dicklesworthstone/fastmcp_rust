@@ -784,6 +784,25 @@ pub use fastmcp_transport::websocket::{
 };
 pub use fastmcp_transport::{event_store, http, memory};
 
+/// Caller-owned, reactor-driven Unix process stdio for `serve_stdio_io`.
+///
+/// `serve_stdio_io` requires endpoints that are *already* nonblocking.
+/// `AsyncStdin` and `AsyncStdout`, re-exported above, satisfy its `AsyncRead`
+/// and `AsyncWrite` bounds but perform blocking I/O internally, so passing
+/// them compiles and then blocks the serving runtime. These are the pair that
+/// does not: `NativePipeReader::from_stdin` and `NativePipeWriter::from_stdout`
+/// register with the caller's reactor and observe its cancellation and
+/// deadline, with no helper thread and no blocking pool.
+///
+/// Bind them to the same `Cx` that serves the transport. A pipe whose own
+/// context is cancelled or past its deadline reports a cooperative stop on
+/// every poll, which the transport now ends with a diagnostic rather than
+/// retrying without bound.
+///
+/// `crates/fastmcp-server/examples/native_stdio.rs` is the worked example.
+#[cfg(unix)]
+pub use fastmcp_transport::{NativePipeReader, NativePipeWriter, create_native_pipe};
+
 // Re-export server types
 // FND-01: JWT verifier is not a facade feature (FACADE-NO-JSONWEBTOKEN).
 pub use fastmcp_server::{

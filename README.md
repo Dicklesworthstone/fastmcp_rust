@@ -257,9 +257,13 @@ fn main() {
 }
 ```
 
-The application creates the runtime once and supplies its context. Stdio needs
-a blocking pool for its receive pump; FastMCP does not create a runtime at this
-entry point. See Quick Start below for the dependency declarations.
+The application creates the runtime once and supplies its context. FastMCP does
+not create a runtime at this entry point. `run_stdio_with_cx` needs a blocking
+pool because its receive pump blocks on `recv`; that is a property of this entry
+point, not of the framework. On Unix you can instead serve reactor-driven
+process stdio with no blocking pool at all — see
+[Non-blocking stdio](#non-blocking-stdio-unix-opt-in). See Quick Start below for
+the dependency declarations.
 
 `auto::ServerBuilder` serves MCP 2026-07-28 clients and also the exact
 2024-11-05 `initialize` handshake that today's desktop clients and the MCP
@@ -819,6 +823,70 @@ npx @modelcontextprotocol/inspector cargo run
 
 ---
 
+## Non-blocking stdio (Unix, opt-in)
+
+`run_stdio_with_cx` above is the portable default, and it is blocking: it hands
+`run_stdio_pump` to `spawn_blocking` and reads through `StdioTransport::stdio()`
+and `AsyncStdout`, whose own documentation records that they "perform blocking
+I/O internally. An async trait alone does not make those standard-stream
+operations nonblocking." Several stdio caveats in
+[Limitations](#limitations) are consequences of that choice rather than of the
+framework, and the rows that describe only this entry point now say so. Others,
+such as the client-subprocess rows, are unrelated to it and still apply.
+
+On Unix there is a second path. `NativePipeReader::from_stdin` and
+`NativePipeWriter::from_stdout` claim the real process descriptors, register
+them with the caller's reactor, and observe that caller's cancellation and
+deadline — no helper thread, no blocking pool, and no change to descriptor
+flags that is not restored on release. `serve_stdio_io` then serves the
+transport over them. `modern::ServerBuilder` is already modern-only, so no
+protocol-policy call is needed:
+
+```rust
+use fastmcp_rust::modern::ServerBuilder;
+use fastmcp_rust::{NativePipeReader, NativePipeWriter};
+
+// Note blocking_threads(0, 0): this path needs no blocking pool at all.
+let runtime = RuntimeBuilder::current_thread()
+    .with_reactor(create_reactor().expect("create I/O reactor"))
+    .blocking_threads(0, 0)
+    .build()
+    .expect("create application runtime");
+runtime.block_on(async {
+    let cx = Cx::current().expect("application context");
+    let server = ServerBuilder::new("native-process-stdio", "1.0")
+        .tool(Echo)
+        .build();
+    let input = NativePipeReader::from_stdin(&cx)?;
+    let output = NativePipeWriter::from_stdout(&cx)?;
+    server.serve_stdio_io(&cx, input, output).await
+})
+```
+
+That is the wiring, not a complete program: acquiring the second descriptor can
+fail after the first succeeded, and the two halves report `io::Error` while
+`serve_stdio_io` reports `McpResult`, so a real `main` has to reconcile both.
+`crates/fastmcp-server/examples/native_stdio.rs` does, including closing the
+already-claimed reader rather than implying a partial process binding was
+released. It is a checked-in target with no `required-features`; run it with
+`cargo run -p fastmcp-server --example native_stdio`.
+
+**Bind both endpoints to the same `Cx` that serves the transport.** A pipe whose
+own context is cancelled or past its deadline reports a cooperative stop on
+every poll while the serving context stays live. The transport retries a
+bounded number of those and then fails the endpoint with a diagnostic naming
+this cause, instead of retrying without end.
+
+**What this does not claim.** This is an opt-in transport pairing, not the
+default, and not an aggregate cancellation, quiescence, or conformance
+qualification — every boundary in [Limitations](#limitations) still applies
+except where it is explicitly about the blocking default. `from_stdin` and
+`from_stdout` are `#[cfg(unix)]`; there is no non-Unix equivalent, because
+asupersync's readiness `Source` is socket-bound on Windows while Windows
+standard streams are handles.
+
+---
+
 ## Architecture
 
 ```
@@ -999,9 +1067,9 @@ fn commit_revision(
 | **Experimental WebSocket framing** | The frame codec that ships is asupersync's. `fastmcp_transport::websocket` compiles unconditionally, but its own RFC 6455 implementation — `WsFrame`, `WsReader::read_frame`, `WsWriter::write_frame`, `WsClientWriter`, `generate_mask`, `EndpointRole::validate_peer_mask`, `WsTransport`/`WsClientTransport` and their `Transport` impls — is `#[cfg(test)]` and is in no release binary. `getrandom`'s WebSocket-masking use is likewise test-only. The shipping path (`AsyncWsClientTransport`, `AsyncWsServerTransport`, `WebSocketListener`, `WebSocketUpgradeAdmission`) uses `asupersync::net::websocket` for handshake and framing; FastMCP owns fragmentation assembly, opcode dispatch, size ceilings, pending-write bounds and close-code selection above it. Those production transports implement no `Transport` impl, unlike `AsyncStdioTransport`. Consequently any RFC 6455 invariant proven only against the `cfg(test)` codec — mask direction in particular — is not evidence about the shipped path |
 | **Experimental WebSocket TLS** | The experimental async transport supports `ws://` and `wss://`. `wss://` can use the built-in WebPKI-rooted connector or a caller-supplied TLS connector for private roots, pinning, or client certificates; this connection support does not imply complete TLS, lifecycle, or MCP conformance qualification |
 | **HTTP Dispatch Qualification** | Public `run_http*` binds and serves the caller-owned dual-era HTTP lifecycle. `ModernOnly` selects the exact MCP 2026-07-28 era and `LegacyOnly` selects the exact MCP 2024-11-05 era; MCP 2025-11-25 is not an adapter or supported policy. This executable surface does not establish aggregate MCP conformance or complete lifecycle qualification |
-| **Wire Cancellation** | The modern-only split receive pump, including Unix stdio, admits bounded concurrent requests on the caller's dispatch runtime, including `subscriptions/listen`. It authenticates cancellation against the existing connection owner and serializes cancellation, response, and notification commits at the writer. Synchronous split runners use the bounded asupersync blocking bridge. Unsplit custom transports dispatch ordinary requests serially because receive and send share one handle; a `subscriptions/listen` runs off the receive loop, and output produced while `recv` blocks is queued and written as soon as `recv` returns. Transport reads and writes can still block. The dual-era Unix stdio pump retains its concurrent modern children and serialized exact MCP 2024-11-05 worker. A non-cooperative handler can exceed the bounded process-exit drain, and reliable `awaitCleanup` semantics remain unverified |
+| **Wire Cancellation** | The modern-only split receive pump, including Unix stdio, admits bounded concurrent requests on the caller's dispatch runtime, including `subscriptions/listen`. It authenticates cancellation against the existing connection owner and serializes cancellation, response, and notification commits at the writer. Synchronous split runners use the bounded asupersync blocking bridge. Unsplit custom transports dispatch ordinary requests serially because receive and send share one handle; a `subscriptions/listen` runs off the receive loop, and output produced while `recv` blocks is queued and written as soon as `recv` returns. Transport reads and writes can still block. The dual-era Unix stdio pump retains its concurrent modern children and serialized exact MCP 2024-11-05 worker. A non-cooperative handler can exceed the bounded process-exit drain, and reliable `awaitCleanup` semantics remain unverified. "Transport reads and writes can still block" is a statement about the blocking stdio and custom adapters; a Unix `serve_stdio_io` server over the native process pipes does not block in its reader or writer, which removes that one residual without establishing any of the others |
 | **Silent stdio peers** | On Unix, the public subprocess `Client` enforces configured idle/absolute deadlines at child-pipe readiness and decode boundaries, including silent and partial-frame peers. Generic blocking `StdioTransport::recv` and non-Unix child-pipe I/O retain their documented frame/I/O-boundary limitation. Unix client writes use a separate two-second queue-and-commit deadline, so response-wait deadlines are not an end-to-end request or process wall-clock guarantee. Those residuals remain FND-04 work |
-| **Stdio output backpressure** | On Unix, primary server responses and notifications use serialized nonblocking writes with a two-second commit deadline for ordinary pipes/sockets; a timeout, lock poison, partial write, notification encoding failure, or descriptor-flag restoration failure is connection-fatal. The writer attempts to restore descriptor flags before releasing the local lock; on restoration failure the descriptor may remain nonblocking, and inherited duplicate descriptors can observe the temporary `O_NONBLOCK` setting. Regular files/devices and non-Unix stdout retain blocking-I/O limits. A handler that ignores cancellation may force unsuccessful process exit after the bounded drain; shutdown hooks are skipped unless all worker and modern-child quiescence is proven |
+| **Stdio output backpressure** | On Unix, primary server responses and notifications use serialized nonblocking writes with a two-second commit deadline for ordinary pipes/sockets; a timeout, lock poison, partial write, notification encoding failure, or descriptor-flag restoration failure is connection-fatal. The writer attempts to restore descriptor flags before releasing the local lock; on restoration failure the descriptor may remain nonblocking, and inherited duplicate descriptors can observe the temporary `O_NONBLOCK` setting. Regular files/devices and non-Unix stdout retain blocking-I/O limits. A handler that ignores cancellation may force unsuccessful process exit after the bounded drain; shutdown hooks are skipped unless all worker and modern-child quiescence is proven. This row describes the `run_stdio_with_cx` writer; a `serve_stdio_io` server over `NativePipeWriter` commits through the asynchronous transport instead, which has its own separate boundaries (see [Non-blocking stdio](#non-blocking-stdio-unix-opt-in)) |
 | **Subprocess cleanup** | `Client::close(&mut self) -> McpResult<()>` is the proof-bearing path; Drop is best effort. `fastmcp test` uses Unix-only anchored process-group ownership; successful connections report explicit final cleanup separately, and initialization-cleanup failures remain visible. Descendants can escape via a new group/session, host forks can copy the control descriptor, and `SIGCHLD=SIG_IGN`, `SA_NOCLDWAIT`, or competing global reapers can invalidate reap evidence. Windows Job Object support is not implemented |
 | **Development subprocess cleanup** | On Unix, each `fastmcp dev` build/server group contains a signal-immune watchdog tied to a private owner-held control pipe, so ordinary shutdown, child-handle drop, and CLI owner death trigger bounded TERM-then-KILL cleanup. A host-side fork that copies the owner descriptor or a descendant that changes group/session remains outside this boundary; non-Unix `dev` remains fail-closed |
 | **Synchronous HTTP readers** | Low-level HTTP parsing checkpoints before/after reads and retries `EINTR`, but a generic synchronous `Read` already blocked in the kernel cannot be preempted. A bounded host must supply readiness-aware/asynchronous I/O. Public turnkey `run_http*` uses its caller-owned asynchronous listener lifecycle, whose broader qualification boundaries remain documented here |
