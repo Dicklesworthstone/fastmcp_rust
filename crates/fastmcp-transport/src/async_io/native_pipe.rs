@@ -451,29 +451,88 @@ mod tests {
     }
 
     fn await_wake(driver: &IoDriverHandle, wakes: &Wakes) {
+        // `try_turn_with` rather than `turn_with`, and the outcome is RECORDED
+        // rather than discarded. `IoDriverHandle::turn_with` delegates to this
+        // and collapses `Ok(None)` into `Ok(0)`, so the caller cannot tell
+        // "polled the reactor, saw no events" from "never polled at all
+        // because another holder had the is_polling CAS". asupersync's own doc
+        // on turn_with names this: "Callers that need explicit contention
+        // signaling can use try_turn_with."
+        //
+        // That distinction is the whole diagnosis here. A contended turn
+        // returns IMMEDIATELY, so eight of them spend none of the nominal
+        // 8 x 100 ms and the loop can fail in microseconds without any timeout
+        // having elapsed. The driver's own `polls` counter stays 0 in that
+        // case, which is outside the range the panic text below was written to
+        // interpret, and it makes `events_received == 0` uninformative about
+        // whether the pipe was ever armed.
+        //
+        // AND the contended branch now actually spends its slice. This is the
+        // defect the instrumentation found: measured over five failures, every
+        // one reported contended=8/8 polled=0 with elapsed between 1.2 and 5.2
+        // MICROSECONDS, against a nominal 8 x 100 ms. A contended turn returns
+        // instantly, so the loop burned all eight iterations and panicked
+        // having waited essentially no time at all. The driver's own `polls`
+        // counter was simultaneously 1, 2 or 4 while this loop polled ZERO
+        // times, which proves another holder was driving the same driver, and
+        // one failure reported events_received=1 wakers_dispatched=1: the
+        // readiness arrived and a waker was dispatched, microseconds after
+        // this loop had already given up.
+        //
+        // So when the CAS is lost there is a concurrent poller that will
+        // deliver the wake, and the correct response is to WAIT for it rather
+        // than to spin eight no-ops. Sleeping the slice the turn would itself
+        // have blocked for keeps the nominal budget exactly as it was: still
+        // eight iterations, still 100 ms each, still 800 ms worst case. The
+        // bound is unchanged and the assertion is unchanged; the only change
+        // is that the budget is now actually spent instead of being skipped.
+        // Without this the eight turns are not a wait at all.
+        let started = std::time::Instant::now();
+        let mut contended = 0_u32;
+        let mut polled = 0_u32;
         for _ in 0..8 {
-            driver
-                .turn_with(Some(Duration::from_millis(100)), |_, _| {})
-                .unwrap();
+            match driver
+                .try_turn_with(Some(Duration::from_millis(100)), |_, _| {})
+                .unwrap()
+            {
+                Some(_) => polled += 1,
+                None => {
+                    contended += 1;
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
             if wakes.0.load(Ordering::SeqCst) > 0 {
                 return;
             }
         }
-        // Name the state rather than only the symptom. "did not wake" has two
-        // very different causes and the counters separate them:
-        //   events_received == 0  -> the reactor saw no readiness at all, so
-        //                            the fd is not actually armed even though a
-        //                            waker slot exists (waker_count > 0).
+        let elapsed = started.elapsed();
+        // Name the state rather than only the symptom. "did not wake" has
+        // THREE causes, and `contended` is the one that has to be read first
+        // because it invalidates the other two:
+        //   contended == 8        -> this caller never polled the reactor at
+        //                            all; every turn lost the is_polling CAS
+        //                            and returned instantly. events_received
+        //                            is then 0 by construction and says
+        //                            NOTHING about whether the fd was armed,
+        //                            and `elapsed` will be far below the
+        //                            nominal 800ms because no timeout ran.
+        //   events_received == 0
+        //     with contended == 0 -> the reactor really was polled and really
+        //                            saw no readiness, so the fd is not armed
+        //                            even though a waker slot exists
+        //                            (waker_count > 0). This is the reading
+        //                            that implicates the pipe.
         //   unknown_tokens > 0    -> readiness DID arrive but its token had no
         //                            waker, i.e. the registration and the
         //                            turned driver disagree.
-        // `polls` confirms the eight turns really happened; a total elapsed
-        // time near zero with polls == 8 means the reactor returned instantly
-        // every time rather than waiting out its timeout.
+        // `polls` is the driver's own count and should equal this loop's
+        // `polled`; a disagreement means some other holder is also turning
+        // this driver, which is itself the answer to the contention question.
         let stats = driver.stats();
         panic!(
             "pipe readiness did not wake its registered task \
-             (wakers={} polls={} events_received={} wakers_dispatched={} \
+             (contended={contended}/8 polled={polled} elapsed={elapsed:?} \
+             wakers={} polls={} events_received={} wakers_dispatched={} \
              unknown_tokens={} registrations={} deregistrations={})",
             driver.waker_count(),
             stats.polls,
