@@ -2850,6 +2850,155 @@ fn e2e_http_startup_guard_preserves_planted_startup_error() {
     );
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum HttpFixtureDropCase {
+    Quiescent,
+    ReportedFailure,
+    Unwinding,
+    LiveOwner,
+}
+
+/// Isolate intentional aborts so a broken destructor cannot erase the other
+/// test results. These cases prove fixture ownership, not HTTP behavior.
+#[cfg(unix)]
+fn http_fixture_drop_case(name: &str, case: HttpFixtureDropCase) {
+    const CHILD: &str = "FASTMCP_E2E_HTTP_FIXTURE_DROP_CASE";
+    if let Ok(selected) = std::env::var(CHILD) {
+        assert_eq!(selected, name, "the child runs exactly its selected case");
+        let (finished_tx, finished) = mpsc::sync_channel(1);
+        let (release, blocked) = mpsc::sync_channel::<()>(0);
+        let exited = Arc::new(AtomicBool::new(false));
+        let owner_exited = Arc::clone(&exited);
+        let completion = if matches!(case, HttpFixtureDropCase::Quiescent) {
+            Ok(HttpServerShutdown::Quiescent)
+        } else {
+            Err("planted joined-owner teardown failure".to_owned())
+        };
+        let join = thread::spawn(move || {
+            finished_tx.send(completion).expect("report shutdown");
+            if matches!(case, HttpFixtureDropCase::LiveOwner) {
+                blocked
+                    .recv()
+                    .expect("retain the live owner until process exit");
+            }
+            owner_exited.store(true, Ordering::SeqCst);
+        });
+        let fixture = HttpServerFixture {
+            address: "127.0.0.1:0".parse().expect("unused fixture address"),
+            server_cx: Cx::for_request(),
+            finished,
+            shutdown_completion: None,
+            join: Some(join),
+            nonquiescent: None,
+            handler_calls: Arc::new(PublicHttpHandlerCallCounters::default()),
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _fixture = fixture;
+            if matches!(case, HttpFixtureDropCase::Unwinding) {
+                panic!("original owning test failure");
+            }
+        }));
+        // Keep the sender alive across Drop so the negative cannot accidentally
+        // release its owner when the receiver observes disconnection.
+        drop(release);
+        match case {
+            HttpFixtureDropCase::Quiescent => {
+                assert!(outcome.is_ok(), "a quiescent owner drops successfully");
+            }
+            HttpFixtureDropCase::ReportedFailure => {
+                let payload = outcome.expect_err("a joined shutdown failure still fails the test");
+                let message = payload
+                    .downcast_ref::<String>()
+                    .expect("shutdown diagnostic");
+                assert!(message.contains("planted joined-owner teardown failure"));
+            }
+            HttpFixtureDropCase::Unwinding => {
+                let payload = outcome.expect_err("the original failure must propagate");
+                assert_eq!(
+                    payload.downcast_ref::<&str>(),
+                    Some(&"original owning test failure")
+                );
+            }
+            HttpFixtureDropCase::LiveOwner => {
+                panic!("dropping a retained live owner must abort, not detach or unwind");
+            }
+        }
+        assert!(
+            exited.load(Ordering::SeqCst),
+            "the owner exited before Drop returned"
+        );
+        return;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(CHILD, name)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .expect("launch fixture-drop child");
+    let deadline = Instant::now() + HTTP_SERVER_TEARDOWN_BOUND * 4;
+    loop {
+        if let Some(status) = child.try_wait().expect("poll fixture-drop child") {
+            if matches!(case, HttpFixtureDropCase::LiveOwner) {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(
+                    status.signal(),
+                    Some(6),
+                    "the retained owner requires SIGABRT"
+                );
+            } else {
+                assert!(
+                    status.success(),
+                    "fixture-drop child {name} failed: {status}"
+                );
+            }
+            return;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("fixture-drop child {name} exceeded its bounded lifetime");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_http_fixture_drop_quiescent_owner_still_succeeds() {
+    http_fixture_drop_case(
+        "e2e_http_fixture_drop_quiescent_owner_still_succeeds",
+        HttpFixtureDropCase::Quiescent,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_http_fixture_drop_reported_failure_is_a_recoverable_panic() {
+    http_fixture_drop_case(
+        "e2e_http_fixture_drop_reported_failure_is_a_recoverable_panic",
+        HttpFixtureDropCase::ReportedFailure,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_http_fixture_drop_preserves_an_existing_panic_after_join() {
+    http_fixture_drop_case(
+        "e2e_http_fixture_drop_preserves_an_existing_panic_after_join",
+        HttpFixtureDropCase::Unwinding,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_http_fixture_drop_live_owner_still_aborts() {
+    http_fixture_drop_case(
+        "e2e_http_fixture_drop_live_owner_still_aborts",
+        HttpFixtureDropCase::LiveOwner,
+    );
+}
+
 #[test]
 fn e2e_http_startup_guard_resumes_planted_pre_readiness_panic() {
     let (_finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
