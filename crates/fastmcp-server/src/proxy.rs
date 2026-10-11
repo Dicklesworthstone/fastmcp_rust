@@ -172,9 +172,7 @@ impl ProxyFinalCoreRequest {
             mut client,
             request_id,
         } = self;
-        if let Some(level) = inbound_logging_level(ctx) {
-            client.set_log_level(level);
-        }
+        overlay_inbound_identity_on_detached_client(&mut client, ctx);
         if let Some(marker) = ctx.progress_marker() {
             overlay_legacy_progress_token(&mut parameters, marker)?;
         }
@@ -289,9 +287,7 @@ impl ProxyFinalTaskRequest {
             operation,
             maximum_response_bytes,
         } = self;
-        if let Some(level) = inbound_logging_level(ctx) {
-            client.set_log_level(level);
-        }
+        overlay_inbound_identity_on_detached_client(&mut client, ctx);
         match operation {
             ProxyFinalTaskOperation::CallTool { name, arguments } => {
                 let progress_marker = ctx_progress_marker(ctx);
@@ -2134,7 +2130,9 @@ fn inbound_client_info_value(
 
 /// Inbound identity projected for the client crate's own inbound overlay,
 /// which takes the official `Implementation` rather than the handler view.
-#[cfg(feature = "tasks")]
+///
+/// Both detached native HTTP request forms stamp this onto their own cloned
+/// `ModernHttpClient`, so this is not gated on the Tasks relay.
 fn inbound_identity_implementation(ctx: &McpContext) -> Option<Implementation> {
     ctx.client_implementation()
         .and_then(implementation_from_request_identity)
@@ -2166,6 +2164,34 @@ fn inbound_client_capabilities(ctx: &McpContext) -> Option<ClientCapabilities> {
         });
     }
     Some(capabilities)
+}
+
+/// Stamps the inbound caller's per-request identity, log level and
+/// reverse-direction capabilities onto one detached native HTTP handle.
+///
+/// A gateway leg is transparent. The upstream needs the inbound caller's
+/// identity, and `sampling`/`elicitation`/`roots` are the capabilities it
+/// exercises by calling BACK through this proxy, so they must describe the
+/// caller that will service them rather than this proxy's own upstream-leg
+/// configuration. `ModernHttpClient` is cloneable and stateless after
+/// discovery and `start_final_*` hands out a per-request clone, so this
+/// mutates nothing the route shares and no caller's identity can leak into
+/// another request.
+///
+/// Custom [`ProxyAsyncRequest`] backends are deliberately NOT covered: they
+/// declare their own upstream identity through the trait and must never admit
+/// a downstream substitution; see
+/// `proxy_custom_async_request_configured_identity_probe`.
+fn overlay_inbound_identity_on_detached_client(client: &mut ModernHttpClient, ctx: &McpContext) {
+    if let Some(implementation) = inbound_identity_implementation(ctx) {
+        client.set_client_implementation(implementation);
+    }
+    if let Some(level) = inbound_logging_level(ctx) {
+        client.set_log_level(level);
+    }
+    if let Some(capabilities) = inbound_client_capabilities(ctx) {
+        client.overlay_client_capabilities(capabilities);
+    }
 }
 
 fn mrtr_input_responses_from_completed(
