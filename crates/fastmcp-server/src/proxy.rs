@@ -20941,7 +20941,7 @@ IFS= read -r end
                 };
                 match finish {
                     "cancel" => {
-                        assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled)
+                        assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
                     }
                     "error" => assert_eq!(result.unwrap_err().message, "upstream stream failed"),
                     _ => assert!(matches!(
