@@ -682,10 +682,23 @@ fn https_native_handshake_deadline_closes_a_stalled_socket_and_preserves_listene
 fn https_native_shutdown_settles_handshakes_without_waiting_for_their_timeout() {
     run(|cx| async move {
         let probe = Probe::new();
-        let running = Running::start(&cx, &probe, Duration::from_secs(120)).await;
+        let shutdown_calls = Arc::new(AtomicUsize::new(0));
+        let shutdown_observer = Arc::clone(&shutdown_calls);
+        let server = Server::new("native-https", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .unwrap()
+            .auth_provider(probe.clone())
+            .tool(probe.clone())
+            .on_shutdown(move || {
+                shutdown_observer.fetch_add(1, Ordering::SeqCst);
+            })
+            .build();
+        let running = Running::configured(&cx, server, policy(), Duration::from_secs(120)).await;
         let mut stalled = TcpStream::connect(running.address).await.unwrap();
         asupersync::time::sleep(cx.now(), Duration::from_millis(30)).await;
+        assert_eq!(shutdown_calls.load(Ordering::SeqCst), 0);
         running.stop(&cx).await;
+        assert_eq!(shutdown_calls.load(Ordering::SeqCst), 1);
         let mut byte = [0_u8; 1];
         let closed =
             asupersync::time::timeout(cx.now(), EXCHANGE_TIMEOUT, stalled.read(&mut byte)).await;
