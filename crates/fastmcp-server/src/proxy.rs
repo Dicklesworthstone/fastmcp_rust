@@ -50,7 +50,7 @@ use fastmcp_core::{
 };
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_core::{SamplingRequest, SamplingRequestMessage, SamplingRole};
-use fastmcp_protocol::common_types::{Implementation, LoggingLevel, RawIcon};
+use fastmcp_protocol::common_types::{AbsoluteUri, Implementation, LoggingLevel, RawIcon};
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::extensions::{
     ExtensionLocalEnablement, OFFICIAL_TASKS_RESULT_DISCRIMINATOR, official_tasks_empty_settings,
@@ -2099,6 +2099,46 @@ fn sampling_request_from_create_message_params(
     Ok(request)
 }
 
+/// Projects a handler-visible inbound identity back onto the official
+/// Implementation object stamped on a native upstream request.
+///
+/// This serves the gateway legs only. A custom [`ProxyAsyncRequest`] backend
+/// owns its upstream identity through its own trait method and must never
+/// receive a downstream substitution; see
+/// `proxy_custom_async_request_configured_identity_probe`.
+fn implementation_from_request_identity(
+    identity: &fastmcp_core::ClientImplementationInfo,
+) -> Option<Implementation> {
+    let mut implementation = Implementation::try_new(&identity.name, &identity.version).ok()?;
+    implementation.title = identity.title.clone();
+    implementation.description = identity.description.clone();
+    if let Some(website_url) = identity.website_url.as_deref()
+        && let Ok(uri) = AbsoluteUri::parse(website_url)
+    {
+        implementation.website_url = Some(uri);
+    }
+    implementation.icons = identity
+        .icon_sources
+        .iter()
+        .filter_map(|src| RawIcon::try_new(src.clone()).ok())
+        .collect();
+    Some(implementation)
+}
+
+fn inbound_client_info_value(
+    identity: &fastmcp_core::ClientImplementationInfo,
+) -> Option<serde_json::Value> {
+    serde_json::to_value(implementation_from_request_identity(identity)?).ok()
+}
+
+/// Inbound identity projected for the client crate's own inbound overlay,
+/// which takes the official `Implementation` rather than the handler view.
+#[cfg(feature = "tasks")]
+fn inbound_identity_implementation(ctx: &McpContext) -> Option<Implementation> {
+    ctx.client_implementation()
+        .and_then(implementation_from_request_identity)
+}
+
 fn inbound_logging_level(ctx: &McpContext) -> Option<LoggingLevel> {
     ctx.min_log_level().map(logging_level_from_mcp)
 }
@@ -2200,17 +2240,30 @@ fn mcp_log_level_from_logging(level: LoggingLevel) -> McpLogLevel {
 fn stdio_parameters_with_inbound_identity(
     era: Option<ProtocolEra>,
     mut parameters: serde_json::Value,
-    _identity: Option<&fastmcp_core::ClientImplementationInfo>,
+    identity: Option<&fastmcp_core::ClientImplementationInfo>,
     log_level: Option<LoggingLevel>,
-    _capabilities: Option<ClientCapabilities>,
+    capabilities: Option<ClientCapabilities>,
 ) -> serde_json::Value {
-    // Identity and capabilities belong to the configured upstream client.
-    // Downstream metadata may request a logging level but cannot replace
-    // either local field. Exact-2024 receives no reserved final metadata.
+    // A gateway leg is transparent: the inbound caller's per-request identity
+    // and its reverse-direction capabilities are what the upstream needs in
+    // order to address the caller at all. `sampling`, `elicitation` and
+    // `roots` are the capabilities the upstream exercises by calling BACK
+    // through this proxy, so they must describe the caller that will service
+    // them rather than this proxy's own upstream-leg configuration; stamping
+    // the local set instead makes the upstream refuse requests the caller can
+    // in fact answer. Absent an inbound identity the locally configured one
+    // stands. Exact-2024 decode rejects reserved final `_meta` members, so
+    // every overlay here is modern-only and a legacy stdio session keeps
+    // progressToken (stamped by the caller) and nothing else.
+    //
+    // Custom `ProxyAsyncRequest` backends are deliberately NOT covered: they
+    // declare their own upstream identity and capabilities through the trait
+    // and must never admit a downstream substitution.
     if era != Some(ProtocolEra::Modern2026) {
         return parameters;
     }
-    if log_level.is_none() {
+    let client_info = identity.and_then(inbound_client_info_value);
+    if client_info.is_none() && log_level.is_none() && capabilities.is_none() {
         return parameters;
     }
     let Some(object) = parameters.as_object_mut() else {
@@ -2220,10 +2273,33 @@ fn stdio_parameters_with_inbound_identity(
         .entry("_meta")
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
     if let Some(metadata) = metadata.as_object_mut() {
+        if let Some(client_info) = client_info {
+            metadata.insert(FINAL_CLIENT_INFO_META_KEY.to_owned(), client_info);
+        }
         if let Some(log_level) = log_level
             && let Ok(value) = serde_json::to_value(log_level)
         {
             metadata.insert(FINAL_LOG_LEVEL_META_KEY.to_owned(), value);
+        }
+        if let Some(capabilities) = capabilities
+            && let Ok(value) = serde_json::to_value(capabilities)
+            && let Some(inbound) = value.as_object()
+        {
+            let existing = metadata
+                .entry(FINAL_CLIENT_CAPABILITIES_META_KEY.to_owned())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let Some(existing) = existing.as_object_mut() {
+                for key in ["sampling", "elicitation", "roots"] {
+                    match inbound.get(key) {
+                        Some(member) => {
+                            existing.insert(key.to_owned(), member.clone());
+                        }
+                        None => {
+                            existing.remove(key);
+                        }
+                    }
+                }
+            }
         }
     }
     parameters
@@ -3779,9 +3855,9 @@ impl ProxyBackend for Client {
             name,
             arguments,
             progress_marker.as_ref(),
-            None,
+            inbound_identity_implementation(ctx).as_ref(),
             inbound_logging_level(ctx),
-            None,
+            inbound_client_capabilities(ctx),
         )?;
         relay_upstream_catalog_resource_updates(ctx, self)?;
         relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
@@ -5847,9 +5923,9 @@ impl ProxyHttpClient {
     fn request_parameters(
         &self,
         mut parameters: serde_json::Value,
-        _inbound_identity: Option<&fastmcp_core::ClientImplementationInfo>,
+        inbound_identity: Option<&fastmcp_core::ClientImplementationInfo>,
         inbound_log_level: Option<LoggingLevel>,
-        _inbound_capabilities: Option<ClientCapabilities>,
+        inbound_capabilities: Option<ClientCapabilities>,
     ) -> McpResult<serde_json::Value> {
         if self.binding.era() == ProtocolEra::Legacy2024 {
             return Ok(parameters);
@@ -5868,8 +5944,24 @@ impl ProxyHttpClient {
                     .and_then(|value| serde_json::from_value(value.clone()).ok())
             })
         });
-        let mut metadata = FinalRequestMeta::new(self.client_capabilities.clone());
-        metadata.client_info = Some(self.client_info.to_implementation());
+        // The gateway leg is transparent for the three reverse-direction
+        // capabilities and for the per-request identity: the upstream calls
+        // BACK through this proxy for sampling, elicitation and roots, so the
+        // set it reads must describe the inbound caller that will service
+        // those calls. Every other advertised capability, and the identity
+        // when no inbound one exists, stays locally configured.
+        let mut capabilities = self.client_capabilities.clone();
+        if let Some(inbound) = &inbound_capabilities {
+            capabilities.sampling = inbound.sampling.clone();
+            capabilities.elicitation = inbound.elicitation.clone();
+            capabilities.roots = inbound.roots.clone();
+        }
+        let mut metadata = FinalRequestMeta::new(capabilities);
+        metadata.client_info = Some(
+            inbound_identity
+                .and_then(implementation_from_request_identity)
+                .unwrap_or_else(|| self.client_info.to_implementation()),
+        );
         if let Some(progress_marker) = progress_marker {
             metadata
                 .additional_metadata
@@ -13040,7 +13132,7 @@ IFS= read -r end
                     assert_eq!(wire["id"], index + 2);
                     assert_eq!(wire["method"], method);
                     assert_eq!(wire["params"]["taskId"], if index == 0 { first_id.as_str() } else { second_id.as_str() });
-                    assert_eq!(wire["params"]["_meta"][fastmcp_protocol::FINAL_CLIENT_INFO_META_KEY]["name"], "fastmcp-client");
+                    assert_eq!(wire["params"]["_meta"][fastmcp_protocol::FINAL_CLIENT_INFO_META_KEY], serde_json::json!({"name": subject.clone(), "version": "19"}), "the gateway leg forwards the inbound per-request identity rather than its own configured one");
                     assert_eq!(wire["params"]["_meta"][fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"][fastmcp_protocol::TASKS_EXTENSION], serde_json::json!({}));
                     assert_eq!(wire["params"]["_meta"][fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]["roots"], serde_json::json!({}));
                     if method == "tasks/update" {
@@ -16239,7 +16331,7 @@ IFS= read -r end
                         let params = &wire["params"];
                         assert_eq!(params[if method == "resources/read" { "uri" } else { "name" }], target);
                         assert_eq!(params["_meta"]["io.modelcontextprotocol/protocolVersion"], "2026-07-28");
-                        assert_eq!(params["_meta"][FINAL_CLIENT_INFO_META_KEY]["name"], "fastmcp-client");
+                        assert_eq!(params["_meta"][FINAL_CLIENT_INFO_META_KEY], serde_json::json!({"name": subject.clone(), "version": "18"}), "the gateway leg forwards the inbound per-request identity rather than its own configured one");
                         assert_eq!(params["_meta"]["progressToken"], if index % 2 == 0 { "first" } else { "second" });
                         let tasks = params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"].get("io.modelcontextprotocol/tasks");
                         if task_result.is_some() { assert_eq!(tasks, Some(&serde_json::json!({}))); }
