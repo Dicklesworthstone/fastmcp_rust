@@ -2188,6 +2188,15 @@ impl HttpServerFixture {
         self.handler_calls.snapshot()
     }
 
+    fn retains_shutdown_ownership(&self) -> bool {
+        self.join.is_some()
+            || self.nonquiescent.is_some()
+            || matches!(
+                self.shutdown_completion.as_ref(),
+                Some(Ok(HttpServerShutdown::Nonquiescent(_)))
+            )
+    }
+
     fn settle(&mut self) -> Result<(), String> {
         if let Some(shutdown) = self.nonquiescent.as_mut() {
             return match runtime_block_on(shutdown.settle_for(HTTP_SERVER_TEARDOWN_BOUND)) {
@@ -2466,15 +2475,23 @@ fn spawn_modern_mounted_http_server() -> HttpServerFixture {
 
 impl Drop for HttpServerFixture {
     fn drop(&mut self) {
-        if self.join.is_none() && self.nonquiescent.is_none() {
+        if !self.retains_shutdown_ownership() {
             return;
         }
         if let Err(error) = self.settle() {
             eprintln!("public HTTP server fixture drop failed: {error}");
-            // A `JoinHandle` dropped after a failed bounded settlement detaches
-            // a live server. Aborting is fail-closed in both normal and panic
-            // unwinding paths, after shutdown has already been requested.
-            std::process::abort();
+            // A failed join can leave child ownership in the buffered report
+            // even after consuming the thread handle. Never discard either
+            // form of retained ownership after bounded settlement fails.
+            if self.retains_shutdown_ownership() {
+                std::process::abort();
+            }
+            // The owner has exited and been joined. Keep its teardown error
+            // visible without replacing an existing panic with a double panic.
+            if thread::panicking() {
+                return;
+            }
+            panic!("public HTTP server fixture drop failed: {error}");
         }
     }
 }
@@ -2911,7 +2928,10 @@ fn http_fixture_drop_case(name: &str, case: HttpFixtureDropCase) {
                 let message = payload
                     .downcast_ref::<String>()
                     .expect("shutdown diagnostic");
-                assert!(message.contains("planted joined-owner teardown failure"));
+                assert_eq!(
+                    message,
+                    "public HTTP server fixture drop failed: public HTTP server teardown failed: planted joined-owner teardown failure"
+                );
             }
             HttpFixtureDropCase::Unwinding => {
                 let payload = outcome.expect_err("the original failure must propagate");
