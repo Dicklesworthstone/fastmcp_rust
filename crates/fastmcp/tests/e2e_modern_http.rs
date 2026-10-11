@@ -15385,6 +15385,165 @@ fn e2e_public_http_as_proxy_adopts_upstream_implementation() {
     identified_upstream.shutdown();
 }
 
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+#[test]
+fn e2e_public_http_as_proxy_tasks_identity_json() {
+    as_proxy_owner_isolated("e2e_public_http_as_proxy_tasks_identity_json", || {
+        assert_http_proxy_tasks_identity(false);
+    });
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+#[test]
+fn e2e_public_http_as_proxy_tasks_identity_sse() {
+    as_proxy_owner_isolated("e2e_public_http_as_proxy_tasks_identity_sse", || {
+        assert_http_proxy_tasks_identity(true);
+    });
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+struct PublicHttpTasksClientIdentity;
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+impl ToolHandler for PublicHttpTasksClientIdentity {
+    fn definition(&self) -> Tool {
+        PublicHttpClientIdentity.definition()
+    }
+
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        if !ctx.client_supports_tasks() {
+            return Err(McpError::invalid_request(
+                "identity probe requires Tasks on the upstream request",
+            ));
+        }
+        PublicHttpClientIdentity.call(ctx, arguments)
+    }
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+fn assert_http_proxy_tasks_identity(streamed: bool) {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_http_server("modern Tasks client identity", || {
+        let task_runtime = FinalTaskRuntime::in_memory(
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000))
+                .expect("the identity upstream uses the existing Tasks timing policy"),
+            Arc::new(|_| {}),
+        );
+        ServerBuilder::new("facade-http-task-identity", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly is available")
+            .tool(PublicHttpTaskTool)
+            .tool(PublicHttpTasksClientIdentity)
+            .final_tasks(task_runtime)
+            .expect("the identity upstream installs the official Tasks extension")
+            .task_supervisor(Arc::new(PublicHttpHoldingTaskSupervisor))
+            .build()
+    });
+    let gateway =
+        AsProxyOwnerGateway::fronting(spawn_modern_http_task_proxy_gateway(upstream.address()));
+    let prefixed = format!("ext/{PUBLIC_HTTP_CLIENT_IDENTITY_TOOL_NAME}");
+    let mut identified = runtime_block_on_bounded(
+        &cx,
+        gateway
+            .owner("e2e-as-proxy-tasks-identity")
+            .title("Caller Title")
+            .connect_http_with_cx(&cx, gateway.target()),
+    )
+    .expect("the identified caller connects as the authenticated Tasks owner");
+    let mut bare = runtime_block_on_bounded(
+        &cx,
+        gateway
+            .owner("e2e-as-proxy-tasks-identity-bare")
+            .connect_http_with_cx(&cx, gateway.target()),
+    )
+    .expect("the bare caller connects as the same authenticated Tasks owner");
+
+    for client in [&identified, &bare] {
+        let capabilities = serde_json::to_value(client.server_discovery().capabilities())
+            .expect("discovery capabilities serialize");
+        assert_eq!(
+            capabilities.pointer("/extensions/io.modelcontextprotocol~1tasks"),
+            Some(&json!({})),
+            "the gateway must have installed the upstream's real Tasks relay"
+        );
+    }
+
+    // The authenticated owner and Tasks outcome API elect the detached Tasks
+    // request, not the core request. Alternate callers on the same gateway to
+    // reject a connection-wide identity overlay and leaking a previous title.
+    for (round, has_title) in [true, false, true].into_iter().enumerate() {
+        let client = if has_title {
+            &mut identified
+        } else {
+            &mut bare
+        };
+        let request_id = RequestId::Number(10 + i64::try_from(round).unwrap());
+        let outcome = if streamed {
+            runtime_block_on_bounded(
+                &cx,
+                client.call_tool_outcome_with_progress_marker(
+                    &cx,
+                    request_id,
+                    &prefixed,
+                    json!({}),
+                    modern::ProgressMarker::from("tasks-identity-stream"),
+                    1 << 20,
+                ),
+            )
+        } else {
+            runtime_block_on_bounded(
+                &cx,
+                client.call_tool_outcome(&cx, request_id, &prefixed, json!({}), 1 << 20),
+            )
+        }
+        .expect("the Tasks-negotiated proxy call reaches the live identity handler");
+        let FinalToolCallOutcome::Complete(result) = outcome else {
+            panic!("the identity tool completes without creating a Task: {outcome:?}");
+        };
+        let expected = if has_title {
+            "name=e2e-as-proxy-tasks-identity|title=Caller Title"
+        } else {
+            "name=e2e-as-proxy-tasks-identity-bare|title=none"
+        };
+        assert!(!result.payload.is_error);
+        assert_eq!(result.payload.content.len(), 1);
+        assert!(
+            matches!(&result.payload.content[0], ContentBlock::Text { text, .. } if text == expected),
+            "each Tasks request must carry its own inbound identity: {result:?}"
+        );
+    }
+
+    drop(identified);
+    drop(bare);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 #[test]
 fn e2e_public_http_as_proxy_bare_upstream_omits_implementation() {
