@@ -67,7 +67,9 @@ fn multiple_of_preserves_exact_fractional_and_exponent_semantics() {
             schema.validate(&number(rejected)).is_err(),
             "{rejected} / {divisor} is not integral"
         );
-        schema.validate(&number("-0.0")).expect("zero is a multiple");
+        schema
+            .validate(&number("-0.0"))
+            .expect("zero is a multiple");
     }
 }
 

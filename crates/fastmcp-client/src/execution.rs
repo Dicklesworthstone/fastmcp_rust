@@ -2013,9 +2013,11 @@ where
             let key = request_id.correlation_key().map_err(|_| {
                 McpError::invalid_params("Request execution owns an invalid JSON-RPC request ID")
             })?;
-            if state.pending.get(&key).is_none_or(|pending| {
-                pending.record.execution_generation != generation
-            }) {
+            if state
+                .pending
+                .get(&key)
+                .is_none_or(|pending| pending.record.execution_generation != generation)
+            {
                 // The handle may have lost its terminal receipt while another
                 // thread reused the wire ID. Neither a new read nor local
                 // cancellation below belongs to that replacement execution.
@@ -2734,9 +2736,11 @@ where
         let key = execution.request_id.correlation_key().map_err(|_| {
             McpError::invalid_params("Request execution owns an invalid JSON-RPC request ID")
         })?;
-        if state.pending.get(&key).is_none_or(|pending| {
-            pending.record.execution_generation != execution.generation
-        }) {
+        if state
+            .pending
+            .get(&key)
+            .is_none_or(|pending| pending.record.execution_generation != execution.generation)
+        {
             // A retained handle is authority for one generation, not for
             // every future use of its wire ID. Treat a retired generation
             // like an already-elected terminal: no new control or mutation.
@@ -4230,16 +4234,28 @@ mod tests {
         }
 
         fn cancellation_ids(executor: &RequestExecutor<ScriptedTransport>) -> Vec<RequestId> {
-            executor.state.borrow().transport.sent.iter().filter_map(|message| {
-                let JsonRpcMessage::Request(request) = message else {
-                    return None;
-                };
-                if request.method != "notifications/cancelled" {
-                    return None;
-                }
-                assert!(request.id.is_none());
-                Some(serde_json::from_value(request.params.as_ref().unwrap()["requestId"].clone()).unwrap())
-            }).collect()
+            executor
+                .state
+                .borrow()
+                .transport
+                .sent
+                .iter()
+                .filter_map(|message| {
+                    let JsonRpcMessage::Request(request) = message else {
+                        return None;
+                    };
+                    if request.method != "notifications/cancelled" {
+                        return None;
+                    }
+                    assert!(request.id.is_none());
+                    Some(
+                        serde_json::from_value(
+                            request.params.as_ref().unwrap()["requestId"].clone(),
+                        )
+                        .unwrap(),
+                    )
+                })
+                .collect()
         }
 
         #[test]
@@ -4256,17 +4272,29 @@ mod tests {
                     // Use both external ingress surfaces. Neither is passed
                     // the stopped context, and no explicit cancel() is called.
                     if raw_result_route {
-                        driver.route_response_with_raw_result(&live, final_response(1), None).unwrap();
-                        driver.route_response_with_raw_result(&live, final_response(2), None).unwrap();
+                        driver
+                            .route_response_with_raw_result(&live, final_response(1), None)
+                            .unwrap();
+                        driver
+                            .route_response_with_raw_result(&live, final_response(2), None)
+                            .unwrap();
                     } else {
                         driver.drive_frame(&live, frame(final_response(1))).unwrap();
                         driver.drive_frame(&live, frame(final_response(2))).unwrap();
                     }
-                    assert_eq!(executor.try_take_response(&mut cancelled).unwrap_err().code,
-                        McpErrorCode::RequestCancelled);
-                    assert_eq!(executor.try_take_response(&mut sibling).unwrap(), Some(final_response(2)));
+                    assert_eq!(
+                        executor.try_take_response(&mut cancelled).unwrap_err().code,
+                        McpErrorCode::RequestCancelled
+                    );
+                    assert_eq!(
+                        executor.try_take_response(&mut sibling).unwrap(),
+                        Some(final_response(2))
+                    );
                     assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(1)]);
-                    assert!(executor.take_uncorrelated_responses().is_empty(), "late cancelled final escaped its tombstone");
+                    assert!(
+                        executor.take_uncorrelated_responses().is_empty(),
+                        "late cancelled final escaped its tombstone"
+                    );
                     assert!(executor.terminal_error().is_none());
                     assert!(live.checkpoint().is_ok());
                 }
@@ -4275,15 +4303,21 @@ mod tests {
 
         #[test]
         fn fresh_waiter_observes_origin_cancellation_without_another_peer_read() {
-            let executor = RequestExecutor::new(ScriptedTransport::new([
-                Ok(JsonRpcMessage::Response(final_response(11))),
-            ]));
+            let executor = RequestExecutor::new(ScriptedTransport::new([Ok(
+                JsonRpcMessage::Response(final_response(11)),
+            )]));
             let originating = Cx::for_testing();
             let live = Cx::for_testing();
             let mut execution = executor.execute(&originating, call(11)).unwrap();
             originating.set_cancel_requested(true);
-            assert_eq!(executor.clone().wait(&live, &mut execution).unwrap_err().code,
-                McpErrorCode::RequestCancelled);
+            assert_eq!(
+                executor
+                    .clone()
+                    .wait(&live, &mut execution)
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::RequestCancelled
+            );
             // A returned cancellation alone would not prove pre-read refusal.
             assert_eq!(executor.state.borrow().transport.received.len(), 1);
             assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(11)]);
@@ -4320,9 +4354,14 @@ mod tests {
             let mut sibling = executor.execute(&live, call(22)).unwrap();
             assert!(originating.checkpoint().is_ok());
             executor.drive(&live).unwrap();
-            assert_eq!(executor.try_take_response(&mut cancelled).unwrap_err().code,
-                McpErrorCode::RequestCancelled);
-            assert_eq!(executor.try_take_response(&mut sibling).unwrap(), Some(final_response(22)));
+            assert_eq!(
+                executor.try_take_response(&mut cancelled).unwrap_err().code,
+                McpErrorCode::RequestCancelled
+            );
+            assert_eq!(
+                executor.try_take_response(&mut sibling).unwrap(),
+                Some(final_response(22))
+            );
             assert!(executor.terminal_error().is_none());
             assert!(live.checkpoint().is_ok());
         }
@@ -4338,7 +4377,8 @@ mod tests {
             let runtime = RuntimeBuilder::current_thread()
                 .blocking_threads(0, 0)
                 .with_timer_driver(timer)
-                .build().unwrap();
+                .build()
+                .unwrap();
             let originating = runtime.request_cx_with_budget(
                 Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
             );
@@ -4355,8 +4395,10 @@ mod tests {
             // Neither response-wait timeout nor the live service caller's
             // budget changed; only the origin's virtual deadline elapsed.
             assert!(executor.pending_records().is_empty());
-            assert_eq!(executor.try_take_response(&mut execution).unwrap_err().code,
-                McpErrorCode::RequestCancelled);
+            assert_eq!(
+                executor.try_take_response(&mut execution).unwrap_err().code,
+                McpErrorCode::RequestCancelled
+            );
             assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(31)]);
             assert!(live.checkpoint().is_ok());
             drop(execution);
@@ -4371,10 +4413,15 @@ mod tests {
             let originating = Cx::for_testing();
             let live = Cx::for_testing();
             let mut execution = executor.execute(&originating, call(41)).unwrap();
-            executor.drive_frame(&live, frame(final_response(41))).unwrap();
+            executor
+                .drive_frame(&live, frame(final_response(41)))
+                .unwrap();
             originating.set_cancel_requested(true);
             executor.poll_timeouts_at(&live, Instant::now()).unwrap();
-            assert_eq!(executor.try_take_response(&mut execution).unwrap(), Some(final_response(41)));
+            assert_eq!(
+                executor.try_take_response(&mut execution).unwrap(),
+                Some(final_response(41))
+            );
             assert!(cancellation_ids(&executor).is_empty());
             assert!(executor.take_cancellation_events().is_empty());
         }
@@ -4386,12 +4433,16 @@ mod tests {
             let live = Cx::for_testing();
             let mut execution = executor.execute(&originating, call(51)).unwrap();
             originating.set_cancel_requested(true);
-            originating.masked(|| executor.poll_timeouts_at(&live, Instant::now())).unwrap();
+            originating
+                .masked(|| executor.poll_timeouts_at(&live, Instant::now()))
+                .unwrap();
             assert_eq!(executor.pending_records().len(), 1);
             assert!(cancellation_ids(&executor).is_empty());
             executor.poll_timeouts_at(&live, Instant::now()).unwrap();
-            assert_eq!(executor.try_take_response(&mut execution).unwrap_err().code,
-                McpErrorCode::RequestCancelled);
+            assert_eq!(
+                executor.try_take_response(&mut execution).unwrap_err().code,
+                McpErrorCode::RequestCancelled
+            );
             assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(51)]);
         }
 
@@ -4405,16 +4456,26 @@ mod tests {
             let second = executor.clone().execute(&live, call(62)).unwrap();
             {
                 let state = executor.state.borrow();
-                let methods = state.transport.sent.iter().map(|message| match message {
-                    JsonRpcMessage::Request(request) => request.method.as_str(),
-                    _ => panic!("client must not send a response here"),
-                }).collect::<Vec<_>>();
+                let methods = state
+                    .transport
+                    .sent
+                    .iter()
+                    .map(|message| match message {
+                        JsonRpcMessage::Request(request) => request.method.as_str(),
+                        _ => panic!("client must not send a response here"),
+                    })
+                    .collect::<Vec<_>>();
                 assert_eq!(methods, [TOOLS_CALL, "notifications/cancelled", TOOLS_CALL]);
             }
             assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(61)]);
-            assert_eq!(executor.try_take_response(&mut first).unwrap_err().code,
-                McpErrorCode::RequestCancelled);
-            assert_eq!(executor.pending_records()[0].request_id, *second.request_id());
+            assert_eq!(
+                executor.try_take_response(&mut first).unwrap_err().code,
+                McpErrorCode::RequestCancelled
+            );
+            assert_eq!(
+                executor.pending_records()[0].request_id,
+                *second.request_id()
+            );
         }
 
         #[test]
@@ -4429,8 +4490,10 @@ mod tests {
             executor.poll_timeouts_at(&stopped, Instant::now()).unwrap();
             assert!(executor.pending_records().is_empty());
             assert!(cancellation_ids(&executor).is_empty());
-            assert_eq!(executor.try_take_response(&mut execution).unwrap_err().code,
-                McpErrorCode::RequestCancelled);
+            assert_eq!(
+                executor.try_take_response(&mut execution).unwrap_err().code,
+                McpErrorCode::RequestCancelled
+            );
             executor.poll_timeouts_at(&live, Instant::now()).unwrap();
             executor.poll_timeouts_at(&live, Instant::now()).unwrap();
             assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(71)]);
@@ -4450,12 +4513,16 @@ mod tests {
             let state = executor.state.borrow();
             for execution in [&first, &second] {
                 let key = (execution.request_id.clone(), execution.generation);
-                assert_eq!(state.terminal_records[&key].terminal_reason,
-                    ExecutionTerminalReason::CallerCancelled);
+                assert_eq!(
+                    state.terminal_records[&key].terminal_reason,
+                    ExecutionTerminalReason::CallerCancelled
+                );
             }
             let key = (sibling.request_id.clone(), sibling.generation);
-            assert_eq!(state.terminal_records[&key].terminal_reason,
-                ExecutionTerminalReason::ConnectionLost);
+            assert_eq!(
+                state.terminal_records[&key].terminal_reason,
+                ExecutionTerminalReason::ConnectionLost
+            );
         }
 
         #[test]
@@ -4481,21 +4548,28 @@ mod tests {
                     assert!(state.deferred_cancellations.is_empty());
                     assert!(state.tombstones.is_empty());
                     for execution in [&first, &second] {
-                        let record = &state.terminal_records[
-                            &(execution.request_id.clone(), execution.generation)
-                        ];
+                        let record = &state.terminal_records
+                            [&(execution.request_id.clone(), execution.generation)];
                         assert_eq!(record.terminal_state, ExecutionTerminalState::Cancelled);
-                        assert_eq!(record.terminal_reason, ExecutionTerminalReason::CallerCancelled);
+                        assert_eq!(
+                            record.terminal_reason,
+                            ExecutionTerminalReason::CallerCancelled
+                        );
                         assert!(record.cancellation_committed && record.local_cancellation_event);
                         assert!(record.waiter_release);
                         assert_eq!(record.cancellation_transport_attempts, 0);
                         assert!(!record.final_delivered && !record.tombstone);
                     }
-                    let sibling_record = &state.terminal_records[
-                        &(sibling.request_id.clone(), sibling.generation)
-                    ];
-                    assert_eq!(sibling_record.terminal_state, ExecutionTerminalState::Failed);
-                    assert_eq!(sibling_record.terminal_reason, ExecutionTerminalReason::ConnectionLost);
+                    let sibling_record =
+                        &state.terminal_records[&(sibling.request_id.clone(), sibling.generation)];
+                    assert_eq!(
+                        sibling_record.terminal_state,
+                        ExecutionTerminalState::Failed
+                    );
+                    assert_eq!(
+                        sibling_record.terminal_reason,
+                        ExecutionTerminalReason::ConnectionLost
+                    );
                     assert!(!sibling_record.local_cancellation_event);
                 }
                 let events = executor.take_cancellation_events();
@@ -4507,16 +4581,27 @@ mod tests {
                     }));
                 }
                 assert!(cancellation_ids(&executor).is_empty());
-                assert_eq!(executor.try_take_response(&mut first).unwrap_err().code,
-                    McpErrorCode::RequestCancelled);
-                assert_eq!(executor.try_take_response(&mut second).unwrap_err().code,
-                    McpErrorCode::RequestCancelled);
-                assert_eq!(executor.try_take_response(&mut sibling).unwrap_err().message,
-                    failure.message);
+                assert_eq!(
+                    executor.try_take_response(&mut first).unwrap_err().code,
+                    McpErrorCode::RequestCancelled
+                );
+                assert_eq!(
+                    executor.try_take_response(&mut second).unwrap_err().code,
+                    McpErrorCode::RequestCancelled
+                );
+                assert_eq!(
+                    executor
+                        .try_take_response(&mut sibling)
+                        .unwrap_err()
+                        .message,
+                    failure.message
+                );
                 // Request-local cancellation must not erase the connection's
                 // real failure or allow another application write through it.
-                assert_eq!(executor.execute(&live, call(104)).unwrap_err().message,
-                    failure.message);
+                assert_eq!(
+                    executor.execute(&live, call(104)).unwrap_err().message,
+                    failure.message
+                );
                 assert_eq!(executor.state.borrow().transport.sent.len(), 3);
                 assert!(live.checkpoint().is_ok());
             }
@@ -4531,25 +4616,37 @@ mod tests {
             let mut completed = executor.execute(&originating, call(111)).unwrap();
             let mut cancelled = executor.execute(&originating, call(112)).unwrap();
             let mut sibling = executor.execute(&live, call(113)).unwrap();
-            executor.drive_frame(&live, frame(final_response(111))).unwrap();
+            executor
+                .drive_frame(&live, frame(final_response(111)))
+                .unwrap();
             stopped_service.set_cancel_requested(true);
             executor.cancel(&stopped_service, &mut cancelled).unwrap();
             let cancellation_key = (cancelled.request_id.clone(), cancelled.generation);
-            let cancellation_record = executor.state.borrow().terminal_records[
-                &cancellation_key
-            ].clone();
+            let cancellation_record =
+                executor.state.borrow().terminal_records[&cancellation_key].clone();
             assert_eq!(executor.state.borrow().deferred_cancellations.len(), 1);
             originating.set_cancel_requested(true);
             let failure = McpError::internal_error("terminal transport loss");
             executor.fail_connection(failure.clone());
-            assert_eq!(executor.state.borrow().terminal_records[&cancellation_key],
-                cancellation_record);
-            assert_eq!(executor.try_take_response(&mut completed).unwrap(),
-                Some(final_response(111)));
-            assert_eq!(executor.try_take_response(&mut cancelled).unwrap_err().code,
-                McpErrorCode::RequestCancelled);
-            assert_eq!(executor.try_take_response(&mut sibling).unwrap_err().message,
-                failure.message);
+            assert_eq!(
+                executor.state.borrow().terminal_records[&cancellation_key],
+                cancellation_record
+            );
+            assert_eq!(
+                executor.try_take_response(&mut completed).unwrap(),
+                Some(final_response(111))
+            );
+            assert_eq!(
+                executor.try_take_response(&mut cancelled).unwrap_err().code,
+                McpErrorCode::RequestCancelled
+            );
+            assert_eq!(
+                executor
+                    .try_take_response(&mut sibling)
+                    .unwrap_err()
+                    .message,
+                failure.message
+            );
             assert!(executor.state.borrow().deferred_cancellations.is_empty());
             assert_eq!(executor.take_cancellation_events().len(), 1);
             assert!(cancellation_ids(&executor).is_empty());
@@ -4570,10 +4667,18 @@ mod tests {
             let records = executor.terminal_records();
             assert_eq!(records.len(), 1);
             assert_eq!(records[0].terminal_state, ExecutionTerminalState::Failed);
-            assert_eq!(records[0].terminal_reason, ExecutionTerminalReason::ConnectionLost);
+            assert_eq!(
+                records[0].terminal_reason,
+                ExecutionTerminalReason::ConnectionLost
+            );
             assert!(!records[0].cancellation_committed);
-            assert_eq!(executor.try_take_response(&mut execution).unwrap_err().message,
-                failure.message);
+            assert_eq!(
+                executor
+                    .try_take_response(&mut execution)
+                    .unwrap_err()
+                    .message,
+                failure.message
+            );
             assert!(executor.take_cancellation_events().is_empty());
             assert!(cancellation_ids(&executor).is_empty());
         }
@@ -4590,7 +4695,8 @@ mod tests {
                 let runtime = RuntimeBuilder::current_thread()
                     .blocking_threads(0, 0)
                     .with_timer_driver(timer)
-                    .build().unwrap();
+                    .build()
+                    .unwrap();
                 let originating = runtime.request_cx_with_budget(
                     Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
                 );
@@ -4603,14 +4709,25 @@ mod tests {
                 executor.fail_connection(failure.clone());
                 let stopped = elapsed == 10_000_000;
                 let error = executor.try_take_response(&mut execution).unwrap_err();
-                assert_eq!(error.code, if stopped {
-                    McpErrorCode::RequestCancelled
-                } else {
-                    failure.code
-                });
-                assert_eq!(executor.try_take_response(&mut sibling).unwrap_err().message,
-                    failure.message);
-                assert_eq!(executor.take_cancellation_events().len(), usize::from(stopped));
+                assert_eq!(
+                    error.code,
+                    if stopped {
+                        McpErrorCode::RequestCancelled
+                    } else {
+                        failure.code
+                    }
+                );
+                assert_eq!(
+                    executor
+                        .try_take_response(&mut sibling)
+                        .unwrap_err()
+                        .message,
+                    failure.message
+                );
+                assert_eq!(
+                    executor.take_cancellation_events().len(),
+                    usize::from(stopped)
+                );
                 assert!(cancellation_ids(&executor).is_empty());
                 assert_eq!(executor.state.borrow().transport.sent.len(), 2);
                 drop(execution);
@@ -4626,18 +4743,25 @@ mod tests {
             let executor = executor(ProtocolEra::Legacy2024);
             let originating = Cx::for_testing();
             let live = Cx::for_testing();
-            let mut execution = executor.execute(&originating, JsonRpcRequest::new(
-                INITIALIZE,
-                Some(serde_json::json!({
-                    "protocolVersion": "2024-11-05", "capabilities": {},
-                    "clientInfo": {"name": "origin", "version": "1"},
-                })),
-                91_i64,
-            )).unwrap();
+            let mut execution = executor
+                .execute(
+                    &originating,
+                    JsonRpcRequest::new(
+                        INITIALIZE,
+                        Some(serde_json::json!({
+                            "protocolVersion": "2024-11-05", "capabilities": {},
+                            "clientInfo": {"name": "origin", "version": "1"},
+                        })),
+                        91_i64,
+                    ),
+                )
+                .unwrap();
             originating.set_cancel_requested(true);
             executor.poll_timeouts_at(&live, Instant::now()).unwrap();
-            assert_eq!(executor.try_take_response(&mut execution).unwrap_err().code,
-                McpErrorCode::RequestCancelled);
+            assert_eq!(
+                executor.try_take_response(&mut execution).unwrap_err().code,
+                McpErrorCode::RequestCancelled
+            );
             assert!(cancellation_ids(&executor).is_empty());
             assert_eq!(executor.state.borrow().transport.sent.len(), 1);
         }
@@ -4749,7 +4873,11 @@ mod tests {
             state.prune_tombstones(now);
             state.prune_retained_terminals(now);
             assert!(!state.tombstones.contains_key(&key));
-            assert!(!state.completed.contains_key(&(old.request_id.clone(), old.generation)));
+            assert!(
+                !state
+                    .completed
+                    .contains_key(&(old.request_id.clone(), old.generation))
+            );
         }
 
         fn cancellation_ids(executor: &Executor) -> Vec<RequestId> {
@@ -4792,9 +4920,13 @@ mod tests {
                         let executor = executor(era);
                         let cx = Cx::for_testing();
                         let service = Cx::for_testing();
-                        let mut old = executor.execute(&cx, request_with_id(old_id.clone())).unwrap();
+                        let mut old = executor
+                            .execute(&cx, request_with_id(old_id.clone()))
+                            .unwrap();
                         retire_and_expire(&executor, &cx, &old);
-                        let mut current = executor.execute(&cx, request_with_id(new_id.clone())).unwrap();
+                        let mut current = executor
+                            .execute(&cx, request_with_id(new_id.clone()))
+                            .unwrap();
                         assert_ne!(old.generation(), current.generation());
                         if stopped_service {
                             service.set_cancel_requested(true);
@@ -4802,7 +4934,10 @@ mod tests {
                         executor.clone().cancel(&service, &mut old).unwrap();
                         assert!(executor.try_take_response(&mut current).unwrap().is_none());
                         assert_eq!(executor.pending_records().len(), 1);
-                        assert_eq!(executor.pending_records()[0].execution_generation, current.generation());
+                        assert_eq!(
+                            executor.pending_records()[0].execution_generation,
+                            current.generation()
+                        );
                         assert!(cancellation_ids(&executor).is_empty());
                         assert!(executor.take_cancellation_events().is_empty());
                         assert!(executor.state.borrow().deferred_cancellations.is_empty());
@@ -4812,8 +4947,10 @@ mod tests {
                         let controls = cancellation_ids(&executor);
                         assert_eq!(controls.len(), 1);
                         assert!(controls[0].correlates_with(&new_id));
-                        assert_eq!(executor.try_take_response(&mut current).unwrap_err().code,
-                            McpErrorCode::RequestCancelled);
+                        assert_eq!(
+                            executor.try_take_response(&mut current).unwrap_err().code,
+                            McpErrorCode::RequestCancelled
+                        );
                     }
                 }
             }
@@ -4852,15 +4989,30 @@ mod tests {
                         SubscriptionTimeoutPolicy::default(),
                     )
                     .unwrap();
-                assert_eq!(executor.accept_subscription_teardown(&cx, &mut old).unwrap_err().code,
-                    McpErrorCode::InvalidRequest);
+                assert_eq!(
+                    executor
+                        .accept_subscription_teardown(&cx, &mut old)
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidRequest
+                );
                 assert!(executor.try_take_response(&mut current).unwrap().is_none());
-                assert_eq!(executor.pending_records()[0].execution_generation, current.generation());
+                assert_eq!(
+                    executor.pending_records()[0].execution_generation,
+                    current.generation()
+                );
                 assert!(executor.take_cancellation_events().is_empty());
-                executor.accept_subscription_teardown(&cx, &mut current).unwrap();
-                assert_eq!(executor.try_take_response(&mut current).unwrap_err().code,
-                    McpErrorCode::RequestCancelled);
-                assert!(cancellation_ids(&executor).is_empty(), "peer teardown must not echo a control");
+                executor
+                    .accept_subscription_teardown(&cx, &mut current)
+                    .unwrap();
+                assert_eq!(
+                    executor.try_take_response(&mut current).unwrap_err().code,
+                    McpErrorCode::RequestCancelled
+                );
+                assert!(
+                    cancellation_ids(&executor).is_empty(),
+                    "peer teardown must not echo a control"
+                );
             }
         }
 
@@ -4874,9 +5026,12 @@ mod tests {
                 retire_and_expire(&executor, &cx, &old);
                 let mut current = executor.execute(&cx, request(27)).unwrap();
                 let response = retired_response(current.request_id.clone());
-                executor.state.borrow_mut().transport.received.push_back(
-                    Ok(JsonRpcMessage::Response(response.clone())),
-                );
+                executor
+                    .state
+                    .borrow_mut()
+                    .transport
+                    .received
+                    .push_back(Ok(JsonRpcMessage::Response(response.clone())));
                 if stopped_service {
                     service.set_cancel_requested(true);
                 }
@@ -4914,9 +5069,12 @@ mod tests {
                     retire_and_expire(&executor, &cx, &old);
                     let mut current = executor.execute(&cx, request(37)).unwrap();
                     let response = retired_response(current.request_id.clone());
-                    executor.state.borrow_mut().transport.received.push_back(
-                        Ok(JsonRpcMessage::Response(response.clone())),
-                    );
+                    executor
+                        .state
+                        .borrow_mut()
+                        .transport
+                        .received
+                        .push_back(Ok(JsonRpcMessage::Response(response.clone())));
                     if stopped_service {
                         service.set_cancel_requested(true);
                     }
@@ -4928,15 +5086,26 @@ mod tests {
                             )
                             .is_err()
                     );
-                    assert_eq!(executor.state.borrow().ingress_owner, IngressOwner::Unclaimed);
+                    assert_eq!(
+                        executor.state.borrow().ingress_owner,
+                        IngressOwner::Unclaimed
+                    );
                     assert_eq!(executor.state.borrow().transport.received.len(), 1);
                     assert!(cancellation_ids(&executor).is_empty());
                     // No reset, fresh executor or replacement connection is
                     // used: the actual external driver must still be able to
                     // claim ingress and complete this replacement request.
-                    executor.drive_frame(&cx, response_frame(&response)).unwrap();
-                    assert_eq!(executor.state.borrow().ingress_owner, IngressOwner::ExternalDriver);
-                    assert_eq!(executor.try_take_response(&mut current).unwrap(), Some(response));
+                    executor
+                        .drive_frame(&cx, response_frame(&response))
+                        .unwrap();
+                    assert_eq!(
+                        executor.state.borrow().ingress_owner,
+                        IngressOwner::ExternalDriver
+                    );
+                    assert_eq!(
+                        executor.try_take_response(&mut current).unwrap(),
+                        Some(response)
+                    );
                     assert_eq!(executor.state.borrow().transport.received.len(), 1);
                 }
             }
@@ -4951,9 +5120,16 @@ mod tests {
             let response = retired_response(sibling.request_id.clone());
             {
                 let mut state = executor.state.borrow_mut();
-                state.pending.get_mut(&expired.request_id.correlation_key().unwrap())
-                    .unwrap().record.idle_deadline = Instant::now();
-                state.transport.received.push_back(Ok(JsonRpcMessage::Response(response.clone())));
+                state
+                    .pending
+                    .get_mut(&expired.request_id.correlation_key().unwrap())
+                    .unwrap()
+                    .record
+                    .idle_deadline = Instant::now();
+                state
+                    .transport
+                    .received
+                    .push_back(Ok(JsonRpcMessage::Response(response.clone())));
             }
             executor
                 .drive_for_owner(
@@ -4961,13 +5137,23 @@ mod tests {
                     Some((&expired.request_id, expired.generation)),
                 )
                 .unwrap();
-            assert_eq!(executor.state.borrow().ingress_owner, IngressOwner::Unclaimed);
+            assert_eq!(
+                executor.state.borrow().ingress_owner,
+                IngressOwner::Unclaimed
+            );
             assert_eq!(executor.state.borrow().transport.received.len(), 1);
-            assert_eq!(executor.try_take_response(&mut expired).unwrap_err().code,
-                McpErrorCode::RequestCancelled);
+            assert_eq!(
+                executor.try_take_response(&mut expired).unwrap_err().code,
+                McpErrorCode::RequestCancelled
+            );
             assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(47)]);
-            executor.drive_frame(&cx, response_frame(&response)).unwrap();
-            assert_eq!(executor.try_take_response(&mut sibling).unwrap(), Some(response));
+            executor
+                .drive_frame(&cx, response_frame(&response))
+                .unwrap();
+            assert_eq!(
+                executor.try_take_response(&mut sibling).unwrap(),
+                Some(response)
+            );
             assert!(executor.terminal_error().is_none());
         }
 
@@ -4977,8 +5163,13 @@ mod tests {
             let cx = Cx::for_testing();
             let mut completed = executor.execute(&cx, request(57)).unwrap();
             let response = retired_response(completed.request_id.clone());
-            executor.drive_frame(&cx, response_frame(&response)).unwrap();
-            assert_eq!(executor.try_take_response(&mut completed).unwrap(), Some(response));
+            executor
+                .drive_frame(&cx, response_frame(&response))
+                .unwrap();
+            assert_eq!(
+                executor.try_take_response(&mut completed).unwrap(),
+                Some(response)
+            );
             let mut active = executor.execute(&cx, request(58)).unwrap();
             let abandoned = executor.execute(&cx, request(59)).unwrap();
             drop(abandoned);
@@ -4999,11 +5190,19 @@ mod tests {
             // driver retains sole authority to service these queued controls.
             assert_eq!(executor.state.borrow().transport.sent.len(), sent);
             assert_eq!(executor.state.borrow().deferred_cancellations.len(), 1);
-            assert_eq!(executor.state.borrow().ingress_owner, IngressOwner::ExternalDriver);
+            assert_eq!(
+                executor.state.borrow().ingress_owner,
+                IngressOwner::ExternalDriver
+            );
             assert!(executor.try_take_response(&mut active).unwrap().is_none());
             let response = retired_response(active.request_id.clone());
-            executor.drive_frame(&cx, response_frame(&response)).unwrap();
-            assert_eq!(executor.try_take_response(&mut active).unwrap(), Some(response));
+            executor
+                .drive_frame(&cx, response_frame(&response))
+                .unwrap();
+            assert_eq!(
+                executor.try_take_response(&mut active).unwrap(),
+                Some(response)
+            );
             assert!(executor.state.borrow().deferred_cancellations.is_empty());
             assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(59)]);
         }
@@ -5018,22 +5217,43 @@ mod tests {
                 let execution = executor
                     .execute_tasks_subscription(cx, tasks_subscription_request(73, &task_id))
                     .unwrap();
-                executor.drive_frame(cx, source_frame(tasks_subscription_acknowledgement(73, &task_id)))
+                executor
+                    .drive_frame(
+                        cx,
+                        source_frame(tasks_subscription_acknowledgement(73, &task_id)),
+                    )
                     .unwrap();
-                executor.drive_frame(cx, source_frame(tasks_status_notification(73, &task_id)))
+                executor
+                    .drive_frame(cx, source_frame(tasks_status_notification(73, &task_id)))
                     .unwrap();
                 (executor, execution)
             }
 
             fn assert_live_subscription(executor: &Executor, execution: &Execution, task: &str) {
-                let filter = executor.clone().tasks_subscription_acknowledgement(execution)
-                    .unwrap().unwrap();
-                assert_eq!(task_subscription_ids(&filter).unwrap().unwrap(),
-                    vec![TaskId::parse(task).unwrap()]);
-                let events = executor.clone().take_tasks_subscription_notifications(execution).unwrap();
+                let filter = executor
+                    .clone()
+                    .tasks_subscription_acknowledgement(execution)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    task_subscription_ids(&filter).unwrap().unwrap(),
+                    vec![TaskId::parse(task).unwrap()]
+                );
+                let events = executor
+                    .clone()
+                    .take_tasks_subscription_notifications(execution)
+                    .unwrap();
                 assert_eq!(events.len(), 1);
-                assert_eq!(serde_json::to_value(&events[0]).unwrap()["params"]["taskId"], task);
-                assert!(executor.take_tasks_subscription_notifications(execution).unwrap().is_empty());
+                assert_eq!(
+                    serde_json::to_value(&events[0]).unwrap()["params"]["taskId"],
+                    task
+                );
+                assert!(
+                    executor
+                        .take_tasks_subscription_notifications(execution)
+                        .unwrap()
+                        .is_empty()
+                );
                 assert_eq!(executor.pending_records().len(), 1);
             }
 
@@ -5049,8 +5269,13 @@ mod tests {
                 let (first, foreign) = subscribed(&cx, "task-first");
                 let (second, local) = subscribed(&cx, "task-second");
                 same_wire_identity(&foreign, &local);
-                assert_eq!(second.tasks_subscription_acknowledgement(&foreign).unwrap_err().code,
-                    McpErrorCode::InvalidParams);
+                assert_eq!(
+                    second
+                        .tasks_subscription_acknowledgement(&foreign)
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidParams
+                );
                 assert_live_subscription(&second, &local, "task-second");
                 assert_live_subscription(&first, &foreign, "task-first");
             }
@@ -5061,8 +5286,13 @@ mod tests {
                 let (first, foreign) = subscribed(&cx, "task-first");
                 let (second, local) = subscribed(&cx, "task-second");
                 same_wire_identity(&foreign, &local);
-                assert_eq!(second.take_tasks_subscription_notifications(&foreign).unwrap_err().code,
-                    McpErrorCode::InvalidParams);
+                assert_eq!(
+                    second
+                        .take_tasks_subscription_notifications(&foreign)
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidParams
+                );
                 assert_live_subscription(&second, &local, "task-second");
                 assert_live_subscription(&first, &foreign, "task-first");
             }
@@ -5073,8 +5303,13 @@ mod tests {
                 let (first, mut foreign) = subscribed(&cx, "task-first");
                 let (second, local) = subscribed(&cx, "task-second");
                 same_wire_identity(&foreign, &local);
-                assert_eq!(second.wait_tasks_subscription(&cx, &mut foreign).unwrap_err().code,
-                    McpErrorCode::InvalidParams);
+                assert_eq!(
+                    second
+                        .wait_tasks_subscription(&cx, &mut foreign)
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidParams
+                );
                 // The original error path already returned InvalidParams,
                 // but removed the local entry with this same (ID, generation).
                 // Retained accepted filters AND events prove absence of that
@@ -5090,8 +5325,13 @@ mod tests {
                 let (first, mut foreign) = subscribed(&cx, "task-first");
                 let (second, local) = subscribed(&cx, "task-second");
                 same_wire_identity(&foreign, &local);
-                assert_eq!(second.try_take_tasks_subscription_terminal(&mut foreign).unwrap_err().code,
-                    McpErrorCode::InvalidParams);
+                assert_eq!(
+                    second
+                        .try_take_tasks_subscription_terminal(&mut foreign)
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidParams
+                );
                 assert_live_subscription(&second, &local, "task-second");
                 assert_live_subscription(&first, &foreign, "task-first");
             }

@@ -81,11 +81,26 @@ fn ambient_capability_ceiling() -> CapMask {
     let capabilities = active.capabilities();
     let mut ceiling = CapMask::all();
     for (allowed, without_effect) in [
-        (capabilities.spawn, CapSet::<false, true, true, true, true>::MASK),
-        (capabilities.time, CapSet::<true, false, true, true, true>::MASK),
-        (capabilities.entropy, CapSet::<true, true, false, true, true>::MASK),
-        (capabilities.io, CapSet::<true, true, true, false, true>::MASK),
-        (capabilities.remote, CapSet::<true, true, true, true, false>::MASK),
+        (
+            capabilities.spawn,
+            CapSet::<false, true, true, true, true>::MASK,
+        ),
+        (
+            capabilities.time,
+            CapSet::<true, false, true, true, true>::MASK,
+        ),
+        (
+            capabilities.entropy,
+            CapSet::<true, true, false, true, true>::MASK,
+        ),
+        (
+            capabilities.io,
+            CapSet::<true, true, true, false, true>::MASK,
+        ),
+        (
+            capabilities.remote,
+            CapSet::<true, true, true, true, false>::MASK,
+        ),
     ] {
         if !allowed {
             ceiling = ceiling.intersect(without_effect);

@@ -88,9 +88,7 @@ fn native_admission_retains_all_sixteen_spawn_allowed_rows_in_request_work() {
             );
             let mut work = region
                 .cx()
-                .spawn(|work_cx| async move {
-                    (row(&work_cx), row(&Cx::current().unwrap()))
-                })
+                .spawn(|work_cx| async move { (row(&work_cx), row(&Cx::current().unwrap())) })
                 .unwrap();
             let observed = std::future::poll_fn(|task| work.poll_join(task))
                 .await

@@ -239,8 +239,14 @@ impl BlockingHandlerLane {
             self.verify()?;
             ctx.ensure_live()
                 .map_err(|_| McpError::request_cancelled())?;
-            if request_cancelled.as_mut().poll(&mut control_task).is_ready()
-                || runtime_cancelled.as_mut().poll(&mut control_task).is_ready()
+            if request_cancelled
+                .as_mut()
+                .poll(&mut control_task)
+                .is_ready()
+                || runtime_cancelled
+                    .as_mut()
+                    .poll(&mut control_task)
+                    .is_ready()
             {
                 return Err(McpError::request_cancelled());
             }
@@ -596,9 +602,9 @@ mod tests {
                     .execute(&ctx, &cx, move |worker_ctx| {
                         // Tighten AFTER pool admission so the case measures
                         // application polling rather than spawn bookkeeping.
-                        let bounded = worker_ctx.clone().with_budget_ceiling(
-                            asupersync::Budget::new().with_poll_quota(quota),
-                        );
+                        let bounded = worker_ctx
+                            .clone()
+                            .with_budget_ceiling(asupersync::Budget::new().with_poll_quota(quota));
                         let mut polls = 0;
                         let result = admitted.wait_for(poll_fn(|task| {
                             polls += 1;
@@ -641,9 +647,9 @@ mod tests {
             let admitted = lane.clone();
             let values = lane
                 .execute(&ctx, &cx, move |worker_ctx| {
-                    let bounded = worker_ctx.clone().with_budget_ceiling(
-                        asupersync::Budget::new().with_poll_quota(2),
-                    );
+                    let bounded = worker_ctx
+                        .clone()
+                        .with_budget_ceiling(asupersync::Budget::new().with_poll_quota(2));
                     let first = admitted.wait_for(async { Ok(11) })?;
                     assert_eq!(bounded.budget().poll_quota, 1);
                     let second = admitted.wait_for(async { Ok(31) })?;
@@ -678,9 +684,9 @@ mod tests {
             let drops = Arc::new(AtomicUsize::new(0));
             let observed = Arc::clone(&drops);
             lane.execute(&ctx, &cx, move |worker_ctx| {
-                let _bounded = worker_ctx.clone().with_budget_ceiling(
-                    asupersync::Budget::new().with_poll_quota(1),
-                );
+                let _bounded = worker_ctx
+                    .clone()
+                    .with_budget_ceiling(asupersync::Budget::new().with_poll_quota(1));
                 let guard = DropObserved(Arc::clone(&observed));
                 let mut polls = 0;
                 let error = admitted
@@ -723,7 +729,10 @@ mod tests {
 
         control_waker.wake_by_ref();
         signal.wait();
-        assert!(!operation.take_ready(), "control activity is not application work");
+        assert!(
+            !operation.take_ready(),
+            "control activity is not application work"
+        );
 
         // Several wakes coalesce into one ready poll, including a control wake.
         operation_waker.wake_by_ref();
@@ -759,9 +768,9 @@ mod tests {
                 let worker_released = Arc::clone(&released);
                 let (started, mut entered) = oneshot::channel::<Waker>();
                 let mut call = Box::pin(lane.execute(&ctx, &cx, move |worker_ctx| {
-                    let _bounded = worker_ctx.clone().with_budget_ceiling(
-                        asupersync::Budget::new().with_poll_quota(2),
-                    );
+                    let _bounded = worker_ctx
+                        .clone()
+                        .with_budget_ceiling(asupersync::Budget::new().with_poll_quota(2));
                     let guard = DropObserved(observed_drops);
                     let mut started = Some(started);
                     admitted.wait_for(async {
@@ -793,9 +802,9 @@ mod tests {
                 assert_eq!(ctx.budget().poll_quota, 1);
                 assert_eq!(drops.load(Ordering::SeqCst), 0);
                 if tighten_before_wake {
-                    let _tightened = ctx.clone().with_budget_ceiling(
-                        asupersync::Budget::new().with_poll_quota(0),
-                    );
+                    let _tightened = ctx
+                        .clone()
+                        .with_budget_ceiling(asupersync::Budget::new().with_poll_quota(0));
                 }
                 released.store(true, Ordering::Release);
                 operation_waker.wake();

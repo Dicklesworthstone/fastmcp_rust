@@ -57,7 +57,11 @@ fn validate_with_hasher<S: BuildHasher>(
                 return false;
             };
             if equal {
-                push_error(errors, &format!("{path}[{index}]"), "duplicate item in array");
+                push_error(
+                    errors,
+                    &format!("{path}[{index}]"),
+                    "duplicate item in array",
+                );
                 duplicate = true;
                 break;
             }
@@ -91,7 +95,11 @@ fn fingerprint<S: BuildHasher>(
         Value::Number(value) => {
             2_u8.hash(&mut hasher);
             let Some(decimal) = ExactDecimal::from_number(value) else {
-                push_error(errors, path, "instance number exceeds exact comparison bound");
+                push_error(
+                    errors,
+                    path,
+                    "instance number exceeds exact comparison bound",
+                );
                 return None;
             };
             // ExactDecimal already canonicalizes signed zero. Strip trailing
