@@ -7078,21 +7078,34 @@ pub enum HttpShutdownSettlement {
 #[must_use = "a nonquiescent HTTP shutdown owns child handles that must be settled"]
 pub struct HttpNonquiescentShutdown {
     children: HttpConnectionChildren,
+    server: Arc<Server>,
     listener_error: Option<McpError>,
+    shutdown_complete: bool,
 }
 
 impl HttpNonquiescentShutdown {
+    fn finish_shutdown(&mut self) {
+        if !self.shutdown_complete {
+            self.server.graceful_shutdown_returning();
+            self.shutdown_complete = true;
+        }
+    }
+
     /// Returns the listener failure that accompanied this shutdown, if any.
     #[must_use]
     pub fn listener_error(&self) -> Option<&McpError> {
         self.listener_error.as_ref()
     }
 
-    /// Reaps completed children without waiting.
+    /// Reaps completed children without waiting for live children.
+    ///
+    /// Once all children are terminal, runs the shutdown lifecycle hook
+    /// synchronously, exactly once across settlement observations.
     #[must_use]
     pub fn poll_settlement(&mut self) -> HttpShutdownSettlement {
         self.children.reap_finished();
         if self.children.tasks.is_empty() {
+            self.finish_shutdown();
             if self.children.terminal_failures.is_empty() {
                 HttpShutdownSettlement::Settled
             } else {
@@ -7107,7 +7120,10 @@ impl HttpNonquiescentShutdown {
         }
     }
 
-    /// Waits no longer than `timeout` for cooperative completion.
+    /// Waits no longer than `timeout` for cooperative child completion.
+    ///
+    /// Once the children are terminal, shutdown finalization runs synchronously;
+    /// the application's shutdown hook is outside the child-wait bound.
     pub async fn settle_for(&mut self, timeout: Duration) -> HttpShutdownSettlement {
         let deadline = Instant::now() + timeout;
         loop {
@@ -7137,6 +7153,7 @@ impl HttpNonquiescentShutdown {
                 Err(error) => failures.push(error.to_string()),
             }
         }
+        self.finish_shutdown();
         if failures.is_empty() {
             Ok(())
         } else {
@@ -7564,7 +7581,12 @@ impl BoundHttpServer {
                 Server::settle_hosted_task_service(hosted_task_service, cx).await;
             #[cfg(not(feature = "tasks"))]
             let task_service_result: McpResult<()> = Ok(());
-            server.graceful_shutdown_returning();
+            // Live children may need this runtime to finish their cleanup.
+            // Preserve their server lifecycle with the retained settlement
+            // authority instead of synchronously waiting on those same children.
+            if connection_children.tasks.is_empty() {
+                server.graceful_shutdown_returning();
+            }
             let result = result.and(task_service_result);
             match (connection_shutdown, connection_children.tasks.len()) {
                 (_, 0) if connection_children.terminal_failures.is_empty() => {
@@ -7579,7 +7601,9 @@ impl BoundHttpServer {
                     debug_assert!(remaining > 0);
                     Ok(HttpServerShutdown::Nonquiescent(HttpNonquiescentShutdown {
                         children: connection_children,
+                        server,
                         listener_error: result.err(),
+                        shutdown_complete: false,
                     }))
                 }
             }
