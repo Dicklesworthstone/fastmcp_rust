@@ -481,24 +481,41 @@ mod tests {
         //
         // So when the CAS is lost there is a concurrent poller that will
         // deliver the wake, and the correct response is to WAIT for it rather
-        // than to spin eight no-ops. Sleeping the slice the turn would itself
-        // have blocked for keeps the nominal budget exactly as it was: still
-        // eight iterations, still 100 ms each, still 800 ms worst case. The
-        // bound is unchanged and the assertion is unchanged; the only change
-        // is that the budget is now actually spent instead of being skipped.
-        // Without this the eight turns are not a wait at all.
+        // than to spin no-ops. Waiting on contention keeps the nominal budget
+        // exactly as it was, 8 x 100 ms = 800 ms worst case. The bound is
+        // unchanged and the assertion is unchanged; the only change is that
+        // the budget is now actually spent instead of being skipped. Without
+        // this the eight turns are not a wait at all.
+        // The budget is a DEADLINE rather than an iteration count, so that the
+        // same 800 ms covers both paths exactly. With a plain `for 0..8` the
+        // two paths cost different amounts of time for the same number of
+        // turns, which is how the contended path came to spend nothing at all.
+        //
+        // The contended slice is deliberately much finer than the turn
+        // timeout. Sleeping a full 100 ms on contention is correct but
+        // wasteful: measured, it took this crate's lib suite from 1.96 s to
+        // 7.83 s, because a wake that arrives a few ms in still costs the
+        // whole slice. 10 ms keeps the identical 800 ms ceiling while
+        // surrendering at most 10 ms after the wake is actually available.
+        const BUDGET: Duration = Duration::from_millis(800);
+        const TURN_SLICE: Duration = Duration::from_millis(100);
+        const CONTENDED_SLICE: Duration = Duration::from_millis(10);
         let started = std::time::Instant::now();
         let mut contended = 0_u32;
         let mut polled = 0_u32;
-        for _ in 0..8 {
+        loop {
+            let left = BUDGET.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                break;
+            }
             match driver
-                .try_turn_with(Some(Duration::from_millis(100)), |_, _| {})
+                .try_turn_with(Some(TURN_SLICE.min(left)), |_, _| {})
                 .unwrap()
             {
                 Some(_) => polled += 1,
                 None => {
                     contended += 1;
-                    std::thread::sleep(Duration::from_millis(100));
+                    std::thread::sleep(CONTENDED_SLICE.min(left));
                 }
             }
             if wakes.0.load(Ordering::SeqCst) > 0 {
@@ -507,15 +524,18 @@ mod tests {
         }
         let elapsed = started.elapsed();
         // Name the state rather than only the symptom. "did not wake" has
-        // THREE causes, and `contended` is the one that has to be read first
-        // because it invalidates the other two:
-        //   contended == 8        -> this caller never polled the reactor at
-        //                            all; every turn lost the is_polling CAS
-        //                            and returned instantly. events_received
-        //                            is then 0 by construction and says
-        //                            NOTHING about whether the fd was armed,
-        //                            and `elapsed` will be far below the
-        //                            nominal 800ms because no timeout ran.
+        // THREE causes, and `polled` is the one that has to be read first
+        // because a zero there invalidates the other two:
+        //   polled == 0           -> this caller never polled the reactor at
+        //                            all; every turn lost the is_polling CAS.
+        //                            events_received is then 0 by construction
+        //                            and says NOTHING about whether the fd was
+        //                            armed. `elapsed` should still be close to
+        //                            the 800ms budget, because the contended
+        //                            branch now waits; an `elapsed` in the
+        //                            MICROSECONDS would mean the budget is
+        //                            being skipped again, which is the exact
+        //                            regression this loop was repaired for.
         //   events_received == 0
         //     with contended == 0 -> the reactor really was polled and really
         //                            saw no readiness, so the fd is not armed
@@ -531,7 +551,7 @@ mod tests {
         let stats = driver.stats();
         panic!(
             "pipe readiness did not wake its registered task \
-             (contended={contended}/8 polled={polled} elapsed={elapsed:?} \
+             (contended={contended} polled={polled} elapsed={elapsed:?} \
              wakers={} polls={} events_received={} wakers_dispatched={} \
              unknown_tokens={} registrations={} deregistrations={})",
             driver.waker_count(),
