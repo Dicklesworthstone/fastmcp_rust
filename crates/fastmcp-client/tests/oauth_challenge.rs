@@ -286,6 +286,8 @@ impl Peer {
         .unwrap()
         .with_extra_root_certificate(root())
         .unwrap()
+        .with_resource_root_certificate(root())
+        .unwrap()
     }
     async fn request(&self, expected_start: &str) -> (TlsStream<TcpStream>, Value, Vec<u8>) {
         let (socket, _) = self.listener.accept().await.unwrap();
