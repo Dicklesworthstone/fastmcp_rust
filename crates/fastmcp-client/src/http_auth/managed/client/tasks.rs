@@ -1,6 +1,6 @@
-//! Completed official Tasks operations under the managed credential boundary.
+//! Official Tasks operations under the managed credential boundary.
 //!
-//! The returned values contain no connection, token, or running response owner.
+//! Returned values contain no connection, token, or running response owner.
 //! Task identity is opaque data; the upstream must authorize every later action.
 
 use std::time::Duration;
@@ -8,7 +8,7 @@ use std::time::Duration;
 use asupersync::Cx;
 use asupersync::time::Sleep;
 use fastmcp_core::{McpError, McpErrorCode, McpRequestCancellation};
-use fastmcp_protocol::FinalCoreResult;
+use fastmcp_protocol::{CompleteResult, FinalCoreResult, FinalSubscriptionsListenResult};
 use fastmcp_protocol::tasks_extension::TaskInputLedger;
 use serde_json::Value;
 
@@ -18,6 +18,8 @@ use crate::{
     FinalTaskId, FinalTaskInputResponses, FinalToolCallOutcome, FinalUpdateTaskResult,
     HttpClient, HttpClientError,
 };
+
+mod listen;
 
 const MAX_TASK_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TASK_WAIT_POLLS: usize = 1_024;
@@ -38,6 +40,7 @@ pub(super) enum TaskCall<'a> {
         minimum_interval: Duration,
         max_polls: usize,
     },
+    Listen(listen::ListenRequest<'a>),
 }
 
 pub(super) enum TaskResult {
@@ -45,6 +48,7 @@ pub(super) enum TaskResult {
     Get(Box<FinalGetTaskResult>),
     Update(FinalUpdateTaskResult),
     Cancel(FinalCancelTaskResult),
+    Listen(Option<Box<CompleteResult<FinalSubscriptionsListenResult>>>),
 }
 
 fn invalid_input() -> ManagedHttpClientError {
@@ -196,6 +200,7 @@ impl TaskCall<'_> {
                     "Task wait requires a nonzero poll count",
                 )))
             }
+            Self::Listen(request) => request.dispatch(cx, cancellation, client, id).await,
         }
     }
 }
