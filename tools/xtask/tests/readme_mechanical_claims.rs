@@ -131,6 +131,10 @@ fn feature_mentions(krate: &str, feature: &str) -> usize {
 
 /// `(crate, feature)` pairs the README's "Feature flags that gate nothing" row
 /// asserts are inert. Measured 2026-10-05 at 99a3b4e8; every one was 0.
+/// Re-measured 2026-10-12: all ten still 0, and `fastmcp-console`'s
+/// `websocket-experimental` joined them. It was always inert and the README row
+/// simply never named it, found by sweeping all 72 declared features across the
+/// eight crates that declare any rather than by reading the row.
 const README_INERT: &[(&str, &str)] = &[
     ("fastmcp-server", "enterprise-auth"),
     ("fastmcp-server", "jwt-resource-auth"),
@@ -140,6 +144,7 @@ const README_INERT: &[(&str, &str)] = &[
     ("fastmcp-console", "builtin-auth-server"),
     ("fastmcp-console", "jwt-resource-auth"),
     ("fastmcp-console", "proxy"),
+    ("fastmcp-console", "websocket-experimental"),
     ("fastmcp-transport", "websocket-experimental"),
     ("fastmcp-cli", "jwt-resource-auth"),
 ];
