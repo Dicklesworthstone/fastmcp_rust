@@ -14980,6 +14980,15 @@ IFS= read -r end
                     listener.set_nonblocking(true).unwrap();
                     let address = listener.local_addr().unwrap();
                     let subject = format!("read-prompt-{}", address.port());
+                    // The inbound caller's declared version, bound once so the
+                    // upstream assertion below and the McpContext that declares
+                    // it cannot drift apart. a70b0eb9 made the gateway leg
+                    // forward the INBOUND per-request identity rather than its
+                    // own configured one, so this value is what the peer must
+                    // observe; a literal in each place would let one side move
+                    // silently, which is how the stale expectation this
+                    // replaces survived.
+                    let caller_version = "17";
                     let target = if resource {
                         format!("db://{subject}")
                     } else {
@@ -15064,7 +15073,11 @@ IFS= read -r end
                             assert_eq!(metadata["progressToken"], peer_subject);
                             assert_eq!(
                                 metadata[fastmcp_protocol::FINAL_CLIENT_INFO_META_KEY],
-                                serde_json::to_value(proxy_http_client_info()).unwrap()
+                                serde_json::json!({
+                                    "name": peer_subject,
+                                    "version": caller_version
+                                }),
+                                "the gateway leg forwards the inbound per-request identity rather than its own configured one"
                             );
                             assert_eq!(
                                 metadata[fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]["roots"],
@@ -15163,7 +15176,7 @@ IFS= read -r end
                         let ctx = McpContext::with_progress(cx.clone(), 892,
                             ProgressReporter::with_marker(serde_json::json!(subject), Arc::clone(&capture) as Arc<dyn NotificationSender>))
                             .with_request_cancellation(cancellation.clone()).with_client_capabilities(capabilities)
-                            .with_client_implementation(fastmcp_core::ClientImplementationInfo::new(subject.clone(), "17"));
+                            .with_client_implementation(fastmcp_core::ClientImplementationInfo::new(subject.clone(), caller_version));
                         let exchange_binding = MrtrExchangeBinding::new(method, target.clone(), [8;32], [10;32], None, [12;32]);
                         let mut resumes = Vec::new();
                         let exposed_uri = format!("tenant/remote/{target}");
