@@ -8,15 +8,15 @@ use std::time::Duration;
 use asupersync::Cx;
 use asupersync::time::Sleep;
 use fastmcp_core::{McpError, McpErrorCode, McpRequestCancellation};
-use fastmcp_protocol::{CompleteResult, FinalCoreResult, FinalSubscriptionsListenResult};
 use fastmcp_protocol::tasks_extension::TaskInputLedger;
+use fastmcp_protocol::{CompleteResult, FinalCoreResult, FinalSubscriptionsListenResult};
 use serde_json::Value;
 
 use super::{Call, CallResult, ManagedHttpClient, ManagedHttpClientError};
 use crate::{
-    ClientHttpConnectionError, FinalCancelTaskResult, FinalGetTaskResult, FinalTask,
-    FinalTaskId, FinalTaskInputResponses, FinalToolCallOutcome, FinalUpdateTaskResult,
-    HttpClient, HttpClientError,
+    ClientHttpConnectionError, FinalCancelTaskResult, FinalGetTaskResult, FinalTask, FinalTaskId,
+    FinalTaskInputResponses, FinalToolCallOutcome, FinalUpdateTaskResult, HttpClient,
+    HttpClientError,
 };
 
 mod listen;
@@ -307,7 +307,10 @@ impl ManagedHttpClient {
         cancellation: &McpRequestCancellation,
         task_id: FinalTaskId,
     ) -> Result<FinalGetTaskResult, ManagedHttpClientError> {
-        match self.perform_task(cx, cancellation, TaskCall::Get(task_id)).await? {
+        match self
+            .perform_task(cx, cancellation, TaskCall::Get(task_id))
+            .await?
+        {
             TaskResult::Get(result) => Ok(*result),
             _ => Err(ManagedHttpClientError::InvalidPolicy),
         }
@@ -371,7 +374,11 @@ impl ManagedHttpClient {
             .perform_task(
                 cx,
                 cancellation,
-                TaskCall::Wait { task_id, minimum_interval, max_polls },
+                TaskCall::Wait {
+                    task_id,
+                    minimum_interval,
+                    max_polls,
+                },
             )
             .await?
         {
@@ -440,7 +447,10 @@ impl ManagedHttpClient {
         cancellation: &McpRequestCancellation,
         task_id: FinalTaskId,
     ) -> Result<FinalCancelTaskResult, ManagedHttpClientError> {
-        match self.perform_task(cx, cancellation, TaskCall::Cancel(task_id)).await? {
+        match self
+            .perform_task(cx, cancellation, TaskCall::Cancel(task_id))
+            .await?
+        {
             TaskResult::Cancel(result) => Ok(result),
             _ => Err(ManagedHttpClientError::InvalidPolicy),
         }

@@ -1703,7 +1703,10 @@ mod tests {
             CapSet::<true, true, true, true, false>::MASK,
             CapMask::none(),
         ];
-        for held_mask in [CapMask::all(), CapSet::<true, true, false, true, true>::MASK] {
+        for held_mask in [
+            CapMask::all(),
+            CapSet::<true, true, false, true, true>::MASK,
+        ] {
             for mask in masks {
                 let owner = Cx::for_testing();
                 let held = {
@@ -1734,7 +1737,9 @@ mod tests {
                 // These adapters only copy memory. Removing an effect must not
                 // blanket-refuse pure I/O adapters instead of narrowing them.
                 assert_eq!(
-                    ready(transport.recv_with_source_async(&held)).unwrap().source(),
+                    ready(transport.recv_with_source_async(&held))
+                        .unwrap()
+                        .source(),
                     source
                 );
                 ready(transport.send_async(&held, &request(94))).unwrap();
@@ -1855,12 +1860,14 @@ mod tests {
             let mut bytes = [0_u8; 256];
             let mut output = ReadBuf::new(&mut bytes);
             assert!(matches!(
-                Pin::new(&mut peer)
-                    .poll_read(&mut Context::from_waker(Waker::noop()), &mut output),
+                Pin::new(&mut peer).poll_read(&mut Context::from_waker(Waker::noop()), &mut output),
                 Poll::Ready(Ok(()))
             ));
             if denied {
-                assert!(output.filled().is_empty(), "denied send published pipe bytes");
+                assert!(
+                    output.filled().is_empty(),
+                    "denied send published pipe bytes"
+                );
             } else {
                 assert_eq!(output.filled(), expected.as_slice());
             }

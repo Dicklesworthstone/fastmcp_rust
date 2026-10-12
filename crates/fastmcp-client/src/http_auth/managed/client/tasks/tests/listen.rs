@@ -1,11 +1,11 @@
 //! Live Tasks subscriptions using the existing real OAuth callback and TLS peer.
 
 use super::*;
+use crate::http_executor::ModernHttpSubscriptionListenEvent as Event;
+use asupersync::channel::oneshot;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use asupersync::channel::oneshot;
-use crate::http_executor::ModernHttpSubscriptionListenEvent as Event;
 
 const PAYLOAD_BYTES: usize = 64 * 1024;
 const SUB_ID: &str = "io.modelcontextprotocol/subscriptionId";
@@ -42,7 +42,10 @@ fn sse_head(length: usize) -> String {
 async fn finite_stream(stream: &mut Tls, frames: &[Value]) {
     let body: String = frames.iter().map(sse_frame).collect();
     // One small write also makes buffered-event tests exercise coalescing.
-    stream.write_all(format!("{}{body}", sse_head(body.len())).as_bytes()).await.unwrap();
+    stream
+        .write_all(format!("{}{body}", sse_head(body.len())).as_bytes())
+        .await
+        .unwrap();
     // A negative/host-stop client may already have retired its response.
     let _ = stream.shutdown().await;
 }
@@ -68,13 +71,24 @@ fn managed_task_listen_delivers_before_eof_and_retains_exact_requested_ids() {
         let mut observer = |event: &Event| {
             match event {
                 Event::Acknowledged { accepted_filter } => {
-                    assert_eq!(serde_json::to_value(accepted_filter).unwrap(), json!({"taskIds":["task-1"]}));
+                    assert_eq!(
+                        serde_json::to_value(accepted_filter).unwrap(),
+                        json!({"taskIds":["task-1"]})
+                    );
                     observed.push("ack".to_owned());
                     acknowledged.take().unwrap().send_blocking(()).unwrap();
                 }
                 Event::TaskNotification(notification) => {
                     assert_eq!(notification.params.task.base().task_id, id());
-                    assert_eq!(notification.params.meta.as_ref().unwrap().get("x-observation"), Some(&json!("retained")));
+                    assert_eq!(
+                        notification
+                            .params
+                            .meta
+                            .as_ref()
+                            .unwrap()
+                            .get("x-observation"),
+                        Some(&json!("retained"))
+                    );
                     let task = serde_json::to_value(&notification.params.task).unwrap();
                     observed.push(task["status"].as_str().unwrap().to_owned());
                 }
@@ -84,27 +98,41 @@ fn managed_task_listen_delivers_before_eof_and_retains_exact_requested_ids() {
         };
         let (result, ()) = pair(
             client.listen_task_events(
-                &cx, vec![id(), id(), FinalTaskId::parse("task-2").unwrap()],
-                3, PAYLOAD_BYTES, &mut observer,
+                &cx,
+                vec![id(), id(), FinalTaskId::parse("task-2").unwrap()],
+                3,
+                PAYLOAD_BYTES,
+                &mut observer,
             ),
             async {
                 peer.discovery("access-one", true).await;
-                let (mut stream, request) = peer.request("subscriptions/listen", "access-one").await;
-                assert_eq!(request["params"]["notifications"], json!({"taskIds":["task-1","task-1","task-2"]}));
+                let (mut stream, request) =
+                    peer.request("subscriptions/listen", "access-one").await;
+                assert_eq!(
+                    request["params"]["notifications"],
+                    json!({"taskIds":["task-1","task-1","task-2"]})
+                );
                 let ack = sse_frame(&acknowledgement(&request["id"], json!(["task-1"])));
                 let rest: String = [
                     status_event(&request["id"], "working"),
                     status_event(&request["id"], "completed"),
                     terminal(&request["id"]),
-                ].iter().map(sse_frame).collect();
-                stream.write_all(format!("{}{ack}", sse_head(ack.len() + rest.len())).as_bytes()).await.unwrap();
+                ]
+                .iter()
+                .map(sse_frame)
+                .collect();
+                stream
+                    .write_all(format!("{}{ack}", sse_head(ack.len() + rest.len())).as_bytes())
+                    .await
+                    .unwrap();
                 // The terminal body has NOT been sent. A collector instead of
                 // incremental delivery deadlocks here and hits the fixture guard.
                 receipt.recv(&cx).await.unwrap();
                 stream.write_all(rest.as_bytes()).await.unwrap();
                 let _ = stream.shutdown().await;
             },
-        ).await;
+        )
+        .await;
         assert!(result.unwrap().is_some());
         assert_eq!(observed, ["ack", "working", "completed"]);
         assert_eq!(client.cached_credential_generation(), Some(1));
@@ -129,7 +157,8 @@ fn managed_task_listen_rejects_foreign_or_unacknowledged_events_and_premature_eo
                 client.listen_task_events(&cx, vec![id()], 8, PAYLOAD_BYTES, &mut observer),
                 async {
                     peer.discovery("access-one", true).await;
-                    let (mut stream, request) = peer.request("subscriptions/listen", "access-one").await;
+                    let (mut stream, request) =
+                        peer.request("subscriptions/listen", "access-one").await;
                     let ack = acknowledgement(&request["id"], json!(["task-1"]));
                     let mut notification = status_event(&request["id"], "working");
                     let frames = match case {
@@ -149,9 +178,17 @@ fn managed_task_listen_rejects_foreign_or_unacknowledged_events_and_premature_eo
                     };
                     finite_stream(&mut stream, &frames).await;
                 },
-            ).await;
+            )
+            .await;
             assert!(result.is_err(), "case {case}");
-            assert_eq!(observations, match case { 0 | 3 => 0, 5 => 2, _ => 1 });
+            assert_eq!(
+                observations,
+                match case {
+                    0 | 3 => 0,
+                    5 => 2,
+                    _ => 1,
+                }
+            );
             assert_eq!(client.cached_credential_generation(), None);
             assert!(!cx.is_cancel_requested());
             peer.no_more(&cx).await;
@@ -179,23 +216,43 @@ fn managed_task_listen_host_stop_is_not_a_peer_terminal_or_remote_task_cancel() 
             client.listen_task_events(&cx, vec![id()], 8, PAYLOAD_BYTES, &mut observer),
             async {
                 peer.discovery("access-one", true).await;
-                let (mut stream, request) = peer.request("subscriptions/listen", "access-one").await;
-                finite_stream(&mut stream, &[
-                    acknowledgement(&request["id"], json!(["task-1"])),
-                    status_event(&request["id"], "working"),
-                    status_event(&request["id"], "completed"),
-                    terminal(&request["id"]),
-                ]).await;
+                let (mut stream, request) =
+                    peer.request("subscriptions/listen", "access-one").await;
+                finite_stream(
+                    &mut stream,
+                    &[
+                        acknowledgement(&request["id"], json!(["task-1"])),
+                        status_event(&request["id"], "working"),
+                        status_event(&request["id"], "completed"),
+                        terminal(&request["id"]),
+                    ],
+                )
+                .await;
             },
-        ).await;
+        )
+        .await;
         assert!(result.unwrap().is_none());
-        assert_eq!(observations, 2, "buffered later events are not published after host stop");
+        assert_eq!(
+            observations, 2,
+            "buffered later events are not published after host stop"
+        );
         assert_eq!(client.cached_credential_generation(), Some(1));
         assert!(session.check(&cx, &McpRequestCancellation::new()).is_ok());
         peer.no_more(&cx).await;
-        let (next, _) = pair(client.get_task_final(&cx, id()),
-            peer.rpc("tasks/get", "access-one", task("working", "complete"), false)).await;
-        assert!(next.is_ok(), "a normal local stop retains usable discovery, not the live stream");
+        let (next, _) = pair(
+            client.get_task_final(&cx, id()),
+            peer.rpc(
+                "tasks/get",
+                "access-one",
+                task("working", "complete"),
+                false,
+            ),
+        )
+        .await;
+        assert!(
+            next.is_ok(),
+            "a normal local stop retains usable discovery, not the live stream"
+        );
     });
 }
 
@@ -211,28 +268,51 @@ fn managed_task_listen_callback_cancellation_or_logout_stops_coalesced_later_eve
             let mut observations = 0;
             let mut observer = |_: &Event| {
                 observations += 1;
-                if logout { session.close(); } else { cancellation.cancel(); }
+                if logout {
+                    session.close();
+                } else {
+                    cancellation.cancel();
+                }
                 ControlFlow::Continue(())
             };
             let (result, ()) = pair(
                 client.listen_task_events_with_cancellation(
-                    &cx, &cancellation, vec![id()], 8, PAYLOAD_BYTES, &mut observer,
+                    &cx,
+                    &cancellation,
+                    vec![id()],
+                    8,
+                    PAYLOAD_BYTES,
+                    &mut observer,
                 ),
                 async {
                     peer.discovery("access-one", true).await;
-                    let (mut stream, request) = peer.request("subscriptions/listen", "access-one").await;
-                    finite_stream(&mut stream, &[
-                        acknowledgement(&request["id"], json!(["task-1"])),
-                        status_event(&request["id"], "working"),
-                        status_event(&request["id"], "completed"),
-                        terminal(&request["id"]),
-                    ]).await;
+                    let (mut stream, request) =
+                        peer.request("subscriptions/listen", "access-one").await;
+                    finite_stream(
+                        &mut stream,
+                        &[
+                            acknowledgement(&request["id"], json!(["task-1"])),
+                            status_event(&request["id"], "working"),
+                            status_event(&request["id"], "completed"),
+                            terminal(&request["id"]),
+                        ],
+                    )
+                    .await;
                 },
-            ).await;
+            )
+            .await;
             if logout {
-                assert!(matches!(result, Err(ManagedHttpClientError::Session(OAuthSessionError::Closed))));
+                assert!(matches!(
+                    result,
+                    Err(ManagedHttpClientError::Session(OAuthSessionError::Closed))
+                ));
             } else {
-                assert!(matches!(result, Err(ManagedHttpClientError::Session(OAuthSessionError::Cancelled))));
+                assert!(matches!(
+                    result,
+                    Err(ManagedHttpClientError::Session(
+                        OAuthSessionError::Cancelled
+                    ))
+                ));
             }
             assert_eq!(observations, 1);
             assert_eq!(client.cached_credential_generation(), None);
@@ -252,10 +332,19 @@ fn managed_task_listen_idle_cancellation_logout_and_deadline_release_the_respons
             let mut client = peer.client(session.clone()).with_tasks();
             let (primed, ()) = pair(client.get_task_final(&cx, id()), async {
                 peer.discovery("access-one", true).await;
-                peer.rpc("tasks/get", "access-one", task("working", "complete"), false).await;
-            }).await;
+                peer.rpc(
+                    "tasks/get",
+                    "access-one",
+                    task("working", "complete"),
+                    false,
+                )
+                .await;
+            })
+            .await;
             primed.unwrap();
-            if cause == 2 { client.operation_timeout = Duration::from_secs(2); }
+            if cause == 2 {
+                client.operation_timeout = Duration::from_secs(2);
+            }
             let cancellation = McpRequestCancellation::new();
             let (observed, mut receipt) = oneshot::channel::<()>();
             let mut observed = Some(observed);
@@ -266,26 +355,51 @@ fn managed_task_listen_idle_cancellation_logout_and_deadline_release_the_respons
             };
             let (result, ()) = pair(
                 client.listen_task_events_with_cancellation(
-                    &cx, &cancellation, vec![id()], 8, PAYLOAD_BYTES, &mut observer,
+                    &cx,
+                    &cancellation,
+                    vec![id()],
+                    8,
+                    PAYLOAD_BYTES,
+                    &mut observer,
                 ),
                 async {
-                    let (mut stream, request) = peer.request("subscriptions/listen", "access-one").await;
+                    let (mut stream, request) =
+                        peer.request("subscriptions/listen", "access-one").await;
                     let ack = sse_frame(&acknowledgement(&request["id"], json!(["task-1"])));
-                    stream.write_all(format!("{}{ack}", sse_head(ack.len() + 1024)).as_bytes()).await.unwrap();
+                    stream
+                        .write_all(format!("{}{ack}", sse_head(ack.len() + 1024)).as_bytes())
+                        .await
+                        .unwrap();
                     receipt.recv(&cx).await.unwrap();
                     match cause {
-                        0 => { cancellation.cancel(); }
-                        1 => { session.close(); }
+                        0 => {
+                            cancellation.cancel();
+                        }
+                        1 => {
+                            session.close();
+                        }
                         2 => {} // no peer activity; the original deadline must wake it
                         _ => unreachable!(),
                     }
                     assert_released(&mut stream).await;
                 },
-            ).await;
+            )
+            .await;
             match cause {
-                0 => assert!(matches!(result, Err(ManagedHttpClientError::Session(OAuthSessionError::Cancelled)))),
-                1 => assert!(matches!(result, Err(ManagedHttpClientError::Session(OAuthSessionError::Closed)))),
-                2 => assert!(matches!(result, Err(ManagedHttpClientError::Session(OAuthSessionError::TimedOut)))),
+                0 => assert!(matches!(
+                    result,
+                    Err(ManagedHttpClientError::Session(
+                        OAuthSessionError::Cancelled
+                    ))
+                )),
+                1 => assert!(matches!(
+                    result,
+                    Err(ManagedHttpClientError::Session(OAuthSessionError::Closed))
+                )),
+                2 => assert!(matches!(
+                    result,
+                    Err(ManagedHttpClientError::Session(OAuthSessionError::TimedOut))
+                )),
                 _ => unreachable!(),
             }
             assert_eq!(client.cached_credential_generation(), None);
@@ -302,9 +416,14 @@ fn managed_task_listen_limits_and_activation_refuse_before_unapproved_contact() 
         let peer = Peer::new().await;
         let session = peer.login(&cx).await;
         let mut client = peer.client(session);
-        let mut observer = |_: &Event| -> ControlFlow<()> { panic!("refused listen invoked observer") };
-        assert!(matches!(client.listen_task_events(&cx, vec![id()], 8, PAYLOAD_BYTES, &mut observer).await,
-            Err(ManagedHttpClientError::InvalidPolicy)));
+        let mut observer =
+            |_: &Event| -> ControlFlow<()> { panic!("refused listen invoked observer") };
+        assert!(matches!(
+            client
+                .listen_task_events(&cx, vec![id()], 8, PAYLOAD_BYTES, &mut observer)
+                .await,
+            Err(ManagedHttpClientError::InvalidPolicy)
+        ));
         let mut client = client.with_tasks();
         for (ids, count, bytes) in [
             (vec![], 8, PAYLOAD_BYTES),
@@ -314,19 +433,36 @@ fn managed_task_listen_limits_and_activation_refuse_before_unapproved_contact() 
             (vec![id()], 8, 0),
             (vec![id()], 8, 128 * 1024 * 1024 + 1),
         ] {
-            assert!(matches!(client.listen_task_events(&cx, ids, count, bytes, &mut observer).await,
-                Err(ManagedHttpClientError::InvalidPolicy)));
+            assert!(matches!(
+                client
+                    .listen_task_events(&cx, ids, count, bytes, &mut observer)
+                    .await,
+                Err(ManagedHttpClientError::InvalidPolicy)
+            ));
         }
         let cancelled = McpRequestCancellation::new();
         cancelled.cancel();
-        assert!(matches!(client.listen_task_events_with_cancellation(
-            &cx, &cancelled, vec![id()], 8, PAYLOAD_BYTES, &mut observer,
-        ).await, Err(ManagedHttpClientError::Session(OAuthSessionError::Cancelled))));
+        assert!(matches!(
+            client
+                .listen_task_events_with_cancellation(
+                    &cx,
+                    &cancelled,
+                    vec![id()],
+                    8,
+                    PAYLOAD_BYTES,
+                    &mut observer,
+                )
+                .await,
+            Err(ManagedHttpClientError::Session(
+                OAuthSessionError::Cancelled
+            ))
+        ));
         peer.no_more(&cx).await;
         let (unsupported, ()) = pair(
             client.listen_task_events(&cx, vec![id()], 8, PAYLOAD_BYTES, &mut observer),
             peer.discovery("access-one", false),
-        ).await;
+        )
+        .await;
         assert!(unsupported.is_err());
         assert_eq!(client.cached_credential_generation(), None);
         peer.no_more(&cx).await;
@@ -335,7 +471,11 @@ fn managed_task_listen_limits_and_activation_refuse_before_unapproved_contact() 
 
 #[test]
 fn managed_task_listen_counts_acknowledgement_and_refuses_excess_before_callback() {
-    for (count, bytes, expected, succeeds) in [(1, PAYLOAD_BYTES, 1, false), (2, PAYLOAD_BYTES, 2, true), (2, 1, 0, false)] {
+    for (count, bytes, expected, succeeds) in [
+        (1, PAYLOAD_BYTES, 1, false),
+        (2, PAYLOAD_BYTES, 2, true),
+        (2, 1, 0, false),
+    ] {
         run(async {
             let cx = Cx::current().unwrap();
             let peer = Peer::new().await;
@@ -350,17 +490,26 @@ fn managed_task_listen_counts_acknowledgement_and_refuses_excess_before_callback
                 client.listen_task_events(&cx, vec![id()], count, bytes, &mut observer),
                 async {
                     peer.discovery("access-one", true).await;
-                    let (mut stream, request) = peer.request("subscriptions/listen", "access-one").await;
-                    finite_stream(&mut stream, &[
-                        acknowledgement(&request["id"], json!(["task-1"])),
-                        status_event(&request["id"], "working"),
-                        terminal(&request["id"]),
-                    ]).await;
+                    let (mut stream, request) =
+                        peer.request("subscriptions/listen", "access-one").await;
+                    finite_stream(
+                        &mut stream,
+                        &[
+                            acknowledgement(&request["id"], json!(["task-1"])),
+                            status_event(&request["id"], "working"),
+                            terminal(&request["id"]),
+                        ],
+                    )
+                    .await;
                 },
-            ).await;
+            )
+            .await;
             assert_eq!(result.is_ok(), succeeds);
             assert_eq!(observations, expected);
-            assert_eq!(client.cached_credential_generation(), if succeeds { Some(1) } else { None });
+            assert_eq!(
+                client.cached_credential_generation(),
+                if succeeds { Some(1) } else { None }
+            );
             peer.no_more(&cx).await;
         });
     }
@@ -380,22 +529,38 @@ fn managed_task_listen_abandonment_drops_the_live_socket_without_task_cancellati
             ControlFlow::Continue(())
         };
         let mut stream = {
-            let mut operation = Box::pin(client.listen_task_events(&cx, vec![id()], 8, PAYLOAD_BYTES, &mut observer));
+            let mut operation = Box::pin(client.listen_task_events(
+                &cx,
+                vec![id()],
+                8,
+                PAYLOAD_BYTES,
+                &mut observer,
+            ));
             let mut server = Box::pin(async {
                 peer.discovery("access-one", true).await;
-                let (mut stream, request) = peer.request("subscriptions/listen", "access-one").await;
+                let (mut stream, request) =
+                    peer.request("subscriptions/listen", "access-one").await;
                 let ack = sse_frame(&acknowledgement(&request["id"], json!(["task-1"])));
-                stream.write_all(format!("{}{ack}", sse_head(ack.len() + 1024)).as_bytes()).await.unwrap();
+                stream
+                    .write_all(format!("{}{ack}", sse_head(ack.len() + 1024)).as_bytes())
+                    .await
+                    .unwrap();
                 stream
             });
             let stream = poll_fn(|task| {
                 assert!(operation.as_mut().poll(task).is_pending());
                 server.as_mut().poll(task)
-            }).await;
+            })
+            .await;
             poll_fn(|task| {
                 assert!(operation.as_mut().poll(task).is_pending());
-                if observed.load(Ordering::SeqCst) { Poll::Ready(()) } else { Poll::Pending }
-            }).await;
+                if observed.load(Ordering::SeqCst) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
             stream
         };
         assert_released(&mut stream).await;
@@ -405,8 +570,15 @@ fn managed_task_listen_abandonment_drops_the_live_socket_without_task_cancellati
         peer.no_more(&cx).await;
         let (next, ()) = pair(client.get_task_final(&cx, id()), async {
             peer.discovery("access-one", true).await;
-            peer.rpc("tasks/get", "access-one", task("working", "complete"), false).await;
-        }).await;
+            peer.rpc(
+                "tasks/get",
+                "access-one",
+                task("working", "complete"),
+                false,
+            )
+            .await;
+        })
+        .await;
         assert!(next.is_ok());
     });
 }
@@ -421,21 +593,29 @@ fn managed_task_listen_does_not_renew_or_replay_midstream() {
         let mut observations = 0;
         let mut observer = |event: &Event| {
             observations += 1;
-            if matches!(event, Event::Acknowledged { .. }) { renew(&session); }
+            if matches!(event, Event::Acknowledged { .. }) {
+                renew(&session);
+            }
             ControlFlow::Continue(())
         };
         let (result, ()) = pair(
             client.listen_task_events(&cx, vec![id()], 8, PAYLOAD_BYTES, &mut observer),
             async {
                 peer.discovery("access-one", true).await;
-                let (mut stream, request) = peer.request("subscriptions/listen", "access-one").await;
-                finite_stream(&mut stream, &[
-                    acknowledgement(&request["id"], json!(["task-1"])),
-                    status_event(&request["id"], "completed"),
-                    terminal(&request["id"]),
-                ]).await;
+                let (mut stream, request) =
+                    peer.request("subscriptions/listen", "access-one").await;
+                finite_stream(
+                    &mut stream,
+                    &[
+                        acknowledgement(&request["id"], json!(["task-1"])),
+                        status_event(&request["id"], "completed"),
+                        terminal(&request["id"]),
+                    ],
+                )
+                .await;
             },
-        ).await;
+        )
+        .await;
         assert!(result.unwrap().is_some());
         assert_eq!(observations, 2);
         assert_eq!(client.cached_credential_generation(), Some(1));
@@ -443,8 +623,15 @@ fn managed_task_listen_does_not_renew_or_replay_midstream() {
         let (next, ()) = pair(client.get_task_final(&cx, id()), async {
             peer.token(true).await;
             peer.discovery("access-two", true).await;
-            peer.rpc("tasks/get", "access-two", task("completed", "complete"), false).await;
-        }).await;
+            peer.rpc(
+                "tasks/get",
+                "access-two",
+                task("completed", "complete"),
+                false,
+            )
+            .await;
+        })
+        .await;
         assert!(next.is_ok());
         assert_eq!(client.cached_credential_generation(), Some(2));
     });

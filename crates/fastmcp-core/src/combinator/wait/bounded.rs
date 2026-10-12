@@ -169,7 +169,8 @@ impl<'a, T> Batch<'a, T> {
             if !current.wake.ready.swap(false, Ordering::AcqRel) {
                 continue;
             }
-            ctx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            ctx.checkpoint()
+                .map_err(|_| McpError::request_cancelled())?;
             let waker = Waker::from(Arc::clone(&current.wake));
             let result = current
                 .future
@@ -359,7 +360,9 @@ impl McpContext {
             .try_reserve_exact(calls.len())
             .map_err(|_| allocation_error())?;
         for (name, arguments) in calls {
-            futures.push(Box::pin(async move { self.call_tool(&name, arguments).await }));
+            futures.push(Box::pin(
+                async move { self.call_tool(&name, arguments).await },
+            ));
         }
         self.try_join_all_bounded(concurrency, futures).await
     }
@@ -479,7 +482,10 @@ mod tests {
         }
     }
 
-    type Probes = (Vec<Arc<Observed>>, Vec<BoxFuture<'static, McpResult<usize>>>);
+    type Probes = (
+        Vec<Arc<Observed>>,
+        Vec<BoxFuture<'static, McpResult<usize>>>,
+    );
 
     fn probes(count: usize, ready: bool, failure: Option<usize>) -> Probes {
         let observed: Vec<_> = (0..count).map(|_| Arc::new(Observed::default())).collect();
@@ -517,9 +523,11 @@ mod tests {
     }
 
     fn all_dropped(observed: &[Arc<Observed>]) {
-        assert!(observed
-            .iter()
-            .all(|entry| entry.drops.load(Ordering::SeqCst) == 1));
+        assert!(
+            observed
+                .iter()
+                .all(|entry| entry.drops.load(Ordering::SeqCst) == 1)
+        );
     }
 
     #[test]
@@ -634,13 +642,19 @@ mod tests {
             completed(poll(batch.as_mut(), Waker::noop())).unwrap(),
             vec![0]
         );
-        assert_eq!(ctx.budget().poll_quota, 0, "the final admitted unit can complete");
+        assert_eq!(
+            ctx.budget().poll_quota,
+            0,
+            "the final admitted unit can complete"
+        );
         assert!(ctx.ensure_live().is_ok());
         drop(batch);
         let (later, futures) = probes(1, true, None);
         let mut batch = Box::pin(ctx.try_join_all_bounded(1, futures));
         assert_eq!(
-            completed(poll(batch.as_mut(), Waker::noop())).unwrap_err().code,
+            completed(poll(batch.as_mut(), Waker::noop()))
+                .unwrap_err()
+                .code,
             McpErrorCode::RequestCancelled
         );
         assert_eq!(counts(&later), vec![0]);
@@ -736,7 +750,9 @@ mod tests {
         ];
         let mut batch = Box::pin(ctx.try_join_all_bounded(2, futures));
         assert_eq!(
-            completed(poll(batch.as_mut(), Waker::noop())).unwrap_err().code,
+            completed(poll(batch.as_mut(), Waker::noop()))
+                .unwrap_err()
+                .code,
             McpErrorCode::RequestCancelled
         );
         assert_eq!(started.load(Ordering::SeqCst), 0);
@@ -773,8 +789,7 @@ mod tests {
         expected_io.store(false, Ordering::SeqCst);
         observed.finish();
         {
-            let _restriction =
-                Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK);
+            let _restriction = Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK);
             assert_eq!(
                 completed(poll(batch.as_mut(), Waker::noop())).unwrap(),
                 vec![42]
@@ -809,7 +824,11 @@ mod tests {
         }
         let ctx = McpContext::new(Cx::for_testing(), 7);
         let mut empty = Box::pin(ctx.try_join_all_bounded::<usize>(1, Vec::new()));
-        assert!(completed(poll(empty.as_mut(), Waker::noop())).unwrap().is_empty());
+        assert!(
+            completed(poll(empty.as_mut(), Waker::noop()))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     type Visit = (&'static str, String, Value, u32);
@@ -831,10 +850,20 @@ mod tests {
     }
 
     impl RoutedProvider {
-        fn record(&self, ctx: &McpContext, kind: &'static str, name: &str, args: Value, depth: u32) {
+        fn record(
+            &self,
+            ctx: &McpContext,
+            kind: &'static str,
+            name: &str,
+            args: Value,
+            depth: u32,
+        ) {
             assert_eq!(ctx.request_id(), 7);
             assert_eq!(Cx::current().unwrap().task_id(), ctx.cx().task_id());
-            self.visits.lock().unwrap().push((kind, name.to_owned(), args, depth));
+            self.visits
+                .lock()
+                .unwrap()
+                .push((kind, name.to_owned(), args, depth));
         }
 
         async fn wait(&self, name: &str) {
@@ -842,7 +871,10 @@ mod tests {
                 return;
             }
             poll_fn(|task| {
-                self.waiters.lock().unwrap().insert(name.to_owned(), task.waker().clone());
+                self.waiters
+                    .lock()
+                    .unwrap()
+                    .insert(name.to_owned(), task.waker().clone());
                 if self.released.lock().unwrap().contains(name) {
                     Poll::Ready(())
                 } else {
@@ -926,14 +958,30 @@ mod tests {
             Composition::Tools => ctx
                 .call_tools_bounded(
                     concurrency,
-                    names.iter().map(|name| ((*name).to_owned(), json!({}))).collect(),
+                    names
+                        .iter()
+                        .map(|name| ((*name).to_owned(), json!({})))
+                        .collect(),
                 )
                 .await
-                .map(|results| results.iter().map(|result| result.first_text().unwrap().to_owned()).collect()),
+                .map(|results| {
+                    results
+                        .iter()
+                        .map(|result| result.first_text().unwrap().to_owned())
+                        .collect()
+                }),
             Composition::Resources => ctx
-                .read_resources_bounded(concurrency, names.iter().map(|name| (*name).to_owned()).collect())
+                .read_resources_bounded(
+                    concurrency,
+                    names.iter().map(|name| (*name).to_owned()).collect(),
+                )
                 .await
-                .map(|results| results.iter().map(|result| result.first_text().unwrap().to_owned()).collect()),
+                .map(|results| {
+                    results
+                        .iter()
+                        .map(|result| result.first_text().unwrap().to_owned())
+                        .collect()
+                }),
         }
     }
 
@@ -954,7 +1002,12 @@ mod tests {
         let calls = ["wait:a", "wait:b", "wait:c", "wait:d"]
             .into_iter()
             .enumerate()
-            .map(|(index, name)| (name.to_owned(), json!({"value":index,"nested":{"exact":true}})))
+            .map(|(index, name)| {
+                (
+                    name.to_owned(),
+                    json!({"value":index,"nested":{"exact":true}}),
+                )
+            })
             .collect();
         let mut batch = Box::pin(ctx.call_tools_bounded(2, calls));
         assert!(poll(batch.as_mut(), Waker::noop()).is_pending());
@@ -970,7 +1023,10 @@ mod tests {
         provider.release("wait:a");
         let results = completed(poll(batch.as_mut(), Waker::noop())).unwrap();
         assert_eq!(
-            results.iter().map(|result| result.first_text().unwrap()).collect::<Vec<_>>(),
+            results
+                .iter()
+                .map(|result| result.first_text().unwrap())
+                .collect::<Vec<_>>(),
             vec!["wait:a", "wait:b", "wait:c", "wait:d"]
         );
         for (index, visit) in provider.visits.lock().unwrap().iter().enumerate() {
@@ -989,13 +1045,21 @@ mod tests {
     fn bounded_resource_reads_preserve_uris_input_order_and_shared_depth() {
         let (runtime, _, _, ctx) = environment();
         let provider = Arc::new(RoutedProvider::default());
-        let ctx = ctx.with_resource_reader(provider.clone()).with_tool_call_depth(4);
-        let uris = ["file:///docs/a%2Fb", "resource://catalog?kind=two", "file:///docs/a%2Fb"];
+        let ctx = ctx
+            .with_resource_reader(provider.clone())
+            .with_tool_call_depth(4);
+        let uris = [
+            "file:///docs/a%2Fb",
+            "resource://catalog?kind=two",
+            "file:///docs/a%2Fb",
+        ];
         let mut batch = Box::pin(compose(Composition::Resources, &ctx, 1, &uris));
         assert_eq!(finish_ready(batch.as_mut()).unwrap(), uris);
         assert_eq!(
             *provider.visits.lock().unwrap(),
-            uris.into_iter().map(|uri| ("resource", uri.to_owned(), Value::Null, 5)).collect::<Vec<_>>()
+            uris.into_iter()
+                .map(|uri| ("resource", uri.to_owned(), Value::Null, 5))
+                .collect::<Vec<_>>()
         );
         assert_eq!(provider.drops.load(Ordering::SeqCst), 3);
         drop(batch);
@@ -1010,7 +1074,10 @@ mod tests {
         let ctx = ctx.with_tool_caller(provider.clone());
         let mut batch = Box::pin(ctx.call_tools_bounded(
             1,
-            vec![("tool-error".to_owned(), json!({})), ("next".to_owned(), json!({}))],
+            vec![
+                ("tool-error".to_owned(), json!({})),
+                ("next".to_owned(), json!({})),
+            ],
         ));
         let results = finish_ready(batch.as_mut()).unwrap();
         assert!(results[0].is_error);
@@ -1029,7 +1096,9 @@ mod tests {
             for first in ["cancel", "fail"] {
                 let (runtime, _, timer, ctx) = environment();
                 let provider = Arc::new(RoutedProvider::default());
-                let ctx = ctx.with_tool_caller(provider.clone()).with_resource_reader(provider.clone());
+                let ctx = ctx
+                    .with_tool_caller(provider.clone())
+                    .with_resource_reader(provider.clone());
                 let names = [first, "must-not-run"];
                 let mut batch = Box::pin(compose(kind, &ctx, 1, &names));
                 let error = completed(poll(batch.as_mut(), Waker::noop())).unwrap_err();
@@ -1056,7 +1125,9 @@ mod tests {
             for at_limit in [false, true] {
                 let (runtime, _, _, ctx) = environment();
                 let provider = Arc::new(RoutedProvider::default());
-                let ctx = ctx.with_tool_caller(provider.clone()).with_resource_reader(provider.clone());
+                let ctx = ctx
+                    .with_tool_caller(provider.clone())
+                    .with_resource_reader(provider.clone());
                 let limit = match kind {
                     Composition::Tools => MAX_TOOL_CALL_DEPTH,
                     Composition::Resources => MAX_RESOURCE_READ_DEPTH,
@@ -1090,7 +1161,9 @@ mod tests {
         for kind in [Composition::Tools, Composition::Resources] {
             let (runtime, _, timer, ctx) = environment();
             let provider = Arc::new(RoutedProvider::default());
-            let ctx = ctx.with_tool_caller(provider.clone()).with_resource_reader(provider.clone());
+            let ctx = ctx
+                .with_tool_caller(provider.clone())
+                .with_resource_reader(provider.clone());
             let mut batch = Box::pin(compose(kind, &ctx, 1, &["wait:first", "wait:second"]));
             assert!(poll(batch.as_mut(), Waker::noop()).is_pending());
             assert_eq!(provider.visits.lock().unwrap().len(), 1);
@@ -1111,7 +1184,9 @@ mod tests {
             for concurrency in [0, 65, 1] {
                 let (runtime, _, _, ctx) = environment();
                 let provider = Arc::new(RoutedProvider::default());
-                let ctx = ctx.with_tool_caller(provider.clone()).with_resource_reader(provider.clone());
+                let ctx = ctx
+                    .with_tool_caller(provider.clone())
+                    .with_resource_reader(provider.clone());
                 if concurrency == 1 {
                     ctx.request_cancellation().cancel();
                 }

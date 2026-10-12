@@ -22,7 +22,12 @@ fn managed_task_wait_honors_local_and_peer_polling_floors() {
                     // connection, rather than passing on a nominal policy value.
                     peer.no_more(&cx).await;
                     let second = peer
-                        .rpc("tasks/get", "access-one", task("completed", "complete"), false)
+                        .rpc(
+                            "tasks/get",
+                            "access-one",
+                            task("completed", "complete"),
+                            false,
+                        )
                         .await;
                     assert_ne!(first["id"], second["id"]);
                     assert_eq!(first["params"]["taskId"], "task-1");
@@ -55,7 +60,8 @@ fn managed_task_wait_returns_all_actionable_variants_without_another_poll() {
                 client.wait_task_final(&cx, id(), Duration::from_millis(1), 8),
                 async {
                     peer.discovery("access-one", true).await;
-                    peer.rpc("tasks/get", "access-one", wire.clone(), false).await;
+                    peer.rpc("tasks/get", "access-one", wire.clone(), false)
+                        .await;
                 },
             )
             .await;
@@ -91,7 +97,10 @@ fn managed_task_wait_returns_latest_working_snapshot_at_exact_poll_limit() {
         .await;
         let result = result.unwrap();
         assert!(matches!(&result.task, FinalTask::Working(_)));
-        assert_eq!(result.task.base().status_message.as_deref(), Some("working-2"));
+        assert_eq!(
+            result.task.base().status_message.as_deref(),
+            Some("working-2")
+        );
         assert_eq!(requests.len(), 3);
         assert_eq!(client.cached_credential_generation(), Some(1));
         peer.no_more(&cx).await;
@@ -109,12 +118,21 @@ fn managed_task_wait_interrupts_idle_delay_on_cancellation_or_session_close() {
             let cancellation = McpRequestCancellation::new();
             let (result, ()) = pair(
                 client.wait_task_final_with_cancellation(
-                    &cx, &cancellation, id(), Duration::from_secs(60), 8,
+                    &cx,
+                    &cancellation,
+                    id(),
+                    Duration::from_secs(60),
+                    8,
                 ),
                 async {
                     peer.discovery("access-one", true).await;
-                    peer.rpc("tasks/get", "access-one", task("working", "complete"), false)
-                        .await;
+                    peer.rpc(
+                        "tasks/get",
+                        "access-one",
+                        task("working", "complete"),
+                        false,
+                    )
+                    .await;
                     peer.no_more(&cx).await;
                     if close_session {
                         session.close();
@@ -125,9 +143,17 @@ fn managed_task_wait_interrupts_idle_delay_on_cancellation_or_session_close() {
             )
             .await;
             if close_session {
-                assert!(matches!(result, Err(ManagedHttpClientError::Session(OAuthSessionError::Closed))));
+                assert!(matches!(
+                    result,
+                    Err(ManagedHttpClientError::Session(OAuthSessionError::Closed))
+                ));
             } else {
-                assert!(matches!(result, Err(ManagedHttpClientError::Session(OAuthSessionError::Cancelled))));
+                assert!(matches!(
+                    result,
+                    Err(ManagedHttpClientError::Session(
+                        OAuthSessionError::Cancelled
+                    ))
+                ));
             }
             assert_eq!(client.cached_credential_generation(), None);
             assert!(!cx.is_cancel_requested());
@@ -136,11 +162,19 @@ fn managed_task_wait_interrupts_idle_delay_on_cancellation_or_session_close() {
                 assert!(session.check(&cx, &McpRequestCancellation::new()).is_ok());
                 let (resumed, ()) = pair(client.get_task_final(&cx, id()), async {
                     peer.discovery("access-one", true).await;
-                    peer.rpc("tasks/get", "access-one", task("working", "complete"), false)
-                        .await;
+                    peer.rpc(
+                        "tasks/get",
+                        "access-one",
+                        task("working", "complete"),
+                        false,
+                    )
+                    .await;
                 })
                 .await;
-                assert!(resumed.is_ok(), "only the cancelled operation lost its connection");
+                assert!(
+                    resumed.is_ok(),
+                    "only the cancelled operation lost its connection"
+                );
             }
         });
     }
@@ -156,17 +190,31 @@ fn managed_task_wait_deadline_covers_idle_time_without_poll_reset() {
         // Establish discovery under the ordinary generous fixture timeout.
         let (primed, ()) = pair(client.get_task_final(&cx, id()), async {
             peer.discovery("access-one", true).await;
-            peer.rpc("tasks/get", "access-one", task("working", "complete"), false).await;
+            peer.rpc(
+                "tasks/get",
+                "access-one",
+                task("working", "complete"),
+                false,
+            )
+            .await;
         })
         .await;
         primed.unwrap();
         client.operation_timeout = Duration::from_secs(2);
         let (result, _) = pair(
             client.wait_task_final(&cx, id(), Duration::from_secs(60), 8),
-            peer.rpc("tasks/get", "access-one", task("working", "complete"), false),
+            peer.rpc(
+                "tasks/get",
+                "access-one",
+                task("working", "complete"),
+                false,
+            ),
         )
         .await;
-        assert!(matches!(result, Err(ManagedHttpClientError::Session(OAuthSessionError::TimedOut))));
+        assert!(matches!(
+            result,
+            Err(ManagedHttpClientError::Session(OAuthSessionError::TimedOut))
+        ));
         assert_eq!(client.cached_credential_generation(), None);
         assert!(!cx.is_cancel_requested());
         peer.no_more(&cx).await;
@@ -184,11 +232,23 @@ fn managed_task_wait_keeps_one_credential_generation_until_the_operation_ends() 
             client.wait_task_final(&cx, id(), Duration::from_millis(1), 8),
             async {
                 peer.discovery("access-one", true).await;
-                peer.rpc("tasks/get", "access-one", task("working", "complete"), false).await;
+                peer.rpc(
+                    "tasks/get",
+                    "access-one",
+                    task("working", "complete"),
+                    false,
+                )
+                .await;
                 renew(&session);
                 // Renewal is now due, but the running wait still has its original
                 // valid credential and deadline. A token exchange here is wrong.
-                peer.rpc("tasks/get", "access-one", task("completed", "complete"), false).await;
+                peer.rpc(
+                    "tasks/get",
+                    "access-one",
+                    task("completed", "complete"),
+                    false,
+                )
+                .await;
             },
         )
         .await;
@@ -197,7 +257,13 @@ fn managed_task_wait_keeps_one_credential_generation_until_the_operation_ends() 
         let (next, ()) = pair(client.get_task_final(&cx, id()), async {
             peer.token(true).await;
             peer.discovery("access-two", true).await;
-            peer.rpc("tasks/get", "access-two", task("completed", "complete"), false).await;
+            peer.rpc(
+                "tasks/get",
+                "access-two",
+                task("completed", "complete"),
+                false,
+            )
+            .await;
         })
         .await;
         assert!(next.is_ok());
@@ -213,7 +279,9 @@ fn managed_task_wait_invalid_bounds_and_precancellation_refuse_before_contact() 
         let session = peer.login(&cx).await;
         let mut disabled = peer.client(session.clone());
         assert!(matches!(
-            disabled.wait_task_final(&cx, id(), Duration::from_millis(1), 1).await,
+            disabled
+                .wait_task_final(&cx, id(), Duration::from_millis(1), 1)
+                .await,
             Err(ManagedHttpClientError::InvalidPolicy)
         ));
         let mut client = peer.client(session).with_tasks();
@@ -232,8 +300,18 @@ fn managed_task_wait_invalid_bounds_and_precancellation_refuse_before_contact() 
         let cancelled = McpRequestCancellation::new();
         cancelled.cancel();
         assert!(matches!(
-            client.wait_task_final_with_cancellation(&cx, &cancelled, id(), Duration::from_millis(1), 1).await,
-            Err(ManagedHttpClientError::Session(OAuthSessionError::Cancelled))
+            client
+                .wait_task_final_with_cancellation(
+                    &cx,
+                    &cancelled,
+                    id(),
+                    Duration::from_millis(1),
+                    1
+                )
+                .await,
+            Err(ManagedHttpClientError::Session(
+                OAuthSessionError::Cancelled
+            ))
         ));
         assert_eq!(client.cached_credential_generation(), None);
         peer.no_more(&cx).await;
@@ -272,12 +350,17 @@ fn managed_task_wait_abandonment_retires_local_owner_without_remote_cancellation
         let session = peer.login(&cx).await;
         let mut client = peer.client(session.clone()).with_tasks();
         {
-            let mut operation = Box::pin(client.wait_task_final(
-                &cx, id(), Duration::from_secs(60), 8,
-            ));
+            let mut operation =
+                Box::pin(client.wait_task_final(&cx, id(), Duration::from_secs(60), 8));
             let mut server = Box::pin(async {
                 peer.discovery("access-one", true).await;
-                peer.rpc("tasks/get", "access-one", task("working", "complete"), false).await;
+                peer.rpc(
+                    "tasks/get",
+                    "access-one",
+                    task("working", "complete"),
+                    false,
+                )
+                .await;
                 peer.no_more(&cx).await;
             });
             poll_fn(|task| {
@@ -294,7 +377,13 @@ fn managed_task_wait_abandonment_retires_local_owner_without_remote_cancellation
         peer.no_more(&cx).await;
         let (result, ()) = pair(client.get_task_final(&cx, id()), async {
             peer.discovery("access-one", true).await;
-            peer.rpc("tasks/get", "access-one", task("working", "complete"), false).await;
+            peer.rpc(
+                "tasks/get",
+                "access-one",
+                task("working", "complete"),
+                false,
+            )
+            .await;
         })
         .await;
         assert!(matches!(result.unwrap().task, FinalTask::Working(_)));

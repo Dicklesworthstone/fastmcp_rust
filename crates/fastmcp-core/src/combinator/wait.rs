@@ -677,8 +677,8 @@ mod tests {
                 let _ambient = Cx::set_current(Some(ambient.clone()));
                 let polls = Arc::new(AtomicUsize::new(0));
                 let observed = Arc::clone(&polls);
-                let futures: Vec<BoxFuture<'_, McpResult<i32>>> = vec![Box::pin(poll_fn(
-                    move |_| {
+                let futures: Vec<BoxFuture<'_, McpResult<i32>>> =
+                    vec![Box::pin(poll_fn(move |_| {
                         let count = observed.fetch_add(1, Ordering::Relaxed);
                         let expected = if count == 0 {
                             initially_allowed
@@ -691,8 +691,7 @@ mod tests {
                         } else {
                             Poll::Ready(Ok(42))
                         }
-                    },
-                ))];
+                    }))];
                 let mut future = run(kind, &cx, futures);
                 for (turn, allowed) in [initially_allowed, !initially_allowed]
                     .into_iter()
@@ -730,14 +729,12 @@ mod tests {
         let owner = Cx::for_testing();
         let held = {
             let _owner = Cx::set_current(Some(owner.clone()));
-            let _restriction =
-                Cx::push_restriction(CapSet::<true, true, false, true, true>::MASK);
+            let _restriction = Cx::push_restriction(CapSet::<true, true, false, true, true>::MASK);
             Cx::current().unwrap()
         };
         let foreign = Cx::for_testing();
         let _foreign = Cx::set_current(Some(foreign.clone()));
-        let _restriction =
-            Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK);
+        let _restriction = Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK);
         let futures: Vec<BoxFuture<'_, McpResult<i32>>> = vec![Box::pin(async {
             let active = Cx::current().unwrap();
             assert_eq!(effects(&active), [true, true, false, false, true]);
@@ -754,7 +751,10 @@ mod tests {
         assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
         assert!(owner.is_cancel_requested());
         assert!(!foreign.is_cancel_requested());
-        assert_eq!(effects(&Cx::current().unwrap()), [true, true, true, false, true]);
+        assert_eq!(
+            effects(&Cx::current().unwrap()),
+            [true, true, true, false, true]
+        );
     }
 
     #[test]
@@ -763,8 +763,7 @@ mod tests {
             let cx = Cx::for_testing();
             let ambient = Cx::for_testing();
             let _ambient = Cx::set_current(Some(ambient.clone()));
-            let _restriction =
-                Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK);
+            let _restriction = Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK);
             let futures: Vec<BoxFuture<'_, McpResult<i32>>> = vec![Box::pin(async {
                 assert!(!Cx::current().unwrap().capabilities().io);
                 panic!("intentional child panic");
@@ -777,7 +776,10 @@ mod tests {
             }));
             assert!(result.is_err());
             drop(future);
-            assert_eq!(effects(&Cx::current().unwrap()), [true, true, true, false, true]);
+            assert_eq!(
+                effects(&Cx::current().unwrap()),
+                [true, true, true, false, true]
+            );
             Cx::current().unwrap().set_cancel_requested(true);
             assert!(ambient.is_cancel_requested());
             assert!(!cx.is_cancel_requested());
