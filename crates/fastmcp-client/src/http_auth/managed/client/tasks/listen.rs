@@ -6,16 +6,19 @@ use std::ops::ControlFlow;
 use asupersync::Cx;
 use fastmcp_core::{McpError, McpRequestCancellation};
 use fastmcp_protocol::tasks_extension::{MAX_TASK_SUBSCRIPTION_IDS, set_task_subscription_ids};
-use fastmcp_protocol::{CompleteResult, FinalSubscriptionsListenResult, RequestId, SubscriptionFilter};
+use fastmcp_protocol::{
+    CompleteResult, FinalSubscriptionsListenResult, RequestId, SubscriptionFilter,
+    encode_complete_result,
+};
 use serde::Serialize;
 
 use super::{
     MAX_TASK_RESPONSE_BYTES, ManagedHttpClient, ManagedHttpClientError, TaskCall, TaskResult,
     checkpoint,
 };
-use crate::{ClientHttpConnectionError, FinalTaskId, HttpClient, HttpClientError};
 use crate::http_executor::ModernHttpSubscriptionListenEvent;
 use crate::sse::SseLimits;
+use crate::{ClientHttpConnectionError, FinalTaskId, HttpClient, HttpClientError};
 
 const MAX_NOTIFICATIONS: usize = 1_024;
 const MAX_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
@@ -62,9 +65,15 @@ struct EventBudget {
 }
 
 impl EventBudget {
-    fn charge(&mut self, value: &impl Serialize, notification: bool) -> Result<(), HttpClientError> {
+    fn charge(
+        &mut self,
+        value: &impl Serialize,
+        notification: bool,
+    ) -> Result<(), HttpClientError> {
         if notification && self.notifications == 0 {
-            return Err(refusal("Managed Tasks subscription notification limit exceeded"));
+            return Err(refusal(
+                "Managed Tasks subscription notification limit exceeded",
+            ));
         }
         let mut counter = PayloadCounter {
             remaining: self.remaining_bytes,
@@ -89,12 +98,31 @@ impl EventBudget {
             ModernHttpSubscriptionListenEvent::TaskNotification(notification) => {
                 self.charge(notification, true)
             }
-            ModernHttpSubscriptionListenEvent::Terminal { result, .. } => self.charge(result, false),
+            ModernHttpSubscriptionListenEvent::Terminal { result, .. } => {
+                self.charge_terminal(result)
+            }
             ModernHttpSubscriptionListenEvent::Notification(_) => {
                 // This facade requests taskIds only, never catalog categories.
                 Err(refusal("Non-Tasks event on a managed Tasks subscription"))
             }
         }
+    }
+
+    // A complete result is encoded by the result algebra, not serde.
+    // `subscriptions/listen` owns no method members, so its payload is the
+    // discriminator, the common metadata and any inert open siblings. A
+    // terminal is not a notification and never consumes that allowance.
+    fn charge_terminal(
+        &mut self,
+        result: &CompleteResult<FinalSubscriptionsListenResult>,
+    ) -> Result<(), HttpClientError> {
+        let encoded = encode_complete_result(&result.meta, Vec::new(), &[], &result.extras)
+            .map_err(|_| refusal("Managed Tasks subscription terminal result is invalid"))?;
+        self.remaining_bytes = self
+            .remaining_bytes
+            .checked_sub(encoded.len())
+            .ok_or_else(|| refusal("Managed Tasks subscription payload limit exceeded"))?;
+        Ok(())
     }
 }
 
@@ -145,9 +173,13 @@ impl<'a> ListenRequest<'a> {
                 .next_event(cx)
                 .await
                 .map_err(|error| {
-                    HttpClientError::Connection(ClientHttpConnectionError::SubscriptionsListen(error))
+                    HttpClientError::Connection(ClientHttpConnectionError::SubscriptionsListen(
+                        error,
+                    ))
                 })?
-                .ok_or_else(|| refusal("Managed Tasks subscription ended without a terminal result"))?;
+                .ok_or_else(|| {
+                    refusal("Managed Tasks subscription ended without a terminal result")
+                })?;
             self.budget.admit(&event)?;
 
             // An I/O poll can finish after the credential expired or was revoked.
@@ -215,7 +247,8 @@ impl ManagedHttpClient {
         max_notifications: usize,
         max_payload_bytes: usize,
         observer: &mut (dyn FnMut(&ModernHttpSubscriptionListenEvent) -> ControlFlow<()> + Send),
-    ) -> Result<Option<CompleteResult<FinalSubscriptionsListenResult>>, ManagedHttpClientError> {
+    ) -> Result<Option<CompleteResult<FinalSubscriptionsListenResult>>, ManagedHttpClientError>
+    {
         self.listen_task_events_with_cancellation(
             cx,
             &McpRequestCancellation::new(),
@@ -238,10 +271,14 @@ impl ManagedHttpClient {
         max_notifications: usize,
         max_payload_bytes: usize,
         observer: &mut (dyn FnMut(&ModernHttpSubscriptionListenEvent) -> ControlFlow<()> + Send),
-    ) -> Result<Option<CompleteResult<FinalSubscriptionsListenResult>>, ManagedHttpClientError> {
+    ) -> Result<Option<CompleteResult<FinalSubscriptionsListenResult>>, ManagedHttpClientError>
+    {
         self.admit_tasks(cx, cancellation)?;
         let request = ListenRequest::new(task_ids, max_notifications, max_payload_bytes, observer)?;
-        match self.perform_task(cx, cancellation, TaskCall::Listen(request)).await? {
+        match self
+            .perform_task(cx, cancellation, TaskCall::Listen(request))
+            .await?
+        {
             TaskResult::Listen(result) => Ok(result.map(|result| *result)),
             _ => Err(ManagedHttpClientError::InvalidPolicy),
         }
@@ -257,12 +294,18 @@ mod tests {
     fn event_budget_accepts_exact_bytes_and_rolls_back_failed_admission() {
         let value = json!({"exact": "payload"});
         let length = serde_json::to_vec(&value).unwrap().len();
-        let mut budget = EventBudget { notifications: 1, remaining_bytes: length };
+        let mut budget = EventBudget {
+            notifications: 1,
+            remaining_bytes: length,
+        };
         budget.charge(&value, true).unwrap();
         assert_eq!(budget.remaining_bytes, 0);
         assert_eq!(budget.notifications, 0);
         assert!(budget.charge(&value, true).is_err());
-        let mut insufficient = EventBudget { notifications: 2, remaining_bytes: length - 1 };
+        let mut insufficient = EventBudget {
+            notifications: 2,
+            remaining_bytes: length - 1,
+        };
         assert!(insufficient.charge(&value, true).is_err());
         assert_eq!(insufficient.remaining_bytes, length - 1);
         assert_eq!(insufficient.notifications, 2);
@@ -270,10 +313,43 @@ mod tests {
 
     #[test]
     fn notification_budget_leaves_room_for_an_actual_terminal() {
-        let mut budget = EventBudget { notifications: 1, remaining_bytes: 128 };
+        let mut budget = EventBudget {
+            notifications: 1,
+            remaining_bytes: 128,
+        };
         budget.charge(&json!({}), true).unwrap();
         assert!(budget.charge(&json!({}), true).is_err());
-        budget.charge(&json!({"resultType": "complete"}), false).unwrap();
+        budget
+            .charge(&json!({"resultType": "complete"}), false)
+            .unwrap();
         assert_eq!(budget.notifications, 0);
+    }
+
+    #[test]
+    fn terminal_is_charged_its_encoded_bytes_and_refused_one_byte_short() {
+        let terminal = CompleteResult::new(
+            FinalSubscriptionsListenResult {},
+            fastmcp_protocol::ResultMeta::empty(),
+        );
+        let length = encode_complete_result(&terminal.meta, Vec::new(), &[], &terminal.extras)
+            .unwrap()
+            .len();
+        assert!(length >= r#"{"resultType":"complete"}"#.len());
+
+        let mut exact = EventBudget {
+            notifications: 0,
+            remaining_bytes: length,
+        };
+        exact.charge_terminal(&terminal).unwrap();
+        assert_eq!(exact.remaining_bytes, 0);
+        assert_eq!(exact.notifications, 0);
+
+        let mut short = EventBudget {
+            notifications: 3,
+            remaining_bytes: length - 1,
+        };
+        assert!(short.charge_terminal(&terminal).is_err());
+        assert_eq!(short.remaining_bytes, length - 1);
+        assert_eq!(short.notifications, 3);
     }
 }
