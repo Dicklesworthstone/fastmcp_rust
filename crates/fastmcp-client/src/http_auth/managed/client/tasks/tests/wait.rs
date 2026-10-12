@@ -67,7 +67,17 @@ fn managed_task_wait_returns_all_actionable_variants_without_another_poll() {
             .await;
             // An input-required or failed task is not reinterpreted as success,
             // and neither is discarded just because the wait stopped polling.
-            assert_eq!(serde_json::to_value(result.unwrap()).unwrap(), wire);
+            // The typed tool result omits a default `isError: false` when it
+            // is serialized, so that explicit default is the one member the
+            // peer sent that does not come back textually.
+            let mut expected = wire.clone();
+            if expected.pointer("/result/isError") == Some(&json!(false)) {
+                expected["result"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("isError");
+            }
+            assert_eq!(serde_json::to_value(result.unwrap()).unwrap(), expected);
             peer.no_more(&cx).await;
         });
     }
