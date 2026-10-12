@@ -106,10 +106,19 @@ things:
   driver is inert unless `FASTMCP_CONFORMANCE_OAUTH` carries its configuration,
   and nothing in this repository sets it, including
   `scripts/run_official_conformance.sh`. So these checks measure the adapter
-  with authorization switched off, and closing them is a configuration-and-
-  discovery problem against the suite's own authorization scenarios rather than
-  a driver that has to be written. What those scenarios require of a client is
-  not established here. The nine
+  with authorization switched off. **They are not one problem, though.** The
+  pinned suite drives PKCE (`code_challenge`), `authorization_code`, dynamic
+  `register`, and 401 `WWW-Authenticate` + `resource_metadata` discovery, all of
+  which this client implements; those are plausibly reachable by configuring the
+  existing driver. It also carries a DPoP family — `sep-1932-client-dpop-auth-scheme`,
+  `-token-request-proof`, `-fresh-proof`, `-as-nonce`, `-rs-nonce` — and DPoP
+  (RFC 9449) is **not implemented**: `http_auth/discovery/challenge.rs` states
+  "No automatic login/retry, DPoP, DCR, DNS pinning, or OIDC identity
+  authentication is installed", and a sender-constrained token (`token_type:
+  "DPoP"`, or a `cnf` holding `jkt`) is deliberately *rejected*. So some of
+  these checks need configuration and at least the DPoP ones need a capability
+  that does not exist. How the 46 split between those two is not measured here.
+  The nine
   in-tree `oauth_*` test targets are gated on `native-tls-roots`; each one now
   carries a matching `required-features` stanza, so a default run *excludes*
   them and naming one explicitly makes cargo refuse. They are therefore not a
