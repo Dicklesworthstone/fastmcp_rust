@@ -108,18 +108,35 @@ things:
   driver is inert unless `FASTMCP_CONFORMANCE_OAUTH` carries its configuration,
   and nothing in this repository sets it, including
   `scripts/run_official_conformance.sh`. So these checks measure the adapter
-  with authorization switched off. **They are not one problem, though.** The
+  with authorization switched off. **No value of that variable can switch it
+  on, though.** Measured 2026-10-12 against the pinned suite: `configure`
+  requires the `resource` member to equal the MCP endpoint *and* to use
+  `https` (`conformance_oauth.rs:306`), and `issuer` and
+  `authorization_endpoint` are required static pins rather than discovered
+  values. The suite serves plain HTTP on an ephemeral loopback port and has no
+  TLS capability at all — a census of its 472,891-byte bundle finds
+  `http://localhost:${this.port}` and `http://127.0.0.1:${e}` against **zero**
+  occurrences of `createSecureServer`, `node:tls`, or any cert/key material —
+  and it stands up a fresh authorization server per scenario, across 25
+  `auth/*` client scenarios that deliberately vary the issuer
+  (`iss-wrong-issuer`, `metadata-issuer-mismatch`,
+  `authorization-server-migration`). So the driver refuses any configuration
+  naming the suite's endpoint, on two independent grounds. Closing these needs
+  a separate loopback-HTTP adapter profile, not a configuration value; relaxing
+  the shipped driver's HTTPS requirement to move a conformance number would
+  weaken a deliberate security property, so that is not on the table.
+  **They are also not one problem.** The
   pinned suite drives PKCE (`code_challenge`), `authorization_code`, dynamic
   `register`, and 401 `WWW-Authenticate` + `resource_metadata` discovery, all of
-  which this client implements; those are plausibly reachable by configuring the
-  existing driver. It also carries a DPoP family — `sep-1932-client-dpop-auth-scheme`,
+  which this client implements. It also carries a DPoP family — `sep-1932-client-dpop-auth-scheme`,
   `-token-request-proof`, `-fresh-proof`, `-as-nonce`, `-rs-nonce` — and DPoP
   (RFC 9449) is **not implemented**: `http_auth/discovery/challenge.rs` states
   "No automatic login/retry, DPoP, DCR, DNS pinning, or OIDC identity
   authentication is installed", and a sender-constrained token (`token_type:
   "DPoP"`, or a `cnf` holding `jkt`) is deliberately *rejected*. So some of
-  these checks need configuration and at least the DPoP ones need a capability
-  that does not exist. How the 46 split between those two is not measured here.
+  these checks await an adapter profile that does not exist yet, and at least
+  the DPoP ones additionally need a library capability that does not exist. How
+  the 46 split between those two is not measured here.
   The nine
   in-tree `oauth_*` test targets are gated on `native-tls-roots`; each one now
   carries a matching `required-features` stanza, so a default run *excludes*
