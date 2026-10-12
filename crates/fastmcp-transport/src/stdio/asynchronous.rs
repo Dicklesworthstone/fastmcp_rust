@@ -14,6 +14,7 @@ use std::task::{Context, Poll};
 
 use asupersync::Cx;
 use asupersync::channel::oneshot;
+use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
 use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
 use asupersync::sync::Notify;
 use asupersync::time::Sleep;
@@ -27,9 +28,10 @@ use crate::{
 const READ_CHUNK_SIZE: usize = 4096;
 const READ_TURN_CHUNKS: usize = 16;
 
-/// Consecutive `Interrupted` results, with no readiness and no transferred
-/// bytes between them, that one `await_io` retries before it stops believing
-/// the source was transiently interrupted.
+/// `Interrupted` results that one `await_io` retries before the operation
+/// completes. `Pending` does not transfer bytes or complete a flush/shutdown,
+/// so it cannot reset this budget. Each new completed-operation boundary
+/// starts a fresh wait with a fresh retry budget.
 ///
 /// `Interrupted` is this layer's single representation for *every* cooperative
 /// stop (see `async_io::io_checkpoint`), so it conflates two conditions that
@@ -81,6 +83,44 @@ fn native_io_error(cx: &Cx, error: io::Error) -> TransportError {
     TransportError::Io(error)
 }
 
+// Selecting the caller's drivers must not widen the host's effect authority.
+// Capture this before set_current replaces the active context. Only effects
+// intersect: cancellation, deadlines and driver identity remain caller-owned.
+fn ambient_capability_ceiling() -> CapMask {
+    let Some(active) = Cx::current() else {
+        return CapMask::all();
+    };
+    let capabilities = active.capabilities();
+    let mut ceiling = CapMask::all();
+    for (allowed, without_effect) in [
+        (
+            capabilities.spawn,
+            CapSet::<false, true, true, true, true>::MASK,
+        ),
+        (
+            capabilities.time,
+            CapSet::<true, false, true, true, true>::MASK,
+        ),
+        (
+            capabilities.entropy,
+            CapSet::<true, true, false, true, true>::MASK,
+        ),
+        (
+            capabilities.io,
+            CapSet::<true, true, true, false, true>::MASK,
+        ),
+        (
+            capabilities.remote,
+            CapSet::<true, true, true, true, false>::MASK,
+        ),
+    ] {
+        if !allowed {
+            ceiling = ceiling.intersect(without_effect);
+        }
+    }
+    ceiling
+}
+
 /// Poll under the exact caller context, including its cancellation registration
 /// and timer driver. A silent peer does not need to generate an I/O wakeup for
 /// cancellation, a deadline, or the opposite half's terminal state to win.
@@ -109,7 +149,11 @@ async fn await_io<T>(
         if !closing && terminal.is_closed() {
             return Poll::Ready(Err(TransportError::Closed));
         }
+        // Re-evaluate on every poll: a pending operation may resume under a
+        // narrower host scope. Both guards unwind before returning Pending.
+        let ceiling = ambient_capability_ceiling();
         let _caller = Cx::set_current(Some(cx.clone()));
+        let _restriction = Cx::push_restriction(ceiling);
         if let Err(error) = stdio_checkpoint(cx) {
             return Poll::Ready(Err(error));
         }
@@ -145,14 +189,14 @@ async fn await_io<T>(
                 }
                 interrupted += 1;
                 if interrupted > INTERRUPTED_RETRY_LIMIT {
-                    // Not transient: this caller's context is live, so only the
-                    // source's own cooperative stop can repeat without end.
+                    // The serving caller is still live, but this source has
+                    // exceeded the bounded retry policy without completing I/O.
                     return Poll::Ready(Err(TransportError::Io(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
                         format!(
-                            "async stdio source reported a cooperative stop \
-                             {INTERRUPTED_RETRY_LIMIT} consecutive times while this \
-                             caller's context stayed live; bind the source to the same \
+                            "async stdio source exceeded {INTERRUPTED_RETRY_LIMIT} \
+                             cooperative-stop retries without completing I/O while \
+                             this caller's context stayed live; bind the source to the same \
                              Cx that serves it (last reason: {error})"
                         ),
                     ))));
@@ -164,9 +208,8 @@ async fn await_io<T>(
                 Poll::Pending
             }
             result => {
-                // Readiness or a committed transfer ends the run: a later
-                // interruption is a fresh one, not a continuation of this one.
-                interrupted = 0;
+                // Pending is not progress, even if the source self-woke. Only
+                // completing this wait starts a fresh budget for the next I/O.
                 result.map(|result| result.map_err(|error| native_io_error(cx, error)))
             }
         }
@@ -1583,5 +1626,313 @@ mod tests {
             transport.is_closed(),
             "the endpoint latches closed so a retry cannot re-enter the spin"
         );
+    }
+
+    fn effects(cx: &Cx) -> [bool; 5] {
+        let capabilities = cx.capabilities();
+        [
+            capabilities.spawn,
+            capabilities.time,
+            capabilities.entropy,
+            capabilities.io,
+            capabilities.remote,
+        ]
+    }
+
+    type Observations = Arc<Mutex<Vec<(&'static str, [bool; 5])>>>;
+
+    struct ObserveIo<T> {
+        inner: T,
+        observations: Observations,
+    }
+
+    impl<T> ObserveIo<T> {
+        fn record(&self, operation: &'static str) {
+            let active = Cx::current().expect("I/O must run inside its explicit caller");
+            self.observations
+                .lock()
+                .unwrap()
+                .push((operation, effects(&active)));
+        }
+    }
+
+    impl<R: AsyncRead + Unpin> AsyncRead for ObserveIo<R> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            task: &mut Context<'_>,
+            output: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            this.record("read");
+            Pin::new(&mut this.inner).poll_read(task, output)
+        }
+    }
+
+    impl<W: AsyncWrite + Unpin> AsyncWrite for ObserveIo<W> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            task: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            this.record("write");
+            Pin::new(&mut this.inner).poll_write(task, bytes)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            this.record("flush");
+            Pin::new(&mut this.inner).poll_flush(task)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            this.record("shutdown");
+            Pin::new(&mut this.inner).poll_shutdown(task)
+        }
+    }
+
+    #[test]
+    fn async_stdio_preserves_all_ambient_and_held_effect_restrictions() {
+        let masks = [
+            CapMask::all(),
+            CapSet::<false, true, true, true, true>::MASK,
+            CapSet::<true, false, true, true, true>::MASK,
+            CapSet::<true, true, false, true, true>::MASK,
+            CapSet::<true, true, true, false, true>::MASK,
+            CapSet::<true, true, true, true, false>::MASK,
+            CapMask::none(),
+        ];
+        for held_mask in [CapMask::all(), CapSet::<true, true, false, true, true>::MASK] {
+            for mask in masks {
+                let owner = Cx::for_testing();
+                let held = {
+                    let _owner = Cx::set_current(Some(owner.clone()));
+                    let _restriction = Cx::push_restriction(held_mask);
+                    Cx::current().unwrap()
+                };
+                let foreign = Cx::for_testing();
+                let _foreign = Cx::set_current(Some(foreign.clone()));
+                let _restriction = Cx::push_restriction(mask);
+                let ambient_effects = effects(&Cx::current().unwrap());
+                let held_effects = effects(&held);
+                let expected = std::array::from_fn(|i| ambient_effects[i] && held_effects[i]);
+                let observations: Observations = Arc::new(Mutex::new(Vec::new()));
+                let source = br#"{"jsonrpc":"2.0","method":"test/authority","id":93}"#;
+                let wire = [source.as_slice(), b"\n"].concat();
+                let output = Output::new(usize::MAX);
+                let mut transport = AsyncStdioTransport::from_io(
+                    ObserveIo {
+                        inner: wire.as_slice(),
+                        observations: Arc::clone(&observations),
+                    },
+                    ObserveIo {
+                        inner: TestWriter(Arc::clone(&output)),
+                        observations: Arc::clone(&observations),
+                    },
+                );
+                // These adapters only copy memory. Removing an effect must not
+                // blanket-refuse pure I/O adapters instead of narrowing them.
+                assert_eq!(
+                    ready(transport.recv_with_source_async(&held)).unwrap().source(),
+                    source
+                );
+                ready(transport.send_async(&held, &request(94))).unwrap();
+                ready(transport.close_async(&held)).unwrap();
+                assert_eq!(
+                    *observations.lock().unwrap(),
+                    vec![
+                        ("read", expected),
+                        ("write", expected),
+                        ("flush", expected),
+                        ("shutdown", expected),
+                    ]
+                );
+                assert_eq!(newline_count(&output.bytes.lock().unwrap()), 1);
+                assert_eq!(effects(&Cx::current().unwrap()), ambient_effects);
+                Cx::current().unwrap().set_cancel_requested(true);
+                assert!(foreign.is_cancel_requested());
+                assert!(!owner.is_cancel_requested());
+            }
+        }
+    }
+
+    #[test]
+    fn async_stdio_rechecks_ambient_authority_after_a_pending_read() {
+        for initially_allowed in [false, true] {
+            let cx = Cx::for_testing();
+            let _ambient = Cx::set_current(Some(Cx::for_testing()));
+            let feed = Arc::new(Feed::default());
+            let observations: Observations = Arc::new(Mutex::new(Vec::new()));
+            let mut transport = AsyncStdioTransport::from_io(
+                ObserveIo {
+                    inner: FeedReader(Arc::clone(&feed)),
+                    observations: Arc::clone(&observations),
+                },
+                Vec::<u8>::new(),
+            );
+            let source = br#"{"jsonrpc":"2.0","method":"test/authority","id":95}"#;
+            let mut receiving = pin!(transport.recv_with_source_async(&cx));
+            for (turn, allowed) in [initially_allowed, !initially_allowed]
+                .into_iter()
+                .enumerate()
+            {
+                let mask = if allowed {
+                    CapMask::all()
+                } else {
+                    CapSet::<true, true, true, false, true>::MASK
+                };
+                {
+                    let _restriction = Cx::push_restriction(mask);
+                    if turn == 0 {
+                        assert!(poll(receiving.as_mut(), Waker::noop()).is_pending());
+                    } else {
+                        let Poll::Ready(result) = poll(receiving.as_mut(), Waker::noop()) else {
+                            panic!("the complete in-memory frame must be delivered");
+                        };
+                        assert_eq!(result.unwrap().source(), source);
+                    }
+                    assert_eq!(Cx::current().unwrap().capabilities().io, allowed);
+                }
+                assert_eq!(effects(&Cx::current().unwrap()), [true; 5]);
+                if turn == 0 {
+                    feed.push(&[source.as_slice(), b"\n"].concat());
+                }
+            }
+            assert_eq!(
+                *observations.lock().unwrap(),
+                vec![
+                    ("read", [true, true, true, initially_allowed, true]),
+                    ("read", [true, true, true, !initially_allowed, true]),
+                ]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn async_stdio_native_send_refuses_ambient_io_denial_before_publishing_bytes() {
+        for denied in [false, true] {
+            let runtime = RuntimeBuilder::current_thread()
+                .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+                .blocking_threads(0, 0)
+                .build()
+                .unwrap();
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let (mut peer, writer) = crate::async_io::create_native_pipe(&cx).unwrap();
+            let mut transport = AsyncStdioTransport::from_io(&b""[..], writer);
+            let request = JsonRpcRequest::new("test/authority", None, 96_i64);
+            let expected = Codec::new().encode_request(&request).unwrap();
+            let message = JsonRpcMessage::Request(request);
+            {
+                let foreign = Cx::for_testing();
+                // An unrelated ambient cancellation is not the operation's
+                // cancellation domain, even when its effect ceiling applies.
+                foreign.set_cancel_requested(true);
+                let _foreign = Cx::set_current(Some(foreign));
+                let mask = if denied {
+                    CapSet::<true, true, true, false, true>::MASK
+                } else {
+                    CapMask::all()
+                };
+                let _restriction = Cx::push_restriction(mask);
+                let result = ready(transport.send_async(&cx, &message));
+                if denied {
+                    assert!(matches!(
+                        result,
+                        Err(TransportError::Io(error))
+                            if error.kind() == io::ErrorKind::PermissionDenied
+                    ));
+                    assert!(transport.is_closed());
+                } else {
+                    result.unwrap();
+                }
+                assert_eq!(Cx::current().unwrap().capabilities().io, !denied);
+                assert!(Cx::current().unwrap().is_cancel_requested());
+                assert!(!cx.is_cancel_requested());
+            }
+            ready(transport.close_async(&cx)).unwrap();
+            let mut bytes = [0_u8; 256];
+            let mut output = ReadBuf::new(&mut bytes);
+            assert!(matches!(
+                Pin::new(&mut peer)
+                    .poll_read(&mut Context::from_waker(Waker::noop()), &mut output),
+                Poll::Ready(Ok(()))
+            ));
+            if denied {
+                assert!(output.filled().is_empty(), "denied send published pipe bytes");
+            } else {
+                assert_eq!(output.filled(), expected.as_slice());
+            }
+            assert_eq!(cx.io_driver_handle().unwrap().waker_count(), 0);
+            drop((transport, peer, cx));
+            assert!(runtime.shutdown_timeout(std::time::Duration::from_secs(1)));
+        }
+    }
+
+    struct YieldBetweenReads<R> {
+        inner: R,
+        pending: bool,
+        turns: Arc<AtomicUsize>,
+    }
+
+    impl<R: AsyncRead + Unpin> AsyncRead for YieldBetweenReads<R> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            task: &mut Context<'_>,
+            output: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            this.turns.fetch_add(1, Ordering::SeqCst);
+            if this.pending {
+                this.pending = false;
+                task.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            this.pending = true;
+            Pin::new(&mut this.inner).poll_read(task, output)
+        }
+    }
+
+    #[test]
+    fn async_stdio_pending_between_interruptions_does_not_reset_the_retry_budget() {
+        let source = br#"{"jsonrpc":"2.0","method":"test/async-stdio","id":97}"#;
+        let wire = [source.as_slice(), b"\n"].concat();
+        for bounded in [true, false] {
+            let inner = Arc::new(Interrupting {
+                remaining: Mutex::new(bounded.then_some(INTERRUPTED_RETRY_LIMIT)),
+                polls: AtomicUsize::new(0),
+                rest: Mutex::new(wire.iter().copied().collect()),
+            });
+            let turns = Arc::new(AtomicUsize::new(0));
+            let mut transport = AsyncStdioTransport::from_io(
+                YieldBetweenReads {
+                    inner: InterruptingReader(Arc::clone(&inner)),
+                    pending: true,
+                    turns: Arc::clone(&turns),
+                },
+                Vec::<u8>::new(),
+            );
+            let result = drive_receive(&mut transport, &Cx::for_testing(), Waker::noop());
+            if bounded {
+                assert_eq!(result.unwrap().source(), source);
+                assert!(!transport.is_closed());
+                assert!(inner.rest.lock().unwrap().is_empty());
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(TransportError::Io(error))
+                        if error.kind() == io::ErrorKind::ConnectionAborted
+                ));
+                assert!(transport.is_closed());
+                assert_eq!(
+                    *inner.rest.lock().unwrap(),
+                    wire.iter().copied().collect::<VecDeque<_>>()
+                );
+            }
+            let attempts = usize::try_from(INTERRUPTED_RETRY_LIMIT).unwrap() + 1;
+            assert_eq!(inner.polls.load(Ordering::SeqCst), attempts);
+            assert_eq!(turns.load(Ordering::SeqCst), attempts * 2);
+        }
     }
 }
