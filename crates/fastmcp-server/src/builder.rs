@@ -6727,9 +6727,18 @@ mod tests {
                 &notification_sender,
                 &request_sender,
             ))
-            .expect("the public exact-2024 completion path returns a response")
-            .result
-            .expect("the exact-2024 completion response has a result payload");
+            .expect("the public exact-2024 completion path returns a response");
+            // Report the error instead of discarding it. `.result.expect(..)`
+            // panics with only its own message when the dispatch answered with
+            // an error, which is exactly the case that needs diagnosing and
+            // the one case where the cause is already in hand.
+            let legacy = match legacy.result {
+                Some(result) => result,
+                None => panic!(
+                    "the exact-2024 completion response has a result payload, got error: {:?}",
+                    legacy.error
+                ),
+            };
             assert_eq!(
                 legacy["completion"]["values"],
                 serde_json::json!(["legacy-staging"])
@@ -7063,9 +7072,16 @@ mod tests {
             let completion = fastmcp_core::block_on(
                 server.dispatch_stateless(&completion_inbound, &final_completion_request(830)),
             )
-            .expect("the replaced target forwards through the public final completion route")
-            .result
-            .expect("the replaced target completion has a result payload");
+            .expect("the replaced target forwards through the public final completion route");
+            // Same reason as the exact-2024 site above: surface the error
+            // rather than panicking with a message that cannot name the cause.
+            let completion = match completion.result {
+                Some(result) => result,
+                None => panic!(
+                    "the replaced target completion has a result payload, got error: {:?}",
+                    completion.error
+                ),
+            };
             assert_eq!(
                 completion["completion"]["values"],
                 serde_json::json!(["final-staging"])
