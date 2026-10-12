@@ -13,6 +13,7 @@ use asupersync::{Cx, Time};
 
 use super::ambient_capability_ceiling;
 use crate::combinator::BoxFuture;
+use crate::context::{ResourceReadResult, ToolCallResult};
 use crate::{McpContext, McpError, McpResult};
 
 const MAX_BATCH_OPERATIONS: usize = 4_096;
@@ -329,6 +330,67 @@ impl McpContext {
         })
         .await
     }
+
+    /// Calls several local tools with bounded request-owned concurrency.
+    ///
+    /// Every admitted call uses [`Self::call_tool`], retaining the originating
+    /// request, exact tool name and arguments, shared budget and cross-component
+    /// recursion limits. Queued calls do not enter the router until a slot is
+    /// available. Results retain input order even when tools finish out of order.
+    /// Duplicate calls are distinct operations: nothing is deduplicated or retried.
+    ///
+    /// An `Err(McpError)` stops the batch and drops pending and unstarted calls.
+    /// A successful `ToolCallResult` with `is_error` set remains a tool result;
+    /// it is not silently promoted to a protocol error or stripped of content.
+    /// Earlier side effects are not rolled back when a later call fails.
+    ///
+    /// The limits, caller timer requirement, cancellation and cleanup contract
+    /// of [`Self::try_join_all_bounded`] apply. This is handler composition, not
+    /// a JSON-RPC wire batch and not a substitute for router authorization.
+    pub async fn call_tools_bounded(
+        &self,
+        concurrency: usize,
+        calls: Vec<(String, serde_json::Value)>,
+    ) -> McpResult<Vec<ToolCallResult>> {
+        admit_limits(concurrency, calls.len())?;
+        live(self)?;
+        let mut futures: Vec<BoxFuture<'_, McpResult<ToolCallResult>>> = Vec::new();
+        futures
+            .try_reserve_exact(calls.len())
+            .map_err(|_| allocation_error())?;
+        for (name, arguments) in calls {
+            futures.push(Box::pin(async move { self.call_tool(&name, arguments).await }));
+        }
+        self.try_join_all_bounded(concurrency, futures).await
+    }
+
+    /// Reads several resources with bounded request-owned concurrency.
+    ///
+    /// Each admitted read uses [`Self::read_resource`], preserving the exact URI,
+    /// router policy, originating request and cross-component recursion depth.
+    /// No URI rewriting or deduplication occurs. Results retain input order.
+    /// The first error stops admission and drops active and queued reads; partial
+    /// results are not returned as a successful catalog or silently retried.
+    ///
+    /// The limits, caller timer requirement, cancellation and cleanup contract
+    /// of [`Self::try_join_all_bounded`] apply. Resource providers must still use
+    /// nonblocking futures and retain ownership of any work they spawn elsewhere.
+    pub async fn read_resources_bounded(
+        &self,
+        concurrency: usize,
+        uris: Vec<String>,
+    ) -> McpResult<Vec<ResourceReadResult>> {
+        admit_limits(concurrency, uris.len())?;
+        live(self)?;
+        let mut futures: Vec<BoxFuture<'_, McpResult<ResourceReadResult>>> = Vec::new();
+        futures
+            .try_reserve_exact(uris.len())
+            .map_err(|_| allocation_error())?;
+        for uri in uris {
+            futures.push(Box::pin(async move { self.read_resource(&uri).await }));
+        }
+        self.try_join_all_bounded(concurrency, futures).await
+    }
 }
 
 #[cfg(test)]
@@ -337,10 +399,15 @@ mod tests {
     use asupersync::Budget;
     use asupersync::runtime::{Runtime, RuntimeBuilder};
     use asupersync::time::{TimerDriverHandle, VirtualClock};
+    use std::collections::{HashMap, HashSet};
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     use crate::McpErrorCode;
+    use crate::context::{
+        MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH, ResourceReader, ToolCaller,
+    };
+    use serde_json::{Value, json};
 
     fn environment() -> (Runtime, Arc<VirtualClock>, TimerDriverHandle, McpContext) {
         let clock = Arc::new(VirtualClock::new());
@@ -743,5 +810,320 @@ mod tests {
         let ctx = McpContext::new(Cx::for_testing(), 7);
         let mut empty = Box::pin(ctx.try_join_all_bounded::<usize>(1, Vec::new()));
         assert!(completed(poll(empty.as_mut(), Waker::noop())).unwrap().is_empty());
+    }
+
+    type Visit = (&'static str, String, Value, u32);
+
+    #[derive(Default)]
+    struct RoutedProvider {
+        visits: Mutex<Vec<Visit>>,
+        released: Mutex<HashSet<String>>,
+        waiters: Mutex<HashMap<String, Waker>>,
+        drops: AtomicUsize,
+    }
+
+    struct RoutedDrop<'a>(&'a AtomicUsize);
+
+    impl Drop for RoutedDrop<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl RoutedProvider {
+        fn record(&self, ctx: &McpContext, kind: &'static str, name: &str, args: Value, depth: u32) {
+            assert_eq!(ctx.request_id(), 7);
+            assert_eq!(Cx::current().unwrap().task_id(), ctx.cx().task_id());
+            self.visits.lock().unwrap().push((kind, name.to_owned(), args, depth));
+        }
+
+        async fn wait(&self, name: &str) {
+            if !name.starts_with("wait:") {
+                return;
+            }
+            poll_fn(|task| {
+                self.waiters.lock().unwrap().insert(name.to_owned(), task.waker().clone());
+                if self.released.lock().unwrap().contains(name) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+        }
+
+        fn release(&self, name: &str) {
+            self.released.lock().unwrap().insert(name.to_owned());
+            let waiter = self.waiters.lock().unwrap().get(name).cloned();
+            if let Some(waiter) = waiter {
+                waiter.wake();
+            }
+        }
+    }
+
+    impl ToolCaller for RoutedProvider {
+        fn call_tool<'a>(
+            &'a self,
+            context: &'a McpContext,
+            name: &'a str,
+            args: Value,
+            depth: u32,
+        ) -> BoxFuture<'a, McpResult<ToolCallResult>> {
+            Box::pin(async move {
+                self.record(context, "tool", name, args, depth);
+                let _drop = RoutedDrop(&self.drops);
+                if name == "fail" {
+                    return Err(McpError::invalid_params("routed failure"));
+                }
+                if name == "cancel" {
+                    context.request_cancellation().cancel();
+                }
+                self.wait(name).await;
+                Ok(if name == "tool-error" {
+                    ToolCallResult::error("tool-level failure")
+                } else {
+                    ToolCallResult::text(name)
+                })
+            })
+        }
+    }
+
+    impl ResourceReader for RoutedProvider {
+        fn read_resource<'a>(
+            &'a self,
+            context: &'a McpContext,
+            uri: &'a str,
+            depth: u32,
+        ) -> BoxFuture<'a, McpResult<ResourceReadResult>> {
+            Box::pin(async move {
+                self.record(context, "resource", uri, Value::Null, depth);
+                let _drop = RoutedDrop(&self.drops);
+                if uri == "fail" {
+                    return Err(McpError::invalid_params("routed failure"));
+                }
+                if uri == "cancel" {
+                    context.request_cancellation().cancel();
+                }
+                self.wait(uri).await;
+                Ok(ResourceReadResult::text(uri, uri))
+            })
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Composition {
+        Tools,
+        Resources,
+    }
+
+    async fn compose(
+        kind: Composition,
+        ctx: &McpContext,
+        concurrency: usize,
+        names: &[&str],
+    ) -> McpResult<Vec<String>> {
+        match kind {
+            Composition::Tools => ctx
+                .call_tools_bounded(
+                    concurrency,
+                    names.iter().map(|name| ((*name).to_owned(), json!({}))).collect(),
+                )
+                .await
+                .map(|results| results.iter().map(|result| result.first_text().unwrap().to_owned()).collect()),
+            Composition::Resources => ctx
+                .read_resources_bounded(concurrency, names.iter().map(|name| (*name).to_owned()).collect())
+                .await
+                .map(|results| results.iter().map(|result| result.first_text().unwrap().to_owned()).collect()),
+        }
+    }
+
+    fn finish_ready<T>(mut future: Pin<&mut impl Future<Output = McpResult<T>>>) -> McpResult<T> {
+        for _ in 0..32 {
+            if let Poll::Ready(result) = poll(future.as_mut(), Waker::noop()) {
+                return result;
+            }
+        }
+        panic!("ready routed batch did not finish within its test poll ceiling");
+    }
+
+    #[test]
+    fn bounded_tool_calls_route_exact_arguments_and_limit_started_handlers() {
+        let (runtime, _, timer, ctx) = environment();
+        let provider = Arc::new(RoutedProvider::default());
+        let ctx = ctx.with_tool_caller(provider.clone());
+        let calls = ["wait:a", "wait:b", "wait:c", "wait:d"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| (name.to_owned(), json!({"value":index,"nested":{"exact":true}})))
+            .collect();
+        let mut batch = Box::pin(ctx.call_tools_bounded(2, calls));
+        assert!(poll(batch.as_mut(), Waker::noop()).is_pending());
+        assert_eq!(provider.visits.lock().unwrap().len(), 2);
+        for name in ["wait:b", "wait:c", "wait:d"] {
+            provider.release(name);
+            assert!(poll(batch.as_mut(), Waker::noop()).is_pending());
+            assert!(poll(batch.as_mut(), Waker::noop()).is_pending());
+            let started = provider.visits.lock().unwrap().len();
+            let dropped = provider.drops.load(Ordering::SeqCst);
+            assert!(started - dropped <= 2);
+        }
+        provider.release("wait:a");
+        let results = completed(poll(batch.as_mut(), Waker::noop())).unwrap();
+        assert_eq!(
+            results.iter().map(|result| result.first_text().unwrap()).collect::<Vec<_>>(),
+            vec!["wait:a", "wait:b", "wait:c", "wait:d"]
+        );
+        for (index, visit) in provider.visits.lock().unwrap().iter().enumerate() {
+            assert_eq!(visit.0, "tool");
+            assert_eq!(visit.2, json!({"value":index,"nested":{"exact":true}}));
+            assert_eq!(visit.3, 1);
+        }
+        assert_eq!(provider.drops.load(Ordering::SeqCst), 4);
+        assert_eq!(timer.pending_count(), 0);
+        drop(batch);
+        drop(ctx);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn bounded_resource_reads_preserve_uris_input_order_and_shared_depth() {
+        let (runtime, _, _, ctx) = environment();
+        let provider = Arc::new(RoutedProvider::default());
+        let ctx = ctx.with_resource_reader(provider.clone()).with_tool_call_depth(4);
+        let uris = ["file:///docs/a%2Fb", "resource://catalog?kind=two", "file:///docs/a%2Fb"];
+        let mut batch = Box::pin(compose(Composition::Resources, &ctx, 1, &uris));
+        assert_eq!(finish_ready(batch.as_mut()).unwrap(), uris);
+        assert_eq!(
+            *provider.visits.lock().unwrap(),
+            uris.into_iter().map(|uri| ("resource", uri.to_owned(), Value::Null, 5)).collect::<Vec<_>>()
+        );
+        assert_eq!(provider.drops.load(Ordering::SeqCst), 3);
+        drop(batch);
+        drop(ctx);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn bounded_tool_error_payload_is_not_a_batch_failure() {
+        let (runtime, _, _, ctx) = environment();
+        let provider = Arc::new(RoutedProvider::default());
+        let ctx = ctx.with_tool_caller(provider.clone());
+        let mut batch = Box::pin(ctx.call_tools_bounded(
+            1,
+            vec![("tool-error".to_owned(), json!({})), ("next".to_owned(), json!({}))],
+        ));
+        let results = finish_ready(batch.as_mut()).unwrap();
+        assert!(results[0].is_error);
+        assert_eq!(results[0].first_text(), Some("tool-level failure"));
+        assert!(!results[1].is_error);
+        assert_eq!(results[1].first_text(), Some("next"));
+        assert_eq!(provider.visits.lock().unwrap().len(), 2);
+        drop(batch);
+        drop(ctx);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn bounded_composition_cancellation_and_errors_stop_unstarted_handlers() {
+        for kind in [Composition::Tools, Composition::Resources] {
+            for first in ["cancel", "fail"] {
+                let (runtime, _, timer, ctx) = environment();
+                let provider = Arc::new(RoutedProvider::default());
+                let ctx = ctx.with_tool_caller(provider.clone()).with_resource_reader(provider.clone());
+                let names = [first, "must-not-run"];
+                let mut batch = Box::pin(compose(kind, &ctx, 1, &names));
+                let error = completed(poll(batch.as_mut(), Waker::noop())).unwrap_err();
+                if first == "cancel" {
+                    assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                } else {
+                    assert_eq!(error.message, "routed failure");
+                }
+                assert_eq!(provider.visits.lock().unwrap().len(), 1);
+                assert_eq!(provider.visits.lock().unwrap()[0].1, first);
+                assert_eq!(provider.drops.load(Ordering::SeqCst), 1);
+                assert_eq!(timer.pending_count(), 0);
+                assert!(!ctx.cx().is_cancel_requested());
+                drop(batch);
+                drop(ctx);
+                assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_composition_keeps_cross_component_recursion_checks() {
+        for kind in [Composition::Tools, Composition::Resources] {
+            for at_limit in [false, true] {
+                let (runtime, _, _, ctx) = environment();
+                let provider = Arc::new(RoutedProvider::default());
+                let ctx = ctx.with_tool_caller(provider.clone()).with_resource_reader(provider.clone());
+                let limit = match kind {
+                    Composition::Tools => MAX_TOOL_CALL_DEPTH,
+                    Composition::Resources => MAX_RESOURCE_READ_DEPTH,
+                };
+                let depth = if at_limit { limit } else { limit - 1 };
+                // Tighten the OTHER component's depth; a batch must not reset
+                // tool -> resource or resource -> tool recursion accounting.
+                let ctx = match kind {
+                    Composition::Tools => ctx.with_resource_read_depth(depth),
+                    Composition::Resources => ctx.with_tool_call_depth(depth),
+                };
+                let mut batch = Box::pin(compose(kind, &ctx, 1, &["item"]));
+                let result = completed(poll(batch.as_mut(), Waker::noop()));
+                if at_limit {
+                    assert!(result.is_err());
+                    assert!(provider.visits.lock().unwrap().is_empty());
+                } else {
+                    assert_eq!(result.unwrap(), vec!["item"]);
+                    assert_eq!(provider.visits.lock().unwrap()[0].3, limit);
+                }
+                assert!(!ctx.cx().is_cancel_requested());
+                drop(batch);
+                drop(ctx);
+                assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_composition_drop_releases_active_handler_and_never_admits_queue() {
+        for kind in [Composition::Tools, Composition::Resources] {
+            let (runtime, _, timer, ctx) = environment();
+            let provider = Arc::new(RoutedProvider::default());
+            let ctx = ctx.with_tool_caller(provider.clone()).with_resource_reader(provider.clone());
+            let mut batch = Box::pin(compose(kind, &ctx, 1, &["wait:first", "wait:second"]));
+            assert!(poll(batch.as_mut(), Waker::noop()).is_pending());
+            assert_eq!(provider.visits.lock().unwrap().len(), 1);
+            drop(batch);
+            assert_eq!(provider.drops.load(Ordering::SeqCst), 1);
+            assert_eq!(timer.pending_count(), 0);
+            provider.release("wait:first");
+            assert_eq!(provider.visits.lock().unwrap().len(), 1);
+            assert!(ctx.ensure_live().is_ok());
+            drop(ctx);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+    }
+
+    #[test]
+    fn bounded_composition_invalid_bounds_and_precancel_refuse_without_routing() {
+        for kind in [Composition::Tools, Composition::Resources] {
+            for concurrency in [0, 65, 1] {
+                let (runtime, _, _, ctx) = environment();
+                let provider = Arc::new(RoutedProvider::default());
+                let ctx = ctx.with_tool_caller(provider.clone()).with_resource_reader(provider.clone());
+                if concurrency == 1 {
+                    ctx.request_cancellation().cancel();
+                }
+                let mut batch = Box::pin(compose(kind, &ctx, concurrency, &["item"]));
+                assert!(completed(poll(batch.as_mut(), Waker::noop())).is_err());
+                assert!(provider.visits.lock().unwrap().is_empty());
+                assert_eq!(provider.drops.load(Ordering::SeqCst), 0);
+                assert!(!ctx.cx().is_cancel_requested());
+                drop(batch);
+                drop(ctx);
+                assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+            }
+        }
     }
 }
