@@ -7995,7 +7995,15 @@ impl Router {
 
     /// Consumes the router and returns its internal handlers.
     ///
-    /// This is used internally for mounting operations.
+    /// CURRENTLY UNCALLED, which is what the `allow(dead_code)` records. The
+    /// doc line here used to claim "this is used internally for mounting
+    /// operations"; that consumer no longer exists. Mounting is done by the
+    /// `mount_*_from` helpers above (`mount_prompts_from` at :7897,
+    /// `mount_resource_templates_from` at :7601 and their siblings), which move
+    /// entries into `self` under the mounted name and maintain `prompt_order`
+    /// directly rather than destructuring the source router into maps. Left in
+    /// place rather than removed, but do not read the attribute as "nothing
+    /// calls it yet": nothing calls it any more.
     #[must_use]
     #[allow(dead_code)]
     pub(crate) fn into_parts(
