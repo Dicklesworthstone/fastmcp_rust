@@ -3,7 +3,10 @@
 //! The returned values contain no connection, token, or running response owner.
 //! Task identity is opaque data; the upstream must authorize every later action.
 
+use std::time::Duration;
+
 use asupersync::Cx;
+use asupersync::time::Sleep;
 use fastmcp_core::{McpError, McpErrorCode, McpRequestCancellation};
 use fastmcp_protocol::FinalCoreResult;
 use fastmcp_protocol::tasks_extension::TaskInputLedger;
@@ -17,12 +20,24 @@ use crate::{
 };
 
 const MAX_TASK_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TASK_WAIT_POLLS: usize = 1_024;
 
 pub(super) enum TaskCall<'a> {
-    Tool { name: &'a str, arguments: Value },
+    Tool {
+        name: &'a str,
+        arguments: Value,
+    },
     Get(FinalTaskId),
-    Update { task: &'a FinalTask, responses: FinalTaskInputResponses },
+    Update {
+        task: &'a FinalTask,
+        responses: FinalTaskInputResponses,
+    },
     Cancel(FinalTaskId),
+    Wait {
+        task_id: FinalTaskId,
+        minimum_interval: Duration,
+        max_polls: usize,
+    },
 }
 
 pub(super) enum TaskResult {
@@ -33,10 +48,15 @@ pub(super) enum TaskResult {
 }
 
 fn invalid_input() -> ManagedHttpClientError {
-    ManagedHttpClientError::Request { code: Some(McpErrorCode::InvalidParams) }
+    ManagedHttpClientError::Request {
+        code: Some(McpErrorCode::InvalidParams),
+    }
 }
 
-fn admit_input(task: &FinalTask, responses: &FinalTaskInputResponses) -> Result<(), ManagedHttpClientError> {
+fn admit_input(
+    task: &FinalTask,
+    responses: &FinalTaskInputResponses,
+) -> Result<(), ManagedHttpClientError> {
     let FinalTask::InputRequired { input_requests, .. } = task else {
         return Err(invalid_input());
     };
@@ -46,6 +66,35 @@ fn admit_input(task: &FinalTask, responses: &FinalTaskInputResponses) -> Result<
         .map_err(|_| invalid_input())
 }
 
+fn admit_wait(minimum_interval: Duration, max_polls: usize) -> Result<(), ManagedHttpClientError> {
+    if !(1..=MAX_TASK_WAIT_POLLS).contains(&max_polls)
+        || minimum_interval < Duration::from_millis(1)
+        || minimum_interval > Duration::from_secs(60)
+    {
+        return Err(ManagedHttpClientError::InvalidPolicy);
+    }
+    Ok(())
+}
+
+fn checkpoint(cx: &Cx, cancellation: &McpRequestCancellation) -> Result<(), HttpClientError> {
+    if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+        return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
+    }
+    Ok(())
+}
+
+fn poll_interval(task: &FinalTask, minimum: Duration) -> Result<Duration, HttpClientError> {
+    let Some(interval) = &task.base().poll_interval_ms else {
+        return Ok(minimum);
+    };
+    let millis = interval.try_as_millis().map_err(|_| {
+        HttpClientError::CoreResult(McpError::invalid_request("Invalid task polling interval"))
+    })?;
+    // Never shorten a peer interval to make it fit the local operation timeout.
+    // The enclosing managed deadline/credential guard wins a longer wait instead.
+    Ok(minimum.max(Duration::from_millis(millis)))
+}
+
 impl TaskCall<'_> {
     pub(super) async fn dispatch(
         self,
@@ -53,9 +102,7 @@ impl TaskCall<'_> {
         cancellation: &McpRequestCancellation,
         client: &mut HttpClient,
     ) -> Result<TaskResult, HttpClientError> {
-        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-            return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
-        }
+        checkpoint(cx, cancellation)?;
         // All verbs use the ordinary client's one monotonic ID allocator. The
         // native methods retain bilateral Tasks admission and raw correlation.
         let id = client.next_request_id()?;
@@ -65,10 +112,14 @@ impl TaskCall<'_> {
                     MAX_TASK_RESPONSE_BYTES + 8,
                     MAX_TASK_RESPONSE_BYTES,
                     64,
-                ).ok_or_else(|| HttpClientError::CoreResult(
-                    McpError::internal_error("Invalid managed Tasks response limits"),
-                ))?;
-                let listener = client.connection
+                )
+                .ok_or_else(|| {
+                    HttpClientError::CoreResult(McpError::internal_error(
+                        "Invalid managed Tasks response limits",
+                    ))
+                })?;
+                let listener = client
+                    .connection
                     .open_final_tasks_tool_call_listener(cx, id, name, arguments, limits)
                     .await
                     .map_err(HttpClientError::Connection)?;
@@ -78,30 +129,73 @@ impl TaskCall<'_> {
                     HttpClientError::Connection(ClientHttpConnectionError::FinalCoreListen(error))
                 })?;
                 let outcome = match collected.terminal {
-                    FinalCoreResult::ToolsCall { result, .. } => FinalToolCallOutcome::Complete(result),
+                    FinalCoreResult::ToolsCall { result, .. } => {
+                        FinalToolCallOutcome::Complete(result)
+                    }
                     FinalCoreResult::ToolsCallTask { result } => FinalToolCallOutcome::Task(result),
-                    FinalCoreResult::ToolsCallInputRequired { result, .. } => FinalToolCallOutcome::InputRequired(result),
-                    _ => return Err(HttpClientError::CoreResult(McpError::invalid_request(
-                        "Unexpected managed Tasks tool outcome",
-                    ))),
+                    FinalCoreResult::ToolsCallInputRequired { result, .. } => {
+                        FinalToolCallOutcome::InputRequired(result)
+                    }
+                    _ => {
+                        return Err(HttpClientError::CoreResult(McpError::invalid_request(
+                            "Unexpected managed Tasks tool outcome",
+                        )));
+                    }
                 };
                 Ok(TaskResult::Tool(Box::new(outcome)))
             }
-            Self::Get(task_id) => client.connection
+            Self::Get(task_id) => client
+                .connection
                 .get_task_final(cx, id, task_id, MAX_TASK_RESPONSE_BYTES)
                 .await
                 .map(|result| TaskResult::Get(Box::new(result)))
                 .map_err(HttpClientError::Connection),
-            Self::Update { task, responses } => client.connection
+            Self::Update { task, responses } => client
+                .connection
                 .update_task_final(cx, id, task, responses, MAX_TASK_RESPONSE_BYTES)
                 .await
                 .map(TaskResult::Update)
                 .map_err(HttpClientError::Connection),
-            Self::Cancel(task_id) => client.connection
+            Self::Cancel(task_id) => client
+                .connection
                 .cancel_task_final(cx, id, task_id, MAX_TASK_RESPONSE_BYTES)
                 .await
                 .map(TaskResult::Cancel)
                 .map_err(HttpClientError::Connection),
+            Self::Wait {
+                task_id,
+                minimum_interval,
+                max_polls,
+            } => {
+                let mut request_id = id;
+                for poll in 0..max_polls {
+                    checkpoint(cx, cancellation)?;
+                    let result = client
+                        .connection
+                        .get_task_final(cx, request_id, task_id.clone(), MAX_TASK_RESPONSE_BYTES)
+                        .await
+                        .map_err(HttpClientError::Connection)?;
+                    checkpoint(cx, cancellation)?;
+                    if !matches!(&result.task, FinalTask::Working(_)) || poll + 1 == max_polls {
+                        return Ok(TaskResult::Get(Box::new(result)));
+                    }
+                    let interval = poll_interval(&result.task, minimum_interval)?;
+                    // Retain no history or response body while idle. Peer delays
+                    // outside the clock's range saturate, never wrap into a hot loop.
+                    drop(result);
+                    let at = cx.now().saturating_add_nanos(
+                        u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX),
+                    );
+                    Sleep::new(at).await;
+                    checkpoint(cx, cancellation)?;
+                    request_id = client.next_request_id()?;
+                }
+                // The public entrypoint admits a nonzero bounded count. Keep an
+                // internal misuse a typed failure rather than an unbounded loop.
+                Err(HttpClientError::CoreResult(McpError::invalid_params(
+                    "Task wait requires a nonzero poll count",
+                )))
+            }
         }
     }
 }
@@ -123,7 +217,11 @@ impl ManagedHttpClient {
         self
     }
 
-    fn admit_tasks(&self, cx: &Cx, cancellation: &McpRequestCancellation) -> Result<(), ManagedHttpClientError> {
+    fn admit_tasks(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+    ) -> Result<(), ManagedHttpClientError> {
         if self.closed {
             return Err(ManagedHttpClientError::Closed);
         }
@@ -154,16 +252,32 @@ impl ManagedHttpClient {
     /// the entire JSON/SSE response. Dropping the call retires its connection,
     /// not an already-created remote task; cancel that task explicitly by ID.
     pub async fn call_tool_final_outcome(
-        &mut self, cx: &Cx, name: &str, arguments: Value,
+        &mut self,
+        cx: &Cx,
+        name: &str,
+        arguments: Value,
     ) -> Result<FinalToolCallOutcome, ManagedHttpClientError> {
-        self.call_tool_final_outcome_with_cancellation(cx, &McpRequestCancellation::new(), name, arguments).await
+        self.call_tool_final_outcome_with_cancellation(
+            cx,
+            &McpRequestCancellation::new(),
+            name,
+            arguments,
+        )
+        .await
     }
 
     /// The exact tool-outcome operation with an independent cancellation domain.
     pub async fn call_tool_final_outcome_with_cancellation(
-        &mut self, cx: &Cx, cancellation: &McpRequestCancellation, name: &str, arguments: Value,
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        name: &str,
+        arguments: Value,
     ) -> Result<FinalToolCallOutcome, ManagedHttpClientError> {
-        match self.perform_task(cx, cancellation, TaskCall::Tool { name, arguments }).await? {
+        match self
+            .perform_task(cx, cancellation, TaskCall::Tool { name, arguments })
+            .await?
+        {
             TaskResult::Tool(result) => Ok(*result),
             _ => Err(ManagedHttpClientError::InvalidPolicy),
         }
@@ -173,14 +287,20 @@ impl ManagedHttpClient {
     /// credential; renewal invalidates discovery and caches before the GET-like
     /// MCP POST. The peer's returned task ID must match the requested ID.
     pub async fn get_task_final(
-        &mut self, cx: &Cx, task_id: FinalTaskId,
+        &mut self,
+        cx: &Cx,
+        task_id: FinalTaskId,
     ) -> Result<FinalGetTaskResult, ManagedHttpClientError> {
-        self.get_task_final_with_cancellation(cx, &McpRequestCancellation::new(), task_id).await
+        self.get_task_final_with_cancellation(cx, &McpRequestCancellation::new(), task_id)
+            .await
     }
 
     /// Fetches a snapshot under the supplied cancellation domain.
     pub async fn get_task_final_with_cancellation(
-        &mut self, cx: &Cx, cancellation: &McpRequestCancellation, task_id: FinalTaskId,
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task_id: FinalTaskId,
     ) -> Result<FinalGetTaskResult, ManagedHttpClientError> {
         match self.perform_task(cx, cancellation, TaskCall::Get(task_id)).await? {
             TaskResult::Get(result) => Ok(*result),
@@ -188,25 +308,109 @@ impl ManagedHttpClient {
         }
     }
 
+    /// Waits for a task to need input, complete, fail or be cancelled.
+    ///
+    /// Fetches immediately, then polls only while the task is `Working`. Each
+    /// delay is at least both `minimum_interval` and the latest peer-provided
+    /// `pollIntervalMs`. At most `max_polls` requests are sent. Exhausting that
+    /// count returns the last exact `Working` snapshot: callers MUST inspect
+    /// `result.task`, not equate a successful wait with successful task completion.
+    /// Input-required and failed results likewise retain their original variants.
+    ///
+    /// One operation deadline covers acquisition, discovery, all HTTP responses
+    /// and all delays. One credential generation authorizes the entire wait;
+    /// renewal is considered only before it starts and never extends a running
+    /// wait's authority. Cancellation, session closure and original credential
+    /// expiry interrupt an idle delay as well as an active HTTP request. A failed
+    /// request is not retried. Explicitly start another wait to continue later.
+    ///
+    /// No history, subscription stream or live response owner is returned. No
+    /// input-required task is automatically resumed. Dropping this future drops
+    /// its connection and timer, not the remote task; remote cancellation remains
+    /// an explicit `cancel_task_final` operation.
+    ///
+    /// Requires `with_tasks`, 1..=1024 polls and a local minimum interval from
+    /// 1ms through 60s. An even longer peer interval is respected until the
+    /// enclosing operation deadline wins. Invalid bounds refuse before I/O.
+    pub async fn wait_task_final(
+        &mut self,
+        cx: &Cx,
+        task_id: FinalTaskId,
+        minimum_interval: Duration,
+        max_polls: usize,
+    ) -> Result<FinalGetTaskResult, ManagedHttpClientError> {
+        self.wait_task_final_with_cancellation(
+            cx,
+            &McpRequestCancellation::new(),
+            task_id,
+            minimum_interval,
+            max_polls,
+        )
+        .await
+    }
+
+    /// Waits under an independent cancellation domain without cancelling the
+    /// shared OAuth login or the remote task. See `wait_task_final` for bounds
+    /// and the distinction between an actionable result and poll-count exhaustion.
+    pub async fn wait_task_final_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task_id: FinalTaskId,
+        minimum_interval: Duration,
+        max_polls: usize,
+    ) -> Result<FinalGetTaskResult, ManagedHttpClientError> {
+        self.admit_tasks(cx, cancellation)?;
+        admit_wait(minimum_interval, max_polls)?;
+        match self
+            .perform_task(
+                cx,
+                cancellation,
+                TaskCall::Wait { task_id, minimum_interval, max_polls },
+            )
+            .await?
+        {
+            TaskResult::Get(result) => Ok(*result),
+            _ => Err(ManagedHttpClientError::InvalidPolicy),
+        }
+    }
+
     /// Supplies responses matching a retained input-required snapshot. Invalid
-    /// phase, keys or response kinds refuse before acquiring/renewing credentials
-    /// or taking connection custody. The upstream remains responsible for current
-    /// ownership and state authorization. The acknowledgement is not a new task
-    /// snapshot, and a failed/abandoned update is never automatically replayed.
+    /// phase or mismatched outstanding response kinds refuse before acquiring
+    /// credentials or taking connection custody. Partial updates and unknown or
+    /// already-satisfied keys retain the shared protocol ledger's semantics.
+    /// The upstream remains responsible for current ownership and state
+    /// authorization. The acknowledgement is not a new task snapshot, and a
+    /// failed or abandoned update is never automatically replayed.
     pub async fn update_task_final(
-        &mut self, cx: &Cx, task: &FinalTask, responses: FinalTaskInputResponses,
+        &mut self,
+        cx: &Cx,
+        task: &FinalTask,
+        responses: FinalTaskInputResponses,
     ) -> Result<FinalUpdateTaskResult, ManagedHttpClientError> {
-        self.update_task_final_with_cancellation(cx, &McpRequestCancellation::new(), task, responses).await
+        self.update_task_final_with_cancellation(
+            cx,
+            &McpRequestCancellation::new(),
+            task,
+            responses,
+        )
+        .await
     }
 
     /// Submits task inputs under an independent cancellation domain.
     pub async fn update_task_final_with_cancellation(
-        &mut self, cx: &Cx, cancellation: &McpRequestCancellation,
-        task: &FinalTask, responses: FinalTaskInputResponses,
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task: &FinalTask,
+        responses: FinalTaskInputResponses,
     ) -> Result<FinalUpdateTaskResult, ManagedHttpClientError> {
         self.admit_tasks(cx, cancellation)?;
         admit_input(task, &responses)?;
-        match self.perform_task(cx, cancellation, TaskCall::Update { task, responses }).await? {
+        match self
+            .perform_task(cx, cancellation, TaskCall::Update { task, responses })
+            .await?
+        {
             TaskResult::Update(result) => Ok(result),
             _ => Err(ManagedHttpClientError::InvalidPolicy),
         }
@@ -216,14 +420,20 @@ impl ManagedHttpClient {
     /// Returns the exact complete acknowledgement without inventing a terminal
     /// snapshot. Explicitly fetch the task again to observe its current state.
     pub async fn cancel_task_final(
-        &mut self, cx: &Cx, task_id: FinalTaskId,
+        &mut self,
+        cx: &Cx,
+        task_id: FinalTaskId,
     ) -> Result<FinalCancelTaskResult, ManagedHttpClientError> {
-        self.cancel_task_final_with_cancellation(cx, &McpRequestCancellation::new(), task_id).await
+        self.cancel_task_final_with_cancellation(cx, &McpRequestCancellation::new(), task_id)
+            .await
     }
 
     /// Cancels the remote task under the supplied request-cancellation domain.
     pub async fn cancel_task_final_with_cancellation(
-        &mut self, cx: &Cx, cancellation: &McpRequestCancellation, task_id: FinalTaskId,
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task_id: FinalTaskId,
     ) -> Result<FinalCancelTaskResult, ManagedHttpClientError> {
         match self.perform_task(cx, cancellation, TaskCall::Cancel(task_id)).await? {
             TaskResult::Cancel(result) => Ok(result),

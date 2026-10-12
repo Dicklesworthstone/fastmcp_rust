@@ -310,7 +310,7 @@ fn managed_tasks_preserve_complete_and_input_required_tool_outcomes_without_retr
         }).await;
         let FinalToolCallOutcome::Complete(result) = result.unwrap() else { panic!("complete branch lost"); };
         assert_eq!(serde_json::to_value(result).unwrap()["isError"], true);
-        let wire = json!({"resultType":"input_required","requestState":"opaque-state","inputRequests":{"roots":{"method":"roots/list"}}});
+        let wire = json!({"resultType":"input_required","requestState":"bound-state","inputRequests":{"roots":{"method":"roots/list"}}});
         let (result, _) = pair(client.call_tool_final_outcome(&cx, "build", json!({})), peer.rpc("tools/call", "access-one", wire.clone(), true)).await;
         let FinalToolCallOutcome::InputRequired(result) = result.unwrap() else { panic!("input-required branch lost"); };
         assert_eq!(serde_json::to_value(result).unwrap(), wire);
@@ -401,3 +401,5 @@ fn managed_task_input_admission_preserves_partial_and_unknown_key_semantics() {
     let working: FinalGetTaskResult = serde_json::from_str(&task("working", "complete").to_string()).unwrap();
     assert!(admit_input(&working.task, &responses(json!({}))).is_err());
 }
+
+mod wait;
