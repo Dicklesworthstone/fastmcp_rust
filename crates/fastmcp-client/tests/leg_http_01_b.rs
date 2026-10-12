@@ -197,19 +197,42 @@ fn begin_sse(stream: &mut TcpStream) {
     stream.flush().expect("flush SSE head");
 }
 
+/// Accepts a body write that lost a race with the client closing its end.
+///
+/// Once the response head is out, the client may leave at any byte: it closes
+/// as soon as it reaches a typed refusal or has read the last message a case
+/// asks for, while this peer is still writing the rest of its script. That
+/// close is the behavior under test, not a fixture fault, so a peer-closed
+/// error ends the write quietly. Every other I/O error still panics, and what
+/// the client observed is asserted on the client side.
+fn unless_client_left(written: std::io::Result<()>, what: &str) {
+    use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
+
+    if let Err(error) = written {
+        assert!(
+            matches!(
+                error.kind(),
+                BrokenPipe | ConnectionReset | ConnectionAborted
+            ),
+            "{what}: {error}"
+        );
+    }
+}
+
 /// Writes one chunk. A zero-length chunk would terminate the body, so it is
 /// refused rather than silently ending the stream.
 fn write_chunk(stream: &mut TcpStream, bytes: &[u8]) {
     assert!(!bytes.is_empty(), "a zero-length chunk would end the body");
-    write!(stream, "{:x}\r\n", bytes.len()).expect("write chunk length");
-    stream.write_all(bytes).expect("write chunk payload");
-    write!(stream, "\r\n").expect("write chunk terminator");
-    stream.flush().expect("flush chunk");
+    let written = write!(stream, "{:x}\r\n", bytes.len())
+        .and_then(|()| stream.write_all(bytes))
+        .and_then(|()| write!(stream, "\r\n"))
+        .and_then(|()| stream.flush());
+    unless_client_left(written, "write chunk");
 }
 
 fn end_sse(stream: &mut TcpStream) {
-    write!(stream, "0\r\n\r\n").expect("write terminating chunk");
-    stream.flush().expect("flush terminator");
+    let written = write!(stream, "0\r\n\r\n").and_then(|()| stream.flush());
+    unless_client_left(written, "write terminating chunk");
 }
 
 fn endpoint_event(message_target: &str) -> Vec<u8> {
