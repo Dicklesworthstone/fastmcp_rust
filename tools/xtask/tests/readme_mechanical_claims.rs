@@ -183,6 +183,125 @@ fn readme_inert_feature_claims_hold() {
     );
 }
 
+/// Occurrences of `feature = "<feature>"` under one workspace member's `src/`.
+///
+/// Keyed on the member PATH rather than a crate name, so a member outside
+/// `crates/` (`tools/xtask`) is counted against its own sources instead of a
+/// `crates/<name>/src/` prefix that does not exist and would silently return 0.
+fn member_feature_mentions(member: &str, feature: &str) -> usize {
+    let needle = format!("feature = \"{feature}\"");
+    let prefix = format!("{member}/src/");
+    source_corpus()
+        .iter()
+        .filter(|(path, _)| path.starts_with(prefix.as_str()))
+        .map(|(_, text)| text.matches(needle.as_str()).count())
+        .sum()
+}
+
+/// Declared features of one workspace member as `name -> value-count`.
+///
+/// Parsed with the `toml` crate, which is load-bearing rather than incidental.
+/// A hand-rolled line parser for this exact table was written during the
+/// 2026-10-12 sweep and was wrong twice: it skipped every multi-line
+/// `name = [\n  ...\n]` definition (8 in `fastmcp-cli` alone, including the
+/// `jwt-resource-auth` the README describes), and once that was fixed it leaked
+/// `required-features` out of the `[[example]]` and `[[test]]` tables that
+/// follow `[features]` in `fastmcp-console`. Both bugs silently changed which
+/// features the sweep believed existed, and neither was visible in its output.
+fn declared_features(root: &Path, member: &str) -> BTreeMap<String, usize> {
+    let manifest = root.join(member).join("Cargo.toml");
+    if !manifest.exists() {
+        return BTreeMap::new();
+    }
+    let parsed: toml::Value =
+        toml::from_str(&read(&manifest)).expect("a member manifest must parse as TOML");
+    parsed
+        .get("features")
+        .and_then(toml::Value::as_table)
+        .map(|table| {
+            table
+                .iter()
+                .filter_map(|(name, value)| {
+                    value.as_array().map(|values| (name.clone(), values.len()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every inert feature in the tree is named by the README row that enumerates
+/// them.
+///
+/// This is the OTHER direction from `readme_inert_feature_claims_hold`, and the
+/// two catch disjoint defects. That check proves every feature the README calls
+/// inert really is inert, which by construction cannot notice a NEW inert
+/// feature the row fails to mention. That is precisely the defect found by hand
+/// on 2026-10-12: `fastmcp-console/websocket-experimental` had always been `[]`
+/// with zero `cfg` sites, and the row had simply never named it. A feature a
+/// user can enable for no effect is a footgun, so the enumeration has to stay
+/// complete, not merely truthful about its own entries.
+///
+/// `default` is excluded deliberately: `default = []` says a crate has no
+/// default features, which is not a capability claim a user can be misled by.
+#[test]
+fn every_inert_feature_is_named_in_the_readme_inert_list() {
+    let root = repo_root();
+    let named: BTreeSet<(String, String)> = README_INERT
+        .iter()
+        .map(|(krate, feature)| ((*krate).to_owned(), (*feature).to_owned()))
+        .collect();
+
+    let mut inert = BTreeSet::new();
+    let mut declared = 0usize;
+    for member in workspace_members(&root) {
+        let krate = member
+            .rsplit('/')
+            .next()
+            .unwrap_or(member.as_str())
+            .to_owned();
+        for (feature, values) in declared_features(&root, &member) {
+            declared += 1;
+            if values != 0
+                || feature == "default"
+                || member_feature_mentions(&member, &feature) != 0
+            {
+                continue;
+            }
+            inert.insert((krate.clone(), feature));
+        }
+    }
+
+    // Two controls, because an empty finding list is only evidence if the
+    // instrument can see anything at all. Without the first a manifest-reading
+    // break would pass as "no inert features"; without the second a classifier
+    // that labelled everything non-inert would pass vacuously.
+    assert!(
+        declared > 0,
+        "no declared features were read from any member manifest, so this check          proved nothing"
+    );
+    assert!(
+        inert.contains(&(
+            "fastmcp-transport".to_owned(),
+            "websocket-experimental".to_owned()
+        )),
+        "the classifier no longer recognises fastmcp-transport/\
+         websocket-experimental as inert, so its finding list is not evidence"
+    );
+
+    let unnamed: Vec<String> = inert
+        .difference(&named)
+        .map(|(krate, feature)| format!("{krate}/{feature}"))
+        .collect();
+    assert!(
+        unnamed.is_empty(),
+        "these features are inert — empty value list AND zero \
+         `cfg(feature = ..)` sites in their own crate's `src/` — but the \
+         README's \"Feature flags that gate nothing\" row does not name them. \
+         Add each to that row AND to README_INERT:\n  {}",
+        unnamed.join("\n  ")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Claim 2: a feature-gated test target declares `required-features`.
 // ---------------------------------------------------------------------------
