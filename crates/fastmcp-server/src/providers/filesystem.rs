@@ -79,6 +79,72 @@ const REDACTED_RESOURCE_PATH: &str = "<resource-path>";
 const LISTING_ENTRY_PREFIX: &str = "{\"uri\":\"";
 const LISTING_ENTRY_MIME: &str = "\",\"mimeType\":\"";
 const LISTING_ENTRY_SUFFIX: &str = "\"}";
+/// Closes `mimeType`'s quote and opens an unquoted JSON integer for `size`.
+const LISTING_ENTRY_SIZE: &str = "\",\"size\":";
+/// Closes an entry whose last member is the unquoted `size` integer.
+const LISTING_ENTRY_SIZED_SUFFIX: &str = "}";
+
+/// Rendered decimal width of a listing entry's `size`, without formatting it.
+///
+/// The listing budget is charged before an entry is built, so the cost of a
+/// variable-width integer has to be known without rendering it first.
+const fn decimal_width(value: u64) -> usize {
+    let mut width = 1;
+    let mut remaining = value;
+    while remaining >= 10 {
+        width += 1;
+        remaining /= 10;
+    }
+    width
+}
+
+/// Byte cost of one rendered listing entry, including its leading separator.
+///
+/// `walk_directory` charges this before pushing an entry and `read` charges it
+/// again while accumulating, so the early rejection and the final ceiling must
+/// agree exactly. A `size` member makes that cost depend on the value rather
+/// than on constants, so both callers derive it here instead of each repeating
+/// the arithmetic; `listing_entry_cost_matches_rendered_entry` pins the result
+/// against what `push_listing_entry` actually writes.
+fn listing_entry_bytes(uri: &str, mime_type: &str, size: Option<u64>, first: bool) -> usize {
+    let base = usize::from(!first)
+        .saturating_add(LISTING_ENTRY_PREFIX.len())
+        .saturating_add(uri.len())
+        .saturating_add(LISTING_ENTRY_MIME.len())
+        .saturating_add(mime_type.len());
+    match size {
+        Some(size) => base
+            .saturating_add(LISTING_ENTRY_SIZE.len())
+            .saturating_add(decimal_width(size))
+            .saturating_add(LISTING_ENTRY_SIZED_SUFFIX.len()),
+        None => base.saturating_add(LISTING_ENTRY_SUFFIX.len()),
+    }
+}
+
+/// Appends one entry in the exact shape `listing_entry_bytes` charged for.
+fn push_listing_entry(
+    listing: &mut String,
+    uri: &str,
+    mime_type: &str,
+    size: Option<u64>,
+    first: bool,
+) {
+    if !first {
+        listing.push(',');
+    }
+    listing.push_str(LISTING_ENTRY_PREFIX);
+    listing.push_str(uri);
+    listing.push_str(LISTING_ENTRY_MIME);
+    listing.push_str(mime_type);
+    match size {
+        Some(size) => {
+            listing.push_str(LISTING_ENTRY_SIZE);
+            listing.push_str(&size.to_string());
+            listing.push_str(LISTING_ENTRY_SIZED_SUFFIX);
+        }
+        None => listing.push_str(LISTING_ENTRY_SUFFIX),
+    }
+}
 
 const fn is_directional_format_character(character: char) -> bool {
     matches!(
@@ -948,14 +1014,9 @@ impl FilesystemProvider {
                 if opened_metadata.is_file() && opened_metadata.nlink() == 1 {
                     let mime_type = detect_mime_type(Path::new(&relative_path));
                     let uri = self.file_uri(&relative_path)?;
-                    let separator_bytes = usize::from(!entries.is_empty());
-                    let line_bytes = uri
-                        .len()
-                        .saturating_add(LISTING_ENTRY_PREFIX.len())
-                        .saturating_add(LISTING_ENTRY_MIME.len())
-                        .saturating_add(mime_type.len())
-                        .saturating_add(LISTING_ENTRY_SUFFIX.len())
-                        .saturating_add(separator_bytes);
+                    let size = Some(opened_metadata.len());
+                    let line_bytes =
+                        listing_entry_bytes(&uri, &mime_type, size, entries.is_empty());
                     let projected_listing_bytes = (*listing_bytes).saturating_add(line_bytes);
                     if projected_listing_bytes > self.max_listing_bytes {
                         return Err(FilesystemProviderError::ListingTooLarge {
@@ -972,7 +1033,7 @@ impl FilesystemProvider {
                     entries.push(FileEntry {
                         relative_path: relative_path.clone(),
                         uri,
-                        size: Some(opened_metadata.len()),
+                        size,
                         mime_type,
                     });
                 }
@@ -1180,7 +1241,7 @@ impl FilesystemProvider {
 struct FileEntry {
     relative_path: String,
     uri: String,
-    #[allow(dead_code)]
+    /// Exact byte size from the opened file's metadata, emitted in the listing.
     size: Option<u64>,
     mime_type: String,
 }
@@ -1345,23 +1406,12 @@ impl ResourceHandler for FilesystemResourceHandler {
         for (index, file) in files.into_iter().enumerate() {
             ctx.checkpoint()
                 .map_err(|_| McpError::request_cancelled())?;
-            let additional = usize::from(index != 0)
-                .saturating_add(LISTING_ENTRY_PREFIX.len())
-                .saturating_add(file.uri.len())
-                .saturating_add(LISTING_ENTRY_MIME.len())
-                .saturating_add(file.mime_type.len());
-            let additional = additional.saturating_add(LISTING_ENTRY_SUFFIX.len());
+            let first = index == 0;
+            let additional = listing_entry_bytes(&file.uri, &file.mime_type, file.size, first);
             listing.try_reserve(additional).map_err(|error| {
                 McpError::internal_error(format!("Cannot grow filesystem listing: {error}"))
             })?;
-            if index != 0 {
-                listing.push(',');
-            }
-            listing.push_str(LISTING_ENTRY_PREFIX);
-            listing.push_str(&file.uri);
-            listing.push_str(LISTING_ENTRY_MIME);
-            listing.push_str(&file.mime_type);
-            listing.push_str(LISTING_ENTRY_SUFFIX);
+            push_listing_entry(&mut listing, &file.uri, &file.mime_type, file.size, first);
         }
         listing.push(']');
         if listing.len() > self.provider.max_listing_bytes {
@@ -2092,9 +2142,12 @@ mod tests {
             serde_json::from_str(listing_text).expect("valid JSON listing");
         assert_eq!(
             listing_json,
+            // "# docs" is 6 bytes; the listing now carries the size the walk
+            // already stat'd (bd-wvi90).
             serde_json::json!([{
                 "uri": "file:///docs/docs/readme.md",
-                "mimeType": "text/markdown"
+                "mimeType": "text/markdown",
+                "size": 6
             }])
         );
 
@@ -2142,7 +2195,11 @@ mod tests {
         let text = listing[0].text.as_deref().expect("JSON listing");
         assert_eq!(
             text,
-            "[{\"uri\":\"file:///a.txt\",\"mimeType\":\"text/plain\"},{\"uri\":\"file:///b.txt\",\"mimeType\":\"text/plain\"},{\"uri\":\"file:///directional%E2%80%AE.txt\",\"mimeType\":\"text/plain\"}]"
+            // Each entry carries the exact byte size the walk already stat'd
+            // (bd-wvi90): "a" and "b" are 1 byte, "encoded safely" is 14. This
+            // golden was updated deliberately for that format change, not
+            // regenerated to accommodate a broken output.
+            "[{\"uri\":\"file:///a.txt\",\"mimeType\":\"text/plain\",\"size\":1},{\"uri\":\"file:///b.txt\",\"mimeType\":\"text/plain\",\"size\":1},{\"uri\":\"file:///directional%E2%80%AE.txt\",\"mimeType\":\"text/plain\",\"size\":14}]"
         );
         assert!(!text.contains('\u{202e}'));
         serde_json::from_str::<serde_json::Value>(text).expect("listing must remain valid JSON");
@@ -3121,7 +3178,9 @@ mod tests {
     fn listing_byte_ceiling_accepts_n_and_rejects_n_plus_one() {
         let root = TestDir::new("list-byte-limit");
         write_text(&root.join("a.txt"), "a");
-        let expected_bytes = "[{\"uri\":\"file:///a.txt\",\"mimeType\":\"text/plain\"}]".len();
+        // "a" is one byte, so the entry renders "size":1 (bd-wvi90).
+        let expected_bytes =
+            "[{\"uri\":\"file:///a.txt\",\"mimeType\":\"text/plain\",\"size\":1}]".len();
 
         let exact = FilesystemProvider::new(root.path())
             .with_exclude(&[])
@@ -3135,6 +3194,60 @@ mod tests {
             too_small.list_files(&test_context()),
             Err(FilesystemProviderError::ListingTooLarge { size, max })
                 if size == expected_bytes && max == expected_bytes - 1
+        ));
+    }
+
+    #[test]
+    fn listing_entry_cost_matches_rendered_entry() {
+        // The budget charges for an entry before it exists, so the pre-push
+        // ceiling in `walk_directory` and the final ceiling in `read` stay
+        // honest only while these two functions agree. A `size` that gains a
+        // digit is precisely the case a constant-width charge gets wrong.
+        for (size, first) in [
+            (Some(0_u64), true),
+            (Some(9), false),
+            (Some(999), true),
+            (Some(1000), false),
+            (Some(u64::MAX), true),
+            (None, false),
+        ] {
+            let mut rendered = String::new();
+            push_listing_entry(&mut rendered, "file:///a.txt", "text/plain", size, first);
+            assert_eq!(
+                listing_entry_bytes("file:///a.txt", "text/plain", size, first),
+                rendered.len(),
+                "charge and render disagree for size={size:?} first={first}"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn listing_budget_accounts_for_a_size_that_gains_a_digit() {
+        let root = TestDir::new("list-size-digit");
+        write_text(&root.join("a.txt"), &"x".repeat(999));
+        write_text(&root.join("b.txt"), &"y".repeat(1000));
+        let expected = "[{\"uri\":\"file:///a.txt\",\"mimeType\":\"text/plain\",\"size\":999},{\"uri\":\"file:///b.txt\",\"mimeType\":\"text/plain\",\"size\":1000}]";
+
+        let exact = FilesystemProvider::new(root.path())
+            .with_exclude(&[])
+            .with_max_listing_bytes(expected.len())
+            .build_for_test()
+            .expect("valid filesystem provider");
+        let listing = exact.read(&test_context()).expect("bounded listing");
+        // The rendered listing is exactly the number of bytes the walk charged.
+        assert_eq!(listing[0].text.as_deref(), Some(expected));
+
+        // Planted negative: one byte under the exact fit. The refusal must come
+        // from the pre-push budget in `list_files`, before the listing is built,
+        // not from `read`'s final length check afterwards.
+        let too_small = FilesystemProvider::new(root.path())
+            .with_exclude(&[])
+            .with_max_listing_bytes(expected.len() - 1);
+        assert!(matches!(
+            too_small.list_files(&test_context()),
+            Err(FilesystemProviderError::ListingTooLarge { size, max })
+                if size == expected.len() && max == expected.len() - 1
         ));
     }
 
