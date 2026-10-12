@@ -3995,6 +3995,11 @@ pub struct HttpServerConfig {
     pub max_connections: usize,
     /// Time allowed to receive one complete request on an accepted
     /// connection before it is closed (default: 30 seconds).
+    ///
+    /// This is one budget for the whole request, head and body together, not
+    /// an idle timeout: a large body uploaded slowly is cut off when it
+    /// expires even while bytes are still arriving. Raise it for deployments
+    /// that accept large request bodies over slow links.
     pub request_read_timeout: Duration,
     /// Inner HTTP handler configuration (endpoint path, CORS, and body size).
     pub handler_config: HttpHandlerConfig,
@@ -4123,6 +4128,10 @@ impl HttpServerConfig {
 
     /// Sets the time allowed to receive one complete request before the
     /// connection is closed and its slot released.
+    ///
+    /// The budget covers the request head and body together, so it must be
+    /// long enough for the largest body the deployment accepts at the slowest
+    /// upload rate it tolerates.
     #[must_use]
     pub fn request_read_timeout(mut self, timeout: Duration) -> Self {
         self.request_read_timeout = timeout;
@@ -8051,7 +8060,14 @@ async fn serve_websocket_connection(
     expected_path: &str,
 ) -> McpResult<()> {
     let read_timeout = server.http_config.request_read_timeout;
-    let (request, trailing) = match read_websocket_handshake(cx, &mut stream, read_timeout).await {
+    let handshake = read_websocket_handshake(
+        cx,
+        &mut stream,
+        read_timeout,
+        &server.http_config.handler_config,
+    )
+    .await;
+    let (request, trailing) = match handshake {
         Ok(handshake) => handshake,
         Err(error) => {
             let rejection = if error.message == "WebSocket Authorization admission failed" {
@@ -8157,6 +8173,7 @@ async fn read_websocket_handshake(
     cx: &Cx,
     stream: &mut AsyncTcpStream,
     read_timeout: Duration,
+    handler_config: &HttpHandlerConfig,
 ) -> McpResult<(asupersync::net::websocket::HttpRequest, Vec<u8>)> {
     let mut bytes = Vec::with_capacity(1024);
     let mut chunk = [0_u8; 1024];
@@ -8205,7 +8222,7 @@ async fn read_websocket_handshake(
             if raw_websocket_upgrade_headers_are_well_formed(header_block).is_err() {
                 return Err(McpError::invalid_request("WebSocket handshake is invalid"));
             }
-            if !raw_websocket_upgrade_origin_is_admissible(header_block) {
+            if !raw_websocket_upgrade_origin_is_admissible(header_block, handler_config) {
                 return Err(McpError::invalid_request("WebSocket Origin is not allowed"));
             }
         }
@@ -8238,12 +8255,16 @@ fn raw_websocket_upgrade_headers_are_well_formed(head: &[u8]) -> Result<(), ()> 
 }
 
 /// Cross-site WebSocket hijacking protection: a browser always sends
-/// `Origin` on a WebSocket upgrade, and the server-side transport has no CORS
-/// allowlist, so a present `Origin` must be a loopback origin (the same
-/// admission policy the HTTP routes apply by default). Non-browser clients
-/// that send no `Origin` are unaffected.
+/// `Origin` on a WebSocket upgrade, so a present `Origin` must pass the same
+/// admission policy the HTTP routes apply: a loopback origin, or one the
+/// listener's `handler_config` allows explicitly (`allow_cors` with an exact
+/// `cors_origins` entry). Non-browser clients that send no `Origin` are
+/// unaffected.
 #[cfg(feature = "websocket")]
-fn raw_websocket_upgrade_origin_is_admissible(head: &[u8]) -> bool {
+fn raw_websocket_upgrade_origin_is_admissible(
+    head: &[u8],
+    handler_config: &HttpHandlerConfig,
+) -> bool {
     let Ok(head) = std::str::from_utf8(head) else {
         // Left to the handshake parser's generic bounded 400 path.
         return true;
@@ -8255,7 +8276,7 @@ fn raw_websocket_upgrade_origin_is_admissible(head: &[u8]) -> bool {
     });
     match (origins.next(), origins.next()) {
         (None, _) => true,
-        (Some(origin), None) => HttpHandlerConfig::default().admits_origin(origin),
+        (Some(origin), None) => handler_config.admits_origin(origin),
         // A repeated Origin is ambiguous; refuse rather than pick one.
         (Some(_), Some(_)) => false,
     }
@@ -22550,6 +22571,90 @@ mod lib_unit_tests {
         assert!(source.contains("pub async fn bind_websocket"));
         assert!(source.contains("pub async fn serve_websocket"));
         assert!(source.contains("pub async fn run_http"));
+    }
+
+    #[cfg(feature = "websocket")]
+    fn websocket_upgrade_head(origins: &[&str]) -> Vec<u8> {
+        let mut head = String::from(
+            "GET /mcp HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade",
+        );
+        for origin in origins {
+            head.push_str("\r\nOrigin: ");
+            head.push_str(origin);
+        }
+        head.into_bytes()
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_upgrade_origin_follows_the_configured_cors_allowlist() {
+        let listed = "https://app.example";
+        let configured = HttpHandlerConfig {
+            allow_cors: true,
+            cors_origins: vec![listed.to_string()],
+            ..HttpHandlerConfig::default()
+        };
+        let default = HttpHandlerConfig::default();
+
+        // The listed origin is admitted only by the listener that lists it.
+        assert!(raw_websocket_upgrade_origin_is_admissible(
+            &websocket_upgrade_head(&[listed]),
+            &configured
+        ));
+        assert!(!raw_websocket_upgrade_origin_is_admissible(
+            &websocket_upgrade_head(&[listed]),
+            &default
+        ));
+
+        // Planted negatives against the configured listener: an unlisted
+        // origin, a lookalike, and the same list with CORS switched off.
+        for refused in ["https://evil.example", "https://app.example.evil.example"] {
+            assert!(
+                !raw_websocket_upgrade_origin_is_admissible(
+                    &websocket_upgrade_head(&[refused]),
+                    &configured
+                ),
+                "{refused} must not be admitted"
+            );
+        }
+        let cors_off = HttpHandlerConfig {
+            allow_cors: false,
+            ..configured.clone()
+        };
+        assert!(!raw_websocket_upgrade_origin_is_admissible(
+            &websocket_upgrade_head(&[listed]),
+            &cors_off
+        ));
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_upgrade_origin_keeps_loopback_absent_and_repeated_origin_rules() {
+        let configured = HttpHandlerConfig {
+            allow_cors: true,
+            cors_origins: vec!["https://app.example".to_string()],
+            ..HttpHandlerConfig::default()
+        };
+        for config in [&HttpHandlerConfig::default(), &configured] {
+            // Non-browser clients send no Origin.
+            assert!(raw_websocket_upgrade_origin_is_admissible(
+                &websocket_upgrade_head(&[]),
+                config
+            ));
+            assert!(raw_websocket_upgrade_origin_is_admissible(
+                &websocket_upgrade_head(&["http://localhost:6274"]),
+                config
+            ));
+            assert!(!raw_websocket_upgrade_origin_is_admissible(
+                &websocket_upgrade_head(&["http://localhost.evil.example"]),
+                config
+            ));
+        }
+        // A repeated Origin is refused even when both values are admissible.
+        assert!(!raw_websocket_upgrade_origin_is_admissible(
+            &websocket_upgrade_head(&["https://app.example", "https://app.example"]),
+            &configured
+        ));
     }
 
     #[cfg(feature = "websocket")]
