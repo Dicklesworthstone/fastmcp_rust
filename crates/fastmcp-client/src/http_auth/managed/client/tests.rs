@@ -940,7 +940,7 @@ fn independent_high_level_clients_share_one_refresh_exchange() {
         )
         .unwrap();
         force_renewal(&session);
-        let ((a, b), (refreshes, discoveries, calls)) = pair(
+        let ((a, b), (refreshes, discoveries, calls)) = Box::pin(pair(
             pair(
                 first.call_tool(&cx, "lookup", json!({"caller":1})),
                 second.call_tool(&cx, "lookup", json!({"caller":2})),
@@ -983,7 +983,7 @@ fn independent_high_level_clients_share_one_refresh_exchange() {
                 }
                 (refreshes, discoveries, calls)
             },
-        )
+        ))
         .await;
         assert!(a.is_ok() && b.is_ok());
         assert_eq!((refreshes, discoveries, calls), (1, 2, 2));
