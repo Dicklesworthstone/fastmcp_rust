@@ -183,6 +183,87 @@ fn readme_inert_feature_claims_hold() {
     );
 }
 
+/// The README table row that enumerates features which gate nothing.
+///
+/// Returned as one string because the row is a single Markdown line.
+fn readme_inert_row(readme: &str) -> &str {
+    const HEADER: &str = "| **Feature flags that gate nothing** |";
+    let row = readme
+        .lines()
+        .filter(|line| line.starts_with(HEADER))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        row.len(),
+        1,
+        "the README must carry exactly one \"Feature flags that gate nothing\" \
+         row; found {}",
+        row.len()
+    );
+    row[0]
+}
+
+/// `README_INERT` and the README row it models still agree.
+///
+/// Neither inert check above reads the README's prose: both compare the const
+/// list against the tree. So the list and the row it claims to mirror could
+/// drift apart silently, and the row's own instruction to "fix the README row
+/// and this list together" was an unenforced comment. Half of exactly that
+/// drift was real on 2026-10-12: `fastmcp-console/websocket-experimental` was
+/// missing from BOTH, and fixing only one would have left no test failing.
+///
+/// NO-CLAIM: this binds feature NAMES, not crate-qualified pairs, because the
+/// row names a feature once and then discusses several crates that share the
+/// name. It therefore catches a feature dropped from the row, not a
+/// mis-attributed crate.
+#[test]
+fn readme_inert_row_names_every_listed_feature() {
+    let readme = read(&repo_root().join("README.md"));
+    let row = readme_inert_row(&readme);
+
+    let mut missing = Vec::new();
+    for (krate, feature) in README_INERT {
+        if !row.contains(&format!("`{feature}`")) {
+            missing.push(format!("{krate}/{feature}"));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "README_INERT lists these features but the \"Feature flags that gate \
+         nothing\" row does not name them, so the list and the prose have \
+         drifted:\n  {}",
+        missing.join("\n  ")
+    );
+
+    // Control: the needle must be able to fail. A row that matched everything
+    // would make the loop above vacuous.
+    assert!(
+        !row.contains("`definitely-not-a-declared-feature`"),
+        "the row matched a feature name that does not exist, so this check \
+         cannot distinguish a named feature from an unnamed one"
+    );
+}
+
+/// Planted negative for the row/list binding above.
+///
+/// `readme_inert_row_names_every_listed_feature` passing proves nothing unless
+/// the same predicate detects an omission, so this runs it against a fabricated
+/// row that names one listed feature and drops another.
+#[test]
+fn planted_inert_row_omission_is_detected() {
+    let row = "| **Feature flags that gate nothing** | `fastmcp-console`'s \
+               `proxy` is empty |";
+    let omitted: Vec<&str> = ["proxy", "websocket-experimental"]
+        .into_iter()
+        .filter(|feature| !row.contains(&format!("`{feature}`")))
+        .collect();
+    assert_eq!(
+        omitted,
+        vec!["websocket-experimental"],
+        "the binding must flag exactly the feature the planted row omits, and \
+         must not flag the one it names"
+    );
+}
+
 /// Occurrences of `feature = "<feature>"` under one workspace member's `src/`.
 ///
 /// Keyed on the member PATH rather than a crate name, so a member outside
