@@ -38,6 +38,8 @@ pin and the result tally. Measurements use
 
 | revision | date | scenarios | checks | SUCCESS | FAILURE | WARNING | INFO |
 |---|---|---|---|---|---|---|---|
+| `1c2dc896` | 2026-10-12 | 40 | 115 | **112** | **0** | 2 | 1 |
+| `e2a0ac5c` | 2026-10-12 | 40 | 115 | 110 | **0** | 4 | 1 |
 | `99a3b4e8` | 2026-10-05 | 40 | 115 | 110 | **0** | 4 | 1 |
 | working tree (unanchored) | 2026-10-04 | 40 | 115 | 110 | **0** | 4 | 1 |
 | `6b54e023` | 2026-10-03 | 40 | 114 | 108 | 1 | 4 | 1 |
@@ -128,8 +130,21 @@ things:
 Client-mode conformance is measured; aggregate conformance is still **not**
 claimed, in either mode.
 
-No server-mode FAILURE-level check remains. The four SHOULD-level warnings are enumerated in
-that same file; two are the absent runtime catalog-mutation API, and two are a
+No server-mode FAILURE-level check remains, and **two of the four SHOULD-level
+warnings are now gone**. The two that cleared were
+`sep-2575-server-sends-tools-list-changed-on-subscription` and its prompts
+counterpart, which the adapter had declined on the stated grounds that "the
+server has no runtime catalog-mutation API". That was false: `McpContext`
+exposes `disable_tool`/`enable_tool` and the resource and prompt pairs, each
+publishing a catalog change, and the server already attached both the session
+state and the `subscriptions/listen` publisher. Serving the suite's two trigger
+fixtures through that API took no library change at all — only
+`examples/conformance_server.rs`, +93/-4. The `e2a0ac5c` and `1c2dc896` rows
+above are a measured before/after over an identical 99-check id set, with
+exactly those two statuses changing and nothing else moving, so the +2 is not a
+denominator shift.
+
+The two remaining warnings are enumerated in that same file: both are the
 deliberate fail-closed choice about empty MRTR response maps that the suite
 would prefer we relax.
 

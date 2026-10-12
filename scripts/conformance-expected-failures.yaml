@@ -2,11 +2,11 @@
 # `scripts/run_official_conformance.sh --baseline <this file>`, which forwards
 # it to the suite's own `--expected-failures`.
 #
-# Measured 2026-10-04 on worker hz3 with
+# Measured 2026-10-12 at 1c2dc896 on worker hz3 with
 # `@modelcontextprotocol/conformance@0.2.0-alpha.10`,
 # `--spec-version 2026-07-28 --suite all`:
 #
-#   40 scenarios, 115 checks: SUCCESS=110, FAILURE=0, WARNING=4, INFO=1
+#   40 scenarios, 115 checks: SUCCESS=112, FAILURE=0, WARNING=2, INFO=1
 #
 # History (do NOT read these as a ratio; the denominator moves because a
 # scenario that fails an early check never runs its later ones):
@@ -15,6 +15,8 @@
 #   6b54e023  2026-10-03   40 scenarios, 114 checks, 108 SUCCESS,  1 FAILURE
 #   (unanchored) 2026-10-04 40 scenarios, 115 checks, 110 SUCCESS,  0 FAILURE
 #   99a3b4e8  2026-10-05   40 scenarios, 115 checks, 110 SUCCESS,  0 FAILURE
+#   e2a0ac5c  2026-10-12   40 scenarios, 115 checks, 110 SUCCESS,  0 FAILURE
+#   1c2dc896  2026-10-12   40 scenarios, 115 checks, 112 SUCCESS,  0 FAILURE
 #
 # The 2026-10-04 row carries a date and no revision, and 98 commits touching
 # 388 lines of server-mode source landed after it. 99a3b4e8 re-measures it and
@@ -58,9 +60,45 @@ server: []
 #
 # server-stateless:sep-2575-server-sends-tools-list-changed-on-subscription
 # server-stateless:sep-2575-server-sends-prompts-list-changed-on-subscription
-#     The server has no runtime catalog-mutation API, so it never emits a
-#     list-changed notification. Deliberate; documented in the adapter, which
-#     also declines to serve the test_trigger_* fixtures for the same reason.
+#     RESOLVED 2026-10-12 at 1c2dc896. Both are now SUCCESS.
+#
+#     The justification that used to stand here -- "the server has no runtime
+#     catalog-mutation API, so it never emits a list-changed notification.
+#     Deliberate; documented in the adapter, which also declines to serve the
+#     test_trigger_* fixtures for the same reason." -- was a FALSE PREMISE, not
+#     a deliberate scope choice. The mutation API existed the whole time:
+#     McpContext::{disable,enable}_{tool,prompt} (fastmcp-core/src/context.rs)
+#     mutate SessionState and emit through CatalogChangePublisher, which
+#     Server::request_context attaches to every request. What was missing was
+#     only the adapter's own trigger tools, so the suite had no way to ASK for
+#     a mutation. 1c2dc896 adds test_trigger_tool_change and
+#     test_trigger_prompt_change plus their toggle targets to
+#     crates/fastmcp/examples/conformance_server.rs. No library change.
+#
+#     Measured before/after on hz3, same pin, server mode, `--suite all`, by
+#     reading every scenario's checks.json rather than a printed tally:
+#
+#       e2a0ac5c  40 scenarios, 115 checks, 110 SUCCESS, 4 WARNING, 1 INFO
+#       1c2dc896  40 scenarios, 115 checks, 112 SUCCESS, 2 WARNING, 1 INFO
+#
+#     The (scenario, check-id) set is IDENTICAL across the two runs -- 99 pairs
+#     both sides, sha256 7e427ae1 of the sorted pair list, 0 added, 0 removed --
+#     so the +2 is a status change, not the denominator drift warned about in
+#     the History block above. Exactly two ids changed, both WARNING ->
+#     SUCCESS, both the ids named here. The e2a0ac5c baseline was run TWICE
+#     into one output directory, which is why that directory holds 80 scenario
+#     dirs; the two groups agree exactly (both 110/4/1, both sha256 7e427ae1),
+#     so the pre-change reading is a reproduced double sample, not one draw.
+#
+#     Consequence for the `--baseline` defect recorded above: the
+#     `server-stateless` scenario now has NO non-success check of any level, so
+#     it should drop out of the suite's "Unexpected failures" list, leaving the
+#     two `input-required-result-*` scenarios below. That is a PREDICTION from
+#     the measured per-check statuses plus the suite's observed keying -- the
+#     INFO check in `server-sse-multiple-streams` never listed its scenario,
+#     while WARNINGs did -- and NOT a re-run: no run with `--baseline` has been
+#     made since 1c2dc896. Either way `--baseline <this file>` stays red as
+#     written, so bd-conformance-row-unanchored-jw3pb stays open.
 #
 # input-required-result-missing-input-response:sep-2322-missing-response-rerequests
 # input-required-result-ignore-extra-params:sep-2322-ignore-unexpected-params
