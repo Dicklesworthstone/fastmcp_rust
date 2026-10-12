@@ -12,6 +12,8 @@ use asupersync::time::Sleep;
 use super::{BoxFuture, poll_slot};
 use crate::error::{McpError, McpResult};
 
+mod bounded;
+
 // Capture the active effect ceiling before installing the explicit caller.
 // Cx::set_current preserves the supplied Cx's restrictions, not those of the
 // ambient frame it replaces. The ambient context contributes only a ceiling:
