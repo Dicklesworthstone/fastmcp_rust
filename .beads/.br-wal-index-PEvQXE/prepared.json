@@ -1,0 +1,10 @@
+{
+  "schema_version": "br.wal_index.quarantine.v1",
+  "database_path": "/Users/jemanuel/projects/fastmcp_rust/.beads/beads.db",
+  "reason": "initialized-zero-page-wal-index",
+  "main_sha256": "2375ec5447333448cf7608ca15d497d306d1397427dc0461bdde615640e22da1",
+  "wal_sha256": "9a93f1f29648600fe4150f7c4cdba3e399b8a36c728df31c30282f2e6feaa38b",
+  "shm_sha256": "afe2786fcbf84e7550c17e7af1b2ee0a751218368fce0e4962c36c808e0dbed7",
+  "retained_index": "/Users/jemanuel/projects/fastmcp_rust/.beads/.br-wal-index-PEvQXE/poisoned-shm",
+  "completion_marker": "quarantine-complete.json"
+}
