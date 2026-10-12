@@ -538,7 +538,7 @@ fn managed_tasks_preserve_complete_and_input_required_tool_outcomes_without_retr
         let FinalToolCallOutcome::Complete(result) = result.unwrap() else {
             panic!("complete branch lost");
         };
-        assert_eq!(serde_json::to_value(result).unwrap()["isError"], true);
+        assert!(result.payload.is_error);
         let wire = json!({"resultType":"input_required","requestState":"bound-state","inputRequests":{"roots":{"method":"roots/list"}}});
         let (result, _) = pair(
             client.call_tool_final_outcome(&cx, "build", json!({})),
@@ -548,7 +548,14 @@ fn managed_tasks_preserve_complete_and_input_required_tool_outcomes_without_retr
         let FinalToolCallOutcome::InputRequired(result) = result.unwrap() else {
             panic!("input-required branch lost");
         };
-        assert_eq!(serde_json::to_value(result).unwrap(), wire);
+        // Results are encoded by the result algebra, not serde.
+        let encoded = fastmcp_protocol::encode_result(
+            &fastmcp_protocol::DecodedResult::InputRequired(result),
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded).unwrap(),
+            wire
+        );
         peer.no_more(&cx).await;
     });
 }
