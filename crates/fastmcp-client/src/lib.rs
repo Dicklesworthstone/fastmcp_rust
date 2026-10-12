@@ -27098,9 +27098,13 @@ mod tests {
                             &peer_cx,
                             &JsonRpcMessage::Response(JsonRpcResponse::success(
                                 discover.id.expect("discovery has an ID"),
+                                // A missing server identity is admitted
+                                // since 0.12.0, so the result is made
+                                // invalid another way: `supportedVersions`
+                                // is a bare string, not an array.
                                 serde_json::json!({
                                     "resultType": "complete",
-                                    "supportedVersions": [MODERN_PROTOCOL_VERSION],
+                                    "supportedVersions": MODERN_PROTOCOL_VERSION,
                                     "capabilities": {},
                                     "_meta": {},
                                     "ttlMs": 0,
@@ -27109,7 +27113,7 @@ mod tests {
                             )),
                         )
                         .await
-                        .expect("peer returns a structurally incomplete discovery result");
+                        .expect("peer returns a structurally invalid discovery result");
                     assert!(matches!(
                         server.recv(&peer_cx).await,
                         Err(TransportError::Closed)
@@ -27125,11 +27129,11 @@ mod tests {
                 AsyncWsClientTransport::from_upgraded(client_io),
             )
             .await
-            .expect_err("incomplete discovery remains a handshake error");
+            .expect_err("an invalid discovery result remains a handshake error");
             assert_eq!(error.code, McpErrorCode::InvalidRequest);
             assert_eq!(
                 error.message,
-                "Modern WebSocket discovery response has no server identity"
+                "Modern WebSocket discovery response has an invalid result"
             );
             assert_eq!(contacts.load(Ordering::SeqCst), 1);
             assert!(matches!(peer.join(&cx).await, Ok(())));
