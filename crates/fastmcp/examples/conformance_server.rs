@@ -31,10 +31,11 @@
 //! JSON Schema 2020-12 tool, the `x-mcp-header` tool, the `server-stateless`
 //! diagnostic tools, and the SEP-2322 `input_required` tools). Fixtures carry
 //! no conformance-specific behavior in the library: they use only the public
-//! handler APIs an application would use. Not served: the list-mutation
-//! triggers (`test_trigger_tool_change` / `test_trigger_prompt_change`, SHOULD
-//! level), because the server has no runtime catalog-mutation API, and the
-//! 2025-era scenarios this 2026-07-28 server does not claim.
+//! handler APIs an application would use — including the list-mutation
+//! triggers (`test_trigger_tool_change` / `test_trigger_prompt_change`), which
+//! toggle a throwaway target through `McpContext::disable_tool` /
+//! `disable_prompt` and their `enable_*` counterparts. Not served: the 2025-era
+//! scenarios this 2026-07-28 server does not claim.
 
 #![allow(clippy::needless_pass_by_value)]
 
@@ -272,6 +273,90 @@ fn test_tool_with_logging(ctx: &McpContext) -> McpResult<Vec<Content>> {
 fn test_logging_tool(ctx: &McpContext) -> McpResult<Vec<Content>> {
     log_three_steps(ctx)?;
     Ok(vec![Content::text("logging tool completed")])
+}
+
+// ============================================================================
+// server-stateless list-mutation triggers (sep-2575)
+// ============================================================================
+
+/// Visibility toggle targets for the two triggers below.
+///
+/// They exist only to be hidden and revealed. No other scenario names them, so
+/// changing their visibility cannot perturb another check's expectations.
+const TOGGLE_TOOL: &str = "test_toggle_target_tool";
+const TOGGLE_PROMPT: &str = "test_toggle_target_prompt";
+
+#[tool(
+    name = "test_toggle_target_tool",
+    description = "Visibility toggle target for test_trigger_tool_change"
+)]
+fn test_toggle_target_tool(ctx: &McpContext) -> McpResult<Vec<Content>> {
+    ctx.checkpoint()?;
+    Ok(vec![Content::text("toggle target")])
+}
+
+#[prompt(
+    name = "test_toggle_target_prompt",
+    description = "Visibility toggle target for test_trigger_prompt_change"
+)]
+fn test_toggle_target_prompt(ctx: &McpContext) -> McpResult<Vec<PromptMessage>> {
+    ctx.checkpoint()?;
+    Ok(vec![PromptMessage {
+        role: Role::User,
+        content: Content::text("toggle target"),
+    }])
+}
+
+/// `server-stateless`: mutates this session's tool catalog so the server emits
+/// `notifications/tools/list_changed` on an open `subscriptions/listen`.
+///
+/// TOGGLING IS LOAD-BEARING. `McpContext::disable_tool` publishes a catalog
+/// change only when the disabled set actually changed, so a trigger that always
+/// disables the same name would emit on its first call and be silent on every
+/// later one — passing or failing depending on what ran before it in the same
+/// session. Toggling keeps every call a real mutation.
+///
+/// A failed mutation is reported rather than swallowed: `disable_tool` returns
+/// false when no session state is attached, and a silent success there would
+/// look identical to a server that simply never notifies.
+#[tool(
+    name = "test_trigger_tool_change",
+    description = "Mutates the tool catalog so tools/list_changed is emitted"
+)]
+fn test_trigger_tool_change(ctx: &McpContext) -> McpResult<Vec<Content>> {
+    ctx.checkpoint()?;
+    let mutated = if ctx.disabled_tools().contains(TOGGLE_TOOL) {
+        ctx.enable_tool(TOGGLE_TOOL)
+    } else {
+        ctx.disable_tool(TOGGLE_TOOL)
+    };
+    if !mutated {
+        return Err(McpError::internal_error(
+            "no session state, so no tool catalog change could be published",
+        ));
+    }
+    Ok(vec![Content::text("tool catalog changed")])
+}
+
+/// The prompts counterpart of [`test_trigger_tool_change`]; same toggle
+/// reasoning applies.
+#[tool(
+    name = "test_trigger_prompt_change",
+    description = "Mutates the prompt catalog so prompts/list_changed is emitted"
+)]
+fn test_trigger_prompt_change(ctx: &McpContext) -> McpResult<Vec<Content>> {
+    ctx.checkpoint()?;
+    let mutated = if ctx.disabled_prompts().contains(TOGGLE_PROMPT) {
+        ctx.enable_prompt(TOGGLE_PROMPT)
+    } else {
+        ctx.disable_prompt(TOGGLE_PROMPT)
+    };
+    if !mutated {
+        return Err(McpError::internal_error(
+            "no session state, so no prompt catalog change could be published",
+        ));
+    }
+    Ok(vec![Content::text("prompt catalog changed")])
 }
 
 // ============================================================================
@@ -1174,6 +1259,9 @@ fn main() -> ExitCode {
             .tool(TestToolWithProgress)
             .tool(TestToolWithLogging)
             .tool(TestLoggingTool)
+            .tool(TestToggleTargetTool)
+            .tool(TestTriggerToolChange)
+            .tool(TestTriggerPromptChange)
             .tool(TestMissingCapability)
             .tool(TestStreamingElicitation)
             .tool(JsonSchema202012Tool)
@@ -1190,6 +1278,7 @@ fn main() -> ExitCode {
             .resource(StaticBinaryResource)
             .resource(TemplateResourceResource)
             .prompt(TestSimplePromptPrompt)
+            .prompt(TestToggleTargetPromptPrompt)
             .prompt(TestPromptWithArgumentsPrompt)
             .prompt(TestPromptWithImagePrompt)
             .prompt(EmbeddedResourcePrompt)
