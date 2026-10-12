@@ -27,6 +27,8 @@ use crate::{ClientBuilder, HttpClient, HttpClientError, ProtocolPolicy};
 
 mod cursors;
 use cursors::{CatalogKind, CursorLedger};
+#[cfg(feature = "tasks")]
+mod tasks;
 
 /// Sanitized high-level failures. The original session error remains available
 /// for typed handling, but formatting never includes transport or peer data.
@@ -115,6 +117,36 @@ struct Connection {
     cursors: CursorLedger,
 }
 
+// Only completed values cross the managed guard. This private sum is not an
+// escape hatch for raw clients, callbacks or credential-bearing stream owners.
+enum CallResult {
+    Core(Box<CoreResult>),
+    #[cfg(feature = "tasks")]
+    Task(Box<tasks::TaskResult>),
+}
+
+impl CallResult {
+    fn into_core(self) -> Result<CoreResult, ManagedHttpClientError> {
+        match self {
+            Self::Core(value) => Ok(*value),
+            #[cfg(feature = "tasks")]
+            Self::Task(_) => Err(ManagedHttpClientError::InvalidPolicy),
+        }
+    }
+
+    fn publish_catalog(
+        &mut self,
+        cursors: &mut CursorLedger,
+        kind: CatalogKind,
+    ) -> Result<(), ManagedHttpClientError> {
+        match self {
+            Self::Core(value) => cursors.publish(kind, value),
+            #[cfg(feature = "tasks")]
+            Self::Task(_) => Err(ManagedHttpClientError::InvalidPolicy),
+        }
+    }
+}
+
 /// A reusable high-level HTTP client whose authentication is caller-owned.
 ///
 /// `new` performs no I/O. The first operation performs authenticated discovery.
@@ -128,9 +160,11 @@ struct Connection {
 /// is replaced by this explicitly selected session before every connection.
 /// `Auto` and legacy plans are rejected before acquiring a grant.
 ///
-/// The wrapper accepts completed core calls only. Subscription streams, Tasks
-/// response owners, and arbitrary callbacks into a raw `HttpClient` are not
-/// exposed, because those could escape the credential lifetime guard.
+/// The wrapper accepts completed core calls and, with the `tasks` feature and
+/// explicit `with_tasks` selection, completed official Tasks operations. Task
+/// snapshots are data, not authorization or live response owners. Subscription
+/// streams and arbitrary callbacks into a raw `HttpClient` remain unexposed,
+/// because those could escape the credential lifetime guard.
 ///
 /// Returned catalog cursors are opaque, single-use LOCAL handles, not the
 /// upstream cursor bytes. Pass them back only to the same client's same list
@@ -144,6 +178,8 @@ pub struct ManagedHttpClient {
     operation_timeout: Duration,
     connection: Option<Connection>,
     closed: bool,
+    #[cfg(feature = "tasks")]
+    tasks_enabled: bool,
 }
 
 impl fmt::Debug for ManagedHttpClient {
@@ -194,6 +230,8 @@ impl ManagedHttpClient {
             operation_timeout,
             connection: None,
             closed: false,
+            #[cfg(feature = "tasks")]
+            tasks_enabled: false,
         })
     }
 
@@ -397,6 +435,15 @@ impl ManagedHttpClient {
         cancellation: &McpRequestCancellation,
         call: Call<'_>,
     ) -> Result<CoreResult, ManagedHttpClientError> {
+        self.perform_any(cx, cancellation, call).await?.into_core()
+    }
+
+    async fn perform_any(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        call: Call<'_>,
+    ) -> Result<CallResult, ManagedHttpClientError> {
         if self.closed {
             return Err(ManagedHttpClientError::Closed);
         }
@@ -475,7 +522,7 @@ impl ManagedHttpClient {
                                 Err(error) => return Ok(Err(request_error(error))),
                             };
                             if let Some((kind, _)) = catalog {
-                                if let Err(error) = cursors.publish(kind, &mut value) {
+                                if let Err(error) = value.publish_catalog(&mut cursors, kind) {
                                     return Ok(Err(error));
                                 }
                             }
@@ -530,6 +577,8 @@ enum Call<'a> {
         name: &'a str,
         arguments: HashMap<String, String>,
     },
+    #[cfg(feature = "tasks")]
+    Task(tasks::TaskCall<'a>),
 }
 
 impl<'a> Call<'a> {
@@ -549,8 +598,8 @@ impl<'a> Call<'a> {
         cancellation: &McpRequestCancellation,
         client: &mut HttpClient,
         wire_cursor: Option<&str>,
-    ) -> Result<CoreResult, HttpClientError> {
-        match self {
+    ) -> Result<CallResult, HttpClientError> {
+        let result = match self {
             Self::Tools(_) => client.list_tools(cx, wire_cursor).await,
             Self::Resources(_) => client.list_resources(cx, wire_cursor).await,
             Self::Templates(_) => client.list_resource_templates(cx, wire_cursor).await,
@@ -577,7 +626,15 @@ impl<'a> Call<'a> {
             }
             Self::Read(uri) => client.read_resource(cx, uri).await,
             Self::Prompt { name, arguments } => client.get_prompt(cx, name, arguments).await,
-        }
+            #[cfg(feature = "tasks")]
+            Self::Task(call) => {
+                return call
+                    .dispatch(cx, cancellation, client)
+                    .await
+                    .map(|result| CallResult::Task(Box::new(result)));
+            }
+        };
+        result.map(|value| CallResult::Core(Box::new(value)))
     }
 }
 
