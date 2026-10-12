@@ -100,7 +100,16 @@ things:
   `x-mcp-header` annotations are invalid is excluded rather than called.
 - **Authorization: the adapter, not the library.** `conformance_client`
   supplies no interactive OAuth driver, so these measure adapter completeness.
-  Closing them needs a non-interactive authorization-code driver. The nine
+  It does ship a *non-interactive* authorization-code driver —
+  `examples/conformance_oauth.rs` plus its `managed` submodule, compiled into
+  the adapter as a module and wired at `conformance_client.rs:376` — but that
+  driver is inert unless `FASTMCP_CONFORMANCE_OAUTH` carries its configuration,
+  and nothing in this repository sets it, including
+  `scripts/run_official_conformance.sh`. So these checks measure the adapter
+  with authorization switched off, and closing them is a configuration-and-
+  discovery problem against the suite's own authorization scenarios rather than
+  a driver that has to be written. What those scenarios require of a client is
+  not established here. The nine
   in-tree `oauth_*` test targets are gated on `native-tls-roots`; each one now
   carries a matching `required-features` stanza, so a default run *excludes*
   them and naming one explicitly makes cargo refuse. They are therefore not a
