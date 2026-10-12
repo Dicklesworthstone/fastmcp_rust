@@ -6419,7 +6419,11 @@ mod tests {
                 706,
                 JsonRpcRequest::new("tools/call", Some(missing_capability), 706_i64),
             );
-            assert!(rejected.error.is_some());
+            assert!(
+                rejected.error.is_some(),
+                "the capability-stripped tools/call must be refused; it was admitted with result: {:?}",
+                rejected.result
+            );
             assert_eq!(
                 calls
                     .lock()
@@ -7484,7 +7488,12 @@ mod tests {
                 &request_sender,
             ))
             .expect("the exact-2024 public dispatch path responds to ping");
-            assert_eq!(legacy.result, Some(serde_json::json!({})));
+            assert_eq!(
+                legacy.result,
+                Some(serde_json::json!({})),
+                "the exact-2024 ping answers an empty object; error was {:?}",
+                legacy.error
+            );
             assert!(legacy.error.is_none());
 
             let inbound = crate::InboundRequestContext::new(
@@ -7494,7 +7503,12 @@ mod tests {
             );
             let answered = fastmcp_core::block_on(server.dispatch_stateless(&inbound, &final_ping))
                 .expect("stateless modern ping is a connection health-check");
-            assert_eq!(answered.result, Some(serde_json::json!({})));
+            assert_eq!(
+                answered.result,
+                Some(serde_json::json!({})),
+                "the stateless modern ping answers an empty object; error was {:?}",
+                answered.error
+            );
             assert!(answered.error.is_none());
             assert_eq!(
                 legacy_session.state().len(),
