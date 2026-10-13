@@ -34,6 +34,8 @@ use fastmcp_protocol::{
 
 /// Bounded sampling-only resolution of final input-required response maps.
 pub mod inputs;
+/// Opt-in bounded concurrency for independently executable, approved tools.
+pub mod parallel;
 
 /// A host-owned operation borrowing its model/tool implementation and caller.
 /// There is no 'static requirement and no task is spawned by this driver.
@@ -80,6 +82,18 @@ pub trait SamplingHost: Send {
         cancellation: &'a McpRequestCancellation,
         call: &'a SamplingContentBlock,
     ) -> SamplingHostFuture<'a, SamplingContentBlock>;
+
+    /// Opt into concurrent execution of this approved batch. The default keeps
+    /// the existing sequential `execute_tool` path. This hook runs only after
+    /// whole-batch approval, under the caller's Cx and lifetime checks.
+    ///
+    /// The host must select only tools safe to overlap under its own policy.
+    /// The returned executor is borrowed until the batch finishes or is
+    /// dropped; the model and approval callbacks cannot overlap that batch.
+    /// Embedded sampling resolvers use this same hook through the runner.
+    fn parallel_tools(&self) -> Option<parallel::ParallelSamplingTools<'_>> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -169,8 +183,10 @@ pub struct SamplingRunResult {
 /// Runs a complete bounded sampling conversation using explicit host callbacks.
 ///
 /// Initial schemas/history and each whole model batch are admitted before host
-/// tool approval or execution. Each result is correlated and output-validated
-/// before the next tool can start. Explicit null, metadata, multimodal content,
+/// tool approval or execution. Sequential execution validates each result
+/// before starting the next tool. An explicitly installed parallel executor
+/// validates each completion before admitting queued work and preserves model
+/// order in the next request. Explicit null, metadata, multimodal content,
 /// model names and open stop-reason values remain in their typed wire forms.
 ///
 /// Dropping this future retires the conversation and its pending host future;
@@ -246,27 +262,48 @@ pub async fn run_sampling_tool_loop<H: SamplingHost + ?Sized>(
                         })
                 })
                 .await?;
-                let mut results = Vec::with_capacity(count);
-                for call in &calls {
-                    // A cooperative boundary also gives cancellation a chance
-                    // to run when every host callback completes immediately.
-                    cooperate(cx, cancellation, deadline).await?;
-                    let result = within(cx, cancellation, deadline, async {
-                        host.execute_tool(cx, cancellation, call)
-                            .await
-                            .map_err(|reason| SamplingRunError::Host {
-                                stage: SamplingStage::Tool,
-                                reason,
-                            })
-                    })
-                    .await?;
-                    let remaining = limits.tool_result_bytes - result_bytes;
-                    let bytes = encoded_size(&result, remaining)?;
-                    validate_output(call, &result, &outputs)?;
-                    result_bytes += bytes;
-                    executed_tools += 1;
-                    results.push(result);
-                }
+                let parallel = {
+                    let _caller = Cx::set_current(Some(cx.clone()));
+                    check(cx, cancellation, deadline)?;
+                    let executor = host.parallel_tools();
+                    check(cx, cancellation, deadline)?;
+                    executor
+                };
+                let results = if let Some(executor) = parallel {
+                    executor
+                        .execute(
+                            cx,
+                            cancellation,
+                            deadline,
+                            &calls,
+                            &outputs,
+                            limits.tool_result_bytes,
+                            &mut result_bytes,
+                        )
+                        .await?
+                } else {
+                    let mut results = Vec::with_capacity(count);
+                    for call in &calls {
+                        // Yield even when every host callback is immediately ready.
+                        cooperate(cx, cancellation, deadline).await?;
+                        let result = within(cx, cancellation, deadline, async {
+                            host.execute_tool(cx, cancellation, call)
+                                .await
+                                .map_err(|reason| SamplingRunError::Host {
+                                    stage: SamplingStage::Tool,
+                                    reason,
+                                })
+                        })
+                        .await?;
+                        let remaining = limits.tool_result_bytes - result_bytes;
+                        let bytes = encoded_size(&result, remaining)?;
+                        validate_output(call, &result, &outputs)?;
+                        result_bytes += bytes;
+                        results.push(result);
+                    }
+                    results
+                };
+                executed_tools += results.len();
                 conversation.submit_tool_results(results)?;
                 cooperate(cx, cancellation, deadline).await?;
             }
