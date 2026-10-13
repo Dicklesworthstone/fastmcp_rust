@@ -21,6 +21,10 @@ use fastmcp_protocol::{SecurityDocumentKind, admit_security_document_object};
 
 use super::BoundBearerCredential;
 
+/// Bounded explicit resource POST execution over native HTTPS.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod native;
+
 /// A redacted refusal from the explicit DPoP client path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DpopClientError {
