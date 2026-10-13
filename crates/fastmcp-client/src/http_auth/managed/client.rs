@@ -27,6 +27,7 @@ use crate::{ClientBuilder, HttpClient, HttpClientError, ProtocolPolicy};
 
 mod callbacks;
 mod catalog;
+mod core_listen;
 mod cursors;
 pub use catalog::{CatalogError, CatalogLimits, ManagedCatalog};
 use cursors::{CatalogKind, CursorLedger};
@@ -138,16 +139,17 @@ struct Connection {
 enum CallResult {
     Core(Box<CoreResult>),
     Catalog(Result<catalog::Collected, ManagedHttpClientError>),
+    CoreListen(core_listen::ListenResult),
     #[cfg(feature = "tasks")]
     Task(Box<tasks::TaskResult>),
 }
 
 impl CallResult {
-    // Catalog and task results cannot be returned by a single-core-call API.
+    // Catalog, listen and task results cannot be returned by a single-core-call API.
     fn into_core(self) -> Result<CoreResult, ManagedHttpClientError> {
         match self {
             Self::Core(value) => Ok(*value),
-            Self::Catalog(_) => Err(ManagedHttpClientError::InvalidPolicy),
+            Self::Catalog(_) | Self::CoreListen(_) => Err(ManagedHttpClientError::InvalidPolicy),
             #[cfg(feature = "tasks")]
             Self::Task(_) => Err(ManagedHttpClientError::InvalidPolicy),
         }
@@ -165,7 +167,9 @@ impl CallResult {
                 cursors.take(kind, None)?;
                 Ok(())
             }
-            Self::Catalog(Err(_)) => Err(ManagedHttpClientError::InvalidPolicy),
+            Self::Catalog(Err(_)) | Self::CoreListen(_) => {
+                Err(ManagedHttpClientError::InvalidPolicy)
+            }
             #[cfg(feature = "tasks")]
             Self::Task(_) => Err(ManagedHttpClientError::InvalidPolicy),
         }
@@ -187,9 +191,10 @@ impl CallResult {
 ///
 /// The wrapper accepts completed core calls and, with the `tasks` feature and
 /// explicit `with_tasks` selection, completed official Tasks operations. Task
-/// snapshots are data, not authorization or live response owners. Subscription
-/// streams and arbitrary callbacks into a raw `HttpClient` remain unexposed,
-/// because those could escape the credential lifetime guard.
+/// snapshots are data, not authorization or live response owners. Core event
+/// observers run inside a bounded managed listen; subscription streams and
+/// arbitrary callbacks into a raw `HttpClient` remain unexposed, because those
+/// could escape the credential lifetime guard.
 ///
 /// Returned catalog cursors are opaque, single-use LOCAL handles, not the
 /// upstream cursor bytes. Pass them back only to the same client's same list
@@ -197,6 +202,8 @@ impl CallResult {
 /// advancing that list supersedes its previous handle. Renewal, disconnection,
 /// and failed or abandoned operations retire all handles. An unrelated call
 /// cannot make an old cursor valid again, even if a peer reuses its cursor text.
+/// Every started core event listen also retires all handles and cached state
+/// on return, since a listen gap cannot establish that a catalog is current.
 pub struct ManagedHttpClient {
     session: ManagedOAuthSession,
     builder: ClientBuilder,
@@ -612,7 +619,11 @@ impl ManagedHttpClient {
         let (value, connection) = guarded?;
         // Both managed guards have made their final cancellation/expiry checks.
         // Failed or abandoned requests never restore their connection or cache.
-        self.connection = Some(connection);
+        // A core listen also retires successful state: its terminal or local
+        // stop begins an observation gap, not proof that old caches are current.
+        if !matches!(&value, CallResult::CoreListen(_)) {
+            self.connection = Some(connection);
+        }
         Ok(value)
     }
 }
@@ -623,6 +634,7 @@ enum Call<'a> {
     Templates(Option<&'a str>),
     Prompts(Option<&'a str>),
     Catalog(CatalogKind, CatalogLimits),
+    CoreListen(core_listen::ListenRequest<'a>),
     Tool {
         name: &'a str,
         arguments: Value,
@@ -671,6 +683,11 @@ impl<'a> Call<'a> {
                 return Ok(CallResult::Catalog(
                     Box::pin(catalog::collect(cx, boundary, client, kind, limits)).await,
                 ));
+            }
+            Self::CoreListen(request) => {
+                return Box::pin(request.dispatch(cx, client, boundary))
+                    .await
+                    .map(CallResult::CoreListen);
             }
             Self::Tool { name, arguments } => {
                 client
