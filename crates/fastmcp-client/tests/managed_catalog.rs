@@ -466,17 +466,27 @@ fn all_four_catalogs_follow_opaque_cursors_and_preserve_page_order() {
                 async {
                     peer.discovery().await;
                     let first = peer.page(kind, None, &["first"], Some("")).await;
-                    let second = peer.page(kind, Some(""), &[], Some("opaque-雪%2F")).await;
+                    let second = peer.page(kind, Some(""), &[], Some("")).await;
                     let third = peer
+                        .page(kind, Some(""), &["first"], Some("opaque-雪%2F"))
+                        .await;
+                    let fourth = peer
+                        .page(kind, Some("opaque-雪%2F"), &[], Some("opaque-雪%2F"))
+                        .await;
+                    let fifth = peer
                         .page(kind, Some("opaque-雪%2F"), &["second"], None)
                         .await;
-                    assert_ne!(first, second);
-                    assert_ne!(second, third);
-                    assert_ne!(first, third);
+                    let ids = [first, second, third, fourth, fifth];
+                    for (index, id) in ids.iter().enumerate() {
+                        assert!(ids[..index].iter().all(|previous| previous != id));
+                    }
                 },
             )
             .await;
-            assert_eq!(result.unwrap(), (vec!["first".into(), "second".into()], 3));
+            assert_eq!(
+                result.unwrap(),
+                (vec!["first".into(), "first".into(), "second".into()], 5)
+            );
             assert_eq!(client.cached_credential_generation(), Some(1));
             assert_eq!(session.credential(&cx).await.unwrap().generation(), 1);
             assert!(!cancellation.is_cancel_requested());
@@ -486,9 +496,8 @@ fn all_four_catalogs_follow_opaque_cursors_and_preserve_page_order() {
 }
 
 #[test]
-fn cycles_and_limits_never_publish_or_replay_a_partial_catalog() {
+fn limits_never_publish_or_replay_a_partial_catalog() {
     for failure in [
-        CatalogError::CursorCycle,
         CatalogError::PageLimit,
         CatalogError::EntryLimit,
         CatalogError::ByteLimit,
@@ -523,12 +532,7 @@ fn cycles_and_limits_never_publish_or_replay_a_partial_catalog() {
                     if !(reject
                         && matches!(failure, CatalogError::PageLimit | CatalogError::ByteLimit))
                     {
-                        let next = if reject && failure == CatalogError::CursorCycle {
-                            Some("next")
-                        } else {
-                            None
-                        };
-                        peer.page(Kind::Tools, Some("next"), &["second"], next)
+                        peer.page(Kind::Tools, Some("next"), &["second"], None)
                             .await;
                     }
                 })
@@ -547,6 +551,59 @@ fn cycles_and_limits_never_publish_or_replay_a_partial_catalog() {
                 assert_eq!(session.credential(&cx).await.unwrap().generation(), 1);
                 peer.no_more(&cx).await;
             });
+        }
+    }
+}
+
+#[test]
+fn repeated_tokens_terminate_only_on_absence_or_the_unchanged_page_budget() {
+    for kind in [Kind::Tools, Kind::Resources, Kind::Templates, Kind::Prompts] {
+        for cursor in ["", "opaque-雪%2F", " \t\"\\\n "] {
+            for terminal in [false, true] {
+                run(async {
+                    let cx = Cx::current().unwrap();
+                    let peer = Peer::new().await;
+                    let session = peer.login(&cx).await;
+                    let mut client = peer.client(session.clone(), Duration::from_secs(30));
+                    let cancellation = McpRequestCancellation::new();
+                    let limits = CatalogLimits::new(3, 4, 4096).unwrap();
+                    let (outcome, ()) = pair(
+                        kind.all(&mut client, &cx, &cancellation, limits),
+                        async {
+                            peer.discovery().await;
+                            let first = peer.page(kind, None, &["first"], Some(cursor)).await;
+                            let second = peer.page(kind, Some(cursor), &[], Some(cursor)).await;
+                            let third = peer
+                                .page(
+                                    kind,
+                                    Some(cursor),
+                                    &["second"],
+                                    if terminal { None } else { Some(cursor) },
+                                )
+                                .await;
+                            assert_ne!(first, second);
+                            assert_ne!(first, third);
+                            assert_ne!(second, third);
+                        },
+                    )
+                    .await;
+                    if terminal {
+                        assert_eq!(outcome.unwrap(), (vec!["first".into(), "second".into()], 3));
+                        assert_eq!(client.cached_credential_generation(), Some(1));
+                    } else {
+                        assert!(matches!(
+                            outcome,
+                            Err(ManagedHttpClientError::Catalog(CatalogError::PageLimit))
+                        ));
+                        assert_eq!(client.cached_credential_generation(), None);
+                    }
+                    // A repeated token is neither a request to refresh nor
+                    // permission to exceed the cap or leak a partial result.
+                    assert_eq!(session.credential(&cx).await.unwrap().generation(), 1);
+                    assert!(!cancellation.is_cancel_requested());
+                    peer.no_more(&cx).await;
+                });
+            }
         }
     }
 }

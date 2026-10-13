@@ -5,7 +5,6 @@
 //! The managed operation owns the deadline, cancellation, and connection until
 //! the entire catalog succeeds. Errors and abandonment discard partial entries.
 
-use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, Write};
 
@@ -69,7 +68,6 @@ pub enum CatalogError {
     EntryLimit,
     ByteLimit,
     CursorLimit,
-    CursorCycle,
     UnexpectedResult,
 }
 
@@ -81,7 +79,6 @@ impl fmt::Display for CatalogError {
             Self::EntryLimit => "managed catalog entry limit exceeded",
             Self::ByteLimit => "managed catalog encoded-byte limit exceeded",
             Self::CursorLimit => "managed catalog cursor limit exceeded",
-            Self::CursorCycle => "managed catalog contains a continuation cycle",
             Self::UnexpectedResult => "managed catalog returned an unexpected result",
         })
     }
@@ -96,6 +93,8 @@ impl std::error::Error for CatalogError {}
 /// not combined; use the single-page APIs when that information is needed.
 /// Duplicate entries remain entries, not silently overwritten identities. Raw
 /// continuation tokens never escape this collection, including through Debug.
+/// Cursor equality conveys no progress or completion information: even a
+/// repeated empty token is followed until absence or a configured limit.
 pub struct ManagedCatalog<T> {
     entries: Vec<T>,
     pages: usize,
@@ -268,8 +267,8 @@ impl ManagedHttpClient {
 }
 
 // This alternate all-pages admission path retains the single-page ledger's
-// 16 KiB per-token ceiling. The aggregate byte and page ceilings also bound
-// the cycle index; no process-global cursor state or canonicalization is used.
+// 16 KiB per-token ceiling. Termination is bounded by page/item/byte/deadline
+// budgets, never by examining or comparing these opaque token contents.
 const MAX_CURSOR_BYTES: usize = 16 * 1024;
 
 struct Meter {
@@ -277,7 +276,6 @@ struct Meter {
     pages: usize,
     entries: usize,
     remaining_bytes: usize,
-    seen: HashSet<String>,
 }
 
 impl Meter {
@@ -287,7 +285,6 @@ impl Meter {
             pages: 0,
             entries: 0,
             remaining_bytes: limits.bytes,
-            seen: HashSet::new(),
         }
     }
 
@@ -311,9 +308,6 @@ impl Meter {
             if cursor.len() > MAX_CURSOR_BYTES {
                 return Err(CatalogError::CursorLimit);
             }
-            if self.seen.contains(cursor) {
-                return Err(CatalogError::CursorCycle);
-            }
         }
         let mut writer = BudgetWriter {
             remaining: self.remaining_bytes,
@@ -331,9 +325,6 @@ impl Meter {
             // An incomplete final allowed page is not a successful truncated list.
             // Refuse now rather than making a request we cannot admit.
             return Err(CatalogError::PageLimit);
-        }
-        if let Some(cursor) = cursor {
-            self.seen.insert(cursor.to_owned());
         }
         self.pages += 1;
         self.entries = count;
@@ -541,32 +532,61 @@ mod tests {
     }
 
     #[test]
-    fn opaque_empty_and_non_ascii_cursors_are_not_end_of_catalog() {
-        for cursor in ["", "opaque-雪%2F", "private-cursor"] {
+    fn repeated_empty_and_non_ascii_cursors_do_not_imply_completion_or_failure() {
+        for cursor in ["", "opaque-雪%2F", "private-cursor", " \t\"\\\n "] {
             let mut meter = Meter::new(CatalogLimits::default());
-            meter.admit::<serde_json::Value>(&[], Some(cursor)).unwrap();
-            assert_eq!(
-                meter.admit::<serde_json::Value>(&[], Some(cursor)),
-                Err(CatalogError::CursorCycle)
-            );
-            assert_eq!(meter.pages, 1);
+            for page in 1..=3 {
+                meter.admit::<serde_json::Value>(&[], Some(cursor)).unwrap();
+                assert_eq!(meter.pages, page);
+            }
             meter.admit::<serde_json::Value>(&[], None).unwrap();
-            assert_eq!(meter.pages, 2);
+            assert_eq!(meter.pages, 4);
         }
     }
 
     #[test]
-    fn a_longer_cursor_cycle_is_refused_before_another_request() {
-        let mut meter = Meter::new(CatalogLimits::default());
-        for cursor in ["a", "b", "c"] {
-            meter.admit(&[json!(cursor)], Some(cursor)).unwrap();
+    fn nonterminating_repeated_tokens_stop_at_page_limit_without_advancing_state() {
+        for sequence in [["a", "a", "a", "a"], ["a", "b", "c", "a"], ["", "", "", ""]] {
+            let mut meter = Meter::new(CatalogLimits::new(4, 4, 4096).unwrap());
+            for cursor in &sequence[..3] {
+                meter.admit(&[json!("duplicate entry")], Some(cursor)).unwrap();
+            }
+            let before = (meter.pages, meter.entries, meter.remaining_bytes);
+            assert_eq!(
+                meter.admit(&[json!("not published")], Some(sequence[3])),
+                Err(CatalogError::PageLimit)
+            );
+            assert_eq!((meter.pages, meter.entries, meter.remaining_bytes), before);
+            // The identical page is admissible when cursor absence actually
+            // marks completion, including duplicate entry identities.
+            meter.admit(&[json!("duplicate entry")], None).unwrap();
+            assert_eq!((meter.pages, meter.entries), (4, 4));
         }
-        assert_eq!(
-            meter.admit(&[json!("not published")], Some("a")),
-            Err(CatalogError::CursorCycle)
-        );
-        assert_eq!(meter.entries, 3);
-        assert_eq!(meter.pages, 3);
+    }
+
+    #[test]
+    fn repeated_tokens_still_consume_every_encoded_byte() {
+        let empty: &[serde_json::Value] = &[];
+        let cursor = Some(" \"雪\\\n ");
+        let page_bytes = serde_json::to_vec(&(empty, cursor)).unwrap().len();
+        let terminal_bytes = serde_json::to_vec(&(empty, None::<&str>)).unwrap().len();
+        let total = 3 * page_bytes + terminal_bytes;
+        for exact in [false, true] {
+            let limits = CatalogLimits::new(4, 1, total - usize::from(!exact)).unwrap();
+            let mut meter = Meter::new(limits);
+            for _ in 0..3 {
+                meter.admit(empty, cursor).unwrap();
+            }
+            let before = (meter.pages, meter.entries, meter.remaining_bytes);
+            let result = meter.admit(empty, None);
+            if exact {
+                result.unwrap();
+                assert_eq!((meter.pages, meter.entries, meter.remaining_bytes), (4, 0, 0));
+            } else {
+                assert_eq!(result, Err(CatalogError::ByteLimit));
+                assert_eq!((meter.pages, meter.entries, meter.remaining_bytes), before);
+            }
+        }
     }
 
     #[test]
@@ -586,18 +606,20 @@ mod tests {
     }
 
     #[test]
-    fn oversized_cursor_is_not_copied_into_the_cycle_index() {
+    fn oversized_cursor_is_refused_without_advancing_any_counter() {
         let mut meter = Meter::new(CatalogLimits::default());
+        let before = (meter.pages, meter.entries, meter.remaining_bytes);
         assert_eq!(
             meter.admit::<serde_json::Value>(&[], Some(&"x".repeat(MAX_CURSOR_BYTES + 1))),
             Err(CatalogError::CursorLimit)
         );
-        assert!(meter.seen.is_empty());
-        assert_eq!(meter.pages, 0);
-        meter
-            .admit::<serde_json::Value>(&[], Some(&"x".repeat(MAX_CURSOR_BYTES)))
-            .unwrap();
-        assert_eq!(meter.seen.len(), 1);
+        assert_eq!((meter.pages, meter.entries, meter.remaining_bytes), before);
+        for _ in 0..2 {
+            meter
+                .admit::<serde_json::Value>(&[], Some(&"x".repeat(MAX_CURSOR_BYTES)))
+                .unwrap();
+        }
+        assert_eq!(meter.pages, 2);
     }
 
     #[test]
