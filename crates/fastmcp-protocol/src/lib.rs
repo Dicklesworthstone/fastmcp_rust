@@ -81,10 +81,10 @@ pub use extensions::{
     MCP_APPS_MESSAGE_METHOD, MCP_APPS_NEGOTIATION_RESOLVER_ID, MCP_APPS_OPEN_LINK_METHOD,
     MCP_APPS_REQUEST_DISPLAY_MODE_METHOD, MCP_APPS_REQUEST_TEARDOWN_NOTIFICATION,
     MCP_APPS_RESOURCE_TEARDOWN_METHOD, MCP_APPS_SANDBOX_PROXY_READY_NOTIFICATION,
-    MCP_APPS_SERVER_SETTINGS_SCHEMA_ID, MCP_APPS_SIZE_CHANGED_NOTIFICATION,
-    MCP_APPS_TOOL_CANCELLED_NOTIFICATION, MCP_APPS_TOOL_INPUT_NOTIFICATION,
-    MCP_APPS_TOOL_INPUT_PARTIAL_NOTIFICATION, MCP_APPS_TOOL_RESULT_NOTIFICATION,
-    MCP_APPS_UPDATE_MODEL_CONTEXT_METHOD, McpAppsClientSettings,
+    MCP_APPS_SANDBOX_RESOURCE_READY_NOTIFICATION, MCP_APPS_SERVER_SETTINGS_SCHEMA_ID,
+    MCP_APPS_SIZE_CHANGED_NOTIFICATION, MCP_APPS_TOOL_CANCELLED_NOTIFICATION,
+    MCP_APPS_TOOL_INPUT_NOTIFICATION, MCP_APPS_TOOL_INPUT_PARTIAL_NOTIFICATION,
+    MCP_APPS_TOOL_RESULT_NOTIFICATION, MCP_APPS_UPDATE_MODEL_CONTEXT_METHOD, McpAppsClientSettings,
     McpAppsNegotiationResolver, OFFICIAL_MCP_APPS_EXTENSION_ID,
     RejectingExtensionNegotiationResolver, ServerExtensionDiscovery, StdioCorrelationDescriptor,
     official_mcp_apps_descriptor, official_mcp_apps_empty_server_settings,
@@ -95,8 +95,9 @@ pub use extensions::{
 pub use extensions::{
     OFFICIAL_TASKS_EMPTY_SETTINGS_CODEC_ID, OFFICIAL_TASKS_EMPTY_SETTINGS_SCHEMA_ID,
     OFFICIAL_TASKS_EXTENSION_ID, OFFICIAL_TASKS_METHODS, OFFICIAL_TASKS_NOTIFICATION,
-    OfficialTasksNegotiationResolver, TasksNegotiationResolver, official_tasks_descriptor,
-    official_tasks_empty_settings, official_tasks_extension_id, register_official_tasks_extension,
+    OFFICIAL_TASKS_RESULT_DISCRIMINATOR, OfficialTasksNegotiationResolver,
+    TasksNegotiationResolver, official_tasks_descriptor, official_tasks_empty_settings,
+    official_tasks_extension_id, register_official_tasks_extension,
 };
 pub use jsonrpc::{
     ClientIngressFailureScope, CorrelationKey, JSONRPC_VERSION, JsonRpcAdmissionError,
@@ -122,7 +123,7 @@ pub use protocol_version::{
     MissingRequiredClientCapabilityError, ProtocolVersionError, RequestAdmissionError,
     RequestVersionMetadata, RequiredCapabilitiesError, SUPPORTED_FINAL_PROTOCOL_VERSIONS,
     UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE, UnsupportedProtocolVersionError,
-    admit_final_http_request, admit_final_request, validate_final_http_version,
+    admit_final_http_request, admit_final_request, validate_final_protocol_version,
 };
 pub use result::*;
 pub use schema::{
@@ -158,7 +159,7 @@ pub use tasks_extension::{
     TaskDuration, TaskId as FinalTaskId, TaskInputLedger, TaskInputRequests, TaskInputResponses,
     TaskMethodRequest, TaskRequestMeta, TaskStatus as FinalTaskStatus, TaskStatusNotification,
     TaskStatusNotificationParams as FinalTaskStatusNotificationParams, TaskTimestamp,
-    TaskWireError, UpdateTaskParams, TaskWireErrorCode, set_task_subscription_ids,
+    TaskWireError, UpdateTaskParams, UpdateTaskResult, set_task_subscription_ids,
     task_subscription_ids,
 };
 pub use types::*;
