@@ -26,6 +26,9 @@ use fastmcp_core::{CanonicalHttpUrl, McpRequestCancellation};
 use super::{DpopClientError, DpopCredential, DpopSession, require_credential};
 use crate::http_executor::ModernHttpRequest;
 
+/// Method-owned core MCP calls over the same bounded DPoP transport.
+pub mod core;
+
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ROOT_BYTES: usize = 64 * 1024;
 const MAX_ROOTS: usize = 16;
@@ -263,6 +266,20 @@ impl DpopHttpClient {
         request: &ModernHttpRequest,
     ) -> Result<DpopHttpResponse, DpopHttpError> {
         let bounds = WaitBounds::new(cx, self.policy.timeout, credential)?;
+        self.post_resource_with_bounds(cx, cancellation, credential, request, bounds)
+            .await
+    }
+
+    // Typed calls freeze this bound before encoding, then retain it through
+    // HTTP and result admission. Preparation must not restart the timeout.
+    async fn post_resource_with_bounds(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        request: &ModernHttpRequest,
+        bounds: WaitBounds,
+    ) -> Result<DpopHttpResponse, DpopHttpError> {
         let response = within(cx, cancellation, &self.session, credential, bounds, async {
             let headers = resource_headers(&self.session, credential, request, &self.policy)?;
             let body = request.body().to_vec();
@@ -471,8 +488,13 @@ async fn within<T>(
     future: impl Future<Output = Result<T, DpopHttpError>>,
 ) -> Result<T, DpopHttpError> {
     check_live(cx, cancellation, session, credential, bounds)?;
-    let driver = cx.timer_driver().ok_or(DpopHttpError::RuntimeUnavailable)?;
-    let mut timer = pin!(Sleep::with_timer_driver(bounds.deadline, driver));
+    if cx.timer_driver().is_none() {
+        return Err(DpopHttpError::RuntimeUnavailable);
+    }
+    // Sleep::new is the public constructor in the pinned runtime. It resolves
+    // the driver when polled; the caller guard below covers every timer poll
+    // so an unrelated ambient driver or the global fallback cannot be used.
+    let mut timer = pin!(Sleep::new(bounds.deadline));
     let (_sender, mut receiver) = oneshot::channel::<()>();
     let mut caller = pin!(receiver.recv(cx));
     let mut operation_cancelled = pin!(cancellation.cancelled());
@@ -1076,6 +1098,51 @@ mod tests {
     }
 
     #[test]
+    fn pending_deadline_uses_the_callers_driver_not_an_unrelated_ambient_driver() {
+        let (caller_runtime, cx, timer, clock) = runtime();
+        let (ambient_runtime, ambient_cx, ambient_timer, _) = runtime();
+        let ambient_guard = Cx::set_current(Some(ambient_cx.clone()));
+        let session = session();
+        let credential = credential(&session);
+        let cancellation = McpRequestCancellation::new();
+        let bounds = WaitBounds::new(&cx, Duration::from_secs(10), &credential).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::new(WakeCount::default());
+        let waker = Waker::from(Arc::clone(&counter));
+        let mut task = Context::from_waker(&waker);
+        let mut operation = Box::pin(within(
+            &cx,
+            &cancellation,
+            &session,
+            &credential,
+            bounds,
+            PendingIo(Arc::clone(&drops)),
+        ));
+        assert!(operation.as_mut().poll(&mut task).is_pending());
+        assert_eq!(timer.pending_count(), 1);
+        assert_eq!(ambient_timer.pending_count(), 0);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+        clock.advance(bounds.deadline.as_nanos());
+        assert!(timer.process_timers() > 0);
+        assert!(counter.0.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            operation.as_mut().poll(&mut task),
+            Poll::Ready(Err(DpopHttpError::TimedOut))
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(timer.pending_count(), 0);
+        assert_eq!(ambient_timer.pending_count(), 0);
+        assert_eq!(Cx::current().unwrap().now(), ambient_timer.now());
+        assert_ne!(cx.now(), ambient_timer.now());
+        drop(operation);
+        drop(ambient_guard);
+        drop(ambient_cx);
+        drop(cx);
+        assert!(ambient_runtime.shutdown_timeout(Duration::from_secs(1)));
+        assert!(caller_runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
     fn native_response_debug_cannot_print_reflected_authorization() {
         let response = response(
             401,
@@ -1169,6 +1236,115 @@ mod tls_tests {
         }
         assert_eq!(wire.len(), end + length);
         (head, wire[end..].to_vec())
+    }
+
+    #[test]
+    fn native_https_typed_calls_correlate_results_and_leave_continuations_to_the_host() {
+        use fastmcp_protocol::protocol_policy::ProtocolEra;
+        use fastmcp_protocol::{
+            ClientCapabilities, CoreRequest, CoreResult, FinalCoreResult, FinalRequestMeta,
+            RequestId,
+        };
+        use crate::http_auth::rpc::{ManagedCoreError, ManagedCoreLimits};
+        use super::core::DpopCoreError;
+
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .build().unwrap().block_on(async {
+                let cx = Cx::current().unwrap();
+                let deadline = cx.now().saturating_add_nanos(20_000_000_000);
+                asupersync::time::timeout_at(deadline, async {
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let address = listener.local_addr().unwrap();
+                    let target = CanonicalHttpUrl::parse(&format!("https://{address}/mcp")).unwrap();
+                    let session = DpopSession::new(
+                        DpopKey::generate().unwrap(),
+                        CanonicalHttpUrl::parse("https://issuer.example/token").unwrap(),
+                        target.clone(),
+                    ).unwrap();
+                    let credential = session.admit_token_response(
+                        &session.token_endpoint, 200,
+                        br#"{"access_token":"typed-token","token_type":"DPoP","expires_in":60}"#,
+                        Instant::now(), Duration::from_secs(60),
+                    ).unwrap();
+                    let root = Certificate::from_pem(ROOT).unwrap().remove(0);
+                    let policy = DpopHttpPolicy::default()
+                        .with_resource_root_der(root.as_der().to_vec()).unwrap();
+                    let mut client = DpopHttpClient::new(session, policy).unwrap();
+                    let acceptor = TlsAcceptorBuilder::new(
+                        CertificateChain::from_pem(LEAF).unwrap(),
+                        PrivateKey::from_pem(KEY).unwrap(),
+                    ).alpn_protocols(vec![b"http/1.1".to_vec()]).build().unwrap();
+                    let server = async {
+                        let mut proofs = Vec::new();
+                        for (status, body) in [
+                            (200, r#"{"jsonrpc":"2.0","id":7,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#),
+                            (200, r#"{"jsonrpc":"2.0","id":8,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#),
+                            (200, r#"{"jsonrpc":"2.0","id":7,"result":{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"opaque-state"}}"#),
+                            (401, r#"{"error":"use_dpop_nonce","secret":"must-not-enter-diagnostics"}"#),
+                        ] {
+                            let (socket, _) = listener.accept().await.unwrap();
+                            let mut socket = acceptor.accept(socket).await.unwrap();
+                            let (head, payload) = read_request(&mut socket).await;
+                            let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                            assert_eq!(payload["id"], 7);
+                            assert_eq!(payload["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"], fastmcp_protocol::FINAL_PROTOCOL_VERSION);
+                            let headers: Vec<_> = head.lines().filter_map(|line| line.split_once(':'))
+                                .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+                                .collect();
+                            assert!(headers.iter().any(|(name, value)| name == "authorization" && value == "DPoP typed-token"));
+                            assert!(headers.iter().any(|(name, value)| name == "mcp-method" && Some(value.as_str()) == payload["method"].as_str()));
+                            let proof = headers.iter().find(|(name, _)| name == "dpop").unwrap().1.clone();
+                            assert!(!proofs.contains(&proof));
+                            proofs.push(proof);
+                            let response = format!(
+                                "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nDPoP-Nonce: typed-nonce\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            socket.write_all(response.as_bytes()).await.unwrap();
+                            socket.shutdown().await.unwrap();
+                        }
+                        proofs
+                    };
+                    let request = |method: &str, mut params: serde_json::Value| {
+                        params["_meta"] = serde_json::to_value(
+                            FinalRequestMeta::new(ClientCapabilities::default())
+                        ).unwrap();
+                        CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&params)).unwrap()
+                    };
+                    let application = async {
+                        let result = client.request_core(
+                            &cx, &credential, request("tools/list", serde_json::json!({})),
+                            RequestId::Number(7), ManagedCoreLimits::default(),
+                        ).await.unwrap();
+                        assert!(result.encode().unwrap().contains("\"tools\":[]"));
+                        assert!(matches!(
+                            client.request_core(
+                                &cx, &credential, request("tools/list", serde_json::json!({})),
+                                RequestId::Number(7), ManagedCoreLimits::default(),
+                            ).await,
+                            Err(DpopCoreError::Protocol(ManagedCoreError::ResponseIdMismatch))
+                        ));
+                        let result = client.request_core(
+                            &cx, &credential, request("resources/read", serde_json::json!({"uri":"file:///sample"})),
+                            RequestId::Number(7), ManagedCoreLimits::default(),
+                        ).await.unwrap();
+                        assert!(matches!(result, CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { .. })));
+                        assert!(matches!(
+                            client.request_core(
+                                &cx, &credential, request("tools/list", serde_json::json!({})),
+                                RequestId::Number(7), ManagedCoreLimits::default(),
+                            ).await,
+                            Err(DpopCoreError::Protocol(ManagedCoreError::HttpStatus { status: 401 }))
+                        ));
+                        assert_eq!(client.session.resource_nonce, Some(DpopNonce::new("typed-nonce").unwrap()));
+                        assert!(client.session.token_nonce.is_none());
+                    };
+                    let (proofs, ()) = pair(server, application).await;
+                    assert_eq!(proofs.len(), 4);
+                    assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
+                }).await.expect("typed DPoP calls must settle without hidden continuations");
+            });
     }
 
     #[test]
