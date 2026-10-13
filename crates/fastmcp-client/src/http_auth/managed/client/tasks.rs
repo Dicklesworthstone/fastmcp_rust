@@ -20,6 +20,7 @@ use crate::{
 };
 
 mod listen;
+mod resolve;
 
 const MAX_TASK_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TASK_WAIT_POLLS: usize = 1_024;
@@ -61,6 +62,11 @@ pub(super) enum TaskCall<'a> {
     },
     Listen(listen::ListenRequest<'a>),
     Watch(listen::watch::WatchRequest),
+    Resolve {
+        task_id: FinalTaskId,
+        max_inputs: usize,
+        max_payload_bytes: usize,
+    },
 }
 
 pub(super) enum TaskResult {
@@ -213,6 +219,22 @@ impl TaskCall<'_> {
             }
             Self::Listen(request) => request.dispatch(cx, cancellation, client, id).await,
             Self::Watch(request) => Box::pin(request.dispatch(cx, cancellation, client, id)).await,
+            Self::Resolve {
+                task_id,
+                max_inputs,
+                max_payload_bytes,
+            } => {
+                Box::pin(resolve::dispatch(
+                    cx,
+                    cancellation,
+                    client,
+                    id,
+                    task_id,
+                    max_inputs,
+                    max_payload_bytes,
+                ))
+                .await
+            }
         }
     }
 }
