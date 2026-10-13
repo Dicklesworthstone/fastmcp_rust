@@ -11,11 +11,10 @@ use fastmcp_protocol::{RequestId, SubscriptionFilter};
 
 use super::super::{
     MAX_TASK_RESPONSE_BYTES, ManagedHttpClient, ManagedHttpClientError, TaskCall, TaskResult,
-    checkpoint,
+    checkpoint, task_sse_limits,
 };
 use super::{EventBudget, MAX_NOTIFICATIONS, MAX_PAYLOAD_BYTES, refusal};
 use crate::http_executor::ModernHttpSubscriptionListenEvent;
-use crate::sse::SseLimits;
 use crate::{
     ClientHttpConnectionError, FinalGetTaskResult, FinalTask, FinalTaskId, HttpClient,
     HttpClientError,
@@ -111,9 +110,7 @@ impl WatchRequest {
             return Err(refusal("Managed task watch payload limit exceeded"));
         }
         // Frame overhead is bounded independently of admitted event payloads.
-        let frame_bytes = MAX_TASK_RESPONSE_BYTES;
-        let limits = SseLimits::with_data_lines(frame_bytes + 8, frame_bytes, 64, 4_096)
-            .ok_or_else(|| refusal("Invalid managed task watch response limits"))?;
+        let limits = task_sse_limits()?;
         let listen_id = client.next_request_id()?;
         let mut listener = client
             .connection
