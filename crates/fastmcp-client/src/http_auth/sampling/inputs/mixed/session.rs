@@ -141,6 +141,14 @@ impl CoreInputSession {
     pub fn usage(&self) -> CoreInputUsage {
         self.usage
     }
+
+    // Network owners intersect this already-frozen deadline with their own
+    // lifetime. Recomputing it from a duration would restart the host budget
+    // after request preparation or after a successful input round.
+    pub(crate) fn deadline(&self) -> Time {
+        self.deadline
+    }
+
     pub fn is_closed(&self) -> bool {
         self.closed
     }

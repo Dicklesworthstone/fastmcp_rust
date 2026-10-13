@@ -142,19 +142,20 @@ impl DpopHttpClient {
         let timeout = self.policy.timeout.min(limits.interaction.core().timeout());
         let bounds = WaitBounds::new(cx, timeout, credential)?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
-        let (mut rounds, mut wire, mut decoder) = Rounds::new(
-            self.resource().as_str(),
-            request.clone(),
-            first_id,
-            limits.interaction,
-            self.policy.max_body_bytes,
-        )?;
         let mut inputs = CoreInputSession::new(
             cx,
             cancellation,
-            request,
+            request.clone(),
             limits.inputs,
             limits.resolutions,
+        )?;
+        let bounds = host_bounds(bounds, &inputs);
+        let (mut rounds, mut wire, mut decoder) = Rounds::new(
+            self.resource().as_str(),
+            request,
+            first_id,
+            limits.interaction,
+            self.policy.max_body_bytes,
         )?;
         loop {
             check_live(cx, cancellation, &self.session, credential, bounds)?;
@@ -190,6 +191,17 @@ impl DpopHttpClient {
             (wire, decoder) = rounds.resume(&input, reply)?;
         }
     }
+}
+
+// Freeze the intersection before request encoding. It also governs waits
+// that never invoke a resolver and the final reply after the last host effect.
+// Equal deadlines retain the existing credential-expiry classification.
+fn host_bounds(mut bounds: WaitBounds, inputs: &CoreInputSession) -> WaitBounds {
+    if inputs.deadline() < bounds.deadline {
+        bounds.deadline = inputs.deadline();
+        bounds.terminal = DpopHttpError::TimedOut;
+    }
+    bounds
 }
 
 fn request_id(prefix: &str, ordinal: usize) -> Result<RequestId, DpopHostError> {
@@ -239,6 +251,7 @@ mod tests {
     use fastmcp_protocol::common_types::SamplingContentBlock;
     use fastmcp_protocol::dpop::DpopKey;
     use fastmcp_protocol::protocol_policy::ProtocolEra;
+    use fastmcp_protocol::sampling::SamplingToolLoopLimits;
     use fastmcp_protocol::{
         ClientCapabilities, FinalCreateMessageResult, FinalEmbeddedCreateMessageParams,
         FinalEmbeddedElicitationResult, FinalEmbeddedFormElicitationParams,
@@ -248,8 +261,13 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    #[cfg(feature = "native-tls-roots")]
+    use crate::http_auth::dpop::native::core::DpopCoreError;
     use crate::http_auth::rpc::interaction::input_required;
-    use crate::http_auth::sampling::{SamplingHost, SamplingHostError, SamplingHostFuture};
+    use crate::http_auth::sampling::{
+        SamplingHost, SamplingHostError, SamplingHostFuture, SamplingRunLimits,
+    };
+    use crate::http_auth::sampling::inputs::SamplingInputLimits;
     use crate::http_auth::sampling::inputs::mixed::{
         CoreInputError, CoreInputHostError, CoreInputHostFuture, CoreInputRequest,
     };
@@ -258,6 +276,12 @@ mod tests {
         "r":{"method":"roots/list"},
         "f":{"method":"elicitation/create","params":{"mode":"form","message":"Quantity?","requestedSchema":{"type":"object","properties":{"quantity":{"type":"integer","minimum":1,"maximum":5}},"required":["quantity"],"additionalProperties":false}}}
     }}"#;
+
+    fn input_limits(timeout: Duration) -> CoreInputLimits {
+        let run = SamplingRunLimits::new(SamplingToolLoopLimits::default(), timeout, 8192).unwrap();
+        let sampling = SamplingInputLimits::new(run, 8, 16, 32, 8192, 8192).unwrap();
+        CoreInputLimits::new(sampling, 16, 16).unwrap()
+    }
 
     fn original() -> CoreRequest {
         let mut meta =
@@ -543,6 +567,158 @@ mod tests {
     }
 
     #[test]
+    fn host_deadline_is_frozen_and_never_extends_an_earlier_native_limit() {
+        use asupersync::types::Time;
+        use crate::http_auth::dpop::DpopClientError;
+
+        let (runtime, cx, _, clock) = runtime();
+        let cancel = McpRequestCancellation::new();
+        let inputs = CoreInputSession::new(
+            &cx,
+            &cancel,
+            original(),
+            input_limits(Duration::from_secs(2)),
+            4,
+        )
+        .unwrap();
+        let end = inputs.deadline();
+        assert_eq!(end, Time::from_nanos(2_000_000_000));
+        // Preparation consumes time rather than granting another two seconds.
+        clock.advance(1_000_000_000);
+        for (deadline, terminal) in [
+            (Time::from_nanos(1_500_000_000), DpopHttpError::TimedOut),
+            (
+                Time::from_nanos(1_500_000_000),
+                DpopClientError::CredentialUnavailable.into(),
+            ),
+            (end, DpopClientError::CredentialUnavailable.into()),
+            (Time::from_nanos(10_000_000_000), DpopHttpError::TimedOut),
+        ] {
+            let selected = host_bounds(WaitBounds { deadline, terminal }, &inputs);
+            assert_eq!(selected.deadline, deadline.min(end));
+            assert_eq!(selected.terminal, terminal);
+            assert_eq!(inputs.usage(), CoreInputUsage::default());
+        }
+        drop(cx);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn host_deadline_wakes_quiet_non_host_work_and_retires_its_future() {
+        let (runtime, cx, timer, clock) = runtime();
+        let (session, credential) = session();
+        let cancel = McpRequestCancellation::new();
+        let inputs = CoreInputSession::new(
+            &cx,
+            &cancel,
+            original(),
+            input_limits(Duration::from_secs(2)),
+            4,
+        )
+        .unwrap();
+        let native = WaitBounds::new(&cx, Duration::from_secs(20), &credential).unwrap();
+        let bounds = host_bounds(native, &inputs);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let wakes = Arc::new(Wakes::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut task = Context::from_waker(&waker);
+        let owned = PendingDrop(Arc::clone(&drops));
+        let mut waiting = Box::pin(within(
+            &cx,
+            &cancel,
+            &session,
+            &credential,
+            bounds,
+            async move {
+                let _owned = owned;
+                std::future::pending::<Result<(), DpopHttpError>>().await
+            },
+        ));
+        assert!(waiting.as_mut().poll(&mut task).is_pending());
+        clock.advance(bounds.deadline.as_nanos() - 1);
+        assert_eq!(timer.process_timers(), 0);
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        clock.advance(1);
+        assert!(timer.process_timers() > 0);
+        assert!(wakes.0.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            waiting.as_mut().poll(&mut task),
+            Poll::Ready(Err(DpopHttpError::TimedOut))
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(timer.pending_count(), 0);
+        assert_eq!(inputs.usage(), CoreInputUsage::default());
+        assert!(!credential.is_revoked());
+        assert!(!cancel.is_cancel_requested());
+        drop(waiting);
+        drop(cx);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn completed_host_round_does_not_restart_the_final_response_deadline() {
+        for expired in [false, true] {
+            let (runtime, cx, timer, clock) = runtime();
+            let (session, credential) = session();
+            let cancel = McpRequestCancellation::new();
+            let mut inputs = CoreInputSession::new(
+                &cx,
+                &cancel,
+                original(),
+                input_limits(Duration::from_secs(2)),
+                4,
+            )
+            .unwrap();
+            let native = WaitBounds::new(&cx, Duration::from_secs(20), &credential).unwrap();
+            let bounds = host_bounds(native, &inputs);
+            let mut host = Host::default();
+            let challenge = input(MIXED);
+            assert!(
+                ready(resolve_host(
+                    &cx,
+                    &cancel,
+                    &session,
+                    &credential,
+                    bounds,
+                    &mut inputs,
+                    &challenge,
+                    RequestId::Number(1),
+                    &mut host,
+                ))
+                .is_ok()
+            );
+            assert_eq!(host_bounds(native, &inputs).deadline, bounds.deadline);
+            let mut operation = Box::pin(within(
+                &cx,
+                &cancel,
+                &session,
+                &credential,
+                bounds,
+                async {
+                    clock.advance(bounds.deadline.as_nanos() - u64::from(!expired));
+                    Ok(42)
+                },
+            ));
+            let result = operation.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+            assert_eq!(
+                result,
+                if expired {
+                    Poll::Ready(Err(DpopHttpError::TimedOut))
+                } else {
+                    Poll::Ready(Ok(42))
+                }
+            );
+            assert_eq!(inputs.usage().resolutions, 1);
+            assert_eq!(timer.pending_count(), 0);
+            assert!(!credential.is_revoked());
+            drop(operation);
+            drop(cx);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+    }
+
+    #[test]
     fn token_owner_and_deadline_wake_a_quiet_typed_host_without_partial_replies() {
         for cause in 0..3 {
             let (runtime, cx, timer, clock) = runtime();
@@ -709,6 +885,9 @@ mod tests {
         #[derive(Clone, Copy)]
         enum Case {
             Complete,
+            CompleteWithoutInput,
+            QuietResponseHead,
+            QuietResponseBody,
             InvalidForm,
             ResolutionLimit,
             HostDenies,
@@ -716,7 +895,15 @@ mod tests {
 
         #[test]
         fn public_dpop_host_execution_preserves_state_and_stops_before_partial_or_excess_posts() {
-            for case in [Case::Complete, Case::InvalidForm, Case::ResolutionLimit, Case::HostDenies] {
+            for case in [
+                Case::Complete,
+                Case::CompleteWithoutInput,
+                Case::QuietResponseHead,
+                Case::QuietResponseBody,
+                Case::InvalidForm,
+                Case::ResolutionLimit,
+                Case::HostDenies,
+            ] {
                 RuntimeBuilder::current_thread()
                     .with_reactor(create_reactor().unwrap())
                     .build()
@@ -774,7 +961,17 @@ mod tests {
                                     let proof = headers.iter().find(|(key, _)| key == "dpop").unwrap().1.to_owned();
                                     assert!(!proofs.contains(&proof));
                                     proofs.push(proof);
-                                    let result = if ordinal == 2 {
+                                    if matches!(case, Case::QuietResponseHead | Case::QuietResponseBody) {
+                                        if matches!(case, Case::QuietResponseBody) {
+                                            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n{").await.unwrap();
+                                        }
+                                        // A silent peer cannot wait until the much later
+                                        // native timeout. The host deadline must close I/O.
+                                        let mut byte = [0];
+                                        assert!(!matches!(socket.read(&mut byte).await, Ok(n) if n > 0));
+                                        break;
+                                    }
+                                    let result = if ordinal == 2 || matches!(case, Case::CompleteWithoutInput) {
                                         r#"{"resultType":"complete","content":[{"type":"text","text":"done"}]}"#
                                     } else {
                                         MIXED
@@ -789,8 +986,13 @@ mod tests {
                                 proofs.len()
                             };
                             let cancel = McpRequestCancellation::new();
+                            let input_policy = if matches!(case, Case::QuietResponseHead | Case::QuietResponseBody | Case::CompleteWithoutInput) {
+                                input_limits(Duration::from_secs(3))
+                            } else {
+                                CoreInputLimits::default()
+                            };
                             let limits = DpopHostLimits::new(
-                                ManagedInteractionLimits::default(), CoreInputLimits::default(),
+                                ManagedInteractionLimits::default(), input_policy,
                                 if matches!(case, Case::ResolutionLimit) { 1 } else { 4 },
                             ).unwrap();
                             let mut host = Host {
@@ -804,6 +1006,18 @@ mod tests {
                             let (received, outcome) = pair(server, application).await;
                             assert_eq!(received, posts);
                             match case {
+                                Case::CompleteWithoutInput => {
+                                    assert!(outcome.unwrap().result.encode().unwrap().contains("done"));
+                                    assert!(host.calls.is_empty());
+                                }
+                                Case::QuietResponseHead | Case::QuietResponseBody => {
+                                    assert!(matches!(outcome, Err(DpopHostError::Interaction(
+                                        DpopInteractionError::Core(DpopCoreError::Transport(
+                                            DpopHttpError::TimedOut
+                                        ))
+                                    ))));
+                                    assert!(host.calls.is_empty());
+                                }
                                 Case::Complete => {
                                     let outcome = outcome.unwrap();
                                     assert!(outcome.result.encode().unwrap().contains("done"));
