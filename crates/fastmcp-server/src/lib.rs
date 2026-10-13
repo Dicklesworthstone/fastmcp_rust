@@ -23383,6 +23383,7 @@ mod lib_unit_tests {
             let mut terminal_prefix: Vec<u8> = Vec::new();
             let mut terminal_bytes = 0_usize;
             let mut terminal_reads = 0_u32;
+            let terminal_started = std::time::Instant::now();
             loop {
                 let mut terminal = [0_u8; 64];
                 let read = asupersync::time::timeout_at(deadline, mixed.read(&mut terminal))
@@ -23390,11 +23391,16 @@ mod lib_unit_tests {
                     .map_err(|_| {
                         format!(
                             "Auto cross-era peer close timed out after {terminal_reads} \
-                             non-empty reads totalling {terminal_bytes} bytes; first bytes \
-                             {terminal_prefix:02x?}. An empty prefix means the peer sent \
-                             nothing and the close is missing; a non-empty one means the peer \
-                             did send something this loop does not treat as terminal, since it \
-                             breaks only on end of stream"
+                             non-empty reads totalling {terminal_bytes} bytes over {:?}; bytes \
+                             {terminal_prefix:02x?}; as text {:?}. An empty capture means the \
+                             peer sent nothing and the close is missing; a non-empty one means \
+                             the peer did send something this loop does not treat as terminal, \
+                             since it breaks only on end of stream. The elapsed figure says \
+                             whether the shared deadline still had room when the peer went \
+                             quiet, which distinguishes a close that never comes from one this \
+                             bound cannot wait for",
+                            terminal_started.elapsed(),
+                            String::from_utf8_lossy(&terminal_prefix)
                         )
                     })?
                     .map_err(|error| format!("Auto cross-era peer close failed: {error}"))?;
@@ -23403,7 +23409,11 @@ mod lib_unit_tests {
                 }
                 terminal_reads += 1;
                 terminal_bytes += read;
-                let room = 32_usize.saturating_sub(terminal_prefix.len());
+                // 512 rather than a token prefix: the observed frame was 344
+                // bytes and a JSON-RPC response carries its id at the END, so
+                // a short prefix showed the result but hid which request it
+                // answered.
+                let room = 512_usize.saturating_sub(terminal_prefix.len());
                 if room > 0 {
                     terminal_prefix.extend_from_slice(&terminal[..read.min(room)]);
                 }
@@ -36452,6 +36462,13 @@ mod lib_unit_tests {
     /// independence that makes the pair worth having.
     #[test]
     fn modern_ping_through_the_owned_production_dispatch_answers_an_empty_object() {
+        // Every policy is evaluated before anything is asserted. An assertion
+        // inside the loop ends the test on the first refusal and silently
+        // leaves the remaining policies unmeasured, which is how the first
+        // version of this test reported one policy while its name promised
+        // two -- and the unmeasured one, ModernOnly, is precisely what the
+        // stdio loop dispatches under.
+        let mut observed: Vec<(ProtocolPolicy, bool, String)> = Vec::new();
         for policy in [ProtocolPolicy::Auto, ProtocolPolicy::ModernOnly] {
             let server = Arc::new(Server::new("policy-modern-ping", "1.0.0").build());
             let connection = ModernConnection::new();
@@ -36491,20 +36508,25 @@ mod lib_unit_tests {
             .unwrap_or_else(|| {
                 panic!("ping with an id must produce a JSON-RPC response under {policy:?}")
             });
-            assert_eq!(
-                response.result,
-                Some(serde_json::json!({})),
-                "a modern ping through the owned {policy:?} production dispatch answers an empty \
-                 object; error was {:?}",
-                response.error
-            );
-            assert!(
-                response.error.is_none(),
-                "a modern ping through the owned {policy:?} production dispatch carries no \
-                 error: {:?}",
-                response.error
-            );
+            let answered_empty_object =
+                response.result == Some(serde_json::json!({})) && response.error.is_none();
+            observed.push((
+                policy,
+                answered_empty_object,
+                format!("result={:?} error={:?}", response.result, response.error),
+            ));
         }
+        let refused: Vec<&(ProtocolPolicy, bool, String)> = observed
+            .iter()
+            .filter(|(_, answered, _)| !answered)
+            .collect();
+        assert!(
+            refused.is_empty(),
+            "every shipped policy must answer a modern ping with an empty object and no error; \
+             {} of {} refused: {refused:#?}",
+            refused.len(),
+            observed.len()
+        );
     }
 
     #[test]
