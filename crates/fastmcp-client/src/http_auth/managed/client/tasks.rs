@@ -21,6 +21,7 @@ use crate::{
 
 mod listen;
 mod resolve;
+mod tool_events;
 
 const MAX_TASK_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TASK_WAIT_POLLS: usize = 1_024;
@@ -49,6 +50,7 @@ pub(super) enum TaskCall<'a> {
         name: &'a str,
         arguments: Value,
     },
+    ToolEvents(tool_events::ToolEventRequest<'a>),
     Get(FinalTaskId),
     Update {
         task: &'a FinalTask,
@@ -164,6 +166,9 @@ impl TaskCall<'_> {
                     }
                 };
                 Ok(TaskResult::Tool(Box::new(outcome)))
+            }
+            Self::ToolEvents(request) => {
+                Box::pin(request.dispatch(cx, cancellation, client, id)).await
             }
             Self::Get(task_id) => client
                 .connection
