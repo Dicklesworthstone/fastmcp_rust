@@ -206,9 +206,15 @@ fn watch_subscription_terminal_requires_an_actionable_final_snapshot() {
             if completed {
                 assert_state(result.unwrap(), "completed");
             } else {
-                assert!(result.is_err(), "stream completion cannot imply task completion");
+                assert!(
+                    result.is_err(),
+                    "stream completion cannot imply task completion"
+                );
             }
-            assert_eq!(client.cached_credential_generation(), completed.then_some(1));
+            assert_eq!(
+                client.cached_credential_generation(),
+                completed.then_some(1)
+            );
             peer.no_more(&cx).await;
         });
     }
@@ -241,7 +247,10 @@ fn watch_requires_its_task_in_the_acknowledged_subset_before_reconciliation() {
             } else {
                 assert!(result.is_err());
             }
-            assert_eq!(client.cached_credential_generation(), accepts_task.then_some(1));
+            assert_eq!(
+                client.cached_credential_generation(),
+                accepts_task.then_some(1)
+            );
         });
     }
 }
@@ -332,10 +341,8 @@ fn watch_cancellation_logout_and_revocation_release_both_owned_responses() {
                 match (cause, result) {
                     (0, Err(ManagedHttpClientError::Session(OAuthSessionError::Cancelled)))
                     | (1, Err(ManagedHttpClientError::Session(OAuthSessionError::Closed)))
-                    | (
-                        2,
-                        Err(ManagedHttpClientError::Session(OAuthSessionError::LoginRequired)),
-                    ) => {}
+                    | (2, Err(ManagedHttpClientError::Session(OAuthSessionError::LoginRequired))) =>
+                        {}
                     _ => panic!("wrong watch lifetime disposition"),
                 }
                 assert_eq!(client.cached_credential_generation(), None);
@@ -453,7 +460,9 @@ fn watch_invalid_limits_and_precancellation_never_open_a_connection() {
             client
                 .watch_task_final_with_cancellation(&cx, &cancellation, id(), 8, PAYLOAD_BYTES)
                 .await,
-            Err(ManagedHttpClientError::Session(OAuthSessionError::Cancelled))
+            Err(ManagedHttpClientError::Session(
+                OAuthSessionError::Cancelled
+            ))
         ));
         assert_eq!(client.cached_credential_generation(), None);
         peer.no_more(&cx).await;
@@ -479,14 +488,12 @@ fn watch_exact_snapshot_payload_budget_excludes_the_transport_envelope() {
             let peer = Peer::new().await;
             let session = peer.login(&cx).await;
             let mut client = peer.client(session).with_tasks();
-            let (result, ()) = Box::pin(pair(
-                client.watch_task_final(&cx, id(), 1, budget),
-                async {
+            let (result, ()) =
+                Box::pin(pair(client.watch_task_final(&cx, id(), 1, budget), async {
                     peer.discovery("access-one", true).await;
                     get(&peer, "completed").await;
-                },
-            ))
-            .await;
+                }))
+                .await;
             if fits {
                 assert_state(result.unwrap(), "completed");
             } else {

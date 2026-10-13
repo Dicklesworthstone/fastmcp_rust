@@ -25,8 +25,8 @@ use super::{
     ManagedCoreError, ModernHttpRequest, WaitBounds, check_live, decode_response, prepare,
 };
 use crate::http_auth::rpc::interaction::{
-    ManagedInteractionError, admit_challenge, admit_fresh_id, continuation_request,
-    input_required, validate_initial,
+    ManagedInteractionError, admit_challenge, admit_fresh_id, continuation_request, input_required,
+    validate_initial,
 };
 
 pub use crate::http_auth::rpc::interaction::{ManagedInputReply, ManagedInteractionLimits};
@@ -92,7 +92,10 @@ impl fmt::Debug for DpopInputChallenge {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DpopInputChallenge")
             .field("inputs_present", &self.requests.is_some())
-            .field("input_count", &self.requests.as_ref().map_or(0, BTreeMap::len))
+            .field(
+                "input_count",
+                &self.requests.as_ref().map_or(0, BTreeMap::len),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -232,10 +235,12 @@ where
 {
     check_live(cx, cancellation, session, credential, bounds)?;
     let projected = DpopInputChallenge::from_input(input)?;
-    Ok(within(cx, cancellation, session, credential, bounds, async {
-        Ok(resolve(projected).await)
-    })
-    .await??)
+    Ok(
+        within(cx, cancellation, session, credential, bounds, async {
+            Ok(resolve(projected).await)
+        })
+        .await??,
+    )
 }
 
 // Only the currently owned conversation can construct a next request. These
@@ -327,7 +332,11 @@ impl Rounds {
         if self.request_bytes > self.limits.core().total_bytes()
             || response_bytes < self.response_bytes
             || response_bytes
-                > self.limits.core().total_bytes().saturating_sub(self.request_bytes)
+                > self
+                    .limits
+                    .core()
+                    .total_bytes()
+                    .saturating_sub(self.request_bytes)
         {
             return Err(ManagedCoreError::ResponseByteLimit.into());
         }
@@ -472,35 +481,61 @@ mod tests {
     #[test]
     fn every_continuation_preserves_original_identity_and_only_current_answers() {
         for (method, params) in [
-            ("tools/call", json!({"name":"echo","arguments":{"text":"original"}})),
+            (
+                "tools/call",
+                json!({"name":"echo","arguments":{"text":"original"}}),
+            ),
             ("resources/read", json!({"uri":"file:///original"})),
-            ("prompts/get", json!({"name":"greet","arguments":{"name":"original"}})),
+            (
+                "prompts/get",
+                json!({"name":"greet","arguments":{"name":"original"}}),
+            ),
         ] {
             let original = request(method, params, json!({"roots":{}}));
             let before = original.encode_params().unwrap().unwrap();
             let (mut state, _, mut decoder) = Rounds::new(
-                TARGET, original, RequestId::Number(7), ManagedInteractionLimits::default(), 8192,
+                TARGET,
+                original,
+                RequestId::Number(7),
+                ManagedInteractionLimits::default(),
+                8192,
             )
             .unwrap();
             let input = challenge(&mut state, &mut decoder);
-            let (wire, mut decoder) = state.resume(&input, reply(8, Some(json!({"r":{"roots":[]}})))).unwrap();
+            let (wire, mut decoder) = state
+                .resume(&input, reply(8, Some(json!({"r":{"roots":[]}}))))
+                .unwrap();
             let mut payload: Value = serde_json::from_slice(wire.body()).unwrap();
             assert_eq!(wire.target(), TARGET);
             assert_eq!(payload["method"], method);
             assert_eq!(payload["id"], 8);
             assert_eq!(payload["params"]["requestState"], " opaque+/% ");
-            assert_eq!(payload["params"]["inputResponses"], json!({"r":{"roots":[]}}));
-            payload["params"].as_object_mut().unwrap().remove("requestState");
-            payload["params"].as_object_mut().unwrap().remove("inputResponses");
+            assert_eq!(
+                payload["params"]["inputResponses"],
+                json!({"r":{"roots":[]}})
+            );
+            payload["params"]
+                .as_object_mut()
+                .unwrap()
+                .remove("requestState");
+            payload["params"]
+                .as_object_mut()
+                .unwrap()
+                .remove("inputResponses");
             assert_eq!(payload["params"], before);
 
             let next = r#"{"resultType":"input_required","inputRequests":{"s":{"method":"roots/list"}},"requestState":"successor"}"#;
             let result = decode_response(&mut decoder, response(8, next)).unwrap();
             let input = state.accept(&decoder, &result).unwrap().unwrap();
-            let (wire, _) = state.resume(&input, reply(9, Some(json!({"s":{"roots":[]}})))).unwrap();
+            let (wire, _) = state
+                .resume(&input, reply(9, Some(json!({"s":{"roots":[]}}))))
+                .unwrap();
             let payload: Value = serde_json::from_slice(wire.body()).unwrap();
             assert_eq!(payload["params"]["requestState"], "successor");
-            assert_eq!(payload["params"]["inputResponses"], json!({"s":{"roots":[]}}));
+            assert_eq!(
+                payload["params"]["inputResponses"],
+                json!({"s":{"roots":[]}})
+            );
             assert_eq!(state.original.encode_params().unwrap().unwrap(), before);
             assert_eq!(state.used_ids.len(), 3);
             assert_eq!(state.continuations, 2);
@@ -525,10 +560,16 @@ mod tests {
             assert_eq!(state.continuations, 0);
             assert_eq!(state.input_responses, 0);
         }
-        assert!(state.resume(&input, reply(8, Some(json!({"r":{"roots":[]}})))).is_ok());
+        assert!(
+            state
+                .resume(&input, reply(8, Some(json!({"r":{"roots":[]}}))))
+                .is_ok()
+        );
         assert!(matches!(
             state.resume(&input, reply(8, Some(json!({"r":{"roots":[]}})))),
-            Err(DpopInteractionError::Input(ManagedInteractionError::RepeatedRequestId))
+            Err(DpopInteractionError::Input(
+                ManagedInteractionError::RepeatedRequestId
+            ))
         ));
     }
 
@@ -541,9 +582,16 @@ mod tests {
         let projected = DpopInputChallenge::from_input(&input).unwrap();
         let requests = projected.input_requests().unwrap();
         assert_eq!(requests.len(), 1);
-        assert!(matches!(requests.get("r"), Some(FinalEmbeddedInputRequest::Roots(_))));
+        assert!(matches!(
+            requests.get("r"),
+            Some(FinalEmbeddedInputRequest::Roots(_))
+        ));
         let debug = format!("{projected:?}");
-        for secret in ["private-state-canary", "private-meta-canary", "private-unknown-canary"] {
+        for secret in [
+            "private-state-canary",
+            "private-meta-canary",
+            "private-unknown-canary",
+        ] {
             assert!(!debug.contains(secret));
         }
         // Projection does not destroy or rewrite the state needed on wire.
@@ -559,8 +607,14 @@ mod tests {
     #[test]
     fn resolver_projection_keeps_absence_distinct_from_present_empty_inputs() {
         for (source, present) in [
-            (r#"{"resultType":"input_required","requestState":"private"}"#, false),
-            (r#"{"resultType":"input_required","inputRequests":{},"requestState":"private"}"#, true),
+            (
+                r#"{"resultType":"input_required","requestState":"private"}"#,
+                false,
+            ),
+            (
+                r#"{"resultType":"input_required","inputRequests":{},"requestState":"private"}"#,
+                true,
+            ),
         ] {
             let (mut state, _, mut decoder) = initial(ManagedInteractionLimits::default());
             let result = state.decode(&mut decoder, response(7, source)).unwrap();
@@ -587,7 +641,13 @@ mod tests {
             std::future::ready(Ok(reply(8, Some(json!({"r":{"roots":[]}})))))
         };
         let mut waiting = Box::pin(resolve_input(
-            &cx, &cancellation, &session, &credential, bounds, &input, &mut resolve,
+            &cx,
+            &cancellation,
+            &session,
+            &credential,
+            bounds,
+            &input,
+            &mut resolve,
         ));
         let Poll::Ready(Ok(answer)) = waiting
             .as_mut()
@@ -613,13 +673,17 @@ mod tests {
         let before = (state.request_bytes, state.response_bytes);
         assert!(matches!(
             state.resume(&input, reply(8, Some(json!({"r":{"roots":[]}})))),
-            Err(DpopInteractionError::Input(ManagedInteractionError::InvalidInputResponses))
+            Err(DpopInteractionError::Input(
+                ManagedInteractionError::InvalidInputResponses
+            ))
         ));
         assert_eq!((state.request_bytes, state.response_bytes), before);
         assert_eq!(state.used_ids, vec![RequestId::Number(7)]);
         assert_eq!(state.input_responses, 0);
         let answers = json!({"r":{"roots":[]},"s":{"roots":[]}});
-        let (wire, _) = state.resume(&input, reply(8, Some(answers.clone()))).unwrap();
+        let (wire, _) = state
+            .resume(&input, reply(8, Some(answers.clone())))
+            .unwrap();
         let body: Value = serde_json::from_slice(wire.body()).unwrap();
         assert_eq!(body["params"]["inputResponses"], answers);
         assert_eq!(state.input_responses, 2);
@@ -641,7 +705,11 @@ mod tests {
         for exact in [false, true] {
             let maximum = total - usize::from(!exact);
             let core = ManagedCoreLimits::new(
-                8192, first_size.max(final_size), maximum, 0, Duration::from_secs(10),
+                8192,
+                first_size.max(final_size),
+                maximum,
+                0,
+                Duration::from_secs(10),
             )
             .unwrap();
             let limits = ManagedInteractionLimits::new(core, 8, 128).unwrap();
@@ -678,10 +746,8 @@ mod tests {
             .unwrap();
         let response_size = response(7, INPUT).body().len();
         let maximum = first_wire.body().len() + response_size + second_wire.body().len();
-        let core = ManagedCoreLimits::new(
-            8192, response_size, maximum, 0, Duration::from_secs(10),
-        )
-        .unwrap();
+        let core = ManagedCoreLimits::new(8192, response_size, maximum, 0, Duration::from_secs(10))
+            .unwrap();
         let limits = ManagedInteractionLimits::new(core, 8, 128).unwrap();
         let (mut state, _, mut decoder) = initial(limits);
         let input = challenge(&mut state, &mut decoder);
@@ -705,17 +771,27 @@ mod tests {
     fn state_only_and_empty_input_presence_retain_different_wire_meanings() {
         for (source, answers) in [
             (r#"{"resultType":"input_required","requestState":""}"#, None),
-            (r#"{"resultType":"input_required","inputRequests":{}}"#, Some(json!({}))),
+            (
+                r#"{"resultType":"input_required","inputRequests":{}}"#,
+                Some(json!({})),
+            ),
         ] {
             let (mut state, _, mut decoder) = initial(ManagedInteractionLimits::default());
             let result = decode_response(&mut decoder, response(7, source)).unwrap();
             let input = state.accept(&decoder, &result).unwrap().unwrap();
-            let opposite = if answers.is_some() { None } else { Some(json!({})) };
+            let opposite = if answers.is_some() {
+                None
+            } else {
+                Some(json!({}))
+            };
             assert!(state.resume(&input, reply(8, opposite)).is_err());
             let (wire, _) = state.resume(&input, reply(8, answers.clone())).unwrap();
             let payload: Value = serde_json::from_slice(wire.body()).unwrap();
             assert_eq!(payload["params"].get("inputResponses"), answers.as_ref());
-            assert_eq!(payload["params"].get("requestState").is_some(), answers.is_none());
+            assert_eq!(
+                payload["params"].get("requestState").is_some(),
+                answers.is_none()
+            );
         }
     }
 
@@ -726,7 +802,9 @@ mod tests {
         let result = decode_response(&mut decoder, response(7, mixed)).unwrap();
         assert!(matches!(
             state.accept(&decoder, &result),
-            Err(DpopInteractionError::Input(ManagedInteractionError::CapabilityNotAdvertised))
+            Err(DpopInteractionError::Input(
+                ManagedInteractionError::CapabilityNotAdvertised
+            ))
         ));
         assert_eq!(state.continuations, 0);
         assert_eq!(state.input_responses, 0);
@@ -735,10 +813,9 @@ mod tests {
     #[test]
     fn continuation_and_input_limits_refuse_further_host_work() {
         for (max_rounds, max_inputs, expected_round_limit) in [(0, 4, true), (4, 0, false)] {
-            let limits = ManagedInteractionLimits::new(
-                ManagedCoreLimits::default(), max_rounds, max_inputs,
-            )
-            .unwrap();
+            let limits =
+                ManagedInteractionLimits::new(ManagedCoreLimits::default(), max_rounds, max_inputs)
+                    .unwrap();
             let (mut state, _, mut decoder) = initial(limits);
             let result = decode_response(&mut decoder, response(7, INPUT)).unwrap();
             let error = state.accept(&decoder, &result).err().unwrap();
@@ -755,7 +832,8 @@ mod tests {
             }
             let (mut state, _, mut decoder) = initial(limits);
             let complete = decode_response(
-                &mut decoder, response(7, r#"{"resultType":"complete","content":[]}"#),
+                &mut decoder,
+                response(7, r#"{"resultType":"complete","content":[]}"#),
             )
             .unwrap();
             assert!(state.accept(&decoder, &complete).unwrap().is_none());
@@ -780,10 +858,13 @@ mod tests {
         let result = decode_response(&mut decoder, response(7, INPUT)).unwrap();
         assert!(matches!(
             state.accept(&decoder, &result),
-            Err(DpopInteractionError::Core(DpopCoreError::Protocol(ManagedCoreError::ResponseByteLimit)))
+            Err(DpopInteractionError::Core(DpopCoreError::Protocol(
+                ManagedCoreError::ResponseByteLimit
+            )))
         ));
 
-        let (mut reference, _, mut reference_decoder) = initial(ManagedInteractionLimits::default());
+        let (mut reference, _, mut reference_decoder) =
+            initial(ManagedInteractionLimits::default());
         let input = challenge(&mut reference, &mut reference_decoder);
         let (second_wire, _) = reference
             .resume(&input, reply(8, Some(json!({"r":{"roots":[]}}))))
@@ -799,7 +880,9 @@ mod tests {
         let limits = ManagedInteractionLimits::new(core, 8, 128).unwrap();
         let (mut state, _, mut decoder) = initial(limits);
         let input = challenge(&mut state, &mut decoder);
-        let (_, mut decoder) = state.resume(&input, reply(8, Some(json!({"r":{"roots":[]}})))).unwrap();
+        let (_, mut decoder) = state
+            .resume(&input, reply(8, Some(json!({"r":{"roots":[]}}))))
+            .unwrap();
         assert_eq!(decoder.usage().0, first_size);
         assert!(matches!(
             state.decode(&mut decoder, response(8, INPUT)),
@@ -856,13 +939,21 @@ mod tests {
             let waker = Waker::from(Arc::clone(&counter));
             let mut task = Context::from_waker(&waker);
             let mut waiting = Box::pin(resolve_input(
-                &cx, &cancellation, &session, &credential, bounds, &input, &mut resolve,
+                &cx,
+                &cancellation,
+                &session,
+                &credential,
+                bounds,
+                &input,
+                &mut resolve,
             ));
             assert!(waiting.as_mut().poll(&mut task).is_pending());
             assert_eq!(invocations.load(Ordering::SeqCst), 1);
             match cause {
                 0 => cx.set_cancel_requested(true),
-                1 => { cancellation.cancel(); }
+                1 => {
+                    cancellation.cancel();
+                }
                 2 => session.revoke(),
                 3 => credential.revoke(),
                 _ => {
@@ -871,7 +962,10 @@ mod tests {
                 }
             }
             assert!(counter.0.load(Ordering::SeqCst) > 0);
-            assert!(matches!(waiting.as_mut().poll(&mut task), Poll::Ready(Err(_))));
+            assert!(matches!(
+                waiting.as_mut().poll(&mut task),
+                Poll::Ready(Err(_))
+            ));
             assert_eq!(invocations.load(Ordering::SeqCst), 1);
             assert_eq!(drops.load(Ordering::SeqCst), 1);
             assert_eq!(state.continuations, 0);
@@ -895,15 +989,25 @@ mod tests {
             deadline: asupersync::types::Time::from_nanos(u64::MAX),
             terminal: DpopHttpError::TimedOut,
         };
-        let mut resolve = |_: DpopInputChallenge| -> std::future::Ready<Result<ManagedInputReply, ManagedInteractionError>> {
-            panic!("cancelled operation invoked its resolver")
-        };
+        let mut resolve = |_: DpopInputChallenge| -> std::future::Ready<
+            Result<ManagedInputReply, ManagedInteractionError>,
+        > { panic!("cancelled operation invoked its resolver") };
         let mut waiting = Box::pin(resolve_input(
-            &cx, &cancellation, &session, &credential, bounds, &input, &mut resolve,
+            &cx,
+            &cancellation,
+            &session,
+            &credential,
+            bounds,
+            &input,
+            &mut resolve,
         ));
         assert!(matches!(
-            waiting.as_mut().poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(Err(DpopInteractionError::Core(DpopCoreError::Transport(DpopHttpError::Cancelled))))
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(DpopInteractionError::Core(DpopCoreError::Transport(
+                DpopHttpError::Cancelled
+            ))))
         ));
     }
 
@@ -918,9 +1022,20 @@ mod tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut resolve = |_: DpopInputChallenge| PendingReply(Arc::clone(&drops));
         let mut waiting = Box::pin(resolve_input(
-            &cx, &cancellation, &session, &credential, bounds, &input, &mut resolve,
+            &cx,
+            &cancellation,
+            &session,
+            &credential,
+            bounds,
+            &input,
+            &mut resolve,
         ));
-        assert!(waiting.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         drop(waiting);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert_eq!(timer.pending_count(), 0);
@@ -944,12 +1059,22 @@ mod tests {
             std::future::ready(Ok(reply(8, Some(json!({"r":{"roots":[]}})))))
         };
         let mut waiting = Box::pin(resolve_input(
-            &cx, &cancellation, &session, &credential, bounds, &input, &mut resolve,
+            &cx,
+            &cancellation,
+            &session,
+            &credential,
+            bounds,
+            &input,
+            &mut resolve,
         ));
         assert!(matches!(
-            waiting.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
             Poll::Ready(Err(DpopInteractionError::Core(DpopCoreError::Transport(
-                DpopHttpError::Authorization(crate::http_auth::dpop::DpopClientError::CredentialUnavailable)
+                DpopHttpError::Authorization(
+                    crate::http_auth::dpop::DpopClientError::CredentialUnavailable
+                )
             ))))
         ));
         assert_eq!(state.continuations, 0);

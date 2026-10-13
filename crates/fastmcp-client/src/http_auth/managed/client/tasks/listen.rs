@@ -341,7 +341,10 @@ mod tests {
                 remaining_bytes,
             };
             assert_eq!(budget.admit(&event).is_ok(), fits);
-            assert_eq!(budget.remaining_bytes, if fits { 0 } else { remaining_bytes });
+            assert_eq!(
+                budget.remaining_bytes,
+                if fits { 0 } else { remaining_bytes }
+            );
             assert_eq!(budget.notifications, usize::from(!fits));
         }
     }
