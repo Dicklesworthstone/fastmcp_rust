@@ -37,6 +37,8 @@ use crate::http_executor::ModernHttpExecutor;
 
 // Shared dispatch/body guard for the original token's local revocation.
 mod credential_lifetime;
+// Refresh admission must retain the old token's revocation signal until handoff.
+mod renewal;
 
 /// High-level HTTP calls retaining shared OAuth renewal and credential lifetime.
 pub mod client;
@@ -441,25 +443,7 @@ impl ManagedOAuthSession {
                 if !state.credentials.has_refresh_token() {
                     return Err(OAuthSessionError::LoginRequired);
                 }
-                let generation = state
-                    .generation
-                    .checked_add(1)
-                    .ok_or(OAuthSessionError::GenerationExhausted)?;
-                state.renewal_failed = true;
-                self.inner
-                    .client
-                    .refresh(cx, &mut state.credentials)
-                    .await
-                    .map_err(OAuthSessionError::OAuth)?;
-                self.check(cx, cancellation)?;
-                state.renew_after = renewal_time(
-                    Instant::now(),
-                    state.credentials.expires_at(),
-                    state.credentials.has_refresh_token(),
-                    self.inner.policy.refresh_leeway,
-                );
-                state.generation = generation;
-                state.renewal_failed = false;
+                renewal::refresh(self, cx, cancellation, state).await?;
             }
             if Instant::now() >= state.credentials.expires_at() {
                 return Err(OAuthSessionError::LoginRequired);
@@ -1205,7 +1189,7 @@ mod tests {
                         Duration::from_secs(30)
                     };
                     let response =
-                        open_response(&cx, &listener, &session, &cancellation, lifetime).await;
+                        open_response(&cx, &listener,&session, &cancellation, lifetime).await;
                     let mut reading = Box::pin(response.read_to_end(&cx, 4096));
                     poll_pending(reading.as_mut()).await;
                     match action {
