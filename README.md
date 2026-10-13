@@ -133,9 +133,35 @@ different things:
   (`iss-wrong-issuer`, `metadata-issuer-mismatch`,
   `authorization-server-migration`). So the driver refuses any configuration
   naming the suite's endpoint, on two independent grounds. Closing these needs
-  a separate loopback-HTTP adapter profile, not a configuration value; relaxing
-  the shipped driver's HTTPS requirement to move a conformance number would
-  weaken a deliberate security property, so that is not on the table.
+  **more than an adapter profile**, which is worth stating precisely because
+  the cheap-sounding estimate is wrong. The HTTPS requirement is not one check
+  in the conformance adapter: a census of `crates/fastmcp-client/src`, with
+  `cfg(test)` modules excluded, finds **32 production HTTPS hard-gates across
+  19 files** — `validate_https` and `https_url` in `discovery.rs`, and
+  independent `scheme() != "https"` or `starts_with("https://")` refusals in
+  `challenge.rs`, `step_up.rs`, `private_key_jwt.rs`, `registration.rs`,
+  `metadata_document.rs`, `dpop.rs`, `driver.rs`, `redirect.rs`,
+  `http_client.rs`, `managed/client.rs`, `resume.rs`, `oauth.rs`,
+  `revocation.rs`, `recovery.rs`, `repair.rs`, `http_executor.rs` and
+  `parameter_headers.rs` — and **no loopback exemption anywhere**. The one
+  `127.0.0.1` occurrence in the discovery tests is a fixture asserting
+  rejection. Reaching the suite's ephemeral plain-HTTP loopback authorization
+  server therefore means threading a loopback exemption through all of them,
+  which is a change to the transport security posture of the whole client
+  authorization subsystem, plus accepting a *discovered* issuer where
+  `OAuthDiscoveryPlan` currently takes a caller-supplied `TrustedOAuthIssuer`
+  allowlist. A loopback exemption is spec-backed (RFC 8252 §7.3, and OAuth 2.1
+  permits `http` on loopback), so this is a reviewed design decision rather
+  than a forbidden relaxation — but it is a library decision, not adapter
+  plumbing, and it is not taken here.
+
+  **A trap for whoever does take it.** Gating the exemption behind a
+  conformance-only feature or `cfg` would be the cheap version and is
+  self-defeating as proof: the 46 passing checks would then measure a profile
+  no user can build, so they would be evidence about a conformance-only code
+  path rather than about shipped behaviour. Either the shipped validators gain
+  a spec-backed loopback exemption, or the 46 stay closed and are reported as
+  a deliberate boundary.
   **They are also not one problem.** The
   pinned suite drives PKCE (`code_challenge`), `authorization_code`, dynamic
   `register`, and 401 `WWW-Authenticate` + `resource_metadata` discovery, all of
