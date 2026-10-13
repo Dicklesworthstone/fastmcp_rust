@@ -36430,6 +36430,83 @@ mod lib_unit_tests {
         );
     }
 
+    /// The severity companion to
+    /// `dispatch_stateless_modern_ping_answers_an_empty_object`, and the one
+    /// that reaches the chain a real transport uses.
+    ///
+    /// Its companion dispatches through `dispatch_stateless`, which for those
+    /// arguments resolves to `dispatch_stateless_with_cancellation`. The
+    /// production stdio loop does NOT use that function: `async_stdio` contains
+    /// no ping handling of its own and routes every inbound request through
+    /// `dispatch_with_protocol_policy_owned` under `ProtocolPolicy::ModernOnly`,
+    /// which descends the separate `dispatch_stateless_owned_*` chain. So the
+    /// companion alone cannot say whether a shipped transport is affected, and
+    /// a test that merely swapped in the non-owned policy wrapper would have
+    /// been close to tautological against it. This one takes the owned path,
+    /// shaped exactly like the stdio call site, and keeps `Auto` beside
+    /// `ModernOnly` because `Auto` is the default policy.
+    ///
+    /// Written self-contained rather than sharing a request-building helper
+    /// with its companion on purpose: if one fixture fed both, a fault in the
+    /// fixture would fail both halves together and destroy exactly the
+    /// independence that makes the pair worth having.
+    #[test]
+    fn modern_ping_through_the_owned_production_dispatch_answers_an_empty_object() {
+        for policy in [ProtocolPolicy::Auto, ProtocolPolicy::ModernOnly] {
+            let server = Arc::new(Server::new("policy-modern-ping", "1.0.0").build());
+            let connection = ModernConnection::new();
+            let inbound = InboundRequestContext::with_modern_connection(
+                Cx::for_testing(),
+                928,
+                InboundRequestTransport::Memory,
+                &connection,
+            );
+            let notifications: NotificationSender = Arc::new(|_| {});
+            let mut request = JsonRpcRequest::new("ping", Some(serde_json::json!({})), 928_i64);
+            request
+                .params
+                .as_mut()
+                .expect("the ping request retains its object parameters")
+                .as_object_mut()
+                .expect("the ping parameters remain an object")
+                .insert(
+                    "_meta".to_owned(),
+                    serde_json::json!({
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    }),
+                );
+            let response = block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                policy,
+                &inbound,
+                &request,
+                None,
+                None,
+                None,
+                None,
+                fastmcp_core::McpRequestCancellation::new(),
+                None,
+                Arc::clone(&notifications),
+            ))
+            .unwrap_or_else(|| {
+                panic!("ping with an id must produce a JSON-RPC response under {policy:?}")
+            });
+            assert_eq!(
+                response.result,
+                Some(serde_json::json!({})),
+                "a modern ping through the owned {policy:?} production dispatch answers an empty \
+                 object; error was {:?}",
+                response.error
+            );
+            assert!(
+                response.error.is_none(),
+                "a modern ping through the owned {policy:?} production dispatch carries no \
+                 error: {:?}",
+                response.error
+            );
+        }
+    }
+
     #[test]
     fn open_subscription_listen_receives_stateless_catalog_mutation() {
         let server = Server::new("in-process-listen", "1.0.0")
