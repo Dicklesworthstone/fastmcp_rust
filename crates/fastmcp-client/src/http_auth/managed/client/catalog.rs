@@ -11,7 +11,10 @@ use std::io::{self, Write};
 use asupersync::Cx;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::{
-    CoreResult, FinalCoreResult, FinalPrompt, FinalResource, FinalResourceTemplate, FinalTool,
+    CacheScope, CacheTtl, CompleteResult, CoreResult, FinalCoreResult, FinalListPromptsResult,
+    FinalListResourceTemplatesResult, FinalListResourcesResult, FinalListToolsResult, FinalPrompt,
+    FinalResource, FinalResourceTemplate, FinalTool, ResultMeta, ResultPeerDiagnostic,
+    UnknownResultMembers,
 };
 use serde::Serialize;
 
@@ -41,10 +44,11 @@ impl Default for CatalogLimits {
 impl CatalogLimits {
     /// Selects ceilings of at most 256 pages, 16,384 entries and 32 MiB.
     ///
-    /// `bytes` counts each page's serialized entry array and continuation token,
-    /// including JSON escaping and framing, without retaining serialized copies.
-    /// It is not a heap-size estimate. Native response/parser bounds still apply
-    /// to each page, including result metadata that this collection discards.
+    /// `bytes` counts the protocol codec's encoding of every complete result,
+    /// including entries, cursor, cache hints, metadata and exact open siblings.
+    /// It excludes the JSON-RPC envelope and is not a heap-size estimate. One
+    /// bounded page is encoded temporarily for accounting, never retained as a
+    /// second serialized copy. Native response/parser bounds still apply.
     pub fn new(pages: usize, entries: usize, bytes: usize) -> Result<Self, CatalogError> {
         if !(1..=256).contains(&pages)
             || !(1..=16_384).contains(&entries)
@@ -86,32 +90,130 @@ impl fmt::Display for CatalogError {
 
 impl std::error::Error for CatalogError {}
 
-/// Complete entries in peer page order, obtained under one credential lifetime.
+// Metadata, open fields, cache hints and diagnostics move intact. The consumed
+// cursor moves directly into the next request, never into a public page view.
+// Ranges retain empty page boundaries without cloning catalog entries.
+// Exhaustive payload destructuring makes new fields an integration obligation.
+struct Page {
+    entry_start: usize,
+    entry_count: usize,
+    has_continuation: bool,
+    ttl_ms: CacheTtl,
+    cache_scope: CacheScope,
+    meta: ResultMeta,
+    extras: UnknownResultMembers,
+    diagnostic: Option<ResultPeerDiagnostic>,
+}
+
+/// Complete entries and per-page result details under one credential lifetime.
 ///
 /// This is NOT an atomic server snapshot or a cache entry. A peer can mutate its
-/// catalog between pages. Per-page TTL/cache-scope/result metadata is deliberately
-/// not combined; use the single-page APIs when that information is needed.
-/// Duplicate entries remain entries, not silently overwritten identities. Raw
-/// continuation tokens never escape this collection, including through Debug.
+/// catalog between pages. Per-page cache hints, metadata, exact open siblings
+/// and diagnostics remain available through per-page views in received order.
+/// The collector never combines their cache authority. Consumed raw cursors
+/// remain private; page views expose only whether a continuation was present.
+/// Result fields are peer-controlled; apply a disclosure policy before logging.
+/// Duplicate entries remain entries, not silently overwritten identities.
+/// Debug prints only counts, never entries, metadata or continuation tokens.
 /// Cursor equality conveys no progress or completion information: even a
 /// repeated empty token is followed until absence or a configured limit.
 pub struct ManagedCatalog<T> {
     entries: Vec<T>,
-    pages: usize,
+    pages: Vec<Page>,
 }
 
 impl<T> ManagedCatalog<T> {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            pages: Vec::new(),
+        }
+    }
+
+    /// Borrow the flat entry view without discarding retained page results.
     pub fn entries(&self) -> &[T] {
         &self.entries
     }
 
+    /// Explicitly select entries only, discarding page metadata and open fields.
+    /// Inspect the per-page views before consuming when those fields are needed.
     pub fn into_entries(self) -> Vec<T> {
         self.entries
     }
 
     /// Includes empty pages and the terminal page.
     pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// Entries from one zero-based page, including a present empty slice for
+    /// an empty page. No entry values are cloned or reordered for this view.
+    pub fn page_entries(&self, index: usize) -> Option<&[T]> {
+        let page = self.pages.get(index)?;
+        self.entries
+            .get(page.entry_start..page.entry_start + page.entry_count)
+    }
+
+    /// The page's original common result metadata, without a serde round-trip.
+    pub fn page_metadata(&self, index: usize) -> Option<&ResultMeta> {
+        self.pages.get(index).map(|page| &page.meta)
+    }
+
+    /// Inert open result siblings, preserving number lexemes and member order.
+    /// Their names and values never become pagination or extension authority.
+    pub fn page_extras(&self, index: usize) -> Option<&UnknownResultMembers> {
+        self.pages.get(index).map(|page| &page.extras)
+    }
+
+    /// Exact per-page cache hints. These are not a TTL or scope for the combined
+    /// catalog, which may have changed on the server between page requests.
+    pub fn page_cache_hints(&self, index: usize) -> Option<(&CacheTtl, &CacheScope)> {
         self.pages
+            .get(index)
+            .map(|page| (&page.ttl_ms, &page.cache_scope))
+    }
+
+    /// A page's bounded peer diagnostic, when one was emitted by its decoder.
+    pub fn page_diagnostic(&self, index: usize) -> Option<&ResultPeerDiagnostic> {
+        self.pages.get(index).and_then(|page| page.diagnostic.as_ref())
+    }
+
+    /// Cursor presence only: no raw token or reusable pagination handle escapes.
+    pub fn page_has_continuation(&self, index: usize) -> Option<bool> {
+        self.pages.get(index).map(|page| page.has_continuation)
+    }
+
+    fn append_page(
+        &mut self,
+        entries: Vec<T>,
+        mut page: Page,
+        cursor: Option<String>,
+        meter: &mut Meter,
+        encoded_bytes: usize,
+    ) -> Result<Option<String>, CatalogError>
+    where
+        T: Serialize,
+    {
+        // Stage all checks on a small counter copy. No retained entry, page,
+        // cursor or accounting field changes after a refused page.
+        let mut next = meter.clone();
+        next.admit(&entries, cursor.as_deref())?;
+        let entry_bytes = meter.remaining_bytes - next.remaining_bytes;
+        let remaining_fields = encoded_bytes
+            .checked_sub(entry_bytes)
+            .ok_or(CatalogError::UnexpectedResult)?;
+        next.remaining_bytes = next
+            .remaining_bytes
+            .checked_sub(remaining_fields)
+            .ok_or(CatalogError::ByteLimit)?;
+        if cursor.is_some() && next.remaining_bytes == 0 {
+            return Err(CatalogError::ByteLimit);
+        }
+        page.entry_start = self.entries.len();
+        self.entries.extend(entries);
+        self.pages.push(page);
+        *meter = next;
+        Ok(cursor)
     }
 }
 
@@ -119,10 +221,62 @@ impl<T> fmt::Debug for ManagedCatalog<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ManagedCatalog")
             .field("entries", &self.entries.len())
-            .field("pages", &self.pages)
+            .field("pages", &self.pages.len())
             .finish()
     }
 }
+
+// The four list payloads share precisely these fields. No serde round-trip of
+// ResultMeta or UnknownResultMembers is permitted for storage or public views.
+macro_rules! catalog_result {
+    ($entry:ty, $payload:ident, $field:ident) => {
+        impl ManagedCatalog<$entry> {
+            fn append(
+                &mut self,
+                result: CompleteResult<$payload>,
+                diagnostic: Option<ResultPeerDiagnostic>,
+                meter: &mut Meter,
+                encoded_bytes: usize,
+            ) -> Result<Option<String>, CatalogError> {
+                let CompleteResult {
+                    payload,
+                    meta,
+                    extras,
+                } = result;
+                let $payload {
+                    $field,
+                    next_cursor,
+                    ttl_ms,
+                    cache_scope,
+                } = payload;
+                let page = Page {
+                    entry_start: 0,
+                    entry_count: $field.len(),
+                    has_continuation: next_cursor.is_some(),
+                    ttl_ms,
+                    cache_scope,
+                    meta,
+                    extras,
+                    diagnostic,
+                };
+                self.append_page($field, page, next_cursor, meter, encoded_bytes)
+            }
+        }
+    };
+}
+
+catalog_result!(FinalTool, FinalListToolsResult, tools);
+catalog_result!(
+    FinalResource,
+    FinalListResourcesResult,
+    resources
+);
+catalog_result!(
+    FinalResourceTemplate,
+    FinalListResourceTemplatesResult,
+    resource_templates
+);
+catalog_result!(FinalPrompt, FinalListPromptsResult, prompts);
 
 pub(super) enum Collected {
     Tools(ManagedCatalog<FinalTool>),
@@ -271,6 +425,7 @@ impl ManagedHttpClient {
 // budgets, never by examining or comparing these opaque token contents.
 const MAX_CURSOR_BYTES: usize = 16 * 1024;
 
+#[derive(Clone)]
 struct Meter {
     limits: CatalogLimits,
     pages: usize,
@@ -288,7 +443,8 @@ impl Meter {
         }
     }
 
-    // Called before entries or cursor copies enter the accumulated result.
+    // First admit entries/cursor on a staged counter copy. append_page then
+    // charges the rest of the complete result before publishing this copy.
     fn admit<T: Serialize>(
         &mut self,
         entries: &[T],
@@ -354,19 +510,19 @@ impl Write for BudgetWriter {
 }
 
 enum Entries {
-    Tools(Vec<FinalTool>),
-    Resources(Vec<FinalResource>),
-    Templates(Vec<FinalResourceTemplate>),
-    Prompts(Vec<FinalPrompt>),
+    Tools(ManagedCatalog<FinalTool>),
+    Resources(ManagedCatalog<FinalResource>),
+    Templates(ManagedCatalog<FinalResourceTemplate>),
+    Prompts(ManagedCatalog<FinalPrompt>),
 }
 
 impl Entries {
     fn new(kind: CatalogKind) -> Self {
         match kind {
-            CatalogKind::Tools => Self::Tools(Vec::new()),
-            CatalogKind::Resources => Self::Resources(Vec::new()),
-            CatalogKind::Templates => Self::Templates(Vec::new()),
-            CatalogKind::Prompts => Self::Prompts(Vec::new()),
+            CatalogKind::Tools => Self::Tools(ManagedCatalog::new()),
+            CatalogKind::Resources => Self::Resources(ManagedCatalog::new()),
+            CatalogKind::Templates => Self::Templates(ManagedCatalog::new()),
+            CatalogKind::Prompts => Self::Prompts(ManagedCatalog::new()),
         }
     }
 
@@ -375,58 +531,47 @@ impl Entries {
         page: CoreResult,
         meter: &mut Meter,
     ) -> Result<Option<String>, CatalogError> {
+        // Use the protocol encoder so exact number lexemes and metadata
+        // presence are counted without a lossy serde_json::Value conversion.
+        let encoded_bytes = page
+            .encode()
+            .map_err(|_| CatalogError::UnexpectedResult)?
+            .len();
         match (self, page) {
             (
                 Self::Tools(entries),
-                CoreResult::Final(FinalCoreResult::ToolsList { result, .. }),
+                CoreResult::Final(FinalCoreResult::ToolsList { result, diagnostic }),
             ) => {
-                meter.admit(&result.payload.tools, result.payload.next_cursor.as_deref())?;
-                entries.extend(result.payload.tools);
-                Ok(result.payload.next_cursor)
+                entries.append(result, diagnostic, meter, encoded_bytes)
             }
             (
                 Self::Resources(entries),
-                CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }),
+                CoreResult::Final(FinalCoreResult::ResourcesList { result, diagnostic }),
             ) => {
-                meter.admit(
-                    &result.payload.resources,
-                    result.payload.next_cursor.as_deref(),
-                )?;
-                entries.extend(result.payload.resources);
-                Ok(result.payload.next_cursor)
+                entries.append(result, diagnostic, meter, encoded_bytes)
             }
             (
                 Self::Templates(entries),
-                CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, .. }),
+                CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, diagnostic }),
             ) => {
-                meter.admit(
-                    &result.payload.resource_templates,
-                    result.payload.next_cursor.as_deref(),
-                )?;
-                entries.extend(result.payload.resource_templates);
-                Ok(result.payload.next_cursor)
+                entries.append(result, diagnostic, meter, encoded_bytes)
             }
             (
                 Self::Prompts(entries),
-                CoreResult::Final(FinalCoreResult::PromptsList { result, .. }),
+                CoreResult::Final(FinalCoreResult::PromptsList { result, diagnostic }),
             ) => {
-                meter.admit(
-                    &result.payload.prompts,
-                    result.payload.next_cursor.as_deref(),
-                )?;
-                entries.extend(result.payload.prompts);
-                Ok(result.payload.next_cursor)
+                entries.append(result, diagnostic, meter, encoded_bytes)
             }
             _ => Err(CatalogError::UnexpectedResult),
         }
     }
 
-    fn finish(self, pages: usize) -> Collected {
+    fn finish(self) -> Collected {
         match self {
-            Self::Tools(entries) => Collected::Tools(ManagedCatalog { entries, pages }),
-            Self::Resources(entries) => Collected::Resources(ManagedCatalog { entries, pages }),
-            Self::Templates(entries) => Collected::Templates(ManagedCatalog { entries, pages }),
-            Self::Prompts(entries) => Collected::Prompts(ManagedCatalog { entries, pages }),
+            Self::Tools(catalog) => Collected::Tools(catalog),
+            Self::Resources(catalog) => Collected::Resources(catalog),
+            Self::Templates(catalog) => Collected::Templates(catalog),
+            Self::Prompts(catalog) => Collected::Prompts(catalog),
         }
     }
 }
@@ -462,10 +607,13 @@ pub(super) async fn collect(
             .check(cx)
             .map_err(|error| request_error(HttpClientError::CoreResult(error)))?;
         if cursor.is_none() {
-            return Ok(entries.finish(meter.pages));
+            return Ok(entries.finish());
         }
     }
 }
+
+#[cfg(test)]
+mod page_tests;
 
 #[cfg(test)]
 mod tests {
@@ -593,9 +741,7 @@ mod tests {
     fn empty_pages_consume_page_budget_and_truncation_is_not_success() {
         for terminal in [false, true] {
             let mut meter = Meter::new(CatalogLimits::new(2, 1, 4096).unwrap());
-            meter
-                .admit::<serde_json::Value>(&[], Some("first"))
-                .unwrap();
+            meter.admit::<serde_json::Value>(&[], Some("first")).unwrap();
             let result =
                 meter.admit::<serde_json::Value>(&[], if terminal { None } else { Some("second") });
             assert_eq!(result.is_ok(), terminal);
@@ -639,12 +785,9 @@ mod tests {
 
     #[test]
     fn collection_debug_does_not_expose_entries_or_tokens() {
-        let catalog = ManagedCatalog {
-            entries: vec!["private-catalog-entry"],
-            pages: 2,
-        };
+        let mut catalog = ManagedCatalog::new();
+        catalog.entries.push("private-catalog-entry");
         assert_eq!(catalog.entries(), &["private-catalog-entry"]);
-        assert_eq!(catalog.page_count(), 2);
         assert!(!format!("{catalog:?}").contains("private-catalog-entry"));
         assert_eq!(catalog.into_entries(), vec!["private-catalog-entry"]);
     }
