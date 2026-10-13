@@ -22629,20 +22629,18 @@ mod lib_unit_tests {
 
     #[cfg(feature = "websocket")]
     #[test]
-    fn websocket_upgrade_origin_keeps_loopback_absent_and_repeated_origin_rules() {
+    fn websocket_upgrade_origin_respects_strict_allowlists_and_repeated_origin_rules() {
+        let default = HttpHandlerConfig::default();
         let configured = HttpHandlerConfig {
             allow_cors: true,
             cors_origins: vec!["https://app.example".to_string()],
             ..HttpHandlerConfig::default()
         };
-        for config in [&HttpHandlerConfig::default(), &configured] {
-            // Non-browser clients send no Origin.
+
+        // Non-browser clients send no Origin and remain unaffected.
+        for config in [&default, &configured] {
             assert!(raw_websocket_upgrade_origin_is_admissible(
                 &websocket_upgrade_head(&[]),
-                config
-            ));
-            assert!(raw_websocket_upgrade_origin_is_admissible(
-                &websocket_upgrade_head(&["http://localhost:6274"]),
                 config
             ));
             assert!(!raw_websocket_upgrade_origin_is_admissible(
@@ -22650,6 +22648,28 @@ mod lib_unit_tests {
                 config
             ));
         }
+
+        // The implicit loopback exception is a convenience only when no
+        // explicit allowlist exists. An operator-provided list is strict.
+        assert!(raw_websocket_upgrade_origin_is_admissible(
+            &websocket_upgrade_head(&["http://localhost:6274"]),
+            &default
+        ));
+        assert!(!raw_websocket_upgrade_origin_is_admissible(
+            &websocket_upgrade_head(&["http://localhost:6274"]),
+            &configured
+        ));
+
+        let explicit_loopback = HttpHandlerConfig {
+            allow_cors: true,
+            cors_origins: vec!["http://localhost:6274".to_string()],
+            ..HttpHandlerConfig::default()
+        };
+        assert!(raw_websocket_upgrade_origin_is_admissible(
+            &websocket_upgrade_head(&["http://localhost:6274"]),
+            &explicit_loopback
+        ));
+
         // A repeated Origin is refused even when both values are admissible.
         assert!(!raw_websocket_upgrade_origin_is_admissible(
             &websocket_upgrade_head(&["https://app.example", "https://app.example"]),
