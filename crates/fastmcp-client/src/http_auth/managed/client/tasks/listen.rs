@@ -20,6 +20,8 @@ use crate::http_executor::ModernHttpSubscriptionListenEvent;
 use crate::sse::SseLimits;
 use crate::{ClientHttpConnectionError, FinalTaskId, HttpClient, HttpClientError};
 
+pub(super) mod watch;
+
 const MAX_NOTIFICATIONS: usize = 1_024;
 const MAX_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
 

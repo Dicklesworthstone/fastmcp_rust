@@ -41,6 +41,7 @@ pub(super) enum TaskCall<'a> {
         max_polls: usize,
     },
     Listen(listen::ListenRequest<'a>),
+    Watch(listen::watch::WatchRequest),
 }
 
 pub(super) enum TaskResult {
@@ -201,6 +202,7 @@ impl TaskCall<'_> {
                 )))
             }
             Self::Listen(request) => request.dispatch(cx, cancellation, client, id).await,
+            Self::Watch(request) => Box::pin(request.dispatch(cx, cancellation, client, id)).await,
         }
     }
 }
