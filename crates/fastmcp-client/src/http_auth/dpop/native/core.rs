@@ -11,17 +11,14 @@ use std::io::{self, Write};
 use asupersync::Cx;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::{
-    CoreRequest, CoreResult, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION,
-    RequestId,
+    CoreRequest, CoreResult, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION, RequestId,
 };
 
 use super::{
-    DpopCredential, DpopHttpClient, DpopHttpError, DpopHttpResponse, ModernHttpRequest,
-    WaitBounds, check_live,
+    DpopCredential, DpopHttpClient, DpopHttpError, DpopHttpResponse, ModernHttpRequest, WaitBounds,
+    check_live,
 };
-use crate::http_auth::rpc::{
-    CoreDecoder, ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits,
-};
+use crate::http_auth::rpc::{CoreDecoder, ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits};
 
 /// Diagnostics retain no peer message, body, nonce or authorization header.
 /// An admitted JSON-RPC error exposes only its numeric code through Protocol.
@@ -133,7 +130,10 @@ fn prepare(
     let decoder = CoreDecoder::for_request(request, request_id.clone(), limits)?;
     admit_core_metadata(&params)?;
     let name = if matches!(method.as_str(), "tools/call" | "prompts/get") {
-        params.get("name").and_then(serde_json::Value::as_str).map(str::to_owned)
+        params
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
     } else {
         None
     };
@@ -146,14 +146,8 @@ fn prepare(
     };
     serde_json::to_writer(&mut encoded, &envelope)
         .map_err(|_| ManagedCoreError::RequestTooLarge)?;
-    let wire = ModernHttpRequest::new(
-        target,
-        encoded.bytes,
-        FINAL_PROTOCOL_VERSION,
-        method,
-        name,
-    )
-    .map_err(|_| ManagedCoreError::InvalidRequest)?;
+    let wire = ModernHttpRequest::new(target, encoded.bytes, FINAL_PROTOCOL_VERSION, method, name)
+        .map_err(|_| ManagedCoreError::InvalidRequest)?;
     Ok((wire, decoder))
 }
 
@@ -165,7 +159,9 @@ fn admit_core_metadata(params: &serde_json::Value) -> Result<(), ManagedCoreErro
     if let Some(extensions) = metadata
         .get(FINAL_CLIENT_CAPABILITIES_META_KEY)
         .and_then(|capabilities| capabilities.get("extensions"))
-        && !extensions.as_object().is_some_and(serde_json::Map::is_empty)
+        && !extensions
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
     {
         return Err(ManagedCoreError::UnsupportedRequest);
     }
@@ -179,7 +175,10 @@ fn decode_response(
     // A 202 acknowledgement is not a result for a request with an ID. Neither
     // an HTTP failure nor a redirect may promote itself by looking like JSON.
     if response.status() != 200 {
-        return Err(ManagedCoreError::HttpStatus { status: response.status() }.into());
+        return Err(ManagedCoreError::HttpStatus {
+            status: response.status(),
+        }
+        .into());
     }
     match decoder.admit(response.body(), false)? {
         ManagedCoreEvent::Result(result) => Ok(*result),
@@ -262,8 +261,17 @@ mod tests {
             body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
             FINAL_PROTOCOL_VERSION
         );
-        assert!(wire.headers().iter().any(|(name, value)| name == "Mcp-Name" && value == "echo"));
-        assert!(!wire.headers().iter().any(|(name, _)| name == "Authorization" || name == "DPoP"));
+        assert!(
+            wire.headers()
+                .iter()
+                .any(|(name, value)| name == "Mcp-Name" && value == "echo")
+        );
+        assert!(
+            !wire
+                .headers()
+                .iter()
+                .any(|(name, _)| name == "Authorization" || name == "DPoP")
+        );
     }
 
     #[test]
@@ -274,16 +282,27 @@ mod tests {
             for exact in [false, true] {
                 let cap = length - usize::from(!exact);
                 let limits = ManagedCoreLimits::new(
-                    if native_cap { 8192 } else { cap }, 8192, 8192, 0, Duration::from_secs(1),
-                ).unwrap();
+                    if native_cap { 8192 } else { cap },
+                    8192,
+                    8192,
+                    0,
+                    Duration::from_secs(1),
+                )
+                .unwrap();
                 let result = prepare(
-                    "https://mcp.example/mcp", request("tools/list", json!({})),
-                    RequestId::Number(7), limits, if native_cap { cap } else { 8192 },
+                    "https://mcp.example/mcp",
+                    request("tools/list", json!({})),
+                    RequestId::Number(7),
+                    limits,
+                    if native_cap { cap } else { 8192 },
                 );
                 if exact {
                     assert!(result.is_ok());
                 } else {
-                    assert!(matches!(result, Err(DpopCoreError::Protocol(ManagedCoreError::RequestTooLarge))));
+                    assert!(matches!(
+                        result,
+                        Err(DpopCoreError::Protocol(ManagedCoreError::RequestTooLarge))
+                    ));
                 }
             }
         }
@@ -291,20 +310,32 @@ mod tests {
 
     #[test]
     fn extension_advertisement_is_not_an_implicit_negotiation() {
-        let mut params = request("tools/list", json!({})).encode_params().unwrap().unwrap();
+        let mut params = request("tools/list", json!({}))
+            .encode_params()
+            .unwrap()
+            .unwrap();
         assert!(admit_core_metadata(&params).is_ok());
         params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"] = json!({});
         assert!(admit_core_metadata(&params).is_ok());
-        for offer in [json!({"io.modelcontextprotocol/tasks":{}}), json!([]), Value::Null] {
+        for offer in [
+            json!({"io.modelcontextprotocol/tasks":{}}),
+            json!([]),
+            Value::Null,
+        ] {
             params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"] = offer;
-            assert!(matches!(admit_core_metadata(&params), Err(ManagedCoreError::UnsupportedRequest)));
+            assert!(matches!(
+                admit_core_metadata(&params),
+                Err(ManagedCoreError::UnsupportedRequest)
+            ));
         }
     }
 
     #[test]
     fn typed_dpop_results_use_the_shared_lossless_method_decoder() {
         let (_, mut decoder) = prepared("tools/list", json!({}));
-        let bytes = frame(r#"{"resultType":"complete","tools":[],"ttlMs":100,"cacheScope":"private","x-exact":{"z":900719925474099312345,"a":1.20e+4}}"#);
+        let bytes = frame(
+            r#"{"resultType":"complete","tools":[],"ttlMs":100,"cacheScope":"private","x-exact":{"z":900719925474099312345,"a":1.20e+4}}"#,
+        );
         let result = decode_response(&mut decoder, response(200, &bytes)).unwrap();
         let encoded = result.encode().unwrap();
         assert!(encoded.contains("900719925474099312345"));
@@ -337,9 +368,14 @@ mod tests {
     #[test]
     fn input_required_stays_a_typed_terminal_and_tasks_stay_unnegotiated() {
         let (_, mut decoder) = prepared("resources/read", json!({"uri":"file:///sample"}));
-        let bytes = frame(r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"opaque-state"}"#);
+        let bytes = frame(
+            r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"opaque-state"}"#,
+        );
         let result = decode_response(&mut decoder, response(200, &bytes)).unwrap();
-        assert!(matches!(result, CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { .. })));
+        assert!(matches!(
+            result,
+            CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { .. })
+        ));
         let (_, mut decoder) = prepared("tools/call", json!({"name":"echo"}));
         let task = frame(r#"{"resultType":"task","taskId":"opaque","status":"working"}"#);
         assert!(matches!(
@@ -351,7 +387,8 @@ mod tests {
 
     #[test]
     fn status_notifications_and_remote_diagnostics_cannot_bypass_core_admission() {
-        let valid = frame(r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}"#);
+        let valid =
+            frame(r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}"#);
         for status in [202, 204, 307, 401, 500] {
             let (_, mut decoder) = prepared("tools/list", json!({}));
             assert!(matches!(
@@ -364,30 +401,46 @@ mod tests {
         let notification = br#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
         assert!(matches!(
             decode_response(&mut decoder, response(200, notification)),
-            Err(DpopCoreError::Protocol(ManagedCoreError::UnexpectedNotification))
+            Err(DpopCoreError::Protocol(
+                ManagedCoreError::UnexpectedNotification
+            ))
         ));
         let peer_error = br#"{"jsonrpc":"2.0","id":7,"error":{"code":-32603,"message":"secret-token","data":{"private":"secret-proof"}}}"#;
-        let error = decode_response(&mut decoder, response(200, peer_error)).err().unwrap();
-        assert!(matches!(&error, DpopCoreError::Protocol(ManagedCoreError::Remote { .. })));
+        let error = decode_response(&mut decoder, response(200, peer_error))
+            .err()
+            .unwrap();
+        assert!(matches!(
+            &error,
+            DpopCoreError::Protocol(ManagedCoreError::Remote { .. })
+        ));
         assert!(!format!("{error:?} {error}").contains("secret"));
     }
 
     #[test]
     fn the_typed_frame_limit_is_exact_and_rejection_does_not_advance_decoder() {
-        let bytes = frame(r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}"#);
+        let bytes =
+            frame(r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}"#);
         for exact in [true, false] {
             let maximum = bytes.len() - usize::from(!exact);
-            let limits = ManagedCoreLimits::new(8192, maximum, maximum, 0, Duration::from_secs(1)).unwrap();
+            let limits =
+                ManagedCoreLimits::new(8192, maximum, maximum, 0, Duration::from_secs(1)).unwrap();
             let (_, mut decoder) = prepare(
-                "https://mcp.example/mcp", request("tools/list", json!({})),
-                RequestId::Number(7), limits, 8192,
-            ).unwrap();
+                "https://mcp.example/mcp",
+                request("tools/list", json!({})),
+                RequestId::Number(7),
+                limits,
+                8192,
+            )
+            .unwrap();
             let outcome = decode_response(&mut decoder, response(200, &bytes));
             if exact {
                 assert!(outcome.is_ok());
                 assert_eq!(decoder.usage(), (bytes.len(), 0));
             } else {
-                assert!(matches!(outcome, Err(DpopCoreError::Protocol(ManagedCoreError::ResponseByteLimit))));
+                assert!(matches!(
+                    outcome,
+                    Err(DpopCoreError::Protocol(ManagedCoreError::ResponseByteLimit))
+                ));
                 assert_eq!(decoder.usage(), (0, 0));
             }
         }
@@ -401,16 +454,24 @@ mod tests {
             DpopKey::generate().unwrap(),
             CanonicalHttpUrl::parse("https://issuer.example/token").unwrap(),
             CanonicalHttpUrl::parse("https://mcp.example/mcp").unwrap(),
-        ).unwrap();
-        let credential = session.admit_token_response(
-            &CanonicalHttpUrl::parse("https://issuer.example/token").unwrap(), 200,
-            br#"{"access_token":"token","token_type":"DPoP","expires_in":60}"#,
-            Instant::now(), Duration::from_secs(60),
-        ).unwrap();
+        )
+        .unwrap();
+        let credential = session
+            .admit_token_response(
+                &CanonicalHttpUrl::parse("https://issuer.example/token").unwrap(),
+                200,
+                br#"{"access_token":"token","token_type":"DPoP","expires_in":60}"#,
+                Instant::now(),
+                Duration::from_secs(60),
+            )
+            .unwrap();
         let mut client = DpopHttpClient::new(session, DpopHttpPolicy::default()).unwrap();
         let mut call = Box::pin(client.request_core(
-            &cx, &credential, request("tools/list", json!({})),
-            RequestId::Number(7), ManagedCoreLimits::default(),
+            &cx,
+            &credential,
+            request("tools/list", json!({})),
+            RequestId::Number(7),
+            ManagedCoreLimits::default(),
         ));
         assert!(matches!(
             call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
