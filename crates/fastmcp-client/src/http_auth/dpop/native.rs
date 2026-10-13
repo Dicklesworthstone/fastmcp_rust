@@ -263,36 +263,29 @@ impl DpopHttpClient {
         request: &ModernHttpRequest,
     ) -> Result<DpopHttpResponse, DpopHttpError> {
         let bounds = WaitBounds::new(cx, self.policy.timeout, credential)?;
-        let response = within(
-            cx,
-            cancellation,
-            &self.session,
-            credential,
-            bounds,
-            async {
-                let headers = resource_headers(&self.session, credential, request, &self.policy)?;
-                let body = request.body().to_vec();
-                // Proof signing and allocation are synchronous; re-admit before
-                // the first network poll, not only after that poll completes.
-                check_live(cx, cancellation, &self.session, credential, bounds)?;
-                let response = self
-                    .transport
-                    .request(
-                        cx,
-                        Method::Post,
-                        self.session.resource.as_str(),
-                        headers,
-                        body,
-                    )
-                    .await
-                    .map_err(|_| DpopHttpError::TransportFailed)?;
-                Ok(DpopHttpResponse {
-                    status: response.status,
-                    headers: response.headers,
-                    body: response.body,
-                })
-            },
-        )
+        let response = within(cx, cancellation, &self.session, credential, bounds, async {
+            let headers = resource_headers(&self.session, credential, request, &self.policy)?;
+            let body = request.body().to_vec();
+            // Proof signing and allocation are synchronous; re-admit before
+            // the first network poll, not only after that poll completes.
+            check_live(cx, cancellation, &self.session, credential, bounds)?;
+            let response = self
+                .transport
+                .request(
+                    cx,
+                    Method::Post,
+                    self.session.resource.as_str(),
+                    headers,
+                    body,
+                )
+                .await
+                .map_err(|_| DpopHttpError::TransportFailed)?;
+            Ok(DpopHttpResponse {
+                status: response.status,
+                headers: response.headers,
+                body: response.body,
+            })
+        })
         .await?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let response = finish_response(&mut self.session, &self.policy, response)?;
@@ -310,8 +303,8 @@ fn resource_headers(
     if request.body().len() > policy.max_body_bytes {
         return Err(DpopHttpError::BodyTooLarge);
     }
-    let target = CanonicalHttpUrl::parse(request.target())
-        .map_err(|_| DpopClientError::EndpointMismatch)?;
+    let target =
+        CanonicalHttpUrl::parse(request.target()).map_err(|_| DpopClientError::EndpointMismatch)?;
     let mut headers = request.headers();
     for (name, value) in &mut headers {
         if name.eq_ignore_ascii_case("Accept") {
@@ -361,7 +354,9 @@ fn finish_response(
         .filter(|(name, _)| name.eq_ignore_ascii_case("Content-Encoding"));
     if let Some((_, encoding)) = encodings.next() {
         if encodings.next().is_some()
-            || !encoding.trim_matches([' ', '\t']).eq_ignore_ascii_case("identity")
+            || !encoding
+                .trim_matches([' ', '\t'])
+                .eq_ignore_ascii_case("identity")
         {
             return Err(DpopHttpError::InvalidResponseHeaders);
         }
@@ -385,9 +380,12 @@ fn is_json_content_type(value: &str) -> bool {
             let Some((name, value)) = parameter.split_once('=') else {
                 return false;
             };
-            name.trim_matches([' ', '\t']).eq_ignore_ascii_case("charset")
+            name.trim_matches([' ', '\t'])
+                .eq_ignore_ascii_case("charset")
                 && ["utf-8", "\"utf-8\""].iter().any(|allowed| {
-                    value.trim_matches([' ', '\t']).eq_ignore_ascii_case(allowed)
+                    value
+                        .trim_matches([' ', '\t'])
+                        .eq_ignore_ascii_case(allowed)
                 })
                 && parts.next().is_none()
         }
@@ -473,9 +471,7 @@ async fn within<T>(
     future: impl Future<Output = Result<T, DpopHttpError>>,
 ) -> Result<T, DpopHttpError> {
     check_live(cx, cancellation, session, credential, bounds)?;
-    let driver = cx
-        .timer_driver()
-        .ok_or(DpopHttpError::RuntimeUnavailable)?;
+    let driver = cx.timer_driver().ok_or(DpopHttpError::RuntimeUnavailable)?;
     let mut timer = pin!(Sleep::with_timer_driver(bounds.deadline, driver));
     let (_sender, mut receiver) = oneshot::channel::<()>();
     let mut caller = pin!(receiver.recv(cx));
@@ -539,17 +535,20 @@ mod tests {
             DpopKey::generate().unwrap(),
             url("https://issuer.example/token"),
             url("https://mcp.example/api?tenant=one"),
-        ).unwrap()
+        )
+        .unwrap()
     }
 
     fn credential(session: &DpopSession) -> DpopCredential {
-        session.admit_token_response(
-            &session.token_endpoint,
-            200,
-            br#"{"access_token":"private-token","token_type":"DPoP","expires_in":60}"#,
-            Instant::now(),
-            Duration::from_secs(60),
-        ).unwrap()
+        session
+            .admit_token_response(
+                &session.token_endpoint,
+                200,
+                br#"{"access_token":"private-token","token_type":"DPoP","expires_in":60}"#,
+                Instant::now(),
+                Duration::from_secs(60),
+            )
+            .unwrap()
     }
 
     fn request(target: &str) -> ModernHttpRequest {
@@ -565,7 +564,10 @@ mod tests {
     fn response(status: u16, headers: &[(&str, &str)], body: &[u8]) -> DpopHttpResponse {
         DpopHttpResponse {
             status,
-            headers: headers.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect(),
+            headers: headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
             body: body.to_vec(),
         }
     }
@@ -576,7 +578,8 @@ mod tests {
         let runtime = RuntimeBuilder::current_thread()
             .blocking_threads(0, 0)
             .with_timer_driver(timer.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
         let cx = runtime.request_cx_with_budget(Budget::INFINITE);
         (runtime, cx, timer, clock)
     }
@@ -585,8 +588,12 @@ mod tests {
     struct WakeCount(AtomicUsize);
 
     impl Wake for WakeCount {
-        fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
-        fn wake_by_ref(self: &Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     struct PendingIo(Arc<AtomicUsize>);
@@ -599,7 +606,9 @@ mod tests {
     }
 
     impl Drop for PendingIo {
-        fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     #[test]
@@ -616,17 +625,32 @@ mod tests {
             ("Accept-Encoding", "identity"),
             ("Mcp-Method", "tools/call"),
             ("Mcp-Name", "echo"),
-            ("MCP-Protocol-Version", fastmcp_protocol::FINAL_PROTOCOL_VERSION),
+            (
+                "MCP-Protocol-Version",
+                fastmcp_protocol::FINAL_PROTOCOL_VERSION,
+            ),
             ("Connection", "close"),
         ] {
-            let values: Vec<_> = first.iter().filter(|(key, _)| key.eq_ignore_ascii_case(name)).collect();
+            let values: Vec<_> = first
+                .iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                .collect();
             assert_eq!(values.len(), 1, "{name}");
             assert_eq!(values[0].1, expected, "{name}");
         }
         let proof = |headers: &Vec<(String, String)>| {
-            headers.iter().find(|(name, _)| name == "DPoP").unwrap().1.clone()
+            headers
+                .iter()
+                .find(|(name, _)| name == "DPoP")
+                .unwrap()
+                .1
+                .clone()
         };
-        assert_ne!(proof(&first), proof(&second), "an explicit retry must not replay a proof");
+        assert_ne!(
+            proof(&first),
+            proof(&second),
+            "an explicit retry must not replay a proof"
+        );
         assert!(!request.headers().iter().any(|(name, _)| name == "DPoP"));
     }
 
@@ -638,15 +662,22 @@ mod tests {
         let exact = request(session.resource.as_str());
         assert!(resource_headers(&session, &credential, &exact, &policy).is_ok());
         let changed = request("https://mcp.example/api?tenant=two");
-        assert_eq!(resource_headers(&session, &credential, &changed, &policy).unwrap_err(),
-            DpopHttpError::Authorization(DpopClientError::EndpointMismatch));
-        let bearer = BoundBearerCredential::bind(session.resource.clone(), "bearer-secret").unwrap();
+        assert_eq!(
+            resource_headers(&session, &credential, &changed, &policy).unwrap_err(),
+            DpopHttpError::Authorization(DpopClientError::EndpointMismatch)
+        );
+        let bearer =
+            BoundBearerCredential::bind(session.resource.clone(), "bearer-secret").unwrap();
         let conflict = exact.clone().with_authorization(&bearer);
-        assert_eq!(resource_headers(&session, &credential, &conflict, &policy).unwrap_err(),
-            DpopHttpError::Authorization(DpopClientError::HeaderConflict));
+        assert_eq!(
+            resource_headers(&session, &credential, &conflict, &policy).unwrap_err(),
+            DpopHttpError::Authorization(DpopClientError::HeaderConflict)
+        );
         credential.revoke();
-        assert_eq!(resource_headers(&session, &credential, &exact, &policy).unwrap_err(),
-            DpopHttpError::Authorization(DpopClientError::CredentialUnavailable));
+        assert_eq!(
+            resource_headers(&session, &credential, &exact, &policy).unwrap_err(),
+            DpopHttpError::Authorization(DpopClientError::CredentialUnavailable)
+        );
     }
 
     #[test]
@@ -654,30 +685,57 @@ mod tests {
         let session = session();
         let credential = credential(&session);
         let request = request(session.resource.as_str());
-        let policy = DpopHttpPolicy::default().with_max_body_bytes(request.body().len()).unwrap();
+        let policy = DpopHttpPolicy::default()
+            .with_max_body_bytes(request.body().len())
+            .unwrap();
         assert!(resource_headers(&session, &credential, &request, &policy).is_ok());
-        let smaller = policy.with_max_body_bytes(request.body().len() - 1).unwrap();
-        assert_eq!(resource_headers(&session, &credential, &request, &smaller).unwrap_err(), DpopHttpError::BodyTooLarge);
+        let smaller = policy
+            .with_max_body_bytes(request.body().len() - 1)
+            .unwrap();
+        assert_eq!(
+            resource_headers(&session, &credential, &request, &smaller).unwrap_err(),
+            DpopHttpError::BodyTooLarge
+        );
         for bytes in [0, MAX_BODY_BYTES + 1] {
-            assert!(DpopHttpPolicy::default().with_max_body_bytes(bytes).is_err());
+            assert!(
+                DpopHttpPolicy::default()
+                    .with_max_body_bytes(bytes)
+                    .is_err()
+            );
         }
         for timeout in [Duration::ZERO, MAX_TIMEOUT + Duration::from_secs(1)] {
             assert!(DpopHttpPolicy::default().with_timeout(timeout).is_err());
         }
-        assert!(DpopHttpPolicy::default().with_resource_root_der(vec![1, 2, 3]).is_err());
+        assert!(
+            DpopHttpPolicy::default()
+                .with_resource_root_der(vec![1, 2, 3])
+                .is_err()
+        );
     }
 
     #[test]
     fn response_nonce_is_captured_on_success_and_challenge_without_touching_as_nonce() {
         let mut session = session();
         session.token_nonce = Some(DpopNonce::new("as-nonce").unwrap());
-        for (status, nonce) in [(200, "rs-success"), (401, "rs-challenge"), (307, "rs-redirect")] {
-            let response = response(status, &[("Content-Type", "application/json"), ("DPoP-Nonce", nonce)], b"{}");
-            let accepted = finish_response(&mut session, &DpopHttpPolicy::default(), response).unwrap();
+        for (status, nonce) in [
+            (200, "rs-success"),
+            (401, "rs-challenge"),
+            (307, "rs-redirect"),
+        ] {
+            let response = response(
+                status,
+                &[("Content-Type", "application/json"), ("DPoP-Nonce", nonce)],
+                b"{}",
+            );
+            let accepted =
+                finish_response(&mut session, &DpopHttpPolicy::default(), response).unwrap();
             assert_eq!(accepted.status(), status);
             assert_eq!(accepted.body(), b"{}");
             assert_eq!(session.resource_nonce, Some(DpopNonce::new(nonce).unwrap()));
-            assert_eq!(session.token_nonce, Some(DpopNonce::new("as-nonce").unwrap()));
+            assert_eq!(
+                session.token_nonce,
+                Some(DpopNonce::new("as-nonce").unwrap())
+            );
         }
     }
 
@@ -687,25 +745,66 @@ mod tests {
         let initial = DpopNonce::new("last-admitted").unwrap();
         session.resource_nonce = Some(initial.clone());
         for headers in [
-            vec![("Content-Type", "application/json"), ("DPoP-Nonce", "new"), ("dpop-nonce", "new")],
+            vec![
+                ("Content-Type", "application/json"),
+                ("DPoP-Nonce", "new"),
+                ("dpop-nonce", "new"),
+            ],
             vec![("Content-Type", "text/event-stream"), ("DPoP-Nonce", "new")],
-            vec![("Content-Type", "application/json"), ("content-type", "application/json"), ("DPoP-Nonce", "new")],
-            vec![("Content-Type", "application/json"), ("Content-Encoding", "gzip"), ("DPoP-Nonce", "new")],
+            vec![
+                ("Content-Type", "application/json"),
+                ("content-type", "application/json"),
+                ("DPoP-Nonce", "new"),
+            ],
+            vec![
+                ("Content-Type", "application/json"),
+                ("Content-Encoding", "gzip"),
+                ("DPoP-Nonce", "new"),
+            ],
         ] {
-            assert!(finish_response(&mut session, &DpopHttpPolicy::default(), response(200, &headers, b"{}")).is_err());
+            assert!(
+                finish_response(
+                    &mut session,
+                    &DpopHttpPolicy::default(),
+                    response(200, &headers, b"{}")
+                )
+                .is_err()
+            );
             assert_eq!(session.resource_nonce, Some(initial.clone()));
         }
         let policy = DpopHttpPolicy::default().with_max_body_bytes(1).unwrap();
-        assert_eq!(finish_response(&mut session, &policy, response(200, &[("Content-Type", "application/json"), ("DPoP-Nonce", "new")], b"{}")).unwrap_err(), DpopHttpError::BodyTooLarge);
+        assert_eq!(
+            finish_response(
+                &mut session,
+                &policy,
+                response(
+                    200,
+                    &[("Content-Type", "application/json"), ("DPoP-Nonce", "new")],
+                    b"{}"
+                )
+            )
+            .unwrap_err(),
+            DpopHttpError::BodyTooLarge
+        );
         assert_eq!(session.resource_nonce, Some(initial));
     }
 
     #[test]
     fn json_media_type_admission_does_not_accept_sse_or_duplicate_charsets() {
-        for value in ["application/json", "Application/JSON; charset=UTF-8", "application/json;charset=\"utf-8\""] {
+        for value in [
+            "application/json",
+            "Application/JSON; charset=UTF-8",
+            "application/json;charset=\"utf-8\"",
+        ] {
             assert!(is_json_content_type(value), "{value}");
         }
-        for value in ["text/event-stream", "application/json;charset=utf-16", "application/json;charset=utf-8;charset=utf-8", "application/json, text/event-stream", "application/json;"] {
+        for value in [
+            "text/event-stream",
+            "application/json;charset=utf-16",
+            "application/json;charset=utf-8;charset=utf-8",
+            "application/json, text/event-stream",
+            "application/json;",
+        ] {
             assert!(!is_json_content_type(value), "{value}");
         }
     }
@@ -750,7 +849,9 @@ mod tests {
             }),
         ));
         assert_eq!(
-            operation.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            operation
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
             Poll::Ready(Err(DpopHttpError::Cancelled))
         );
     }
@@ -767,17 +868,31 @@ mod tests {
             let waker = Waker::from(Arc::clone(&counter));
             let mut task = Context::from_waker(&waker);
             let bounds = WaitBounds::new(&cx, Duration::from_secs(10), &credential).unwrap();
-            let mut operation = Box::pin(within(&cx, &cancellation, &session, &credential, bounds, PendingIo(Arc::clone(&drops))));
+            let mut operation = Box::pin(within(
+                &cx,
+                &cancellation,
+                &session,
+                &credential,
+                bounds,
+                PendingIo(Arc::clone(&drops)),
+            ));
             assert!(operation.as_mut().poll(&mut task).is_pending());
             assert_eq!(counter.0.load(Ordering::SeqCst), 0);
             match kind {
                 0 => cx.set_cancel_requested(true),
-                1 => { cancellation.cancel(); }
+                1 => {
+                    cancellation.cancel();
+                }
                 2 => session.revoke(),
                 _ => credential.revoke(),
             }
-            assert!(counter.0.load(Ordering::SeqCst) > 0, "domain {kind} failed to wake pending I/O");
-            let Poll::Ready(Err(error)) = operation.as_mut().poll(&mut task) else { panic!("cancelled I/O stayed pending"); };
+            assert!(
+                counter.0.load(Ordering::SeqCst) > 0,
+                "domain {kind} failed to wake pending I/O"
+            );
+            let Poll::Ready(Err(error)) = operation.as_mut().poll(&mut task) else {
+                panic!("cancelled I/O stayed pending");
+            };
             let expected = match kind {
                 0 | 1 => DpopHttpError::Cancelled,
                 2 => DpopClientError::SessionRevoked.into(),
@@ -801,19 +916,35 @@ mod tests {
             let cancellation = McpRequestCancellation::new();
             let timeout = Duration::from_secs(if short_timeout { 10 } else { 120 });
             let bounds = WaitBounds::new(&cx, timeout, &credential).unwrap();
-            let expected = if short_timeout { DpopHttpError::TimedOut } else { DpopClientError::CredentialUnavailable.into() };
+            let expected = if short_timeout {
+                DpopHttpError::TimedOut
+            } else {
+                DpopClientError::CredentialUnavailable.into()
+            };
             assert_eq!(bounds.terminal, expected);
             assert!(bounds.deadline.as_nanos() <= timeout.as_nanos() as u64);
             let drops = Arc::new(AtomicUsize::new(0));
             let counter = Arc::new(WakeCount::default());
             let waker = Waker::from(Arc::clone(&counter));
             let mut task = Context::from_waker(&waker);
-            let mut operation = Box::pin(within(&cx, &cancellation, &session, &credential, bounds, PendingIo(Arc::clone(&drops))));
+            let mut operation = Box::pin(within(
+                &cx,
+                &cancellation,
+                &session,
+                &credential,
+                bounds,
+                PendingIo(Arc::clone(&drops)),
+            ));
             assert!(operation.as_mut().poll(&mut task).is_pending());
             clock.advance(bounds.deadline.as_nanos());
             assert!(timer.process_timers() > 0);
-            assert!(counter.0.load(Ordering::SeqCst) > 0, "deadline must wake before manual repoll");
-            let Poll::Ready(Err(error)) = operation.as_mut().poll(&mut task) else { panic!("expired operation stayed pending"); };
+            assert!(
+                counter.0.load(Ordering::SeqCst) > 0,
+                "deadline must wake before manual repoll"
+            );
+            let Poll::Ready(Err(error)) = operation.as_mut().poll(&mut task) else {
+                panic!("expired operation stayed pending");
+            };
             assert_eq!(error, expected);
             assert_eq!(drops.load(Ordering::SeqCst), 1);
             assert_eq!(timer.pending_count(), 0);
@@ -833,8 +964,20 @@ mod tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let counter = Arc::new(WakeCount::default());
         let waker = Waker::from(Arc::clone(&counter));
-        let mut operation = Box::pin(within(&cx, &cancellation, &session, &credential, bounds, PendingIo(Arc::clone(&drops))));
-        assert!(operation.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+        let mut operation = Box::pin(within(
+            &cx,
+            &cancellation,
+            &session,
+            &credential,
+            bounds,
+            PendingIo(Arc::clone(&drops)),
+        ));
+        assert!(
+            operation
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
         drop(operation);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert_eq!(timer.pending_count(), 0);
@@ -857,12 +1000,23 @@ mod tests {
         let credential = credential(&session);
         let cancellation = McpRequestCancellation::new();
         let bounds = WaitBounds::new(&cx, Duration::from_secs(10), &credential).unwrap();
-        let mut operation = Box::pin(within(&cx, &cancellation, &session, &credential, bounds, async {
-            credential.revoke();
-            Ok("must-not-be-delivered")
-        }));
-        assert_eq!(operation.as_mut().poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(Err(DpopClientError::CredentialUnavailable.into())));
+        let mut operation = Box::pin(within(
+            &cx,
+            &cancellation,
+            &session,
+            &credential,
+            bounds,
+            async {
+                credential.revoke();
+                Ok("must-not-be-delivered")
+            },
+        ));
+        assert_eq!(
+            operation
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(DpopClientError::CredentialUnavailable.into()))
+        );
         assert_eq!(timer.pending_count(), 0);
         drop(operation);
         drop(cx);
@@ -878,11 +1032,23 @@ mod tests {
         let bounds = WaitBounds::new(&cx, Duration::from_secs(10), &credential).unwrap();
         let ambient = Cx::for_testing();
         let _ambient = Cx::set_current(Some(ambient.clone()));
-        let mut operation = Box::pin(within(&cx, &cancellation, &session, &credential, bounds, async {
-            assert!(Cx::current().unwrap().timer_driver().is_some());
-            Ok(42)
-        }));
-        assert_eq!(operation.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Ready(Ok(42)));
+        let mut operation = Box::pin(within(
+            &cx,
+            &cancellation,
+            &session,
+            &credential,
+            bounds,
+            async {
+                assert!(Cx::current().unwrap().timer_driver().is_some());
+                Ok(42)
+            },
+        ));
+        assert_eq!(
+            operation
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Ok(42))
+        );
         assert!(Cx::current().unwrap().timer_driver().is_none());
         assert!(!ambient.is_cancel_requested());
         assert_eq!(timer.pending_count(), 0);
@@ -903,12 +1069,22 @@ mod tests {
         owner.revoke();
         assert!(owner.is_revoked());
         assert!(credential.is_revoked());
-        assert_eq!(session.require_active(), Err(DpopClientError::SessionRevoked));
+        assert_eq!(
+            session.require_active(),
+            Err(DpopClientError::SessionRevoked)
+        );
     }
 
     #[test]
     fn native_response_debug_cannot_print_reflected_authorization() {
-        let response = response(401, &[("DPoP-Nonce", "private-nonce"), ("X-Reflect", "private-token")], b"private-token");
+        let response = response(
+            401,
+            &[
+                ("DPoP-Nonce", "private-nonce"),
+                ("X-Reflect", "private-token"),
+            ],
+            b"private-token",
+        );
         let debug = format!("{response:?}");
         assert!(!debug.contains("private-token"));
         assert!(!debug.contains("private-nonce"));
@@ -947,17 +1123,22 @@ mod tls_tests {
         let mut r = None;
         poll_fn(|task| {
             if l.is_none() {
-                if let Poll::Ready(result) = left.as_mut().poll(task) { l = Some(result); }
+                if let Poll::Ready(result) = left.as_mut().poll(task) {
+                    l = Some(result);
+                }
             }
             if r.is_none() {
-                if let Poll::Ready(result) = right.as_mut().poll(task) { r = Some(result); }
+                if let Poll::Ready(result) = right.as_mut().poll(task) {
+                    r = Some(result);
+                }
             }
             if l.is_some() && r.is_some() {
                 Poll::Ready((l.take().unwrap(), r.take().unwrap()))
             } else {
                 Poll::Pending
             }
-        }).await
+        })
+        .await
     }
 
     async fn read_request<IO: AsyncRead + Unpin>(io: &mut IO) -> (String, Vec<u8>) {
@@ -972,11 +1153,14 @@ mod tls_tests {
             }
         };
         let head = std::str::from_utf8(&wire[..end]).unwrap().to_owned();
-        let length = head.lines().find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().unwrap())
-        }).unwrap();
+        let length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
         assert!(end + length <= 32 * 1024);
         while wire.len() < end + length {
             let count = io.read(&mut buffer).await.unwrap();
