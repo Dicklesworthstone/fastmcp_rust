@@ -24,6 +24,7 @@ use asupersync::types::Time;
 use fastmcp_core::{CanonicalHttpUrl, McpRequestCancellation};
 
 use super::{DpopClientError, DpopCredential, DpopSession, require_credential};
+use crate::http_auth::caller::with_caller;
 use crate::http_executor::ModernHttpRequest;
 
 /// Method-owned core MCP calls over the same bounded DPoP transport.
@@ -32,7 +33,7 @@ pub mod core;
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ROOT_BYTES: usize = 64 * 1024;
 const MAX_ROOTS: usize = 16;
-const MAX_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const MAX_TIMEOUT: Duration = Duration::from_mins(15);
 
 /// Redacted failures; no peer text, URL, proof, token or response body is stored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -421,9 +422,7 @@ impl WaitBounds {
             return Err(DpopHttpError::Cancelled);
         }
         require_credential(credential)?;
-        if !cx.capabilities().io || cx.timer_driver().is_none() {
-            return Err(DpopHttpError::RuntimeUnavailable);
-        }
+        with_caller(cx, || require_runtime(cx))?;
         if timeout.is_zero() || timeout > MAX_TIMEOUT {
             return Err(DpopHttpError::InvalidPolicy);
         }
@@ -461,6 +460,21 @@ impl WaitBounds {
     }
 }
 
+// Called inside with_caller: possession of a native driver does not override
+// the surrounding effect ceiling. The whole DPoP exchange needs time and I/O,
+// including when it is paused in host resolution rather than network polling.
+fn require_runtime(cx: &Cx) -> Result<(), DpopHttpError> {
+    if cx.timer_driver().is_none()
+        || !Cx::current().is_some_and(|active| {
+            let capabilities = active.capabilities();
+            capabilities.time && capabilities.io
+        })
+    {
+        return Err(DpopHttpError::RuntimeUnavailable);
+    }
+    Ok(())
+}
+
 fn check_live(
     cx: &Cx,
     cancellation: &McpRequestCancellation,
@@ -488,12 +502,9 @@ async fn within<T>(
     future: impl Future<Output = Result<T, DpopHttpError>>,
 ) -> Result<T, DpopHttpError> {
     check_live(cx, cancellation, session, credential, bounds)?;
-    if cx.timer_driver().is_none() {
-        return Err(DpopHttpError::RuntimeUnavailable);
-    }
-    // Sleep::new is the public constructor in the pinned runtime. It resolves
-    // the driver when polled; the caller guard below covers every timer poll
-    // so an unrelated ambient driver or the global fallback cannot be used.
+    // Public Sleep resolves its driver when polled. The non-widening caller
+    // scope below covers every timer, cancellation and application poll, and
+    // is restored before suspension. Nested host runners inherit the ceiling.
     let mut timer = pin!(Sleep::new(bounds.deadline));
     let (_sender, mut receiver) = oneshot::channel::<()>();
     let mut caller = pin!(receiver.recv(cx));
@@ -508,27 +519,29 @@ async fn within<T>(
     });
     let mut future = pin!(future);
     poll_fn(|task| {
-        check_live(cx, cancellation, session, credential, bounds)?;
-        let _caller = Cx::set_current(Some(cx.clone()));
-        if caller.as_mut().poll(task).is_ready()
-            || operation_cancelled.as_mut().poll(task).is_ready()
-        {
-            return Poll::Ready(Err(DpopHttpError::Cancelled));
-        }
-        if owner_cancelled.as_mut().poll(task).is_ready() {
-            return Poll::Ready(Err(DpopClientError::SessionRevoked.into()));
-        }
-        if token_cancelled.as_mut().poll(task).is_ready()
-            || credential_owner_cancelled.as_mut().poll(task).is_ready()
-        {
-            return Poll::Ready(Err(DpopClientError::CredentialUnavailable.into()));
-        }
-        if timer.as_mut().poll(task).is_ready() {
-            return Poll::Ready(Err(bounds.terminal));
-        }
-        let result = future.as_mut().poll(task);
-        check_live(cx, cancellation, session, credential, bounds)?;
-        result
+        with_caller(cx, || {
+            check_live(cx, cancellation, session, credential, bounds)?;
+            require_runtime(cx)?;
+            if caller.as_mut().poll(task).is_ready()
+                || operation_cancelled.as_mut().poll(task).is_ready()
+            {
+                return Poll::Ready(Err(DpopHttpError::Cancelled));
+            }
+            if owner_cancelled.as_mut().poll(task).is_ready() {
+                return Poll::Ready(Err(DpopClientError::SessionRevoked.into()));
+            }
+            if token_cancelled.as_mut().poll(task).is_ready()
+                || credential_owner_cancelled.as_mut().poll(task).is_ready()
+            {
+                return Poll::Ready(Err(DpopClientError::CredentialUnavailable.into()));
+            }
+            if timer.as_mut().poll(task).is_ready() {
+                return Poll::Ready(Err(bounds.terminal));
+            }
+            let result = future.as_mut().poll(task);
+            check_live(cx, cancellation, session, credential, bounds)?;
+            result
+        })
     })
     .await
 }
@@ -547,6 +560,8 @@ mod tests {
 
     use super::*;
     use crate::http_auth::BoundBearerCredential;
+
+    mod authority;
 
     fn url(value: &str) -> CanonicalHttpUrl {
         CanonicalHttpUrl::parse(value).unwrap()
