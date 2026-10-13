@@ -85,6 +85,9 @@ mod tests {
     use super::*;
     use crate::http_auth::{BoundBearerCredential, CanonicalHttpUrl};
 
+    #[cfg(feature = "native-tls-roots")]
+    mod tls;
+
     fn credential() -> BoundBearerCredential {
         BoundBearerCredential::bind(
             CanonicalHttpUrl::parse("https://resource.example/mcp").unwrap(),
@@ -149,8 +152,16 @@ mod tests {
                 Poll::<Result<(), OAuthSessionError>>::Pending
             }),
         ));
-        assert!(wait.as_mut().poll(&mut Context::from_waker(&first_waker)).is_pending());
-        assert!(wait.as_mut().poll(&mut Context::from_waker(&last_waker)).is_pending());
+        assert!(
+            wait.as_mut()
+                .poll(&mut Context::from_waker(&first_waker))
+                .is_pending()
+        );
+        assert!(
+            wait.as_mut()
+                .poll(&mut Context::from_waker(&last_waker))
+                .is_pending()
+        );
         clone.revoke();
         assert_eq!(first.0.load(Ordering::SeqCst), 0);
         assert!(last.0.load(Ordering::SeqCst) > 0);
@@ -215,7 +226,11 @@ mod tests {
             Instant::now(),
         )
         .unwrap();
-        assert!(credential.authorization_for_target(credential.resource()).is_none());
+        assert!(
+            credential
+                .authorization_for_target(credential.resource())
+                .is_none()
+        );
         let mut wait = Box::pin(unless_revoked(
             &credential.revoked,
             std::future::ready(Ok(42)),
