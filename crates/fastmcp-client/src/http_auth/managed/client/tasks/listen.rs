@@ -13,11 +13,9 @@ use fastmcp_protocol::{
 use serde::Serialize;
 
 use super::{
-    MAX_TASK_RESPONSE_BYTES, ManagedHttpClient, ManagedHttpClientError, TaskCall, TaskResult,
-    checkpoint,
+    ManagedHttpClient, ManagedHttpClientError, TaskCall, TaskResult, checkpoint, task_sse_limits,
 };
 use crate::http_executor::ModernHttpSubscriptionListenEvent;
-use crate::sse::SseLimits;
 use crate::{ClientHttpConnectionError, FinalTaskId, HttpClient, HttpClientError};
 
 pub(super) mod watch;
@@ -161,9 +159,10 @@ impl<'a> ListenRequest<'a> {
         client: &mut HttpClient,
         request_id: RequestId,
     ) -> Result<TaskResult, HttpClientError> {
-        let frame_bytes = MAX_TASK_RESPONSE_BYTES.min(self.budget.remaining_bytes);
-        let limits = SseLimits::with_data_lines(frame_bytes + 8, frame_bytes, 64, 4_096)
-            .ok_or_else(|| refusal("Invalid managed Tasks subscription limits"))?;
+        // JSON-RPC correlation fields and SSE framing are not application
+        // payload. Keep their native ceiling independent so an exact-fitting
+        // accepted filter or terminal can reach the typed budget below.
+        let limits = task_sse_limits()?;
         let mut listener = client
             .connection
             .open_subscriptions_listener(cx, request_id, self.filter, limits)
@@ -311,6 +310,40 @@ mod tests {
         assert!(insufficient.charge(&value, true).is_err());
         assert_eq!(insufficient.remaining_bytes, length - 1);
         assert_eq!(insufficient.notifications, 2);
+    }
+
+    #[test]
+    fn acknowledgement_payload_budget_is_independent_of_its_wire_envelope() {
+        let accepted_filter: SubscriptionFilter =
+            serde_json::from_value(json!({"taskIds": ["task-1"]})).unwrap();
+        let payload_bytes = serde_json::to_vec(&accepted_filter).unwrap().len();
+        let envelope = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/subscriptions/acknowledged",
+            "params": {
+                "notifications": accepted_filter,
+                "_meta": {"io.modelcontextprotocol/subscriptionId": 7}
+            }
+        });
+        let wire = format!("data: {envelope}\n\n");
+        assert!(wire.len() > payload_bytes);
+        let event = ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter };
+        for (remaining_bytes, fits) in [(payload_bytes, true), (payload_bytes - 1, false)] {
+            let mut parser = crate::sse::BoundedSseParser::new(task_sse_limits().unwrap());
+            let frames = parser.push(wire.as_bytes()).unwrap();
+            assert_eq!(frames.len(), 1);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&frames[0]).unwrap(),
+                envelope
+            );
+            let mut budget = EventBudget {
+                notifications: 1,
+                remaining_bytes,
+            };
+            assert_eq!(budget.admit(&event).is_ok(), fits);
+            assert_eq!(budget.remaining_bytes, if fits { 0 } else { remaining_bytes });
+            assert_eq!(budget.notifications, usize::from(!fits));
+        }
     }
 
     #[test]

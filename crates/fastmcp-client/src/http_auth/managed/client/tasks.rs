@@ -24,6 +24,25 @@ mod listen;
 const MAX_TASK_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TASK_WAIT_POLLS: usize = 1_024;
 
+// Tool outcomes, direct subscriptions, and watches share the same native
+// framing policy. Application payload budgets count decoded typed values,
+// not JSON-RPC envelopes or SSE fields, and must not shrink these limits.
+// Conversely a small wire document can still contain excessive data fields:
+// the byte ceiling is not a substitute for the explicit per-event line cap.
+fn task_sse_limits() -> Result<crate::sse::SseLimits, HttpClientError> {
+    crate::sse::SseLimits::with_data_lines(
+        MAX_TASK_RESPONSE_BYTES + 8,
+        MAX_TASK_RESPONSE_BYTES,
+        64,
+        4_096,
+    )
+    .ok_or_else(|| {
+        HttpClientError::CoreResult(McpError::internal_error(
+            "Invalid managed Tasks response limits",
+        ))
+    })
+}
+
 pub(super) enum TaskCall<'a> {
     Tool {
         name: &'a str,
@@ -113,16 +132,7 @@ impl TaskCall<'_> {
         let id = client.next_request_id()?;
         match self {
             Self::Tool { name, arguments } => {
-                let limits = crate::sse::SseLimits::new(
-                    MAX_TASK_RESPONSE_BYTES + 8,
-                    MAX_TASK_RESPONSE_BYTES,
-                    64,
-                )
-                .ok_or_else(|| {
-                    HttpClientError::CoreResult(McpError::internal_error(
-                        "Invalid managed Tasks response limits",
-                    ))
-                })?;
+                let limits = task_sse_limits()?;
                 let listener = client
                     .connection
                     .open_final_tasks_tool_call_listener(cx, id, name, arguments, limits)
@@ -463,3 +473,67 @@ impl ManagedHttpClient {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod framing_tests {
+    use super::task_sse_limits;
+    use crate::sse::{BoundedSseParser, SseParseError};
+
+    #[test]
+    fn native_task_frames_accept_4096_data_lines_but_refuse_one_more() {
+        let payload = r#"{"jsonrpc":"2.0","id":7,"result":{"resultType":"complete","content":[]}}"#;
+        for lines in [4_096, 4_097] {
+            let wire = format!("data: {payload}\n{}\n", "data:\n".repeat(lines - 1));
+            let mut parser = BoundedSseParser::new(task_sse_limits().unwrap());
+            if lines == 4_096 {
+                let frames = parser.push(wire.as_bytes()).unwrap();
+                assert_eq!(frames.len(), 1);
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&frames[0]).unwrap(),
+                    serde_json::from_str::<serde_json::Value>(payload).unwrap()
+                );
+                assert!(!parser.finish().unwrap().discarded_pending_event);
+            } else {
+                assert!(matches!(
+                    parser.push(wire.as_bytes()),
+                    Err(SseParseError::TooManyDataLines { limit_lines: 4_096 })
+                ));
+                assert_eq!(parser.buffered_bytes(), 0);
+                assert!(matches!(parser.push(b"\n"), Err(SseParseError::Poisoned)));
+            }
+        }
+    }
+
+    #[test]
+    fn data_line_accounting_survives_chunk_boundaries_and_resets_per_event() {
+        let mut parser = BoundedSseParser::new(task_sse_limits().unwrap());
+        for _ in 0..2 {
+            for _ in 0..4_096 {
+                assert!(parser.push(b"dat").unwrap().is_empty());
+                assert!(parser.push(b"a:\n").unwrap().is_empty());
+            }
+            let frames = parser.push(b"\n").unwrap();
+            assert_eq!(frames, ["\n".repeat(4_095)]);
+            assert_eq!(parser.buffered_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn task_framing_still_refuses_oversized_lines_and_keepalive_floods() {
+        let limits = task_sse_limits().unwrap();
+        let mut parser = BoundedSseParser::new(limits);
+        let oversized = vec![b'x'; limits.max_line_bytes() + 1];
+        assert!(matches!(
+            parser.push(&oversized),
+            Err(SseParseError::LineTooLong { .. })
+        ));
+        assert_eq!(parser.buffered_bytes(), 0);
+        let mut parser = BoundedSseParser::new(limits);
+        assert!(parser.push(&b":alive\n".repeat(64)).unwrap().is_empty());
+        assert!(matches!(
+            parser.push(b":alive\n"),
+            Err(SseParseError::KeepaliveFlood { limit_lines: 64 })
+        ));
+        assert_eq!(parser.buffered_bytes(), 0);
+    }
+}

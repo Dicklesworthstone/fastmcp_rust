@@ -5,6 +5,9 @@
 //! remain fixed across all rounds, including time spent obtaining host input.
 //! A failed or abandoned exchange is terminal, never an automatic retry.
 
+/// Complete DPoP execution with the common typed, cumulatively budgeted host.
+pub mod host;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
