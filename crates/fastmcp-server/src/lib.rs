@@ -23371,14 +23371,41 @@ mod lib_unit_tests {
                         .to_owned(),
                 );
             }
+            // This loop breaks ONLY on end of stream, and every byte it
+            // receives is read into a buffer that is then dropped. So two
+            // opposite peer behaviours used to mint the identical timeout
+            // string: a peer that sent nothing at all, and a peer that sent a
+            // terminal frame without closing the stream. Those have opposite
+            // owners -- a server that fails to close an offending peer versus
+            // a test that does not answer the close it was handed -- so the
+            // timeout records what actually arrived and lets the reader tell
+            // them apart. Message-only: the break condition is unchanged.
+            let mut terminal_prefix: Vec<u8> = Vec::new();
+            let mut terminal_bytes = 0_usize;
+            let mut terminal_reads = 0_u32;
             loop {
                 let mut terminal = [0_u8; 64];
                 let read = asupersync::time::timeout_at(deadline, mixed.read(&mut terminal))
                     .await
-                    .map_err(|_| "Auto cross-era peer close timed out".to_owned())?
+                    .map_err(|_| {
+                        format!(
+                            "Auto cross-era peer close timed out after {terminal_reads} \
+                             non-empty reads totalling {terminal_bytes} bytes; first bytes \
+                             {terminal_prefix:02x?}. An empty prefix means the peer sent \
+                             nothing and the close is missing; a non-empty one means the peer \
+                             did send something this loop does not treat as terminal, since it \
+                             breaks only on end of stream"
+                        )
+                    })?
                     .map_err(|error| format!("Auto cross-era peer close failed: {error}"))?;
                 if read == 0 {
                     break;
+                }
+                terminal_reads += 1;
+                terminal_bytes += read;
+                let room = 32_usize.saturating_sub(terminal_prefix.len());
+                if room > 0 {
+                    terminal_prefix.extend_from_slice(&terminal[..read.min(room)]);
                 }
             }
             drop(mixed);
