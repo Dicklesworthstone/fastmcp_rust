@@ -129,14 +129,29 @@ things:
   pinned suite drives PKCE (`code_challenge`), `authorization_code`, dynamic
   `register`, and 401 `WWW-Authenticate` + `resource_metadata` discovery, all of
   which this client implements. It also carries a DPoP family — `sep-1932-client-dpop-auth-scheme`,
-  `-token-request-proof`, `-fresh-proof`, `-as-nonce`, `-rs-nonce` — and DPoP
-  (RFC 9449) is **not implemented**: `http_auth/discovery/challenge.rs` states
-  "No automatic login/retry, DPoP, DCR, DNS pinning, or OIDC identity
-  authentication is installed", and a sender-constrained token (`token_type:
-  "DPoP"`, or a `cnf` holding `jkt`) is deliberately *rejected*. So some of
-  these checks await an adapter profile that does not exist yet, and at least
-  the DPoP ones additionally need a library capability that does not exist. How
-  the 46 split between those two is not measured here.
+  `-token-request-proof`, `-fresh-proof`, `-as-nonce`, `-rs-nonce`. DPoP
+  (RFC 9449) primitives now **exist and compile**, which was not true before
+  2026-10-12: `fastmcp_client::http_auth::dpop` is 781 lines with 18 public
+  items and 9 in-module tests, and it is reachable by facade users through
+  `pub use fastmcp_client::http_auth`. It had been **unwired rather than
+  absent** — the file was created by `2612a7d4`, the `pub mod dpop;` that puts
+  it in the build was added only by `ac00c6ad`, and the only `mod dpop`
+  declaration in `http_auth.rs` is that one, so those lines had never been
+  compiled until then. (They had never been formatted either; `c65eced1`
+  restored `cargo fmt --check` afterwards.)
+  **It has no consumer, though.** Nothing in this workspace drives that module:
+  a search for `dpop::` outside the module itself returns nothing, the
+  automatic path still states "No automatic login/retry, DPoP, DCR, DNS
+  pinning, or OIDC identity authentication is installed"
+  (`http_auth/discovery/challenge.rs`), and the client-credentials path still
+  *rejects* a sender-constrained token (`token_type: "DPoP"`, or a `cnf`
+  holding `jkt`) under the test
+  `machine_token_cannot_downgrade_sender_constraints_or_exchange_grants`. So
+  the five DPoP checks stay unreachable, but the estimate changed: it is now
+  "drive an existing primitive from the adapter", not "implement DPoP" — and it
+  is still behind the loopback-HTTP blocker above, since the adapter cannot
+  address the suite's authorization server at all. How the 46 split across
+  these causes is not measured here.
   The nine
   in-tree `oauth_*` test targets are gated on `native-tls-roots`; each one now
   carries a matching `required-features` stanza, so a default run *excludes*
