@@ -82,10 +82,21 @@ push a percentage *up*. Compare the *sets* of failing check ids, which is what
 `scripts/conformance-expected-failures.yaml` records and what the suite's own
 `--expected-failures` gates on.
 
-**Client mode.** The gate is the harness passing in *both* modes. Most recent
-run, 32 scenarios / 155 checks: SUCCESS=55, FAILURE=46, SKIPPED=2, WARNING=1,
-INFO=51. Split it before quoting it, because the halves measure different
-things:
+**Client mode.** The gate is the harness passing in *both* modes.
+32 scenarios / 155 checks: SUCCESS=55, FAILURE=46, SKIPPED=2, WARNING=1,
+INFO=51. Measured 2026-10-13, bound to:
+
+    revision          2b6c519e, crates tree 6a57e7ca
+    adapter binary    sha256 2d47186b24962718e3e9a01be48f746449823ecf...
+    suite             @modelcontextprotocol/conformance@0.2.0-alpha.10,
+                      client --suite all --spec-version 2026-07-28
+    host              hz3 (x86_64 linux), cold dependency rebuild
+    exit              build rc 0, suite rc 1 (FAILUREs present, as expected)
+
+This row previously read "most recent run" with no revision, date, host or
+toolchain, which made it unverifiable; the re-measurement reproduces all five
+counts exactly. Split it before quoting it, because the halves measure
+different things:
 
 | | checks | SUCCESS | FAILURE |
 |---|---|---|---|
@@ -128,8 +139,17 @@ things:
   **They are also not one problem.** The
   pinned suite drives PKCE (`code_challenge`), `authorization_code`, dynamic
   `register`, and 401 `WWW-Authenticate` + `resource_metadata` discovery, all of
-  which this client implements. It also carries a DPoP family — `sep-1932-client-dpop-auth-scheme`,
-  `-token-request-proof`, `-fresh-proof`, `-as-nonce`, `-rs-nonce`. DPoP
+  which this client implements. **None of the 46 is DPoP**, which this row used to imply. The suite does carry
+  DPoP client scenarios — `auth/dpop` and `auth/dpop-nonce` — but both are
+  tagged `[extension]` rather than a dated spec version, so `--spec-version
+  2026-07-28` filters them out: `list --client` reports 43 scenarios
+  unfiltered and 32 at that version, and `dpop`/`sep-1932` appear **zero**
+  times anywhere in the run. So DPoP is not measured at this pin, and the
+  46 are entirely authorization-flow checks (protected-resource and
+  authorization-server metadata, client registration, authorization and token
+  requests, `iss` handling, scope derivation and step-up, the three
+  token-endpoint auth methods, CIMD, pre-registration, offline access and AS
+  migration). DPoP
   (RFC 9449) primitives now **exist and compile**, which was not true before
   2026-10-12: `fastmcp_client::http_auth::dpop` is 781 lines with 18 public
   items and 9 in-module tests, and it is reachable by facade users through
@@ -150,8 +170,9 @@ things:
   the five DPoP checks stay unreachable, but the estimate changed: it is now
   "drive an existing primitive from the adapter", not "implement DPoP" — and it
   is still behind the loopback-HTTP blocker above, since the adapter cannot
-  address the suite's authorization server at all. How the 46 split across
-  these causes is not measured here.
+  address the suite's authorization server at all. The split across causes **is**
+  now measured, and it is not a split: all 46 are the adapter-profile blocker
+  and none is a missing library capability.
   The nine
   in-tree `oauth_*` test targets are gated on `native-tls-roots`; each one now
   carries a matching `required-features` stanza, so a default run *excludes*
