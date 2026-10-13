@@ -401,4 +401,5 @@ fn managed_task_wait_abandonment_retires_local_owner_without_remote_cancellation
 }
 
 mod resolve;
+mod tool_events;
 mod watch;
