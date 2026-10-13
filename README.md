@@ -150,18 +150,25 @@ different things:
   which is a change to the transport security posture of the whole client
   authorization subsystem, plus accepting a *discovered* issuer where
   `OAuthDiscoveryPlan` currently takes a caller-supplied `TrustedOAuthIssuer`
-  allowlist. A loopback exemption is spec-backed (RFC 8252 §7.3, and OAuth 2.1
-  permits `http` on loopback), so this is a reviewed design decision rather
-  than a forbidden relaxation — but it is a library decision, not adapter
-  plumbing, and it is not taken here.
+  allowlist. And the exemption is **not** spec-backed in the
+  direction that matters: RFC 8252 §7.3 permits loopback `http` for the
+  *client's own redirect URI*, which is not what blocks us, while OAuth 2.1
+  requires `https` for the authorization server's own endpoints — exactly the
+  URLs these 32 gates refuse. The pinned suite serves its authorization server
+  over plain `http` as a harness convenience, not because the spec allows it.
+  So permitting it would be a real relaxation beyond the spec, not a reviewed
+  alignment with it, and it is a library decision rather than adapter plumbing.
+  It is not taken here.
 
   **A trap for whoever does take it.** Gating the exemption behind a
   conformance-only feature or `cfg` would be the cheap version and is
   self-defeating as proof: the 46 passing checks would then measure a profile
   no user can build, so they would be evidence about a conformance-only code
-  path rather than about shipped behaviour. Either the shipped validators gain
-  a spec-backed loopback exemption, or the 46 stay closed and are reported as
-  a deliberate boundary.
+  path rather than about shipped behaviour. Either the shipped validators take a
+  beyond-spec loopback exemption as an explicit, reviewed decision, or these 46
+  stay closed and are reported as a deliberate boundary — which, given that
+  OAuth 2.1 requires `https` for authorization-server endpoints, is a defensible
+  place to land rather than a gap to apologise for.
   **They are also not one problem.** The
   pinned suite drives PKCE (`code_challenge`), `authorization_code`, dynamic
   `register`, and 401 `WWW-Authenticate` + `resource_metadata` discovery, all of
