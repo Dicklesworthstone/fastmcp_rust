@@ -28,6 +28,9 @@ use fastmcp_core::{AccessToken, McpRequestCancellation};
 
 /// Protected-resource and issuer discovery for preregistered native clients.
 pub mod discovery;
+/// Explicit DPoP proof, credential, and nonce handling for caller-owned HTTPS I/O.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod dpop;
 /// Jointly-polled, caller-owned browser driving for native authorization.
 pub mod driver;
 /// High-level HTTP calls with shared OAuth renewal and generation-local caches.
