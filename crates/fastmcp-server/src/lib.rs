@@ -36479,7 +36479,7 @@ mod lib_unit_tests {
             let response = block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
                 policy,
                 &inbound,
-                &request,
+                request,
                 None,
                 None,
                 None,
