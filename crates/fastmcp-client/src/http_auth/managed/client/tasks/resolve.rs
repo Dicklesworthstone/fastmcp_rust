@@ -172,6 +172,67 @@ async fn resolve_one(
     Ok((response, owner))
 }
 
+// Poll every admitted input before waiting. A host input can itself wait for
+// another input in the same batch; awaiting them serially never starts that
+// sibling. These futures remain owned by this operation, not spawned tasks.
+async fn resolve_batch(
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    handlers: &ReverseRequestHandlers,
+    effective: TaskInputRequests,
+    budget: &mut PayloadBudget,
+) -> Result<(FinalTaskInputResponses, Vec<MrtrCallbackOwner>), HttpClientError> {
+    if effective.is_empty() || effective.len() > MAX_TASK_INPUT_MAP_ENTRIES {
+        return Err(HttpClientError::CoreResult(invalid(
+            "Managed Task input count is outside its bounds",
+        )));
+    }
+    let mut pending: Vec<_> = effective
+        .into_iter()
+        .map(|(key, request)| {
+            Some(Box::pin(async move {
+                let (response, owner) =
+                    resolve_one(cx, cancellation, handlers, &key, request).await?;
+                Ok::<_, HttpClientError>((key, response, owner))
+            }))
+        })
+        .collect();
+    let mut responses = FinalTaskInputResponses::new();
+    let mut owners = Vec::with_capacity(pending.len());
+    poll_fn(|task| {
+        checkpoint(cx, cancellation)?;
+        for slot in &mut pending {
+            checkpoint(cx, cancellation)?;
+            let Some(future) = slot else {
+                continue;
+            };
+            let Poll::Ready(result) = future.as_mut().poll(task) else {
+                continue;
+            };
+            // A completed child must never be polled again. On any subsequent
+            // failure, dropping this batch cancels both completed owners and
+            // still-pending callbacks before dispatch can submit an update.
+            *slot = None;
+            let (key, response, owner) = result?;
+            budget
+                .charge(&(&key, &response))
+                .map_err(HttpClientError::CoreResult)?;
+            responses.insert(key, response);
+            owners.push(owner);
+        }
+        checkpoint(cx, cancellation)?;
+        if owners.len() == pending.len() {
+            Poll::Ready(Ok((
+                std::mem::take(&mut responses),
+                std::mem::take(&mut owners),
+            )))
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
 pub(super) async fn dispatch(
     cx: &Cx,
     cancellation: &McpRequestCancellation,
@@ -221,16 +282,8 @@ pub(super) async fn dispatch(
     if omitted_contexts != 0 {
         log::debug!("Unadvertised sampling context omitted from managed Task inputs");
     }
-    let mut responses = FinalTaskInputResponses::new();
-    let mut owners = Vec::with_capacity(effective.len());
-    for (key, request) in effective {
-        let (response, owner) = resolve_one(cx, cancellation, &handlers, &key, request).await?;
-        budget
-            .charge(&(&key, &response))
-            .map_err(HttpClientError::CoreResult)?;
-        owners.push(owner);
-        responses.insert(key, response);
-    }
+    let (responses, owners) =
+        resolve_batch(cx, cancellation, &handlers, effective, &mut budget).await?;
     ledger
         .validate_responses(&responses)
         .map_err(|_| HttpClientError::CoreResult(invalid("Invalid Task input response batch")))?;
@@ -259,6 +312,13 @@ impl ManagedHttpClient {
     /// any callback runs. Sampling tools and URL elicitation need their specific
     /// capability leaves; unsupported sampling context is omitted with a fixed
     /// diagnostic before host effects. The original snapshot is not rewritten.
+    ///
+    /// Admitted callbacks progress concurrently within this operation, up to
+    /// `max_inputs` live futures; no runtime tasks or threads are spawned. A
+    /// pending input does not prevent an independent input from starting.
+    /// Replies retain their original keys regardless of completion order. All
+    /// replies must pass the shared payload budget and input ledger before the
+    /// single update is sent. Failure disposes the entire local batch.
     ///
     /// This is an explicit disclosure operation, not part of get/wait/watch.
     /// The caller must authorize use of its configured roots, sampling and
@@ -460,6 +520,353 @@ mod tests {
             panic!("callback panic must settle as an error");
         };
         assert!(!error.message.contains("private-handler-payload"));
+        assert!(cx.checkpoint().is_ok());
+    }
+
+    fn root_inputs(keys: &[&str]) -> TaskInputRequests {
+        keys.iter()
+            .map(|key| {
+                (
+                    (*key).to_owned(),
+                    serde_json::from_value(json!({"method":"roots/list"})).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    struct WakeCount(AtomicUsize);
+
+    impl std::task::Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct PendingInput {
+        cancellation: ReverseRequestCancellation,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Future for PendingInput {
+        type Output = McpResult<FinalEmbeddedRootsListResult>;
+
+        fn poll(self: std::pin::Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingInput {
+        fn drop(&mut self) {
+            assert!(
+                self.cancellation.is_cancel_requested(),
+                "the callback owner must cancel before dropping its pending future"
+            );
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn pending_first_input_does_not_block_its_sibling_and_replies_keep_their_keys() {
+        use asupersync::channel::oneshot;
+        use std::sync::Mutex;
+
+        let cx = Cx::for_testing();
+        let cancellation = McpRequestCancellation::new();
+        let (sender, receiver) = oneshot::channel::<()>();
+        let sender = Mutex::new(Some(sender));
+        let receiver = Mutex::new(Some(receiver));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let called = Arc::clone(&calls);
+        let handlers = ReverseRequestHandlers::new().with_modern_roots_list(move |cx, _, _| {
+            let index = called.fetch_add(1, Ordering::SeqCst);
+            assert!(index < 2, "a completed callback must not run twice");
+            if index == 0 {
+                let mut receiver = receiver.lock().unwrap().take().unwrap();
+                Box::pin(async move {
+                    receiver.recv(cx).await.unwrap();
+                    Ok(serde_json::from_value(json!({
+                        "roots":[{"uri":"file:///first"}]
+                    }))
+                    .unwrap())
+                })
+            } else {
+                sender
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send_blocking(())
+                    .unwrap();
+                Box::pin(async {
+                    Ok(serde_json::from_value(json!({
+                        "roots":[{"uri":"file:///second"}]
+                    }))
+                    .unwrap())
+                })
+            }
+        });
+        let mut budget = PayloadBudget(4096);
+        let mut batch = Box::pin(resolve_batch(
+            &cx,
+            &cancellation,
+            &handlers,
+            root_inputs(&["a", "b"]),
+            &mut budget,
+        ));
+        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut context = Context::from_waker(&waker);
+        assert!(batch.as_mut().poll(&mut context).is_pending());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(wakes.0.load(Ordering::SeqCst) > 0);
+        let Poll::Ready(Ok((responses, owners))) = batch.as_mut().poll(&mut context) else {
+            panic!("the later sibling must release the earlier input without external polling");
+        };
+        assert_eq!(
+            serde_json::to_value(responses).unwrap(),
+            json!({
+                "a":{"roots":[{"uri":"file:///first"}]},
+                "b":{"roots":[{"uri":"file:///second"}]}
+            })
+        );
+        assert_eq!(owners.len(), 2);
+        for owner in &owners {
+            assert!(!owner.0.is_cancel_requested());
+            owner.0.record_response_sent();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(cx.checkpoint().is_ok());
+    }
+
+    #[test]
+    fn batch_failure_disposes_pending_and_completed_owners_without_starting_later_inputs() {
+        use std::sync::Mutex;
+
+        for failure in 0..3 {
+            let cx = Cx::for_testing();
+            let cancellation = McpRequestCancellation::new();
+            let tokens = Arc::new(Mutex::new(Vec::new()));
+            let observed = Arc::clone(&tokens);
+            let drops = Arc::new(AtomicUsize::new(0));
+            let disposed = Arc::clone(&drops);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let called = Arc::clone(&calls);
+            let handlers = ReverseRequestHandlers::new().with_modern_roots_list(
+                move |_, local, _| {
+                    observed.lock().unwrap().push(local.clone());
+                    match called.fetch_add(1, Ordering::SeqCst) {
+                        0 => Box::pin(async { Ok(FinalEmbeddedRootsListResult { roots: vec![] }) }),
+                        1 => Box::pin(PendingInput {
+                            cancellation: local,
+                            drops: Arc::clone(&disposed),
+                        }),
+                        2 => match failure {
+                            0 => Box::pin(async { Err(McpError::invalid_params("host declined")) }),
+                            1 => panic!("private-batch-panic"),
+                            _ => Box::pin(async {
+                                Ok(serde_json::from_value(json!({
+                                    "roots":[{"uri":format!("file:///{}", "x".repeat(4096))}]
+                                }))
+                                .unwrap())
+                            }),
+                        },
+                        _ => panic!("later callback ran after a terminal batch failure"),
+                    }
+                },
+            );
+            let mut budget = PayloadBudget(1024);
+            let mut batch = Box::pin(resolve_batch(
+                &cx,
+                &cancellation,
+                &handlers,
+                root_inputs(&["a", "b", "c", "d"]),
+                &mut budget,
+            ));
+            let Poll::Ready(Err(HttpClientError::CoreResult(error))) =
+                batch.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+            else {
+                panic!("one rejected input must terminate the whole batch");
+            };
+            assert!(!error.message.contains("private-batch-panic"));
+            drop(batch);
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert!(
+                tokens
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(ReverseRequestCancellation::is_cancel_requested)
+            );
+            assert!(!cancellation.is_cancel_requested());
+            assert!(cx.checkpoint().is_ok());
+        }
+    }
+
+    #[test]
+    fn abandoning_a_parallel_batch_cancels_every_started_callback_before_disposal() {
+        use std::sync::Mutex;
+
+        let cx = Cx::for_testing();
+        let cancellation = McpRequestCancellation::new();
+        let tokens = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&tokens);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let disposed = Arc::clone(&drops);
+        let handlers = ReverseRequestHandlers::new().with_modern_roots_list(move |_, local, _| {
+            observed.lock().unwrap().push(local.clone());
+            Box::pin(PendingInput {
+                cancellation: local,
+                drops: Arc::clone(&disposed),
+            })
+        });
+        let mut budget = PayloadBudget(4096);
+        let mut batch = Box::pin(resolve_batch(
+            &cx,
+            &cancellation,
+            &handlers,
+            root_inputs(&["a", "b", "c"]),
+            &mut budget,
+        ));
+        assert!(
+            batch
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_eq!(tokens.lock().unwrap().len(), 3);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(batch);
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
+        assert!(
+            tokens
+                .lock()
+                .unwrap()
+                .iter()
+                .all(ReverseRequestCancellation::is_cancel_requested)
+        );
+        assert!(!cancellation.is_cancel_requested());
+        assert_eq!(budget.0, 4096);
+        assert!(cx.checkpoint().is_ok());
+    }
+
+    #[test]
+    fn ready_sibling_cancellation_stops_other_inputs_in_the_same_poll() {
+        use std::sync::Mutex;
+
+        let cx = Cx::for_testing();
+        let cancellation = McpRequestCancellation::new();
+        let cancel = cancellation.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let called = Arc::clone(&calls);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let disposed = Arc::clone(&drops);
+        let tokens = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&tokens);
+        let handlers = ReverseRequestHandlers::new().with_modern_roots_list(move |_, local, _| {
+            observed.lock().unwrap().push(local.clone());
+            match called.fetch_add(1, Ordering::SeqCst) {
+                0 => Box::pin(PendingInput {
+                    cancellation: local,
+                    drops: Arc::clone(&disposed),
+                }),
+                1 => {
+                    cancel.cancel();
+                    Box::pin(async { Ok(FinalEmbeddedRootsListResult { roots: vec![] }) })
+                }
+                _ => panic!("a cancelled batch must not construct another host callback"),
+            }
+        });
+        let mut budget = PayloadBudget(4096);
+        let mut batch = Box::pin(resolve_batch(
+            &cx,
+            &cancellation,
+            &handlers,
+            root_inputs(&["a", "b", "c"]),
+            &mut budget,
+        ));
+        assert!(matches!(
+            batch.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(HttpClientError::CoreResult(error)))
+                if error.code == fastmcp_core::McpErrorCode::RequestCancelled
+        ));
+        drop(batch);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(
+            tokens
+                .lock()
+                .unwrap()
+                .iter()
+                .all(ReverseRequestCancellation::is_cancel_requested)
+        );
+        assert_eq!(budget.0, 4096);
+        assert!(cx.checkpoint().is_ok());
+    }
+
+    #[test]
+    fn parallel_answers_share_one_exact_byte_budget() {
+        let cx = Cx::for_testing();
+        let cancellation = McpRequestCancellation::new();
+        let response: FinalEmbeddedInputResponse =
+            serde_json::from_value(json!({"roots":[]})).unwrap();
+        let bytes: usize = ["a", "b", "c"]
+            .iter()
+            .map(|key| serde_json::to_vec(&(key, &response)).unwrap().len())
+            .sum();
+        let handlers = roots();
+        for exact in [false, true] {
+            let mut budget = PayloadBudget(bytes - usize::from(!exact));
+            let mut batch = Box::pin(resolve_batch(
+                &cx,
+                &cancellation,
+                &handlers,
+                root_inputs(&["a", "b", "c"]),
+                &mut budget,
+            ));
+            let Poll::Ready(result) =
+                batch.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+            else {
+                panic!("all-ready inputs must settle in one poll");
+            };
+            assert_eq!(result.is_ok(), exact);
+            if let Ok((responses, owners)) = result {
+                assert_eq!(responses.len(), 3);
+                assert_eq!(owners.len(), 3);
+            }
+            drop(batch);
+            if exact {
+                assert_eq!(budget.0, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn precancelled_batch_does_not_invoke_any_host_handler() {
+        let cx = Cx::for_testing();
+        let cancellation = McpRequestCancellation::new();
+        cancellation.cancel();
+        let handlers = ReverseRequestHandlers::new().with_modern_roots_list(|_, _, _| {
+            panic!("precancelled input handler must never be invoked")
+        });
+        let mut budget = PayloadBudget(4096);
+        let mut batch = Box::pin(resolve_batch(
+            &cx,
+            &cancellation,
+            &handlers,
+            root_inputs(&["a", "b"]),
+            &mut budget,
+        ));
+        assert!(matches!(
+            batch.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(_))
+        ));
+        drop(batch);
+        assert_eq!(budget.0, 4096);
         assert!(cx.checkpoint().is_ok());
     }
 }
