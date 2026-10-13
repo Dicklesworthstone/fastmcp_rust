@@ -72,13 +72,15 @@ impl WatchRequest {
         // poll can finish after logout/expiry even with an otherwise live Cx.
         asupersync::runtime::yield_now().await;
         checkpoint(cx, cancellation)?;
-        let limit = MAX_TASK_RESPONSE_BYTES.min(self.budget.remaining_bytes);
-        if limit == 0 {
+        if self.budget.remaining_bytes == 0 {
             return Err(refusal("Managed task watch payload limit exceeded"));
         }
+        // The native limit counts the whole response, including its JSON-RPC
+        // envelope. The aggregate budget below counts the typed payload only;
+        // using its remainder as a wire limit rejects an exact-fitting payload.
         let result = client
             .connection
-            .get_task_final(cx, request_id, self.task_id.clone(), limit)
+            .get_task_final(cx, request_id, self.task_id.clone(), MAX_TASK_RESPONSE_BYTES)
             .await
             .map_err(HttpClientError::Connection)?;
         // Count snapshot bytes too, not just stream notifications. No second
@@ -105,7 +107,11 @@ impl WatchRequest {
         let mut filter = SubscriptionFilter::default();
         super::set_task_subscription_ids(&mut filter, vec![self.task_id.clone()])
             .map_err(|_| refusal("Invalid managed task watch filter"))?;
-        let frame_bytes = MAX_TASK_RESPONSE_BYTES.min(self.budget.remaining_bytes);
+        if self.budget.remaining_bytes == 0 {
+            return Err(refusal("Managed task watch payload limit exceeded"));
+        }
+        // Frame overhead is bounded independently of admitted event payloads.
+        let frame_bytes = MAX_TASK_RESPONSE_BYTES;
         let limits = SseLimits::with_data_lines(frame_bytes + 8, frame_bytes, 64, 4_096)
             .ok_or_else(|| refusal("Invalid managed task watch response limits"))?;
         let listen_id = client.next_request_id()?;

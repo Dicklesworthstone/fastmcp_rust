@@ -399,3 +399,5 @@ fn managed_task_wait_abandonment_retires_local_owner_without_remote_cancellation
         assert!(matches!(result.unwrap().task, FinalTask::Working(_)));
     });
 }
+
+mod watch;
