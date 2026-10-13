@@ -20,6 +20,9 @@ use super::{
 };
 use crate::http_auth::rpc::{CoreDecoder, ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits};
 
+/// Explicit host-driven multi-round operations with one credential and deadline.
+pub mod interaction;
+
 /// Diagnostics retain no peer message, body, nonce or authorization header.
 /// An admitted JSON-RPC error exposes only its numeric code through Protocol.
 #[derive(Debug)]
