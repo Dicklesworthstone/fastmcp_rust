@@ -96,7 +96,9 @@ impl DpopRequestHeaders {
     /// resource proofs set Authorization themselves and refuse any collision.
     pub fn apply_to(self, headers: &mut Vec<(String, String)>) -> Result<(), DpopClientError> {
         if self.0.iter().any(|(new_name, _)| {
-            headers.iter().any(|(name, _)| name.eq_ignore_ascii_case(new_name))
+            headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(new_name))
         }) {
             return Err(DpopClientError::HeaderConflict);
         }
@@ -228,9 +230,14 @@ impl DpopSession {
         if target.as_str() != self.token_endpoint.as_str() {
             return Err(DpopClientError::EndpointMismatch);
         }
-        let proof = self.key.token_endpoint_proof(target, self.token_nonce.as_ref())?;
+        let proof = self
+            .key
+            .token_endpoint_proof(target, self.token_nonce.as_ref())?;
         self.require_active()?;
-        Ok(DpopRequestHeaders(vec![("DPoP".to_owned(), proof.into_header_value())]))
+        Ok(DpopRequestHeaders(vec![(
+            "DPoP".to_owned(),
+            proof.into_header_value(),
+        )]))
     }
 
     /// Admit a successful token response from the pinned HTTPS token endpoint.
@@ -264,13 +271,17 @@ impl DpopSession {
         if response.contains_key("error") {
             return Err(DpopClientError::InvalidTokenResponse);
         }
-        if !response.get("token_type").and_then(serde_json::Value::as_str)
+        if !response
+            .get("token_type")
+            .and_then(serde_json::Value::as_str)
             .is_some_and(|kind| kind.eq_ignore_ascii_case("DPoP"))
         {
             return Err(DpopClientError::UnexpectedTokenType);
         }
         if let Some(confirmation) = response.get("cnf") {
-            let confirmation = confirmation.as_object().ok_or(DpopClientError::KeyMismatch)?;
+            let confirmation = confirmation
+                .as_object()
+                .ok_or(DpopClientError::KeyMismatch)?;
             if confirmation.len() != 1
                 || confirmation.get("jkt").and_then(serde_json::Value::as_str)
                     != Some(self.key.thumbprint())
@@ -279,19 +290,25 @@ impl DpopSession {
             }
         }
         let lifetime = match response.get("expires_in") {
-            Some(value) => Duration::from_secs(value.as_u64().ok_or(DpopClientError::InvalidLifetime)?)
-                .min(maximum_lifetime),
+            Some(value) => {
+                Duration::from_secs(value.as_u64().ok_or(DpopClientError::InvalidLifetime)?)
+                    .min(maximum_lifetime)
+            }
             None => maximum_lifetime,
         };
         let now = Instant::now();
         if lifetime.is_zero() || received_at > now {
             return Err(DpopClientError::InvalidLifetime);
         }
-        let deadline = received_at.checked_add(lifetime).ok_or(DpopClientError::InvalidLifetime)?;
+        let deadline = received_at
+            .checked_add(lifetime)
+            .ok_or(DpopClientError::InvalidLifetime)?;
         if deadline <= now {
             return Err(DpopClientError::InvalidLifetime);
         }
-        let token = response.get("access_token").and_then(serde_json::Value::as_str)
+        let token = response
+            .get("access_token")
+            .and_then(serde_json::Value::as_str)
             .ok_or(DpopClientError::InvalidTokenResponse)?;
         let bound = BoundBearerCredential::bind_with_expiry(self.resource.clone(), token, deadline)
             .map_err(|_| DpopClientError::InvalidTokenResponse)?
@@ -373,7 +390,9 @@ impl DpopSession {
 
 fn require_credential(credential: &DpopCredential) -> Result<(), DpopClientError> {
     if credential.is_revoked()
-        || credential.expires_at().is_none_or(|deadline| Instant::now() >= deadline)
+        || credential
+            .expires_at()
+            .is_none_or(|deadline| Instant::now() >= deadline)
     {
         return Err(DpopClientError::CredentialUnavailable);
     }
@@ -384,7 +403,9 @@ fn update_nonce(
     current: &mut Option<DpopNonce>,
     headers: &[(String, String)],
 ) -> Result<bool, DpopClientError> {
-    let mut fields = headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("DPoP-Nonce"));
+    let mut fields = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("DPoP-Nonce"));
     let Some((_, value)) = fields.next() else {
         return Ok(false);
     };
@@ -411,31 +432,57 @@ mod tests {
             DpopKey::generate().unwrap(),
             url("https://issuer.example/token"),
             url("https://mcp.example/api?tenant=one"),
-        ).unwrap()
+        )
+        .unwrap()
     }
 
-    fn admit(session: &DpopSession, value: serde_json::Value) -> Result<DpopCredential, DpopClientError> {
+    fn admit(
+        session: &DpopSession,
+        value: serde_json::Value,
+    ) -> Result<DpopCredential, DpopClientError> {
         session.admit_token_response(
-            &session.token_endpoint, 200, &serde_json::to_vec(&value).unwrap(),
-            Instant::now(), Duration::from_secs(60),
+            &session.token_endpoint,
+            200,
+            &serde_json::to_vec(&value).unwrap(),
+            Instant::now(),
+            Duration::from_secs(60),
         )
     }
 
     fn credential(session: &DpopSession) -> DpopCredential {
-        admit(session, json!({"access_token": "sensitive-token", "token_type": "DPoP", "expires_in": 60})).unwrap()
+        admit(
+            session,
+            json!({"access_token": "sensitive-token", "token_type": "DPoP", "expires_in": 60}),
+        )
+        .unwrap()
     }
 
     #[test]
     fn dpop_client_emits_separate_token_and_resource_headers_without_bearer_downgrade() {
         let session = session();
-        let token = session.token_request_headers(&session.token_endpoint).unwrap().into_headers();
+        let token = session
+            .token_request_headers(&session.token_endpoint)
+            .unwrap()
+            .into_headers();
         assert_eq!(token.len(), 1);
         assert_eq!(token[0].0, "DPoP");
         let credential = credential(&session);
-        let first = session.resource_request_headers("POST", &session.resource, &credential).unwrap().into_headers();
-        let second = session.resource_request_headers("POST", &session.resource, &credential).unwrap().into_headers();
+        let first = session
+            .resource_request_headers("POST", &session.resource, &credential)
+            .unwrap()
+            .into_headers();
+        let second = session
+            .resource_request_headers("POST", &session.resource, &credential)
+            .unwrap()
+            .into_headers();
         assert_eq!(first.len(), 2);
-        assert_eq!(first[0], ("Authorization".to_owned(), "DPoP sensitive-token".to_owned()));
+        assert_eq!(
+            first[0],
+            (
+                "Authorization".to_owned(),
+                "DPoP sensitive-token".to_owned()
+            )
+        );
         assert_eq!(first[1].0, "DPoP");
         assert_ne!(first[1].1, second[1].1);
         assert_ne!(first[1].1, token[0].1);
@@ -444,22 +491,51 @@ mod tests {
     #[test]
     fn dpop_client_nonce_updates_are_role_isolated_and_atomic() {
         let endpoint = url("https://same.example/api");
-        let mut session = DpopSession::new(DpopKey::generate().unwrap(), endpoint.clone(), endpoint.clone()).unwrap();
-        assert!(session.observe_token_nonce(&endpoint, &[("DPoP-Nonce".into(), "as-nonce".into())]).unwrap());
+        let mut session = DpopSession::new(
+            DpopKey::generate().unwrap(),
+            endpoint.clone(),
+            endpoint.clone(),
+        )
+        .unwrap();
+        assert!(
+            session
+                .observe_token_nonce(&endpoint, &[("DPoP-Nonce".into(), "as-nonce".into())])
+                .unwrap()
+        );
         assert!(session.resource_nonce.is_none());
-        assert!(session.observe_resource_nonce(&endpoint, &[("dpop-nonce".into(), "rs-nonce".into())]).unwrap());
+        assert!(
+            session
+                .observe_resource_nonce(&endpoint, &[("dpop-nonce".into(), "rs-nonce".into())])
+                .unwrap()
+        );
         assert_eq!(session.token_nonce.as_ref().unwrap().as_str(), "as-nonce");
-        assert_eq!(session.resource_nonce.as_ref().unwrap().as_str(), "rs-nonce");
+        assert_eq!(
+            session.resource_nonce.as_ref().unwrap().as_str(),
+            "rs-nonce"
+        );
         assert!(!session.observe_token_nonce(&endpoint, &[]).unwrap());
         for headers in [
-            vec![("DPoP-Nonce".into(), "new".into()), ("dpop-nonce".into(), "new".into())],
+            vec![
+                ("DPoP-Nonce".into(), "new".into()),
+                ("dpop-nonce".into(), "new".into()),
+            ],
             vec![("DPoP-Nonce".into(), "bad nonce".into())],
         ] {
             assert!(session.observe_token_nonce(&endpoint, &headers).is_err());
             assert_eq!(session.token_nonce.as_ref().unwrap().as_str(), "as-nonce");
-            assert_eq!(session.resource_nonce.as_ref().unwrap().as_str(), "rs-nonce");
+            assert_eq!(
+                session.resource_nonce.as_ref().unwrap().as_str(),
+                "rs-nonce"
+            );
         }
-        assert!(session.observe_token_nonce(&url("https://other.example/api"), &[("DPoP-Nonce".into(), "bad-origin".into())]).is_err());
+        assert!(
+            session
+                .observe_token_nonce(
+                    &url("https://other.example/api"),
+                    &[("DPoP-Nonce".into(), "bad-origin".into())]
+                )
+                .is_err()
+        );
         assert_eq!(session.token_nonce.as_ref().unwrap().as_str(), "as-nonce");
     }
 
@@ -476,7 +552,18 @@ mod tests {
             assert!(admit(&session, value).is_err());
         }
         let duplicate = br#"{"access_token":"one","access_token":"two","token_type":"DPoP"}"#;
-        assert_eq!(session.admit_token_response(&session.token_endpoint, 200, duplicate, Instant::now(), Duration::from_secs(60)).unwrap_err(), DpopClientError::InvalidTokenResponse);
+        assert_eq!(
+            session
+                .admit_token_response(
+                    &session.token_endpoint,
+                    200,
+                    duplicate,
+                    Instant::now(),
+                    Duration::from_secs(60)
+                )
+                .unwrap_err(),
+            DpopClientError::InvalidTokenResponse
+        );
         assert!(admit(&session, json!({"access_token": "good", "token_type": "dpop", "cnf": {"jkt": session.authorization_jkt()}})).is_ok());
     }
 
@@ -484,13 +571,43 @@ mod tests {
     fn dpop_client_keeps_full_query_binding_and_refuses_other_keys_and_issuers() {
         let session = session();
         let credential = credential(&session);
-        for target in ["https://mcp.example/api", "https://mcp.example/api?tenant=two", "https://mcp.example/other?tenant=one", "http://mcp.example/api?tenant=one"] {
-            assert_eq!(session.resource_request_headers("POST", &url(target), &credential).unwrap_err(), DpopClientError::EndpointMismatch);
+        for target in [
+            "https://mcp.example/api",
+            "https://mcp.example/api?tenant=two",
+            "https://mcp.example/other?tenant=one",
+            "http://mcp.example/api?tenant=one",
+        ] {
+            assert_eq!(
+                session
+                    .resource_request_headers("POST", &url(target), &credential)
+                    .unwrap_err(),
+                DpopClientError::EndpointMismatch
+            );
         }
-        let another_key = DpopSession::new(DpopKey::generate().unwrap(), session.token_endpoint.clone(), session.resource.clone()).unwrap();
-        assert_eq!(another_key.resource_request_headers("POST", &session.resource, &credential).unwrap_err(), DpopClientError::KeyMismatch);
-        let another_issuer = DpopSession::new(session.key.clone(), url("https://other.example/token"), session.resource.clone()).unwrap();
-        assert_eq!(another_issuer.resource_request_headers("POST", &session.resource, &credential).unwrap_err(), DpopClientError::EndpointMismatch);
+        let another_key = DpopSession::new(
+            DpopKey::generate().unwrap(),
+            session.token_endpoint.clone(),
+            session.resource.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            another_key
+                .resource_request_headers("POST", &session.resource, &credential)
+                .unwrap_err(),
+            DpopClientError::KeyMismatch
+        );
+        let another_issuer = DpopSession::new(
+            session.key.clone(),
+            url("https://other.example/token"),
+            session.resource.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            another_issuer
+                .resource_request_headers("POST", &session.resource, &credential)
+                .unwrap_err(),
+            DpopClientError::EndpointMismatch
+        );
     }
 
     #[test]
@@ -498,15 +615,79 @@ mod tests {
         let session = session();
         let received = Instant::now();
         let bytes = br#"{"access_token":"token","token_type":"DPoP","expires_in":3600}"#;
-        let credential = session.admit_token_response(&session.token_endpoint, 200, bytes, received, Duration::from_secs(30)).unwrap();
-        assert_eq!(credential.expires_at(), received.checked_add(Duration::from_secs(30)));
-        for seconds in [json!(0), json!(-1), json!(1.5), json!("60"), serde_json::Value::Null] {
-            assert_eq!(admit(&session, json!({"access_token": "token", "token_type": "DPoP", "expires_in": seconds})).unwrap_err(), DpopClientError::InvalidLifetime);
+        let credential = session
+            .admit_token_response(
+                &session.token_endpoint,
+                200,
+                bytes,
+                received,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        assert_eq!(
+            credential.expires_at(),
+            received.checked_add(Duration::from_secs(30))
+        );
+        for seconds in [
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("60"),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(
+                admit(
+                    &session,
+                    json!({"access_token": "token", "token_type": "DPoP", "expires_in": seconds})
+                )
+                .unwrap_err(),
+                DpopClientError::InvalidLifetime
+            );
         }
-        assert!(session.admit_token_response(&session.token_endpoint, 200, bytes, received - Duration::from_secs(120), Duration::from_secs(30)).is_err());
-        assert!(session.admit_token_response(&session.token_endpoint, 200, bytes, received + Duration::from_secs(120), Duration::from_secs(30)).is_err());
-        assert!(session.admit_token_response(&session.token_endpoint, 200, bytes, received, Duration::ZERO).is_err());
-        assert!(session.admit_token_response(&session.token_endpoint, 400, bytes, received, Duration::from_secs(30)).is_err());
+        assert!(
+            session
+                .admit_token_response(
+                    &session.token_endpoint,
+                    200,
+                    bytes,
+                    received - Duration::from_secs(120),
+                    Duration::from_secs(30)
+                )
+                .is_err()
+        );
+        assert!(
+            session
+                .admit_token_response(
+                    &session.token_endpoint,
+                    200,
+                    bytes,
+                    received + Duration::from_secs(120),
+                    Duration::from_secs(30)
+                )
+                .is_err()
+        );
+        assert!(
+            session
+                .admit_token_response(
+                    &session.token_endpoint,
+                    200,
+                    bytes,
+                    received,
+                    Duration::ZERO
+                )
+                .is_err()
+        );
+        assert!(
+            session
+                .admit_token_response(
+                    &session.token_endpoint,
+                    400,
+                    bytes,
+                    received,
+                    Duration::from_secs(30)
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -518,7 +699,12 @@ mod tests {
         first.revoke();
         assert!(first_clone.is_revoked());
         assert!(!second.is_revoked());
-        assert_eq!(session.resource_request_headers("POST", &session.resource, &first_clone).unwrap_err(), DpopClientError::CredentialUnavailable);
+        assert_eq!(
+            session
+                .resource_request_headers("POST", &session.resource, &first_clone)
+                .unwrap_err(),
+            DpopClientError::CredentialUnavailable
+        );
         drop(session);
         assert!(second.is_revoked());
     }
@@ -529,10 +715,25 @@ mod tests {
         let credential = credential(&session);
         session.revoke();
         assert!(credential.is_revoked());
-        assert_eq!(session.token_request_headers(&session.token_endpoint).unwrap_err(), DpopClientError::SessionRevoked);
-        assert_eq!(admit(&session, json!({"access_token": "token", "token_type": "DPoP"})).unwrap_err(), DpopClientError::SessionRevoked);
+        assert_eq!(
+            session
+                .token_request_headers(&session.token_endpoint)
+                .unwrap_err(),
+            DpopClientError::SessionRevoked
+        );
+        assert_eq!(
+            admit(
+                &session,
+                json!({"access_token": "token", "token_type": "DPoP"})
+            )
+            .unwrap_err(),
+            DpopClientError::SessionRevoked
+        );
         let source = session.resource.clone();
-        assert_eq!(session.observe_resource_nonce(&source, &[]).unwrap_err(), DpopClientError::SessionRevoked);
+        assert_eq!(
+            session.observe_resource_nonce(&source, &[]).unwrap_err(),
+            DpopClientError::SessionRevoked
+        );
     }
 
     #[test]
@@ -542,12 +743,21 @@ mod tests {
         for existing in ["authorization", "dPoP"] {
             let mut headers = vec![(existing.to_owned(), "existing".to_owned())];
             let before = headers.clone();
-            let fresh = session.resource_request_headers("POST", &session.resource, &credential).unwrap();
-            assert_eq!(fresh.apply_to(&mut headers).unwrap_err(), DpopClientError::HeaderConflict);
+            let fresh = session
+                .resource_request_headers("POST", &session.resource, &credential)
+                .unwrap();
+            assert_eq!(
+                fresh.apply_to(&mut headers).unwrap_err(),
+                DpopClientError::HeaderConflict
+            );
             assert_eq!(headers, before);
         }
         let mut headers = vec![("Authorization".to_owned(), "Basic client-auth".to_owned())];
-        session.token_request_headers(&session.token_endpoint).unwrap().apply_to(&mut headers).unwrap();
+        session
+            .token_request_headers(&session.token_endpoint)
+            .unwrap()
+            .apply_to(&mut headers)
+            .unwrap();
         assert_eq!(headers.len(), 2);
         assert_eq!(headers[0].1, "Basic client-auth");
     }
@@ -556,8 +766,14 @@ mod tests {
     fn dpop_client_redacts_credentials_headers_and_nonce_state() {
         let session = session();
         let credential = credential(&session);
-        let headers = session.resource_request_headers("POST", &session.resource, &credential).unwrap();
-        for debug in [format!("{session:?}"), format!("{credential:?}"), format!("{headers:?}")] {
+        let headers = session
+            .resource_request_headers("POST", &session.resource, &credential)
+            .unwrap();
+        for debug in [
+            format!("{session:?}"),
+            format!("{credential:?}"),
+            format!("{headers:?}"),
+        ] {
             assert!(debug.contains("<redacted>"));
             assert!(!debug.contains("sensitive-token"));
         }
