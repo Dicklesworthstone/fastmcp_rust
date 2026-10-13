@@ -5,6 +5,7 @@
 //! - MCP-specific method types (tools, resources, prompts)
 //! - Protocol version negotiation
 //! - Message serialization/deserialization
+//! - Opt-in ES256 DPoP proofs and RFC 7638 key thumbprints (`jose` feature)
 //!
 //! MCP 2026-07-28 support is under implementation and remains unverified.
 //! Its core vocabulary is always available. Optional legacy, Tasks, and Apps
@@ -39,6 +40,8 @@
 #![forbid(unsafe_code)]
 
 pub mod common_types;
+#[cfg(feature = "jose")]
+pub mod dpop;
 pub mod extensions;
 pub mod http_headers;
 #[cfg(feature = "jose")]
