@@ -698,11 +698,101 @@ fn http_transport_has_no_shipped_consumer_as_the_readme_says() {
     );
 }
 
+/// `#[test]` attributes in one repository-relative source file.
+///
+/// Counts attributes rather than running anything, which is the same quantity
+/// the README row quotes and is stable without a build.
+fn test_attribute_count(path: &str) -> usize {
+    source_corpus()
+        .iter()
+        .find(|(candidate, _)| candidate == path)
+        .map_or(0, |(_, text)| text.matches("#[test]").count())
+}
+
+/// The unclaimed-surface row's three test counts still match the tree.
+///
+/// The two checks above deliberately pin the CONSUMER SET "rather than the
+/// mere count", so the numbers themselves were ungated — and they had already
+/// drifted once: the row said 168 for `http.rs` and 213 for the total when the
+/// tree held 167 and 212, which was corrected by hand on 2026-10-12 with
+/// nothing to catch it. This pins all three so the next drift fails here.
+///
+/// The total is checked as a sum rather than independently, because a row that
+/// quotes two parts and a whole can be internally inconsistent as well as
+/// stale.
+#[test]
+fn readme_unclaimed_surface_test_counts_match_the_tree() {
+    let readme = read(&repo_root().join("README.md"));
+    const HEADER: &str = "| **Two modules ship with tests but no consumer** |";
+    let row = readme
+        .lines()
+        .find(|line| line.starts_with(HEADER))
+        .expect("the README must carry the unclaimed-surface row");
+
+    let event_store = test_attribute_count("crates/fastmcp-transport/src/event_store.rs");
+    let http = test_attribute_count("crates/fastmcp-transport/src/http.rs");
+
+    // Control: a zero would make every claim below vacuously checkable against
+    // a row that happens to say zero, and signals the corpus lookup broke.
+    assert!(
+        event_store > 0 && http > 0,
+        "counted {event_store} and {http} tests; a zero means the corpus \
+         lookup stopped finding these files, not that the tests vanished"
+    );
+
+    let mut wrong = Vec::new();
+    for (label, phrase) in [
+        ("event_store", format!("{event_store} tests")),
+        ("http", format!("{http} tests")),
+        ("total", format!("{} green tests", event_store + http)),
+    ] {
+        if !row.contains(phrase.as_str()) {
+            wrong.push(format!("{label}: row does not say {phrase:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "the unclaimed-surface row's test counts no longer match the tree \
+         (event_store {event_store}, http {http}, total {}). Fix the row:\n  {}",
+        event_store + http,
+        wrong.join("\n  ")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // RH-5: each check above must actually fire. These feed the same pure
 // functions a mutated input and require the defect to be detected, so a
 // refactor that silently neuters a check cannot stay green.
 // ---------------------------------------------------------------------------
+
+/// Planted negative for the unclaimed-surface count gate.
+///
+/// Uses the exact drift that really happened: the row said 168 and 213 while
+/// the tree held 167 and 212. The predicate must flag the two stale numbers and
+/// must NOT flag the one that was correct, so it discriminates rather than
+/// failing on everything.
+#[test]
+fn planted_unclaimed_surface_count_drift_is_detected() {
+    let stale_row = "| **Two modules ship with tests but no consumer** | \
+                     event_store (45 tests) ... HttpTransport (168 tests) ... \
+                     but 213 green tests exercise code |";
+    let (event_store, http) = (45usize, 167usize);
+    let flagged: Vec<&str> = [
+        ("event_store", format!("{event_store} tests")),
+        ("http", format!("{http} tests")),
+        ("total", format!("{} green tests", event_store + http)),
+    ]
+    .iter()
+    .filter(|(_, phrase)| !stale_row.contains(phrase.as_str()))
+    .map(|(label, _)| *label)
+    .collect();
+    assert_eq!(
+        flagged,
+        vec!["http", "total"],
+        "the count gate must flag exactly the two numbers that drifted and \
+         leave the correct one alone"
+    );
+}
 
 #[test]
 fn planted_file_scope_cfg_is_detected_and_an_item_cfg_is_not() {
